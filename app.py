@@ -3,7 +3,7 @@
 
 from flask import (Flask, render_template_string, request, jsonify,
     redirect, url_for, session, send_from_directory, make_response)
-from werkzeug.security import check_password_hash
+from werkzeug.security import check_password_hash, generate_password_hash
 from functools import wraps
 import os, re, ssl, json, secrets, subprocess, time, psutil, threading, html, shutil
 from datetime import datetime
@@ -105,6 +105,17 @@ def load_auth():
     except Exception:
         pass
     return {}
+
+def save_auth(auth_dict):
+    """Write auth.json to CONFIG_DIR. Caller must ensure auth_dict has password_hash."""
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    p = os.path.join(CONFIG_DIR, 'auth.json')
+    auth_dict = dict(auth_dict)
+    if 'created' not in auth_dict:
+        auth_dict['created'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+    with open(p, 'w') as f:
+        json.dump(auth_dict, f, indent=4)
+    os.chmod(p, 0o600)
 
 def _apply_authentik_session():
     """If request has Authentik headers (from Caddy forward_auth), set session so we treat user as logged in."""
@@ -254,6 +265,7 @@ def render_sidebar(modules, active_path):
     if email.get('installed'):
         parts.append(link('/emailrelay', '<span class="nav-icon material-symbols-outlined">outgoing_mail</span>Email Relay'))
     parts.append(link('/marketplace', '<span class="nav-icon material-symbols-outlined">shopping_cart</span>Marketplace'))
+    parts.append(link('/help', '<span class="nav-icon material-symbols-outlined">help</span>Help'))
     return '<nav class="sidebar">\n  ' + '\n  '.join(parts) + '\n</nav>'
 
 def get_system_metrics():
@@ -374,6 +386,13 @@ def marketplace_page():
     r = make_response(resp)
     r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
     return r
+
+@app.route('/help')
+@login_required
+def help_page():
+    """Help: backdoor URL, console password info, reset password."""
+    settings = load_settings()
+    return render_template_string(HELP_TEMPLATE, settings=settings, version=VERSION)
 
 @app.route('/api/update/check')
 @login_required
@@ -9380,6 +9399,16 @@ def run_full_uninstall():
         full_uninstall_status.update({'running': False, 'done': True, 'error': str(e)})
         full_uninstall_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] ✗ {str(e)}")
 
+@app.route('/api/console/uninstall-all/validate', methods=['POST'])
+@login_required
+def console_uninstall_all_validate():
+    """Check admin password only (for green check in UI)."""
+    data = request.json or {}
+    password = data.get('password', '')
+    auth = load_auth()
+    valid = bool(auth.get('password_hash') and check_password_hash(auth['password_hash'], password))
+    return jsonify({'valid': valid})
+
 @app.route('/api/console/uninstall-all', methods=['POST'])
 @login_required
 def console_uninstall_all():
@@ -9408,6 +9437,91 @@ def console_uninstall_all_status():
         'error': full_uninstall_status.get('error'),
         'log': full_uninstall_log[-200:],
     })
+
+@app.route('/api/console/password/reset', methods=['POST'])
+@login_required
+def console_password_reset():
+    """Reset console admin password (for 5001 and Uninstall all). Requires current password."""
+    data = request.json or {}
+    current = data.get('current_password', '')
+    new_pw = data.get('new_password', '')
+    confirm = data.get('new_password_confirm', '')
+    auth = load_auth()
+    if not auth.get('password_hash') or not check_password_hash(auth['password_hash'], current):
+        return jsonify({'success': False, 'error': 'Current password is wrong'}), 403
+    if not new_pw or len(new_pw) < 8:
+        return jsonify({'success': False, 'error': 'New password must be at least 8 characters'}), 400
+    if new_pw != confirm:
+        return jsonify({'success': False, 'error': 'New password and confirmation do not match'}), 400
+    auth['password_hash'] = generate_password_hash(new_pw)
+    auth['created'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+    save_auth(auth)
+    subprocess.Popen('sleep 2 && systemctl restart takwerx-console', shell=True,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return jsonify({'success': True, 'message': 'Password updated. Console will restart in a few seconds.'})
+
+# === Help Template (sidebar: backdoor, password info, reset) ===
+HELP_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Help — infra-TAK</title>
+<style>
+''' + BASE_CSS + '''
+body{display:flex;flex-direction:row;min-height:100vh}
+.sidebar{width:220px;min-width:220px;background:var(--bg-surface);border-right:1px solid var(--border);padding:24px 0;flex-shrink:0}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;color:var(--text-secondary);text-decoration:none;font-size:13px;font-weight:500;border-left:2px solid transparent}
+.nav-item:hover{color:var(--text-primary);background:rgba(255,255,255,.03)}.nav-item.active{color:var(--cyan);background:rgba(6,182,212,.06);border-left-color:var(--cyan)}
+.nav-icon{font-size:15px;width:18px;text-align:center}
+.main{flex:1;min-width:0;overflow-y:auto;padding:32px;max-width:640px;margin:0 auto}
+.help-card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px}
+.help-card h2{font-size:16px;font-weight:600;margin-bottom:12px;color:var(--text-primary)}
+.help-card p{font-size:13px;color:var(--text-secondary);line-height:1.6;margin-bottom:12px}
+.help-card p:last-child{margin-bottom:0}
+.backdoor-url{font-family:'JetBrains Mono',monospace;font-size:13px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:12px 14px;color:var(--cyan);word-break:break-all;user-select:all}
+.form-field{margin-bottom:14px}.form-field label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px}
+.form-field input{width:100%;padding:10px 14px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-size:13px}
+.btn{display:inline-block;padding:10px 20px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:none}
+.btn-primary{background:var(--accent);color:#fff}.btn-primary:hover{opacity:0.9}
+#reset-msg{margin-top:12px;font-size:13px;min-height:20px}
+</style></head><body>
+{{ sidebar_html }}
+<main class="main">
+<div class="help-card">
+<h2>Backdoor (IP:5001)</h2>
+<p>If Authentik or the domain is down, you can always reach the console at:</p>
+<p class="backdoor-url">https://{{ settings.get('server_ip', 'SERVER_IP') }}:5001</p>
+<p>Accept the self-signed cert and log in with your <strong>console password</strong>.</p>
+</div>
+<div class="help-card">
+<h2>Console password</h2>
+<p>This is the password you set when you ran <code style="background:var(--bg-surface);padding:2px 6px;border-radius:4px">start.sh</code>. The <strong>same password</strong> is used to log in at the backdoor (above) and for <strong>Uninstall all services</strong> on the Console page. We don't store the plaintext, so it can't be shown here. Forgot it? Reset below.</p>
+</div>
+<div class="help-card">
+<h2>Reset console password</h2>
+<p>Enter your current password and choose a new one. The console will restart and you'll use the new password for 5001 and Uninstall all.</p>
+<div class="form-field"><label>Current password</label><input type="password" id="reset-current" placeholder="Current console password"></div>
+<div class="form-field"><label>New password</label><input type="password" id="reset-new" placeholder="At least 8 characters"></div>
+<div class="form-field"><label>Confirm new password</label><input type="password" id="reset-confirm" placeholder="Same as above"></div>
+<button type="button" class="btn btn-primary" onclick="doResetPassword()">Reset password</button>
+<div id="reset-msg"></div>
+</div>
+</main>
+<script>
+async function doResetPassword(){
+    var cur=document.getElementById('reset-current').value;
+    var neu=document.getElementById('reset-new').value;
+    var conf=document.getElementById('reset-confirm').value;
+    var msg=document.getElementById('reset-msg');
+    msg.textContent='';
+    if(!cur){msg.style.color='var(--red)';msg.textContent='Enter current password';return;}
+    if(!neu||neu.length<8){msg.style.color='var(--red)';msg.textContent='New password must be at least 8 characters';return;}
+    if(neu!==conf){msg.style.color='var(--red)';msg.textContent='New password and confirmation do not match';return;}
+    msg.style.color='var(--cyan)';msg.textContent='Updating...';
+    try{
+        var r=await fetch('/api/console/password/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:cur,new_password:neu,new_password_confirm:conf})});
+        var d=await r.json();
+        if(d.success){msg.style.color='var(--green)';msg.textContent=d.message||'Password updated. Reload in a few seconds.';}
+        else{msg.style.color='var(--red)';msg.textContent=d.error||'Failed';}
+    }catch(e){msg.style.color='var(--red)';msg.textContent=e.message||'Request failed';}
+}
+</script></body></html>'''
 
 # === Console Template (installed services only) ===
 CONSOLE_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Console — infra-TAK</title>
@@ -9494,12 +9608,12 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <span style="position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:{% if metrics.unattended_upgrades.enabled %}var(--green){% else %}rgba(71,85,105,0.5){% endif %};border-radius:20px;transition:.3s" id="uu-slider"></span>
 <span style="position:absolute;content:'';height:16px;width:16px;left:{% if metrics.unattended_upgrades.enabled %}18px{% else %}2px{% endif %};bottom:2px;background:#fff;border-radius:50%;transition:.3s" id="uu-knob"></span>
 </label>
-<span id="uu-label" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:{% if metrics.unattended_upgrades.enabled %}var(--green){% else %}var(--text-dim){% endif %}">{% if metrics.unattended_upgrades.running %}Running…{% elif metrics.unattended_upgrades.enabled %}Enabled{% else %}Disabled{% endif %}</span>
+<span id="uu-label" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:{% if metrics.unattended_upgrades.enabled %}var(--green){% else %}var(--text-dim){% endif %}">{% if metrics.unattended_upgrades.running %}Running...{% elif metrics.unattended_upgrades.enabled %}Enabled{% else %}Disabled{% endif %}</span>
 </div>
 </div>
 </div>
 <div class="section-title">Console</div>
-<div class="meta-line">v{{ version }} · {{ settings.get('os_name', 'Unknown OS') }} · {{ settings.get('server_ip', 'N/A') }}{% if settings.get('fqdn') %} · {{ settings.get('fqdn') }}{% endif %}</div>
+<div class="meta-line">v{{ version }} | {{ settings.get('os_name', 'Unknown OS') }} | {{ settings.get('server_ip', 'N/A') }}{% if settings.get('fqdn') %} | {{ settings.get('fqdn') }}{% endif %}</div>
 <div class="modules-grid">
 {% if not modules %}
 <div style="grid-column:1/-1;background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:48px;text-align:center">
@@ -9524,14 +9638,14 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div style="margin-top:32px;padding:20px;background:var(--bg-card);border:1px solid var(--border);border-radius:12px">
 <div style="font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:8px">Testing — reset server</div>
 <div style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Remove all deployed services (TAK Server, Authentik, Caddy, TAK Portal, MediaMTX, Node-RED, CloudTAK, Email Relay). The console stays so you can redeploy from Marketplace without burning the VPS.</div>
-<button type="button" onclick="document.getElementById('full-uninstall-modal').classList.add('open');setTimeout(fullUninstallCheckFields,50)" style="padding:8px 16px;background:rgba(239,68,68,0.15);color:var(--red);border:1px solid rgba(239,68,68,0.4);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;cursor:pointer">Uninstall all services</button>
+<button type="button" onclick="document.getElementById('full-uninstall-modal').classList.add('open');setTimeout(function(){fullUninstallCheckFields();var p=document.getElementById('full-uninstall-password');if(p&&p.value.trim())fullUninstallValidatePassword();},50)" style="padding:8px 16px;background:rgba(239,68,68,0.15);color:var(--red);border:1px solid rgba(239,68,68,0.4);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;cursor:pointer">Uninstall all services</button>
 </div>
 <div id="full-uninstall-modal" class="modal-overlay" style="z-index:9999;padding:24px">
 <div class="modal" style="max-width:480px;max-height:90vh;overflow:hidden;display:flex;flex-direction:column">
 <div style="font-weight:600;margin-bottom:16px">Uninstall all deployed services</div>
 <p style="font-size:12px;color:var(--text-dim);margin-bottom:16px">This will remove TAK Server, Authentik, Caddy, TAK Portal, MediaMTX, Node-RED, CloudTAK, and Email Relay. The console and your password remain. You can redeploy from Marketplace afterward.</p>
-<div style="margin-bottom:12px"><label class="form-label" style="display:block;margin-bottom:4px;font-size:12px">Admin password</label><div style="position:relative;display:flex;align-items:center;gap:8px"><input class="form-input" id="full-uninstall-password" type="password" placeholder="Your console password" style="flex:1" oninput="fullUninstallCheckFields()"><span id="full-uninstall-pw-check" style="display:none;color:var(--green);font-size:18px;flex-shrink:0" title="Password entered">&#10003;</span></div></div>
-<div style="margin-bottom:12px"><label class="form-label" style="display:block;margin-bottom:4px;font-size:12px">Type <strong>UNINSTALL</strong> to confirm</label><div style="position:relative;display:flex;align-items:center;gap:8px"><input class="form-input" id="full-uninstall-confirm" type="text" placeholder="UNINSTALL" autocomplete="off" style="flex:1" oninput="fullUninstallCheckFields()"><span id="full-uninstall-confirm-check" style="display:none;color:var(--green);font-size:18px;flex-shrink:0" title="Confirmation correct">&#10003;</span></div></div>
+<div style="margin-bottom:12px"><label class="form-label" style="display:block;margin-bottom:4px;font-size:12px">Admin password</label><div style="position:relative;display:flex;align-items:center;gap:8px"><input class="form-input" id="full-uninstall-password" type="password" placeholder="Your console password" style="flex:1" oninput="fullUninstallPasswordInput()" onblur="fullUninstallValidatePassword()"><span id="full-uninstall-pw-check" style="display:none;color:var(--green);font-size:18px;flex-shrink:0" title="Password correct">&#10003;</span></div></div>
+<div style="margin-bottom:12px"><label class="form-label" style="display:block;margin-bottom:4px;font-size:12px">Type <strong>UNINSTALL</strong> to confirm</label><div style="position:relative;display:flex;align-items:center;gap:8px"><input class="form-input" id="full-uninstall-confirm" type="text" placeholder="UNINSTALL" autocomplete="off" style="flex:1" oninput="fullUninstallCheckFields()"><span id="full-uninstall-confirm-check" style="display:none;color:var(--green);font-size:18px;flex-shrink:0" title="UNINSTALL typed correctly">&#10003;</span></div></div>
 <div id="full-uninstall-msg" style="margin-bottom:8px;font-size:12px;color:var(--red);min-height:18px"></div>
 <div id="full-uninstall-progress" style="display:none;margin-bottom:12px;font-size:12px;color:var(--text-secondary)"></div>
 <div id="full-uninstall-log" style="display:none;background:var(--bg-deep);border:1px solid var(--border);border-radius:8px;padding:12px;font-family:'JetBrains Mono',monospace;font-size:11px;max-height:200px;overflow-y:auto;margin-bottom:12px;white-space:pre-wrap;word-break:break-all"></div>
@@ -9542,15 +9656,9 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 </div>
 <div class="help-footer" style="margin-top:48px;padding-top:24px;border-top:1px solid var(--border);font-size:12px;color:var(--text-dim)">
-<details style="cursor:pointer">
-<summary style="font-weight:600;color:var(--text-secondary);margin-bottom:8px">Help — backdoor, deployment steps, reset password</summary>
-<div style="margin-top:12px;line-height:1.6">
-<p style="margin-bottom:8px"><strong>Backdoor (when Authentik is down or you're locked out):</strong> The console is always reachable at <strong>IP:5001</strong> — e.g. <code style="background:var(--bg-card);padding:2px 6px;border-radius:4px">https://{{ settings.get('server_ip', 'SERVER_IP') }}:5001</code>. Accept the self-signed cert and log in with your console password. This path does not go through Authentik.</p>
-<p style="margin-bottom:8px"><strong>Deployment order:</strong> (1) Caddy — set FQDN and TLS · (2) Authentik · (3) Email Relay (Configure Authentik runs automatically; button remains for switching providers) · (4) TAK Server — upload .deb/.rpm and deploy · (5) TAK Portal · (6) Connect TAK Server to LDAP (button on TAK Server page) · (7) Node-RED, MediaMTX, CloudTAK as needed.</p>
-<p style="margin-bottom:8px"><strong>Reset console password from CLI:</strong> SSH to the server, go to the repo directory (e.g. <code style="background:var(--bg-card);padding:2px 6px;border-radius:4px">cd ~/infra-TAK</code>), then run <code style="background:var(--bg-card);padding:2px 6px;border-radius:4px">sudo ./reset-console-password.sh</code>. Then open the backdoor URL above and log in with the new password.</p>
-<p style="margin-bottom:0">Full docs and commands: <a href="https://github.com/takwerx/infra-TAK" target="_blank" rel="noopener" style="color:var(--cyan);text-decoration:none">github.com/takwerx/infra-TAK</a> (README, docs/COMMANDS.md, docs/HANDOFF-LDAP-AUTHENTIK.md)</p>
-</div>
-</details>
+<p style="margin-bottom:8px"><strong>Backdoor, console password, reset:</strong> See <a href="/help" style="color:var(--cyan);text-decoration:none">Help</a> in the menu.</p>
+<p style="margin-bottom:8px"><strong>Deployment order:</strong> (1) Caddy — set FQDN and TLS · (2) Authentik · (3) Email Relay · (4) TAK Server — upload .deb/.rpm and deploy · (5) TAK Portal · (6) Connect TAK Server to LDAP (button on TAK Server page) · (7) Node-RED, MediaMTX, CloudTAK as needed.</p>
+<p style="margin-bottom:0"><a href="https://github.com/takwerx/infra-TAK" target="_blank" rel="noopener" style="color:var(--cyan);text-decoration:none">github.com/takwerx/infra-TAK</a> (README, docs/)</p>
 </div>
 </div>
 <script>
@@ -9598,7 +9706,7 @@ function refreshModuleVersions(){
             var d=data[key];
             var s='';
             if(d.version)s='v'+d.version;
-            if(d.update_available)s+=(s?' ':'')+'<span style="color:var(--cyan);font-size:10px" title="Update available">⬆ update</span>';
+            if(d.update_available)s+=(s?' ':'')+'<span style="color:var(--cyan);font-size:10px" title="Update available">update</span>';
             el.innerHTML=s;if(s)el.style.display='';
         }
     }).catch(function(){});
@@ -9611,7 +9719,7 @@ async function checkUpdate(){
         var r=await fetch('/api/update/check');var d=await r.json();
         if(d.update_available){
             document.getElementById('update-banner').style.display='block';
-            document.getElementById('update-info').textContent='v'+d.current+' → v'+d.latest+(d.notes?' · '+d.notes:'');
+            document.getElementById('update-info').textContent='v'+d.current+' -> v'+d.latest+(d.notes?' - '+d.notes:'');
             updateBody=d.body||'No details available';
         }
     }catch(e){}
@@ -9630,24 +9738,41 @@ async function applyUpdate(){
         var r=await fetch('/api/update/apply',{method:'POST'});var d=await r.json();
         if(d.success){
             status.style.color='var(--green)';
-            status.textContent='✓ Updated! Restarting console...';
+            status.textContent='OK Updated! Restarting console...';
             setTimeout(function(){window.location.reload()},5000);
         }else{
-            status.style.color='var(--red)';status.textContent='✗ '+d.error;
+            status.style.color='var(--red)';status.textContent='Error: '+d.error;
             btn.disabled=false;btn.textContent='Update Now';btn.style.opacity='1';
         }
-    }catch(e){status.style.color='var(--red)';status.textContent='✗ '+e.message;btn.disabled=false;btn.textContent='Update Now';btn.style.opacity='1'}
+    }catch(e){status.style.color='var(--red)';status.textContent='Error: '+e.message;btn.disabled=false;btn.textContent='Update Now';btn.style.opacity='1'}
 }
 checkUpdate();
 function closeFullUninstallModal(){
     document.getElementById('full-uninstall-modal').classList.remove('open');
 }
-function fullUninstallCheckFields(){
-    var pw=document.getElementById('full-uninstall-password');
-    var conf=document.getElementById('full-uninstall-confirm');
+var fullUninstallPwValidateTimer = null;
+function fullUninstallPasswordInput(){
     var pwCheck=document.getElementById('full-uninstall-pw-check');
+    if(pwCheck)pwCheck.style.display='none';
+    clearTimeout(fullUninstallPwValidateTimer);
+    var pw=document.getElementById('full-uninstall-password');
+    if(!pw||!pw.value.trim())return;
+    fullUninstallPwValidateTimer=setTimeout(fullUninstallValidatePassword,400);
+}
+async function fullUninstallValidatePassword(){
+    var pw=document.getElementById('full-uninstall-password');
+    var pwCheck=document.getElementById('full-uninstall-pw-check');
+    if(!pw||!pwCheck)return;
+    if(!pw.value.trim()){pwCheck.style.display='none';return;}
+    try{
+        var r=await fetch('/api/console/uninstall-all/validate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw.value})});
+        var d=await r.json();
+        pwCheck.style.display=d.valid?'inline':'none';
+    }catch(e){pwCheck.style.display='none';}
+}
+function fullUninstallCheckFields(){
+    var conf=document.getElementById('full-uninstall-confirm');
     var confCheck=document.getElementById('full-uninstall-confirm-check');
-    if(pwCheck)pwCheck.style.display=pw&&pw.value.trim()!==''?'inline':'none';
     if(confCheck)confCheck.style.display=conf&&conf.value.trim().toUpperCase()==='UNINSTALL'?'inline':'none';
 }
 var fullUninstallPollTimer = null;
