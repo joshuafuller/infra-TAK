@@ -146,6 +146,20 @@ def detect_modules():
     if caddy_installed:
         r = subprocess.run(['systemctl', 'is-active', 'caddy'], capture_output=True, text=True)
         caddy_running = r.stdout.strip() == 'active'
+        # Leftover from uninstall-all? (binary still there but service disabled and stopped)
+        if not caddy_running:
+            re = subprocess.run(['systemctl', 'is-enabled', 'caddy'], capture_output=True, text=True, timeout=5)
+            if (re.stdout or '').strip() == 'disabled':
+                for path in ['/usr/bin/caddy', '/usr/local/bin/caddy']:
+                    if os.path.exists(path):
+                        try:
+                            os.remove(path)
+                        except Exception:
+                            subprocess.run(f'rm -f {path}', shell=True, capture_output=True)
+                if os.path.exists('/etc/caddy'):
+                    subprocess.run('rm -rf /etc/caddy', shell=True, capture_output=True, timeout=10)
+                subprocess.run('systemctl daemon-reload 2>/dev/null; true', shell=True, capture_output=True)
+                caddy_installed = False
     modules['caddy'] = {'name': 'Caddy SSL', 'installed': caddy_installed, 'running': caddy_running,
         'description': "Domain setup, Let's Encrypt SSL & reverse proxy" if not has_fqdn else f"SSL & reverse proxy — {settings.get('fqdn', '')}",
         'icon': '🔒', 'icon_url': CADDY_LOGO_URL, 'route': '/caddy', 'priority': 0 if not has_fqdn else 10}
