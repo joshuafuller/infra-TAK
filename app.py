@@ -9582,8 +9582,8 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <button type="button" id="sync-webadmin-btn" onclick="syncWebadmin()" style="padding:8px 16px;background:rgba(59,130,246,.2);color:var(--cyan);border:1px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;cursor:pointer">Sync webadmin to Authentik</button>
 <span id="sync-webadmin-msg" style="font-size:12px;color:var(--text-dim)"></span><span id="resync-ldap-msg" style="font-size:12px;color:var(--text-dim)"></span>
 </div>
-<p style="font-size:11px;color:var(--text-dim);margin-top:6px;margin-bottom:4px"><strong>Resync LDAP</strong> — Re-runs the full flow (fix blueprint if needed, restart Authentik worker, ensure service account &amp; webadmin, sync CoreConfig). Use after pulling console updates or if QR/login fails.</p>
-<p style="font-size:11px;color:var(--text-dim);margin-top:0;margin-bottom:0"><strong>Sync webadmin</strong> — Only pushes the 8446 password from settings into Authentik.</p>
+<p style="font-size:11px;color:var(--text-dim);margin-top:6px;margin-bottom:4px"><strong>Resync LDAP</strong> — Re-runs the full flow (fix blueprint if needed, restart Authentik worker, ensure service account &amp; webadmin, sync CoreConfig). Use after pulling console updates or if QR/login fails. <span style="color:var(--yellow)">Restarts Authentik worker; TAK Portal user list may take a short moment to repopulate.</span></p>
+<p style="font-size:11px;color:var(--text-dim);margin-top:0;margin-bottom:0"><strong>Sync webadmin</strong> — Only pushes the 8446 password from settings into Authentik. Does not restart anything.</p>
 </div>
 {% endif %}
 <div class="section-title">Access</div>
@@ -9741,6 +9741,7 @@ async function connectLdap(){
 }
 
 async function resyncLdap(){
+    if(!confirm('Resync will restart the Authentik worker and re-apply the LDAP blueprint. The TAK Portal user list may take a short moment to repopulate.\n\nContinue?')){return;}
     var btn=document.getElementById('resync-ldap-btn');
     var msg=document.getElementById('resync-ldap-msg');
     if(btn){btn.disabled=true;btn.style.opacity='0.7';btn.textContent='Resyncing...';}
