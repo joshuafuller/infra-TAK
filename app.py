@@ -8550,6 +8550,18 @@ def _ensure_authentik_webadmin():
             _req.urlopen(req, timeout=10)
         req = _req.Request(f'{url}/api/v3/core/users/{webadmin_pk}/set_password/', data=json.dumps({'password': webadmin_pass}).encode(), headers=headers, method='POST')
         _req.urlopen(req, timeout=10)
+        # Add webadmin to authentik Admins so LDAP application allows bind (8446 login)
+        req = _req.Request(f'{url}/api/v3/core/groups/?search=authentik+Admins', headers=headers)
+        resp = _req.urlopen(req, timeout=10)
+        groups = json.loads(resp.read().decode())['results']
+        admins_grp = next((g for g in groups if g.get('name') == 'authentik Admins'), None)
+        if admins_grp:
+            users_raw = admins_grp.get('users') or []
+            member_pks = [u.get('pk') if isinstance(u, dict) else u for u in users_raw]
+            if webadmin_pk not in member_pks:
+                req = _req.Request(f'{url}/api/v3/core/groups/{admins_grp["pk"]}/add_user/',
+                    data=json.dumps({'pk': webadmin_pk}).encode(), headers=headers, method='POST')
+                _req.urlopen(req, timeout=10)
         return True, None
     except urllib.error.HTTPError as e:
         try:
@@ -8572,6 +8584,17 @@ def takserver_sync_webadmin():
     if ok:
         return jsonify({'success': True, 'message': 'Webadmin user synced to Authentik. Use the same password you set at TAK Server deploy to log in to 8446.'})
     return jsonify({'success': False, 'message': err or 'Sync failed'}), 400
+
+
+@app.route('/api/takserver/webadmin-password')
+@login_required
+def takserver_webadmin_password():
+    """Return webadmin password from settings (for Show Password on TAK Server page)."""
+    settings = load_settings()
+    pw = settings.get('webadmin_password', '').strip()
+    if pw:
+        return jsonify({'password': pw})
+    return jsonify({'password': ''})
 
 
 @app.route('/api/takserver/connect-ldap', methods=['POST'])
@@ -9127,6 +9150,14 @@ def run_takserver_deploy(config):
             generate_caddyfile(settings)
             subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True)
             log_step(f"  ✓ Caddy config updated for TAK Server")
+
+        # If Authentik is installed, ensure webadmin exists there (for 8446 LDAP login). On fresh install with Authentik-first order, this runs here so user does not need to click Sync webadmin.
+        if webadmin_pass and os.path.exists(os.path.expanduser('~/authentik/.env')):
+            ok, err = _ensure_authentik_webadmin()
+            if ok:
+                log_step("  ✓ webadmin synced to Authentik (8446 login ready)")
+            elif err:
+                log_step(f"  ⚠ webadmin sync: {err[:80]} — use Sync webadmin button if 8446 fails")
 
         # If Caddy is already running with a domain, install LE cert on 8446 now.
         # This handles the case where Caddy was deployed before TAK Server.
@@ -10023,6 +10054,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <a href="{{ 'https://takportal.' + settings.get('fqdn', '') if settings.get('fqdn') else 'http://' + settings.get('server_ip', '') + ':3000' }}" target="_blank" class="cert-btn cert-btn-secondary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">👥 TAK Portal{% if not settings.get('fqdn') %} :3000{% endif %}</a>
 <a href="{{ 'https://authentik.' + settings.get('fqdn', '') if settings.get('fqdn') else 'http://' + settings.get('server_ip', '') + ':9090' }}" target="_blank" class="cert-btn cert-btn-secondary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">🔐 Authentik{% if not settings.get('fqdn') %} :9090{% endif %}</a>
 </div>
+<div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:12px">8446 login: <span style="color:var(--cyan)">webadmin</span> · <button type="button" onclick="showWebadminPassword()" id="webadmin-pw-btn" style="background:none;border:1px solid var(--border);color:var(--cyan);padding:2px 10px;border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">🔑 Show Password</button> <span id="webadmin-pw-display" style="color:var(--green);user-select:all;display:none"></span></div>
 </div>
 <div class="section-title">Services</div>
 <div id="services-panel" style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
@@ -10105,6 +10137,18 @@ async function resyncLdap(){
         else{if(msg){msg.textContent=d.message||'Failed';msg.style.color='var(--red)';} if(btn){btn.disabled=false;btn.style.opacity='1';btn.textContent='Resync LDAP to TAK Server';}}
     }
     catch(e){if(msg){msg.textContent='Error: '+e.message;msg.style.color='var(--red)';} if(btn){btn.disabled=false;btn.style.opacity='1';btn.textContent='Resync LDAP to TAK Server';}}
+}
+async function showWebadminPassword(){
+    var btn=document.getElementById('webadmin-pw-btn');
+    var display=document.getElementById('webadmin-pw-display');
+    if(!btn||!display)return;
+    if(display.style.display==='inline'){display.style.display='none';display.textContent='';btn.textContent='🔑 Show Password';return;}
+    try{
+        var r=await fetch('/api/takserver/webadmin-password');
+        var d=await r.json();
+        if(d.password){display.textContent=d.password;display.style.display='inline';btn.textContent='🔑 Hide';}
+        else{display.textContent='Not set (set at deploy or sync webadmin)';display.style.display='inline';}
+    }catch(e){display.textContent='Error';display.style.display='inline';}
 }
 async function syncWebadmin(){
     var btn=document.getElementById('sync-webadmin-btn');
