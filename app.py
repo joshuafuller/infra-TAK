@@ -8100,6 +8100,30 @@ def _ensure_ldap_flow_authentication_none():
             ldap_bindings = [b for b in all_bindings if str(b.get('target')) == str(ldap_flow_pk)]
             stage_names = {(b.get('stage_obj') or {}).get('name') or '' for b in ldap_bindings}
             need_names = {'ldap-identification-stage', 'ldap-authentication-password', 'ldap-authentication-login'}
+            # Clear password_stage on identification stage (DB may have it from old blueprint → "exceeded stage recursion depth")
+            def _find_stage(api_path, name):
+                for page in range(1, 4):
+                    data = _get(f'{api_path}?page={page}&page_size=100')
+                    for s in data.get('results', []):
+                        if s.get('name') == name:
+                            return s.get('pk')
+                    if not data.get('pagination', {}).get('next'):
+                        break
+                return None
+            id_stage_pk = None
+            for b in ldap_bindings:
+                so = b.get('stage_obj') or {}
+                if so.get('name') == 'ldap-identification-stage':
+                    id_stage_pk = so.get('pk') or (b.get('stage') if isinstance(b.get('stage'), int) else None)
+                    break
+            if not id_stage_pk:
+                id_stage_pk = _find_stage('stages/identification/', 'ldap-identification-stage')
+            if id_stage_pk:
+                try:
+                    # Include user_fields so PATCH does not trigger "no user fields selected" validation
+                    _patch(f'stages/identification/{id_stage_pk}/', {'password_stage': None, 'user_fields': ['username']})
+                except Exception:
+                    pass
             wrong_bindings = len(ldap_bindings) < 3 or need_names != stage_names
             if wrong_bindings:
                 for b in ldap_bindings:
@@ -8110,15 +8134,6 @@ def _ensure_ldap_flow_authentication_none():
                 ldap_bindings = []
             if len(ldap_bindings) < 3:
                 # Find or create blueprint stages by name (blueprint may not have run)
-                def _find_stage(api_path, name):
-                    for page in range(1, 4):
-                        data = _get(f'{api_path}?page={page}&page_size=100')
-                        for s in data.get('results', []):
-                            if s.get('name') == name:
-                                return s.get('pk')
-                        if not data.get('pagination', {}).get('next'):
-                            break
-                    return None
                 def _create_ldap_stage(api_path, name, attrs):
                     try:
                         body = {'name': name, **attrs}
@@ -8511,6 +8526,12 @@ def takserver_connect_ldap():
                 diag.append('LDAP blueprint fixed (removed password_stage); worker restarted')
         except Exception as e:
             diag.append(f'Blueprint fix: {str(e)[:80]}')
+    # Fix flow (clear identification password_stage, ensure 3 ldap-* bindings) so user bind / QR works
+    ok_flow, err_flow = _ensure_ldap_flow_authentication_none()
+    if not ok_flow:
+        diag.append(f'Flow fix: {err_flow}')
+    else:
+        diag.append('Flow: OK')
     ok, msg = _ensure_authentik_ldap_service_account()
     if not ok:
         if '-w' in (msg or ''):
