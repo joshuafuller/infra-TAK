@@ -298,6 +298,9 @@ def _get_unattended_upgrades_status():
         running = bool(proc.stdout.strip())
     except Exception:
         pass
+    # Only show "running" when auto-updates are enabled; otherwise timer/cron can run the binary and confuse the UI
+    if not enabled:
+        running = False
     return {'enabled': enabled, 'running': running}
 
 # === Routes ===
@@ -9241,9 +9244,14 @@ def api_toggle_unattended_upgrades():
         if action == 'disable':
             subprocess.run('systemctl stop unattended-upgrades && systemctl disable unattended-upgrades',
                 shell=True, check=True, capture_output=True, text=True, timeout=30)
+            # Ubuntu/Debian also run unattended-upgrade via apt-daily-upgrade.timer; disable that too
+            subprocess.run('systemctl stop apt-daily-upgrade.timer 2>/dev/null; systemctl disable apt-daily-upgrade.timer 2>/dev/null; true',
+                shell=True, timeout=10)
         else:
             subprocess.run('systemctl enable unattended-upgrades && systemctl start unattended-upgrades',
                 shell=True, check=True, capture_output=True, text=True, timeout=30)
+            subprocess.run('systemctl enable apt-daily-upgrade.timer 2>/dev/null; systemctl start apt-daily-upgrade.timer 2>/dev/null; true',
+                shell=True, timeout=10)
         uu = _get_unattended_upgrades_status()
         return jsonify({'success': True, 'enabled': uu['enabled'], 'running': uu['running']})
     except subprocess.CalledProcessError as e:
@@ -9643,7 +9651,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div class="metric-card"><div class="metric-label">Uptime</div><div class="metric-value" id="uptime-value" style="font-size:18px">{{ metrics.uptime }}</div></div>
 <div class="metric-card" style="position:relative">
 <div class="metric-label" style="display:flex;align-items:center;gap:6px">Auto Updates
-{% if metrics.unattended_upgrades.running %}<span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--cyan);animation:pulse 2s infinite" title="Upgrade in progress"></span>{% endif %}
+{% if metrics.unattended_upgrades.enabled and metrics.unattended_upgrades.running %}<span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--cyan);animation:pulse 2s infinite" title="Upgrade in progress"></span>{% endif %}
 </div>
 <div style="display:flex;align-items:center;gap:8px;margin-top:6px">
 <label style="position:relative;display:inline-block;width:36px;height:20px;cursor:pointer;margin:0">
@@ -9651,7 +9659,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <span style="position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:{% if metrics.unattended_upgrades.enabled %}var(--green){% else %}rgba(71,85,105,0.5){% endif %};border-radius:20px;transition:.3s" id="uu-slider"></span>
 <span style="position:absolute;content:'';height:16px;width:16px;left:{% if metrics.unattended_upgrades.enabled %}18px{% else %}2px{% endif %};bottom:2px;background:#fff;border-radius:50%;transition:.3s" id="uu-knob"></span>
 </label>
-<span id="uu-label" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:{% if metrics.unattended_upgrades.enabled %}var(--green){% else %}var(--text-dim){% endif %}">{% if metrics.unattended_upgrades.running %}Running...{% elif metrics.unattended_upgrades.enabled %}Enabled{% else %}Disabled{% endif %}</span>
+<span id="uu-label" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:{% if metrics.unattended_upgrades.enabled %}var(--green){% else %}var(--text-dim){% endif %}">{% if metrics.unattended_upgrades.enabled and metrics.unattended_upgrades.running %}Running...{% elif metrics.unattended_upgrades.enabled %}Enabled{% else %}Disabled{% endif %}</span>
 </div>
 </div>
 </div>
@@ -9687,7 +9695,7 @@ function updateUU(uu){
     sl.style.background=uu.enabled?'var(--green)':'rgba(71,85,105,0.5)';
     kn.style.left=uu.enabled?'18px':'2px';
     lb.style.color=uu.enabled?'var(--green)':'var(--text-dim)';
-    lb.textContent=uu.running?'Running...':uu.enabled?'Enabled':'Disabled';
+    lb.textContent=(uu.enabled&&uu.running)?'Running...':uu.enabled?'Enabled':'Disabled';
 }
 async function toggleUU(cb){
     var action=cb.checked?'enable':'disable';
