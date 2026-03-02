@@ -9480,6 +9480,12 @@ body{display:flex;flex-direction:row;min-height:100vh}
 .btn{display:inline-block;padding:10px 20px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:none}
 .btn-primary{background:var(--accent);color:#fff}.btn-primary:hover{opacity:0.9}
 #reset-msg{margin-top:12px;font-size:13px;min-height:20px}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;display:none;align-items:center;justify-content:center}
+.modal-overlay.open{display:flex}
+.modal{background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;max-width:90vw}
+.form-label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px}
+.btn-ghost{background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border);padding:10px 18px;border-radius:8px;cursor:pointer;font-size:13px}
+.btn-danger{background:var(--red);color:#fff;border:none;padding:10px 18px;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600}
 </style></head><body>
 {{ sidebar_html }}
 <main class="main">
@@ -9502,7 +9508,44 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <button type="button" class="btn btn-primary" onclick="doResetPassword()">Reset password</button>
 <div id="reset-msg"></div>
 </div>
+<div class="help-card">
+<h2>Uninstall all services</h2>
+<p>Remove all deployed services (TAK Server, Authentik, Caddy, TAK Portal, MediaMTX, Node-RED, CloudTAK, Email Relay). The console stays so you can redeploy from Marketplace without burning the VPS.</p>
+<button type="button" onclick="document.getElementById('full-uninstall-modal').classList.add('open');setTimeout(function(){fullUninstallCheckFields();var p=document.getElementById('full-uninstall-password');if(p&&p.value.trim())fullUninstallValidatePassword();},50)" style="padding:8px 16px;background:rgba(239,68,68,0.15);color:var(--red);border:1px solid rgba(239,68,68,0.4);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;cursor:pointer">Uninstall all services</button>
+</div>
+<div id="full-uninstall-modal" class="modal-overlay" style="z-index:9999;padding:24px">
+<div class="modal" style="max-width:480px;max-height:90vh;overflow:hidden;display:flex;flex-direction:column">
+<div style="font-weight:600;margin-bottom:16px">Uninstall all deployed services</div>
+<p style="font-size:12px;color:var(--text-dim);margin-bottom:16px">This will remove TAK Server, Authentik, Caddy, TAK Portal, MediaMTX, Node-RED, CloudTAK, and Email Relay. The console and your password remain. You can redeploy from Marketplace afterward.</p>
+<div style="margin-bottom:12px"><label class="form-label" style="display:block;margin-bottom:4px;font-size:12px">Admin password</label><div style="position:relative;display:flex;align-items:center;gap:8px"><input class="form-input" id="full-uninstall-password" type="password" placeholder="Your console password" style="flex:1" oninput="fullUninstallPasswordInput()" onblur="fullUninstallValidatePassword()"><span id="full-uninstall-pw-check" style="display:none;color:var(--green);font-size:18px;flex-shrink:0" title="Password correct">&#10003;</span></div></div>
+<div style="margin-bottom:12px"><label class="form-label" style="display:block;margin-bottom:4px;font-size:12px">Type <strong>UNINSTALL</strong> to confirm</label><div style="position:relative;display:flex;align-items:center;gap:8px"><input class="form-input" id="full-uninstall-confirm" type="text" placeholder="UNINSTALL" autocomplete="off" style="flex:1" oninput="fullUninstallCheckFields()"><span id="full-uninstall-confirm-check" style="display:none;color:var(--green);font-size:18px;flex-shrink:0" title="UNINSTALL typed correctly">&#10003;</span></div></div>
+<div id="full-uninstall-msg" style="margin-bottom:8px;font-size:12px;color:var(--red);min-height:18px"></div>
+<div id="full-uninstall-progress" style="display:none;margin-bottom:12px;font-size:12px;color:var(--text-secondary)"></div>
+<div id="full-uninstall-log" style="display:none;background:var(--bg-deep);border:1px solid var(--border);border-radius:8px;padding:12px;font-family:'JetBrains Mono',monospace;font-size:11px;max-height:200px;overflow-y:auto;margin-bottom:12px;white-space:pre-wrap;word-break:break-all"></div>
+<div style="display:flex;gap:8px;margin-top:8px">
+<button type="button" class="btn btn-ghost" id="full-uninstall-cancel" onclick="closeFullUninstallModal()">Cancel</button>
+<button type="button" class="btn btn-danger" id="full-uninstall-submit" onclick="doFullUninstall()">Uninstall all</button>
+</div>
+</div>
+</div>
+<div class="help-card">
+<h2>Deployment order</h2>
+<p>(1) Caddy — set FQDN and TLS · (2) Authentik · (3) Email Relay · (4) TAK Server — upload .deb/.rpm and deploy · (5) TAK Portal · (6) Connect TAK Server to LDAP (button on TAK Server page) · (7) Node-RED, MediaMTX, CloudTAK as needed.</p>
+</div>
+<div class="help-card">
+<h2>Docs</h2>
+<p><a href="https://github.com/takwerx/infra-TAK" target="_blank" rel="noopener" style="color:var(--cyan);text-decoration:none">github.com/takwerx/infra-TAK</a> (README, docs/COMMANDS.md, docs/HANDOFF-LDAP-AUTHENTIK.md)</p>
+</div>
 </main>
+<script>
+function closeFullUninstallModal(){document.getElementById('full-uninstall-modal').classList.remove('open');}
+var fullUninstallPwValidateTimer=null;
+function fullUninstallPasswordInput(){var c=document.getElementById('full-uninstall-pw-check');if(c)c.style.display='none';clearTimeout(fullUninstallPwValidateTimer);var p=document.getElementById('full-uninstall-password');if(!p||!p.value.trim())return;fullUninstallPwValidateTimer=setTimeout(fullUninstallValidatePassword,400);}
+async function fullUninstallValidatePassword(){var p=document.getElementById('full-uninstall-password');var c=document.getElementById('full-uninstall-pw-check');if(!p||!c)return;if(!p.value.trim()){c.style.display='none';return;}try{var r=await fetch('/api/console/uninstall-all/validate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:p.value})});var d=await r.json();c.style.display=d.valid?'inline':'none';}catch(e){c.style.display='none';}}
+function fullUninstallCheckFields(){var conf=document.getElementById('full-uninstall-confirm');var chk=document.getElementById('full-uninstall-confirm-check');if(chk)chk.style.display=conf&&conf.value.trim().toUpperCase()==='UNINSTALL'?'inline':'none';}
+var fullUninstallPollTimer=null;
+async function doFullUninstall(){var pw=document.getElementById('full-uninstall-password').value;var confirmVal=document.getElementById('full-uninstall-confirm').value.trim().toUpperCase();var msgEl=document.getElementById('full-uninstall-msg');var progressEl=document.getElementById('full-uninstall-progress');var logEl=document.getElementById('full-uninstall-log');var cancelBtn=document.getElementById('full-uninstall-cancel');var submitBtn=document.getElementById('full-uninstall-submit');msgEl.textContent='';if(!pw){msgEl.textContent='Enter your password';return;}if(confirmVal!=='UNINSTALL'){msgEl.textContent='Type UNINSTALL in the confirmation box to proceed';return;}progressEl.style.display='block';progressEl.textContent='Starting...';logEl.style.display='none';logEl.textContent='';cancelBtn.disabled=true;submitBtn.disabled=true;try{var r=await fetch('/api/console/uninstall-all',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw,confirm:confirmVal})});var d=await r.json();if(!d.success){msgEl.textContent=d.error||'Request failed';progressEl.style.display='none';cancelBtn.disabled=false;submitBtn.disabled=false;return;}logEl.style.display='block';function poll(){fetch('/api/console/uninstall-all/status').then(function(res){return res.json();}).then(function(s){if(s.log&&s.log.length){logEl.textContent=s.log.join('\\n');logEl.scrollTop=logEl.scrollHeight;}if(s.running){progressEl.textContent='Uninstalling...';fullUninstallPollTimer=setTimeout(poll,1500);return;}if(s.done){progressEl.textContent=s.error?'Error: '+s.error:'Done. Reloading...';if(s.error)msgEl.textContent=s.error;cancelBtn.disabled=false;if(!s.error)setTimeout(function(){window.location.href='/console';},1500);}}).catch(function(){progressEl.textContent='Error polling';cancelBtn.disabled=false;submitBtn.disabled=false;});}poll();}catch(e){msgEl.textContent=e.message||'Request failed';progressEl.style.display='none';cancelBtn.disabled=false;submitBtn.disabled=false;}}
+</script>
 <script>
 async function doResetPassword(){
     var cur=document.getElementById('reset-current').value;
@@ -9619,7 +9662,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div style="grid-column:1/-1;background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:48px;text-align:center">
 <div style="font-size:15px;color:var(--text-secondary);margin-bottom:12px">No deployed services yet</div>
 <div style="font-size:13px;color:var(--text-dim);margin-bottom:20px">Install and deploy from the Marketplace to see them here.</div>
-<a href="/marketplace" style="display:inline-block;padding:10px 24px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;text-decoration:none">Go to Marketplace →</a>
+<a href="/marketplace" style="display:inline-block;padding:10px 24px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;text-decoration:none">Go to Marketplace</a>
 </div>
 {% else %}
 {% for key, mod in modules.items() %}
@@ -9628,38 +9671,12 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% if not mod.get('icon_url') or key == 'takportal' or key == 'emailrelay' %}<div class="module-name">{{ mod.name }}</div>{% endif %}
 </div>
 <div class="module-desc">{{ mod.description }}</div>
-{% if module_versions.get(key) %}{% set v = module_versions.get(key) %}{% if v.version or v.update_available %}<div class="meta-line module-version-line" id="module-version-{{ key }}" style="margin-bottom:4px">{% if v.version %}v{{ v.version }}{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">⬆ update</span>{% endif %}</div>{% endif %}{% endif %}
+{% if module_versions.get(key) %}{% set v = module_versions.get(key) %}{% if v.version or v.update_available %}<div class="meta-line module-version-line" id="module-version-{{ key }}" style="margin-bottom:4px">{% if v.version %}v{{ v.version }}{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% endif %}</div>{% endif %}{% endif %}
 <span class="module-status status-{% if mod.installed and mod.running %}running{% elif mod.installed %}stopped{% else %}not-installed{% endif %}" id="module-status-{{ key }}" data-module="{{ key }}">{% if mod.installed and mod.running %}<span class="status-dot"></span> Running{% elif mod.installed %}<span class="status-dot"></span> Stopped{% else %}Not Installed{% endif %}</span>
-{% if mod.installed %}<span class="module-action">Manage →</span>{% else %}<span class="module-action">Deploy →</span>{% endif %}
+{% if mod.installed %}<span class="module-action">Manage</span>{% else %}<span class="module-action">Deploy</span>{% endif %}
 </a>
 {% endfor %}
 {% endif %}
-</div>
-<div style="margin-top:32px;padding:20px;background:var(--bg-card);border:1px solid var(--border);border-radius:12px">
-<div style="font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:8px">Testing — reset server</div>
-<div style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Remove all deployed services (TAK Server, Authentik, Caddy, TAK Portal, MediaMTX, Node-RED, CloudTAK, Email Relay). The console stays so you can redeploy from Marketplace without burning the VPS.</div>
-<button type="button" onclick="document.getElementById('full-uninstall-modal').classList.add('open');setTimeout(function(){fullUninstallCheckFields();var p=document.getElementById('full-uninstall-password');if(p&&p.value.trim())fullUninstallValidatePassword();},50)" style="padding:8px 16px;background:rgba(239,68,68,0.15);color:var(--red);border:1px solid rgba(239,68,68,0.4);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;cursor:pointer">Uninstall all services</button>
-</div>
-<div id="full-uninstall-modal" class="modal-overlay" style="z-index:9999;padding:24px">
-<div class="modal" style="max-width:480px;max-height:90vh;overflow:hidden;display:flex;flex-direction:column">
-<div style="font-weight:600;margin-bottom:16px">Uninstall all deployed services</div>
-<p style="font-size:12px;color:var(--text-dim);margin-bottom:16px">This will remove TAK Server, Authentik, Caddy, TAK Portal, MediaMTX, Node-RED, CloudTAK, and Email Relay. The console and your password remain. You can redeploy from Marketplace afterward.</p>
-<div style="margin-bottom:12px"><label class="form-label" style="display:block;margin-bottom:4px;font-size:12px">Admin password</label><div style="position:relative;display:flex;align-items:center;gap:8px"><input class="form-input" id="full-uninstall-password" type="password" placeholder="Your console password" style="flex:1" oninput="fullUninstallPasswordInput()" onblur="fullUninstallValidatePassword()"><span id="full-uninstall-pw-check" style="display:none;color:var(--green);font-size:18px;flex-shrink:0" title="Password correct">&#10003;</span></div></div>
-<div style="margin-bottom:12px"><label class="form-label" style="display:block;margin-bottom:4px;font-size:12px">Type <strong>UNINSTALL</strong> to confirm</label><div style="position:relative;display:flex;align-items:center;gap:8px"><input class="form-input" id="full-uninstall-confirm" type="text" placeholder="UNINSTALL" autocomplete="off" style="flex:1" oninput="fullUninstallCheckFields()"><span id="full-uninstall-confirm-check" style="display:none;color:var(--green);font-size:18px;flex-shrink:0" title="UNINSTALL typed correctly">&#10003;</span></div></div>
-<div id="full-uninstall-msg" style="margin-bottom:8px;font-size:12px;color:var(--red);min-height:18px"></div>
-<div id="full-uninstall-progress" style="display:none;margin-bottom:12px;font-size:12px;color:var(--text-secondary)"></div>
-<div id="full-uninstall-log" style="display:none;background:var(--bg-deep);border:1px solid var(--border);border-radius:8px;padding:12px;font-family:'JetBrains Mono',monospace;font-size:11px;max-height:200px;overflow-y:auto;margin-bottom:12px;white-space:pre-wrap;word-break:break-all"></div>
-<div style="display:flex;gap:8px;margin-top:8px">
-<button type="button" class="btn btn-ghost" id="full-uninstall-cancel" onclick="closeFullUninstallModal()">Cancel</button>
-<button type="button" class="btn btn-danger" id="full-uninstall-submit" onclick="doFullUninstall()">Uninstall all</button>
-</div>
-</div>
-</div>
-<div class="help-footer" style="margin-top:48px;padding-top:24px;border-top:1px solid var(--border);font-size:12px;color:var(--text-dim)">
-<p style="margin-bottom:8px"><strong>Backdoor, console password, reset:</strong> See <a href="/help" style="color:var(--cyan);text-decoration:none">Help</a> in the menu.</p>
-<p style="margin-bottom:8px"><strong>Deployment order:</strong> (1) Caddy — set FQDN and TLS · (2) Authentik · (3) Email Relay · (4) TAK Server — upload .deb/.rpm and deploy · (5) TAK Portal · (6) Connect TAK Server to LDAP (button on TAK Server page) · (7) Node-RED, MediaMTX, CloudTAK as needed.</p>
-<p style="margin-bottom:0"><a href="https://github.com/takwerx/infra-TAK" target="_blank" rel="noopener" style="color:var(--cyan);text-decoration:none">github.com/takwerx/infra-TAK</a> (README, docs/)</p>
-</div>
 </div>
 <script>
 function updateUU(uu){
@@ -9747,83 +9764,6 @@ async function applyUpdate(){
     }catch(e){status.style.color='var(--red)';status.textContent='Error: '+e.message;btn.disabled=false;btn.textContent='Update Now';btn.style.opacity='1'}
 }
 checkUpdate();
-function closeFullUninstallModal(){
-    document.getElementById('full-uninstall-modal').classList.remove('open');
-}
-var fullUninstallPwValidateTimer = null;
-function fullUninstallPasswordInput(){
-    var pwCheck=document.getElementById('full-uninstall-pw-check');
-    if(pwCheck)pwCheck.style.display='none';
-    clearTimeout(fullUninstallPwValidateTimer);
-    var pw=document.getElementById('full-uninstall-password');
-    if(!pw||!pw.value.trim())return;
-    fullUninstallPwValidateTimer=setTimeout(fullUninstallValidatePassword,400);
-}
-async function fullUninstallValidatePassword(){
-    var pw=document.getElementById('full-uninstall-password');
-    var pwCheck=document.getElementById('full-uninstall-pw-check');
-    if(!pw||!pwCheck)return;
-    if(!pw.value.trim()){pwCheck.style.display='none';return;}
-    try{
-        var r=await fetch('/api/console/uninstall-all/validate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw.value})});
-        var d=await r.json();
-        pwCheck.style.display=d.valid?'inline':'none';
-    }catch(e){pwCheck.style.display='none';}
-}
-function fullUninstallCheckFields(){
-    var conf=document.getElementById('full-uninstall-confirm');
-    var confCheck=document.getElementById('full-uninstall-confirm-check');
-    if(confCheck)confCheck.style.display=conf&&conf.value.trim().toUpperCase()==='UNINSTALL'?'inline':'none';
-}
-var fullUninstallPollTimer = null;
-async function doFullUninstall(){
-    var pw=document.getElementById('full-uninstall-password').value;
-    var confirmVal=document.getElementById('full-uninstall-confirm').value.trim().toUpperCase();
-    var msgEl=document.getElementById('full-uninstall-msg');
-    var progressEl=document.getElementById('full-uninstall-progress');
-    var logEl=document.getElementById('full-uninstall-log');
-    var cancelBtn=document.getElementById('full-uninstall-cancel');
-    var submitBtn=document.getElementById('full-uninstall-submit');
-    msgEl.textContent='';
-    if(!pw){msgEl.textContent='Enter your password';return;}
-    if(confirmVal!=='UNINSTALL'){msgEl.textContent='Type UNINSTALL in the confirmation box to proceed';return;}
-    progressEl.style.display='block';
-    progressEl.textContent='Starting...';
-    logEl.style.display='none';
-    logEl.textContent='';
-    cancelBtn.disabled=true;
-    submitBtn.disabled=true;
-    try{
-        var r=await fetch('/api/console/uninstall-all',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw,confirm:confirmVal})});
-        var d=await r.json();
-        if(!d.success){
-            msgEl.textContent=d.error||'Request failed';
-            progressEl.style.display='none';
-            cancelBtn.disabled=false;
-            submitBtn.disabled=false;
-            return;
-        }
-        logEl.style.display='block';
-        function poll(){
-            fetch('/api/console/uninstall-all/status').then(function(res){return res.json();}).then(function(s){
-                if(s.log&&s.log.length){logEl.textContent=s.log.join('\n');logEl.scrollTop=logEl.scrollHeight;}
-                if(s.running){progressEl.textContent='Uninstalling...';fullUninstallPollTimer=setTimeout(poll,1500);return;}
-                if(s.done){
-                    progressEl.textContent=s.error?'Error: '+s.error:'Done. Reloading...';
-                    if(s.error)msgEl.textContent=s.error;
-                    cancelBtn.disabled=false;
-                    if(!s.error)setTimeout(function(){window.location.href='/console';},1500);
-                }
-            }).catch(function(){progressEl.textContent='Error polling';cancelBtn.disabled=false;submitBtn.disabled=false;});
-        }
-        poll();
-    }catch(e){
-        msgEl.textContent=e.message||'Request failed';
-        progressEl.style.display='none';
-        cancelBtn.disabled=false;
-        submitBtn.disabled=false;
-    }
-}
 </script></body></html>'''
 
 # === Marketplace Template (all services, deploy from here) ===
