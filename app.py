@@ -9524,14 +9524,14 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div style="margin-top:32px;padding:20px;background:var(--bg-card);border:1px solid var(--border);border-radius:12px">
 <div style="font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:8px">Testing — reset server</div>
 <div style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Remove all deployed services (TAK Server, Authentik, Caddy, TAK Portal, MediaMTX, Node-RED, CloudTAK, Email Relay). The console stays so you can redeploy from Marketplace without burning the VPS.</div>
-<button type="button" onclick="document.getElementById('full-uninstall-modal').classList.add('open')" style="padding:8px 16px;background:rgba(239,68,68,0.15);color:var(--red);border:1px solid rgba(239,68,68,0.4);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;cursor:pointer">Uninstall all services</button>
+<button type="button" onclick="document.getElementById('full-uninstall-modal').classList.add('open');setTimeout(fullUninstallCheckFields,50)" style="padding:8px 16px;background:rgba(239,68,68,0.15);color:var(--red);border:1px solid rgba(239,68,68,0.4);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;cursor:pointer">Uninstall all services</button>
 </div>
 <div id="full-uninstall-modal" class="modal-overlay" style="z-index:9999;padding:24px">
 <div class="modal" style="max-width:480px;max-height:90vh;overflow:hidden;display:flex;flex-direction:column">
 <div style="font-weight:600;margin-bottom:16px">Uninstall all deployed services</div>
 <p style="font-size:12px;color:var(--text-dim);margin-bottom:16px">This will remove TAK Server, Authentik, Caddy, TAK Portal, MediaMTX, Node-RED, CloudTAK, and Email Relay. The console and your password remain. You can redeploy from Marketplace afterward.</p>
-<div style="margin-bottom:12px"><label class="form-label" style="display:block;margin-bottom:4px;font-size:12px">Admin password</label><input class="form-input" id="full-uninstall-password" type="password" placeholder="Your console password"></div>
-<div style="margin-bottom:12px"><label class="form-label" style="display:block;margin-bottom:4px;font-size:12px">Type <strong>UNINSTALL</strong> to confirm</label><input class="form-input" id="full-uninstall-confirm" type="text" placeholder="UNINSTALL" autocomplete="off"></div>
+<div style="margin-bottom:12px"><label class="form-label" style="display:block;margin-bottom:4px;font-size:12px">Admin password</label><div style="position:relative;display:flex;align-items:center;gap:8px"><input class="form-input" id="full-uninstall-password" type="password" placeholder="Your console password" style="flex:1" oninput="fullUninstallCheckFields()"><span id="full-uninstall-pw-check" style="display:none;color:var(--green);font-size:18px;flex-shrink:0" title="Password entered">&#10003;</span></div></div>
+<div style="margin-bottom:12px"><label class="form-label" style="display:block;margin-bottom:4px;font-size:12px">Type <strong>UNINSTALL</strong> to confirm</label><div style="position:relative;display:flex;align-items:center;gap:8px"><input class="form-input" id="full-uninstall-confirm" type="text" placeholder="UNINSTALL" autocomplete="off" style="flex:1" oninput="fullUninstallCheckFields()"><span id="full-uninstall-confirm-check" style="display:none;color:var(--green);font-size:18px;flex-shrink:0" title="Confirmation correct">&#10003;</span></div></div>
 <div id="full-uninstall-msg" style="margin-bottom:8px;font-size:12px;color:var(--red);min-height:18px"></div>
 <div id="full-uninstall-progress" style="display:none;margin-bottom:12px;font-size:12px;color:var(--text-secondary)"></div>
 <div id="full-uninstall-log" style="display:none;background:var(--bg-deep);border:1px solid var(--border);border-radius:8px;padding:12px;font-family:'JetBrains Mono',monospace;font-size:11px;max-height:200px;overflow-y:auto;margin-bottom:12px;white-space:pre-wrap;word-break:break-all"></div>
@@ -9562,12 +9562,12 @@ function updateUU(uu){
     sl.style.background=uu.enabled?'var(--green)':'rgba(71,85,105,0.5)';
     kn.style.left=uu.enabled?'18px':'2px';
     lb.style.color=uu.enabled?'var(--green)':'var(--text-dim)';
-    lb.textContent=uu.running?'Running…':uu.enabled?'Enabled':'Disabled';
+    lb.textContent=uu.running?'Running...':uu.enabled?'Enabled':'Disabled';
 }
 async function toggleUU(cb){
     var action=cb.checked?'enable':'disable';
     var lb=document.getElementById('uu-label');
-    lb.textContent=cb.checked?'Enabling…':'Disabling…';lb.style.color='var(--cyan)';
+    lb.textContent=cb.checked?'Enabling...':'Disabling...';lb.style.color='var(--cyan)';
     try{
         var r=await fetch('/api/unattended-upgrades',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:action})});
         var d=await r.json();
@@ -9642,6 +9642,14 @@ checkUpdate();
 function closeFullUninstallModal(){
     document.getElementById('full-uninstall-modal').classList.remove('open');
 }
+function fullUninstallCheckFields(){
+    var pw=document.getElementById('full-uninstall-password');
+    var conf=document.getElementById('full-uninstall-confirm');
+    var pwCheck=document.getElementById('full-uninstall-pw-check');
+    var confCheck=document.getElementById('full-uninstall-confirm-check');
+    if(pwCheck)pwCheck.style.display=pw&&pw.value.trim()!==''?'inline':'none';
+    if(confCheck)confCheck.style.display=conf&&conf.value.trim().toUpperCase()==='UNINSTALL'?'inline':'none';
+}
 var fullUninstallPollTimer = null;
 async function doFullUninstall(){
     var pw=document.getElementById('full-uninstall-password').value;
@@ -9655,7 +9663,7 @@ async function doFullUninstall(){
     if(!pw){msgEl.textContent='Enter your password';return;}
     if(confirmVal!=='UNINSTALL'){msgEl.textContent='Type UNINSTALL in the confirmation box to proceed';return;}
     progressEl.style.display='block';
-    progressEl.textContent='Starting…';
+    progressEl.textContent='Starting...';
     logEl.style.display='none';
     logEl.textContent='';
     cancelBtn.disabled=true;
@@ -9674,9 +9682,9 @@ async function doFullUninstall(){
         function poll(){
             fetch('/api/console/uninstall-all/status').then(function(res){return res.json();}).then(function(s){
                 if(s.log&&s.log.length){logEl.textContent=s.log.join('\n');logEl.scrollTop=logEl.scrollHeight;}
-                if(s.running){progressEl.textContent='Uninstalling…';fullUninstallPollTimer=setTimeout(poll,1500);return;}
+                if(s.running){progressEl.textContent='Uninstalling...';fullUninstallPollTimer=setTimeout(poll,1500);return;}
                 if(s.done){
-                    progressEl.textContent=s.error?'Error: '+s.error:'Done. Reloading…';
+                    progressEl.textContent=s.error?'Error: '+s.error:'Done. Reloading...';
                     if(s.error)msgEl.textContent=s.error;
                     cancelBtn.disabled=false;
                     if(!s.error)setTimeout(function(){window.location.href='/console';},1500);
