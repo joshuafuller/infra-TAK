@@ -8087,9 +8087,10 @@ def _ensure_ldap_flow_authentication_none():
         _req.urlopen(r, timeout=_api_timeout)
 
     try:
-        auth_flows = _get('flows/instances/?designation=authentication').get('results', [])
-        ldap_flow = next((f for f in auth_flows if f.get('slug') == 'ldap-authentication-flow'), None)
-        default_flow = next((f for f in auth_flows if f.get('slug') == 'default-authentication-flow'), None)
+        ldap_flow_results = _get('flows/instances/?slug=ldap-authentication-flow').get('results', [])
+        ldap_flow = ldap_flow_results[0] if ldap_flow_results else None
+        default_flow_results = _get('flows/instances/?slug=default-authentication-flow').get('results', [])
+        default_flow = default_flow_results[0] if default_flow_results else None
 
         if ldap_flow:
             _patch('flows/instances/ldap-authentication-flow/', {'authentication': 'none'})
