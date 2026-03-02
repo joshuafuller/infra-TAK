@@ -8076,6 +8076,10 @@ def _ensure_ldap_flow_authentication_none():
         r = _req.Request(f'{url}/api/v3/{path}', data=json.dumps(body).encode(), headers=headers, method='PATCH')
         _req.urlopen(r, timeout=15)
 
+    def _delete(path):
+        r = _req.Request(f'{url}/api/v3/{path}', headers=headers, method='DELETE')
+        _req.urlopen(r, timeout=15)
+
     try:
         auth_flows = _get('flows/instances/?designation=authentication').get('results', [])
         ldap_flow = next((f for f in auth_flows if f.get('slug') == 'ldap-authentication-flow'), None)
@@ -8083,7 +8087,7 @@ def _ensure_ldap_flow_authentication_none():
 
         if ldap_flow:
             _patch('flows/instances/ldap-authentication-flow/', {'authentication': 'none'})
-            # Ensure 3 stage bindings exist (blueprint may not have recreated them after manual deletion)
+            # Ensure 3 stage bindings are our ldap-* stages (not default/MFA — those break LDAP bind)
             ldap_flow_pk = ldap_flow['pk']
             all_bindings = []
             page = 1
@@ -8094,6 +8098,16 @@ def _ensure_ldap_flow_authentication_none():
                     break
                 page += 1
             ldap_bindings = [b for b in all_bindings if str(b.get('target')) == str(ldap_flow_pk)]
+            stage_names = {(b.get('stage_obj') or {}).get('name') or '' for b in ldap_bindings}
+            need_names = {'ldap-identification-stage', 'ldap-authentication-password', 'ldap-authentication-login'}
+            wrong_bindings = len(ldap_bindings) < 3 or need_names != stage_names
+            if wrong_bindings:
+                for b in ldap_bindings:
+                    try:
+                        _delete(f'flows/bindings/{b["pk"]}/')
+                    except urllib.error.HTTPError:
+                        pass
+                ldap_bindings = []
             if len(ldap_bindings) < 3:
                 # Find or create blueprint stages by name (blueprint may not have run)
                 def _find_stage(api_path, name):
