@@ -4417,9 +4417,9 @@ def _ensure_app_access_policies(ak_url, ak_headers, plog=None):
         else:
             _log(f"  ✓ Policy exists: {policy_name}")
 
-        # 3) Admin-only apps: bind the admin policy (infra-TAK, Node-RED, LDAP). TAK Portal and MediaMTX: no binding = all authenticated users.
-        admin_only_slugs = ['infra-tak', 'infratak', 'console', 'node-red', 'ldap']
-        user_visible_slugs = ['mediamtx', 'stream', 'tak-portal']  # no policy = visible to all authenticated users
+        # 3) Admin-only apps: bind the admin policy (infra-TAK, Node-RED). LDAP must be open to all authenticated users (QR registration, device bind). TAK Portal and MediaMTX: no binding = all authenticated users.
+        admin_only_slugs = ['infra-tak', 'infratak', 'console', 'node-red']
+        user_visible_slugs = ['mediamtx', 'stream', 'tak-portal', 'ldap']  # no policy = visible to all authenticated users (LDAP needed for QR registration)
 
         all_apps = _api_get('core/applications/?page_size=100')['results']
 
@@ -4454,6 +4454,22 @@ def _ensure_app_access_policies(ak_url, ak_headers, plog=None):
             bindings = _api_get(f'policies/bindings/?target={app_pk}&page_size=100')['results']
             for b in bindings:
                 if (b.get('policy_obj', {}) or {}).get('name') == mtx_policy_name:
+                    try:
+                        _api_delete(f'policies/bindings/{b["pk"]}/')
+                        _log(f"  ✓ {app_name}: removed restrictive policy — now open to all authenticated users")
+                    except Exception:
+                        pass
+                    break
+        # Remove "Allow authentik Admins" binding from LDAP if present (blocks QR registration / device bind for non-admin users)
+        for app in all_apps:
+            app_slug = app.get('slug', '')
+            if app_slug != 'ldap':
+                continue
+            app_pk = app.get('pk', '')
+            app_name = app.get('name', '')
+            bindings = _api_get(f'policies/bindings/?target={app_pk}&page_size=100')['results']
+            for b in bindings:
+                if (b.get('policy_obj', {}) or {}).get('name') == policy_name:
                     try:
                         _api_delete(f'policies/bindings/{b["pk"]}/')
                         _log(f"  ✓ {app_name}: removed restrictive policy — now open to all authenticated users")
@@ -8607,7 +8623,7 @@ def takserver_webadmin_password():
 @app.route('/api/takserver/connect-ldap', methods=['POST'])
 @login_required
 def takserver_connect_ldap():
-    """One-shot: fix LDAP blueprint (remove recursion-causing password_stage), fix flow auth, ensure service account, ensure webadmin, patch CoreConfig, restart TAK Server."""
+    """One-shot: fix LDAP blueprint (remove recursion-causing password_stage), fix flow auth, ensure LDAP app open to all users (QR registration), ensure service account, ensure webadmin, patch CoreConfig, restart TAK Server."""
     diag = []
     # Fix LDAP blueprint on disk if it still has the broken password_stage (causes "invalid credentials" / recursion on user bind, e.g. QR code)
     bp_path = os.path.expanduser('~/authentik/blueprints/tak-ldap-setup.yaml')
@@ -8630,6 +8646,20 @@ def takserver_connect_ldap():
         diag.append(f'Flow fix: {err_flow}')
     else:
         diag.append('Flow: OK')
+    # Ensure LDAP app has no restrictive policy (blocks QR registration for non-admin users)
+    try:
+        env_path = os.path.expanduser('~/authentik/.env')
+        ak_token = ''
+        with open(env_path) as f:
+            for line in f:
+                if line.strip().startswith('AUTHENTIK_BOOTSTRAP_TOKEN='):
+                    ak_token = line.strip().split('=', 1)[1].strip()
+                    break
+        if ak_token:
+            _ensure_app_access_policies('http://127.0.0.1:9090', {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}, lambda m: diag.append(m.strip()))
+            diag.append('App policies: LDAP open to all authenticated users')
+    except Exception as e:
+        diag.append(f'App policies: {str(e)[:60]}')
     ok, msg = _ensure_authentik_ldap_service_account()
     if not ok:
         if '-w' in (msg or ''):
