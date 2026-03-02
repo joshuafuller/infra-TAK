@@ -1282,8 +1282,13 @@ def run_caddy_deploy(domain):
                 caddy_deploy_status.update({'running': False, 'error': True})
                 return
 
-        # Verify install
+        # Verify install (if binary missing e.g. after uninstall, reinstall restores it)
         r = subprocess.run('which caddy', shell=True, capture_output=True, text=True)
+        if r.returncode != 0 and pkg_mgr == 'apt':
+            plog("  Binary missing after install; reinstalling package...")
+            subprocess.run('DEBIAN_FRONTEND=noninteractive apt-get install --reinstall -y caddy 2>&1',
+                shell=True, capture_output=True, text=True, timeout=120, env={**os.environ, 'DEBIAN_FRONTEND': 'noninteractive', 'NEEDRESTART_MODE': 'a'})
+            r = subprocess.run('which caddy', shell=True, capture_output=True, text=True)
         if r.returncode != 0:
             plog("✗ Caddy binary not found after install")
             caddy_deploy_status.update({'running': False, 'error': True})
@@ -1318,13 +1323,24 @@ def run_caddy_deploy(domain):
         subprocess.run('systemctl enable caddy 2>/dev/null; true', shell=True, capture_output=True)
         r = subprocess.run('systemctl restart caddy 2>&1', shell=True, capture_output=True, text=True, timeout=30)
         if r.returncode != 0:
-            plog(f"⚠ Caddy start issue: {r.stderr.strip()[:200]}")
+            plog(f"⚠ systemctl restart: {(r.stderr or r.stdout or '').strip()[:300]}")
         time.sleep(3)
         r = subprocess.run('systemctl is-active caddy', shell=True, capture_output=True, text=True)
         if r.stdout.strip() == 'active':
             plog("✓ Caddy is running")
         else:
-            plog("⚠ Caddy may not be fully started — check with: systemctl status caddy")
+            plog("✗ Caddy did not start. Capturing status and logs:")
+            status = subprocess.run('systemctl status caddy --no-pager -l 2>&1', shell=True, capture_output=True, text=True, timeout=10)
+            if status.stdout:
+                for line in (status.stdout or '').strip().split('\n')[:15]:
+                    plog(f"  {line}")
+            journal = subprocess.run('journalctl -u caddy -n 25 --no-pager 2>&1', shell=True, capture_output=True, text=True, timeout=10)
+            if journal.stdout:
+                plog("  --- journalctl -u caddy (last 25 lines) ---")
+                for line in (journal.stdout or '').strip().split('\n'):
+                    plog(f"  {line}")
+            caddy_deploy_status.update({'running': False, 'error': True})
+            return
 
         # Update settings
         settings['ssl_mode'] = 'fqdn'
