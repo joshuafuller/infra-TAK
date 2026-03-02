@@ -9239,6 +9239,176 @@ def api_modules():
     modules = detect_modules()
     return jsonify({k: {'installed': m.get('installed', False), 'running': m.get('running', False)} for k, m in modules.items()})
 
+# Full uninstall (all deployed services) — for testing: reset VPS without destroying it
+full_uninstall_log = []
+full_uninstall_status = {'running': False, 'done': False, 'error': None}
+
+def run_full_uninstall():
+    """Remove all deployed services in reverse dependency order. Console and config remain."""
+    def plog(msg):
+        entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
+        full_uninstall_log.append(entry)
+        print(entry, flush=True)
+    try:
+        settings = load_settings()
+        pkg_mgr = settings.get('pkg_mgr', 'apt')
+
+        # 1. MediaMTX
+        plog("━━━ MediaMTX ━━━")
+        subprocess.run('systemctl stop mediamtx mediamtx-webeditor 2>/dev/null; true', shell=True, capture_output=True, timeout=30)
+        subprocess.run('systemctl disable mediamtx mediamtx-webeditor 2>/dev/null; true', shell=True, capture_output=True)
+        for f in ['/etc/systemd/system/mediamtx.service', '/etc/systemd/system/mediamtx-webeditor.service',
+                  '/usr/local/bin/mediamtx', '/usr/local/etc/mediamtx.yml']:
+            if os.path.exists(f):
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
+        if os.path.exists('/opt/mediamtx-webeditor'):
+            subprocess.run('rm -rf /opt/mediamtx-webeditor', shell=True, capture_output=True)
+        subprocess.run('systemctl daemon-reload 2>/dev/null; true', shell=True, capture_output=True)
+        mediamtx_deploy_log.clear()
+        mediamtx_deploy_status.update({'running': False, 'complete': False, 'error': False})
+        plog("✓ MediaMTX removed")
+
+        # 2. TAK Portal
+        plog("━━━ TAK Portal ━━━")
+        portal_dir = os.path.expanduser('~/TAK-Portal')
+        if os.path.exists(portal_dir):
+            subprocess.run(f'cd {portal_dir} && docker compose down -v --rmi local 2>/dev/null; true', shell=True, capture_output=True, timeout=120)
+            subprocess.run(f'rm -rf {portal_dir}', shell=True, capture_output=True)
+        takportal_deploy_log.clear()
+        takportal_deploy_status.update({'running': False, 'complete': False, 'error': False})
+        plog("✓ TAK Portal removed")
+
+        # 3. CloudTAK
+        plog("━━━ CloudTAK ━━━")
+        cloudtak_dir = os.path.expanduser('~/CloudTAK')
+        for yml in [os.path.join(cloudtak_dir, 'docker-compose.yml'), os.path.join(cloudtak_dir, 'compose.yaml')]:
+            if os.path.exists(yml):
+                subprocess.run(f'docker compose -f "{yml}" down -v --rmi local 2>/dev/null; true', shell=True, capture_output=True, timeout=180, cwd=cloudtak_dir)
+                break
+        if os.path.exists(cloudtak_dir):
+            subprocess.run(f'rm -rf "{cloudtak_dir}"', shell=True, capture_output=True, timeout=60)
+        cloudtak_deploy_log.clear()
+        cloudtak_deploy_status.update({'running': False, 'complete': False, 'error': False})
+        plog("✓ CloudTAK removed")
+
+        # 4. Node-RED
+        plog("━━━ Node-RED ━━━")
+        nr_dir = os.path.expanduser('~/node-red')
+        compose = os.path.join(nr_dir, 'docker-compose.yml')
+        if os.path.exists(compose):
+            subprocess.run(f'docker compose -f "{compose}" down -v 2>/dev/null; true', shell=True, capture_output=True, timeout=60, cwd=nr_dir)
+        if os.path.exists(nr_dir):
+            subprocess.run(f'rm -rf "{nr_dir}"', shell=True, capture_output=True, timeout=10)
+        nodered_deploy_log.clear()
+        nodered_deploy_status.update({'running': False, 'complete': False, 'error': False})
+        plog("✓ Node-RED removed")
+
+        # 5. TAK Server
+        plog("━━━ TAK Server ━━━")
+        subprocess.run(['systemctl', 'stop', 'takserver'], capture_output=True, timeout=60)
+        subprocess.run(['systemctl', 'disable', 'takserver'], capture_output=True, timeout=30)
+        subprocess.run('pkill -9 -f takserver 2>/dev/null; true', shell=True, capture_output=True)
+        pkg_result = subprocess.run('dpkg -l | grep takserver', shell=True, capture_output=True, text=True)
+        if 'takserver' in (pkg_result.stdout or ''):
+            subprocess.run('DEBIAN_FRONTEND=noninteractive apt-get remove -y takserver 2>/dev/null; true', shell=True, capture_output=True, timeout=120)
+        if os.path.exists('/opt/tak'):
+            subprocess.run('rm -rf /opt/tak', shell=True, capture_output=True)
+        subprocess.run("sudo -u postgres psql -c \"DROP DATABASE IF EXISTS cot;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
+        subprocess.run("sudo -u postgres psql -c \"DROP USER IF EXISTS martiuser;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
+        subprocess.run('rm -rf /usr/share/debsig/keyrings/* /etc/debsig/policies/* 2>/dev/null; true', shell=True, capture_output=True, timeout=10)
+        for f in os.listdir(UPLOAD_DIR):
+            try:
+                os.remove(os.path.join(UPLOAD_DIR, f))
+            except Exception:
+                pass
+        deploy_log.clear()
+        deploy_status.update({'running': False, 'complete': False, 'error': False})
+        plog("✓ TAK Server removed")
+
+        # 6. Email Relay
+        plog("━━━ Email Relay ━━━")
+        subprocess.run('systemctl stop postfix 2>/dev/null; true', shell=True, capture_output=True, timeout=30)
+        subprocess.run('systemctl disable postfix 2>/dev/null; true', shell=True, capture_output=True)
+        if pkg_mgr == 'apt':
+            subprocess.run('apt-get remove -y postfix 2>/dev/null; true', shell=True, capture_output=True, timeout=120)
+        else:
+            subprocess.run('dnf remove -y postfix 2>/dev/null; true', shell=True, capture_output=True, timeout=120)
+        settings = load_settings()
+        settings.pop('email_relay', None)
+        save_settings(settings)
+        email_deploy_log.clear()
+        email_deploy_status.update({'running': False, 'complete': False, 'error': False})
+        plog("✓ Email Relay removed")
+
+        # 7. Authentik
+        plog("━━━ Authentik ━━━")
+        ak_dir = os.path.expanduser('~/authentik')
+        if os.path.exists(ak_dir):
+            subprocess.run(f'cd {ak_dir} && docker compose down -v --rmi all --remove-orphans 2>/dev/null; true', shell=True, capture_output=True, text=True, timeout=180)
+            subprocess.run(f'rm -rf {ak_dir}', shell=True, capture_output=True)
+        authentik_deploy_log.clear()
+        authentik_deploy_status.update({'running': False, 'complete': False, 'error': False})
+        plog("✓ Authentik removed")
+
+        # 8. Caddy
+        plog("━━━ Caddy ━━━")
+        subprocess.run('systemctl stop caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=30)
+        subprocess.run('systemctl disable caddy 2>/dev/null; true', shell=True, capture_output=True)
+        if pkg_mgr == 'apt':
+            subprocess.run('apt-get remove -y caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=120)
+        else:
+            subprocess.run('dnf remove -y caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=120)
+        settings = load_settings()
+        settings['fqdn'] = ''
+        save_settings(settings)
+        caddy_deploy_log.clear()
+        caddy_deploy_status.update({'running': False, 'complete': False, 'error': False})
+        plog("✓ Caddy removed")
+
+        plog("")
+        plog("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        plog("All deployed services removed. Console remains. Use Marketplace to deploy again.")
+        plog("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        full_uninstall_status.update({'running': False, 'done': True, 'error': None})
+    except subprocess.TimeoutExpired:
+        full_uninstall_status.update({'running': False, 'done': True, 'error': 'Uninstall timed out'})
+        full_uninstall_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] ✗ Timeout")
+    except Exception as e:
+        full_uninstall_status.update({'running': False, 'done': True, 'error': str(e)})
+        full_uninstall_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] ✗ {str(e)}")
+
+@app.route('/api/console/uninstall-all', methods=['POST'])
+@login_required
+def console_uninstall_all():
+    """Start full uninstall of all deployed services (for testing: reset without burning VPS)."""
+    data = request.json or {}
+    password = data.get('password', '')
+    confirm = (data.get('confirm') or '').strip().upper()
+    auth = load_auth()
+    if not auth.get('password_hash') or not check_password_hash(auth['password_hash'], password):
+        return jsonify({'error': 'Invalid admin password'}), 403
+    if confirm != 'UNINSTALL':
+        return jsonify({'error': 'Type UNINSTALL in the confirmation box to proceed'}), 400
+    if full_uninstall_status.get('running'):
+        return jsonify({'error': 'Uninstall already in progress'}), 409
+    full_uninstall_log.clear()
+    full_uninstall_status.update({'running': True, 'done': False, 'error': None})
+    threading.Thread(target=run_full_uninstall, daemon=True).start()
+    return jsonify({'success': True, 'message': 'Full uninstall started'})
+
+@app.route('/api/console/uninstall-all/status')
+@login_required
+def console_uninstall_all_status():
+    return jsonify({
+        'running': full_uninstall_status.get('running', False),
+        'done': full_uninstall_status.get('done', False),
+        'error': full_uninstall_status.get('error'),
+        'log': full_uninstall_log[-200:],
+    })
+
 # === Console Template (installed services only) ===
 CONSOLE_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Console — infra-TAK</title>
 <style>
@@ -9274,6 +9444,13 @@ body{display:flex;flex-direction:row;min-height:100vh}
 .module-action{display:inline-block;margin-top:6px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--accent);opacity:0;transition:opacity 0.2s}
 .module-card:hover .module-action{opacity:1}
 .meta-line{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-bottom:12px}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;display:none;align-items:center;justify-content:center}
+.modal-overlay.open{display:flex}
+.modal{background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;max-width:90vw}
+.form-label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px}
+.form-input{width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px;color:var(--text-primary);font-size:13px}
+.btn-ghost{background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border);padding:10px 18px;border-radius:8px;cursor:pointer;font-size:13px}
+.btn-danger{background:var(--red);color:#fff;border:none;padding:10px 18px;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600}
 </style></head><body>
 {{ sidebar_html }}
 <div class="main">
@@ -9343,6 +9520,26 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </a>
 {% endfor %}
 {% endif %}
+</div>
+<div style="margin-top:32px;padding:20px;background:var(--bg-card);border:1px solid var(--border);border-radius:12px">
+<div style="font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:8px">Testing — reset server</div>
+<div style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Remove all deployed services (TAK Server, Authentik, Caddy, TAK Portal, MediaMTX, Node-RED, CloudTAK, Email Relay). The console stays so you can redeploy from Marketplace without burning the VPS.</div>
+<button type="button" onclick="document.getElementById('full-uninstall-modal').classList.add('open')" style="padding:8px 16px;background:rgba(239,68,68,0.15);color:var(--red);border:1px solid rgba(239,68,68,0.4);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;cursor:pointer">Uninstall all services</button>
+</div>
+<div id="full-uninstall-modal" class="modal-overlay" style="z-index:9999;padding:24px">
+<div class="modal" style="max-width:480px;max-height:90vh;overflow:hidden;display:flex;flex-direction:column">
+<div style="font-weight:600;margin-bottom:16px">Uninstall all deployed services</div>
+<p style="font-size:12px;color:var(--text-dim);margin-bottom:16px">This will remove TAK Server, Authentik, Caddy, TAK Portal, MediaMTX, Node-RED, CloudTAK, and Email Relay. The console and your password remain. You can redeploy from Marketplace afterward.</p>
+<div style="margin-bottom:12px"><label class="form-label" style="display:block;margin-bottom:4px;font-size:12px">Admin password</label><input class="form-input" id="full-uninstall-password" type="password" placeholder="Your console password"></div>
+<div style="margin-bottom:12px"><label class="form-label" style="display:block;margin-bottom:4px;font-size:12px">Type <strong>UNINSTALL</strong> to confirm</label><input class="form-input" id="full-uninstall-confirm" type="text" placeholder="UNINSTALL" autocomplete="off"></div>
+<div id="full-uninstall-msg" style="margin-bottom:8px;font-size:12px;color:var(--red);min-height:18px"></div>
+<div id="full-uninstall-progress" style="display:none;margin-bottom:12px;font-size:12px;color:var(--text-secondary)"></div>
+<div id="full-uninstall-log" style="display:none;background:var(--bg-deep);border:1px solid var(--border);border-radius:8px;padding:12px;font-family:'JetBrains Mono',monospace;font-size:11px;max-height:200px;overflow-y:auto;margin-bottom:12px;white-space:pre-wrap;word-break:break-all"></div>
+<div style="display:flex;gap:8px;margin-top:8px">
+<button type="button" class="btn btn-ghost" id="full-uninstall-cancel" onclick="closeFullUninstallModal()">Cancel</button>
+<button type="button" class="btn btn-danger" id="full-uninstall-submit" onclick="doFullUninstall()">Uninstall all</button>
+</div>
+</div>
 </div>
 <div class="help-footer" style="margin-top:48px;padding-top:24px;border-top:1px solid var(--border);font-size:12px;color:var(--text-dim)">
 <details style="cursor:pointer">
@@ -9442,6 +9639,58 @@ async function applyUpdate(){
     }catch(e){status.style.color='var(--red)';status.textContent='✗ '+e.message;btn.disabled=false;btn.textContent='Update Now';btn.style.opacity='1'}
 }
 checkUpdate();
+function closeFullUninstallModal(){
+    document.getElementById('full-uninstall-modal').classList.remove('open');
+}
+var fullUninstallPollTimer = null;
+async function doFullUninstall(){
+    var pw=document.getElementById('full-uninstall-password').value;
+    var confirmVal=document.getElementById('full-uninstall-confirm').value.trim().toUpperCase();
+    var msgEl=document.getElementById('full-uninstall-msg');
+    var progressEl=document.getElementById('full-uninstall-progress');
+    var logEl=document.getElementById('full-uninstall-log');
+    var cancelBtn=document.getElementById('full-uninstall-cancel');
+    var submitBtn=document.getElementById('full-uninstall-submit');
+    msgEl.textContent='';
+    if(!pw){msgEl.textContent='Enter your password';return;}
+    if(confirmVal!=='UNINSTALL'){msgEl.textContent='Type UNINSTALL in the confirmation box to proceed';return;}
+    progressEl.style.display='block';
+    progressEl.textContent='Starting…';
+    logEl.style.display='none';
+    logEl.textContent='';
+    cancelBtn.disabled=true;
+    submitBtn.disabled=true;
+    try{
+        var r=await fetch('/api/console/uninstall-all',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw,confirm:confirmVal})});
+        var d=await r.json();
+        if(!d.success){
+            msgEl.textContent=d.error||'Request failed';
+            progressEl.style.display='none';
+            cancelBtn.disabled=false;
+            submitBtn.disabled=false;
+            return;
+        }
+        logEl.style.display='block';
+        function poll(){
+            fetch('/api/console/uninstall-all/status').then(function(res){return res.json();}).then(function(s){
+                if(s.log&&s.log.length){logEl.textContent=s.log.join('\n');logEl.scrollTop=logEl.scrollHeight;}
+                if(s.running){progressEl.textContent='Uninstalling…';fullUninstallPollTimer=setTimeout(poll,1500);return;}
+                if(s.done){
+                    progressEl.textContent=s.error?'Error: '+s.error:'Done. Reloading…';
+                    if(s.error)msgEl.textContent=s.error;
+                    cancelBtn.disabled=false;
+                    if(!s.error)setTimeout(function(){window.location.href='/console';},1500);
+                }
+            }).catch(function(){progressEl.textContent='Error polling';cancelBtn.disabled=false;submitBtn.disabled=false;});
+        }
+        poll();
+    }catch(e){
+        msgEl.textContent=e.message||'Request failed';
+        progressEl.style.display='none';
+        cancelBtn.disabled=false;
+        submitBtn.disabled=false;
+    }
+}
 </script></body></html>'''
 
 # === Marketplace Template (all services, deploy from here) ===
@@ -9479,6 +9728,13 @@ body{display:flex;flex-direction:row;min-height:100vh}
 .module-action{display:inline-block;margin-top:6px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--accent);opacity:0;transition:opacity 0.2s}
 .module-card:hover .module-action{opacity:1}
 .meta-line{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-bottom:12px}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;display:none;align-items:center;justify-content:center}
+.modal-overlay.open{display:flex}
+.modal{background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;max-width:90vw}
+.form-label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px}
+.form-input{width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px;color:var(--text-primary);font-size:13px}
+.btn-ghost{background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border);padding:10px 18px;border-radius:8px;cursor:pointer;font-size:13px}
+.btn-danger{background:var(--red);color:#fff;border:none;padding:10px 18px;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600}
 </style></head><body>
 {{ sidebar_html }}
 <div class="main">
