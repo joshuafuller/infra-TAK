@@ -582,6 +582,65 @@ def guarddog_deploy_log_api():
         'running': guarddog_deploy_status['running'], 'complete': guarddog_deploy_status['complete'],
         'error': guarddog_deploy_status['error']})
 
+def _parse_guarddog_log_date(line):
+    """Return (date, display_str) for a restarts.log line, or (None, line) if unparseable."""
+    line = line.strip()
+    if not line:
+        return None, line
+    # ISO: 2026-03-03T15:00:00Z | ...
+    if len(line) >= 20 and line[10] == 'T' and line[19] in 'Z| ':
+        try:
+            dt = datetime.strptime(line[:19], '%Y-%m-%dT%H:%M:%S')
+            return dt.date(), line[:19].replace('T', ' ')
+        except ValueError:
+            pass
+    # date(1): Tue Mar  3 15:00:00 UTC 2026: message
+    idx = line.find(': ')
+    if idx > 20:
+        prefix = line[:idx].strip()
+        try:
+            dt = datetime.strptime(prefix, '%a %b %d %H:%M:%S %Z %Y')
+            return dt.date(), prefix
+        except ValueError:
+            pass
+    return None, ''
+
+@app.route('/api/guarddog/activity-log')
+@login_required
+def guarddog_activity_log():
+    """Return Guard Dog restarts/alert log entries, optionally filtered by date. Newest first."""
+    from_arg = request.args.get('from', '').strip()
+    to_arg = request.args.get('to', '').strip()
+    date_from = None
+    date_to = None
+    try:
+        if from_arg:
+            date_from = datetime.strptime(from_arg, '%Y-%m-%d').date()
+        if to_arg:
+            date_to = datetime.strptime(to_arg, '%Y-%m-%d').date()
+    except ValueError:
+        return jsonify({'error': 'Invalid date; use YYYY-MM-DD'}), 400
+    log_path = '/var/log/takguard/restarts.log'
+    entries = []
+    try:
+        if not os.path.exists(log_path):
+            return jsonify({'entries': [], 'log_path': log_path})
+        with open(log_path, 'r') as f:
+            lines = f.readlines()
+    except (OSError, PermissionError):
+        return jsonify({'entries': [], 'error': 'Could not read log file', 'log_path': log_path})
+    for raw in reversed(lines):
+        raw = raw.rstrip('\n')
+        if not raw:
+            continue
+        parsed_date, display_ts = _parse_guarddog_log_date(raw)
+        if date_from is not None and parsed_date is not None and parsed_date < date_from:
+            continue
+        if date_to is not None and parsed_date is not None and parsed_date > date_to:
+            continue
+        entries.append({'raw': raw, 'date': parsed_date.isoformat() if parsed_date else None, 'time_display': display_ts})
+    return jsonify({'entries': entries, 'log_path': log_path})
+
 @app.route('/api/guarddog/uninstall', methods=['POST'])
 @login_required
 def guarddog_uninstall():
@@ -5172,6 +5231,20 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   </div>
 
   {% if gd.installed %}
+  <div class="card"><div class="card-title">Activity log</div>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Restarts, alerts, and monitor events from Guard Dog. Filter by date or leave blank for all.</p>
+    <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:14px">
+      <label style="font-size:12px;color:var(--text-secondary)">From <input type="date" id="gd-log-from" class="form-input" style="width:140px;display:inline-block;margin-left:6px"></label>
+      <label style="font-size:12px;color:var(--text-secondary)">To <input type="date" id="gd-log-to" class="form-input" style="width:140px;display:inline-block;margin-left:6px"></label>
+      <button type="button" class="btn btn-ghost" onclick="gdLoadActivityLog()">Refresh</button>
+      <button type="button" class="btn btn-ghost" style="color:var(--text-dim)" onclick="document.getElementById('gd-log-from').value='';document.getElementById('gd-log-to').value='';gdLoadActivityLog()">Clear filter</button>
+    </div>
+    <div class="log-box" id="gd-activity-log" style="max-height:320px">Loading…</div>
+    <p style="font-size:11px;color:var(--text-dim);margin-top:8px">Log file: <code>/var/log/takguard/restarts.log</code></p>
+  </div>
+  {% endif %}
+
+  {% if gd.installed %}
   <div class="modal-overlay" id="gd-uninstall-modal"><div class="modal" style="background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:400px;max-width:90vw">
     <h3 style="font-size:16px;margin-bottom:8px;color:var(--red)">Uninstall Guard Dog?</h3>
     <p style="font-size:13px;color:var(--text-secondary);margin-bottom:20px">This will stop all timers and the health endpoint, and remove scripts and systemd units. Alert history in /var/lib/takguard and /var/log/takguard is left in place.</p>
@@ -5204,6 +5277,8 @@ function gdTestEmail(){var el=document.getElementById('gd-test-email-msg');var b
 function gdSmsProviderChange(){var p=document.getElementById('gd-sms-provider');var v=p?p.value:'';document.getElementById('gd-sms-twilio').style.display=(v==='twilio')?'block':'none';document.getElementById('gd-sms-brevo').style.display=(v==='brevo')?'block':'none';}
 function gdSmsSave(){var el=document.getElementById('gd-sms-msg');var p=document.getElementById('gd-sms-provider');var provider=(p&&p.value)?p.value.trim():'';var body={provider:provider};if(provider==='twilio'){body.account_sid=document.getElementById('gd-sms-tw-account').value.trim();body.auth_token=document.getElementById('gd-sms-tw-auth').value;body.from_number=document.getElementById('gd-sms-tw-from').value.trim();body.to_numbers=document.getElementById('gd-sms-tw-to').value.trim();}else if(provider==='brevo'){body.api_key=document.getElementById('gd-sms-br-api').value;body.sender=document.getElementById('gd-sms-br-sender').value.trim();body.to_numbers=document.getElementById('gd-sms-br-to').value.trim();}el.textContent='Saving...';el.style.color='var(--text-dim)';fetch('/api/guarddog/sms/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){if(d.success){el.textContent=d.message||'Saved.';el.style.color='var(--green)';}else{el.textContent=d.error||'Failed';el.style.color='var(--red)';}}).catch(function(e){el.textContent=e.message||'Request failed';el.style.color='var(--red)';});}
 function gdTestSms(){var el=document.getElementById('gd-sms-msg');var btn=document.getElementById('gd-test-sms-btn');if(!el)return;el.textContent='Sending test SMS...';el.style.color='var(--text-dim)';if(btn)btn.disabled=true;fetch('/api/guarddog/test-sms',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){if(btn)btn.disabled=false;if(d.success){el.textContent=d.message||'Test SMS sent.';el.style.color='var(--green)';}else{el.textContent=d.error||'Failed';el.style.color='var(--red)';}}).catch(function(e){if(btn)btn.disabled=false;el.textContent=e.message||'Request failed';el.style.color='var(--red)';});}
+function gdLoadActivityLog(){var el=document.getElementById('gd-activity-log');if(!el)return;el.textContent='Loading…';var fromVal=document.getElementById('gd-log-from')?document.getElementById('gd-log-from').value:'';var toVal=document.getElementById('gd-log-to')?document.getElementById('gd-log-to').value:'';var q='';if(fromVal)q+='from='+encodeURIComponent(fromVal)+'&';if(toVal)q+='to='+encodeURIComponent(toVal)+'&';fetch('/api/guarddog/activity-log?'+q,{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){if(d.error){el.textContent='Error: '+d.error;return;}if(!d.entries||d.entries.length===0){el.textContent='No entries'+(fromVal||toVal?' for this date range':'')+'.';return;}el.textContent=d.entries.map(function(e){return e.raw;}).join(String.fromCharCode(10));}).catch(function(e){el.textContent='Request failed: '+(e.message||'Unknown error');});}
+if (document.getElementById('gd-activity-log')) gdLoadActivityLog();
 </script>
 </body></html>
 '''
