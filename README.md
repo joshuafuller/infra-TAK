@@ -148,7 +148,7 @@ start.sh                    ← One CLI command to launch everything
 
 ## Changelog
 
-### v0.1.8 — 2026-03-02
+### v0.1.8-alpha — 2026-03-02
 
 **LDAP QR Registration Fix**
 LDAP application was restricted to authentik Admins, blocking QR code enrollment for non-admin users. LDAP is now open to all authenticated users. Connect LDAP / Resync LDAP applies this fix automatically.
