@@ -14,7 +14,7 @@ if [ -f "/opt/tak/certs/files/takserver-le.jks" ]; then
     
     rm -f "$TEMP_CERT"
     
-    if [ "$DAYS_LEFT" -lt 40 ]; then
+    if [ "$DAYS_LEFT" -le 40 ]; then
       if [ ! -f "$ALERT_SENT_FILE" ] || [ "$(find $ALERT_SENT_FILE -mtime +7 2>/dev/null)" ]; then
         touch "$ALERT_SENT_FILE"
         

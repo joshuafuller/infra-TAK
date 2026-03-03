@@ -538,13 +538,15 @@ def guarddog_page():
         {'name': 'PostgreSQL', 'interval': '5 min', 'desc': 'Checks that the PostgreSQL service is running. Attempts restart if down; sends alert.'},
         {'name': 'OOM', 'interval': '1 min', 'desc': 'Scans TAK Server logs for OutOfMemoryError. Auto-restarts TAK Server and sends alert when detected.'},
         {'name': 'Disk', 'interval': '1 hour', 'desc': 'Checks root and TAK logs filesystem usage. Alert only when usage exceeds 80% (warning) or 90% (critical).'},
-        {'name': 'Certificate', 'interval': 'Daily', 'desc': 'Checks Let\'s Encrypt / TAK Server cert expiry. Alert when less than 40 days remaining.'},
+        {'name': 'Certificate', 'interval': 'Daily', 'desc': 'Checks Let\'s Encrypt / TAK Server cert expiry. Alert when 40 days or less remaining until expiry.'},
     ]
+    guarddog_docs_url = f'https://github.com/{GITHUB_REPO}/blob/main/docs/GUARDDOG.md'
     return render_template_string(GUARDDOG_TEMPLATE,
         settings=settings, gd=gd, tak=tak, version=VERSION,
         guarddog_alert_email=settings.get('guarddog_alert_email', ''),
         guarddog_sms=settings.get('guarddog_sms', {}),
         guarddog_monitors=guarddog_monitors,
+        guarddog_docs_url=guarddog_docs_url,
         email_relay_configured=email_relay_configured,
         health_url=_guarddog_health_url(settings),
         deploying=guarddog_deploy_status.get('running', False),
@@ -824,6 +826,13 @@ def run_guarddog_deploy(alert_email):
             with open(path, 'w') as f:
                 f.write(content)
         plog("✓ Systemd units installed")
+        # TAK Server soft start: start after network and PostgreSQL to avoid boot race / restart loops
+        tak_dropin_dir = '/etc/systemd/system/takserver.service.d'
+        os.makedirs(tak_dropin_dir, exist_ok=True)
+        tak_dropin = os.path.join(tak_dropin_dir, 'soft-start.conf')
+        with open(tak_dropin, 'w') as f:
+            f.write('[Unit]\nAfter=network-online.target postgresql.service postgresql-15.service\nWants=network-online.target\n')
+        plog("✓ TAK Server soft-start drop-in installed (starts after network + PostgreSQL)")
         r = subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, text=True, timeout=10)
         if r.returncode != 0:
             plog(f"✗ daemon-reload failed: {r.stderr}")
@@ -5069,7 +5078,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 <body>
 {{ sidebar_html }}
 <div class="main">
-  <div class="page-header"><h1 style="display:flex;align-items:center;gap:10px"><span style="font-size:28px;line-height:1">&#128054;</span><span>Guard Dog</span></h1><p>TAK Server health monitoring and auto-recovery (7 monitors + health endpoint)</p></div>
+  <div class="page-header"><h1 style="display:flex;align-items:center;gap:10px"><span style="font-size:28px;line-height:1">&#128054;</span><span>Guard Dog</span></h1><p>TAK Server health monitoring and auto-recovery (7 monitors + health endpoint). <a href="{{ guarddog_docs_url }}" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);text-decoration:none;font-weight:500">How Guard Dog works</a> (delays, soft start, restart-loop protection) → docs</p></div>
   {% if gd.running %}<div class="status-banner running"><div class="dot"></div>Guard Dog is running (timers active)</div>
   {% elif gd.installed %}<div class="status-banner stopped"><div class="dot"></div>Guard Dog is installed but timers may be stopped</div>
   {% else %}<div class="status-banner not-installed"><div class="dot"></div>Guard Dog is not installed</div>{% endif %}

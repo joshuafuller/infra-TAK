@@ -4,6 +4,13 @@ ALERT_SENT_FILE="/var/lib/takguard/process_alert_sent"
 FAIL_COUNT_FILE="/var/lib/takguard/process_fail_count"
 LAST_RESTART_FILE="/var/lib/takguard/last_restart_time"
 RESTART_LOCK="/var/lib/takguard/restart.lock"
+MIN_UPTIME_SECS=900
+
+# Don't run during first 15 minutes after boot (avoid restart loop on slow startup)
+UPTIME_SECS=$(awk '{print int($1)}' /proc/uptime)
+if [ "$UPTIME_SECS" -lt "$MIN_UPTIME_SECS" ]; then
+  exit 0
+fi
 
 if ! systemctl is-active --quiet takserver; then
   rm -f "$FAIL_COUNT_FILE"

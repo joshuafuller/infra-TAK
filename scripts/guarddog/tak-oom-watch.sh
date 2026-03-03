@@ -3,6 +3,13 @@
 LOGFILE="/opt/tak/logs/takserver-messaging.log"
 STATEFILE="/var/run/tak_oom.state"
 SERVICE="takserver"
+MIN_UPTIME_SECS=900
+
+# Don't run during first 15 minutes after boot (avoid acting on stale log or boot race)
+UPTIME_SECS=$(awk '{print int($1)}' /proc/uptime)
+if [ "$UPTIME_SECS" -lt "$MIN_UPTIME_SECS" ]; then
+  exit 0
+fi
 
 # Check for OutOfMemoryError in logs
 if grep -q "OutOfMemoryError: Java heap space" "$LOGFILE" 2>/dev/null; then
