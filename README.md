@@ -18,6 +18,8 @@ A unified web console for deploying and managing TAK ecosystem infrastructure:
 - **Email Relay** — Outbound email for notifications and alerts
 - **Guard Dog** — Network monitoring and intrusion detection *(in development)*
 
+*All modules except Guard Dog are production-ready.*
+
 No more SSH. No more editing XML by hand. No more running scripts and hoping.
 
 ## Quick Start
@@ -63,18 +65,20 @@ Deploy services in this order — each step auto-configures the next:
 ```
 1. Caddy SSL         Set your FQDN, get Let's Encrypt certs (recommended first if using a domain)
          ↓
-2. TAK Server        Upload .deb, deploy, configure ports + certs
+2. Authentik         Identity provider + LDAP outpost (automated deploy)
          ↓
-3. Authentik         Identity provider + LDAP outpost (automated deploy)
-                     Auto-patches CoreConfig.xml with LDAP auth block
+3. Email Relay       Optional; configure SMTP for password recovery
          ↓
-4. TAK Portal        User/cert management portal
-                     Auto-configures Authentik URL, API token, TAK Server certs
+4. TAK Server        Upload .deb, deploy, configure ports + certs
          ↓
-5. Anything else     CloudTAK, Node-RED, MediaMTX, Email Relay — any order
+5. Connect LDAP      On TAK Server page — patches CoreConfig, creates webadmin in Authentik
+         ↓
+6. TAK Portal        User/cert management portal
+         ↓
+7. Anything else     CloudTAK, Node-RED, MediaMTX — any order
 ```
 
-**For TAK Server + TAK Portal:** Deploy TAK Server before Authentik so Authentik can add LDAP auth to CoreConfig.xml. TAK Portal then auto-detects the Authentik bootstrap token and TAK Server certificates. **For MediaMTX-only (or standalone Authentik):** You can deploy Authentik without TAK Server — it will skip CoreConfig and webadmin; add TAK Server later and redeploy Authentik to wire LDAP to TAK Server if needed. After TAK Portal (or if you skip it), remaining services can be deployed in any order from the Marketplace.
+**Connect LDAP** runs after TAK Server deploy and wires LDAP auth to CoreConfig. 8446 webadmin login and QR enrollment work immediately after. **For MediaMTX-only (or standalone Authentik):** Deploy Authentik without TAK Server — it skips CoreConfig and webadmin; add TAK Server later and use Connect LDAP.
 
 ## What Gets Automated
 
@@ -143,6 +147,21 @@ start.sh                    ← One CLI command to launch everything
 ---
 
 ## Changelog
+
+### v0.1.8-alpha — 2026-03-02
+
+**LDAP QR Registration Fix**
+LDAP application was restricted to authentik Admins, blocking QR code enrollment for non-admin users. LDAP is now open to all authenticated users. Connect LDAP / Resync LDAP applies this fix automatically.
+
+**Fresh Deploy Flow**
+8446 webadmin login and QR registration now work on initial deployment without manual Sync webadmin or Resync LDAP. LDAP outpost restart runs at end of TAK Server deploy and during Connect LDAP.
+
+**Authentik Deploy**
+Caddy reload timeout (30s) prevents indefinite hang. Progress message "Updating Caddy config..." before slow steps.
+
+**Recommended deployment order:** Caddy → Authentik → Email Relay → TAK Server → Connect LDAP → TAK Portal → Node-RED / CloudTAK / MediaMTX
+
+---
 
 ### v0.1.7-alpha — 2026-02-24
 
