@@ -532,7 +532,6 @@ def guarddog_page():
     return render_template_string(GUARDDOG_TEMPLATE,
         settings=settings, gd=gd, tak=tak, version=VERSION,
         guarddog_alert_email=settings.get('guarddog_alert_email', ''),
-        guarddog_uptimerobot_api_key=settings.get('guarddog_uptimerobot_api_key', ''),
         guarddog_sms=settings.get('guarddog_sms', {}),
         email_relay_configured=email_relay_configured,
         health_url=_guarddog_health_url(settings),
@@ -593,35 +592,6 @@ def guarddog_uninstall():
         shutil.rmtree('/opt/tak-guarddog', ignore_errors=True)
     subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=10)
     return jsonify({'success': True})
-
-@app.route('/api/guarddog/uptimerobot/add-monitor', methods=['POST'])
-@login_required
-def guarddog_uptimerobot_add():
-    """Create a new Uptime Robot monitor for the health endpoint (free API)."""
-    data = request.json or {}
-    api_key = (data.get('api_key') or '').strip()
-    settings = load_settings()
-    if not api_key:
-        api_key = (settings.get('guarddog_uptimerobot_api_key') or '').strip()
-    if not api_key:
-        return jsonify({'success': False, 'error': 'Uptime Robot API key required'}), 400
-    url = (data.get('url') or '').strip() or _guarddog_health_url(settings)
-    friendly_name = (data.get('friendly_name') or '').strip() or f"TAK Server Health ({settings.get('server_ip', '')})"
-    try:
-        import urllib.request
-        body = f"api_key={urllib.parse.quote(api_key)}&url={urllib.parse.quote(url)}&friendly_name={urllib.parse.quote(friendly_name)}&type=1"
-        req = urllib.request.Request('https://api.uptimerobot.com/v2/newMonitor', data=body.encode(), method='POST', headers={'Content-Type': 'application/x-www-form-urlencoded'})
-        with urllib.request.urlopen(req, timeout=15) as r:
-            out = json.loads(r.read().decode())
-        if out.get('stat') != 'ok':
-            return jsonify({'success': False, 'error': out.get('error', {}).get('message', 'Unknown error')}), 400
-        if not settings.get('guarddog_uptimerobot_api_key'):
-            settings['guarddog_uptimerobot_api_key'] = api_key
-            save_settings(settings)
-        mon = out.get('monitor', {})
-        return jsonify({'success': True, 'monitor_id': mon.get('id'), 'message': 'Monitor created'})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/guarddog/test-email', methods=['POST'])
 @login_required
@@ -5101,14 +5071,10 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
       <div id="gd-test-email-msg" style="margin-top:8px;font-size:12px"></div>
     </div>
     <div class="gd-section" style="margin-bottom:20px">
-      <div class="form-label">Uptime Robot (free)</div>
-      <p style="font-size:12px;color:var(--text-dim);margin-bottom:8px">Add a monitor that pings the health endpoint. Get your API key from <a href="https://uptimerobot.com/mySettings" target="_blank" rel="noopener noreferrer" style="color:var(--cyan)">My Settings</a>.</p>
-      <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:8px">
-        <input class="form-input" type="password" id="gd-ur-api-key" placeholder="API key" value="{{ guarddog_uptimerobot_api_key }}" style="max-width:280px" autocomplete="off">
-        <button class="btn btn-ghost" id="gd-ur-add-btn" onclick="gdUptimeRobotAdd()">Add monitor to Uptime Robot</button>
-      </div>
-      <p style="font-size:11px;color:var(--text-dim)">Health URL: <code style="word-break:break-all">{{ health_url }}</code></p>
-      <div id="gd-ur-msg" style="margin-top:8px;font-size:12px"></div>
+      <div class="form-label">Uptime Robot (outside-in monitoring)</div>
+      <p style="font-size:12px;color:var(--text-dim);margin-bottom:8px">Create a free account at <a href="https://uptimerobot.com" target="_blank" rel="noopener noreferrer" style="color:var(--cyan)">uptimerobot.com</a>, add your email for alerts, then add an HTTP(S) monitor with this URL:</p>
+      <p style="font-size:13px;margin-bottom:4px"><code style="word-break:break-all;background:var(--bg-deep);padding:8px 12px;border-radius:6px;display:inline-block">{{ health_url }}</code></p>
+      <p style="font-size:11px;color:var(--text-dim)">Copy and paste this into Uptime Robot when creating a new monitor.</p>
     </div>
     <div class="gd-section">
       <div class="form-label">SMS (optional)</div>
@@ -5163,7 +5129,6 @@ if(!d.running){clearInterval(gdLogInterval);var btn=document.getElementById('gd-
 if ({{ 'true' if deploying else 'false' }}) { var c=document.getElementById('gd-log-card');if(c)c.style.display='block';gdPollLog(); }
 function gdUninstall(){var pw=document.getElementById('gd-uninstall-password');var msg=document.getElementById('gd-uninstall-msg');if(!pw||!msg)return;msg.textContent='';fetch('/api/guarddog/uninstall',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw.value}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){if(d.error){msg.textContent=d.error;return;}msg.textContent='Done. Reloading...';document.getElementById('gd-uninstall-modal').classList.remove('open');setTimeout(function(){location.reload();},800);}).catch(function(e){msg.textContent=e.message||'Request failed';});}
 function gdTestEmail(){var el=document.getElementById('gd-test-email-msg');var btn=document.getElementById('gd-test-email-btn');var email=document.getElementById('gd-notify-email');var to=(email&&email.value)?email.value.trim():'';if(!to){el.textContent='Enter an email address.';el.style.color='var(--red)';return;}el.textContent='Sending...';el.style.color='var(--text-dim)';if(btn)btn.disabled=true;fetch('/api/guarddog/test-email',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({to:to,save:true}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){if(btn)btn.disabled=false;if(d.success){el.textContent=d.message||'Sent.';el.style.color='var(--green)';}else{el.textContent=d.error||'Failed';el.style.color='var(--red)';}}).catch(function(e){if(btn)btn.disabled=false;el.textContent=e.message||'Request failed';el.style.color='var(--red)';});}
-function gdUptimeRobotAdd(){var el=document.getElementById('gd-ur-msg');var btn=document.getElementById('gd-ur-add-btn');var key=document.getElementById('gd-ur-api-key');var apiKey=(key&&key.value)?key.value.trim():'';if(!apiKey){el.textContent='Enter your Uptime Robot API key.';el.style.color='var(--red)';return;}el.textContent='Adding monitor...';el.style.color='var(--text-dim)';if(btn)btn.disabled=true;fetch('/api/guarddog/uptimerobot/add-monitor',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({api_key:apiKey}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){if(btn)btn.disabled=false;if(d.success){el.textContent=d.message||'Monitor created.';el.style.color='var(--green)';}else{el.textContent=d.error||'Failed';el.style.color='var(--red)';}}).catch(function(e){if(btn)btn.disabled=false;el.textContent=e.message||'Request failed';el.style.color='var(--red)';});}
 function gdSmsProviderChange(){var p=document.getElementById('gd-sms-provider');var v=p?p.value:'';document.getElementById('gd-sms-twilio').style.display=(v==='twilio')?'block':'none';document.getElementById('gd-sms-brevo').style.display=(v==='brevo')?'block':'none';}
 function gdSmsSave(){var el=document.getElementById('gd-sms-msg');var p=document.getElementById('gd-sms-provider');var provider=(p&&p.value)?p.value.trim():'';var body={provider:provider};if(provider==='twilio'){body.account_sid=document.getElementById('gd-sms-tw-account').value.trim();body.auth_token=document.getElementById('gd-sms-tw-auth').value;body.from_number=document.getElementById('gd-sms-tw-from').value.trim();body.to_numbers=document.getElementById('gd-sms-tw-to').value.trim();}else if(provider==='brevo'){body.api_key=document.getElementById('gd-sms-br-api').value;body.sender=document.getElementById('gd-sms-br-sender').value.trim();body.to_numbers=document.getElementById('gd-sms-br-to').value.trim();}el.textContent='Saving...';el.style.color='var(--text-dim)';fetch('/api/guarddog/sms/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){if(d.success){el.textContent=d.message||'Saved.';el.style.color='var(--green)';}else{el.textContent=d.error||'Failed';el.style.color='var(--red)';}}).catch(function(e){el.textContent=e.message||'Request failed';el.style.color='var(--red)';});}
 </script>
