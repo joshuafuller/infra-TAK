@@ -11117,16 +11117,16 @@ def api_toggle_unattended_upgrades():
         if action == 'disable':
             # Kill in-flight process first so systemctl stop doesn't hang waiting for it
             subprocess.run('pkill -TERM -f "/usr/bin/unattended-upgrade" 2>/dev/null; true', shell=True, timeout=5)
-            for _ in range(8):
+            for _ in range(15):
                 time.sleep(1)
                 r = subprocess.run('pgrep -f "/usr/bin/unattended-upgrade" 2>/dev/null', shell=True, capture_output=True, text=True, timeout=3)
                 if not (r.stdout or '').strip():
                     break
             else:
                 subprocess.run('pkill -9 -f "/usr/bin/unattended-upgrade" 2>/dev/null; true', shell=True, timeout=5)
-                time.sleep(2)
+                time.sleep(3)
             subprocess.run('systemctl stop unattended-upgrades && systemctl disable unattended-upgrades',
-                shell=True, check=True, capture_output=True, text=True, timeout=15)
+                shell=True, check=True, capture_output=True, text=True, timeout=25)
             subprocess.run('systemctl stop apt-daily-upgrade.timer 2>/dev/null; systemctl disable apt-daily-upgrade.timer 2>/dev/null; true',
                 shell=True, timeout=10)
         else:
@@ -11668,10 +11668,11 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div class="metric-card"><div class="metric-label">Memory</div><div class="metric-value" id="ram-value">{{ metrics.ram_percent }}%</div><div class="metric-detail">{{ metrics.ram_used_gb }}GB / {{ metrics.ram_total_gb }}GB</div></div>
 <div class="metric-card"><div class="metric-label">Disk</div><div class="metric-value" id="disk-value">{{ metrics.disk_percent }}%</div><div class="metric-detail">{{ metrics.disk_used_gb }}GB / {{ metrics.disk_total_gb }}GB</div></div>
 <div class="metric-card"><div class="metric-label">Uptime</div><div class="metric-value" id="uptime-value" style="font-size:18px">{{ metrics.uptime }}</div></div>
-<div class="metric-card" style="position:relative">
-<div class="metric-label" style="display:flex;align-items:center;gap:6px">Auto Updates
-{% if metrics.unattended_upgrades.enabled and metrics.unattended_upgrades.running %}<span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--cyan);animation:pulse 2s infinite" title="Upgrade in progress"></span>{% endif %}
+<div class="metric-card" style="position:relative" title="Automatic OS/apt package upgrades on this server. Does not control infra-TAK or module updates.">
+<div class="metric-label" style="display:flex;align-items:center;gap:6px">Unattended server upgrades
+{% if metrics.unattended_upgrades.enabled and metrics.unattended_upgrades.running %}<span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--cyan);animation:pulse 2s infinite" title="OS upgrade in progress"></span>{% endif %}
 </div>
+<div class="metric-detail" style="margin-top:2px;font-size:10px;color:var(--text-dim)">OS/apt — not console or modules</div>
 <div style="display:flex;align-items:center;gap:8px;margin-top:6px">
 <label style="position:relative;display:inline-block;width:36px;height:20px;cursor:pointer;margin:0">
 <input type="checkbox" id="uu-toggle" {% if metrics.unattended_upgrades.enabled %}checked{% endif %} onchange="toggleUU(this)" style="opacity:0;width:0;height:0">
@@ -11724,8 +11725,8 @@ async function toggleUU(cb){
         var r=await fetch('/api/unattended-upgrades',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:action})});
         var d=await r.json();
         if(d.success){updateUU(d)}
-        else{cb.checked=!cb.checked;lb.textContent='Error: '+(d.error||'unknown');lb.style.color='var(--red)'}
-    }catch(e){cb.checked=!cb.checked;lb.textContent='Error';lb.style.color='var(--red)'}
+        else{cb.checked=!cb.checked;lb.textContent=(action==='disable'?'Disable failed — try again':('Error: '+(d.error||'unknown')));lb.style.color='var(--red)'}
+    }catch(e){cb.checked=!cb.checked;lb.textContent=(action==='disable'?'Disable failed — try again':'Error');lb.style.color='var(--red)'}
 }
 setInterval(async()=>{try{const r=await fetch('/api/metrics');const d=await r.json();document.getElementById('cpu-value').textContent=d.cpu_percent+'%';document.getElementById('ram-value').textContent=d.ram_percent+'%';document.getElementById('disk-value').textContent=d.disk_percent+'%';document.getElementById('uptime-value').textContent=d.uptime;updateUU(d.unattended_upgrades)}catch(e){}},5000);
 function refreshModuleCards(){
