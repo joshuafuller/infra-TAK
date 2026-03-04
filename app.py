@@ -11121,6 +11121,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div id="upgrade-upload-text" style="color:var(--text-dim);font-size:13px">Click or drop to select upgrade package (.deb)</div>
 <div id="upgrade-filename" style="display:none;font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--cyan);margin-top:8px"></div>
 </div>
+<div id="upgrade-progress-area" style="margin-bottom:16px"></div>
 <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
 <button type="button" id="tak-update-btn" onclick="startTakUpdate()" style="padding:12px 24px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:14px;font-weight:600;cursor:pointer">Update TAK Server</button>
 <span id="tak-update-msg" style="font-size:12px;color:var(--text-dim)"></span>

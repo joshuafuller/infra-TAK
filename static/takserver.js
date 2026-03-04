@@ -375,15 +375,46 @@ function pollDeployLog(){
     };poll();
 }
 var upgradeLogIndex=0;
+var upgradeXhr=null;
+function cancelUpgradeUpload(){
+  if(upgradeXhr){upgradeXhr.abort();upgradeXhr=null;}
+  var pa=document.getElementById('upgrade-progress-area');if(pa)pa.innerHTML='';
+  var ua=document.getElementById('upgrade-upload-area');if(ua){ua.style.maxHeight='';ua.style.padding='';}
+}
 function uploadUpgradeDeb(file){
   if(!file||!file.name.toLowerCase().endsWith('.deb')){var m=document.getElementById('tak-update-msg');if(m){m.textContent='Select a .deb file.';m.style.color='var(--red)';}return;}
+  var pa=document.getElementById('upgrade-progress-area');
+  pa.innerHTML='';
+  var fnEl=document.getElementById('upgrade-filename');if(fnEl){fnEl.style.display='none';}
+  var ua=document.getElementById('upgrade-upload-area');if(ua){ua.style.maxHeight='80px';ua.style.padding='16px';}
+  var row=document.createElement('div');row.className='progress-item';
+  var top=document.createElement('div');top.style.cssText='display:flex;justify-content:space-between;align-items:center';
+  var lbl=document.createElement('span');lbl.style.cssText='font-family:JetBrains Mono,monospace;font-size:13px;color:var(--text-secondary)';lbl.textContent=file.name+' ('+formatSize(file.size)+')';
+  var right=document.createElement('span');right.style.cssText='display:flex;align-items:center;gap:8px';
+  var pct=document.createElement('span');pct.style.cssText='font-family:JetBrains Mono,monospace;font-size:12px;color:var(--cyan)';pct.textContent='0%';
+  var cancelBtn=document.createElement('span');cancelBtn.textContent='\u2717';cancelBtn.style.cssText='color:var(--red);cursor:pointer;font-size:14px';cancelBtn.title='Cancel upload';
+  cancelBtn.onclick=function(){cancelUpgradeUpload();};
+  right.appendChild(pct);right.appendChild(cancelBtn);top.appendChild(lbl);top.appendChild(right);
+  var barOuter=document.createElement('div');barOuter.className='progress-bar-outer';
+  var barInner=document.createElement('div');barInner.className='progress-bar-inner';barInner.style.width='0%';
+  barOuter.appendChild(barInner);row.appendChild(top);row.appendChild(barOuter);pa.appendChild(row);
   var fd=new FormData();fd.append('files',file);
-  var fnEl=document.getElementById('upgrade-filename');if(fnEl){fnEl.textContent='Uploading '+file.name+'...';fnEl.style.display='block';}
-  fetch('/api/upload/takserver',{method:'POST',body:fd,credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
-    if(d.error){if(fnEl)fnEl.textContent=d.error;return;}
-    if(fnEl)fnEl.textContent='Ready: '+file.name;
-    var m=document.getElementById('tak-update-msg');if(m)m.textContent='';
-  }).catch(function(e){if(fnEl)fnEl.textContent='Upload failed';var m=document.getElementById('tak-update-msg');if(m){m.textContent=e.message;m.style.color='var(--red)';}});
+  var xhr=new XMLHttpRequest();
+  upgradeXhr=xhr;
+  xhr.upload.onprogress=function(e){if(e.lengthComputable){var p=Math.round((e.loaded/e.total)*100);barInner.style.width=p+'%';pct.textContent=p+'%';}};
+  xhr.onload=function(){
+    upgradeXhr=null;barInner.style.width='100%';cancelBtn.remove();
+    if(xhr.status===200){var d=JSON.parse(xhr.responseText);if(d.error){barInner.style.background='var(--red)';pct.textContent=d.error;pct.style.color='var(--red)';return;}
+      barInner.style.background='var(--green)';pct.style.color='var(--green)';pct.textContent='\u2713 ';
+      var rBtn=document.createElement('span');rBtn.textContent='\u2717';rBtn.style.cssText='color:var(--red);cursor:pointer;margin-left:8px;font-size:14px';rBtn.title='Remove';rBtn.onclick=function(){cancelUpgradeUpload();};pct.appendChild(rBtn);
+      if(fnEl){fnEl.textContent=file.name;fnEl.style.display='block';}var m=document.getElementById('tak-update-msg');if(m)m.textContent='';}
+    else{barInner.style.background='var(--red)';pct.textContent='\u2717';pct.style.color='var(--red)';}
+  };
+  xhr.onerror=function(){upgradeXhr=null;barInner.style.background='var(--red)';pct.textContent='\u2717 Failed';pct.style.color='var(--red)';};
+  xhr.onabort=function(){upgradeXhr=null;};
+  xhr.timeout=1800000;
+  xhr.ontimeout=function(){upgradeXhr=null;barInner.style.background='var(--red)';pct.textContent='Timeout';pct.style.color='var(--red)';};
+  xhr.open('POST','/api/upload/takserver');xhr.send(fd);
 }
 function handleUpgradeFile(ev){var f=ev.target.files[0];if(f)uploadUpgradeDeb(f);}
 function handleUpgradeDrop(ev){ev.preventDefault();ev.stopPropagation();document.getElementById('upgrade-upload-area').classList.remove('dragover');var f=ev.dataTransfer.files[0];if(f)uploadUpgradeDeb(f);}
