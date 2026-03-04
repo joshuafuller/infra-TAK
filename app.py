@@ -877,6 +877,40 @@ def _guarddog_send_sms_now(sms, text):
                 raise ValueError(f'Brevo SMS: {msg}')
     return out
 
+@app.route('/api/guarddog/brevo-sms-events', methods=['GET'])
+@login_required
+def guarddog_brevo_sms_events():
+    """Fetch last SMS events from Brevo (sent, delivered, rejected, etc.) so user can see delivery status without digging in Brevo UI."""
+    settings = load_settings()
+    sms = settings.get('guarddog_sms', {})
+    if not sms or sms.get('provider') != 'brevo':
+        return jsonify({'error': 'Brevo SMS not configured'}), 400
+    api_key = sms.get('api_key', '')
+    if not api_key:
+        return jsonify({'error': 'Brevo API key not set'}), 400
+    days = request.args.get('days', '1')
+    try:
+        days_int = max(1, min(7, int(days)))
+    except ValueError:
+        days_int = 1
+    url = f'https://api.brevo.com/v3/transactionalSMS/statistics/events?days={days_int}&tags=GuardDog&limit=50&sort=desc'
+    req = urllib.request.Request(url, method='GET', headers={'api-key': api_key, 'accept': 'application/json'})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode() if e.fp else ''
+        try:
+            err = json.loads(body) if body else {}
+            msg = err.get('message') or err.get('code') or body[:200] or f'HTTP {e.code}'
+        except Exception:
+            msg = body[:200] or f'HTTP {e.code}'
+        return jsonify({'error': f'Brevo: {msg}'}), 400
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    events = data.get('events') or []
+    return jsonify({'events': events})
+
 @app.route('/api/guarddog/test-sms', methods=['POST'])
 @login_required
 def guarddog_test_sms():
@@ -5377,8 +5411,10 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
       <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center">
         <button class="btn btn-ghost" onclick="gdSmsSave()">Save SMS settings</button>
         <button class="btn btn-ghost" id="gd-test-sms-btn" onclick="gdTestSms()">Send test SMS</button>
+        <button class="btn btn-ghost" id="gd-brevo-events-btn" onclick="gdBrevoSmsEvents()" style="display:none">Check delivery status</button>
       </div>
       <div id="gd-sms-msg" style="margin-top:8px;font-size:12px"></div>
+      <div id="gd-sms-events" style="display:none;margin-top:10px;padding:10px;background:var(--bg-card);border:1px solid var(--border);border-radius:8px;font-size:12px;max-height:180px;overflow-y:auto"></div>
     </div>
     {% if notifications_configured %}
     <button type="button" class="btn btn-ghost" onclick="gdToggleNotifications()" style="margin-top:12px"><span class="material-symbols-outlined" style="font-size:18px;vertical-align:middle;margin-right:4px">expand_less</span>Collapse</button>
@@ -5449,10 +5485,11 @@ if ({{ 'true' if deploying else 'false' }}) { var c=document.getElementById('gd-
 function gdUninstall(){var pw=document.getElementById('gd-uninstall-password');var msg=document.getElementById('gd-uninstall-msg');if(!pw||!msg)return;msg.textContent='';fetch('/api/guarddog/uninstall',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw.value}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){if(d.error){msg.textContent=d.error;return;}msg.textContent='Done. Reloading...';document.getElementById('gd-uninstall-modal').classList.remove('open');setTimeout(function(){location.reload();},800);}).catch(function(e){msg.textContent=e.message||'Request failed';});}
 function gdToggleNotifications(){var body=document.getElementById('gd-notify-body');var btn=document.getElementById('gd-notify-toggle-btn');var label=document.getElementById('gd-notify-toggle-label');if(!body)return;var show=body.style.display==='none';body.style.display=show?'block':'none';if(btn){var icon=btn.querySelector('.material-symbols-outlined');if(icon)icon.textContent=show?'expand_less':'expand_more';}if(label)label.textContent=show?'Collapse':'Expand to edit';}
 function gdTestEmail(){var el=document.getElementById('gd-test-email-msg');var btn=document.getElementById('gd-test-email-btn');var email=document.getElementById('gd-notify-email');var to=(email&&email.value)?email.value.trim():'';if(!to){el.textContent='Enter an email address.';el.style.color='var(--red)';return;}el.textContent='Sending...';el.style.color='var(--text-dim)';if(btn)btn.disabled=true;fetch('/api/guarddog/test-email',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({to:to,save:true}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){if(btn)btn.disabled=false;if(d.success){el.textContent=d.message||'Sent.';el.style.color='var(--green)';}else{el.textContent=d.error||'Failed';el.style.color='var(--red)';}}).catch(function(e){if(btn)btn.disabled=false;el.textContent=e.message||'Request failed';el.style.color='var(--red)';});}
-function gdSmsProviderChange(){var p=document.getElementById('gd-sms-provider');var v=p?p.value:'';document.getElementById('gd-sms-twilio').style.display=(v==='twilio')?'block':'none';document.getElementById('gd-sms-brevo').style.display=(v==='brevo')?'block':'none';if(v==='brevo')gdSenderCheck();}
+function gdSmsProviderChange(){var p=document.getElementById('gd-sms-provider');var v=p?p.value:'';document.getElementById('gd-sms-twilio').style.display=(v==='twilio')?'block':'none';document.getElementById('gd-sms-brevo').style.display=(v==='brevo')?'block':'none';var eb=document.getElementById('gd-brevo-events-btn');if(eb)eb.style.display=(v==='brevo')?'inline-block':'none';if(v==='brevo')gdSenderCheck();}
 function gdSenderCheck(){var inp=document.getElementById('gd-sms-br-sender');var ok=document.getElementById('gd-sms-sender-check');var warn=document.getElementById('gd-sms-sender-warn');if(!inp||!ok||!warn)return;var n=(inp.value||'').trim().length;if(n===0){ok.style.display='none';warn.style.display='none';return;}if(n<=11){ok.style.display='inline';warn.style.display='none';}else{warn.style.display='inline';warn.textContent=n+' chars (max 11)';ok.style.display='none';}}
 function gdSmsSave(){var el=document.getElementById('gd-sms-msg');var p=document.getElementById('gd-sms-provider');var provider=(p&&p.value)?p.value.trim():'';var body={provider:provider};if(provider==='twilio'){body.account_sid=document.getElementById('gd-sms-tw-account').value.trim();body.auth_token=document.getElementById('gd-sms-tw-auth').value;body.from_number=document.getElementById('gd-sms-tw-from').value.trim();body.to_numbers=document.getElementById('gd-sms-tw-to').value.trim();}else if(provider==='brevo'){body.api_key=document.getElementById('gd-sms-br-api').value;body.sender=document.getElementById('gd-sms-br-sender').value.trim();body.to_numbers=document.getElementById('gd-sms-br-to').value.trim();}el.textContent='Saving...';el.style.color='var(--text-dim)';fetch('/api/guarddog/sms/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){if(d.success){el.textContent=d.message||'Saved.';el.style.color='var(--green)';}else{el.textContent=d.error||'Failed';el.style.color='var(--red)';}}).catch(function(e){el.textContent=e.message||'Request failed';el.style.color='var(--red)';});}
 function gdTestSms(){var el=document.getElementById('gd-sms-msg');var btn=document.getElementById('gd-test-sms-btn');if(!el)return;el.textContent='Sending test SMS...';el.style.color='var(--text-dim)';if(btn)btn.disabled=true;fetch('/api/guarddog/test-sms',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){if(btn)btn.disabled=false;if(d.success){el.textContent=d.message||'Test SMS sent.';el.style.color='var(--green)';}else{el.textContent=d.error||'Failed';el.style.color='var(--red)';}}).catch(function(e){if(btn)btn.disabled=false;el.textContent=e.message||'Request failed';el.style.color='var(--red)';});}
+function gdBrevoSmsEvents(){var box=document.getElementById('gd-sms-events');var btn=document.getElementById('gd-brevo-events-btn');if(!box)return;box.style.display='block';box.textContent='Loading…';if(btn)btn.disabled=true;fetch('/api/guarddog/brevo-sms-events?days=1',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){if(btn)btn.disabled=false;if(d.error){box.innerHTML='<span style="color:var(--red)">'+d.error+'</span>';return;}var ev=d.events||[];if(ev.length===0){box.textContent='No SMS events in the last 24h (tag: GuardDog). Send a test SMS and try again.';return;}var lines=ev.map(function(e){var d=e.date?new Date(e.date):null;var t=d?d.toLocaleString():e.date||'—';var evt=e.event||'—';var ph=e.phoneNumber||'';var r=e.reason?(' — '+e.reason):'';return t+' · '+evt+(ph?' · '+ph:'')+r;});box.textContent=lines.join('\n');}).catch(function(e){if(btn)btn.disabled=false;box.innerHTML='<span style="color:var(--red)">Request failed</span>';});}
 function gdLoadActivityLog(){var el=document.getElementById('gd-activity-log');if(!el)return;el.textContent='Loading…';var fromVal=document.getElementById('gd-log-from')?document.getElementById('gd-log-from').value:'';var toVal=document.getElementById('gd-log-to')?document.getElementById('gd-log-to').value:'';var q='';if(fromVal)q+='from='+encodeURIComponent(fromVal)+'&';if(toVal)q+='to='+encodeURIComponent(toVal)+'&';fetch('/api/guarddog/activity-log?'+q,{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){if(d.error){el.textContent='Error: '+d.error;return;}if(!d.entries||d.entries.length===0){el.textContent='No entries'+(fromVal||toVal?' for this date range':'')+'.';return;}el.textContent=d.entries.map(function(e){return e.raw;}).join(String.fromCharCode(10));}).catch(function(e){el.textContent='Request failed: '+(e.message||'Unknown error');});}
 async function gdRefreshCotSize(){var el=document.getElementById('gd-cot-db-size');if(!el)return;el.textContent='…';el.style.color='';try{var r=await fetch('/api/takserver/cot-db-size');var d=await r.json();el.textContent=d.error?d.error:(d.size_human||'—');var b=d.size_bytes;if(typeof b==='number'&&!d.error){var gb25=25*1024*1024*1024;var gb40=40*1024*1024*1024;if(b<gb25)el.style.color='var(--green)';else if(b<gb40)el.style.color='var(--yellow)';else el.style.color='var(--red)';}}catch(e){el.textContent='Error';}}
 async function gdRunVacuum(full){var msg=document.getElementById('gd-vacuum-msg');var out=document.getElementById('gd-vacuum-output');var btnA=document.getElementById('gd-vacuum-analyze-btn');var btnF=document.getElementById('gd-vacuum-full-btn');if(full&&!confirm('VACUUM FULL locks the CoT tables. Run when TAK Server is not running. Continue?'))return;if(msg){msg.textContent=full?'Running VACUUM FULL…':'Running VACUUM ANALYZE…';msg.style.color='var(--text-dim)';}if(out){out.style.display='none';out.textContent='';}if(btnA){btnA.disabled=true;}if(btnF){btnF.disabled=true;}try{var r=await fetch('/api/takserver/vacuum',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({full:full})});var d=await r.json();if(d.success){if(msg){msg.textContent='Done.';msg.style.color='var(--green)';}if(out&&d.output){out.textContent=d.output;out.style.display='block';}if(document.getElementById('gd-cot-db-size')){gdRefreshCotSize();}}else{if(msg){msg.textContent=d.error||'Failed';msg.style.color='var(--red)';}}if(btnA){btnA.disabled=false;}if(btnF){btnF.disabled=false;} }catch(e){if(msg){msg.textContent='Request failed';msg.style.color='var(--red)';}if(btnA){btnA.disabled=false;}if(btnF){btnF.disabled=false;}}}
@@ -5461,6 +5498,7 @@ function gdRefreshHealth(){fetch('/api/guarddog/health',{credentials:'same-origi
 if (document.getElementById('gd-activity-log')) gdLoadActivityLog();
 if (document.getElementById('gd-cot-db-size')) gdRefreshCotSize();
 if (document.querySelector('.guard-service-row')){gdRefreshHealth();setInterval(gdRefreshHealth,60000);}
+if (document.getElementById('gd-sms-provider')) gdSmsProviderChange();
 if (document.getElementById('gd-sms-br-sender')) gdSenderCheck();
 </script>
 </body></html>
