@@ -748,6 +748,19 @@ def guarddog_enable():
     subprocess.run(['systemctl', 'start', 'tak-health.service'], capture_output=True, timeout=5)
     return jsonify({'success': True, 'enabled': True})
 
+@app.route('/api/guarddog/apply-docker-log-limits', methods=['POST'])
+@login_required
+def guarddog_apply_docker_log_limits():
+    """Apply Docker log limits (50m × 3 per container) so Node-RED/Authentik etc. cannot fill the disk. No redeploy needed."""
+    restarted, err = _ensure_docker_log_limits()
+    if err:
+        return jsonify({'success': False, 'error': err}), 500
+    return jsonify({
+        'success': True,
+        'docker_restarted': restarted,
+        'message': 'Docker log limits applied (50 MB × 3 files per container).' + (' Docker was restarted — start other containers from their pages if needed.' if restarted else ' Limits were already set.')
+    })
+
 @app.route('/api/guarddog/uninstall', methods=['POST'])
 @login_required
 def guarddog_uninstall():
@@ -4602,10 +4615,10 @@ def emailrelay_configure_authentik():
 # ── Docker log limits (prevents Node-RED / Authentik LDAP etc. from filling disk) ──
 def _ensure_docker_log_limits(log_fn=None):
     """Ensure /etc/docker/daemon.json has log-opts (max-size 50m, max-file 3). If we write or change it, restart Docker.
-    Call before deploying any Docker-based service (Node-RED, etc.) so container logs cannot grow unbounded."""
+    Returns (docker_restarted: bool, error: str or None)."""
     daemon_json = '/etc/docker/daemon.json'
     if not os.path.isdir('/etc/docker'):
-        return
+        return False, 'Docker not installed'
     try:
         data = {}
         if os.path.isfile(daemon_json) and os.path.getsize(daemon_json) > 0:
@@ -4613,7 +4626,9 @@ def _ensure_docker_log_limits(log_fn=None):
                 data = json.load(f)
         opts = data.get('log-opts') or {}
         if opts.get('max-size') == '50m' and opts.get('max-file') == '3':
-            return
+            if log_fn:
+                log_fn("✓ Docker log limits already set.")
+            return False, None
         data['log-driver'] = 'json-file'
         data['log-opts'] = {'max-size': '50m', 'max-file': '3'}
         os.makedirs('/etc/docker', exist_ok=True)
@@ -4624,8 +4639,12 @@ def _ensure_docker_log_limits(log_fn=None):
         time.sleep(5)
         if log_fn:
             log_fn("✓ Docker log limits set (50 MB × 3 per container). Docker was restarted; other containers may need starting from their pages.")
-    except Exception:
-        pass
+        return True, None
+    except Exception as e:
+        err = str(e)
+        if log_fn:
+            log_fn(f"✗ Failed to set Docker log limits: {err}")
+        return False, err
 
 
 # ── Node-RED ──────────────────────────────────────────────────────────────────
@@ -5445,6 +5464,13 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   {% if gd.running %}<div class="status-banner running" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px"><div style="display:flex;align-items:center;gap:12px"><div class="dot"></div>Guard Dog is running</div><button type="button" class="btn btn-ghost" style="border-color:var(--yellow);color:var(--yellow)" onclick="gdSetEnabled(false)">Disable</button></div>
   {% elif gd.installed %}<div class="status-banner stopped" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px"><div style="display:flex;align-items:center;gap:12px"><div class="dot"></div>Guard Dog is disabled</div><button type="button" class="btn btn-primary" onclick="gdSetEnabled(true)">Enable</button></div>
   {% else %}<div class="status-banner not-installed"><div class="dot"></div>Guard Dog is not installed (it will install automatically when you deploy TAK Server)</div>{% endif %}
+
+  <div class="card">
+    <div class="card-title">Docker container log limits</div>
+    <p style="font-size:12px;color:var(--text-secondary);margin-bottom:12px">Prevents container logs (e.g. Node-RED, Authentik LDAP) from filling the disk. Apply once per server or after updating infra-TAK — no need to redeploy a module.</p>
+    <button type="button" class="btn btn-ghost" id="gd-docker-limits-btn" onclick="gdApplyDockerLogLimits()">Apply limits</button>
+    <span id="gd-docker-limits-msg" style="margin-left:12px;font-size:12px"></span>
+  </div>
 
   {% if not tak.installed %}
   <div class="card" style="border-color:var(--yellow)">
