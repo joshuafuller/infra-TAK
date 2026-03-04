@@ -9596,8 +9596,20 @@ def takserver_groups():
     if not os.path.exists(admin_p12):
         return jsonify({'error': 'admin.p12 not found in /opt/tak/certs/files/', 'groups': []})
     try:
+        # TAK Server generates legacy PKCS12 (RC2-40-CBC) that modern curl/OpenSSL 3.x
+        # rejects (exit 58). Extract PEM cert+key with -legacy flag for curl.
+        admin_pem = '/tmp/tak-admin-curl.pem'
+        admin_key = '/tmp/tak-admin-curl.key'
+        subprocess.run(
+            f'openssl pkcs12 -in {admin_p12} -passin pass:atakatak -clcerts -nokeys -legacy 2>/dev/null > {admin_pem}',
+            shell=True, capture_output=True, text=True, timeout=10)
+        subprocess.run(
+            f'openssl pkcs12 -in {admin_p12} -passin pass:atakatak -nocerts -nodes -legacy 2>/dev/null > {admin_key}',
+            shell=True, capture_output=True, text=True, timeout=10)
+        if not os.path.exists(admin_pem) or os.path.getsize(admin_pem) == 0:
+            return jsonify({'error': 'Failed to extract PEM from admin.p12 (legacy conversion)', 'groups': []})
         cmd = ['curl', '-sk', '--max-time', '8',
-               '--cert-type', 'P12', '--cert', f'{admin_p12}:atakatak',
+               '--cert', admin_pem, '--key', admin_key,
                'https://127.0.0.1:8443/Marti/api/groups/all']
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
         body = (r.stdout or '').strip()
@@ -9625,6 +9637,12 @@ def takserver_groups():
         return jsonify({'groups': groups})
     except Exception as e:
         return jsonify({'error': str(e), 'groups': []})
+    finally:
+        for f in ['/tmp/tak-admin-curl.pem', '/tmp/tak-admin-curl.key']:
+            try:
+                os.remove(f)
+            except OSError:
+                pass
 
 
 @app.route('/api/takserver/create-client-cert', methods=['POST'])
@@ -9663,10 +9681,10 @@ def takserver_create_client_cert():
         if groups_in or groups_out:
             pem_path = os.path.join(cert_dir, f'{cert_name}.pem')
             cmd = f'java -jar /opt/tak/utils/UserManager.jar certmod'
-            if groups_in:
-                cmd += f' -ig {",".join(groups_in)}'
-            if groups_out:
-                cmd += f' -og {",".join(groups_out)}'
+            for g in groups_in:
+                cmd += f' -ig {g}'
+            for g in groups_out:
+                cmd += f' -og {g}'
             cmd += f' {pem_path} 2>&1'
             gr = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=15)
             if gr.returncode != 0:
