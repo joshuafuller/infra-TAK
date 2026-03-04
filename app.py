@@ -1614,9 +1614,18 @@ def wait_for_apt_lock(log_fn, log_list):
     """
     Wait for unattended-upgrades / apt locks to release before installing packages.
     Called at the start of every deploy that uses apt/dpkg.
-    Waits indefinitely — no timeout. Checks both process and dpkg lock file.
+    If unattended-upgrades is disabled but a process is still running, we kill it and wait briefly.
+    Otherwise waits until lock clears (no timeout when upgrades are enabled).
     Appends a ⏳ ticker line every 10s — the frontend JS overwrites it in place.
     """
+    uu = _get_unattended_upgrades_status()
+    uu_disabled = not uu.get('enabled', True)
+
+    def _unattended_process_running():
+        r = subprocess.run('ps aux | grep "/usr/bin/unattended-upgrade" | grep -v shutdown | grep -v grep',
+            shell=True, capture_output=True, text=True)
+        return bool(r.stdout.strip())
+
     def is_locked():
         # Check dpkg lock file
         lock = subprocess.run('lsof /var/lib/dpkg/lock-frontend 2>/dev/null',
@@ -1624,12 +1633,24 @@ def wait_for_apt_lock(log_fn, log_list):
         if lock.stdout.strip():
             return True
         # Check for active upgrade process (exclude the shutdown watcher)
-        proc = subprocess.run('ps aux | grep "/usr/bin/unattended-upgrade" | grep -v shutdown | grep -v grep',
-            shell=True, capture_output=True, text=True)
-        return bool(proc.stdout.strip())
+        return _unattended_process_running()
 
     if not is_locked():
         return True
+
+    # Unattended-upgrades is disabled but process/lock still present (e.g. user just turned it off)
+    if uu_disabled:
+        log_fn("Unattended-upgrades is disabled; stopping any remaining upgrade process...")
+        subprocess.run('pkill -TERM -f "/usr/bin/unattended-upgrade" 2>/dev/null; true', shell=True, timeout=5)
+        # Wait up to 60s for process to exit and lock to release
+        for _ in range(12):
+            time.sleep(5)
+            if not is_locked():
+                log_fn("✓ Clear to proceed.")
+                return True
+        log_fn("⚠ Lock still held after 60s; continuing anyway (dpkg may be in use elsewhere).")
+        return True
+
     log_fn("⏳ Unattended-upgrades is running — waiting for it to finish...")
     log_fn("  This can take 20-45 minutes on a fresh VPS. Do not cancel.")
     waited = 0
@@ -10940,6 +10961,8 @@ def api_toggle_unattended_upgrades():
             # Ubuntu/Debian also run unattended-upgrade via apt-daily-upgrade.timer; disable that too
             subprocess.run('systemctl stop apt-daily-upgrade.timer 2>/dev/null; systemctl disable apt-daily-upgrade.timer 2>/dev/null; true',
                 shell=True, timeout=10)
+            # Kill any in-flight unattended-upgrade process so deploys don't wait; user explicitly disabled
+            subprocess.run('pkill -TERM -f "/usr/bin/unattended-upgrade" 2>/dev/null; true', shell=True, timeout=5)
         else:
             subprocess.run('systemctl enable unattended-upgrades && systemctl start unattended-upgrades',
                 shell=True, check=True, capture_output=True, text=True, timeout=30)
@@ -11301,7 +11324,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div class="help-card">
 <div class="help-card-header" onclick="helpToggle(this)"><h2>Deployment order</h2><span class="help-card-toggle">&#9662;</span></div>
 <div class="help-card-body">
-<p>(1) Caddy — set FQDN and TLS · (2) Authentik · (3) Email Relay · (4) TAK Server — upload .deb/.rpm and deploy · (5) TAK Portal · (6) Connect TAK Server to LDAP (button on TAK Server page) · (7) Node-RED, MediaMTX, CloudTAK as needed.</p>
+<p>(1) Caddy — set FQDN and TLS · (2) Authentik · (3) Email Relay · (4) TAK Server — upload .deb/.rpm and deploy · (5) Connect TAK Server to LDAP (button on TAK Server page) · (6) TAK Portal · (7) Node-RED, MediaMTX, CloudTAK, Guard Dog as needed.</p>
 </div></div>
 <div class="help-card">
 <div class="help-card-header" onclick="helpToggle(this)"><h2>Backdoor (IP:5001)</h2><span class="help-card-toggle">&#9662;</span></div>
