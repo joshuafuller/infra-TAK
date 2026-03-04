@@ -9645,6 +9645,261 @@ def takserver_groups():
                 pass
 
 
+@app.route('/api/takserver/ca-info')
+@login_required
+def takserver_ca_info():
+    """Return current Root CA and Intermediate CA names, expiry, and truststore contents."""
+    cert_dir = '/opt/tak/certs/files'
+    info = {'root_ca': None, 'intermediate_ca': None, 'old_cas_in_truststore': [], 'suggested_new_name': ''}
+    for label, filename in [('root_ca', 'root-ca.pem'), ('intermediate_ca', 'ca.pem')]:
+        path = os.path.join(cert_dir, filename)
+        if not os.path.exists(path):
+            continue
+        try:
+            r = subprocess.run(['openssl', 'x509', '-subject', '-enddate', '-noout', '-in', path],
+                               capture_output=True, text=True, timeout=5)
+            cn = ''
+            for part in r.stdout.replace('subject=', '').split(','):
+                part = part.strip()
+                if part.startswith('CN') or part.startswith('CN '):
+                    cn = part.split('=', 1)[-1].strip()
+            expiry_raw = ''
+            for line in r.stdout.strip().split('\n'):
+                if 'notAfter' in line:
+                    expiry_raw = line.split('=', 1)[-1].strip()
+            days_left = None
+            expires = ''
+            if expiry_raw:
+                from datetime import datetime
+                exp_dt = datetime.strptime(expiry_raw, '%b %d %H:%M:%S %Y %Z')
+                days_left = (exp_dt - datetime.utcnow()).days
+                expires = exp_dt.strftime('%Y-%m-%d')
+            info[label] = {'name': cn, 'file': filename, 'expires': expires, 'days_left': days_left}
+        except Exception:
+            pass
+    if info['intermediate_ca'] and info['intermediate_ca']['name']:
+        import re
+        name = info['intermediate_ca']['name']
+        m = re.search(r'(\d+)$', name)
+        if m:
+            num = int(m.group(1))
+            info['suggested_new_name'] = name[:m.start()] + f'{num + 1:02d}'
+        else:
+            info['suggested_new_name'] = name + '-02'
+    # List CAs in current truststore (to show old CAs that can be revoked)
+    import glob as _glob
+    ts_files = sorted(_glob.glob(os.path.join(cert_dir, 'truststore-*.jks')))
+    ts_files = [f for f in ts_files if 'root' not in os.path.basename(f)]
+    if ts_files:
+        ts_path = ts_files[-1]
+        info['truststore_file'] = os.path.basename(ts_path)
+        try:
+            r = subprocess.run(
+                ['keytool', '-list', '-keystore', ts_path, '-storepass', 'atakatak'],
+                capture_output=True, text=True, timeout=10)
+            aliases = []
+            for line in r.stdout.split('\n'):
+                if ',' in line and ('trustedCertEntry' in line or 'PrivateKeyEntry' in line):
+                    alias = line.split(',')[0].strip()
+                    aliases.append(alias)
+            info['truststore_aliases'] = aliases
+            current_cn = (info['intermediate_ca'] or {}).get('name', '').lower()
+            root_cn = (info['root_ca'] or {}).get('name', '').lower()
+            old_cas = []
+            for a in aliases:
+                if a.lower() != current_cn.lower() and a.lower() != 'root-ca' and a.lower() != root_cn.lower():
+                    old_cas.append(a)
+            info['old_cas_in_truststore'] = old_cas
+        except Exception:
+            pass
+    return jsonify(info)
+
+
+rotate_intca_log = []
+rotate_intca_status = {'running': False, 'complete': False, 'error': False}
+
+@app.route('/api/takserver/rotate-intca', methods=['POST'])
+@login_required
+def takserver_rotate_intca():
+    """Rotate the intermediate CA: create new CA, server cert, admin cert, import old CA into truststore."""
+    if rotate_intca_status.get('running'):
+        return jsonify({'error': 'Rotation already in progress'}), 409
+    data = request.json or {}
+    new_ca_name = (data.get('new_ca_name') or '').strip()
+    if not new_ca_name:
+        return jsonify({'error': 'New CA name is required'}), 400
+    import re
+    if not re.match(r'^[a-zA-Z0-9._-]+$', new_ca_name):
+        return jsonify({'error': 'CA name can only contain letters, numbers, dots, hyphens, underscores'}), 400
+
+    cert_dir = '/opt/tak/certs/files'
+    if not os.path.exists(os.path.join(cert_dir, 'root-ca.pem')):
+        return jsonify({'error': 'root-ca.pem not found — cannot rotate without a Root CA'}), 400
+    if not os.path.exists(os.path.join(cert_dir, 'ca.pem')):
+        return jsonify({'error': 'ca.pem not found — no current intermediate CA detected'}), 400
+
+    # Detect current intermediate CA name
+    try:
+        r = subprocess.run(['openssl', 'x509', '-subject', '-noout', '-in', os.path.join(cert_dir, 'ca.pem')],
+                           capture_output=True, text=True, timeout=5)
+        old_ca_name = ''
+        for part in r.stdout.replace('subject=', '').split(','):
+            part = part.strip()
+            if part.startswith('CN') or part.startswith('CN '):
+                old_ca_name = part.split('=', 1)[-1].strip()
+    except Exception:
+        old_ca_name = ''
+    if not old_ca_name:
+        return jsonify({'error': 'Could not detect current intermediate CA name from ca.pem'}), 500
+    if new_ca_name == old_ca_name:
+        return jsonify({'error': f'New CA name must be different from current ({old_ca_name})'}), 400
+
+    rotate_intca_log.clear()
+    rotate_intca_status.update({'running': True, 'complete': False, 'error': False})
+
+    def do_rotate():
+        def log(msg):
+            rotate_intca_log.append(msg)
+
+        def run(cmd, desc=None, check=True):
+            if desc:
+                log(desc)
+            try:
+                r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
+                if check and r.returncode != 0:
+                    err = (r.stderr or r.stdout or '').strip()[:200]
+                    log(f"  ✗ Failed (exit {r.returncode}): {err}")
+                    return False
+                return True
+            except Exception as e:
+                log(f"  ✗ Exception: {e}")
+                return False
+
+        try:
+            log(f"━━━ Rotating Intermediate CA ━━━")
+            log(f"  Old CA: {old_ca_name}")
+            log(f"  New CA: {new_ca_name}")
+            log("")
+
+            log("Step 1/7: Restoring Root CA as working CA...")
+            run(f'cp {cert_dir}/root-ca.pem {cert_dir}/ca.pem')
+            run(f'cp {cert_dir}/root-ca-do-not-share.key {cert_dir}/ca-do-not-share.key')
+            run(f'cp {cert_dir}/root-ca-trusted.pem {cert_dir}/ca-trusted.pem')
+            log("✓ Root CA files restored")
+
+            log("")
+            log(f"Step 2/7: Creating new Intermediate CA: {new_ca_name}...")
+            run('chmod +r /opt/tak/certs/cert-metadata.sh 2>/dev/null')
+            if not run(f'cd /opt/tak/certs && echo "y" | sudo -u tak ./makeCert.sh ca "{new_ca_name}" 2>&1'):
+                raise Exception('Failed to create new intermediate CA')
+            log(f"✓ Intermediate CA {new_ca_name} created")
+
+            log("")
+            log("Step 3/7: Creating new server certificate...")
+            if not run('cd /opt/tak/certs && echo "y" | sudo -u tak ./makeCert.sh server takserver 2>&1'):
+                raise Exception('Failed to create server certificate')
+            log("✓ Server certificate created (signed by new CA)")
+
+            log("")
+            log("Step 4/7: Creating new admin and user certificates...")
+            run('cd /opt/tak/certs && echo "y" | sudo -u tak ./makeCert.sh client admin 2>&1')
+            run('cd /opt/tak/certs && echo "y" | sudo -u tak ./makeCert.sh client user 2>&1')
+            log("✓ Admin and user certificates recreated")
+
+            log("")
+            log("Step 5/7: Updating truststore...")
+            ts_jks = os.path.join(cert_dir, f'truststore-{new_ca_name}.jks')
+            run(f'keytool -import -alias root-ca -file {cert_dir}/root-ca.pem '
+                f'-keystore {ts_jks} -storepass atakatak -noprompt 2>&1', check=False)
+            log("  Root CA imported into new truststore")
+            old_pem = os.path.join(cert_dir, f'{old_ca_name}.pem')
+            if os.path.exists(old_pem):
+                run(f'keytool -import -trustcacerts -file {old_pem} '
+                    f'-keystore {ts_jks} -alias "{old_ca_name}" -deststorepass atakatak -noprompt 2>&1',
+                    check=False)
+                log(f"  Old CA ({old_ca_name}) imported into new truststore (transition period)")
+            else:
+                log(f"  ⚠ {old_ca_name}.pem not found — old CA NOT added to truststore")
+            log("✓ Truststore updated")
+
+            log("")
+            log("Step 6/7: Updating CoreConfig.xml...")
+            run(f'sed -i "s/{old_ca_name}/{new_ca_name}/g" /opt/tak/CoreConfig.xml')
+            run(f'sed -i "s/{old_ca_name}/{new_ca_name}/g" /opt/tak/CoreConfig.example.xml 2>/dev/null', check=False)
+            log("✓ CoreConfig.xml updated")
+
+            log("")
+            log("Step 7/7: Restarting TAK Server...")
+            run('systemctl restart takserver 2>&1')
+            log("  Waiting for TAK Server to come back up...")
+            time.sleep(45)
+            log("✓ TAK Server restarted")
+
+            log("")
+            log("━━━ ROTATION COMPLETE ━━━")
+            log(f"  New signing CA: {new_ca_name}")
+            log(f"  Old CA ({old_ca_name}) is still trusted for existing clients")
+            log(f"  New admin.p12 and user.p12 have been regenerated")
+            log(f"  When ready, use 'Revoke Old CA' to remove {old_ca_name} from the truststore")
+            rotate_intca_status.update({'running': False, 'complete': True, 'error': False})
+        except Exception as e:
+            log(f"")
+            log(f"✗ ROTATION FAILED: {e}")
+            rotate_intca_status.update({'running': False, 'complete': True, 'error': True})
+
+    import threading
+    threading.Thread(target=do_rotate, daemon=True).start()
+    return jsonify({'started': True, 'old_ca': old_ca_name, 'new_ca': new_ca_name})
+
+
+@app.route('/api/takserver/rotate-intca/status')
+@login_required
+def takserver_rotate_intca_status():
+    return jsonify({'log': rotate_intca_log, **rotate_intca_status})
+
+
+@app.route('/api/takserver/revoke-old-ca', methods=['POST'])
+@login_required
+def takserver_revoke_old_ca():
+    """Remove an old intermediate CA from the truststore, cutting off clients with old certs."""
+    data = request.json or {}
+    old_ca_alias = (data.get('old_ca_alias') or '').strip()
+    if not old_ca_alias:
+        return jsonify({'error': 'Old CA alias is required'}), 400
+
+    cert_dir = '/opt/tak/certs/files'
+    import glob as _glob
+    ts_files = sorted(_glob.glob(os.path.join(cert_dir, 'truststore-*.jks')))
+    ts_files = [f for f in ts_files if 'root' not in os.path.basename(f)]
+    if not ts_files:
+        return jsonify({'error': 'No truststore found'}), 500
+    ts_path = ts_files[-1]
+
+    try:
+        r = subprocess.run(
+            ['keytool', '-delete', '-alias', old_ca_alias,
+             '-keystore', ts_path, '-storepass', 'atakatak'],
+            capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            return jsonify({'error': f'keytool failed: {r.stderr or r.stdout}'}), 500
+
+        # Also regenerate the .p12 truststore from the .jks
+        ts_p12 = ts_path.replace('.jks', '.p12')
+        subprocess.run(
+            f'keytool -importkeystore -srckeystore {ts_path} -destkeystore {ts_p12} '
+            f'-srcstoretype JKS -deststoretype PKCS12 -srcstorepass atakatak -deststorepass atakatak -noprompt 2>&1',
+            shell=True, capture_output=True, text=True, timeout=15)
+
+        subprocess.run('systemctl restart takserver 2>&1', shell=True, capture_output=True, text=True, timeout=30)
+        return jsonify({
+            'success': True,
+            'message': f'Removed {old_ca_alias} from truststore and restarted TAK Server. '
+                       f'Clients with certificates signed by {old_ca_alias} will no longer be able to connect.'
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/takserver/create-client-cert', methods=['POST'])
 @login_required
 def takserver_create_client_cert():
@@ -11333,6 +11588,33 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <a href="/certs" class="cert-btn cert-btn-secondary" style="text-decoration:none">📁 Browse Certificates</a>
 </div>
 <div id="cert-expiry-info" style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim)">Loading certificate expiry...</div>
+</div>
+</div>
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:24px">
+<div style="display:flex;align-items:center;justify-content:space-between;padding:16px 24px;cursor:pointer" onclick="takToggleSection('rotate-ca')">
+<span class="section-title" style="margin-bottom:0">Rotate Intermediate CA</span>
+<span id="rotate-ca-toggle-icon" style="font-size:18px;color:var(--text-dim);transition:transform 0.2s ease">&#9662;</span>
+</div>
+<div id="rotate-ca-body" style="display:none;padding:0 24px 24px 24px;border-top:1px solid var(--border)">
+<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">Create a new Intermediate CA signed by your Root CA. The old CA stays in the truststore so existing clients remain connected during transition. Once all clients have re-enrolled, revoke the old CA.</p>
+<div id="rotate-ca-info" style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim);margin-bottom:16px">Loading CA info...</div>
+<div id="rotate-ca-controls" style="display:none">
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+<div class="form-field"><label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">New Intermediate CA Name</label><input type="text" id="rotate-ca-name" placeholder="e.g. INTERMEDIATE-CA-02" maxlength="64" style="width:100%;padding:10px 14px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px;box-sizing:border-box"></div>
+<div></div>
+</div>
+<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:16px">
+<button type="button" id="rotate-ca-btn" onclick="rotateIntCA()" style="padding:12px 24px;background:linear-gradient(135deg,#b45309,#92400e);color:#fff;border:none;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:14px;font-weight:600;cursor:pointer">Rotate Intermediate CA</button>
+<span id="rotate-ca-msg" style="font-size:12px;color:var(--text-dim)"></span>
+</div>
+</div>
+<div id="rotate-ca-log" style="display:none;background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:400px;overflow-y:auto;line-height:1.6;white-space:pre-wrap;margin-bottom:16px"></div>
+<div id="revoke-ca-section" style="display:none;background:rgba(239,68,68,0.06);border:1px solid rgba(239,68,68,0.2);border-radius:10px;padding:16px">
+<div style="font-size:13px;font-weight:600;color:var(--red);margin-bottom:8px">Revoke Old CA</div>
+<p style="font-size:12px;color:var(--text-secondary);line-height:1.5;margin-bottom:12px">Remove the old CA from the truststore. Clients with certificates signed by the old CA will be disconnected and must re-enroll.</p>
+<div id="revoke-ca-list" style="margin-bottom:12px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim)"></div>
+<div id="revoke-ca-msg" style="font-size:12px;margin-top:8px"></div>
+</div>
 </div>
 </div>
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:24px">

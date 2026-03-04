@@ -72,6 +72,7 @@ async function loadServices(){
 if(document.getElementById('services-list')){loadServices();setInterval(loadServices,10000)}
 if(document.getElementById('cot-db-size')){refreshCotSize();}
 if(document.getElementById('cert-expiry-info')){loadCertExpiry();}
+if(document.getElementById('rotate-ca-info')){loadCAInfo();}
 async function loadGroups(){
   var el=document.getElementById('cc-groups-list');if(!el)return;
   el.innerHTML='<span style="color:var(--text-dim)">Loading groups...</span>';
@@ -172,6 +173,129 @@ async function loadCertExpiry(){
     }
   }catch(e){el.textContent='Failed to load certificate info';}
 }
+
+async function loadCAInfo(){
+  var infoEl=document.getElementById('rotate-ca-info');
+  var ctrlEl=document.getElementById('rotate-ca-controls');
+  var revokeEl=document.getElementById('revoke-ca-section');
+  if(!infoEl)return;
+  try{
+    var r=await fetch('/api/takserver/ca-info');
+    var d=await r.json();
+    var h='';
+    if(d.root_ca){
+      h+='<div style="display:flex;align-items:center;gap:12px;margin-bottom:6px">';
+      h+='<span style="color:var(--text-secondary);min-width:140px">Root CA</span>';
+      h+='<span style="color:var(--cyan);font-weight:600">'+d.root_ca.name+'</span>';
+      if(d.root_ca.expires)h+='<span style="color:var(--text-dim)">expires '+d.root_ca.expires+'</span>';
+      h+='</div>';
+    }
+    if(d.intermediate_ca){
+      var days=d.intermediate_ca.days_left,color='var(--green)';
+      if(days<=90)color='var(--red)';else if(days<=365)color='var(--yellow)';
+      h+='<div style="display:flex;align-items:center;gap:12px;margin-bottom:6px">';
+      h+='<span style="color:var(--text-secondary);min-width:140px">Intermediate CA</span>';
+      h+='<span style="color:var(--cyan);font-weight:600">'+d.intermediate_ca.name+'</span>';
+      if(d.intermediate_ca.expires)h+='<span style="color:'+color+'">expires '+d.intermediate_ca.expires+' ('+days+'d)</span>';
+      h+='</div>';
+    }
+    if(d.truststore_file){
+      h+='<div style="display:flex;align-items:center;gap:12px;margin-bottom:6px">';
+      h+='<span style="color:var(--text-secondary);min-width:140px">Truststore</span>';
+      h+='<span style="color:var(--text-dim)">'+d.truststore_file+'</span>';
+      if(d.truststore_aliases&&d.truststore_aliases.length){
+        h+=' <span style="color:var(--text-dim)">('+d.truststore_aliases.join(', ')+')</span>';
+      }
+      h+='</div>';
+    }
+    infoEl.innerHTML=h||'No CA information available.';
+    if(ctrlEl)ctrlEl.style.display='block';
+    var nameInput=document.getElementById('rotate-ca-name');
+    if(nameInput&&d.suggested_new_name&&!nameInput.value)nameInput.value=d.suggested_new_name;
+    if(revokeEl&&d.old_cas_in_truststore&&d.old_cas_in_truststore.length>0){
+      revokeEl.style.display='block';
+      var listEl=document.getElementById('revoke-ca-list');
+      if(listEl){
+        var rh='';
+        for(var i=0;i<d.old_cas_in_truststore.length;i++){
+          var alias=d.old_cas_in_truststore[i];
+          rh+='<div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">';
+          rh+='<span style="color:var(--yellow)">'+alias+'</span>';
+          rh+='<button type="button" onclick="revokeOldCA(\''+alias.replace(/'/g,"\\'")+'\')" style="padding:6px 14px;background:rgba(239,68,68,0.15);color:var(--red);border:1px solid rgba(239,68,68,0.3);border-radius:6px;font-family:\'JetBrains Mono\',monospace;font-size:11px;cursor:pointer">Revoke</button>';
+          rh+='</div>';
+        }
+        listEl.innerHTML=rh;
+      }
+    }
+  }catch(e){infoEl.textContent='Failed to load CA info';}
+}
+
+async function rotateIntCA(){
+  var nameInput=document.getElementById('rotate-ca-name');
+  var newName=(nameInput?nameInput.value:'').trim();
+  if(!newName){alert('Enter a name for the new Intermediate CA');return;}
+  if(!confirm('This will create a new Intermediate CA "'+newName+'", regenerate server/admin/user certificates, and restart TAK Server. Existing clients will remain connected via the old CA in the truststore.\n\nContinue?'))return;
+  var btn=document.getElementById('rotate-ca-btn');
+  var msg=document.getElementById('rotate-ca-msg');
+  var logEl=document.getElementById('rotate-ca-log');
+  if(btn)btn.disabled=true;
+  if(msg){msg.textContent='Starting rotation...';msg.style.color='var(--text-dim)';}
+  if(logEl){logEl.style.display='block';logEl.textContent='Starting...\n';}
+  try{
+    var r=await fetch('/api/takserver/rotate-intca',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({new_ca_name:newName})});
+    var d=await r.json();
+    if(d.error){
+      if(msg){msg.textContent=d.error;msg.style.color='var(--red)';}
+      if(btn)btn.disabled=false;
+      return;
+    }
+    if(msg){msg.textContent='Rotation in progress...';}
+    pollRotateLog();
+  }catch(e){
+    if(msg){msg.textContent='Error: '+e.message;msg.style.color='var(--red)';}
+    if(btn)btn.disabled=false;
+  }
+}
+
+function pollRotateLog(){
+  var logEl=document.getElementById('rotate-ca-log');
+  var msg=document.getElementById('rotate-ca-msg');
+  var btn=document.getElementById('rotate-ca-btn');
+  fetch('/api/takserver/rotate-intca/status').then(function(r){return r.json();}).then(function(d){
+    if(logEl&&d.log){logEl.textContent=d.log.join('\n');logEl.scrollTop=logEl.scrollHeight;}
+    if(!d.running&&d.complete){
+      if(d.error){
+        if(msg){msg.textContent='Rotation failed';msg.style.color='var(--red)';}
+      }else{
+        if(msg){msg.textContent='Rotation complete!';msg.style.color='var(--green)';}
+      }
+      if(btn)btn.disabled=false;
+      loadCAInfo();
+      loadCertExpiry();
+    }else{
+      setTimeout(pollRotateLog,1500);
+    }
+  }).catch(function(){setTimeout(pollRotateLog,2000);});
+}
+
+async function revokeOldCA(alias){
+  if(!confirm('REVOKE "'+alias+'" from the truststore?\n\nAll clients with certificates signed by this CA will be DISCONNECTED and must re-enroll.\n\nThis cannot be undone.'))return;
+  var msgEl=document.getElementById('revoke-ca-msg');
+  if(msgEl){msgEl.textContent='Revoking '+alias+'...';msgEl.style.color='var(--text-dim)';}
+  try{
+    var r=await fetch('/api/takserver/revoke-old-ca',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({old_ca_alias:alias})});
+    var d=await r.json();
+    if(d.success){
+      if(msgEl){msgEl.innerHTML='<span style="color:var(--green)">'+d.message+'</span>';}
+      loadCAInfo();
+    }else{
+      if(msgEl){msgEl.innerHTML='<span style="color:var(--red)">'+(d.error||'Failed')+'</span>';}
+    }
+  }catch(e){
+    if(msgEl){msgEl.innerHTML='<span style="color:var(--red)">Error: '+e.message+'</span>';}
+  }
+}
+
 async function refreshCotSize(){var el=document.getElementById('cot-db-size');if(!el)return;el.textContent='...';el.style.color='';try{var r=await fetch('/api/takserver/cot-db-size');var d=await r.json();if(d.error){el.textContent=d.error;}else{el.textContent=d.size_human||'-';var b=d.size_bytes;if(typeof b==='number'){var gb25=25*1024*1024*1024;var gb40=40*1024*1024*1024;if(b<gb25)el.style.color='var(--green)';else if(b<gb40)el.style.color='var(--yellow)';else el.style.color='var(--red)';}}}catch(e){el.textContent='Error';}}
 async function runVacuum(full){var msg=document.getElementById('vacuum-msg');var out=document.getElementById('vacuum-output');var btnA=document.getElementById('vacuum-analyze-btn');var btnF=document.getElementById('vacuum-full-btn');if(full&&!confirm("VACUUM FULL locks the CoT tables. Run when TAK Server is not running. Continue?"))return;if(msg){msg.textContent=full?'Running VACUUM FULL (may take a long time)...':'Running VACUUM ANALYZE...';msg.style.color='var(--text-dim)';}if(out){out.style.display='none';out.textContent='';}if(btnA){btnA.disabled=true;}if(btnF){btnF.disabled=true;}try{var r=await fetch('/api/takserver/vacuum',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({full:full})});var d=await r.json();if(d.success){if(msg){msg.textContent='Done.';msg.style.color='var(--green)';}if(out&&d.output){out.textContent=d.output;out.style.display='block';}if(document.getElementById('cot-db-size')){refreshCotSize();}}else{if(msg){msg.textContent=d.error||'Failed';msg.style.color='var(--red)';}if(out&&d.error){out.textContent=d.error;out.style.display='block';}}}catch(e){if(msg){msg.textContent='Error: '+e.message;msg.style.color='var(--red)';}}if(btnA){btnA.disabled=false;}if(btnF){btnF.disabled=false;}}
 
