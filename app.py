@@ -11510,7 +11510,8 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 <div class="module-desc">{{ mod.description }}</div>
 {% if module_versions.get(key) %}{% set v = module_versions.get(key) %}{% if v.version or v.update_available %}<div class="meta-line module-version-line" id="module-version-{{ key }}" style="margin-bottom:4px">{% if v.version %}v{{ v.version }}{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% endif %}</div>{% endif %}{% endif %}
-<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px"><span class="module-status status-{% if mod.installed and mod.running %}running{% elif mod.installed %}stopped{% else %}not-installed{% endif %}" id="module-status-{{ key }}" data-module="{{ key }}" style="margin-top:0">{% if mod.installed and mod.running %}<span class="status-dot"></span> Running{% elif mod.installed %}<span class="status-dot"></span> Stopped{% else %}Not Installed{% endif %}</span>{% if key == 'takserver' and mod.installed %}<span id="takserver-card-cert-expiry" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);line-height:1.2"></span>{% endif %}</div>
+<span class="module-status status-{% if mod.installed and mod.running %}running{% elif mod.installed %}stopped{% else %}not-installed{% endif %}" id="module-status-{{ key }}" data-module="{{ key }}">{% if mod.installed and mod.running %}<span class="status-dot"></span> Running{% elif mod.installed %}<span class="status-dot"></span> Stopped{% else %}Not Installed{% endif %}</span>
+{% if key == 'takserver' and mod.installed %}<div id="takserver-card-cert-expiry" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:6px"></div>{% endif %}
 {% if mod.installed %}<span class="module-action">Manage</span>{% else %}<span class="module-action">Deploy</span>{% endif %}
 </a>
 {% endfor %}
@@ -11584,9 +11585,9 @@ function loadTakCertExpiry(){
             if(!c||c.error)continue;
             var days=c.days_left,color='#22c55e';
             if(days<=90)color='#ef4444';else if(days<=365)color='#eab308';
-            parts.push(label+' CA <span style="color:'+color+';font-weight:600">'+fmt(days)+'</span>');
+            parts.push(label+' <span style="color:'+color+';font-weight:600">'+fmt(days)+'</span>');
         }
-        el.innerHTML=parts.join(' &middot; ');
+        el.innerHTML=parts.join(' &nbsp;&middot;&nbsp; ');
     }).catch(function(){});
 }
 loadTakCertExpiry();
