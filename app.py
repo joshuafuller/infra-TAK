@@ -544,10 +544,10 @@ def guarddog_page():
     # Per-service list for expandable UI. "monitored" = Guard Dog monitors this (installed when Guard Dog was deployed).
     guarddog_services = [
         {'id': 'takserver', 'name': 'TAK Server', 'monitored': gd.get('installed'), 'monitors': guarddog_monitors_tak},
-        {'id': 'authentik', 'name': 'Authentik', 'monitored': modules.get('authentik', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'interval': '2 min', 'desc': 'Checks Authentik HTTP (9090). Alert and restart containers after 3 failures.'}]},
-        {'id': 'mediamtx', 'name': 'MediaMTX', 'monitored': modules.get('mediamtx', {}).get('installed'), 'monitors': [{'name': 'Service', 'interval': '2 min', 'desc': 'Checks systemd mediamtx. Alert and restart after 3 failures.'}]},
-        {'id': 'nodered', 'name': 'Node-RED', 'monitored': modules.get('nodered', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'interval': '2 min', 'desc': 'Checks Node-RED HTTP (1880). Alert and restart container after 3 failures.'}]},
-        {'id': 'cloudtak', 'name': 'CloudTAK', 'monitored': modules.get('cloudtak', {}).get('installed'), 'monitors': [{'name': 'Container', 'interval': '2 min', 'desc': 'Checks CloudTAK container. Alert and restart after 3 failures.'}]},
+        {'id': 'authentik', 'name': 'Authentik', 'monitored': modules.get('authentik', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'interval': '1 min', 'desc': 'Checks Authentik HTTP (9090). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
+        {'id': 'mediamtx', 'name': 'MediaMTX', 'monitored': modules.get('mediamtx', {}).get('installed'), 'monitors': [{'name': 'Service', 'interval': '1 min', 'desc': 'Checks systemd mediamtx. Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
+        {'id': 'nodered', 'name': 'Node-RED', 'monitored': modules.get('nodered', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'interval': '1 min', 'desc': 'Checks Node-RED HTTP (1880). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
+        {'id': 'cloudtak', 'name': 'CloudTAK', 'monitored': modules.get('cloudtak', {}).get('installed'), 'monitors': [{'name': 'Container', 'interval': '1 min', 'desc': 'Checks CloudTAK container. Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
     ]
     guarddog_docs_url = f'https://github.com/{GITHUB_REPO}/blob/main/docs/GUARDDOG.md'
     notifications_configured = bool((settings.get('guarddog_alert_email') or '').strip())
@@ -949,22 +949,22 @@ def run_guarddog_deploy(alert_email):
         if 'tak-authentik-watch.sh' in script_files:
             units.extend([
                 ('takauthentikguard.service', '[Unit]\nDescription=Guard Dog Authentik Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-authentik-watch.sh\n'),
-                ('takauthentikguard.timer', '[Unit]\nDescription=Run Authentik guard every 2 minutes\n\n[Timer]\nOnBootSec=5min\nOnUnitActiveSec=2min\nUnit=takauthentikguard.service\n\n[Install]\nWantedBy=timers.target\n'),
+                ('takauthentikguard.timer', '[Unit]\nDescription=Run Authentik guard every 1 minute\n\n[Timer]\nOnBootSec=15min\nOnUnitActiveSec=1min\nUnit=takauthentikguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ])
         if 'tak-mediamtx-watch.sh' in script_files:
             units.extend([
                 ('takmediamtxguard.service', '[Unit]\nDescription=Guard Dog MediaMTX Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-mediamtx-watch.sh\n'),
-                ('takmediamtxguard.timer', '[Unit]\nDescription=Run MediaMTX guard every 2 minutes\n\n[Timer]\nOnBootSec=5min\nOnUnitActiveSec=2min\nUnit=takmediamtxguard.service\n\n[Install]\nWantedBy=timers.target\n'),
+                ('takmediamtxguard.timer', '[Unit]\nDescription=Run MediaMTX guard every 1 minute\n\n[Timer]\nOnBootSec=15min\nOnUnitActiveSec=1min\nUnit=takmediamtxguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ])
         if 'tak-nodered-watch.sh' in script_files:
             units.extend([
                 ('taknoderedguard.service', '[Unit]\nDescription=Guard Dog Node-RED Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-nodered-watch.sh\n'),
-                ('taknoderedguard.timer', '[Unit]\nDescription=Run Node-RED guard every 2 minutes\n\n[Timer]\nOnBootSec=5min\nOnUnitActiveSec=2min\nUnit=taknoderedguard.service\n\n[Install]\nWantedBy=timers.target\n'),
+                ('taknoderedguard.timer', '[Unit]\nDescription=Run Node-RED guard every 1 minute\n\n[Timer]\nOnBootSec=15min\nOnUnitActiveSec=1min\nUnit=taknoderedguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ])
         if 'tak-cloudtak-watch.sh' in script_files:
             units.extend([
                 ('takcloudtakguard.service', '[Unit]\nDescription=Guard Dog CloudTAK Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-cloudtak-watch.sh\n'),
-                ('takcloudtakguard.timer', '[Unit]\nDescription=Run CloudTAK guard every 2 minutes\n\n[Timer]\nOnBootSec=5min\nOnUnitActiveSec=2min\nUnit=takcloudtakguard.service\n\n[Install]\nWantedBy=timers.target\n'),
+                ('takcloudtakguard.timer', '[Unit]\nDescription=Run CloudTAK guard every 1 minute\n\n[Timer]\nOnBootSec=15min\nOnUnitActiveSec=1min\nUnit=takcloudtakguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ])
         for name, content in units:
             path = os.path.join('/etc/systemd/system', name)

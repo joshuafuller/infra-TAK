@@ -9,6 +9,10 @@ COOLDOWN_SECS=900
 
 mkdir -p "$STATE_DIR"
 
+# Don't run during first 15 minutes after boot (avoid restarting during startup)
+UPTIME_SECS=$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0)
+[ "$UPTIME_SECS" -lt 900 ] && exit 0
+
 AK_DIR="${HOME:-/root}/authentik"
 [ ! -f "$AK_DIR/docker-compose.yml" ] && exit 0
 
