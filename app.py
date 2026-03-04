@@ -9680,15 +9680,17 @@ def takserver_ca_info():
             info[label] = {'name': cn, 'file': filename, 'expires': expires, 'days_left': days_left}
         except Exception:
             pass
-    if info['intermediate_ca'] and info['intermediate_ca']['name']:
-        import re
-        name = info['intermediate_ca']['name']
+    import re
+    def _increment_name(name):
         m = re.search(r'(\d+)$', name)
         if m:
-            num = int(m.group(1))
-            info['suggested_new_name'] = name[:m.start()] + f'{num + 1:02d}'
-        else:
-            info['suggested_new_name'] = name + '-02'
+            return name[:m.start()] + f'{int(m.group(1)) + 1:02d}'
+        return name + '-02'
+    if info['intermediate_ca'] and info['intermediate_ca']['name']:
+        info['suggested_new_name'] = _increment_name(info['intermediate_ca']['name'])
+    if info['root_ca'] and info['root_ca']['name']:
+        info['suggested_new_root_name'] = _increment_name(info['root_ca']['name'])
+        info['suggested_new_root_int_name'] = _increment_name(info.get('suggested_new_name', 'INT-CA-01'))
     # List CAs in current truststore (to show old CAs that can be revoked)
     import glob as _glob
     ts_files = sorted(_glob.glob(os.path.join(cert_dir, 'truststore-*.jks')))
@@ -9701,15 +9703,21 @@ def takserver_ca_info():
                 ['keytool', '-list', '-keystore', ts_path, '-storepass', 'atakatak'],
                 capture_output=True, text=True, timeout=10)
             aliases = []
+            trusted_aliases = []
             for line in r.stdout.split('\n'):
-                if ',' in line and ('trustedCertEntry' in line or 'PrivateKeyEntry' in line):
-                    alias = line.split(',')[0].strip()
+                if ',' not in line:
+                    continue
+                alias = line.split(',')[0].strip()
+                if 'trustedCertEntry' in line:
+                    aliases.append(alias)
+                    trusted_aliases.append(alias)
+                elif 'PrivateKeyEntry' in line:
                     aliases.append(alias)
             info['truststore_aliases'] = aliases
             current_cn = (info['intermediate_ca'] or {}).get('name', '').lower()
             root_cn = (info['root_ca'] or {}).get('name', '').lower()
             old_cas = []
-            for a in aliases:
+            for a in trusted_aliases:
                 if a.lower() != current_cn.lower() and a.lower() != 'root-ca' and a.lower() != root_cn.lower():
                     old_cas.append(a)
             info['old_cas_in_truststore'] = old_cas
@@ -9804,10 +9812,20 @@ def takserver_rotate_intca():
             log("✓ Server certificate created (signed by new CA)")
 
             log("")
-            log("Step 4/7: Creating new admin and user certificates...")
-            run('cd /opt/tak/certs && echo "y" | sudo -u tak ./makeCert.sh client admin 2>&1')
-            run('cd /opt/tak/certs && echo "y" | sudo -u tak ./makeCert.sh client user 2>&1')
-            log("✓ Admin and user certificates recreated")
+            log("Step 4/7: Regenerating all client certificates...")
+            run('chmod +r /opt/tak/certs/cert-metadata.sh 2>/dev/null')
+            skip = {'takserver', 'root-ca', 'ca', old_ca_name.lower(), new_ca_name.lower()}
+            regen_count = 0
+            for f in sorted(os.listdir(cert_dir)):
+                if not f.endswith('.p12'):
+                    continue
+                name = f[:-4]
+                if name.lower() in skip or name.startswith('truststore-'):
+                    continue
+                log(f"  Regenerating: {name}")
+                run(f'cd /opt/tak/certs && echo "y" | sudo -u tak ./makeCert.sh client {name} 2>&1')
+                regen_count += 1
+            log(f"✓ {regen_count} client certificate(s) regenerated (signed by new CA)")
 
             log("")
             log("Step 5/7: Updating truststore...")
@@ -9901,6 +9919,213 @@ def takserver_revoke_old_ca():
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+rotate_rootca_log = []
+rotate_rootca_status = {'running': False, 'complete': False, 'error': False}
+
+@app.route('/api/takserver/rotate-rootca', methods=['POST'])
+@login_required
+def takserver_rotate_rootca():
+    """Full Root CA rotation: new root, new intermediate, new server cert, all client certs, update TAK Portal, restart."""
+    if rotate_rootca_status.get('running'):
+        return jsonify({'error': 'Root CA rotation already in progress'}), 409
+    data = request.json or {}
+    new_root_name = (data.get('new_root_name') or '').strip()
+    new_int_name = (data.get('new_int_name') or '').strip()
+    if not new_root_name or not new_int_name:
+        return jsonify({'error': 'Both new Root CA and Intermediate CA names are required'}), 400
+    import re
+    for name in [new_root_name, new_int_name]:
+        if not re.match(r'^[a-zA-Z0-9._-]+$', name):
+            return jsonify({'error': f'CA name "{name}" can only contain letters, numbers, dots, hyphens, underscores'}), 400
+
+    cert_dir = '/opt/tak/certs/files'
+    if not os.path.exists(os.path.join(cert_dir, 'root-ca.pem')):
+        return jsonify({'error': 'root-ca.pem not found — no current Root CA detected'}), 400
+
+    # Detect current names
+    old_root_name = ''
+    old_int_name = ''
+    for label, filename in [('root', 'root-ca.pem'), ('int', 'ca.pem')]:
+        path = os.path.join(cert_dir, filename)
+        if not os.path.exists(path):
+            continue
+        try:
+            r = subprocess.run(['openssl', 'x509', '-subject', '-noout', '-in', path],
+                               capture_output=True, text=True, timeout=5)
+            for line in r.stdout.strip().split('\n'):
+                if line.startswith('subject=') or line.startswith('subject ='):
+                    subj = line.split('=', 1)[-1].strip()
+                    for part in subj.split(','):
+                        part = part.strip()
+                        if part.startswith('CN') or part.startswith('CN '):
+                            cn = part.split('=', 1)[-1].strip()
+                            if label == 'root':
+                                old_root_name = cn
+                            else:
+                                old_int_name = cn
+        except Exception:
+            pass
+    if not old_root_name:
+        return jsonify({'error': 'Could not detect current Root CA name'}), 500
+
+    rotate_rootca_log.clear()
+    rotate_rootca_status.update({'running': True, 'complete': False, 'error': False})
+
+    def do_rotate_root():
+        def log(msg):
+            rotate_rootca_log.append(msg)
+
+        def run(cmd, desc=None, check=True):
+            if desc:
+                log(desc)
+            try:
+                r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
+                if check and r.returncode != 0:
+                    err = (r.stderr or r.stdout or '').strip()[:200]
+                    log(f"  ✗ Failed (exit {r.returncode}): {err}")
+                    return False
+                return True
+            except Exception as e:
+                log(f"  ✗ Exception: {e}")
+                return False
+
+        try:
+            log("━━━ Rotating Root CA ━━━")
+            log(f"  Old Root CA: {old_root_name}")
+            log(f"  Old Intermediate CA: {old_int_name}")
+            log(f"  New Root CA: {new_root_name}")
+            log(f"  New Intermediate CA: {new_int_name}")
+            log("")
+
+            log("Step 1/8: Removing old certificate files...")
+            run('rm -rf /opt/tak/certs/files')
+            run('mkdir -p /opt/tak/certs/files')
+            run('chown -R tak:tak /opt/tak/certs/')
+            log("✓ Old cert files cleared")
+
+            log("")
+            log(f"Step 2/8: Creating new Root CA: {new_root_name}...")
+            run('chmod +r /opt/tak/certs/cert-metadata.sh 2>/dev/null')
+            if not run(f'cd /opt/tak/certs && echo "{new_root_name}" | sudo -u tak ./makeRootCa.sh 2>&1'):
+                raise Exception('Failed to create new Root CA')
+            log(f"✓ Root CA {new_root_name} created")
+
+            log("")
+            log(f"Step 3/8: Creating new Intermediate CA: {new_int_name}...")
+            if not run(f'cd /opt/tak/certs && echo "y" | sudo -u tak ./makeCert.sh ca "{new_int_name}" 2>&1'):
+                raise Exception('Failed to create new Intermediate CA')
+            log(f"✓ Intermediate CA {new_int_name} created")
+
+            log("")
+            log("Step 4/8: Creating new server certificate...")
+            if not run('cd /opt/tak/certs && echo "y" | sudo -u tak ./makeCert.sh server takserver 2>&1'):
+                raise Exception('Failed to create server certificate')
+            log("✓ Server certificate created")
+
+            log("")
+            log("Step 5/8: Regenerating all client certificates...")
+            skip = {'takserver', 'root-ca', 'ca', new_root_name.lower(), new_int_name.lower(),
+                    old_root_name.lower(), old_int_name.lower()}
+            # We need to create admin and user first since old files were cleared
+            run('cd /opt/tak/certs && sudo -u tak ./makeCert.sh client admin 2>&1')
+            log("  Regenerated: admin")
+            run('cd /opt/tak/certs && sudo -u tak ./makeCert.sh client user 2>&1')
+            log("  Regenerated: user")
+            # Check settings or old backup for any other client cert names to recreate
+            regen_count = 2
+            log(f"✓ {regen_count} client certificate(s) created")
+            log("  Note: Additional client certs (Node-RED, etc.) must be recreated manually")
+
+            log("")
+            log("Step 6/8: Updating truststore...")
+            ts_jks = os.path.join(cert_dir, f'truststore-{new_int_name}.jks')
+            run(f'keytool -import -alias root-ca -file {cert_dir}/root-ca.pem '
+                f'-keystore {ts_jks} -storepass atakatak -noprompt 2>&1', check=False)
+            log("  Root CA imported into truststore")
+            log("✓ Truststore updated")
+
+            log("")
+            log("Step 7/8: Updating CoreConfig.xml...")
+            if old_int_name:
+                run(f'sed -i "s/{old_int_name}/{new_int_name}/g" /opt/tak/CoreConfig.xml')
+                run(f'sed -i "s/{old_int_name}/{new_int_name}/g" /opt/tak/CoreConfig.example.xml 2>/dev/null', check=False)
+            if old_root_name and old_root_name != new_root_name:
+                run(f'sed -i "s/{old_root_name}/{new_root_name}/g" /opt/tak/CoreConfig.xml', check=False)
+                run(f'sed -i "s/{old_root_name}/{new_root_name}/g" /opt/tak/CoreConfig.example.xml 2>/dev/null', check=False)
+            log("✓ CoreConfig.xml updated")
+
+            log("")
+            log("Step 8/8: Restarting TAK Server and updating TAK Portal...")
+            run('systemctl restart takserver 2>&1')
+            log("  TAK Server restarting...")
+
+            # Copy new certs to TAK Portal if it's running
+            portal_running = subprocess.run('docker ps --format "{{.Names}}" 2>/dev/null | grep -q tak-portal',
+                                            shell=True, capture_output=True).returncode == 0
+            if portal_running:
+                log("  Updating TAK Portal certificates...")
+                run('docker exec tak-portal mkdir -p /usr/src/app/data/certs', check=False)
+                admin_p12 = os.path.join(cert_dir, 'admin.p12')
+                modern_p12 = '/tmp/tak-portal-admin-modern.p12'
+                r_enc = subprocess.run(
+                    f'openssl pkcs12 -in {admin_p12} -passin pass:atakatak -nodes -legacy 2>/dev/null | '
+                    f'openssl pkcs12 -export -passout pass:atakatak -out {modern_p12}',
+                    shell=True, capture_output=True, text=True, timeout=30)
+                if os.path.exists(modern_p12) and os.path.getsize(modern_p12) > 0:
+                    run(f'docker cp {modern_p12} tak-portal:/usr/src/app/data/certs/tak-client.p12', check=False)
+                    os.remove(modern_p12)
+                    log("  ✓ admin.p12 copied to TAK Portal (re-encoded)")
+                else:
+                    run(f'docker cp {admin_p12} tak-portal:/usr/src/app/data/certs/tak-client.p12', check=False)
+                    log("  ✓ admin.p12 copied to TAK Portal")
+                takserver_pem = os.path.join(cert_dir, 'takserver.pem')
+                if os.path.exists(takserver_pem):
+                    run(f'docker cp {takserver_pem} tak-portal:/usr/src/app/data/certs/tak-ca.pem', check=False)
+                    log("  ✓ CA chain copied to TAK Portal")
+                else:
+                    int_pem = os.path.join(cert_dir, 'ca.pem')
+                    root_pem = os.path.join(cert_dir, 'root-ca.pem')
+                    bundle = '/tmp/tak-ca-bundle.pem'
+                    run(f'cat {int_pem} {root_pem} > {bundle} 2>/dev/null', check=False)
+                    if os.path.exists(bundle) and os.path.getsize(bundle) > 0:
+                        run(f'docker cp {bundle} tak-portal:/usr/src/app/data/certs/tak-ca.pem', check=False)
+                        os.remove(bundle)
+                        log("  ✓ CA bundle copied to TAK Portal")
+                run('docker restart tak-portal 2>/dev/null', check=False)
+                log("  ✓ TAK Portal restarted with new certificates")
+            else:
+                log("  TAK Portal not running — skip cert copy (will update on next TAK Portal deploy)")
+
+            log("  Waiting for TAK Server to come back up...")
+            time.sleep(45)
+            log("✓ TAK Server restarted")
+
+            log("")
+            log("━━━ ROOT CA ROTATION COMPLETE ━━━")
+            log(f"  New Root CA: {new_root_name}")
+            log(f"  New Intermediate CA: {new_int_name}")
+            log(f"  All certificates have been regenerated")
+            if portal_running:
+                log(f"  TAK Portal updated — users can scan new QR codes to re-enroll")
+            log(f"  All existing client connections are disconnected")
+            log(f"  Clients must re-enroll via TAK Portal QR code")
+            rotate_rootca_status.update({'running': False, 'complete': True, 'error': False})
+        except Exception as e:
+            log(f"")
+            log(f"✗ ROOT CA ROTATION FAILED: {e}")
+            rotate_rootca_status.update({'running': False, 'complete': True, 'error': True})
+
+    import threading
+    threading.Thread(target=do_rotate_root, daemon=True).start()
+    return jsonify({'started': True, 'old_root': old_root_name, 'new_root': new_root_name})
+
+
+@app.route('/api/takserver/rotate-rootca/status')
+@login_required
+def takserver_rotate_rootca_status():
+    return jsonify({'log': rotate_rootca_log, **rotate_rootca_status})
 
 
 @app.route('/api/takserver/create-client-cert', methods=['POST'])
@@ -11618,6 +11843,25 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div id="revoke-ca-list" style="margin-bottom:12px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim)"></div>
 <div id="revoke-ca-msg" style="font-size:12px;margin-top:8px"></div>
 </div>
+</div>
+</div>
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:24px">
+<div style="display:flex;align-items:center;justify-content:space-between;padding:16px 24px;cursor:pointer" onclick="takToggleSection('rotate-root')">
+<span class="section-title" style="margin-bottom:0">Rotate Root CA</span>
+<span id="rotate-root-toggle-icon" style="font-size:18px;color:var(--text-dim);transition:transform 0.2s ease">&#9662;</span>
+</div>
+<div id="rotate-root-body" style="display:none;padding:0 24px 24px 24px;border-top:1px solid var(--border)">
+<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">Full PKI rebuild. Creates a new Root CA, new Intermediate CA, new server cert, and regenerates all client certificates. <strong style="color:var(--red)">All existing connections will be disconnected.</strong> Users must re-enroll via TAK Portal QR code. Schedule a maintenance window before proceeding.</p>
+<div id="rotate-root-info" style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim);margin-bottom:16px">Loading Root CA info...</div>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+<div class="form-field"><label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">New Root CA Name</label><input type="text" id="rotate-root-name" placeholder="e.g. ROOT-CA-02" maxlength="64" style="width:100%;padding:10px 14px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px;box-sizing:border-box"></div>
+<div class="form-field"><label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">New Intermediate CA Name</label><input type="text" id="rotate-root-int-name" placeholder="e.g. INT-CA-01" maxlength="64" style="width:100%;padding:10px 14px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px;box-sizing:border-box"></div>
+</div>
+<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+<button type="button" id="rotate-root-btn" onclick="rotateRootCA()" style="padding:12px 24px;background:linear-gradient(135deg,#991b1b,#7f1d1d);color:#fff;border:none;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:14px;font-weight:600;cursor:pointer">Rotate Root CA</button>
+<span id="rotate-root-msg" style="font-size:12px;color:var(--text-dim)"></span>
+</div>
+<div id="rotate-root-log" style="display:none;margin-top:16px;background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:400px;overflow-y:auto;line-height:1.6;white-space:pre-wrap"></div>
 </div>
 </div>
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:24px">

@@ -219,6 +219,22 @@ async function loadCAInfo(){
     if(ctrlEl)ctrlEl.style.display='block';
     var nameInput=document.getElementById('rotate-ca-name');
     if(nameInput&&d.suggested_new_name&&!nameInput.value)nameInput.value=d.suggested_new_name;
+    // Populate Root CA rotation card info (root CA only)
+    var rootInfoEl=document.getElementById('rotate-root-info');
+    if(rootInfoEl&&d.root_ca){
+      var rh='<div style="display:flex;align-items:center;gap:12px;margin-bottom:6px">';
+      rh+='<span style="color:var(--text-secondary);min-width:140px">Root CA</span>';
+      rh+='<span style="color:var(--cyan);font-weight:600">'+d.root_ca.name+'</span>';
+      var rd2=d.root_ca.days_left,rc2='var(--green)';
+      if(rd2!==null){if(rd2<=90)rc2='var(--red)';else if(rd2<=365)rc2='var(--yellow)';}
+      if(d.root_ca.expires&&rd2!==null)rh+='<span style="color:'+rc2+';font-weight:600">'+fmtDays(rd2)+'</span> <span style="color:var(--text-dim)">'+d.root_ca.expires+'</span>';
+      rh+='</div>';
+      rootInfoEl.innerHTML=rh;
+    }
+    var rootNameInput=document.getElementById('rotate-root-name');
+    if(rootNameInput&&d.suggested_new_root_name&&!rootNameInput.value)rootNameInput.value=d.suggested_new_root_name;
+    var rootIntInput=document.getElementById('rotate-root-int-name');
+    if(rootIntInput&&d.suggested_new_root_int_name&&!rootIntInput.value)rootIntInput.value=d.suggested_new_root_int_name;
     if(revokeEl&&d.old_cas_in_truststore&&d.old_cas_in_truststore.length>0){
       revokeEl.style.display='block';
       var listEl=document.getElementById('revoke-ca-list');
@@ -301,6 +317,57 @@ async function revokeOldCA(alias){
   }catch(e){
     if(msgEl){msgEl.innerHTML='<span style="color:var(--red)">Error: '+e.message+'</span>';}
   }
+}
+
+async function rotateRootCA(){
+  var rootInput=document.getElementById('rotate-root-name');
+  var intInput=document.getElementById('rotate-root-int-name');
+  var newRoot=(rootInput?rootInput.value:'').trim();
+  var newInt=(intInput?intInput.value:'').trim();
+  if(!newRoot||!newInt){alert('Enter names for both the new Root CA and new Intermediate CA');return;}
+  if(!confirm('⚠ FULL ROOT CA ROTATION ⚠\n\nThis will:\n• Create new Root CA: '+newRoot+'\n• Create new Intermediate CA: '+newInt+'\n• Regenerate ALL certificates\n• Restart TAK Server\n• Update TAK Portal\n\nALL existing client connections will be DISCONNECTED.\nUsers must re-enroll via TAK Portal QR code.\n\nAre you sure?'))return;
+  if(!confirm('FINAL CONFIRMATION\n\nThis is a destructive operation. The old PKI will be removed.\n\nType your maintenance window: 0900 it goes dark, 0915 scan new QR.\n\nProceed?'))return;
+  var btn=document.getElementById('rotate-root-btn');
+  var msg=document.getElementById('rotate-root-msg');
+  var logEl=document.getElementById('rotate-root-log');
+  if(btn)btn.disabled=true;
+  if(msg){msg.textContent='Starting Root CA rotation...';msg.style.color='var(--text-dim)';}
+  if(logEl){logEl.style.display='block';logEl.textContent='Starting...\n';}
+  try{
+    var r=await fetch('/api/takserver/rotate-rootca',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({new_root_name:newRoot,new_int_name:newInt})});
+    var d=await r.json();
+    if(d.error){
+      if(msg){msg.textContent=d.error;msg.style.color='var(--red)';}
+      if(btn)btn.disabled=false;
+      return;
+    }
+    if(msg){msg.textContent='Root CA rotation in progress...';}
+    pollRootRotateLog();
+  }catch(e){
+    if(msg){msg.textContent='Error: '+e.message;msg.style.color='var(--red)';}
+    if(btn)btn.disabled=false;
+  }
+}
+
+function pollRootRotateLog(){
+  var logEl=document.getElementById('rotate-root-log');
+  var msg=document.getElementById('rotate-root-msg');
+  var btn=document.getElementById('rotate-root-btn');
+  fetch('/api/takserver/rotate-rootca/status').then(function(r){return r.json();}).then(function(d){
+    if(logEl&&d.log){logEl.textContent=d.log.join('\n');logEl.scrollTop=logEl.scrollHeight;}
+    if(!d.running&&d.complete){
+      if(d.error){
+        if(msg){msg.textContent='Root CA rotation failed';msg.style.color='var(--red)';}
+      }else{
+        if(msg){msg.textContent='Root CA rotation complete!';msg.style.color='var(--green)';}
+      }
+      if(btn)btn.disabled=false;
+      loadCAInfo();
+      loadCertExpiry();
+    }else{
+      setTimeout(pollRootRotateLog,1500);
+    }
+  }).catch(function(){setTimeout(pollRootRotateLog,2000);});
 }
 
 async function refreshCotSize(){var el=document.getElementById('cot-db-size');if(!el)return;el.textContent='...';el.style.color='';try{var r=await fetch('/api/takserver/cot-db-size');var d=await r.json();if(d.error){el.textContent=d.error;}else{el.textContent=d.size_human||'-';var b=d.size_bytes;if(typeof b==='number'){var gb25=25*1024*1024*1024;var gb40=40*1024*1024*1024;if(b<gb25)el.style.color='var(--green)';else if(b<gb40)el.style.color='var(--yellow)';else el.style.color='var(--red)';}}}catch(e){el.textContent='Error';}}
