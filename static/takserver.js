@@ -77,7 +77,7 @@ async function loadGroups(){
   el.innerHTML='<span style="color:var(--text-dim)">Loading groups...</span>';
   try{
     var r=await fetch('/api/takserver/groups');var d=await r.json();
-    if(d.error&&!d.groups.length){el.textContent=d.error;return;}
+    if(d.error&&(!d.groups||!d.groups.length)){el.innerHTML='<span style="color:var(--red)">'+d.error+'</span> <button type="button" onclick="loadGroups()" style="margin-left:8px;padding:4px 12px;background:rgba(59,130,246,0.1);color:var(--accent);border:1px solid var(--border);border-radius:6px;font-size:11px;cursor:pointer">Retry</button>';return;}
     if(!d.groups||d.groups.length===0){el.innerHTML='<span style="color:var(--text-dim)">No groups found. Groups are created in the TAK Server WebGUI or via LDAP.</span>';return;}
     var h='<div style="display:grid;grid-template-columns:1fr auto auto auto;gap:4px 16px;align-items:center">';
     h+='<div style="color:var(--text-dim);font-size:11px;font-weight:600;padding-bottom:4px">GROUP</div>';
@@ -116,6 +116,7 @@ async function createClientCert(){
   var groupsIn=[],groupsOut=[];
   document.querySelectorAll('.cc-grp-read:checked').forEach(function(c){var g=c.getAttribute('data-group');if(groupsOut.indexOf(g)<0)groupsOut.push(g);});
   document.querySelectorAll('.cc-grp-write:checked').forEach(function(c){var g=c.getAttribute('data-group');if(groupsIn.indexOf(g)<0)groupsIn.push(g);});
+  if(groupsIn.length===0&&groupsOut.length===0){if(msg){msg.textContent='Select at least one group with read or write permission.';msg.style.color='var(--red)';}return;}
   if(btn)btn.disabled=true;
   if(msg){msg.textContent='Creating certificate...';msg.style.color='var(--text-dim)';}
   if(result)result.style.display='none';

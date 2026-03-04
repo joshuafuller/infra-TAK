@@ -9594,31 +9594,37 @@ def takserver_groups():
     cert_dir = '/opt/tak/certs/files'
     admin_pem = os.path.join(cert_dir, 'admin.pem')
     admin_key = os.path.join(cert_dir, 'admin.key')
-    truststore_pem = os.path.join(cert_dir, 'ca.pem')
+    ca_pem = os.path.join(cert_dir, 'ca.pem')
     if not os.path.exists(admin_pem) or not os.path.exists(admin_key):
         return jsonify({'error': 'Admin certificate not found', 'groups': []})
     try:
-        r = subprocess.run(
-            ['curl', '-sk', '--cert', admin_pem, '--key', admin_key,
-             'https://127.0.0.1:8443/Marti/api/groups/all'],
-            capture_output=True, text=True, timeout=10
-        )
-        if r.returncode != 0:
-            return jsonify({'error': 'Failed to query TAK Server', 'groups': []})
+        cmd = ['curl', '-s', '--max-time', '8', '--cert', admin_pem, '--key', admin_key]
+        if os.path.exists(ca_pem):
+            cmd += ['--cacert', ca_pem]
+        else:
+            cmd.append('-k')
+        cmd.append('https://127.0.0.1:8443/Marti/api/groups/all')
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
+        body = (r.stdout or '').strip()
+        if r.returncode != 0 or not body:
+            # Fallback: try with -k (skip verify) in case CA doesn't match
+            cmd2 = ['curl', '-sk', '--max-time', '8', '--cert', admin_pem, '--key', admin_key,
+                     'https://127.0.0.1:8443/Marti/api/groups/all']
+            r2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=12)
+            body = (r2.stdout or '').strip()
+            if r2.returncode != 0 or not body:
+                return jsonify({'error': f'TAK Server did not respond (exit {r2.returncode})', 'groups': []})
         import json as _json
-        data = _json.loads(r.stdout)
+        try:
+            data = _json.loads(body)
+        except _json.JSONDecodeError:
+            return jsonify({'error': 'TAK Server returned invalid response', 'groups': [], 'raw': body[:200]})
         groups = []
-        if isinstance(data, dict) and 'data' in data:
-            for g in data['data']:
-                name = g.get('name', '')
-                if name and name != '__ANON__':
-                    groups.append({
-                        'name': name,
-                        'direction': g.get('direction', ''),
-                        'active': g.get('active', True)
-                    })
-        elif isinstance(data, list):
-            for g in data:
+        items = data.get('data', data) if isinstance(data, dict) else data
+        if isinstance(items, list):
+            for g in items:
+                if not isinstance(g, dict):
+                    continue
                 name = g.get('name', '')
                 if name and name != '__ANON__':
                     groups.append({
@@ -11333,7 +11339,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div></div>
 </div>
 <div style="margin-bottom:16px">
-<label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:8px">Groups <span style="font-weight:400;color:var(--text-dim)">(optional - assign read/write permissions)</span></label>
+<label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:8px">Groups <span style="font-weight:400;color:var(--text-dim)">(select groups and permissions)</span></label>
 <div id="cc-groups-list" style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim)"><button type="button" id="cc-load-groups-btn" onclick="loadGroups()" style="padding:8px 16px;background:rgba(59,130,246,0.1);color:var(--accent);border:1px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;cursor:pointer">Load Groups from TAK Server</button></div>
 </div>
 <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
