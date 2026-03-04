@@ -11270,15 +11270,17 @@ body{display:flex;flex-direction:row;min-height:100vh}
 .nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;color:var(--text-secondary);text-decoration:none;font-size:13px;font-weight:500;border-left:2px solid transparent}
 .nav-item:hover{color:var(--text-primary);background:rgba(255,255,255,.03)}.nav-item.active{color:var(--cyan);background:rgba(6,182,212,.06);border-left-color:var(--cyan)}
 .nav-icon{font-size:15px;width:18px;text-align:center}
-.main{flex:1;min-width:0;overflow-y:auto;padding:32px;max-width:640px;margin:0 auto}
+.main{flex:1;min-width:0;overflow-y:auto;padding:32px;max-width:960px}
 .help-card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:24px}
-.help-card-header{display:flex;align-items:center;gap:10px;padding:16px 24px;cursor:pointer}
-.help-card-header h2{font-size:16px;font-weight:600;margin:0;color:var(--text-primary)}
-.help-card-toggle{font-size:18px;color:var(--text-dim);transition:transform 0.2s ease;flex-shrink:0;order:-1}
-.help-card-body{display:none;padding:16px 24px 24px 24px;border-top:1px solid var(--border)}
-.help-card-body p{font-size:13px;color:var(--text-secondary);line-height:1.6;margin-bottom:12px;margin-top:0}
+.help-card-header{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;padding:16px 24px;cursor:pointer}
+.help-card-header h2{font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;color:var(--text-dim);letter-spacing:2px;text-transform:uppercase;margin:0}
+.help-card-toggle{font-size:18px;color:var(--text-dim);transition:transform 0.2s ease}
+.help-card-body{display:none;padding:0 24px 24px 24px;border-top:1px solid var(--border)}
+.help-card-body p{font-size:13px;color:var(--text-secondary);line-height:1.6;margin-bottom:12px;margin-top:0;padding-top:0}
+.help-card-body p:first-child{padding-top:16px}
 .help-card-body p:last-child{margin-bottom:0}
 .help-card-body .form-field{margin-bottom:14px}
+.help-card-body .form-field:first-child{margin-top:16px}
 .backdoor-url{font-family:'JetBrains Mono',monospace;font-size:13px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:12px 14px;color:var(--cyan);word-break:break-all;user-select:all}
 .form-field{margin-bottom:14px}.form-field label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px}
 .form-field input{width:100%;padding:10px 14px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-size:13px}
@@ -11508,8 +11510,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 <div class="module-desc">{{ mod.description }}</div>
 {% if module_versions.get(key) %}{% set v = module_versions.get(key) %}{% if v.version or v.update_available %}<div class="meta-line module-version-line" id="module-version-{{ key }}" style="margin-bottom:4px">{% if v.version %}v{{ v.version }}{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% endif %}</div>{% endif %}{% endif %}
-<span class="module-status status-{% if mod.installed and mod.running %}running{% elif mod.installed %}stopped{% else %}not-installed{% endif %}" id="module-status-{{ key }}" data-module="{{ key }}">{% if mod.installed and mod.running %}<span class="status-dot"></span> Running{% elif mod.installed %}<span class="status-dot"></span> Stopped{% else %}Not Installed{% endif %}</span>
-{% if key == 'takserver' and mod.installed %}<div id="takserver-card-cert-expiry" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:6px;line-height:1.5"></div>{% endif %}
+<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px"><span class="module-status status-{% if mod.installed and mod.running %}running{% elif mod.installed %}stopped{% else %}not-installed{% endif %}" id="module-status-{{ key }}" data-module="{{ key }}" style="margin-top:0">{% if mod.installed and mod.running %}<span class="status-dot"></span> Running{% elif mod.installed %}<span class="status-dot"></span> Stopped{% else %}Not Installed{% endif %}</span>{% if key == 'takserver' and mod.installed %}<span id="takserver-card-cert-expiry" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);line-height:1.2"></span>{% endif %}</div>
 {% if mod.installed %}<span class="module-action">Manage</span>{% else %}<span class="module-action">Deploy</span>{% endif %}
 </a>
 {% endfor %}
@@ -11576,16 +11577,16 @@ function loadTakCertExpiry(){
             var p=[];if(y>0)p.push(y+'y');if(m>0)p.push(m+'mo');if(dd>0||p.length===0)p.push(dd+'d');
             return p.join(' ');
         }
-        var h='';
+        var parts=[];
         var certs=[['root_ca','Root'],['intermediate_ca','Int']];
         for(var i=0;i<certs.length;i++){
             var key=certs[i][0],label=certs[i][1],c=d[key];
             if(!c||c.error)continue;
             var days=c.days_left,color='#22c55e';
             if(days<=90)color='#ef4444';else if(days<=365)color='#eab308';
-            h+='<div>'+label+' CA <span style="color:'+color+';font-weight:600">'+fmt(days)+'</span></div>';
+            parts.push(label+' CA <span style="color:'+color+';font-weight:600">'+fmt(days)+'</span>');
         }
-        el.innerHTML=h;
+        el.innerHTML=parts.join(' &middot; ');
     }).catch(function(){});
 }
 loadTakCertExpiry();
