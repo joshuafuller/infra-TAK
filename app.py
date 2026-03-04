@@ -818,8 +818,9 @@ BODY_FILE="$2"
         os.chmod(p, 0o755)
 
 def _guarddog_send_sms_now(sms, text):
-    """Send SMS via Twilio or Brevo. sms = settings['guarddog_sms'], text = message body (max 1600 chars). Raises on error."""
+    """Send SMS via Twilio or Brevo. sms = settings['guarddog_sms'], text = message body (max 1600 chars). Raises on error. Returns optional dict with e.g. {'brevo_message_id': ...} for debugging."""
     text = (text or '')[:1600]
+    out = {}
     if sms.get('provider') == 'twilio':
         import base64
         import urllib.error
@@ -855,10 +856,17 @@ def _guarddog_send_sms_now(sms, text):
             recipient = ''.join(c for c in to_num if c.isdigit())
             if not recipient or len(recipient) < 10:
                 raise ValueError(f'Brevo recipient must be digits with country code (e.g. 15551234567). Got: {to_num[:25]}')
-            payload = json.dumps({'sender': sender, 'recipient': recipient, 'content': text, 'type': 'transactional', 'tag': 'GuardDog'}).encode()
+            payload = json.dumps({'sender': sender, 'recipient': recipient, 'content': text, 'type': 'transactional', 'tag': 'GuardDog', 'unicodeEnabled': True}).encode()
             req = urllib.request.Request('https://api.brevo.com/v3/transactionalSMS/send', data=payload, method='POST', headers={'api-key': api_key, 'Content-Type': 'application/json', 'accept': 'application/json'})
             try:
-                urllib.request.urlopen(req, timeout=15)
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    body = resp.read().decode()
+                    try:
+                        data = json.loads(body) if body else {}
+                        if data.get('messageId') is not None:
+                            out['brevo_message_id'] = data.get('messageId')
+                    except Exception:
+                        pass
             except urllib.error.HTTPError as e:
                 body = e.read().decode() if e.fp else ''
                 try:
@@ -867,6 +875,7 @@ def _guarddog_send_sms_now(sms, text):
                 except Exception:
                     msg = body[:200] or f'HTTP {e.code}'
                 raise ValueError(f'Brevo SMS: {msg}')
+    return out
 
 @app.route('/api/guarddog/test-sms', methods=['POST'])
 @login_required
@@ -877,8 +886,11 @@ def guarddog_test_sms():
     if not sms or sms.get('provider') not in ('twilio', 'brevo'):
         return jsonify({'success': False, 'error': 'SMS not configured. Save Twilio or Brevo settings first.'}), 400
     try:
-        _guarddog_send_sms_now(sms, 'Guard Dog test — if you got this, SMS is working.')
-        return jsonify({'success': True, 'message': 'Test SMS sent to configured number(s).'})
+        info = _guarddog_send_sms_now(sms, 'Guard Dog test - if you got this, SMS is working.')
+        msg = 'Test SMS sent to configured number(s).'
+        if info.get('brevo_message_id') is not None:
+            msg += f' Brevo message ID: {info["brevo_message_id"]} (check Brevo SMS logs if the text did not arrive).'
+        return jsonify({'success': True, 'message': msg})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
@@ -5360,7 +5372,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
           <span id="gd-sms-sender-warn" style="font-size:12px;color:var(--text-dim);display:none"></span>
         </div>
         <input class="form-input" type="text" id="gd-sms-br-to" placeholder="To: digits + country code, e.g. 15551234567" value="{{ guarddog_sms.get('to_numbers','') }}" style="margin-bottom:6px">
-        <p style="font-size:11px;color:var(--text-dim);margin-top:0">To: digits + country code (e.g. 15551234567). Sender: up to 11 letters/numbers (Brevo has no separate SMS sender page — we send it in the API). If test fails, Brevo’s error appears below.</p>
+        <p style="font-size:11px;color:var(--text-dim);margin-top:0">To: digits + country code (e.g. 15551234567). Sender: up to 11 letters/numbers (Brevo has no separate SMS sender page — we send it in the API). If test fails, Brevo’s error appears below. If test says sent but you get no text, check Brevo → Campaigns → SMS or Statistics for delivery status.</p>
       </div>
       <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center">
         <button class="btn btn-ghost" onclick="gdSmsSave()">Save SMS settings</button>
