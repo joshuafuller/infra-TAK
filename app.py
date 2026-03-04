@@ -9592,28 +9592,17 @@ def takserver_cert_expiry():
 def takserver_groups():
     """List groups from TAK Server via the Marti API using admin cert."""
     cert_dir = '/opt/tak/certs/files'
-    admin_pem = os.path.join(cert_dir, 'admin.pem')
-    admin_key = os.path.join(cert_dir, 'admin.key')
-    ca_pem = os.path.join(cert_dir, 'ca.pem')
-    if not os.path.exists(admin_pem) or not os.path.exists(admin_key):
-        return jsonify({'error': 'Admin certificate not found', 'groups': []})
+    admin_p12 = os.path.join(cert_dir, 'admin.p12')
+    if not os.path.exists(admin_p12):
+        return jsonify({'error': 'admin.p12 not found in /opt/tak/certs/files/', 'groups': []})
     try:
-        cmd = ['curl', '-s', '--max-time', '8', '--cert', admin_pem, '--key', admin_key]
-        if os.path.exists(ca_pem):
-            cmd += ['--cacert', ca_pem]
-        else:
-            cmd.append('-k')
-        cmd.append('https://127.0.0.1:8443/Marti/api/groups/all')
+        cmd = ['curl', '-sk', '--max-time', '8',
+               '--cert-type', 'P12', '--cert', f'{admin_p12}:atakatak',
+               'https://127.0.0.1:8443/Marti/api/groups/all']
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
         body = (r.stdout or '').strip()
         if r.returncode != 0 or not body:
-            # Fallback: try with -k (skip verify) in case CA doesn't match
-            cmd2 = ['curl', '-sk', '--max-time', '8', '--cert', admin_pem, '--key', admin_key,
-                     'https://127.0.0.1:8443/Marti/api/groups/all']
-            r2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=12)
-            body = (r2.stdout or '').strip()
-            if r2.returncode != 0 or not body:
-                return jsonify({'error': f'TAK Server did not respond (exit {r2.returncode})', 'groups': []})
+            return jsonify({'error': f'TAK Server did not respond (exit {r.returncode})', 'groups': []})
         import json as _json
         try:
             data = _json.loads(body)
