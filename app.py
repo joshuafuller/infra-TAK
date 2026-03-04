@@ -9507,7 +9507,8 @@ def takserver_vacuum():
         cmd = "sudo -u postgres psql -d cot -c 'VACUUM ANALYZE;' 2>&1"
         timeout_sec = 600
     try:
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout_sec)
+        # Run from / so postgres user does not hit "Permission denied" on app dir (e.g. /root/infra-TAK)
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout_sec, cwd='/')
         out = (r.stdout or '') + (r.stderr or '')
         if r.returncode != 0:
             return jsonify({'success': False, 'error': out.strip() or f'Exit code {r.returncode}'}), 400
