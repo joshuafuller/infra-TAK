@@ -9850,7 +9850,44 @@ def takserver_rotate_intca():
             log("✓ CoreConfig.xml updated")
 
             log("")
-            log("Step 7/7: Restarting TAK Server...")
+            log("Step 7/8: Updating TAK Portal certificates...")
+            portal_running = subprocess.run('docker ps --format "{{.Names}}" 2>/dev/null | grep -q tak-portal',
+                                            shell=True, capture_output=True).returncode == 0
+            if portal_running:
+                run('docker exec tak-portal mkdir -p /usr/src/app/data/certs', check=False)
+                admin_p12 = os.path.join(cert_dir, 'admin.p12')
+                modern_p12 = '/tmp/tak-portal-admin-modern.p12'
+                subprocess.run(
+                    f'openssl pkcs12 -in {admin_p12} -passin pass:atakatak -nodes -legacy 2>/dev/null | '
+                    f'openssl pkcs12 -export -passout pass:atakatak -out {modern_p12}',
+                    shell=True, capture_output=True, text=True, timeout=30)
+                if os.path.exists(modern_p12) and os.path.getsize(modern_p12) > 0:
+                    run(f'docker cp {modern_p12} tak-portal:/usr/src/app/data/certs/tak-client.p12', check=False)
+                    os.remove(modern_p12)
+                    log("  ✓ admin.p12 copied to TAK Portal (re-encoded)")
+                else:
+                    run(f'docker cp {admin_p12} tak-portal:/usr/src/app/data/certs/tak-client.p12', check=False)
+                    log("  ✓ admin.p12 copied to TAK Portal")
+                takserver_pem = os.path.join(cert_dir, 'takserver.pem')
+                if os.path.exists(takserver_pem):
+                    run(f'docker cp {takserver_pem} tak-portal:/usr/src/app/data/certs/tak-ca.pem', check=False)
+                    log("  ✓ CA chain copied to TAK Portal")
+                else:
+                    int_pem = os.path.join(cert_dir, 'ca.pem')
+                    root_pem = os.path.join(cert_dir, 'root-ca.pem')
+                    bundle = '/tmp/tak-ca-bundle.pem'
+                    run(f'cat {int_pem} {root_pem} > {bundle} 2>/dev/null', check=False)
+                    if os.path.exists(bundle) and os.path.getsize(bundle) > 0:
+                        run(f'docker cp {bundle} tak-portal:/usr/src/app/data/certs/tak-ca.pem', check=False)
+                        os.remove(bundle)
+                        log("  ✓ CA bundle copied to TAK Portal")
+                run('docker restart tak-portal 2>/dev/null', check=False)
+                log("  ✓ TAK Portal restarted with new certificates")
+            else:
+                log("  TAK Portal not running — will update on next deploy")
+
+            log("")
+            log("Step 8/8: Restarting TAK Server...")
             run('systemctl restart takserver 2>&1')
             log("  Waiting for TAK Server to come back up...")
             time.sleep(45)
@@ -9861,6 +9898,7 @@ def takserver_rotate_intca():
             log(f"  New signing CA: {new_ca_name}")
             log(f"  Old CA ({old_ca_name}) is still trusted for existing clients")
             log(f"  New admin.p12 and user.p12 have been regenerated")
+            log(f"  ⚠ Re-import admin.p12 in your browser for CloudTAK/8443 access")
             log(f"  When ready, use 'Revoke Old CA' to remove {old_ca_name} from the truststore")
             rotate_intca_status.update({'running': False, 'complete': True, 'error': False})
         except Exception as e:
