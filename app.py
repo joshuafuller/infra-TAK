@@ -5390,7 +5390,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     </div>
     <div class="gd-section">
       <div class="form-label">SMS (optional)</div>
-      <p style="font-size:12px;color:var(--text-dim);margin-bottom:10px">Use Twilio or Brevo to send SMS for critical alerts.</p>
+      <p style="font-size:12px;color:var(--text-dim);margin-bottom:10px">Use Twilio or Brevo to send SMS for critical alerts. No SMS? Alerts still go to the email address above.</p>
       <select class="form-input" id="gd-sms-provider" style="max-width:120px;margin-bottom:10px" onchange="gdSmsProviderChange()">
         <option value="">Off</option>
         <option value="twilio" {{ 'selected' if guarddog_sms.get('provider')=='twilio' else '' }}>Twilio</option>
