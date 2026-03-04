@@ -5377,6 +5377,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
         <button class="btn btn-ghost" id="gd-test-email-btn" onclick="gdTestEmail()">Send test email</button>
       </div>
       <div id="gd-test-email-msg" style="margin-top:8px;font-size:12px"></div>
+      <p style="font-size:11px;color:var(--text-dim);margin-top:8px">No SMS? Use the alert email above and enable push or notifications for that sender in your email client so you get alerted when Guard Dog sends.</p>
     </div>
     <div class="gd-section" style="margin-bottom:20px">
       <div class="form-label">Uptime Robot (outside-in monitoring)</div>
