@@ -86,7 +86,8 @@ AUTHENTIK_LOGO_URL = "https://raw.githubusercontent.com/goauthentik/authentik/ma
 CADDY_LOGO_URL = "https://upload.wikimedia.org/wikipedia/commons/5/56/Caddyserver_logo_dark.svg"
 # TAK (Team Awareness Kit) official brand logo from tak.gov
 TAK_LOGO_URL = "https://tak.gov/assets/logos/brand-06b80939.svg"
-# Login page logo: put your TAKWERX logo at static/takwerx-logo.png (recommended: 240×80px or 160px height max, PNG/SVG)
+# Login page logo: put your TAKWERX logo at static/takwerx-logo.png
+# For sharp display (no fuzz): export at 2x display size — e.g. 960px wide or 400–500px height (PNG, transparent).
 LOGIN_LOGO_FILENAME = "takwerx-logo.png"
 update_cache = {'latest': None, 'checked': 0, 'notes': ''}
 os.makedirs(UPLOAD_DIR, exist_ok=True)
