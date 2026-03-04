@@ -9667,8 +9667,9 @@ def takserver_create_client_cert():
     groups_out = data.get('groups_out', [])
 
     try:
+        subprocess.run('chmod +r /opt/tak/certs/cert-metadata.sh 2>/dev/null', shell=True, capture_output=True)
         r = subprocess.run(
-            f'cd /opt/tak/certs && sudo -u tak ./makeCert.sh client {cert_name} 2>&1',
+            f'sudo -u tak bash -c "cd /opt/tak/certs && ./makeCert.sh client {cert_name}" 2>&1',
             shell=True, capture_output=True, text=True, timeout=30
         )
         if r.returncode != 0:
