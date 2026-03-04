@@ -387,7 +387,7 @@ function uploadUpgradeDeb(file){
 }
 function handleUpgradeFile(ev){var f=ev.target.files[0];if(f)uploadUpgradeDeb(f);}
 function handleUpgradeDrop(ev){ev.preventDefault();ev.stopPropagation();document.getElementById('upgrade-upload-area').classList.remove('dragover');var f=ev.dataTransfer.files[0];if(f)uploadUpgradeDeb(f);}
-function takToggleUpdate(){var body=document.getElementById('tak-update-body');var btn=document.getElementById('tak-update-toggle-btn');var icon=document.getElementById('tak-update-toggle-icon');var label=document.getElementById('tak-update-toggle-label');if(!body)return;var show=body.style.display==='none';body.style.display=show?'block':'none';if(icon)icon.textContent=show?'\u9650':'\u9660';if(label)label.textContent=show?'Collapse':'Expand';}
+function takToggleUpdate(){var body=document.getElementById('tak-update-body');var icon=document.getElementById('tak-update-toggle-icon');if(!body)return;var show=body.style.display==='none';body.style.display=show?'block':'none';if(icon)icon.style.transform=show?'rotate(180deg)':'';}
 async function startTakUpdate(){
   var btn=document.getElementById('tak-update-btn');var msg=document.getElementById('tak-update-msg');
   if(btn)btn.disabled=true;if(msg){msg.textContent='Starting update...';msg.style.color='var(--text-dim)';}
