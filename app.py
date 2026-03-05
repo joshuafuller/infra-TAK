@@ -3898,7 +3898,7 @@ services:
             return
 
         # Settling: require multiple consecutive OK responses so we don't declare done while the app is still warming up.
-        settle_wait = 45
+        settle_wait = 105  # ~1m45s before first check — backend often needs extra time on second/fresh deploy
         needed_ok = 3
         check_interval = 15
         plog(f"  Waiting {settle_wait}s then checking backend {needed_ok} times ({check_interval}s apart)...")
