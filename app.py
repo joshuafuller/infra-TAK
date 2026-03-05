@@ -2436,8 +2436,8 @@ def run_takportal_deploy():
             plog("  TAK-Portal directory already exists, pulling latest...")
             subprocess.run(f'cd {portal_dir} && git pull --rebase --autostash', shell=True, capture_output=True, text=True, timeout=60)
         else:
-            plog("  Cloning from GitHub...")
-            r = subprocess.run(f'git clone https://github.com/AdventureSeeker423/TAK-Portal.git {portal_dir}', shell=True, capture_output=True, text=True, timeout=120)
+            plog("  Cloning from GitHub (shallow, latest only)...")
+            r = subprocess.run(f'git clone --depth 1 https://github.com/AdventureSeeker423/TAK-Portal.git {portal_dir}', shell=True, capture_output=True, text=True, timeout=180)
             if r.returncode != 0:
                 plog(f"\u2717 Clone failed: {r.stderr.strip()}")
                 takportal_deploy_status.update({'running': False, 'error': True})
