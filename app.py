@@ -3838,35 +3838,60 @@ services:
         # Step 6: Wait for API to be ready (Node backend can take 10+ min after containers start on slow VPS)
         plog("")
         plog("━━━ Step 6/7: Waiting for CloudTAK API ━━━")
+        plog("  Checking http://127.0.0.1:5000 — accept 200/401/403/404 or GET / 200")
         import urllib.request as _urlreq
+        import urllib.error as _urlerr
         api_ready = False
         max_wait_sec = 900  # 15 minutes — backend first start is slow after heavy build
         poll_interval = 2
         attempts = max_wait_sec // poll_interval
-        for attempt in range(attempts):
+        _step6_logged_exc = [False]
+        _step6_logged_502 = [False]
+        def _check_url(url, name):
             try:
-                req = _urlreq.Request('http://localhost:5000/api/connections', method='GET')
-                resp = _urlreq.urlopen(req, timeout=5)
-                code = resp.getcode()
+                r = _urlreq.Request(url, method='GET')
+                resp = _urlreq.urlopen(r, timeout=5)
+                return resp.getcode()
+            except _urlerr.HTTPError as e:
+                return e.code
+            except Exception as e:
+                if not _step6_logged_exc[0]:
+                    _step6_logged_exc[0] = True
+                    plog(f"  (diagnostic: {name} → {type(e).__name__}: {str(e)[:80]})")
+                return None
+        for attempt in range(attempts):
+            code = _check_url('http://127.0.0.1:5000/api/connections', 'api/connections')
+            if code is not None:
                 if code in (200, 401, 403):
                     plog("✓ CloudTAK API is responding (backend ready)")
                     api_ready = True
                     break
                 if code == 404:
-                    # Backend is up but path may differ by CloudTAK version; treat as ready so deploy completes
                     plog("✓ CloudTAK backend is up (GET /api/connections returned 404 — path may vary by version)")
                     api_ready = True
                     break
-            except Exception:
-                pass
+                if code in (502, 503) and not _step6_logged_502[0]:
+                    _step6_logged_502[0] = True
+                    plog(f"  Backend returned {code} (Node app may still be starting — we'll keep trying)")
+            if not api_ready:
+                code_root = _check_url('http://127.0.0.1:5000/', 'root')
+                if code_root == 200:
+                    plog("✓ CloudTAK web server is up (GET / returned 200)")
+                    api_ready = True
+                    break
+                if code_root in (502, 503) and not _step6_logged_502[0]:
+                    _step6_logged_502[0] = True
+                    plog(f"  Backend returned {code_root} (Node app may still be starting — we'll keep trying)")
+            if api_ready:
+                break
             elapsed = attempt * poll_interval
             if elapsed > 0 and elapsed % 30 == 0:
                 plog(f"  ⏳ Waiting for backend... ({elapsed}s)")
             time.sleep(poll_interval)
         if not api_ready:
             plog("✗ CloudTAK API did not respond in time — deploy failed.")
-            plog("  First start can take 10+ minutes. Check: docker logs cloudtak-api-1")
-            plog("  If the Node app is still starting, wait and open the CloudTAK URL manually once it responds.")
+            plog("  Check: docker logs cloudtak-api-1. If you see 404 for /api/connections, the backend is up — ensure you have pulled latest infra-TAK and restarted the console (sudo systemctl restart takwerx-console), then redeploy.")
+            plog("  Otherwise wait and open the CloudTAK URL manually once it responds.")
             cloudtak_deploy_status.update({'running': False, 'error': True})
             return
 
