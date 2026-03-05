@@ -3796,21 +3796,25 @@ services:
         # CloudTAK nginx proxies /api to 127.0.0.1:5001 (Node app in same container). Do NOT
         # replace that with host:5001 or /api would hit TAKWERX Console and the app would stay on "Loading CloudTAK".
 
-        # Step 6: Wait for API to be ready
+        # Step 6: Wait for API to be ready (nginx on 5000 + Node backend on 5001 inside container)
         plog("")
         plog("━━━ Step 6/7: Waiting for CloudTAK API ━━━")
         import urllib.request as _urlreq
-        for attempt in range(30):
+        for attempt in range(60):
             try:
-                _urlreq.urlopen('http://localhost:5000/', timeout=3)
-                plog("✓ CloudTAK API is responding")
-                break
+                req = _urlreq.Request('http://localhost:5000/api/connections', method='GET')
+                resp = _urlreq.urlopen(req, timeout=5)
+                code = resp.getcode()
+                if code in (200, 401, 403):
+                    plog("✓ CloudTAK API is responding (backend ready)")
+                    break
             except Exception:
-                if attempt % 5 == 0:
-                    plog(f"  ⏳ Waiting... ({attempt * 2}s)")
-                time.sleep(2)
+                pass
+            if attempt % 10 == 0 and attempt > 0:
+                plog(f"  ⏳ Waiting for backend... ({attempt * 2}s)")
+            time.sleep(2)
         else:
-            plog("⚠ CloudTAK API did not respond in time — check container logs")
+            plog("⚠ CloudTAK API did not respond in time — check container logs (docker logs cloudtak-api-1)")
 
         # Step 7: Update Caddyfile
         plog("")
