@@ -76,7 +76,7 @@ MEDIAMTX_LOGO_URL = "https://raw.githubusercontent.com/bluenviron/mediamtx/main/
 # MediaMTX web editor: regular repo (no LDAP); when Authentik/LDAP is installed we use LDAP branch if set
 MEDIAMTX_EDITOR_REPO = "https://github.com/takwerx/mediamtx-installer.git"
 MEDIAMTX_EDITOR_PATH = "config-editor"  # subdir containing mediamtx_config_editor.py
-MEDIAMTX_EDITOR_LDAP_BRANCH = "infratak"  # when LDAP/Authentik installed, try this branch first; None = always use default branch
+MEDIAMTX_EDITOR_LDAP_BRANCH = None  # LDAP behavior comes from mediamtx_ldap_overlay.py in this repo; use repo default branch
 # Node-RED official icons (https://nodered.org/about/resources/media/)
 NODERED_LOGO_URL = "https://nodered.org/about/resources/media/node-red-icon.png"       # icon only (e.g. small nav)
 NODERED_LOGO_URL_2 = "https://nodered.org/about/resources/media/node-red-icon-2.png"   # icon + "Node-RED" text (card, sidebar)
@@ -3108,7 +3108,7 @@ WantedBy=multi-user.target
         ak = modules.get('authentik', {})
         ldap_available = bool(ak.get('installed'))
         if ldap_available:
-            plog("  LDAP/Authentik detected — using editor source for LDAP-aware console")
+            plog("  LDAP/Authentik detected — will apply LDAP overlay after install")
         else:
             plog("  No LDAP — using regular MediaMTX editor from repo")
 
@@ -3117,23 +3117,13 @@ WantedBy=multi-user.target
         try:
             subprocess.run(f'rm -rf {clone_dir}', shell=True, capture_output=True)
             os.makedirs(clone_dir, exist_ok=True)
-            branch = MEDIAMTX_EDITOR_LDAP_BRANCH if (ldap_available and MEDIAMTX_EDITOR_LDAP_BRANCH) else None
-            if branch:
-                r = subprocess.run(f'git clone --depth 1 -b "{branch}" "{MEDIAMTX_EDITOR_REPO}" {clone_dir}',
-                    shell=True, capture_output=True, text=True, timeout=60)
-                if r.returncode != 0:
-                    plog(f"  LDAP branch \"{branch}\" not found or clone failed, trying default branch")
-                    subprocess.run(f'rm -rf {clone_dir}', shell=True, capture_output=True)
-                    r = subprocess.run(f'git clone --depth 1 "{MEDIAMTX_EDITOR_REPO}" {clone_dir}',
-                        shell=True, capture_output=True, text=True, timeout=60)
-            else:
-                r = subprocess.run(f'git clone --depth 1 "{MEDIAMTX_EDITOR_REPO}" {clone_dir}',
-                    shell=True, capture_output=True, text=True, timeout=60)
+            r = subprocess.run(f'git clone --depth 1 "{MEDIAMTX_EDITOR_REPO}" {clone_dir}',
+                shell=True, capture_output=True, text=True, timeout=60)
             if r.returncode == 0:
                 candidate = os.path.join(clone_dir, MEDIAMTX_EDITOR_PATH, 'mediamtx_config_editor.py')
                 if os.path.exists(candidate):
                     webeditor_src = candidate
-                    plog(f"  Cloned editor from {MEDIAMTX_EDITOR_REPO}" + (f" (branch {branch})" if branch else ""))
+                    plog(f"  Cloned editor from {MEDIAMTX_EDITOR_REPO}")
         except Exception as e:
             plog(f"  Clone failed: {e}")
         if not webeditor_src:
