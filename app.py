@@ -3835,12 +3835,12 @@ services:
         # CloudTAK nginx proxies /api to 127.0.0.1:5001 (Node app in same container). Do NOT
         # replace that with host:5001 or /api would hit TAKWERX Console and the app would stay on "Loading CloudTAK".
 
-        # Step 6: Wait for API to be ready (backend can take several minutes after containers start)
+        # Step 6: Wait for API to be ready (Node backend can take 10+ min after containers start on slow VPS)
         plog("")
         plog("━━━ Step 6/7: Waiting for CloudTAK API ━━━")
         import urllib.request as _urlreq
         api_ready = False
-        max_wait_sec = 360  # up to 6 minutes (backend sometimes needs ~5 min after containers up)
+        max_wait_sec = 900  # 15 minutes — backend first start is slow after heavy build
         poll_interval = 2
         attempts = max_wait_sec // poll_interval
         for attempt in range(attempts):
@@ -3864,7 +3864,9 @@ services:
                 plog(f"  ⏳ Waiting for backend... ({elapsed}s)")
             time.sleep(poll_interval)
         if not api_ready:
-            plog("✗ CloudTAK API did not respond in time — deploy failed. Check: docker logs cloudtak-api-1")
+            plog("✗ CloudTAK API did not respond in time — deploy failed.")
+            plog("  First start can take 10+ minutes. Check: docker logs cloudtak-api-1")
+            plog("  If the Node app is still starting, wait and open the CloudTAK URL manually once it responds.")
             cloudtak_deploy_status.update({'running': False, 'error': True})
             return
 
@@ -6377,14 +6379,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   </div>
   {% endif %}
 
-  <!-- Deploy log -->
-  {% if deploying %}
-  <div class="card" id="deploy-log-card">
-    <div class="card-title">Deploy Log</div>
-    <div class="log-box" id="deploy-log">Initializing...</div>
-  </div>
-  {% endif %}
-
+  <!-- Deploy log (single card: shown when deploying or after error) -->
   <div id="log-card" class="card" style="display:{% if deploying or deploy_error %}block{% else %}none{% endif %}">
     <div class="card-title">Deploy Log</div>
     {% if deploy_error %}
@@ -6425,7 +6420,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 </body></html>'''
 
 EMAIL_RELAY_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Email Relay</title>
+<title>Email Relay — infra-TAK</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet">
 <style>
@@ -6749,7 +6744,7 @@ async function emailUninstall(){
 
 
 CADDY_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Caddy SSL</title>
+<title>Caddy SSL — infra-TAK</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet">
 <style>
@@ -7011,7 +7006,7 @@ loadServiceDomains();
 </body></html>'''
 
 CERTS_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Certificates · infra-TAK</title>
+<title>Certificates — infra-TAK</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
 :root{--bg-deep:#080b14;--bg-surface:#0f1219;--bg-card:#161b26;--border:#1e2736;--border-hover:#2a3548;--text-primary:#f1f5f9;--text-secondary:#cbd5e1;--text-dim:#94a3b8;--accent:#3b82f6;--cyan:#06b6d4;--green:#10b981;--red:#ef4444;--yellow:#eab308}
@@ -7076,7 +7071,7 @@ function filterCerts(ext){
 </body></html>'''
 
 TAKPORTAL_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>TAK Portal</title>
+<title>TAK Portal — infra-TAK</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet">
 <style>
@@ -8858,7 +8853,7 @@ entries:
             pass
 
 AUTHENTIK_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Authentik</title>
+<title>Authentik — infra-TAK</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet">
 <style>
@@ -12140,7 +12135,7 @@ setInterval(async()=>{try{const r=await fetch('/api/metrics');const d=await r.js
 </script></body></html>'''
 
 # === TAK Server Template ===
-TAKSERVER_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>TAK Server</title>
+TAKSERVER_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>TAK Server — infra-TAK</title>
 <style>
 ''' + BASE_CSS + '''
 .upload-area{border:2px dashed var(--border);border-radius:12px;padding:40px;text-align:center;cursor:pointer;transition:all 0.3s;background:rgba(15,23,42,0.3);margin-bottom:20px}
