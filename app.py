@@ -8141,7 +8141,7 @@ entries:
                 # Build the new auth block — matches TAK Portal reference exactly
                 auth_block = (
                     '    <auth default="ldap" x509groups="true" x509addAnonymous="false" x509useGroupCache="true" x509useGroupCacheDefaultActive="true" x509checkRevocation="true">\n'
-                    '        <ldap url="ldap://127.0.0.1:389" userstring="cn={username},ou=users,dc=takldap" updateinterval="60" groupprefix="cn=tak_" groupNameExtractorRegex="cn=tak_(.*?)(?:,|$)" serviceAccountDN="cn=adm_ldapservice,ou=users,dc=takldap" serviceAccountCredential="'
+                    '        <ldap url="ldap://127.0.0.1:389" userstring="cn={username},ou=users,dc=takldap" updateinterval="30" groupprefix="cn=tak_" groupNameExtractorRegex="cn=tak_(.*?)(?:,|$)" serviceAccountDN="cn=adm_ldapservice,ou=users,dc=takldap" serviceAccountCredential="'
                     + ldap_pass
                     + '" groupBaseRDN="ou=groups,dc=takldap" userBaseRDN="ou=users,dc=takldap" dnAttributeName="DN" nameAttr="CN" adminGroup="ROLE_ADMIN"/>\n'
                     '        <File location="UserAuthenticationFile.xml"/>\n'
@@ -9668,7 +9668,7 @@ def _apply_ldap_to_coreconfig():
     ldap_line = '        <ldap'
     ldap_line += ' url="ldap://127.0.0.1:389"'
     ldap_line += ' userstring="cn={username},ou=users,dc=takldap"'
-    ldap_line += ' updateinterval="60"'
+    ldap_line += ' updateinterval="30"'
     ldap_line += ' groupprefix="cn=tak_"'
     ldap_line += ' groupNameExtractorRegex="cn=tak_(.*?)(?:,|$)"'
     ldap_line += ' serviceAccountDN="cn=adm_ldapservice,ou=users,dc=takldap"'
