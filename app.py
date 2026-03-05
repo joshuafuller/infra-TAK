@@ -3897,6 +3897,33 @@ services:
             cloudtak_deploy_status.update({'running': False, 'error': True})
             return
 
+        # Settling: require multiple consecutive OK responses so we don't declare done while the app is still warming up.
+        settle_wait = 45
+        needed_ok = 3
+        check_interval = 15
+        plog(f"  Waiting {settle_wait}s then checking backend {needed_ok} times ({check_interval}s apart)...")
+        time.sleep(settle_wait)
+        ok_count = 0
+        for round_ in range(5):
+            code_again = _check_url('http://127.0.0.1:5000/api/connections', 'api/connections')
+            if code_again is None:
+                code_again = _check_url('http://127.0.0.1:5000/', 'root')
+            if code_again in (200, 401, 403, 404):
+                ok_count += 1
+                plog(f"  Check {ok_count}/{needed_ok} OK")
+                if ok_count >= needed_ok:
+                    plog("✓ Backend settled — ready for traffic")
+                    break
+            else:
+                ok_count = 0
+                if round_ < 4:
+                    plog("  Backend not ready, waiting 20s before retry...")
+                    time.sleep(20)
+            if ok_count < needed_ok and round_ < 4:
+                time.sleep(check_interval)
+        if ok_count < needed_ok:
+            plog("  Backend not fully stable — if the map stays on 'Loading CloudTAK', wait a minute and try a hard refresh (Ctrl+Shift+R / Cmd+Shift+R).")
+
         # Step 7: Update Caddyfile
         plog("")
         plog("━━━ Step 7/7: Updating Caddy ━━━")
@@ -6111,15 +6138,17 @@ window.startDeploy = function() {
 
 window.pollLog = function(redeployBtn) {
   if (window.logInterval) clearInterval(window.logInterval);
+  window.cloudtakPollFails = 0;
   function doPoll() {
     fetch("/api/cloudtak/deploy/log?index=" + window.logIndex, { credentials: "same-origin" })
       .then(function(r) { return r.json(); })
       .then(function(d) {
+        window.cloudtakPollFails = 0;
         if (!d) return;
+        var dyn = document.getElementById("deploy-log-dyn");
+        var stat = document.getElementById("deploy-log");
         if (d.entries && d.entries.length) {
           var text = d.entries.join("\n") + "\n";
-          var dyn = document.getElementById("deploy-log-dyn");
-          var stat = document.getElementById("deploy-log");
           if (window.logIndex === 0) {
             if (dyn) dyn.textContent = text;
             if (stat) stat.textContent = text;
@@ -6158,11 +6187,22 @@ window.pollLog = function(redeployBtn) {
         }
       })
       .catch(function(err) {
-        clearInterval(window.logInterval);
-        window.logInterval = null;
-        if (redeployBtn) redeployBtn.disabled = false;
+        window.cloudtakPollFails = (window.cloudtakPollFails || 0) + 1;
         var dyn = document.getElementById("deploy-log-dyn");
-        if (dyn) dyn.textContent = (dyn.textContent || "") + "\nRequest failed: " + (err && err.message ? err.message : String(err));
+        var stat = document.getElementById("deploy-log");
+        if (window.cloudtakPollFails === 1) {
+          var msg = "\n[Connection interrupted \u2014 reconnecting...]";
+          if (dyn) dyn.textContent = (dyn.textContent || "") + msg;
+          if (stat) stat.textContent = (stat.textContent || "") + msg;
+        }
+        if (window.cloudtakPollFails >= 10) {
+          clearInterval(window.logInterval);
+          window.logInterval = null;
+          if (redeployBtn) redeployBtn.disabled = false;
+          var failMsg = "\n\nRequest failed: " + (err && err.message ? err.message : String(err)) + " Deploy may still be running on the server \u2014 refresh the page to check.";
+          if (dyn) dyn.textContent = (dyn.textContent || "") + failMsg;
+          if (stat) stat.textContent = (stat.textContent || "") + failMsg;
+        }
       });
   }
   doPoll();
@@ -6388,6 +6428,9 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
       CloudTAK is a browser-based TAK client built by the Colorado DFPC Center of Excellence.
       It connects to your TAK Server and provides a full map interface in any web browser.
       Video streams from your standalone MediaMTX install will be used automatically.
+    </p>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:20px">
+      First deploy builds Docker images and can take 10–15 minutes. Keep the tab open; if the log stops updating, refresh the page to reconnect.
     </p>
 
     {% if not settings.fqdn %}
