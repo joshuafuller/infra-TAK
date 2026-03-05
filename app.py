@@ -3321,7 +3321,9 @@ if changed:
         if ldap_available:
             exec_start_pre = f'ExecStartPre=/usr/bin/python3 {webeditor_dir}/ensure_overlay.py\n'
 
-        webeditor_svc = f"""[Unit]
+        editor_file = f'{webeditor_dir}/mediamtx_config_editor.py'
+        if os.path.exists(editor_file):
+            webeditor_svc = f"""[Unit]
 Description=MediaMTX Web Configuration Editor
 After=network.target mediamtx.service
 
@@ -3338,12 +3340,14 @@ User=root
 [Install]
 WantedBy=multi-user.target
 """
-        with open('/etc/systemd/system/mediamtx-webeditor.service', 'w') as f:
-            f.write(webeditor_svc)
-        plog("✓ mediamtx-webeditor.service created")
+            with open('/etc/systemd/system/mediamtx-webeditor.service', 'w') as f:
+                f.write(webeditor_svc)
+            plog("✓ mediamtx-webeditor.service created")
+        else:
+            plog("  Skipping mediamtx-webeditor.service (editor file not installed)")
 
         # Ensure web editor Python deps (Flask, etc.) so systemd can start it even if Step 1 pip failed
-        if os.path.exists(f'{webeditor_dir}/mediamtx_config_editor.py'):
+        if os.path.exists(editor_file):
             r = subprocess.run(
                 'pip3 install Flask ruamel.yaml requests psutil --break-system-packages 2>&1',
                 shell=True, capture_output=True, text=True, timeout=120)
@@ -3356,9 +3360,11 @@ WantedBy=multi-user.target
                 plog("  ✓ Web editor Python deps installed")
 
         subprocess.run('systemctl daemon-reload', shell=True, capture_output=True)
-        subprocess.run('systemctl enable mediamtx mediamtx-webeditor', shell=True, capture_output=True)
+        subprocess.run('systemctl enable mediamtx', shell=True, capture_output=True)
+        if os.path.exists(editor_file):
+            subprocess.run('systemctl enable mediamtx-webeditor', shell=True, capture_output=True)
         subprocess.run('systemctl start mediamtx', shell=True, capture_output=True)
-        if os.path.exists(f'{webeditor_dir}/mediamtx_config_editor.py'):
+        if os.path.exists(editor_file):
             subprocess.run('systemctl start mediamtx-webeditor', shell=True, capture_output=True)
         plog("✓ Services enabled and started")
 
