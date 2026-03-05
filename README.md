@@ -10,7 +10,7 @@ One clone. One password. One URL. Manage everything from your browser.
 
 A unified web console for deploying and managing TAK ecosystem infrastructure:
 
-- **TAK Server** — Upload your .deb/.rpm, configure, deploy, manage CoreConfig — all from the browser
+- **TAK Server** — Upload your .deb, configure, deploy, manage CoreConfig — all from the browser
 - **Authentik** — Identity provider with automated LDAP configuration for TAK Server auth
 - **TAK Portal** — User and certificate management portal with auto-configured Authentik + TAK Server integration
 - **Caddy SSL** — Let's Encrypt certificates and reverse proxy management
@@ -100,14 +100,14 @@ After deployment, create users in TAK Portal — they flow through Authentik →
 - Root access
 - 8GB+ RAM recommended for TAK Server
 - Internet connection for initial setup
-- TAK Server .deb or .rpm package from [tak.gov](https://tak.gov)
+- TAK Server .deb package from [tak.gov](https://tak.gov)
 
 ## Architecture
 
 ```
 start.sh                    ← One CLI command to launch everything
 ├── app.py                  ← Flask web application (HTTPS on :5001)
-├── uploads/                ← Uploaded .deb/.rpm packages
+├── uploads/                ← Uploaded .deb packages
 └── .config/                ← Auth + settings (gitignored)
 ```
 
