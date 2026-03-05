@@ -3782,7 +3782,7 @@ services:
         plog("  Standalone MediaMTX stays on original ports — no conflict")
         r = subprocess.run(
             f'docker compose -f {compose_yml} up -d 2>&1',
-            shell=True, capture_output=True, text=True, timeout=300, cwd=cloudtak_dir
+            shell=True, capture_output=True, text=True, timeout=600, cwd=cloudtak_dir
         )
         if r.returncode != 0:
             plog(f"✗ docker compose up failed")
@@ -9504,6 +9504,9 @@ def _apply_ldap_to_coreconfig():
                 capture_output=True, text=True, timeout=10)
             if r.returncode != 0:
                 return False, f'Password resync: sudo cp failed: {r.stderr.strip()[:200]}'
+            ag = subprocess.run(['grep', '-c', 'adminGroup="ROLE_ADMIN"', coreconfig_path], capture_output=True, text=True, timeout=5)
+            if ag.returncode != 0 or (ag.stdout or '').strip() == '0':
+                return False, 'CoreConfig updated but adminGroup="ROLE_ADMIN" missing — run Connect LDAP again.'
             r = subprocess.run('sudo systemctl restart takserver 2>&1',
                 shell=True, capture_output=True, text=True, timeout=60)
             if r.returncode != 0:
@@ -9559,10 +9562,13 @@ def _apply_ldap_to_coreconfig():
     r = subprocess.run(['sudo', 'cp', os.path.abspath(patch_path), coreconfig_path], capture_output=True, text=True, timeout=10)
     if r.returncode != 0:
         return False, f'sudo cp failed: {r.stderr.strip()[:200]}. Run manually: sudo cp {os.path.abspath(patch_path)} /opt/tak/CoreConfig.xml && sudo systemctl restart takserver'
-    # Verify the destination file
+    # Verify the destination file has LDAP and adminGroup (required for 8446 admin UI and channel resolution)
     check = subprocess.run(['grep', '-c', 'adm_ldapservice', coreconfig_path], capture_output=True, text=True, timeout=5)
     if check.returncode != 0 or check.stdout.strip() == '0':
         return False, f'File not updated. Run manually: sudo cp {os.path.abspath(patch_path)} /opt/tak/CoreConfig.xml && sudo systemctl restart takserver'
+    ag = subprocess.run(['grep', '-c', 'adminGroup="ROLE_ADMIN"', coreconfig_path], capture_output=True, text=True, timeout=5)
+    if ag.returncode != 0 or (ag.stdout or '').strip() == '0':
+        return False, 'CoreConfig was written but adminGroup="ROLE_ADMIN" is missing — 8446 would show WebTAK for everyone. Run Connect LDAP again.'
     # Restart TAK Server
     r = subprocess.run('sudo systemctl restart takserver 2>&1', shell=True, capture_output=True, text=True, timeout=60)
     if r.returncode != 0:
