@@ -3656,9 +3656,27 @@ def run_cloudtak_deploy():
                 plog(f"  ⚠ git pull warning: {r.stderr.strip()[:100]}")
         else:
             plog("  Cloning from GitHub (shallow, latest only)...")
-            r = subprocess.run(f'git clone --depth 1 https://github.com/dfpc-coe/CloudTAK.git {cloudtak_dir}', shell=True, capture_output=True, text=True, timeout=180)
-            if r.returncode != 0:
-                plog(f"✗ Clone failed: {r.stderr.strip()[:200]}")
+            clone_timeout = 600  # 10 min — VPS→GitHub can be slow
+            clone_cmd = f'git clone --depth 1 https://github.com/dfpc-coe/CloudTAK.git {cloudtak_dir}'
+            for attempt in range(2):
+                try:
+                    r = subprocess.run(clone_cmd, shell=True, capture_output=True, text=True, timeout=clone_timeout)
+                    if r.returncode == 0:
+                        break
+                    plog(f"✗ Clone failed: {r.stderr.strip()[:200]}")
+                    if attempt == 0:
+                        plog("  Retrying once...")
+                        subprocess.run(f'rm -rf {cloudtak_dir}', shell=True, capture_output=True, timeout=30)
+                except subprocess.TimeoutExpired:
+                    plog(f"✗ Clone timed out after {clone_timeout}s")
+                    if attempt == 0:
+                        plog("  Retrying once (slow network to GitHub is common)...")
+                        subprocess.run(f'rm -rf {cloudtak_dir}', shell=True, capture_output=True, timeout=30)
+                    else:
+                        cloudtak_deploy_status.update({'running': False, 'error': True})
+                        return
+            if not os.path.exists(os.path.join(cloudtak_dir, '.git')):
+                plog("✗ Clone failed after retry")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
         plog("✓ Repository ready")
@@ -3669,7 +3687,7 @@ def run_cloudtak_deploy():
         if not os.path.exists(compose_yml) and not os.path.exists(compose_yaml):
             plog("  docker-compose.yml missing — re-cloning...")
             subprocess.run(f'rm -rf {cloudtak_dir}', shell=True, capture_output=True, timeout=30)
-            r = subprocess.run(f'git clone --depth 1 https://github.com/dfpc-coe/CloudTAK.git {cloudtak_dir}', shell=True, capture_output=True, text=True, timeout=180)
+            r = subprocess.run(f'git clone --depth 1 https://github.com/dfpc-coe/CloudTAK.git {cloudtak_dir}', shell=True, capture_output=True, text=True, timeout=600)
             if r.returncode != 0:
                 plog(f"✗ Re-clone failed: {r.stderr.strip()[:200]}")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
