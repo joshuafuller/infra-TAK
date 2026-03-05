@@ -8173,7 +8173,8 @@ entries:
                         plog(f"  ⚠ Token check error: {str(e)[:80]} — giving up")
                         break
 
-                # Create tak_ROLE_ADMIN group
+                # Create tak_ROLE_ADMIN group (for webadmin only; all other group membership is controlled in TAK Portal)
+                group_pk = None
                 try:
                     req = urllib.request.Request(f'{ak_url}/api/v3/core/groups/',
                         data=json.dumps({'name': 'tak_ROLE_ADMIN', 'is_superuser': False}).encode(),
@@ -8185,7 +8186,6 @@ entries:
                 except urllib.error.HTTPError as e:
                     if e.code == 400:
                         plog("  ✓ tak_ROLE_ADMIN group already exists")
-                        # Get existing group PK
                         req = urllib.request.Request(f'{ak_url}/api/v3/core/groups/?search=tak_ROLE_ADMIN',
                             headers=ak_headers)
                         resp = urllib.request.urlopen(req, timeout=10)
@@ -9691,10 +9691,10 @@ def _ensure_authentik_webadmin():
     url = 'http://127.0.0.1:9090'
     headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
     try:
+        # Ensure tak_ROLE_ADMIN exists (for webadmin only; all other group membership is controlled in TAK Portal)
         group_pk = None
         req = _req.Request(f'{url}/api/v3/core/groups/?search=tak_ROLE_ADMIN', headers=headers)
-        resp = _req.urlopen(req, timeout=10)
-        results = json.loads(resp.read().decode())['results']
+        results = json.loads(_req.urlopen(req, timeout=10).read().decode())['results']
         group_pk = results[0]['pk'] if results else None
         if not group_pk:
             gr = _req.Request(f'{url}/api/v3/core/groups/', data=json.dumps({'name': 'tak_ROLE_ADMIN', 'is_superuser': False}).encode(), headers=headers, method='POST')
