@@ -11681,6 +11681,8 @@ body{display:flex;flex-direction:row;min-height:100vh}
 .status-dot{width:5px;height:5px;border-radius:50%;background:currentColor}
 .status-running .status-dot{animation:pulse 2s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
+.uu-spinner{display:inline-block;width:14px;height:14px;border:2px solid var(--border);border-top-color:var(--cyan);border-radius:50%;animation:uu-spin .7s linear infinite;vertical-align:middle;margin-right:6px}
+@keyframes uu-spin{to{transform:rotate(360deg)}}
 .meta-line{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-bottom:12px}
 .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;display:none;align-items:center;justify-content:center}
 .modal-overlay.open{display:flex}
@@ -11733,6 +11735,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <span style="position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:{% if metrics.unattended_upgrades.enabled %}var(--green){% else %}rgba(71,85,105,0.5){% endif %};border-radius:20px;transition:.3s" id="uu-slider"></span>
 <span style="position:absolute;content:'';height:16px;width:16px;left:{% if metrics.unattended_upgrades.enabled %}18px{% else %}2px{% endif %};bottom:2px;background:#fff;border-radius:50%;transition:.3s" id="uu-knob"></span>
 </label>
+<span id="uu-spinner" class="uu-spinner" style="display:none"></span>
 <span id="uu-label" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:{% if metrics.unattended_upgrades.enabled %}var(--green){% else %}var(--text-dim){% endif %}">{% if metrics.unattended_upgrades.enabled and metrics.unattended_upgrades.running %}Running...{% elif metrics.unattended_upgrades.enabled %}Enabled{% else %}Disabled{% endif %}</span>
 </div>
 </div>
@@ -11773,14 +11776,16 @@ function updateUU(uu){
 }
 async function toggleUU(cb){
     var action=cb.checked?'enable':'disable';
-    var lb=document.getElementById('uu-label');
+    var lb=document.getElementById('uu-label'),sp=document.getElementById('uu-spinner');
+    if(sp)sp.style.display='inline-block';
     lb.textContent=cb.checked?'Enabling...':'Disabling...';lb.style.color='var(--cyan)';
     try{
         var r=await fetch('/api/unattended-upgrades',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:action})});
         var d=await r.json();
+        if(sp)sp.style.display='none';
         if(d.success){updateUU(d)}
         else{cb.checked=!cb.checked;lb.textContent=(action==='disable'?'Disable failed — try again':('Error: '+(d.error||'unknown')));lb.style.color='var(--red)'}
-    }catch(e){cb.checked=!cb.checked;lb.textContent=(action==='disable'?'Disable failed — try again':'Error');lb.style.color='var(--red)'}
+    }catch(e){if(sp)sp.style.display='none';cb.checked=!cb.checked;lb.textContent=(action==='disable'?'Disable failed — try again':'Error');lb.style.color='var(--red)'}
 }
 setInterval(async()=>{try{const r=await fetch('/api/metrics');const d=await r.json();document.getElementById('cpu-value').textContent=d.cpu_percent+'%';document.getElementById('ram-value').textContent=d.ram_percent+'%';document.getElementById('disk-value').textContent=d.disk_percent+'%';document.getElementById('uptime-value').textContent=d.uptime;updateUU(d.unattended_upgrades)}catch(e){}},5000);
 function refreshModuleCards(){
