@@ -7541,6 +7541,7 @@ def authentik_page():
         settings=settings, ak=ak, container_info=container_info,
         ak_port=ak_port, authentik_base_url=_get_authentik_base_url(settings),
         takserver_base_url=_get_takserver_base_url(settings), version=VERSION,
+        ak_version_info=_get_authentik_version_info(),
         deploying=authentik_deploy_status.get('running', False),
         deploy_done=authentik_deploy_status.get('complete', False),
         deploy_error=authentik_deploy_status.get('error', False),
@@ -8108,7 +8109,7 @@ entries:
                 needs_write = True
                 plog("  Added POSTGRES_MAX_CONNECTIONS to postgresql")
 
-            # Add LDAP outpost container (version must match server)
+            # Add LDAP outpost container (use same AUTHENTIK_TAG as server so Update pulls both)
             ak_tag = '2026.2.0'
             for l in lines:
                 m = re.search(r'goauthentik/server[:\s]+\$\{AUTHENTIK_TAG:-([^}]+)\}', l)
@@ -8119,13 +8120,14 @@ entries:
                 if m and m.group(1).strip() not in ('${AUTHENTIK_TAG}', ''):
                     ak_tag = m.group(1).strip()
                     break
+            ldap_image = f"ghcr.io/goauthentik/ldap:${{AUTHENTIK_TAG:-{ak_tag}}}"
             if not any('ghcr.io/goauthentik/ldap' in l for l in lines):
                 _ak_host = _get_authentik_host(settings)
                 if _ak_host:
                     _ak_base = _get_authentik_base_url(settings)
-                    ldap_svc = f"  ldap:\n    image: ghcr.io/goauthentik/ldap:{ak_tag}\n    extra_hosts:\n      - \"{_ak_host}:host-gateway\"\n    ports:\n    - 389:3389\n    - 636:6636\n    environment:\n      AUTHENTIK_HOST: {_ak_base}\n      AUTHENTIK_INSECURE: \"true\"\n      AUTHENTIK_TOKEN: placeholder\n    restart: unless-stopped\n"
+                    ldap_svc = f"  ldap:\n    image: {ldap_image}\n    extra_hosts:\n      - \"{_ak_host}:host-gateway\"\n    ports:\n    - 389:3389\n    - 636:6636\n    environment:\n      AUTHENTIK_HOST: {_ak_base}\n      AUTHENTIK_INSECURE: \"true\"\n      AUTHENTIK_TOKEN: placeholder\n    restart: unless-stopped\n"
                 else:
-                    ldap_svc = f"  ldap:\n    image: ghcr.io/goauthentik/ldap:{ak_tag}\n    ports:\n    - 389:3389\n    - 636:6636\n    environment:\n      AUTHENTIK_HOST: http://authentik-server-1:9000\n      AUTHENTIK_INSECURE: \"true\"\n      AUTHENTIK_TOKEN: placeholder\n    restart: unless-stopped\n"
+                    ldap_svc = f"  ldap:\n    image: {ldap_image}\n    ports:\n    - 389:3389\n    - 636:6636\n    environment:\n      AUTHENTIK_HOST: http://authentik-server-1:9000\n      AUTHENTIK_INSECURE: \"true\"\n      AUTHENTIK_TOKEN: placeholder\n    restart: unless-stopped\n"
                 new_lines = []
                 for line in lines:
                     if line.startswith('volumes:'):
@@ -8135,12 +8137,16 @@ entries:
                 needs_write = True
                 plog("  Added LDAP outpost container")
             else:
+                # Ensure existing LDAP block uses AUTHENTIK_TAG so Update pulls same version as server
                 for i, line in enumerate(lines):
-                    m = re.search(r'ghcr\.io/goauthentik/ldap:([^\s\n]+)', line)
-                    if m and m.group(1) != ak_tag:
-                        lines[i] = line.replace(f'ghcr.io/goauthentik/ldap:{m.group(1)}', f'ghcr.io/goauthentik/ldap:{ak_tag}')
-                        needs_write = True
-                        plog(f"  Updated LDAP outpost image {m.group(1)} -> {ak_tag}")
+                    m = re.search(r'image:\s*ghcr\.io/goauthentik/ldap:([^\s\n]+)', line)
+                    if m:
+                        current = m.group(1)
+                        if not current.startswith('${AUTHENTIK_TAG'):
+                            lines[i] = line.replace(f'ghcr.io/goauthentik/ldap:{current}', ldap_image, 1)
+                            needs_write = True
+                            plog(f"  Updated LDAP image to use AUTHENTIK_TAG (default {ak_tag})")
+                        break
             if needs_write:
                 with open(compose_path, 'w') as f:
                     f.writelines(lines)
@@ -9074,14 +9080,14 @@ body{display:flex;min-height:100vh}
 {% if deploying %}
 <div class="status-info"><div class="status-icon running" style="background:rgba(59,130,246,0.1)">🔄</div><div><div class="status-text" style="color:var(--accent)">Deploying...</div><div class="status-detail">Authentik installation in progress</div></div></div>
 {% elif ak.installed and ak.running %}
-<div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--green)">Running</div><div class="status-detail">Identity provider active</div></div></div>
+<div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--green)">Running</div><div class="status-detail">Identity provider active{% if ak_version_info and ak_version_info.version %} · <span class="os-badge" style="margin-left:4px">v{{ ak_version_info.version }}</span>{% if ak_version_info.update_available %} <span style="color:var(--cyan);font-size:11px" title="New image available">update</span>{% endif %}{% endif %}</div></div></div>
 <div class="controls">
 <button class="control-btn btn-stop" onclick="akControl('stop')">⏹ Stop</button>
 <button class="control-btn" onclick="akControl('restart')">🔄 Restart</button>
 <button class="control-btn btn-update" onclick="akControl('update')">⬆ Update</button>
 </div>
 {% elif ak.installed %}
-<div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--red)">Stopped</div><div class="status-detail">Docker containers not running</div></div></div>
+<div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--red)">Stopped</div><div class="status-detail">Docker containers not running{% if ak_version_info and ak_version_info.version %} · <span class="os-badge" style="margin-left:4px">v{{ ak_version_info.version }}</span>{% endif %}</div></div></div>
 <div class="controls">
 <button class="control-btn btn-start" onclick="akControl('start')">▶ Start</button>
 <button class="control-btn btn-update" onclick="akControl('update')">⬆ Update</button>
