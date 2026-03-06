@@ -1642,6 +1642,14 @@ def generate_caddyfile(settings=None):
         lines.append(f"    reverse_proxy 127.0.0.1:9090")
         lines.append(f"}}")
         lines.append("")
+        # If default is tak.<fqdn>, also serve Authentik on authentik.<fqdn> so redirects to authentik.* don't break (TLS works)
+        fqdn_base = domain.split(':')[0].split('/')[0] if domain else ''
+        if fqdn_base and ak_host == f'tak.{fqdn_base}':
+            lines.append(f"# Authentik (alternate hostname — same backend)")
+            lines.append(f"authentik.{fqdn_base} {{")
+            lines.append(f"    reverse_proxy 127.0.0.1:9090")
+            lines.append(f"}}")
+            lines.append("")
 
     portal = modules.get('takportal', {})
     if portal.get('installed'):
