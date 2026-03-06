@@ -66,7 +66,7 @@ def ensure_session_cookie_domain():
             app.config['SESSION_COOKIE_DOMAIN'] = '.' + s['fqdn'].split(':')[0]
     except Exception:
         pass
-VERSION = "0.1.8-alpha"
+VERSION = "0.1.9-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # CloudTAK official icon (SVG data URL)
