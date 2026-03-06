@@ -3840,7 +3840,7 @@ services:
         # Step 6: Wait for API to be ready (Node backend can take 10+ min after containers start on slow VPS)
         plog("")
         plog("━━━ Step 6/7: Waiting for CloudTAK API ━━━")
-        plog("  Checking http://127.0.0.1:5000 — accept 200/401/403/404 or GET / 200")
+        plog("  Waiting for /api/connections (or GET /) — only 200/401/403/404 from /api counts as ready")
         import urllib.request as _urlreq
         import urllib.error as _urlerr
         api_ready = False
@@ -3877,10 +3877,8 @@ services:
                     plog(f"  Backend returned {code} (Node app may still be starting — we'll keep trying)")
             if not api_ready:
                 code_root = _check_url('http://127.0.0.1:5000/', 'root')
-                if code_root == 200:
-                    plog("✓ CloudTAK web server is up (GET / returned 200)")
-                    api_ready = True
-                    break
+                if code_root == 200 and attempt > 0 and (attempt * poll_interval) % 60 == 0:
+                    plog("  (GET / returns 200 but /api not ready yet — waiting for Node app)")
                 if code_root in (502, 503) and not _step6_logged_502[0]:
                     _step6_logged_502[0] = True
                     plog(f"  Backend returned {code_root} (Node app may still be starting — we'll keep trying)")
@@ -3906,8 +3904,6 @@ services:
         ok_count = 0
         for round_ in range(5):
             code_again = _check_url('http://127.0.0.1:5000/api/connections', 'api/connections')
-            if code_again is None:
-                code_again = _check_url('http://127.0.0.1:5000/', 'root')
             if code_again in (200, 401, 403, 404):
                 ok_count += 1
                 plog(f"  Check {ok_count}/{needed_ok} OK")
