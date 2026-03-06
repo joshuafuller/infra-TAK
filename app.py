@@ -5193,6 +5193,41 @@ def _ensure_proxy_providers_cookie_domain(ak_url, ak_headers, fqdn, plog=None):
         _log(f"  ⚠ Proxy cookie_domain: {str(e)[:80]}")
 
 
+def _sync_authentik_provider_external_hosts(ak_url, ak_headers, fqdn, correct_authentik_base_url, plog=None):
+    """Update any proxy provider whose external_host is authentik.<fqdn> to the correct Authentik URL (e.g. tak.<fqdn>).
+    Fixes redirect-to-authentik subdomain when Caddy/default uses tak.<fqdn> but a provider was set to authentik.<fqdn>."""
+    if not fqdn or not correct_authentik_base_url:
+        return
+    import urllib.request as _req
+    import urllib.error
+    base = fqdn.split(':')[0].split('/')[0]
+    wrong_prefix = f'https://authentik.{base}'
+    wrong_prefix_http = f'http://authentik.{base}'
+    _log = plog or (lambda m: None)
+    try:
+        r = _req.Request(f'{ak_url}/api/v3/providers/proxy/?page_size=100', headers=ak_headers)
+        data = json.loads(_req.urlopen(r, timeout=15).read().decode())
+        updated = 0
+        for prov in data.get('results', []):
+            pk = prov.get('pk')
+            ext = (prov.get('external_host') or '').strip().rstrip('/')
+            if not pk or not ext:
+                continue
+            if ext.startswith(wrong_prefix) or ext.startswith(wrong_prefix_http):
+                try:
+                    patch = _req.Request(f'{ak_url}/api/v3/providers/proxy/{pk}/',
+                        data=json.dumps({'external_host': correct_authentik_base_url}).encode(),
+                        headers=ak_headers, method='PATCH')
+                    _req.urlopen(patch, timeout=10)
+                    updated += 1
+                except urllib.error.HTTPError:
+                    pass
+        if updated:
+            _log(f"  ✓ Updated {updated} provider(s) from authentik.<fqdn> to {correct_authentik_base_url}")
+    except Exception as e:
+        _log(f"  ⚠ Sync Authentik provider URLs: {str(e)[:80]}")
+
+
 def _ensure_app_access_policies(ak_url, ak_headers, plog=None):
     """Restrict infra-TAK, Node-RED (and LDAP) to authentik Admins. TAK Portal and MediaMTX open to all authenticated users.
     Creates a 'Group membership: authentik Admins' policy and binds it only to admin-only apps. No binding on TAK Portal/MediaMTX = everyone sees them.
@@ -7773,6 +7808,7 @@ def run_authentik_deploy(reconfigure=False):
                                             data=json.dumps(put_payload).encode(), headers=ak_headers, method='PUT'), timeout=10)
                                         break
                                 plog("  \u2713 Authentik domain synced (env, compose, brand, outpost)")
+                                _sync_authentik_provider_external_hosts(ak_url, ak_headers, fqdn, ak_base, plog)
                                 subprocess.run(f'cd {ak_dir} && docker compose up -d --force-recreate ldap 2>&1', shell=True, capture_output=True, text=True, timeout=60)
                                 subprocess.run(f'cd {ak_dir} && docker compose restart server worker 2>&1', shell=True, capture_output=True, text=True, timeout=90)
                                 plog("  \u2713 Restarted Authentik (LDAP + server/worker to pick up new domain)")
