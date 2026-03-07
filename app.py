@@ -1499,6 +1499,27 @@ def _guarddog_service_monitor_ids(settings):
     }
 
 
+def _guarddog_monitored_service_ids(settings):
+    """Return service IDs that Guard Dog should currently include in health rollups."""
+    modules = detect_modules()
+    tak_cfg = _get_tak_deployment_config(settings)
+    is_two_server = tak_cfg.get('mode') == 'two_server'
+    s1_host = (tak_cfg.get('server_one', {}).get('host') or '').strip() if is_two_server else ''
+
+    ids = ['takserver']
+    if is_two_server and s1_host:
+        ids.append('remotedb')
+    if modules.get('authentik', {}).get('installed'):
+        ids.append('authentik')
+    if modules.get('mediamtx', {}).get('installed'):
+        ids.append('mediamtx')
+    if modules.get('nodered', {}).get('installed'):
+        ids.append('nodered')
+    if modules.get('cloudtak', {}).get('installed'):
+        ids.append('cloudtak')
+    return ids
+
+
 @app.route('/api/guarddog/health')
 @login_required
 def guarddog_health_api():
@@ -1506,7 +1527,7 @@ def guarddog_health_api():
     settings = load_settings()
     result = {}
     multi = _guarddog_service_monitor_ids(settings)
-    for sid in ('takserver', 'authentik', 'mediamtx', 'nodered', 'cloudtak', 'remotedb'):
+    for sid in _guarddog_monitored_service_ids(settings):
         monitor_ids = multi.get(sid)
         if monitor_ids:
             # Multi-monitor service: compute ok / caution / fail from sub-monitors
@@ -1556,7 +1577,7 @@ def _compute_guarddog_overall():
     settings = load_settings()
     multi = _guarddog_service_monitor_ids(settings)
     result = {}
-    for sid in ('takserver', 'authentik', 'mediamtx', 'nodered', 'cloudtak', 'remotedb'):
+    for sid in _guarddog_monitored_service_ids(settings):
         monitor_ids = multi.get(sid)
         if monitor_ids:
             vals = []
