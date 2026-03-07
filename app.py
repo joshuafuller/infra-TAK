@@ -697,7 +697,7 @@ def takserver_two_server_install_ssh_key():
             return jsonify({'success': False, 'error': err}), 400
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)[:400]}), 400
-    return jsonify({'success': True, 'message': 'Key installed on Server One. Next: 4. Deploy Server One (DB).'})
+    return jsonify({'success': True, 'message': 'Key installed on Server One. Next: 4. Run Preflight.'})
 
 
 def _resolve_core_ip(settings, cfg):
@@ -872,7 +872,7 @@ def takserver_two_server_open_db_firewall():
 
     if not ok:
         return jsonify({'success': False, 'error': log[-1] if log else 'Setup failed on Server One', 'log': log}), 400
-    return jsonify({'success': True, 'message': f'Server One ready: PostgreSQL listening, UFW open for {core_ip} → port {db_port}. Next: 5. Run Preflight.', 'log': log})
+    return jsonify({'success': True, 'message': f'Server One ready: PostgreSQL listening, UFW open for {core_ip} → port {db_port}. Next: 6. Deploy Server Two (Core), then fill out certs and hit Deploy TAK Server.', 'log': log})
 
 
 @app.route('/api/takserver/two-server/runbook', methods=['GET'])
@@ -971,7 +971,7 @@ def takserver_two_server_deploy_server_one():
 
     if not ok:
         return jsonify({'success': False, 'error': log[-1] if log else 'Deploy failed on Server One', 'log': log}), 400
-    return jsonify({'success': True, 'message': 'Server One (Database) deploy complete. Next: 5. Run Preflight, then 6. Deploy Server Two.', 'log': log})
+    return jsonify({'success': True, 'message': 'Server One (Database) deploy complete. Next: 6. Deploy Server Two (Core), then fill out certs and hit Deploy TAK Server.', 'log': log})
 
 
 @app.route('/api/takserver/two-server/deploy-server-two', methods=['POST'])
