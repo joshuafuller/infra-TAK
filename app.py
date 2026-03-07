@@ -730,7 +730,22 @@ def takserver_two_server_open_db_firewall():
     ok, out = _ssh_probe(s1, cmd, timeout=25)
     if not ok:
         return jsonify({'success': False, 'error': out or 'UFW command failed on Server One'}), 400
-    return jsonify({'success': True, 'message': f'Firewall on Server One updated: allowed {server_two_ip} → port {db_port}. Run Preflight again.'})
+    # Configure PostgreSQL to listen on all interfaces and allow Core server IP (required for two-server).
+    esc = r'\x27'  # literal \x27 for bash $'...' (single quote)
+    pg_fix = (
+        f'PG_MAIN=$(find /etc/postgresql -type d -name main 2>/dev/null | head -1); '
+        '[ -z "$PG_MAIN" ] && PG_MAIN=/etc/postgresql/15/main; '
+        f'if [ -f "$PG_MAIN/postgresql.conf" ]; then '
+        f"sudo sed -i $'s/^#*listen_addresses.*/listen_addresses = {esc}*{esc}/' \"$PG_MAIN/postgresql.conf\"; "
+        f'grep -q "{server_two_ip}/32" "$PG_MAIN/pg_hba.conf" 2>/dev/null || '
+        f'echo "host cot all {server_two_ip}/32 scram-sha-256" | sudo tee -a "$PG_MAIN/pg_hba.conf"; '
+        'sudo systemctl restart postgresql 2>/dev/null || sudo systemctl restart postgresql-15 2>/dev/null || true; '
+        'fi'
+    )
+    ok2, out2 = _ssh_probe(s1, pg_fix, timeout=30)
+    if not ok2:
+        return jsonify({'success': False, 'error': out2 or 'PostgreSQL config failed on Server One (UFW was applied). Fix PG manually and run Preflight.'}), 400
+    return jsonify({'success': True, 'message': f'Firewall and PostgreSQL on Server One updated: allowed {server_two_ip} → port {db_port}. Run Preflight again.'})
 
 
 @app.route('/api/takserver/two-server/runbook', methods=['GET'])
@@ -822,7 +837,7 @@ def takserver_two_server_deploy_server_one():
         except Exception:
             pass
         if not core_ip:
-            core_ip = 'REDACTED-HOST'
+            return jsonify({'success': False, 'error': 'Server Two (Core) IP unknown. Set Server IP in Settings or ensure this host can reach ifconfig.me.'}), 400
     log = []
     ok, out = _scp_to_host(s1, local_deb, '/tmp/', timeout=300)
     if not ok:
@@ -843,6 +858,23 @@ def takserver_two_server_deploy_server_one():
     log.append(out or '')
     if not ok:
         return jsonify({'success': False, 'error': out or 'Install failed on Server One', 'log': log}), 400
+    # Configure PostgreSQL to listen on all interfaces and allow Core server IP.
+    esc = r'\x27'
+    pg_fix = (
+        f'PG_MAIN=$(find /etc/postgresql -type d -name main 2>/dev/null | head -1); '
+        '[ -z "$PG_MAIN" ] && PG_MAIN=/etc/postgresql/15/main; '
+        f'if [ -f "$PG_MAIN/postgresql.conf" ]; then '
+        f"sudo sed -i $'s/^#*listen_addresses.*/listen_addresses = {esc}*{esc}/' \"$PG_MAIN/postgresql.conf\"; "
+        f'grep -q "{core_ip}/32" "$PG_MAIN/pg_hba.conf" 2>/dev/null || '
+        f'echo "host cot all {core_ip}/32 scram-sha-256" | sudo tee -a "$PG_MAIN/pg_hba.conf"; '
+        'sudo systemctl restart postgresql 2>/dev/null || sudo systemctl restart postgresql-15 2>/dev/null || true; '
+        'fi'
+    )
+    ok2, out2 = _ssh_probe(s1, pg_fix, timeout=30)
+    if not ok2:
+        log.append(out2 or '')
+        return jsonify({'success': False, 'error': 'PostgreSQL config failed on Server One (install and UFW applied). Fix PG manually.', 'log': log}), 400
+    log.append('PostgreSQL configured for remote access.')
     return jsonify({'success': True, 'message': 'Server One (Database) deploy complete. Run Preflight, then Deploy to Server Two.', 'log': log})
 
 
