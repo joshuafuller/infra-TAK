@@ -1088,7 +1088,11 @@ def guarddog_js():
 
 @app.route('/takserver.js')
 def takserver_js():
-    return send_from_directory(os.path.join(BASE_DIR, 'static'), 'takserver.js', mimetype='application/javascript')
+    resp = send_from_directory(os.path.join(BASE_DIR, 'static'), 'takserver.js', mimetype='application/javascript')
+    resp.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    resp.headers['Pragma'] = 'no-cache'
+    resp.headers['Expires'] = '0'
+    return resp
 
 @app.route('/guarddog')
 @login_required
