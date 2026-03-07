@@ -758,7 +758,6 @@ function initTakDeployModeUI(rootEl){
       '<button type="button" onclick="deployTakServerOne()" style="padding:8px 14px;background:rgba(99,102,241,0.2);color:var(--indigo,#6366f1);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer">4. Deploy Server One (DB)</button>',
       '<button type="button" onclick="runTakTwoServerPreflight()" style="padding:8px 14px;background:rgba(14,116,144,0.2);color:var(--cyan);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer">5. Run Preflight</button>',
       '<button type="button" onclick="deployTakServerTwo()" style="padding:8px 14px;background:rgba(34,197,94,0.2);color:var(--green);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer">6. Deploy Server Two (Core)</button>',
-      '<button type="button" onclick="loadTakTwoServerRunbook()" style="padding:8px 14px;background:rgba(16,185,129,0.15);color:var(--green);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer">Generate Runbook</button>',
       '</div>',
       '<div id="two-server-msg" style="margin-top:10px;font-size:12px;color:var(--text-dim)"></div>',
       '<div id="two-server-preflight" style="display:none;margin-top:10px;background:#0c0f1a;border:1px solid var(--border);border-radius:8px;padding:12px;font-family:\'JetBrains Mono\',monospace;font-size:11px;white-space:pre-wrap"></div>',
@@ -1092,14 +1091,7 @@ async function loadTakTwoServerRunbook(){
 async function startDeploy(){
     var deploymentMode=getTakDeploymentMode();
     if(deploymentMode==='two_server'){
-      var pre=await runTakTwoServerPreflight(true);
-      if(!pre.success){
-        alert('Two-server preflight failed. Fix the failing checks in the Split Server panel first.');
-        return;
-      }
-      await loadTakTwoServerRunbook();
-      alert('Two-server mode is configured and preflight passed. Use the generated runbook to apply Server One (Database Server) then Server Two (Core Server). One-click split deploy will be added in a later update.');
-      return;
+      if(!confirm('Two-server mode: This will generate certificates, configure auth, and finish the TAK Server setup on this host (Server Two). Make sure steps 1-6 are complete. Continue?'))return;
     }
     const rf=[{id:'cert_country',l:'Country'},{id:'cert_state',l:'State'},{id:'cert_city',l:'City'},{id:'cert_org',l:'Organization'},{id:'cert_ou',l:'Org Unit'},{id:'root_ca_name',l:'Root CA'},{id:'intermediate_ca_name',l:'Intermediate CA'}];
     const empty=rf.filter(f=>!document.getElementById(f.id).value.trim());

@@ -1059,7 +1059,7 @@ def takserver_two_server_deploy_server_two():
             log.append(f'CoreConfig updated: DB→{db_host}:{db_port}, takserver restarted.')
         except Exception as e:
             return jsonify({'success': False, 'error': f'CoreConfig update failed: {e}', 'log': log}), 400
-    return jsonify({'success': True, 'message': 'Server Two (Core) deploy complete. Two-server TAK is up.', 'log': log})
+    return jsonify({'success': True, 'message': 'Server Two (Core) pre-staged. Next: fill out Certificate Information and hit Deploy TAK Server to generate certs, configure auth, and finish setup.', 'log': log})
 
 
 @app.route('/mediamtx')
@@ -11912,14 +11912,19 @@ def deploy_takserver():
     settings = load_settings()
     tak_deploy_cfg = _get_tak_deployment_config(settings)
     requested_mode = (data.get('deployment_mode') or tak_deploy_cfg.get('mode') or 'single_server').strip().lower()
-    if requested_mode == 'two_server':
-        return jsonify({
-            'error': 'Two-server TAK deploy is preflight/config-ready but not yet one-click automated in this build. Save config via /api/takserver/deployment-config and run /api/takserver/two-server/preflight, then follow the two-server runbook.'
-        }), 400
+    is_two_server = requested_mode == 'two_server'
     pkg_files = [f for f in os.listdir(UPLOAD_DIR) if f.endswith('.deb') or f.endswith('.rpm')]
     if not pkg_files: return jsonify({'error': 'No package file found.'}), 400
+    # For two-server, prefer the core .deb (database is on Server One)
+    if is_two_server:
+        core_pkg = next((f for f in pkg_files if 'core' in f.lower()), pkg_files[0])
+        selected_pkg = core_pkg
+    else:
+        selected_pkg = pkg_files[0]
     config = {
-        'package_path': os.path.join(UPLOAD_DIR, pkg_files[0]),
+        'package_path': os.path.join(UPLOAD_DIR, selected_pkg),
+        'two_server': is_two_server,
+        'tak_deploy_cfg': tak_deploy_cfg if is_two_server else None,
         'cert_country': data.get('cert_country', 'US'), 'cert_state': data.get('cert_state', 'CA'),
         'cert_city': data.get('cert_city', ''), 'cert_org': data.get('cert_org', ''),
         'cert_ou': data.get('cert_ou', ''), 'root_ca_name': data.get('root_ca_name', 'ROOT-CA-01'),
@@ -12037,27 +12042,26 @@ def run_takserver_deploy(config):
             log_step("No GPG key/policy — skipping verification")
 
         log_step(""); log_step("━━━ Step 4/9: Installing TAK Server ━━━")
-        settings = load_settings()
-        if settings.get('pkg_mgr', 'apt') == 'apt':
-            wait_for_apt_lock(log_step, deploy_log)
-        log_step(f"Installing {pkg_name}...")
-        # Primary: apt-get install handles dependencies automatically
-        r1 = run_cmd(f'DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y {pkg} 2>&1', check=False)
-        if not r1:
-            # Fallback: dpkg + fix-broken (proven chain from Ubuntu script)
-            log_step("  apt-get failed, trying dpkg + dependency fix...")
-            run_cmd(f'DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l dpkg -i {pkg} 2>&1', check=False)
-            run_cmd('DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -f -y 2>&1', "  Resolving dependencies...", check=False)
-        # PostgreSQL cluster check (from proven script - sometimes cluster isn't created)
-        pg_check = subprocess.run('pg_lsclusters 2>/dev/null | grep -q "15"', shell=True, capture_output=True)
-        if pg_check.returncode != 0:
-            log_step("  Creating PostgreSQL 15 cluster...")
-            run_cmd('pg_createcluster 15 main --start 2>&1', check=False)
-        # dpkg --configure if partially installed (from proven script)
-        run_cmd('dpkg --configure -a 2>&1', check=False, quiet=True)
-        if not os.path.exists('/opt/tak'):
-            log_step("✗ FATAL: /opt/tak not found after install"); deploy_status.update({'error': True, 'running': False}); return
-        log_step("✓ TAK Server installed")
+        if config.get('two_server') and os.path.exists('/opt/tak'):
+            log_step("✓ TAK Server core already installed (two-server step 6) — skipping")
+        else:
+            settings = load_settings()
+            if settings.get('pkg_mgr', 'apt') == 'apt':
+                wait_for_apt_lock(log_step, deploy_log)
+            log_step(f"Installing {pkg_name}...")
+            r1 = run_cmd(f'DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y {pkg} 2>&1', check=False)
+            if not r1:
+                log_step("  apt-get failed, trying dpkg + dependency fix...")
+                run_cmd(f'DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l dpkg -i {pkg} 2>&1', check=False)
+                run_cmd('DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -f -y 2>&1', "  Resolving dependencies...", check=False)
+            pg_check = subprocess.run('pg_lsclusters 2>/dev/null | grep -q "15"', shell=True, capture_output=True)
+            if pg_check.returncode != 0:
+                log_step("  Creating PostgreSQL 15 cluster...")
+                run_cmd('pg_createcluster 15 main --start 2>&1', check=False)
+            run_cmd('dpkg --configure -a 2>&1', check=False, quiet=True)
+            if not os.path.exists('/opt/tak'):
+                log_step("✗ FATAL: /opt/tak not found after install"); deploy_status.update({'error': True, 'running': False}); return
+            log_step("✓ TAK Server installed")
 
         log_step(""); log_step("━━━ Step 5/9: Starting TAK Server ━━━")
         run_cmd('systemctl daemon-reload')
@@ -12130,6 +12134,29 @@ def run_takserver_deploy(config):
         if config.get('enable_admin_ui') or config.get('enable_webtak') or config.get('enable_nonadmin_ui'):
             log_step(f"WebTAK: AdminUI={admin_ui}, WebTAK={webtak}, NonAdminUI={nonadmin}")
             run_cmd(f'sed -i \'s|"cert_https"/|"cert_https" enableAdminUI="{admin_ui}" enableWebtak="{webtak}" enableNonAdminUI="{nonadmin}"/|g\' /opt/tak/CoreConfig.xml')
+        # For two-server: ensure JDBC URL still points to Server One (reinstall may have reset it)
+        import re
+        if config.get('two_server') and config.get('tak_deploy_cfg'):
+            tc = config['tak_deploy_cfg']
+            s1_host = (tc.get('server_one', {}).get('host') or '').strip()
+            db_port = int(tc.get('database', {}).get('port') or 5432)
+            db_pass = (tc.get('database', {}).get('password') or '').strip()
+            if s1_host:
+                jdbc_url = f'jdbc:postgresql://{s1_host}:{db_port}/cot'
+                log_step(f"Two-server: ensuring JDBC points to {s1_host}:{db_port}...")
+                try:
+                    r = subprocess.run(['cat', '/opt/tak/CoreConfig.xml'], capture_output=True, text=True, timeout=5)
+                    cc = r.stdout or ''
+                    if 'jdbc:postgresql://127.0.0.1' in cc or s1_host not in cc:
+                        cc = re.sub(r'jdbc:postgresql://[^"]*', jdbc_url, cc)
+                        if db_pass:
+                            cc = re.sub(r'(<connection[^>]*password=")[^"]*(")', lambda m: m.group(1) + db_pass + m.group(2), cc)
+                        subprocess.run(['tee', '/opt/tak/CoreConfig.xml'], input=cc, capture_output=True, text=True, timeout=5)
+                        log_step(f"✓ JDBC URL restored to {jdbc_url}")
+                    else:
+                        log_step(f"✓ JDBC URL already points to {s1_host}")
+                except Exception as e:
+                    log_step(f"⚠ Could not verify JDBC URL: {e}")
         log_step("✓ CoreConfig.xml configured")
         log_step("Final restart...")
         run_cmd('systemctl stop takserver'); time.sleep(10)
