@@ -638,6 +638,12 @@ def takserver_two_server_ensure_ssh_key():
             fingerprint = (r.stdout or '').strip() if r.returncode == 0 else ''
         except Exception:
             fingerprint = ''
+        # Persist key path so Guard Dog and TAK Server UI have it without user typing it
+        if cfg.get('server_one', {}).get('ssh_key_path') != key_path:
+            cfg['server_one'] = cfg.get('server_one') or {}
+            cfg['server_one']['ssh_key_path'] = key_path
+            settings['tak_deployment'] = cfg
+            save_settings(settings)
         return jsonify({
             'success': True,
             'key_path': key_path,
@@ -666,6 +672,11 @@ def takserver_two_server_ensure_ssh_key():
         fingerprint = (r.stdout or '').strip() if r.returncode == 0 else ''
     except Exception:
         fingerprint = ''
+    # Persist key path so Guard Dog and TAK Server UI have it without user typing it
+    cfg['server_one'] = cfg.get('server_one') or {}
+    cfg['server_one']['ssh_key_path'] = key_path
+    settings['tak_deployment'] = cfg
+    save_settings(settings)
     return jsonify({
         'success': True,
         'key_path': key_path,
@@ -1357,6 +1368,23 @@ def _deploy_health_agent_to_server_one(s1_cfg):
     return True, 'Health agent deployed (port 8080/health for Guard Dog).'
 
 
+def _find_ssh_key_for_server_one(s1_cfg):
+    """Return path to a usable SSH private key: from config if set and exists, else first of default paths that exists."""
+    p = (s1_cfg.get('ssh_key_path') or '').strip()
+    if p:
+        expanded = os.path.expanduser(p)
+        if os.path.exists(expanded):
+            return expanded
+    for candidate in [
+        os.path.expanduser('~/.ssh/id_rsa'),
+        os.path.expanduser('~/.ssh/id_ed25519'),
+        os.path.expanduser('~/.ssh/infra-tak-server-one'),
+    ]:
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
 @app.route('/api/guarddog/deploy-health-agent', methods=['POST'])
 @login_required
 def guarddog_deploy_health_agent_api():
@@ -1368,10 +1396,17 @@ def guarddog_deploy_health_agent_api():
     s1_host = (tak_cfg.get('server_one', {}).get('host') or '').strip()
     if not s1_host:
         return jsonify({'success': False, 'error': 'Server One host not set in TAK deployment'}), 400
-    s1_cfg = tak_cfg.get('server_one', {})
-    ssh_key_path = (s1_cfg.get('ssh_key_path') or '').strip()
-    if not ssh_key_path or not os.path.exists(os.path.expanduser(ssh_key_path)):
-        return jsonify({'success': False, 'error': 'SSH key to Server One not found. Set it in TAK Server deployment and run steps 2–3.'}), 400
+    s1_cfg = dict(tak_cfg.get('server_one', {}))
+    key_path = _find_ssh_key_for_server_one(s1_cfg)
+    if not key_path:
+        return jsonify({'success': False, 'error': 'No SSH key found. In TAK Server run step 2 (Setup SSH key) and step 3 (Copy key to Server One), then try again.'}), 400
+    s1_cfg['ssh_key_path'] = key_path
+    # Persist so TAK Server page shows it and future deploy-health-agent calls don't need to search
+    if tak_cfg.get('server_one', {}).get('ssh_key_path') != key_path:
+        tak_cfg['server_one'] = dict(tak_cfg.get('server_one', {}))
+        tak_cfg['server_one']['ssh_key_path'] = key_path
+        settings['tak_deployment'] = tak_cfg
+        save_settings(settings)
     ok, msg = _deploy_health_agent_to_server_one(s1_cfg)
     if not ok:
         return jsonify({'success': False, 'error': msg}), 400
@@ -1450,15 +1485,49 @@ def _guarddog_health_check(service_id):
         return False
     return False
 
+# Monitor IDs per service for overall status (ok / caution / fail). Services with multiple monitors get caution when some are down.
+def _guarddog_service_monitor_ids(settings):
+    tak_cfg = _get_tak_deployment_config(settings)
+    is_two_server = tak_cfg.get('mode') == 'two_server'
+    takserver_ids = ['port8089', 'process', 'network']
+    if not is_two_server:
+        takserver_ids.extend(['postgresql', 'cotdb'])
+    takserver_ids.extend(['oom', 'disk', 'cert', 'intca'])
+    return {
+        'takserver': takserver_ids,
+        'remotedb': ['remotedb_tcp', 'remotedb_agent'],
+    }
+
+
 @app.route('/api/guarddog/health')
 @login_required
 def guarddog_health_api():
-    """Return health status per service (for UI). Only includes services that Guard Dog can monitor."""
+    """Return health status per service: 'ok', 'fail', or 'caution' (some checks down). Only includes services Guard Dog can monitor."""
+    settings = load_settings()
     result = {}
+    multi = _guarddog_service_monitor_ids(settings)
     for sid in ('takserver', 'authentik', 'mediamtx', 'nodered', 'cloudtak', 'remotedb'):
-        val = _guarddog_health_check(sid)
-        if val is not None:
-            result[sid] = val
+        monitor_ids = multi.get(sid)
+        if monitor_ids:
+            # Multi-monitor service: compute ok / caution / fail from sub-monitors
+            vals = []
+            for mid in monitor_ids:
+                v = _monitor_health_check(mid)
+                if v is not None:
+                    vals.append(v)
+            if not vals:
+                continue
+            if all(vals):
+                result[sid] = 'ok'
+            elif not any(vals):
+                result[sid] = 'fail'
+            else:
+                result[sid] = 'caution'
+        else:
+            # Single-check service
+            val = _guarddog_health_check(sid)
+            if val is not None:
+                result[sid] = 'ok' if val else 'fail'
     return jsonify(result)
 
 def _monitor_health_check(monitor_id):
@@ -6885,6 +6954,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 .guard-service-header:hover{background:rgba(255,255,255,.04)}
 .guard-service-health{width:8px;height:8px;border-radius:50%;flex-shrink:0}
 .guard-service-health.ok{background:var(--green)}
+.guard-service-health.caution{background:var(--yellow)}
 .guard-service-health.fail{background:var(--red)}
 .guard-service-health.pending{background:var(--text-dim)}
 .guard-monitor-health{display:inline-block;width:7px;min-width:7px;height:7px;border-radius:50%;flex-shrink:0;margin-top:5px}
