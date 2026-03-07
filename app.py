@@ -756,7 +756,14 @@ def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
         ok, out = _ssh_probe(s1, install_cmd, timeout=600)
         log.append(out or '')
         if not ok:
-            return False, log, ''
+            # TAK SchemaManager may exit non-zero on fresh install (WARN about CoreConfig.xml).
+            # Verify PostgreSQL is actually running and the cot database exists before giving up.
+            verify_cmd = 'sudo -u postgres psql -lqt 2>/dev/null | grep -q cot && systemctl is-active postgresql >/dev/null 2>&1 && echo PG_OK'
+            vok, vout = _ssh_probe(s1, verify_cmd, timeout=10)
+            if not (vok and 'PG_OK' in (vout or '')):
+                log.append('Install failed and PostgreSQL/cot database not found.')
+                return False, log, ''
+            log.append('Install had warnings but PostgreSQL is running and cot database exists.')
         log.append('TAK database package installed.')
     else:
         # No .deb provided — check if PG is already installed, if not install vanilla PG
@@ -788,7 +795,7 @@ def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
         "sudo sed -i '/^\\s*#*\\s*listen_addresses\\s*=/d' \"$PG_MAIN/postgresql.conf\" && "
         "printf \"listen_addresses = '*'\\n\" | sudo tee -a \"$PG_MAIN/postgresql.conf\" > /dev/null && "
         f'(grep -q "{core_ip}/32" "$PG_MAIN/pg_hba.conf" 2>/dev/null || '
-        f'echo "host    all    all    {core_ip}/32    md5" | sudo tee -a "$PG_MAIN/pg_hba.conf" > /dev/null) && '
+        f'echo "host    all    all    {core_ip}/32    scram-sha-256" | sudo tee -a "$PG_MAIN/pg_hba.conf" > /dev/null) && '
         '(sudo systemctl restart postgresql 2>/dev/null || sudo systemctl restart postgresql-15 2>/dev/null || true)'
     )
     ok, out = _ssh_probe(s1, pg_config_cmd, timeout=30)
