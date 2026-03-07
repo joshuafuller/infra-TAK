@@ -11866,13 +11866,39 @@ def takserver_services():
         for svc in seen.values():
             del svc['mem_mb_raw']
             services.append(svc)
-        # Check PostgreSQL
-        pg = subprocess.run("systemctl is-active postgresql", shell=True, capture_output=True, text=True, timeout=5)
-        services.append({
-            'name': 'PostgreSQL', 'icon': '🐘', 'pid': '',
-            'cpu': '', 'mem_mb': '', 'mem_pct': '',
-            'status': 'running' if pg.stdout.strip() == 'active' else 'stopped'
-        })
+        # Check PostgreSQL — remote for two-server, local otherwise
+        settings = load_settings()
+        tak_cfg = _get_tak_deployment_config(settings)
+        if tak_cfg.get('mode') == 'two_server':
+            s1 = tak_cfg.get('server_one', {})
+            s1_host = (s1.get('host') or '').strip()
+            if s1_host:
+                import socket
+                db_port = int(tak_cfg.get('database', {}).get('port') or 5432)
+                try:
+                    s = socket.create_connection((s1_host, db_port), timeout=5)
+                    s.close()
+                    pg_status = 'running'
+                except Exception:
+                    pg_status = 'stopped'
+                services.append({
+                    'name': f'PostgreSQL ({s1_host})', 'icon': '🐘', 'pid': '',
+                    'cpu': '', 'mem_mb': '', 'mem_pct': '',
+                    'status': pg_status
+                })
+            else:
+                services.append({
+                    'name': 'PostgreSQL (remote)', 'icon': '🐘', 'pid': '',
+                    'cpu': '', 'mem_mb': '', 'mem_pct': '',
+                    'status': 'stopped'
+                })
+        else:
+            pg = subprocess.run("systemctl is-active postgresql", shell=True, capture_output=True, text=True, timeout=5)
+            services.append({
+                'name': 'PostgreSQL', 'icon': '🐘', 'pid': '',
+                'cpu': '', 'mem_mb': '', 'mem_pct': '',
+                'status': 'running' if pg.stdout.strip() == 'active' else 'stopped'
+            })
     except Exception as e:
         services.append({'name': 'Error', 'icon': '❌', 'status': str(e)})
     return jsonify({'services': services, 'count': len([s for s in services if s['status'] == 'running'])})
