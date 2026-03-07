@@ -769,8 +769,8 @@ function initTakDeployModeUI(rootEl){
       '<div class="form-field"><label>DB Name</label><input type="text" id="ts_db_name" value="cot"></div>',
       '<div class="form-field"><label>DB User</label><input type="text" id="ts_db_user" value="martiuser"></div>',
       '</div>',
-      '<div class="form-field" style="margin-top:10px"><label>DB password (from Server One)</label><input type="password" id="ts_db_password" placeholder="Paste after installing Server One (or leave blank if SSH captured it)" autocomplete="off" style="width:100%;padding:8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px"></div>',
-      '<div style="font-size:11px;color:var(--text-dim);margin-top:4px">Set this before or after step 4. Required for CoreConfig on Server Two; save config then run step 5 / Deploy TAK Server.</div>',
+      '<div id="ts_db_password_row" style="margin-top:10px"><div class="form-field"><label>DB password (from Server One)</label><input type="password" id="ts_db_password" placeholder="Filled automatically when you run step 4" autocomplete="off" style="width:100%;padding:8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px"></div>',
+      '<div id="ts_db_password_hint" style="font-size:11px;color:var(--text-dim);margin-top:4px">Step 4 reads this from Server One over SSH when it deploys (same connection that installs the DB). You only need to paste here if step 4 failed to read it.</div></div>',
       '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px">',
       '<button type="button" onclick="saveTakDeploymentConfig()" style="padding:8px 14px;background:rgba(59,130,246,0.15);color:var(--accent);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer">1. Save Config</button>',
       '<button type="button" onclick="ensureTakSshKey()" style="padding:8px 14px;background:rgba(139,92,246,0.15);color:var(--purple, #a78bfa);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer">2. Setup SSH key</button>',
@@ -954,6 +954,8 @@ function populateTakDeploymentConfigForm(cfg){
     set('ts_db_name',cfg.database&&cfg.database.name);
     set('ts_db_user',cfg.database&&cfg.database.user);
     set('ts_db_password',cfg.database&&cfg.database.password);
+    var pwHint=document.getElementById('ts_db_password_hint');
+    if(pwHint){pwHint.textContent=(cfg.database&&cfg.database.password)?'✓ DB password saved (from step 4). Step 5 and Deploy TAK Server will use it.':'Step 4 reads this from Server One over SSH when it deploys. Paste here only if step 4 could not read it.';}
     toggleTwoServerAuthInputs('one');
     toggleTwoServerAuthInputs('two');
     toggleServerTwoLocal();
@@ -1062,7 +1064,12 @@ async function deployTakServerOne(){
       var r=await fetch('/api/takserver/two-server/deploy-server-one',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:cfg})});
       var d=await r.json();
       if(!d.success)throw new Error(d.error||'Deploy failed');
-      if(msg){msg.textContent='✓ '+(d.message||'Server One deploy complete');msg.style.color='var(--green)';}
+      if(d.db_password_captured){
+        if(msg){msg.textContent='✓ Server One ready. DB password captured automatically.';msg.style.color='var(--green)';}
+        loadTakDeploymentConfig();
+      }else{
+        if(msg){msg.textContent='✓ Server One ready. DB password was not captured — paste it in the field above and Save Config, then run step 5.';msg.style.color='var(--yellow)';}
+      }
       return d;
     }catch(e){
       if(msg){msg.textContent='✗ '+e.message;msg.style.color='var(--red)';}
@@ -1079,6 +1086,7 @@ async function deployTakServerTwo(){
       var d=await r.json();
       if(!d.success)throw new Error(d.error||'Deploy failed');
       if(msg){msg.textContent='✓ '+(d.message||'Server Two deploy complete');msg.style.color='var(--green)';}
+      loadTakDeploymentConfig();
       return d;
     }catch(e){
       if(msg){msg.textContent='✗ '+e.message;msg.style.color='var(--red)';}

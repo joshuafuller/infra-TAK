@@ -1032,7 +1032,12 @@ def takserver_two_server_deploy_server_one():
 
     if not ok:
         return jsonify({'success': False, 'error': log[-1] if log else 'Deploy failed on Server One', 'log': log}), 400
-    return jsonify({'success': True, 'message': 'Server One (Database) deploy complete. Next: 5. Deploy Server Two (Core), then fill out certs and hit Deploy TAK Server.', 'log': log})
+    return jsonify({
+        'success': True,
+        'message': 'Server One (Database) deploy complete. Next: 5. Deploy Server Two (Core), then fill out certs and hit Deploy TAK Server.',
+        'log': log,
+        'db_password_captured': bool(db_password),
+    })
 
 
 @app.route('/api/takserver/two-server/deploy-server-two', methods=['POST'])
@@ -1061,16 +1066,20 @@ def takserver_two_server_deploy_server_two():
         return jsonify({'success': False, 'error': f'Package not found: {core_pkg}'}), 400
     log = []
 
-    # If no DB password stored, try to fetch it from Server One now
+    # If no DB password stored, try to fetch it from Server One now (same SSH as step 4)
     if not db_password:
-        db_password, _ = _fetch_db_password_from_server_one(s1)
+        db_password, fetch_err = _fetch_db_password_from_server_one(s1)
         if db_password:
             cfg['database']['password'] = db_password
             settings['tak_deployment'] = cfg
             save_settings(settings)
             log.append('Fetched DB password from Server One.')
         else:
-            log.append('Warning: no DB password from Server One — CoreConfig may need manual password fix.')
+            return jsonify({
+                'success': False,
+                'error': 'DB password not set. Run steps 2–3 (Setup SSH key, Copy key to Server One), then step 4 (Deploy Server One) so we can capture it automatically. Or paste the password from Server One in the "DB password (from Server One)" field above and click Save Config.',
+                'detail': (fetch_err or '')[:200],
+            }), 400
 
     # Increase concurrent TCP connections per TAK guide
     try:
