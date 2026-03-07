@@ -870,7 +870,8 @@ def _fetch_db_password_from_server_one(s1_cfg):
         ok, out = _ssh_probe(s1_cfg, f"sudo cat {pw_file} 2>/dev/null", timeout=10)
         if not ok:
             if first_ssh_error is None:
-                first_ssh_error = (out or 'SSH failed').strip()[:200]
+                raw = (out or '').strip()[:200]
+                first_ssh_error = raw if raw else 'connection failed or no response (check key, host, and that Server One allows SSH from this host)'
             continue
         if not (out or '').strip():
             continue
@@ -1130,23 +1131,24 @@ def takserver_two_server_deploy_server_two():
 @app.route('/api/takserver/two-server/sync-db-password', methods=['POST'])
 @login_required
 def takserver_two_server_sync_db_password():
-    """Fetch DB password from Server One, patch CoreConfig.xml on this host, restart TAK Server. Fixes empty password / 8443 auth failure."""
+    """Patch CoreConfig.xml on this host with DB password and restart TAK Server. No SSH to Server One.
+    Password from: request body (paste in UI), else settings (saved from deploy). Fixes empty password / 8443 auth failure."""
     settings = load_settings()
     cfg = _get_tak_deployment_config(settings)
     if cfg.get('mode') != 'two_server':
         return jsonify({'success': False, 'error': 'Not in two-server mode'}), 400
-    s1 = cfg.get('server_one', {})
-    s1_host = (s1.get('host') or '').strip()
-    if not s1_host:
-        return jsonify({'success': False, 'error': 'Server One host not configured'}), 400
     if not os.path.exists('/opt/tak/CoreConfig.xml'):
         return jsonify({'success': False, 'error': 'TAK Server not installed (no CoreConfig.xml)'}), 400
 
-    db_pass, fetch_err = _fetch_db_password_from_server_one(s1)
+    data = request.get_json() or {}
+    db_pass = (data.get('password') or '').strip()
     if not db_pass:
-        msg = fetch_err or 'Could not read DB password from Server One.'
-        manual = " SSH to Server One, run: sudo sed -n 's/.*password=\"\\([^\"]*\\)\".*/\\1/p' /opt/tak/CoreConfig.example.xml | head -1 then on Server Two paste that password into CoreConfig (see docs HANDOFF Section 0 two-server)."
-        return jsonify({'success': False, 'error': msg + manual}), 400
+        db_pass = (cfg.get('database', {}).get('password') or '').strip()
+    if not db_pass:
+        return jsonify({
+            'success': False,
+            'error': 'No DB password provided. Paste the martiuser password from Server One in the "DB password" field (from /opt/tak/CoreConfig.example.xml on Server One), or add it in Settings → TAK deployment → Server One / Database.'
+        }), 400
 
     try:
         r = subprocess.run(['sudo', 'cat', '/opt/tak/CoreConfig.xml'], capture_output=True, text=True, timeout=5)
@@ -1164,7 +1166,7 @@ def takserver_two_server_sync_db_password():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)[:300]}), 500
 
-    return jsonify({'success': True, 'message': 'DB password synced from Server One and TAK Server restarted. Try 8443/8446 again in a minute.'})
+    return jsonify({'success': True, 'message': 'DB password updated and TAK Server restarted. Try 8443/8446 again in a minute.'})
 
 
 @app.route('/mediamtx')
@@ -13800,12 +13802,19 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div class="controls"><button class="control-btn btn-stop" onclick="cancelDeploy()">✗ Cancel</button></div>
 {% elif tak.installed and tak.running %}
 <div class="status-info"><div><div class="status-text" style="color:var(--green)">Running</div><div class="status-detail">TAK Server is active{% if tak_version %} · {{ tak_version }}{% endif %}</div><div id="cert-expiry-banner" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:4px"></div></div></div>
-<div class="controls" style="flex-basis:100%;display:flex;gap:10px;flex-wrap:wrap;padding-top:12px;border-top:1px solid var(--border);margin-top:16px"><button class="control-btn" onclick="takControl('restart')">↻ Restart</button>{% if two_server_mode %}<button class="control-btn" onclick="takControl('restart','database')" title="Restart PostgreSQL on Server One ({{ s1_host }})">↻ Restart DB ({{ s1_host }})</button><button class="control-btn" onclick="takControl('restart','both')" title="Restart both TAK Server and remote PostgreSQL">↻ Restart Both</button><button class="control-btn" onclick="syncTakDbPassword()" title="If 8443/8446 fail with DB auth: fetch password from Server One and patch CoreConfig">🔑 Sync DB password</button>{% endif %}<button class="control-btn" onclick="takUpdateConfig()" id="tak-update-config-btn">🔄 Update config</button><button class="control-btn btn-stop" onclick="takControl('stop')">■ Stop</button><button class="control-btn btn-stop" onclick="document.getElementById('tak-uninstall-modal').classList.add('open')">🗑 Remove</button></div>
+<div class="controls" style="flex-basis:100%;display:flex;gap:10px;flex-wrap:wrap;padding-top:12px;border-top:1px solid var(--border);margin-top:16px"><button class="control-btn" onclick="takControl('restart')">↻ Restart</button>{% if two_server_mode %}<button class="control-btn" onclick="takControl('restart','database')" title="Restart PostgreSQL on Server One ({{ s1_host }})">↻ Restart DB ({{ s1_host }})</button><button class="control-btn" onclick="takControl('restart','both')" title="Restart both TAK Server and remote PostgreSQL">↻ Restart Both</button><button class="control-btn" onclick="syncTakDbPassword()" title="Patch CoreConfig with DB password and restart (use field below or saved password)">🔑 Sync DB password</button>{% endif %}<button class="control-btn" onclick="takUpdateConfig()" id="tak-update-config-btn">🔄 Update config</button><button class="control-btn btn-stop" onclick="takControl('stop')">■ Stop</button><button class="control-btn btn-stop" onclick="document.getElementById('tak-uninstall-modal').classList.add('open')">🗑 Remove</button></div>
 {% elif tak.installed %}
 <div class="status-info"><div><div class="status-text" style="color:var(--red)">Stopped</div><div class="status-detail">TAK Server is installed but not running{% if tak_version %} · {{ tak_version }}{% endif %}</div><div id="cert-expiry-banner" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:4px"></div></div></div>
-<div class="controls" style="flex-basis:100%;display:flex;gap:10px;flex-wrap:wrap;padding-top:12px;border-top:1px solid var(--border);margin-top:16px"><button class="control-btn btn-start" onclick="takControl('start')">▶ Start</button>{% if two_server_mode %}<button class="control-btn btn-start" onclick="takControl('start','database')" title="Start PostgreSQL on Server One ({{ s1_host }})">▶ Start DB ({{ s1_host }})</button><button class="control-btn btn-start" onclick="takControl('start','both')" title="Start both TAK Server and remote PostgreSQL">▶ Start Both</button><button class="control-btn" onclick="syncTakDbPassword()" title="Fetch DB password from Server One and patch CoreConfig">🔑 Sync DB password</button>{% endif %}<button class="control-btn" onclick="takUpdateConfig()" id="tak-update-config-btn">🔄 Update config</button><button class="control-btn btn-stop" onclick="document.getElementById('tak-uninstall-modal').classList.add('open')">🗑 Remove</button></div>
+<div class="controls" style="flex-basis:100%;display:flex;gap:10px;flex-wrap:wrap;padding-top:12px;border-top:1px solid var(--border);margin-top:16px"><button class="control-btn btn-start" onclick="takControl('start')">▶ Start</button>{% if two_server_mode %}<button class="control-btn btn-start" onclick="takControl('start','database')" title="Start PostgreSQL on Server One ({{ s1_host }})">▶ Start DB ({{ s1_host }})</button><button class="control-btn btn-start" onclick="takControl('start','both')" title="Start both TAK Server and remote PostgreSQL">▶ Start Both</button><button class="control-btn" onclick="syncTakDbPassword()" title="Patch CoreConfig with DB password and restart (use field below or saved password)">🔑 Sync DB password</button>{% endif %}<button class="control-btn" onclick="takUpdateConfig()" id="tak-update-config-btn">🔄 Update config</button><button class="control-btn btn-stop" onclick="document.getElementById('tak-uninstall-modal').classList.add('open')">🗑 Remove</button></div>
 {% else %}
 <div class="status-info"><div><div class="status-text" style="color:var(--text-dim)">Not Installed</div><div class="status-detail">Upload package files from tak.gov to deploy</div></div></div>
+{% endif %}
+{% if two_server_mode and tak.installed %}
+<div style="flex-basis:100%;margin-top:12px;padding-top:12px;border-top:1px solid var(--border);display:flex;align-items:center;flex-wrap:wrap;gap:8px">
+<label for="sync-db-password-input" style="font-size:12px;color:var(--text-secondary)">DB password (from Server One):</label>
+<input type="password" id="sync-db-password-input" placeholder="Paste or leave blank to use saved" autocomplete="off" style="width:200px;padding:6px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:'JetBrains Mono',monospace;font-size:12px" />
+<span style="font-size:11px;color:var(--text-dim)">Paste from Server One if 8443/8446 fail; leave blank to use saved.</span>
+</div>
 {% endif %}
 </div>
 

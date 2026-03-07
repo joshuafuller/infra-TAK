@@ -421,7 +421,9 @@ async function syncTakDbPassword(){
     var btns=document.querySelectorAll('.control-btn');
     btns.forEach(b=>{b.disabled=true;b.style.opacity='0.5'});
     try{
-        var r=await fetch('/api/takserver/two-server/sync-db-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
+        var pwEl=document.getElementById('sync-db-password-input');
+        var pw=(pwEl&&pwEl.value)?pwEl.value.trim():'';
+        var r=await fetch('/api/takserver/two-server/sync-db-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(pw?{password:pw}:{})});
         var d=await r.json();
         if(d.success){alert(d.message||'DB password synced. TAK Server restarting — try 8443/8446 in a minute.');window.location.reload();}
         else{alert(d.error||'Sync failed');btns.forEach(b=>{b.disabled=false;b.style.opacity='1'});}
