@@ -713,9 +713,6 @@ function initTakDeployModeUI(rootEl){
     var card=rootEl&&rootEl.querySelector('div[style*="background:var(--bg-card)"]');
     if(!card)return;
     var html=[
-      '<div id="tak-deploy-mode-panel" style="margin-bottom:20px;padding:16px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:10px">',
-      '<div id="dep_mode_hint" style="font-size:12px;color:var(--text-dim)">Deployment mode is set on the main page (One Server or Split Server).</div>',
-      '</div>',
       '<div id="two-server-config-panel" style="display:none;margin-bottom:20px;padding:16px;background:rgba(59,130,246,0.06);border:1px solid var(--border);border-radius:10px">',
       '<div style="font-family:\'JetBrains Mono\',monospace;font-size:13px;color:var(--text-dim);margin-bottom:12px;text-transform:uppercase;letter-spacing:1px;font-weight:600">Split Server Wizard (Manual Naming)</div>',
       '<div style="font-size:12px;color:var(--text-dim);margin-bottom:10px">Server One = Database Server. Server Two = Core Server.</div>',
