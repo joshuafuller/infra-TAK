@@ -730,6 +730,7 @@ def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
         'fuser /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || break; '
         'echo "Waiting for apt lock ($i)…"; sleep 5; done; '
         'sudo rm -f /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock 2>/dev/null; '
+        'dpkg -l takserver-database 2>/dev/null | grep -q "^..[rR]" && '
         'sudo dpkg --force-remove-reinstreq --remove takserver-database 2>/dev/null; '
         'sudo dpkg --configure -a 2>/dev/null; '
         'sudo apt-get -f install -y 2>/dev/null; true'
@@ -738,33 +739,39 @@ def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
 
     # Step 1: SCP and install the database .deb if provided
     if db_pkg_path and db_pkg_name:
-        ok, out = _scp_to_host(s1, db_pkg_path, '/tmp/', timeout=300)
-        if not ok:
-            return False, ['SCP failed: ' + (out or '')], ''
-        log.append('Copied database package to Server One /tmp/')
+        # Check if already installed and healthy before re-installing
+        already_ok = False
+        verify_cmd = 'sudo -u postgres psql -lqt 2>/dev/null | grep -q cot && systemctl is-active postgresql >/dev/null 2>&1 && echo PG_OK'
+        vok, vout = _ssh_probe(s1, verify_cmd, timeout=10)
+        if vok and 'PG_OK' in (vout or ''):
+            already_ok = True
+            log.append('PostgreSQL already running and cot database exists — skipping install.')
 
-        install_cmd = (
-            'cd /tmp && sudo apt-get update -qq && '
-            'sudo apt-get install -y lsb-release && '
-            'sudo mkdir -p /etc/apt/keyrings && '
-            'sudo curl -sL https://www.postgresql.org/media/keys/ACCC4CF8.asc --output /etc/apt/keyrings/postgresql.asc && '
-            'echo "deb [signed-by=/etc/apt/keyrings/postgresql.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" '
-            '| sudo tee /etc/apt/sources.list.d/postgresql.list >/dev/null && '
-            'sudo apt-get update -qq && '
-            f'sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ./{db_pkg_name}'
-        )
-        ok, out = _ssh_probe(s1, install_cmd, timeout=600)
-        log.append(out or '')
-        if not ok:
-            # TAK SchemaManager may exit non-zero on fresh install (WARN about CoreConfig.xml).
-            # Verify PostgreSQL is actually running and the cot database exists before giving up.
-            verify_cmd = 'sudo -u postgres psql -lqt 2>/dev/null | grep -q cot && systemctl is-active postgresql >/dev/null 2>&1 && echo PG_OK'
-            vok, vout = _ssh_probe(s1, verify_cmd, timeout=10)
-            if not (vok and 'PG_OK' in (vout or '')):
-                log.append('Install failed and PostgreSQL/cot database not found.')
-                return False, log, ''
-            log.append('Install had warnings but PostgreSQL is running and cot database exists.')
-        log.append('TAK database package installed.')
+        if not already_ok:
+            ok, out = _scp_to_host(s1, db_pkg_path, '/tmp/', timeout=300)
+            if not ok:
+                return False, ['SCP failed: ' + (out or '')], ''
+            log.append('Copied database package to Server One /tmp/')
+
+            install_cmd = (
+                'cd /tmp && sudo apt-get update -qq && '
+                'sudo apt-get install -y lsb-release && '
+                'sudo mkdir -p /etc/apt/keyrings && '
+                'sudo curl -sL https://www.postgresql.org/media/keys/ACCC4CF8.asc --output /etc/apt/keyrings/postgresql.asc && '
+                'echo "deb [signed-by=/etc/apt/keyrings/postgresql.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" '
+                '| sudo tee /etc/apt/sources.list.d/postgresql.list >/dev/null && '
+                'sudo apt-get update -qq && '
+                f'sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ./{db_pkg_name}'
+            )
+            ok, out = _ssh_probe(s1, install_cmd, timeout=600)
+            log.append(out or '')
+            if not ok:
+                vok, vout = _ssh_probe(s1, verify_cmd, timeout=10)
+                if not (vok and 'PG_OK' in (vout or '')):
+                    log.append('Install failed and PostgreSQL/cot database not found.')
+                    return False, log, ''
+                log.append('Install had warnings but PostgreSQL is running and cot database exists.')
+            log.append('TAK database package installed.')
     else:
         # No .deb provided — check if PG is already installed, if not install vanilla PG
         check_cmd = 'dpkg -l 2>/dev/null | grep -ci postgres'
