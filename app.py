@@ -1546,13 +1546,16 @@ def _guarddog_overall_from_result(result):
     return 'caution'
 
 
-@app.route('/api/guarddog/overall-health')
-@login_required
-def guarddog_overall_health_api():
-    """Overall Guard Dog health for Console card. Retries once on caution to avoid flaky single-check."""
+# Cache overall health so we don't re-run all checks every 8s from the Console.
+# The cache holds for 30s. On caution it holds for 10s so we re-check sooner.
+_guarddog_overall_cache = {'overall': 'ok', 'ts': 0}
+
+
+def _compute_guarddog_overall():
+    """Run all Guard Dog health checks and return overall status."""
     settings = load_settings()
-    result = {}
     multi = _guarddog_service_monitor_ids(settings)
+    result = {}
     for sid in ('takserver', 'authentik', 'mediamtx', 'nodered', 'cloudtak', 'remotedb'):
         monitor_ids = multi.get(sid)
         if monitor_ids:
@@ -1568,27 +1571,25 @@ def guarddog_overall_health_api():
             val = _guarddog_health_check(sid)
             if val is not None:
                 result[sid] = 'ok' if val else 'fail'
-    overall = _guarddog_overall_from_result(result)
-    if overall == 'caution':
-        time.sleep(2)
-        result2 = {}
-        for sid in ('takserver', 'authentik', 'mediamtx', 'nodered', 'cloudtak', 'remotedb'):
-            monitor_ids = multi.get(sid)
-            if monitor_ids:
-                vals = []
-                for mid in monitor_ids:
-                    v = _monitor_health_check(mid)
-                    if v is not None:
-                        vals.append(v)
-                if vals:
-                    result2[sid] = 'ok' if all(vals) else ('fail' if not any(vals) else 'caution')
-            else:
-                val = _guarddog_health_check(sid)
-                if val is not None:
-                    result2[sid] = 'ok' if val else 'fail'
-        overall2 = _guarddog_overall_from_result(result2)
-        if overall2 == 'ok':
-            overall = 'ok'
+    return _guarddog_overall_from_result(result)
+
+
+@app.route('/api/guarddog/overall-health')
+@login_required
+def guarddog_overall_health_api():
+    """Overall Guard Dog health for Console card. Cached to avoid re-running all checks on every request."""
+    now = time.time()
+    age = now - _guarddog_overall_cache['ts']
+    cached = _guarddog_overall_cache['overall']
+    ttl = 10 if cached == 'caution' else 30
+    if age < ttl:
+        from flask import make_response
+        r = make_response(jsonify({'overall': cached}))
+        r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
+        return r
+    overall = _compute_guarddog_overall()
+    _guarddog_overall_cache['overall'] = overall
+    _guarddog_overall_cache['ts'] = now
     from flask import make_response
     r = make_response(jsonify({'overall': overall}))
     r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
@@ -13850,19 +13851,22 @@ function refreshModuleCards(){
         if(mods.guarddog&&mods.guarddog.installed&&mods.guarddog.running) updateGuardDogOverallHealth();
     }).catch(function(){});
 }
+var _gdHealthCallCount=0;
 function updateGuardDogOverallHealth(){
     var el=document.getElementById('module-status-guarddog');
     if(!el)return;
-    if(!el.classList.contains('status-running')&&!el.classList.contains('status-caution')&&!el.classList.contains('status-critical')) return;
+    _gdHealthCallCount++;
     fetch('/api/guarddog/overall-health?_='+Date.now(),{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.json();}).then(function(d){
-        var overall=d.overall||'caution';
+        var overall=d.overall||'ok';
+        // Only show caution/critical after at least 2 successful checks (avoid cold-start false positive)
+        if(overall!=='ok'&&_gdHealthCallCount<3) return;
         var cls='module-status status-'+(overall==='ok'?'running':overall==='caution'?'caution':'critical');
         var label=overall==='ok'?'Healthy':overall==='caution'?'Caution':'Critical';
         el.className=cls; el.innerHTML='<span class="status-dot"></span> '+label;
     }).catch(function(){});
 }
 setInterval(refreshModuleCards,8000);
-refreshModuleCards();
+setTimeout(refreshModuleCards,3000);
 function refreshModuleVersions(){
     fetch('/api/modules/version').then(function(r){return r.json()}).then(function(data){
         for(var key in data){
