@@ -115,7 +115,10 @@ install_dependencies() {
             export DEBIAN_FRONTEND=noninteractive
             export NEEDRESTART_MODE=a
             apt-get update -qq > /dev/null 2>&1
-            apt-get install -y python3 python3-pip python3-venv openssl sshpass > /dev/null 2>&1
+            # Dpkg options avoid config prompts; NEEDRESTART_MODE=a avoids "Which services should be restarted?" dialog
+            NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get install -y \
+                -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" \
+                python3 python3-pip python3-venv openssl sshpass > /dev/null 2>&1
             ;;
         dnf)
             dnf install -y python3 python3-pip openssl sshpass > /dev/null 2>&1
