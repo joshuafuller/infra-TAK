@@ -851,14 +851,24 @@ def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
         return False, log, ''
     log.append(f'UFW: allowed {core_ip} → port {db_port}')
 
-    # Step 4: Read auto-generated DB password from CoreConfig.example.xml
-    pwd_cmd = "sudo sed -n 's/.*password=\"\\([^\"]*\\)\".*/\\1/p' /opt/tak/CoreConfig.example.xml 2>/dev/null | head -1"
-    ok, pwd_out = _ssh_probe(s1, pwd_cmd, timeout=10)
-    db_password = (pwd_out or '').strip() if ok else ''
-    if db_password:
-        log.append('Captured DB password from Server One.')
-    else:
-        log.append('Warning: could not read DB password from /opt/tak/CoreConfig.example.xml (may need manual entry).')
+    # Step 4: Read auto-generated DB password from Server One (try multiple sources)
+    db_password = ''
+    for pw_file in ('/opt/tak/CoreConfig.example.xml', '/opt/tak/CoreConfig.xml'):
+        pwd_cmd = f"sudo grep -oP 'password=\"\\K[^\"]+' {pw_file} 2>/dev/null | head -1"
+        ok, pwd_out = _ssh_probe(s1, pwd_cmd, timeout=10)
+        candidate = (pwd_out or '').strip() if ok else ''
+        if candidate:
+            db_password = candidate
+            log.append(f'Captured DB password from Server One ({pw_file}).')
+            break
+    if not db_password:
+        pwd_cmd = "sudo -u postgres psql -tAc \"SELECT rolpassword FROM pg_authid WHERE rolname='martiuser'\" 2>/dev/null | head -1"
+        ok, pwd_out = _ssh_probe(s1, pwd_cmd, timeout=10)
+        candidate = (pwd_out or '').strip() if ok else ''
+        if candidate:
+            log.append('Note: Found hashed PG password but not plaintext. Check /opt/tak/CoreConfig.example.xml on Server One manually.')
+        else:
+            log.append('Warning: could not read DB password from Server One — CoreConfig may need manual password fix.')
 
     return True, log, db_password
 
@@ -1028,9 +1038,12 @@ def takserver_two_server_deploy_server_two():
 
     # If no DB password stored, try to fetch it from Server One now
     if not db_password:
-        pwd_cmd = "sudo sed -n 's/.*password=\"\\([^\"]*\\)\".*/\\1/p' /opt/tak/CoreConfig.example.xml 2>/dev/null | head -1"
-        ok, pwd_out = _ssh_probe(s1, pwd_cmd, timeout=10)
-        db_password = (pwd_out or '').strip() if ok else ''
+        for pw_file in ('/opt/tak/CoreConfig.example.xml', '/opt/tak/CoreConfig.xml'):
+            pwd_cmd = f"sudo grep -oP 'password=\"\\K[^\"]+' {pw_file} 2>/dev/null | head -1"
+            ok, pwd_out = _ssh_probe(s1, pwd_cmd, timeout=10)
+            db_password = (pwd_out or '').strip() if ok else ''
+            if db_password:
+                break
         if db_password:
             cfg['database']['password'] = db_password
             settings['tak_deployment'] = cfg
@@ -1143,34 +1156,38 @@ def guarddog_page():
     tak = modules.get('takserver', {})
     relay = settings.get('email_relay', {})
     email_relay_configured = bool(relay.get('relay_host') and relay.get('smtp_user'))
-    guarddog_monitors_tak = [
-        {'name': 'Port 8089', 'interval': '1 min', 'desc': 'Checks that TAK Server port 8089 is listening and accepting connections. Auto-restarts TAK Server after 3 consecutive failures.'},
-        {'name': 'Process', 'interval': '1 min', 'desc': 'Verifies all 5 TAK Server Java processes (messaging, api, config, plugins, retention). Auto-restart after 3 consecutive failures.'},
-        {'name': 'Network', 'interval': '1 min', 'desc': 'Pings Cloudflare (1.1.1.1) and Google (8.8.8.8). Alerts only (no restart) after 3 failures — helps distinguish network issues from server issues.'},
-        {'name': 'PostgreSQL', 'interval': '5 min', 'desc': 'Checks that the PostgreSQL service is running. Attempts restart if down; sends alert.'},
-        {'name': 'CoT database size', 'interval': '6 hours', 'desc': 'CoT DB size. Alert at 25GB (warning) or 40GB (critical). Retention deletes rows; run VACUUM to reclaim disk. Alert email includes tips.'},
-        {'name': 'OOM', 'interval': '1 min', 'desc': 'Scans TAK Server logs for OutOfMemoryError. Auto-restarts TAK Server and sends alert when detected.'},
-        {'name': 'Disk', 'interval': '1 hour', 'desc': 'Checks root and TAK logs filesystem usage. Alert only when usage exceeds 80% (warning) or 90% (critical).'},
-        {'name': 'Certificate', 'interval': 'Daily', 'desc': 'Checks Let\'s Encrypt / TAK Server cert expiry. Alert when 40 days or less remaining until expiry.'},
-        {'name': 'Root CA / Intermediate CA', 'interval': 'Escalating', 'desc': 'Monitors Root CA and Intermediate CA certificate expiry. First alert at 90 days, then at 75, 60, 45, 30 days, then daily until expiry.'},
-    ]
-    # Per-service list for expandable UI. "monitored" = Guard Dog monitors this (installed when Guard Dog was deployed).
     tak_cfg = _get_tak_deployment_config(settings)
     is_two_server = tak_cfg.get('mode') == 'two_server'
     s1_host = (tak_cfg.get('server_one', {}).get('host') or '').strip() if is_two_server else ''
+    guarddog_monitors_tak = [
+        {'name': 'Port 8089', 'id': 'port8089', 'interval': '1 min', 'desc': 'Checks that TAK Server port 8089 is listening and accepting connections. Auto-restarts TAK Server after 3 consecutive failures.'},
+        {'name': 'Process', 'id': 'process', 'interval': '1 min', 'desc': 'Verifies all 5 TAK Server Java processes (messaging, api, config, plugins, retention). Auto-restart after 3 consecutive failures.'},
+        {'name': 'Network', 'id': 'network', 'interval': '1 min', 'desc': 'Pings Cloudflare (1.1.1.1) and Google (8.8.8.8). Alerts only (no restart) after 3 failures — helps distinguish network issues from server issues.'},
+    ]
+    if not is_two_server:
+        guarddog_monitors_tak.extend([
+            {'name': 'PostgreSQL', 'id': 'postgresql', 'interval': '5 min', 'desc': 'Checks that the PostgreSQL service is running. Attempts restart if down; sends alert.'},
+            {'name': 'CoT database size', 'id': 'cotdb', 'interval': '6 hours', 'desc': 'CoT DB size. Alert at 25GB (warning) or 40GB (critical). Retention deletes rows; run VACUUM to reclaim disk. Alert email includes tips.'},
+        ])
+    guarddog_monitors_tak.extend([
+        {'name': 'OOM', 'id': 'oom', 'interval': '1 min', 'desc': 'Scans TAK Server logs for OutOfMemoryError. Auto-restarts TAK Server and sends alert when detected.'},
+        {'name': 'Disk', 'id': 'disk', 'interval': '1 hour', 'desc': 'Checks root and TAK logs filesystem usage. Alert only when usage exceeds 80% (warning) or 90% (critical).'},
+        {'name': 'Certificate', 'id': 'cert', 'interval': 'Daily', 'desc': 'Checks Let\'s Encrypt / TAK Server cert expiry. Alert when 40 days or less remaining until expiry.'},
+        {'name': 'Root CA / Intermediate CA', 'id': 'intca', 'interval': 'Escalating', 'desc': 'Monitors Root CA and Intermediate CA certificate expiry. First alert at 90 days, then at 75, 60, 45, 30 days, then daily until expiry.'},
+    ])
     guarddog_services = [
         {'id': 'takserver', 'name': 'TAK Server', 'monitored': gd.get('installed'), 'monitors': guarddog_monitors_tak},
     ]
     if is_two_server and s1_host:
         guarddog_services.append({'id': 'remotedb', 'name': f'Remote Database ({s1_host})', 'monitored': gd.get('installed'), 'monitors': [
-            {'name': 'TCP + SSH', 'interval': '2 min', 'desc': f'Checks port 5432 on {s1_host} is reachable and PostgreSQL cluster is up. Auto-restarts PG via SSH after 3 consecutive failures. Alerts on persistent failure.'},
-            {'name': 'Health Agent', 'interval': 'Always', 'desc': f'Lightweight health endpoint on {s1_host}:8080/health — checks PG ready, cot database, disk usage. Deployed automatically by Guard Dog.'},
+            {'name': 'TCP + SSH', 'id': 'remotedb_tcp', 'interval': '2 min', 'desc': f'Checks port 5432 on {s1_host} is reachable and PostgreSQL cluster is up. Auto-restarts PG via SSH after 3 consecutive failures. Alerts on persistent failure.'},
+            {'name': 'Health Agent', 'id': 'remotedb_agent', 'interval': 'Always', 'desc': f'Lightweight health endpoint on {s1_host}:8080/health — checks PG ready, cot database, disk usage. Deployed automatically by Guard Dog.'},
         ]})
     guarddog_services.extend([
-        {'id': 'authentik', 'name': 'Authentik', 'monitored': modules.get('authentik', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'interval': '1 min', 'desc': 'Checks Authentik HTTP (9090). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
-        {'id': 'mediamtx', 'name': 'MediaMTX', 'monitored': modules.get('mediamtx', {}).get('installed'), 'monitors': [{'name': 'Service', 'interval': '1 min', 'desc': 'Checks systemd mediamtx. Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
-        {'id': 'nodered', 'name': 'Node-RED', 'monitored': modules.get('nodered', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'interval': '1 min', 'desc': 'Checks Node-RED HTTP (1880). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
-        {'id': 'cloudtak', 'name': 'CloudTAK', 'monitored': modules.get('cloudtak', {}).get('installed'), 'monitors': [{'name': 'Container', 'interval': '1 min', 'desc': 'Checks CloudTAK container. Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
+        {'id': 'authentik', 'name': 'Authentik', 'monitored': modules.get('authentik', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'id': 'authentik_http', 'interval': '1 min', 'desc': 'Checks Authentik HTTP (9090). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
+        {'id': 'mediamtx', 'name': 'MediaMTX', 'monitored': modules.get('mediamtx', {}).get('installed'), 'monitors': [{'name': 'Service', 'id': 'mediamtx_svc', 'interval': '1 min', 'desc': 'Checks systemd mediamtx. Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
+        {'id': 'nodered', 'name': 'Node-RED', 'monitored': modules.get('nodered', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'id': 'nodered_http', 'interval': '1 min', 'desc': 'Checks Node-RED HTTP (1880). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
+        {'id': 'cloudtak', 'name': 'CloudTAK', 'monitored': modules.get('cloudtak', {}).get('installed'), 'monitors': [{'name': 'Container', 'id': 'cloudtak_ctr', 'interval': '1 min', 'desc': 'Checks CloudTAK container. Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
     ])
     guarddog_docs_url = f'https://github.com/{GITHUB_REPO}/blob/main/docs/GUARDDOG.md'
     notifications_configured = bool((settings.get('guarddog_alert_email') or '').strip())
@@ -1287,6 +1304,109 @@ def guarddog_health_api():
         if val is not None:
             result[sid] = val
     return jsonify(result)
+
+def _monitor_health_check(monitor_id):
+    """Quick health check for individual monitors. Returns True/False/None."""
+    import socket
+    try:
+        if monitor_id == 'port8089':
+            r = subprocess.run('ss -ltn "sport = :8089" 2>/dev/null', shell=True, capture_output=True, text=True, timeout=2)
+            return 'LISTEN' in (r.stdout or '')
+        if monitor_id == 'process':
+            r = subprocess.run('pgrep -f "takserver" 2>/dev/null | head -1', shell=True, capture_output=True, text=True, timeout=3)
+            return bool(r.stdout.strip())
+        if monitor_id == 'network':
+            for host in ('1.1.1.1', '8.8.8.8'):
+                r = subprocess.run(['ping', '-c', '1', '-W', '2', host], capture_output=True, timeout=4)
+                if r.returncode == 0:
+                    return True
+            return False
+        if monitor_id == 'postgresql':
+            r = subprocess.run(['systemctl', 'is-active', 'postgresql'], capture_output=True, text=True, timeout=3)
+            return r.returncode == 0
+        if monitor_id == 'cotdb':
+            r = subprocess.run('sudo -u postgres psql -tAc "SELECT pg_database_size(\'cot\')" 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
+            return r.returncode == 0 and r.stdout.strip().isdigit()
+        if monitor_id == 'oom':
+            r = subprocess.run('grep -c "OutOfMemoryError" /opt/tak/logs/takserver*.log 2>/dev/null', shell=True, capture_output=True, text=True, timeout=3)
+            return (r.stdout.strip() or '0') == '0'
+        if monitor_id == 'disk':
+            r = subprocess.run("df / --output=pcent 2>/dev/null | tail -1", shell=True, capture_output=True, text=True, timeout=3)
+            pct = int(r.stdout.strip().rstrip('%'))
+            return pct < 80
+        if monitor_id == 'cert':
+            cert_path = '/opt/tak/certs/files/admin.pem'
+            if not os.path.isfile(cert_path):
+                cert_path = '/opt/tak/certs/files/takserver.pem'
+            if not os.path.isfile(cert_path):
+                return None
+            r = subprocess.run(f'openssl x509 -in {cert_path} -checkend 3456000 2>/dev/null', shell=True, capture_output=True, timeout=3)
+            return r.returncode == 0
+        if monitor_id == 'intca':
+            for name in ('ca.pem', 'ca-do-not-delete.pem', 'intermediate-ca.pem'):
+                p = f'/opt/tak/certs/files/{name}'
+                if os.path.isfile(p):
+                    r = subprocess.run(f'openssl x509 -in {p} -checkend 7776000 2>/dev/null', shell=True, capture_output=True, timeout=3)
+                    if r.returncode != 0:
+                        return False
+            return True
+        if monitor_id == 'remotedb_tcp':
+            conf_path = '/opt/tak-guarddog/guarddog.conf'
+            if not os.path.isfile(conf_path):
+                return None
+            with open(conf_path) as f:
+                conf = json.load(f)
+            db_host = conf.get('db_host', '')
+            db_port = int(conf.get('db_port', 0))
+            if not db_host or not db_port:
+                return None
+            s = socket.create_connection((db_host, db_port), timeout=5)
+            s.close()
+            return True
+        if monitor_id == 'remotedb_agent':
+            conf_path = '/opt/tak-guarddog/guarddog.conf'
+            if not os.path.isfile(conf_path):
+                return None
+            with open(conf_path) as f:
+                conf = json.load(f)
+            db_host = conf.get('db_host', '')
+            if not db_host:
+                return None
+            req = urllib.request.Request(f'http://{db_host}:8080/health', method='GET')
+            resp = urllib.request.urlopen(req, timeout=5)
+            return resp.status == 200
+        if monitor_id == 'authentik_http':
+            req = urllib.request.Request('http://127.0.0.1:9090/', method='GET')
+            resp = urllib.request.urlopen(req, timeout=5)
+            return resp.status in (200, 302, 301)
+        if monitor_id == 'mediamtx_svc':
+            r = subprocess.run(['systemctl', 'is-active', 'mediamtx'], capture_output=True, text=True, timeout=3)
+            return r.returncode == 0
+        if monitor_id == 'nodered_http':
+            req = urllib.request.Request('http://127.0.0.1:1880/', method='GET')
+            resp = urllib.request.urlopen(req, timeout=5)
+            return resp.status in (200, 302, 301)
+        if monitor_id == 'cloudtak_ctr':
+            r = subprocess.run('docker ps --filter name=cloudtak-api --format "{{.Status}}"', shell=True, capture_output=True, text=True, timeout=5)
+            return bool(r.stdout and 'Up' in r.stdout)
+    except Exception:
+        return False
+    return None
+
+
+@app.route('/api/guarddog/monitor-health')
+@login_required
+def guarddog_monitor_health_api():
+    """Return health status per individual monitor (for sub-service dots in UI)."""
+    monitor_ids = request.args.get('ids', '').split(',')
+    monitor_ids = [m.strip() for m in monitor_ids if m.strip()]
+    result = {}
+    for mid in monitor_ids:
+        val = _monitor_health_check(mid)
+        if val is not None:
+            result[mid] = val
+    return jsonify(result)
+
 
 @app.route('/api/guarddog/activity-log')
 @login_required
@@ -6585,6 +6705,10 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 .guard-service-health.ok{background:var(--green)}
 .guard-service-health.fail{background:var(--red)}
 .guard-service-health.pending{background:var(--text-dim)}
+.guard-monitor-health{display:inline-block;width:7px;min-width:7px;height:7px;border-radius:50%;flex-shrink:0;margin-top:5px}
+.guard-monitor-health.ok{background:var(--green);box-shadow:0 0 4px var(--green)}
+.guard-monitor-health.fail{background:var(--red);box-shadow:0 0 4px var(--red)}
+.guard-monitor-health.pending{background:var(--text-dim)}
 .guard-service-expand{margin-left:auto;transition:transform .2s}
 .guard-service-row.open .guard-service-expand{transform:rotate(180deg)}
 .guard-service-body{display:none;padding:0 16px 12px 16px}
@@ -6640,8 +6764,8 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
         </div>
         <div class="guard-service-body">
           {% for m in svc.monitors %}
-          <div class="guard-item">
-            <span class="guard-item-name">{{ m.name }}</span>
+          <div class="guard-item" data-monitor-id="{{ m.id }}">
+            <span class="guard-item-name" style="display:flex;align-items:center;gap:8px"><span class="guard-monitor-health pending" id="gd-mh-{{ m.id }}" title="Monitor health"></span>{{ m.name }}</span>
             <span class="guard-item-interval">{{ m.interval }}</span>
             <span class="guard-item-desc">{{ m.desc }}</span>
           </div>
@@ -6770,7 +6894,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 
   <div class="card" id="gd-log-card" style="display:none"><div class="card-title">Deploy log</div><div class="log-box" id="gd-deploy-log">Initializing...</div></div>
 </div>
-<script src="/guarddog.js"></script>
+<script src="/guarddog.js?v={{ version }}"></script>
 </body></html>
 '''
 
@@ -12457,25 +12581,53 @@ def run_takserver_deploy(config):
         if config.get('enable_admin_ui') or config.get('enable_webtak') or config.get('enable_nonadmin_ui'):
             log_step(f"WebTAK: AdminUI={admin_ui}, WebTAK={webtak}, NonAdminUI={nonadmin}")
             run_cmd(f'sed -i \'s|"cert_https"/|"cert_https" enableAdminUI="{admin_ui}" enableWebtak="{webtak}" enableNonAdminUI="{nonadmin}"/|g\' /opt/tak/CoreConfig.xml')
-        # For two-server: ensure JDBC URL still points to Server One (reinstall may have reset it)
+        # For two-server: ensure JDBC URL and password point to Server One
         import re
         if config.get('two_server') and config.get('tak_deploy_cfg'):
             tc = config['tak_deploy_cfg']
             s1_host = (tc.get('server_one', {}).get('host') or '').strip()
             db_port = int(tc.get('database', {}).get('port') or 5432)
             db_pass = (tc.get('database', {}).get('password') or '').strip()
+            s1_cfg = tc.get('server_one', {})
+            # If password is missing, fetch it live from Server One
+            if not db_pass and s1_host and s1_cfg:
+                log_step("Two-server: DB password not cached — fetching from Server One...")
+                for pw_file in ('/opt/tak/CoreConfig.example.xml', '/opt/tak/CoreConfig.xml'):
+                    pwd_cmd = f"sudo grep -oP 'password=\"\\K[^\"]+' {pw_file} 2>/dev/null | head -1"
+                    try:
+                        ok, pwd_out = _ssh_probe(s1_cfg, pwd_cmd, timeout=10)
+                        candidate = (pwd_out or '').strip() if ok else ''
+                        if candidate:
+                            db_pass = candidate
+                            log_step(f"✓ Fetched DB password from Server One ({pw_file})")
+                            settings = load_settings()
+                            _tcfg = _get_tak_deployment_config(settings)
+                            _tcfg.setdefault('database', {})['password'] = db_pass
+                            settings['tak_deployment'] = _tcfg
+                            save_settings(settings)
+                            break
+                    except Exception:
+                        pass
+                if not db_pass:
+                    log_step("⚠ Could not fetch DB password from Server One — TAK Server may not authenticate to PostgreSQL")
             if s1_host:
                 jdbc_url = f'jdbc:postgresql://{s1_host}:{db_port}/cot'
                 log_step(f"Two-server: ensuring JDBC points to {s1_host}:{db_port}...")
                 try:
                     r = subprocess.run(['cat', '/opt/tak/CoreConfig.xml'], capture_output=True, text=True, timeout=5)
                     cc = r.stdout or ''
-                    if 'jdbc:postgresql://127.0.0.1' in cc or s1_host not in cc:
+                    needs_patch = 'jdbc:postgresql://127.0.0.1' in cc or s1_host not in cc
+                    # Also patch if password in file is empty
+                    if not needs_patch and db_pass:
+                        pw_match = re.search(r'password="([^"]*)"', cc)
+                        if pw_match and not pw_match.group(1):
+                            needs_patch = True
+                    if needs_patch:
                         cc = re.sub(r'jdbc:postgresql://[^"]*', jdbc_url, cc)
                         if db_pass:
                             cc = re.sub(r'(<connection[^>]*password=")[^"]*(")', lambda m: m.group(1) + db_pass + m.group(2), cc)
                         subprocess.run(['tee', '/opt/tak/CoreConfig.xml'], input=cc, capture_output=True, text=True, timeout=5)
-                        log_step(f"✓ JDBC URL restored to {jdbc_url}")
+                        log_step(f"✓ JDBC URL and password set for {s1_host}:{db_port}")
                     else:
                         log_step(f"✓ JDBC URL already points to {s1_host}")
                 except Exception as e:
