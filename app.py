@@ -1528,7 +1528,10 @@ def guarddog_health_api():
             val = _guarddog_health_check(sid)
             if val is not None:
                 result[sid] = 'ok' if val else 'fail'
-    return jsonify(result)
+    from flask import make_response
+    r = make_response(jsonify(result))
+    r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
+    return r
 
 def _monitor_health_check(monitor_id):
     """Quick health check for individual monitors. Returns True/False/None."""
@@ -13778,7 +13781,7 @@ function refreshModuleCards(){
 function updateGuardDogOverallHealth(){
     var el=document.getElementById('module-status-guarddog');
     if(!el||!el.classList.contains('status-running')&&!el.classList.contains('status-caution')&&!el.classList.contains('status-critical')) return;
-    fetch('/api/guarddog/health',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(h){
+    fetch('/api/guarddog/health?_='+Date.now(),{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.json();}).then(function(h){
         var vals=Object.keys(h).map(function(k){return h[k];});
         if(vals.length===0){ el.className='module-status status-running'; el.innerHTML='<span class="status-dot"></span> Healthy'; return; }
         var allOk=vals.every(function(v){return v==='ok';});
