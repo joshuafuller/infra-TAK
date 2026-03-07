@@ -1038,7 +1038,7 @@ async function deployTakServerOne(){
     var msg=document.getElementById('two-server-msg');
     if(msg){msg.textContent='Deploying to Server One (copying package, installing… may take a few minutes)';msg.style.color='var(--cyan)';}
     try{
-      var cfg=await saveTakDeploymentConfig(true);
+      var cfg=collectTakDeploymentConfigFromForm();
       var r=await fetch('/api/takserver/two-server/deploy-server-one',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:cfg})});
       var d=await r.json();
       if(!d.success)throw new Error(d.error||'Deploy failed');
@@ -1046,7 +1046,7 @@ async function deployTakServerOne(){
       return d;
     }catch(e){
       if(msg){msg.textContent='✗ '+e.message;msg.style.color='var(--red)';}
-      throw e;
+      console.error('deployTakServerOne error:', e);
     }
 }
 
@@ -1054,7 +1054,7 @@ async function deployTakServerTwo(){
     var msg=document.getElementById('two-server-msg');
     if(msg){msg.textContent='Deploying to Server Two (this host)…';msg.style.color='var(--cyan)';}
     try{
-      var cfg=await saveTakDeploymentConfig(true);
+      var cfg=collectTakDeploymentConfigFromForm();
       var r=await fetch('/api/takserver/two-server/deploy-server-two',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:cfg})});
       var d=await r.json();
       if(!d.success)throw new Error(d.error||'Deploy failed');
@@ -1062,7 +1062,7 @@ async function deployTakServerTwo(){
       return d;
     }catch(e){
       if(msg){msg.textContent='✗ '+e.message;msg.style.color='var(--red)';}
-      throw e;
+      console.error('deployTakServerTwo error:', e);
     }
 }
 
