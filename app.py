@@ -770,7 +770,16 @@ def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
                 _ssh_probe(s1, 'sudo systemctl start postgresql 2>/dev/null; true', timeout=15)
                 vok, vout = _ssh_probe(s1, verify_cmd, timeout=10)
                 if not (vok and 'PG_OK' in (vout or '')):
-                    log.append('Install failed and PostgreSQL/cot database not found.')
+                    diag_cmd = (
+                        'echo "--- PG packages ---"; dpkg -l 2>/dev/null | grep -i postgres; '
+                        'echo "--- PG service ---"; systemctl status postgresql 2>&1 | head -15; '
+                        'echo "--- PG clusters ---"; pg_lsclusters 2>/dev/null; '
+                        'echo "--- PG databases ---"; sudo -u postgres psql -lqt 2>&1 | head -10; '
+                        'echo "--- PG logs ---"; tail -20 /var/log/postgresql/*.log 2>/dev/null || echo "no logs"'
+                    )
+                    _, diag = _ssh_probe(s1, diag_cmd, timeout=15)
+                    log.append('Install failed. Diagnostics from Server One:')
+                    log.append(diag or 'no diagnostic output')
                     return False, log, ''
                 log.append('Install had warnings but PostgreSQL is running and cot database exists.')
             log.append('TAK database package installed.')
