@@ -417,6 +417,17 @@ async function takControl(action, target){
     catch(e){alert('Failed: '+e.message);btns.forEach(b=>{b.disabled=false;b.style.opacity='1'})}
 }
 
+async function syncTakDbPassword(){
+    var btns=document.querySelectorAll('.control-btn');
+    btns.forEach(b=>{b.disabled=true;b.style.opacity='0.5'});
+    try{
+        var r=await fetch('/api/takserver/two-server/sync-db-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
+        var d=await r.json();
+        if(d.success){alert(d.message||'DB password synced. TAK Server restarting — try 8443/8446 in a minute.');window.location.reload();}
+        else{alert(d.error||'Sync failed');btns.forEach(b=>{b.disabled=false;b.style.opacity='1'});}
+    }catch(e){alert('Failed: '+e.message);btns.forEach(b=>{b.disabled=false;b.style.opacity='1'});}
+}
+
 async function takUpdateConfig(){
     var btn=document.getElementById('tak-update-config-btn');
     if(!btn)return;
