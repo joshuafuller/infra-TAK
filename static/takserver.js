@@ -758,6 +758,8 @@ function initTakDeployModeUI(rootEl){
       '<button type="button" onclick="openTakDbFirewall()" style="padding:8px 14px;background:rgba(239,68,68,0.15);color:var(--red,#ef4444);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer">Open firewall on Server One</button>',
       '<button type="button" onclick="runTakTwoServerPreflight()" style="padding:8px 14px;background:rgba(14,116,144,0.2);color:var(--cyan);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer">Run Preflight</button>',
       '<button type="button" onclick="loadTakTwoServerRunbook()" style="padding:8px 14px;background:rgba(16,185,129,0.15);color:var(--green);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer">Generate Runbook</button>',
+      '<button type="button" onclick="deployTakServerOne()" style="padding:8px 14px;background:rgba(99,102,241,0.2);color:var(--indigo,#6366f1);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer">Deploy to Server One</button>',
+      '<button type="button" onclick="deployTakServerTwo()" style="padding:8px 14px;background:rgba(34,197,94,0.2);color:var(--green);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer">Deploy to Server Two</button>',
       '</div>',
       '<div id="two-server-msg" style="margin-top:10px;font-size:12px;color:var(--text-dim)"></div>',
       '<div id="two-server-preflight" style="display:none;margin-top:10px;background:#0c0f1a;border:1px solid var(--border);border-radius:8px;padding:12px;font-family:\'JetBrains Mono\',monospace;font-size:11px;white-space:pre-wrap"></div>',
@@ -1025,6 +1027,38 @@ async function installTakSshKey(){
       var d=await r.json();
       if(!d.success)throw new Error(d.error||'Install failed');
       if(msg){msg.textContent='✓ '+(d.message||'Key installed on Server One');msg.style.color='var(--green)';}
+      return d;
+    }catch(e){
+      if(msg){msg.textContent='✗ '+e.message;msg.style.color='var(--red)';}
+      throw e;
+    }
+}
+
+async function deployTakServerOne(){
+    var msg=document.getElementById('two-server-msg');
+    if(msg){msg.textContent='Deploying to Server One (copying package, installing… may take a few minutes)';msg.style.color='var(--cyan)';}
+    try{
+      var cfg=await saveTakDeploymentConfig(true);
+      var r=await fetch('/api/takserver/two-server/deploy-server-one',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:cfg})});
+      var d=await r.json();
+      if(!d.success)throw new Error(d.error||'Deploy failed');
+      if(msg){msg.textContent='✓ '+(d.message||'Server One deploy complete');msg.style.color='var(--green)';}
+      return d;
+    }catch(e){
+      if(msg){msg.textContent='✗ '+e.message;msg.style.color='var(--red)';}
+      throw e;
+    }
+}
+
+async function deployTakServerTwo(){
+    var msg=document.getElementById('two-server-msg');
+    if(msg){msg.textContent='Deploying to Server Two (this host)…';msg.style.color='var(--cyan)';}
+    try{
+      var cfg=await saveTakDeploymentConfig(true);
+      var r=await fetch('/api/takserver/two-server/deploy-server-two',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:cfg})});
+      var d=await r.json();
+      if(!d.success)throw new Error(d.error||'Deploy failed');
+      if(msg){msg.textContent='✓ '+(d.message||'Server Two deploy complete');msg.style.color='var(--green)';}
       return d;
     }catch(e){
       if(msg){msg.textContent='✗ '+e.message;msg.style.color='var(--red)';}

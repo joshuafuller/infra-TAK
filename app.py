@@ -792,6 +792,114 @@ def takserver_two_server_runbook():
         'notes': notes,
     })
 
+
+@app.route('/api/takserver/two-server/deploy-server-one', methods=['POST'])
+@login_required
+def takserver_two_server_deploy_server_one():
+    """Automate Server One: SCP database .deb, run apt/repo and install over SSH."""
+    data = request.get_json() or {}
+    settings = load_settings()
+    cfg = _get_tak_deployment_config(settings)
+    if isinstance(data.get('config'), dict):
+        cfg = _normalize_tak_deployment_config(_deep_merge_dict(cfg, data.get('config')))
+    if cfg.get('mode') != 'two_server':
+        return jsonify({'success': False, 'error': 'Deployment mode is not two_server'}), 400
+    s1 = cfg.get('server_one', {})
+    db_port = int(cfg.get('database', {}).get('port') or 5432)
+    uploaded = [f for f in os.listdir(UPLOAD_DIR) if f.endswith('.deb') or f.endswith('.rpm')]
+    db_pkg = next((f for f in uploaded if 'database' in f.lower()), '')
+    if not db_pkg:
+        return jsonify({'success': False, 'error': 'No database package uploaded. Upload takserver-database .deb first.'}), 400
+    local_deb = os.path.join(UPLOAD_DIR, db_pkg)
+    if not os.path.isfile(local_deb):
+        return jsonify({'success': False, 'error': f'Package not found: {db_pkg}'}), 400
+    settings = load_settings()
+    core_ip = (settings.get('server_ip') or '').strip()
+    if not core_ip:
+        try:
+            r = subprocess.run(['curl', '-s', '--connect-timeout', '5', 'https://ifconfig.me'], capture_output=True, text=True, timeout=8)
+            core_ip = (r.stdout or '').strip() if r.returncode == 0 else ''
+        except Exception:
+            pass
+        if not core_ip:
+            core_ip = 'REDACTED-HOST'
+    log = []
+    ok, out = _scp_to_host(s1, local_deb, '/tmp/', timeout=300)
+    if not ok:
+        return jsonify({'success': False, 'error': out or 'SCP failed', 'log': log}), 400
+    log.append('Copied database package to Server One /tmp/')
+    cmd = (
+        'cd /tmp && sudo apt-get update -qq && sudo apt-get install -y lsb-release && '
+        'sudo mkdir -p /etc/apt/keyrings && '
+        'sudo curl -sL https://www.postgresql.org/media/keys/ACCC4CF8.asc --output /etc/apt/keyrings/postgresql.asc && '
+        'echo "deb [signed-by=/etc/apt/keyrings/postgresql.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/postgresql.list >/dev/null && '
+        'sudo apt-get update -qq && '
+        f'sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ./{db_pkg} && '
+        f'sudo ufw allow 22/tcp && sudo ufw allow from {core_ip} to any port 22 proto tcp && '
+        f'sudo ufw allow from {core_ip} to any port {db_port} proto tcp && sudo ufw allow {db_port}/tcp && '
+        'sudo ufw --force enable && sudo ufw reload'
+    )
+    ok, out = _ssh_probe(s1, cmd, timeout=600)
+    log.append(out or '')
+    if not ok:
+        return jsonify({'success': False, 'error': out or 'Install failed on Server One', 'log': log}), 400
+    return jsonify({'success': True, 'message': 'Server One (Database) deploy complete. Run Preflight, then Deploy to Server Two.', 'log': log})
+
+
+@app.route('/api/takserver/two-server/deploy-server-two', methods=['POST'])
+@login_required
+def takserver_two_server_deploy_server_two():
+    """Automate Server Two (this host): install core .deb, point CoreConfig at Server One DB, restart."""
+    data = request.get_json() or {}
+    settings = load_settings()
+    cfg = _get_tak_deployment_config(settings)
+    if isinstance(data.get('config'), dict):
+        cfg = _normalize_tak_deployment_config(_deep_merge_dict(cfg, data.get('config')))
+    if cfg.get('mode') != 'two_server':
+        return jsonify({'success': False, 'error': 'Deployment mode is not two_server'}), 400
+    s1 = cfg.get('server_one', {})
+    db_host = (s1.get('host') or '').strip()
+    if not db_host:
+        return jsonify({'success': False, 'error': 'Server One host not set'}), 400
+    db_port = int(cfg.get('database', {}).get('port') or 5432)
+    uploaded = [f for f in os.listdir(UPLOAD_DIR) if f.endswith('.deb') or f.endswith('.rpm')]
+    core_pkg = next((f for f in uploaded if 'core' in f.lower()), '')
+    if not core_pkg:
+        return jsonify({'success': False, 'error': 'No core package uploaded. Upload takserver-core .deb first.'}), 400
+    local_deb = os.path.join(UPLOAD_DIR, core_pkg)
+    if not os.path.isfile(local_deb):
+        return jsonify({'success': False, 'error': f'Package not found: {core_pkg}'}), 400
+    log = []
+    try:
+        r = subprocess.run(
+            f'cd {UPLOAD_DIR} && sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ./{core_pkg}',
+            shell=True, capture_output=True, text=True, timeout=600
+        )
+        log.append(r.stdout or '')
+        log.append(r.stderr or '')
+        if r.returncode != 0:
+            return jsonify({'success': False, 'error': (r.stderr or r.stdout or 'apt install failed')[:500], 'log': log}), 400
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)[:400], 'log': log}), 400
+    core_config = '/opt/tak/CoreConfig.xml'
+    if os.path.exists(core_config):
+        try:
+            jdbc_new = f'jdbc:postgresql://{db_host}:{db_port}/cot'
+            r = subprocess.run(
+                ['sudo', 'sed', '-i', f's|jdbc:postgresql://127.0.0.1:5432/cot|{jdbc_new}|g', core_config],
+                capture_output=True, text=True, timeout=10
+            )
+            if r.returncode != 0:
+                return jsonify({'success': False, 'error': (r.stderr or r.stdout or 'sed failed')[:300], 'log': log}), 400
+            subprocess.run(['sudo', 'systemctl', 'daemon-reload'], capture_output=True, timeout=10)
+            subprocess.run(['sudo', 'systemctl', 'enable', 'takserver'], capture_output=True, timeout=10)
+            subprocess.run(['sudo', 'systemctl', 'restart', 'takserver'], capture_output=True, timeout=30)
+            log.append('CoreConfig updated, takserver restarted.')
+        except Exception as e:
+            return jsonify({'success': False, 'error': f'CoreConfig update failed: {e}', 'log': log}), 400
+    return jsonify({'success': True, 'message': 'Server Two (Core) deploy complete. Two-server TAK is up.', 'log': log})
+
+
 @app.route('/mediamtx')
 @login_required
 def mediamtx_page():
@@ -1952,6 +2060,42 @@ def _ssh_probe(host_cfg, cmd='echo ok', timeout=15):
         return r.returncode == 0, out
     except Exception as e:
         return False, str(e)
+
+
+def _scp_to_host(host_cfg, local_path, remote_path, timeout=120):
+    """Copy local_path to remote_path on host. remote_path is like /tmp/ or /tmp/file.deb. Returns (ok, output)."""
+    host = (host_cfg.get('host') or '').strip()
+    user = (host_cfg.get('ssh_user') or 'root').strip() or 'root'
+    port = int(host_cfg.get('ssh_port') or 22)
+    if not host or not os.path.isfile(local_path):
+        return False, 'host not set or file not found'
+    is_local = bool(host_cfg.get('use_localhost')) or host in ('127.0.0.1', 'localhost', '::1')
+    if is_local:
+        try:
+            shutil.copy2(local_path, remote_path.rstrip('/') if not remote_path.endswith('/') else os.path.join(remote_path, os.path.basename(local_path)))
+            return True, ''
+        except Exception as e:
+            return False, str(e)
+    scp_cmd = ['scp', '-o', 'StrictHostKeyChecking=accept-new', '-o', f'ConnectTimeout=15', '-P', str(port)]
+    key_path = (host_cfg.get('ssh_key_path') or '').strip()
+    auth_method = (host_cfg.get('auth_method') or 'ssh_key').strip().lower()
+    if auth_method == 'password':
+        pw = (host_cfg.get('ssh_password') or '').strip()
+        if not pw or not shutil.which('sshpass'):
+            return False, 'password auth requires sshpass'
+        scp_cmd = ['sshpass', '-p', pw] + scp_cmd
+    elif key_path:
+        expanded = os.path.expanduser(key_path)
+        if os.path.exists(expanded):
+            scp_cmd.extend(['-i', expanded])
+    scp_cmd.extend([local_path, f'{user}@{host}:{remote_path}'])
+    try:
+        r = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=timeout)
+        out = (r.stdout or r.stderr or '').strip()
+        return r.returncode == 0, out
+    except Exception as e:
+        return False, str(e)
+
 
 def generate_caddyfile(settings=None):
     """Generate Caddyfile based on current settings and deployed services.
