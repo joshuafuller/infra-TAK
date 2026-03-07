@@ -700,10 +700,121 @@ def takserver_two_server_install_ssh_key():
     return jsonify({'success': True, 'message': 'Key installed on Server One. You can run Preflight now.'})
 
 
+def _resolve_core_ip(settings, cfg):
+    """Resolve Server Two (Core) public IP for firewall and pg_hba rules."""
+    s2 = cfg.get('server_two', {})
+    if s2.get('use_localhost'):
+        core_ip = (settings.get('server_ip') or '').strip()
+        if not core_ip:
+            try:
+                r = subprocess.run(
+                    ['curl', '-s', '--connect-timeout', '5', 'https://ifconfig.me'],
+                    capture_output=True, text=True, timeout=8
+                )
+                core_ip = (r.stdout or '').strip() if r.returncode == 0 else ''
+            except Exception:
+                pass
+        return core_ip or None
+    return (s2.get('host') or '').strip() or None
+
+
+def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
+    """Full Server One setup: optionally install DB .deb, configure PG for remote access, open UFW.
+    Returns (ok, log_lines, db_password).
+    """
+    log = []
+
+    # Step 1: SCP and install the database .deb if provided
+    if db_pkg_path and db_pkg_name:
+        ok, out = _scp_to_host(s1, db_pkg_path, '/tmp/', timeout=300)
+        if not ok:
+            return False, ['SCP failed: ' + (out or '')], ''
+        log.append('Copied database package to Server One /tmp/')
+
+        install_cmd = (
+            'cd /tmp && sudo apt-get update -qq && '
+            'sudo apt-get install -y lsb-release && '
+            'sudo mkdir -p /etc/apt/keyrings && '
+            'sudo curl -sL https://www.postgresql.org/media/keys/ACCC4CF8.asc --output /etc/apt/keyrings/postgresql.asc && '
+            'echo "deb [signed-by=/etc/apt/keyrings/postgresql.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" '
+            '| sudo tee /etc/apt/sources.list.d/postgresql.list >/dev/null && '
+            'sudo apt-get update -qq && '
+            f'sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ./{db_pkg_name}'
+        )
+        ok, out = _ssh_probe(s1, install_cmd, timeout=600)
+        log.append(out or '')
+        if not ok:
+            return False, log, ''
+        log.append('TAK database package installed.')
+    else:
+        # No .deb provided — check if PG is already installed, if not install vanilla PG
+        check_cmd = 'dpkg -l 2>/dev/null | grep -ci postgres'
+        ok, out = _ssh_probe(s1, check_cmd, timeout=10)
+        pg_count = int((out or '0').strip()) if ok else 0
+        if pg_count == 0:
+            pg_install = (
+                'sudo apt-get update -qq && '
+                'sudo apt-get install -y lsb-release && '
+                'sudo mkdir -p /etc/apt/keyrings && '
+                'sudo curl -sL https://www.postgresql.org/media/keys/ACCC4CF8.asc --output /etc/apt/keyrings/postgresql.asc && '
+                'echo "deb [signed-by=/etc/apt/keyrings/postgresql.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" '
+                '| sudo tee /etc/apt/sources.list.d/postgresql.list >/dev/null && '
+                'sudo apt-get update -qq && '
+                'sudo DEBIAN_FRONTEND=noninteractive apt-get install -y postgresql-15 postgresql-15-postgis-3'
+            )
+            ok, out = _ssh_probe(s1, pg_install, timeout=300)
+            log.append(out or '')
+            if not ok:
+                log.append('PostgreSQL install failed on Server One.')
+                return False, log, ''
+            log.append('PostgreSQL installed on Server One.')
+
+    # Step 2: Configure PostgreSQL for remote access
+    pg_config_cmd = (
+        'PG_MAIN=$(find /etc/postgresql -type d -name main 2>/dev/null | head -1) && '
+        '[ -n "$PG_MAIN" ] && [ -f "$PG_MAIN/postgresql.conf" ] && '
+        "sudo sed -i '/^\\s*#*\\s*listen_addresses\\s*=/d' \"$PG_MAIN/postgresql.conf\" && "
+        "printf \"listen_addresses = '*'\\n\" | sudo tee -a \"$PG_MAIN/postgresql.conf\" > /dev/null && "
+        f'(grep -q "{core_ip}/32" "$PG_MAIN/pg_hba.conf" 2>/dev/null || '
+        f'echo "host    all    all    {core_ip}/32    md5" | sudo tee -a "$PG_MAIN/pg_hba.conf" > /dev/null) && '
+        '(sudo systemctl restart postgresql 2>/dev/null || sudo systemctl restart postgresql-15 2>/dev/null || true)'
+    )
+    ok, out = _ssh_probe(s1, pg_config_cmd, timeout=30)
+    if not ok:
+        log.append('PostgreSQL remote-access config failed: ' + (out or ''))
+        return False, log, ''
+    log.append('PostgreSQL configured: listen_addresses=* and pg_hba entry for ' + core_ip)
+
+    # Step 3: UFW
+    ufw_cmd = (
+        f'sudo ufw allow 22/tcp && '
+        f'sudo ufw allow from {core_ip} to any port 22 proto tcp && '
+        f'sudo ufw allow from {core_ip} to any port {db_port} proto tcp && '
+        f'sudo ufw allow {db_port}/tcp && '
+        'sudo ufw --force enable && sudo ufw reload'
+    )
+    ok, out = _ssh_probe(s1, ufw_cmd, timeout=25)
+    if not ok:
+        log.append('UFW config failed: ' + (out or ''))
+        return False, log, ''
+    log.append(f'UFW: allowed {core_ip} → port {db_port}')
+
+    # Step 4: Read auto-generated DB password from CoreConfig.example.xml
+    pwd_cmd = "sudo sed -n 's/.*password=\"\\([^\"]*\\)\".*/\\1/p' /opt/tak/CoreConfig.example.xml 2>/dev/null | head -1"
+    ok, pwd_out = _ssh_probe(s1, pwd_cmd, timeout=10)
+    db_password = (pwd_out or '').strip() if ok else ''
+    if db_password:
+        log.append('Captured DB password from Server One.')
+    else:
+        log.append('Warning: could not read DB password from /opt/tak/CoreConfig.example.xml (may need manual entry).')
+
+    return True, log, db_password
+
+
 @app.route('/api/takserver/two-server/open-db-firewall', methods=['POST'])
 @login_required
 def takserver_two_server_open_db_firewall():
-    """SSH to Server One and open UFW for DB port from Server Two (infra-TAK) IP. Requires SSH key already installed."""
+    """Prepare Server One: install PostgreSQL + TAK database .deb if needed, configure PG for remote access, open UFW."""
     data = request.get_json() or {}
     settings = load_settings()
     cfg = _get_tak_deployment_config(settings)
@@ -712,54 +823,30 @@ def takserver_two_server_open_db_firewall():
     if cfg.get('mode') != 'two_server':
         return jsonify({'success': False, 'error': 'Deployment mode is not two_server'}), 400
     s1 = cfg.get('server_one', {})
-    s2 = cfg.get('server_two', {})
-    db_port = int(cfg.get('database', {}).get('port') or 5432)
-    host = (s1.get('host') or '').strip()
-    if not host:
+    if not (s1.get('host') or '').strip():
         return jsonify({'success': False, 'error': 'Server One host not set'}), 400
-    if s2.get('use_localhost'):
-        server_two_ip = (settings.get('server_ip') or '').strip()
-        if not server_two_ip:
-            try:
-                r = subprocess.run(
-                    ['curl', '-s', '--connect-timeout', '5', 'https://ifconfig.me'],
-                    capture_output=True, text=True, timeout=8
-                )
-                server_two_ip = (r.stdout or '').strip() if r.returncode == 0 else ''
-            except Exception:
-                pass
-            if not server_two_ip:
-                return jsonify({'success': False, 'error': 'Server Two IP unknown. Set Server IP in Settings (or run from infra-TAK host with network access).'}), 400
-    else:
-        server_two_ip = (s2.get('host') or '').strip()
-        if not server_two_ip:
-            return jsonify({'success': False, 'error': 'Server Two host not set'}), 400
-    cmd = (
-        f'sudo ufw allow 22/tcp && '
-        f'sudo ufw allow from {server_two_ip} to any port 22 proto tcp && '
-        f'sudo ufw allow from {server_two_ip} to any port {db_port} proto tcp && '
-        f'sudo ufw allow {db_port}/tcp && '
-        'sudo ufw --force enable && sudo ufw reload'
-    )
-    ok, out = _ssh_probe(s1, cmd, timeout=25)
+    db_port = int(cfg.get('database', {}).get('port') or 5432)
+    core_ip = _resolve_core_ip(settings, cfg)
+    if not core_ip:
+        return jsonify({'success': False, 'error': 'Server Two (Core) IP unknown. Set Server IP in Settings.'}), 400
+
+    # Check for uploaded database .deb to SCP + install if PG is missing
+    uploaded = [f for f in os.listdir(UPLOAD_DIR) if f.endswith('.deb') or f.endswith('.rpm')]
+    db_pkg = next((f for f in uploaded if 'database' in f.lower()), '')
+    db_pkg_path = os.path.join(UPLOAD_DIR, db_pkg) if db_pkg else None
+    if db_pkg_path and not os.path.isfile(db_pkg_path):
+        db_pkg_path = None
+
+    ok, log, db_password = _setup_server_one(s1, core_ip, db_port,
+                                              db_pkg_path=db_pkg_path, db_pkg_name=db_pkg if db_pkg_path else None)
+    if db_password:
+        cfg['database']['password'] = db_password
+        settings['tak_deployment'] = cfg
+        save_settings(settings)
+
     if not ok:
-        return jsonify({'success': False, 'error': out or 'UFW command failed on Server One'}), 400
-    # Configure PostgreSQL to listen on all interfaces and allow Core server IP (required for two-server).
-    esc = r'\x27'  # literal \x27 for bash $'...' (single quote)
-    pg_fix = (
-        f'PG_MAIN=$(find /etc/postgresql -type d -name main 2>/dev/null | head -1); '
-        '[ -z "$PG_MAIN" ] && PG_MAIN=/etc/postgresql/15/main; '
-        f'if [ -f "$PG_MAIN/postgresql.conf" ]; then '
-        f"sudo sed -i $'s/^#*listen_addresses.*/listen_addresses = {esc}*{esc}/' \"$PG_MAIN/postgresql.conf\"; "
-        f'grep -q "{server_two_ip}/32" "$PG_MAIN/pg_hba.conf" 2>/dev/null || '
-        f'echo "host cot all {server_two_ip}/32 scram-sha-256" | sudo tee -a "$PG_MAIN/pg_hba.conf"; '
-        'sudo systemctl restart postgresql 2>/dev/null || sudo systemctl restart postgresql-15 2>/dev/null || true; '
-        'fi'
-    )
-    ok2, out2 = _ssh_probe(s1, pg_fix, timeout=30)
-    if not ok2:
-        return jsonify({'success': False, 'error': out2 or 'PostgreSQL config failed on Server One (UFW was applied). Fix PG manually and run Preflight.'}), 400
-    return jsonify({'success': True, 'message': f'Firewall and PostgreSQL on Server One updated: allowed {server_two_ip} → port {db_port}. Run Preflight again.'})
+        return jsonify({'success': False, 'error': log[-1] if log else 'Setup failed on Server One', 'log': log}), 400
+    return jsonify({'success': True, 'message': f'Server One ready: PostgreSQL listening, UFW open for {core_ip} → port {db_port}. Run Preflight.', 'log': log})
 
 
 @app.route('/api/takserver/two-server/runbook', methods=['GET'])
@@ -825,7 +912,7 @@ def takserver_two_server_runbook():
 @app.route('/api/takserver/two-server/deploy-server-one', methods=['POST'])
 @login_required
 def takserver_two_server_deploy_server_one():
-    """Automate Server One: SCP database .deb, run apt/repo and install over SSH."""
+    """Full Server One deploy: SCP database .deb, install, configure PG for remote, open UFW, capture DB password."""
     data = request.get_json() or {}
     settings = load_settings()
     cfg = _get_tak_deployment_config(settings)
@@ -834,7 +921,13 @@ def takserver_two_server_deploy_server_one():
     if cfg.get('mode') != 'two_server':
         return jsonify({'success': False, 'error': 'Deployment mode is not two_server'}), 400
     s1 = cfg.get('server_one', {})
+    if not (s1.get('host') or '').strip():
+        return jsonify({'success': False, 'error': 'Server One host not set'}), 400
     db_port = int(cfg.get('database', {}).get('port') or 5432)
+    core_ip = _resolve_core_ip(settings, cfg)
+    if not core_ip:
+        return jsonify({'success': False, 'error': 'Server Two (Core) IP unknown. Set Server IP in Settings or ensure this host can reach ifconfig.me.'}), 400
+
     uploaded = [f for f in os.listdir(UPLOAD_DIR) if f.endswith('.deb') or f.endswith('.rpm')]
     db_pkg = next((f for f in uploaded if 'database' in f.lower()), '')
     if not db_pkg:
@@ -842,60 +935,23 @@ def takserver_two_server_deploy_server_one():
     local_deb = os.path.join(UPLOAD_DIR, db_pkg)
     if not os.path.isfile(local_deb):
         return jsonify({'success': False, 'error': f'Package not found: {db_pkg}'}), 400
-    settings = load_settings()
-    core_ip = (settings.get('server_ip') or '').strip()
-    if not core_ip:
-        try:
-            r = subprocess.run(['curl', '-s', '--connect-timeout', '5', 'https://ifconfig.me'], capture_output=True, text=True, timeout=8)
-            core_ip = (r.stdout or '').strip() if r.returncode == 0 else ''
-        except Exception:
-            pass
-        if not core_ip:
-            return jsonify({'success': False, 'error': 'Server Two (Core) IP unknown. Set Server IP in Settings or ensure this host can reach ifconfig.me.'}), 400
-    log = []
-    ok, out = _scp_to_host(s1, local_deb, '/tmp/', timeout=300)
+
+    ok, log, db_password = _setup_server_one(s1, core_ip, db_port,
+                                              db_pkg_path=local_deb, db_pkg_name=db_pkg)
+    if db_password:
+        cfg['database']['password'] = db_password
+        settings['tak_deployment'] = cfg
+        save_settings(settings)
+
     if not ok:
-        return jsonify({'success': False, 'error': out or 'SCP failed', 'log': log}), 400
-    log.append('Copied database package to Server One /tmp/')
-    cmd = (
-        'cd /tmp && sudo apt-get update -qq && sudo apt-get install -y lsb-release && '
-        'sudo mkdir -p /etc/apt/keyrings && '
-        'sudo curl -sL https://www.postgresql.org/media/keys/ACCC4CF8.asc --output /etc/apt/keyrings/postgresql.asc && '
-        'echo "deb [signed-by=/etc/apt/keyrings/postgresql.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/postgresql.list >/dev/null && '
-        'sudo apt-get update -qq && '
-        f'sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ./{db_pkg} && '
-        f'sudo ufw allow 22/tcp && sudo ufw allow from {core_ip} to any port 22 proto tcp && '
-        f'sudo ufw allow from {core_ip} to any port {db_port} proto tcp && sudo ufw allow {db_port}/tcp && '
-        'sudo ufw --force enable && sudo ufw reload'
-    )
-    ok, out = _ssh_probe(s1, cmd, timeout=600)
-    log.append(out or '')
-    if not ok:
-        return jsonify({'success': False, 'error': out or 'Install failed on Server One', 'log': log}), 400
-    # Configure PostgreSQL to listen on all interfaces and allow Core server IP.
-    esc = r'\x27'
-    pg_fix = (
-        f'PG_MAIN=$(find /etc/postgresql -type d -name main 2>/dev/null | head -1); '
-        '[ -z "$PG_MAIN" ] && PG_MAIN=/etc/postgresql/15/main; '
-        f'if [ -f "$PG_MAIN/postgresql.conf" ]; then '
-        f"sudo sed -i $'s/^#*listen_addresses.*/listen_addresses = {esc}*{esc}/' \"$PG_MAIN/postgresql.conf\"; "
-        f'grep -q "{core_ip}/32" "$PG_MAIN/pg_hba.conf" 2>/dev/null || '
-        f'echo "host cot all {core_ip}/32 scram-sha-256" | sudo tee -a "$PG_MAIN/pg_hba.conf"; '
-        'sudo systemctl restart postgresql 2>/dev/null || sudo systemctl restart postgresql-15 2>/dev/null || true; '
-        'fi'
-    )
-    ok2, out2 = _ssh_probe(s1, pg_fix, timeout=30)
-    if not ok2:
-        log.append(out2 or '')
-        return jsonify({'success': False, 'error': 'PostgreSQL config failed on Server One (install and UFW applied). Fix PG manually.', 'log': log}), 400
-    log.append('PostgreSQL configured for remote access.')
+        return jsonify({'success': False, 'error': log[-1] if log else 'Deploy failed on Server One', 'log': log}), 400
     return jsonify({'success': True, 'message': 'Server One (Database) deploy complete. Run Preflight, then Deploy to Server Two.', 'log': log})
 
 
 @app.route('/api/takserver/two-server/deploy-server-two', methods=['POST'])
 @login_required
 def takserver_two_server_deploy_server_two():
-    """Automate Server Two (this host): install core .deb, point CoreConfig at Server One DB, restart."""
+    """Automate Server Two (this host): install core .deb, point CoreConfig at Server One DB with correct password, restart."""
     data = request.get_json() or {}
     settings = load_settings()
     cfg = _get_tak_deployment_config(settings)
@@ -908,6 +964,7 @@ def takserver_two_server_deploy_server_two():
     if not db_host:
         return jsonify({'success': False, 'error': 'Server One host not set'}), 400
     db_port = int(cfg.get('database', {}).get('port') or 5432)
+    db_password = (cfg.get('database', {}).get('password') or '').strip()
     uploaded = [f for f in os.listdir(UPLOAD_DIR) if f.endswith('.deb') or f.endswith('.rpm')]
     core_pkg = next((f for f in uploaded if 'core' in f.lower()), '')
     if not core_pkg:
@@ -916,6 +973,31 @@ def takserver_two_server_deploy_server_two():
     if not os.path.isfile(local_deb):
         return jsonify({'success': False, 'error': f'Package not found: {core_pkg}'}), 400
     log = []
+
+    # If no DB password stored, try to fetch it from Server One now
+    if not db_password:
+        pwd_cmd = "sudo sed -n 's/.*password=\"\\([^\"]*\\)\".*/\\1/p' /opt/tak/CoreConfig.example.xml 2>/dev/null | head -1"
+        ok, pwd_out = _ssh_probe(s1, pwd_cmd, timeout=10)
+        db_password = (pwd_out or '').strip() if ok else ''
+        if db_password:
+            cfg['database']['password'] = db_password
+            settings['tak_deployment'] = cfg
+            save_settings(settings)
+            log.append('Fetched DB password from Server One.')
+        else:
+            log.append('Warning: no DB password from Server One — CoreConfig may need manual password fix.')
+
+    # Increase concurrent TCP connections per TAK guide
+    try:
+        subprocess.run(
+            'grep -q "soft nofile 32768" /etc/security/limits.conf 2>/dev/null || '
+            'printf "* soft nofile 32768\\n* hard nofile 32768\\n" | sudo tee -a /etc/security/limits.conf > /dev/null',
+            shell=True, capture_output=True, text=True, timeout=10
+        )
+    except Exception:
+        pass
+
+    # Install core .deb
     try:
         r = subprocess.run(
             f'cd {UPLOAD_DIR} && sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ./{core_pkg}',
@@ -927,20 +1009,35 @@ def takserver_two_server_deploy_server_two():
             return jsonify({'success': False, 'error': (r.stderr or r.stdout or 'apt install failed')[:500], 'log': log}), 400
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)[:400], 'log': log}), 400
+
+    # Patch CoreConfig.xml: JDBC URL and DB password
     core_config = '/opt/tak/CoreConfig.xml'
     if os.path.exists(core_config):
         try:
+            r = subprocess.run(['sudo', 'cat', core_config], capture_output=True, text=True, timeout=5)
+            content = r.stdout or ''
+            if not content:
+                return jsonify({'success': False, 'error': 'Could not read CoreConfig.xml', 'log': log}), 400
+
             jdbc_new = f'jdbc:postgresql://{db_host}:{db_port}/cot'
-            r = subprocess.run(
-                ['sudo', 'sed', '-i', f's|jdbc:postgresql://127.0.0.1:5432/cot|{jdbc_new}|g', core_config],
-                capture_output=True, text=True, timeout=10
-            )
-            if r.returncode != 0:
-                return jsonify({'success': False, 'error': (r.stderr or r.stdout or 'sed failed')[:300], 'log': log}), 400
+            content = content.replace('jdbc:postgresql://127.0.0.1:5432/cot', jdbc_new)
+
+            if db_password:
+                content = re.sub(
+                    r'(<connection[^>]*password=")[^"]*(")',
+                    lambda m: m.group(1) + db_password + m.group(2),
+                    content
+                )
+
+            proc = subprocess.run(['sudo', 'tee', core_config], input=content,
+                                  capture_output=True, text=True, timeout=5)
+            if proc.returncode != 0:
+                return jsonify({'success': False, 'error': 'Failed to write CoreConfig.xml', 'log': log}), 400
+
             subprocess.run(['sudo', 'systemctl', 'daemon-reload'], capture_output=True, timeout=10)
             subprocess.run(['sudo', 'systemctl', 'enable', 'takserver'], capture_output=True, timeout=10)
             subprocess.run(['sudo', 'systemctl', 'restart', 'takserver'], capture_output=True, timeout=30)
-            log.append('CoreConfig updated, takserver restarted.')
+            log.append(f'CoreConfig updated: DB→{db_host}:{db_port}, takserver restarted.')
         except Exception as e:
             return jsonify({'success': False, 'error': f'CoreConfig update failed: {e}', 'log': log}), 400
     return jsonify({'success': True, 'message': 'Server Two (Core) deploy complete. Two-server TAK is up.', 'log': log})
