@@ -1015,6 +1015,16 @@ def takserver_two_server_deploy_server_one():
     if not core_ip:
         return jsonify({'success': False, 'error': 'Server Two (Core) IP unknown. Set Server IP in Settings or ensure this host can reach ifconfig.me.'}), 400
 
+    # Require SSH to Server One first — otherwise deploy and password capture will both fail
+    ssh_ok, ssh_out = _ssh_probe(s1, 'echo ok', timeout=10)
+    if not ssh_ok:
+        err = (ssh_out or 'Connection failed').strip()[:300]
+        return jsonify({
+            'success': False,
+            'error': f'Cannot SSH to Server One ({s1.get("host")}). Run step 2 (Setup SSH key) and step 3 (Copy key to Server One) first. Without SSH, deployment cannot proceed.',
+            'detail': err,
+        }), 400
+
     uploaded = [f for f in os.listdir(UPLOAD_DIR) if f.endswith('.deb') or f.endswith('.rpm')]
     db_pkg = next((f for f in uploaded if 'database' in f.lower()), '')
     if not db_pkg:
@@ -1398,7 +1408,11 @@ def _monitor_health_check(monitor_id):
             r = subprocess.run('sudo -u postgres psql -tAc "SELECT pg_database_size(\'cot\')" 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
             return r.returncode == 0 and r.stdout.strip().isdigit()
         if monitor_id == 'oom':
-            r = subprocess.run('grep -c "OutOfMemoryError" /opt/tak/logs/takserver*.log 2>/dev/null', shell=True, capture_output=True, text=True, timeout=3)
+            # Only check the active messaging log; only last 10k lines so old OOMs don't keep status red forever
+            log_path = '/opt/tak/logs/takserver-messaging.log'
+            if not os.path.isfile(log_path):
+                return None
+            r = subprocess.run(f'tail -n 10000 "{log_path}" | grep -c "OutOfMemoryError" 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
             return (r.stdout.strip() or '0') == '0'
         if monitor_id == 'disk':
             r = subprocess.run("df / --output=pcent 2>/dev/null | tail -1", shell=True, capture_output=True, text=True, timeout=3)
@@ -13812,21 +13826,26 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div class="controls"><button class="control-btn btn-stop" onclick="cancelDeploy()">✗ Cancel</button></div>
 {% elif tak.installed and tak.running %}
 <div class="status-info"><div><div class="status-text" style="color:var(--green)">Running</div><div class="status-detail">TAK Server is active{% if tak_version %} · {{ tak_version }}{% endif %}</div><div id="cert-expiry-banner" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:4px"></div></div></div>
-<div class="controls" style="flex-basis:100%;display:flex;gap:10px;flex-wrap:wrap;padding-top:12px;border-top:1px solid var(--border);margin-top:16px"><button class="control-btn" onclick="takControl('restart')">↻ Restart</button>{% if two_server_mode %}<button class="control-btn" onclick="takControl('restart','database')" title="Restart PostgreSQL on Server One ({{ s1_host }})">↻ Restart DB ({{ s1_host }})</button><button class="control-btn" onclick="takControl('restart','both')" title="Restart both TAK Server and remote PostgreSQL">↻ Restart Both</button><button class="control-btn" onclick="syncTakDbPassword()" title="Patch CoreConfig with DB password and restart (use field below or saved password)">🔑 Sync DB password</button>{% endif %}<button class="control-btn" onclick="takUpdateConfig()" id="tak-update-config-btn">🔄 Update config</button><button class="control-btn btn-stop" onclick="takControl('stop')">■ Stop</button><button class="control-btn btn-stop" onclick="document.getElementById('tak-uninstall-modal').classList.add('open')">🗑 Remove</button></div>
 {% elif tak.installed %}
 <div class="status-info"><div><div class="status-text" style="color:var(--red)">Stopped</div><div class="status-detail">TAK Server is installed but not running{% if tak_version %} · {{ tak_version }}{% endif %}</div><div id="cert-expiry-banner" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:4px"></div></div></div>
-<div class="controls" style="flex-basis:100%;display:flex;gap:10px;flex-wrap:wrap;padding-top:12px;border-top:1px solid var(--border);margin-top:16px"><button class="control-btn btn-start" onclick="takControl('start')">▶ Start</button>{% if two_server_mode %}<button class="control-btn btn-start" onclick="takControl('start','database')" title="Start PostgreSQL on Server One ({{ s1_host }})">▶ Start DB ({{ s1_host }})</button><button class="control-btn btn-start" onclick="takControl('start','both')" title="Start both TAK Server and remote PostgreSQL">▶ Start Both</button><button class="control-btn" onclick="syncTakDbPassword()" title="Patch CoreConfig with DB password and restart (use field below or saved password)">🔑 Sync DB password</button>{% endif %}<button class="control-btn" onclick="takUpdateConfig()" id="tak-update-config-btn">🔄 Update config</button><button class="control-btn btn-stop" onclick="document.getElementById('tak-uninstall-modal').classList.add('open')">🗑 Remove</button></div>
 {% else %}
 <div class="status-info"><div><div class="status-text" style="color:var(--text-dim)">Not Installed</div><div class="status-detail">Upload package files from tak.gov to deploy</div></div></div>
 {% endif %}
-{% if two_server_mode and tak.installed %}
-<div style="flex-basis:100%;margin-top:12px;padding-top:12px;border-top:1px solid var(--border);display:flex;align-items:center;flex-wrap:wrap;gap:8px">
+</div>
+
+{% if tak.installed %}
+<div class="section-title" style="margin-top:20px">Controls</div>
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:24px">
+<div class="controls" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">{% if tak.running %}<button class="control-btn" onclick="takControl('restart')">↻ Restart</button>{% if two_server_mode %}<button class="control-btn" onclick="takControl('restart','database')" title="Restart PostgreSQL on Server One ({{ s1_host }})">↻ Restart DB ({{ s1_host }})</button><button class="control-btn" onclick="takControl('restart','both')" title="Restart both TAK Server and remote PostgreSQL">↻ Restart Both</button><button class="control-btn" onclick="syncTakDbPassword()" title="Patch CoreConfig with DB password and restart (use field below or saved password)">🔑 Sync DB password</button>{% endif %}<button class="control-btn" onclick="takUpdateConfig()" id="tak-update-config-btn">🔄 Update config</button><button class="control-btn btn-stop" onclick="takControl('stop')">■ Stop</button><button class="control-btn btn-stop" onclick="document.getElementById('tak-uninstall-modal').classList.add('open')">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="takControl('start')">▶ Start</button>{% if two_server_mode %}<button class="control-btn btn-start" onclick="takControl('start','database')" title="Start PostgreSQL on Server One ({{ s1_host }})">▶ Start DB ({{ s1_host }})</button><button class="control-btn btn-start" onclick="takControl('start','both')" title="Start both TAK Server and remote PostgreSQL">▶ Start Both</button><button class="control-btn" onclick="syncTakDbPassword()" title="Patch CoreConfig with DB password and restart (use field below or saved password)">🔑 Sync DB password</button>{% endif %}<button class="control-btn" onclick="takUpdateConfig()" id="tak-update-config-btn">🔄 Update config</button><button class="control-btn btn-stop" onclick="document.getElementById('tak-uninstall-modal').classList.add('open')">🗑 Remove</button>{% endif %}</div>
+{% if two_server_mode %}
+<div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--border);display:flex;align-items:center;flex-wrap:wrap;gap:8px">
 <label for="sync-db-password-input" style="font-size:12px;color:var(--text-secondary)">DB password (from Server One):</label>
 <input type="password" id="sync-db-password-input" placeholder="Paste or leave blank to use saved" autocomplete="off" style="width:200px;padding:6px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:'JetBrains Mono',monospace;font-size:12px" />
 <span style="font-size:11px;color:var(--text-dim)">Paste from Server One if 8443/8446 fail; leave blank to use saved.</span>
 </div>
 {% endif %}
 </div>
+{% endif %}
 
 {% if deploying or deploy_done or deploy_error %}
 <div class="section-title">Deployment Log</div>

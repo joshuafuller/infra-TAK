@@ -1065,10 +1065,10 @@ async function deployTakServerOne(){
       var d=await r.json();
       if(!d.success)throw new Error(d.error||'Deploy failed');
       if(d.db_password_captured){
-        if(msg){msg.textContent='✓ Server One ready. DB password captured automatically.';msg.style.color='var(--green)';}
+        if(msg){msg.textContent='✓ Server One ready. DB password captured automatically. Move to step 5 (Deploy Server Two).';msg.style.color='var(--green)';}
         loadTakDeploymentConfig();
       }else{
-        if(msg){msg.textContent='✓ Server One ready. DB password was not captured — paste it in the field above and Save Config, then run step 5.';msg.style.color='var(--yellow)';}
+        if(msg){msg.textContent='✓ Server One ready. DB password was not captured — step 5 needs it. Paste the password from Server One in the field above and Save Config, then move to step 5.';msg.style.color='var(--yellow)';}
       }
       return d;
     }catch(e){
