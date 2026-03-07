@@ -863,11 +863,13 @@ def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
 
 def _fetch_db_password_from_server_one(s1_cfg):
     """Fetch martiuser DB password from Server One. Tries CoreConfig.example.xml and CoreConfig.xml.
-    Uses grep -oP first; falls back to sed for systems without Perl regex grep."""
+    Uses several extraction methods so it works without grep -P."""
     for pw_file in ('/opt/tak/CoreConfig.example.xml', '/opt/tak/CoreConfig.xml'):
+        # Order: no -P first (works on minimal/busybox), then sed-only, then grep -oP
         for pwd_cmd in (
-            f"sudo grep -oP 'password=\"\\K[^\"]+' {pw_file} 2>/dev/null | head -1",
+            f"sudo grep -o 'password=\"[^\"]*\"' {pw_file} 2>/dev/null | head -1 | sed 's/.*password=\"//;s/\"$//'",
             f"sudo sed -n 's/.*password=\"\\([^\"]*\\)\".*/\\1/p' {pw_file} 2>/dev/null | head -1",
+            f"sudo grep -oP 'password=\"\\K[^\"]+' {pw_file} 2>/dev/null | head -1",
         ):
             ok, pwd_out = _ssh_probe(s1_cfg, pwd_cmd, timeout=10)
             candidate = (pwd_out or '').strip() if ok else ''
@@ -1123,7 +1125,7 @@ def takserver_two_server_sync_db_password():
 
     db_pass = _fetch_db_password_from_server_one(s1)
     if not db_pass:
-        return jsonify({'success': False, 'error': 'Could not read DB password from Server One. SSH to Server One and run: sudo grep -oP \'password="\\K[^"]+\' /opt/tak/CoreConfig.example.xml'}), 400
+        return jsonify({'success': False, 'error': 'Could not read DB password from Server One. SSH to Server One and run: sudo sed -n \'s/.*password="\\([^"]*\\)".*/\1/p\' /opt/tak/CoreConfig.example.xml | head -1 (or check: ls -la /opt/tak/CoreConfig*.xml)'}), 400
 
     try:
         r = subprocess.run(['sudo', 'cat', '/opt/tak/CoreConfig.xml'], capture_output=True, text=True, timeout=5)
