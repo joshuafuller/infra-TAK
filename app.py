@@ -5,7 +5,7 @@ from flask import (Flask, render_template_string, request, jsonify,
     redirect, url_for, session, send_from_directory, make_response)
 from werkzeug.security import check_password_hash, generate_password_hash
 from functools import wraps
-import os, re, ssl, json, secrets, subprocess, time, psutil, threading, html, shutil
+import os, re, ssl, json, secrets, subprocess, time, psutil, threading, html, shutil, copy
 import urllib.request
 import urllib.parse
 from datetime import datetime
@@ -512,6 +512,140 @@ def takserver_page():
         deploy_done=deploy_status.get('complete', False), deploy_error=deploy_status.get('error', False),
         upgrading=upgrade_status.get('running', False), upgrade_done=upgrade_status.get('complete', False),
         upgrade_error=upgrade_status.get('error', False))
+
+@app.route('/api/takserver/deployment-config', methods=['GET'])
+@login_required
+def takserver_get_deployment_config():
+    settings = load_settings()
+    cfg = _get_tak_deployment_config(settings)
+    return jsonify({'success': True, 'config': cfg})
+
+@app.route('/api/takserver/deployment-config', methods=['POST'])
+@login_required
+def takserver_save_deployment_config():
+    data = request.get_json() or {}
+    incoming = data.get('config', data)
+    cfg = _normalize_tak_deployment_config(incoming)
+    settings = load_settings()
+    settings['tak_deployment'] = cfg
+    save_settings(settings)
+    return jsonify({'success': True, 'config': cfg})
+
+@app.route('/api/takserver/two-server/preflight', methods=['POST'])
+@login_required
+def takserver_two_server_preflight():
+    data = request.get_json() or {}
+    settings = load_settings()
+    cfg = _get_tak_deployment_config(settings)
+    if isinstance(data.get('config'), dict):
+        cfg = _normalize_tak_deployment_config(_deep_merge_dict(cfg, data.get('config')))
+    if cfg.get('mode') != 'two_server':
+        return jsonify({'success': False, 'error': 'Deployment mode is not set to two_server', 'config': cfg}), 400
+
+    checks = []
+    server_one = cfg.get('server_one', {})
+    server_two = cfg.get('server_two', {})
+    db_port = int(cfg.get('database', {}).get('port') or 5432)
+
+    def add_check(name, ok, details=''):
+        checks.append({'name': name, 'ok': bool(ok), 'details': (details or '')[:600]})
+
+    add_check('Server One host configured', bool(server_one.get('host')), server_one.get('host', ''))
+    if server_two.get('use_localhost'):
+        add_check('Server Two host configured', True, 'Using infra-TAK host (local)')
+    else:
+        add_check('Server Two host configured', bool(server_two.get('host')), server_two.get('host', ''))
+
+    one_ok = two_ok = False
+    one_out = two_out = ''
+    if server_one.get('host'):
+        one_ok, one_out = _ssh_probe(server_one, 'echo "server_one_ok" && uname -a', timeout=18)
+    add_check('SSH to Server One (Database Server)', one_ok, one_out)
+    if server_two.get('host') or server_two.get('use_localhost'):
+        two_ok, two_out = _ssh_probe(server_two, 'echo "server_two_ok" && uname -a', timeout=18)
+    add_check('SSH to Server Two (Core Server)', two_ok, two_out)
+
+    # From Server Two, verify DB TCP path to Server One:5432 (or configured DB port).
+    db_reach_ok = False
+    if two_ok and server_one.get('host'):
+        probe_cmd = f'timeout 6 bash -lc "</dev/tcp/{server_one.get("host")}/{db_port}" >/dev/null 2>&1 && echo OPEN || echo CLOSED'
+        ok, out = _ssh_probe(server_two, probe_cmd, timeout=20)
+        db_reach_ok = ok and 'OPEN' in (out or '')
+        add_check(f'Server Two can reach Server One DB port {db_port}', db_reach_ok, out)
+    else:
+        add_check(f'Server Two can reach Server One DB port {db_port}', False, 'Skipped (SSH/host check failed)')
+
+    all_ok = all(c['ok'] for c in checks)
+    return jsonify({
+        'success': all_ok,
+        'config': cfg,
+        'checks': checks,
+        'summary': {
+            'ready': all_ok,
+            'server_one_ssh': one_ok,
+            'server_two_ssh': two_ok,
+            'db_reachable_from_server_two': db_reach_ok,
+        }
+    })
+
+@app.route('/api/takserver/two-server/runbook', methods=['GET'])
+@login_required
+def takserver_two_server_runbook():
+    """Generate a practical two-server command runbook using manual naming/order."""
+    settings = load_settings()
+    cfg = _get_tak_deployment_config(settings)
+    if cfg.get('mode') != 'two_server':
+        return jsonify({'success': False, 'error': 'Deployment mode is not set to two_server', 'config': cfg}), 400
+
+    uploaded = [f for f in os.listdir(UPLOAD_DIR) if f.endswith('.deb') or f.endswith('.rpm')]
+    db_pkg = next((f for f in uploaded if 'database' in f.lower()), '')
+    core_pkg = next((f for f in uploaded if 'core' in f.lower()), '')
+
+    s1 = cfg.get('server_one', {})
+    s2 = cfg.get('server_two', {})
+    db_host = (s1.get('host') or '<SERVER_ONE_DB_HOST>').strip() or '<SERVER_ONE_DB_HOST>'
+    db_port = int(cfg.get('database', {}).get('port') or 5432)
+    core_host_for_db_acl = (s2.get('host') or '').strip()
+    if s2.get('use_localhost'):
+        core_host_for_db_acl = (settings.get('server_ip') or '').strip() or '<INFRA_SERVER_IP>'
+    if not core_host_for_db_acl:
+        core_host_for_db_acl = '<SERVER_TWO_CORE_HOST>'
+
+    server_one_steps = [
+        '# Server One: Database Server',
+        'sudo apt-get update && sudo apt-get install -y lsb-release',
+        'sudo mkdir -p /etc/apt/keyrings',
+        'sudo curl https://www.postgresql.org/media/keys/ACCC4CF8.asc --output /etc/apt/keyrings/postgresql.asc',
+        'echo "deb [signed-by=/etc/apt/keyrings/postgresql.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/postgresql.list >/dev/null',
+        'sudo apt update',
+        f'sudo apt install -y ./{db_pkg}' if db_pkg else 'sudo apt install -y ./takserver-database_x.x-RELEASExx_all.deb',
+        f'sudo ufw allow from {core_host_for_db_acl} to any port {db_port} proto tcp',
+        f'sudo ufw allow {db_port}/tcp',
+        'sudo ufw --force enable',
+    ]
+    server_two_steps = [
+        '# Server Two: Core Server',
+        'sudo apt-get update && sudo apt-get install -y lsb-release',
+        f'sudo apt install -y ./{core_pkg}' if core_pkg else 'sudo apt install -y ./takserver-core_x.x-RELEASExx_all.deb',
+        f'sudo sed -i \'s|jdbc:postgresql://127.0.0.1:5432/cot|jdbc:postgresql://{db_host}:{db_port}/cot|g\' /opt/tak/CoreConfig.xml',
+        'sudo systemctl daemon-reload',
+        'sudo systemctl enable takserver',
+        'sudo systemctl restart takserver',
+        'sudo ufw allow 8089/tcp && sudo ufw allow 8443/tcp && sudo ufw allow 8446/tcp && sudo ufw --force enable',
+    ]
+    notes = [
+        'Manual naming/order preserved: Server One (Database Server) first, then Server Two (Core Server).',
+        'Database password is generated by the TAK installer; confirm the value in /opt/tak/CoreConfig.example.xml on Server One and ensure Server Two CoreConfig.xml matches it.',
+        'For production, enable PostgreSQL TLS per Appendix D and use sslEnabled/sslMode fields in CoreConfig.xml.',
+    ]
+    return jsonify({
+        'success': True,
+        'config': cfg,
+        'detected_packages': {'database': db_pkg, 'core': core_pkg},
+        'server_one_steps': server_one_steps,
+        'server_two_steps': server_two_steps,
+        'notes': notes,
+    })
 
 @app.route('/mediamtx')
 @login_required
@@ -1543,6 +1677,136 @@ def _get_authentik_base_url(settings):
         return f'https://{host}'
     server_ip = (settings.get('server_ip') or '').strip() or 'localhost'
     return f'http://{server_ip}:9090'
+
+def _tak_deployment_defaults():
+    """Default TAK deployment shape (single-server by default, optional two-server fields)."""
+    return {
+        'mode': 'single_server',  # single_server | two_server
+        'server_one': {  # Manual naming from TAK guide: "Server One: Database Server"
+            'host': '',
+            'ssh_user': 'root',
+            'ssh_port': 22,
+            'auth_method': 'ssh_key',  # ssh_key | password
+            'ssh_key_path': '',
+            'ssh_password': '',
+            'os_family': 'ubuntu',
+        },
+        'server_two': {  # Manual naming from TAK guide: "Server Two: Core Server"
+            'host': '127.0.0.1',
+            'ssh_user': 'root',
+            'ssh_port': 22,
+            'use_localhost': True,
+            'auth_method': 'ssh_key',  # ssh_key | password
+            'ssh_key_path': '',
+            'ssh_password': '',
+            'os_family': 'ubuntu',
+        },
+        'database': {
+            'port': 5432,
+            'name': 'cot',
+            'user': 'martiuser',
+            'password': '',
+            'enable_postgres_tls': True,
+        },
+    }
+
+def _deep_merge_dict(base, override):
+    """Return a deep-merged copy of dicts (override values win)."""
+    merged = copy.deepcopy(base)
+    for k, v in (override or {}).items():
+        if isinstance(v, dict) and isinstance(merged.get(k), dict):
+            merged[k] = _deep_merge_dict(merged[k], v)
+        else:
+            merged[k] = v
+    return merged
+
+def _normalize_tak_deployment_config(cfg):
+    """Validate and normalize TAK deployment settings for persistence/runtime use."""
+    c = _deep_merge_dict(_tak_deployment_defaults(), cfg or {})
+    mode = (c.get('mode') or 'single_server').strip().lower()
+    c['mode'] = 'two_server' if mode == 'two_server' else 'single_server'
+    for key in ('server_one', 'server_two'):
+        host_cfg = c.get(key, {}) if isinstance(c.get(key), dict) else {}
+        host_cfg['host'] = (host_cfg.get('host') or '').strip()
+        host_cfg['ssh_user'] = (host_cfg.get('ssh_user') or 'root').strip() or 'root'
+        try:
+            host_cfg['ssh_port'] = int(host_cfg.get('ssh_port') or 22)
+        except Exception:
+            host_cfg['ssh_port'] = 22
+        auth_method = (host_cfg.get('auth_method') or 'ssh_key').strip().lower()
+        host_cfg['auth_method'] = 'password' if auth_method == 'password' else 'ssh_key'
+        host_cfg['ssh_key_path'] = (host_cfg.get('ssh_key_path') or '').strip()
+        host_cfg['ssh_password'] = (host_cfg.get('ssh_password') or '').strip()
+        host_cfg['use_localhost'] = bool(host_cfg.get('use_localhost', False))
+        if key == 'server_two' and host_cfg.get('use_localhost'):
+            host_cfg['host'] = '127.0.0.1'
+            host_cfg['auth_method'] = 'ssh_key'
+            host_cfg['ssh_key_path'] = ''
+            host_cfg['ssh_password'] = ''
+        if key == 'server_two' and not host_cfg.get('host'):
+            host_cfg['host'] = '127.0.0.1'
+        host_cfg['os_family'] = (host_cfg.get('os_family') or 'ubuntu').strip().lower() or 'ubuntu'
+        c[key] = host_cfg
+    db_cfg = c.get('database', {}) if isinstance(c.get('database'), dict) else {}
+    try:
+        db_cfg['port'] = int(db_cfg.get('port') or 5432)
+    except Exception:
+        db_cfg['port'] = 5432
+    db_cfg['name'] = (db_cfg.get('name') or 'cot').strip() or 'cot'
+    db_cfg['user'] = (db_cfg.get('user') or 'martiuser').strip() or 'martiuser'
+    db_cfg['password'] = (db_cfg.get('password') or '').strip()
+    db_cfg['enable_postgres_tls'] = bool(db_cfg.get('enable_postgres_tls', True))
+    c['database'] = db_cfg
+    return c
+
+def _get_tak_deployment_config(settings):
+    return _normalize_tak_deployment_config(settings.get('tak_deployment', {}))
+
+def _ssh_probe(host_cfg, cmd='echo ok', timeout=15):
+    """Run a non-interactive SSH probe command. Returns (ok, output)."""
+    host = (host_cfg.get('host') or '').strip()
+    user = (host_cfg.get('ssh_user') or 'root').strip() or 'root'
+    port = int(host_cfg.get('ssh_port') or 22)
+    if not host:
+        return False, 'host not set'
+    is_local = bool(host_cfg.get('use_localhost')) or host in ('127.0.0.1', 'localhost', '::1')
+    if is_local:
+        try:
+            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+            out = (r.stdout or r.stderr or '').strip()
+            return r.returncode == 0, out
+        except Exception as e:
+            return False, str(e)
+    auth_method = (host_cfg.get('auth_method') or 'ssh_key').strip().lower()
+    batch_mode = 'no' if auth_method == 'password' else 'yes'
+    ssh_cmd = [
+        'ssh',
+        '-o', f'BatchMode={batch_mode}',
+        '-o', 'StrictHostKeyChecking=accept-new',
+        '-o', f'ConnectTimeout={max(3, min(10, timeout))}',
+        '-p', str(port),
+    ]
+    key_path = (host_cfg.get('ssh_key_path') or '').strip()
+    if auth_method == 'password':
+        ssh_password = (host_cfg.get('ssh_password') or '').strip()
+        if not ssh_password:
+            return False, 'auth_method=password but ssh_password is empty'
+        if shutil.which('sshpass') is None:
+            return False, 'sshpass not installed on infra host (required for password-based preflight)'
+        ssh_cmd = ['sshpass', '-p', ssh_password] + ssh_cmd
+    elif key_path:
+        expanded = os.path.expanduser(key_path)
+        if os.path.exists(expanded):
+            ssh_cmd.extend(['-i', expanded])
+        else:
+            return False, f'ssh key not found: {expanded}'
+    ssh_cmd.extend([f'{user}@{host}', cmd])
+    try:
+        r = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=timeout)
+        out = (r.stdout or r.stderr or '').strip()
+        return r.returncode == 0, out
+    except Exception as e:
+        return False, str(e)
 
 def generate_caddyfile(settings=None):
     """Generate Caddyfile based on current settings and deployed services.
@@ -11186,6 +11450,13 @@ def deploy_takserver():
         return jsonify({'error': 'Deployment already in progress'}), 400
     data = request.json
     if not data: return jsonify({'error': 'No configuration provided'}), 400
+    settings = load_settings()
+    tak_deploy_cfg = _get_tak_deployment_config(settings)
+    requested_mode = (data.get('deployment_mode') or tak_deploy_cfg.get('mode') or 'single_server').strip().lower()
+    if requested_mode == 'two_server':
+        return jsonify({
+            'error': 'Two-server TAK deploy is preflight/config-ready but not yet one-click automated in this build. Save config via /api/takserver/deployment-config and run /api/takserver/two-server/preflight, then follow the two-server runbook.'
+        }), 400
     pkg_files = [f for f in os.listdir(UPLOAD_DIR) if f.endswith('.deb') or f.endswith('.rpm')]
     if not pkg_files: return jsonify({'error': 'No package file found.'}), 400
     config = {

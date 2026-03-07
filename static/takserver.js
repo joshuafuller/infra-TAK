@@ -553,6 +553,7 @@ async function cancelDeploy(){
 
 let uploadedFiles={package:null,gpg_key:null,policy:null};
 let uploadsInProgress=0;
+let takDeploymentConfigCache=null;
 
 function handleDragOver(e){e.preventDefault();document.getElementById('upload-area').classList.add('dragover')}
 function handleDragLeave(e){document.getElementById('upload-area').classList.remove('dragover')}
@@ -678,6 +679,8 @@ function showDeployConfig(){
       '<div id="cert-download-area" style="display:none;margin-top:20px"><div class="section-title">Download Certificates</div><div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px"><div class="cert-downloads"><a href="/api/download/admin-cert" class="cert-btn cert-btn-secondary">\u2B07 admin.p12</a><a href="/api/download/user-cert" class="cert-btn cert-btn-secondary">\u2B07 user.p12</a><a href="/api/download/truststore" class="cert-btn cert-btn-secondary">\u2B07 truststore.p12</a></div><div style="font-family:\'JetBrains Mono\',monospace;font-size:12px;color:var(--text-dim);margin-top:12px">Certificate password: <span style="color:var(--cyan)">atakatak</span></div></div></div>'
     ].join('');
     main.appendChild(cd);
+    initTakDeployModeUI(cd);
+    loadTakDeploymentConfig();
     const pi=document.getElementById('webadmin_password');if(pi){pi.addEventListener('input',validatePassword);pi.addEventListener('input',checkPasswordMatch)}const pc=document.getElementById('webadmin_password_confirm');if(pc)pc.addEventListener('input',checkPasswordMatch);
 }
 
@@ -696,7 +699,249 @@ function validatePassword(){
     return c.every(function(x){return x.t});
 }
 
+function initTakDeployModeUI(rootEl){
+    var card=rootEl&&rootEl.querySelector('div[style*="background:var(--bg-card)"]');
+    if(!card)return;
+    var html=[
+      '<div id="tak-deploy-mode-panel" style="margin-bottom:20px;padding:16px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:10px">',
+      '<div style="font-family:\'JetBrains Mono\',monospace;font-size:13px;color:var(--text-dim);margin-bottom:12px;text-transform:uppercase;letter-spacing:1px;font-weight:600">Deployment Mode</div>',
+      '<div style="display:flex;gap:18px;flex-wrap:wrap;margin-bottom:8px">',
+      '<label style="display:flex;align-items:center;gap:8px;color:var(--text-secondary);cursor:pointer"><input type="radio" name="deployment_mode" id="dep_mode_single" value="single_server" checked style="accent-color:var(--accent)"> One Server <span style="color:var(--text-dim);font-size:12px">(recommended up to ~500 concurrent users)</span></label>',
+      '<label style="display:flex;align-items:center;gap:8px;color:var(--text-secondary);cursor:pointer"><input type="radio" name="deployment_mode" id="dep_mode_split" value="two_server" style="accent-color:var(--accent)"> Split Server <span style="color:var(--text-dim);font-size:12px">(Server One DB + Server Two Core)</span></label>',
+      '</div>',
+      '<div id="dep_mode_hint" style="font-size:12px;color:var(--text-dim)">Start simple with one server. Use split mode when scale/performance needs exceed ~500 concurrent users.</div>',
+      '</div>',
+      '<div id="two-server-config-panel" style="display:none;margin-bottom:20px;padding:16px;background:rgba(59,130,246,0.06);border:1px solid var(--border);border-radius:10px">',
+      '<div style="font-family:\'JetBrains Mono\',monospace;font-size:13px;color:var(--text-dim);margin-bottom:12px;text-transform:uppercase;letter-spacing:1px;font-weight:600">Split Server Wizard (Manual Naming)</div>',
+      '<div style="font-size:12px;color:var(--text-dim);margin-bottom:10px">Server One = Database Server. Server Two = Core Server.</div>',
+      '<label style="display:flex;align-items:center;gap:8px;color:var(--text-secondary);cursor:pointer;font-size:12px;margin-bottom:12px"><input type="checkbox" id="ts_server_two_local" checked onchange="toggleServerTwoLocal()" style="accent-color:var(--accent)"> Use this infra-TAK host as Server Two (Core Server)</label>',
+      '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">',
+      '<div style="background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:12px">',
+      '<div style="font-size:12px;color:var(--cyan);font-weight:600;margin-bottom:8px">Server One: Database Server</div>',
+      '<div class="form-field"><label>Host / IP</label><input type="text" id="ts_server_one_host" placeholder="10.0.0.21"></div>',
+      '<div class="form-field"><label>SSH User</label><input type="text" id="ts_server_one_user" placeholder="root"></div>',
+      '<div class="form-field"><label>SSH Port</label><input type="number" id="ts_server_one_port" value="22"></div>',
+      '<div class="form-field"><label>Auth Method</label><select id="ts_server_one_auth" onchange="toggleTwoServerAuthInputs(\'one\')" style="width:100%;padding:10px 14px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:13px"><option value="ssh_key">SSH key</option><option value="password">User/password</option></select></div>',
+      '<div class="form-field" id="ts_server_one_key_wrap"><label>SSH Key Path</label><input type="text" id="ts_server_one_key" placeholder="~/.ssh/id_rsa"></div>',
+      '<div class="form-field" id="ts_server_one_pw_wrap" style="display:none"><label>SSH Password</label><input type="password" id="ts_server_one_pw" placeholder="Password"></div>',
+      '</div>',
+      '<div style="background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:12px">',
+      '<div style="font-size:12px;color:var(--cyan);font-weight:600;margin-bottom:8px">Server Two: Core Server</div>',
+      '<div class="form-field"><label>Host / IP</label><input type="text" id="ts_server_two_host" placeholder="10.0.0.22"></div>',
+      '<div class="form-field"><label>SSH User</label><input type="text" id="ts_server_two_user" placeholder="root"></div>',
+      '<div class="form-field"><label>SSH Port</label><input type="number" id="ts_server_two_port" value="22"></div>',
+      '<div class="form-field"><label>Auth Method</label><select id="ts_server_two_auth" onchange="toggleTwoServerAuthInputs(\'two\')" style="width:100%;padding:10px 14px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:13px"><option value="ssh_key">SSH key</option><option value="password">User/password</option></select></div>',
+      '<div class="form-field" id="ts_server_two_key_wrap"><label>SSH Key Path</label><input type="text" id="ts_server_two_key" placeholder="~/.ssh/id_rsa"></div>',
+      '<div class="form-field" id="ts_server_two_pw_wrap" style="display:none"><label>SSH Password</label><input type="password" id="ts_server_two_pw" placeholder="Password"></div>',
+      '</div>',
+      '</div>',
+      '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-top:12px">',
+      '<div class="form-field"><label>DB Port</label><input type="number" id="ts_db_port" value="5432"></div>',
+      '<div class="form-field"><label>DB Name</label><input type="text" id="ts_db_name" value="cot"></div>',
+      '<div class="form-field"><label>DB User</label><input type="text" id="ts_db_user" value="martiuser"></div>',
+      '</div>',
+      '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px">',
+      '<button type="button" onclick="saveTakDeploymentConfig()" style="padding:8px 14px;background:rgba(59,130,246,0.15);color:var(--accent);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer">Save Split Config</button>',
+      '<button type="button" onclick="runTakTwoServerPreflight()" style="padding:8px 14px;background:rgba(14,116,144,0.2);color:var(--cyan);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer">Run Preflight</button>',
+      '<button type="button" onclick="loadTakTwoServerRunbook()" style="padding:8px 14px;background:rgba(16,185,129,0.15);color:var(--green);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer">Generate Runbook</button>',
+      '</div>',
+      '<div id="two-server-msg" style="margin-top:10px;font-size:12px;color:var(--text-dim)"></div>',
+      '<div id="two-server-preflight" style="display:none;margin-top:10px;background:#0c0f1a;border:1px solid var(--border);border-radius:8px;padding:12px;font-family:\'JetBrains Mono\',monospace;font-size:11px;white-space:pre-wrap"></div>',
+      '<div id="two-server-runbook" style="display:none;margin-top:10px;background:#0c0f1a;border:1px solid var(--border);border-radius:8px;padding:12px;font-family:\'JetBrains Mono\',monospace;font-size:11px;white-space:pre-wrap"></div>',
+      '</div>'
+    ].join('');
+    card.insertAdjacentHTML('afterbegin',html);
+    var single=document.getElementById('dep_mode_single');
+    var split=document.getElementById('dep_mode_split');
+    if(single)single.addEventListener('change',toggleTwoServerPanel);
+    if(split)split.addEventListener('change',toggleTwoServerPanel);
+    toggleTwoServerPanel();
+    toggleServerTwoLocal();
+}
+
+function getTakDeploymentMode(){
+    var checked=document.querySelector('input[name="deployment_mode"]:checked');
+    return checked?checked.value:'single_server';
+}
+
+function toggleTwoServerPanel(){
+    var mode=getTakDeploymentMode();
+    var panel=document.getElementById('two-server-config-panel');
+    var hint=document.getElementById('dep_mode_hint');
+    if(panel)panel.style.display=(mode==='two_server'?'block':'none');
+    if(hint){
+      hint.textContent=(mode==='two_server')
+        ?'Split mode selected. Save config, run preflight, then apply Server One and Server Two steps in order.'
+        :'One server selected. This path is recommended up to ~500 concurrent users.';
+    }
+}
+
+function toggleServerTwoLocal(){
+    var useLocal=!!(document.getElementById('ts_server_two_local')||{}).checked;
+    var ids=['ts_server_two_host','ts_server_two_user','ts_server_two_port','ts_server_two_auth','ts_server_two_key','ts_server_two_pw'];
+    ids.forEach(function(id){
+      var el=document.getElementById(id);
+      if(el)el.disabled=useLocal;
+    });
+    if(useLocal){
+      var host=document.getElementById('ts_server_two_host');if(host)host.value='127.0.0.1';
+      var user=document.getElementById('ts_server_two_user');if(user)user.value='root';
+      var port=document.getElementById('ts_server_two_port');if(port)port.value='22';
+      var auth=document.getElementById('ts_server_two_auth');if(auth)auth.value='ssh_key';
+      var key=document.getElementById('ts_server_two_key');if(key)key.value='';
+      var pw=document.getElementById('ts_server_two_pw');if(pw)pw.value='';
+    }
+    toggleTwoServerAuthInputs('two');
+}
+
+function toggleTwoServerAuthInputs(which){
+    var auth=document.getElementById('ts_server_'+which+'_auth');
+    var keyWrap=document.getElementById('ts_server_'+which+'_key_wrap');
+    var pwWrap=document.getElementById('ts_server_'+which+'_pw_wrap');
+    var usePw=auth&&auth.value==='password';
+    if(keyWrap)keyWrap.style.display=usePw?'none':'block';
+    if(pwWrap)pwWrap.style.display=usePw?'block':'none';
+}
+
+function collectTakDeploymentConfigFromForm(){
+    return {
+      mode:getTakDeploymentMode(),
+      server_one:{
+        host:(document.getElementById('ts_server_one_host')||{}).value||'',
+        ssh_user:(document.getElementById('ts_server_one_user')||{}).value||'root',
+        ssh_port:parseInt((document.getElementById('ts_server_one_port')||{}).value||'22',10),
+        auth_method:(document.getElementById('ts_server_one_auth')||{}).value||'ssh_key',
+        ssh_key_path:(document.getElementById('ts_server_one_key')||{}).value||'',
+        ssh_password:(document.getElementById('ts_server_one_pw')||{}).value||''
+      },
+      server_two:{
+        host:(document.getElementById('ts_server_two_host')||{}).value||'',
+        ssh_user:(document.getElementById('ts_server_two_user')||{}).value||'root',
+        ssh_port:parseInt((document.getElementById('ts_server_two_port')||{}).value||'22',10),
+        use_localhost:!!(document.getElementById('ts_server_two_local')||{}).checked,
+        auth_method:(document.getElementById('ts_server_two_auth')||{}).value||'ssh_key',
+        ssh_key_path:(document.getElementById('ts_server_two_key')||{}).value||'',
+        ssh_password:(document.getElementById('ts_server_two_pw')||{}).value||''
+      },
+      database:{
+        port:parseInt((document.getElementById('ts_db_port')||{}).value||'5432',10),
+        name:(document.getElementById('ts_db_name')||{}).value||'cot',
+        user:(document.getElementById('ts_db_user')||{}).value||'martiuser'
+      }
+    };
+}
+
+function populateTakDeploymentConfigForm(cfg){
+    if(!cfg)return;
+    takDeploymentConfigCache=cfg;
+    if(cfg.mode==='two_server'){
+      var split=document.getElementById('dep_mode_split');if(split)split.checked=true;
+    }else{
+      var single=document.getElementById('dep_mode_single');if(single)single.checked=true;
+    }
+    toggleTwoServerPanel();
+    function set(id,val){var el=document.getElementById(id);if(el&&typeof val!=='undefined'&&val!==null)el.value=String(val);}
+    set('ts_server_one_host',cfg.server_one&&cfg.server_one.host);
+    set('ts_server_one_user',cfg.server_one&&cfg.server_one.ssh_user);
+    set('ts_server_one_port',cfg.server_one&&cfg.server_one.ssh_port);
+    set('ts_server_one_auth',cfg.server_one&&cfg.server_one.auth_method);
+    set('ts_server_one_key',cfg.server_one&&cfg.server_one.ssh_key_path);
+    set('ts_server_one_pw',cfg.server_one&&cfg.server_one.ssh_password);
+    set('ts_server_two_host',cfg.server_two&&cfg.server_two.host);
+    set('ts_server_two_user',cfg.server_two&&cfg.server_two.ssh_user);
+    set('ts_server_two_port',cfg.server_two&&cfg.server_two.ssh_port);
+    var s2Local=document.getElementById('ts_server_two_local');
+    if(s2Local)s2Local.checked=!!(cfg.server_two&&cfg.server_two.use_localhost);
+    set('ts_server_two_auth',cfg.server_two&&cfg.server_two.auth_method);
+    set('ts_server_two_key',cfg.server_two&&cfg.server_two.ssh_key_path);
+    set('ts_server_two_pw',cfg.server_two&&cfg.server_two.ssh_password);
+    set('ts_db_port',cfg.database&&cfg.database.port);
+    set('ts_db_name',cfg.database&&cfg.database.name);
+    set('ts_db_user',cfg.database&&cfg.database.user);
+    toggleTwoServerAuthInputs('one');
+    toggleTwoServerAuthInputs('two');
+    toggleServerTwoLocal();
+}
+
+async function loadTakDeploymentConfig(){
+    try{
+      var r=await fetch('/api/takserver/deployment-config');
+      var d=await r.json();
+      if(d&&d.config)populateTakDeploymentConfigForm(d.config);
+    }catch(e){}
+}
+
+async function saveTakDeploymentConfig(silent){
+    var msg=document.getElementById('two-server-msg');
+    try{
+      var cfg=collectTakDeploymentConfigFromForm();
+      var r=await fetch('/api/takserver/deployment-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:cfg})});
+      var d=await r.json();
+      if(!d.success)throw new Error(d.error||'Save failed');
+      takDeploymentConfigCache=d.config;
+      if(msg&&!silent){msg.textContent='✓ Split config saved';msg.style.color='var(--green)';}
+      return d.config;
+    }catch(e){
+      if(msg&&!silent){msg.textContent='✗ '+e.message;msg.style.color='var(--red)';}
+      throw e;
+    }
+}
+
+async function runTakTwoServerPreflight(silent){
+    var msg=document.getElementById('two-server-msg');
+    var out=document.getElementById('two-server-preflight');
+    try{
+      var cfg=await saveTakDeploymentConfig(true);
+      if(out){out.style.display='block';out.textContent='Running preflight...';}
+      var r=await fetch('/api/takserver/two-server/preflight',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:cfg})});
+      var d=await r.json();
+      var lines=['Two-Server Preflight'];
+      (d.checks||[]).forEach(function(c){lines.push((c.ok?'[OK] ':'[FAIL] ')+c.name+(c.details?(' - '+c.details):''));});
+      if(out)out.textContent=lines.join('\n');
+      if(msg&&!silent){msg.textContent=d.success?'✓ Preflight passed':'⚠ Preflight has failures';msg.style.color=d.success?'var(--green)':'var(--yellow)';}
+      return d;
+    }catch(e){
+      if(out){out.style.display='block';out.textContent='Preflight error: '+e.message;}
+      if(msg&&!silent){msg.textContent='✗ '+e.message;msg.style.color='var(--red)';}
+      return {success:false,error:e.message};
+    }
+}
+
+async function loadTakTwoServerRunbook(){
+    var msg=document.getElementById('two-server-msg');
+    var out=document.getElementById('two-server-runbook');
+    try{
+      await saveTakDeploymentConfig(true);
+      var r=await fetch('/api/takserver/two-server/runbook');
+      var d=await r.json();
+      if(!d.success)throw new Error(d.error||'Runbook failed');
+      var lines=['Two-Server Runbook (Manual Naming)','','Server One: Database Server'];
+      (d.server_one_steps||[]).forEach(function(s){lines.push(s);});
+      lines.push('','Server Two: Core Server');
+      (d.server_two_steps||[]).forEach(function(s){lines.push(s);});
+      if(d.notes&&d.notes.length){lines.push('','Notes:');d.notes.forEach(function(n){lines.push('- '+n);});}
+      if(out){out.style.display='block';out.textContent=lines.join('\n');}
+      if(msg){msg.textContent='✓ Runbook generated';msg.style.color='var(--green)';}
+      return d;
+    }catch(e){
+      if(out){out.style.display='block';out.textContent='Runbook error: '+e.message;}
+      if(msg){msg.textContent='✗ '+e.message;msg.style.color='var(--red)';}
+      return {success:false,error:e.message};
+    }
+}
+
 async function startDeploy(){
+    var deploymentMode=getTakDeploymentMode();
+    if(deploymentMode==='two_server'){
+      var pre=await runTakTwoServerPreflight(true);
+      if(!pre.success){
+        alert('Two-server preflight failed. Fix the failing checks in the Split Server panel first.');
+        return;
+      }
+      await loadTakTwoServerRunbook();
+      alert('Two-server mode is configured and preflight passed. Use the generated runbook to apply Server One (Database Server) then Server Two (Core Server). One-click split deploy will be added in a later update.');
+      return;
+    }
     const rf=[{id:'cert_country',l:'Country'},{id:'cert_state',l:'State'},{id:'cert_city',l:'City'},{id:'cert_org',l:'Organization'},{id:'cert_ou',l:'Org Unit'},{id:'root_ca_name',l:'Root CA'},{id:'intermediate_ca_name',l:'Intermediate CA'}];
     const empty=rf.filter(f=>!document.getElementById(f.id).value.trim());
     if(empty.length>0){alert('Please fill in: '+empty.map(f=>f.l).join(', '));empty.forEach(f=>{const el=document.getElementById(f.id);el.style.borderColor='var(--red)';el.addEventListener('input',()=>el.style.borderColor='',{once:true})});return}
@@ -704,7 +949,7 @@ async function startDeploy(){
     if(aui){const p=document.getElementById('webadmin_password').value;const pc=document.getElementById('webadmin_password_confirm').value;if(!p){alert('Please set a webadmin password.');return}if(p!==pc){alert('Passwords do not match.');return}if(!validatePassword()){alert('Password does not meet requirements.');return}}
     const btn=document.getElementById('deploy-btn');btn.disabled=true;btn.textContent='Deploying...';btn.style.opacity='0.6';btn.style.cursor='not-allowed';
     document.querySelectorAll('.form-field input,input[type="checkbox"]').forEach(el=>el.disabled=true);
-    const cfg={cert_country:document.getElementById('cert_country').value.toUpperCase(),cert_state:document.getElementById('cert_state').value.toUpperCase(),cert_city:document.getElementById('cert_city').value.toUpperCase(),cert_org:document.getElementById('cert_org').value.toUpperCase(),cert_ou:document.getElementById('cert_ou').value.toUpperCase(),root_ca_name:document.getElementById('root_ca_name').value.toUpperCase(),intermediate_ca_name:document.getElementById('intermediate_ca_name').value.toUpperCase(),enable_admin_ui:document.getElementById('enable_admin_ui').checked,enable_webtak:document.getElementById('enable_webtak').checked,enable_nonadmin_ui:document.getElementById('enable_nonadmin_ui').checked,webadmin_password:aui?document.getElementById('webadmin_password').value:''};
+    const cfg={cert_country:document.getElementById('cert_country').value.toUpperCase(),cert_state:document.getElementById('cert_state').value.toUpperCase(),cert_city:document.getElementById('cert_city').value.toUpperCase(),cert_org:document.getElementById('cert_org').value.toUpperCase(),cert_ou:document.getElementById('cert_ou').value.toUpperCase(),root_ca_name:document.getElementById('root_ca_name').value.toUpperCase(),intermediate_ca_name:document.getElementById('intermediate_ca_name').value.toUpperCase(),enable_admin_ui:document.getElementById('enable_admin_ui').checked,enable_webtak:document.getElementById('enable_webtak').checked,enable_nonadmin_ui:document.getElementById('enable_nonadmin_ui').checked,webadmin_password:aui?document.getElementById('webadmin_password').value:'',deployment_mode:deploymentMode};
     document.getElementById('deploy-log-area').style.display='block';
     try{const r=await fetch('/api/deploy/takserver',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});const d=await r.json();if(d.success)pollDeployLog();else{document.getElementById('deploy-log').textContent='✗ '+d.error;btn.disabled=false;btn.textContent='🚀 Deploy TAK Server';btn.style.opacity='1';btn.style.cursor='pointer'}}
     catch(e){document.getElementById('deploy-log').textContent='✗ '+e.message}
