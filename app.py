@@ -571,7 +571,21 @@ def takserver_two_server_preflight():
         probe_cmd = f'timeout 6 bash -lc "</dev/tcp/{server_one.get("host")}/{db_port}" >/dev/null 2>&1 && echo OPEN || echo CLOSED'
         ok, out = _ssh_probe(server_two, probe_cmd, timeout=20)
         db_reach_ok = ok and 'OPEN' in (out or '')
-        add_check(f'Server Two can reach Server One DB port {db_port}', db_reach_ok, out)
+        if not db_reach_ok and one_ok:
+            # Diagnose: SSH to Server One and check PG status for actionable detail.
+            diag_cmd = (
+                f'pg_installed=$(dpkg -l 2>/dev/null | grep -ci postgres); '
+                f'pg_listen=$(ss -tlnp 2>/dev/null | grep :{db_port} || true); '
+                f'ufw_line=$(sudo ufw status 2>/dev/null | grep {db_port} | head -3 || true); '
+                f'if [ "$pg_installed" = "0" ]; then echo "DIAG: PostgreSQL not installed on Server One. Run Deploy to Server One first."; '
+                f'elif [ -z "$pg_listen" ]; then echo "DIAG: PostgreSQL installed but not listening on port {db_port}. Service may be stopped."; '
+                f'else echo "DIAG: PostgreSQL listening: $pg_listen | UFW: $ufw_line"; fi'
+            )
+            _, diag_out = _ssh_probe(server_one, diag_cmd, timeout=15)
+            detail = f'CLOSED — {(diag_out or "").strip()}'
+            add_check(f'Server Two can reach Server One DB port {db_port}', False, detail)
+        else:
+            add_check(f'Server Two can reach Server One DB port {db_port}', db_reach_ok, out)
     else:
         add_check(f'Server Two can reach Server One DB port {db_port}', False, 'Skipped (SSH/host check failed)')
 
