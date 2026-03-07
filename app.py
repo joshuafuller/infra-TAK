@@ -697,7 +697,7 @@ def takserver_two_server_install_ssh_key():
             return jsonify({'success': False, 'error': err}), 400
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)[:400]}), 400
-    return jsonify({'success': True, 'message': 'Key installed on Server One. Next: 4. Run Preflight.'})
+    return jsonify({'success': True, 'message': 'Key installed on Server One. Next: 4. Deploy Server One (DB).'})
 
 
 def _resolve_core_ip(settings, cfg):
@@ -739,7 +739,8 @@ def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
 
     # Step 1: SCP and install the database .deb if provided
     if db_pkg_path and db_pkg_name:
-        # Check if already installed and healthy before re-installing
+        # Try to start PostgreSQL if installed but stopped, then check if already healthy
+        _ssh_probe(s1, 'sudo systemctl start postgresql 2>/dev/null; true', timeout=15)
         already_ok = False
         verify_cmd = 'sudo -u postgres psql -lqt 2>/dev/null | grep -q cot && systemctl is-active postgresql >/dev/null 2>&1 && echo PG_OK'
         vok, vout = _ssh_probe(s1, verify_cmd, timeout=10)
@@ -766,6 +767,7 @@ def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
             ok, out = _ssh_probe(s1, install_cmd, timeout=600)
             log.append(out or '')
             if not ok:
+                _ssh_probe(s1, 'sudo systemctl start postgresql 2>/dev/null; true', timeout=15)
                 vok, vout = _ssh_probe(s1, verify_cmd, timeout=10)
                 if not (vok and 'PG_OK' in (vout or '')):
                     log.append('Install failed and PostgreSQL/cot database not found.')
@@ -872,7 +874,7 @@ def takserver_two_server_open_db_firewall():
 
     if not ok:
         return jsonify({'success': False, 'error': log[-1] if log else 'Setup failed on Server One', 'log': log}), 400
-    return jsonify({'success': True, 'message': f'Server One ready: PostgreSQL listening, UFW open for {core_ip} → port {db_port}. Next: 6. Deploy Server Two (Core), then fill out certs and hit Deploy TAK Server.', 'log': log})
+    return jsonify({'success': True, 'message': f'Server One ready: PostgreSQL listening, UFW open for {core_ip} → port {db_port}. Next: 5. Deploy Server Two (Core), then fill out certs and hit Deploy TAK Server.', 'log': log})
 
 
 @app.route('/api/takserver/two-server/runbook', methods=['GET'])
@@ -971,7 +973,7 @@ def takserver_two_server_deploy_server_one():
 
     if not ok:
         return jsonify({'success': False, 'error': log[-1] if log else 'Deploy failed on Server One', 'log': log}), 400
-    return jsonify({'success': True, 'message': 'Server One (Database) deploy complete. Next: 6. Deploy Server Two (Core), then fill out certs and hit Deploy TAK Server.', 'log': log})
+    return jsonify({'success': True, 'message': 'Server One (Database) deploy complete. Next: 5. Deploy Server Two (Core), then fill out certs and hit Deploy TAK Server.', 'log': log})
 
 
 @app.route('/api/takserver/two-server/deploy-server-two', methods=['POST'])
