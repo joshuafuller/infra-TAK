@@ -1533,6 +1533,68 @@ def guarddog_health_api():
     r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
     return r
 
+
+def _guarddog_overall_from_result(result):
+    """Compute single overall status from per-service result dict."""
+    if not result:
+        return 'ok'
+    vals = list(result.values())
+    if all(v == 'ok' for v in vals):
+        return 'ok'
+    if all(v == 'fail' for v in vals):
+        return 'fail'
+    return 'caution'
+
+
+@app.route('/api/guarddog/overall-health')
+@login_required
+def guarddog_overall_health_api():
+    """Overall Guard Dog health for Console card. Retries once on caution to avoid flaky single-check."""
+    settings = load_settings()
+    result = {}
+    multi = _guarddog_service_monitor_ids(settings)
+    for sid in ('takserver', 'authentik', 'mediamtx', 'nodered', 'cloudtak', 'remotedb'):
+        monitor_ids = multi.get(sid)
+        if monitor_ids:
+            vals = []
+            for mid in monitor_ids:
+                v = _monitor_health_check(mid)
+                if v is not None:
+                    vals.append(v)
+            if not vals:
+                continue
+            result[sid] = 'ok' if all(vals) else ('fail' if not any(vals) else 'caution')
+        else:
+            val = _guarddog_health_check(sid)
+            if val is not None:
+                result[sid] = 'ok' if val else 'fail'
+    overall = _guarddog_overall_from_result(result)
+    if overall == 'caution':
+        time.sleep(2)
+        result2 = {}
+        for sid in ('takserver', 'authentik', 'mediamtx', 'nodered', 'cloudtak', 'remotedb'):
+            monitor_ids = multi.get(sid)
+            if monitor_ids:
+                vals = []
+                for mid in monitor_ids:
+                    v = _monitor_health_check(mid)
+                    if v is not None:
+                        vals.append(v)
+                if vals:
+                    result2[sid] = 'ok' if all(vals) else ('fail' if not any(vals) else 'caution')
+            else:
+                val = _guarddog_health_check(sid)
+                if val is not None:
+                    result2[sid] = 'ok' if val else 'fail'
+        overall2 = _guarddog_overall_from_result(result2)
+        if overall2 == 'ok':
+            overall = 'ok'
+    from flask import make_response
+    r = make_response(jsonify({'overall': overall}))
+    r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
+    return r
+
+
 def _monitor_health_check(monitor_id):
     """Quick health check for individual monitors. Returns True/False/None."""
     import socket
@@ -1604,9 +1666,19 @@ def _monitor_health_check(monitor_id):
             db_host = conf.get('db_host', '')
             if not db_host:
                 return None
-            req = urllib.request.Request(f'http://{db_host}:8080/health', method='GET')
-            resp = urllib.request.urlopen(req, timeout=10)
-            return resp.status == 200
+            url = f'http://{db_host}:8080/health'
+            for attempt in range(2):
+                try:
+                    req = urllib.request.Request(url, method='GET')
+                    resp = urllib.request.urlopen(req, timeout=10)
+                    if resp.status == 200:
+                        return True
+                except Exception:
+                    if attempt == 0:
+                        time.sleep(2)
+                    else:
+                        return False
+            return False
         if monitor_id == 'authentik_http':
             req = urllib.request.Request('http://127.0.0.1:9090/', method='GET')
             resp = urllib.request.urlopen(req, timeout=5)
@@ -13782,29 +13854,11 @@ function updateGuardDogOverallHealth(){
     var el=document.getElementById('module-status-guarddog');
     if(!el)return;
     if(!el.classList.contains('status-running')&&!el.classList.contains('status-caution')&&!el.classList.contains('status-critical')) return;
-    function setOverall(overall){
+    fetch('/api/guarddog/overall-health?_='+Date.now(),{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.json();}).then(function(d){
+        var overall=d.overall||'caution';
         var cls='module-status status-'+(overall==='ok'?'running':overall==='caution'?'caution':'critical');
         var label=overall==='ok'?'Healthy':overall==='caution'?'Caution':'Critical';
         el.className=cls; el.innerHTML='<span class="status-dot"></span> '+label;
-    }
-    function fromResponse(h){
-        var vals=Object.keys(h).map(function(k){return h[k];});
-        if(vals.length===0) return 'ok';
-        var allOk=vals.every(function(v){return v==='ok';});
-        var allFail=vals.every(function(v){return v==='fail';});
-        return allOk?'ok':allFail?'fail':'caution';
-    }
-    fetch('/api/guarddog/health?_='+Date.now(),{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.json();}).then(function(h){
-        var overall=fromResponse(h);
-        if(overall==='caution'){
-            setTimeout(function(){
-                fetch('/api/guarddog/health?_='+Date.now(),{credentials:'same-origin',cache:'no-store'}).then(function(r2){return r2.json();}).then(function(h2){
-                    var o2=fromResponse(h2);
-                    setOverall(o2==='ok'?'ok':overall);
-                }).catch(function(){ setOverall('caution'); });
-            },2200);
-        }
-        setOverall(overall);
     }).catch(function(){});
 }
 setInterval(refreshModuleCards,8000);
