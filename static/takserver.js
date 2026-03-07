@@ -493,6 +493,11 @@ async function connectLdap(){
 (function(){
     if(document.getElementById('upload-area')){
         updateUploadHint();
+        updateDeployModeFirstHint();
+        var single=document.getElementById('dep_mode_single');
+        var split=document.getElementById('dep_mode_split');
+        if(single)single.addEventListener('change',function(){toggleTwoServerPanel();updateUploadHint();updateDeployModeFirstHint();});
+        if(split)split.addEventListener('change',function(){toggleTwoServerPanel();updateUploadHint();updateDeployModeFirstHint();});
         fetch('/api/upload/takserver/existing').then(r=>r.json()).then(d=>{
             var hasAny=(d.packages&&d.packages.length)||d.gpg_key||d.policy;
             if(hasAny){
@@ -505,6 +510,7 @@ async function connectLdap(){
                 if(d.policy){pa.insertAdjacentHTML('beforeend','<div class="progress-item"><div style="display:flex;justify-content:space-between;align-items:center"><span style="font-family:JetBrains Mono,monospace;font-size:13px;color:var(--text-secondary)">'+d.policy.filename+'</span><span style="font-family:JetBrains Mono,monospace;font-size:12px;color:var(--green)">\u2713 uploaded</span></div><div class="progress-bar-outer"><div class="progress-bar-inner" style="width:100%;background:var(--green)"></div></div></div>')}
                 var a=document.getElementById('upload-area');if(a){a.style.maxHeight='120px';a.style.padding='20px';var ic=a.querySelector('.upload-icon');if(ic)ic.style.display='none'}
                 updateUploadSummary();
+                applyUploadsModeDetection();
             }
         }).catch(function(){});
     }
@@ -609,7 +615,7 @@ function uploadFile(file){
         delete window['xhr_'+id];
         const bar=document.getElementById(id+'-bar');const pc=document.getElementById(id+'-pct');bar.style.width='100%';
         var cb=document.getElementById(id+'-cancel');if(cb)cb.remove();
-        if(xhr.status===200){const d=JSON.parse(xhr.responseText);bar.style.background='var(--green)';pc.style.color='var(--green)';if(d.packages&&d.packages.length)d.packages.forEach(function(p){if(!uploadedFiles.packages.some(function(x){return x.filename===p.filename}))uploadedFiles.packages.push(p)});else if(d.package){var p=d.package;if(!uploadedFiles.packages.some(function(x){return x.filename===p.filename}))uploadedFiles.packages.push({filename:p.filename,filepath:p.filepath,size_mb:p.size_mb})}if(d.gpg_key)uploadedFiles.gpg_key=d.gpg_key;if(d.policy)uploadedFiles.policy=d.policy;var rBtn=document.createElement('span');rBtn.textContent=' \u2717';rBtn.style.cssText='color:var(--red);cursor:pointer;margin-left:8px';rBtn.title='Remove';rBtn.onclick=function(ev){ev.stopPropagation();removeFile(file.name,id)};pc.textContent='\u2713 ';pc.appendChild(rBtn);updateUploadSummary()}
+        if(xhr.status===200){const d=JSON.parse(xhr.responseText);bar.style.background='var(--green)';pc.style.color='var(--green)';if(d.packages&&d.packages.length)d.packages.forEach(function(p){if(!uploadedFiles.packages.some(function(x){return x.filename===p.filename}))uploadedFiles.packages.push(p)});else if(d.package){var p=d.package;if(!uploadedFiles.packages.some(function(x){return x.filename===p.filename}))uploadedFiles.packages.push({filename:p.filename,filepath:p.filepath,size_mb:p.size_mb})}if(d.gpg_key)uploadedFiles.gpg_key=d.gpg_key;if(d.policy)uploadedFiles.policy=d.policy;var rBtn=document.createElement('span');rBtn.textContent=' \u2717';rBtn.style.cssText='color:var(--red);cursor:pointer;margin-left:8px';rBtn.title='Remove';rBtn.onclick=function(ev){ev.stopPropagation();removeFile(file.name,id)};pc.textContent='\u2713 ';pc.appendChild(rBtn);updateUploadSummary();applyUploadsModeDetection();}
         else{bar.style.background='var(--red)';pc.textContent='\u2717';pc.style.color='var(--red)'}
         uploadsInProgress--;if(uploadsInProgress===0)updateUploadSummary()
     };
@@ -640,6 +646,8 @@ function updateUploadSummary(){
 }
 
 function showDeployConfig(){
+    var validation=validateUploadsForMode();
+    if(!validation.ok){alert(validation.message);return;}
     const ua=document.getElementById('upload-area');const pa=document.getElementById('progress-area');const ur=document.getElementById('upload-results');
     if(ua)ua.style.display='none';if(pa)pa.style.display='none';if(ur)ur.style.display='none';
     const main=document.querySelector('.main');
@@ -706,12 +714,7 @@ function initTakDeployModeUI(rootEl){
     if(!card)return;
     var html=[
       '<div id="tak-deploy-mode-panel" style="margin-bottom:20px;padding:16px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:10px">',
-      '<div style="font-family:\'JetBrains Mono\',monospace;font-size:13px;color:var(--text-dim);margin-bottom:12px;text-transform:uppercase;letter-spacing:1px;font-weight:600">Deployment Mode</div>',
-      '<div style="display:flex;gap:18px;flex-wrap:wrap;margin-bottom:8px">',
-      '<label style="display:flex;align-items:center;gap:8px;color:var(--text-secondary);cursor:pointer"><input type="radio" name="deployment_mode" id="dep_mode_single" value="single_server" checked style="accent-color:var(--accent)"> One Server <span style="color:var(--text-dim);font-size:12px">(recommended up to ~500 concurrent users)</span></label>',
-      '<label style="display:flex;align-items:center;gap:8px;color:var(--text-secondary);cursor:pointer"><input type="radio" name="deployment_mode" id="dep_mode_split" value="two_server" style="accent-color:var(--accent)"> Split Server <span style="color:var(--text-dim);font-size:12px">(Server One DB + Server Two Core)</span></label>',
-      '</div>',
-      '<div id="dep_mode_hint" style="font-size:12px;color:var(--text-dim)">Start simple with one server. Use split mode when scale/performance needs exceed ~500 concurrent users.</div>',
+      '<div id="dep_mode_hint" style="font-size:12px;color:var(--text-dim)">Deployment mode is set on the main page (One Server or Split Server).</div>',
       '</div>',
       '<div id="two-server-config-panel" style="display:none;margin-bottom:20px;padding:16px;background:rgba(59,130,246,0.06);border:1px solid var(--border);border-radius:10px">',
       '<div style="font-family:\'JetBrains Mono\',monospace;font-size:13px;color:var(--text-dim);margin-bottom:12px;text-transform:uppercase;letter-spacing:1px;font-weight:600">Split Server Wizard (Manual Naming)</div>',
@@ -766,6 +769,45 @@ function initTakDeployModeUI(rootEl){
 function getTakDeploymentMode(){
     var checked=document.querySelector('input[name="deployment_mode"]:checked');
     return checked?checked.value:'single_server';
+}
+
+function updateDeployModeFirstHint(){
+    var el=document.getElementById('deploy-mode-first-hint');
+    if(!el)return;
+    var mode=getTakDeploymentMode();
+    el.textContent=(mode==='two_server')
+      ?'Split mode: upload both takserver-database and takserver-core packages (optional: .pol + .key).'
+      :'One server: upload the single takserver package (optional: .pol + .key).';
+}
+
+function packageHasDatabase(fn){return fn&&String(fn).toLowerCase().indexOf('database')!==-1;}
+function packageHasCore(fn){return fn&&String(fn).toLowerCase().indexOf('core')!==-1;}
+function hasBothSplitPackages(){
+  var pkg=uploadedFiles.packages||[];
+  return pkg.some(function(p){return packageHasDatabase(p.filename);})&&pkg.some(function(p){return packageHasCore(p.filename);});
+}
+function hasOnlySplitPackages(){
+  var pkg=uploadedFiles.packages||[];
+  if(pkg.length===0)return false;
+  return pkg.every(function(p){return packageHasDatabase(p.filename)||packageHasCore(p.filename);});
+}
+function applyUploadsModeDetection(){
+  if(!hasBothSplitPackages())return;
+  var split=document.getElementById('dep_mode_split');
+  if(split&&!split.checked){split.checked=true;document.getElementById('dep_mode_single').checked=false;toggleTwoServerPanel();updateUploadHint();updateDeployModeFirstHint();}
+}
+function validateUploadsForMode(){
+  var mode=getTakDeploymentMode();
+  var pkg=uploadedFiles.packages||[];
+  if(pkg.length===0)return{ok:true};
+  if(mode==='two_server'){
+    if(!hasBothSplitPackages())return{ok:false,message:'Split server requires both takserver-database and takserver-core packages. Upload both, or switch to One Server and upload the single takserver package.'};
+    return{ok:true};
+  }
+  if(hasOnlySplitPackages()||pkg.some(function(p){return packageHasCore(p.filename)||packageHasDatabase(p.filename);})){
+    return{ok:false,message:'You chose One Server but uploaded split packages (core and/or database). For One Server upload the single takserver .deb/.rpm. Or switch to Split Server and upload both database and core.'};
+  }
+  return{ok:true};
 }
 
 function updateUploadHint(){
@@ -887,6 +929,8 @@ function populateTakDeploymentConfigForm(cfg){
     toggleTwoServerAuthInputs('one');
     toggleTwoServerAuthInputs('two');
     toggleServerTwoLocal();
+    updateUploadHint();
+    updateDeployModeFirstHint();
 }
 
 async function loadTakDeploymentConfig(){

@@ -13062,6 +13062,14 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 {% else %}
 <div class="section-title">Deploy TAK Server</div>
+<div id="deploy-mode-first" style="margin-bottom:20px;padding:16px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:10px">
+<div style="font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--text-dim);margin-bottom:12px;text-transform:uppercase;letter-spacing:1px;font-weight:600">1. Deployment mode</div>
+<div style="display:flex;gap:18px;flex-wrap:wrap;margin-bottom:8px">
+<label style="display:flex;align-items:center;gap:8px;color:var(--text-secondary);cursor:pointer"><input type="radio" name="deployment_mode" id="dep_mode_single" value="single_server" checked style="accent-color:var(--accent)"> One Server <span style="color:var(--text-dim);font-size:12px">(single takserver .deb/.rpm)</span></label>
+<label style="display:flex;align-items:center;gap:8px;color:var(--text-secondary);cursor:pointer"><input type="radio" name="deployment_mode" id="dep_mode_split" value="two_server" style="accent-color:var(--accent)"> Split Server <span style="color:var(--text-dim);font-size:12px">(takserver-database + takserver-core)</span></label>
+</div>
+<div id="deploy-mode-first-hint" style="font-size:12px;color:var(--text-dim)">Choose One Server, then upload the single takserver package. Or choose Split Server and upload both database and core packages.</div>
+</div>
 <div class="upload-area" id="upload-area" data-os-type="{{ settings.get('os_type', '') }}" ondrop="handleDrop(event)" ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)" onclick="var i=document.getElementById('file-input');i.value='';i.click()">
 <div class="upload-icon">📦</div><div class="upload-text">Drop your TAK Server files here</div>
 <div class="upload-hint" style="margin-bottom:6px"><span style="color:var(--text-dim);font-size:12px">Slow upload? Use the backdoor — open <strong>https://{{ settings.get('server_ip', 'SERVER_IP') }}:5001</strong> and upload from the TAK Server page there (skips proxy, no timeout).</span></div>
