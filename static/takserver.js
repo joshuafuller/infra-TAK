@@ -399,11 +399,16 @@ async function pollServerLog(){
 }
 if(document.getElementById('server-log')){pollServerLog();setInterval(pollServerLog,5000)}
 
-async function takControl(action){
+async function takControl(action, target){
+    target = target || 'core';
     const btns=document.querySelectorAll('.control-btn');
     btns.forEach(b=>{b.disabled=true;b.style.opacity='0.5'});
     try{
-        await fetch('/api/takserver/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action})});
+        var r = await fetch('/api/takserver/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:action,target:target})});
+        var d = await r.json();
+        if(d.results && d.results.database && !d.results.database.success){
+            alert('Database restart failed on ' + (d.results.database.host || 'Server One'));
+        }
         if(action==='start'||action==='restart'){
             sessionStorage.setItem('tak_just_started','1');
         }

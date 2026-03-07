@@ -11915,12 +11915,33 @@ def takserver_update_config_status_api():
 @login_required
 def takserver_control():
     action = request.json.get('action')
+    target = request.json.get('target', 'core')  # core | database | both
     if action not in ['start', 'stop', 'restart']:
         return jsonify({'error': 'Invalid action'}), 400
-    subprocess.run(['systemctl', action, 'takserver'], capture_output=True, text=True, timeout=60)
-    time.sleep(3)
-    s = subprocess.run(['systemctl', 'is-active', 'takserver'], capture_output=True, text=True)
-    return jsonify({'success': True, 'running': s.stdout.strip() == 'active', 'action': action})
+    results = {}
+    settings = load_settings()
+    tak_cfg = _get_tak_deployment_config(settings)
+    is_two_server = tak_cfg.get('mode') == 'two_server'
+    # Handle remote database (Server One)
+    if is_two_server and target in ('database', 'both'):
+        s1 = tak_cfg.get('server_one', {})
+        if s1.get('host'):
+            pg_action = 'restart' if action == 'restart' else action
+            db_cmd = f'sudo pg_ctlcluster 15 main {pg_action} 2>&1 || sudo systemctl {pg_action} postgresql 2>&1'
+            ok, out = _ssh_probe(s1, db_cmd, timeout=30)
+            verify_ok, verify_out = _ssh_probe(s1, 'pg_isready -q && echo DB_OK', timeout=10)
+            db_running = verify_ok and 'DB_OK' in (verify_out or '')
+            results['database'] = {'success': ok or db_running, 'running': db_running, 'host': s1['host']}
+        else:
+            results['database'] = {'success': False, 'error': 'Server One host not configured'}
+    # Handle local TAK Server (Core)
+    if target in ('core', 'both'):
+        subprocess.run(['systemctl', action, 'takserver'], capture_output=True, text=True, timeout=60)
+        time.sleep(3)
+        s = subprocess.run(['systemctl', 'is-active', 'takserver'], capture_output=True, text=True)
+        results['core'] = {'success': True, 'running': s.stdout.strip() == 'active'}
+    return jsonify({'success': True, 'results': results, 'action': action, 'target': target,
+                    'running': results.get('core', {}).get('running', None)})
 
 @app.route('/api/takserver/log')
 @login_required
@@ -13725,10 +13746,10 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div class="controls"><button class="control-btn btn-stop" onclick="cancelDeploy()">✗ Cancel</button></div>
 {% elif tak.installed and tak.running %}
 <div class="status-info"><div><div class="status-text" style="color:var(--green)">Running</div><div class="status-detail">TAK Server is active{% if tak_version %} · {{ tak_version }}{% endif %}</div><div id="cert-expiry-banner" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:4px"></div></div></div>
-<div class="controls"><button class="control-btn" onclick="takControl('restart')">↻ Restart</button><button class="control-btn" onclick="takUpdateConfig()" id="tak-update-config-btn">🔄 Update config</button><button class="control-btn btn-stop" onclick="takControl('stop')">■ Stop</button><button class="control-btn btn-stop" onclick="document.getElementById('tak-uninstall-modal').classList.add('open')" style="margin-left:8px">🗑 Remove</button></div>
+<div class="controls"><button class="control-btn" onclick="takControl('restart')">↻ Restart</button>{% if two_server_mode %}<button class="control-btn" onclick="takControl('restart','database')" title="Restart PostgreSQL on Server One ({{ s1_host }})">↻ Restart DB ({{ s1_host }})</button><button class="control-btn" onclick="takControl('restart','both')" title="Restart both TAK Server and remote PostgreSQL">↻ Restart Both</button>{% endif %}<button class="control-btn" onclick="takUpdateConfig()" id="tak-update-config-btn">🔄 Update config</button><button class="control-btn btn-stop" onclick="takControl('stop')">■ Stop</button><button class="control-btn btn-stop" onclick="document.getElementById('tak-uninstall-modal').classList.add('open')" style="margin-left:8px">🗑 Remove</button></div>
 {% elif tak.installed %}
 <div class="status-info"><div><div class="status-text" style="color:var(--red)">Stopped</div><div class="status-detail">TAK Server is installed but not running{% if tak_version %} · {{ tak_version }}{% endif %}</div><div id="cert-expiry-banner" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:4px"></div></div></div>
-<div class="controls"><button class="control-btn btn-start" onclick="takControl('start')">▶ Start</button><button class="control-btn" onclick="takUpdateConfig()" id="tak-update-config-btn">🔄 Update config</button><button class="control-btn btn-stop" onclick="document.getElementById('tak-uninstall-modal').classList.add('open')" style="margin-left:8px">🗑 Remove</button></div>
+<div class="controls"><button class="control-btn btn-start" onclick="takControl('start')">▶ Start</button>{% if two_server_mode %}<button class="control-btn btn-start" onclick="takControl('start','database')" title="Start PostgreSQL on Server One ({{ s1_host }})">▶ Start DB ({{ s1_host }})</button><button class="control-btn btn-start" onclick="takControl('start','both')" title="Start both TAK Server and remote PostgreSQL">▶ Start Both</button>{% endif %}<button class="control-btn" onclick="takUpdateConfig()" id="tak-update-config-btn">🔄 Update config</button><button class="control-btn btn-stop" onclick="document.getElementById('tak-uninstall-modal').classList.add('open')" style="margin-left:8px">🗑 Remove</button></div>
 {% else %}
 <div class="status-info"><div><div class="status-text" style="color:var(--text-dim)">Not Installed</div><div class="status-detail">Upload package files from tak.gov to deploy</div></div></div>
 {% endif %}
