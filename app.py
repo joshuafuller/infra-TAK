@@ -852,7 +852,7 @@ def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
     log.append(f'UFW: allowed {core_ip} → port {db_port}')
 
     # Step 4: Read auto-generated DB password from Server One (try multiple sources)
-    db_password = _fetch_db_password_from_server_one(s1)
+    db_password, _ = _fetch_db_password_from_server_one(s1)
     if db_password:
         log.append('Captured DB password from Server One.')
     else:
@@ -863,16 +863,27 @@ def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
 
 def _fetch_db_password_from_server_one(s1_cfg):
     """Fetch martiuser DB password from Server One. Tries CoreConfig.example.xml and CoreConfig.xml.
-    Fetches file via sudo cat and parses in Python so we don't depend on remote grep/sed."""
+    Fetches file via sudo cat and parses in Python so we don't depend on remote grep/sed.
+    Returns (password, failure_reason). On success: (str, None). On failure: ('', str)."""
+    first_ssh_error = None
     for pw_file in ('/opt/tak/CoreConfig.example.xml', '/opt/tak/CoreConfig.xml'):
         ok, out = _ssh_probe(s1_cfg, f"sudo cat {pw_file} 2>/dev/null", timeout=10)
-        if not ok or not (out or '').strip():
+        if not ok:
+            if first_ssh_error is None:
+                first_ssh_error = (out or 'SSH failed').strip()[:200]
             continue
-        match = re.search(r'password=["\']([^"\']*)["\']', out)
-        if match:
-            candidate = (match.group(1) or '').strip()
-            if candidate:
-                return candidate
+        if not (out or '').strip():
+            continue
+        # Prefer Python regex (allow single or double quotes, optional spaces)
+        for pattern in (
+            r'password\s*=\s*["\']([^"\']*)["\']',
+            r'password=["\']([^"\']*)["\']',
+        ):
+            match = re.search(pattern, out)
+            if match:
+                candidate = (match.group(1) or '').strip()
+                if candidate:
+                    return candidate, None
         for pwd_cmd in (
             f"sudo grep -o 'password=\"[^\"]*\"' {pw_file} 2>/dev/null | head -1 | sed 's/.*password=\"//;s/\"$//'",
             f"sudo sed -n 's/.*password=\"\\([^\"]*\\)\".*/\\1/p' {pw_file} 2>/dev/null | head -1",
@@ -880,8 +891,10 @@ def _fetch_db_password_from_server_one(s1_cfg):
             ok2, pwd_out = _ssh_probe(s1_cfg, pwd_cmd, timeout=10)
             candidate = (pwd_out or '').strip() if ok2 else ''
             if candidate:
-                return candidate
-    return ''
+                return candidate, None
+    if first_ssh_error:
+        return '', f'SSH to Server One failed: {first_ssh_error}'
+    return '', 'No password= found in CoreConfig.example.xml or CoreConfig.xml on Server One (or password was empty).'
 
 
 @app.route('/api/takserver/two-server/open-db-firewall', methods=['POST'])
@@ -1049,7 +1062,7 @@ def takserver_two_server_deploy_server_two():
 
     # If no DB password stored, try to fetch it from Server One now
     if not db_password:
-        db_password = _fetch_db_password_from_server_one(s1)
+        db_password, _ = _fetch_db_password_from_server_one(s1)
         if db_password:
             cfg['database']['password'] = db_password
             settings['tak_deployment'] = cfg
@@ -1129,9 +1142,11 @@ def takserver_two_server_sync_db_password():
     if not os.path.exists('/opt/tak/CoreConfig.xml'):
         return jsonify({'success': False, 'error': 'TAK Server not installed (no CoreConfig.xml)'}), 400
 
-    db_pass = _fetch_db_password_from_server_one(s1)
+    db_pass, fetch_err = _fetch_db_password_from_server_one(s1)
     if not db_pass:
-        return jsonify({'success': False, 'error': 'Could not read DB password from Server One. SSH to Server One, run: sudo sed -n \'s/.*password="\\([^"]*\\)".*/\\1/p\' /opt/tak/CoreConfig.example.xml | head -1  then on Server Two paste that password into CoreConfig (see docs HANDOFF Section 0 two-server).'}), 400
+        msg = fetch_err or 'Could not read DB password from Server One.'
+        manual = " SSH to Server One, run: sudo sed -n 's/.*password=\"\\([^\"]*\\)\".*/\\1/p' /opt/tak/CoreConfig.example.xml | head -1 then on Server Two paste that password into CoreConfig (see docs HANDOFF Section 0 two-server)."
+        return jsonify({'success': False, 'error': msg + manual}), 400
 
     try:
         r = subprocess.run(['sudo', 'cat', '/opt/tak/CoreConfig.xml'], capture_output=True, text=True, timeout=5)
@@ -12658,7 +12673,7 @@ def run_takserver_deploy(config):
             if not db_pass and s1_host and s1_cfg:
                 log_step("Two-server: DB password not cached — fetching from Server One...")
                 try:
-                    db_pass = _fetch_db_password_from_server_one(s1_cfg)
+                    db_pass, _ = _fetch_db_password_from_server_one(s1_cfg)
                     if db_pass:
                         log_step("✓ Fetched DB password from Server One")
                         settings = load_settings()
