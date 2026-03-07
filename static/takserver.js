@@ -690,7 +690,16 @@ function showDeployConfig(){
     ].join('');
     main.appendChild(cd);
     initTakDeployModeUI(cd);
-    loadTakDeploymentConfig();
+    var modeChosenOnPage=getTakDeploymentMode();
+    loadTakDeploymentConfig().then(function(){
+      var single=document.getElementById('dep_mode_single');
+      var split=document.getElementById('dep_mode_split');
+      if(modeChosenOnPage==='two_server'&&split){split.checked=true;if(single)single.checked=false;}
+      else if(single){single.checked=true;if(split)split.checked=false;}
+      toggleTwoServerPanel();
+      updateUploadHint();
+      updateDeployModeFirstHint();
+    });
     const pi=document.getElementById('webadmin_password');if(pi){pi.addEventListener('input',validatePassword);pi.addEventListener('input',checkPasswordMatch)}const pc=document.getElementById('webadmin_password_confirm');if(pc)pc.addEventListener('input',checkPasswordMatch);
 }
 
