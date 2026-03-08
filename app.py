@@ -2387,6 +2387,7 @@ def nodered_page():
 def cloudtak_page():
     settings = load_settings()
     cloudtak_cfg = _get_cloudtak_deployment_config(settings)
+    cloudtak_tak_suggest = _suggest_tak_core_host(settings)
     cloudtak = detect_modules().get('cloudtak', {})
     container_info = {}
     if cloudtak.get('running'):
@@ -2411,6 +2412,7 @@ def cloudtak_page():
         version=VERSION,
         cloudtak_icon=CLOUDTAK_ICON,
         cloudtak_cfg=cloudtak_cfg,
+        cloudtak_tak_suggest=cloudtak_tak_suggest,
         container_info=container_info,
         deploying=cloudtak_deploy_status.get('running', False),
         deploy_done=cloudtak_deploy_status.get('complete', False),
@@ -2724,9 +2726,10 @@ def _normalize_cloudtak_deployment_config(cfg):
     c['deployed'] = bool(c.get('deployed', False))
     r = c.get('remote', {}) if isinstance(c.get('remote'), dict) else {}
     r['host'] = (r.get('host') or '').strip()
-    r['ssh_user'] = (r.get('ssh_user') or 'root').strip() or 'root'
+    # Accept both ssh_user/ssh_port (backend canonical) and username/port (UI aliases)
+    r['ssh_user'] = (r.get('ssh_user') or r.get('username') or 'root').strip() or 'root'
     try:
-        r['ssh_port'] = int(r.get('ssh_port') or 22)
+        r['ssh_port'] = int((r.get('ssh_port') if r.get('ssh_port') is not None else r.get('port')) or 22)
     except Exception:
         r['ssh_port'] = 22
     auth_method = (r.get('auth_method') or 'ssh_key').strip().lower()
@@ -2734,6 +2737,9 @@ def _normalize_cloudtak_deployment_config(cfg):
     r['ssh_key_path'] = (r.get('ssh_key_path') or '').strip()
     r['ssh_password'] = (r.get('ssh_password') or '').strip()
     r['os_family'] = (r.get('os_family') or 'ubuntu').strip().lower() or 'ubuntu'
+    # Keep UI aliases present in normalized config for template compatibility
+    r['username'] = r['ssh_user']
+    r['port'] = r['ssh_port']
     c['remote'] = r
     if c['target_mode'] == 'local':
         c['deployed'] = bool(c.get('deployed', False))
@@ -2763,6 +2769,96 @@ def _get_cloudtak_upstreams(settings):
         'video_hls': '127.0.0.1:18888',
         'video_api': '127.0.0.1:9997',
     }
+
+
+def _suggest_tak_core_host(settings):
+    """Best-effort TAK core host for CloudTAK bootstrap wizard."""
+    try:
+        tak_cfg = _get_tak_deployment_config(settings)
+        s2 = tak_cfg.get('server_two', {}) if isinstance(tak_cfg.get('server_two'), dict) else {}
+        host = (s2.get('host') or '').strip()
+        if host and host not in ('127.0.0.1', 'localhost'):
+            return host
+    except Exception:
+        pass
+    return (settings.get('server_ip') or '').strip()
+
+
+def _cloudtak_api_base_urls(settings, cfg):
+    """Candidate base URLs for CloudTAK API from infra-TAK host."""
+    urls = []
+    if cfg.get('target_mode') == 'remote':
+        h = (cfg.get('remote', {}).get('host') or '').strip()
+        if h:
+            urls.append(f'http://{h}:5000')
+    else:
+        urls.append('http://127.0.0.1:5000')
+    if settings.get('fqdn'):
+        try:
+            sd = _get_all_service_domains(settings)
+            ct_host = (sd.get('cloudtak_map') or '').strip()
+            if ct_host:
+                urls.append(f'https://{ct_host}')
+        except Exception:
+            pass
+    out = []
+    for u in urls:
+        if u not in out:
+            out.append(u)
+    return out
+
+
+def _cloudtak_request_json(method, url, payload=None, timeout=25):
+    import urllib.error as _uerr
+    data = None
+    headers = {'Accept': 'application/json'}
+    if payload is not None:
+        data = json.dumps(payload).encode('utf-8')
+        headers['Content-Type'] = 'application/json'
+    req = urllib.request.Request(url, data=data, headers=headers, method=method.upper())
+    ctx = ssl._create_unverified_context() if url.lower().startswith('https://') else None
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+            body = resp.read().decode('utf-8', errors='replace') if resp else ''
+            return True, resp.getcode(), json.loads(body) if body else {}
+    except _uerr.HTTPError as e:
+        raw = e.read().decode('utf-8', errors='replace') if hasattr(e, 'read') else ''
+        try:
+            parsed = json.loads(raw) if raw else {'status': e.code, 'message': str(e)}
+        except Exception:
+            parsed = {'status': e.code, 'message': raw or str(e)}
+        return False, e.code, parsed
+    except Exception as e:
+        return False, 0, {'status': 0, 'message': str(e)}
+
+
+def _p12_bytes_to_pem(p12_bytes, password=''):
+    """Convert P12/PFX bytes to PEM cert/key using openssl. Raises RuntimeError on failure."""
+    tmp_dir = tempfile.mkdtemp(prefix='cloudtak-p12-')
+    try:
+        p12_path = os.path.join(tmp_dir, 'bundle.p12')
+        with open(p12_path, 'wb') as f:
+            f.write(p12_bytes)
+        passin = f'pass:{password or ""}'
+
+        def _run_openssl(args):
+            r = subprocess.run(args, capture_output=True, text=True, timeout=25)
+            ok = r.returncode == 0
+            return (r.stdout or '').strip() if ok else '', (r.stderr or '').strip()
+
+        cert_cmd = ['openssl', 'pkcs12', '-in', p12_path, '-clcerts', '-nokeys', '-passin', passin]
+        key_cmd = ['openssl', 'pkcs12', '-in', p12_path, '-nocerts', '-nodes', '-passin', passin]
+        cert_pem, cert_err = _run_openssl(cert_cmd)
+        key_pem, key_err = _run_openssl(key_cmd)
+        if not cert_pem or not key_pem:
+            cert_pem, cert_err = _run_openssl(cert_cmd + ['-legacy'])
+            key_pem, key_err = _run_openssl(key_cmd + ['-legacy'])
+        if 'BEGIN CERTIFICATE' not in cert_pem or 'BEGIN' not in key_pem:
+            err = cert_err or key_err or 'Could not parse P12 certificate/key'
+            raise RuntimeError(err[:260])
+        return cert_pem.strip() + '\n', key_pem.strip() + '\n'
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 def _get_authentik_host(settings):
     """Return the hostname for the Authentik service (configurable via Caddy/Domains, default tak.<fqdn> = hub)."""
@@ -5146,8 +5242,8 @@ def cloudtak_remote_install_ssh_key():
     host = (rcfg.get('host') or '').strip()
     if not host:
         return jsonify({'success': False, 'error': 'Remote host/IP is required'}), 400
-    user = (rcfg.get('username') or 'root').strip() or 'root'
-    port = int(rcfg.get('port') or 22)
+    user = (rcfg.get('ssh_user') or rcfg.get('username') or 'root').strip() or 'root'
+    port = int((rcfg.get('ssh_port') if rcfg.get('ssh_port') is not None else rcfg.get('port')) or 22)
     key_path = (rcfg.get('ssh_key_path') or '').strip() or os.path.expanduser('~/.ssh/infra-tak-cloudtak')
     key_path = os.path.expanduser(key_path)
     pub_path = key_path + '.pub'
@@ -5193,6 +5289,94 @@ def cloudtak_remote_test_ssh():
     if not ok:
         return jsonify({'success': False, 'error': (out or 'SSH failed')[:300], 'output': (out or '')[:800]}), 400
     return jsonify({'success': True, 'message': f'SSH OK to {host}', 'output': (out or '')[:800]})
+
+
+@app.route('/api/cloudtak/bootstrap-server', methods=['POST'])
+@login_required
+def cloudtak_bootstrap_server_api():
+    """Bootstrap CloudTAK initial TAK server configuration via CloudTAK API."""
+    data = request.get_json() or {}
+    settings = load_settings()
+    cfg = _get_cloudtak_deployment_config(settings)
+
+    tak_host = (data.get('tak_host') or '').strip() or _suggest_tak_core_host(settings)
+    server_name = (data.get('server_name') or 'TAK Core').strip() or 'TAK Core'
+    username = (data.get('tak_username') or '').strip()
+    password = (data.get('tak_password') or '').strip()
+    p12_data = (data.get('p12_data') or '').strip()
+    p12_password = str(data.get('p12_password') or '')
+
+    if not tak_host:
+        return jsonify({'success': False, 'error': 'TAK core host/IP is required'}), 400
+    if not username or not password:
+        return jsonify({'success': False, 'error': 'Initial TAK admin username/password are required'}), 400
+    if not p12_data:
+        return jsonify({'success': False, 'error': 'Admin .p12 certificate is required'}), 400
+
+    try:
+        cot_port = int(data.get('cot_port') or 8089)
+        marti_port = int(data.get('marti_port') or 8443)
+        webtak_port = int(data.get('webtak_port') or 8446)
+    except Exception:
+        return jsonify({'success': False, 'error': 'Ports must be valid numbers'}), 400
+
+    # Support plain base64 or data URL payload
+    if p12_data.startswith('data:') and ',' in p12_data:
+        p12_data = p12_data.split(',', 1)[1]
+    try:
+        import base64
+        p12_bytes = base64.b64decode(p12_data)
+    except Exception:
+        return jsonify({'success': False, 'error': 'Could not decode .p12 upload data'}), 400
+
+    try:
+        cert_pem, key_pem = _p12_bytes_to_pem(p12_bytes, p12_password)
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'Could not read .p12: {str(e)[:220]}'}), 400
+
+    payload = {
+        'name': server_name,
+        'url': f'ssl://{tak_host}:{cot_port}',
+        'api': f'https://{tak_host}:{marti_port}',
+        'webtak': f'https://{tak_host}:{webtak_port}',
+        'username': username,
+        'password': password,
+        'auth': {'cert': cert_pem, 'key': key_pem},
+    }
+
+    last_err = ''
+    selected_base = ''
+    server_info = {}
+    for base in _cloudtak_api_base_urls(settings, cfg):
+        ok, code, body = _cloudtak_request_json('GET', f'{base}/api/server', timeout=20)
+        if ok:
+            selected_base = base
+            server_info = body if isinstance(body, dict) else {}
+            break
+        last_err = f'{base}: {(body.get("message") if isinstance(body, dict) else body) or code}'
+    if not selected_base:
+        return jsonify({'success': False, 'error': f'Could not reach CloudTAK API. {last_err[:220]}'}), 400
+
+    if (server_info.get('status') or '').strip().lower() == 'configured':
+        return jsonify({
+            'success': False,
+            'error': 'CloudTAK is already configured. Use CloudTAK Admin > Server to modify the TAK connection.',
+            'api_base': selected_base
+        }), 409
+
+    ok, code, body = _cloudtak_request_json('PATCH', f'{selected_base}/api/server', payload=payload, timeout=35)
+    if not ok:
+        msg = (body.get('message') if isinstance(body, dict) else '') or f'HTTP {code}'
+        return jsonify({'success': False, 'error': f'CloudTAK bootstrap failed: {msg}', 'api_base': selected_base}), 400
+
+    return jsonify({
+        'success': True,
+        'message': 'CloudTAK initial server configuration applied.',
+        'api_base': selected_base,
+        'server': {
+            'host': tak_host, 'cot_port': cot_port, 'marti_port': marti_port, 'webtak_port': webtak_port
+        }
+    })
 
 
 @app.route('/api/cloudtak/deploy', methods=['POST'])
@@ -8139,8 +8323,8 @@ window.collectDeployConfig = function() {
     var p = parseInt(portVal, 10);
     cfg.remote = {
       host: host.trim(),
-      username: (user || "root").trim(),
-      port: isNaN(p) ? 22 : p,
+      ssh_user: (user || "root").trim(),
+      ssh_port: isNaN(p) ? 22 : p,
       ssh_key_path: key.trim()
     };
   }
@@ -8173,6 +8357,70 @@ window.saveCloudtakTarget = function() {
   }).catch(function(e) {
     if (msg) msg.textContent = "Save failed: " + (e && e.message ? e.message : String(e));
   });
+};
+
+window._fileToDataURL = function(file) {
+  return new Promise(function(resolve, reject) {
+    var reader = new FileReader();
+    reader.onload = function() { resolve(reader.result || ""); };
+    reader.onerror = function() { reject(new Error("Could not read file")); };
+    reader.readAsDataURL(file);
+  });
+};
+
+window.bootstrapCloudtakServer = async function() {
+  var status = document.getElementById("cloudtak-bootstrap-status");
+  function setStatus(msg, isErr) {
+    if (!status) return;
+    status.textContent = msg || "";
+    status.style.color = isErr ? "var(--red)" : "var(--text-dim)";
+  }
+  try {
+    var serverName = ((document.getElementById("ct-bootstrap-server-name") || {}).value || "TAK Core").trim();
+    var takHost = ((document.getElementById("ct-bootstrap-host") || {}).value || "").trim();
+    var cotPort = parseInt(((document.getElementById("ct-bootstrap-cot-port") || {}).value || "8089"), 10);
+    var martiPort = parseInt(((document.getElementById("ct-bootstrap-marti-port") || {}).value || "8443"), 10);
+    var webtakPort = parseInt(((document.getElementById("ct-bootstrap-webtak-port") || {}).value || "8446"), 10);
+    var takUser = ((document.getElementById("ct-bootstrap-user") || {}).value || "").trim();
+    var takPass = ((document.getElementById("ct-bootstrap-pass") || {}).value || "").trim();
+    var p12Pass = ((document.getElementById("ct-bootstrap-p12-pass") || {}).value || "").trim();
+    var p12Input = document.getElementById("ct-bootstrap-p12");
+    var file = p12Input && p12Input.files && p12Input.files[0] ? p12Input.files[0] : null;
+
+    if (!takHost) return setStatus("TAK core host/IP is required.", true);
+    if (!takUser || !takPass) return setStatus("TAK admin username/password are required.", true);
+    if (!file) return setStatus("Admin .p12 file is required.", true);
+
+    setStatus("Reading certificate...", false);
+    var p12Data = await window._fileToDataURL(file);
+    setStatus("Bootstrapping CloudTAK server config...", false);
+
+    var payload = {
+      server_name: serverName || "TAK Core",
+      tak_host: takHost,
+      cot_port: isNaN(cotPort) ? 8089 : cotPort,
+      marti_port: isNaN(martiPort) ? 8443 : martiPort,
+      webtak_port: isNaN(webtakPort) ? 8446 : webtakPort,
+      tak_username: takUser,
+      tak_password: takPass,
+      p12_password: p12Pass,
+      p12_data: p12Data
+    };
+
+    var r = await fetch("/api/cloudtak/bootstrap-server", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(payload),
+      credentials: "same-origin"
+    });
+    var d = await r.json();
+    if (!r.ok || !d || !d.success) {
+      return setStatus((d && d.error) ? d.error : "Bootstrap failed", true);
+    }
+    setStatus("CloudTAK bootstrap applied. You can log in now.", false);
+  } catch (e) {
+    setStatus("Bootstrap failed: " + (e && e.message ? e.message : String(e)), true);
+  }
 };
 
 window._cloudtakSshStatus = function(msg, isError) {
@@ -8617,6 +8865,61 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   </div>
 
   {% if cloudtak.installed %}
+  <div class="card">
+    <div class="card-title">Initial TAK Server Bootstrap</div>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">
+      One-click CloudTAK first-time setup. This sends your TAK core host/ports, admin <code>.p12</code>, and TAK admin credentials to CloudTAK's <code>/api/server</code> endpoint.
+    </p>
+    <div class="grid-2">
+      <div class="form-group">
+        <label class="form-label">Server Name</label>
+        <input id="ct-bootstrap-server-name" class="form-input" type="text" value="TAK Core">
+      </div>
+      <div class="form-group">
+        <label class="form-label">TAK Core Host/IP</label>
+        <input id="ct-bootstrap-host" class="form-input" type="text" value="{{ cloudtak_tak_suggest or settings.server_ip or '' }}" placeholder="10.0.0.20">
+      </div>
+    </div>
+    <div class="grid-2">
+      <div class="form-group">
+        <label class="form-label">CoT Port</label>
+        <input id="ct-bootstrap-cot-port" class="form-input" type="number" value="8089">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Marti Port</label>
+        <input id="ct-bootstrap-marti-port" class="form-input" type="number" value="8443">
+      </div>
+    </div>
+    <div class="grid-2">
+      <div class="form-group">
+        <label class="form-label">WebTAK Port</label>
+        <input id="ct-bootstrap-webtak-port" class="form-input" type="number" value="8446">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Admin Certificate (.p12)</label>
+        <input id="ct-bootstrap-p12" class="form-input" type="file" accept=".p12,.pfx,application/x-pkcs12">
+      </div>
+    </div>
+    <div class="grid-2">
+      <div class="form-group">
+        <label class="form-label">.p12 Password</label>
+        <input id="ct-bootstrap-p12-pass" class="form-input" type="password" placeholder="Certificate password">
+      </div>
+      <div class="form-group">
+        <label class="form-label">TAK Admin Username</label>
+        <input id="ct-bootstrap-user" class="form-input" type="text" placeholder="admin">
+      </div>
+    </div>
+    <div class="form-group">
+      <label class="form-label">TAK Admin Password</label>
+      <input id="ct-bootstrap-pass" class="form-input" type="password" placeholder="TAK admin password">
+    </div>
+    <div class="controls">
+      <button type="button" class="btn btn-primary" onclick="bootstrapCloudtakServer()">⚡ Bootstrap CloudTAK from TAK Core</button>
+      <span id="cloudtak-bootstrap-status" style="font-size:12px;color:var(--text-dim)"></span>
+    </div>
+  </div>
+
   <!-- Controls at top -->
   <div class="card">
     <div class="card-title">Controls</div>
