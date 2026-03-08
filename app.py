@@ -5051,6 +5051,150 @@ def cloudtak_save_deployment_config():
     return jsonify({'success': True, 'config': cfg})
 
 
+@app.route('/api/cloudtak/remote/ensure-ssh-key', methods=['POST'])
+@login_required
+def cloudtak_remote_ensure_ssh_key():
+    """Ensure local SSH key exists for CloudTAK remote host access."""
+    data = request.get_json() or {}
+    settings = load_settings()
+    cfg = _get_cloudtak_deployment_config(settings)
+    if isinstance(data.get('config'), dict):
+        cfg = _normalize_cloudtak_deployment_config(_deep_merge_dict(cfg, data.get('config')))
+    rcfg = cfg.get('remote', {})
+    key_path = (rcfg.get('ssh_key_path') or '').strip() or os.path.expanduser('~/.ssh/infra-tak-cloudtak')
+    key_path = os.path.expanduser(key_path)
+    pub_path = key_path + '.pub'
+    if os.path.exists(key_path) and os.path.exists(pub_path):
+        try:
+            fr = subprocess.run(['ssh-keygen', '-l', '-f', pub_path], capture_output=True, text=True, timeout=5)
+            fingerprint = (fr.stdout or '').strip() if fr.returncode == 0 else ''
+        except Exception:
+            fingerprint = ''
+        try:
+            with open(pub_path, 'r', encoding='utf-8') as f:
+                public_key = (f.read() or '').strip()
+        except Exception:
+            public_key = ''
+        cfg['remote'] = cfg.get('remote') or {}
+        cfg['target_mode'] = 'remote'
+        cfg['remote']['ssh_key_path'] = key_path
+        settings['cloudtak_deployment'] = _normalize_cloudtak_deployment_config(cfg)
+        save_settings(settings)
+        return jsonify({
+            'success': True,
+            'message': 'Key already exists',
+            'key_path': key_path,
+            'public_key_path': pub_path,
+            'public_key': public_key,
+            'fingerprint': fingerprint,
+            'config': settings['cloudtak_deployment'],
+        })
+    key_dir = os.path.dirname(key_path)
+    if key_dir and not os.path.isdir(key_dir):
+        try:
+            os.makedirs(key_dir, mode=0o700)
+        except Exception as e:
+            return jsonify({'success': False, 'error': f'Could not create {key_dir}: {e}'}), 400
+    try:
+        subprocess.run(
+            ['ssh-keygen', '-t', 'ed25519', '-N', '', '-f', key_path, '-C', 'infra-tak-cloudtak-remote'],
+            capture_output=True, text=True, timeout=30, check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        return jsonify({'success': False, 'error': (e.stderr or e.stdout or str(e))[:400]}), 400
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)[:400]}), 400
+    try:
+        fr = subprocess.run(['ssh-keygen', '-l', '-f', pub_path], capture_output=True, text=True, timeout=5)
+        fingerprint = (fr.stdout or '').strip() if fr.returncode == 0 else ''
+    except Exception:
+        fingerprint = ''
+    try:
+        with open(pub_path, 'r', encoding='utf-8') as f:
+            public_key = (f.read() or '').strip()
+    except Exception:
+        public_key = ''
+    cfg['remote'] = cfg.get('remote') or {}
+    cfg['target_mode'] = 'remote'
+    cfg['remote']['ssh_key_path'] = key_path
+    settings['cloudtak_deployment'] = _normalize_cloudtak_deployment_config(cfg)
+    save_settings(settings)
+    return jsonify({
+        'success': True,
+        'message': 'New key generated',
+        'key_path': key_path,
+        'public_key_path': pub_path,
+        'public_key': public_key,
+        'fingerprint': fingerprint,
+        'config': settings['cloudtak_deployment'],
+    })
+
+
+@app.route('/api/cloudtak/remote/install-ssh-key', methods=['POST'])
+@login_required
+def cloudtak_remote_install_ssh_key():
+    """Install local public key to remote CloudTAK host using one-time password."""
+    data = request.get_json() or {}
+    password = (data.get('password') or '').strip()
+    if not password:
+        return jsonify({'success': False, 'error': 'Password required for one-time copy'}), 400
+    settings = load_settings()
+    cfg = _get_cloudtak_deployment_config(settings)
+    if isinstance(data.get('config'), dict):
+        cfg = _normalize_cloudtak_deployment_config(_deep_merge_dict(cfg, data.get('config')))
+    rcfg = cfg.get('remote', {})
+    host = (rcfg.get('host') or '').strip()
+    if not host:
+        return jsonify({'success': False, 'error': 'Remote host/IP is required'}), 400
+    user = (rcfg.get('username') or 'root').strip() or 'root'
+    port = int(rcfg.get('port') or 22)
+    key_path = (rcfg.get('ssh_key_path') or '').strip() or os.path.expanduser('~/.ssh/infra-tak-cloudtak')
+    key_path = os.path.expanduser(key_path)
+    pub_path = key_path + '.pub'
+    if not os.path.exists(pub_path):
+        return jsonify({'success': False, 'error': f'Public key not found at {pub_path}. Click "Generate SSH key" first.'}), 400
+    if shutil.which('sshpass') is None:
+        return jsonify({'success': False, 'error': 'sshpass is not installed on infra-TAK host. Install it first (apt install sshpass).'}), 400
+    try:
+        r = subprocess.run(
+            ['sshpass', '-p', password, 'ssh-copy-id', '-i', pub_path,
+             '-o', 'StrictHostKeyChecking=accept-new', '-p', str(port), f'{user}@{host}'],
+            capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode != 0:
+            err = (r.stderr or r.stdout or 'Unknown error').strip()[:500]
+            return jsonify({'success': False, 'error': err}), 400
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)[:400]}), 400
+    cfg['remote'] = cfg.get('remote') or {}
+    cfg['target_mode'] = 'remote'
+    cfg['remote']['ssh_key_path'] = key_path
+    settings['cloudtak_deployment'] = _normalize_cloudtak_deployment_config(cfg)
+    save_settings(settings)
+    return jsonify({'success': True, 'message': f'SSH key installed on {host}. You can now test SSH and deploy CloudTAK.'})
+
+
+@app.route('/api/cloudtak/remote/test-ssh', methods=['POST'])
+@login_required
+def cloudtak_remote_test_ssh():
+    """Test SSH access to remote CloudTAK target host."""
+    data = request.get_json() or {}
+    settings = load_settings()
+    cfg = _get_cloudtak_deployment_config(settings)
+    if isinstance(data.get('config'), dict):
+        cfg = _normalize_cloudtak_deployment_config(_deep_merge_dict(cfg, data.get('config')))
+        settings['cloudtak_deployment'] = cfg
+        save_settings(settings)
+    rcfg = cfg.get('remote', {})
+    host = (rcfg.get('host') or '').strip()
+    if not host:
+        return jsonify({'success': False, 'error': 'Remote host/IP is required'}), 400
+    ok, out = _ssh_probe(rcfg, 'echo CLOUDTAK_REMOTE_OK && uname -a', timeout=20)
+    if not ok:
+        return jsonify({'success': False, 'error': (out or 'SSH failed')[:300], 'output': (out or '')[:800]}), 400
+    return jsonify({'success': True, 'message': f'SSH OK to {host}', 'output': (out or '')[:800]})
+
+
 @app.route('/api/cloudtak/deploy', methods=['POST'])
 @login_required
 def cloudtak_deploy_api():
@@ -8031,6 +8175,92 @@ window.saveCloudtakTarget = function() {
   });
 };
 
+window._cloudtakSshStatus = function(msg, isError) {
+  var el = document.getElementById("cloudtak-ssh-status");
+  if (!el) return;
+  el.style.color = isError ? "var(--red)" : "var(--text-dim)";
+  el.textContent = msg || "";
+};
+
+window._cloudtakEnsureRemoteMode = function() {
+  var modeEl = document.getElementById("cloudtak-target-mode");
+  if (modeEl && modeEl.value !== "remote") {
+    modeEl.value = "remote";
+    window.toggleCloudtakTargetFields();
+  }
+};
+
+window.ensureCloudtakSshKey = function() {
+  window._cloudtakEnsureRemoteMode();
+  window._cloudtakSshStatus("Generating SSH key...", false);
+  fetch("/api/cloudtak/remote/ensure-ssh-key", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({config: window.collectDeployConfig()}),
+    credentials: "same-origin"
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    if (!d || !d.success) {
+      window._cloudtakSshStatus((d && d.error) ? d.error : "Key generation failed", true);
+      return;
+    }
+    if (d.key_path) {
+      var keyEl = document.getElementById("cloudtak-remote-key");
+      if (keyEl) keyEl.value = d.key_path;
+    }
+    var pk = document.getElementById("cloudtak-public-key");
+    if (pk) pk.value = d.public_key || "";
+    var fp = d.fingerprint ? (" | " + d.fingerprint) : "";
+    window._cloudtakSshStatus((d.message || "SSH key ready") + fp, false);
+  }).catch(function(e) {
+    window._cloudtakSshStatus("Key generation failed: " + (e && e.message ? e.message : String(e)), true);
+  });
+};
+
+window.installCloudtakSshKey = function() {
+  window._cloudtakEnsureRemoteMode();
+  var pwEl = document.getElementById("cloudtak-remote-password");
+  var password = pwEl ? (pwEl.value || "").trim() : "";
+  if (!password) {
+    window._cloudtakSshStatus("Enter remote root/admin password for one-time ssh-copy-id.", true);
+    return;
+  }
+  window._cloudtakSshStatus("Installing public key on remote host...", false);
+  fetch("/api/cloudtak/remote/install-ssh-key", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({password: password, config: window.collectDeployConfig()}),
+    credentials: "same-origin"
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    if (!d || !d.success) {
+      window._cloudtakSshStatus((d && d.error) ? d.error : "SSH key install failed", true);
+      return;
+    }
+    if (pwEl) pwEl.value = "";
+    window._cloudtakSshStatus(d.message || "SSH key installed", false);
+  }).catch(function(e) {
+    window._cloudtakSshStatus("SSH key install failed: " + (e && e.message ? e.message : String(e)), true);
+  });
+};
+
+window.testCloudtakRemoteSsh = function() {
+  window._cloudtakEnsureRemoteMode();
+  window._cloudtakSshStatus("Testing SSH connection...", false);
+  fetch("/api/cloudtak/remote/test-ssh", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({config: window.collectDeployConfig()}),
+    credentials: "same-origin"
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    if (!d || !d.success) {
+      window._cloudtakSshStatus((d && d.error) ? d.error : "SSH test failed", true);
+      return;
+    }
+    window._cloudtakSshStatus(d.message || "SSH connection successful", false);
+  }).catch(function(e) {
+    window._cloudtakSshStatus("SSH test failed: " + (e && e.message ? e.message : String(e)), true);
+  });
+};
+
 window.startRedeploy = function() {
   var btn = document.getElementById("redeploy-btn");
   var logCard = document.getElementById("log-card");
@@ -8360,9 +8590,24 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
           <input id="cloudtak-remote-user" class="form-input" type="text" placeholder="root" value="{{ cloudtak_cfg.remote.username or 'root' }}">
         </div>
         <div class="form-group">
-          <label class="form-label">SSH Key Path (optional)</label>
-          <input id="cloudtak-remote-key" class="form-input" type="text" placeholder="~/.ssh/id_rsa" value="{{ cloudtak_cfg.remote.ssh_key_path or '' }}">
+          <label class="form-label">SSH Key Path</label>
+          <input id="cloudtak-remote-key" class="form-input" type="text" placeholder="~/.ssh/infra-tak-cloudtak" value="{{ cloudtak_cfg.remote.ssh_key_path or '' }}">
         </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">One-time remote password (for key copy only)</label>
+        <input id="cloudtak-remote-password" class="form-input" type="password" placeholder="Used only for Install SSH Key">
+        <div class="form-hint">Password is never stored. It is used only for one-time <code>ssh-copy-id</code>.</div>
+      </div>
+      <div class="controls" style="margin-top:8px">
+        <button class="btn btn-ghost" type="button" onclick="ensureCloudtakSshKey()">Generate SSH key</button>
+        <button class="btn btn-ghost" type="button" onclick="installCloudtakSshKey()">Install SSH key</button>
+        <button class="btn btn-ghost" type="button" onclick="testCloudtakRemoteSsh()">Test SSH</button>
+      </div>
+      <div id="cloudtak-ssh-status" style="margin-top:8px;font-size:12px;color:var(--text-dim)"></div>
+      <div class="form-group" style="margin-top:12px">
+        <label class="form-label">Public key (manual copy fallback)</label>
+        <textarea id="cloudtak-public-key" class="form-input" rows="3" readonly placeholder="Click 'Generate SSH key' to show public key"></textarea>
       </div>
     </div>
     <div class="controls" style="margin-top:10px">
