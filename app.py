@@ -2163,7 +2163,11 @@ def run_guarddog_deploy(alert_email):
                 guarddog_deploy_status.update({'running': False, 'error': True})
                 return
             content = open(src, 'r').read()
-            content = content.replace('ALERT_EMAIL_PLACEHOLDER', alert_email).replace('ALERT_SMS_PLACEHOLDER', alert_sms or '')
+            cert_pass = _get_tak_cert_password(settings)
+            content = (content
+                .replace('ALERT_EMAIL_PLACEHOLDER', alert_email)
+                .replace('ALERT_SMS_PLACEHOLDER', alert_sms or '')
+                .replace('CERT_PASS_PLACEHOLDER', cert_pass))
             if is_two_server and name == 'tak-remotedb-watch.sh':
                 content = content.replace('DB_HOST_PLACEHOLDER', s1_host)
                 content = content.replace('DB_PORT_PLACEHOLDER', db_port)
@@ -5672,11 +5676,22 @@ def cloudtak_container_logs():
 def cloudtak_uninstall():
     data = request.json or {}
     password = data.get('password', '')
+    req_cfg = data.get('config') if isinstance(data.get('config'), dict) else None
     auth = load_auth()
     if not auth.get('password_hash') or not check_password_hash(auth['password_hash'], password):
         return jsonify({'error': 'Invalid admin password'}), 403
     if cloudtak_uninstall_status.get('running'):
         return jsonify({'error': 'Uninstall already in progress'}), 409
+    # If UI sent an explicit target config, persist it first so uninstall uses
+    # the same target the user currently selected.
+    if req_cfg is not None:
+        try:
+            settings = load_settings()
+            merged = _normalize_cloudtak_deployment_config(req_cfg)
+            settings['cloudtak_deployment'] = merged
+            save_settings(settings)
+        except Exception as e:
+            return jsonify({'error': f'Could not save deployment target: {e}'}), 400
     cloudtak_uninstall_status.update({'running': True, 'done': False, 'error': None})
     def do_uninstall():
         try:
@@ -5684,8 +5699,23 @@ def cloudtak_uninstall():
             cfg = _get_cloudtak_deployment_config(settings)
             if cfg.get('target_mode') == 'remote':
                 rcfg = cfg.get('remote', {})
-                if (rcfg.get('host') or '').strip():
-                    _ssh_probe(rcfg, "cd ~/CloudTAK && COMPOSE_FILE=docker-compose.yml; [ -f compose.yaml ] && COMPOSE_FILE=compose.yaml; docker compose -f \"$COMPOSE_FILE\" down -v --rmi local 2>/dev/null || true; rm -rf ~/CloudTAK", timeout=240)
+                rhost = (rcfg.get('host') or '').strip()
+                if not rhost:
+                    cloudtak_uninstall_status.update({'running': False, 'done': True, 'error': 'Remote target selected but host is not configured'})
+                    return
+                ok, out = _ssh_probe(
+                    rcfg,
+                    "set -e; cd ~/CloudTAK 2>/dev/null || true; "
+                    "if [ -f ~/CloudTAK/docker-compose.yml ] || [ -f ~/CloudTAK/compose.yaml ]; then "
+                    "cd ~/CloudTAK; COMPOSE_FILE=docker-compose.yml; [ -f compose.yaml ] && COMPOSE_FILE=compose.yaml; "
+                    "docker compose -f \"$COMPOSE_FILE\" down -v --rmi local 2>/dev/null || "
+                    "docker-compose -f \"$COMPOSE_FILE\" down -v --rmi local 2>/dev/null || true; "
+                    "fi; rm -rf ~/CloudTAK",
+                    timeout=300
+                )
+                if not ok:
+                    cloudtak_uninstall_status.update({'running': False, 'done': True, 'error': f'Remote uninstall failed on {rhost}: {(out or "unknown error")[:240]}'})
+                    return
             else:
                 cloudtak_dir = os.path.expanduser('~/CloudTAK')
                 compose_yml = os.path.join(cloudtak_dir, 'docker-compose.yml')
@@ -8858,6 +8888,7 @@ window.doUninstall = function() {
   var progressEl = document.getElementById("uninstall-progress");
   var cancelBtn = document.getElementById("uninstall-cancel-btn");
   var confirmBtn = document.getElementById("uninstall-confirm-btn");
+  var cfg = window.collectDeployConfig ? window.collectDeployConfig() : {};
   msgEl.textContent = "";
   progressEl.innerHTML = "<span class=\"uninstall-spinner\"></span><span>Uninstalling...</span>";
   confirmBtn.disabled = true;
@@ -8865,8 +8896,16 @@ window.doUninstall = function() {
   fetch("/api/cloudtak/uninstall", {
     method: "POST",
     headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({password: password})
-  }).then(function(r) { return r.json(); }).then(function(d) {
+    body: JSON.stringify({password: password, config: cfg}),
+    credentials: "same-origin"
+  }).then(function(r) {
+    if (!r.ok) {
+      return r.text().then(function(t) {
+        throw new Error((t || ("HTTP " + r.status)).slice(0, 240));
+      });
+    }
+    return r.json();
+  }).then(function(d) {
     if (d.error) {
       msgEl.textContent = d.error;
       progressEl.innerHTML = "";
@@ -8876,7 +8915,10 @@ window.doUninstall = function() {
     }
     progressEl.innerHTML = "<span class=\"uninstall-spinner\"></span><span>Stopping containers and removing data...</span>";
     var poll = setInterval(function() {
-      fetch("/api/cloudtak/uninstall/status").then(function(r) { return r.json(); }).then(function(s) {
+      fetch("/api/cloudtak/uninstall/status", { credentials: "same-origin" }).then(function(r) {
+        if (!r.ok) throw new Error("status poll failed (" + r.status + ")");
+        return r.json();
+      }).then(function(s) {
         if (!s.running) {
           clearInterval(poll);
           if (s.error) {
@@ -8891,7 +8933,13 @@ window.doUninstall = function() {
         } else {
           progressEl.innerHTML = "<span class=\"uninstall-spinner\"></span><span>Uninstalling... (this may take 1-2 minutes)</span>";
         }
-      }).catch(function() { clearInterval(poll); progressEl.innerHTML = ""; confirmBtn.disabled = false; cancelBtn.disabled = false; });
+      }).catch(function(err) {
+        clearInterval(poll);
+        progressEl.innerHTML = "";
+        msgEl.textContent = "Status check failed: " + (err && err.message ? err.message : "network error");
+        confirmBtn.disabled = false;
+        cancelBtn.disabled = false;
+      });
     }, 1000);
   }).catch(function(err) {
     msgEl.textContent = "Request failed: " + (err.message || "network error");
