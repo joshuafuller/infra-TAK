@@ -5568,6 +5568,43 @@ def cloudtak_bootstrap_server_api():
         'auth': {'cert': cert_pem, 'key': key_pem},
     }
 
+    # For remote targets, hit the CloudTAK API directly via SSH+curl on localhost:5000.
+    # This bypasses Caddy/Authentik forward-auth which can block PATCH requests.
+    if cfg.get('target_mode') == 'remote':
+        rcfg = cfg.get('remote', {})
+        payload_json = json.dumps(payload)
+        import shlex
+        ssh_curl_cmd = (
+            "curl -sf -X PATCH http://localhost:5000/api/server "
+            "-H 'Content-Type: application/json' "
+            f"-d {shlex.quote(payload_json)} "
+            "--max-time 30"
+        )
+        ssh_ok, ssh_out = _ssh_probe(rcfg, ssh_curl_cmd, timeout=45)
+        if ssh_ok:
+            try:
+                body = json.loads((ssh_out or '').strip())
+            except Exception:
+                body = {}
+            return jsonify({
+                'success': True,
+                'message': (
+                    'CloudTAK initial server configuration applied.'
+                    + (' Host auto-switched to TAK hostname for TLS compatibility.' if host_auto_rewritten else '')
+                ),
+                'p12_source': p12_source,
+                'api_base': 'http://localhost:5000 (via SSH)',
+            })
+        # curl failed — parse error from output
+        err_body = {}
+        try:
+            err_body = json.loads((ssh_out or '').strip().splitlines()[-1])
+        except Exception:
+            pass
+        err_msg = (err_body.get('message') if isinstance(err_body, dict) else '') or (ssh_out or 'unknown error')[:300]
+        return jsonify({'success': False, 'error': f'CloudTAK bootstrap failed: {err_msg}', 'api_base': 'localhost:5000 (via SSH)'}), 400
+
+    # Local target — hit API directly from this host.
     last_err = ''
     selected_base = ''
     server_info = {}
@@ -5577,9 +5614,6 @@ def cloudtak_bootstrap_server_api():
             selected_base = base
             server_info = body if isinstance(body, dict) else {}
             break
-        # Newer CloudTAK builds may return 401/403 ("No Auth Present") for
-        # unauthenticated GET /api/server while still allowing first-time bootstrap.
-        # Treat this as "reachable" and continue with PATCH bootstrap attempt.
         if code in (401, 403):
             selected_base = base
             server_info = {}
@@ -5605,7 +5639,6 @@ def cloudtak_bootstrap_server_api():
         or 'unauthorized' in body_msg_l
     )
     if needs_auth_retry:
-        # If CloudTAK is already in auth-required mode, authenticate then retry patch.
         l_ok, l_code, l_body = _cloudtak_request_json(
             'POST',
             f'{selected_base}/api/login',
@@ -5624,48 +5657,15 @@ def cloudtak_bootstrap_server_api():
                 headers={'Authorization': f'Bearer {token}'},
             )
         else:
-            # Login failed. If the message says server is not configured,
-            # the TAK Server connection was cleared but user auth remains.
-            # Try creating the user first, then login+patch.
             login_msg = (l_body.get('message') if isinstance(l_body, dict) else '') or f'HTTP {l_code}'
-            login_msg_l = str(login_msg).strip().lower()
-            if 'not been configured' in login_msg_l or 'not configured' in login_msg_l:
-                # Server config gone — try registering the user then login.
-                r_ok, r_code, r_body = _cloudtak_request_json(
-                    'POST',
-                    f'{selected_base}/api/login',
-                    payload={'username': username, 'password': password, 'register': True},
-                    timeout=20,
-                )
-                reg_token = ''
-                if r_ok and isinstance(r_body, dict):
-                    reg_token = str(r_body.get('token') or '').strip()
-                if reg_token:
-                    ok, code, body = _cloudtak_request_json(
-                        'PATCH',
-                        f'{selected_base}/api/server',
-                        payload=payload,
-                        timeout=35,
-                        headers={'Authorization': f'Bearer {reg_token}'},
-                    )
-                else:
-                    return jsonify({
-                        'success': False,
-                        'error': (
-                            f'CloudTAK login failed ({login_msg}) and user registration also failed. '
-                            'Uninstall + redeploy CloudTAK to reset state, then bootstrap.'
-                        ),
-                        'api_base': selected_base
-                    }), 400
-            else:
-                return jsonify({
-                    'success': False,
-                    'error': (
-                        f'CloudTAK requires auth for server updates and login failed: {login_msg}. '
-                        'Use existing CloudTAK admin credentials or reset CloudTAK state before bootstrap.'
-                    ),
-                    'api_base': selected_base
-                }), 400
+            return jsonify({
+                'success': False,
+                'error': (
+                    f'CloudTAK requires auth for server updates and login failed: {login_msg}. '
+                    'Use existing CloudTAK admin credentials or reset CloudTAK state before bootstrap.'
+                ),
+                'api_base': selected_base
+            }), 400
     if not ok:
         msg = (body.get('message') if isinstance(body, dict) else '') or f'HTTP {code}'
         return jsonify({'success': False, 'error': f'CloudTAK bootstrap failed: {msg}', 'api_base': selected_base}), 400
