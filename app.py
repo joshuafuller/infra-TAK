@@ -2832,14 +2832,16 @@ def _cloudtak_api_base_urls(settings, cfg):
     return out
 
 
-def _cloudtak_request_json(method, url, payload=None, timeout=25):
+def _cloudtak_request_json(method, url, payload=None, timeout=25, headers=None):
     import urllib.error as _uerr
     data = None
-    headers = {'Accept': 'application/json'}
+    req_headers = {'Accept': 'application/json'}
+    if isinstance(headers, dict):
+        req_headers.update(headers)
     if payload is not None:
         data = json.dumps(payload).encode('utf-8')
-        headers['Content-Type'] = 'application/json'
-    req = urllib.request.Request(url, data=data, headers=headers, method=method.upper())
+        req_headers['Content-Type'] = 'application/json'
+    req = urllib.request.Request(url, data=data, headers=req_headers, method=method.upper())
     ctx = ssl._create_unverified_context() if url.lower().startswith('https://') else None
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
@@ -5531,6 +5533,43 @@ def cloudtak_bootstrap_server_api():
         }), 409
 
     ok, code, body = _cloudtak_request_json('PATCH', f'{selected_base}/api/server', payload=payload, timeout=35)
+    body_msg = (body.get('message') if isinstance(body, dict) else '') if body is not None else ''
+    body_msg_l = str(body_msg or '').strip().lower()
+    needs_auth_retry = (not ok) and (
+        code in (401, 403)
+        or 'no auth present' in body_msg_l
+        or 'invalid token' in body_msg_l
+        or 'unauthorized' in body_msg_l
+    )
+    if needs_auth_retry:
+        # If CloudTAK is already in auth-required mode, authenticate then retry patch.
+        l_ok, l_code, l_body = _cloudtak_request_json(
+            'POST',
+            f'{selected_base}/api/login',
+            payload={'username': username, 'password': password},
+            timeout=20,
+        )
+        token = ''
+        if l_ok and isinstance(l_body, dict):
+            token = str(l_body.get('token') or '').strip()
+        if token:
+            ok, code, body = _cloudtak_request_json(
+                'PATCH',
+                f'{selected_base}/api/server',
+                payload=payload,
+                timeout=35,
+                headers={'Authorization': f'Bearer {token}'},
+            )
+        else:
+            login_msg = (l_body.get('message') if isinstance(l_body, dict) else '') or f'HTTP {l_code}'
+            return jsonify({
+                'success': False,
+                'error': (
+                    f'CloudTAK requires auth for server updates and login failed: {login_msg}. '
+                    'Use existing CloudTAK admin credentials or reset CloudTAK state before bootstrap.'
+                ),
+                'api_base': selected_base
+            }), 400
     if not ok:
         msg = (body.get('message') if isinstance(body, dict) else '') or f'HTTP {code}'
         return jsonify({'success': False, 'error': f'CloudTAK bootstrap failed: {msg}', 'api_base': selected_base}), 400
