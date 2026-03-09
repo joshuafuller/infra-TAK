@@ -5565,7 +5565,6 @@ def cloudtak_bootstrap_server_api():
         'webtak': f'https://{tak_host}:{webtak_port}',
         'username': username,
         'password': password,
-        'auth': {'cert': cert_pem, 'key': key_pem},
     }
 
     # For remote targets, hit the CloudTAK API directly via SSH+curl on localhost:5000.
