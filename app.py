@@ -8670,10 +8670,10 @@ window.checkCloudtakAdminP12Status = function() {
       }
       if (d.found) {
         el.style.color = "var(--green)";
-        el.textContent = d.message || "admin.p12 found";
+        el.textContent = "✓ " + (d.message || "admin.p12 found");
       } else {
         el.style.color = "var(--yellow)";
-        el.textContent = d.message || "admin.p12 not found (upload still works)";
+        el.textContent = "⚠ " + (d.message || "admin.p12 not found (upload still works)");
       }
     })
     .catch(function(e) {
@@ -9159,7 +9159,6 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">
       Defaults loaded: user <code>{{ cloudtak_bootstrap_user }}</code>, cert password <code>{{ cloudtak_cert_password }}</code>. Upload is optional if <code>/opt/tak/certs/files/admin.p12</code> exists.
     </p>
-    <p id="cloudtak-admin-p12-status" style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Checking admin.p12...</p>
     <div class="grid-2">
       <div class="form-group">
         <label class="form-label">Server Name</label>
@@ -9186,6 +9185,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
         <input id="ct-bootstrap-webtak-port" class="form-input" type="number" value="8446">
       </div>
       <div class="form-group">
+        <div id="cloudtak-admin-p12-status" style="font-size:12px;color:var(--text-dim);margin-bottom:8px;font-family:'JetBrains Mono',monospace">Checking admin.p12...</div>
         <label class="form-label">Admin Certificate (.p12)</label>
         <input id="ct-bootstrap-p12" class="form-input" type="file" accept=".p12,.pfx,application/x-pkcs12">
       </div>
