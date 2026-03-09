@@ -5736,13 +5736,13 @@ def cloudtak_control():
         if not (rcfg.get('host') or '').strip():
             return jsonify({'error': 'Remote host not configured'}), 400
         if action == 'start':
-            cmd = "cd ~/CloudTAK && COMPOSE_FILE=docker-compose.yml; [ -f compose.yaml ] && COMPOSE_FILE=compose.yaml; docker compose -f \"$COMPOSE_FILE\" up -d"
+            cmd = "cd ~/CloudTAK && docker compose up -d"
         elif action == 'stop':
-            cmd = "cd ~/CloudTAK && COMPOSE_FILE=docker-compose.yml; [ -f compose.yaml ] && COMPOSE_FILE=compose.yaml; docker compose -f \"$COMPOSE_FILE\" stop"
+            cmd = "cd ~/CloudTAK && docker compose stop"
         elif action == 'restart':
-            cmd = "cd ~/CloudTAK && COMPOSE_FILE=docker-compose.yml; [ -f compose.yaml ] && COMPOSE_FILE=compose.yaml; docker compose -f \"$COMPOSE_FILE\" restart"
+            cmd = "cd ~/CloudTAK && docker compose restart"
         elif action == 'update':
-            cmd = "cd ~/CloudTAK && [ -x ./cloudtak.sh ] && ./cloudtak.sh update || (COMPOSE_FILE=docker-compose.yml; [ -f compose.yaml ] && COMPOSE_FILE=compose.yaml; docker compose -f \"$COMPOSE_FILE\" pull && docker compose -f \"$COMPOSE_FILE\" up -d)"
+            cmd = "cd ~/CloudTAK && [ -x ./cloudtak.sh ] && ./cloudtak.sh update || (docker compose pull && docker compose up -d)"
         else:
             return jsonify({'error': 'Invalid action'}), 400
         ok, out = _ssh_probe(rcfg, cmd, timeout=900 if action == 'update' else 120)
@@ -5782,7 +5782,7 @@ def cloudtak_container_logs():
         if container:
             cmd = f"docker logs {container} --tail {lines} 2>&1"
         else:
-            cmd = "cd ~/CloudTAK && COMPOSE_FILE=docker-compose.yml; [ -f compose.yaml ] && COMPOSE_FILE=compose.yaml; docker compose -f \"$COMPOSE_FILE\" logs --tail " + str(lines) + " 2>&1"
+            cmd = "cd ~/CloudTAK && docker compose logs --tail " + str(lines) + " 2>&1"
         ok, out = _ssh_probe(rcfg, cmd, timeout=20)
         entries = [l for l in ((out or '').strip().split('\n') if (out or '').strip() else []) if l.strip()]
         if not ok and not entries:
@@ -6068,9 +6068,8 @@ def run_cloudtak_deploy(cfg=None):
             plog("━━━ Step 5/6: Building/Starting remote containers ━━━")
             run_cmd = (
                 "cd ~/CloudTAK && "
-                "COMPOSE_FILE=docker-compose.yml; [ -f compose.yaml ] && COMPOSE_FILE=compose.yaml; "
-                "docker compose -f \"$COMPOSE_FILE\" build && "
-                "docker compose -f \"$COMPOSE_FILE\" up -d"
+                "docker compose build && "
+                "docker compose up -d"
             )
             ok, out = _ssh_probe(remote_cfg, run_cmd, timeout=3600)
             if not ok:
@@ -6488,8 +6487,7 @@ def run_cloudtak_redeploy(cfg=None):
             cmd = (
                 "mv /tmp/.env ~/CloudTAK/.env && "
                 "mv /tmp/docker-compose.override.yml ~/CloudTAK/docker-compose.override.yml && "
-                "cd ~/CloudTAK && COMPOSE_FILE=docker-compose.yml; [ -f compose.yaml ] && COMPOSE_FILE=compose.yaml; "
-                "docker compose -f \"$COMPOSE_FILE\" restart"
+                "cd ~/CloudTAK && docker compose up -d"
             )
             ok, out = _ssh_probe(remote_cfg, cmd, timeout=180)
             if not ok:
