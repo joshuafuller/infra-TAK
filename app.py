@@ -5512,6 +5512,13 @@ def cloudtak_bootstrap_server_api():
             selected_base = base
             server_info = body if isinstance(body, dict) else {}
             break
+        # Newer CloudTAK builds may return 401/403 ("No Auth Present") for
+        # unauthenticated GET /api/server while still allowing first-time bootstrap.
+        # Treat this as "reachable" and continue with PATCH bootstrap attempt.
+        if code in (401, 403):
+            selected_base = base
+            server_info = {}
+            break
         last_err = f'{base}: {(body.get("message") if isinstance(body, dict) else body) or code}'
     if not selected_base:
         return jsonify({'success': False, 'error': f'Could not reach CloudTAK API. {last_err[:220]}'}), 400
