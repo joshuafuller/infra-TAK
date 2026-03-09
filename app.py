@@ -2388,6 +2388,8 @@ def cloudtak_page():
     settings = load_settings()
     cloudtak_cfg = _get_cloudtak_deployment_config(settings)
     cloudtak_tak_suggest = _suggest_tak_core_host(settings)
+    ct_bootstrap_user, ct_bootstrap_pass = _get_webadmin_defaults(settings)
+    ct_cert_pass = _get_tak_cert_password(settings)
     cloudtak = detect_modules().get('cloudtak', {})
     container_info = {}
     if cloudtak.get('running'):
@@ -2413,6 +2415,9 @@ def cloudtak_page():
         cloudtak_icon=CLOUDTAK_ICON,
         cloudtak_cfg=cloudtak_cfg,
         cloudtak_tak_suggest=cloudtak_tak_suggest,
+        cloudtak_bootstrap_user=ct_bootstrap_user,
+        cloudtak_bootstrap_pass=ct_bootstrap_pass,
+        cloudtak_cert_password=ct_cert_pass,
         container_info=container_info,
         deploying=cloudtak_deploy_status.get('running', False),
         deploy_done=cloudtak_deploy_status.get('complete', False),
@@ -2773,6 +2778,13 @@ def _get_cloudtak_upstreams(settings):
 
 def _suggest_tak_core_host(settings):
     """Best-effort TAK core host for CloudTAK bootstrap wizard."""
+    # Prefer TAK Server domain (cert hostname) when available.
+    try:
+        tak_host = (_get_takserver_host(settings) or '').strip()
+        if tak_host:
+            return tak_host
+    except Exception:
+        pass
     try:
         tak_cfg = _get_tak_deployment_config(settings)
         s2 = tak_cfg.get('server_two', {}) if isinstance(tak_cfg.get('server_two'), dict) else {}
@@ -2782,6 +2794,14 @@ def _suggest_tak_core_host(settings):
     except Exception:
         pass
     return (settings.get('server_ip') or '').strip()
+
+
+def _is_ipv4_host(value):
+    try:
+        parts = (value or '').strip().split('.')
+        return len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts)
+    except Exception:
+        return False
 
 
 def _cloudtak_api_base_urls(settings, cfg):
@@ -2859,6 +2879,110 @@ def _p12_bytes_to_pem(p12_bytes, password=''):
         return cert_pem.strip() + '\n', key_pem.strip() + '\n'
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _cloudtak_bootstrap_preflight(cfg, tak_host, cot_port, marti_port, webtak_port):
+    """Connectivity check to TAK ports from CloudTAK target host perspective."""
+    import socket
+    ports = [int(cot_port), int(marti_port), int(webtak_port)]
+    if cfg.get('target_mode') == 'remote':
+        rcfg = cfg.get('remote', {})
+        cmd = (
+            "python3 - <<'PY'\n"
+            "import socket, json\n"
+            f"host={json.dumps(tak_host)}\n"
+            f"ports={json.dumps(ports)}\n"
+            "out={}\n"
+            "for p in ports:\n"
+            "  s=socket.socket(); s.settimeout(3)\n"
+            "  try:\n"
+            "    s.connect((host,int(p))); out[str(p)]='ok'\n"
+            "  except Exception as e:\n"
+            "    out[str(p)]='fail:'+str(e)\n"
+            "  finally:\n"
+            "    try: s.close()\n"
+            "    except Exception: pass\n"
+            "print(json.dumps(out))\n"
+            "PY"
+        )
+        ok, out = _ssh_probe(rcfg, cmd, timeout=25)
+        if not ok:
+            return False, {'error': f'Could not run preflight on remote CloudTAK host: {(out or "")[:220]}'}
+        try:
+            result = json.loads((out or '').strip().splitlines()[-1])
+        except Exception:
+            return False, {'error': f'Unexpected preflight output: {(out or "")[:220]}'}
+    else:
+        result = {}
+        for p in ports:
+            s = socket.socket()
+            s.settimeout(3)
+            try:
+                s.connect((tak_host, int(p)))
+                result[str(p)] = 'ok'
+            except Exception as e:
+                result[str(p)] = f'fail:{e}'
+            finally:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+    required = [str(int(marti_port)), str(int(webtak_port))]
+    healthy = all(str(result.get(p, '')).startswith('ok') for p in required)
+    return healthy, result
+
+
+def _get_tak_cert_password(settings):
+    """Current TAK cert export password (default atakatak)."""
+    return (settings.get('tak_cert_password') or 'atakatak').strip() or 'atakatak'
+
+
+def _get_webadmin_defaults(settings):
+    """Default CloudTAK bootstrap TAK user creds."""
+    return 'webadmin', (settings.get('webadmin_password') or '').strip()
+
+
+def _load_admin_p12_bytes_from_tak_core(settings):
+    """Best-effort load of admin.p12 from TAK core (local preferred, remote fallback)."""
+    local_path = '/opt/tak/certs/files/admin.p12'
+    if os.path.exists(local_path):
+        try:
+            with open(local_path, 'rb') as f:
+                return f.read(), local_path, ''
+        except Exception as e:
+            return b'', local_path, f'Could not read local admin.p12: {e}'
+
+    # Fallback: if TAK server two is remote, try reading via SSH.
+    try:
+        tak_cfg = _get_tak_deployment_config(settings)
+        s2 = tak_cfg.get('server_two', {}) if isinstance(tak_cfg.get('server_two'), dict) else {}
+        s2_host = (s2.get('host') or '').strip()
+        if s2_host and s2_host not in ('127.0.0.1', 'localhost'):
+            cmd = (
+                "python3 - <<'PY'\n"
+                "import base64,sys\n"
+                "p='/opt/tak/certs/files/admin.p12'\n"
+                "try:\n"
+                "  b=open(p,'rb').read()\n"
+                "  print(base64.b64encode(b).decode())\n"
+                "except Exception as e:\n"
+                "  print('ERR:'+str(e))\n"
+                "  sys.exit(1)\n"
+                "PY"
+            )
+            ok, out = _ssh_probe(s2, cmd, timeout=20)
+            if ok and out:
+                import base64
+                try:
+                    data = base64.b64decode((out or '').strip().splitlines()[-1])
+                    if data:
+                        return data, f'{s2_host}:/opt/tak/certs/files/admin.p12', ''
+                except Exception:
+                    pass
+            return b'', f'{s2_host}:/opt/tak/certs/files/admin.p12', (out or 'Could not read remote admin.p12')[:260]
+    except Exception as e:
+        return b'', local_path, str(e)[:220]
+    return b'', local_path, 'admin.p12 not found on TAK core'
 
 def _get_authentik_host(settings):
     """Return the hostname for the Authentik service (configurable via Caddy/Domains, default tak.<fqdn> = hub)."""
@@ -3336,6 +3460,7 @@ def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
     """
     import re, shutil
 
+    cert_pass = _get_tak_cert_password(load_settings())
     cert_dir = (f"/var/lib/caddy/.local/share/caddy/certificates/"
                 f"acme-v02.api.letsencrypt.org-directory/{takserver_host}")
     cert_crt = f"{cert_dir}/{takserver_host}.crt"
@@ -3361,7 +3486,7 @@ def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
     # Step A: LE cert → PKCS12
     r = subprocess.run(
         f'openssl pkcs12 -export -in "{cert_crt}" -inkey "{cert_key}" '
-        f'-out /tmp/takserver-le.p12 -name "{takserver_host}" -password pass:atakatak 2>&1',
+        f'-out /tmp/takserver-le.p12 -name "{takserver_host}" -password pass:{cert_pass} 2>&1',
         shell=True, capture_output=True, text=True)
     if r.returncode != 0:
         log_fn(f"  ⚠ PKCS12 conversion failed: {r.stderr.strip()[:200]}")
@@ -3370,9 +3495,9 @@ def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
 
     # Step B: PKCS12 → JKS
     r = subprocess.run(
-        'keytool -importkeystore -srcstorepass atakatak -deststorepass atakatak '
-        '-destkeystore /tmp/takserver-le.jks -srckeystore /tmp/takserver-le.p12 '
-        '-srcstoretype pkcs12 2>&1',
+        f'keytool -importkeystore -srcstorepass "{cert_pass}" -deststorepass "{cert_pass}" '
+        f'-destkeystore /tmp/takserver-le.jks -srckeystore /tmp/takserver-le.p12 '
+        f'-srcstoretype pkcs12 2>&1',
         shell=True, capture_output=True, text=True)
     if r.returncode != 0:
         log_fn(f"  ⚠ JKS conversion failed: {r.stderr.strip()[:200]}")
@@ -3392,7 +3517,7 @@ def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
         new_connector = (
             '<connector port="8446" clientAuth="false" _name="LetsEncrypt" '
             'keystore="JKS" keystoreFile="certs/files/takserver-le.jks" '
-            'keystorePass="atakatak" enableAdminUI="true" enableWebtak="true" '
+            f'keystorePass="{cert_pass}" enableAdminUI="true" enableWebtak="true" '
             'enableNonAdminUI="false"/>'
         )
         patched = re.sub(r'<connector port="8446"[^/]*/>', new_connector, content)
@@ -3445,9 +3570,9 @@ fi
 sleep 15
 
 openssl pkcs12 -export -in "$CERT_CRT" -inkey "$CERT_KEY" \\
-  -out /tmp/takserver-le.p12 -name "$TAK_DOMAIN" -password pass:atakatak
+  -out /tmp/takserver-le.p12 -name "$TAK_DOMAIN" -password pass:{cert_pass}
 
-keytool -importkeystore -srcstorepass atakatak -deststorepass atakatak \\
+keytool -importkeystore -srcstorepass {cert_pass} -deststorepass {cert_pass} \\
   -destkeystore /tmp/takserver-le.jks -srckeystore /tmp/takserver-le.p12 \\
   -srcstoretype pkcs12
 
@@ -3900,6 +4025,7 @@ def takportal_control():
                             ak_token = line.strip().split('=', 1)[1].strip()
             import json as json_mod
             cloudtak_host = _get_service_domain(settings, 'cloudtak_map')
+            cert_pass = _get_tak_cert_password(settings)
             portal_settings = {
                 "AUTHENTIK_URL": f"http://{server_ip}:9090",
                 "AUTHENTIK_TOKEN": ak_token,
@@ -3914,7 +4040,7 @@ def takportal_control():
                 "TAK_PORTAL_PUBLIC_URL": f"https://takportal.{settings['fqdn']}" if settings.get('fqdn') else f"http://{server_ip}:3000",
                 "TAK_URL": f"https://{_get_takserver_host(settings)}:8443/Marti" if _get_takserver_host(settings) else f"https://{server_ip}:8443/Marti",
                 "TAK_API_P12_PATH": "data/certs/tak-client.p12",
-                "TAK_API_P12_PASSPHRASE": "atakatak",
+                "TAK_API_P12_PASSPHRASE": cert_pass,
                 "TAK_CA_PATH": "data/certs/tak-ca.pem",
                 "TAK_REVOKE_ON_DISABLE": "true",
                 "TAK_DEBUG": "false",
@@ -4166,9 +4292,10 @@ def run_takportal_deploy():
             # Re-encode P12 with modern encryption (AES-256-CBC) — TAK Server generates
             # legacy RC2-40-CBC which Node.js 22+ / OpenSSL 3.x rejects
             modern_p12 = '/tmp/tak-portal-admin-modern.p12'
+            cert_pass = _get_tak_cert_password(load_settings())
             r = subprocess.run(
-                f'openssl pkcs12 -in {webadmin_p12} -passin pass:atakatak -nodes -legacy 2>/dev/null | '
-                f'openssl pkcs12 -export -passout pass:atakatak -out {modern_p12}',
+                f'openssl pkcs12 -in {webadmin_p12} -passin pass:{cert_pass} -nodes -legacy 2>/dev/null | '
+                f'openssl pkcs12 -export -passout pass:{cert_pass} -out {modern_p12}',
                 shell=True, capture_output=True, text=True, timeout=30)
             if os.path.exists(modern_p12) and os.path.getsize(modern_p12) > 0:
                 subprocess.run(f'docker cp {modern_p12} tak-portal:/usr/src/app/data/certs/tak-client.p12', shell=True, capture_output=True, text=True)
@@ -4231,6 +4358,7 @@ def run_takportal_deploy():
                         ak_token = line.strip().split('=', 1)[1].strip()
         import json as json_mod
         cloudtak_host = _get_service_domain(settings, 'cloudtak_map')
+        cert_pass = _get_tak_cert_password(settings)
         portal_settings = {
             "AUTHENTIK_URL": f"http://{server_ip}:9090",
             "AUTHENTIK_TOKEN": ak_token,
@@ -4245,7 +4373,7 @@ def run_takportal_deploy():
             "TAK_PORTAL_PUBLIC_URL": f"https://takportal.{settings['fqdn']}" if settings.get('fqdn') else f"http://{server_ip}:3000",
             "TAK_URL": f"https://{_get_takserver_host(settings)}:8443/Marti" if _get_takserver_host(settings) else f"https://{server_ip}:8443/Marti",
             "TAK_API_P12_PATH": "data/certs/tak-client.p12",
-            "TAK_API_P12_PASSPHRASE": "atakatak",
+            "TAK_API_P12_PASSPHRASE": cert_pass,
             "TAK_CA_PATH": "data/certs/tak-ca.pem",
             "TAK_REVOKE_ON_DISABLE": "true",
             "TAK_DEBUG": "false",
@@ -5301,17 +5429,17 @@ def cloudtak_bootstrap_server_api():
 
     tak_host = (data.get('tak_host') or '').strip() or _suggest_tak_core_host(settings)
     server_name = (data.get('server_name') or 'TAK Core').strip() or 'TAK Core'
-    username = (data.get('tak_username') or '').strip()
-    password = (data.get('tak_password') or '').strip()
+    default_user, default_pass = _get_webadmin_defaults(settings)
+    username = (data.get('tak_username') or '').strip() or default_user
+    password = (data.get('tak_password') or '').strip() or default_pass
     p12_data = (data.get('p12_data') or '').strip()
-    p12_password = str(data.get('p12_password') or '')
+    p12_password = str(data.get('p12_password') or _get_tak_cert_password(settings) or '')
 
     if not tak_host:
         return jsonify({'success': False, 'error': 'TAK core host/IP is required'}), 400
     if not username or not password:
         return jsonify({'success': False, 'error': 'Initial TAK admin username/password are required'}), 400
-    if not p12_data:
-        return jsonify({'success': False, 'error': 'Admin .p12 certificate is required'}), 400
+    p12_source = 'upload'
 
     try:
         cot_port = int(data.get('cot_port') or 8089)
@@ -5320,19 +5448,46 @@ def cloudtak_bootstrap_server_api():
     except Exception:
         return jsonify({'success': False, 'error': 'Ports must be valid numbers'}), 400
 
-    # Support plain base64 or data URL payload
-    if p12_data.startswith('data:') and ',' in p12_data:
-        p12_data = p12_data.split(',', 1)[1]
-    try:
-        import base64
-        p12_bytes = base64.b64decode(p12_data)
-    except Exception:
-        return jsonify({'success': False, 'error': 'Could not decode .p12 upload data'}), 400
+    if p12_data:
+        # Support plain base64 or data URL payload
+        if p12_data.startswith('data:') and ',' in p12_data:
+            p12_data = p12_data.split(',', 1)[1]
+        try:
+            import base64
+            p12_bytes = base64.b64decode(p12_data)
+        except Exception:
+            return jsonify({'success': False, 'error': 'Could not decode .p12 upload data'}), 400
+    else:
+        p12_bytes, p12_loc, p12_err = _load_admin_p12_bytes_from_tak_core(settings)
+        p12_source = p12_loc
+        if not p12_bytes:
+            return jsonify({'success': False, 'error': f'Admin .p12 not uploaded and auto-load failed: {p12_err}'}), 400
 
     try:
         cert_pem, key_pem = _p12_bytes_to_pem(p12_bytes, p12_password)
     except Exception as e:
         return jsonify({'success': False, 'error': f'Could not read .p12: {str(e)[:220]}'}), 400
+
+    # If user entered raw IP and a TAK hostname is known, prefer hostname for TLS/cert compatibility.
+    preferred_host = (_get_takserver_host(settings) or '').strip()
+    host_auto_rewritten = False
+    if _is_ipv4_host(tak_host) and preferred_host:
+        tak_host = preferred_host
+        host_auto_rewritten = True
+
+    preflight_ok, preflight = _cloudtak_bootstrap_preflight(cfg, tak_host, cot_port, marti_port, webtak_port)
+    if not preflight_ok:
+        p8443 = preflight.get(str(marti_port), 'unknown') if isinstance(preflight, dict) else 'unknown'
+        p8446 = preflight.get(str(webtak_port), 'unknown') if isinstance(preflight, dict) else 'unknown'
+        return jsonify({
+            'success': False,
+            'error': (
+                f'Preflight failed from CloudTAK target to TAK host {tak_host}. '
+                f'8443={p8443}; 8446={p8446}. '
+                'Use TAK cert hostname/FQDN and ensure firewall/routes allow access.'
+            ),
+            'preflight': preflight,
+        }), 400
 
     payload = {
         'name': server_name,
@@ -5371,11 +5526,21 @@ def cloudtak_bootstrap_server_api():
 
     return jsonify({
         'success': True,
-        'message': 'CloudTAK initial server configuration applied.',
+        'message': (
+            'CloudTAK initial server configuration applied.'
+            + (' Host auto-switched to TAK hostname for TLS compatibility.' if host_auto_rewritten else '')
+        ),
         'api_base': selected_base,
+        'defaults_used': {
+            'tak_username': username,
+            'tak_password_from_settings': bool((data.get('tak_password') or '').strip() == '' and default_pass),
+            'p12_source': p12_source,
+            'cert_password': p12_password,
+        },
         'server': {
             'host': tak_host, 'cot_port': cot_port, 'marti_port': marti_port, 'webtak_port': webtak_port
-        }
+        },
+        'host_auto_rewritten': host_auto_rewritten,
     })
 
 
@@ -8388,11 +8553,12 @@ window.bootstrapCloudtakServer = async function() {
     var file = p12Input && p12Input.files && p12Input.files[0] ? p12Input.files[0] : null;
 
     if (!takHost) return setStatus("TAK core host/IP is required.", true);
-    if (!takUser || !takPass) return setStatus("TAK admin username/password are required.", true);
-    if (!file) return setStatus("Admin .p12 file is required.", true);
 
-    setStatus("Reading certificate...", false);
-    var p12Data = await window._fileToDataURL(file);
+    var p12Data = "";
+    if (file) {
+      setStatus("Reading certificate...", false);
+      p12Data = await window._fileToDataURL(file);
+    }
     setStatus("Bootstrapping CloudTAK server config...", false);
 
     var payload = {
@@ -8417,7 +8583,12 @@ window.bootstrapCloudtakServer = async function() {
     if (!r.ok || !d || !d.success) {
       return setStatus((d && d.error) ? d.error : "Bootstrap failed", true);
     }
-    setStatus("CloudTAK bootstrap applied. You can log in now.", false);
+    var msg = d.message || "CloudTAK bootstrap applied. You can log in now.";
+    setStatus(msg, false);
+    if (d && d.server && d.server.host) {
+      var hostEl = document.getElementById("ct-bootstrap-host");
+      if (hostEl) hostEl.value = d.server.host;
+    }
   } catch (e) {
     setStatus("Bootstrap failed: " + (e && e.message ? e.message : String(e)), true);
   }
@@ -8870,6 +9041,12 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">
       One-click CloudTAK first-time setup. This sends your TAK core host/ports, admin <code>.p12</code>, and TAK admin credentials to CloudTAK's <code>/api/server</code> endpoint.
     </p>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">
+      Tip: Use TAK cert hostname/FQDN (recommended) instead of raw IP for best TLS compatibility.
+    </p>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">
+      Defaults loaded: user <code>{{ cloudtak_bootstrap_user }}</code>, cert password <code>{{ cloudtak_cert_password }}</code>. Upload is optional if <code>/opt/tak/certs/files/admin.p12</code> exists.
+    </p>
     <div class="grid-2">
       <div class="form-group">
         <label class="form-label">Server Name</label>
@@ -8903,16 +9080,16 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     <div class="grid-2">
       <div class="form-group">
         <label class="form-label">.p12 Password</label>
-        <input id="ct-bootstrap-p12-pass" class="form-input" type="password" placeholder="Certificate password">
+        <input id="ct-bootstrap-p12-pass" class="form-input" type="password" value="{{ cloudtak_cert_password }}" placeholder="Certificate password">
       </div>
       <div class="form-group">
         <label class="form-label">TAK Admin Username</label>
-        <input id="ct-bootstrap-user" class="form-input" type="text" placeholder="admin">
+        <input id="ct-bootstrap-user" class="form-input" type="text" value="{{ cloudtak_bootstrap_user }}" placeholder="admin">
       </div>
     </div>
     <div class="form-group">
       <label class="form-label">TAK Admin Password</label>
-      <input id="ct-bootstrap-pass" class="form-input" type="password" placeholder="TAK admin password">
+      <input id="ct-bootstrap-pass" class="form-input" type="password" value="{{ cloudtak_bootstrap_pass or '' }}" placeholder="TAK admin password">
     </div>
     <div class="controls">
       <button type="button" class="btn btn-primary" onclick="bootstrapCloudtakServer()">⚡ Bootstrap CloudTAK from TAK Core</button>
@@ -9655,7 +9832,7 @@ CERTS_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><
 <main class="main">
 <div class="section-title">Certificate Files</div>
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px">
-<div class="info-bar">Password: <span>atakatak</span> &nbsp;&middot;&nbsp; {{ files|length }} files in /opt/tak/certs/files/</div>
+<div class="info-bar">Password: <span>{{ settings.get('tak_cert_password','atakatak') }}</span> &nbsp;&middot;&nbsp; {{ files|length }} files in /opt/tak/certs/files/</div>
 <div class="filter-btns">
 <button class="filter-btn active" onclick="filterCerts('all')">All</button>
 <button class="filter-btn" onclick="filterCerts('p12')">🔑 .p12</button>
@@ -12534,6 +12711,28 @@ def takserver_webadmin_password():
     return jsonify({'password': ''})
 
 
+@app.route('/api/takserver/cert-password')
+@login_required
+def takserver_cert_password():
+    """Return configured TAK certificate password (default atakatak)."""
+    settings = load_settings()
+    return jsonify({'password': _get_tak_cert_password(settings)})
+
+
+@app.route('/api/takserver/cert-password', methods=['POST'])
+@login_required
+def takserver_set_cert_password():
+    """Persist TAK certificate password used by helper defaults."""
+    data = request.get_json() or {}
+    pw = (data.get('password') or '').strip()
+    if not pw:
+        return jsonify({'success': False, 'error': 'Password required'}), 400
+    settings = load_settings()
+    settings['tak_cert_password'] = pw
+    save_settings(settings)
+    return jsonify({'success': True, 'password': pw})
+
+
 @app.route('/api/takserver/webadmin-authentik-status')
 @login_required
 def takserver_webadmin_authentik_status():
@@ -12736,6 +12935,7 @@ def takserver_cert_expiry():
 def takserver_groups():
     """List groups from TAK Server via the Marti API using admin cert."""
     cert_dir = '/opt/tak/certs/files'
+    cert_pass = _get_tak_cert_password(load_settings())
     admin_p12 = os.path.join(cert_dir, 'admin.p12')
     if not os.path.exists(admin_p12):
         return jsonify({'error': 'admin.p12 not found in /opt/tak/certs/files/', 'groups': []})
@@ -12745,10 +12945,10 @@ def takserver_groups():
         admin_pem = '/tmp/tak-admin-curl.pem'
         admin_key = '/tmp/tak-admin-curl.key'
         subprocess.run(
-            f'openssl pkcs12 -in {admin_p12} -passin pass:atakatak -clcerts -nokeys -legacy 2>/dev/null > {admin_pem}',
+            f'openssl pkcs12 -in {admin_p12} -passin pass:{cert_pass} -clcerts -nokeys -legacy 2>/dev/null > {admin_pem}',
             shell=True, capture_output=True, text=True, timeout=10)
         subprocess.run(
-            f'openssl pkcs12 -in {admin_p12} -passin pass:atakatak -nocerts -nodes -legacy 2>/dev/null > {admin_key}',
+            f'openssl pkcs12 -in {admin_p12} -passin pass:{cert_pass} -nocerts -nodes -legacy 2>/dev/null > {admin_key}',
             shell=True, capture_output=True, text=True, timeout=10)
         if not os.path.exists(admin_pem) or os.path.getsize(admin_pem) == 0:
             return jsonify({'error': 'Failed to extract PEM from admin.p12 (legacy conversion)', 'groups': []})
@@ -12794,6 +12994,7 @@ def takserver_groups():
 def takserver_ca_info():
     """Return current Root CA and Intermediate CA names, expiry, and truststore contents."""
     cert_dir = '/opt/tak/certs/files'
+    cert_pass = _get_tak_cert_password(load_settings())
     info = {'root_ca': None, 'intermediate_ca': None, 'old_cas_in_truststore': [], 'suggested_new_name': ''}
     for label, filename in [('root_ca', 'root-ca.pem'), ('intermediate_ca', 'ca.pem')]:
         path = os.path.join(cert_dir, filename)
@@ -12844,7 +13045,7 @@ def takserver_ca_info():
         info['truststore_file'] = os.path.basename(ts_path)
         try:
             r = subprocess.run(
-                ['keytool', '-list', '-keystore', ts_path, '-storepass', 'atakatak'],
+                ['keytool', '-list', '-keystore', ts_path, '-storepass', cert_pass],
                 capture_output=True, text=True, timeout=10)
             aliases = []
             trusted_aliases = []
@@ -12888,6 +13089,7 @@ def takserver_rotate_intca():
         return jsonify({'error': 'CA name can only contain letters, numbers, dots, hyphens, underscores'}), 400
 
     cert_dir = '/opt/tak/certs/files'
+    cert_pass = _get_tak_cert_password(load_settings())
     if not os.path.exists(os.path.join(cert_dir, 'root-ca.pem')):
         return jsonify({'error': 'root-ca.pem not found — cannot rotate without a Root CA'}), 400
     if not os.path.exists(os.path.join(cert_dir, 'ca.pem')):
@@ -12975,12 +13177,12 @@ def takserver_rotate_intca():
             log("Step 5/7: Updating truststore...")
             ts_jks = os.path.join(cert_dir, f'truststore-{new_ca_name}.jks')
             run(f'keytool -import -alias root-ca -file {cert_dir}/root-ca.pem '
-                f'-keystore {ts_jks} -storepass atakatak -noprompt 2>&1', check=False)
+                f'-keystore {ts_jks} -storepass "{cert_pass}" -noprompt 2>&1', check=False)
             log("  Root CA imported into new truststore")
             old_pem = os.path.join(cert_dir, f'{old_ca_name}.pem')
             if os.path.exists(old_pem):
                 run(f'keytool -import -trustcacerts -file {old_pem} '
-                    f'-keystore {ts_jks} -alias "{old_ca_name}" -deststorepass atakatak -noprompt 2>&1',
+                    f'-keystore {ts_jks} -alias "{old_ca_name}" -deststorepass "{cert_pass}" -noprompt 2>&1',
                     check=False)
                 log(f"  Old CA ({old_ca_name}) imported into new truststore (transition period)")
             else:
@@ -13002,8 +13204,8 @@ def takserver_rotate_intca():
                 admin_p12 = os.path.join(cert_dir, 'admin.p12')
                 modern_p12 = '/tmp/tak-portal-admin-modern.p12'
                 subprocess.run(
-                    f'openssl pkcs12 -in {admin_p12} -passin pass:atakatak -nodes -legacy 2>/dev/null | '
-                    f'openssl pkcs12 -export -passout pass:atakatak -out {modern_p12}',
+                    f'openssl pkcs12 -in {admin_p12} -passin pass:{cert_pass} -nodes -legacy 2>/dev/null | '
+                    f'openssl pkcs12 -export -passout pass:{cert_pass} -out {modern_p12}',
                     shell=True, capture_output=True, text=True, timeout=30)
                 if os.path.exists(modern_p12) and os.path.getsize(modern_p12) > 0:
                     run(f'docker cp {modern_p12} tak-portal:/usr/src/app/data/certs/tak-client.p12', check=False)
@@ -13071,6 +13273,7 @@ def takserver_revoke_old_ca():
         return jsonify({'error': 'Old CA alias is required'}), 400
 
     cert_dir = '/opt/tak/certs/files'
+    cert_pass = _get_tak_cert_password(load_settings())
     import glob as _glob
     ts_files = sorted(_glob.glob(os.path.join(cert_dir, 'truststore-*.jks')))
     ts_files = [f for f in ts_files if 'root' not in os.path.basename(f)]
@@ -13081,7 +13284,7 @@ def takserver_revoke_old_ca():
     try:
         r = subprocess.run(
             ['keytool', '-delete', '-alias', old_ca_alias,
-             '-keystore', ts_path, '-storepass', 'atakatak'],
+             '-keystore', ts_path, '-storepass', cert_pass],
             capture_output=True, text=True, timeout=10)
         if r.returncode != 0:
             return jsonify({'error': f'keytool failed: {r.stderr or r.stdout}'}), 500
@@ -13090,7 +13293,7 @@ def takserver_revoke_old_ca():
         ts_p12 = ts_path.replace('.jks', '.p12')
         subprocess.run(
             f'keytool -importkeystore -srckeystore {ts_path} -destkeystore {ts_p12} '
-            f'-srcstoretype JKS -deststoretype PKCS12 -srcstorepass atakatak -deststorepass atakatak -noprompt 2>&1',
+            f'-srcstoretype JKS -deststoretype PKCS12 -srcstorepass "{cert_pass}" -deststorepass "{cert_pass}" -noprompt 2>&1',
             shell=True, capture_output=True, text=True, timeout=15)
 
         subprocess.run('systemctl restart takserver 2>&1', shell=True, capture_output=True, text=True, timeout=30)
@@ -13123,6 +13326,7 @@ def takserver_rotate_rootca():
             return jsonify({'error': f'CA name "{name}" can only contain letters, numbers, dots, hyphens, underscores'}), 400
 
     cert_dir = '/opt/tak/certs/files'
+    cert_pass = _get_tak_cert_password(load_settings())
     if not os.path.exists(os.path.join(cert_dir, 'root-ca.pem')):
         return jsonify({'error': 'root-ca.pem not found — no current Root CA detected'}), 400
 
@@ -13224,7 +13428,7 @@ def takserver_rotate_rootca():
             log("Step 6/8: Updating truststore...")
             ts_jks = os.path.join(cert_dir, f'truststore-{new_int_name}.jks')
             run(f'keytool -import -alias root-ca -file {cert_dir}/root-ca.pem '
-                f'-keystore {ts_jks} -storepass atakatak -noprompt 2>&1', check=False)
+                f'-keystore {ts_jks} -storepass "{cert_pass}" -noprompt 2>&1', check=False)
             log("  Root CA imported into truststore")
             log("✓ Truststore updated")
 
@@ -13252,8 +13456,8 @@ def takserver_rotate_rootca():
                 admin_p12 = os.path.join(cert_dir, 'admin.p12')
                 modern_p12 = '/tmp/tak-portal-admin-modern.p12'
                 r_enc = subprocess.run(
-                    f'openssl pkcs12 -in {admin_p12} -passin pass:atakatak -nodes -legacy 2>/dev/null | '
-                    f'openssl pkcs12 -export -passout pass:atakatak -out {modern_p12}',
+                    f'openssl pkcs12 -in {admin_p12} -passin pass:{cert_pass} -nodes -legacy 2>/dev/null | '
+                    f'openssl pkcs12 -export -passout pass:{cert_pass} -out {modern_p12}',
                     shell=True, capture_output=True, text=True, timeout=30)
                 if os.path.exists(modern_p12) and os.path.getsize(modern_p12) > 0:
                     run(f'docker cp {modern_p12} tak-portal:/usr/src/app/data/certs/tak-client.p12', check=False)
@@ -13963,6 +14167,7 @@ def wait_for_package_lock():
 def run_takserver_deploy(config):
     try:
         deploy_status['cancelled'] = False
+        cert_pass = _get_tak_cert_password(load_settings())
         log_step("=" * 50); log_step("TAK Server Deployment Starting"); log_step("=" * 50)
         pkg = config['package_path']; pkg_name = os.path.basename(pkg)
 
@@ -14072,7 +14277,7 @@ def run_takserver_deploy(config):
         run_cmd('cd /opt/tak/certs && sudo -u tak ./makeCert.sh client user 2>&1', quiet=True)
         log_step("✓ All certificates created")
         log_step("Importing root CA into TAK clients truststore...")
-        run_cmd(f'keytool -import -alias root-ca -file /opt/tak/certs/files/root-ca.pem -keystore /opt/tak/certs/files/truststore-{int_ca}.jks -storepass atakatak -noprompt 2>&1', check=False)
+        run_cmd(f'keytool -import -alias root-ca -file /opt/tak/certs/files/root-ca.pem -keystore /opt/tak/certs/files/truststore-{int_ca}.jks -storepass "{cert_pass}" -noprompt 2>&1', check=False)
         log_step("✓ Root CA imported into truststore (TAK clients trust chain complete)")
         log_step("Restarting TAK Server...")
         run_cmd('systemctl stop takserver'); time.sleep(10)
@@ -14090,7 +14295,7 @@ def run_takserver_deploy(config):
             f'<nameEntries>\\n<nameEntry name="O" value="{config["cert_org"]}"/>\\n'
             f'<nameEntry name="OU" value="{config["cert_ou"]}"/>\\n</nameEntries>\\n'
             f'</certificateConfig>\\n<TAKServerCAConfig keystore="JKS" '
-            f'keystoreFile="certs/files/{int_ca}-signing.jks" keystorePass="atakatak" '
+            f'keystoreFile="certs/files/{int_ca}-signing.jks" keystorePass="{cert_pass}" '
             f'validityDays="3650" signatureAlg="SHA256WithRSA" />\\n'
             f'</certificateSigning>\\n<vbm enabled="false"/>')
         run_cmd(f'sed -i \'s|<vbm enabled="false"/>|{cert_block}|g\' /opt/tak/CoreConfig.xml', "Enabling certificate enrollment...")
@@ -14189,7 +14394,7 @@ def run_takserver_deploy(config):
         if webadmin_pass:
             log_step(f"  WebGUI (password): https://{ip}:8446")
             log_step(f"  Username: webadmin")
-        log_step(f"  Certificate Password: atakatak")
+        log_step(f"  Certificate Password: {cert_pass}")
         log_step(f"  Admin cert: /opt/tak/certs/files/admin.p12")
         # Regenerate Caddyfile if Caddy is configured
         if settings.get('fqdn'):
@@ -15285,7 +15490,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div id="deploy-log" style="background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary);max-height:500px;overflow-y:auto;line-height:1.7;white-space:pre-wrap">Reconnecting to deployment log...</div>
 <div id="deploy-log-area" style="display:block"></div>
 {% if deploy_done %}
-<div id="cert-download-area" style="margin-top:20px"><div class="section-title">Download Certificates</div><div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px"><div class="cert-downloads"><a href="/api/download/admin-cert" class="cert-btn cert-btn-secondary">⬇ admin.p12</a><a href="/api/download/user-cert" class="cert-btn cert-btn-secondary">⬇ user.p12</a><a href="/api/download/truststore" class="cert-btn cert-btn-secondary">⬇ truststore.p12</a></div><div style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim);margin-top:12px">Certificate password: <span style="color:var(--cyan)">atakatak</span></div></div></div>
+<div id="cert-download-area" style="margin-top:20px"><div class="section-title">Download Certificates</div><div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px"><div class="cert-downloads"><a href="/api/download/admin-cert" class="cert-btn cert-btn-secondary">⬇ admin.p12</a><a href="/api/download/user-cert" class="cert-btn cert-btn-secondary">⬇ user.p12</a><a href="/api/download/truststore" class="cert-btn cert-btn-secondary">⬇ truststore.p12</a></div><div style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim);margin-top:12px">Certificate password: <span style="color:var(--cyan)">{{ settings.get('tak_cert_password','atakatak') }}</span></div></div></div>
 {% endif %}
 {% elif tak.installed %}
 {% if show_connect_ldap %}
@@ -15382,8 +15587,13 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 <div id="certs-body" style="display:none;padding:0 24px 24px 24px;border-top:1px solid var(--border)">
 <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;padding-top:16px">
-<div style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim)">Certificate password: <span style="color:var(--cyan)">atakatak</span> &nbsp;&middot;&nbsp; /opt/tak/certs/files/</div>
+<div style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim)">Certificate password: <span id="tak-cert-password-inline" style="color:var(--cyan)">{{ settings.get('tak_cert_password','atakatak') }}</span> &nbsp;&middot;&nbsp; /opt/tak/certs/files/</div>
 <a href="/certs" class="cert-btn cert-btn-secondary" style="text-decoration:none">📁 Browse Certificates</a>
+</div>
+<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px">
+<input id="tak-cert-password-input" type="text" value="{{ settings.get('tak_cert_password','atakatak') }}" placeholder="Certificate password" style="min-width:240px;padding:8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:12px">
+<button type="button" onclick="saveTakCertPassword()" class="cert-btn cert-btn-secondary" style="padding:8px 14px;font-size:12px">Save Password</button>
+<span id="tak-cert-password-msg" style="font-size:12px;color:var(--text-dim)"></span>
 </div>
 <div id="cert-expiry-info" style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim)">Loading certificate expiry...</div>
 </div>
@@ -15455,7 +15665,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 <div id="cc-result" style="display:none;margin-top:16px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:10px;padding:16px">
 <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px">
-<div><span style="color:var(--green);font-weight:600" id="cc-result-name"></span><span style="color:var(--text-dim);font-size:12px;margin-left:8px">Password: atakatak</span></div>
+<div><span style="color:var(--green);font-weight:600" id="cc-result-name"></span><span style="color:var(--text-dim);font-size:12px;margin-left:8px">Password: {{ settings.get('tak_cert_password','atakatak') }}</span></div>
 <a id="cc-download-link" href="#" class="cert-btn cert-btn-secondary" style="text-decoration:none;font-size:12px;padding:8px 16px">⬇ Download .p12</a>
 </div>
 </div>

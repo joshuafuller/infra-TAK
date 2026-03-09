@@ -43,6 +43,35 @@ async function syncWebadmin(){
     catch(e){if(msg){msg.textContent='Error: '+e.message;msg.style.color='var(--red)';} if(btn){btn.disabled=false;btn.style.opacity='1';}}
 }
 
+async function saveTakCertPassword(){
+    var input=document.getElementById('tak-cert-password-input');
+    var msg=document.getElementById('tak-cert-password-msg');
+    if(!input||!msg)return;
+    var pw=(input.value||'').trim();
+    if(!pw){msg.textContent='Enter a password';msg.style.color='var(--red)';return;}
+    msg.textContent='Saving...';msg.style.color='var(--text-dim)';
+    try{
+        var r=await fetch('/api/takserver/cert-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});
+        var d=await r.json();
+        if(d.success){msg.textContent='Saved';msg.style.color='var(--green)';loadTakCertPassword();}
+        else{msg.textContent=d.error||'Save failed';msg.style.color='var(--red)';}
+    }catch(e){
+        msg.textContent='Error: '+e.message;msg.style.color='var(--red)';
+    }
+}
+
+async function loadTakCertPassword(){
+    try{
+        var r=await fetch('/api/takserver/cert-password');
+        var d=await r.json();
+        var pw=(d&&d.password)||'atakatak';
+        var inline=document.getElementById('tak-cert-password-inline');
+        if(inline)inline.textContent=pw;
+        var deployInline=document.getElementById('deploy-cert-password-inline');
+        if(deployInline)deployInline.textContent=pw;
+    }catch(e){}
+}
+
 async function loadWebadminSuperuserStatus(){
     var el=document.getElementById('webadmin-superuser-status');
     if(!el)return;
@@ -95,6 +124,7 @@ async function loadServices(){
 }
 if(document.getElementById('services-list')){loadServices();setInterval(loadServices,10000)}
 if(document.getElementById('webadmin-superuser-status')){loadWebadminSuperuserStatus();}
+if(document.getElementById('tak-cert-password-inline')){loadTakCertPassword();}
 if(document.getElementById('cot-db-size')){refreshCotSize();}
 if(document.getElementById('cert-expiry-info')){loadCertExpiry();}
 if(document.getElementById('rotate-ca-info')){loadCAInfo();}
@@ -729,9 +759,10 @@ function showDeployConfig(){
       '<div style="margin-top:28px;text-align:center"><button onclick="startDeploy()" id="deploy-btn" style="padding:14px 48px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:10px;font-family:\'DM Sans\',sans-serif;font-size:16px;font-weight:600;cursor:pointer">\uD83D\uDE80 Deploy TAK Server</button></div>',
       '</div>',
       '<div id="deploy-log-area" style="display:none"><div class="section-title">Deployment Log</div><div id="deploy-log" style="background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:\'JetBrains Mono\',monospace;font-size:12px;color:var(--text-secondary);max-height:500px;overflow-y:auto;line-height:1.7;white-space:pre-wrap"></div></div>',
-      '<div id="cert-download-area" style="display:none;margin-top:20px"><div class="section-title">Download Certificates</div><div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px"><div class="cert-downloads"><a href="/api/download/admin-cert" class="cert-btn cert-btn-secondary">\u2B07 admin.p12</a><a href="/api/download/user-cert" class="cert-btn cert-btn-secondary">\u2B07 user.p12</a><a href="/api/download/truststore" class="cert-btn cert-btn-secondary">\u2B07 truststore.p12</a></div><div style="font-family:\'JetBrains Mono\',monospace;font-size:12px;color:var(--text-dim);margin-top:12px">Certificate password: <span style="color:var(--cyan)">atakatak</span></div></div></div>'
+      '<div id="cert-download-area" style="display:none;margin-top:20px"><div class="section-title">Download Certificates</div><div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px"><div class="cert-downloads"><a href="/api/download/admin-cert" class="cert-btn cert-btn-secondary">\u2B07 admin.p12</a><a href="/api/download/user-cert" class="cert-btn cert-btn-secondary">\u2B07 user.p12</a><a href="/api/download/truststore" class="cert-btn cert-btn-secondary">\u2B07 truststore.p12</a></div><div style="font-family:\'JetBrains Mono\',monospace;font-size:12px;color:var(--text-dim);margin-top:12px">Certificate password: <span id="deploy-cert-password-inline" style="color:var(--cyan)">loading...</span></div></div></div>'
     ].join('');
     main.appendChild(cd);
+    loadTakCertPassword();
     initTakDeployModeUI(cd);
     var modeChosenOnPage=getTakDeploymentMode();
     loadTakDeploymentConfig().then(function(){
