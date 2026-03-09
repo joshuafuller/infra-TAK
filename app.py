@@ -5624,15 +5624,48 @@ def cloudtak_bootstrap_server_api():
                 headers={'Authorization': f'Bearer {token}'},
             )
         else:
+            # Login failed. If the message says server is not configured,
+            # the TAK Server connection was cleared but user auth remains.
+            # Try creating the user first, then login+patch.
             login_msg = (l_body.get('message') if isinstance(l_body, dict) else '') or f'HTTP {l_code}'
-            return jsonify({
-                'success': False,
-                'error': (
-                    f'CloudTAK requires auth for server updates and login failed: {login_msg}. '
-                    'Use existing CloudTAK admin credentials or reset CloudTAK state before bootstrap.'
-                ),
-                'api_base': selected_base
-            }), 400
+            login_msg_l = str(login_msg).strip().lower()
+            if 'not been configured' in login_msg_l or 'not configured' in login_msg_l:
+                # Server config gone — try registering the user then login.
+                r_ok, r_code, r_body = _cloudtak_request_json(
+                    'POST',
+                    f'{selected_base}/api/login',
+                    payload={'username': username, 'password': password, 'register': True},
+                    timeout=20,
+                )
+                reg_token = ''
+                if r_ok and isinstance(r_body, dict):
+                    reg_token = str(r_body.get('token') or '').strip()
+                if reg_token:
+                    ok, code, body = _cloudtak_request_json(
+                        'PATCH',
+                        f'{selected_base}/api/server',
+                        payload=payload,
+                        timeout=35,
+                        headers={'Authorization': f'Bearer {reg_token}'},
+                    )
+                else:
+                    return jsonify({
+                        'success': False,
+                        'error': (
+                            f'CloudTAK login failed ({login_msg}) and user registration also failed. '
+                            'Uninstall + redeploy CloudTAK to reset state, then bootstrap.'
+                        ),
+                        'api_base': selected_base
+                    }), 400
+            else:
+                return jsonify({
+                    'success': False,
+                    'error': (
+                        f'CloudTAK requires auth for server updates and login failed: {login_msg}. '
+                        'Use existing CloudTAK admin credentials or reset CloudTAK state before bootstrap.'
+                    ),
+                    'api_base': selected_base
+                }), 400
     if not ok:
         msg = (body.get('message') if isinstance(body, dict) else '') or f'HTTP {code}'
         return jsonify({'success': False, 'error': f'CloudTAK bootstrap failed: {msg}', 'api_base': selected_base}), 400
