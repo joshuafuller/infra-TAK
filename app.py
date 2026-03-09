@@ -5506,7 +5506,7 @@ def cloudtak_bootstrap_server_api():
 
     try:
         cot_port = int(data.get('cot_port') or 8089)
-        marti_port = int(data.get('marti_port') or 8443)
+        marti_port = int(data.get('marti_port') or 8446)
         webtak_port = int(data.get('webtak_port') or 8446)
     except Exception:
         return jsonify({'success': False, 'error': 'Ports must be valid numbers'}), 400
@@ -5540,13 +5540,13 @@ def cloudtak_bootstrap_server_api():
 
     preflight_ok, preflight = _cloudtak_bootstrap_preflight(cfg, tak_host, cot_port, marti_port, webtak_port)
     if not preflight_ok:
-        p8443 = preflight.get(str(marti_port), 'unknown') if isinstance(preflight, dict) else 'unknown'
-        p8446 = preflight.get(str(webtak_port), 'unknown') if isinstance(preflight, dict) else 'unknown'
+        p_marti = preflight.get(str(marti_port), 'unknown') if isinstance(preflight, dict) else 'unknown'
+        p_webtak = preflight.get(str(webtak_port), 'unknown') if isinstance(preflight, dict) else 'unknown'
         return jsonify({
             'success': False,
             'error': (
                 f'Preflight failed from CloudTAK target to TAK host {tak_host}. '
-                f'8443={p8443}; 8446={p8446}. '
+                f'marti({marti_port})={p_marti}; webtak({webtak_port})={p_webtak}. '
                 'Use TAK cert hostname/FQDN and ensure firewall/routes allow access.'
             ),
             'preflight': preflight,
@@ -8740,7 +8740,7 @@ window.bootstrapCloudtakServer = async function() {
     var serverName = ((document.getElementById("ct-bootstrap-server-name") || {}).value || "TAK Core").trim();
     var takHost = ((document.getElementById("ct-bootstrap-host") || {}).value || "").trim();
     var cotPort = parseInt(((document.getElementById("ct-bootstrap-cot-port") || {}).value || "8089"), 10);
-    var martiPort = parseInt(((document.getElementById("ct-bootstrap-marti-port") || {}).value || "8443"), 10);
+    var martiPort = parseInt(((document.getElementById("ct-bootstrap-marti-port") || {}).value || "8446"), 10);
     var webtakPort = parseInt(((document.getElementById("ct-bootstrap-webtak-port") || {}).value || "8446"), 10);
     var takUser = ((document.getElementById("ct-bootstrap-user") || {}).value || "").trim();
     var takPass = ((document.getElementById("ct-bootstrap-pass") || {}).value || "").trim();
@@ -8761,7 +8761,7 @@ window.bootstrapCloudtakServer = async function() {
       server_name: serverName || "TAK Core",
       tak_host: takHost,
       cot_port: isNaN(cotPort) ? 8089 : cotPort,
-      marti_port: isNaN(martiPort) ? 8443 : martiPort,
+      marti_port: isNaN(martiPort) ? 8446 : martiPort,
       webtak_port: isNaN(webtakPort) ? 8446 : webtakPort,
       tak_username: takUser,
       tak_password: takPass,
@@ -9311,7 +9311,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
       </div>
       <div class="form-group">
         <label class="form-label">Marti Port</label>
-        <input id="ct-bootstrap-marti-port" class="form-input" type="number" value="8443">
+        <input id="ct-bootstrap-marti-port" class="form-input" type="number" value="8446">
       </div>
     </div>
     <div class="grid-2">
