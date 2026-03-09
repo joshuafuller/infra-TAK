@@ -8555,6 +8555,15 @@ window.toggleCloudtakTargetFields = function() {
   remoteBox.style.display = modeEl.value === "remote" ? "block" : "none";
 };
 
+window.cloudtakToggleSection = function(id) {
+  var body = document.getElementById(id + "-body");
+  var icon = document.getElementById(id + "-toggle-icon");
+  if (!body) return;
+  var show = body.style.display === "none";
+  body.style.display = show ? "block" : "none";
+  if (icon) icon.style.transform = show ? "rotate(180deg)" : "";
+};
+
 window.saveCloudtakTarget = function() {
   var msg = document.getElementById("cloudtak-target-save-msg");
   if (msg) msg.textContent = "Saving...";
@@ -9064,11 +9073,6 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 .svc-card{background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:12px;font-family:'JetBrains Mono',monospace;font-size:12px}
 .svc-name{color:var(--text-secondary);font-weight:600;margin-bottom:4px}
 .svc-status{font-size:11px}
-.collapse-card{margin-bottom:20px}
-.collapse-summary{cursor:pointer;list-style:none;display:flex;align-items:center;justify-content:space-between;padding:12px 2px;color:var(--text-secondary);font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;user-select:none}
-.collapse-summary::-webkit-details-marker{display:none}
-.collapse-summary .chev{transition:transform .2s ease;color:var(--text-dim)}
-.collapse-card[open] .collapse-summary .chev{transform:rotate(180deg)}
 </style></head>
 <body data-deploying="{{ 'true' if deploying else 'false' }}">
 {{ sidebar_html }}
@@ -9086,12 +9090,12 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <div class="status-banner not-installed"><div class="dot"></div>CloudTAK is not installed</div>
   {% endif %}
 
-  <details id="cloudtak-target-card" class="collapse-card" open>
-    <summary class="collapse-summary">
-      <span>Deployment Target</span>
-      <span class="chev">&#9662;</span>
-    </summary>
-  <div class="card" style="margin-bottom:0">
+  <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:24px">
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:16px 24px;cursor:pointer" onclick="cloudtakToggleSection('cloudtak-target')">
+      <span class="section-title" style="margin-bottom:0">Deployment Target</span>
+      <span id="cloudtak-target-toggle-icon" style="font-size:18px;color:var(--text-dim);transition:transform 0.2s ease;transform:rotate(180deg)">&#9662;</span>
+    </div>
+  <div id="cloudtak-target-body" style="display:block;padding:0 24px 24px 24px;border-top:1px solid var(--border)">
     <div class="form-group">
       <label class="form-label">Where should CloudTAK run?</label>
       <select id="cloudtak-target-mode" class="form-input">
@@ -9141,7 +9145,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
       <span id="cloudtak-target-save-msg" style="font-size:12px;color:var(--text-dim)"></span>
     </div>
   </div>
-  </details>
+  </div>
 
   {% if cloudtak.installed %}
   <div class="card">
