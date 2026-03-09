@@ -5595,6 +5595,27 @@ def cloudtak_bootstrap_server_api():
         except Exception:
             pass
         if ssh_ok and 200 <= http_code < 300:
+            # Verify the config actually persisted before reporting success.
+            verify_ok, verify_out = _ssh_probe(
+                rcfg,
+                "curl -s --max-time 15 http://localhost:5000/api/server",
+                timeout=25
+            )
+            verify_body = {}
+            if verify_ok:
+                try:
+                    verify_body = json.loads((verify_out or '').strip())
+                except Exception:
+                    verify_body = {}
+            if str((verify_body or {}).get('status') or '').strip().lower() != 'configured':
+                return jsonify({
+                    'success': False,
+                    'error': (
+                        'CloudTAK bootstrap did not persist configuration '
+                        f'(post-check status={(verify_body or {}).get("status") or "unknown"}).'
+                    ),
+                    'api_base': 'localhost:5000 (via SSH)'
+                }), 400
             return jsonify({
                 'success': True,
                 'message': (
@@ -5676,6 +5697,18 @@ def cloudtak_bootstrap_server_api():
     if not ok:
         msg = (body.get('message') if isinstance(body, dict) else '') or f'HTTP {code}'
         return jsonify({'success': False, 'error': f'CloudTAK bootstrap failed: {msg}', 'api_base': selected_base}), 400
+
+    # Verify persisted state (prevents false-positive success responses).
+    v_ok, v_code, v_body = _cloudtak_request_json('GET', f'{selected_base}/api/server', timeout=20)
+    if not v_ok or str((v_body or {}).get('status') or '').strip().lower() != 'configured':
+        return jsonify({
+            'success': False,
+            'error': (
+                'CloudTAK bootstrap write returned success but post-check is not configured. '
+                f'GET /api/server status={(v_body or {}).get("status") if isinstance(v_body, dict) else "unknown"}'
+            ),
+            'api_base': selected_base
+        }), 400
 
     return jsonify({
         'success': True,
