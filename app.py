@@ -5862,6 +5862,12 @@ MEDIA_PORT_RTSP=18554
 MEDIA_PORT_RTMP=11935
 MEDIA_PORT_HLS=18888
 MEDIA_PORT_SRT=18890
+
+# TAK Server uses self-signed certs; Node.js 22+ / OpenSSL 3.x rejects them
+# during mTLS polling unless we disable strict verification.
+# NOTE: This must also be injected via docker-compose.override.yml environment
+# because docker-compose.yml only passes explicitly listed env vars.
+NODE_TLS_REJECT_UNAUTHORIZED=0
 """
 
 
@@ -5932,11 +5938,17 @@ def run_cloudtak_deploy(cfg=None):
             signing_secret = _secrets.token_hex(32)
             minio_pass = _secrets.token_hex(16)
             env_content = _cloudtak_build_env_content(settings, domain, signing_secret, minio_pass, remote_host=remote_host)
-            override_yml = """# TAKWERX: API container must reach host (e.g. :5001 for Marti/TAK Server proxy)
+            override_yml = """# TAKWERX: API + events overrides for remote deployment
 services:
   api:
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    environment:
+      - NODE_TLS_REJECT_UNAUTHORIZED=0
+  events:
+    environment:
+      - NODE_TLS_REJECT_UNAUTHORIZED=0
+      - API_URL=http://api:5000
 """
             tmp_dir = tempfile.mkdtemp(prefix='cloudtak-remote-')
             try:
@@ -6154,17 +6166,25 @@ MEDIA_PORT_RTSP=18554
 MEDIA_PORT_RTMP=11935
 MEDIA_PORT_HLS=18888
 MEDIA_PORT_SRT=18890
+
+NODE_TLS_REJECT_UNAUTHORIZED=0
 """
         with open(env_path, 'w') as f:
             f.write(env_content)
 
         # So the API container can reach the host (e.g. TAKWERX Console / Marti at :5001)
         override_path = os.path.join(cloudtak_dir, 'docker-compose.override.yml')
-        override_yml = """# TAKWERX: API container must reach host (e.g. :5001 for Marti/TAK Server proxy)
+        override_yml = """# TAKWERX: API + events overrides for local deployment
 services:
   api:
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    environment:
+      - NODE_TLS_REJECT_UNAUTHORIZED=0
+  events:
+    environment:
+      - NODE_TLS_REJECT_UNAUTHORIZED=0
+      - API_URL=http://api:5000
 """
         with open(override_path, 'w') as f:
             f.write(override_yml)
@@ -6372,11 +6392,17 @@ def run_cloudtak_redeploy(cfg=None):
             signing_secret = _secrets.token_hex(32)
             minio_pass = _secrets.token_hex(16)
             env_content = _cloudtak_build_env_content(settings, domain, signing_secret, minio_pass, remote_host=remote_host)
-            override_yml = """# TAKWERX: API container must reach host (e.g. :5001 for Marti/TAK Server proxy)
+            override_yml = """# TAKWERX: API + events overrides for remote deployment
 services:
   api:
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    environment:
+      - NODE_TLS_REJECT_UNAUTHORIZED=0
+  events:
+    environment:
+      - NODE_TLS_REJECT_UNAUTHORIZED=0
+      - API_URL=http://api:5000
 """
             tmp_dir = tempfile.mkdtemp(prefix='cloudtak-reremote-')
             try:
