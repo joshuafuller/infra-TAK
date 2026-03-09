@@ -5999,18 +5999,19 @@ services:
     extra_hosts:
 {hosts_block}
     environment:
-      - NODE_TLS_REJECT_UNAUTHORIZED=0
+      NODE_TLS_REJECT_UNAUTHORIZED: "0"
   events:
     extra_hosts:
 {hosts_block}
     environment:
-      - NODE_TLS_REJECT_UNAUTHORIZED=0
-      - API_URL=http://api:5000
+      NODE_TLS_REJECT_UNAUTHORIZED: "0"
+      API_URL: "http://api:5000"
   media:
     extra_hosts:
 {hosts_block}
     environment:
-      - NODE_TLS_REJECT_UNAUTHORIZED=0
+      NODE_TLS_REJECT_UNAUTHORIZED: "0"
+      API_URL: "http://api:5000"
 """
 
 
@@ -6319,7 +6320,7 @@ NODE_TLS_REJECT_UNAUTHORIZED=0
         plog("━━━ Step 4/7: Building Docker Images ━━━")
         plog("  This may take 5-10 minutes on first run...")
         proc = subprocess.Popen(
-            f'docker compose -f {compose_yml} build 2>&1',
+            'docker compose build 2>&1',
             shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=cloudtak_dir, bufsize=1
         )
         def _read_build():
@@ -6349,7 +6350,7 @@ NODE_TLS_REJECT_UNAUTHORIZED=0
         plog("  Starting all containers including media (remapped ports)...")
         plog("  Standalone MediaMTX stays on original ports — no conflict")
         r = subprocess.run(
-            f'docker compose -f {compose_yml} up -d 2>&1',
+            'docker compose up -d --force-recreate 2>&1',
             shell=True, capture_output=True, text=True, timeout=600, cwd=cloudtak_dir
         )
         if r.returncode != 0:
@@ -6558,14 +6559,6 @@ def run_cloudtak_redeploy(cfg=None):
             cloudtak_deploy_status.update({'running': False, 'error': True})
             return
         domain = (settings.get('fqdn') or '').strip() or None
-        if domain:
-            api_url = f"https://map.{domain}"
-            pmtiles_url = f"https://tiles.map.{domain}"
-            media_url = f"https://video.{domain}"
-        else:
-            api_url = f"http://172.20.0.1:5000"
-            pmtiles_url = f"http://{settings.get('server_ip', '127.0.0.1')}:5002"
-            media_url = "http://media:9997"
         env_path = os.path.join(cloudtak_dir, '.env')
         signing_secret = None
         minio_pass = None
@@ -6582,45 +6575,24 @@ def run_cloudtak_redeploy(cfg=None):
             signing_secret = _secrets.token_hex(32)
         if not minio_pass:
             minio_pass = _secrets.token_hex(16)
-        env_content = f"""CLOUDTAK_Mode=docker-compose
-CLOUDTAK_Config_media_url={media_url}
-
-SigningSecret={signing_secret}
-
-ASSET_BUCKET=cloudtak
-AWS_S3_Endpoint=http://store:9000
-AWS_S3_AccessKeyId=cloudtakminioadmin
-AWS_S3_SecretAccessKey={minio_pass}
-MINIO_ROOT_USER=cloudtakminioadmin
-MINIO_ROOT_PASSWORD={minio_pass}
-
-POSTGRES=postgres://docker:docker@postgis:5432/gis
-
-API_URL={api_url}
-PMTILES_URL={pmtiles_url}
-
-MEDIA_PORT_API=9997
-MEDIA_PORT_RTSP=18554
-MEDIA_PORT_RTMP=11935
-MEDIA_PORT_HLS=18888
-MEDIA_PORT_SRT=18890
-"""
+        env_content = _cloudtak_build_env_content(settings, domain, signing_secret, minio_pass)
         with open(env_path, 'w') as f:
             f.write(env_content)
         override_path = os.path.join(cloudtak_dir, 'docker-compose.override.yml')
         with open(override_path, 'w') as f:
-            f.write("""# TAKWERX: API container must reach host (e.g. :5001 for Marti/TAK Server proxy)
-services:
-  api:
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-""")
+            f.write(_cloudtak_build_override_yml(settings))
         plog("✓ .env and override written")
         plog("  Restarting containers...")
-        r = subprocess.run(f'docker compose -f "{compose_yml}" restart 2>&1', shell=True, capture_output=True, text=True, timeout=120, cwd=cloudtak_dir)
+        r = subprocess.run(
+            'docker compose up -d --force-recreate 2>&1',
+            shell=True, capture_output=True, text=True, timeout=180, cwd=cloudtak_dir
+        )
         if r.returncode != 0:
             # Fallback for systems with docker-compose (hyphen) instead of docker compose
-            r = subprocess.run(f'docker-compose -f "{compose_yml}" restart 2>&1', shell=True, capture_output=True, text=True, timeout=120, cwd=cloudtak_dir)
+            r = subprocess.run(
+                'docker-compose up -d --force-recreate 2>&1',
+                shell=True, capture_output=True, text=True, timeout=180, cwd=cloudtak_dir
+            )
         if r.returncode != 0:
             plog(f"✗ Restart failed: {r.stderr or r.stdout or 'unknown'}")
             cloudtak_deploy_status.update({'running': False, 'error': True})
@@ -6630,7 +6602,7 @@ services:
         # Restore /api proxy to 127.0.0.1:5001 (Node in container) if a previous patch sent it to the host
         api_container = None
         for _ in range(15):
-            r = subprocess.run(f'docker compose -f "{compose_yml}" ps -q api 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5, cwd=cloudtak_dir)
+            r = subprocess.run('docker compose ps -q api 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5, cwd=cloudtak_dir)
             cid = (r.stdout or '').strip()
             if cid and len(cid) >= 8:
                 api_container = cid
