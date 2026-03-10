@@ -5355,7 +5355,71 @@ paths:
     if ok:
         _module_run(deploy_cfg, 'cp /tmp/mediamtx_editor_clone/config-editor/mediamtx_config_editor.py /opt/mediamtx-webeditor/ 2>/dev/null; rm -rf /tmp/mediamtx_editor_clone', timeout=15)
         _module_run(deploy_cfg, "sed -i 's/port=5000/port=5080/' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null; sed -i 's/9997/9898/g' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null", timeout=10)
-    editor_svc = "[Unit]\nDescription=MediaMTX Web Configuration Editor\nAfter=network.target mediamtx.service\n\n[Service]\nType=simple\nExecStart=/usr/bin/python3 /opt/mediamtx-webeditor/mediamtx_config_editor.py\nWorkingDirectory=/opt/mediamtx-webeditor\nEnvironment=PORT=5080\nEnvironment=MEDIAMTX_API_URL=http://127.0.0.1:9898\nRestart=always\nRestartSec=5\nUser=root\n\n[Install]\nWantedBy=multi-user.target\n"
+    # LDAP overlay: when Authentik is present locally, patch remote editor for header auth
+    ak_installed = os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml'))
+    ldap_env_lines = ''
+    if ak_installed:
+        overlay_src = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mediamtx_ldap_overlay.py')
+        if os.path.exists(overlay_src):
+            ok_ov, _ = _module_copy(deploy_cfg, overlay_src, '/tmp/mediamtx_ldap_overlay.py', log_fn=plog)
+            if ok_ov:
+                _module_run(deploy_cfg, 'mv /tmp/mediamtx_ldap_overlay.py /opt/mediamtx-webeditor/mediamtx_ldap_overlay.py', timeout=10)
+                patcher = (
+                    "import sys\n"
+                    "EDITOR = '/opt/mediamtx-webeditor/mediamtx_config_editor.py'\n"
+                    "MARKER = '# --- infra-TAK LDAP overlay ---'\n"
+                    "with open(EDITOR) as f: src = f.read()\n"
+                    "if MARKER in src: sys.exit(0)\n"
+                    "inject = (\n"
+                    "    '\\n' + MARKER + '\\n'\n"
+                    "    'import os as _os\\n'\n"
+                    "    \"if _os.environ.get(\\'LDAP_ENABLED\\'):\\n\"\n"
+                    "    '    import sys as _sys; _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))\\n'\n"
+                    "    '    from mediamtx_ldap_overlay import apply_ldap_overlay\\n'\n"
+                    "    '    apply_ldap_overlay(app)\\n'\n"
+                    "    '# --- end LDAP overlay ---\\n'\n"
+                    ")\n"
+                    "lines = src.splitlines(keepends=True)\n"
+                    "done = False\n"
+                    "for i, line in enumerate(lines):\n"
+                    "    if 'app = Flask(' in line:\n"
+                    "        lines.insert(i + 1, '\\n' + inject)\n"
+                    "        done = True; break\n"
+                    "if not done:\n"
+                    "    for i, line in enumerate(lines):\n"
+                    "        if 'app.run(' in line:\n"
+                    "            lines.insert(i, '\\n' + inject)\n"
+                    "            done = True; break\n"
+                    "if done:\n"
+                    "    with open(EDITOR, 'w') as f: f.writelines(lines)\n"
+                )
+                with open('/tmp/mtx_ldap_patcher.py', 'w') as pf:
+                    pf.write(patcher)
+                _module_copy(deploy_cfg, '/tmp/mtx_ldap_patcher.py', '/tmp/mtx_ldap_patcher.py', log_fn=plog)
+                _module_run(deploy_cfg, 'python3 /tmp/mtx_ldap_patcher.py && rm -f /tmp/mtx_ldap_patcher.py', timeout=15)
+                try:
+                    os.remove('/tmp/mtx_ldap_patcher.py')
+                except Exception:
+                    pass
+                plog("✓ LDAP overlay applied (Authentik header auth)")
+            else:
+                plog("⚠ Failed to copy LDAP overlay to remote")
+        else:
+            plog("⚠ mediamtx_ldap_overlay.py not found — LDAP overlay skipped")
+        ak_token_val = ''
+        ak_env_path = os.path.expanduser('~/authentik/.env')
+        if os.path.exists(ak_env_path):
+            with open(ak_env_path) as _f:
+                for _line in _f:
+                    if _line.strip().startswith('AUTHENTIK_BOOTSTRAP_TOKEN='):
+                        ak_token_val = _line.strip().split('=', 1)[1].strip()
+        ak_public_url = f'https://{_get_authentik_host(settings)}' if settings.get('fqdn') else 'http://127.0.0.1:9090'
+        ldap_env_lines = (
+            f'Environment=LDAP_ENABLED=1\n'
+            f'Environment=AUTHENTIK_API_URL={ak_public_url}\n'
+            f'Environment=AUTHENTIK_TOKEN={ak_token_val}\n'
+        )
+    editor_svc = f"[Unit]\nDescription=MediaMTX Web Configuration Editor\nAfter=network.target mediamtx.service\n\n[Service]\nType=simple\nExecStart=/usr/bin/python3 /opt/mediamtx-webeditor/mediamtx_config_editor.py\nWorkingDirectory=/opt/mediamtx-webeditor\nEnvironment=PORT=5080\nEnvironment=MEDIAMTX_API_URL=http://127.0.0.1:9898\n{ldap_env_lines}Restart=always\nRestartSec=5\nUser=root\n\n[Install]\nWantedBy=multi-user.target\n"
     with open('/tmp/mediamtx_webeditor_remote.service', 'w') as f:
         f.write(editor_svc)
     _module_copy(deploy_cfg, '/tmp/mediamtx_webeditor_remote.service', '/tmp/mediamtx-webeditor.service', log_fn=plog)
