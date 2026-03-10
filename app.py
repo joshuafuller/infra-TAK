@@ -9341,7 +9341,7 @@ function ensureMediamtxSshKey() {
       if (!d || !d.success) { _mediamtxSshStatus((d && d.error) ? d.error : 'Key generation failed', true); return; }
       var keyEl = document.getElementById('mediamtx-remote-key'); if (d.key_path && keyEl) keyEl.value = d.key_path;
       var pk = document.getElementById('mediamtx-public-key'); if (pk) pk.value = d.public_key || '';
-      _mediamtxSshStatus((d.message || 'SSH key ready') + (d.fingerprint ? ' | ' + d.fingerprint : ''), false);
+      _mediamtxSshStatus('✓ ' + (d.message || 'SSH key ready') + (d.fingerprint ? ' | ' + d.fingerprint : ''), false, true);
     }).catch(function(e) { _mediamtxSshStatus('Key generation failed: ' + (e && e.message ? e.message : String(e)), true); });
 }
 function installMediamtxSshKey() {
@@ -9606,7 +9606,7 @@ window.ensureCloudtakSshKey = function() {
     var pk = document.getElementById("cloudtak-public-key");
     if (pk) pk.value = d.public_key || "";
     var fp = d.fingerprint ? (" | " + d.fingerprint) : "";
-    window._cloudtakSshStatus((d.message || "SSH key ready") + fp, false);
+    window._cloudtakSshStatus("✓ " + (d.message || "SSH key ready") + fp, false, true);
   }).catch(function(e) {
     window._cloudtakSshStatus("Key generation failed: " + (e && e.message ? e.message : String(e)), true);
   });
