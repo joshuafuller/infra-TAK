@@ -1,6 +1,58 @@
 #!/usr/bin/env python3
 """infra-TAK v0.1.8 - TAK Infrastructure Platform"""
 
+# === Auto-upgrade: seamlessly switch from Flask dev server to gunicorn ===
+# When the old systemd service runs "python3 app.py", this block installs
+# gunicorn, rewrites the service file, and exec's into gunicorn — all
+# transparent to the user. After the first restart, gunicorn runs directly.
+if __name__ == '__main__':
+    import sys as _sys, os as _os, json as _json, re as _re, subprocess as _sp
+    _base = _os.path.dirname(_os.path.abspath(__file__))
+    _venv_bin = _os.path.dirname(_sys.executable)
+    _gunicorn = _os.path.join(_venv_bin, 'gunicorn')
+
+    if not _os.path.exists(_gunicorn):
+        print('[auto-upgrade] Installing gunicorn...')
+        _sp.run([_os.path.join(_venv_bin, 'pip'), 'install', '--quiet', 'gunicorn'],
+                capture_output=True)
+
+    if _os.path.exists(_gunicorn):
+        try:
+            with open(_os.path.join(_base, '.config', 'settings.json')) as _f:
+                _port = _json.load(_f).get('console_port', 5001)
+        except Exception:
+            _port = 5001
+
+        _cert_dir = _os.path.join(_base, '.config', 'ssl')
+        _ssl_args = []
+        if _os.path.exists(_os.path.join(_cert_dir, 'console.crt')):
+            _ssl_args = [f'--certfile={_cert_dir}/console.crt', f'--keyfile={_cert_dir}/console.key']
+
+        _svc = '/etc/systemd/system/takwerx-console.service'
+        if _os.path.exists(_svc):
+            with open(_svc) as _f:
+                _svc_c = _f.read()
+            if 'python3' in _svc_c and 'app.py' in _svc_c:
+                print('[auto-upgrade] Upgrading systemd service to gunicorn...')
+                _exec_line = f'{_gunicorn} --bind 0.0.0.0:{_port} --workers 1 --threads 4 --timeout 300 --graceful-timeout 30'
+                if _ssl_args:
+                    _exec_line += ' ' + ' '.join(_ssl_args)
+                _exec_line += ' app:app'
+                _svc_c = _re.sub(r'^ExecStart=.*$', f'ExecStart={_exec_line}', _svc_c, flags=_re.MULTILINE)
+                with open(_svc, 'w') as _f:
+                    _f.write(_svc_c)
+                _sp.run(['systemctl', 'daemon-reload'], capture_output=True)
+
+        _args = [_gunicorn, '--bind', f'0.0.0.0:{_port}',
+                 '--workers', '1', '--threads', '4',
+                 '--timeout', '300', '--graceful-timeout', '30']
+        _args.extend(_ssl_args)
+        _args.append('app:app')
+        _os.chdir(_base)
+        print(f'[auto-upgrade] Launching gunicorn on port {_port}...')
+        _os.execvp(_gunicorn, _args)
+
+
 from flask import (Flask, render_template_string, request, jsonify,
     redirect, url_for, session, send_from_directory, make_response)
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -38,6 +90,42 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # Pin config to env so auth works even if service WorkingDirectory and code path ever differ (e.g. after git pull)
 CONFIG_DIR = os.environ.get('CONFIG_DIR') or os.path.join(BASE_DIR, '.config')
 UPLOAD_DIR = os.path.join(BASE_DIR, 'uploads')
+
+
+def _ensure_gunicorn_upgrade(console_dir=None):
+    """Install gunicorn and upgrade systemd service if still using Flask dev server.
+
+    Called automatically by the in-app update flow so users clicking
+    'Update Now' get gunicorn without any manual steps.
+    """
+    console_dir = console_dir or BASE_DIR
+    venv_pip = os.path.join(console_dir, '.venv', 'bin', 'pip')
+    venv_gunicorn = os.path.join(console_dir, '.venv', 'bin', 'gunicorn')
+    if not os.path.exists(venv_pip):
+        return
+    if not os.path.exists(venv_gunicorn):
+        subprocess.run([venv_pip, 'install', '--quiet', 'gunicorn'],
+                       capture_output=True, timeout=60)
+    svc = '/etc/systemd/system/takwerx-console.service'
+    if not os.path.exists(svc) or not os.path.exists(venv_gunicorn):
+        return
+    with open(svc) as f:
+        content = f.read()
+    if 'gunicorn' in content:
+        return
+    settings = load_settings()
+    port = settings.get('console_port', 5001)
+    cert_dir = os.path.join(console_dir, '.config', 'ssl')
+    ssl_args = ''
+    if os.path.exists(os.path.join(cert_dir, 'console.crt')):
+        ssl_args = f' --certfile={cert_dir}/console.crt --keyfile={cert_dir}/console.key'
+    exec_line = (f'{venv_gunicorn} --bind 0.0.0.0:{port} --workers 1 --threads 4 '
+                 f'--timeout 300 --graceful-timeout 30{ssl_args} app:app')
+    content = re.sub(r'^ExecStart=.*$', f'ExecStart={exec_line}', content, flags=re.MULTILINE)
+    with open(svc, 'w') as f:
+        f.write(content)
+    subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=10)
+
 
 def _request_host_is_ip():
     """True if the request is to an IP address (backdoor), so we must not set cookie domain."""
@@ -501,6 +589,7 @@ def update_apply():
                 )
             return jsonify(out)
         update_cache.update({'latest': None, 'checked': 0})
+        _ensure_gunicorn_upgrade(console_dir)
         subprocess.Popen('sleep 2 && systemctl restart takwerx-console', shell=True,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return jsonify({'success': True, 'output': (r.stdout or '').strip(), 'restart_required': True})
@@ -16347,30 +16436,30 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <footer class="footer"></footer>
 <script src="/takserver.js"></script></body></html>'''
 
-# === Main Entry Point ===
+# === Startup Banner (prints for both gunicorn and direct invocation) ===
+_startup_settings = load_settings()
+_ssl_mode = _startup_settings.get('ssl_mode', 'self-signed')
+_port = _startup_settings.get('console_port', 5001)
+print("=" * 50)
+print("infra-TAK v" + VERSION)
+print("=" * 50)
+print(f"OS: {_startup_settings.get('os_name', 'Unknown')}")
+print(f"SSL Mode: {_ssl_mode}")
+_fqdn = _startup_settings.get('fqdn', '')
+if _fqdn:
+    print(f"FQDN: {_fqdn}")
+print(f"Port: {_port}")
+print("=" * 50)
+
+# === Main Entry Point (fallback for direct python3 app.py) ===
 if __name__ == '__main__':
-    settings = load_settings()
-    ssl_mode = settings.get('ssl_mode', 'self-signed')
-    port = settings.get('console_port', 5001)
-    print("=" * 50)
-    print("infra-TAK v" + VERSION)
-    print("=" * 50)
-    print(f"OS: {settings.get('os_name', 'Unknown')}")
-    print(f"SSL Mode: {ssl_mode}")
-    fqdn = settings.get('fqdn', '')
-    if fqdn:
-        print(f"FQDN: {fqdn}")
-    print(f"Port: {port}")
-    print("=" * 50)
-    # Always run with self-signed cert on 0.0.0.0
-    # Caddy proxies on top when configured
     cert_dir = os.path.join(CONFIG_DIR, 'ssl')
     cert_file = os.path.join(cert_dir, 'console.crt')
     key_file = os.path.join(cert_dir, 'console.key')
     if os.path.exists(cert_file) and os.path.exists(key_file):
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(cert_file, key_file)
-        app.run(host='0.0.0.0', port=port, ssl_context=context, debug=False)
+        app.run(host='0.0.0.0', port=_port, ssl_context=context, debug=False)
     else:
         print("WARNING: SSL certs not found, running without HTTPS")
-        app.run(host='0.0.0.0', port=port, debug=False)
+        app.run(host='0.0.0.0', port=_port, debug=False)

@@ -146,8 +146,8 @@ install_dependencies() {
     fi
 
     # Install Flask and dependencies in venv
-    "$INSTALL_DIR/.venv/bin/pip" install --quiet flask psutil werkzeug 2>/dev/null || \
-        "$INSTALL_DIR/.venv/bin/pip" install flask psutil werkzeug
+    "$INSTALL_DIR/.venv/bin/pip" install --quiet flask psutil werkzeug gunicorn 2>/dev/null || \
+        "$INSTALL_DIR/.venv/bin/pip" install flask psutil werkzeug gunicorn
 
     echo -e "  ${GREEN}✓ Dependencies installed${NC}"
     echo ""
@@ -266,6 +266,23 @@ create_service() {
         fi
     fi
 
+    # Build gunicorn command with SSL if certs exist
+    CERT_DIR="$USE_DIR/.config/ssl"
+    GUNICORN_BIN="$USE_DIR/.venv/bin/gunicorn"
+    PORT=$("$USE_DIR/.venv/bin/python3" -c "
+import json, os
+try:
+    with open(os.path.join('$USE_DIR', '.config', 'settings.json')) as f:
+        print(json.load(f).get('console_port', 5001))
+except Exception:
+    print(5001)
+" 2>/dev/null || echo 5001)
+
+    GUNICORN_ARGS="--bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 300 --graceful-timeout 30"
+    if [ -f "$CERT_DIR/console.crt" ] && [ -f "$CERT_DIR/console.key" ]; then
+        GUNICORN_ARGS="$GUNICORN_ARGS --certfile=$CERT_DIR/console.crt --keyfile=$CERT_DIR/console.key"
+    fi
+
     cat > "$SERVICE_FILE" << EOF
 [Unit]
 Description=infra-TAK - Team Awareness Kit Infrastructure Platform
@@ -274,7 +291,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$USE_DIR/.venv/bin/python3 $USE_DIR/app.py
+ExecStart=$GUNICORN_BIN $GUNICORN_ARGS app:app
 WorkingDirectory=$USE_DIR
 Restart=always
 RestartSec=5
