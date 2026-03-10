@@ -9325,9 +9325,9 @@ function saveMediamtxTarget() {
       else if (msg) msg.textContent = (d && d.error) ? d.error : 'Save failed';
     }).catch(function(e) { if (msg) msg.textContent = 'Save failed: ' + (e && e.message ? e.message : String(e)); });
 }
-function _mediamtxSshStatus(msg, isError) {
+function _mediamtxSshStatus(msg, isError, isSuccess) {
   var el = document.getElementById('mediamtx-ssh-status');
-  if (el) { el.style.color = isError ? 'var(--red)' : 'var(--text-dim)'; el.textContent = msg || ''; }
+  if (el) { el.style.color = isError ? 'var(--red)' : isSuccess ? 'var(--green)' : 'var(--text-dim)'; el.textContent = msg || ''; }
 }
 function ensureMediamtxSshKey() {
   var modeEl = document.getElementById('mediamtx-target-mode');
@@ -9349,7 +9349,7 @@ function installMediamtxSshKey() {
   _mediamtxSshStatus('Installing key...', false);
   fetch('/api/mediamtx/remote/install-ssh-key', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ password: pw, config: collectMediamtxDeployConfig() }), credentials: 'same-origin' })
     .then(function(r) { return r.json(); }).then(function(d) {
-      if (d && d.success) { _mediamtxSshStatus('SSH key installed', false); }
+      if (d && d.success) { _mediamtxSshStatus('✓ SSH key installed', false, true); }
       else { _mediamtxSshStatus((d && d.error) ? d.error : 'Install failed', true); }
     }).catch(function(e) { _mediamtxSshStatus('Install failed: ' + (e && e.message ? e.message : String(e)), true); });
 }
@@ -9359,7 +9359,7 @@ function testMediamtxRemoteSsh() {
   _mediamtxSshStatus('Testing SSH...', false);
   fetch('/api/mediamtx/remote/test', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ config: collectMediamtxDeployConfig() }), credentials: 'same-origin' })
     .then(function(r) { return r.json(); }).then(function(d) {
-      if (d && d.success) { _mediamtxSshStatus('SSH OK: ' + (d.output || '').trim().substring(0, 80), false); }
+      if (d && d.success) { _mediamtxSshStatus('✓ Test passed', false, true); }
       else { _mediamtxSshStatus((d && d.error) ? d.error : (d && d.output) || 'Test failed', true); }
     }).catch(function(e) { _mediamtxSshStatus('Test failed: ' + (e && e.message ? e.message : String(e)), true); });
 }
@@ -9568,10 +9568,10 @@ window._fileToDataURL = function(file) {
 
 /* Bootstrap CloudTAK — deferred to v0.2.1 */
 
-window._cloudtakSshStatus = function(msg, isError) {
+window._cloudtakSshStatus = function(msg, isError, isSuccess) {
   var el = document.getElementById("cloudtak-ssh-status");
   if (!el) return;
-  el.style.color = isError ? "var(--red)" : "var(--text-dim)";
+  el.style.color = isError ? "var(--red)" : isSuccess ? "var(--green)" : "var(--text-dim)";
   el.textContent = msg || "";
 };
 
@@ -9629,7 +9629,7 @@ window.installCloudtakSshKey = function() {
       return;
     }
     if (pwEl) pwEl.value = "";
-    window._cloudtakSshStatus(d.message || "SSH key installed", false);
+    window._cloudtakSshStatus("✓ SSH key installed", false, true);
   }).catch(function(e) {
     window._cloudtakSshStatus("SSH key install failed: " + (e && e.message ? e.message : String(e)), true);
   });
@@ -9648,7 +9648,7 @@ window.testCloudtakRemoteSsh = function() {
       window._cloudtakSshStatus((d && d.error) ? d.error : "SSH test failed", true);
       return;
     }
-    window._cloudtakSshStatus(d.message || "SSH connection successful", false);
+    window._cloudtakSshStatus("✓ Test passed", false, true);
   }).catch(function(e) {
     window._cloudtakSshStatus("SSH test failed: " + (e && e.message ? e.message : String(e)), true);
   });
