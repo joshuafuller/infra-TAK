@@ -13279,7 +13279,13 @@ def takserver_groups():
                     if isinstance(g, str):
                         name = g.strip()
                     elif isinstance(g, dict):
-                        name = (g.get('name') or g.get('groupName') or g.get('group') or '').strip()
+                        name = (
+                            g.get('name')
+                            or g.get('groupName')
+                            or g.get('groupname')
+                            or g.get('group')
+                            or ''
+                        ).strip()
                     else:
                         name = ''
                     if not name or name == '__ANON__':
