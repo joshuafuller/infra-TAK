@@ -272,28 +272,27 @@ def detect_modules():
         ak_running = 'Up' in r.stdout
     modules['authentik'] = {'name': 'Authentik', 'installed': ak_installed, 'running': ak_running,
         'description': 'Identity provider — SSO, LDAP, user management', 'icon': '🔐', 'icon_url': AUTHENTIK_LOGO_URL, 'route': '/authentik', 'priority': 2}
-    # TAK Portal - Docker-based user management (local or remote)
-    tp_cfg = _get_module_deployment_config(settings, 'takportal_deployment')
-    portal_installed = False
+    # TAK Portal - Docker-based user management (local only; stays with TAK Server)
+    portal_installed = os.path.exists(os.path.expanduser('~/TAK-Portal/docker-compose.yml'))
     portal_running = False
-    if tp_cfg.get('target_mode') == 'remote':
-        if tp_cfg.get('deployed') and (tp_cfg.get('remote', {}).get('host') or '').strip():
-            portal_installed = True
-            ok, out = _ssh_probe(tp_cfg.get('remote', {}), "docker ps --filter name=tak-portal --format '{{.Status}}' 2>/dev/null", timeout=12)
-            portal_running = bool(ok and out and 'Up' in out)
-    else:
-        portal_installed = os.path.exists(os.path.expanduser('~/TAK-Portal/docker-compose.yml'))
-        if portal_installed:
-            r = subprocess.run('docker ps --filter name=tak-portal --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
-            portal_running = 'Up' in r.stdout
+    if portal_installed:
+        r = subprocess.run('docker ps --filter name=tak-portal --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
+        portal_running = 'Up' in r.stdout
     modules['takportal'] = {'name': 'TAK Portal', 'installed': portal_installed, 'running': portal_running,
         'description': 'User & certificate management with Authentik', 'icon': '👥', 'route': '/takportal', 'priority': 3}
-    # MediaMTX
-    mtx_installed = os.path.exists('/usr/local/bin/mediamtx') and os.path.exists('/usr/local/etc/mediamtx.yml')
+    # MediaMTX (local or remote deployment)
+    mtx_cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
+    mtx_installed = False
     mtx_running = False
-    if mtx_installed:
-        r = subprocess.run(['systemctl', 'is-active', 'mediamtx'], capture_output=True, text=True)
-        mtx_running = r.stdout.strip() == 'active'
+    if mtx_cfg.get('target_mode') == 'remote' and mtx_cfg.get('deployed') and (mtx_cfg.get('remote', {}).get('host') or '').strip():
+        mtx_installed = True
+        ok, out = _ssh_probe(mtx_cfg.get('remote', {}), "systemctl is-active mediamtx 2>/dev/null", timeout=12)
+        mtx_running = bool(ok and out and out.strip() == 'active')
+    else:
+        mtx_installed = os.path.exists('/usr/local/bin/mediamtx') and os.path.exists('/usr/local/etc/mediamtx.yml')
+        if mtx_installed:
+            r = subprocess.run(['systemctl', 'is-active', 'mediamtx'], capture_output=True, text=True)
+            mtx_running = r.stdout.strip() == 'active'
     modules['mediamtx'] = {'name': 'MediaMTX', 'installed': mtx_installed, 'running': mtx_running,
         'description': 'Video Streaming Server', 'icon': '📹', 'icon_url': MEDIAMTX_LOGO_URL, 'route': '/mediamtx', 'priority': 4}
     # Guard Dog
@@ -1333,9 +1332,11 @@ def mediamtx_page():
     modules = detect_modules()
     mtx = modules.get('mediamtx', {})
     cloudtak_installed = modules.get('cloudtak', {}).get('installed', False)
+    mediamtx_deploy_cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
     return render_template_string(MEDIAMTX_TEMPLATE,
         settings=settings, mtx=mtx, version=VERSION,
         cloudtak_installed=cloudtak_installed,
+        mediamtx_deploy_cfg=mediamtx_deploy_cfg,
         deploying=mediamtx_deploy_status.get('running', False),
         deploy_done=mediamtx_deploy_status.get('complete', False))
 
@@ -3100,6 +3101,16 @@ def _get_cloudtak_upstreams(settings):
     }
 
 
+def _get_mediamtx_upstream(settings):
+    """Return MediaMTX web console upstream for Caddy (127.0.0.1:5080 or remote_host:5080)."""
+    cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
+    if cfg.get('target_mode') == 'remote':
+        host = (cfg.get('remote', {}).get('host') or '').strip()
+        if host:
+            return f'{host}:5080'
+    return '127.0.0.1:5080'
+
+
 def _get_takportal_upstream(settings):
     """Return TAK Portal upstream for Caddy (host:port)."""
     cfg = _get_module_deployment_config(settings, 'takportal_deployment')
@@ -3842,20 +3853,21 @@ def generate_caddyfile(settings=None):
     mtx = modules.get('mediamtx', {})
     if mtx.get('installed'):
         mtx_host = sd['mediamtx']
+        mtx_up = _get_mediamtx_upstream(settings)
         lines.append(f"# MediaMTX Web Console")
         lines.append(f"{mtx_host} {{")
         if ak.get('installed'):
             lines.append(f"    route /watch/* {{")
-            lines.append(f"        reverse_proxy 127.0.0.1:5080")
+            lines.append(f"        reverse_proxy {mtx_up}")
             lines.append(f"    }}")
             lines.append(f"    route /hls-proxy/* {{")
-            lines.append(f"        reverse_proxy 127.0.0.1:5080")
+            lines.append(f"        reverse_proxy {mtx_up}")
             lines.append(f"    }}")
             lines.append(f"    route /shared/* {{")
-            lines.append(f"        reverse_proxy 127.0.0.1:5080")
+            lines.append(f"        reverse_proxy {mtx_up}")
             lines.append(f"    }}")
             lines.append(f"    route /shared-hls/* {{")
-            lines.append(f"        reverse_proxy 127.0.0.1:5080")
+            lines.append(f"        reverse_proxy {mtx_up}")
             lines.append(f"    }}")
             lines.append(f"    route {{")
             lines.append(f"        reverse_proxy /outpost.goauthentik.io/* 127.0.0.1:9090")
@@ -3864,10 +3876,10 @@ def generate_caddyfile(settings=None):
             lines.append(f"            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid")
             lines.append(f"            trusted_proxies private_ranges")
             lines.append(f"        }}")
-            lines.append(f"        reverse_proxy 127.0.0.1:5080")
+            lines.append(f"        reverse_proxy {mtx_up}")
             lines.append(f"    }}")
         else:
-            lines.append(f"    reverse_proxy 127.0.0.1:5080")
+            lines.append(f"    reverse_proxy {mtx_up}")
         lines.append(f"}}")
         lines.append("")
 
@@ -5098,6 +5110,12 @@ mediamtx_deploy_status = {'running': False, 'complete': False, 'error': False}
 def mediamtx_deploy_api():
     if mediamtx_deploy_status.get('running'):
         return jsonify({'error': 'Deployment already in progress'}), 409
+    data = request.get_json() or {}
+    if data.get('config'):
+        settings = load_settings()
+        cfg = _normalize_module_deployment_config(data['config'])
+        settings['mediamtx_deployment'] = cfg
+        save_settings(settings)
     mediamtx_deploy_log.clear()
     mediamtx_deploy_status.update({'running': True, 'complete': False, 'error': False})
     threading.Thread(target=run_mediamtx_deploy, daemon=True).start()
@@ -5115,14 +5133,26 @@ def mediamtx_deploy_log_api():
 @login_required
 def mediamtx_control():
     action = (request.json or {}).get('action', '')
+    if action not in ('start', 'stop', 'restart'):
+        return jsonify({'error': 'Invalid action'}), 400
+    settings = load_settings()
+    deploy_cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
+    if deploy_cfg.get('target_mode') == 'remote':
+        remote = deploy_cfg.get('remote', {})
+        if not (remote.get('host') or '').strip():
+            return jsonify({'error': 'Remote host not configured'}), 400
+        cmd = f'systemctl {action} mediamtx mediamtx-webeditor 2>&1'
+        ok, _ = _ssh_probe(remote, cmd, timeout=30)
+        time.sleep(2)
+        ok2, out = _ssh_probe(remote, 'systemctl is-active mediamtx 2>/dev/null', timeout=10)
+        running = bool(ok2 and out and out.strip() == 'active')
+        return jsonify({'success': True, 'running': running})
     if action == 'start':
         subprocess.run('systemctl start mediamtx mediamtx-webeditor 2>&1', shell=True, capture_output=True)
     elif action == 'stop':
         subprocess.run('systemctl stop mediamtx mediamtx-webeditor 2>&1', shell=True, capture_output=True)
     elif action == 'restart':
         subprocess.run('systemctl restart mediamtx mediamtx-webeditor 2>&1', shell=True, capture_output=True)
-    else:
-        return jsonify({'error': 'Invalid action'}), 400
     time.sleep(2)
     r = subprocess.run(['systemctl', 'is-active', 'mediamtx'], capture_output=True, text=True)
     running = r.stdout.strip() == 'active'
@@ -5132,6 +5162,12 @@ def mediamtx_control():
 @login_required
 def mediamtx_logs():
     lines = request.args.get('lines', 60, type=int)
+    settings = load_settings()
+    deploy_cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
+    if deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip():
+        ok, out = _ssh_probe(deploy_cfg['remote'], f'journalctl -u mediamtx --no-pager -n {lines} 2>&1', timeout=15)
+        entries = [l for l in (out.strip().split('\n') if out and out.strip() else []) if l.strip()] if ok else []
+        return jsonify({'entries': entries})
     r = subprocess.run(f'journalctl -u mediamtx --no-pager -n {lines} 2>&1', shell=True, capture_output=True, text=True, timeout=10)
     entries = [l for l in (r.stdout.strip().split('\n') if r.stdout.strip() else []) if l.strip()]
     return jsonify({'entries': entries})
@@ -5145,23 +5181,221 @@ def mediamtx_uninstall():
     if not auth.get('password_hash') or not check_password_hash(auth['password_hash'], password):
         return jsonify({'error': 'Invalid admin password'}), 403
     steps = []
-    subprocess.run('systemctl stop mediamtx mediamtx-webeditor 2>/dev/null; true', shell=True, capture_output=True)
-    subprocess.run('systemctl disable mediamtx mediamtx-webeditor 2>/dev/null; true', shell=True, capture_output=True)
-    for f in ['/etc/systemd/system/mediamtx.service', '/etc/systemd/system/mediamtx-webeditor.service',
-              '/usr/local/bin/mediamtx', '/usr/local/etc/mediamtx.yml']:
-        if os.path.exists(f):
-            os.remove(f)
-    if os.path.exists('/opt/mediamtx-webeditor'):
-        subprocess.run('rm -rf /opt/mediamtx-webeditor', shell=True, capture_output=True)
-    subprocess.run('systemctl daemon-reload 2>/dev/null; true', shell=True, capture_output=True)
-    steps.append('Stopped and disabled mediamtx and mediamtx-webeditor services')
-    steps.append('Removed binary, config, and web editor files')
+    settings = load_settings()
+    deploy_cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
+    if deploy_cfg.get('target_mode') == 'remote':
+        remote = deploy_cfg.get('remote', {})
+        if (remote.get('host') or '').strip():
+            ok, out = _ssh_probe(remote, 'systemctl stop mediamtx mediamtx-webeditor 2>/dev/null; systemctl disable mediamtx mediamtx-webeditor 2>/dev/null; true', timeout=15)
+            _ssh_probe(remote, 'rm -f /etc/systemd/system/mediamtx.service /etc/systemd/system/mediamtx-webeditor.service /usr/local/bin/mediamtx /usr/local/etc/mediamtx.yml', timeout=10)
+            _ssh_probe(remote, 'rm -rf /opt/mediamtx-webeditor', timeout=10)
+            _ssh_probe(remote, 'systemctl daemon-reload 2>/dev/null; true', timeout=10)
+            steps.append('Stopped and removed MediaMTX on remote host')
+        settings['mediamtx_deployment'] = dict(deploy_cfg)
+        settings['mediamtx_deployment']['deployed'] = False
+        save_settings(settings)
+    else:
+        subprocess.run('systemctl stop mediamtx mediamtx-webeditor 2>/dev/null; true', shell=True, capture_output=True)
+        subprocess.run('systemctl disable mediamtx mediamtx-webeditor 2>/dev/null; true', shell=True, capture_output=True)
+        for f in ['/etc/systemd/system/mediamtx.service', '/etc/systemd/system/mediamtx-webeditor.service',
+                  '/usr/local/bin/mediamtx', '/usr/local/etc/mediamtx.yml']:
+            if os.path.exists(f):
+                os.remove(f)
+        if os.path.exists('/opt/mediamtx-webeditor'):
+            subprocess.run('rm -rf /opt/mediamtx-webeditor', shell=True, capture_output=True)
+        subprocess.run('systemctl daemon-reload 2>/dev/null; true', shell=True, capture_output=True)
+        steps.append('Stopped and disabled mediamtx and mediamtx-webeditor services')
+        steps.append('Removed binary, config, and web editor files')
     mediamtx_deploy_log.clear()
     mediamtx_deploy_status.update({'running': False, 'complete': False, 'error': False})
-    generate_caddyfile()
+    generate_caddyfile(settings)
     subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True)
     steps.append('Updated Caddyfile')
     return jsonify({'success': True, 'steps': steps})
+
+def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
+    """Run MediaMTX deploy on a remote host via SSH."""
+    import re as _re
+    import secrets as _sec
+    remote = deploy_cfg.get('remote', {})
+    host = (remote.get('host') or '').strip()
+    if not host:
+        plog("✗ Remote host not configured")
+        mediamtx_deploy_status.update({'running': False, 'error': True})
+        return
+    plog(f"  Deploying to remote host: {host}")
+
+    # Step 1: Dependencies
+    plog("━━━ Step 1/7: Installing Dependencies (remote) ━━━")
+    ok, out = _module_run(deploy_cfg, 'apt-get update -qq && apt-get install -y wget tar curl ffmpeg openssl python3 python3-pip 2>&1', timeout=300, log_fn=plog)
+    if not ok:
+        plog(f"✗ apt install failed: {(out or '')[-300:]}")
+        mediamtx_deploy_status.update({'running': False, 'error': True})
+        return
+    plog("✓ Dependencies installed")
+    ok, _ = _module_run(deploy_cfg, 'pip3 install Flask ruamel.yaml requests psutil --break-system-packages 2>&1', timeout=120)
+    if not ok:
+        _module_run(deploy_cfg, 'pip3 install Flask ruamel.yaml requests psutil 2>&1', timeout=120)
+    plog("✓ Python packages installed")
+
+    # Step 2: Version + arch on remote
+    plog("")
+    plog("━━━ Step 2/7: Detecting MediaMTX Version ━━━")
+    r = subprocess.run('curl -s https://api.github.com/repos/bluenviron/mediamtx/releases/latest', shell=True, capture_output=True, text=True, timeout=30)
+    m = _re.search(r'"tag_name":\s*"v([^"]+)"', r.stdout or '')
+    if not m:
+        plog("✗ Could not detect latest MediaMTX version")
+        mediamtx_deploy_status.update({'running': False, 'error': True})
+        return
+    version = m.group(1)
+    ok, arch_out = _module_run(deploy_cfg, 'uname -m', timeout=10)
+    arch_raw = (arch_out or '').strip() or 'x86_64'
+    arch_map = {'x86_64': 'amd64', 'aarch64': 'arm64v8', 'armv7l': 'armv7'}
+    mtx_arch = arch_map.get(arch_raw, 'amd64')
+    plog(f"  Version: {version}, arch: {arch_raw} → {mtx_arch}")
+
+    # Step 3: Download and install binary on remote
+    plog("")
+    plog("━━━ Step 3/7: Downloading & Installing MediaMTX (remote) ━━━")
+    url = f"https://github.com/bluenviron/mediamtx/releases/download/v{version}/mediamtx_v{version}_linux_{mtx_arch}.tar.gz"
+    cmd = f'cd /tmp && wget -q -O mediamtx.tar.gz "{url}" && tar -xzf mediamtx.tar.gz && mv -f mediamtx /usr/local/bin/ && chmod +x /usr/local/bin/mediamtx && rm -f mediamtx.tar.gz'
+    ok, out = _module_run(deploy_cfg, cmd, timeout=120, log_fn=plog)
+    if not ok:
+        plog(f"✗ Download/install failed: {(out or '')[-200:]}")
+        mediamtx_deploy_status.update({'running': False, 'error': True})
+        return
+    plog(f"✓ MediaMTX v{version} installed")
+
+    # Step 4: Config
+    plog("")
+    plog("━━━ Step 4/7: Writing Configuration (remote) ━━━")
+    hls_pass = _sec.token_hex(8)
+    mediamtx_yml = f"""# MediaMTX - infra-TAK remote
+logLevel: info
+logDestinations: [stdout]
+readTimeout: 10s
+writeTimeout: 10s
+api: yes
+apiAddress: :9898
+apiEncryption: no
+apiAllowOrigins: ['*']
+rtsp: yes
+rtspTransports: [tcp]
+rtspAddress: :8554
+rtspsAddress: :8322
+rtpAddress: :8000
+rtcpAddress: :8001
+rtmp: no
+rtmpAddress: :1935
+hls: yes
+hlsAddress: :8888
+hlsAllowOrigins: ['*']
+hlsTrustedProxies: ['127.0.0.1']
+webrtc: no
+srt: yes
+srtAddress: :8890
+authMethod: internal
+authInternalUsers:
+- user: any
+  ips: ['127.0.0.1', '::1']
+  permissions:
+  - action: read
+  - action: publish
+  - action: api
+- user: hlsviewer
+  pass: {hls_pass}
+  ips: []
+  permissions:
+  - action: read
+paths:
+  teststream: {{}}
+  all_others: {{}}
+"""
+    tmp_yml = '/tmp/mediamtx_remote.yml'
+    with open(tmp_yml, 'w') as f:
+        f.write(mediamtx_yml)
+    ok, _ = _module_copy(deploy_cfg, tmp_yml, '/tmp/mediamtx.yml', log_fn=plog)
+    try:
+        os.remove(tmp_yml)
+    except Exception:
+        pass
+    if not ok:
+        plog("✗ Failed to copy config to remote")
+        mediamtx_deploy_status.update({'running': False, 'error': True})
+        return
+    ok, _ = _module_run(deploy_cfg, 'sudo mv /tmp/mediamtx.yml /usr/local/etc/mediamtx.yml', timeout=10)
+    if not ok:
+        _module_run(deploy_cfg, 'mv /tmp/mediamtx.yml /usr/local/etc/mediamtx.yml', timeout=10)
+    plog("✓ Configuration written")
+    plog(f"  HLS viewer password: {hls_pass}")
+
+    # Step 5: systemd mediamtx.service
+    plog("")
+    plog("━━━ Step 5/7: Creating systemd Services (remote) ━━━")
+    mediamtx_svc = "[Unit]\nDescription=MediaMTX RTSP/HLS/SRT Streaming Server\nAfter=network.target\n\n[Service]\nType=simple\nExecStart=/usr/local/bin/mediamtx /usr/local/etc/mediamtx.yml\nRestart=always\nRestartSec=5\nUser=root\n\n[Install]\nWantedBy=multi-user.target\n"
+    tmp_svc = '/tmp/mediamtx_remote.service'
+    with open(tmp_svc, 'w') as f:
+        f.write(mediamtx_svc)
+    ok, _ = _module_copy(deploy_cfg, tmp_svc, '/tmp/mediamtx.service', log_fn=plog)
+    try:
+        os.remove(tmp_svc)
+    except Exception:
+        pass
+    if not ok:
+        plog("✗ Failed to copy systemd unit")
+        mediamtx_deploy_status.update({'running': False, 'error': True})
+        return
+    _module_run(deploy_cfg, 'sudo mv /tmp/mediamtx.service /etc/systemd/system/mediamtx.service || mv /tmp/mediamtx.service /etc/systemd/system/mediamtx.service', timeout=10)
+    # Web editor: clone on remote and install
+    _module_run(deploy_cfg, 'mkdir -p /opt/mediamtx-webeditor', timeout=10)
+    ok, _ = _module_run(deploy_cfg, f'rm -rf /tmp/mediamtx_editor_clone && git clone --depth 1 "{MEDIAMTX_EDITOR_REPO}" /tmp/mediamtx_editor_clone', timeout=90)
+    if ok:
+        _module_run(deploy_cfg, 'cp /tmp/mediamtx_editor_clone/config-editor/mediamtx_config_editor.py /opt/mediamtx-webeditor/ 2>/dev/null; rm -rf /tmp/mediamtx_editor_clone', timeout=15)
+        _module_run(deploy_cfg, "sed -i \"s/port=5000/port=int(os.environ.get(\\\\\"PORT\\\\\", 5080))/\" /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null; sed -i 's/9997/9898/g' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null", timeout=10)
+    editor_svc = "[Unit]\nDescription=MediaMTX Web Configuration Editor\nAfter=network.target mediamtx.service\n\n[Service]\nType=simple\nExecStart=/usr/bin/python3 /opt/mediamtx-webeditor/mediamtx_config_editor.py\nWorkingDirectory=/opt/mediamtx-webeditor\nEnvironment=PORT=5080\nEnvironment=MEDIAMTX_API_URL=http://127.0.0.1:9898\nRestart=always\nRestartSec=5\nUser=root\n\n[Install]\nWantedBy=multi-user.target\n"
+    with open('/tmp/mediamtx_webeditor_remote.service', 'w') as f:
+        f.write(editor_svc)
+    _module_copy(deploy_cfg, '/tmp/mediamtx_webeditor_remote.service', '/tmp/mediamtx-webeditor.service', log_fn=plog)
+    _module_run(deploy_cfg, 'sudo mv /tmp/mediamtx-webeditor.service /etc/systemd/system/ 2>/dev/null || mv /tmp/mediamtx-webeditor.service /etc/systemd/system/', timeout=10)
+    try:
+        os.remove('/tmp/mediamtx_webeditor_remote.service')
+    except Exception:
+        pass
+    plog("✓ Services created")
+    _module_run(deploy_cfg, 'systemctl daemon-reload && systemctl enable mediamtx && systemctl enable mediamtx-webeditor 2>/dev/null; systemctl start mediamtx && systemctl start mediamtx-webeditor 2>/dev/null', timeout=30)
+    plog("✓ Services started")
+
+    # Step 6: Firewall
+    plog("")
+    plog("━━━ Step 6/7: Firewall (remote) ━━━")
+    _module_run(deploy_cfg, "ufw allow 8554/tcp 2>/dev/null; ufw allow 8322/tcp 2>/dev/null; ufw allow 8888/tcp 2>/dev/null; ufw allow 5080/tcp 2>/dev/null; ufw allow 9898/tcp 2>/dev/null; true", timeout=15)
+    plog("✓ Ports opened")
+
+    # Step 7: Caddy on infra-TAK (point stream.* to remote)
+    plog("")
+    plog("━━━ Step 7/7: Caddy Integration ━━━")
+    cfg = _normalize_module_deployment_config(deploy_cfg)
+    cfg['deployed'] = True
+    settings['mediamtx_deployment'] = cfg
+    save_settings(settings)
+    generate_caddyfile(settings)
+    subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True)
+    domain = settings.get('fqdn', '')
+    mtx_domain = _get_service_domain(settings, 'mediamtx') if domain else ''
+    if mtx_domain:
+        plog(f"✓ Caddyfile updated — {mtx_domain} → {host}:5080")
+    else:
+        plog("✓ Caddy updated (no FQDN — use IP:5080 for web console)")
+    plog("")
+    plog("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    plog(f"🎉 MediaMTX v{version} deployed on remote host {host}!")
+    if domain:
+        plog(f"   Web Console: https://stream.{domain.split(':')[0]}")
+    plog(f"   Remote: http://{host}:5080")
+    plog(f"   HLS viewer password: {hls_pass}")
+    plog("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    mediamtx_deploy_status.update({'running': False, 'complete': True, 'error': False})
+    return
 
 def run_mediamtx_deploy():
     def plog(msg):
@@ -5171,6 +5405,10 @@ def run_mediamtx_deploy():
     try:
         settings = load_settings()
         domain = settings.get('fqdn', '')
+        deploy_cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
+        if deploy_cfg.get('target_mode') == 'remote':
+            _run_mediamtx_deploy_remote(settings, deploy_cfg, plog)
+            return
 
         # Step 1: Wait for apt lock / install deps
         plog("━━━ Step 1/7: Installing Dependencies ━━━")
@@ -8947,6 +9185,64 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   </div>
 
   {% else %}
+  <!-- Deployment Target -->
+  <div class="card" style="margin-bottom:20px">
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:0 0 12px 0;cursor:pointer" onclick="mediamtxToggleSection('mediamtx-target')">
+      <span class="card-title" style="margin-bottom:0">Deployment Target</span>
+      <span id="mediamtx-target-toggle-icon" style="font-size:18px;color:var(--text-dim);transition:transform 0.2s ease;transform:rotate(180deg)">&#9662;</span>
+    </div>
+    <div id="mediamtx-target-body" style="display:block;padding-top:12px;border-top:1px solid var(--border)">
+      <div class="form-group" style="margin-bottom:12px">
+        <label class="form-label">Where should MediaMTX run?</label>
+        <select id="mediamtx-target-mode" class="form-input">
+          <option value="local" {% if mediamtx_deploy_cfg.target_mode != 'remote' %}selected{% endif %}>On this infra-TAK host</option>
+          <option value="remote" {% if mediamtx_deploy_cfg.target_mode == 'remote' %}selected{% endif %}>On a remote host (SSH)</option>
+        </select>
+      </div>
+      <div id="mediamtx-remote-fields" style="display:{% if mediamtx_deploy_cfg.target_mode == 'remote' %}block{% else %}none{% endif %}">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px">
+          <div class="form-group" style="margin-bottom:0">
+            <label class="form-label">Remote Host/IP</label>
+            <input id="mediamtx-remote-host" class="form-input" type="text" placeholder="10.0.0.15" value="{{ mediamtx_deploy_cfg.remote.host or '' }}">
+          </div>
+          <div class="form-group" style="margin-bottom:0">
+            <label class="form-label">SSH Port</label>
+            <input id="mediamtx-remote-port" class="form-input" type="number" min="1" max="65535" value="{{ mediamtx_deploy_cfg.remote.port or 22 }}">
+          </div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px">
+          <div class="form-group" style="margin-bottom:0">
+            <label class="form-label">SSH Username</label>
+            <input id="mediamtx-remote-user" class="form-input" type="text" placeholder="root" value="{{ mediamtx_deploy_cfg.remote.username or 'root' }}">
+          </div>
+          <div class="form-group" style="margin-bottom:0">
+            <label class="form-label">SSH Key Path</label>
+            <input id="mediamtx-remote-key" class="form-input" type="text" placeholder="~/.ssh/infra-tak-mediamtx" value="{{ mediamtx_deploy_cfg.remote.ssh_key_path or '' }}">
+          </div>
+        </div>
+        <div class="form-group" style="margin-bottom:12px">
+          <label class="form-label">One-time remote password (for key copy only)</label>
+          <input id="mediamtx-remote-password" class="form-input" type="password" placeholder="Used only for Install SSH Key">
+          <div style="font-size:11px;color:var(--text-dim);margin-top:4px">Password is never stored. Used only for <code>ssh-copy-id</code>.</div>
+        </div>
+        <div class="controls" style="margin-bottom:8px">
+          <button class="btn btn-ghost" type="button" onclick="ensureMediamtxSshKey()">Generate SSH key</button>
+          <button class="btn btn-ghost" type="button" onclick="installMediamtxSshKey()">Install SSH key</button>
+          <button class="btn btn-ghost" type="button" onclick="testMediamtxRemoteSsh()">Test SSH</button>
+        </div>
+        <div id="mediamtx-ssh-status" style="margin-bottom:12px;font-size:12px;color:var(--text-dim)"></div>
+        <div class="form-group" style="margin-bottom:0">
+          <label class="form-label">Public key (manual copy fallback)</label>
+          <textarea id="mediamtx-public-key" class="form-input" rows="3" readonly placeholder="Click Generate SSH key to show"></textarea>
+        </div>
+      </div>
+      <div class="controls" style="margin-top:12px">
+        <button class="btn btn-ghost" type="button" onclick="saveMediamtxTarget()">Save target settings</button>
+        <span id="mediamtx-target-save-msg" style="font-size:12px;color:var(--text-dim)"></span>
+      </div>
+    </div>
+  </div>
+
   <!-- Deploy -->
   <div class="card">
     <div class="card-title">Deploy MediaMTX</div>
@@ -8993,12 +9289,92 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 let logIndex = 0;
 let logInterval = null;
 
+function collectMediamtxDeployConfig() {
+  var modeEl = document.getElementById('mediamtx-target-mode');
+  var mode = modeEl ? modeEl.value : 'local';
+  var cfg = { target_mode: mode };
+  if (mode === 'remote') {
+    var host = (document.getElementById('mediamtx-remote-host') || {}).value || '';
+    var user = (document.getElementById('mediamtx-remote-user') || {}).value || 'root';
+    var key = (document.getElementById('mediamtx-remote-key') || {}).value || '';
+    var portVal = (document.getElementById('mediamtx-remote-port') || {}).value || '22';
+    var p = parseInt(portVal, 10);
+    cfg.remote = { host: host.trim(), ssh_user: (user || 'root').trim(), ssh_port: isNaN(p) ? 22 : p, ssh_key_path: key.trim() };
+  }
+  return cfg;
+}
+function toggleMediamtxTargetFields() {
+  var modeEl = document.getElementById('mediamtx-target-mode');
+  var remoteBox = document.getElementById('mediamtx-remote-fields');
+  if (modeEl && remoteBox) remoteBox.style.display = modeEl.value === 'remote' ? 'block' : 'none';
+}
+function mediamtxToggleSection(id) {
+  var body = document.getElementById(id + '-body');
+  var icon = document.getElementById(id + '-toggle-icon');
+  if (!body) return;
+  var show = body.style.display === 'none';
+  body.style.display = show ? 'block' : 'none';
+  if (icon) icon.style.transform = show ? 'rotate(180deg)' : '';
+}
+function saveMediamtxTarget() {
+  var msg = document.getElementById('mediamtx-target-save-msg');
+  if (msg) msg.textContent = 'Saving...';
+  fetch('/api/mediamtx/deployment-config', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ config: collectMediamtxDeployConfig() }), credentials: 'same-origin' })
+    .then(function(r) { return r.json(); }).then(function(d) {
+      if (d && (d.target_mode !== undefined || d.remote)) { if (msg) msg.textContent = 'Saved'; setTimeout(function() { if (msg) msg.textContent = ''; }, 1600); }
+      else if (msg) msg.textContent = (d && d.error) ? d.error : 'Save failed';
+    }).catch(function(e) { if (msg) msg.textContent = 'Save failed: ' + (e && e.message ? e.message : String(e)); });
+}
+function _mediamtxSshStatus(msg, isError) {
+  var el = document.getElementById('mediamtx-ssh-status');
+  if (el) { el.style.color = isError ? 'var(--red)' : 'var(--text-dim)'; el.textContent = msg || ''; }
+}
+function ensureMediamtxSshKey() {
+  var modeEl = document.getElementById('mediamtx-target-mode');
+  if (modeEl && modeEl.value !== 'remote') { modeEl.value = 'remote'; toggleMediamtxTargetFields(); }
+  _mediamtxSshStatus('Generating SSH key...', false);
+  fetch('/api/mediamtx/remote/ensure-ssh-key', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ config: collectMediamtxDeployConfig() }), credentials: 'same-origin' })
+    .then(function(r) { return r.json(); }).then(function(d) {
+      if (!d || !d.success) { _mediamtxSshStatus((d && d.error) ? d.error : 'Key generation failed', true); return; }
+      var keyEl = document.getElementById('mediamtx-remote-key'); if (d.key_path && keyEl) keyEl.value = d.key_path;
+      var pk = document.getElementById('mediamtx-public-key'); if (pk) pk.value = d.public_key || '';
+      _mediamtxSshStatus((d.message || 'SSH key ready') + (d.fingerprint ? ' | ' + d.fingerprint : ''), false);
+    }).catch(function(e) { _mediamtxSshStatus('Key generation failed: ' + (e && e.message ? e.message : String(e)), true); });
+}
+function installMediamtxSshKey() {
+  var modeEl = document.getElementById('mediamtx-target-mode');
+  if (modeEl && modeEl.value !== 'remote') { modeEl.value = 'remote'; toggleMediamtxTargetFields(); }
+  var pw = (document.getElementById('mediamtx-remote-password') || {}).value || '';
+  if (!pw) { _mediamtxSshStatus('Enter password for ssh-copy-id', true); return; }
+  _mediamtxSshStatus('Installing key...', false);
+  fetch('/api/mediamtx/remote/install-ssh-key', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ password: pw, config: collectMediamtxDeployConfig() }), credentials: 'same-origin' })
+    .then(function(r) { return r.json(); }).then(function(d) {
+      if (d && d.success) { _mediamtxSshStatus('SSH key installed', false); }
+      else { _mediamtxSshStatus((d && d.error) ? d.error : 'Install failed', true); }
+    }).catch(function(e) { _mediamtxSshStatus('Install failed: ' + (e && e.message ? e.message : String(e)), true); });
+}
+function testMediamtxRemoteSsh() {
+  var modeEl = document.getElementById('mediamtx-target-mode');
+  if (modeEl && modeEl.value !== 'remote') { modeEl.value = 'remote'; toggleMediamtxTargetFields(); }
+  _mediamtxSshStatus('Testing SSH...', false);
+  fetch('/api/mediamtx/remote/test', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ config: collectMediamtxDeployConfig() }), credentials: 'same-origin' })
+    .then(function(r) { return r.json(); }).then(function(d) {
+      if (d && d.success) { _mediamtxSshStatus('SSH OK: ' + (d.output || '').trim().substring(0, 80), false); }
+      else { _mediamtxSshStatus((d && d.error) ? d.error : (d && d.output) || 'Test failed', true); }
+    }).catch(function(e) { _mediamtxSshStatus('Test failed: ' + (e && e.message ? e.message : String(e)), true); });
+}
+document.addEventListener('DOMContentLoaded', function() {
+  var modeEl = document.getElementById('mediamtx-target-mode');
+  if (modeEl) modeEl.addEventListener('change', toggleMediamtxTargetFields);
+});
+
 function startDeploy() {
   document.getElementById('deploy-btn').disabled = true;
   document.getElementById('log-card').style.display = 'block';
   document.getElementById('deploy-log').textContent = 'Starting deployment...';
   logIndex = 0;
-  fetch('/api/mediamtx/deploy', {method:'POST', headers:{'Content-Type':'application/json'}})
+  var config = typeof collectMediamtxDeployConfig === 'function' ? collectMediamtxDeployConfig() : {};
+  fetch('/api/mediamtx/deploy', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ config: config })})
     .then(r => r.json()).then(d => {
       if (d.error) {
         var lg = document.getElementById('log-card');
