@@ -1333,6 +1333,8 @@ def mediamtx_page():
     mtx = modules.get('mediamtx', {})
     cloudtak_installed = modules.get('cloudtak', {}).get('installed', False)
     mediamtx_deploy_cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
+    if mtx.get('installed') and not mediamtx_deploy_status.get('running', False):
+        mediamtx_deploy_status.update({'complete': False, 'error': False})
     return render_template_string(MEDIAMTX_TEMPLATE,
         settings=settings, mtx=mtx, version=VERSION,
         cloudtak_installed=cloudtak_installed,
@@ -5432,15 +5434,24 @@ paths:
     _module_run(deploy_cfg, 'systemctl daemon-reload && systemctl enable mediamtx && systemctl enable mediamtx-webeditor 2>/dev/null; systemctl start mediamtx && systemctl start mediamtx-webeditor 2>/dev/null', timeout=30)
     plog("✓ Services started")
 
+    # Step 5b: Test video
+    test_video_url = 'https://raw.githubusercontent.com/takwerx/mediamtx-installer/main/config-editor/truck_60.ts'
+    plog("  Downloading test video (truck_60.ts)...")
+    ok_tv, _ = _module_run(deploy_cfg, f'mkdir -p /opt/mediamtx-webeditor/test_videos && wget -q -O /opt/mediamtx-webeditor/test_videos/truck_60.ts "{test_video_url}"', timeout=60)
+    if ok_tv:
+        plog("✓ Test video installed")
+    else:
+        plog("⚠ Test video download failed — you can upload it manually via the web console")
+
     # Step 6: Firewall
     plog("")
-    plog("━━━ Step 6/7: Firewall (remote) ━━━")
+    plog("━━━ Step 6/8: Firewall (remote) ━━━")
     _module_run(deploy_cfg, "ufw allow 8554/tcp 2>/dev/null; ufw allow 8322/tcp 2>/dev/null; ufw allow 8888/tcp 2>/dev/null; ufw allow 5080/tcp 2>/dev/null; ufw allow 9898/tcp 2>/dev/null; true", timeout=15)
     plog("✓ Ports opened")
 
     # Step 7: Caddy on infra-TAK (point stream.* to remote)
     plog("")
-    plog("━━━ Step 7/7: Caddy Integration ━━━")
+    plog("━━━ Step 7/8: Caddy Integration ━━━")
     cfg = _normalize_module_deployment_config(deploy_cfg)
     cfg['deployed'] = True
     settings['mediamtx_deployment'] = cfg
@@ -5453,6 +5464,88 @@ paths:
         plog(f"✓ Caddyfile updated — {mtx_domain} → {host}:5080")
     else:
         plog("✓ Caddy updated (no FQDN — use IP:5080 for web console)")
+
+    # Step 8: SSL cert sync for RTSPS / HLS encryption
+    plog("")
+    plog("━━━ Step 8/8: SSL Certificates (remote) ━━━")
+    ssl_ok = False
+    if mtx_domain:
+        cert_base = '/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory'
+        cert_file = f'{cert_base}/{mtx_domain}/{mtx_domain}.crt'
+        key_file  = f'{cert_base}/{mtx_domain}/{mtx_domain}.key'
+        plog(f"  Waiting for Caddy to issue cert for {mtx_domain}...")
+        for i in range(30):
+            if os.path.exists(cert_file) and os.path.exists(key_file):
+                break
+            if i % 5 == 0:
+                plog(f"  ⏳ {i * 2}s...")
+            time.sleep(2)
+        if os.path.exists(cert_file) and os.path.exists(key_file):
+            _module_run(deploy_cfg, 'mkdir -p /etc/mediamtx/certs', timeout=10)
+            ok_cert, _ = _module_copy(deploy_cfg, cert_file, '/tmp/mediamtx_stream.crt', log_fn=plog)
+            ok_key, _  = _module_copy(deploy_cfg, key_file,  '/tmp/mediamtx_stream.key', log_fn=plog)
+            if ok_cert and ok_key:
+                _module_run(deploy_cfg, 'mv /tmp/mediamtx_stream.crt /etc/mediamtx/certs/stream.crt && mv /tmp/mediamtx_stream.key /etc/mediamtx/certs/stream.key && chmod 600 /etc/mediamtx/certs/stream.key', timeout=10)
+                remote_cert = '/etc/mediamtx/certs/stream.crt'
+                remote_key  = '/etc/mediamtx/certs/stream.key'
+                yml_cmd = (
+                    f"sed -i 's|^rtspServerKey:.*|rtspServerKey: {remote_key}|' /usr/local/etc/mediamtx.yml; "
+                    f"sed -i 's|^rtspServerCert:.*|rtspServerCert: {remote_cert}|' /usr/local/etc/mediamtx.yml; "
+                    f"sed -i 's|^hlsServerKey:.*|hlsServerKey: {remote_key}|' /usr/local/etc/mediamtx.yml; "
+                    f"sed -i 's|^hlsServerCert:.*|hlsServerCert: {remote_cert}|' /usr/local/etc/mediamtx.yml; "
+                    f"sed -i 's|^rtmpServerKey:.*|rtmpServerKey: {remote_key}|' /usr/local/etc/mediamtx.yml; "
+                    f"sed -i 's|^rtmpServerCert:.*|rtmpServerCert: {remote_cert}|' /usr/local/etc/mediamtx.yml; "
+                    f"sed -i 's|^rtspEncryption:.*|rtspEncryption: \"optional\"|' /usr/local/etc/mediamtx.yml; "
+                    f"sed -i 's|^hlsEncryption:.*|hlsEncryption: yes|' /usr/local/etc/mediamtx.yml"
+                )
+                _module_run(deploy_cfg, yml_cmd, timeout=15)
+                _module_run(deploy_cfg, 'systemctl restart mediamtx', timeout=15)
+                plog(f"✓ SSL certificates synced — RTSPS and HTTPS HLS enabled")
+                ssl_ok = True
+                # Create cert-sync script on infra-TAK host for renewals
+                rcfg = deploy_cfg.get('remote', {})
+                ssh_user = rcfg.get('ssh_user', 'root')
+                ssh_port = int(rcfg.get('ssh_port', 22))
+                ssh_key  = (rcfg.get('ssh_key_path') or '').strip()
+                ssh_key_expanded = os.path.expanduser(ssh_key) if ssh_key else ''
+                key_flag = f'-i {ssh_key_expanded}' if ssh_key_expanded and os.path.exists(ssh_key_expanded) else ''
+                sync_script = (
+                    f"#!/bin/bash\n"
+                    f"# Auto-generated: sync Caddy certs to remote MediaMTX\n"
+                    f"CERT='{cert_file}'\n"
+                    f"KEY='{key_file}'\n"
+                    f"REMOTE='{ssh_user}@{host}'\n"
+                    f"PORT='{ssh_port}'\n"
+                    f"KEY_FLAG='{key_flag}'\n"
+                    f"[ -f \"$CERT\" ] || exit 0\n"
+                    f"scp -P $PORT $KEY_FLAG -o StrictHostKeyChecking=accept-new -o BatchMode=yes "
+                    f"\"$CERT\" \"$REMOTE:/etc/mediamtx/certs/stream.crt\" 2>/dev/null\n"
+                    f"scp -P $PORT $KEY_FLAG -o StrictHostKeyChecking=accept-new -o BatchMode=yes "
+                    f"\"$KEY\" \"$REMOTE:/etc/mediamtx/certs/stream.key\" 2>/dev/null\n"
+                    f"ssh -p $PORT $KEY_FLAG -o BatchMode=yes \"$REMOTE\" "
+                    f"'chmod 600 /etc/mediamtx/certs/stream.key && systemctl restart mediamtx' 2>/dev/null\n"
+                )
+                sync_path = '/opt/tak-guarddog/mediamtx-cert-sync.sh'
+                os.makedirs('/opt/tak-guarddog', exist_ok=True)
+                with open(sync_path, 'w') as sf:
+                    sf.write(sync_script)
+                os.chmod(sync_path, 0o755)
+                svc = "[Unit]\nDescription=Sync MediaMTX SSL certs to remote host\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/mediamtx-cert-sync.sh\n"
+                timer = "[Unit]\nDescription=Sync MediaMTX certs daily\n\n[Timer]\nOnCalendar=daily\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n"
+                with open('/etc/systemd/system/mediamtx-cert-sync.service', 'w') as f:
+                    f.write(svc)
+                with open('/etc/systemd/system/mediamtx-cert-sync.timer', 'w') as f:
+                    f.write(timer)
+                subprocess.run('systemctl daemon-reload && systemctl enable --now mediamtx-cert-sync.timer 2>/dev/null; true', shell=True, capture_output=True)
+                plog("✓ Cert renewal sync timer installed (daily)")
+            else:
+                plog("⚠ Failed to copy certs to remote — RTSPS not configured")
+        else:
+            plog("⚠ Cert not found after 60s — RTSPS not configured")
+            plog("  Go to Caddy page, reload, then redeploy to retry")
+    else:
+        plog("  No domain configured — skipping SSL (RTSP unencrypted only)")
+
     plog("")
     plog("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     plog(f"🎉 MediaMTX v{version} deployed on remote host {host}!")
@@ -5460,6 +5553,8 @@ paths:
         plog(f"   Web Console: https://stream.{domain.split(':')[0]}")
     plog(f"   Remote: http://{host}:5080")
     plog(f"   HLS viewer password: {hls_pass}")
+    if ssl_ok:
+        plog(f"   RTSPS: rtsps://stream.{domain.split(':')[0]}:8322")
     plog("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     mediamtx_deploy_status.update({'running': False, 'complete': True, 'error': False})
     return
