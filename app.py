@@ -272,12 +272,20 @@ def detect_modules():
         ak_running = 'Up' in r.stdout
     modules['authentik'] = {'name': 'Authentik', 'installed': ak_installed, 'running': ak_running,
         'description': 'Identity provider — SSO, LDAP, user management', 'icon': '🔐', 'icon_url': AUTHENTIK_LOGO_URL, 'route': '/authentik', 'priority': 2}
-    # TAK Portal - Docker-based user management
-    portal_installed = os.path.exists(os.path.expanduser('~/TAK-Portal/docker-compose.yml'))
+    # TAK Portal - Docker-based user management (local or remote)
+    tp_cfg = _get_module_deployment_config(settings, 'takportal_deployment')
+    portal_installed = False
     portal_running = False
-    if portal_installed:
-        r = subprocess.run('docker ps --filter name=tak-portal --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
-        portal_running = 'Up' in r.stdout
+    if tp_cfg.get('target_mode') == 'remote':
+        if tp_cfg.get('deployed') and (tp_cfg.get('remote', {}).get('host') or '').strip():
+            portal_installed = True
+            ok, out = _ssh_probe(tp_cfg.get('remote', {}), "docker ps --filter name=tak-portal --format '{{.Status}}' 2>/dev/null", timeout=12)
+            portal_running = bool(ok and out and 'Up' in out)
+    else:
+        portal_installed = os.path.exists(os.path.expanduser('~/TAK-Portal/docker-compose.yml'))
+        if portal_installed:
+            r = subprocess.run('docker ps --filter name=tak-portal --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
+            portal_running = 'Up' in r.stdout
     modules['takportal'] = {'name': 'TAK Portal', 'installed': portal_installed, 'running': portal_running,
         'description': 'User & certificate management with Authentik', 'icon': '👥', 'route': '/takportal', 'priority': 3}
     # MediaMTX
@@ -3092,6 +3100,16 @@ def _get_cloudtak_upstreams(settings):
     }
 
 
+def _get_takportal_upstream(settings):
+    """Return TAK Portal upstream for Caddy (host:port)."""
+    cfg = _get_module_deployment_config(settings, 'takportal_deployment')
+    if cfg.get('target_mode') == 'remote':
+        host = (cfg.get('remote', {}).get('host') or '').strip()
+        if host:
+            return f'{host}:3000'
+    return '127.0.0.1:3000'
+
+
 def _suggest_tak_core_host(settings):
     """Best-effort TAK core host for CloudTAK bootstrap wizard."""
     # Prefer TAK Server domain (cert hostname) when available.
@@ -3762,6 +3780,7 @@ def generate_caddyfile(settings=None):
 
     portal = modules.get('takportal', {})
     if portal.get('installed'):
+        portal_up = _get_takportal_upstream(settings)
         portal_host = sd['takportal']
         lines.append(f"# TAK Portal")
         lines.append(f"{portal_host} {{")
@@ -3774,7 +3793,7 @@ def generate_caddyfile(settings=None):
             lines.append(f"        }}")
             lines.append(f"")
             lines.append(f"        handle @public {{")
-            lines.append(f"            reverse_proxy 127.0.0.1:3000")
+            lines.append(f"            reverse_proxy {portal_up}")
             lines.append(f"        }}")
             lines.append(f"")
             lines.append(f"        forward_auth 127.0.0.1:9090 {{")
@@ -3783,10 +3802,10 @@ def generate_caddyfile(settings=None):
             lines.append(f"            trusted_proxies private_ranges")
             lines.append(f"        }}")
             lines.append(f"")
-            lines.append(f"        reverse_proxy 127.0.0.1:3000")
+            lines.append(f"        reverse_proxy {portal_up}")
             lines.append(f"    }}")
         else:
-            lines.append(f"    reverse_proxy 127.0.0.1:3000")
+            lines.append(f"    reverse_proxy {portal_up}")
         lines.append(f"}}")
         lines.append("")
 
@@ -4455,10 +4474,12 @@ def takportal_page():
     portal_version = vinfo['version'] or ''
     portal_update_available = vinfo['update_available']
     portal_latest = vinfo['latest']
+    takportal_deploy_cfg = _get_module_deployment_config(settings, 'takportal_deployment')
     return render_template_string(TAKPORTAL_TEMPLATE,
         settings=settings, portal=portal, container_info=container_info,
         portal_port=portal_port, portal_version=portal_version,
         portal_update_available=portal_update_available, portal_latest=portal_latest,
+        takportal_deploy_cfg=takportal_deploy_cfg,
         version=VERSION,
         deploying=takportal_deploy_status.get('running', False),
         deploy_done=takportal_deploy_status.get('complete', False))
