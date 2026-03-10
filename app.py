@@ -5354,7 +5354,7 @@ paths:
     ok, _ = _module_run(deploy_cfg, f'rm -rf /tmp/mediamtx_editor_clone && git clone --depth 1 "{MEDIAMTX_EDITOR_REPO}" /tmp/mediamtx_editor_clone', timeout=90)
     if ok:
         _module_run(deploy_cfg, 'cp /tmp/mediamtx_editor_clone/config-editor/mediamtx_config_editor.py /opt/mediamtx-webeditor/ 2>/dev/null; rm -rf /tmp/mediamtx_editor_clone', timeout=15)
-        _module_run(deploy_cfg, "sed -i \"s/port=5000/port=int(os.environ.get(\\\\\"PORT\\\\\", 5080))/\" /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null; sed -i 's/9997/9898/g' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null", timeout=10)
+        _module_run(deploy_cfg, "sed -i 's/port=5000/port=5080/' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null; sed -i 's/9997/9898/g' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null", timeout=10)
     editor_svc = "[Unit]\nDescription=MediaMTX Web Configuration Editor\nAfter=network.target mediamtx.service\n\n[Service]\nType=simple\nExecStart=/usr/bin/python3 /opt/mediamtx-webeditor/mediamtx_config_editor.py\nWorkingDirectory=/opt/mediamtx-webeditor\nEnvironment=PORT=5080\nEnvironment=MEDIAMTX_API_URL=http://127.0.0.1:9898\nRestart=always\nRestartSec=5\nUser=root\n\n[Install]\nWantedBy=multi-user.target\n"
     with open('/tmp/mediamtx_webeditor_remote.service', 'w') as f:
         f.write(editor_svc)
