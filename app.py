@@ -5539,18 +5539,27 @@ def cloudtak_bootstrap_server_api():
         host_auto_rewritten = True
 
     preflight_ok, preflight = _cloudtak_bootstrap_preflight(cfg, tak_host, cot_port, marti_port, webtak_port)
+    marti_fallback_to_webtak = False
     if not preflight_ok:
         p_marti = preflight.get(str(marti_port), 'unknown') if isinstance(preflight, dict) else 'unknown'
         p_webtak = preflight.get(str(webtak_port), 'unknown') if isinstance(preflight, dict) else 'unknown'
-        return jsonify({
-            'success': False,
-            'error': (
-                f'Preflight failed from CloudTAK target to TAK host {tak_host}. '
-                f'marti({marti_port})={p_marti}; webtak({webtak_port})={p_webtak}. '
-                'Use TAK cert hostname/FQDN and ensure firewall/routes allow access.'
-            ),
-            'preflight': preflight,
-        }), 400
+        marti_ok = str(p_marti).strip().lower().startswith('ok')
+        webtak_ok = str(p_webtak).strip().lower().startswith('ok')
+        # Some VPS/network paths expose 8446 but block 8443. In that case, use 8446
+        # for both webtak and API path so bootstrap can proceed.
+        if (not marti_ok) and webtak_ok and marti_port != webtak_port:
+            marti_port = webtak_port
+            marti_fallback_to_webtak = True
+        else:
+            return jsonify({
+                'success': False,
+                'error': (
+                    f'Preflight failed from CloudTAK target to TAK host {tak_host}. '
+                    f'marti({marti_port})={p_marti}; webtak({webtak_port})={p_webtak}. '
+                    'Use TAK cert hostname/FQDN and ensure firewall/routes allow access.'
+                ),
+                'preflight': preflight,
+            }), 400
 
     # For remote deployments, ensure the Docker container can also reach the TAK server.
     # Host-level preflight passes but Docker containers may be blocked by iptables FORWARD.
@@ -5620,6 +5629,7 @@ def cloudtak_bootstrap_server_api():
                 'success': True,
                 'message': (
                     'CloudTAK initial server configuration applied.'
+                    + (' Marti preflight failed; API endpoint auto-switched to WebTAK port.' if marti_fallback_to_webtak else '')
                     + (' Host auto-switched to TAK hostname for TLS compatibility.' if host_auto_rewritten else '')
                 ),
                 'p12_source': p12_source,
@@ -5714,6 +5724,7 @@ def cloudtak_bootstrap_server_api():
         'success': True,
         'message': (
             'CloudTAK initial server configuration applied.'
+                    + (' Marti preflight failed; API endpoint auto-switched to WebTAK port.' if marti_fallback_to_webtak else '')
             + (' Host auto-switched to TAK hostname for TLS compatibility.' if host_auto_rewritten else '')
         ),
         'api_base': selected_base,
