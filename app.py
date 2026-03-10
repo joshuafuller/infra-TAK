@@ -13212,7 +13212,13 @@ def takserver_cert_expiry():
 @app.route('/api/takserver/groups')
 @login_required
 def takserver_groups():
-    """List groups from TAK Server via the Marti API using admin cert."""
+    """List groups from TAK Server APIs using admin cert.
+
+    We merge:
+    - /Marti/api/groups/all
+    - /user-management/api/list-groupnames
+    so TAK Portal-created groups can still appear in certificate workflows.
+    """
     cert_dir = '/opt/tak/certs/files'
     cert_pass = _get_tak_cert_password(load_settings())
     admin_p12 = os.path.join(cert_dir, 'admin.p12')
@@ -13231,32 +13237,67 @@ def takserver_groups():
             shell=True, capture_output=True, text=True, timeout=10)
         if not os.path.exists(admin_pem) or os.path.getsize(admin_pem) == 0:
             return jsonify({'error': 'Failed to extract PEM from admin.p12 (legacy conversion)', 'groups': []})
-        cmd = ['curl', '-sk', '--max-time', '8',
-               '--cert', admin_pem, '--key', admin_key,
-               'https://127.0.0.1:8443/Marti/api/groups/all']
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
-        body = (r.stdout or '').strip()
-        if r.returncode != 0 or not body:
-            return jsonify({'error': f'TAK Server did not respond (exit {r.returncode})', 'groups': []})
         import json as _json
-        try:
-            data = _json.loads(body)
-        except _json.JSONDecodeError:
-            return jsonify({'error': 'TAK Server returned invalid response', 'groups': [], 'raw': body[:200]})
-        groups = []
-        items = data.get('data', data) if isinstance(data, dict) else data
-        if isinstance(items, list):
-            for g in items:
-                if not isinstance(g, dict):
-                    continue
-                name = g.get('name', '')
-                if name and name != '__ANON__':
-                    groups.append({
+        def _curl_json(url):
+            cmd = ['curl', '-sk', '--max-time', '8',
+                   '--cert', admin_pem, '--key', admin_key, url]
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
+            body = (r.stdout or '').strip()
+            if r.returncode != 0 or not body:
+                return None, f'curl_exit_{r.returncode}'
+            try:
+                return _json.loads(body), None
+            except _json.JSONDecodeError:
+                return None, 'invalid_json'
+
+        merged = {}
+        warnings = []
+
+        marti_data, marti_err = _curl_json('https://127.0.0.1:8443/Marti/api/groups/all')
+        if marti_data is not None:
+            items = marti_data.get('data', marti_data) if isinstance(marti_data, dict) else marti_data
+            if isinstance(items, list):
+                for g in items:
+                    if not isinstance(g, dict):
+                        continue
+                    name = (g.get('name') or '').strip()
+                    if not name or name == '__ANON__':
+                        continue
+                    merged[name] = {
                         'name': name,
                         'direction': g.get('direction', ''),
                         'active': g.get('active', True)
-                    })
-        groups.sort(key=lambda x: x['name'])
+                    }
+        elif marti_err:
+            warnings.append(f'marti_groups:{marti_err}')
+
+        um_data, um_err = _curl_json('https://127.0.0.1:8443/user-management/api/list-groupnames')
+        if um_data is not None:
+            items = um_data.get('data', um_data) if isinstance(um_data, dict) else um_data
+            if isinstance(items, list):
+                for g in items:
+                    if isinstance(g, str):
+                        name = g.strip()
+                    elif isinstance(g, dict):
+                        name = (g.get('name') or g.get('groupName') or g.get('group') or '').strip()
+                    else:
+                        name = ''
+                    if not name or name == '__ANON__':
+                        continue
+                    if name not in merged:
+                        merged[name] = {
+                            'name': name,
+                            'direction': '',
+                            'active': True
+                        }
+        elif um_err:
+            warnings.append(f'user_mgmt_groups:{um_err}')
+
+        groups = sorted(merged.values(), key=lambda x: x['name'].lower())
+        if not groups and warnings:
+            return jsonify({'error': '; '.join(warnings), 'groups': []})
+        if warnings:
+            return jsonify({'groups': groups, 'warnings': warnings})
         return jsonify({'groups': groups})
     except Exception as e:
         return jsonify({'error': str(e), 'groups': []})
