@@ -95,6 +95,19 @@ async function loadWebadminSuperuserStatus(){
         el.style.color='var(--red)';
     }
 }
+async function checkLdapDrift(){
+    var banner=document.getElementById('ldap-drift-banner');
+    var msg=document.getElementById('ldap-drift-msg');
+    if(!banner||!msg)return;
+    try{
+        var r=await fetch('/api/takserver/ldap-drift-check');
+        var d=await r.json();
+        if(d.match===false){
+            msg.textContent=d.detail||'LDAP credential mismatch — click Resync LDAP to fix.';
+            banner.style.display='block';
+        }else{banner.style.display='none';}
+    }catch(e){banner.style.display='none';}
+}
 async function loadServices(){
     var el=document.getElementById('services-list');
     if(!el)return;
@@ -125,6 +138,7 @@ async function loadServices(){
 if(document.getElementById('services-list')){loadServices();setInterval(loadServices,10000)}
 if(document.getElementById('webadmin-superuser-status')){loadWebadminSuperuserStatus();}
 if(document.getElementById('tak-cert-password-inline')){loadTakCertPassword();}
+if(document.getElementById('ldap-drift-banner')){checkLdapDrift();}
 if(document.getElementById('cot-db-size')){refreshCotSize();}
 if(document.getElementById('cert-expiry-info')){loadCertExpiry();}
 if(document.getElementById('rotate-ca-info')){loadCAInfo();}

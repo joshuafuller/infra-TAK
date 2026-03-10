@@ -12378,6 +12378,71 @@ def _coreconfig_has_ldap():
     except Exception:
         return False
 
+
+def _resync_ldap_credential_to_coreconfig():
+    """Ensure CoreConfig.xml serviceAccountCredential matches Authentik .env.
+
+    Called automatically before every TAK Server start/restart from the console
+    so LDAP credential drift can never silently break group sync.
+    Returns (changed: bool, message: str).
+    """
+    import re as _re
+    coreconfig = '/opt/tak/CoreConfig.xml'
+    env_candidates = [
+        os.path.expanduser('~/authentik/.env'),
+        os.path.expanduser('~/tak-portal/.env'),
+    ]
+    if not os.path.exists(coreconfig):
+        return False, 'no_coreconfig'
+    try:
+        with open(coreconfig, 'r') as f:
+            cc = f.read()
+    except Exception:
+        return False, 'coreconfig_unreadable'
+    if 'adm_ldapservice' not in cc:
+        return False, 'no_ldap_in_coreconfig'
+    m = _re.search(r'serviceAccountCredential="([^"]*)"', cc)
+    if not m:
+        return False, 'no_credential_attr'
+    cc_pass = m.group(1)
+
+    env_pass = None
+    for env_path in env_candidates:
+        if not os.path.exists(env_path):
+            continue
+        try:
+            with open(env_path, 'r') as f:
+                for line in f:
+                    if line.strip().startswith('AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD='):
+                        env_pass = line.strip().split('=', 1)[1].strip()
+                        break
+        except Exception:
+            continue
+        if env_pass is not None:
+            break
+
+    if env_pass is None:
+        return False, 'no_env_password_found'
+    if cc_pass == env_pass:
+        return False, 'credentials_match'
+
+    new_cc = _re.sub(
+        r'serviceAccountCredential="[^"]*"',
+        f'serviceAccountCredential="{env_pass}"',
+        cc,
+        count=1
+    )
+    try:
+        with open(coreconfig, 'w') as f:
+            f.write(new_cc)
+    except PermissionError:
+        patch_path = os.path.join(BASE_DIR, 'CoreConfig.ldap-resync.xml')
+        with open(patch_path, 'w') as f:
+            f.write(new_cc)
+        subprocess.run(['sudo', 'cp', patch_path, coreconfig],
+                       capture_output=True, text=True, timeout=10)
+    return True, 'LDAP credential resynced from Authentik .env to CoreConfig.xml'
+
 def _ensure_ldapsearch():
     """Ensure ldapsearch CLI is available (install ldap-utils / openldap-clients if missing).
     Used by Connect TAK Server to LDAP to trigger a bind for outpost log verification."""
@@ -13105,6 +13170,63 @@ def takserver_connect_ldap():
         diag.append(f'Diagnostic error: {str(e)[:100]}')
     return jsonify({'success': ok, 'message': ' | '.join(diag)})
 
+
+@app.route('/api/takserver/ldap-drift-check')
+@login_required
+def takserver_ldap_drift_check():
+    """Compare LDAP service-account password in Authentik .env vs CoreConfig.xml.
+
+    Returns {match: bool, detail: str} so the frontend can warn on drift.
+    """
+    coreconfig = '/opt/tak/CoreConfig.xml'
+    env_candidates = [
+        os.path.expanduser('~/authentik/.env'),
+        os.path.expanduser('~/tak-portal/.env'),
+    ]
+    if not os.path.exists(coreconfig):
+        return jsonify({'match': True, 'detail': 'no_coreconfig'})
+    try:
+        with open(coreconfig, 'r') as f:
+            cc = f.read()
+    except Exception:
+        return jsonify({'match': True, 'detail': 'coreconfig_unreadable'})
+    if 'adm_ldapservice' not in cc:
+        return jsonify({'match': True, 'detail': 'no_ldap_in_coreconfig'})
+    import re as _re
+    m = _re.search(r'serviceAccountCredential="([^"]*)"', cc)
+    if not m:
+        return jsonify({'match': True, 'detail': 'no_credential_attr'})
+    cc_pass = m.group(1)
+
+    env_pass = None
+    env_src = None
+    for env_path in env_candidates:
+        if not os.path.exists(env_path):
+            continue
+        try:
+            with open(env_path, 'r') as f:
+                for line in f:
+                    if line.strip().startswith('AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD='):
+                        env_pass = line.strip().split('=', 1)[1].strip()
+                        env_src = env_path
+                        break
+        except Exception:
+            continue
+        if env_pass is not None:
+            break
+
+    if env_pass is None:
+        return jsonify({'match': True, 'detail': 'no_env_password_found'})
+
+    if cc_pass == env_pass:
+        return jsonify({'match': True, 'detail': 'ok', 'source': env_src})
+    return jsonify({
+        'match': False,
+        'detail': 'LDAP credential drift detected — CoreConfig.xml password does not match Authentik .env. Click Resync LDAP to fix.',
+        'source': env_src
+    })
+
+
 @app.route('/api/takserver/vacuum', methods=['POST'])
 @login_required
 def takserver_vacuum():
@@ -13560,6 +13682,9 @@ def takserver_rotate_intca():
 
             log("")
             log("Step 8/8: Restarting TAK Server...")
+            changed, resync_msg = _resync_ldap_credential_to_coreconfig()
+            if changed:
+                log(f"  LDAP resync: {resync_msg}")
             run('systemctl restart takserver 2>&1')
             log("  Waiting for TAK Server to come back up...")
             time.sleep(45)
@@ -13770,6 +13895,9 @@ def takserver_rotate_rootca():
 
             log("")
             log("Step 8/8: Restarting TAK Server and updating TAK Portal...")
+            changed, resync_msg = _resync_ldap_credential_to_coreconfig()
+            if changed:
+                log(f"  LDAP resync: {resync_msg}")
             run('systemctl restart takserver 2>&1')
             log("  TAK Server restarting...")
 
@@ -13965,6 +14093,10 @@ def takserver_control():
             results['database'] = {'success': False, 'error': 'Server One host not configured'}
     # Handle local TAK Server (Core)
     if target in ('core', 'both'):
+        if action in ('start', 'restart'):
+            changed, msg = _resync_ldap_credential_to_coreconfig()
+            if changed:
+                results['ldap_resync'] = msg
         subprocess.run(['systemctl', action, 'takserver'], capture_output=True, text=True, timeout=60)
         time.sleep(3)
         s = subprocess.run(['systemctl', 'is-active', 'takserver'], capture_output=True, text=True)
@@ -14261,6 +14393,9 @@ def run_takserver_upgrade(pkg_path):
             ulog("Update failed (exit " + str(r.returncode) + ")")
             upgrade_status.update({'running': False, 'complete': False, 'error': True})
             return
+        changed, resync_msg = _resync_ldap_credential_to_coreconfig()
+        if changed:
+            ulog(f"LDAP resync: {resync_msg}")
         ulog("Restarting TAK Server...")
         subprocess.run('systemctl restart takserver', shell=True, capture_output=True, text=True, timeout=30)
         ulog("TAK Server update complete.")
@@ -14369,6 +14504,9 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
         # Step 4: Start TAK Server
         ulog("")
         ulog("━━━ Step 4/4: Starting TAK Server ━━━")
+        changed, resync_msg = _resync_ldap_credential_to_coreconfig()
+        if changed:
+            ulog(f"LDAP resync: {resync_msg}")
         subprocess.run('systemctl start takserver', shell=True, capture_output=True, text=True, timeout=30)
         ulog("Waiting 30 seconds for startup...")
         for remaining in range(20, -1, -10):
@@ -14563,6 +14701,9 @@ def run_takserver_deploy(config):
 
         log_step(""); log_step("━━━ Step 5/9: Starting TAK Server ━━━")
         run_cmd('systemctl daemon-reload')
+        changed, resync_msg = _resync_ldap_credential_to_coreconfig()
+        if changed:
+            log_step(f"LDAP resync: {resync_msg}")
         run_cmd('systemctl start takserver', "Starting TAK Server...")
         run_cmd('systemctl enable takserver > /dev/null 2>&1')
         log_step("Waiting 30 seconds...")
@@ -14606,6 +14747,9 @@ def run_takserver_deploy(config):
         run_cmd(f'keytool -import -alias root-ca -file /opt/tak/certs/files/root-ca.pem -keystore /opt/tak/certs/files/truststore-{int_ca}.jks -storepass "{cert_pass}" -noprompt 2>&1', check=False)
         log_step("✓ Root CA imported into truststore (TAK clients trust chain complete)")
         log_step("Restarting TAK Server...")
+        changed, resync_msg = _resync_ldap_credential_to_coreconfig()
+        if changed:
+            log_step(f"LDAP resync: {resync_msg}")
         run_cmd('systemctl stop takserver'); time.sleep(10)
         run_cmd('pkill -9 -f takserver 2>/dev/null; true', check=False); time.sleep(5)
         run_cmd('systemctl start takserver')
@@ -14680,6 +14824,9 @@ def run_takserver_deploy(config):
                     log_step(f"⚠ Could not verify JDBC URL: {e}")
         log_step("✓ CoreConfig.xml configured")
         log_step("Final restart...")
+        changed, resync_msg = _resync_ldap_credential_to_coreconfig()
+        if changed:
+            log_step(f"LDAP resync: {resync_msg}")
         run_cmd('systemctl stop takserver'); time.sleep(10)
         run_cmd('pkill -9 -f takserver 2>/dev/null; true', check=False); time.sleep(5)
         run_cmd('systemctl start takserver')
@@ -14704,6 +14851,9 @@ def run_takserver_deploy(config):
             log_step("Creating webadmin user...")
             run_cmd(f"java -jar /opt/tak/utils/UserManager.jar usermod -A -p '{webadmin_pass}' webadmin 2>&1", check=False)
             log_step("✓ webadmin user created")
+        changed, resync_msg = _resync_ldap_credential_to_coreconfig()
+        if changed:
+            log_step(f"LDAP resync: {resync_msg}")
         run_cmd('systemctl restart takserver')
         log_step("Waiting 30 seconds...")
         for remaining in range(20, -1, -10):
@@ -15832,6 +15982,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <span style="color:var(--green);font-size:18px">✓</span><span style="font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--green);font-weight:600">LDAP Connected to Authentik</span>
 </div>
 <div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:8px">CoreConfig.xml patched · Service account: adm_ldapservice · Base DN: DC=takldap · Port 389</div>
+<div id="ldap-drift-banner" style="display:none;margin-top:8px;padding:10px 14px;background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.5);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;color:#f87171">⚠ <span id="ldap-drift-msg"></span></div>
 <div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:4px">webadmin superuser in Authentik: <span id="webadmin-superuser-status" style="color:var(--text-dim)">Checking...</span></div>
 <div style="margin-top:12px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
 <button type="button" id="resync-ldap-btn" onclick="resyncLdap()" style="padding:8px 16px;background:rgba(16,185,129,.2);color:var(--green);border:1px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;cursor:pointer">Resync LDAP to TAK Server</button>
