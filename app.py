@@ -12210,59 +12210,30 @@ volumes:
     else:
         plog("⚠ Authentik not healthy after 5 minutes — may still be starting")
 
-    # Step 6b: Inject LDAP outpost token and recreate LDAP container (fix 403)
+    # Step 6b: Inject LDAP outpost token and recreate LDAP container (run on remote so API is called from localhost — avoids 403)
     plog("")
     plog("━━━ Step 6b/8: LDAP Outpost Token (remote) ━━━")
     plog("  Waiting for blueprint to create LDAP outpost...")
     time.sleep(15)
-    # Remote compose exposes Authentik on host port 9090 (COMPOSE_PORT_HTTP=9090), not 9000
-    ak_url_remote = f"http://{host}:9090"
-    ak_headers_remote = {'Authorization': f'Bearer {bootstrap_token}', 'Content-Type': 'application/json'}
-    ldap_token_key = None
     try:
-        req = urllib.request.Request(f'{ak_url_remote}/api/v3/outposts/instances/?search=LDAP', headers=ak_headers_remote)
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            results = json.loads(resp.read().decode()).get('results', [])
-        ldap_outpost = next((o for o in results if o.get('name') == 'LDAP' and o.get('type') == 'ldap'), None)
-        if ldap_outpost:
-            outpost_token_id = ldap_outpost.get('token_identifier') or ldap_outpost.get('token')
-            if not outpost_token_id:
-                req = urllib.request.Request(f'{ak_url_remote}/api/v3/outposts/instances/{ldap_outpost["pk"]}/', headers=ak_headers_remote)
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    detail = json.loads(resp.read().decode())
-                outpost_token_id = detail.get('token_identifier') or detail.get('token')
-            if outpost_token_id:
-                req = urllib.request.Request(
-                    f'{ak_url_remote}/api/v3/core/tokens/{outpost_token_id}/view_key/',
-                    headers=ak_headers_remote, method='GET')
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    ldap_token_key = json.loads(resp.read().decode()).get('key', '')
-                plog(f"  ✓ Retrieved LDAP outpost token from API")
-    except urllib.error.HTTPError as e:
-        plog(f"  ⚠ API error: {e.code} {e.read().decode()[:150]}")
-    except Exception as e:
-        plog(f"  ⚠ Token fetch: {str(e)[:150]}")
-    if ldap_token_key:
+        with open('/tmp/authentik_fix_ldap_token.py', 'w') as f:
+            f.write(_AUTHENTIK_FIX_LDAP_REMOTE_SCRIPT)
+        ok, _ = _module_copy(deploy_cfg, '/tmp/authentik_fix_ldap_token.py', '/tmp/fix_ldap_token.py')
+        if ok:
+            ok, out = _module_run(deploy_cfg, 'python3 /tmp/fix_ldap_token.py 2>&1; rm -f /tmp/fix_ldap_token.py', timeout=120, log_fn=plog)
+            if ok and 'OK' in (out or ''):
+                plog("  ✓ LDAP token injected and container recreated")
+            else:
+                plog(f"  ⚠ Script output: {(out or '').strip()[:300]}")
+        else:
+            plog("  ⚠ Could not copy script to remote")
         try:
-            # Escape for YAML: token may contain special chars
-            safe_key = ldap_token_key.replace("'", "''")
-            patched_compose = compose_content.replace('AUTHENTIK_TOKEN: placeholder', f"AUTHENTIK_TOKEN: '{safe_key}'")
-            with open('/tmp/authentik_remote_compose.yml', 'w') as f:
-                f.write(patched_compose)
-            ok, _ = _module_copy(deploy_cfg, '/tmp/authentik_remote_compose.yml', '/tmp/docker-compose.yml', log_fn=plog)
-            _module_run(deploy_cfg, 'mv /tmp/docker-compose.yml ~/authentik/docker-compose.yml', timeout=10)
-            plog("  ✓ Injected LDAP token into docker-compose on remote")
-            plog("  Recreating LDAP container...")
-            _module_run(deploy_cfg, 'cd ~/authentik && docker compose stop ldap 2>&1; docker compose rm -f ldap 2>&1; docker compose up -d ldap 2>&1', timeout=90, log_fn=plog)
-            plog("  ✓ LDAP container recreated with correct token")
-            try:
-                os.remove('/tmp/authentik_remote_compose.yml')
-            except Exception:
-                pass
-        except Exception as e:
-            plog(f"  ⚠ Token inject failed: {str(e)[:150]}")
-    else:
-        plog("  ⚠ Could not get LDAP token — LDAP may show 403 until token is set in Authentik UI and container restarted")
+            os.remove('/tmp/authentik_fix_ldap_token.py')
+        except Exception:
+            pass
+    except Exception as e:
+        plog(f"  ⚠ Step 6b failed: {str(e)[:150]}")
+        plog("  Use Fix LDAP token button on Authentik page if LDAP stays unhealthy")
 
     # Step 7: Patch CoreConfig.xml to point LDAP at remote host
     plog("")
@@ -13784,11 +13755,9 @@ body{display:flex;min-height:100vh}
 .nav-item.active{color:var(--cyan);background:rgba(6,182,212,.06);border-left-color:var(--cyan)}
 .nav-icon{font-size:15px;width:18px;text-align:center}
 .main{flex:1;min-width:0;overflow-y:auto;padding:32px;max-width:1000px;margin:0 auto}
-.page-header{margin-bottom:20px}.page-header h1{font-size:22px;font-weight:700;display:flex;align-items:center;gap:8px}.page-header p{color:var(--text-secondary);font-size:13px;margin-top:4px}
 </style></head><body>
 {{ sidebar_html }}
 <div class="main">
-<div class="page-header"><h1><img src="{{ authentik_logo_url }}" alt="" style="height:28px;width:auto;object-fit:contain">Authentik{% if ak_version_info and ak_version_info.version %} <span style="font-weight:500;color:var(--text-dim);font-size:16px">· v{{ ak_version_info.version }}</span>{% endif %}</h1><p>Identity provider — SSO, LDAP, user management</p></div>
 <div class="status-banner">
 {% if deploying %}
 <div class="status-info"><div class="status-icon running" style="background:rgba(59,130,246,0.1)">🔄</div><div><div class="status-text" style="color:var(--accent)">Deploying...</div><div class="status-detail">Authentik installation in progress</div></div></div>
