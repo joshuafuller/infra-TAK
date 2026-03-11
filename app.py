@@ -418,6 +418,34 @@ def get_system_metrics():
         'disk_total_gb': round(disk.total / (1024**3), 1), 'uptime': f"{d}d {h}h {m}m",
         'unattended_upgrades': uu}
 
+
+def _get_remote_host_metrics(remote_cfg):
+    """Return get_system_metrics()-style dict for a remote host via SSH, or None on failure."""
+    if not remote_cfg or not (remote_cfg.get('host') or '').strip():
+        return None
+    # One Python one-liner that works on Ubuntu (no psutil): read /proc, statvfs, uptime
+    script = (
+        "python3 -c \""
+        "import json,os,time;"
+        "r=open('/proc/meminfo').read();d=dict(l.split(None,1) for l in r.split('\\n') if ':' in l);"
+        "t=int(d.get('MemTotal:','0').split()[0])*1024;a=int(d.get('MemAvailable:','0').split()[0])*1024;u=t-a;"
+        "mem_pct=round(100*u/t,1) if t else 0;"
+        "secs=float(open('/proc/uptime').read().split()[0]);d=int(secs//86400);h=int((secs%86400)//3600);m=int((secs%3600)//60);"
+        "uptime=f'{d}d {h}h {m}m';"
+        "s=os.statvfs('/');dt=s.f_blocks*s.f_frsize;du=dt-s.f_bavail*s.f_frsize;disk_pct=round(100*du/dt,1) if dt else 0;"
+        "def r1():f=open('/proc/stat');l=f.readline().split();f.close();return sum(int(x) for x in l[1:5]),int(l[4]);"
+        "t1,i1=r1();time.sleep(1);t2,i2=r1();cpu_pct=round((1-(i2-i1)/(t2-t1))*100,1) if (t2-t1) else 0;"
+        "print(json.dumps({'cpu_percent':cpu_pct,'ram_percent':mem_pct,'ram_used_gb':round(u/1e9,1),'ram_total_gb':round(t/1e9,1),"
+        "'disk_percent':disk_pct,'disk_used_gb':round(du/1e9,1),'disk_total_gb':round(dt/1e9,1),'uptime':uptime}))\""
+    )
+    ok, out = _ssh_probe(remote_cfg, script, timeout=15)
+    if not ok or not out:
+        return None
+    try:
+        return json.loads(out.strip())
+    except Exception:
+        return None
+
 def _get_unattended_upgrades_status():
     """Return dict with 'enabled' (bool) and 'running' (bool) for unattended-upgrades."""
     enabled = False
@@ -3544,6 +3572,47 @@ def _get_authentik_upstream(settings):
             return f'{host}:9090'
     return '127.0.0.1:9090'
 
+
+def _get_authentik_api_url(settings):
+    """Return Authentik API base URL for server-side HTTP calls (e.g. LDAP flow, WebAdmin)."""
+    upstream = _get_authentik_upstream(settings)
+    return f'http://{upstream}'
+
+
+def _get_authentik_env_content(settings):
+    """Return raw content of Authentik .env (local file or fetched via SSH when remote). None if unavailable."""
+    cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+    if cfg.get('target_mode') == 'remote' and (cfg.get('remote', {}).get('host') or '').strip():
+        ok, out = _ssh_probe(cfg['remote'], 'cat ~/authentik/.env 2>/dev/null', timeout=15)
+        if ok and out and out.strip():
+            return out.strip()
+        return None
+    path = os.path.expanduser('~/authentik/.env')
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path) as f:
+            return f.read()
+    except Exception:
+        return None
+
+
+def _get_authentik_env_value(settings, key):
+    """Return value for KEY= from Authentik .env (local or remote). Strips quotes. None if missing."""
+    content = _get_authentik_env_content(settings)
+    if not content:
+        return None
+    for line in content.splitlines():
+        line = line.strip()
+        if line.startswith(key + '='):
+            val = line.split('=', 1)[1].strip()
+            if val.startswith('"') and val.endswith('"'):
+                val = val[1:-1]
+            elif val.startswith("'") and val.endswith("'"):
+                val = val[1:-1]
+            return val
+    return None
+
 def _tak_deployment_defaults():
     """Default TAK deployment shape (single-server by default, optional two-server fields)."""
     return {
@@ -4403,18 +4472,23 @@ def _get_authentik_version_info():
                 out['version'] = m.group(1).strip()
         except Exception:
             pass
-    # If not found locally, check if deployed remotely
+    # If not found locally, check if deployed remotely (actual image tag from docker)
     if not out['version']:
         try:
             settings = load_settings()
             ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
             if ak_cfg.get('target_mode') == 'remote' and ak_cfg.get('deployed') and (ak_cfg.get('remote', {}).get('host') or '').strip():
                 ok, remote_out = _ssh_probe(ak_cfg['remote'],
-                    'grep -m1 "image:.*server:" ~/authentik/docker-compose.yml 2>/dev/null', timeout=10)
-                if ok and remote_out:
-                    m = re.search(r'image:.*?/server:([^\s\n]+)', remote_out)
-                    if m:
-                        out['version'] = m.group(1).strip()
+                    'docker images ghcr.io/goauthentik/server --format "{{.Tag}}" 2>/dev/null | head -1', timeout=10)
+                if ok and remote_out and remote_out.strip():
+                    out['version'] = remote_out.strip()
+                if not out['version']:
+                    ok, remote_out = _ssh_probe(ak_cfg['remote'],
+                        'grep -m1 "AUTHENTIK_TAG\\|server:" ~/authentik/docker-compose.yml 2>/dev/null', timeout=10)
+                    if ok and remote_out:
+                        m = re.search(r'AUTHENTIK_TAG:-(\d+\.\d+\.\d+[^\s}\']*)', remote_out)
+                        if m:
+                            out['version'] = m.group(1).strip()
         except Exception:
             pass
     if not out['version']:
@@ -7084,6 +7158,10 @@ def run_cloudtak_deploy(cfg=None):
             plog(f"✓ {((out or '').splitlines()[-1] if out else 'Docker ready')}")
 
             plog("")
+            plog("━━━ Docker log limits (remote) ━━━")
+            _ensure_docker_log_limits_remote(remote_cfg, log_fn=plog)
+
+            plog("")
             plog("━━━ Step 3/6: Cloning/Updating CloudTAK on remote ━━━")
             prep_cmd = (
                 "if [ -d ~/CloudTAK/.git ]; then "
@@ -8312,6 +8390,66 @@ def emailrelay_configure_authentik():
 
 
 # ── Docker log limits (prevents Node-RED / Authentik LDAP etc. from filling disk) ──
+def _ensure_docker_log_limits_remote(remote_cfg, log_fn=None):
+    """On remote host: ensure /etc/docker/daemon.json has log-opts (max-size 50m, max-file 3). Restart Docker if changed.
+    Returns (ok: bool, docker_restarted: bool). Non-fatal: on failure we log and return (False, False)."""
+    if not remote_cfg or not (remote_cfg.get('host') or '').strip():
+        return True, False
+    script_content = '''import json, os, subprocess, sys
+p = "/etc/docker/daemon.json"
+data = {}
+if os.path.isfile(p) and os.path.getsize(p) > 0:
+    try:
+        with open(p) as f:
+            data = json.load(f)
+    except Exception:
+        pass
+opts = data.get("log-opts") or {}
+if opts.get("max-size") == "50m" and opts.get("max-file") == "3":
+    print("OK_ALREADY")
+    sys.exit(0)
+data["log-driver"] = data.get("log-driver", "json-file")
+data["log-opts"] = {"max-size": "50m", "max-file": "3"}
+os.makedirs("/etc/docker", exist_ok=True)
+with open(p, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\\n")
+subprocess.run(["systemctl", "restart", "docker"], timeout=30, capture_output=True)
+print("OK_RESTARTED")
+'''
+    tmp_path = '/tmp/infra_tak_docker_log_limits.py'
+    try:
+        with open(tmp_path, 'w') as f:
+            f.write(script_content)
+        ok_copy = _module_copy({'target_mode': 'remote', 'remote': remote_cfg}, tmp_path, tmp_path, timeout=15)
+        if not ok_copy:
+            if log_fn:
+                log_fn("  ⚠ Could not copy Docker log-limits script to remote")
+            return False, False
+        ok, out = _ssh_probe(remote_cfg, f'python3 {tmp_path} 2>&1; rm -f {tmp_path}', timeout=45)
+    except Exception as e:
+        if log_fn:
+            log_fn(f"  ⚠ Docker log limits on remote: {str(e)[:100]}")
+        return False, False
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+    out = (out or '').strip()
+    if not ok:
+        if log_fn:
+            log_fn(f"  ⚠ Docker log limits on remote could not be applied: {(out or '')[:120]}")
+        return False, False
+    if 'OK_RESTARTED' in out:
+        if log_fn:
+            log_fn("✓ Docker log limits set on remote (50 MB × 3). Docker was restarted.")
+        return True, True
+    if log_fn and 'OK_ALREADY' in out:
+        log_fn("✓ Docker log limits already set on remote.")
+    return True, False
+
+
 def _ensure_docker_log_limits(log_fn=None):
     """Ensure /etc/docker/daemon.json has log-opts (max-size 50m, max-file 3). If we write or change it, restart Docker.
     Returns (docker_restarted: bool, error: str or None)."""
@@ -9463,6 +9601,9 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <div class="card">
     <div class="card-title">Access</div>
     <div class="info-grid">
+      {% if mediamtx_deploy_cfg.target_mode == 'remote' and mediamtx_deploy_cfg.remote.host %}
+      <div class="info-item"><div class="info-label">Remote host</div><div class="info-value" style="color:var(--cyan);font-family:'JetBrains Mono',monospace">{{ mediamtx_deploy_cfg.remote.host }}</div></div>
+      {% endif %}
       {% if settings.fqdn %}
       <div class="info-item"><div class="info-label">Web Console</div><div class="info-value"><a href="https://stream.{{ settings.fqdn }}" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);text-decoration:none">https://stream.{{ settings.fqdn }}</a> <span style="color:var(--text-dim);font-size:11px">↗</span></div></div>
       {% else %}
@@ -10356,6 +10497,9 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <div class="card">
     <div class="card-title">Access</div>
     <div class="info-grid">
+      {% if cloudtak_cfg.target_mode == 'remote' and cloudtak_cfg.remote.host %}
+      <div class="info-item"><div class="info-label">Remote host</div><div class="info-value" style="color:var(--cyan);font-family:'JetBrains Mono',monospace">{{ cloudtak_cfg.remote.host }}</div></div>
+      {% endif %}
       {% if settings.fqdn %}
       <div class="info-item"><div class="info-label">Web UI</div><div class="info-value"><a href="https://map.{{ settings.fqdn }}" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);text-decoration:none">https://map.{{ settings.fqdn }}</a> <span style="color:var(--text-dim);font-size:11px">↗</span></div></div>
       <div class="info-item"><div class="info-label">Tile Server</div><div class="info-value">https://tiles.map.{{ settings.fqdn }}</div></div>
@@ -11486,6 +11630,9 @@ def authentik_page():
         'unhealthy' not in c.get('status', '') for c in container_info.get('containers', [])
     ) and len(container_info.get('containers', [])) > 0
     authentik_deploy_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+    remote_host = None
+    if authentik_deploy_cfg.get('target_mode') == 'remote':
+        remote_host = (authentik_deploy_cfg.get('remote', {}).get('host') or '').strip() or None
     return render_template_string(AUTHENTIK_TEMPLATE,
         settings=settings, ak=ak, container_info=container_info,
         ak_port=ak_port, authentik_base_url=_get_authentik_base_url(settings),
@@ -11498,7 +11645,8 @@ def authentik_page():
         all_healthy=all_healthy,
         portal_installed=portal_installed,
         portal_running=portal_running,
-        authentik_deploy_cfg=authentik_deploy_cfg)
+        authentik_deploy_cfg=authentik_deploy_cfg,
+        remote_host=remote_host)
 
 @app.route('/api/authentik/control', methods=['POST'])
 @login_required
@@ -11577,6 +11725,20 @@ def authentik_deploy_log_api():
     return jsonify({'entries': authentik_deploy_log[idx:], 'total': len(authentik_deploy_log),
         'running': authentik_deploy_status['running'], 'complete': authentik_deploy_status['complete'],
         'error': authentik_deploy_status['error']})
+
+@app.route('/api/authentik/remote-metrics')
+@login_required
+def authentik_remote_metrics():
+    """Return CPU/memory/disk/uptime for the remote host when Authentik is deployed remotely."""
+    settings = load_settings()
+    deploy_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+    if deploy_cfg.get('target_mode') != 'remote' or not (deploy_cfg.get('remote', {}).get('host') or '').strip():
+        return jsonify({'error': 'Not remote'}), 404
+    metrics = _get_remote_host_metrics(deploy_cfg.get('remote', {}))
+    if metrics is None:
+        return jsonify({'error': 'Could not fetch remote metrics'}), 503
+    return jsonify(metrics)
+
 
 @app.route('/api/authentik/logs')
 @login_required
@@ -11843,6 +12005,11 @@ def _run_authentik_deploy_remote(settings, deploy_cfg, plog):
     else:
         plog(f"  {(out or '').strip()}")
     plog("✓ Docker available on remote")
+
+    # Ensure Docker log limits on remote (same as local: 50m × 3 so logs don't fill disk)
+    plog("")
+    plog("━━━ Docker log limits (remote) ━━━")
+    _ensure_docker_log_limits_remote(deploy_cfg.get('remote', {}), log_fn=plog)
 
     # Step 2: Create directory + generate secrets locally
     plog("")
@@ -13805,6 +13972,11 @@ body{display:flex;min-height:100vh}
 .nav-item:hover{color:var(--text-primary);background:rgba(255,255,255,.03)}
 .nav-item.active{color:var(--cyan);background:rgba(6,182,212,.06);border-left-color:var(--cyan)}
 .nav-icon{font-size:15px;width:18px;text-align:center}
+.metrics-bar{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:24px}
+.metric-card{background:var(--bg-surface);border:1px solid var(--border);border-radius:12px;padding:18px;text-align:center}
+.metric-label{font-family:'JetBrains Mono',monospace;font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--text-dim);margin-bottom:6px}
+.metric-value{font-family:'JetBrains Mono',monospace;font-size:24px;font-weight:700;color:var(--text-primary)}
+.metric-detail{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:2px}
 .main{flex:1;min-width:0;overflow-y:auto;padding:32px;max-width:1000px;margin:0 auto}
 </style></head><body>
 {{ sidebar_html }}
@@ -13844,6 +14016,16 @@ body{display:flex;min-height:100vh}
 {% elif ak.installed and ak.running %}
 <div class="section-title">Access</div>
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
+{% if remote_host %}
+<div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-bottom:12px"><span style="color:var(--text-secondary)">Remote host:</span> <span style="color:var(--cyan)" id="remote-host-ip">{{ remote_host }}</span></div>
+<div class="section-title" style="margin-top:16px;margin-bottom:8px">Remote host health</div>
+<div class="metrics-bar" id="remote-metrics-bar">
+<div class="metric-card"><div class="metric-label">CPU</div><div class="metric-value" id="remote-cpu-value">—</div></div>
+<div class="metric-card"><div class="metric-label">Memory</div><div class="metric-value" id="remote-ram-value">—</div><div class="metric-detail" id="remote-ram-detail"></div></div>
+<div class="metric-card"><div class="metric-label">Disk</div><div class="metric-value" id="remote-disk-value">—</div><div class="metric-detail" id="remote-disk-detail"></div></div>
+<div class="metric-card"><div class="metric-label">Uptime</div><div class="metric-value" id="remote-uptime-value" style="font-size:18px">—</div></div>
+</div>
+{% endif %}
 <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
 <a href="{{ authentik_base_url }}" target="_blank" rel="noopener noreferrer" class="cert-btn cert-btn-primary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px;display:inline-flex;align-items:center;gap:6px" title="Open Authentik admin interface"><img src="{{ authentik_logo_url }}" alt="" style="width:18px;height:18px;object-fit:contain">Authentik{% if not settings.get('fqdn') %} :{{ ak_port }}{% endif %}</a>
 <a href="{{ 'https://takportal.' + settings.get('fqdn', '') if settings.get('fqdn') else 'http://' + settings.get('server_ip', '') + ':3000' }}" target="_blank" class="cert-btn cert-btn-secondary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">👥 TAK Portal{% if not settings.get('fqdn') %} :3000{% endif %}</a>
@@ -14165,6 +14347,23 @@ async function loadContainerLogs(){
 }
 if(document.getElementById('container-log')){loadContainerLogs();setInterval(loadContainerLogs,10000)}
 
+async function loadRemoteMetrics(){
+    var bar=document.getElementById('remote-metrics-bar');
+    if(!bar)return;
+    try{
+        var r=await fetch('/api/authentik/remote-metrics');
+        if(!r.ok){document.getElementById('remote-cpu-value').textContent='—';document.getElementById('remote-ram-value').textContent='—';document.getElementById('remote-disk-value').textContent='—';document.getElementById('remote-uptime-value').textContent='—';return;}
+        var d=await r.json();
+        var cpu=document.getElementById('remote-cpu-value');if(cpu)cpu.textContent=(d.cpu_percent!=null?d.cpu_percent:'—')+'%';
+        var ram=document.getElementById('remote-ram-value');if(ram)ram.textContent=(d.ram_percent!=null?d.ram_percent:'—')+'%';
+        var ramD=document.getElementById('remote-ram-detail');if(ramD)ramD.textContent=(d.ram_used_gb!=null&&d.ram_total_gb!=null)?(d.ram_used_gb+'GB / '+d.ram_total_gb+'GB'):'';
+        var disk=document.getElementById('remote-disk-value');if(disk)disk.textContent=(d.disk_percent!=null?d.disk_percent:'—')+'%';
+        var diskD=document.getElementById('remote-disk-detail');if(diskD)diskD.textContent=(d.disk_used_gb!=null&&d.disk_total_gb!=null)?(d.disk_used_gb+'GB / '+d.disk_total_gb+'GB'):'';
+        var uptime=document.getElementById('remote-uptime-value');if(uptime)uptime.textContent=d.uptime||'—';
+    }catch(e){var cpu=document.getElementById('remote-cpu-value');if(cpu)cpu.textContent='—';}
+}
+if(document.getElementById('remote-metrics-bar')){loadRemoteMetrics();setInterval(loadRemoteMetrics,5000);}
+
 function uninstallAk(){
     document.getElementById('ak-uninstall-modal').classList.add('open');
 }
@@ -14306,11 +14505,21 @@ def _resync_ldap_credential_to_coreconfig():
     Returns (changed: bool, message: str).
     """
     import re as _re
+    settings = load_settings()
     coreconfig = '/opt/tak/CoreConfig.xml'
-    env_candidates = [
-        os.path.expanduser('~/authentik/.env'),
-        os.path.expanduser('~/tak-portal/.env'),
-    ]
+    env_pass = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')
+    if env_pass is None:
+        # Fallback: local tak-portal .env (e.g. when portal has a copy)
+        portal_env = os.path.expanduser('~/tak-portal/.env')
+        if os.path.isfile(portal_env):
+            try:
+                with open(portal_env) as f:
+                    for line in f:
+                        if line.strip().startswith('AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD='):
+                            env_pass = line.strip().split('=', 1)[1].strip()
+                            break
+            except Exception:
+                pass
     if not os.path.exists(coreconfig):
         return False, 'no_coreconfig'
     try:
@@ -14324,21 +14533,6 @@ def _resync_ldap_credential_to_coreconfig():
     if not m:
         return False, 'no_credential_attr'
     cc_pass = m.group(1)
-
-    env_pass = None
-    for env_path in env_candidates:
-        if not os.path.exists(env_path):
-            continue
-        try:
-            with open(env_path, 'r') as f:
-                for line in f:
-                    if line.strip().startswith('AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD='):
-                        env_pass = line.strip().split('=', 1)[1].strip()
-                        break
-        except Exception:
-            continue
-        if env_pass is not None:
-            break
 
     if env_pass is None:
         return False, 'no_env_password_found'
@@ -14421,21 +14615,17 @@ def _ensure_ldap_flow_authentication_none():
     Returns (True, None) on success, (False, error_msg) on failure."""
     import urllib.request as _req
     import urllib.error
-    env_path = os.path.expanduser('~/authentik/.env')
-    if not os.path.exists(env_path):
-        return False, 'Authentik .env not found'
-    ak_token = ''
-    with open(env_path) as f:
-        for line in f:
-            if line.strip().startswith('AUTHENTIK_BOOTSTRAP_TOKEN='):
-                ak_token = line.strip().split('=', 1)[1].strip()
-                break
+    settings = load_settings()
+    ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
     if not ak_token:
-        return False, 'Authentik token not in .env'
-    ak_dir = os.path.expanduser('~/authentik')
-    if not os.path.exists(os.path.join(ak_dir, 'docker-compose.yml')):
-        return False, 'Authentik not deployed'
-    url = 'http://127.0.0.1:9090'
+        return False, 'Authentik .env not found'
+    ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+    is_remote = ak_cfg.get('target_mode') == 'remote' and (ak_cfg.get('remote', {}).get('host') or '').strip()
+    if not is_remote:
+        ak_dir = os.path.expanduser('~/authentik')
+        if not os.path.exists(os.path.join(ak_dir, 'docker-compose.yml')):
+            return False, 'Authentik not deployed'
+    url = _get_authentik_api_url(settings)
     headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
     # Authentik API can be slow after worker restart or under load; use 60s per request
     _api_timeout = 60
@@ -14606,8 +14796,11 @@ def _ensure_ldap_flow_authentication_none():
     except Exception as e:
         return False, str(e)[:120]
     # LDAP outpost caches flow results — force-recreate required after flow/binding changes
-    subprocess.run(f'cd {ak_dir} && docker compose up -d --force-recreate ldap 2>&1',
-        shell=True, capture_output=True, timeout=60)
+    if is_remote:
+        _module_run(ak_cfg, 'cd ~/authentik && docker compose up -d --force-recreate ldap 2>&1', timeout=90)
+    else:
+        subprocess.run('cd ~/authentik && docker compose up -d --force-recreate ldap 2>&1',
+            shell=True, capture_output=True, timeout=60)
     time.sleep(5)
     return True, None
 
@@ -14619,21 +14812,12 @@ def _ensure_authentik_ldap_service_account():
         return False, f'LDAP flow fix failed: {err}'
     import urllib.request as _req
     import urllib.error
-    env_path = os.path.expanduser('~/authentik/.env')
-    if not os.path.exists(env_path):
-        return False, 'Authentik .env not found'
-    ak_token = ''
-    ldap_pass = ''
-    with open(env_path) as f:
-        for line in f:
-            L = line.strip()
-            if L.startswith('AUTHENTIK_BOOTSTRAP_TOKEN='):
-                ak_token = L.split('=', 1)[1].strip()
-            elif L.startswith('AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD='):
-                ldap_pass = L.split('=', 1)[1].strip()
+    settings = load_settings()
+    ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
+    ldap_pass = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')
     if not ak_token or not ldap_pass:
-        return False, 'Authentik token or LDAP password not in .env'
-    url = 'http://127.0.0.1:9090'
+        return False, 'Authentik .env not found'
+    url = _get_authentik_api_url(settings)
     headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
     try:
         # 1. Find or create the service account
@@ -14680,8 +14864,12 @@ def _ensure_authentik_ldap_service_account():
         else:
             return False, 'authentik Admins group not found'
         # 5. Force-recreate the LDAP outpost so it picks up the new credentials
-        subprocess.run('cd ~/authentik && docker compose up -d --force-recreate ldap 2>/dev/null',
-            shell=True, capture_output=True, timeout=60)
+        ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+        if ak_cfg.get('target_mode') == 'remote' and (ak_cfg.get('remote', {}).get('host') or '').strip():
+            _module_run(ak_cfg, 'cd ~/authentik && docker compose up -d --force-recreate ldap 2>/dev/null', timeout=90)
+        else:
+            subprocess.run('cd ~/authentik && docker compose up -d --force-recreate ldap 2>/dev/null',
+                shell=True, capture_output=True, timeout=60)
         # 6. Ensure ldapsearch is available (install ldap-utils / openldap-clients if missing)
         _ensure_ldapsearch()
         # 7. Wait for LDAP outpost to be ready, then VERIFY via outpost logs (ldapsearch exit code is unreliable)
@@ -14706,19 +14894,12 @@ def _ensure_authentik_ldap_service_account():
 def _apply_ldap_to_coreconfig():
     """Patch CoreConfig.xml with LDAP auth and restart TAK Server. Returns (success, message)."""
     coreconfig_path = '/opt/tak/CoreConfig.xml'
-    env_path = os.path.expanduser('~/authentik/.env')
+    settings = load_settings()
+    ldap_pass = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')
     if not os.path.exists(coreconfig_path):
         return False, 'CoreConfig.xml not found'
-    if not os.path.exists(env_path):
-        return False, 'Authentik .env not found'
-    ldap_pass = ''
-    with open(env_path) as f:
-        for line in f:
-            if line.strip().startswith('AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD='):
-                ldap_pass = line.strip().split('=', 1)[1].strip()
-                break
     if not ldap_pass:
-        return False, 'LDAP service password not found in Authentik .env'
+        return False, 'Authentik .env not found'
     # Read current CoreConfig
     with open(coreconfig_path, 'r') as f:
         original = f.read()
@@ -14844,20 +15025,12 @@ def _ensure_authentik_webadmin():
     import urllib.error
     if not os.path.exists('/opt/tak'):
         return True, None
-    env_path = os.path.expanduser('~/authentik/.env')
-    if not os.path.exists(env_path):
-        return False, 'Authentik .env not found'
-    ak_token = ''
-    with open(env_path) as f:
-        for line in f:
-            if line.strip().startswith('AUTHENTIK_BOOTSTRAP_TOKEN='):
-                ak_token = line.strip().split('=', 1)[1].strip()
-                break
-    if not ak_token:
-        return False, 'Authentik token not in .env'
     settings = load_settings()
+    ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
+    if not ak_token:
+        return False, 'Authentik .env not found'
     webadmin_pass = settings.get('webadmin_password', '') or 'TakserverAtak1!'
-    url = 'http://127.0.0.1:9090'
+    url = _get_authentik_api_url(settings)
     headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
     try:
         # Ensure tak_ROLE_ADMIN exists (for webadmin only; all other group membership is controlled in TAK Portal)
@@ -14912,8 +15085,10 @@ def _ensure_authentik_webadmin():
                     data=json.dumps({'pk': webadmin_pk}).encode(), headers=headers, method='POST')
                 _req.urlopen(req, timeout=10)
         # Restart LDAP outpost to clear bind cache (password change would otherwise be ignored until cache expires)
-        ak_dir = os.path.expanduser('~/authentik')
-        if os.path.exists(os.path.join(ak_dir, 'docker-compose.yml')):
+        ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+        if ak_cfg.get('target_mode') == 'remote' and (ak_cfg.get('remote', {}).get('host') or '').strip():
+            _module_run(ak_cfg, 'cd ~/authentik && docker compose up -d --force-recreate ldap 2>/dev/null', timeout=90)
+        elif os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
             subprocess.run('cd ~/authentik && docker compose up -d --force-recreate ldap 2>/dev/null',
                 shell=True, capture_output=True, timeout=90)
         return True, None
@@ -14932,7 +15107,8 @@ def takserver_sync_webadmin():
     """Create or update webadmin user in Authentik with password from settings. Use when 8446 login fails (e.g. Authentik was deployed before TAK Server)."""
     if not os.path.exists('/opt/tak'):
         return jsonify({'success': False, 'message': 'TAK Server not installed'}), 400
-    if not os.path.exists(os.path.expanduser('~/authentik/.env')):
+    settings = load_settings()
+    if not _get_authentik_env_content(settings):
         return jsonify({'success': False, 'message': 'Authentik not installed'}), 400
     ok, err = _ensure_authentik_webadmin()
     if ok:
@@ -14945,20 +15121,12 @@ def _get_authentik_webadmin_status():
     import urllib.request as _req
     import urllib.error
 
-    env_path = os.path.expanduser('~/authentik/.env')
-    if not os.path.exists(env_path):
+    settings = load_settings()
+    ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
+    if not ak_token:
         return {'available': False, 'exists': False, 'is_superuser': False, 'error': 'Authentik not installed'}
 
-    ak_token = ''
-    with open(env_path) as f:
-        for line in f:
-            if line.strip().startswith('AUTHENTIK_BOOTSTRAP_TOKEN='):
-                ak_token = line.strip().split('=', 1)[1].strip()
-                break
-    if not ak_token:
-        return {'available': False, 'exists': False, 'is_superuser': False, 'error': 'Authentik token not found'}
-
-    url = 'http://127.0.0.1:9090'
+    url = _get_authentik_api_url(settings)
     headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
     try:
         req = _req.Request(f'{url}/api/v3/core/users/?search=webadmin', headers=headers)
@@ -15052,15 +15220,11 @@ def takserver_connect_ldap():
         diag.append('Flow: OK')
     # Ensure LDAP app has no restrictive policy (blocks QR registration for non-admin users)
     try:
-        env_path = os.path.expanduser('~/authentik/.env')
-        ak_token = ''
-        with open(env_path) as f:
-            for line in f:
-                if line.strip().startswith('AUTHENTIK_BOOTSTRAP_TOKEN='):
-                    ak_token = line.strip().split('=', 1)[1].strip()
-                    break
+        settings = load_settings()
+        ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
         if ak_token:
-            _ensure_app_access_policies('http://127.0.0.1:9090', {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}, lambda m: diag.append(m.strip()))
+            ak_url = _get_authentik_api_url(settings)
+            _ensure_app_access_policies(ak_url, {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}, lambda m: diag.append(m.strip()))
             diag.append('App policies: LDAP open to all authenticated users')
     except Exception as e:
         diag.append(f'App policies: {str(e)[:60]}')
@@ -15084,13 +15248,8 @@ def takserver_connect_ldap():
     diag.append(f'CoreConfig: {msg}')
     # Diagnostic: compare passwords and check outpost health
     try:
-        env_path = os.path.expanduser('~/authentik/.env')
-        ldap_pass = ''
-        with open(env_path) as f:
-            for line in f:
-                if line.strip().startswith('AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD='):
-                    ldap_pass = line.strip().split('=', 1)[1].strip()
-                    break
+        settings = load_settings()
+        ldap_pass = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')
         import re as _re
         cc_pass = ''
         if os.path.exists('/opt/tak/CoreConfig.xml'):
@@ -15101,13 +15260,21 @@ def takserver_connect_ldap():
             diag.append(f'Password match: {"YES" if ldap_pass == cc_pass else "NO (MISMATCH!)"}')
         elif not cc_pass:
             diag.append('Password: not in CoreConfig')
-        r = subprocess.run('docker ps --filter name=authentik-ldap --format "{{.Status}}" 2>/dev/null',
-            shell=True, capture_output=True, text=True, timeout=10)
-        ldap_status = (r.stdout or '').strip()
-        diag.append(f'LDAP outpost: {ldap_status or "not running"}')
-        r = subprocess.run('docker logs authentik-ldap-1 --since 30s 2>&1 | tail -5',
-            shell=True, capture_output=True, text=True, timeout=10)
-        outpost_tail = (r.stdout or '').strip()
+        ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+        if ak_cfg.get('target_mode') == 'remote' and (ak_cfg.get('remote', {}).get('host') or '').strip():
+            ok_ssh, out = _ssh_probe(ak_cfg['remote'], 'docker ps --filter name=authentik-ldap --format "{{.Status}}" 2>/dev/null', timeout=10)
+            ldap_status = (out or '').strip()
+            diag.append(f'LDAP outpost: {ldap_status or "not running"}')
+            ok_ssh2, out2 = _ssh_probe(ak_cfg['remote'], 'docker logs authentik-ldap-1 --since 30s 2>&1 | tail -5', timeout=15)
+            outpost_tail = (out2 or '').strip()
+        else:
+            r = subprocess.run('docker ps --filter name=authentik-ldap --format "{{.Status}}" 2>/dev/null',
+                shell=True, capture_output=True, text=True, timeout=10)
+            ldap_status = (r.stdout or '').strip()
+            diag.append(f'LDAP outpost: {ldap_status or "not running"}')
+            r = subprocess.run('docker logs authentik-ldap-1 --since 30s 2>&1 | tail -5',
+                shell=True, capture_output=True, text=True, timeout=10)
+            outpost_tail = (r.stdout or '').strip()
         if outpost_tail:
             diag.append(f'Outpost log: {outpost_tail[:200]}')
     except Exception as e:
@@ -15122,11 +15289,22 @@ def takserver_ldap_drift_check():
 
     Returns {match: bool, detail: str} so the frontend can warn on drift.
     """
+    settings = load_settings()
     coreconfig = '/opt/tak/CoreConfig.xml'
-    env_candidates = [
-        os.path.expanduser('~/authentik/.env'),
-        os.path.expanduser('~/tak-portal/.env'),
-    ]
+    env_pass = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')
+    env_src = 'authentik'
+    if env_pass is None:
+        portal_env = os.path.expanduser('~/tak-portal/.env')
+        if os.path.isfile(portal_env):
+            try:
+                with open(portal_env) as f:
+                    for line in f:
+                        if line.strip().startswith('AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD='):
+                            env_pass = line.strip().split('=', 1)[1].strip()
+                            env_src = portal_env
+                            break
+            except Exception:
+                pass
     if not os.path.exists(coreconfig):
         return jsonify({'match': True, 'detail': 'no_coreconfig'})
     try:
@@ -15141,23 +15319,6 @@ def takserver_ldap_drift_check():
     if not m:
         return jsonify({'match': True, 'detail': 'no_credential_attr'})
     cc_pass = m.group(1)
-
-    env_pass = None
-    env_src = None
-    for env_path in env_candidates:
-        if not os.path.exists(env_path):
-            continue
-        try:
-            with open(env_path, 'r') as f:
-                for line in f:
-                    if line.strip().startswith('AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD='):
-                        env_pass = line.strip().split('=', 1)[1].strip()
-                        env_src = env_path
-                        break
-        except Exception:
-            continue
-        if env_pass is not None:
-            break
 
     if env_pass is None:
         return jsonify({'match': True, 'detail': 'no_env_password_found'})
