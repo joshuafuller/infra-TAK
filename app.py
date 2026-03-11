@@ -423,22 +423,71 @@ def _get_remote_host_metrics(remote_cfg):
     """Return get_system_metrics()-style dict for a remote host via SSH, or None on failure."""
     if not remote_cfg or not (remote_cfg.get('host') or '').strip():
         return None
-    # One Python one-liner that works on Ubuntu (no psutil): read /proc, statvfs, uptime
-    script = (
-        "python3 -c \""
-        "import json,os,time;"
-        "r=open('/proc/meminfo').read();d=dict(l.split(None,1) for l in r.split('\\n') if ':' in l);"
-        "t=int(d.get('MemTotal:','0').split()[0])*1024;a=int(d.get('MemAvailable:','0').split()[0])*1024;u=t-a;"
-        "mem_pct=round(100*u/t,1) if t else 0;"
-        "secs=float(open('/proc/uptime').read().split()[0]);d=int(secs//86400);h=int((secs%86400)//3600);m=int((secs%3600)//60);"
-        "uptime=f'{d}d {h}h {m}m';"
-        "s=os.statvfs('/');dt=s.f_blocks*s.f_frsize;du=dt-s.f_bavail*s.f_frsize;disk_pct=round(100*du/dt,1) if dt else 0;"
-        "def r1():f=open('/proc/stat');l=f.readline().split();f.close();return sum(int(x) for x in l[1:5]),int(l[4]);"
-        "t1,i1=r1();time.sleep(1);t2,i2=r1();cpu_pct=round((1-(i2-i1)/(t2-t1))*100,1) if (t2-t1) else 0;"
-        "print(json.dumps({'cpu_percent':cpu_pct,'ram_percent':mem_pct,'ram_used_gb':round(u/1e9,1),'ram_total_gb':round(t/1e9,1),"
-        "'disk_percent':disk_pct,'disk_used_gb':round(du/1e9,1),'disk_total_gb':round(dt/1e9,1),'uptime':uptime}))\""
-    )
-    ok, out = _ssh_probe(remote_cfg, script, timeout=15)
+    # Run a script on remote (avoids SSH quoting issues with inline Python)
+    script_content = '''import json, os, time
+try:
+    with open("/proc/meminfo") as f:
+        d = dict(l.split(None, 1) for l in f if ":" in l)
+    t = int(d.get("MemTotal:", "0").split()[0]) * 1024
+    a = int((d.get("MemAvailable:") or d.get("MemFree:", "0")).split()[0]) * 1024
+    u = t - a
+    mem_pct = round(100 * u / t, 1) if t else 0
+except Exception:
+    mem_pct, u, t = 0, 0, 0
+try:
+    secs = float(open("/proc/uptime").read().split()[0])
+    dd, hh, mm = int(secs // 86400), int((secs % 86400) // 3600), int((secs % 3600) // 60)
+    uptime = f"{dd}d {hh}h {mm}m"
+except Exception:
+    uptime = "-"
+try:
+    s = os.statvfs("/")
+    dt = s.f_blocks * s.f_frsize
+    du = dt - s.f_bavail * s.f_frsize
+    disk_pct = round(100 * du / dt, 1) if dt else 0
+except Exception:
+    disk_pct, du, dt = 0, 0, 0
+try:
+    def r1():
+        with open("/proc/stat") as f:
+            l = f.readline().split()
+        total = sum(int(x) for x in l[1:5])
+        idle = int(l[4])
+        return total, idle
+    t1, i1 = r1()
+    time.sleep(1)
+    t2, i2 = r1()
+    cpu_pct = round((1 - (i2 - i1) / (t2 - t1)) * 100, 1) if (t2 - t1) else 0
+except Exception:
+    cpu_pct = 0
+out = {
+    "cpu_percent": cpu_pct,
+    "ram_percent": mem_pct,
+    "ram_used_gb": round(u / 1e9, 1),
+    "ram_total_gb": round(t / 1e9, 1),
+    "disk_percent": disk_pct,
+    "disk_used_gb": round(du / 1e9, 1),
+    "disk_total_gb": round(dt / 1e9, 1),
+    "uptime": uptime,
+}
+print(json.dumps(out))
+'''
+    tmp_path = '/tmp/infra_tak_remote_metrics.py'
+    try:
+        with open(tmp_path, 'w') as f:
+            f.write(script_content)
+        deploy_cfg = {'target_mode': 'remote', 'remote': remote_cfg}
+        ok_copy = _module_copy(deploy_cfg, tmp_path, tmp_path, timeout=15)
+        if not ok_copy:
+            return None
+        ok, out = _ssh_probe(remote_cfg, f'python3 {tmp_path} 2>/dev/null; rm -f {tmp_path}', timeout=20)
+    except Exception:
+        return None
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
     if not ok or not out:
         return None
     try:
@@ -11764,12 +11813,10 @@ def authentik_container_logs():
 @app.route('/api/authentik/password')
 @login_required
 def authentik_password():
-    env_path = os.path.expanduser('~/authentik/.env')
-    if os.path.exists(env_path):
-        with open(env_path) as f:
-            for line in f:
-                if line.strip().startswith('AUTHENTIK_BOOTSTRAP_PASSWORD='):
-                    return jsonify({'password': line.strip().split('=', 1)[1].strip()})
+    settings = load_settings()
+    password = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_PASSWORD')
+    if password:
+        return jsonify({'password': password})
     return jsonify({'error': 'Password not found'}), 404
 
 @app.route('/api/authentik/error-log')
