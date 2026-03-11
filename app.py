@@ -9409,10 +9409,13 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 .modal h3{font-size:16px;font-weight:700;margin-bottom:8px;color:var(--red)}
 .modal p{font-size:13px;color:var(--text-secondary);margin-bottom:20px}
 .modal-actions{display:flex;gap:10px;justify-content:flex-end}
-.form-group{margin-bottom:0}
+.section-title{font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;color:var(--text-dim);letter-spacing:2px;text-transform:uppercase;margin-bottom:16px;margin-top:24px}
+.form-group{margin-bottom:16px}
 .form-label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em}
 .form-input{width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px;color:var(--text-primary);font-size:13px;font-family:'DM Sans',sans-serif;outline:none;transition:border-color .15s}
 .form-input:focus{border-color:var(--accent)}
+.form-hint{font-size:11px;color:var(--text-dim);margin-top:4px}
+.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
 .proto-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:4px}
 .proto-item{background:#0a0e1a;border-radius:8px;padding:10px 12px;text-align:center}
 .proto-name{font-size:11px;font-weight:700;color:var(--cyan);margin-bottom:2px}
@@ -9472,13 +9475,13 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 
   {% else %}
   <!-- Deployment Target -->
-  <div class="card" style="margin-bottom:20px">
-    <div style="display:flex;align-items:center;justify-content:space-between;padding:0 0 12px 0;cursor:pointer" onclick="mediamtxToggleSection('mediamtx-target')">
-      <span class="card-title" style="margin-bottom:0">Deployment Target</span>
+  <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:24px">
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:16px 24px;cursor:pointer" onclick="mediamtxToggleSection('mediamtx-target')">
+      <span class="section-title" style="margin-bottom:0">Deployment Target</span>
       <span id="mediamtx-target-toggle-icon" style="font-size:18px;color:var(--text-dim);transition:transform 0.2s ease;transform:rotate(180deg)">&#9662;</span>
     </div>
-    <div id="mediamtx-target-body" style="display:block;padding-top:12px;border-top:1px solid var(--border)">
-      <div class="form-group" style="margin-bottom:12px">
+    <div id="mediamtx-target-body" style="display:block;padding:0 24px 24px 24px;border-top:1px solid var(--border)">
+      <div class="form-group">
         <label class="form-label">Where should MediaMTX run?</label>
         <select id="mediamtx-target-mode" class="form-input">
           <option value="local" {% if mediamtx_deploy_cfg.target_mode != 'remote' %}selected{% endif %}>On this infra-TAK host</option>
@@ -9486,43 +9489,43 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
         </select>
       </div>
       <div id="mediamtx-remote-fields" style="display:{% if mediamtx_deploy_cfg.target_mode == 'remote' %}block{% else %}none{% endif %}">
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px">
-          <div class="form-group" style="margin-bottom:0">
+        <div class="grid-2">
+          <div class="form-group">
             <label class="form-label">Remote Host/IP</label>
             <input id="mediamtx-remote-host" class="form-input" type="text" placeholder="10.0.0.15" value="{{ mediamtx_deploy_cfg.remote.host or '' }}">
           </div>
-          <div class="form-group" style="margin-bottom:0">
+          <div class="form-group">
             <label class="form-label">SSH Port</label>
             <input id="mediamtx-remote-port" class="form-input" type="number" min="1" max="65535" value="{{ mediamtx_deploy_cfg.remote.port or 22 }}">
           </div>
         </div>
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px">
-          <div class="form-group" style="margin-bottom:0">
+        <div class="grid-2">
+          <div class="form-group">
             <label class="form-label">SSH Username</label>
             <input id="mediamtx-remote-user" class="form-input" type="text" placeholder="root" value="{{ mediamtx_deploy_cfg.remote.username or 'root' }}">
           </div>
-          <div class="form-group" style="margin-bottom:0">
+          <div class="form-group">
             <label class="form-label">SSH Key Path</label>
             <input id="mediamtx-remote-key" class="form-input" type="text" placeholder="~/.ssh/infra-tak-mediamtx" value="{{ mediamtx_deploy_cfg.remote.ssh_key_path or '' }}">
           </div>
         </div>
-        <div class="form-group" style="margin-bottom:12px">
+        <div class="form-group">
           <label class="form-label">One-time remote password (for key copy only)</label>
           <input id="mediamtx-remote-password" class="form-input" type="password" placeholder="Used only for Install SSH Key">
-          <div style="font-size:11px;color:var(--text-dim);margin-top:4px">Password is never stored. Used only for <code>ssh-copy-id</code>.</div>
+          <div class="form-hint">Password is never stored. It is used only for one-time <code>ssh-copy-id</code>.</div>
         </div>
-        <div class="controls" style="margin-bottom:8px">
+        <div class="controls" style="margin-top:8px">
           <button class="btn btn-ghost" type="button" onclick="ensureMediamtxSshKey()">Generate SSH key</button>
           <button class="btn btn-ghost" type="button" onclick="installMediamtxSshKey()">Install SSH key</button>
           <button class="btn btn-ghost" type="button" onclick="testMediamtxRemoteSsh()">Test SSH</button>
         </div>
-        <div id="mediamtx-ssh-status" style="margin-bottom:12px;font-size:12px;color:var(--text-dim)"></div>
-        <div class="form-group" style="margin-bottom:0">
+        <div id="mediamtx-ssh-status" style="margin-top:8px;font-size:12px;color:var(--text-dim)"></div>
+        <div class="form-group" style="margin-top:12px">
           <label class="form-label">Public key (manual copy fallback)</label>
-          <textarea id="mediamtx-public-key" class="form-input" rows="3" readonly placeholder="Click Generate SSH key to show"></textarea>
+          <textarea id="mediamtx-public-key" class="form-input" rows="3" readonly placeholder="Click 'Generate SSH key' to show public key"></textarea>
         </div>
       </div>
-      <div class="controls" style="margin-top:12px">
+      <div class="controls" style="margin-top:10px">
         <button class="btn btn-ghost" type="button" onclick="saveMediamtxTarget()">Save target settings</button>
         <span id="mediamtx-target-save-msg" style="font-size:12px;color:var(--text-dim)"></span>
       </div>
@@ -13461,8 +13464,20 @@ AUTHENTIK_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-
 .cert-btn{padding:10px 20px;border-radius:8px;text-decoration:none;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;transition:all 0.2s}
 .cert-btn-primary{background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff}
 .cert-btn-secondary{background:rgba(59,130,246,0.1);color:var(--accent);border:1px solid var(--border)}
-.deploy-btn{padding:14px 32px;border:none;border-radius:10px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;font-family:'JetBrains Mono',monospace;font-size:15px;font-weight:700;cursor:pointer;transition:all 0.2s;display:block;margin:24px auto}
-.deploy-btn:hover{transform:translateY(-1px);box-shadow:0 4px 24px rgba(59,130,246,0.25)}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:20px}
+.card-title{font-size:13px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:16px}
+.form-group{margin-bottom:16px}
+.form-label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em}
+.form-input{width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px;color:var(--text-primary);font-size:13px;font-family:'DM Sans',sans-serif;transition:border-color .15s;outline:none}
+.form-input:focus{border-color:var(--accent)}
+.form-hint{font-size:11px;color:var(--text-dim);margin-top:4px}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:10px 20px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:none;transition:all .15s}
+.btn-primary{background:var(--accent);color:#fff}.btn-primary:hover{background:#2563eb}
+.btn-danger{background:var(--red);color:#fff}.btn-danger:hover{background:#dc2626}
+.btn-ghost{background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border)}.btn-ghost:hover{color:var(--text-primary);border-color:var(--border-hover)}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.log-box{background:#070a12;border:1px solid var(--border);border-radius:8px;padding:16px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:340px;overflow-y:auto;line-height:1.7;white-space:pre-wrap}
 .deploy-log{background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:400px;overflow-y:auto;line-height:1.6;white-space:pre-wrap;margin-top:16px}
 .svc-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;margin-top:8px}
 .svc-card{background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:12px;font-family:'JetBrains Mono',monospace;font-size:12px}
@@ -13591,71 +13606,81 @@ It provides centralized user authentication and management for all your services
 </div>
 
 <!-- Deployment Target -->
-<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
-  <div style="display:flex;align-items:center;justify-content:space-between;cursor:pointer" onclick="authentikToggleSection('authentik-target')">
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:24px">
+  <div style="display:flex;align-items:center;justify-content:space-between;padding:16px 24px;cursor:pointer" onclick="authentikToggleSection('authentik-target')">
     <span class="section-title" style="margin-bottom:0">Deployment Target</span>
-    <span id="authentik-target-toggle-icon" style="font-size:18px;color:var(--text-dim);transition:transform 0.2s ease">&#9662;</span>
+    <span id="authentik-target-toggle-icon" style="font-size:18px;color:var(--text-dim);transition:transform 0.2s ease;transform:rotate(180deg)">&#9662;</span>
   </div>
-  <div id="authentik-target-body" style="display:none;padding-top:12px;border-top:1px solid var(--border);margin-top:12px">
-    <div class="form-group" style="margin-bottom:12px">
+  <div id="authentik-target-body" style="display:block;padding:0 24px 24px 24px;border-top:1px solid var(--border)">
+    <div class="form-group">
       <label class="form-label">Where should Authentik run?</label>
-      <select id="authentik-target-mode" class="form-input" style="max-width:340px">
+      <select id="authentik-target-mode" class="form-input">
         <option value="local" {% if authentik_deploy_cfg.target_mode != 'remote' %}selected{% endif %}>On this infra-TAK host</option>
         <option value="remote" {% if authentik_deploy_cfg.target_mode == 'remote' %}selected{% endif %}>On a remote host (SSH)</option>
       </select>
     </div>
     <div id="authentik-remote-fields" style="display:{% if authentik_deploy_cfg.target_mode == 'remote' %}block{% else %}none{% endif %}">
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px">
-        <div class="form-group" style="margin-bottom:0">
+      <div class="grid-2">
+        <div class="form-group">
           <label class="form-label">Remote Host/IP</label>
           <input id="authentik-remote-host" class="form-input" type="text" placeholder="10.0.0.15" value="{{ authentik_deploy_cfg.remote.host or '' }}">
         </div>
-        <div class="form-group" style="margin-bottom:0">
+        <div class="form-group">
           <label class="form-label">SSH Port</label>
           <input id="authentik-remote-port" class="form-input" type="number" min="1" max="65535" value="{{ authentik_deploy_cfg.remote.port or 22 }}">
         </div>
       </div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px">
-        <div class="form-group" style="margin-bottom:0">
+      <div class="grid-2">
+        <div class="form-group">
           <label class="form-label">SSH Username</label>
           <input id="authentik-remote-user" class="form-input" type="text" placeholder="root" value="{{ authentik_deploy_cfg.remote.username or 'root' }}">
         </div>
-        <div class="form-group" style="margin-bottom:0">
+        <div class="form-group">
           <label class="form-label">SSH Key Path</label>
           <input id="authentik-remote-key" class="form-input" type="text" placeholder="~/.ssh/infra-tak-authentik" value="{{ authentik_deploy_cfg.remote.ssh_key_path or '' }}">
         </div>
       </div>
-      <div class="form-group" style="margin-bottom:12px">
+      <div class="form-group">
         <label class="form-label">One-time remote password (for key copy only)</label>
         <input id="authentik-remote-password" class="form-input" type="password" placeholder="Used only for Install SSH Key">
-        <div style="font-size:11px;color:var(--text-dim);margin-top:4px">Password is never stored. Used only for <code>ssh-copy-id</code>.</div>
+        <div class="form-hint">Password is never stored. It is used only for one-time <code>ssh-copy-id</code>.</div>
       </div>
-      <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:8px">
+      <div class="controls" style="margin-top:8px">
         <button class="btn btn-ghost" type="button" onclick="ensureAuthentikSshKey()">Generate SSH key</button>
         <button class="btn btn-ghost" type="button" onclick="installAuthentikSshKey()">Install SSH key</button>
         <button class="btn btn-ghost" type="button" onclick="testAuthentikRemoteSsh()">Test SSH</button>
       </div>
-      <div id="authentik-ssh-status" style="margin-bottom:12px;font-size:12px;color:var(--text-dim)"></div>
-      <div class="form-group" style="margin-bottom:0">
+      <div id="authentik-ssh-status" style="margin-top:8px;font-size:12px;color:var(--text-dim)"></div>
+      <div class="form-group" style="margin-top:12px">
         <label class="form-label">Public key (manual copy fallback)</label>
-        <textarea id="authentik-public-key" class="form-input" rows="3" readonly placeholder="Click Generate SSH key to show"></textarea>
+        <textarea id="authentik-public-key" class="form-input" rows="3" readonly placeholder="Click 'Generate SSH key' to show public key"></textarea>
       </div>
     </div>
-    <div style="display:flex;gap:10px;align-items:center;margin-top:12px">
+    <div class="controls" style="margin-top:10px">
       <button class="btn btn-ghost" type="button" onclick="saveAuthentikTarget()">Save target settings</button>
       <span id="authentik-target-save-msg" style="font-size:12px;color:var(--text-dim)"></span>
     </div>
   </div>
 </div>
 
-<button class="deploy-btn" id="deploy-btn" onclick="deployAk()">🚀 Deploy Authentik</button>
-{% if not settings.fqdn %}
-<div style="background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.25);border-radius:10px;padding:16px 20px;margin-top:16px;font-size:13px;color:#f87171">
-  🔒 <strong>SSL Required</strong> — Authentik requires a domain with SSL configured.<br>
-  <span style="color:var(--text-dim)">Go to <a href="/caddy" style="color:var(--cyan)">Caddy SSL</a> and configure your domain first.</span>
+<div class="card">
+  <div class="card-title">Deploy Authentik</div>
+  <p style="font-size:13px;color:var(--text-secondary);margin-bottom:20px">
+    Deploys Authentik identity provider with PostgreSQL, Redis, Server, Worker, and LDAP outpost.
+    Provides centralized authentication and user management for all TAK services.
+  </p>
+  <button class="btn btn-primary" id="deploy-btn" onclick="deployAk()">🚀 Deploy Authentik</button>
+  {% if not settings.fqdn %}
+  <div style="background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.25);border-radius:10px;padding:16px 20px;margin-top:16px;font-size:13px;color:#f87171">
+    🔒 <strong>SSL Required</strong> — Authentik requires a domain with SSL configured.<br>
+    <span style="color:var(--text-dim)">Go to <a href="/caddy" style="color:var(--cyan)">Caddy SSL</a> and configure your domain first.</span>
+  </div>
+  {% endif %}
 </div>
-{% endif %}
-<div class="deploy-log" id="deploy-log" style="display:none" data-authentik-url="{{ authentik_base_url }}">Waiting for deployment to start...</div>
+<div class="card" id="ak-log-card" style="display:none">
+  <div class="card-title">Deploy Log</div>
+  <div class="deploy-log" id="deploy-log" data-authentik-url="{{ authentik_base_url }}">Waiting for deployment to start...</div>
+</div>
 {% endif %}
 
 {% if deploy_done %}
@@ -13683,8 +13708,8 @@ You can also open the Authentik admin UI below to make additional Admin users (A
 <label class="form-label">Admin Password</label>
 <input class="form-input" id="ak-uninstall-password" type="password" placeholder="Confirm your password">
 <div class="modal-actions">
-<button type="button" class="control-btn" id="ak-uninstall-cancel" onclick="document.getElementById('ak-uninstall-modal').classList.remove('open')">Cancel</button>
-<button type="button" class="control-btn btn-remove" id="ak-uninstall-confirm" onclick="doUninstallAk()">Uninstall</button>
+<button type="button" class="btn btn-ghost" id="ak-uninstall-cancel" onclick="document.getElementById('ak-uninstall-modal').classList.remove('open')">Cancel</button>
+<button type="button" class="btn btn-danger" id="ak-uninstall-confirm" onclick="doUninstallAk()">Uninstall</button>
 </div>
 <div id="ak-uninstall-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
 <div id="ak-uninstall-progress" class="uninstall-progress-row" style="display:none;margin-top:10px" aria-live="polite"></div>
@@ -13718,7 +13743,7 @@ async function akControl(action){
 async function deployAk(){
     var btn=document.getElementById('deploy-btn');
     btn.disabled=true;btn.textContent='Deploying...';btn.style.opacity='0.7';btn.style.cursor='wait';
-    document.getElementById('deploy-log').style.display='block';
+    var logCard=document.getElementById('ak-log-card');if(logCard)logCard.style.display='block';
     var config=typeof collectAuthentikDeployConfig==='function'?collectAuthentikDeployConfig():{};
     try{
         var r=await fetch('/api/authentik/deploy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:config})});
