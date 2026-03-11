@@ -1490,7 +1490,7 @@ def guarddog_page():
     if is_two_server and s1_host:
         guarddog_services.append({'id': 'remotedb', 'name': f'Remote Database ({s1_host})', 'monitored': gd.get('installed'), 'monitors': [
             {'name': 'TCP + SSH', 'id': 'remotedb_tcp', 'interval': '2 min', 'desc': f'Checks port 5432 on {s1_host} is reachable and PostgreSQL cluster is up. Auto-restarts PG via SSH after 3 consecutive failures. Alerts on persistent failure.'},
-            {'name': 'Health Agent', 'id': 'remotedb_agent', 'interval': 'Always', 'desc': f'Lightweight health endpoint on {s1_host}:8080/health — checks PG ready, cot database, disk usage. Deployed automatically by Guard Dog.'},
+            {'name': 'Health Agent', 'id': 'remotedb_agent', 'interval': 'Always', 'desc': f'Lightweight health endpoint on {s1_host}:8080/health — checks PG ready, cot database, disk usage. If red, click "Deploy health agent to Server One" below.'},
         ]})
     guarddog_services.extend([
         {'id': 'authentik', 'name': 'Authentik', 'monitored': modules.get('authentik', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'id': 'authentik_http', 'interval': '1 min', 'desc': 'Checks Authentik HTTP (9090). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
@@ -1746,31 +1746,23 @@ def _guarddog_run_one_service(sid, monitor_ids):
 @app.route('/api/guarddog/health')
 @login_required
 def guarddog_health_api():
-    """Return health status per service: 'ok', 'fail', or 'caution'. Uses cache (25s) and parallel checks for fast page load."""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    settings = load_settings()
-    now = time.time()
-    if _guarddog_page_cache['health'] is not None and (now - _guarddog_page_cache['health_ts']) < _GD_PAGE_CACHE_TTL:
-        from flask import make_response
+    """Return health status per service. Always return cache when present so page shows colors in ~1s; background thread keeps cache warm."""
+    from flask import make_response
+    # Start background refresh on first request so cache is kept warm
+    global _guarddog_background_started
+    if not _guarddog_background_started:
+        with _guarddog_background_lock:
+            if not _guarddog_background_started:
+                _guarddog_background_started = True
+                threading.Thread(target=_guarddog_background_loop, daemon=True).start()
+    # Return cache immediately when we have it (even if slightly stale)
+    if _guarddog_page_cache['health'] is not None:
         r = make_response(jsonify(_guarddog_page_cache['health']))
         r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
         return r
-    multi = _guarddog_service_monitor_ids(settings)
-    service_ids = _guarddog_monitored_service_ids(settings)
-    result = {}
-    with ThreadPoolExecutor(max_workers=min(16, len(service_ids) * 3)) as ex:
-        futures = {ex.submit(_guarddog_run_one_service, sid, multi.get(sid)): sid for sid in service_ids}
-        for fut in as_completed(futures):
-            try:
-                sid, status = fut.result()
-                if status is not None:
-                    result[sid] = status
-            except Exception:
-                pass
-    _guarddog_page_cache['health'] = result
-    _guarddog_page_cache['health_ts'] = time.time()
-    from flask import make_response
-    r = make_response(jsonify(result))
+    # Cold load: populate cache once then return
+    _guarddog_refresh_page_cache()
+    r = make_response(jsonify(_guarddog_page_cache['health'] or {}))
     r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
     return r
 
@@ -1794,6 +1786,61 @@ _guarddog_overall_cache = {'overall': 'ok', 'ts': 0}
 # Cache for Guard Dog page: service and monitor health so the monitors page shows status quickly (TTL 25s).
 _guarddog_page_cache = {'health': None, 'health_ts': 0, 'monitor_key': None, 'monitor_result': None, 'monitor_ts': 0}
 _GD_PAGE_CACHE_TTL = 25
+_guarddog_background_started = False
+_guarddog_background_lock = threading.Lock()
+
+
+def _guarddog_refresh_page_cache():
+    """Run health + monitor checks and update _guarddog_page_cache. Used by background thread and cold load."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    try:
+        settings = load_settings()
+        multi = _guarddog_service_monitor_ids(settings)
+        service_ids = _guarddog_monitored_service_ids(settings)
+        # Health
+        result = {}
+        with ThreadPoolExecutor(max_workers=min(16, len(service_ids) * 3)) as ex:
+            futures = {ex.submit(_guarddog_run_one_service, sid, multi.get(sid)): sid for sid in service_ids}
+            for fut in as_completed(futures):
+                try:
+                    sid, status = fut.result()
+                    if status is not None:
+                        result[sid] = status
+                except Exception:
+                    pass
+        _guarddog_page_cache['health'] = result
+        _guarddog_page_cache['health_ts'] = time.time()
+        # All monitor ids used by services
+        all_mids = []
+        for sid in service_ids:
+            all_mids.extend(multi.get(sid) or [])
+        all_mids = list(dict.fromkeys(all_mids))
+        if not all_mids:
+            return
+        mon_result = {}
+        with ThreadPoolExecutor(max_workers=min(16, len(all_mids) or 1)) as ex:
+            futures = {ex.submit(_monitor_health_check, mid): mid for mid in all_mids}
+            for fut in as_completed(futures):
+                mid = futures[fut]
+                try:
+                    val = fut.result()
+                    if val is not None:
+                        mon_result[mid] = val
+                except Exception:
+                    pass
+        _guarddog_page_cache['monitor_key'] = tuple(sorted(all_mids))
+        _guarddog_page_cache['monitor_result'] = mon_result
+        _guarddog_page_cache['monitor_ts'] = time.time()
+    except Exception:
+        pass
+
+
+def _guarddog_background_loop():
+    """Daemon thread: refresh Guard Dog page cache every 25s so page load is instant."""
+    time.sleep(2)  # Let first request do cold load, then we keep cache warm
+    while True:
+        _guarddog_refresh_page_cache()
+        time.sleep(_GD_PAGE_CACHE_TTL)
 
 
 def _compute_guarddog_overall():
@@ -1912,19 +1959,12 @@ def _monitor_health_check(monitor_id):
             db_host = conf.get('db_host', '')
             if not db_host:
                 return None
-            url = f'http://{db_host}:8080/health'
-            for attempt in range(2):
-                try:
-                    req = urllib.request.Request(url, method='GET')
-                    resp = urllib.request.urlopen(req, timeout=10)
-                    if resp.status == 200:
-                        return True
-                except Exception:
-                    if attempt == 0:
-                        time.sleep(2)
-                    else:
-                        return False
-            return False
+            try:
+                req = urllib.request.Request(f'http://{db_host}:8080/health', method='GET')
+                resp = urllib.request.urlopen(req, timeout=4)
+                return resp.status == 200
+            except Exception:
+                return False
         if monitor_id == 'authentik_http':
             settings = load_settings()
             ak_url = _get_authentik_api_url(settings)
@@ -1957,30 +1997,19 @@ def _monitor_health_check(monitor_id):
 @app.route('/api/guarddog/monitor-health')
 @login_required
 def guarddog_monitor_health_api():
-    """Return health status per individual monitor (for sub-service dots in UI). Uses cache (25s) and parallel checks."""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    """Return health status per individual monitor. Return from cache when we have it (same as health API for fast load)."""
     monitor_ids = [m.strip() for m in request.args.get('ids', '').split(',') if m.strip()]
-    cache_key = tuple(sorted(monitor_ids))
-    now = time.time()
-    if (_guarddog_page_cache['monitor_key'] == cache_key and
-            _guarddog_page_cache['monitor_result'] is not None and
-            (now - _guarddog_page_cache['monitor_ts']) < _GD_PAGE_CACHE_TTL):
-        return jsonify(_guarddog_page_cache['monitor_result'])
-    result = {}
-    with ThreadPoolExecutor(max_workers=min(16, len(monitor_ids) or 1)) as ex:
-        futures = {ex.submit(_monitor_health_check, mid): mid for mid in monitor_ids}
-        for fut in as_completed(futures):
-            mid = futures[fut]
-            try:
-                val = fut.result()
-                if val is not None:
-                    result[mid] = val
-            except Exception:
-                pass
-    _guarddog_page_cache['monitor_key'] = cache_key
-    _guarddog_page_cache['monitor_result'] = result
-    _guarddog_page_cache['monitor_ts'] = time.time()
-    return jsonify(result)
+    cached = _guarddog_page_cache['monitor_result']
+    # If cache has all requested ids, return subset immediately
+    if cached and monitor_ids and all(mid in cached for mid in monitor_ids):
+        subset = {mid: cached[mid] for mid in monitor_ids}
+        return jsonify(subset)
+    # Cold or partial: ensure full cache then return subset
+    if not cached or not all(mid in cached for mid in monitor_ids):
+        _guarddog_refresh_page_cache()
+        cached = _guarddog_page_cache['monitor_result'] or {}
+    subset = {mid: cached[mid] for mid in monitor_ids if mid in cached}
+    return jsonify(subset)
 
 
 @app.route('/api/guarddog/activity-log')
