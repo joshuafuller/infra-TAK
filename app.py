@@ -8041,8 +8041,8 @@ services:
     return message
 
 
-def _wait_for_authentik_api(ak_url, ak_headers, max_attempts=90, plog=None):
-    """Poll until Authentik API responds. Returns True when ready (200 or 401/403), False on timeout."""
+def _wait_for_authentik_api(ak_url, ak_headers, max_attempts=90, plog=None, require_200=False):
+    """Poll until Authentik API responds. Returns True when ready. If require_200=True, only returns True on 200 (token valid)."""
     import urllib.request as _req
     import urllib.error
     _log = plog or (lambda msg: None)
@@ -8052,9 +8052,9 @@ def _wait_for_authentik_api(ak_url, ak_headers, max_attempts=90, plog=None):
             _req.urlopen(req, timeout=5)
             return True
         except urllib.error.HTTPError as e:
-            if e.code in (401, 403):
+            if not require_200 and e.code in (401, 403):
                 return True
-            if e.code == 503:
+            if e.code == 503 or (require_200 and e.code == 403):
                 pass
         except Exception:
             pass
@@ -11621,7 +11621,7 @@ def authentik_error_log():
 
 # Script run on remote host to fix LDAP outpost token (reads .env, calls localhost:9090, patches compose, restarts ldap)
 _AUTHENTIK_FIX_LDAP_REMOTE_SCRIPT = r'''
-import os, sys, json, urllib.request, subprocess
+import os, sys, json, urllib.request, urllib.error, subprocess, time
 os.chdir(os.path.expanduser("~/authentik"))
 token = None
 if os.path.isfile(".env"):
@@ -11638,12 +11638,30 @@ if not token:
     sys.exit(1)
 url = "http://localhost:9090"
 headers = {"Authorization": "Bearer " + token, "Content-Type": "application/json"}
-try:
-    req = urllib.request.Request(url + "/api/v3/outposts/instances/?search=LDAP", headers=headers)
-    with urllib.request.urlopen(req, timeout=15) as r:
-        results = json.loads(r.read().decode()).get("results", [])
-except Exception as e:
-    print("ERROR: API outposts: " + str(e), file=sys.stderr)
+results = None
+for attempt in range(24):
+    try:
+        req = urllib.request.Request(url + "/api/v3/outposts/instances/?search=LDAP", headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as r:
+            results = json.loads(r.read().decode()).get("results", [])
+        break
+    except urllib.error.HTTPError as e:
+        if e.code == 403:
+            if attempt < 23:
+                time.sleep(10)
+            else:
+                print("ERROR: API still 403 after retries (bootstrap token not valid yet)", file=sys.stderr)
+                sys.exit(2)
+        else:
+            print("ERROR: API outposts: " + str(e), file=sys.stderr)
+            sys.exit(2)
+    except Exception as e:
+        if attempt < 23:
+            time.sleep(10)
+        else:
+            print("ERROR: API outposts: " + str(e), file=sys.stderr)
+            sys.exit(2)
+if results is None:
     sys.exit(2)
 outpost = next((o for o in results if o.get("name") == "LDAP" and o.get("type") == "ldap"), None)
 if not outpost:
@@ -12210,30 +12228,63 @@ volumes:
     else:
         plog("⚠ Authentik not healthy after 5 minutes — may still be starting")
 
-    # Step 6b: Inject LDAP outpost token and recreate LDAP container (run on remote so API is called from localhost — avoids 403)
+    # Step 6b: Same process as local — wait for API, then inject LDAP token and recreate (local Step 8 + 9 wait + 11 token inject)
     plog("")
     plog("━━━ Step 6b/8: LDAP Outpost Token (remote) ━━━")
-    plog("  Waiting for blueprint to create LDAP outpost...")
+    ak_url_remote = f"http://{host}:9090"
+    ak_headers_remote = {'Authorization': f'Bearer {bootstrap_token}', 'Content-Type': 'application/json'}
+    plog("  Waiting for Authentik API (same as local Step 8)...")
+    api_ready = _wait_for_authentik_api(ak_url_remote, ak_headers_remote, max_attempts=90, plog=plog, require_200=True)
+    if api_ready:
+        plog("  ✓ Authentik API is ready")
+    else:
+        plog("  ⚠ API timeout — ensure port 9090 is reachable from this host")
+    plog("  Waiting for LDAP outpost (blueprint, same as local Step 9)...")
     time.sleep(15)
+    ldap_token_key = None
     try:
-        with open('/tmp/authentik_fix_ldap_token.py', 'w') as f:
-            f.write(_AUTHENTIK_FIX_LDAP_REMOTE_SCRIPT)
-        ok, _ = _module_copy(deploy_cfg, '/tmp/authentik_fix_ldap_token.py', '/tmp/fix_ldap_token.py')
-        if ok:
-            ok, out = _module_run(deploy_cfg, 'python3 /tmp/fix_ldap_token.py 2>&1; rm -f /tmp/fix_ldap_token.py', timeout=120, log_fn=plog)
-            if ok and 'OK' in (out or ''):
-                plog("  ✓ LDAP token injected and container recreated")
-            else:
-                plog(f"  ⚠ Script output: {(out or '').strip()[:300]}")
-        else:
-            plog("  ⚠ Could not copy script to remote")
-        try:
-            os.remove('/tmp/authentik_fix_ldap_token.py')
-        except Exception:
-            pass
+        req = urllib.request.Request(f'{ak_url_remote}/api/v3/outposts/instances/?search=LDAP', headers=ak_headers_remote)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            results = json.loads(resp.read().decode()).get('results', [])
+        ldap_outpost = next((o for o in results if o.get('name') == 'LDAP' and o.get('type') == 'ldap'), None)
+        if ldap_outpost:
+            outpost_token_id = ldap_outpost.get('token_identifier') or ldap_outpost.get('token')
+            if not outpost_token_id:
+                req = urllib.request.Request(f'{ak_url_remote}/api/v3/outposts/instances/{ldap_outpost["pk"]}/', headers=ak_headers_remote)
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    detail = json.loads(resp.read().decode())
+                outpost_token_id = detail.get('token_identifier') or detail.get('token')
+            if outpost_token_id:
+                req = urllib.request.Request(
+                    f'{ak_url_remote}/api/v3/core/tokens/{outpost_token_id}/view_key/',
+                    headers=ak_headers_remote, method='GET')
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    ldap_token_key = json.loads(resp.read().decode()).get('key', '')
+                plog(f"  ✓ Retrieved LDAP outpost token from API")
+    except urllib.error.HTTPError as e:
+        plog(f"  ⚠ API error: {e.code} {e.read().decode()[:150]}")
     except Exception as e:
-        plog(f"  ⚠ Step 6b failed: {str(e)[:150]}")
-        plog("  Use Fix LDAP token button on Authentik page if LDAP stays unhealthy")
+        plog(f"  ⚠ Token fetch: {str(e)[:150]}")
+    if ldap_token_key:
+        try:
+            safe_key = ldap_token_key.replace("'", "''")
+            patched_compose = compose_content.replace('AUTHENTIK_TOKEN: placeholder', f"AUTHENTIK_TOKEN: '{safe_key}'")
+            with open('/tmp/authentik_remote_compose.yml', 'w') as f:
+                f.write(patched_compose)
+            ok, _ = _module_copy(deploy_cfg, '/tmp/authentik_remote_compose.yml', '/tmp/docker-compose.yml', log_fn=plog)
+            _module_run(deploy_cfg, 'mv /tmp/docker-compose.yml ~/authentik/docker-compose.yml', timeout=10)
+            plog("  ✓ Injected LDAP token into docker-compose on remote")
+            plog("  Recreating LDAP container...")
+            _module_run(deploy_cfg, 'cd ~/authentik && docker compose stop ldap 2>&1; docker compose rm -f ldap 2>&1; docker compose up -d ldap 2>&1', timeout=90, log_fn=plog)
+            plog("  ✓ LDAP container recreated with correct token")
+            try:
+                os.remove('/tmp/authentik_remote_compose.yml')
+            except Exception:
+                pass
+        except Exception as e:
+            plog(f"  ⚠ Token inject failed: {str(e)[:150]}")
+    else:
+        plog("  ⚠ Could not get LDAP token — use Fix LDAP token button on Authentik page if LDAP stays unhealthy")
 
     # Step 7: Patch CoreConfig.xml to point LDAP at remote host
     plog("")
