@@ -9738,9 +9738,9 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:24px">
   <div style="display:flex;align-items:center;justify-content:space-between;padding:16px 24px;cursor:pointer" onclick="noderedToggleSection('nodered-target')">
     <span class="card-title" style="margin-bottom:0">Deployment Target</span>
-    <span id="nodered-target-toggle-icon" style="font-size:18px;color:var(--text-dim);transition:transform 0.2s ease;transform:rotate(180deg)">&#9662;</span>
+    <span id="nodered-target-toggle-icon" style="font-size:18px;color:var(--text-dim);transition:transform 0.2s ease;transform:rotate(0deg)">&#9662;</span>
   </div>
-  <div id="nodered-target-body" style="display:block;padding:0 24px 24px 24px;border-top:1px solid var(--border)">
+  <div id="nodered-target-body" style="display:none;padding:0 24px 24px 24px;border-top:1px solid var(--border)">
     <div class="form-group">
       <label class="form-label">Where should Node-RED run?</label>
       <select id="nodered-target-mode" class="form-input">
@@ -11863,7 +11863,7 @@ TAKPORTAL_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-
 .control-btn:hover{border-color:var(--border-hover);color:var(--text-primary)}
 .control-btn.btn-stop{border-color:rgba(239,68,68,0.3)}.control-btn.btn-stop:hover{background:rgba(239,68,68,0.1);color:var(--red)}
 .control-btn.btn-start{border-color:rgba(16,185,129,0.3)}.control-btn.btn-start:hover{background:rgba(16,185,129,0.1);color:var(--green)}
-.control-btn.btn-update{border-color:rgba(59,130,246,0.3)}.control-btn.btn-update:hover{background:rgba(59,130,246,0.1);color:var(--accent)}
+.control-btn.btn-update{padding-left:12px;padding-right:12px;border-color:rgba(59,130,246,0.3)}.control-btn.btn-update:hover{background:rgba(59,130,246,0.1);color:var(--accent)}
 .control-btn.btn-remove{border-color:rgba(239,68,68,0.2)}.control-btn.btn-remove:hover{background:rgba(239,68,68,0.1);color:var(--red)}
 .cert-btn{padding:10px 20px;border-radius:8px;text-decoration:none;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;transition:all 0.2s}
 .cert-btn-primary{background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff}
