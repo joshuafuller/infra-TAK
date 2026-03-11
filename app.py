@@ -1669,6 +1669,12 @@ def _guarddog_health_check(service_id):
             r = subprocess.run(['systemctl', 'is-active', 'mediamtx'], capture_output=True, text=True, timeout=3)
             return r.returncode == 0
         if service_id == 'nodered':
+            settings = load_settings()
+            nr_cfg = _get_module_deployment_config(settings, 'nodered_deployment')
+            if nr_cfg.get('target_mode') == 'remote' and nr_cfg.get('deployed') and (nr_cfg.get('remote', {}).get('host') or '').strip():
+                ok, out = _ssh_probe(nr_cfg.get('remote', {}),
+                    "curl -s -o /dev/null -w '%{http_code}' --connect-timeout 4 http://127.0.0.1:1880/ 2>/dev/null || echo 000", timeout=10)
+                return bool(ok and out and out.strip() in ('200', '301', '302'))
             req = urllib.request.Request('http://127.0.0.1:1880/', method='GET')
             resp = urllib.request.urlopen(req, timeout=5)
             return resp.status in (200, 302, 301)
@@ -1701,10 +1707,15 @@ def _guarddog_service_monitor_ids(settings):
     if not is_two_server:
         takserver_ids.extend(['postgresql', 'cotdb'])
     takserver_ids.extend(['oom', 'disk', 'cert', 'intca'])
-    return {
+    multi = {
         'takserver': takserver_ids,
         'remotedb': ['remotedb_tcp', 'remotedb_agent'],
+        'authentik': ['authentik_http'],
+        'mediamtx': ['mediamtx_svc'],
+        'nodered': ['nodered_http'],
+        'cloudtak': ['cloudtak_ctr'],
     }
+    return multi
 
 
 def _guarddog_monitored_service_ids(settings):
@@ -1981,6 +1992,12 @@ def _monitor_health_check(monitor_id):
             r = subprocess.run(['systemctl', 'is-active', 'mediamtx'], capture_output=True, text=True, timeout=3)
             return r.returncode == 0
         if monitor_id == 'nodered_http':
+            settings = load_settings()
+            nr_cfg = _get_module_deployment_config(settings, 'nodered_deployment')
+            if nr_cfg.get('target_mode') == 'remote' and nr_cfg.get('deployed') and (nr_cfg.get('remote', {}).get('host') or '').strip():
+                ok, out = _ssh_probe(nr_cfg.get('remote', {}),
+                    "curl -s -o /dev/null -w '%{http_code}' --connect-timeout 4 http://127.0.0.1:1880/ 2>/dev/null || echo 000", timeout=10)
+                return bool(ok and out and out.strip() in ('200', '301', '302'))
             req = urllib.request.Request('http://127.0.0.1:1880/', method='GET')
             resp = urllib.request.urlopen(req, timeout=5)
             return resp.status in (200, 302, 301)
