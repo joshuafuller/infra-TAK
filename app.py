@@ -5416,6 +5416,8 @@ paths:
             "# Test stream URLs\n"
             "s = re.sub(r\"'hls': f'\\{protocol\\}://\\{domain\\}:8888/teststream/index\\.m3u8'\",\n"
             "           \"'hls': '/hls-proxy/teststream/index.m3u8'\", s)\n"
+            "# Fix watchStream new URL() to handle relative paths\n"
+            "s = s.replace('const url = new URL(streamUrl);', 'const url = new URL(streamUrl, window.location.origin);')\n"
             "with open(f, 'w') as fh: fh.write(s)\n"
         )
         with open('/tmp/mtx_hls_patcher.py', 'w') as pf:
@@ -5910,6 +5912,7 @@ WantedBy=multi-user.target
                 esrc = _hls_re.sub(
                     r"'hls': f'\{protocol\}://\{domain\}:8888/teststream/index\.m3u8'",
                     "'hls': '/hls-proxy/teststream/index.m3u8'", esrc)
+                esrc = esrc.replace('const url = new URL(streamUrl);', 'const url = new URL(streamUrl, window.location.origin);')
                 with open(editor_path, 'w') as f:
                     f.write(esrc)
                 plog("✓ HLS URLs patched for HTTPS proxy")
