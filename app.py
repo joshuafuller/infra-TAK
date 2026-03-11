@@ -1654,8 +1654,10 @@ def _guarddog_health_check(service_id):
             r2 = subprocess.run('ss -ltn "sport = :8089" 2>/dev/null', shell=True, capture_output=True, text=True, timeout=2)
             return 'LISTEN' in (r2.stdout or '')
         if service_id == 'authentik':
-            req = urllib.request.Request('http://127.0.0.1:9090/', method='GET')
-            resp = urllib.request.urlopen(req, timeout=5)
+            settings = load_settings()
+            ak_url = _get_authentik_api_url(settings)
+            req = urllib.request.Request(ak_url + '/', method='GET')
+            resp = urllib.request.urlopen(req, timeout=8)
             return resp.status in (200, 302, 301)
         if service_id == 'mediamtx':
             r = subprocess.run(['systemctl', 'is-active', 'mediamtx'], capture_output=True, text=True, timeout=3)
@@ -1720,35 +1722,53 @@ def _guarddog_monitored_service_ids(settings):
     return ids
 
 
+def _guarddog_run_one_service(sid, monitor_ids):
+    """Run checks for one service (multi-monitor or single). Returns (sid, 'ok'|'fail'|'caution'|None)."""
+    if monitor_ids:
+        vals = []
+        for mid in monitor_ids:
+            v = _monitor_health_check(mid)
+            if v is not None:
+                vals.append(v)
+        if not vals:
+            return (sid, None)
+        if all(vals):
+            return (sid, 'ok')
+        if not any(vals):
+            return (sid, 'fail')
+        return (sid, 'caution')
+    val = _guarddog_health_check(sid)
+    if val is not None:
+        return (sid, 'ok' if val else 'fail')
+    return (sid, None)
+
+
 @app.route('/api/guarddog/health')
 @login_required
 def guarddog_health_api():
-    """Return health status per service: 'ok', 'fail', or 'caution' (some checks down). Only includes services Guard Dog can monitor."""
+    """Return health status per service: 'ok', 'fail', or 'caution'. Uses cache (25s) and parallel checks for fast page load."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     settings = load_settings()
-    result = {}
+    now = time.time()
+    if _guarddog_page_cache['health'] is not None and (now - _guarddog_page_cache['health_ts']) < _GD_PAGE_CACHE_TTL:
+        from flask import make_response
+        r = make_response(jsonify(_guarddog_page_cache['health']))
+        r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
+        return r
     multi = _guarddog_service_monitor_ids(settings)
-    for sid in _guarddog_monitored_service_ids(settings):
-        monitor_ids = multi.get(sid)
-        if monitor_ids:
-            # Multi-monitor service: compute ok / caution / fail from sub-monitors
-            vals = []
-            for mid in monitor_ids:
-                v = _monitor_health_check(mid)
-                if v is not None:
-                    vals.append(v)
-            if not vals:
-                continue
-            if all(vals):
-                result[sid] = 'ok'
-            elif not any(vals):
-                result[sid] = 'fail'
-            else:
-                result[sid] = 'caution'
-        else:
-            # Single-check service
-            val = _guarddog_health_check(sid)
-            if val is not None:
-                result[sid] = 'ok' if val else 'fail'
+    service_ids = _guarddog_monitored_service_ids(settings)
+    result = {}
+    with ThreadPoolExecutor(max_workers=min(16, len(service_ids) * 3)) as ex:
+        futures = {ex.submit(_guarddog_run_one_service, sid, multi.get(sid)): sid for sid in service_ids}
+        for fut in as_completed(futures):
+            try:
+                sid, status = fut.result()
+                if status is not None:
+                    result[sid] = status
+            except Exception:
+                pass
+    _guarddog_page_cache['health'] = result
+    _guarddog_page_cache['health_ts'] = time.time()
     from flask import make_response
     r = make_response(jsonify(result))
     r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
@@ -1770,6 +1790,10 @@ def _guarddog_overall_from_result(result):
 # Cache overall health so we don't re-run all checks every 8s from the Console.
 # The cache holds for 30s. On caution it holds for 10s so we re-check sooner.
 _guarddog_overall_cache = {'overall': 'ok', 'ts': 0}
+
+# Cache for Guard Dog page: service and monitor health so the monitors page shows status quickly (TTL 25s).
+_guarddog_page_cache = {'health': None, 'health_ts': 0, 'monitor_key': None, 'monitor_result': None, 'monitor_ts': 0}
+_GD_PAGE_CACHE_TTL = 25
 
 
 def _compute_guarddog_overall():
@@ -1902,8 +1926,10 @@ def _monitor_health_check(monitor_id):
                         return False
             return False
         if monitor_id == 'authentik_http':
-            req = urllib.request.Request('http://127.0.0.1:9090/', method='GET')
-            resp = urllib.request.urlopen(req, timeout=5)
+            settings = load_settings()
+            ak_url = _get_authentik_api_url(settings)
+            req = urllib.request.Request(ak_url + '/', method='GET')
+            resp = urllib.request.urlopen(req, timeout=8)
             return resp.status in (200, 302, 301)
         if monitor_id == 'mediamtx_svc':
             r = subprocess.run(['systemctl', 'is-active', 'mediamtx'], capture_output=True, text=True, timeout=3)
@@ -1931,14 +1957,29 @@ def _monitor_health_check(monitor_id):
 @app.route('/api/guarddog/monitor-health')
 @login_required
 def guarddog_monitor_health_api():
-    """Return health status per individual monitor (for sub-service dots in UI)."""
-    monitor_ids = request.args.get('ids', '').split(',')
-    monitor_ids = [m.strip() for m in monitor_ids if m.strip()]
+    """Return health status per individual monitor (for sub-service dots in UI). Uses cache (25s) and parallel checks."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    monitor_ids = [m.strip() for m in request.args.get('ids', '').split(',') if m.strip()]
+    cache_key = tuple(sorted(monitor_ids))
+    now = time.time()
+    if (_guarddog_page_cache['monitor_key'] == cache_key and
+            _guarddog_page_cache['monitor_result'] is not None and
+            (now - _guarddog_page_cache['monitor_ts']) < _GD_PAGE_CACHE_TTL):
+        return jsonify(_guarddog_page_cache['monitor_result'])
     result = {}
-    for mid in monitor_ids:
-        val = _monitor_health_check(mid)
-        if val is not None:
-            result[mid] = val
+    with ThreadPoolExecutor(max_workers=min(16, len(monitor_ids) or 1)) as ex:
+        futures = {ex.submit(_monitor_health_check, mid): mid for mid in monitor_ids}
+        for fut in as_completed(futures):
+            mid = futures[fut]
+            try:
+                val = fut.result()
+                if val is not None:
+                    result[mid] = val
+            except Exception:
+                pass
+    _guarddog_page_cache['monitor_key'] = cache_key
+    _guarddog_page_cache['monitor_result'] = result
+    _guarddog_page_cache['monitor_ts'] = time.time()
     return jsonify(result)
 
 
@@ -4682,6 +4723,41 @@ def takportal_page():
 takportal_deploy_log = []
 takportal_deploy_status = {'running': False, 'complete': False, 'error': False}
 
+def _takportal_build_settings_json(settings):
+    """Build TAK Portal settings dict and return (json_string, error). Uses Authentik env from local or remote."""
+    import json as json_mod
+    server_ip = settings.get('server_ip', 'localhost')
+    ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
+    cloudtak_host = _get_service_domain(settings, 'cloudtak_map')
+    cert_pass = _get_tak_cert_password(settings)
+    ak_upstream = _get_authentik_upstream(settings)
+    portal_settings = {
+        "AUTHENTIK_URL": f"http://{ak_upstream}",
+        "AUTHENTIK_TOKEN": ak_token or "",
+        "USERS_HIDDEN_PREFIXES": "ak-,adm_,nodered-,ma-",
+        "GROUPS_HIDDEN_PREFIXES": "authentik, MA -, vid_, tak_ROLE_",
+        "USERS_ACTIONS_HIDDEN_PREFIXES": "",
+        "GROUPS_ACTIONS_HIDDEN_PREFIXES": "",
+        "DASHBOARD_AUTHENTIK_STATS_REFRESH_SECONDS": "300",
+        "PORTAL_AUTH_ENABLED": "true" if settings.get('fqdn') else "false",
+        "PORTAL_AUTH_REQUIRED_GROUP": "authentik Admins" if settings.get('fqdn') else "",
+        "AUTHENTIK_PUBLIC_URL": _get_authentik_base_url(settings),
+        "TAK_PORTAL_PUBLIC_URL": f"https://takportal.{settings['fqdn']}" if settings.get('fqdn') else f"http://{server_ip}:3000",
+        "TAK_URL": f"https://{_get_takserver_host(settings)}:8443/Marti" if _get_takserver_host(settings) else f"https://{server_ip}:8443/Marti",
+        "TAK_API_P12_PATH": "data/certs/tak-client.p12",
+        "TAK_API_P12_PASSPHRASE": cert_pass,
+        "TAK_CA_PATH": "data/certs/tak-ca.pem",
+        "TAK_REVOKE_ON_DISABLE": "true",
+        "TAK_DEBUG": "false",
+        "TAK_BYPASS_ENABLED": "false",
+        "CLOUDTAK_URL": f"https://{cloudtak_host}" if cloudtak_host else "",
+        **_portal_email_settings(settings),
+        "BRAND_THEME": "dark",
+        "BRAND_LOGO_URL": ""
+    }
+    return json_mod.dumps(portal_settings, indent=2), None
+
+
 @app.route('/api/takportal/control', methods=['POST'])
 @login_required
 def takportal_control():
@@ -4693,6 +4769,26 @@ def takportal_control():
         subprocess.run(f'cd {portal_dir} && docker compose down', shell=True, capture_output=True, text=True, timeout=60)
     elif action == 'restart':
         subprocess.run(f'cd {portal_dir} && docker compose down && docker compose up -d', shell=True, capture_output=True, text=True, timeout=120)
+    elif action == 'reconfigure':
+        # Update config only: push settings into container and restart (no git pull / image build)
+        settings = load_settings()
+        settings_json, err = _takportal_build_settings_json(settings)
+        if err:
+            return jsonify({'success': False, 'error': err}), 400
+        try:
+            with open('/tmp/tak-portal-settings.json', 'w') as f:
+                f.write(settings_json)
+            cp = subprocess.run('docker cp /tmp/tak-portal-settings.json tak-portal:/usr/src/app/data/settings.json', shell=True, capture_output=True, text=True, timeout=20)
+            os.remove('/tmp/tak-portal-settings.json')
+            if cp.returncode != 0:
+                return jsonify({'success': False, 'error': (cp.stderr or cp.stdout or 'docker cp failed').strip()[:300]}), 500
+            subprocess.run('docker restart tak-portal', shell=True, capture_output=True, text=True, timeout=30)
+        except Exception as e:
+            return jsonify({'success': False, 'error': str(e)[:300]}), 500
+        time.sleep(2)
+        r = subprocess.run('docker ps --filter name=tak-portal --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
+        running = 'Up' in (r.stdout or '')
+        return jsonify({'success': True, 'running': running, 'action': action, 'message': 'Config updated and portal restarted.'})
     elif action == 'update':
         pull = subprocess.run(f'cd {portal_dir} && git pull --rebase --autostash', shell=True, capture_output=True, text=True, timeout=60)
         pull_msg = pull.stdout.strip().split('\n')[-1] if pull.stdout.strip() else ''
@@ -4702,44 +4798,14 @@ def takportal_control():
         cloudtak_url = ''
         try:
             settings = load_settings()
-            server_ip = settings.get('server_ip', 'localhost')
-            ak_env_path = os.path.expanduser('~/authentik/.env')
-            ak_token = ''
-            if os.path.exists(ak_env_path):
-                with open(ak_env_path) as f:
-                    for line in f:
-                        if line.strip().startswith('AUTHENTIK_BOOTSTRAP_TOKEN='):
-                            ak_token = line.strip().split('=', 1)[1].strip()
-            import json as json_mod
-            cloudtak_host = _get_service_domain(settings, 'cloudtak_map')
-            cert_pass = _get_tak_cert_password(settings)
-            ak_upstream = _get_authentik_upstream(settings)
-            portal_settings = {
-                "AUTHENTIK_URL": f"http://{ak_upstream}",
-                "AUTHENTIK_TOKEN": ak_token,
-                "USERS_HIDDEN_PREFIXES": "ak-,adm_,nodered-,ma-",
-                "GROUPS_HIDDEN_PREFIXES": "authentik, MA -, vid_, tak_ROLE_",
-                "USERS_ACTIONS_HIDDEN_PREFIXES": "",
-                "GROUPS_ACTIONS_HIDDEN_PREFIXES": "",
-                "DASHBOARD_AUTHENTIK_STATS_REFRESH_SECONDS": "300",
-                "PORTAL_AUTH_ENABLED": "true" if settings.get('fqdn') else "false",
-                "PORTAL_AUTH_REQUIRED_GROUP": "authentik Admins" if settings.get('fqdn') else "",
-                "AUTHENTIK_PUBLIC_URL": _get_authentik_base_url(settings),
-                "TAK_PORTAL_PUBLIC_URL": f"https://takportal.{settings['fqdn']}" if settings.get('fqdn') else f"http://{server_ip}:3000",
-                "TAK_URL": f"https://{_get_takserver_host(settings)}:8443/Marti" if _get_takserver_host(settings) else f"https://{server_ip}:8443/Marti",
-                "TAK_API_P12_PATH": "data/certs/tak-client.p12",
-                "TAK_API_P12_PASSPHRASE": cert_pass,
-                "TAK_CA_PATH": "data/certs/tak-ca.pem",
-                "TAK_REVOKE_ON_DISABLE": "true",
-                "TAK_DEBUG": "false",
-                "TAK_BYPASS_ENABLED": "false",
-                "CLOUDTAK_URL": f"https://{cloudtak_host}" if cloudtak_host else "",
-                **_portal_email_settings(settings),
-                "BRAND_THEME": "dark",
-                "BRAND_LOGO_URL": ""
-            }
-            cloudtak_url = portal_settings.get('CLOUDTAK_URL', '')
-            settings_json = json_mod.dumps(portal_settings, indent=2)
+            settings_json, _ = _takportal_build_settings_json(settings)
+            cloudtak_url = ''
+            try:
+                import json as json_mod
+                portal_settings = json_mod.loads(settings_json)
+                cloudtak_url = portal_settings.get('CLOUDTAK_URL', '')
+            except Exception:
+                pass
             with open('/tmp/tak-portal-settings.json', 'w') as f:
                 f.write(settings_json)
             cp = subprocess.run('docker cp /tmp/tak-portal-settings.json tak-portal:/usr/src/app/data/settings.json', shell=True, capture_output=True, text=True, timeout=20)
@@ -11373,6 +11439,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div class="controls">
 <button class="control-btn btn-stop" onclick="portalControl('stop')">⏹ Stop</button>
 <button class="control-btn" onclick="portalControl('restart')">🔄 Restart</button>
+<button class="control-btn" onclick="portalReconfigure()" title="Refresh Authentik/TAK Server settings and restart container">🔄 Update config & reconnect</button>
 <button class="control-btn btn-update" id="update-btn" onclick="portalUpdate()"{% if portal_update_available %} style="position:relative;border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if portal_update_available %} <span style="margin-left:4px;color:var(--cyan)" title="Update available">●</span>{% endif %}</button>
 </div>
 {% if portal_version %}<div style="margin-top:8px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim)">Version: {{ portal_version }}{% if portal_update_available and portal_latest %} · <span style="color:var(--cyan)">Update to {{ portal_latest }} available</span>{% endif %}</div>{% endif %}
@@ -11381,6 +11448,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div class="status-info"><div class="status-logo-wrap"><span class="material-symbols-outlined" style="font-size:36px">group</span><span class="status-name">TAK Portal</span></div><div><div class="status-text" style="color:var(--red)">Stopped</div><div class="status-detail">Docker container not running</div></div></div>
 <div class="controls">
 <button class="control-btn btn-start" onclick="portalControl('start')">▶ Start</button>
+<button class="control-btn" onclick="portalReconfigure()" title="Refresh Authentik/TAK Server settings and restart container">🔄 Update config & reconnect</button>
 <button class="control-btn btn-update" id="update-btn" onclick="portalUpdate()"{% if portal_update_available %} style="position:relative;border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if portal_update_available %} <span style="margin-left:4px;color:var(--cyan)" title="Update available">●</span>{% endif %}</button>
 </div>
 {% if portal_version %}<div style="margin-top:8px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim)">Version: {{ portal_version }}{% if portal_update_available and portal_latest %} · <span style="color:var(--cyan)">Update to {{ portal_latest }} available</span>{% endif %}</div>{% endif %}
@@ -11497,6 +11565,26 @@ async function portalControl(action){
         else alert('Error: '+(d.error||'Unknown'));
     }catch(e){alert('Error: '+e.message)}
     btns.forEach(function(b){b.disabled=false;b.style.opacity='1'});
+}
+async function portalReconfigure(){
+    var status=document.getElementById('update-status');
+    var btns=document.querySelectorAll('.control-btn');
+    btns.forEach(function(b){b.disabled=true;b.style.opacity='0.5'});
+    if(status){status.style.display='block';status.style.color='var(--text-secondary)';status.textContent='Updating config...';}
+    try{
+        var r=await fetch('/api/takportal/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'reconfigure'})});
+        var d=await r.json();
+        if(d.success){
+            if(status){status.style.color='var(--green)';status.textContent=d.message||'Config updated. Reloading...';}
+            setTimeout(function(){window.location.href='/takportal';},1200);
+        }else{
+            if(status){status.style.color='var(--red)';status.textContent='✗ '+(d.error||'Failed');}
+            btns.forEach(function(b){b.disabled=false;b.style.opacity='1';});
+        }
+    }catch(e){
+        if(status){status.style.color='var(--red)';status.textContent='✗ '+e.message;}
+        btns.forEach(function(b){b.disabled=false;b.style.opacity='1';});
+    }
 }
 async function portalUpdate(){
     var btn=document.getElementById('update-btn');

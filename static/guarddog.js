@@ -26,6 +26,6 @@ function gdRefreshHealth(){fetch('/api/guarddog/health?_='+Date.now(),{credentia
 function gdRefreshMonitorHealth(){var items=document.querySelectorAll('[data-monitor-id]');if(!items.length)return;var ids=[];items.forEach(function(el){var mid=el.getAttribute('data-monitor-id');if(mid)ids.push(mid);});if(!ids.length)return;fetch('/api/guarddog/monitor-health?ids='+ids.join(','),{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(h){for(var mid in h){var el=document.getElementById('gd-mh-'+mid);if(!el)continue;el.className='guard-monitor-health '+(h[mid]?'ok':'fail');el.title=h[mid]?'Healthy':'Unhealthy';}}).catch(function(){});}
 if (document.getElementById('gd-activity-log')) gdLoadActivityLog();
 if (document.getElementById('gd-cot-db-size')) gdRefreshCotSize();
-if (document.querySelector('.guard-service-row')){gdRefreshHealth();gdRefreshMonitorHealth();setInterval(gdRefreshHealth,60000);setInterval(gdRefreshMonitorHealth,60000);}
+if (document.querySelector('.guard-service-row')){gdRefreshHealth();gdRefreshMonitorHealth();setInterval(gdRefreshHealth,30000);setInterval(gdRefreshMonitorHealth,30000);}
 if (document.getElementById('gd-sms-provider')) gdSmsProviderChange();
 if (document.getElementById('gd-sms-br-sender')) gdSenderCheck();
