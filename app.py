@@ -9928,6 +9928,13 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
             <span class="guard-item-interval">{{ m.interval }}</span>
             <span class="guard-item-desc">{{ m.desc }}</span>
           </div>
+          {% if svc.id == 'remotedb' and m.id == 'remotedb_agent' %}
+          <div class="guard-item" style="align-items:center;gap:8px;padding-left:28px;margin-top:-4px;margin-bottom:8px">
+            <span class="guard-item-desc" style="flex:1">Install or reinstall the health agent on Server One (use if the Health Agent check above is red):</span>
+            <button type="button" class="btn btn-ghost gd-deploy-agent-btn" onclick="gdDeployHealthAgent()" style="padding:6px 14px;font-size:12px;flex-shrink:0">Deploy health agent to Server One</button>
+            <span class="gd-deploy-agent-msg-inline" style="font-size:12px;min-width:80px"></span>
+          </div>
+          {% endif %}
           {% endfor %}
         </div>
       </div>
