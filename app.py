@@ -2800,6 +2800,10 @@ def caddy_update_domain():
                                 break
                 if ak_token:
                     _ensure_authentik_console_app(domain, ak_token)
+                    settings = load_settings()
+                    ak_url = _get_authentik_api_url(settings)
+                    ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+                    _repair_embedded_outpost_all_apps(ak_url, ak_headers, settings)
             except Exception:
                 pass
         threading.Thread(target=_ensure_console_app, daemon=True).start()
@@ -5315,25 +5319,8 @@ def run_takportal_deploy():
                         else:
                             plog(f"  \u26a0 Application error: {str(e)[:80]}")
 
-                    # Add to embedded outpost
-                    try:
-                        req = _urlreq.Request(f'{_ak_url}/api/v3/outposts/instances/?search=embedded', headers=_ak_headers)
-                        resp = _urlreq.urlopen(req, timeout=10)
-                        outposts = json_mod.loads(resp.read().decode())['results']
-                        embedded = next((o for o in outposts if 'embed' in o.get('name','').lower() or o.get('type') == 'proxy'), None)
-                        if embedded:
-                            current_providers = embedded.get('providers', [])
-                            if provider_pk not in current_providers:
-                                current_providers.append(provider_pk)
-                            req = _urlreq.Request(f'{_ak_url}/api/v3/outposts/instances/{embedded["pk"]}/',
-                                data=json_mod.dumps({'providers': current_providers}).encode(),
-                                headers=_ak_headers, method='PATCH')
-                            _urlreq.urlopen(req, timeout=10)
-                            plog(f"  \u2713 TAK Portal added to embedded outpost")
-                        else:
-                            plog(f"  \u26a0 No embedded outpost found")
-                    except Exception as e:
-                        plog(f"  \u26a0 Outpost error: {str(e)[:80]}")
+                    # Add to embedded outpost (safe: never remove existing providers)
+                    _outpost_add_providers_safe(_ak_url, _ak_headers, [provider_pk], plog=plog)
             except Exception as e:
                 plog(f"  \u26a0 Forward auth setup error: {str(e)[:100]}")
 
@@ -8807,24 +8794,7 @@ def _ensure_authentik_nodered_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
                     log(f"  ⚠ Application error: {str(e)[:80]}")
 
             # 5) Add to embedded outpost
-            try:
-                req = _urlreq.Request(f'{_ak_url}/api/v3/outposts/instances/?search=embedded', headers=_ak_headers)
-                resp = _urlreq.urlopen(req, timeout=10)
-                outposts = json.loads(resp.read().decode())['results']
-                embedded = next((o for o in outposts if 'embed' in o.get('name','').lower() or o.get('type') == 'proxy'), None)
-                if embedded:
-                    current_providers = embedded.get('providers', [])
-                    if provider_pk not in current_providers:
-                        current_providers.append(provider_pk)
-                    req = _urlreq.Request(f'{_ak_url}/api/v3/outposts/instances/{embedded["pk"]}/',
-                        data=json.dumps({'providers': current_providers}).encode(),
-                        headers=_ak_headers, method='PATCH')
-                    _urlreq.urlopen(req, timeout=10)
-                    log("  ✓ Node-RED added to embedded outpost")
-                else:
-                    log("  ⚠ No embedded outpost found")
-            except Exception as e:
-                log(f"  ⚠ Outpost error: {str(e)[:80]}")
+            _outpost_add_providers_safe(_ak_url, _ak_headers, [provider_pk], plog=log)
         else:
             log("  ⚠ Could not create or find Node-RED proxy provider")
     except Exception as e:
@@ -8946,23 +8916,7 @@ def _ensure_authentik_console_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
                         pass
 
         if provider_pks:
-            try:
-                req = _urlreq.Request(f'{_ak_url}/api/v3/outposts/instances/?search=embedded', headers=_ak_headers)
-                resp = _urlreq.urlopen(req, timeout=10)
-                outposts = json.loads(resp.read().decode())['results']
-                embedded = next((o for o in outposts if 'embed' in o.get('name', '').lower() or o.get('type') == 'proxy'), None)
-                if embedded:
-                    current = list(embedded.get('providers', []))
-                    for pk in provider_pks:
-                        if pk not in current:
-                            current.append(pk)
-                    req = _urlreq.Request(f'{_ak_url}/api/v3/outposts/instances/{embedded["pk"]}/',
-                        data=json.dumps({'providers': current}).encode(),
-                        headers=_ak_headers, method='PATCH')
-                    _urlreq.urlopen(req, timeout=10)
-                    log("  ✓ infra-TAK Console added to embedded outpost")
-            except Exception as e:
-                log(f"  ⚠ Outpost error: {str(e)[:80]}")
+            _outpost_add_providers_safe(_ak_url, _ak_headers, provider_pks, plog=log)
         return True
     except Exception as e:
         log(f"  ⚠ Console forward auth setup: {str(e)[:100]}")
@@ -8995,6 +8949,73 @@ def _ensure_proxy_providers_cookie_domain(ak_url, ak_headers, fqdn, plog=None):
         _log("  ✓ Proxy providers cookie_domain set for shared session")
     except Exception as e:
         _log(f"  ⚠ Proxy cookie_domain: {str(e)[:80]}")
+
+
+def _outpost_add_providers_safe(ak_url, ak_headers, provider_pks_to_add, plog=None):
+    """Add given provider PKs to the embedded outpost. Never removes existing providers.
+    GET full outpost, normalize providers to PKs, append any missing from provider_pks_to_add, PATCH only if we added and didn't shorten."""
+    if not provider_pks_to_add:
+        return False
+    import urllib.request as _req
+    _log = plog or (lambda m: None)
+    try:
+        r = _req.Request(f'{ak_url}/api/v3/outposts/instances/?search=embedded', headers=ak_headers)
+        outposts = json.loads(_req.urlopen(r, timeout=15).read().decode()).get('results', [])
+        embedded = next((o for o in outposts if 'embed' in (o.get('name') or '').lower() or o.get('type') == 'proxy'), None)
+        if not embedded:
+            return False
+        op_pk = embedded.get('pk')
+        full = json.loads(_req.urlopen(_req.Request(f'{ak_url}/api/v3/outposts/instances/{op_pk}/', headers=ak_headers), timeout=15).read().decode())
+        raw = full.get('providers') or []
+
+        def _to_pk(p):
+            if p is None:
+                return None
+            if isinstance(p, int):
+                return p
+            return p.get('pk') or p.get('id')
+
+        current_pks = [_to_pk(p) for p in raw if _to_pk(p) is not None]
+        added = 0
+        for pk in provider_pks_to_add:
+            if pk and pk not in current_pks:
+                current_pks.append(pk)
+                added += 1
+        if added == 0:
+            return False
+        if len(current_pks) < len(raw):
+            _log("  ⚠ Outpost: not PATCHing (would shorten provider list)")
+            return False
+        _req.urlopen(_req.Request(f'{ak_url}/api/v3/outposts/instances/{op_pk}/',
+            data=json.dumps({'providers': current_pks}).encode(), headers=ak_headers, method='PATCH'), timeout=10)
+        _log("  ✓ Providers added to embedded outpost")
+        return True
+    except Exception as e:
+        _log(f"  ⚠ Outpost error: {str(e)[:80]}")
+        return False
+
+
+def _repair_embedded_outpost_all_apps(ak_url, ak_headers, settings, plog=None):
+    """Ensure embedded outpost includes all deployed app providers: infra-TAK, MediaMTX, Node-RED, TAK Portal.
+    Fetches applications by slug and adds their provider PKs to the outpost (safe, never removes)."""
+    import urllib.request as _req
+    _log = plog or (lambda m: None)
+    slugs = ['infratak', 'stream', 'node-red', 'tak-portal']
+    provider_pks = []
+    try:
+        for slug in slugs:
+            try:
+                r = _req.Request(f'{ak_url}/api/v3/core/applications/{slug}/', headers=ak_headers)
+                data = json.loads(_req.urlopen(r, timeout=10).read().decode())
+                pk = data.get('provider')
+                if pk and pk not in provider_pks:
+                    provider_pks.append(pk)
+            except Exception:
+                pass
+        if provider_pks:
+            _outpost_add_providers_safe(ak_url, ak_headers, provider_pks, plog=_log)
+    except Exception as e:
+        _log(f"  ⚠ Repair outpost: {str(e)[:80]}")
 
 
 def _sync_authentik_takportal_provider_url(settings):
@@ -9073,18 +9094,11 @@ def _sync_authentik_takportal_provider_url(settings):
                 except urllib.error.HTTPError as e:
                     if e.code != 400:
                         pass
-        # Ensure TAK Portal Proxy is on the embedded outpost so takportal.fqdn is matched (else 404)
+        # Ensure TAK Portal Proxy is on the embedded outpost so takportal.fqdn is matched (else 404).
         if provider_pk is not None:
-            r2 = _req.Request(f'{ak_url}/api/v3/outposts/instances/?search=embedded', headers=ak_headers)
-            outposts = json.loads(_req.urlopen(r2, timeout=15).read().decode()).get('results', [])
-            embedded = next((o for o in outposts if 'embed' in (o.get('name') or '').lower() or o.get('type') == 'proxy'), None)
-            if embedded:
-                raw = embedded.get('providers') or []
-                current_pks = [p if isinstance(p, int) else p.get('pk') for p in raw if (p if isinstance(p, int) else p.get('pk')) is not None]
-                if provider_pk not in current_pks:
-                    current_pks.append(provider_pk)
-                    _req.urlopen(_req.Request(f'{ak_url}/api/v3/outposts/instances/{embedded["pk"]}/',
-                        data=json.dumps({'providers': current_pks}).encode(), headers=ak_headers, method='PATCH'), timeout=10)
+            _outpost_add_providers_safe(ak_url, ak_headers, [provider_pk])
+        # Ensure all deployed apps (infra-TAK, MediaMTX, Node-RED, TAK Portal) are on the outpost
+        _repair_embedded_outpost_all_apps(ak_url, ak_headers, settings)
     except Exception:
         pass
 
@@ -14093,6 +14107,8 @@ entries:
                     plog("")
                     plog("  Configuring Authentik for infra-TAK Console...")
                     _ensure_authentik_console_app(fqdn, ak_token, plog, flow_pk=flow_pk, inv_flow_pk=inv_flow_pk)
+                    plog("  Ensuring all app providers on embedded outpost...")
+                    _repair_embedded_outpost_all_apps(ak_url, ak_headers, settings, plog)
 
                     # Set application access policies: admin-only apps restricted to authentik Admins
                     plog("")
