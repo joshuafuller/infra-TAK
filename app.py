@@ -18853,7 +18853,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </style></head><body data-tak-deploying="{{ 'true' if deploying or deploy_done or deploy_error else 'false' }}" data-tak-upgrading="{{ 'true' if upgrading else 'false' }}">
 {{ sidebar_html }}
 <div class="main">
-  <div class="page-header"><h1><img src="{{ tak_logo_url }}" alt="" style="height:28px;vertical-align:middle;margin-right:8px;object-fit:contain"> TAK Server{% if tak_version %} <span style="font-weight:500;color:var(--text-dim);font-size:16px">· {{ tak_version }}</span>{% endif %}</h1><p>Team Awareness Kit Server</p></div>
+  <div class="page-header"><h1><img src="{{ tak_logo_url }}" alt="" style="height:28px;vertical-align:middle;margin-right:8px;object-fit:contain"> TAK Server</h1><p>Team Awareness Kit Server</p></div>
 <div class="status-banner" id="status-banner">
 {% if deploying %}
 <div class="status-info"><div class="status-icon running" style="background:rgba(59,130,246,0.1)">🔄</div><div><div class="status-text" style="color:var(--accent)">Deploying...</div><div class="status-detail">TAK Server installation in progress</div></div></div>
