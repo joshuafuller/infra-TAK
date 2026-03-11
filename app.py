@@ -4388,25 +4388,40 @@ def _get_caddy_version_info():
 def _get_authentik_version_info():
     """Return {version: str, update_available: bool} for Authentik from image tag or docker."""
     out = {'version': '', 'update_available': False}
+    import re
     ak_dir = os.path.expanduser('~/authentik')
     compose_path = os.path.join(ak_dir, 'docker-compose.yml')
-    if not os.path.isfile(compose_path):
-        return out
-    try:
-        with open(compose_path) as f:
-            content = f.read()
-        import re
-        # image: ghcr.io/goauthentik/server:2024.2.1 or :latest
-        m = re.search(r'image:.*?/server:([^\s\n]+)', content)
-        if m:
-            out['version'] = m.group(1).strip()
-        if not out['version']:
+    # Try local compose file first
+    if os.path.isfile(compose_path):
+        try:
+            with open(compose_path) as f:
+                content = f.read()
+            m = re.search(r'image:.*?/server:([^\s\n]+)', content)
+            if m:
+                out['version'] = m.group(1).strip()
+        except Exception:
+            pass
+    # If not found locally, check if deployed remotely
+    if not out['version']:
+        try:
+            settings = load_settings()
+            ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+            if ak_cfg.get('target_mode') == 'remote' and ak_cfg.get('deployed') and (ak_cfg.get('remote', {}).get('host') or '').strip():
+                ok, remote_out = _ssh_probe(ak_cfg['remote'],
+                    'grep -m1 "image:.*server:" ~/authentik/docker-compose.yml 2>/dev/null', timeout=10)
+                if ok and remote_out:
+                    m = re.search(r'image:.*?/server:([^\s\n]+)', remote_out)
+                    if m:
+                        out['version'] = m.group(1).strip()
+        except Exception:
+            pass
+    if not out['version']:
+        try:
             r = subprocess.run('docker images --format "{{.Tag}}" ghcr.io/goauthentik/server 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
             if r.returncode == 0 and r.stdout.strip():
                 out['version'] = r.stdout.strip().split('\n')[0]
-    except Exception:
-        pass
-    # update_available: leave False unless we add docker compose pull check
+        except Exception:
+            pass
     return out
 
 
@@ -4573,8 +4588,9 @@ def takportal_control():
             import json as json_mod
             cloudtak_host = _get_service_domain(settings, 'cloudtak_map')
             cert_pass = _get_tak_cert_password(settings)
+            ak_upstream = _get_authentik_upstream(settings)
             portal_settings = {
-                "AUTHENTIK_URL": f"http://{server_ip}:9090",
+                "AUTHENTIK_URL": f"http://{ak_upstream}",
                 "AUTHENTIK_TOKEN": ak_token,
                 "USERS_HIDDEN_PREFIXES": "ak-,adm_,nodered-,ma-",
                 "GROUPS_HIDDEN_PREFIXES": "authentik, MA -, vid_, tak_ROLE_",
@@ -4906,8 +4922,9 @@ def run_takportal_deploy():
         import json as json_mod
         cloudtak_host = _get_service_domain(settings, 'cloudtak_map')
         cert_pass = _get_tak_cert_password(settings)
+        ak_upstream = _get_authentik_upstream(settings)
         portal_settings = {
-            "AUTHENTIK_URL": f"http://{server_ip}:9090",
+            "AUTHENTIK_URL": f"http://{ak_upstream}",
             "AUTHENTIK_TOKEN": ak_token,
             "USERS_HIDDEN_PREFIXES": "ak-,adm_,nodered-,ma-",
             "GROUPS_HIDDEN_PREFIXES": "authentik, MA -, vid_, tak_ROLE_",
@@ -11446,9 +11463,16 @@ def authentik_page():
                         if ':' in val: ak_port = val.split(':')[-1]
                         else: ak_port = val or '9090'
     if ak.get('running'):
-        r = subprocess.run('docker ps --filter "name=authentik" --format "{{.Names}}|||{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
+        ak_deploy = _get_module_deployment_config(settings, 'authentik_deployment')
+        docker_cmd = 'docker ps --filter "name=authentik" --format "{{.Names}}|||{{.Status}}" 2>/dev/null'
+        if ak_deploy.get('target_mode') == 'remote' and (ak_deploy.get('remote', {}).get('host') or '').strip():
+            ok, out = _ssh_probe(ak_deploy['remote'], docker_cmd, timeout=15)
+            raw = out or ''
+        else:
+            r = subprocess.run(docker_cmd, shell=True, capture_output=True, text=True)
+            raw = r.stdout or ''
         containers = []
-        for line in r.stdout.strip().split('\n'):
+        for line in raw.strip().split('\n'):
             if line.strip():
                 parts = line.split('|||')
                 containers.append({'name': parts[0], 'status': parts[1] if len(parts) > 1 else ''})
@@ -11644,7 +11668,7 @@ def _run_authentik_deploy_remote(settings, deploy_cfg, plog):
     plog(f"  Deploying Authentik to remote host: {host}")
 
     # Step 1: Check/install Docker on remote
-    plog("━━━ Step 1/7: Checking Docker (remote) ━━━")
+    plog("━━━ Step 1/8: Checking Docker (remote) ━━━")
     ok, out = _module_run(deploy_cfg, 'docker --version 2>&1', timeout=15)
     if not ok or 'Docker version' not in (out or ''):
         plog("  Docker not found. Installing...")
@@ -11661,13 +11685,13 @@ def _run_authentik_deploy_remote(settings, deploy_cfg, plog):
 
     # Step 2: Create directory + generate secrets locally
     plog("")
-    plog("━━━ Step 2/7: Setting Up Directory (remote) ━━━")
+    plog("━━━ Step 2/8: Setting Up Directory (remote) ━━━")
     _module_run(deploy_cfg, 'mkdir -p ~/authentik/blueprints', timeout=10)
     plog("✓ Directory ready")
 
     # Step 3: Generate .env and copy to remote
     plog("")
-    plog("━━━ Step 3/7: Generating Configuration ━━━")
+    plog("━━━ Step 3/8: Generating Configuration ━━━")
     pg_pass = subprocess.run('openssl rand -base64 36 | tr -d "\\n"', shell=True, capture_output=True, text=True).stdout.strip()[:90]
     secret_key = subprocess.run('openssl rand -hex 32', shell=True, capture_output=True, text=True).stdout.strip()
     ldap_svc_pass = subprocess.run('openssl rand -base64 24 | tr -d "\\n"', shell=True, capture_output=True, text=True).stdout.strip()
@@ -11708,7 +11732,7 @@ AUTHENTIK_TOKEN={bootstrap_token}{cookie_line}
 
     # Step 4: Generate LDAP blueprint and copy
     plog("")
-    plog("━━━ Step 4/7: Installing LDAP Blueprint ━━━")
+    plog("━━━ Step 4/8: Installing LDAP Blueprint ━━━")
     bp_content = """version: 1
 metadata:
   name: LDAP Setup for TAK
@@ -11913,7 +11937,7 @@ entries:
 
     # Step 5: Generate docker-compose.yml and copy
     plog("")
-    plog("━━━ Step 5/7: Creating Docker Compose ━━━")
+    plog("━━━ Step 5/8: Creating Docker Compose ━━━")
     compose_content = """services:
   postgresql:
     image: docker.io/library/postgres:16-alpine
@@ -12019,7 +12043,7 @@ volumes:
 
     # Step 6: Docker Compose up
     plog("")
-    plog("━━━ Step 6/7: Starting Authentik (remote) ━━━")
+    plog("━━━ Step 6/8: Starting Authentik (remote) ━━━")
     plog("  Running docker compose up (this may take 2-5 minutes)...")
     ok, out = _module_run(deploy_cfg, 'cd ~/authentik && docker compose pull 2>&1', timeout=600, log_fn=plog)
     if not ok:
@@ -12043,9 +12067,70 @@ volumes:
     else:
         plog("⚠ Authentik not healthy after 5 minutes — may still be starting")
 
-    # Step 7: Caddy integration + save settings
+    # Step 7: Patch CoreConfig.xml to point LDAP at remote host
     plog("")
-    plog("━━━ Step 7/7: Caddy Integration ━━━")
+    plog("━━━ Step 7/8: Connecting TAK Server to Remote LDAP ━━━")
+    coreconfig_path = '/opt/tak/CoreConfig.xml'
+    if os.path.exists(coreconfig_path):
+        if ldap_svc_pass:
+            backup_path = coreconfig_path + '.pre-ldap.bak'
+            if not os.path.exists(backup_path):
+                import shutil
+                shutil.copy2(coreconfig_path, backup_path)
+                plog("  Backed up CoreConfig.xml")
+
+            with open(coreconfig_path, 'r') as f:
+                config_content = f.read()
+
+            auth_block = (
+                '    <auth default="ldap" x509groups="true" x509addAnonymous="false" x509useGroupCache="true" x509useGroupCacheDefaultActive="true" x509checkRevocation="true">\n'
+                f'        <ldap url="ldap://{host}:389" userstring="cn={{username}},ou=users,dc=takldap" updateinterval="30" groupprefix="cn=tak_" groupNameExtractorRegex="cn=tak_(.*?)(?:,|$)" serviceAccountDN="cn=adm_ldapservice,ou=users,dc=takldap" serviceAccountCredential="'
+                + ldap_svc_pass
+                + '" groupBaseRDN="ou=groups,dc=takldap" userBaseRDN="ou=users,dc=takldap" dnAttributeName="DN" nameAttr="CN" adminGroup="ROLE_ADMIN"/>\n'
+                '        <File location="UserAuthenticationFile.xml"/>\n'
+                '    </auth>'
+            )
+
+            new_content = re.sub(
+                r'<auth[^>]*>.*?</auth>',
+                auth_block,
+                config_content,
+                flags=re.DOTALL
+            )
+
+            if new_content != config_content:
+                with open(coreconfig_path, 'w') as f:
+                    f.write(new_content)
+                plog(f"✓ CoreConfig.xml updated — LDAP pointing to {host}:389")
+                plog("  Restarting TAK Server...")
+                r = subprocess.run('systemctl restart takserver 2>&1', shell=True, capture_output=True, text=True, timeout=60)
+                if r.returncode == 0:
+                    plog("✓ TAK Server restarted")
+                else:
+                    plog(f"⚠ TAK Server restart issue: {r.stderr.strip()[:100]}")
+            else:
+                if _coreconfig_has_ldap():
+                    plog("✓ CoreConfig.xml already has LDAP auth configured")
+                    cur_url_match = re.search(r'<ldap url="ldap://([^"]+)"', config_content)
+                    if cur_url_match and cur_url_match.group(1) != f'{host}:389':
+                        plog(f"  ⚠ Current LDAP URL points to {cur_url_match.group(1)}, updating to {host}:389")
+                        new_content = config_content.replace(cur_url_match.group(0), f'<ldap url="ldap://{host}:389"')
+                        with open(coreconfig_path, 'w') as f:
+                            f.write(new_content)
+                        subprocess.run('systemctl restart takserver 2>&1', shell=True, capture_output=True, text=True, timeout=60)
+                        plog(f"✓ LDAP URL updated to {host}:389, TAK Server restarted")
+                else:
+                    plog("⚠ CoreConfig <auth> block not found — use Connect TAK Server to LDAP after deploy")
+        else:
+            plog("⚠ LDAP service password not available, skipping CoreConfig patch")
+            plog("  Use Connect TAK Server to LDAP after deploy")
+    else:
+        plog("  ℹ TAK Server not installed — skipping CoreConfig (OK for standalone Authentik)")
+        plog("  Deploy TAK Server later, then use Connect TAK Server to LDAP")
+
+    # Step 8: Caddy integration + save settings
+    plog("")
+    plog("━━━ Step 8/8: Caddy Integration ━━━")
     cfg = _normalize_module_deployment_config(deploy_cfg)
     cfg['deployed'] = True
     settings['authentik_deployment'] = cfg
@@ -14063,20 +14148,33 @@ def _test_ldap_bind(ldap_pass):
     """Test LDAP bind by triggering a connection and checking the outpost logs.
     ldapsearch CLI is incompatible with Authentik's LDAP outpost (returns error 49
     even when the outpost authenticates successfully), so we verify via outpost logs."""
+    settings = load_settings()
+    ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+    ldap_host = '127.0.0.1'
+    is_remote = ak_cfg.get('target_mode') == 'remote'
+    if is_remote:
+        remote_host = (ak_cfg.get('remote', {}).get('host') or '').strip()
+        if remote_host:
+            ldap_host = remote_host
     try:
         if shutil.which('ldapsearch'):
             subprocess.run(
-                ['ldapsearch', '-x', '-H', 'ldap://127.0.0.1:389',
+                ['ldapsearch', '-x', '-H', f'ldap://{ldap_host}:389',
                  '-D', 'cn=adm_ldapservice,ou=users,dc=takldap', '-w', ldap_pass,
                  '-b', 'dc=takldap', '-s', 'base', '(objectClass=*)'],
                 capture_output=True, text=True, timeout=15)
     except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
-        pass  # ldapsearch missing, failed, or timed out; still check logs below
+        pass
     time.sleep(2)
-    r = subprocess.run(
-        'docker logs authentik-ldap-1 --since 25s 2>&1',
-        shell=True, capture_output=True, text=True, timeout=10)
-    log = (r.stdout or '').lower()
+    if is_remote:
+        ok, out = _ssh_probe(ak_cfg.get('remote', {}),
+            'docker logs authentik-ldap-1 --since 25s 2>&1', timeout=15)
+        log = (out or '').lower()
+    else:
+        r = subprocess.run(
+            'docker logs authentik-ldap-1 --since 25s 2>&1',
+            shell=True, capture_output=True, text=True, timeout=10)
+        log = (r.stdout or '').lower()
     return 'authenticated' in log and ('adm_ldapservice' in log or 'ldapservice' in log)
 
 def _ensure_ldap_flow_authentication_none():
@@ -14438,9 +14536,16 @@ def _apply_ldap_to_coreconfig():
     backup_path = coreconfig_path + '.pre-ldap.bak'
     if not os.path.exists(backup_path):
         subprocess.run(['sudo', 'cp', coreconfig_path, backup_path], capture_output=True, timeout=10)
-    # Build the replacement auth block — matches TAK Portal reference exactly
+    # Build the replacement auth block — use remote LDAP host if Authentik deployed remotely
+    settings = load_settings()
+    ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+    ldap_host = '127.0.0.1'
+    if ak_cfg.get('target_mode') == 'remote':
+        remote_host = (ak_cfg.get('remote', {}).get('host') or '').strip()
+        if remote_host:
+            ldap_host = remote_host
     ldap_line = '        <ldap'
-    ldap_line += ' url="ldap://127.0.0.1:389"'
+    ldap_line += f' url="ldap://{ldap_host}:389"'
     ldap_line += ' userstring="cn={username},ou=users,dc=takldap"'
     ldap_line += ' updateinterval="30"'
     ldap_line += ' groupprefix="cn=tak_"'
