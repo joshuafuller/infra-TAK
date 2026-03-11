@@ -12009,11 +12009,28 @@ def authentik_deploy():
     return jsonify({'success': True})
 
 def _authentik_installed_for_reconfigure():
-    """True if Authentik is present: compose file in ~/authentik or authentik-server container running (so Update config is allowed)."""
+    """True if Authentik is present so Update config is allowed. Checks: remote deployed, compose file, docker container, or HTTP reachable."""
+    settings = load_settings()
+    deploy_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+    if deploy_cfg.get('target_mode') == 'remote' and deploy_cfg.get('deployed') and (deploy_cfg.get('remote', {}).get('host') or '').strip():
+        return True
     if os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
         return True
-    r = subprocess.run('docker ps --filter name=authentik-server --format "{{.Names}}" 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
-    return bool(r.returncode == 0 and r.stdout and 'authentik' in r.stdout.strip().lower())
+    try:
+        r = subprocess.run('docker ps --filter name=authentik-server --format "{{.Names}}" 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout and 'authentik' in (r.stdout or '').strip().lower():
+            return True
+    except Exception:
+        pass
+    try:
+        import urllib.request
+        url = _get_authentik_api_url(settings).rstrip('/') + '/'
+        req = urllib.request.Request(url, method='GET')
+        urllib.request.urlopen(req, timeout=5)
+        return True
+    except Exception:
+        pass
+    return False
 
 
 @app.route('/api/authentik/reconfigure', methods=['POST'])
