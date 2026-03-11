@@ -8998,7 +8998,7 @@ def _ensure_proxy_providers_cookie_domain(ak_url, ak_headers, fqdn, plog=None):
 
 
 def _sync_authentik_takportal_provider_url(settings):
-    """Set TAK Portal Proxy external_host/cookie_domain and ensure it is on the embedded outpost (fixes 404 on takportal.fqdn)."""
+    """Set TAK Portal Proxy external_host/cookie_domain, ensure provider+app exist and are on embedded outpost (fixes 404 on takportal.fqdn)."""
     import urllib.request as _req
     import urllib.error
     fqdn = (settings.get('fqdn') or '').strip()
@@ -9034,17 +9034,57 @@ def _sync_authentik_takportal_provider_url(settings):
                 _req.urlopen(_req.Request(f'{ak_url}/api/v3/providers/proxy/{pk}/',
                     data=json.dumps(patch).encode(), headers=ak_headers, method='PATCH'), timeout=10)
             break
+        # If no provider exists, create it + application + add to outpost (idempotent)
+        if provider_pk is None:
+            flow_pk = inv_flow_pk = None
+            try:
+                fr = _req.Request(f'{ak_url}/api/v3/flows/instances/?designation=authorization&ordering=slug', headers=ak_headers)
+                flows = json.loads(_req.urlopen(fr, timeout=10).read().decode()).get('results', [])
+                for fl in flows:
+                    if 'implicit' in fl.get('slug', ''):
+                        flow_pk = fl['pk']
+                        break
+                if not flow_pk and flows:
+                    flow_pk = flows[0]['pk']
+                ir = _req.Request(f'{ak_url}/api/v3/flows/instances/?designation=invalidation', headers=ak_headers)
+                inv_flows = json.loads(_req.urlopen(ir, timeout=10).read().decode()).get('results', [])
+                inv_flow_pk = next((f['pk'] for f in inv_flows if 'provider' not in f.get('slug', '')), inv_flows[0]['pk'] if inv_flows else None)
+            except Exception:
+                pass
+            if flow_pk and inv_flow_pk:
+                try:
+                    body = json.dumps({'name': 'TAK Portal Proxy', 'authorization_flow': flow_pk, 'invalidation_flow': inv_flow_pk,
+                        'external_host': desired_host, 'mode': 'forward_single', 'token_validity': 'hours=24', 'cookie_domain': desired_cookie})
+                    pr = _req.Request(f'{ak_url}/api/v3/providers/proxy/', data=body.encode(), headers=ak_headers, method='POST')
+                    provider_pk = json.loads(_req.urlopen(pr, timeout=10).read().decode()).get('pk')
+                except urllib.error.HTTPError as e:
+                    if e.code == 400:
+                        sr = _req.Request(f'{ak_url}/api/v3/providers/proxy/?search=TAK+Portal', headers=ak_headers)
+                        results = json.loads(_req.urlopen(sr, timeout=10).read().decode()).get('results', [])
+                        if results:
+                            provider_pk = results[0].get('pk')
+                except Exception:
+                    pass
+            if provider_pk:
+                try:
+                    _req.urlopen(_req.Request(f'{ak_url}/api/v3/core/applications/',
+                        data=json.dumps({'name': 'TAK Portal', 'slug': 'tak-portal', 'provider': provider_pk}).encode(),
+                        headers=ak_headers, method='POST'), timeout=10)
+                except urllib.error.HTTPError as e:
+                    if e.code != 400:
+                        pass
         # Ensure TAK Portal Proxy is on the embedded outpost so takportal.fqdn is matched (else 404)
         if provider_pk is not None:
             r2 = _req.Request(f'{ak_url}/api/v3/outposts/instances/?search=embedded', headers=ak_headers)
             outposts = json.loads(_req.urlopen(r2, timeout=15).read().decode()).get('results', [])
             embedded = next((o for o in outposts if 'embed' in (o.get('name') or '').lower() or o.get('type') == 'proxy'), None)
             if embedded:
-                current = list(embedded.get('providers') or [])
-                if provider_pk not in current:
-                    current.append(provider_pk)
+                raw = embedded.get('providers') or []
+                current_pks = [p if isinstance(p, int) else p.get('pk') for p in raw if (p if isinstance(p, int) else p.get('pk')) is not None]
+                if provider_pk not in current_pks:
+                    current_pks.append(provider_pk)
                     _req.urlopen(_req.Request(f'{ak_url}/api/v3/outposts/instances/{embedded["pk"]}/',
-                        data=json.dumps({'providers': current}).encode(), headers=ak_headers, method='PATCH'), timeout=10)
+                        data=json.dumps({'providers': current_pks}).encode(), headers=ak_headers, method='PATCH'), timeout=10)
     except Exception:
         pass
 
