@@ -9476,6 +9476,10 @@ volumes:
         plog(f"  {(out or '').strip()}")
     plog("✓ Docker available on remote")
 
+    plog("")
+    plog("━━━ Docker log limits (remote) ━━━")
+    _ensure_docker_log_limits_remote(deploy_cfg.get('remote', {}), log_fn=plog)
+
     plog("  Starting Node-RED on remote...")
     ok, out = _module_run(deploy_cfg, 'cd ~/node-red && docker compose up -d 2>&1', timeout=120, log_fn=plog)
     if not ok:
