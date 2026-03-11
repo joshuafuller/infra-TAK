@@ -310,22 +310,28 @@ def detect_modules():
         gd_running = 'tak8089guard' in r.stdout
     modules['guarddog'] = {'name': 'Guard Dog', 'installed': gd_installed, 'running': gd_running,
         'description': 'Health monitoring and auto-recovery', 'icon': '🐕', 'route': '/guarddog', 'priority': 5}
-    # Node-RED (container name is "nodered" from compose container_name)
+    # Node-RED (container name is "nodered" from compose container_name); local or remote deploy
+    nodered_cfg = _get_module_deployment_config(settings, 'nodered_deployment')
     nodered_installed = False
     nodered_running = False
-    nr_dir = os.path.expanduser('~/node-red')
-    nr_compose = os.path.join(nr_dir, 'docker-compose.yml')
-    if os.path.exists(nr_compose):
+    if nodered_cfg.get('target_mode') == 'remote' and nodered_cfg.get('deployed') and (nodered_cfg.get('remote', {}).get('host') or '').strip():
         nodered_installed = True
-        r = subprocess.run(f'docker compose -f "{nr_compose}" ps -q 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5, cwd=nr_dir)
-        if r.returncode == 0 and (r.stdout or '').strip():
-            r2 = subprocess.run('docker ps --filter name=nodered --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
-            nodered_running = bool(r2.stdout and 'Up' in r2.stdout)
-    if not nodered_installed and (os.path.exists(os.path.expanduser('~/node-red')) or os.path.exists('/opt/nodered')):
-        nodered_installed = True
-        r = subprocess.run(['systemctl', 'is-active', 'nodered'], capture_output=True, text=True)
-        if r.stdout.strip() == 'active':
-            nodered_running = True
+        ok, out = _ssh_probe(nodered_cfg.get('remote', {}), 'docker ps --filter name=nodered --format "{{.Status}}" 2>/dev/null', timeout=12)
+        nodered_running = bool(ok and out and 'Up' in out)
+    else:
+        nr_dir = os.path.expanduser('~/node-red')
+        nr_compose = os.path.join(nr_dir, 'docker-compose.yml')
+        if os.path.exists(nr_compose):
+            nodered_installed = True
+            r = subprocess.run(f'docker compose -f "{nr_compose}" ps -q 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5, cwd=nr_dir)
+            if r.returncode == 0 and (r.stdout or '').strip():
+                r2 = subprocess.run('docker ps --filter name=nodered --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
+                nodered_running = bool(r2.stdout and 'Up' in r2.stdout)
+        if not nodered_installed and (os.path.exists(os.path.expanduser('~/node-red')) or os.path.exists('/opt/nodered')):
+            nodered_installed = True
+            r = subprocess.run(['systemctl', 'is-active', 'nodered'], capture_output=True, text=True)
+            if r.stdout.strip() == 'active':
+                nodered_running = True
     modules['nodered'] = {'name': 'Node-RED', 'installed': nodered_installed, 'running': nodered_running,
         'description': 'Flow-based automation & integrations', 'icon': '🔴', 'icon_url': NODERED_LOGO_URL_2, 'route': '/nodered', 'priority': 6}
     # CloudTAK (local or remote deployment target)
@@ -2630,9 +2636,11 @@ def nodered_page():
     modules = detect_modules()
     nr = modules.get('nodered', {})
     ak = modules.get('authentik', {})
+    nodered_deploy_cfg = _get_module_deployment_config(settings, 'nodered_deployment')
     resp = make_response(render_template_string(NODERED_TEMPLATE,
         settings=settings, nr=nr, version=VERSION,
         authentik_installed=ak.get('installed'),
+        nodered_deploy_cfg=nodered_deploy_cfg,
         deploying=nodered_deploy_status.get('running', False),
         deploy_done=nodered_deploy_status.get('complete', False),
         caddy_logo_url=CADDY_LOGO_URL, tak_logo_url=TAK_LOGO_URL, authentik_logo_url=AUTHENTIK_LOGO_URL,
@@ -3285,6 +3293,16 @@ def _get_mediamtx_hls_upstream(settings):
         if host:
             return f'{host}:8888', hls_encrypted
     return '127.0.0.1:8888', hls_encrypted
+
+
+def _get_nodered_upstream(settings):
+    """Return Node-RED upstream for Caddy (127.0.0.1:1880 or remote_host:1880)."""
+    cfg = _get_module_deployment_config(settings, 'nodered_deployment')
+    if cfg.get('target_mode') == 'remote':
+        host = (cfg.get('remote', {}).get('host') or '').strip()
+        if host:
+            return f'{host}:1880'
+    return '127.0.0.1:1880'
 
 
 def _get_takportal_upstream(settings):
@@ -3968,6 +3986,7 @@ def generate_caddyfile(settings=None):
 
     if nodered.get('installed'):
         nodered_host = sd['nodered']
+        nodered_up = _get_nodered_upstream(settings)
         lines.append(f"# Node-RED flow editor")
         lines.append(f"{nodered_host} {{")
         if ak.get('installed'):
@@ -3977,10 +3996,10 @@ def generate_caddyfile(settings=None):
             lines.append(f"            uri /outpost.goauthentik.io/auth/caddy")
             lines.append(f"            trusted_proxies private_ranges")
             lines.append(f"        }}")
-            lines.append(f"        reverse_proxy 127.0.0.1:1880")
+            lines.append(f"        reverse_proxy {nodered_up}")
             lines.append(f"    }}")
         else:
-            lines.append(f"    reverse_proxy 127.0.0.1:1880")
+            lines.append(f"    reverse_proxy {nodered_up}")
         lines.append(f"}}")
         lines.append("")
 
@@ -8626,6 +8645,12 @@ nodered_deploy_status = {'running': False, 'complete': False, 'error': False, 'c
 def nodered_deploy_api():
     if nodered_deploy_status.get('running'):
         return jsonify({'error': 'Deployment already in progress'}), 409
+    data = request.get_json() or {}
+    if data.get('config'):
+        settings = load_settings()
+        cfg = _normalize_module_deployment_config(data['config'])
+        settings['nodered_deployment'] = cfg
+        save_settings(settings)
     nodered_deploy_log.clear()
     nodered_deploy_status.update({'running': True, 'complete': False, 'error': False, 'cancelled': False})
     threading.Thread(target=run_nodered_deploy, daemon=True).start()
@@ -8711,6 +8736,9 @@ def _is_module_deployed(settings, module_key):
     if module_key == 'takportal':
         return os.path.exists(os.path.expanduser('~/TAK-Portal/docker-compose.yml'))
     if module_key == 'nodered':
+        nr_cfg = _get_module_deployment_config(settings, 'nodered_deployment')
+        if nr_cfg.get('target_mode') == 'remote' and nr_cfg.get('deployed') and (nr_cfg.get('remote', {}).get('host') or '').strip():
+            return True
         nr_compose = os.path.join(os.path.expanduser('~/node-red'), 'docker-compose.yml')
         if os.path.exists(nr_compose):
             return True
@@ -9385,6 +9413,76 @@ def _ensure_app_access_policies(ak_url, ak_headers, plog=None):
         return False
 
 
+def _run_nodered_deploy_remote(settings, deploy_cfg, plog):
+    """Deploy Node-RED on remote host via SSH (mirrors Authentik remote deploy)."""
+    remote = deploy_cfg.get('remote', {})
+    host = (remote.get('host') or '').strip()
+    if not host:
+        plog("✗ Remote host not configured")
+        nodered_deploy_status.update({'running': False, 'error': True})
+        return
+    plog("━━━ Node-RED remote deploy ━━━")
+    plog(f"  Target: {host}")
+    _module_run(deploy_cfg, 'mkdir -p ~/node-red', timeout=10, log_fn=plog)
+    settings_js = """module.exports = {
+  flowFile: 'flows.json',
+  flowFilePretty: true,
+  userDir: '/data',
+  httpAdminRoot: '/',
+  httpNodeRoot: '/'
+};
+"""
+    compose_yml = """services:
+  node-red:
+    image: nodered/node-red:latest
+    container_name: nodered
+    ports:
+      - "1880:1880"
+    volumes:
+      - node_red_data:/data
+      - ./settings.js:/data/settings.js
+volumes:
+  node_red_data:
+"""
+    with open('/tmp/nodered_settings.js', 'w') as f:
+        f.write(settings_js)
+    with open('/tmp/nodered_docker-compose.yml', 'w') as f:
+        f.write(compose_yml)
+    ok1, _ = _module_copy(deploy_cfg, '/tmp/nodered_settings.js', '~/node-red/settings.js', log_fn=plog)
+    ok2, _ = _module_copy(deploy_cfg, '/tmp/nodered_docker-compose.yml', '~/node-red/docker-compose.yml', log_fn=plog)
+    try:
+        os.remove('/tmp/nodered_settings.js')
+        os.remove('/tmp/nodered_docker-compose.yml')
+    except Exception:
+        pass
+    if not ok1 or not ok2:
+        plog("✗ Failed to copy config to remote")
+        nodered_deploy_status.update({'running': False, 'error': True})
+        return
+    plog("  Starting Node-RED on remote...")
+    ok, out = _module_run(deploy_cfg, 'cd ~/node-red && docker compose up -d 2>&1', timeout=120, log_fn=plog)
+    if not ok:
+        plog(f"✗ docker compose up failed: {(out or '')[:300]}")
+        nodered_deploy_status.update({'running': False, 'error': True})
+        return
+    plog("✓ Node-RED container started on remote")
+    deploy_cfg['deployed'] = True
+    settings['nodered_deployment'] = _normalize_module_deployment_config(deploy_cfg)
+    save_settings(settings)
+    domain = (settings.get('fqdn') or '').strip()
+    if domain:
+        plog("  Updating Caddy...")
+        generate_caddyfile(settings)
+        subprocess.run('systemctl reload caddy 2>/dev/null', shell=True, capture_output=True, timeout=15)
+        plog(f"✓ Caddy updated — https://nodered.{domain}")
+    if domain and _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN'):
+        plog("  Configuring Authentik for Node-RED...")
+        ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+        _ensure_authentik_nodered_app(domain, ak_token, plog)
+    plog("✓ Node-RED deployed on remote.")
+    nodered_deploy_status.update({'running': False, 'complete': True, 'error': False})
+
+
 def run_nodered_deploy():
     def plog(msg):
         entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
@@ -9395,6 +9493,10 @@ def run_nodered_deploy():
             nodered_deploy_status.update({'running': False, 'complete': False, 'cancelled': True})
             return
         settings = load_settings()
+        deploy_cfg = _get_module_deployment_config(settings, 'nodered_deployment')
+        if deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip():
+            _run_nodered_deploy_remote(settings, deploy_cfg, plog)
+            return
         plog("━━━ Ensuring Docker log limits (prevents container logs from filling disk) ━━━")
         _ensure_docker_log_limits(plog)
         if nodered_deploy_status.get('cancelled'):
@@ -9529,6 +9631,45 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   {% if nr.running %}<div class="status-banner running"><div class="dot"></div>Node-RED is running</div>
   {% elif nr.installed %}<div class="status-banner stopped"><div class="dot"></div>Node-RED is installed but stopped</div>
   {% else %}<div class="status-banner not-installed"><div class="dot"></div>Node-RED is not installed</div>{% endif %}
+  <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:24px">
+  <div style="display:flex;align-items:center;justify-content:space-between;padding:16px 24px;cursor:pointer" onclick="noderedToggleSection('nodered-target')">
+    <span class="card-title" style="margin-bottom:0">Deployment Target</span>
+    <span id="nodered-target-toggle-icon" style="font-size:18px;color:var(--text-dim);transition:transform 0.2s ease;transform:rotate(180deg)">&#9662;</span>
+  </div>
+  <div id="nodered-target-body" style="display:block;padding:0 24px 24px 24px;border-top:1px solid var(--border)">
+    <div class="form-group">
+      <label class="form-label">Where should Node-RED run?</label>
+      <select id="nodered-target-mode" class="form-input">
+        <option value="local" {% if nodered_deploy_cfg.target_mode != 'remote' %}selected{% endif %}>On this infra-TAK host</option>
+        <option value="remote" {% if nodered_deploy_cfg.target_mode == 'remote' %}selected{% endif %}>On a remote host (SSH)</option>
+      </select>
+    </div>
+    <div id="nodered-remote-fields" style="display:{% if nodered_deploy_cfg.target_mode == 'remote' %}block{% else %}none{% endif %}">
+      <div class="info-grid" style="margin-top:12px">
+        <div class="form-group"><label class="form-label">Remote Host/IP</label><input id="nodered-remote-host" class="form-input" type="text" placeholder="10.0.0.15" value="{{ nodered_deploy_cfg.remote.host or '' }}"></div>
+        <div class="form-group"><label class="form-label">SSH Port</label><input id="nodered-remote-port" class="form-input" type="number" min="1" max="65535" value="{{ nodered_deploy_cfg.remote.port or 22 }}"></div>
+      </div>
+      <div class="info-grid" style="margin-top:12px">
+        <div class="form-group"><label class="form-label">SSH Username</label><input id="nodered-remote-user" class="form-input" type="text" placeholder="root" value="{{ nodered_deploy_cfg.remote.username or 'root' }}"></div>
+        <div class="form-group"><label class="form-label">SSH Key Path</label><input id="nodered-remote-key" class="form-input" type="text" placeholder="~/.ssh/infra-tak-nodered" value="{{ nodered_deploy_cfg.remote.ssh_key_path or '' }}"></div>
+      </div>
+      <div class="form-group" style="margin-top:12px">
+        <label class="form-label">One-time password (for Install SSH Key only)</label>
+        <input id="nodered-remote-password" class="form-input" type="password" placeholder="Used only for ssh-copy-id">
+      </div>
+      <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn btn-ghost" type="button" onclick="ensureNoderedSshKey()">Generate SSH key</button>
+        <button class="btn btn-ghost" type="button" onclick="installNoderedSshKey()">Install SSH key</button>
+        <button class="btn btn-ghost" type="button" onclick="testNoderedRemoteSsh()">Test SSH</button>
+      </div>
+      <div id="nodered-ssh-status" style="margin-top:8px;font-size:12px;color:var(--text-dim)"></div>
+    </div>
+    <div style="margin-top:10px">
+      <button class="btn btn-ghost" type="button" onclick="saveNoderedTarget()">Save target settings</button>
+      <span id="nodered-target-save-msg" style="font-size:12px;color:var(--text-dim);margin-left:8px"></span>
+    </div>
+  </div>
+  </div>
   {% if nr.installed %}
   {% if authentik_installed and settings.fqdn %}<div class="card" style="border-color:rgba(59,130,246,.3);background:rgba(59,130,246,.05)"><div class="card-title">&#128274; Protected by Authentik</div><p style="font-size:13px;color:var(--text-secondary);line-height:1.5">Node-RED is behind Authentik. The application and proxy provider are created automatically when you deploy Authentik or Node-RED.</p></div>{% endif %}
   <div class="card"><div class="card-title">Access</div><div class="info-grid">
@@ -9561,8 +9702,16 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 </div></div>
 <script>
 var logIndex=0,logInterval=null;
+function collectNoderedDeployConfig(){var mode=document.getElementById('nodered-target-mode');var host=document.getElementById('nodered-remote-host');var port=document.getElementById('nodered-remote-port');var user=document.getElementById('nodered-remote-user');var key=document.getElementById('nodered-remote-key');return{target_mode:(mode&&mode.value)||'local',remote:{host:host?host.value.trim():'',port:port?parseInt(port.value,10)||22:22,username:user?user.value.trim()||'root':'root',ssh_key_path:key?key.value.trim():''}};}
+function noderedToggleSection(id){var body=document.getElementById(id+'-body');var icon=document.getElementById(id+'-toggle-icon');if(body){body.style.display=body.style.display==='none'?'block':'none';}if(icon){icon.style.transform=(body&&body.style.display==='none')?'rotate(0deg)':'rotate(180deg)';}}
+function saveNoderedTarget(){var cfg=collectNoderedDeployConfig();var msg=document.getElementById('nodered-target-save-msg');if(msg)msg.textContent='Saving...';fetch('/api/nodered/deployment-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:cfg}),credentials:'same-origin'}).then(function(r){return r.ok?r.json():r.json().then(function(d){throw new Error(d.error||'Failed');});}).then(function(d){if(msg){msg.textContent=(d&&(d.target_mode!==undefined||d.remote!==undefined))?'Saved.':'Failed';msg.style.color=(d&&(d.target_mode!==undefined||d.remote!==undefined))?'var(--green)':'var(--red)';}}).catch(function(e){if(msg){msg.textContent=e.message||'Request failed';msg.style.color='var(--red)';}});}
+function ensureNoderedSshKey(){var k=document.getElementById('nodered-remote-key');var path=(k&&k.value.trim())||'~/.ssh/infra-tak-nodered';fetch('/api/nodered/remote/ensure-ssh-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:collectNoderedDeployConfig(),key_path:path}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){if(d.public_key&&k)k.value=d.key_path||path;if(d.public_key){var ta=document.getElementById('nodered-public-key');if(ta)ta.value=d.public_key;}});}
+function installNoderedSshKey(){var pw=document.getElementById('nodered-remote-password')&&document.getElementById('nodered-remote-password').value;if(!pw){var s=document.getElementById('nodered-ssh-status');if(s)s.textContent='Enter one-time password for ssh-copy-id';return;}fetch('/api/nodered/remote/install-ssh-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:collectNoderedDeployConfig(),password:pw}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){var s=document.getElementById('nodered-ssh-status');if(s)s.textContent=d.success?'SSH key installed.':(d.error||'Failed');s.style.color=d.success?'var(--green)':'var(--red)';});}
+function testNoderedRemoteSsh(){var s=document.getElementById('nodered-ssh-status');if(s)s.textContent='Testing...';fetch('/api/nodered/remote/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:collectNoderedDeployConfig()}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){if(s){s.textContent=d.success?'SSH OK':(d.error||'Failed');s.style.color=d.success?'var(--green)':'var(--red)';if(d.output)s.textContent+=' '+(d.output||'').substring(0,80);}});}
+var noderedTargetMode=document.getElementById('nodered-target-mode');if(noderedTargetMode){noderedTargetMode.onchange=function(){var f=document.getElementById('nodered-remote-fields');if(f)f.style.display=noderedTargetMode.value==='remote'?'block':'none';};}
 function startDeploy(){var btn=document.getElementById('deploy-btn');btn.disabled=true;document.getElementById('log-card').style.display='block';document.getElementById('deploy-log-dyn').textContent='Starting...';logIndex=0;
-fetch('/api/nodered/deploy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+var config=typeof collectNoderedDeployConfig==='function'?collectNoderedDeployConfig():{};
+fetch('/api/nodered/deploy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:config}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
 if(d.error){var lg=document.getElementById('log-card');var dyn=document.getElementById('deploy-log-dyn');if(dyn)dyn.textContent='Error: '+d.error;if(lg&&!document.getElementById('deploy-fail-banner')){var b=document.createElement('div');b.id='deploy-fail-banner';b.style.cssText='background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';b.innerHTML='<strong>\u2717 Deployment failed.</strong> Uninstall (if partial) and retry, or click Retry below.';lg.insertBefore(b,lg.querySelector('.log-box')||lg.firstChild);}btn.disabled=false;btn.textContent='\u2717 Deployment failed \u2014 Retry';btn.style.background='var(--red)';btn.style.opacity='1';btn.onclick=function(){btn.textContent='\u1f680 Deploy Node-RED';btn.style.background='';startDeploy();};return;}pollLog();});}
 function pollLog(){function pickLogEl(){var lc=document.getElementById('log-card');return (lc&&lc.style.display!=='none'?document.getElementById('deploy-log-dyn'):null)||document.getElementById('deploy-log')||document.getElementById('deploy-log-dyn');}
 var logEl=pickLogEl();function showCancel(show){var s=document.getElementById('nodered-cancel-btn-static'),d=document.getElementById('nodered-cancel-btn-dyn');if(s)s.style.display=show?'inline-block':'none';if(d)d.style.display=show?'inline-block':'none';}
