@@ -157,6 +157,8 @@ def ensure_session_cookie_domain():
 VERSION = "0.1.9-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
+# Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
+CADDYFILE_USER_BLOCKS_MARKER = "# --- User-added blocks (do not remove) ---"
 # CloudTAK official icon (SVG data URL)
 CLOUDTAK_ICON = "data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiPz48c3ZnIGlkPSJMYXllcl8xIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHhtbG5zOnhsaW5rPSJodHRwOi8vd3d3LnczLm9yZy8xOTk5L3hsaW5rIiB2aWV3Qm94PSIwIDAgNzQuMyA0Ni42MiI+PGRlZnM+PHN0eWxlPi5jbHMtMXtmaWxsOnVybCgjbGluZWFyLWdyYWRpZW50LTIpO30uY2xzLTJ7ZmlsbDp1cmwoI2xpbmVhci1ncmFkaWVudCk7fTwvc3R5bGU+PGxpbmVhckdyYWRpZW50IGlkPSJsaW5lYXItZ3JhZGllbnQiIHgxPSIxNC4zOCIgeTE9IjguOTMiIHgyPSI2Ni45MiIgeTI9IjYxLjQ3IiBncmFkaWVudFVuaXRzPSJ1c2VyU3BhY2VPblVzZSI+PHN0b3Agb2Zmc2V0PSIwIiBzdG9wLWNvbG9yPSIjZmY5ODIwIi8+PHN0b3Agb2Zmc2V0PSIuNDIiIHN0b3AtY29sb3I9IiNmZmNlMDQiLz48c3RvcCBvZmZzZXQ9Ii40OSIgc3RvcC1jb2xvcj0iZ29sZCIvPjwvbGluZWFyR3JhZGllbnQ+PGxpbmVhckdyYWRpZW50IGlkPSJsaW5lYXItZ3JhZGllbnQtMiIgeDE9IjU5LjI3IiB5MT0iLS4zOCIgeDI9IjcyLjc0IiB5Mj0iMTIuMDgiIGdyYWRpZW50VW5pdHM9InVzZXJTcGFjZU9uVXNlIj48c3RvcCBvZmZzZXQ9IjAiIHN0b3AtY29sb3I9IiNmZjk4MjAiLz48c3RvcCBvZmZzZXQ9Ii4yOSIgc3RvcC1jb2xvcj0iI2ZmYjYxMCIvPjxzdG9wIG9mZnNldD0iLjU3IiBzdG9wLWNvbG9yPSJnb2xkIi8+PC9saW5lYXJHcmFkaWVudD48L2RlZnM+PHBhdGggY2xhc3M9ImNscy0yIiBkPSJNNzIuMDUsMjMuNTVjLTEuMjYtMS44OC0zLjAxLTMuNDUtNS4yMS00LjY1LTEuODUtMS4wMS0zLjY5LTEuNTktNS4wNi0xLjkxLS40Mi0xLjc0LTEuMjMtNC4yOC0yLjc3LTYuODVDNTYuNDQsNS44OCw1MS4zNy42Nyw0MS43LjA2Yy0uNTktLjA0LTEuMTgtLjA2LTEuNzUtLjA2LTcuODIsMC0xMi4wNCwzLjUyLTE0LjE5LDYuNDctLjkxLDEuMjQtMS41MywyLjQ4LTEuOTUsMy41NS0uODYtLjEzLTEuODYtLjIyLTIuOTMtLjIyLTMuNTYsMC02LjUyLDEuMDgtOC41NCwzLjEzLTEuOTEsMS45Mi0zLjIsNC4yNi0zLjczLDYuNzUtLjA5LjQxLS4xNS44LS4xOSwxLjE2LS45NS40Ny0yLjEyLDEuMTYtMy4yOSwyLjExQzEuNTYsMjUuODMtLjIsMjkuNjcuMDIsMzQuMDZjLjIyLDQuNDEsMi4yNyw3Ljk2LDUuOTQsMTAuMjksMi42LDEuNjUsNS4xLDIuMTksNS4zOCwyLjIzbC4yMi4wM2guMjJzNDguODYsMCw0OC44NiwwaC4xcy4xLDAsLjEsMGMuMzQtLjAyLDMuMzktLjI2LDYuNTQtMi4xMywzLjA0LTEuOCw2LjctNS40NSw2LjkyLTEyLjU2LjEtMy4xOC0uNjYtNS45OS0yLjI0LTguMzZaTTE0LjQzLDE1YzEuNzUtMS43Nyw0LjI0LTIuMjYsNi40NS0yLjI2LDIuNzEsMCw0Ljk5LjczLDQuOTkuNzMsMCwwLDEuMzMtMTAuNTMsMTQuMDctMTAuNTMuNSwwLDEuMDMuMDIsMS41Ny4wNSwxNi4yNCwxLjAzLDE3Ljc0LDE2LjU0LDE3Ljc0LDE2LjU0LDAsMCw0LjY3LjQyLDguMjEsMy4zMS0zLjQ3LDMuMjItNC45NSw1LjE5LTEyLjc3LDUuNzUtOC42NS42MS03LjQ3LDMuOTUtNy40NywzLjk1bC00LjA1LTguOThoNS43OWMuMTQtMi44NS0uODctNS42NS01LjMxLTUuNjVoLTguNDlsLTYuNTYsMTQuNjJzMS45Ni0zLjMxLTYuNjktMy45NWMtNy42OS0uNTUtNy41OC0yLjY5LTEwLjYxLTUuODgtLjA2LS41OC0uMjYtNC4zLDMuMTMtNy43MloiLz48cGF0aCBjbGFzcz0iY2xzLTEiIGQ9Ik02MS43OSwzLjczaDIuNTl2LjY0aC0uOTN2Mi4zOGgtLjc0di0yLjM4aC0uOTN2LS42NFpNNjcuMDUsMy43M2wtLjc3LDIuMDMtLjc3LTIuMDNoLS45M3YzLjAzaC43di0ybC43MywyaC41NGwuNzMtMnYyaC43di0zLjAzaC0uOTNaIi8+PC9zdmc+"
 # MediaMTX official logo (external URL to avoid long inline strings)
@@ -1666,6 +1668,11 @@ def _guarddog_health_check(service_id):
             resp = urllib.request.urlopen(req, timeout=8)
             return resp.status in (200, 302, 301)
         if service_id == 'mediamtx':
+            settings = load_settings()
+            mtx_cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
+            if mtx_cfg.get('target_mode') == 'remote' and mtx_cfg.get('deployed') and (mtx_cfg.get('remote', {}).get('host') or '').strip():
+                ok, out = _ssh_probe(mtx_cfg.get('remote', {}), 'systemctl is-active mediamtx 2>/dev/null', timeout=8)
+                return bool(ok and out and out.strip() == 'active')
             r = subprocess.run(['systemctl', 'is-active', 'mediamtx'], capture_output=True, text=True, timeout=3)
             return r.returncode == 0
         if service_id == 'nodered':
@@ -1679,6 +1686,14 @@ def _guarddog_health_check(service_id):
             resp = urllib.request.urlopen(req, timeout=5)
             return resp.status in (200, 302, 301)
         if service_id == 'cloudtak':
+            settings = load_settings()
+            cfg = _get_cloudtak_deployment_config(settings)
+            if cfg.get('target_mode') == 'remote':
+                rcfg = cfg.get('remote', {})
+                if cfg.get('deployed') and (rcfg.get('host') or '').strip():
+                    ok, out = _ssh_probe(rcfg, "docker ps --filter name=cloudtak-api --format '{{.Status}}' 2>/dev/null", timeout=10)
+                    return bool(ok and out and 'Up' in out)
+                return False
             r = subprocess.run('docker ps --filter name=cloudtak-api --format "{{.Status}}"', shell=True, capture_output=True, text=True, timeout=5)
             return bool(r.stdout and 'Up' in r.stdout)
         if service_id == 'remotedb':
@@ -1989,6 +2004,11 @@ def _monitor_health_check(monitor_id):
             resp = urllib.request.urlopen(req, timeout=8)
             return resp.status in (200, 302, 301)
         if monitor_id == 'mediamtx_svc':
+            settings = load_settings()
+            mtx_cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
+            if mtx_cfg.get('target_mode') == 'remote' and mtx_cfg.get('deployed') and (mtx_cfg.get('remote', {}).get('host') or '').strip():
+                ok, out = _ssh_probe(mtx_cfg.get('remote', {}), 'systemctl is-active mediamtx 2>/dev/null', timeout=8)
+                return bool(ok and out and out.strip() == 'active')
             r = subprocess.run(['systemctl', 'is-active', 'mediamtx'], capture_output=True, text=True, timeout=3)
             return r.returncode == 0
         if monitor_id == 'nodered_http':
@@ -4160,6 +4180,17 @@ def generate_caddyfile(settings=None):
         lines.append("")
 
     caddyfile = '\n'.join(lines)
+    # Preserve user-added blocks (e.g. health.tntak.net for Uptime Robot) that sit below the marker.
+    if os.path.exists(CADDYFILE_PATH):
+        try:
+            with open(CADDYFILE_PATH) as f:
+                existing = f.read()
+            if CADDYFILE_USER_BLOCKS_MARKER in existing:
+                user_blocks = existing[existing.index(CADDYFILE_USER_BLOCKS_MARKER):].rstrip()
+                if user_blocks:
+                    caddyfile = caddyfile.rstrip() + '\n\n' + user_blocks
+        except Exception:
+            pass
     os.makedirs(os.path.dirname(CADDYFILE_PATH), exist_ok=True)
     with open(CADDYFILE_PATH, 'w') as f:
         f.write(caddyfile)
