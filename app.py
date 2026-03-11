@@ -9459,6 +9459,23 @@ volumes:
         plog("✗ Failed to copy config to remote")
         nodered_deploy_status.update({'running': False, 'error': True})
         return
+
+    # Ensure Docker on remote (same pattern as CloudTAK / Authentik)
+    plog("━━━ Checking Docker (remote) ━━━")
+    ok, out = _module_run(deploy_cfg, 'docker --version 2>&1', timeout=15)
+    if not ok or 'Docker version' not in (out or ''):
+        plog("  Docker not found. Installing...")
+        ok, out = _module_run(deploy_cfg, 'curl -fsSL https://get.docker.com | sh 2>&1', timeout=300, log_fn=plog)
+        if not ok:
+            plog("✗ Failed to install Docker on remote")
+            nodered_deploy_status.update({'running': False, 'error': True})
+            return
+        ok, out = _module_run(deploy_cfg, 'docker --version 2>&1', timeout=15)
+        plog(f"  {(out or '').strip()}")
+    else:
+        plog(f"  {(out or '').strip()}")
+    plog("✓ Docker available on remote")
+
     plog("  Starting Node-RED on remote...")
     ok, out = _module_run(deploy_cfg, 'cd ~/node-red && docker compose up -d 2>&1', timeout=120, log_fn=plog)
     if not ok:
