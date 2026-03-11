@@ -14384,6 +14384,10 @@ body{display:flex;min-height:100vh}
 <div style="margin-top:8px;font-size:11px;color:var(--text-dim)">LDAP configured via blueprint · Check Admin → Outposts to verify</div>
 </div>
 </div>
+<div class="card" id="ak-log-card" style="display:none">
+  <div class="card-title">Update config &amp; reconnect — Log</div>
+  <div class="deploy-log" id="deploy-log" data-authentik-url="{{ authentik_base_url }}">Waiting...</div>
+</div>
 {% if container_info.get('containers') %}
 <div class="section-title">Services</div>
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
@@ -14408,12 +14412,20 @@ body{display:flex;min-height:100vh}
 {% endif %}
 <div class="section-title">Container Logs <span id="log-filter-label" style="font-size:11px;color:var(--cyan);margin-left:8px"></span></div>
 <div class="deploy-log" id="container-log">Loading logs...</div>
+<div class="card" id="ak-log-card" style="display:none;margin-top:24px">
+  <div class="card-title">Update config & reconnect — Log</div>
+  <div class="deploy-log" id="deploy-log" data-authentik-url="{{ authentik_base_url }}">Waiting...</div>
+</div>
 <div style="margin-top:24px;text-align:center">
 <button class="control-btn" onclick="reconfigureAk()" style="margin-right:12px">🔄 Update config & reconnect</button>{% if authentik_deploy_cfg.target_mode == 'remote' and ak.installed %}
 <button class="control-btn" onclick="fixAkLdapToken(this)" style="margin-right:12px" title="Emergency: inject LDAP outpost token and recreate LDAP container">🔑 Fix LDAP token</button>{% endif %}
 <button class="control-btn btn-remove" onclick="document.getElementById('ak-uninstall-modal').classList.add('open')">🗑 Remove Authentik</button>
 </div>
 {% elif ak.installed %}
+<div class="card" id="ak-log-card" style="display:none;margin-top:24px">
+  <div class="card-title">Update config & reconnect — Log</div>
+  <div class="deploy-log" id="deploy-log" data-authentik-url="{{ authentik_base_url }}">Waiting...</div>
+</div>
 <div style="margin-top:24px;text-align:center">
 <button class="control-btn btn-start" onclick="akControl('start')" style="margin-right:12px">▶ Start</button>
 <button class="control-btn" onclick="reconfigureAk()" style="margin-right:12px">🔄 Update config & reconnect</button>{% if authentik_deploy_cfg.target_mode == 'remote' %}
@@ -14583,7 +14595,14 @@ async function reconfigureAk(){
     try{
         var r=await fetch('/api/authentik/reconfigure',{method:'POST',headers:{'Content-Type':'application/json'}});
         var d=await r.json();
-        if(d.success)window.location.href='/authentik';
+        if(d.success){
+            var logCard=document.getElementById('ak-log-card');
+            var logEl=document.getElementById('deploy-log');
+            if(logCard){logCard.style.display='block';logCard.scrollIntoView({behavior:'smooth',block:'nearest'});}
+            if(logEl){logEl.innerHTML='';logEl.appendChild(document.createTextNode('Starting update config & reconnect...'));}
+            logIndex=0;
+            pollDeployLog();
+        }
         else alert('Error: '+(d.error||'Reconfigure failed'));
     }catch(e){alert('Error: '+e.message)}
 }
