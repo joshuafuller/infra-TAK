@@ -12865,6 +12865,50 @@ volumes:
     authentik_deploy_status.update({'running': False, 'complete': True, 'error': False})
 
 
+def _run_authentik_reconfigure_remote(settings, deploy_cfg, plog):
+    """Reconfigure Authentik on remote host: ensure up, then run API steps (cookie domain, apps, outpost, policies)."""
+    remote = deploy_cfg.get('remote', {})
+    host = (remote.get('host') or '').strip()
+    if not host:
+        plog("\u2717 Remote host not configured")
+        authentik_deploy_status.update({'running': False, 'error': True})
+        return
+    plog("\u2501\u2501\u2501 Reconfigure: Remote Authentik (no local ~/authentik) \u2501\u2501\u2501")
+    plog(f"  Target: {host}")
+    _module_run(deploy_cfg, 'cd ~/authentik && docker compose up -d 2>&1', timeout=120, log_fn=plog)
+    plog("  Ensured containers are up on remote")
+    fqdn = settings.get('fqdn', '')
+    ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+    if not ak_token:
+        plog("  \u26a0 No token in remote .env — run a full Deploy or set AUTHENTIK_TOKEN on remote")
+        authentik_deploy_status.update({'running': False, 'error': True})
+        return
+    ak_url = _get_authentik_api_url(settings)
+    ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+    plog("  Waiting for Authentik API (remote)...")
+    if not _wait_for_authentik_api(ak_url, ak_headers, max_attempts=24, plog=plog):
+        plog("  \u26a0 API not ready in time — run Update config & reconnect again")
+        authentik_deploy_status.update({'running': False, 'error': True})
+        return
+    plog("  Setting proxy cookie domain...")
+    _ensure_proxy_providers_cookie_domain(ak_url, ak_headers, fqdn, plog)
+    plog("  Syncing TAK Portal provider URL and outpost...")
+    _sync_authentik_takportal_provider_url(settings)
+    plog("  Configuring Authentik for Node-RED...")
+    _ensure_authentik_nodered_app(fqdn, ak_token, plog)
+    plog("  Configuring Authentik for infra-TAK Console (infra-TAK + MediaMTX)...")
+    _ensure_authentik_console_app(fqdn, ak_token, plog)
+    plog("  Ensuring all app providers on embedded outpost...")
+    _repair_embedded_outpost_all_apps(ak_url, ak_headers, settings, plog)
+    plog("  Configuring application access policies...")
+    _ensure_app_access_policies(ak_url, ak_headers, plog)
+    plog("  Enabling show password on login...")
+    _authentik_enable_show_password(ak_url, ak_headers, plog)
+    plog("")
+    plog("\u2713 Reconfigure complete (remote).")
+    authentik_deploy_status.update({'running': False, 'complete': True, 'error': False})
+
+
 def _find_authentik_install_dir():
     """Return (ak_dir, env_path, compose_path) if found, else (None, None, None). Tries ~/authentik, /opt/authentik, then docker compose project dir."""
     for candidate in [os.path.expanduser('~/authentik'), '/opt/authentik']:
@@ -12913,7 +12957,10 @@ def run_authentik_deploy(reconfigure=False):
         ldap_svc_pass = None
 
         deploy_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
-        if deploy_cfg.get('target_mode') == 'remote' and not reconfigure:
+        if deploy_cfg.get('target_mode') == 'remote':
+            if reconfigure:
+                _run_authentik_reconfigure_remote(settings, deploy_cfg, plog)
+                return
             _run_authentik_deploy_remote(settings, deploy_cfg, plog)
             return
 

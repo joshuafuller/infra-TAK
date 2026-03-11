@@ -168,17 +168,26 @@ start.sh                    ← One CLI command to launch everything
 
 ## Changelog
 
-### v0.1.10-alpha (dev) — 2026-03-11
+### v0.2.0-alpha (dev) — 2026-03-11
 
-**Remote Authentik — LDAP token fix**
-- When Authentik is deployed to a remote host, the console now injects the LDAP outpost token and recreates the LDAP container (Step 6b) so the outpost no longer gets 403 (token invalid/expired). Redeploy remote Authentik to pick up the fix.
+**Authentik — Update config & reconnect (local and remote)**
+- **Remote reconfigure:** When Authentik is deployed to a **remote** host, “Update config & reconnect” now runs against the remote host only (SSH to ensure containers up, then API steps against `http://<remote_host>:9090`). No local `~/authentik` is required. Token is read from remote .env via SSH.
+- **Local reconfigure** now creates/repairs all four applications (infra-TAK, MediaMTX, Node-RED, TAK Portal) and ensures their providers are on the embedded outpost. If `~/authentik` is missing, the console tries `/opt/authentik` and the Docker Compose project dir from the authentik-server container.
+- **Outpost safety:** All code that adds a provider to the embedded outpost uses a single safe helper that never shortens the provider list, so adding TAK Portal (or any app) no longer removes the others.
+- **Install check:** “Update config & reconnect” is allowed when remote + deployed, or when the compose file exists, or when an authentik-server container is running, or when Authentik HTTP is reachable — so it no longer fails with “Authentik not installed” when the stack is running but the console has no local compose file (e.g. remote deploy).
+- **Deploy log:** Reconfigure now shows a live log (no immediate redirect); the “Update config & reconnect — Log” card appears and streams output.
+
+**Current struggles (see docs/HANDOFF-LDAP-AUTHENTIK.md)**
+- Remote Authentik: ensure the console can reach the remote host on port 9090 (API) and that SSH is configured; token must be present in remote `~/authentik/.env`.
+- If only TAK Portal (or a subset of apps) appears in the launcher, run “Update config & reconnect” and check Authentik Admin → Applications and Outposts → embedded outpost; reconfigure should repair all four apps.
 
 **Console and module version display**
 - TAK Server version is shown again on the Console card and on the TAK Server page header; version is read from `takserver`, `takserver-core`, or `takserver-database` so two-server setups show the correct version.
 - CloudTAK page shows the CloudTAK version in the header (e.g. “CloudTAK · v12.93.0”).
 
 **Docs**
-- README: “Branches” (main vs dev) and “Remote deployment and firewalls” — SSH, Authentik API (9000), two-server PostgreSQL (5432); note that firewall tweaks may be needed so the console and remotes can talk.
+- README: “Branches” (main vs dev) and “Remote deployment and firewalls” — SSH, Authentik API (9090), two-server PostgreSQL (5432).
+- `docs/HANDOFF-LDAP-AUTHENTIK.md`: v0.2.0 session state, current struggles (remote Authentik, applications not loading). `docs/MAIN-VS-DEV-AUTHENTIK.md`: main vs dev reconfigure and outpost behavior.
 
 ---
 
