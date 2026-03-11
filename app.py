@@ -2637,10 +2637,14 @@ def nodered_page():
     nr = modules.get('nodered', {})
     ak = modules.get('authentik', {})
     nodered_deploy_cfg = _get_module_deployment_config(settings, 'nodered_deployment')
+    nodered_remote_host = None
+    if nodered_deploy_cfg.get('target_mode') == 'remote':
+        nodered_remote_host = (nodered_deploy_cfg.get('remote', {}).get('host') or '').strip() or None
     resp = make_response(render_template_string(NODERED_TEMPLATE,
         settings=settings, nr=nr, version=VERSION,
         authentik_installed=ak.get('installed'),
         nodered_deploy_cfg=nodered_deploy_cfg,
+        nodered_remote_host=nodered_remote_host,
         deploying=nodered_deploy_status.get('running', False),
         deploy_done=nodered_deploy_status.get('complete', False),
         caddy_logo_url=CADDY_LOGO_URL, tak_logo_url=TAK_LOGO_URL, authentik_logo_url=AUTHENTIK_LOGO_URL,
@@ -8703,6 +8707,21 @@ def nodered_logs():
     entries = [l for l in (r.stdout.strip().split('\n') if r.stdout else []) if l.strip()]
     return jsonify({'entries': entries})
 
+
+@app.route('/api/nodered/remote-metrics')
+@login_required
+def nodered_remote_metrics():
+    """Return CPU/memory/disk/uptime for the remote host when Node-RED is deployed remotely."""
+    settings = load_settings()
+    deploy_cfg = _get_module_deployment_config(settings, 'nodered_deployment')
+    if deploy_cfg.get('target_mode') != 'remote' or not (deploy_cfg.get('remote', {}).get('host') or '').strip():
+        return jsonify({'error': 'Not remote'}), 404
+    metrics = _get_remote_host_metrics(deploy_cfg.get('remote', {}))
+    if metrics is None:
+        return jsonify({'error': 'Could not fetch remote metrics'}), 503
+    return jsonify(metrics)
+
+
 @app.route('/api/nodered/uninstall', methods=['POST'])
 @login_required
 def nodered_uninstall():
@@ -8753,9 +8772,10 @@ def _is_module_deployed(settings, module_key):
     return False
 
 
-def _ensure_authentik_nodered_app(fqdn, ak_token, plog=None, flow_pk=None, inv_flow_pk=None):
+def _ensure_authentik_nodered_app(fqdn, ak_token, plog=None, flow_pk=None, inv_flow_pk=None, settings=None):
     """Create Node-RED proxy provider + application in Authentik, add to embedded outpost.
-    When flow_pk/inv_flow_pk are provided (e.g. from Step 12), use them. Otherwise wait for flows."""
+    When flow_pk/inv_flow_pk are provided (e.g. from Step 12), use them. Otherwise wait for flows.
+    When settings is provided, use _get_authentik_api_url(settings) so remote Authentik is supported."""
     if not fqdn or not ak_token:
         return False
     def log(msg):
@@ -8764,7 +8784,7 @@ def _ensure_authentik_nodered_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
     import urllib.request as _urlreq
     import urllib.error
     _ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
-    _ak_url = 'http://127.0.0.1:9090'
+    _ak_url = _get_authentik_api_url(settings) if settings else 'http://127.0.0.1:9090'
 
     try:
         if not flow_pk or not inv_flow_pk:
@@ -9496,10 +9516,10 @@ volumes:
         generate_caddyfile(settings)
         subprocess.run('systemctl reload caddy 2>/dev/null', shell=True, capture_output=True, timeout=15)
         plog(f"✓ Caddy updated — https://nodered.{domain}")
-    if domain and _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN'):
+    ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+    if domain and ak_token:
         plog("  Configuring Authentik for Node-RED...")
-        ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
-        _ensure_authentik_nodered_app(domain, ak_token, plog)
+        _ensure_authentik_nodered_app(domain, ak_token, plog, settings=settings)
     plog("✓ Node-RED deployed on remote.")
     nodered_deploy_status.update({'running': False, 'complete': True, 'error': False})
 
@@ -9578,7 +9598,7 @@ volumes:
                     if line.strip().startswith('AUTHENTIK_BOOTSTRAP_TOKEN='):
                         ak_token = line.strip().split('=', 1)[1].strip()
                         break
-            _ensure_authentik_nodered_app(domain, ak_token, plog)
+            _ensure_authentik_nodered_app(domain, ak_token, plog, settings=settings)
             plog("")
             plog("  Waiting 2 minutes for Authentik outpost to sync...")
             for i in range(24):
@@ -9644,6 +9664,11 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 .modal-actions{display:flex;gap:10px;justify-content:flex-end}
 .form-label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px}
 .form-input{width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px;color:var(--text-primary);font-size:13px}
+.metrics-bar{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:24px}
+.metric-card{background:var(--bg-surface);border:1px solid var(--border);border-radius:12px;padding:18px;text-align:center}
+.metric-label{font-size:11px;color:var(--text-dim);margin-bottom:4px}
+.metric-value{font-size:20px;font-weight:600;color:var(--text-primary)}
+.metric-detail{font-size:11px;color:var(--text-dim);margin-top:4px}
 </style></head>
 <body>
 {{ sidebar_html }}
@@ -9695,6 +9720,18 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     </div>
   </div>
   </div>
+  {% if nr.installed and nodered_remote_host %}
+  <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
+  <div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-bottom:12px"><span style="color:var(--text-secondary)">Remote host:</span> <span style="color:var(--cyan)" id="nodered-remote-host-ip">{{ nodered_remote_host }}</span></div>
+  <div class="card-title" style="margin-top:16px;margin-bottom:8px">Remote host health</div>
+  <div class="metrics-bar" id="nodered-remote-metrics-bar">
+  <div class="metric-card"><div class="metric-label">CPU</div><div class="metric-value" id="nodered-remote-cpu-value">—</div></div>
+  <div class="metric-card"><div class="metric-label">Memory</div><div class="metric-value" id="nodered-remote-ram-value">—</div><div class="metric-detail" id="nodered-remote-ram-detail"></div></div>
+  <div class="metric-card"><div class="metric-label">Disk</div><div class="metric-value" id="nodered-remote-disk-value">—</div><div class="metric-detail" id="nodered-remote-disk-detail"></div></div>
+  <div class="metric-card"><div class="metric-label">Uptime</div><div class="metric-value" id="nodered-remote-uptime-value" style="font-size:18px">—</div></div>
+  </div>
+  </div>
+  {% endif %}
   {% if nr.installed %}
   {% if authentik_installed and settings.fqdn %}<div class="card" style="border-color:rgba(59,130,246,.3);background:rgba(59,130,246,.05)"><div class="card-title">&#128274; Protected by Authentik</div><p style="font-size:13px;color:var(--text-secondary);line-height:1.5">Node-RED is behind Authentik. The application and proxy provider are created automatically when you deploy Authentik or Node-RED.</p></div>{% endif %}
   <div class="card"><div class="card-title">Access</div><div class="info-grid">
@@ -9734,6 +9771,8 @@ function ensureNoderedSshKey(){var st=document.getElementById('nodered-ssh-statu
 function installNoderedSshKey(){var pw=document.getElementById('nodered-remote-password')&&document.getElementById('nodered-remote-password').value;if(!pw){var s=document.getElementById('nodered-ssh-status');if(s)s.textContent='Enter one-time password for ssh-copy-id';return;}fetch('/api/nodered/remote/install-ssh-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:collectNoderedDeployConfig(),password:pw}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){var s=document.getElementById('nodered-ssh-status');if(s)s.textContent=d.success?'SSH key installed.':(d.error||'Failed');s.style.color=d.success?'var(--green)':'var(--red)';});}
 function testNoderedRemoteSsh(){var s=document.getElementById('nodered-ssh-status');if(s){s.textContent='Testing SSH...';s.style.color='var(--text-dim)';}fetch('/api/nodered/remote/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:collectNoderedDeployConfig()}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){if(s){if(d&&d.success){s.textContent='✓ Test passed';s.style.color='var(--green)';}else{s.textContent=(d&&d.error)?d.error:(d&&d.output)||'Test failed';s.style.color='var(--red)';}}}).catch(function(e){if(s){s.textContent='Test failed: '+(e&&e.message?e.message:String(e));s.style.color='var(--red)';}});}
 var noderedTargetMode=document.getElementById('nodered-target-mode');if(noderedTargetMode){noderedTargetMode.onchange=function(){var f=document.getElementById('nodered-remote-fields');if(f)f.style.display=noderedTargetMode.value==='remote'?'block':'none';};}
+async function loadNoderedRemoteMetrics(){var bar=document.getElementById('nodered-remote-metrics-bar');if(!bar)return;try{var r=await fetch('/api/nodered/remote-metrics');if(!r.ok){document.getElementById('nodered-remote-cpu-value').textContent='—';document.getElementById('nodered-remote-ram-value').textContent='—';document.getElementById('nodered-remote-disk-value').textContent='—';document.getElementById('nodered-remote-uptime-value').textContent='—';return;}var d=await r.json();var cpu=document.getElementById('nodered-remote-cpu-value');if(cpu)cpu.textContent=(d.cpu_percent!=null?d.cpu_percent:'—')+'%';var ram=document.getElementById('nodered-remote-ram-value');if(ram)ram.textContent=(d.ram_percent!=null?d.ram_percent:'—')+'%';var ramD=document.getElementById('nodered-remote-ram-detail');if(ramD)ramD.textContent=(d.ram_used_gb!=null&&d.ram_total_gb!=null)?(d.ram_used_gb+'GB / '+d.ram_total_gb+'GB'):'';var disk=document.getElementById('nodered-remote-disk-value');if(disk)disk.textContent=(d.disk_percent!=null?d.disk_percent:'—')+'%';var diskD=document.getElementById('nodered-remote-disk-detail');if(diskD)diskD.textContent=(d.disk_used_gb!=null&&d.disk_total_gb!=null)?(d.disk_used_gb+'GB / '+d.disk_total_gb+'GB'):'';var uptime=document.getElementById('nodered-remote-uptime-value');if(uptime)uptime.textContent=d.uptime||'—';}catch(e){var cpu=document.getElementById('nodered-remote-cpu-value');if(cpu)cpu.textContent='—';}}
+if(document.getElementById('nodered-remote-metrics-bar')){loadNoderedRemoteMetrics();setInterval(loadNoderedRemoteMetrics,5000);}
 function startDeploy(){var btn=document.getElementById('deploy-btn');btn.disabled=true;document.getElementById('log-card').style.display='block';document.getElementById('deploy-log-dyn').textContent='Starting...';logIndex=0;
 var config=typeof collectNoderedDeployConfig==='function'?collectNoderedDeployConfig():{};
 fetch('/api/nodered/deploy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:config}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
@@ -13095,7 +13134,7 @@ def _run_authentik_reconfigure_remote(settings, deploy_cfg, plog):
         _sync_authentik_takportal_provider_url(settings)
     if _is_module_deployed(settings, 'nodered'):
         plog("  Configuring Authentik for Node-RED...")
-        _ensure_authentik_nodered_app(fqdn, ak_token, plog)
+        _ensure_authentik_nodered_app(fqdn, ak_token, plog, settings=settings)
     plog("  Configuring Authentik for infra-TAK Console (infra-TAK + MediaMTX if deployed)...")
     _ensure_authentik_console_app(fqdn, ak_token, plog)
     plog("  Ensuring all app providers on embedded outpost...")
@@ -13222,7 +13261,7 @@ def run_authentik_deploy(reconfigure=False):
                             _sync_authentik_takportal_provider_url(settings)
                         if _is_module_deployed(settings, 'nodered'):
                             plog("  Configuring Authentik for Node-RED...")
-                            _ensure_authentik_nodered_app(fqdn, ak_token, plog)
+                            _ensure_authentik_nodered_app(fqdn, ak_token, plog, settings=settings)
                         plog("  Configuring Authentik for infra-TAK Console (infra-TAK + MediaMTX if deployed)...")
                         _ensure_authentik_console_app(fqdn, ak_token, plog)
                         plog("  Ensuring all app providers on embedded outpost...")
@@ -14423,7 +14462,7 @@ entries:
                     if _is_module_deployed(settings, 'nodered'):
                         plog("")
                         plog("  Configuring Authentik for Node-RED...")
-                        _ensure_authentik_nodered_app(fqdn, ak_token, plog, flow_pk=flow_pk, inv_flow_pk=inv_flow_pk)
+                        _ensure_authentik_nodered_app(fqdn, ak_token, plog, flow_pk=flow_pk, inv_flow_pk=inv_flow_pk, settings=settings)
                     # infra-TAK console (infratak + MediaMTX if deployed) behind Authentik
                     plog("")
                     plog("  Configuring Authentik for infra-TAK Console (infra-TAK + MediaMTX if deployed)...")
