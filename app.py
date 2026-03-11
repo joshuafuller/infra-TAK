@@ -4779,15 +4779,31 @@ def takportal_page():
 takportal_deploy_log = []
 takportal_deploy_status = {'running': False, 'complete': False, 'error': False}
 
-def _takportal_build_settings_json(settings):
-    """Build TAK Portal settings dict and return (json_string, error). Uses Authentik env from local or remote."""
-    import json as json_mod
+# Keys in TAK Portal settings.json that are configurable in TAK Portal UI (e.g. custom logo/photo). We never overwrite these when pushing settings on update/reconfigure/deploy.
+PRESERVE_TAKPORTAL_KEYS = frozenset(['BRAND_LOGO_URL'])
+
+
+def _takportal_get_existing_settings():
+    """Read current settings.json from TAK Portal container. Returns dict or {} if container missing or file invalid."""
+    try:
+        r = subprocess.run(
+            'docker exec tak-portal cat /usr/src/app/data/settings.json 2>/dev/null',
+            shell=True, capture_output=True, text=True, timeout=10)
+        if r.returncode != 0 or not (r.stdout or '').strip():
+            return {}
+        return json.loads(r.stdout.strip())
+    except Exception:
+        return {}
+
+
+def _takportal_build_settings_dict(settings):
+    """Build infra-TAK managed TAK Portal settings dict (no merge)."""
     server_ip = settings.get('server_ip', 'localhost')
     ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
     cloudtak_host = _get_service_domain(settings, 'cloudtak_map')
     cert_pass = _get_tak_cert_password(settings)
     ak_upstream = _get_authentik_upstream(settings)
-    portal_settings = {
+    return {
         "AUTHENTIK_URL": f"http://{ak_upstream}",
         "AUTHENTIK_TOKEN": ak_token or "",
         "USERS_HIDDEN_PREFIXES": "ak-,adm_,nodered-,ma-",
@@ -4811,7 +4827,24 @@ def _takportal_build_settings_json(settings):
         "BRAND_THEME": "dark",
         "BRAND_LOGO_URL": ""
     }
-    return json_mod.dumps(portal_settings, indent=2), None
+
+
+def _takportal_merged_settings_json(settings):
+    """Build settings JSON for TAK Portal, preserving user-configured keys (e.g. BRAND_LOGO_URL / custom photo) from existing container settings."""
+    existing = _takportal_get_existing_settings()
+    our = _takportal_build_settings_dict(settings)
+    merged = dict(existing) if isinstance(existing, dict) else {}
+    for k, v in our.items():
+        if k in PRESERVE_TAKPORTAL_KEYS and (merged.get(k) or '').strip():
+            continue
+        merged[k] = v
+    return json.dumps(merged, indent=2)
+
+
+def _takportal_build_settings_json(settings):
+    """Build TAK Portal settings dict and return (json_string, error). Uses Authentik env from local or remote. Prefer _takportal_merged_settings_json when pushing to container so user customizations (e.g. custom logo) are preserved."""
+    d = _takportal_build_settings_dict(settings)
+    return json.dumps(d, indent=2), None
 
 
 @app.route('/api/takportal/control', methods=['POST'])
@@ -4826,11 +4859,9 @@ def takportal_control():
     elif action == 'restart':
         subprocess.run(f'cd {portal_dir} && docker compose down && docker compose up -d', shell=True, capture_output=True, text=True, timeout=120)
     elif action == 'reconfigure':
-        # Update config only: push settings into container and restart (no git pull / image build)
+        # Update config only: push settings into container and restart (no git pull / image build). Preserves user-configured keys (e.g. BRAND_LOGO_URL).
         settings = load_settings()
-        settings_json, err = _takportal_build_settings_json(settings)
-        if err:
-            return jsonify({'success': False, 'error': err}), 400
+        settings_json = _takportal_merged_settings_json(settings)
         try:
             with open('/tmp/tak-portal-settings.json', 'w') as f:
                 f.write(settings_json)
@@ -4856,7 +4887,7 @@ def takportal_control():
         cloudtak_url = ''
         try:
             settings = load_settings()
-            settings_json, _ = _takportal_build_settings_json(settings)
+            settings_json = _takportal_merged_settings_json(settings)
             cloudtak_url = ''
             try:
                 import json as json_mod
@@ -5155,50 +5186,12 @@ def run_takportal_deploy():
         if certs_copied:
             plog("\u2713 Certificates copied to container data volume")
 
-        # Step 6: Auto-configure settings.json
+        # Step 6: Auto-configure settings.json (merge with existing so user-configured e.g. BRAND_LOGO_URL / custom photo is preserved)
         plog("")
         plog("\u2501\u2501\u2501 Step 6/6: Auto-configuring TAK Portal Settings \u2501\u2501\u2501")
         settings = load_settings()
-        server_ip = settings.get('server_ip', 'localhost')
-        # Read Authentik bootstrap token
-        ak_env_path = os.path.expanduser('~/authentik/.env')
-        ak_token = ''
-        if os.path.exists(ak_env_path):
-            with open(ak_env_path) as f:
-                for line in f:
-                    if line.strip().startswith('AUTHENTIK_BOOTSTRAP_TOKEN='):
-                        ak_token = line.strip().split('=', 1)[1].strip()
-        import json as json_mod
-        cloudtak_host = _get_service_domain(settings, 'cloudtak_map')
-        cert_pass = _get_tak_cert_password(settings)
-        ak_upstream = _get_authentik_upstream(settings)
-        portal_settings = {
-            "AUTHENTIK_URL": f"http://{ak_upstream}",
-            "AUTHENTIK_TOKEN": ak_token,
-            "USERS_HIDDEN_PREFIXES": "ak-,adm_,nodered-,ma-",
-            "GROUPS_HIDDEN_PREFIXES": "authentik, MA -, vid_, tak_ROLE_",
-            "USERS_ACTIONS_HIDDEN_PREFIXES": "",
-            "GROUPS_ACTIONS_HIDDEN_PREFIXES": "",
-            "DASHBOARD_AUTHENTIK_STATS_REFRESH_SECONDS": "300",
-            "PORTAL_AUTH_ENABLED": "true" if settings.get('fqdn') else "false",
-            "PORTAL_AUTH_REQUIRED_GROUP": "authentik Admins" if settings.get('fqdn') else "",
-            "AUTHENTIK_PUBLIC_URL": _get_authentik_base_url(settings),
-            "TAK_PORTAL_PUBLIC_URL": f"https://takportal.{settings['fqdn']}" if settings.get('fqdn') else f"http://{server_ip}:3000",
-            "TAK_URL": f"https://{_get_takserver_host(settings)}:8443/Marti" if _get_takserver_host(settings) else f"https://{server_ip}:8443/Marti",
-            "TAK_API_P12_PATH": "data/certs/tak-client.p12",
-            "TAK_API_P12_PASSPHRASE": cert_pass,
-            "TAK_CA_PATH": "data/certs/tak-ca.pem",
-            "TAK_REVOKE_ON_DISABLE": "true",
-            "TAK_DEBUG": "false",
-            "TAK_BYPASS_ENABLED": "false",
-            "CLOUDTAK_URL": f"https://{cloudtak_host}" if cloudtak_host else "",
-            **_portal_email_settings(settings),
-            "BRAND_THEME": "dark",
-            "BRAND_LOGO_URL": ""
-        }
-        # Write settings.json into the container data volume
-        settings_json = json_mod.dumps(portal_settings, indent=2)
-        # Write to temp file then docker cp
+        portal_settings = _takportal_build_settings_dict(settings)
+        settings_json = _takportal_merged_settings_json(settings)
         with open('/tmp/tak-portal-settings.json', 'w') as f:
             f.write(settings_json)
         subprocess.run('docker cp /tmp/tak-portal-settings.json tak-portal:/usr/src/app/data/settings.json', shell=True, capture_output=True, text=True)
@@ -5210,11 +5203,11 @@ def run_takportal_deploy():
             plog(f"  Email: enabled ({portal_settings.get('SMTP_HOST')}:{portal_settings.get('SMTP_PORT')} from {portal_settings.get('SMTP_FROM')})")
         else:
             plog("  Email: not configured (deploy Email Relay first for auto-config)")
-        if ak_token:
+        if portal_settings.get('AUTHENTIK_TOKEN'):
             plog("  Authentik API token: configured")
         else:
             plog("\u26a0 Authentik not deployed yet - configure token in Server Settings")
-        plog("\u2713 Settings auto-configured")
+        plog("\u2713 Settings auto-configured (user customizations e.g. custom logo preserved)")
 
         # Restart container to pick up settings
         subprocess.run('docker restart tak-portal', shell=True, capture_output=True, text=True, timeout=30)
