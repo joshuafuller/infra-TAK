@@ -8703,6 +8703,28 @@ def nodered_uninstall():
     except Exception as e:
         return jsonify({'error': f'Uninstall failed: {str(e)}'}), 500
 
+
+def _is_module_deployed(settings, module_key):
+    """True if the given module is deployed (so we only create its Authentik app when deployed). Keys: nodered, mediamtx, takportal, infratak (infratak always True)."""
+    if module_key == 'infratak':
+        return True
+    if module_key == 'takportal':
+        return os.path.exists(os.path.expanduser('~/TAK-Portal/docker-compose.yml'))
+    if module_key == 'nodered':
+        nr_compose = os.path.join(os.path.expanduser('~/node-red'), 'docker-compose.yml')
+        if os.path.exists(nr_compose):
+            return True
+        if os.path.exists(os.path.expanduser('~/node-red')) or os.path.exists('/opt/nodered'):
+            return True
+        return False
+    if module_key == 'mediamtx':
+        mtx_cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
+        if mtx_cfg.get('target_mode') == 'remote' and mtx_cfg.get('deployed') and (mtx_cfg.get('remote', {}).get('host') or '').strip():
+            return True
+        return os.path.exists('/usr/local/bin/mediamtx') and os.path.exists('/usr/local/etc/mediamtx.yml')
+    return False
+
+
 def _ensure_authentik_nodered_app(fqdn, ak_token, plog=None, flow_pk=None, inv_flow_pk=None):
     """Create Node-RED proxy provider + application in Authentik, add to embedded outpost.
     When flow_pk/inv_flow_pk are provided (e.g. from Step 12), use them. Otherwise wait for flows."""
@@ -8840,8 +8862,9 @@ def _ensure_authentik_console_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
         entries = [('infra-TAK', 'infratak', f'https://{_get_service_domain(load_settings(), "infratak")}')]
         try:
             s = load_settings()
-            mtx_domain = _get_service_domain(s, 'mediamtx')
-            entries.append(('MediaMTX', 'stream', f'https://{mtx_domain}'))
+            if _is_module_deployed(s, 'mediamtx'):
+                mtx_domain = _get_service_domain(s, 'mediamtx')
+                entries.append(('MediaMTX', 'stream', f'https://{mtx_domain}'))
         except Exception:
             pass
         provider_pks = []
@@ -8996,14 +9019,15 @@ def _outpost_add_providers_safe(ak_url, ak_headers, provider_pks_to_add, plog=No
 
 
 def _repair_embedded_outpost_all_apps(ak_url, ak_headers, settings, plog=None):
-    """Ensure embedded outpost includes all deployed app providers: infra-TAK, MediaMTX, Node-RED, TAK Portal.
-    Fetches applications by slug and adds their provider PKs to the outpost (safe, never removes)."""
+    """Ensure embedded outpost includes providers for deployed apps only: infra-TAK, MediaMTX (if deployed), Node-RED (if deployed), TAK Portal (if deployed)."""
     import urllib.request as _req
     _log = plog or (lambda m: None)
-    slugs = ['infratak', 'stream', 'node-red', 'tak-portal']
+    slug_to_module = [('infratak', 'infratak'), ('stream', 'mediamtx'), ('node-red', 'nodered'), ('tak-portal', 'takportal')]
     provider_pks = []
     try:
-        for slug in slugs:
+        for slug, module_key in slug_to_module:
+            if not _is_module_deployed(settings, module_key):
+                continue
             try:
                 r = _req.Request(f'{ak_url}/api/v3/core/applications/{slug}/', headers=ak_headers)
                 data = json.loads(_req.urlopen(r, timeout=10).read().decode())
@@ -12892,11 +12916,13 @@ def _run_authentik_reconfigure_remote(settings, deploy_cfg, plog):
         return
     plog("  Setting proxy cookie domain...")
     _ensure_proxy_providers_cookie_domain(ak_url, ak_headers, fqdn, plog)
-    plog("  Syncing TAK Portal provider URL and outpost...")
-    _sync_authentik_takportal_provider_url(settings)
-    plog("  Configuring Authentik for Node-RED...")
-    _ensure_authentik_nodered_app(fqdn, ak_token, plog)
-    plog("  Configuring Authentik for infra-TAK Console (infra-TAK + MediaMTX)...")
+    if _is_module_deployed(settings, 'takportal'):
+        plog("  Syncing TAK Portal provider URL and outpost...")
+        _sync_authentik_takportal_provider_url(settings)
+    if _is_module_deployed(settings, 'nodered'):
+        plog("  Configuring Authentik for Node-RED...")
+        _ensure_authentik_nodered_app(fqdn, ak_token, plog)
+    plog("  Configuring Authentik for infra-TAK Console (infra-TAK + MediaMTX if deployed)...")
     _ensure_authentik_console_app(fqdn, ak_token, plog)
     plog("  Ensuring all app providers on embedded outpost...")
     _repair_embedded_outpost_all_apps(ak_url, ak_headers, settings, plog)
@@ -13017,11 +13043,13 @@ def run_authentik_deploy(reconfigure=False):
                     if _wait_for_authentik_api(ak_url, ak_headers, max_attempts=24, plog=plog):
                         plog("  Setting proxy cookie domain (shared session across subdomains)...")
                         _ensure_proxy_providers_cookie_domain(ak_url, ak_headers, fqdn, plog)
-                        plog("  Syncing TAK Portal provider URL and outpost...")
-                        _sync_authentik_takportal_provider_url(settings)
-                        plog("  Configuring Authentik for Node-RED...")
-                        _ensure_authentik_nodered_app(fqdn, ak_token, plog)
-                        plog("  Configuring Authentik for infra-TAK Console (infra-TAK + MediaMTX)...")
+                        if _is_module_deployed(settings, 'takportal'):
+                            plog("  Syncing TAK Portal provider URL and outpost...")
+                            _sync_authentik_takportal_provider_url(settings)
+                        if _is_module_deployed(settings, 'nodered'):
+                            plog("  Configuring Authentik for Node-RED...")
+                            _ensure_authentik_nodered_app(fqdn, ak_token, plog)
+                        plog("  Configuring Authentik for infra-TAK Console (infra-TAK + MediaMTX if deployed)...")
                         _ensure_authentik_console_app(fqdn, ak_token, plog)
                         plog("  Ensuring all app providers on embedded outpost...")
                         _repair_embedded_outpost_all_apps(ak_url, ak_headers, settings, plog)
@@ -14111,9 +14139,9 @@ entries:
                     elif flow_pk:
                         plog("  ⚠ Invalidation flow not found — proxy may still work")
 
-                    # 12c: Create Proxy Provider (Forward auth single application)
+                    # 12c–12e: TAK Portal proxy + app + outpost only when TAK Portal is deployed
                     provider_pk = None
-                    if flow_pk:
+                    if _is_module_deployed(settings, 'takportal') and flow_pk:
                         try:
                             base_domain = fqdn.split(':')[0]
                             provider_data = {
@@ -14143,7 +14171,7 @@ entries:
                                     provider_pk = results[0]['pk']
                             else:
                                 plog(f"  ⚠ Proxy Provider error: {e.code}")
-                    else:
+                    elif _is_module_deployed(settings, 'takportal') and not flow_pk:
                         plog("  ⚠ No authorization flow found after waiting — create a flow in Authentik and re-run deploy or add proxy provider manually")
 
                     # 12d: Create Application
@@ -14214,15 +14242,17 @@ entries:
                         except Exception as e:
                             plog(f"  ⚠ Outpost config: {str(e)[:100]}")
 
-                    plog(f"  ✓ Forward auth ready for takportal.{fqdn}")
+                    if _is_module_deployed(settings, 'takportal'):
+                        plog(f"  ✓ Forward auth ready for takportal.{fqdn}")
 
-                    # Create Node-RED app in Authentik (so it's ready when Node-RED is deployed later)
+                    # Create Node-RED app in Authentik only when Node-RED is deployed (so launcher shows only deployed modules)
+                    if _is_module_deployed(settings, 'nodered'):
+                        plog("")
+                        plog("  Configuring Authentik for Node-RED...")
+                        _ensure_authentik_nodered_app(fqdn, ak_token, plog, flow_pk=flow_pk, inv_flow_pk=inv_flow_pk)
+                    # infra-TAK console (infratak + MediaMTX if deployed) behind Authentik
                     plog("")
-                    plog("  Configuring Authentik for Node-RED...")
-                    _ensure_authentik_nodered_app(fqdn, ak_token, plog, flow_pk=flow_pk, inv_flow_pk=inv_flow_pk)
-                    # infra-TAK console (infratak + console subdomains) behind Authentik — reuse same flows, no second fetch
-                    plog("")
-                    plog("  Configuring Authentik for infra-TAK Console...")
+                    plog("  Configuring Authentik for infra-TAK Console (infra-TAK + MediaMTX if deployed)...")
                     _ensure_authentik_console_app(fqdn, ak_token, plog, flow_pk=flow_pk, inv_flow_pk=inv_flow_pk)
                     plog("  Ensuring all app providers on embedded outpost...")
                     _repair_embedded_outpost_all_apps(ak_url, ak_headers, settings, plog)
