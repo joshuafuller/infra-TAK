@@ -4747,6 +4747,20 @@ def _get_nodered_version_info():
     return out
 
 
+def _get_cloudtak_latest_release_tag():
+    """Fetch the latest stable release tag from GitHub (e.g. 'v12.94.0').
+    Returns the tag string, or None if the API call fails."""
+    try:
+        import urllib.request as _ur
+        req = _ur.Request('https://api.github.com/repos/dfpc-coe/CloudTAK/releases/latest',
+                          headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'infra-TAK'})
+        with _ur.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+            return (data.get('tag_name') or '').strip() or None
+    except Exception:
+        return None
+
+
 def _get_cloudtak_version_info():
     """Return {version: str, update_available: bool, latest: str|None} for CloudTAK."""
     import re
@@ -7456,14 +7470,27 @@ def run_cloudtak_deploy(cfg=None):
 
             plog("")
             plog("━━━ Step 3/6: Cloning/Updating CloudTAK on remote ━━━")
-            prep_cmd = (
-                "if [ -d ~/CloudTAK/.git ]; then "
-                "cd ~/CloudTAK && git pull --rebase --autostash; "
-                "else "
-                "rm -rf ~/CloudTAK && git clone --depth 1 https://github.com/dfpc-coe/CloudTAK.git ~/CloudTAK; "
-                "fi; "
-                "test -f ~/CloudTAK/docker-compose.yml -o -f ~/CloudTAK/compose.yaml"
-            )
+            remote_release_tag = _get_cloudtak_latest_release_tag()
+            if remote_release_tag:
+                plog(f"  Target: stable release {remote_release_tag}")
+                prep_cmd = (
+                    "if [ -d ~/CloudTAK/.git ]; then "
+                    f"cd ~/CloudTAK && git fetch --depth 1 origin tag {remote_release_tag} && git checkout {remote_release_tag}; "
+                    "else "
+                    f"rm -rf ~/CloudTAK && git clone --depth 1 --branch {remote_release_tag} https://github.com/dfpc-coe/CloudTAK.git ~/CloudTAK; "
+                    "fi; "
+                    "test -f ~/CloudTAK/docker-compose.yml -o -f ~/CloudTAK/compose.yaml"
+                )
+            else:
+                plog("  ⚠ Could not fetch latest release tag — using main branch")
+                prep_cmd = (
+                    "if [ -d ~/CloudTAK/.git ]; then "
+                    "cd ~/CloudTAK && git pull --rebase --autostash; "
+                    "else "
+                    "rm -rf ~/CloudTAK && git clone --depth 1 https://github.com/dfpc-coe/CloudTAK.git ~/CloudTAK; "
+                    "fi; "
+                    "test -f ~/CloudTAK/docker-compose.yml -o -f ~/CloudTAK/compose.yaml"
+                )
             ok, out = _ssh_probe(remote_cfg, prep_cmd, timeout=600)
             if not ok:
                 plog(f"✗ CloudTAK repo prep failed on remote: {(out or '')[:220]}")
@@ -7588,14 +7615,27 @@ def run_cloudtak_deploy(cfg=None):
         plog("")
         plog("━━━ Step 2/7: Cloning CloudTAK ━━━")
         if os.path.exists(cloudtak_dir):
-            plog("  ~/CloudTAK exists — pulling latest...")
-            r = subprocess.run(f'cd {cloudtak_dir} && git pull --rebase --autostash', shell=True, capture_output=True, text=True, timeout=120)
-            if r.returncode != 0:
-                plog(f"  ⚠ git pull warning: {r.stderr.strip()[:100]}")
+            release_tag = _get_cloudtak_latest_release_tag()
+            if release_tag:
+                plog(f"  ~/CloudTAK exists — updating to stable {release_tag}...")
+                r = subprocess.run(
+                    f'cd {cloudtak_dir} && git fetch --depth 1 origin tag {release_tag} && git checkout {release_tag}',
+                    shell=True, capture_output=True, text=True, timeout=120)
+                if r.returncode != 0:
+                    plog(f"  ⚠ git fetch/checkout warning: {r.stderr.strip()[:100]} — falling back to pull")
+                    subprocess.run(f'cd {cloudtak_dir} && git pull --rebase --autostash', shell=True, capture_output=True, text=True, timeout=120)
+            else:
+                plog("  ~/CloudTAK exists — pulling latest (could not fetch release tag)...")
+                r = subprocess.run(f'cd {cloudtak_dir} && git pull --rebase --autostash', shell=True, capture_output=True, text=True, timeout=120)
+                if r.returncode != 0:
+                    plog(f"  ⚠ git pull warning: {r.stderr.strip()[:100]}")
         else:
-            plog("  Cloning from GitHub (shallow, latest only)...")
+            release_tag = _get_cloudtak_latest_release_tag()
+            tag_label = release_tag or 'main (latest release tag unavailable)'
+            plog(f"  Cloning from GitHub (shallow, {tag_label})...")
             clone_timeout = 600  # 10 min — VPS→GitHub can be slow
-            clone_cmd = f'git clone --depth 1 https://github.com/dfpc-coe/CloudTAK.git {cloudtak_dir}'
+            branch_flag = f' --branch {release_tag}' if release_tag else ''
+            clone_cmd = f'git clone --depth 1{branch_flag} https://github.com/dfpc-coe/CloudTAK.git {cloudtak_dir}'
             for attempt in range(2):
                 try:
                     r = subprocess.run(clone_cmd, shell=True, capture_output=True, text=True, timeout=clone_timeout)
@@ -7625,7 +7665,9 @@ def run_cloudtak_deploy(cfg=None):
         if not os.path.exists(compose_yml) and not os.path.exists(compose_yaml):
             plog("  docker-compose.yml missing — re-cloning...")
             subprocess.run(f'rm -rf {cloudtak_dir}', shell=True, capture_output=True, timeout=30)
-            r = subprocess.run(f'git clone --depth 1 https://github.com/dfpc-coe/CloudTAK.git {cloudtak_dir}', shell=True, capture_output=True, text=True, timeout=600)
+            _rclone_tag = release_tag if 'release_tag' in dir() else _get_cloudtak_latest_release_tag()
+            _rclone_branch = f' --branch {_rclone_tag}' if _rclone_tag else ''
+            r = subprocess.run(f'git clone --depth 1{_rclone_branch} https://github.com/dfpc-coe/CloudTAK.git {cloudtak_dir}', shell=True, capture_output=True, text=True, timeout=600)
             if r.returncode != 0:
                 plog(f"✗ Re-clone failed: {r.stderr.strip()[:200]}")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
