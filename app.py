@@ -5189,31 +5189,32 @@ def run_takportal_deploy():
                 needs_write = True
                 plog("  ✓ Healthcheck added to docker-compose.yml")
             plog(f"  Authentik upstream: {ak_upstream} (same_host={same_host_authentik})")
-            if same_host_authentik and 'network_mode' not in compose_content:
-                # Same-host: use host network so 127.0.0.1:9090 in container = host's Authentik (no URL hacks)
-                before_len = len(compose_content)
-                # Match "  restart: unless-stopped" or "    restart: ..." and add network_mode with same indent
-                compose_content = re.sub(
-                    r'^(\s*)restart:\s*unless-stopped\s*$',
-                    r'\1restart: unless-stopped\n\1network_mode: host',
-                    compose_content,
-                    count=1,
-                    flags=re.MULTILINE
-                )
-                if len(compose_content) > before_len:
-                    needs_write = True
-                    plog("  ✓ network_mode: host (same-host Authentik — 127.0.0.1:9090 works)")
-                else:
-                    plog("  ⚠ Could not insert network_mode: host (regex had no match)")
-            elif not same_host_authentik and 'host.docker.internal' not in compose_content and 'extra_hosts' not in compose_content:
-                # Remote Authentik: keep bridge network, add extra_hosts if ever needed for other host access
-                extra_hosts = '    extra_hosts:\n      - "host.docker.internal:host-gateway"\n'
-                compose_content = compose_content.replace(
-                    'restart: unless-stopped',
-                    'restart: unless-stopped\n' + extra_hosts.rstrip('\n')
-                )
+            if same_host_authentik:
+                # Same-host: force host network via override so 127.0.0.1:9090 = host's Authentik (no regex on main compose)
+                override_path = os.path.join(portal_dir, 'docker-compose.override.yml')
+                override_content = 'services:\n  tak-portal:\n    network_mode: host\n'
+                with open(override_path, 'w') as f:
+                    f.write(override_content)
                 needs_write = True
-                plog("  ✓ extra_hosts added for Authentik API access")
+                plog("  ✓ docker-compose.override.yml: network_mode: host (same-host Authentik)")
+            elif not same_host_authentik:
+                # Remote Authentik: remove override so we don't use host mode; add extra_hosts to main if needed
+                override_path = os.path.join(portal_dir, 'docker-compose.override.yml')
+                if os.path.exists(override_path):
+                    try:
+                        os.remove(override_path)
+                        needs_write = True
+                        plog("  ✓ Removed docker-compose.override.yml (remote Authentik)")
+                    except OSError:
+                        pass
+                if 'host.docker.internal' not in compose_content and 'extra_hosts' not in compose_content:
+                    extra_hosts = '    extra_hosts:\n      - "host.docker.internal:host-gateway"\n'
+                    compose_content = compose_content.replace(
+                        'restart: unless-stopped',
+                        'restart: unless-stopped\n' + extra_hosts.rstrip('\n')
+                    )
+                    needs_write = True
+                    plog("  ✓ extra_hosts added for Authentik API access")
             # Ensure container env has AUTHENTIK_URL
             auth_url = _takportal_build_settings_dict(settings).get('AUTHENTIK_URL', '')
             if auth_url:
