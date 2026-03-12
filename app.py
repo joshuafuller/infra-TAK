@@ -5275,6 +5275,7 @@ def run_takportal_deploy():
         plog("")
         plog("\u2501\u2501\u2501 Step 6/6: Auto-configuring TAK Portal Settings \u2501\u2501\u2501")
         settings = load_settings()
+        ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
         portal_settings = _takportal_build_settings_dict(settings)
         settings_json = _takportal_merged_settings_json(settings)
         with open('/tmp/tak-portal-settings.json', 'w') as f:
@@ -13211,8 +13212,19 @@ volumes:
     subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True)
     plog("✓ Caddyfile updated")
 
-    _module_run(deploy_cfg, 'ufw allow 9090/tcp 2>/dev/null; ufw allow 9443/tcp 2>/dev/null; ufw allow 389/tcp 2>/dev/null; ufw allow 636/tcp 2>/dev/null; true', timeout=15)
-    plog("✓ Firewall ports opened")
+    # Open Authentik ports on remote so console can reach API (9090) and LDAP (389/636); enable UFW/firewalld so rules apply
+    _module_run(deploy_cfg, (
+        'command -v ufw >/dev/null 2>&1 && (sudo ufw allow 22/tcp 2>/dev/null; '
+        'sudo ufw allow 9090/tcp 2>/dev/null; sudo ufw allow 9443/tcp 2>/dev/null; '
+        'sudo ufw allow 389/tcp 2>/dev/null; sudo ufw allow 636/tcp 2>/dev/null; '
+        'sudo ufw --force enable 2>/dev/null; sudo ufw reload 2>/dev/null); '
+        'command -v firewall-cmd >/dev/null 2>&1 && (sudo firewall-cmd --permanent --add-port=9090/tcp 2>/dev/null; '
+        'sudo firewall-cmd --permanent --add-port=9443/tcp 2>/dev/null; '
+        'sudo firewall-cmd --permanent --add-port=389/tcp 2>/dev/null; '
+        'sudo firewall-cmd --permanent --add-port=636/tcp 2>/dev/null; '
+        'sudo firewall-cmd --reload 2>/dev/null); true'
+    ), timeout=20)
+    plog("✓ Firewall ports opened (9090 API, 9443 HTTPS, 389/636 LDAP) — console can reach Authentik")
 
     plog("")
     plog("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
