@@ -4883,8 +4883,8 @@ def _takportal_build_settings_dict(settings):
     cloudtak_host = _get_service_domain(settings, 'cloudtak_map')
     cert_pass = _get_tak_cert_password(settings)
     ak_upstream = _get_authentik_upstream(settings)
-    # TAK Portal runs in Docker; 127.0.0.1 inside container is the container itself. Use host.docker.internal so container can reach host's Authentik.
-    auth_url_host = 'host.docker.internal' if ak_upstream == '127.0.0.1:9090' else ak_upstream.split(':')[0]
+    # Same-host: we run TAK Portal with network_mode: host so 127.0.0.1 is the host. Remote: use remote host.
+    auth_url_host = '127.0.0.1' if ak_upstream == '127.0.0.1:9090' else ak_upstream.split(':')[0]
     auth_url_port = '9090' if ak_upstream == '127.0.0.1:9090' else (ak_upstream.split(':')[1] if ':' in ak_upstream else '9090')
     return {
         "AUTHENTIK_URL": f"http://{auth_url_host}:{auth_url_port}",
@@ -5186,16 +5186,26 @@ def run_takportal_deploy():
                 )
                 needs_write = True
                 plog("  ✓ Healthcheck added to docker-compose.yml")
-            if 'host.docker.internal' not in compose_content and 'extra_hosts' not in compose_content:
-                # So TAK Portal container can reach Authentik on host (AUTHENTIK_URL=http://host.docker.internal:9090)
+            ak_upstream = _get_authentik_upstream(settings)
+            same_host_authentik = (ak_upstream == '127.0.0.1:9090')
+            if same_host_authentik and 'network_mode' not in compose_content:
+                # Same-host: use host network so 127.0.0.1:9090 in container = host's Authentik (no URL hacks)
+                compose_content = compose_content.replace(
+                    'restart: unless-stopped',
+                    'restart: unless-stopped\n network_mode: host'
+                )
+                needs_write = True
+                plog("  ✓ network_mode: host (same-host Authentik — 127.0.0.1:9090 works)")
+            elif not same_host_authentik and 'host.docker.internal' not in compose_content and 'extra_hosts' not in compose_content:
+                # Remote Authentik: keep bridge network, add extra_hosts if ever needed for other host access
                 extra_hosts = '    extra_hosts:\n      - "host.docker.internal:host-gateway"\n'
                 compose_content = compose_content.replace(
                     'restart: unless-stopped',
                     'restart: unless-stopped\n' + extra_hosts.rstrip('\n')
                 )
                 needs_write = True
-                plog("  ✓ extra_hosts (host.docker.internal) added for Authentik API access")
-            # Ensure container env has AUTHENTIK_URL so it overrides repo .env (which may have 127.0.0.1:9090)
+                plog("  ✓ extra_hosts added for Authentik API access")
+            # Ensure container env has AUTHENTIK_URL
             auth_url = _takportal_build_settings_dict(settings).get('AUTHENTIK_URL', '')
             if auth_url:
                 if 'AUTHENTIK_URL' not in compose_content:
