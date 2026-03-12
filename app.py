@@ -2841,29 +2841,26 @@ def caddy_update_domain():
     settings['fqdn'] = domain
     save_settings(settings)
     generate_caddyfile(settings)
-    # If Authentik is installed, ensure infra-TAK Console provider exists (so infratak/console are behind Authentik)
-    ak_installed = os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml'))
-    if ak_installed:
-        def _ensure_console_app():
-            time.sleep(1)
+    # If Authentik is installed (local or remote), ensure infra-TAK + TAK Portal apps exist so "Applications" at tak.<fqdn> work
+    modules = detect_modules()
+    if modules.get('authentik', {}).get('installed'):
+        def _ensure_ak_apps_after_domain():
+            time.sleep(2)
             try:
-                env_path = os.path.expanduser('~/authentik/.env')
-                ak_token = ''
-                if os.path.exists(env_path):
-                    with open(env_path) as f:
-                        for line in f:
-                            if line.strip().startswith('AUTHENTIK_TOKEN='):
-                                ak_token = line.strip().split('=', 1)[1].strip()
-                                break
-                if ak_token:
-                    _ensure_authentik_console_app(domain, ak_token)
-                    settings = load_settings()
-                    ak_url = _get_authentik_api_url(settings)
-                    ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
-                    _repair_embedded_outpost_all_apps(ak_url, ak_headers, settings)
+                s = load_settings()
+                ak_token = _get_authentik_env_value(s, 'AUTHENTIK_TOKEN') or _get_authentik_env_value(s, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+                if not ak_token:
+                    return
+                _ensure_authentik_console_app(domain, ak_token)
+                s = load_settings()
+                ak_url = _get_authentik_api_url(s)
+                ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+                _repair_embedded_outpost_all_apps(ak_url, ak_headers, s)
+                if _is_module_deployed(s, 'takportal'):
+                    _sync_authentik_takportal_provider_url(s)
             except Exception:
                 pass
-        threading.Thread(target=_ensure_console_app, daemon=True).start()
+        threading.Thread(target=_ensure_ak_apps_after_domain, daemon=True).start()
     # Restart in background so response reaches client before Caddy restarts (console is behind Caddy)
     def _restart():
         time.sleep(2)
