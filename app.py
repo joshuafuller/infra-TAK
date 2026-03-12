@@ -5182,6 +5182,28 @@ def run_takportal_deploy():
                 )
                 needs_write = True
                 plog("  ✓ extra_hosts (host.docker.internal) added for Authentik API access")
+            # Ensure container env has AUTHENTIK_URL so it overrides repo .env (which may have 127.0.0.1:9090)
+            auth_url = _takportal_build_settings_dict(settings).get('AUTHENTIK_URL', '')
+            if auth_url:
+                if 'AUTHENTIK_URL' not in compose_content:
+                    # Upstream TAK-Portal: env_file:\n - .env
+                    if re.search(r'env_file:\s*\n\s*-\s*\.env', compose_content):
+                        compose_content = re.sub(
+                            r'(env_file:\s*\n\s*-\s*\.env)',
+                            r'\1\n    environment:\n      AUTHENTIK_URL: "' + auth_url + '"',
+                            compose_content,
+                            count=1
+                        )
+                        needs_write = True
+                        plog("  ✓ AUTHENTIK_URL set in container environment (overrides .env)")
+                else:
+                    compose_content = re.sub(
+                        r'AUTHENTIK_URL:\s*["\']?[^"\'\n]+["\']?',
+                        'AUTHENTIK_URL: "' + auth_url + '"',
+                        compose_content,
+                        count=1
+                    )
+                    needs_write = True
             if needs_write:
                 with open(compose_path, 'w') as f:
                     f.write(compose_content)
