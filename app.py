@@ -413,11 +413,11 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
     parts.append(link('/help', '<span class="nav-icon material-symbols-outlined">help</span>Help'))
     if takwerx_logo_url:
         parts.append(
-            '<div style="margin-top:auto;padding:20px 20px 24px;text-align:center;border-top:1px solid var(--border)">'
-            f'<img src="{html.escape(takwerx_logo_url)}" alt="TAKWERX" style="max-width:100%;height:auto;max-height:56px;object-fit:contain;display:block;margin:0 auto">'
+            '<div style="padding:20px 20px 24px;text-align:center;border-top:1px solid var(--border)">'
+            f'<img src="{html.escape(takwerx_logo_url)}" alt="TAKWERX" style="max-width:100%;height:auto;max-height:168px;object-fit:contain;display:block;margin:0 auto">'
             '</div>'
         )
-    nav_style = ' style="display:flex;flex-direction:column"' if takwerx_logo_url else ''
+    nav_style = ''
     return f'<nav class="sidebar"{nav_style}>\n  ' + '\n  '.join(parts) + '\n</nav>'
 
 def get_system_metrics():
