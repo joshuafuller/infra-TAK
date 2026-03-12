@@ -4881,13 +4881,16 @@ def _takportal_get_existing_settings():
 
 def _takportal_build_settings_dict(settings):
     """Build infra-TAK managed TAK Portal settings dict (no merge)."""
-    server_ip = settings.get('server_ip', 'localhost')
+    server_ip = (settings.get('server_ip') or '').strip() or 'localhost'
     ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
     cloudtak_host = _get_service_domain(settings, 'cloudtak_map')
     cert_pass = _get_tak_cert_password(settings)
     ak_upstream = _get_authentik_upstream(settings)
-    # Same-host: use server_ip so container (bridge) can reach host's Authentik (main-branch behavior). Remote: use remote host.
-    auth_url_host = server_ip if ak_upstream == '127.0.0.1:9090' else ak_upstream.split(':')[0]
+    # Same-host: use server_ip so container (bridge) can reach host's Authentik. If server_ip missing/localhost use host.docker.internal (add extra_hosts in deploy).
+    if ak_upstream == '127.0.0.1:9090':
+        auth_url_host = server_ip if (server_ip and server_ip != 'localhost') else 'host.docker.internal'
+    else:
+        auth_url_host = ak_upstream.split(':')[0]
     auth_url_port = '9090' if ak_upstream == '127.0.0.1:9090' else (ak_upstream.split(':')[1] if ':' in ak_upstream else '9090')
     return {
         "AUTHENTIK_URL": f"http://{auth_url_host}:{auth_url_port}",
@@ -5192,6 +5195,17 @@ def run_takportal_deploy():
                 needs_write = True
                 plog("  ✓ Healthcheck added to docker-compose.yml")
             plog(f"  Authentik upstream: {ak_upstream} (same_host={same_host_authentik})")
+            auth_url = _takportal_build_settings_dict(settings).get('AUTHENTIK_URL', '')
+            # Same-host with host.docker.internal: need extra_hosts so container can resolve it (Linux)
+            if same_host_authentik and 'host.docker.internal' in auth_url:
+                if 'host.docker.internal' not in compose_content and 'extra_hosts' not in compose_content:
+                    extra_hosts = '    extra_hosts:\n      - "host.docker.internal:host-gateway"\n'
+                    compose_content = compose_content.replace(
+                        'restart: unless-stopped',
+                        'restart: unless-stopped\n' + extra_hosts.rstrip('\n')
+                    )
+                    needs_write = True
+                    plog("  ✓ extra_hosts added (host.docker.internal for same-host Authentik)")
             if not same_host_authentik:
                 # Remote Authentik: remove override so we don't use host mode; add extra_hosts to main if needed
                 override_path = os.path.join(portal_dir, 'docker-compose.override.yml')
@@ -5378,6 +5392,7 @@ def run_takportal_deploy():
         # Configure Authentik forward auth for TAK Portal (fqdn/ak_token defined here so always in scope; wrapped so deploy succeeds even if this step fails)
         fqdn = settings.get('fqdn', '')
         ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
+        import json as json_mod
         try:
             if fqdn and ak_token:
                 plog("")
