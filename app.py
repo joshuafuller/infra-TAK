@@ -227,6 +227,9 @@ def login_required(f):
         if _apply_authentik_session():
             return f(*args, **kwargs)
         if not session.get('authenticated'):
+            # API routes: return 401 JSON so fetch gets JSON, not HTML redirect
+            if request.path.startswith('/api/'):
+                return jsonify({'error': 'Unauthorized', 'login_required': True}), 401
             return redirect(url_for('login'))
         return f(*args, **kwargs)
     return decorated
@@ -12295,8 +12298,9 @@ async function doUninstallPortal(){
     confirmBtn.disabled=true;
     cancelBtn.disabled=true;
     try{
-        var r=await fetch('/api/takportal/uninstall',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});
-        var d=await r.json();
+        var r=await fetch('/api/takportal/uninstall',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw}),credentials:'same-origin'});
+        var ct=r.headers.get('Content-Type')||'';
+        var d=ct.indexOf('application/json')>=0?await r.json():{error:r.status===401?'Session expired. Reload the page and try again.':'Uninstall request failed ('+r.status+')'};
         if(d.success){
             progressEl.innerHTML='<span class="uninstall-spinner"></span><span>Done. Reloading…</span>';
             setTimeout(function(){window.location.href='/takportal';},800);
