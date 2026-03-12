@@ -4886,8 +4886,8 @@ def _takportal_build_settings_dict(settings):
     cloudtak_host = _get_service_domain(settings, 'cloudtak_map')
     cert_pass = _get_tak_cert_password(settings)
     ak_upstream = _get_authentik_upstream(settings)
-    # Same-host: we run TAK Portal with network_mode: host so 127.0.0.1 is the host. Remote: use remote host.
-    auth_url_host = '127.0.0.1' if ak_upstream == '127.0.0.1:9090' else ak_upstream.split(':')[0]
+    # Same-host: use server_ip so container (bridge) can reach host's Authentik (main-branch behavior). Remote: use remote host.
+    auth_url_host = server_ip if ak_upstream == '127.0.0.1:9090' else ak_upstream.split(':')[0]
     auth_url_port = '9090' if ak_upstream == '127.0.0.1:9090' else (ak_upstream.split(':')[1] if ':' in ak_upstream else '9090')
     return {
         "AUTHENTIK_URL": f"http://{auth_url_host}:{auth_url_port}",
@@ -5192,15 +5192,7 @@ def run_takportal_deploy():
                 needs_write = True
                 plog("  ✓ Healthcheck added to docker-compose.yml")
             plog(f"  Authentik upstream: {ak_upstream} (same_host={same_host_authentik})")
-            if same_host_authentik:
-                # Same-host: force host network via override so 127.0.0.1:9090 = host's Authentik (no regex on main compose)
-                override_path = os.path.join(portal_dir, 'docker-compose.override.yml')
-                override_content = 'services:\n  tak-portal:\n    network_mode: host\n'
-                with open(override_path, 'w') as f:
-                    f.write(override_content)
-                needs_write = True
-                plog("  ✓ docker-compose.override.yml: network_mode: host (same-host Authentik)")
-            elif not same_host_authentik:
+            if not same_host_authentik:
                 # Remote Authentik: remove override so we don't use host mode; add extra_hosts to main if needed
                 override_path = os.path.join(portal_dir, 'docker-compose.override.yml')
                 if os.path.exists(override_path):
@@ -5382,10 +5374,10 @@ def run_takportal_deploy():
                     if line.strip().startswith('WEB_UI_PORT='):
                         port = line.strip().split('=', 1)[1].strip() or '3000'
 
-        # Configure Authentik forward auth for TAK Portal (wrapped so deploy still succeeds if this step fails)
+        # Configure Authentik forward auth for TAK Portal (fqdn/ak_token defined here so always in scope; wrapped so deploy succeeds even if this step fails)
+        fqdn = settings.get('fqdn', '')
+        ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
         try:
-            fqdn = settings.get('fqdn', '')
-            ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
             if fqdn and ak_token:
                 plog("")
                 plog("\u2501\u2501\u2501 Configuring Authentik Forward Auth \u2501\u2501\u2501")
