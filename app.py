@@ -12222,15 +12222,38 @@ async function deployPortal(){
     document.getElementById('deploy-log').style.display='block';
     try{
         var r=await fetch('/api/takportal/deploy',{method:'POST',headers:{'Content-Type':'application/json'}});
+        var ct=(r.headers.get('content-type')||'').toLowerCase();
+        if(ct.indexOf('application/json')<0){
+            var raw=await r.text();
+            if(raw.indexOf('<!DOCTYPE')>=0||raw.indexOf('<html')>=0){
+                throw new Error('Session expired or server returned HTML. Refresh and sign in again.');
+            }
+            throw new Error('Deploy endpoint returned non-JSON response.');
+        }
         var d=await r.json();
         if(d.success)pollDeployLog();
         else{var lg=document.getElementById('deploy-log');if(lg)lg.textContent='\u2717 '+d.error;var card=lg?lg.closest('.card'):null;if(card&&!document.getElementById('deploy-fail-banner')){var b=document.createElement('div');b.id='deploy-fail-banner';b.style.cssText='background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';b.innerHTML='<strong>\u2717 Deployment failed.</strong> Uninstall (if partial) and retry, or click Retry below.';card.insertBefore(b,card.firstChild);}btn.disabled=false;btn.textContent='\u2717 Deployment failed \u2014 Retry';btn.style.background='var(--red)';btn.style.opacity='1';btn.style.cursor='pointer';btn.onclick=function(){btn.textContent='\u1f680 Deploy TAK Portal';btn.style.background='';deployPortal();};}
-    }catch(e){document.getElementById('deploy-log').textContent='Error: '+e.message}
+    }catch(e){
+        document.getElementById('deploy-log').textContent='Error: '+e.message;
+        btn.disabled=false;btn.textContent='\u2717 Deployment failed \u2014 Retry';btn.style.background='var(--red)';btn.style.opacity='1';btn.style.cursor='pointer';
+        btn.onclick=function(){btn.textContent='\u1f680 Deploy TAK Portal';btn.style.background='';deployPortal();};
+    }
 }
 
 var logIndex=0;
 function pollDeployLog(){
-    fetch('/api/takportal/deploy/log?index='+logIndex).then(function(r){return r.json()}).then(function(d){
+    fetch('/api/takportal/deploy/log?index='+logIndex).then(function(r){
+        var ct=(r.headers.get('content-type')||'').toLowerCase();
+        if(ct.indexOf('application/json')<0){
+            return r.text().then(function(raw){
+                if(raw.indexOf('<!DOCTYPE')>=0||raw.indexOf('<html')>=0){
+                    throw new Error('Deploy log returned HTML (session expired or backend error).');
+                }
+                throw new Error('Deploy log returned non-JSON response.');
+            });
+        }
+        return r.json();
+    }).then(function(d){
         var el=document.getElementById('deploy-log');
         if(d.entries.length>0){
             d.entries.forEach(function(e){
@@ -12268,6 +12291,17 @@ function pollDeployLog(){
             var btn=document.getElementById('deploy-btn');
             if(btn){btn.disabled=false;btn.textContent='\u2717 Deployment failed \u2014 Retry';btn.style.background='var(--red)';btn.style.opacity='1';btn.style.cursor='pointer';btn.onclick=function(){btn.textContent='\u1f680 Deploy TAK Portal';btn.style.background='';deployPortal();};}
         }
+    }).catch(function(e){
+        var el=document.getElementById('deploy-log');
+        if(el){
+            var l=document.createElement('div');
+            l.style.color='var(--red)';
+            l.textContent='\u2717 '+e.message;
+            el.appendChild(l);
+            el.scrollTop=el.scrollHeight;
+        }
+        var btn=document.getElementById('deploy-btn');
+        if(btn){btn.disabled=false;btn.textContent='\u2717 Deployment failed \u2014 Retry';btn.style.background='var(--red)';btn.style.opacity='1';btn.style.cursor='pointer';btn.onclick=function(){btn.textContent='\u1f680 Deploy TAK Portal';btn.style.background='';deployPortal();};}
     });
 }
 
