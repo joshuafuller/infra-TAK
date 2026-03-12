@@ -5170,13 +5170,37 @@ def run_takportal_deploy():
                     "      retries: 3\n"
                     "      start_period: 15s\n"
                 )
-                compose_content = compose_content.replace(
-                    'restart: unless-stopped',
-                    'restart: unless-stopped\n' + healthcheck.rstrip('\n')
+                extra_hosts_block = (
+                    "    extra_hosts:\n"
+                    "      - \"host.docker.internal:host-gateway\"\n"
                 )
-                with open(compose_path, 'w') as f:
-                    f.write(compose_content)
-                plog("  ✓ Healthcheck added to docker-compose.yml")
+                updated_compose_content = compose_content.replace(
+                    'restart: unless-stopped',
+                    'restart: unless-stopped\n' + healthcheck.rstrip('\n') + '\n' + extra_hosts_block.rstrip('\n')
+                )
+                if updated_compose_content != compose_content:
+                    compose_content = updated_compose_content
+                    with open(compose_path, 'w') as f:
+                        f.write(compose_content)
+                    plog("  ✓ Healthcheck + extra_hosts added to docker-compose.yml")
+                else:
+                    plog("  ⚠ Could not auto-patch docker-compose.yml (missing 'restart: unless-stopped'). Add extra_hosts manually if needed.")
+            elif 'host.docker.internal' not in compose_content:
+                extra_hosts_block = (
+                    "    extra_hosts:\n"
+                    "      - \"host.docker.internal:host-gateway\"\n"
+                )
+                updated_compose_content = compose_content.replace(
+                    'restart: unless-stopped',
+                    'restart: unless-stopped\n' + extra_hosts_block.rstrip('\n')
+                )
+                if updated_compose_content != compose_content:
+                    compose_content = updated_compose_content
+                    with open(compose_path, 'w') as f:
+                        f.write(compose_content)
+                    plog("  ✓ extra_hosts (host.docker.internal) added for container→host")
+                else:
+                    plog("  ⚠ Could not auto-add extra_hosts (missing 'restart: unless-stopped').")
 
         plog("  Building image (this may take a minute)...")
         r = subprocess.run(f'cd {portal_dir} && docker compose up -d --build 2>&1', shell=True, capture_output=True, text=True, timeout=900)
@@ -5283,6 +5307,9 @@ def run_takportal_deploy():
         plog("\u2501\u2501\u2501 Step 6/6: Auto-configuring TAK Portal Settings \u2501\u2501\u2501")
         settings = load_settings()
         server_ip = (settings.get('server_ip') or '').strip() or 'localhost'
+        # Container must reach Authentik on the host; localhost inside container is the container itself -> ECONNREFUSED.
+        # Use host IP when set, else host.docker.internal (Step 4 adds extra_hosts so this resolves on Linux).
+        auth_url_host = server_ip if (server_ip and server_ip != 'localhost') else 'host.docker.internal'
         ak_env_path = os.path.expanduser('~/authentik/.env')
         ak_token = ''
         if os.path.exists(ak_env_path):
@@ -5294,7 +5321,7 @@ def run_takportal_deploy():
         import json as json_mod
         cert_pass = _get_tak_cert_password(settings)
         portal_settings = {
-            "AUTHENTIK_URL": f"http://{server_ip}:9090",
+            "AUTHENTIK_URL": f"http://{auth_url_host}:9090",
             "AUTHENTIK_TOKEN": ak_token,
             "USERS_HIDDEN_PREFIXES": "ak-,adm_,nodered-,ma-",
             "GROUPS_HIDDEN_PREFIXES": "authentik, MA -, vid_, tak_ROLE_",
