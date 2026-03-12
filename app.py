@@ -4706,7 +4706,10 @@ def _get_authentik_latest_release_tag(use_cache=True):
                           headers={'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'infra-TAK'})
         resp = _ur.urlopen(req, timeout=10)
         data = json.loads(resp.read().decode())
-        tag = (data.get('tag_name') or '').strip().lstrip('vV') or None
+        tag = (data.get('tag_name') or '').strip()
+        if tag.startswith('version/'):
+            tag = tag[len('version/'):]
+        tag = tag.lstrip('vV').strip() or None
         if tag:
             _authentik_release_cache['tag'] = tag
             _authentik_release_cache['ts'] = _time.time()
