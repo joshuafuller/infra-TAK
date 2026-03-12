@@ -5344,8 +5344,9 @@ def run_takportal_deploy():
                     if line.strip().startswith('WEB_UI_PORT='):
                         port = line.strip().split('=', 1)[1].strip() or '3000'
 
-        # Configure Authentik forward auth for TAK Portal
+        # Configure Authentik forward auth for TAK Portal (use settings from Step 6 so ak_token is in scope)
         fqdn = settings.get('fqdn', '')
+        ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
         if fqdn and ak_token:
             plog("")
             plog("\u2501\u2501\u2501 Configuring Authentik Forward Auth \u2501\u2501\u2501")
