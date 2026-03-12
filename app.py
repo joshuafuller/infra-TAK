@@ -15955,6 +15955,20 @@ def takserver_webadmin_password():
     return jsonify({'password': ''})
 
 
+@app.route('/api/takserver/webadmin-password', methods=['POST'])
+@login_required
+def takserver_set_webadmin_password():
+    """Set webadmin password in settings (used for 8446 and Sync webadmin to Authentik). Use when 8446 fails with remote Authentik so you can set a known password and sync."""
+    data = request.get_json() or {}
+    pw = (data.get('password') or '').strip()
+    if not pw:
+        return jsonify({'success': False, 'error': 'Password required'}), 400
+    settings = load_settings()
+    settings['webadmin_password'] = pw
+    save_settings(settings)
+    return jsonify({'success': True, 'message': 'Password saved. Click Sync webadmin to Authentik, then restart LDAP on the Authentik server if needed.'})
+
+
 @app.route('/api/takserver/cert-password')
 @login_required
 def takserver_cert_password():
@@ -15990,21 +16004,33 @@ def takserver_webadmin_authentik_status():
 def takserver_connect_ldap():
     """One-shot: fix LDAP blueprint (remove recursion-causing password_stage), fix flow auth, ensure LDAP app open to all users (QR registration), ensure service account, ensure webadmin, patch CoreConfig, restart TAK Server."""
     diag = []
-    # Fix LDAP blueprint on disk if it still has the broken password_stage (causes "invalid credentials" / recursion on user bind, e.g. QR code)
-    bp_path = os.path.expanduser('~/authentik/blueprints/tak-ldap-setup.yaml')
-    if os.path.exists(bp_path):
-        try:
-            with open(bp_path, 'r') as f:
-                content = f.read()
-            if 'password_stage: !KeyOf ldap-authentication-password' in content:
-                content = content.replace('      password_stage: !KeyOf ldap-authentication-password\n', '')
-                with open(bp_path, 'w') as f:
-                    f.write(content)
-                subprocess.run('cd ~/authentik && docker compose restart worker 2>&1', shell=True, capture_output=True, timeout=90)
-                time.sleep(50)  # let blueprint reconcile and update identification stage
-                diag.append('LDAP blueprint fixed (removed password_stage); worker restarted')
-        except Exception as e:
-            diag.append(f'Blueprint fix: {str(e)[:80]}')
+    settings = load_settings()
+    ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+    is_remote_ak = ak_cfg.get('target_mode') == 'remote' and (ak_cfg.get('remote', {}).get('host') or '').strip()
+    # Fix LDAP blueprint if it has the broken password_stage (causes "invalid credentials" / recursion on user bind). Same fix for local or remote.
+    if is_remote_ak:
+        ok_bp, out = _module_run(ak_cfg, "grep -q 'password_stage: !KeyOf ldap-authentication-password' ~/authentik/blueprints/tak-ldap-setup.yaml 2>/dev/null && sed -i '/password_stage: !KeyOf ldap-authentication-password/d' ~/authentik/blueprints/tak-ldap-setup.yaml && cd ~/authentik && docker compose restart worker 2>&1; echo BP_DONE", timeout=120)
+        if ok_bp and 'BP_DONE' in (out or ''):
+            diag.append('LDAP blueprint checked on remote (flow fix via API runs next)')
+            if 'restart' in (out or '').lower():
+                time.sleep(10)  # allow worker to reconcile if we restarted it
+        elif not ok_bp:
+            diag.append('Blueprint fix on remote: skip or failed (flow fix via API will still run)')
+    else:
+        bp_path = os.path.expanduser('~/authentik/blueprints/tak-ldap-setup.yaml')
+        if os.path.exists(bp_path):
+            try:
+                with open(bp_path, 'r') as f:
+                    content = f.read()
+                if 'password_stage: !KeyOf ldap-authentication-password' in content:
+                    content = content.replace('      password_stage: !KeyOf ldap-authentication-password\n', '')
+                    with open(bp_path, 'w') as f:
+                        f.write(content)
+                    subprocess.run('cd ~/authentik && docker compose restart worker 2>&1', shell=True, capture_output=True, timeout=90)
+                    time.sleep(50)  # let blueprint reconcile and update identification stage
+                    diag.append('LDAP blueprint fixed (removed password_stage); worker restarted')
+            except Exception as e:
+                diag.append(f'Blueprint fix: {str(e)[:80]}')
     # Fix flow (clear identification password_stage, ensure 3 ldap-* bindings) so user bind / QR works
     ok_flow, err_flow = _ensure_ldap_flow_authentication_none()
     if not ok_flow:
