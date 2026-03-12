@@ -4938,6 +4938,9 @@ def takportal_control():
         pull = subprocess.run(f'cd {portal_dir} && git pull --rebase --autostash', shell=True, capture_output=True, text=True, timeout=60)
         pull_msg = pull.stdout.strip().split('\n')[-1] if pull.stdout.strip() else ''
         build = subprocess.run(f'cd {portal_dir} && docker compose up -d --build', shell=True, capture_output=True, text=True, timeout=180)
+        if build.returncode != 0:
+            err = (build.stderr or build.stdout or 'Build failed').strip()[:400]
+            return jsonify({'success': False, 'error': 'Build failed. Container may have stopped — try Start below or check container logs.'}), 500
         settings_synced = False
         settings_sync_error = ''
         cloudtak_url = ''
@@ -4967,7 +4970,9 @@ def takportal_control():
         vinfo = _get_takportal_version_info()
         new_version = vinfo['version'] or ''
         r = subprocess.run('docker ps --filter name=tak-portal --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
-        running = 'Up' in r.stdout
+        running = 'Up' in (r.stdout or '')
+        if not running:
+            return jsonify({'success': False, 'error': 'Container not running after update — click Start below.'}), 500
         return jsonify({'success': True, 'running': running, 'action': action, 'pull': pull_msg, 'version': new_version, 'settings_synced': settings_synced, 'settings_sync_error': settings_sync_error, 'cloudtak_url': cloudtak_url})
     else:
         return jsonify({'error': 'Invalid action'}), 400
@@ -11904,9 +11909,20 @@ body{display:flex;flex-direction:row;min-height:100vh}
 .nav-item.active{color:var(--cyan);background:rgba(6,182,212,.06);border-left-color:var(--cyan)}
 .nav-icon{font-size:15px;width:18px;text-align:center}
 .main{flex:1;min-width:0;overflow-y:auto;padding:32px;max-width:1000px;margin:0 auto}
+.portal-collapse-header{display:flex;align-items:center;justify-content:space-between;cursor:pointer;user-select:none;font-size:12px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin:0}
+.portal-collapse-header:hover{color:var(--text-secondary)}
+.portal-collapse-toggle{font-size:18px;color:var(--text-dim);transition:transform .2s ease;flex-shrink:0;margin-left:8px}
+.portal-collapse-body{display:none;padding-top:16px;margin-top:16px;border-top:1px solid var(--border)}
+.portal-collapse-body.open{display:block}
 </style></head><body>
 {{ sidebar_html }}
 <div class="main">
+{% if portal.installed %}
+<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:20px">
+<button class="control-btn" onclick="portalReconfigure()" title="Refresh Authentik/TAK Server settings and restart container">🔄 Update config & reconnect</button>
+<button class="control-btn btn-remove" onclick="document.getElementById('portal-uninstall-modal').classList.add('open')">🗑 Remove TAK Portal</button>
+</div>
+{% endif %}
 <div class="status-banner">
 {% if deploying %}
 <div class="status-info"><div class="status-icon running" style="background:rgba(59,130,246,0.1)">🔄</div><div><div class="status-text" style="color:var(--accent)">Deploying...</div><div class="status-detail">TAK Portal installation in progress</div></div></div>
@@ -11969,15 +11985,16 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 </div>
 {% endif %}
-<div class="section-title">Container Logs <span id="log-filter-label" style="font-size:11px;color:var(--cyan);margin-left:8px"></span></div>
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px 24px;margin-bottom:24px">
+<div class="portal-collapse-header" onclick="portalSectionToggle(this)">
+<span>Container Logs <span id="log-filter-label" style="font-size:11px;color:var(--cyan);margin-left:8px"></span></span>
+<span class="portal-collapse-toggle" style="transform:rotate(180deg)">&#9662;</span>
+</div>
+<div class="portal-collapse-body open" id="portal-container-logs-body">
 <div class="deploy-log" id="container-log">Loading logs...</div>
-<div style="margin-top:24px;text-align:center">
-<button class="control-btn btn-remove" onclick="document.getElementById('portal-uninstall-modal').classList.add('open')">🗑 Remove TAK Portal</button>
+</div>
 </div>
 {% elif portal.installed %}
-<div style="margin-top:24px;text-align:center">
-<button class="control-btn btn-remove" onclick="document.getElementById('portal-uninstall-modal').classList.add('open')">🗑 Remove TAK Portal</button>
-</div>
 {% else %}
 <div class="section-title">About TAK Portal</div>
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
@@ -12020,6 +12037,13 @@ Features: User creation with auto-cert generation, group management, mutual aid 
 </div>
 <footer class="footer"></footer>
 <script>
+function portalSectionToggle(header){
+    var body=header.nextElementSibling;
+    var icon=header.querySelector('.portal-collapse-toggle');
+    if(!body)return;
+    if(body.classList.contains('open')){body.classList.remove('open');if(icon)icon.style.transform='rotate(0deg)'}
+    else{body.classList.add('open');if(icon)icon.style.transform='rotate(180deg)'}
+}
 async function showAkPassword(){
     var btn=document.getElementById('ak-pw-btn');
     var display=document.getElementById('ak-pw-display');
@@ -12070,13 +12094,15 @@ async function portalUpdate(){
     document.querySelectorAll('.control-btn').forEach(function(b){if(b!==btn){b.disabled=true;b.style.opacity='0.5'}});
     try{
         var r=await fetch('/api/takportal/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'update'})});
-        var d=await r.json();
-        if(d.success){
+        var d;
+        try{d=r.ok?await r.json():{};}catch(_){d={};}
+        if(!r.ok&&d&&typeof d.error==='string'){ status.style.color='var(--red)'; status.textContent='✗ '+(d.error.length>100?d.error.slice(0,100)+'…':d.error); }
+        else if(d.success){
             status.style.color='var(--green)';
             status.textContent='✓ Updated'+(d.pull?' — '+d.pull:'')+(d.version?' ('+d.version+')':'');
             setTimeout(function(){window.location.href='/takportal'},1500);
-        }else{status.style.color='var(--red)';status.textContent='✗ '+(d.error||'Update failed')}
-    }catch(e){status.style.color='var(--red)';status.textContent='✗ '+e.message}
+        }else{ status.style.color='var(--red)'; var msg=(d&&d.error)?String(d.error).slice(0,120):'Update failed'; if(msg.length>=120)msg+='…'; status.textContent='✗ '+msg+'. Try Start below.'; }
+    }catch(e){ status.style.color='var(--red)'; status.textContent='✗ Update failed — try Start below.'; }
     btn.disabled=false;btn.innerHTML='⬆ Update';
     document.querySelectorAll('.control-btn').forEach(function(b){b.disabled=false;b.style.opacity='1'});
 }
@@ -13216,6 +13242,7 @@ def _run_authentik_reconfigure_remote(settings, deploy_cfg, plog):
     _ensure_app_access_policies(ak_url, ak_headers, plog)
     plog("  Enabling show password on login...")
     _authentik_enable_show_password(ak_url, ak_headers, plog)
+    _sync_webadmin_after_authentik_reconfigure(plog)
     plog("")
     plog("\u2713 Reconfigure complete (remote).")
     authentik_deploy_status.update({'running': False, 'complete': True, 'error': False})
@@ -13404,6 +13431,11 @@ def run_authentik_deploy(reconfigure=False):
                         plog("  \u26a0 API not ready in time — run Update config & reconnect again to apply app access policies")
                 else:
                     plog("  \u26a0 No token in .env — app access policies not applied")
+                plog("")
+                plog("\u2713 Reconfigure complete.")
+                _sync_webadmin_after_authentik_reconfigure(plog)
+                authentik_deploy_status.update({'running': False, 'complete': True, 'error': False})
+                return
         else:
             if settings.get('pkg_mgr', 'apt') == 'apt':
                 wait_for_apt_lock(plog, authentik_deploy_log)
@@ -16900,6 +16932,19 @@ def takserver_create_client_cert():
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+def _sync_webadmin_after_authentik_reconfigure(plog):
+    """After Authentik reconfigure, run TAK Server update config (Caddy + 8446 cert + restart) so WebAdmin is in sync. No-op if TAK Server not installed. plog is a logging fn (e.g. from run_authentik_deploy)."""
+    modules = detect_modules()
+    if not modules.get('takserver', {}).get('installed'):
+        return
+    try:
+        plog("  Syncing WebAdmin (Caddy + TAK Server restart)...")
+        _run_takserver_update_config()
+        plog("  ✓ WebAdmin synced.")
+    except Exception as e:
+        plog(f"  ⚠ WebAdmin sync failed: {str(e)[:80]} — run Update config on TAK Server page if needed.")
 
 
 def _run_takserver_update_config():
