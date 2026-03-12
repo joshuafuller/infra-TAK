@@ -17843,13 +17843,13 @@ def run_takserver_deploy(config):
             subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True)
             log_step(f"  ✓ Caddy config updated for TAK Server")
 
-        # If Authentik is installed, ensure webadmin exists there (for 8446 LDAP login). On fresh install with Authentik-first order, this runs here so user does not need to click Sync webadmin.
-        if webadmin_pass and os.path.exists(os.path.expanduser('~/authentik/.env')):
+        # If Authentik is installed (local or remote), ensure webadmin exists there (for 8446 LDAP login). Matches main-branch behavior so 8446 works after Connect LDAP without manual Sync webadmin.
+        if webadmin_pass and _get_authentik_env_content(settings):
             ok, err = _ensure_authentik_webadmin()
             if ok:
                 log_step("  ✓ webadmin synced to Authentik (8446 login ready)")
             elif err:
-                log_step(f"  ⚠ webadmin sync: {err[:80]} — use Sync webadmin button if 8446 fails")
+                log_step(f"  ⚠ webadmin sync: {err[:80]} — use Sync webadmin or Connect LDAP if 8446 fails")
 
         # If Caddy is already running with a domain, install LE cert on 8446 now.
         # This handles the case where Caddy was deployed before TAK Server.
