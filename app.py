@@ -5142,17 +5142,39 @@ def run_takportal_deploy():
                 return
         plog("\u2713 Repository ready")
 
-        # Step 3: Create .env if missing (main: no AUTHENTIK_URL in .env; we set it only in settings.json in Step 6)
+        # Step 3: Create .env if missing; always set AUTHENTIK_URL so container reaches host (not 127.0.0.1)
         plog("")
         plog("\u2501\u2501\u2501 Step 3/6: Configuring \u2501\u2501\u2501")
         env_path = os.path.join(portal_dir, '.env')
-        if not os.path.exists(env_path):
-            plog("  Creating default .env...")
-            with open(env_path, 'w') as f:
-                f.write("WEB_UI_PORT=3000\n")
-            plog("\u2713 Default .env created (port 3000)")
+        server_ip = (settings.get('server_ip') or '').strip()
+        if not server_ip or server_ip == 'localhost':
+            r = subprocess.run("hostname -I 2>/dev/null | awk '{print $1}'", shell=True, capture_output=True, text=True, timeout=5)
+            detected = (r.stdout or '').strip() if r.returncode == 0 else ''
+            if detected:
+                server_ip = detected
+                settings['server_ip'] = server_ip
+                try:
+                    save_settings(settings)
+                except Exception:
+                    pass
+                plog(f"  Using detected host IP for Authentik: {server_ip}")
+            else:
+                server_ip = server_ip or 'localhost'
+        auth_url = f"http://{server_ip}:9090"
+        env_lines = []
+        if os.path.exists(env_path):
+            with open(env_path, 'r') as f:
+                for line in f:
+                    if line.strip().startswith('AUTHENTIK_URL='):
+                        continue
+                    env_lines.append(line.rstrip('\n'))
         else:
-            plog("\u2713 .env already exists")
+            plog("  Creating default .env...")
+            env_lines.append("WEB_UI_PORT=3000")
+        env_lines.append(f"AUTHENTIK_URL={auth_url}")
+        with open(env_path, 'w') as f:
+            f.write('\n'.join(env_lines) + '\n')
+        plog(f"  \u2713 .env: AUTHENTIK_URL={auth_url}")
 
         # Step 4: Build and start (main: only healthcheck in compose, no AUTHENTIK_URL injection)
         plog("")
@@ -5179,7 +5201,7 @@ def run_takportal_deploy():
                 plog("  ✓ Healthcheck added to docker-compose.yml")
 
         plog("  Building image (this may take a minute)...")
-        r = subprocess.run(f'cd {portal_dir} && docker compose up -d --build 2>&1', shell=True, capture_output=True, text=True, timeout=900)
+        r = subprocess.run(f'cd {portal_dir} && docker compose up -d --build --force-recreate 2>&1', shell=True, capture_output=True, text=True, timeout=900)
         for line in r.stdout.strip().split('\n'):
             if line.strip() and 'NEEDRESTART' not in line:
                 takportal_deploy_log.append(f"  {line.strip()}")
