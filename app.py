@@ -2727,11 +2727,16 @@ def cloudtak_page():
                     parts = line.split('|||')
                     containers.append({'name': parts[0], 'status': parts[1] if len(parts) > 1 else ''})
         container_info['containers'] = containers
-    ct_version = _get_cloudtak_version_info().get('version', '') if cloudtak.get('installed') else ''
+    ct_vinfo = _get_cloudtak_version_info() if cloudtak.get('installed') else {}
+    ct_version = ct_vinfo.get('version', '')
+    ct_update_available = ct_vinfo.get('update_available', False)
+    ct_latest = ct_vinfo.get('latest', '')
     return render_template_string(CLOUDTAK_TEMPLATE,
         settings=settings, cloudtak=cloudtak,
         version=VERSION,
         cloudtak_version=ct_version,
+        cloudtak_update_available=ct_update_available,
+        cloudtak_latest=ct_latest,
         cloudtak_icon=CLOUDTAK_ICON,
         cloudtak_cfg=cloudtak_cfg,
         cloudtak_tak_suggest=cloudtak_tak_suggest,
@@ -4747,18 +4752,29 @@ def _get_nodered_version_info():
     return out
 
 
-def _get_cloudtak_latest_release_tag():
+_cloudtak_release_cache = {'tag': None, 'ts': 0}
+
+def _get_cloudtak_latest_release_tag(use_cache=True):
     """Fetch the latest stable release tag from GitHub (e.g. 'v12.94.0').
+    Cached for 4 hours to avoid hitting GitHub API on every page load.
+    Pass use_cache=False during deploy to get a fresh result.
     Returns the tag string, or None if the API call fails."""
+    import time as _time
+    if use_cache and _cloudtak_release_cache['tag'] and (_time.time() - _cloudtak_release_cache['ts'] < 14400):
+        return _cloudtak_release_cache['tag']
     try:
         import urllib.request as _ur
         req = _ur.Request('https://api.github.com/repos/dfpc-coe/CloudTAK/releases/latest',
                           headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'infra-TAK'})
         with _ur.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode())
-            return (data.get('tag_name') or '').strip() or None
+            tag = (data.get('tag_name') or '').strip() or None
+            if tag:
+                _cloudtak_release_cache['tag'] = tag
+                _cloudtak_release_cache['ts'] = _time.time()
+            return tag
     except Exception:
-        return None
+        return _cloudtak_release_cache.get('tag')
 
 
 def _get_cloudtak_version_info():
@@ -4793,6 +4809,13 @@ def _get_cloudtak_version_info():
                     if 'update=true' in line:
                         out['update_available'] = True
                     break
+    if out['version'] and not out['latest']:
+        tag = _get_cloudtak_latest_release_tag()
+        if tag:
+            latest_ver = tag.lstrip('vV')
+            out['latest'] = latest_ver
+            if out['version'] != latest_ver:
+                out['update_available'] = True
     return out
 
 
@@ -7160,6 +7183,19 @@ def cloudtak_redeploy_api():
         threading.Thread(target=run_cloudtak_redeploy, args=(cfg,), daemon=True).start()
     return jsonify({'success': True, 'message': 'Update config & restart started'})
 
+@app.route('/api/cloudtak/update', methods=['POST'])
+@login_required
+def cloudtak_update_api():
+    """Pull latest stable release, rebuild images, and restart. Preserves config/data."""
+    with _cloudtak_deploy_lock:
+        if cloudtak_deploy_status.get('running'):
+            return jsonify({'error': 'Another operation is in progress'}), 409
+        cloudtak_deploy_log.clear()
+        cloudtak_deploy_status.update({'running': True, 'complete': False, 'error': False})
+        cloudtak_deploy_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] CloudTAK update started")
+        threading.Thread(target=run_cloudtak_update, daemon=True).start()
+    return jsonify({'success': True, 'message': 'CloudTAK update started'})
+
 @app.route('/api/cloudtak/control', methods=['POST'])
 @login_required
 def cloudtak_control():
@@ -7470,7 +7506,7 @@ def run_cloudtak_deploy(cfg=None):
 
             plog("")
             plog("━━━ Step 3/6: Cloning/Updating CloudTAK on remote ━━━")
-            remote_release_tag = _get_cloudtak_latest_release_tag()
+            remote_release_tag = _get_cloudtak_latest_release_tag(use_cache=False)
             if remote_release_tag:
                 plog(f"  Target: stable release {remote_release_tag}")
                 prep_cmd = (
@@ -7615,7 +7651,7 @@ def run_cloudtak_deploy(cfg=None):
         plog("")
         plog("━━━ Step 2/7: Cloning CloudTAK ━━━")
         if os.path.exists(cloudtak_dir):
-            release_tag = _get_cloudtak_latest_release_tag()
+            release_tag = _get_cloudtak_latest_release_tag(use_cache=False)
             if release_tag:
                 plog(f"  ~/CloudTAK exists — updating to stable {release_tag}...")
                 r = subprocess.run(
@@ -7630,7 +7666,7 @@ def run_cloudtak_deploy(cfg=None):
                 if r.returncode != 0:
                     plog(f"  ⚠ git pull warning: {r.stderr.strip()[:100]}")
         else:
-            release_tag = _get_cloudtak_latest_release_tag()
+            release_tag = _get_cloudtak_latest_release_tag(use_cache=False)
             tag_label = release_tag or 'main (latest release tag unavailable)'
             plog(f"  Cloning from GitHub (shallow, {tag_label})...")
             clone_timeout = 600  # 10 min — VPS→GitHub can be slow
@@ -8039,6 +8075,94 @@ def run_cloudtak_redeploy(cfg=None):
         cloudtak_deploy_status.update({'running': False, 'error': True})
     finally:
         cloudtak_deploy_status['running'] = False
+
+
+def run_cloudtak_update():
+    """Fetch latest stable release tag, checkout, rebuild images, restart. Preserves DB and config."""
+    def plog(msg):
+        entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
+        cloudtak_deploy_log.append(entry)
+        print(entry, flush=True)
+    try:
+        settings = load_settings()
+        cfg = _get_cloudtak_deployment_config(settings)
+        is_remote = cfg.get('target_mode') == 'remote'
+        remote_cfg = cfg.get('remote', {}) if is_remote else {}
+        remote_host = (remote_cfg.get('host') or '').strip() if is_remote else ''
+
+        plog("━━━ Step 1/3: Fetching latest stable release ━━━")
+        release_tag = _get_cloudtak_latest_release_tag(use_cache=False)
+        if not release_tag:
+            plog("✗ Could not fetch latest release tag from GitHub")
+            cloudtak_deploy_status.update({'running': False, 'error': True})
+            return
+        plog(f"  Target: {release_tag}")
+
+        plog("")
+        plog("━━━ Step 2/3: Checking out stable release ━━━")
+        if is_remote:
+            if not remote_host:
+                plog("✗ Remote host not configured")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
+            checkout_cmd = (
+                f"cd ~/CloudTAK && "
+                f"git fetch --depth 1 origin tag {release_tag} && "
+                f"git checkout {release_tag}"
+            )
+            ok, out = _ssh_probe(remote_cfg, checkout_cmd, timeout=120)
+            if not ok:
+                plog(f"✗ Checkout failed on remote: {(out or '')[:220]}")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
+        else:
+            cloudtak_dir = os.path.expanduser('~/CloudTAK')
+            if not os.path.isdir(os.path.join(cloudtak_dir, '.git')):
+                plog("✗ ~/CloudTAK not found — use Deploy instead")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
+            r = subprocess.run(
+                f'cd {cloudtak_dir} && git fetch --depth 1 origin tag {release_tag} && git checkout {release_tag}',
+                shell=True, capture_output=True, text=True, timeout=120)
+            if r.returncode != 0:
+                plog(f"✗ Checkout failed: {r.stderr.strip()[:200]}")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
+        plog(f"✓ Checked out {release_tag}")
+
+        plog("")
+        plog("━━━ Step 3/3: Rebuilding and restarting ━━━")
+        if is_remote:
+            build_cmd = "cd ~/CloudTAK && docker compose up -d --build"
+            ok, out = _ssh_probe(remote_cfg, build_cmd, timeout=2700)
+            if not ok:
+                plog(f"✗ Build/restart failed on remote: {(out or '')[:220]}")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
+        else:
+            cloudtak_dir = os.path.expanduser('~/CloudTAK')
+            r = subprocess.run(
+                'docker compose up -d --build 2>&1',
+                shell=True, capture_output=True, text=True, timeout=2700, cwd=cloudtak_dir)
+            if r.returncode != 0:
+                r = subprocess.run(
+                    'docker-compose up -d --build 2>&1',
+                    shell=True, capture_output=True, text=True, timeout=2700, cwd=cloudtak_dir)
+            if r.returncode != 0:
+                plog(f"✗ Build/restart failed: {(r.stderr or r.stdout or 'unknown')[:300]}")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
+        plog("✓ Containers rebuilt and restarted")
+        plog("")
+        plog(f"✓ CloudTAK updated to {release_tag}")
+        _update_boot_stagger_service()
+        cloudtak_deploy_status.update({'running': False, 'complete': True, 'error': False})
+    except Exception as e:
+        plog(f"✗ Error: {str(e)}")
+        cloudtak_deploy_status.update({'running': False, 'error': True})
+    finally:
+        cloudtak_deploy_status['running'] = False
+
 
 # ── Email Relay ────────────────────────────────────────────────────────────────
 email_deploy_log = []
@@ -10919,6 +11043,44 @@ window.startRedeploy = function() {
   });
 };
 
+window.startCloudtakUpdate = function() {
+  if (!confirm("Update CloudTAK to the latest stable release? This will rebuild images and restart containers. Your config and data are preserved.")) return;
+  var btn = document.getElementById("cloudtak-update-btn");
+  var logCard = document.getElementById("log-card");
+  var dyn = document.getElementById("deploy-log-dyn");
+  var stat = document.getElementById("deploy-log");
+  function showErr(s) {
+    if (dyn) dyn.textContent = s;
+    if (stat) stat.textContent = s;
+    if (btn) btn.disabled = false;
+    alert(s);
+  }
+  if (btn) btn.disabled = true;
+  if (logCard) { logCard.style.display = "block"; logCard.scrollIntoView({ behavior: "smooth", block: "nearest" }); }
+  var initMsg = "Updating CloudTAK to latest stable release...";
+  if (dyn) dyn.textContent = initMsg;
+  if (stat) stat.textContent = initMsg;
+  window.logIndex = 0;
+  fetch("/api/cloudtak/update", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    credentials: "same-origin"
+  }).then(function(r) {
+    if (!r.ok) {
+      return r.text().then(function(t) { throw new Error(r.status + ": " + (t || r.statusText).slice(0, 200)); });
+    }
+    return r.json();
+  }).then(function(d) {
+    if (d && d.error) {
+      showErr("Error: " + d.error);
+    } else {
+      window.pollLog(btn);
+    }
+  }).catch(function(e) {
+    showErr("Failed: " + (e && e.message ? e.message : String(e)));
+  });
+};
+
 window.startDeploy = function() {
   document.getElementById("deploy-btn").disabled = true;
   document.getElementById("log-card").style.display = "block";
@@ -11188,7 +11350,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 {{ sidebar_html }}
 <div class="main">
   <div class="page-header">
-    <h1><img src="{{ cloudtak_icon }}" alt="" style="height:28px;vertical-align:middle;margin-right:8px">CloudTAK{% if cloudtak_version %} <span style="font-weight:500;color:var(--text-dim);font-size:16px">· v{{ cloudtak_version }}</span>{% endif %}</h1>
+    <h1><img src="{{ cloudtak_icon }}" alt="" style="height:28px;vertical-align:middle;margin-right:8px">CloudTAK{% if cloudtak_version %} <span style="font-weight:500;color:var(--text-dim);font-size:16px">· v{{ cloudtak_version }}</span>{% endif %}{% if cloudtak_update_available %} <span style="font-size:12px;color:var(--cyan);font-weight:600;margin-left:8px">v{{ cloudtak_latest }} available</span>{% endif %}</h1>
     <p>Browser-based TAK client — in-browser map and situational awareness via TAK Server</p>
   </div>
 
@@ -11266,6 +11428,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
       <button class="btn {% if cloudtak.running %}btn-danger{% else %}btn-ghost{% endif %}" onclick="control('stop')">⏹ Stop</button>
       <button class="btn btn-ghost" onclick="control('restart')">↺ Restart</button>
       <button type="button" class="btn btn-primary" onclick="startRedeploy()" id="redeploy-btn">🔄 Update config & restart</button>
+      <button type="button" class="btn btn-ghost" onclick="startCloudtakUpdate()" id="cloudtak-update-btn"{% if cloudtak_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if cloudtak_update_available %} <span style="color:var(--cyan)" title="Update available: v{{ cloudtak_latest }}">●</span>{% endif %}</button>
       <button class="btn btn-danger" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Uninstall</button>
     </div>
     <div id="control-status" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
