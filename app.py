@@ -382,7 +382,7 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
         cls = 'nav-item active' if path == active else 'nav-item'
         t = f' title="{html.escape(title)}"' if title else ''
         return f'<a href="{href}" class="{cls}"{t}>{content}</a>'
-    logo = '<div class="sidebar-logo"><span>infra-TAK</span><small>Infrastructure Platform</small><small style="display:block;margin-top:2px;font-size:9px;color:var(--text-dim);opacity:0.85">built by TAKWERX</small></div>'
+    logo = f'<div class="sidebar-logo"><span>infra-TAK</span><small>Infrastructure Platform</small><small style="display:block;margin-top:2px;font-size:9px;color:var(--text-dim);opacity:0.85">built by TAKWERX</small><small style="display:block;margin-top:3px;font-size:9px;color:var(--text-dim);opacity:0.6;font-family:\'JetBrains Mono\',monospace">v{VERSION}</small></div>'
     parts = [logo]
     parts.append(link('/console', '<span class="nav-icon material-symbols-outlined">dashboard</span>Console'))
     gd = modules.get('guarddog', {})
