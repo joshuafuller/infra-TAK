@@ -213,6 +213,9 @@ start.sh                    ← One CLI command to launch everything
 - Reconfigure shows a live deploy log instead of immediate redirect.
 - Enables the **show password eyeball** on all Authentik login stages (for existing deployments, run "Update config & reconnect").
 
+**TAK Portal — updates preserve custom branding**
+- All TAK Portal operations (Update, Update config, reconfigure) now preserve user-configured settings like `BRAND_LOGO_URL` (custom logo/photo). Custom branding survives all updates.
+
 **Email Relay — Authentik SMTP auto-configuration**
 - Deploying Email Relay automatically configures Authentik's SMTP settings and sets up the password recovery flow.
 
