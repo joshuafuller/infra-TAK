@@ -382,7 +382,7 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
         cls = 'nav-item active' if path == active else 'nav-item'
         t = f' title="{html.escape(title)}"' if title else ''
         return f'<a href="{href}" class="{cls}"{t}>{content}</a>'
-    logo = f'<div class="sidebar-logo"><span>infra-TAK</span><small>Infrastructure Platform</small><small style="display:block;margin-top:2px;font-size:9px;color:var(--text-dim);opacity:0.85">built by TAKWERX</small><small style="display:block;margin-top:3px;font-size:9px;color:var(--text-dim);opacity:0.6;font-family:\'JetBrains Mono\',monospace">v{VERSION}</small></div>'
+    logo = f'<div class="sidebar-logo"><span>infra-TAK</span><small>Infrastructure Platform</small><small style="display:block;margin-top:2px">built by TAKWERX</small><small style="display:block;margin-top:2px">v{VERSION}</small></div>'
     parts = [logo]
     parts.append(link('/console', '<span class="nav-icon material-symbols-outlined">dashboard</span>Console'))
     gd = modules.get('guarddog', {})
@@ -428,6 +428,8 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
         )
     nav_style = ''
     light_mode_block = '''<style>
+@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@600;700;800&display=swap');
+.sidebar-logo>span{font-family:'Orbitron',sans-serif!important;letter-spacing:.08em}
 body.light-mode{--bg-deep:#f0f2f5;--bg-surface:#e4e7ec;--bg-card:#ffffff;--border:#bfc6d0;--border-hover:#8892a2;--text-primary:#0f172a;--text-secondary:#1e293b;--text-dim:#475569;--accent:#1d4ed8;--accent-glow:rgba(29,78,216,.12);--cyan:#0e7490;--green:#047857;--red:#b91c1c;--yellow:#a16207;--bg-primary:#f0f2f5;--bg-card-hover:#f0f4f8}
 body.light-mode::before{background-image:none!important}
 body.light-mode .sidebar{background:#dde1e8}
