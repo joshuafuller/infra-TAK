@@ -1,10 +1,11 @@
 #!/bin/bash
 
 ALERT_SENT_FILE="/var/lib/takguard/cert_alert_sent"
+CERT_PASS="CERT_PASS_PLACEHOLDER"
 
 if [ -f "/opt/tak/certs/files/takserver-le.jks" ]; then
   TEMP_CERT="/tmp/takserver-le-temp.pem"
-  keytool -exportcert -keystore /opt/tak/certs/files/takserver-le.jks -storepass atakatak -alias takserver -rfc > "$TEMP_CERT" 2>/dev/null
+  keytool -exportcert -keystore /opt/tak/certs/files/takserver-le.jks -storepass "$CERT_PASS" -alias takserver -rfc > "$TEMP_CERT" 2>/dev/null
   
   if [ -f "$TEMP_CERT" ]; then
     EXPIRY_DATE=$(openssl x509 -enddate -noout -in "$TEMP_CERT" | cut -d= -f2)

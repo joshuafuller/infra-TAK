@@ -12,11 +12,23 @@ if [ ! -f "$SERVICE_FILE" ]; then
     exit 1
 fi
 
+# Ensure gunicorn is installed (added in v0.2.0)
+"$INSTALL_DIR/.venv/bin/pip" install --quiet gunicorn 2>/dev/null || \
+    "$INSTALL_DIR/.venv/bin/pip" install gunicorn
+
 # Ensure CONFIG_DIR is set in the unit so auth is always read from this install dir
 if ! grep -q 'Environment=CONFIG_DIR=' "$SERVICE_FILE" 2>/dev/null; then
     echo "Pinning CONFIG_DIR in systemd unit to $INSTALL_DIR/.config"
     sed -i "/^\[Service\]/a Environment=CONFIG_DIR=$INSTALL_DIR/.config" "$SERVICE_FILE"
     systemctl daemon-reload
+fi
+
+# Upgrade systemd unit to gunicorn if still using python3 app.py
+if grep -q 'python3.*app.py' "$SERVICE_FILE" 2>/dev/null; then
+    echo "Upgrading console to gunicorn..."
+    bash "$INSTALL_DIR/start.sh"
+    echo "Console upgraded to gunicorn."
+    exit 0
 fi
 
 echo ""

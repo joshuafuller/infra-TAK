@@ -64,6 +64,16 @@ detect_os() {
                 PKG_MGR="apt"
             fi
             ;;
+        debian)
+            if [[ "$OS_VERSION" == "12"* ]]; then
+                OS_TYPE="debian-12"
+                PKG_MGR="apt"
+            else
+                echo -e "${YELLOW}WARNING: Debian $OS_VERSION not tested. Debian 12 recommended.${NC}"
+                OS_TYPE="debian-$OS_VERSION"
+                PKG_MGR="apt"
+            fi
+            ;;
         rocky|rhel)
             if [[ "$OS_VERSION" == 9* ]]; then
                 OS_TYPE="rocky-9"
@@ -76,7 +86,7 @@ detect_os() {
             ;;
         *)
             echo -e "${YELLOW}WARNING: $OS_NAME is not officially supported.${NC}"
-            echo -e "${YELLOW}Supported: Ubuntu 22.04, Rocky Linux 9${NC}"
+            echo -e "${YELLOW}Supported: Ubuntu 22.04/24.04, Debian 12, Rocky Linux 9${NC}"
             OS_TYPE="$OS_ID-$OS_VERSION"
             PKG_MGR="unknown"
             ;;
@@ -115,14 +125,17 @@ install_dependencies() {
             export DEBIAN_FRONTEND=noninteractive
             export NEEDRESTART_MODE=a
             apt-get update -qq > /dev/null 2>&1
-            apt-get install -y python3 python3-pip python3-venv openssl > /dev/null 2>&1
+            # Dpkg options avoid config prompts; NEEDRESTART_MODE=a avoids "Which services should be restarted?" dialog
+            NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get install -y \
+                -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" \
+                python3 python3-pip python3-venv openssl sshpass > /dev/null 2>&1
             ;;
         dnf)
-            dnf install -y python3 python3-pip openssl > /dev/null 2>&1
+            dnf install -y python3 python3-pip openssl sshpass > /dev/null 2>&1
             ;;
         *)
             echo -e "${RED}  Cannot auto-install dependencies for $PKG_MGR${NC}"
-            echo "  Please install: python3, python3-pip, python3-venv, openssl"
+            echo "  Please install: python3, python3-pip, python3-venv, openssl, sshpass"
             exit 1
             ;;
     esac
@@ -133,8 +146,8 @@ install_dependencies() {
     fi
 
     # Install Flask and dependencies in venv
-    "$INSTALL_DIR/.venv/bin/pip" install --quiet flask psutil werkzeug 2>/dev/null || \
-        "$INSTALL_DIR/.venv/bin/pip" install flask psutil werkzeug
+    "$INSTALL_DIR/.venv/bin/pip" install --quiet flask psutil werkzeug gunicorn 2>/dev/null || \
+        "$INSTALL_DIR/.venv/bin/pip" install flask psutil werkzeug gunicorn
 
     echo -e "  ${GREEN}✓ Dependencies installed${NC}"
     echo ""
@@ -253,6 +266,23 @@ create_service() {
         fi
     fi
 
+    # Build gunicorn command with SSL if certs exist
+    CERT_DIR="$USE_DIR/.config/ssl"
+    GUNICORN_BIN="$USE_DIR/.venv/bin/gunicorn"
+    PORT=$("$USE_DIR/.venv/bin/python3" -c "
+import json, os
+try:
+    with open(os.path.join('$USE_DIR', '.config', 'settings.json')) as f:
+        print(json.load(f).get('console_port', 5001))
+except Exception:
+    print(5001)
+" 2>/dev/null || echo 5001)
+
+    GUNICORN_ARGS="--bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 300 --graceful-timeout 30"
+    if [ -f "$CERT_DIR/console.crt" ] && [ -f "$CERT_DIR/console.key" ]; then
+        GUNICORN_ARGS="$GUNICORN_ARGS --certfile=$CERT_DIR/console.crt --keyfile=$CERT_DIR/console.key"
+    fi
+
     cat > "$SERVICE_FILE" << EOF
 [Unit]
 Description=infra-TAK - Team Awareness Kit Infrastructure Platform
@@ -261,7 +291,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$USE_DIR/.venv/bin/python3 $USE_DIR/app.py
+ExecStart=$GUNICORN_BIN $GUNICORN_ARGS app:app
 WorkingDirectory=$USE_DIR
 Restart=always
 RestartSec=5
