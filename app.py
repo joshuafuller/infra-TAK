@@ -10091,6 +10091,12 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 .btn-primary{background:var(--accent);color:#fff}.btn-success{background:var(--green);color:#fff}.btn-ghost{background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border)}
 .btn-danger{background:var(--red);color:#fff}
 .controls{display:flex;gap:10px;flex-wrap:wrap}
+.control-btn{padding:10px 20px;border:1px solid var(--border);border-radius:8px;background:var(--bg-card);color:var(--text-secondary);font-family:'JetBrains Mono',monospace;font-size:13px;cursor:pointer;transition:all 0.2s}
+.control-btn:hover{border-color:var(--border-hover);color:var(--text-primary)}
+.control-btn.btn-stop{border-color:rgba(239,68,68,0.3)}.control-btn.btn-stop:hover{background:rgba(239,68,68,0.1);color:var(--red)}
+.control-btn.btn-start{border-color:rgba(16,185,129,0.3)}.control-btn.btn-start:hover{background:rgba(16,185,129,0.1);color:var(--green)}
+.control-btn.btn-remove{border-color:rgba(239,68,68,0.2)}.control-btn.btn-remove:hover{background:rgba(239,68,68,0.1);color:var(--red)}
+.section-title{font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;color:var(--text-dim);letter-spacing:2px;text-transform:uppercase;margin-bottom:16px}
 .log-box{background:#070a12;border:1px solid var(--border);border-radius:8px;padding:16px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:340px;overflow-y:auto;white-space:pre-wrap}
 .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;display:none;align-items:center;justify-content:center}
 .modal-overlay.open{display:flex}
@@ -10175,13 +10181,13 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     {% else %}<div class="info-item"><div class="info-label">Flow editor</div><div class="info-value"><a href="http://{{ settings.server_ip }}:1880" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);text-decoration:none">http://{{ settings.server_ip }}:1880</a> &#8599;</div></div>{% endif %}
     <div class="info-item"><div class="info-label">Install dir</div><div class="info-value">~/node-red</div></div>
   </div></div>
-  <div class="card"><div class="card-title">Controls</div><div class="controls">
-    <button class="btn {% if nr.running %}btn-ghost{% else %}btn-success{% endif %}" onclick="control('start')">&#x25b6; Start</button>
-    <button class="btn {% if nr.running %}btn-danger{% else %}btn-ghost{% endif %}" onclick="control('stop')">&#x23f9; Stop</button>
-    <button class="btn btn-ghost" onclick="control('restart')">&#x27fa; Restart</button>
-    <button class="btn btn-ghost" onclick="loadLogs()">&#x1f4cb; Logs</button>
-    <button class="btn btn-danger" onclick="document.getElementById('uninstall-modal').classList.add('open')">&#x1f5d1; Uninstall</button>
-  </div><div id="control-status" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div></div>
+  <div class="section-title" style="margin-top:20px">Controls</div>
+  <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:24px">
+  <div class="controls" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+  {% if nr.running %}<button class="control-btn" onclick="control('restart')">↻ Restart</button><button class="control-btn" onclick="loadLogs()">📋 Logs</button><button class="control-btn btn-stop" onclick="control('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="control('start')">▶ Start</button><button class="control-btn" onclick="loadLogs()">📋 Logs</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% endif %}
+  </div>
+  <div id="control-status" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
+  </div>
   <div class="card" id="logs-card" style="display:none"><div class="card-title">Container logs</div><div class="log-box" id="container-logs">Loading...</div></div>
   {% else %}
   <div class="card"><div class="card-title">Deploy Node-RED</div>
@@ -10514,6 +10520,11 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 .btn-danger{background:var(--red);color:#fff}.btn-danger:hover{background:#dc2626}
 .btn:disabled{opacity:.5;cursor:not-allowed}
 .controls{display:flex;gap:10px;flex-wrap:wrap}
+.control-btn{padding:10px 20px;border:1px solid var(--border);border-radius:8px;background:var(--bg-card);color:var(--text-secondary);font-family:'JetBrains Mono',monospace;font-size:13px;cursor:pointer;transition:all 0.2s}
+.control-btn:hover{border-color:var(--border-hover);color:var(--text-primary)}
+.control-btn.btn-stop{border-color:rgba(239,68,68,0.3)}.control-btn.btn-stop:hover{background:rgba(239,68,68,0.1);color:var(--red)}
+.control-btn.btn-start{border-color:rgba(16,185,129,0.3)}.control-btn.btn-start:hover{background:rgba(16,185,129,0.1);color:var(--green)}
+.control-btn.btn-remove{border-color:rgba(239,68,68,0.2)}.control-btn.btn-remove:hover{background:rgba(239,68,68,0.1);color:var(--red)}
 .info-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
 .info-item{background:#0a0e1a;border-radius:8px;padding:12px 14px}
 .info-label{font-size:11px;color:var(--text-dim);margin-bottom:3px;text-transform:uppercase;letter-spacing:.05em}
@@ -10573,17 +10584,12 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     </div>
   </div>
 
-  <!-- Controls -->
-  <div class="card">
-    <div class="card-title">Controls</div>
-    <div class="controls">
-      <button class="btn btn-ghost" onclick="control('start')">▶ Start</button>
-      <button class="btn btn-ghost" onclick="control('stop')">⏹ Stop</button>
-      <button class="btn btn-ghost" onclick="control('restart')">↺ Restart</button>
-      <button class="btn btn-ghost" onclick="loadLogs()">📋 Logs</button>
-      <button class="btn btn-danger" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Uninstall</button>
-    </div>
-    <div id="control-status" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
+  <div class="section-title" style="margin-top:20px">Controls</div>
+  <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:24px">
+  <div class="controls" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+  {% if mtx.running %}<button class="control-btn" onclick="control('restart')">↻ Restart</button><button class="control-btn" onclick="loadLogs()">📋 Logs</button><button class="control-btn btn-stop" onclick="control('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="control('start')">▶ Start</button><button class="control-btn" onclick="loadLogs()">📋 Logs</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% endif %}
+  </div>
+  <div id="control-status" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
   </div>
 
   <!-- Container logs -->
@@ -11387,6 +11393,13 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 .info-value{font-size:13px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;word-break:break-all}
 .log-box{background:#070a12;border:1px solid var(--border);border-radius:8px;padding:16px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:340px;overflow-y:auto;line-height:1.7;white-space:pre-wrap}
 .controls{display:flex;gap:10px;flex-wrap:wrap}
+.control-btn{padding:10px 20px;border:1px solid var(--border);border-radius:8px;background:var(--bg-card);color:var(--text-secondary);font-family:'JetBrains Mono',monospace;font-size:13px;cursor:pointer;transition:all 0.2s}
+.control-btn:hover{border-color:var(--border-hover);color:var(--text-primary)}
+.control-btn.btn-stop{border-color:rgba(239,68,68,0.3)}.control-btn.btn-stop:hover{background:rgba(239,68,68,0.1);color:var(--red)}
+.control-btn.btn-start{border-color:rgba(16,185,129,0.3)}.control-btn.btn-start:hover{background:rgba(16,185,129,0.1);color:var(--green)}
+.control-btn.btn-update{border-color:rgba(59,130,246,0.3)}.control-btn.btn-update:hover{background:rgba(59,130,246,0.1);color:var(--accent)}
+.control-btn.btn-remove{border-color:rgba(239,68,68,0.2)}.control-btn.btn-remove:hover{background:rgba(239,68,68,0.1);color:var(--red)}
+.section-title{font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;color:var(--text-dim);letter-spacing:2px;text-transform:uppercase;margin-bottom:16px}
 .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;display:none;align-items:center;justify-content:center}
 .modal-overlay.open{display:flex}
 .modal{background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:400px;max-width:90vw}
@@ -11479,18 +11492,12 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   </div>
 
   {% if cloudtak.installed %}
-  <!-- Controls at top -->
-  <div class="card">
-    <div class="card-title">Controls</div>
-    <div class="controls">
-      <button class="btn {% if cloudtak.running %}btn-ghost{% else %}btn-success{% endif %}" onclick="control('start')">▶ Start</button>
-      <button class="btn {% if cloudtak.running %}btn-danger{% else %}btn-ghost{% endif %}" onclick="control('stop')">⏹ Stop</button>
-      <button class="btn btn-ghost" onclick="control('restart')">↺ Restart</button>
-      <button type="button" class="btn btn-primary" onclick="startRedeploy()" id="redeploy-btn">🔄 Update config & restart</button>
-      <button type="button" class="btn btn-ghost" onclick="startCloudtakUpdate()" id="cloudtak-update-btn"{% if cloudtak_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if cloudtak_update_available %} <span style="color:var(--cyan)" title="Update available: v{{ cloudtak_latest }}">●</span>{% endif %}</button>
-      <button class="btn btn-danger" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Uninstall</button>
-    </div>
-    <div id="control-status" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
+  <div class="section-title" style="margin-top:20px">Controls</div>
+  <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:24px">
+  <div class="controls" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+  {% if cloudtak.running %}<button class="control-btn" onclick="control('restart')">↻ Restart</button><button class="control-btn" onclick="startRedeploy()" id="redeploy-btn">🔄 Update config</button><button class="control-btn btn-update" onclick="startCloudtakUpdate()" id="cloudtak-update-btn"{% if cloudtak_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if cloudtak_update_available %} <span style="color:var(--cyan)" title="Update available: v{{ cloudtak_latest }}">●</span>{% endif %}</button><button class="control-btn btn-stop" onclick="control('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="control('start')">▶ Start</button><button class="control-btn" onclick="startRedeploy()" id="redeploy-btn">🔄 Update config</button><button class="control-btn btn-update" onclick="startCloudtakUpdate()" id="cloudtak-update-btn"{% if cloudtak_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if cloudtak_update_available %} <span style="color:var(--cyan)" title="Update available: v{{ cloudtak_latest }}">●</span>{% endif %}</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% endif %}
+  </div>
+  <div id="control-status" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
   </div>
 
   <!-- Access -->
@@ -11618,11 +11625,12 @@ EMAIL_RELAY_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UT
 .status-icon.running{background:rgba(16,185,129,0.1)}.status-icon.stopped{background:rgba(239,68,68,0.1)}.status-icon.not-installed{background:rgba(71,85,105,0.2)}
 .status-text{font-family:'JetBrains Mono',monospace;font-size:18px;font-weight:600}
 .status-detail{font-size:13px;color:var(--text-dim);margin-top:4px}
-.controls{display:flex;gap:10px}
-.control-btn{padding:8px 16px;border:1px solid var(--border);border-radius:8px;background:transparent;color:var(--text-secondary);font-family:'JetBrains Mono',monospace;font-size:12px;cursor:pointer;transition:all 0.2s}
-.control-btn:hover{border-color:var(--border-hover);background:var(--bg-surface)}
-.control-btn.btn-stop{color:var(--red)}.control-btn.btn-stop:hover{border-color:rgba(239,68,68,0.3);background:rgba(239,68,68,0.05)}
-.control-btn.btn-start{color:var(--green)}.control-btn.btn-start:hover{border-color:rgba(16,185,129,0.3);background:rgba(16,185,129,0.05)}
+.controls{display:flex;gap:10px;flex-wrap:wrap}
+.control-btn{padding:10px 20px;border:1px solid var(--border);border-radius:8px;background:var(--bg-card);color:var(--text-secondary);font-family:'JetBrains Mono',monospace;font-size:13px;cursor:pointer;transition:all 0.2s}
+.control-btn:hover{border-color:var(--border-hover);color:var(--text-primary)}
+.control-btn.btn-stop{border-color:rgba(239,68,68,0.3)}.control-btn.btn-stop:hover{background:rgba(239,68,68,0.1);color:var(--red)}
+.control-btn.btn-start{border-color:rgba(16,185,129,0.3)}.control-btn.btn-start:hover{background:rgba(16,185,129,0.1);color:var(--green)}
+.control-btn.btn-remove{border-color:rgba(239,68,68,0.2)}.control-btn.btn-remove:hover{background:rgba(239,68,68,0.1);color:var(--red)}
 .deploy-log{background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:400px;overflow-y:auto;line-height:1.6;white-space:pre-wrap;margin-top:16px}
 .input-field{width:100%;padding:12px 16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:14px;outline:none;transition:border-color 0.2s}
 .input-field:focus{border-color:var(--accent)}
@@ -11667,17 +11675,11 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div class="status-text" style="color:var(--green)">Running</div>
 <div class="status-detail">Postfix relay active{% if relay_config.get('provider') %} · {{ providers.get(relay_config.provider,{}).get('name', relay_config.provider) }}{% endif %}{% if relay_config.get('from_addr') %} · {{ relay_config.from_addr }}{% endif %}</div>
 </div></div>
-<div class="controls">
-<button class="control-btn" onclick="emailControl('restart')">↻ Restart</button>
-<button class="control-btn btn-stop" onclick="emailControl('stop')">■ Stop</button>
-<button class="control-btn btn-stop" onclick="emailUninstall()" style="margin-left:8px">🗑 Remove</button>
-</div>
 {% elif email.installed %}
 <div class="status-info"><div class="status-logo-wrap"><span class="material-symbols-outlined" style="font-size:36px">outgoing_mail</span><span class="status-name">Email Relay</span></div><div>
 <div class="status-text" style="color:var(--red)">Stopped</div>
 <div class="status-detail">Postfix is installed but not running</div>
 </div></div>
-<div class="controls"><button class="control-btn btn-start" onclick="emailControl('start')">▶ Start</button></div>
 {% else %}
 <div class="status-info"><div class="status-logo-wrap"><span class="material-symbols-outlined" style="font-size:36px">outgoing_mail</span><span class="status-name">Email Relay</span></div><div>
 <div class="status-text" style="color:var(--text-dim)">Not Installed</div>
@@ -11685,6 +11687,14 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div></div>
 {% endif %}
 </div>
+
+{% if email.installed %}
+<div class="section-title" style="margin-top:20px">Controls</div>
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:24px">
+<div class="controls" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+{% if email.running %}<button class="control-btn" onclick="emailControl('restart')">↻ Restart</button><button class="control-btn btn-stop" onclick="emailControl('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="emailUninstall()">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="emailControl('start')">▶ Start</button><button class="control-btn btn-remove" onclick="emailUninstall()">🗑 Remove</button>{% endif %}
+</div></div>
+{% endif %}
 
 {% if deploying %}
 <!-- Deploy Log -->
@@ -11943,11 +11953,12 @@ CADDY_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><
 .status-icon.running{background:rgba(16,185,129,0.1)}.status-icon.stopped{background:rgba(239,68,68,0.1)}.status-icon.not-installed{background:rgba(71,85,105,0.2)}
 .status-text{font-family:'JetBrains Mono',monospace;font-size:18px;font-weight:600}
 .status-detail{font-size:13px;color:var(--text-dim);margin-top:4px}
-.controls{display:flex;gap:10px}
-.control-btn{padding:8px 16px;border:1px solid var(--border);border-radius:8px;background:transparent;color:var(--text-secondary);font-family:'JetBrains Mono',monospace;font-size:12px;cursor:pointer;transition:all 0.2s}
-.control-btn:hover{border-color:var(--border-hover);background:var(--bg-surface)}
-.control-btn.btn-stop{color:var(--red)}.control-btn.btn-stop:hover{border-color:rgba(239,68,68,0.3);background:rgba(239,68,68,0.05)}
-.control-btn.btn-start{color:var(--green)}.control-btn.btn-start:hover{border-color:rgba(16,185,129,0.3);background:rgba(16,185,129,0.05)}
+.controls{display:flex;gap:10px;flex-wrap:wrap}
+.control-btn{padding:10px 20px;border:1px solid var(--border);border-radius:8px;background:var(--bg-card);color:var(--text-secondary);font-family:'JetBrains Mono',monospace;font-size:13px;cursor:pointer;transition:all 0.2s}
+.control-btn:hover{border-color:var(--border-hover);color:var(--text-primary)}
+.control-btn.btn-stop{border-color:rgba(239,68,68,0.3)}.control-btn.btn-stop:hover{background:rgba(239,68,68,0.1);color:var(--red)}
+.control-btn.btn-start{border-color:rgba(16,185,129,0.3)}.control-btn.btn-start:hover{background:rgba(16,185,129,0.1);color:var(--green)}
+.control-btn.btn-remove{border-color:rgba(239,68,68,0.2)}.control-btn.btn-remove:hover{background:rgba(239,68,68,0.1);color:var(--red)}
 .deploy-log{background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:400px;overflow-y:auto;line-height:1.6;white-space:pre-wrap;margin-top:16px}
 .input-field{width:100%;padding:12px 16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:14px;outline:none;transition:border-color 0.2s}
 .input-field:focus{border-color:var(--accent)}
@@ -11978,14 +11989,20 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div class="status-banner">
 {% if caddy.installed and caddy.running %}
 <div class="status-info"><div class="status-logo-wrap"><img src="{{ caddy_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--green)">Running</div><div class="status-detail">Caddy is active{% if settings.get('fqdn') %} · {{ settings.get('fqdn') }}{% endif %}</div></div></div>
-<div class="controls"><button class="control-btn" onclick="caddyControl('reload')">↻ Reload</button><button class="control-btn" onclick="caddyControl('restart')">↻ Restart</button><button class="control-btn btn-stop" onclick="caddyControl('stop')">■ Stop</button><button class="control-btn btn-stop" onclick="caddyUninstall()" style="margin-left:8px">🗑 Remove</button></div>
 {% elif caddy.installed %}
 <div class="status-info"><div class="status-logo-wrap"><img src="{{ caddy_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--red)">Stopped</div><div class="status-detail">Caddy is installed but not running</div></div></div>
-<div class="controls"><button class="control-btn btn-start" onclick="caddyControl('start')">▶ Start</button><button class="control-btn btn-stop" onclick="caddyUninstall()" style="margin-left:8px">🗑 Remove</button></div>
 {% else %}
 <div class="status-info"><div class="status-logo-wrap"><img src="{{ caddy_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--text-dim)">Not Installed</div><div class="status-detail">Set up a domain for full functionality</div></div></div>
 {% endif %}
 </div>
+
+{% if caddy.installed %}
+<div class="section-title" style="margin-top:20px">Controls</div>
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:24px">
+<div class="controls" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+{% if caddy.running %}<button class="control-btn" onclick="caddyControl('reload')">↻ Reload</button><button class="control-btn" onclick="caddyControl('restart')">↻ Restart</button><button class="control-btn btn-stop" onclick="caddyControl('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="caddyUninstall()">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="caddyControl('start')">▶ Start</button><button class="control-btn btn-remove" onclick="caddyUninstall()">🗑 Remove</button>{% endif %}
+</div></div>
+{% endif %}
 
 {% if deploying %}
 <div class="section-title">Deployment Log</div>
@@ -12321,38 +12338,27 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </style></head><body>
 {{ sidebar_html }}
 <div class="main">
-{% if portal.installed %}
-<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:20px">
-<button class="control-btn" onclick="portalReconfigure()" title="Refresh Authentik/TAK Server settings and restart container">🔄 Update config & reconnect</button>
-<button class="control-btn btn-remove" onclick="document.getElementById('portal-uninstall-modal').classList.add('open')">🗑 Remove TAK Portal</button>
-</div>
-{% endif %}
 <div class="status-banner">
 {% if deploying %}
 <div class="status-info"><div class="status-icon running" style="background:rgba(59,130,246,0.1)">🔄</div><div><div class="status-text" style="color:var(--accent)">Deploying...</div><div class="status-detail">TAK Portal installation in progress</div></div></div>
 {% elif portal.installed and portal.running %}
-<div class="status-info"><div class="status-logo-wrap"><span class="material-symbols-outlined" style="font-size:36px">group</span><span class="status-name">TAK Portal</span></div><div><div class="status-text" style="color:var(--green)">Running</div><div class="status-detail">{{ container_info.get('status', 'Docker container active') }}</div></div></div>
-<div class="controls">
-<button class="control-btn btn-stop" onclick="portalControl('stop')">⏹ Stop</button>
-<button class="control-btn" onclick="portalControl('restart')">🔄 Restart</button>
-<button class="control-btn" onclick="portalReconfigure()" title="Refresh Authentik/TAK Server settings and restart container">🔄 Update config & reconnect</button>
-<button class="control-btn btn-update" id="update-btn" onclick="portalUpdate()"{% if portal_update_available %} style="position:relative;border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if portal_update_available %} <span style="margin-left:4px;color:var(--cyan)" title="Update available">●</span>{% endif %}</button>
-</div>
-{% if portal_version %}<div style="margin-top:12px;margin-left:12px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim)">Version: {{ portal_version }}{% if portal_update_available and portal_latest %} · <span style="color:var(--cyan)">Update to {{ portal_latest }} available</span>{% endif %}</div>{% endif %}
-<div id="update-status" style="display:none;margin-top:8px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary)"></div>
+<div class="status-info"><div class="status-logo-wrap"><span class="material-symbols-outlined" style="font-size:36px">group</span><span class="status-name">TAK Portal</span></div><div><div class="status-text" style="color:var(--green)">Running</div><div class="status-detail">{{ container_info.get('status', 'Docker container active') }}{% if portal_version %} · {{ portal_version }}{% endif %}{% if portal_update_available and portal_latest %} · <span style="color:var(--cyan)">v{{ portal_latest }} available</span>{% endif %}</div></div></div>
 {% elif portal.installed %}
-<div class="status-info"><div class="status-logo-wrap"><span class="material-symbols-outlined" style="font-size:36px">group</span><span class="status-name">TAK Portal</span></div><div><div class="status-text" style="color:var(--red)">Stopped</div><div class="status-detail">Docker container not running</div></div></div>
-<div class="controls">
-<button class="control-btn btn-start" onclick="portalControl('start')">▶ Start</button>
-<button class="control-btn" onclick="portalReconfigure()" title="Refresh Authentik/TAK Server settings and restart container">🔄 Update config & reconnect</button>
-<button class="control-btn btn-update" id="update-btn" onclick="portalUpdate()"{% if portal_update_available %} style="position:relative;border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if portal_update_available %} <span style="margin-left:4px;color:var(--cyan)" title="Update available">●</span>{% endif %}</button>
-</div>
-{% if portal_version %}<div style="margin-top:12px;margin-left:12px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim)">Version: {{ portal_version }}{% if portal_update_available and portal_latest %} · <span style="color:var(--cyan)">Update to {{ portal_latest }} available</span>{% endif %}</div>{% endif %}
-<div id="update-status" style="display:none;margin-top:8px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary)"></div>
+<div class="status-info"><div class="status-logo-wrap"><span class="material-symbols-outlined" style="font-size:36px">group</span><span class="status-name">TAK Portal</span></div><div><div class="status-text" style="color:var(--red)">Stopped</div><div class="status-detail">Docker container not running{% if portal_version %} · {{ portal_version }}{% endif %}{% if portal_update_available and portal_latest %} · <span style="color:var(--cyan)">v{{ portal_latest }} available</span>{% endif %}</div></div></div>
 {% else %}
 <div class="status-info"><div class="status-logo-wrap"><span class="material-symbols-outlined" style="font-size:36px">group</span><span class="status-name">TAK Portal</span></div><div><div class="status-text" style="color:var(--text-dim)">Not Installed</div><div class="status-detail">Deploy TAK Portal for user & certificate management</div></div></div>
 {% endif %}
 </div>
+
+{% if portal.installed %}
+<div class="section-title" style="margin-top:20px">Controls</div>
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:24px">
+<div class="controls" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+{% if portal.running %}<button class="control-btn" onclick="portalControl('restart')">↻ Restart</button><button class="control-btn" onclick="portalReconfigure()" title="Refresh Authentik/TAK Server settings and restart container">🔄 Update config</button><button class="control-btn btn-update" id="update-btn" onclick="portalUpdate()"{% if portal_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if portal_update_available %} <span style="color:var(--cyan)" title="Update available: v{{ portal_latest }}">●</span>{% endif %}</button><button class="control-btn btn-stop" onclick="portalControl('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('portal-uninstall-modal').classList.add('open')">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="portalControl('start')">▶ Start</button><button class="control-btn" onclick="portalReconfigure()" title="Refresh Authentik/TAK Server settings and restart container">🔄 Update config</button><button class="control-btn btn-update" id="update-btn" onclick="portalUpdate()"{% if portal_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if portal_update_available %} <span style="color:var(--cyan)" title="Update available: v{{ portal_latest }}">●</span>{% endif %}</button><button class="control-btn btn-remove" onclick="document.getElementById('portal-uninstall-modal').classList.add('open')">🗑 Remove</button>{% endif %}
+</div>
+<div id="update-status" style="display:none;margin-top:12px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary)"></div>
+</div>
+{% endif %}
 
 {% if deploying %}
 <div class="section-title">Deployment Log</div>
@@ -15226,21 +15232,20 @@ body{display:flex;min-height:100vh}
 <div class="status-info"><div class="status-icon running" style="background:rgba(59,130,246,0.1)">🔄</div><div><div class="status-text" style="color:var(--accent)">Deploying...</div><div class="status-detail">Authentik installation in progress</div></div></div>
 {% elif ak.installed and ak.running %}
 <div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--green)">Running</div><div class="status-detail">Identity provider active{% if ak_version_info and ak_version_info.version %} · <span class="os-badge" style="margin-left:4px">v{{ ak_version_info.version }}</span>{% if ak_version_info.update_available and ak_version_info.latest %} · <span style="color:var(--cyan);font-size:11px">v{{ ak_version_info.latest }} available</span>{% endif %}{% endif %}</div></div></div>
-<div class="controls">
-<button class="control-btn btn-stop" onclick="akControl('stop')">⏹ Stop</button>
-<button class="control-btn" onclick="akControl('restart')">🔄 Restart</button>
-<button class="control-btn btn-update" onclick="akControl('update')"{% if ak_version_info and ak_version_info.update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if ak_version_info and ak_version_info.update_available %} <span style="color:var(--cyan)" title="Update available: v{{ ak_version_info.latest }}">●</span>{% endif %}</button>
-</div>
 {% elif ak.installed %}
 <div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--red)">Stopped</div><div class="status-detail">Docker containers not running{% if ak_version_info and ak_version_info.version %} · <span class="os-badge" style="margin-left:4px">v{{ ak_version_info.version }}</span>{% if ak_version_info.update_available and ak_version_info.latest %} · <span style="color:var(--cyan);font-size:11px">v{{ ak_version_info.latest }} available</span>{% endif %}{% endif %}</div></div></div>
-<div class="controls">
-<button class="control-btn btn-start" onclick="akControl('start')">▶ Start</button>
-<button class="control-btn btn-update" onclick="akControl('update')"{% if ak_version_info and ak_version_info.update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if ak_version_info and ak_version_info.update_available %} <span style="color:var(--cyan)" title="Update available: v{{ ak_version_info.latest }}">●</span>{% endif %}</button>
-</div>
 {% else %}
 <div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--text-dim)">Not Installed</div><div class="status-detail">Deploy Authentik for identity management & SSO</div></div></div>
 {% endif %}
 </div>
+
+{% if ak.installed %}
+<div class="section-title" style="margin-top:20px">Controls</div>
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:24px">
+<div class="controls" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+{% if ak.running %}<button class="control-btn" onclick="akControl('restart')">↻ Restart</button><button class="control-btn" onclick="reconfigureAk()">🔄 Update config</button><button class="control-btn btn-update" onclick="akControl('update')"{% if ak_version_info and ak_version_info.update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if ak_version_info and ak_version_info.update_available %} <span style="color:var(--cyan)" title="Update available: v{{ ak_version_info.latest }}">●</span>{% endif %}</button>{% if authentik_deploy_cfg.target_mode == 'remote' %}<button class="control-btn" onclick="fixAkLdapToken(this)" title="Emergency: inject LDAP outpost token and recreate LDAP container">🔑 Fix LDAP token</button>{% endif %}<button class="control-btn btn-stop" onclick="akControl('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('ak-uninstall-modal').classList.add('open')">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="akControl('start')">▶ Start</button><button class="control-btn" onclick="reconfigureAk()">🔄 Update config</button><button class="control-btn btn-update" onclick="akControl('update')"{% if ak_version_info and ak_version_info.update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if ak_version_info and ak_version_info.update_available %} <span style="color:var(--cyan)" title="Update available: v{{ ak_version_info.latest }}">●</span>{% endif %}</button>{% if authentik_deploy_cfg.target_mode == 'remote' %}<button class="control-btn" onclick="fixAkLdapToken(this)" title="Emergency: inject LDAP outpost token and recreate LDAP container">🔑 Fix LDAP token</button>{% endif %}<button class="control-btn btn-remove" onclick="document.getElementById('ak-uninstall-modal').classList.add('open')">🗑 Remove</button>{% endif %}
+</div></div>
+{% endif %}
 
 {% if deploying %}
 <div class="section-title">Deployment Log</div>
@@ -15315,21 +15320,10 @@ body{display:flex;min-height:100vh}
   <div class="card-title">Update config & reconnect — Log</div>
   <div class="deploy-log" id="deploy-log" data-authentik-url="{{ authentik_base_url }}">Waiting...</div>
 </div>
-<div style="margin-top:24px;text-align:center">
-<button class="control-btn" onclick="reconfigureAk()" style="margin-right:12px">🔄 Update config & reconnect</button>{% if authentik_deploy_cfg.target_mode == 'remote' and ak.installed %}
-<button class="control-btn" onclick="fixAkLdapToken(this)" style="margin-right:12px" title="Emergency: inject LDAP outpost token and recreate LDAP container">🔑 Fix LDAP token</button>{% endif %}
-<button class="control-btn btn-remove" onclick="document.getElementById('ak-uninstall-modal').classList.add('open')">🗑 Remove Authentik</button>
-</div>
 {% elif ak.installed %}
 <div class="card" id="ak-log-card" style="display:none;margin-top:24px">
   <div class="card-title">Update config & reconnect — Log</div>
   <div class="deploy-log" id="deploy-log" data-authentik-url="{{ authentik_base_url }}">Waiting...</div>
-</div>
-<div style="margin-top:24px;text-align:center">
-<button class="control-btn btn-start" onclick="akControl('start')" style="margin-right:12px">▶ Start</button>
-<button class="control-btn" onclick="reconfigureAk()" style="margin-right:12px">🔄 Update config & reconnect</button>{% if authentik_deploy_cfg.target_mode == 'remote' %}
-<button class="control-btn" onclick="fixAkLdapToken(this)" style="margin-right:12px" title="Emergency: inject LDAP outpost token and recreate LDAP container">🔑 Fix LDAP token</button>{% endif %}
-<button class="control-btn btn-remove" onclick="document.getElementById('ak-uninstall-modal').classList.add('open')">🗑 Remove Authentik</button>
 </div>
 {% else %}
 <div class="section-title">About Authentik</div>
