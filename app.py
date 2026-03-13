@@ -11947,7 +11947,7 @@ CADDY_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><
 .btn-back{color:var(--text-dim);text-decoration:none;font-size:13px;padding:6px 14px;border:1px solid var(--border);border-radius:6px;transition:all 0.2s}.btn-back:hover{color:var(--text-secondary);border-color:var(--border-hover)}
 .btn-logout{color:var(--text-dim);text-decoration:none;font-size:13px;padding:6px 14px;border:1px solid var(--border);border-radius:6px;transition:all 0.2s}.btn-logout:hover{color:var(--red);border-color:rgba(239,68,68,0.3)}
 .os-badge{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);padding:4px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:4px}
-.main{max-width:1000px;margin:0 auto;padding:32px 40px}
+.main{flex:1;min-width:0;overflow-y:auto;padding:32px}
 .section-title{font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;color:var(--text-dim);letter-spacing:2px;text-transform:uppercase;margin-bottom:16px;margin-top:24px}
 .status-banner{background:var(--bg-card);border:1px solid var(--border);border-top:none;border-radius:12px;padding:24px;margin-bottom:24px;display:flex;align-items:center;justify-content:space-between}
 .status-info{display:flex;align-items:center;gap:16px}
@@ -12213,7 +12213,7 @@ CERTS_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><
 .header-left{display:flex;align-items:center;gap:16px}.header-icon{font-size:28px}.header-title{font-family:'JetBrains Mono',monospace;font-size:20px;font-weight:700;letter-spacing:-0.5px}.header-subtitle{font-size:13px;color:var(--text-dim)}
 .header-right{display:flex;align-items:center;gap:12px}
 .btn-back{color:var(--text-dim);text-decoration:none;font-size:13px;padding:6px 14px;border:1px solid var(--border);border-radius:6px;transition:all 0.2s}.btn-back:hover{color:var(--text-secondary);border-color:var(--border-hover)}
-.main{max-width:1000px;margin:0 auto;padding:32px 40px}
+.main{flex:1;min-width:0;overflow-y:auto;padding:32px}
 .section-title{font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;color:var(--text-dim);letter-spacing:2px;text-transform:uppercase;margin-bottom:16px}
 .cert-table{width:100%;border-collapse:collapse}
 .cert-table tr{border-bottom:1px solid var(--border);transition:background 0.15s}
@@ -12283,7 +12283,7 @@ TAKPORTAL_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-
 .btn-back{color:var(--text-dim);text-decoration:none;font-size:13px;padding:6px 14px;border:1px solid var(--border);border-radius:6px;transition:all 0.2s}.btn-back:hover{color:var(--text-secondary);border-color:var(--border-hover)}
 .btn-logout{color:var(--text-dim);text-decoration:none;font-size:13px;padding:6px 14px;border:1px solid var(--border);border-radius:6px;transition:all 0.2s}.btn-logout:hover{color:var(--red);border-color:rgba(239,68,68,0.3)}
 .os-badge{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);padding:4px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:4px}
-.main{max-width:1000px;margin:0 auto;padding:32px 40px}
+.main{flex:1;min-width:0;overflow-y:auto;padding:32px}
 .section-title{font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;color:var(--text-dim);letter-spacing:2px;text-transform:uppercase;margin-bottom:16px;margin-top:24px}
 .status-banner{background:var(--bg-card);border:1px solid var(--border);border-top:none;border-radius:12px;padding:24px;margin-bottom:24px;display:flex;align-items:center;justify-content:space-between}
 .status-info{display:flex;align-items:center;gap:16px}
@@ -15160,7 +15160,7 @@ AUTHENTIK_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-
 .btn-back{color:var(--text-dim);text-decoration:none;font-size:13px;padding:6px 14px;border:1px solid var(--border);border-radius:6px;transition:all 0.2s}.btn-back:hover{color:var(--text-secondary);border-color:var(--border-hover)}
 .btn-logout{color:var(--text-dim);text-decoration:none;font-size:13px;padding:6px 14px;border:1px solid var(--border);border-radius:6px;transition:all 0.2s}.btn-logout:hover{color:var(--red);border-color:rgba(239,68,68,0.3)}
 .os-badge{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);padding:4px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:4px}
-.main{max-width:1000px;margin:0 auto;padding:32px 40px}
+.main{flex:1;min-width:0;overflow-y:auto;padding:32px}
 .section-title{font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;color:var(--text-dim);letter-spacing:2px;text-transform:uppercase;margin-bottom:16px;margin-top:24px}
 .status-banner{background:var(--bg-card);border:1px solid var(--border);border-top:none;border-radius:12px;padding:24px;margin-bottom:24px;display:flex;align-items:center;justify-content:space-between}
 .status-info{display:flex;align-items:center;gap:16px}
@@ -18475,7 +18475,7 @@ body::before{content:'';position:fixed;top:0;left:0;right:0;bottom:0;background-
 .os-badge{background:var(--bg-card);border:1px solid var(--border);padding:6px 14px;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim)}
 .btn-logout,.btn-back{color:var(--text-dim);text-decoration:none;font-family:'JetBrains Mono',monospace;font-size:12px;padding:6px 14px;border:1px solid var(--border);border-radius:8px;transition:all 0.2s}
 .btn-logout:hover,.btn-back:hover{color:var(--text-secondary);border-color:var(--border-hover)}
-.main{position:relative;z-index:10;max-width:1100px;margin:0 auto;padding:32px}
+.main{flex:1;min-width:0;overflow-y:auto;padding:32px}
 .section-title{font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--text-dim);text-transform:uppercase;letter-spacing:1.5px;margin-bottom:16px;font-weight:600}
 .metrics-bar{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:32px}
 .metric-card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:18px;text-align:center}
