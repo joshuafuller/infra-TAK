@@ -547,17 +547,35 @@ async function syncTakDbPassword(){
 var _pkgLocked=null;
 async function togglePkgLock(){
     var btn=document.getElementById('pkg-lock-btn');
+    var label=document.getElementById('pkg-lock-status-label');
     if(!btn||btn.disabled)return;
-    btn.disabled=true;btn.style.opacity='0.5';
-    var endpoint=_pkgLocked?'/api/takserver/unpin-packages':'/api/takserver/pin-packages';
+    var isUnlock=_pkgLocked;
+    btn.disabled=true;
+    btn.style.opacity='0.7';
+    btn.textContent=isUnlock?'Unlocking...':'Locking...';
+    if(label)label.innerHTML='<span style="color:var(--text-dim)">…</span>';
     try{
+        var endpoint=isUnlock?'/api/takserver/unpin-packages':'/api/takserver/pin-packages';
         var r=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
-        var d=await r.json();
+        var text=await r.text();
+        var d;
+        try{d=JSON.parse(text);}catch(_){ d={success:false,message:r.ok?'Invalid response':('HTTP '+r.status)}; }
+        if(!r.ok&&d.message===undefined){ d.message='HTTP '+r.status; }
         if(d.success){ await checkPkgLockStatus(); }
-        else{alert('Failed: '+(d.message||JSON.stringify(d.results)));}
-    }catch(e){alert('Error: '+e.message);}
-    btn.disabled=false;btn.style.opacity='1';
+        else{
+            var msg=(d.message||(d.results&&JSON.stringify(d.results))||'Unlock failed');
+            if(label)label.innerHTML='<span style="color:var(--error)">'+escapeHtml(String(msg))+'</span>';
+            alert('Failed: '+msg);
+        }
+    }catch(e){
+        if(label)label.innerHTML='<span style="color:var(--error)">Error: '+escapeHtml(e.message)+'</span>';
+        alert('Error: '+e.message);
+    }
+    btn.disabled=false;
+    btn.style.opacity='1';
+    renderPkgLock();
 }
+function escapeHtml(s){ var d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
 function renderPkgLock(){
     var btn=document.getElementById('pkg-lock-btn');
     var label=document.getElementById('pkg-lock-status-label');

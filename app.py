@@ -19593,11 +19593,11 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div class="metric-card"><div class="metric-label">Memory</div><div class="metric-value" id="ram-value">{{ metrics.ram_percent }}%</div><div class="metric-detail">{{ metrics.ram_used_gb }}GB / {{ metrics.ram_total_gb }}GB</div></div>
 <div class="metric-card"><div class="metric-label">Disk</div><div class="metric-value" id="disk-value">{{ metrics.disk_percent }}%</div><div class="metric-detail">{{ metrics.disk_used_gb }}GB / {{ metrics.disk_total_gb }}GB</div></div>
 <div class="metric-card"><div class="metric-label">Uptime</div><div class="metric-value" id="uptime-value" style="font-size:18px">{{ metrics.uptime }}</div></div>
-<div class="metric-card" style="position:relative" title="Automatic OS/apt package upgrades on this server. Does not control infra-TAK or module updates.">
-<div class="metric-label" style="display:flex;align-items:center;gap:6px">Unattended server upgrades
+<div class="metric-card" style="position:relative" title="Automatic OS/apt package upgrades on this server (console host). Does not control infra-TAK or module updates.">
+<div class="metric-label" style="display:flex;align-items:center;gap:6px">Unattended upgrades (this host)
 {% if metrics.unattended_upgrades.enabled and metrics.unattended_upgrades.running %}<span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--cyan);animation:pulse 2s infinite" title="OS upgrade in progress"></span>{% endif %}
 </div>
-<div class="metric-detail" style="margin-top:2px;font-size:10px;color:var(--text-dim)">OS/apt — not console or modules</div>
+<div class="metric-detail" style="margin-top:2px;font-size:10px;color:var(--text-dim)">OS/apt on console server. <a href="/takserver" style="color:var(--cyan);text-decoration:none">TAK Server package lock → TAK Server page</a></div>
 <div style="display:flex;align-items:center;gap:8px;margin-top:6px">
 <label style="position:relative;display:inline-block;width:36px;height:20px;cursor:pointer;margin:0">
 <input type="checkbox" id="uu-toggle" {% if metrics.unattended_upgrades.enabled %}checked{% endif %} onchange="toggleUU(this)" style="opacity:0;width:0;height:0">
@@ -19946,6 +19946,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <button class="control-btn" id="pkg-lock-btn" onclick="togglePkgLock()" style="min-width:110px"></button>
 <span style="font-size:11px;color:var(--text-dim)">Prevents automatic PG/TAK upgrades that can break the DB connection overnight.</span>
 </div>
+<div style="font-size:10px;color:var(--text-dim);margin-top:6px"><a href="/" style="color:var(--cyan);text-decoration:none">Console host: enable/disable unattended-upgrades → main dashboard</a></div>
 </div>
 {% endif %}
 </div>
