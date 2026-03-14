@@ -18126,10 +18126,8 @@ def takserver_rotate_intca():
             log(f"✓ Intermediate CA {new_ca_name} created")
 
             log("")
-            log("Step 3/7: Creating new server certificate...")
-            if not run('cd /opt/tak/certs && echo "y" | sudo -u tak ./makeCert.sh server takserver 2>&1'):
-                raise Exception('Failed to create server certificate')
-            log("✓ Server certificate created (signed by new CA)")
+            log("Step 3/7: Keeping existing server TLS certificate (signed by old CA)...")
+            log("  (Server cert is NOT replaced so existing ATAK clients keep connecting.)")
 
             log("")
             log("Step 4/7: Regenerating all client certificates...")
@@ -18170,7 +18168,7 @@ def takserver_rotate_intca():
             log("✓ CoreConfig.xml updated")
 
             log("")
-            log("Step 7/8: Updating TAK Portal certificates...")
+            log("Step 7/7: Updating TAK Portal certificates...")
             portal_running = subprocess.run('docker ps --format "{{.Names}}" 2>/dev/null | grep -q tak-portal',
                                             shell=True, capture_output=True).returncode == 0
             if portal_running:
@@ -18207,7 +18205,7 @@ def takserver_rotate_intca():
                 log("  TAK Portal not running — will update on next deploy")
 
             log("")
-            log("Step 8/8: Restarting TAK Server...")
+            log("Restarting TAK Server...")
             ne_changed, ne_msg = _sanitize_coreconfig_name_entries()
             if ne_changed:
                 log(f"  NameEntry fix: {ne_msg}")
@@ -18221,11 +18219,11 @@ def takserver_rotate_intca():
 
             log("")
             log("━━━ ROTATION COMPLETE ━━━")
-            log(f"  New signing CA: {new_ca_name}")
-            log(f"  Old CA ({old_ca_name}) is still trusted for existing clients")
-            log(f"  New admin.p12 and user.p12 have been regenerated")
-            log(f"  ⚠ Re-import admin.p12 in your browser for CloudTAK/8443 access")
-            log(f"  When ready, use 'Revoke Old CA' to remove {old_ca_name} from the truststore")
+            log(f"  New signing CA: {new_ca_name} (new client certs use this)")
+            log(f"  Server TLS cert unchanged (still signed by {old_ca_name}) — existing ATAK clients keep working")
+            log(f"  Old CA ({old_ca_name}) remains in truststore so server accepts both old and new client certs")
+            log(f"  New admin.p12 and user.p12 regenerated (signed by new CA); re-import admin.p12 for 8443/CloudTAK")
+            log(f"  When everyone has re-enrolled (new CA), use 'Revoke Old CA' to remove {old_ca_name}")
             rotate_intca_status.update({'running': False, 'complete': True, 'error': False})
         except Exception as e:
             log(f"")
@@ -18246,7 +18244,7 @@ def takserver_rotate_intca_status():
 @app.route('/api/takserver/revoke-old-ca', methods=['POST'])
 @login_required
 def takserver_revoke_old_ca():
-    """Remove an old intermediate CA from the truststore, cutting off clients with old certs."""
+    """Create new server cert (signed by current/new CA), remove old CA from truststore, restart. Cuts off clients with old certs."""
     data = request.json or {}
     old_ca_alias = (data.get('old_ca_alias') or '').strip()
     if not old_ca_alias:
@@ -18262,6 +18260,24 @@ def takserver_revoke_old_ca():
     ts_path = ts_files[-1]
 
     try:
+        # 1) Create new server cert (signed by current = new CA) so server presents new chain. Skip if using Let's Encrypt.
+        le_jks = os.path.join(cert_dir, 'takserver-le.jks')
+        if not os.path.isfile(le_jks):
+            r = subprocess.run(
+                'cd /opt/tak/certs && echo "y" | sudo -u tak ./makeCert.sh server takserver 2>&1',
+                shell=True, capture_output=True, text=True, timeout=120)
+            if r.returncode != 0:
+                return jsonify({'error': f'Creating new server cert failed: {(r.stderr or r.stdout or "")[:200]}'}), 500
+            # Build JKS from new takserver.p12 so server can use it (CoreConfig may reference takserver.jks or we update connector)
+            p12 = os.path.join(cert_dir, 'takserver.p12')
+            jks = os.path.join(cert_dir, 'takserver.jks')
+            if os.path.isfile(p12):
+                subprocess.run(
+                    f'keytool -importkeystore -srcstoretype PKCS12 -srckeystore {p12} -srcstorepass "{cert_pass}" '
+                    f'-deststoretype JKS -destkeystore {jks} -deststorepass "{cert_pass}" -noprompt 2>&1',
+                    shell=True, capture_output=True, text=True, timeout=30)
+
+        # 2) Remove old CA from truststore
         r = subprocess.run(
             ['keytool', '-delete', '-alias', old_ca_alias,
              '-keystore', ts_path, '-storepass', cert_pass],
@@ -18269,7 +18285,7 @@ def takserver_revoke_old_ca():
         if r.returncode != 0:
             return jsonify({'error': f'keytool failed: {r.stderr or r.stdout}'}), 500
 
-        # Also regenerate the .p12 truststore from the .jks
+        # 3) Regenerate .p12 truststore
         ts_p12 = ts_path.replace('.jks', '.p12')
         subprocess.run(
             f'keytool -importkeystore -srckeystore {ts_path} -destkeystore {ts_p12} '
@@ -18277,11 +18293,13 @@ def takserver_revoke_old_ca():
             shell=True, capture_output=True, text=True, timeout=15)
 
         subprocess.run('systemctl restart takserver 2>&1', shell=True, capture_output=True, text=True, timeout=30)
-        return jsonify({
-            'success': True,
-            'message': f'Removed {old_ca_alias} from truststore and restarted TAK Server. '
-                       f'Clients with certificates signed by {old_ca_alias} will no longer be able to connect.'
-        })
+        msg = (f'Removed {old_ca_alias} from truststore and restarted TAK Server. '
+               f'Server cert is now signed by the new CA (clients who re-enrolled via CloudTAK/QR can connect). '
+               f'Clients still using certs signed by {old_ca_alias} must re-enroll.')
+        if os.path.isfile(le_jks):
+            msg = (f'Removed {old_ca_alias} from truststore and restarted TAK Server. '
+                   f'(Server TLS is Let\'s Encrypt; unchanged.) Clients with certs signed by {old_ca_alias} must re-enroll.')
+        return jsonify({'success': True, 'message': msg})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -20895,7 +20913,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <span id="rotate-ca-toggle-icon" style="font-size:18px;color:var(--text-dim);transition:transform 0.2s ease">&#9662;</span>
 </div>
 <div id="rotate-ca-body" style="display:none;padding:0 24px 24px 24px;border-top:1px solid var(--border)">
-<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">Create a new Intermediate CA signed by your Root CA. The old CA stays in the truststore so existing clients remain connected during transition. Once all clients have re-enrolled, revoke the old CA.</p>
+<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">Create a new Intermediate CA signed by your Root CA. The server TLS cert is <strong>not</strong> replaced, so existing ATAK clients keep connecting. The old CA stays in the truststore; new client certs are signed by the new CA. When everyone has re-enrolled, use Revoke Old CA.</p>
 <div id="rotate-ca-info" style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim);margin-bottom:16px">Loading CA info...</div>
 <div id="rotate-ca-controls" style="display:none">
 <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
@@ -20910,7 +20928,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div id="rotate-ca-log" style="display:none;background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:400px;overflow-y:auto;line-height:1.6;white-space:pre-wrap;margin-bottom:16px"></div>
 <div id="revoke-ca-section" style="display:none;background:rgba(239,68,68,0.06);border:1px solid rgba(239,68,68,0.2);border-radius:10px;padding:16px">
 <div style="font-size:13px;font-weight:600;color:var(--red);margin-bottom:8px">Revoke Old CA</div>
-<p style="font-size:12px;color:var(--text-secondary);line-height:1.5;margin-bottom:12px">Remove the old CA from the truststore. Clients with certificates signed by the old CA will be disconnected and must re-enroll.</p>
+<p style="font-size:12px;color:var(--text-secondary);line-height:1.5;margin-bottom:12px">Final step: create new server cert (signed by new CA), remove the old CA from the truststore, restart. After this, only clients who re-enrolled (e.g. new CloudTAK QR) can connect. Do this when everyone has re-enrolled.</p>
 <div id="revoke-ca-list" style="margin-bottom:12px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim)"></div>
 <div id="revoke-ca-msg" style="font-size:12px;margin-top:8px"></div>
 </div>
