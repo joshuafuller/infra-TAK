@@ -63,15 +63,11 @@ if [ "$AUTH_OUT" = "1" ]; then
   exit 0
 fi
 
-# Auth failed — increment counter, require 2 consecutive failures before acting
+# Auth failed — resync immediately
 FAIL_COUNT=0
 [ -f "$FAIL_COUNT_FILE" ] && FAIL_COUNT=$(cat "$FAIL_COUNT_FILE")
 FAIL_COUNT=$((FAIL_COUNT + 1))
 echo "$FAIL_COUNT" > "$FAIL_COUNT_FILE"
-
-if [ "$FAIL_COUNT" -lt 2 ]; then
-  exit 0
-fi
 
 # Fetch fresh password from Server One CoreConfig.example.xml / CoreConfig.xml
 FRESH_PW=""
@@ -115,14 +111,13 @@ elif [ -n "$FRESH_PW" ]; then
   RESYNC_MSG="Password on Server One matches CoreConfig.xml but auth still fails. Check pg_hba.conf or PostgreSQL status on Server One."
 fi
 
-# Rate-limit alerts (once per hour)
-if [ -f "$ALERT_SENT_FILE" ] && [ -z "$(find "$ALERT_SENT_FILE" -mmin +60 2>/dev/null)" ]; then
-  # Still log locally even if we skip the email
-  mkdir -p /var/log/takguard
-  if $RESYNCED; then
-    echo "$(date): DB credential drift auto-resynced on $DB_HOST:$DB_PORT" >> /var/log/takguard/restarts.log
+# Always notify on resync. Rate-limit repeat alerts only if resync failed.
+if ! $RESYNCED; then
+  if [ -f "$ALERT_SENT_FILE" ] && [ -z "$(find "$ALERT_SENT_FILE" -mmin +60 2>/dev/null)" ]; then
+    mkdir -p /var/log/takguard
+    echo "$(date): DB credential drift — resync failed, alert suppressed (sent <1hr ago)" >> /var/log/takguard/restarts.log
+    exit 0
   fi
-  exit 0
 fi
 
 touch "$ALERT_SENT_FILE"

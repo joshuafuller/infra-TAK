@@ -1896,7 +1896,7 @@ def guarddog_page():
         guarddog_services.append({'id': 'remotedb', 'name': f'Remote Database ({s1_host})', 'monitored': gd.get('installed'), 'monitors': [
             {'name': 'TCP + SSH', 'id': 'remotedb_tcp', 'interval': '2 min', 'desc': f'Checks port 5432 on Server One / remote server ({s1_host}) is reachable and PostgreSQL cluster is up. Auto-restarts PG via SSH after 3 consecutive failures. Alerts on persistent failure.'},
             {'name': 'Health Agent', 'id': 'remotedb_agent', 'interval': 'Always', 'desc': f'Lightweight health endpoint on Server One / remote server ({s1_host}:8080/health) — checks PG ready, cot database, disk usage. If red, click "Deploy health agent to Server One / remote server" below.'},
-            {'name': 'DB Auth', 'id': 'remotedb_auth', 'interval': '5 min', 'desc': f'Validates martiuser password from CoreConfig.xml against PostgreSQL on Server One / remote server ({s1_host}). Red means credential drift — Guard Dog auto-resyncs and notifies you.'},
+            {'name': 'DB Auth', 'id': 'remotedb_auth', 'interval': '2 min', 'desc': f'Validates martiuser password from CoreConfig.xml against PostgreSQL on Server One / remote server ({s1_host}). Red means credential drift — Guard Dog auto-resyncs and notifies you.'},
         ]})
     guarddog_services.extend([
         {'id': 'authentik', 'name': 'Authentik', 'monitored': modules.get('authentik', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'id': 'authentik_http', 'interval': '1 min', 'desc': 'Checks Authentik HTTP (9090). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
@@ -2930,7 +2930,7 @@ def run_guarddog_deploy(alert_email):
                 ('takremotedbguard.service', '[Unit]\nDescription=Guard Dog Remote Database Monitor\nAfter=network-online.target\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-remotedb-watch.sh\n'),
                 ('takremotedbguard.timer', '[Unit]\nDescription=Run remote DB monitor every 2 minutes\n\n[Timer]\nOnBootSec=5min\nOnUnitActiveSec=2min\nUnit=takremotedbguard.service\n\n[Install]\nWantedBy=timers.target\n'),
                 ('takremotedbauthguard.service', '[Unit]\nDescription=Guard Dog Remote DB Auth Monitor\nAfter=network-online.target\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-remotedb-auth-watch.sh\n'),
-                ('takremotedbauthguard.timer', '[Unit]\nDescription=Validate DB credentials every 5 minutes\n\n[Timer]\nOnBootSec=6min\nOnUnitActiveSec=5min\nUnit=takremotedbauthguard.service\n\n[Install]\nWantedBy=timers.target\n'),
+                ('takremotedbauthguard.timer', '[Unit]\nDescription=Validate DB credentials every 2 minutes\n\n[Timer]\nOnBootSec=3min\nOnUnitActiveSec=2min\nUnit=takremotedbauthguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ])
         else:
             units.extend([
