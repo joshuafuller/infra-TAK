@@ -677,6 +677,51 @@ def _get_unattended_upgrades_status():
         running = False
     return {'enabled': enabled, 'running': running}
 
+
+def _get_unattended_upgrades_status_remote(remote_cfg):
+    """Return {enabled, running} for unattended-upgrades on a remote host via SSH, or {error: str}."""
+    if not remote_cfg or not (remote_cfg.get('host') or '').strip():
+        return {'error': 'no host'}
+    cmd = (
+        'e=$(systemctl is-enabled unattended-upgrades 2>/dev/null); '
+        'r=0; pgrep -f "/usr/bin/unattended-upgrade" >/dev/null 2>&1 || r=1; '
+        'echo "ENABLED=$e"; echo "RUNNING=$r"'
+    )
+    try:
+        ok, out = _ssh_probe(remote_cfg, cmd, timeout=10)
+        if not ok:
+            return {'error': (out or 'ssh failed')[:80]}
+        enabled = 'enabled' in (out or '')
+        running = 'RUNNING=0' in (out or '')  # remote script: RUNNING=0 when process is running
+        return {'enabled': enabled, 'running': running}
+    except Exception as e:
+        return {'error': str(e)[:80]}
+
+
+def _build_uu_hosts(metrics, settings):
+    """Build list of {id, label, enabled, running} for main console UU per-host cards."""
+    hosts = [{
+        'id': 'this_host',
+        'label': 'This host',
+        'enabled': metrics.get('unattended_upgrades', {}).get('enabled', False),
+        'running': metrics.get('unattended_upgrades', {}).get('running', False),
+    }]
+    cfg = _get_tak_deployment_config(settings)
+    if cfg.get('mode') == 'two_server':
+        s1 = cfg.get('server_one', {})
+        h = (s1.get('host') or '').strip()
+        if h:
+            remote = _get_unattended_upgrades_status_remote(s1)
+            hosts.append({
+                'id': 'tak_db',
+                'label': 'TAK DB (' + h + ')',
+                'enabled': remote.get('enabled', False) if 'error' not in remote else False,
+                'running': remote.get('running', False) if 'error' not in remote else False,
+                'error': remote.get('error'),
+            })
+    return hosts
+
+
 # === Routes ===
 
 def _login_logo_url():
@@ -750,10 +795,12 @@ def console_page():
     all_modules = detect_modules()
     modules = {k: m for k, m in all_modules.items() if m.get('installed')}
     module_versions = get_all_module_versions()
+    metrics = get_system_metrics()
+    uu_hosts = _build_uu_hosts(metrics, settings)
     resp = render_template_string(CONSOLE_TEMPLATE,
-        settings=settings, modules=modules, metrics=get_system_metrics(), version=VERSION,
+        settings=settings, modules=modules, metrics=metrics, version=VERSION,
         module_versions=module_versions, authentik_base_url=_get_authentik_base_url(settings),
-        takserver_base_url=_get_takserver_base_url(settings))
+        takserver_base_url=_get_takserver_base_url(settings), uu_hosts=uu_hosts)
     from flask import make_response
     r = make_response(resp)
     r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
@@ -19042,18 +19089,69 @@ body::after{content:'';position:fixed;top:0;left:0;right:0;height:2px;background
 @app.route('/api/metrics')
 @login_required
 def api_metrics():
-    return jsonify(get_system_metrics())
+    metrics = get_system_metrics()
+    try:
+        settings = load_settings()
+        metrics['unattended_upgrades_hosts'] = _build_uu_hosts(metrics, settings)
+    except Exception:
+        metrics['unattended_upgrades_hosts'] = [{
+            'id': 'this_host', 'label': 'This host',
+            'enabled': metrics.get('unattended_upgrades', {}).get('enabled', False),
+            'running': metrics.get('unattended_upgrades', {}).get('running', False),
+        }]
+    return jsonify(metrics)
+
+def _run_unattended_upgrades_remote(remote_cfg, action):
+    """Run enable/disable unattended-upgrades on remote host via SSH. Returns (success, result_dict)."""
+    if action == 'disable':
+        script = (
+            'pkill -TERM -f "/usr/bin/unattended-upgrade" 2>/dev/null; true; '
+            'systemctl stop unattended-upgrades 2>/dev/null; systemctl disable unattended-upgrades 2>/dev/null; '
+            'systemctl stop apt-daily-upgrade.timer 2>/dev/null; systemctl disable apt-daily-upgrade.timer 2>/dev/null; true; '
+            'e=$(systemctl is-enabled unattended-upgrades 2>/dev/null); echo "ENABLED=$e"'
+        )
+    else:
+        script = (
+            'systemctl enable unattended-upgrades 2>/dev/null; systemctl start unattended-upgrades 2>/dev/null; '
+            'systemctl enable apt-daily-upgrade.timer 2>/dev/null; systemctl start apt-daily-upgrade.timer 2>/dev/null; true; '
+            'e=$(systemctl is-enabled unattended-upgrades 2>/dev/null); echo "ENABLED=$e"'
+        )
+    try:
+        ok, out = _ssh_probe(remote_cfg, script, timeout=30)
+        if not ok:
+            return False, {'error': (out or 'ssh failed')[:100]}
+        uu = _get_unattended_upgrades_status_remote(remote_cfg)
+        if 'error' in uu:
+            return False, uu
+        return True, uu
+    except Exception as e:
+        return False, {'error': str(e)[:100]}
+
 
 @app.route('/api/unattended-upgrades', methods=['POST'])
 @login_required
 def api_toggle_unattended_upgrades():
-    """Enable or disable unattended-upgrades service."""
-    action = request.json.get('action') if request.is_json else None
+    """Enable or disable unattended-upgrades service on this host or a remote (target)."""
+    data = request.json if request.is_json else {}
+    action = data.get('action')
+    target = data.get('target', 'this_host')
     if action not in ('enable', 'disable'):
         return jsonify({'success': False, 'error': 'action must be enable or disable'}), 400
+    if target == 'tak_db':
+        settings = load_settings()
+        cfg = _get_tak_deployment_config(settings)
+        if cfg.get('mode') != 'two_server':
+            return jsonify({'success': False, 'error': 'Not two-server'}), 400
+        s1 = cfg.get('server_one', {})
+        if not (s1.get('host') or '').strip():
+            return jsonify({'success': False, 'error': 'No DB host'}), 400
+        ok, result = _run_unattended_upgrades_remote(s1, action)
+        if ok:
+            return jsonify({'success': True, 'target': 'tak_db', 'enabled': result['enabled'], 'running': result['running']})
+        return jsonify({'success': False, 'error': result.get('error', 'unknown')}), 500
+    # this_host
     try:
         if action == 'disable':
-            # Kill in-flight process first so systemctl stop doesn't hang waiting for it
             subprocess.run('pkill -TERM -f "/usr/bin/unattended-upgrade" 2>/dev/null; true', shell=True, timeout=5)
             for _ in range(15):
                 time.sleep(1)
@@ -19073,7 +19171,7 @@ def api_toggle_unattended_upgrades():
             subprocess.run('systemctl enable apt-daily-upgrade.timer 2>/dev/null; systemctl start apt-daily-upgrade.timer 2>/dev/null; true',
                 shell=True, timeout=10)
         uu = _get_unattended_upgrades_status()
-        return jsonify({'success': True, 'enabled': uu['enabled'], 'running': uu['running']})
+        return jsonify({'success': True, 'target': 'this_host', 'enabled': uu['enabled'], 'running': uu['running']})
     except subprocess.CalledProcessError as e:
         return jsonify({'success': False, 'error': e.stderr or str(e)}), 500
     except Exception as e:
@@ -19611,21 +19709,24 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div class="metric-card"><div class="metric-label">Memory</div><div class="metric-value" id="ram-value">{{ metrics.ram_percent }}%</div><div class="metric-detail">{{ metrics.ram_used_gb }}GB / {{ metrics.ram_total_gb }}GB</div></div>
 <div class="metric-card"><div class="metric-label">Disk</div><div class="metric-value" id="disk-value">{{ metrics.disk_percent }}%</div><div class="metric-detail">{{ metrics.disk_used_gb }}GB / {{ metrics.disk_total_gb }}GB</div></div>
 <div class="metric-card"><div class="metric-label">Uptime</div><div class="metric-value" id="uptime-value" style="font-size:18px">{{ metrics.uptime }}</div></div>
-<div class="metric-card" style="position:relative" title="Automatic OS/apt package upgrades on this server (console host). Does not control infra-TAK or module updates.">
-<div class="metric-label" style="display:flex;align-items:center;gap:6px">Unattended upgrades (this host)
-{% if metrics.unattended_upgrades.enabled and metrics.unattended_upgrades.running %}<span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--cyan);animation:pulse 2s infinite" title="OS upgrade in progress"></span>{% endif %}
+{% for host in uu_hosts %}
+<div class="metric-card" style="position:relative" title="OS/apt automatic upgrades on this host." data-uu-target="{{ host.id }}">
+<div class="metric-label" style="display:flex;align-items:center;gap:6px">Unattended upgrades — {{ host.label }}
+{% if host.enabled and host.running %}<span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--cyan);animation:pulse 2s infinite" title="Upgrade in progress"></span>{% endif %}
 </div>
-<div class="metric-detail" style="margin-top:2px;font-size:10px;color:var(--text-dim)">OS/apt on console server. <a href="/takserver" style="color:var(--cyan);text-decoration:none">TAK Server package lock → TAK Server page</a></div>
+{% if host.get('error') %}<div class="metric-detail" style="color:var(--red);font-size:10px;margin-top:2px">{{ host.error }}</div>{% endif %}
+<div class="metric-detail" style="margin-top:2px;font-size:10px;color:var(--text-dim)">OS/apt</div>
 <div style="display:flex;align-items:center;gap:8px;margin-top:6px">
 <label style="position:relative;display:inline-block;width:36px;height:20px;cursor:pointer;margin:0">
-<input type="checkbox" id="uu-toggle" {% if metrics.unattended_upgrades.enabled %}checked{% endif %} onchange="toggleUU(this)" style="opacity:0;width:0;height:0">
-<span style="position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:{% if metrics.unattended_upgrades.enabled %}var(--green){% else %}rgba(71,85,105,0.5){% endif %};border-radius:20px;transition:.3s" id="uu-slider"></span>
-<span style="position:absolute;content:'';height:16px;width:16px;left:{% if metrics.unattended_upgrades.enabled %}18px{% else %}2px{% endif %};bottom:2px;background:#fff;border-radius:50%;transition:.3s" id="uu-knob"></span>
+<input type="checkbox" class="uu-toggle" data-target="{{ host.id }}" {% if host.enabled %}checked{% endif %} onchange="toggleUU(this)" style="opacity:0;width:0;height:0">
+<span class="uu-slider" data-target="{{ host.id }}" style="position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:{% if host.enabled %}var(--green){% else %}rgba(71,85,105,0.5){% endif %};border-radius:20px;transition:.3s"></span>
+<span class="uu-knob" data-target="{{ host.id }}" style="position:absolute;height:16px;width:16px;left:{% if host.enabled %}18px{% else %}2px{% endif %};bottom:2px;background:#fff;border-radius:50%;transition:.3s"></span>
 </label>
-<span id="uu-spinner" class="uu-spinner" style="display:none"></span>
-<span id="uu-label" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:{% if metrics.unattended_upgrades.enabled %}var(--green){% else %}var(--text-dim){% endif %}">{% if metrics.unattended_upgrades.enabled and metrics.unattended_upgrades.running %}Running...{% elif metrics.unattended_upgrades.enabled %}Enabled{% else %}Disabled{% endif %}</span>
+<span class="uu-spinner" data-target="{{ host.id }}" style="display:none"></span>
+<span class="uu-label" id="uu-label-{{ host.id }}" data-target="{{ host.id }}" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:{% if host.enabled %}var(--green){% else %}var(--text-dim){% endif %}">{% if host.enabled and host.running %}Running...{% elif host.enabled %}Enabled{% else %}Disabled{% endif %}</span>
 </div>
 </div>
+{% endfor %}
 </div>
 <div class="section-title">Console</div>
 <div class="meta-line">v{{ version }} | {{ settings.get('os_name', 'Unknown OS') }} | {{ settings.get('server_ip', 'N/A') }}{% if settings.get('fqdn') %} | {{ settings.get('fqdn') }}{% endif %}</div>
@@ -19651,30 +19752,34 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% endif %}
 </div>
 <script>
-function updateUU(uu){
+function updateUUHost(hostId,uu){
     if(!uu)return;
-    var tog=document.getElementById('uu-toggle'),sl=document.getElementById('uu-slider'),kn=document.getElementById('uu-knob'),lb=document.getElementById('uu-label');
+    var tog=document.querySelector('.uu-toggle[data-target="'+hostId+'"]'),sl=document.querySelector('.uu-slider[data-target="'+hostId+'"]'),kn=document.querySelector('.uu-knob[data-target="'+hostId+'"]'),lb=document.getElementById('uu-label-'+hostId);
     if(!tog)return;
     tog.checked=uu.enabled;
-    sl.style.background=uu.enabled?'var(--green)':'rgba(71,85,105,0.5)';
-    kn.style.left=uu.enabled?'18px':'2px';
-    lb.style.color=uu.enabled?'var(--green)':'var(--text-dim)';
-    lb.textContent=(uu.enabled&&uu.running)?'Running...':uu.enabled?'Enabled':'Disabled';
+    if(sl)sl.style.background=uu.enabled?'var(--green)':'rgba(71,85,105,0.5)';
+    if(kn)kn.style.left=uu.enabled?'18px':'2px';
+    if(lb){lb.style.color=uu.enabled?'var(--green)':'var(--text-dim)';lb.textContent=(uu.enabled&&uu.running)?'Running...':uu.enabled?'Enabled':'Disabled';}
+}
+function updateUUHosts(hosts){
+    if(!hosts||!hosts.length)return;
+    hosts.forEach(function(h){updateUUHost(h.id,{enabled:h.enabled,running:h.running});});
 }
 async function toggleUU(cb){
+    var target=cb.getAttribute('data-target')||'this_host';
     var action=cb.checked?'enable':'disable';
-    var lb=document.getElementById('uu-label'),sp=document.getElementById('uu-spinner');
+    var lb=document.getElementById('uu-label-'+target),sp=document.querySelector('.uu-spinner[data-target="'+target+'"]');
     if(sp)sp.style.display='inline-block';
-    lb.textContent=cb.checked?'Enabling...':'Disabling...';lb.style.color='var(--cyan)';
+    if(lb){lb.textContent=cb.checked?'Enabling...':'Disabling...';lb.style.color='var(--cyan)';}
     try{
-        var r=await fetch('/api/unattended-upgrades',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:action})});
+        var r=await fetch('/api/unattended-upgrades',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:action,target:target})});
         var d=await r.json();
         if(sp)sp.style.display='none';
-        if(d.success){updateUU(d)}
-        else{cb.checked=!cb.checked;lb.textContent=(action==='disable'?'Disable failed — try again':('Error: '+(d.error||'unknown')));lb.style.color='var(--red)'}
-    }catch(e){if(sp)sp.style.display='none';cb.checked=!cb.checked;lb.textContent=(action==='disable'?'Disable failed — try again':'Error');lb.style.color='var(--red)'}
+        if(d.success){updateUUHost(target,d);}
+        else{cb.checked=!cb.checked;if(lb){lb.textContent=(action==='disable'?'Disable failed':'Error: '+(d.error||'unknown'));lb.style.color='var(--red)';}}
+    }catch(e){if(sp)sp.style.display='none';cb.checked=!cb.checked;if(lb){lb.textContent='Error';lb.style.color='var(--red)';}}
 }
-setInterval(async()=>{try{const r=await fetch('/api/metrics');const d=await r.json();document.getElementById('cpu-value').textContent=d.cpu_percent+'%';document.getElementById('ram-value').textContent=d.ram_percent+'%';document.getElementById('disk-value').textContent=d.disk_percent+'%';document.getElementById('uptime-value').textContent=d.uptime;updateUU(d.unattended_upgrades)}catch(e){}},5000);
+setInterval(async()=>{try{const r=await fetch('/api/metrics');const d=await r.json();document.getElementById('cpu-value').textContent=d.cpu_percent+'%';document.getElementById('ram-value').textContent=d.ram_percent+'%';document.getElementById('disk-value').textContent=d.disk_percent+'%';document.getElementById('uptime-value').textContent=d.uptime;if(d.unattended_upgrades_hosts)updateUUHosts(d.unattended_upgrades_hosts);}catch(e){}},5000);
 function refreshModuleCards(){
     fetch('/api/modules').then(r=>r.json()).then(function(mods){
         for(var k in mods){
@@ -19954,19 +20059,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <span style="font-size:11px;color:var(--text-dim)">Paste from Server One if 8443/8446 fail; leave blank to use saved.</span>
 </div>
 {% endif %}
-{% if two_server_mode %}
-<div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--border)">
-<div style="display:flex;align-items:center;gap:12px;margin-bottom:6px">
-<span style="font-size:12px;font-weight:600;color:var(--text-secondary)">Auto-Update Protection</span>
-<span id="pkg-lock-status-label" style="font-size:11px;color:var(--text-dim)"></span>
-</div>
-<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-<button class="control-btn" id="pkg-lock-btn" onclick="togglePkgLock()" style="min-width:110px"></button>
-<span style="font-size:11px;color:var(--text-dim)">Prevents automatic PG/TAK upgrades that can break the DB connection overnight.</span>
-</div>
-<div style="font-size:10px;color:var(--text-dim);margin-top:6px"><a href="/" style="color:var(--cyan);text-decoration:none">Console host: enable/disable unattended-upgrades → main dashboard</a></div>
-</div>
-{% endif %}
+<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);font-size:11px;color:var(--text-dim)">Unattended-upgrades (each host) are controlled on the <a href="/" style="color:var(--cyan);text-decoration:none">main dashboard</a>.</div>
 </div>
 {% endif %}
 
