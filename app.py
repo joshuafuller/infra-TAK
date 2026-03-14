@@ -3250,6 +3250,44 @@ def cloudtak_page():
 def cloudtak_page_js():
     return app.response_class(CLOUDTAK_PAGE_JS, mimetype='application/javascript')
 
+def _caddy_letsencrypt_days_left(settings):
+    """Return days until Let's Encrypt cert expires (for primary FQDN), or None if unavailable."""
+    fqdn = (settings.get('fqdn') or '').strip().split(':')[0]
+    if not fqdn:
+        return None
+    try:
+        cmd = (
+            f'echo | openssl s_client -connect localhost:443 -servername {fqdn} 2>/dev/null '
+            '| openssl x509 -noout -enddate 2>/dev/null'
+        )
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+        out = (r.stdout or '').strip()
+        if not out or 'notAfter=' not in out:
+            return None
+        # notAfter=Mar 15 12:00:00 2026 GMT
+        date_str = out.replace('notAfter=', '').strip()
+        from datetime import datetime
+        expiry = datetime.strptime(date_str, '%b %d %H:%M:%S %Y %Z')
+        now = datetime.utcnow()
+        if expiry.tzinfo:
+            expiry = expiry.replace(tzinfo=None)
+        delta = expiry - now
+        return max(0, delta.days)
+    except Exception:
+        return None
+
+
+def _caddy_cert_days_color(days_left):
+    """Return color for cert days display; matches Guard Dog Certificate monitor (alert at 40 days)."""
+    if days_left is None:
+        return None
+    if days_left <= 14:
+        return 'red'   # critical
+    if days_left <= 40:
+        return 'yellow'  # Guard Dog fires email at <= 40 days
+    return 'green'
+
+
 def _caddy_configured_urls(settings, modules):
     """Build list of configured subdomain → service for the Caddy page. Only when FQDN is set."""
     fqdn = settings.get('fqdn', '').strip()
@@ -3299,9 +3337,12 @@ def caddy_page():
         except Exception:
             pass
     configured_urls = _caddy_configured_urls(settings, modules)
+    cert_days = _caddy_letsencrypt_days_left(settings)
+    cert_days_color = _caddy_cert_days_color(cert_days)
     return render_template_string(CADDY_TEMPLATE,
         settings=settings, caddy=caddy, caddyfile=caddyfile_content,
         configured_urls=configured_urls,
+        cert_days_left=cert_days, cert_days_color=cert_days_color,
         version=VERSION, deploying=caddy_deploy_status.get('running', False),
         deploy_done=caddy_deploy_status.get('complete', False))
 
@@ -3326,6 +3367,16 @@ def caddy_deploy():
     caddy_deploy_status.update({'running': True, 'complete': False, 'error': False})
     threading.Thread(target=run_caddy_deploy, args=(domain,), daemon=True).start()
     return jsonify({'success': True})
+
+@app.route('/api/caddy/cert-days')
+@login_required
+def caddy_cert_days():
+    """Days until Let's Encrypt cert expires; color matches Guard Dog (yellow <=40d, red <=14d)."""
+    settings = load_settings()
+    days = _caddy_letsencrypt_days_left(settings)
+    color = _caddy_cert_days_color(days)
+    return jsonify({'days_left': days, 'color': color})
+
 
 @app.route('/api/caddy/log')
 @login_required
@@ -12522,9 +12573,9 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div class="main">
 <div class="status-banner">
 {% if caddy.installed and caddy.running %}
-<div class="status-info"><div class="status-logo-wrap"><img src="{{ caddy_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--green)">Running</div><div class="status-detail">Caddy is active{% if settings.get('fqdn') %} · {{ settings.get('fqdn') }}{% endif %}</div></div></div>
+<div class="status-info"><div class="status-logo-wrap"><img src="{{ caddy_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--green)">Running</div><div class="status-detail">Caddy is active{% if settings.get('fqdn') %} · {{ settings.get('fqdn') }}{% endif %}{% if cert_days_left is not none %} · Let's Encrypt cert: <span style="color:var(--{{ cert_days_color or 'text-dim' }});font-weight:600">{{ cert_days_left }} day{{ 's' if cert_days_left != 1 else '' }} left</span>{% endif %}</div></div></div>
 {% elif caddy.installed %}
-<div class="status-info"><div class="status-logo-wrap"><img src="{{ caddy_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--red)">Stopped</div><div class="status-detail">Caddy is installed but not running</div></div></div>
+<div class="status-info"><div class="status-logo-wrap"><img src="{{ caddy_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--red)">Stopped</div><div class="status-detail">Caddy is installed but not running{% if cert_days_left is not none %} · Let's Encrypt cert: <span style="color:var(--{{ cert_days_color or 'text-dim' }});font-weight:600">{{ cert_days_left }} day{{ 's' if cert_days_left != 1 else '' }} left</span>{% endif %}</div></div></div>
 {% else %}
 <div class="status-info"><div class="status-logo-wrap"><img src="{{ caddy_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--text-dim)">Not Installed</div><div class="status-detail">Set up a domain for full functionality</div></div></div>
 {% endif %}
@@ -19747,6 +19798,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% if module_versions.get(key) %}{% set v = module_versions.get(key) %}{% if v.version or v.update_available %}<div class="meta-line module-version-line" id="module-version-{{ key }}" style="margin-bottom:4px">{% if v.version %}v{{ v.version }}{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% endif %}</div>{% endif %}{% endif %}
 <span class="module-status status-{% if mod.installed and mod.running %}running{% elif mod.installed %}stopped{% else %}not-installed{% endif %}" id="module-status-{{ key }}" data-module="{{ key }}" data-gd-overall="{% if key == 'guarddog' and mod.installed and mod.running %}fetch{% endif %}">{% if mod.installed and mod.running %}<span class="status-dot"></span> Running{% elif mod.installed %}<span class="status-dot"></span> Stopped{% else %}Not Installed{% endif %}</span>
 {% if key == 'takserver' and mod.installed %}<div id="takserver-card-cert-expiry" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
+{% if key == 'caddy' and mod.installed %}<div id="caddy-card-cert-days" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
 </a>
 {% endfor %}
 {% endif %}
@@ -19846,7 +19898,21 @@ function loadTakCertExpiry(){
         el.innerHTML=parts.join(' &nbsp;&middot;&nbsp; ');
     }).catch(function(){});
 }
+function loadCaddyCertDays(){
+    var el=document.getElementById('caddy-card-cert-days');
+    if(!el)return;
+    fetch('/api/caddy/cert-days').then(function(r){return r.json()}).then(function(d){
+        var days=d.days_left,color=d.color;
+        if(days==null){el.textContent='Cert: —';el.style.color='var(--text-dim)';return;}
+        el.textContent='Cert: '+days+' day'+(days!==1?'s':'')+' left';
+        if(color==='green')el.style.color='var(--green)';
+        else if(color==='yellow')el.style.color='var(--yellow)';
+        else if(color==='red')el.style.color='var(--red)';
+        else el.style.color='var(--text-dim)';
+    }).catch(function(){el.textContent='Cert: —';el.style.color='var(--text-dim)';});
+}
 loadTakCertExpiry();
+loadCaddyCertDays();
 var updateBody='';
 async function checkUpdate(){
     try{
