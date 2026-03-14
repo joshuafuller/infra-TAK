@@ -18034,7 +18034,10 @@ def takserver_ca_info():
             current_cn = (info['intermediate_ca'] or {}).get('name', '').lower()
             root_cn = (info['root_ca'] or {}).get('name', '').lower()
             old_cas = []
+            skip_aliases = {'mykey'}  # legacy default alias, not a CA to revoke
             for a in trusted_aliases:
+                if a.lower() in skip_aliases:
+                    continue
                 if a.lower() != current_cn.lower() and a.lower() != 'root-ca' and a.lower() != root_cn.lower():
                     old_cas.append(a)
             info['old_cas_in_truststore'] = old_cas
