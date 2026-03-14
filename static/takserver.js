@@ -544,54 +544,43 @@ async function syncTakDbPassword(){
     }catch(e){alert('Failed: '+e.message);btns.forEach(b=>{b.disabled=false;b.style.opacity='1'});}
 }
 
-async function pinPackages(){
-    var btn=document.getElementById('pin-packages-btn');
-    var status=document.getElementById('pin-packages-status');
-    if(!btn)return;
+var _pkgLocked=null;
+async function togglePkgLock(){
+    var btn=document.getElementById('pkg-lock-btn');
+    if(!btn||btn.disabled)return;
     btn.disabled=true;btn.style.opacity='0.5';
-    if(status)status.textContent='Applying...';
+    var endpoint=_pkgLocked?'/api/takserver/unpin-packages':'/api/takserver/pin-packages';
     try{
-        var r=await fetch('/api/takserver/pin-packages',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
+        var r=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
         var d=await r.json();
-        if(d.success){
-            if(status)status.innerHTML='<span style="color:var(--success)">🔒 Core Host &nbsp; 🔒 DB Host (Remote)</span>';
-            btn.style.opacity='1';btn.disabled=false;
-        }else{
-            if(status)status.innerHTML='<span style="color:var(--error)">'+(d.message||'Failed')+'</span>';
-            btn.style.opacity='1';btn.disabled=false;
-        }
-    }catch(e){
-        if(status)status.innerHTML='<span style="color:var(--error)">Error: '+e.message+'</span>';
-        btn.style.opacity='1';btn.disabled=false;
+        if(d.success){_pkgLocked=!_pkgLocked;renderPkgLock();}
+        else{alert('Failed: '+(d.message||JSON.stringify(d.results)));}
+    }catch(e){alert('Error: '+e.message);}
+    btn.disabled=false;btn.style.opacity='1';
+}
+function renderPkgLock(){
+    var btn=document.getElementById('pkg-lock-btn');
+    var label=document.getElementById('pkg-lock-status-label');
+    if(!btn)return;
+    if(_pkgLocked){
+        btn.innerHTML='🔒 Unlock';
+        if(label)label.innerHTML='<span style="color:var(--success)">Locked — auto-updates blocked</span>';
+    }else{
+        btn.innerHTML='🔓 Lock';
+        if(label)label.innerHTML='<span style="color:var(--text-dim)">Unlocked — auto-updates active</span>';
     }
 }
-
-async function checkPinStatus(){
-    var btn=document.getElementById('pin-packages-btn');
-    var status=document.getElementById('pin-packages-status');
-    if(!btn||!status)return;
+async function checkPkgLockStatus(){
+    var btn=document.getElementById('pkg-lock-btn');
+    if(!btn)return;
     try{
         var r=await fetch('/api/takserver/pin-packages/status');
         var d=await r.json();
-        if(d.results){
-            var parts=[];
-            var s2=d.results.server_two;
-            var s1=d.results.server_one;
-            if(s2==='pinned')parts.push('🔒 This Host');
-            else if(s2==='safe')parts.push('🔒 This Host');
-            else if(s2==='not_pinned')parts.push('🔓 This Host');
-            if(s1==='pinned')parts.push('🔒 Server One / Remote');
-            else if(s1==='safe')parts.push('🔒 Server One / Remote');
-            else if(s1==='not_pinned')parts.push('🔓 Server One / Remote');
-            if(d.pinned){
-                status.innerHTML='<span style="color:var(--success)">'+parts.join(' &nbsp; ')+'</span>';
-            }else{
-                status.innerHTML='<span style="color:var(--warning)">'+parts.join(' &nbsp; ')+'</span>';
-            }
-        }
-    }catch(e){}
+        _pkgLocked=d.pinned;
+        renderPkgLock();
+    }catch(e){_pkgLocked=false;renderPkgLock();}
 }
-if(document.getElementById('pin-packages-btn')){checkPinStatus();}
+if(document.getElementById('pkg-lock-btn')){checkPkgLockStatus();}
 
 async function takUpdateConfig(){
     var btn=document.getElementById('tak-update-config-btn');

@@ -1763,6 +1763,57 @@ def takserver_pin_packages_status():
     return jsonify({'pinned': all_pinned, 'results': results})
 
 
+@app.route('/api/takserver/unpin-packages', methods=['POST'])
+@login_required
+def takserver_unpin_packages():
+    """Remove takserver* and postgresql* from unattended-upgrades blacklist on both servers."""
+    settings = load_settings()
+    cfg = _get_tak_deployment_config(settings)
+    is_two_server = cfg.get('mode') == 'two_server'
+    results = {}
+
+    unpin_script = (
+        'UA_CONF="/etc/apt/apt.conf.d/50unattended-upgrades"; '
+        'if [ ! -f "$UA_CONF" ]; then echo NO_UA; exit 0; fi; '
+        'if ! grep -q "takserver" "$UA_CONF" 2>/dev/null; then echo ALREADY_UNPINNED; exit 0; fi; '
+        'sudo sed -i \'/"takserver\\*"/d;/"postgresql\\*"/d\' "$UA_CONF" 2>/dev/null && echo UNPINNED || echo FAILED'
+    )
+
+    try:
+        r = subprocess.run(unpin_script, shell=True, capture_output=True, text=True, timeout=15)
+        out = (r.stdout or '').strip()
+        if 'UNPINNED' in out:
+            results['server_two'] = 'unpinned'
+        elif 'ALREADY_UNPINNED' in out:
+            results['server_two'] = 'already_unpinned'
+        elif 'NO_UA' in out:
+            results['server_two'] = 'no_unattended_upgrades'
+        else:
+            results['server_two'] = 'failed'
+    except Exception as e:
+        results['server_two'] = f'error: {str(e)[:100]}'
+
+    if is_two_server:
+        s1 = cfg.get('server_one', {})
+        if (s1.get('host') or '').strip():
+            try:
+                ok, out = _ssh_probe(s1, unpin_script, timeout=15)
+                out_s = (out or '').strip()
+                if ok and 'UNPINNED' in out_s:
+                    results['server_one'] = 'unpinned'
+                elif ok and 'ALREADY_UNPINNED' in out_s:
+                    results['server_one'] = 'already_unpinned'
+                elif ok and 'NO_UA' in out_s:
+                    results['server_one'] = 'no_unattended_upgrades'
+                else:
+                    results['server_one'] = f'failed: {out_s[:100]}'
+            except Exception as e:
+                results['server_one'] = f'error: {str(e)[:100]}'
+
+    all_ok = all(v in ('unpinned', 'already_unpinned', 'no_unattended_upgrades') for v in results.values())
+    return jsonify({'success': all_ok, 'results': results})
+
+
 @app.route('/mediamtx')
 @login_required
 def mediamtx_page():
@@ -19870,10 +19921,15 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 {% endif %}
 {% if two_server_mode %}
-<div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--border);display:flex;align-items:center;flex-wrap:wrap;gap:10px">
-<button class="control-btn" id="pin-packages-btn" onclick="pinPackages()" title="Prevent unattended-upgrades from auto-updating TAK Server and PostgreSQL packages on both servers">📌 Pin Packages</button>
-<span id="pin-packages-status" style="font-size:12px;color:var(--text-dim)"></span>
-<span style="font-size:11px;color:var(--text-dim)">Optional — blocks automatic PG/TAK upgrades that can break the DB connection overnight. Security patches will need manual apply.</span>
+<div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--border)">
+<div style="display:flex;align-items:center;gap:12px;margin-bottom:6px">
+<span style="font-size:12px;font-weight:600;color:var(--text-secondary)">Auto-Update Protection</span>
+<span id="pkg-lock-status-label" style="font-size:11px;color:var(--text-dim)"></span>
+</div>
+<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+<button class="control-btn" id="pkg-lock-btn" onclick="togglePkgLock()" style="min-width:110px"></button>
+<span style="font-size:11px;color:var(--text-dim)">Prevents automatic PG/TAK upgrades that can break the DB connection overnight.</span>
+</div>
 </div>
 {% endif %}
 </div>
