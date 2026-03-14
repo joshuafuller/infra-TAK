@@ -1719,6 +1719,11 @@ def takserver_pin_packages():
     return jsonify({'success': all_ok, 'results': results, 'message': '; '.join(msgs)})
 
 
+def _pin_status_short(s):
+    """Short label for pin status for UI breakdown."""
+    return {'pinned': 'locked', 'not_pinned': 'unlocked', 'safe': 'unlocked (no UA)', 'unknown': '?'}.get(s, s)
+
+
 @app.route('/api/takserver/pin-packages/status')
 @login_required
 def takserver_pin_packages_status():
@@ -1761,7 +1766,13 @@ def takserver_pin_packages_status():
 
     # Only show "Locked" when blacklist is actually present. 'safe' (no UA file) = show Unlocked.
     all_pinned = all(v == 'pinned' for v in results.values())
-    return jsonify({'pinned': all_pinned, 'results': results})
+    # Per-host breakdown for two-server so UI can show which host is still pinned.
+    breakdown = []
+    if results.get('server_two') is not None:
+        breakdown.append('This host: ' + _pin_status_short(results['server_two']))
+    if results.get('server_one') is not None:
+        breakdown.append('DB host: ' + _pin_status_short(results['server_one']))
+    return jsonify({'pinned': all_pinned, 'results': results, 'breakdown': ' · '.join(breakdown) if breakdown else None})
 
 
 @app.route('/api/takserver/unpin-packages', methods=['POST'])

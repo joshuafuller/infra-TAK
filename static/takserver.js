@@ -585,12 +585,13 @@ function renderPkgLock(){
     if(!btn)return;
     if(_pkgLocked){
         btn.innerHTML='<span class="material-symbols-outlined" style="font-size:18px;vertical-align:middle">lock</span> Unlock';
-        if(label)label.innerHTML='<span style="color:var(--success)">Locked — auto-updates blocked</span>';
+        if(label)label.innerHTML='<span style="color:var(--success)">Locked — auto-updates blocked</span>'+( _pkgLockBreakdown ? '<span style="display:block;font-size:10px;color:var(--text-dim);margin-top:2px">'+escapeHtml(_pkgLockBreakdown)+'</span>' : '');
     }else{
         btn.innerHTML='<span class="material-symbols-outlined" style="font-size:18px;vertical-align:middle">lock_open_right</span> Lock';
-        if(label)label.innerHTML='<span style="color:var(--text-dim)">Unlocked — auto-updates active</span>';
+        if(label)label.innerHTML='<span style="color:var(--text-dim)">Unlocked — auto-updates active</span>'+( _pkgLockBreakdown ? '<span style="display:block;font-size:10px;color:var(--text-dim);margin-top:2px">'+escapeHtml(_pkgLockBreakdown)+'</span>' : '');
     }
 }
+var _pkgLockBreakdown=null;
 async function checkPkgLockStatus(){
     var btn=document.getElementById('pkg-lock-btn');
     if(!btn)return;
@@ -598,8 +599,9 @@ async function checkPkgLockStatus(){
         var r=await fetch('/api/takserver/pin-packages/status');
         var d=await r.json();
         _pkgLocked=d.pinned;
+        _pkgLockBreakdown=d.breakdown||null;
         renderPkgLock();
-    }catch(e){_pkgLocked=false;renderPkgLock();}
+    }catch(e){_pkgLocked=false;_pkgLockBreakdown=null;renderPkgLock();}
 }
 if(document.getElementById('pkg-lock-btn')){checkPkgLockStatus();}
 
