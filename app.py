@@ -657,28 +657,22 @@ print(json.dumps(out))
         return None
 
 def _get_unattended_upgrades_status():
-    """Return dict with 'enabled' (bool) and 'running' (bool). 'running' = upgrade in progress, not just shutdown-waiter."""
+    """Return dict with 'enabled' (bool) and 'running' (bool). 'running' = upgrade job active (not shutdown-waiter)."""
     enabled = False
     try:
         r = subprocess.run('systemctl is-enabled unattended-upgrades 2>/dev/null',
             shell=True, capture_output=True, text=True, timeout=5)
-        enabled = r.stdout.strip() == 'enabled'
+        enabled = (r.stdout or '').strip() == 'enabled'
     except Exception:
         pass
     running = False
     try:
-        # "Running" = upgrade job active or lock held; ignore unattended-upgrade-shutdown (idle waiter)
+        # Only "Running" when the timer-started upgrade job is active (apt-daily-upgrade.service)
         r = subprocess.run('systemctl is-active apt-daily-upgrade.service 2>/dev/null',
             shell=True, capture_output=True, text=True, timeout=5)
-        if r.stdout and r.stdout.strip() == 'active':
-            running = True
+        running = (r.stdout or '').strip() == 'active'
     except Exception:
         pass
-    if not running:
-        try:
-            running = os.path.exists('/var/run/unattended-upgrades.lock')
-        except Exception:
-            pass
     if not enabled:
         running = False
     return {'enabled': enabled, 'running': running}
@@ -690,8 +684,7 @@ def _get_unattended_upgrades_status_remote(remote_cfg):
         return {'error': 'no host'}
     cmd = (
         'e=$(systemctl is-enabled unattended-upgrades 2>/dev/null); '
-        'r=1; systemctl is-active apt-daily-upgrade.service 2>/dev/null | grep -q active && r=0; '
-        '[ -f /var/run/unattended-upgrades.lock ] && r=0; '
+        'r=1; systemctl is-active apt-daily-upgrade.service 2>/dev/null | grep -qx active && r=0; '
         'echo "ENABLED=$e"; echo "RUNNING=$r"'
     )
     try:
