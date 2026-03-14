@@ -1,6 +1,7 @@
 #!/bin/bash
 # Guard Dog: MediaMTX systemd service health. On 3 consecutive failures: alert and restart.
 
+SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
 STATE_DIR="/var/lib/takguard"
 FAIL_FILE="$STATE_DIR/mediamtx.failcount"
 COOLDOWN_FILE="$STATE_DIR/mediamtx_last_restart"
@@ -43,9 +44,10 @@ TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 mkdir -p /var/log/takguard
 echo "$TS | restart | MediaMTX not active — restarting" >> /var/log/takguard/restarts.log
 
-SUBJ="Guard Dog: MediaMTX restarted on $(hostname)"
+SUBJ="Guard Dog: MediaMTX restarted on $SERVER_IDENTIFIER"
 BODY="MediaMTX was not running for $FAILS consecutive checks.
 
+Server: $SERVER_IDENTIFIER
 Time (UTC): $TS
 Action: systemctl restart mediamtx
 

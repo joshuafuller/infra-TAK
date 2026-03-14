@@ -10,6 +10,7 @@
 #   SSH_USER_PLACEHOLDER       → SSH user for Server One
 #   ALERT_EMAIL_PLACEHOLDER    → Alert email (empty = no email)
 
+SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
 DB_HOST="DB_HOST_PLACEHOLDER"
 DB_PORT="DB_PORT_PLACEHOLDER"
 SSH_KEY="SSH_KEY_PLACEHOLDER"
@@ -92,9 +93,10 @@ else
   RESTART_MSG="Guard Dog attempted a remote restart but PostgreSQL is still not responding. Manual intervention required."
 fi
 
-SUBJ="TAK Server Remote Database Alert on $(hostname)"
+SUBJ="TAK Server Remote Database Alert on $SERVER_IDENTIFIER"
 BODY="The remote database server ($DB_HOST:$DB_PORT) is not healthy.
 
+Server: $SERVER_IDENTIFIER
 Time (UTC): $TS
 Consecutive failures: $FAIL_COUNT
 Details: $DETAILS

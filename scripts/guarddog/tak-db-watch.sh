@@ -1,5 +1,6 @@
 #!/bin/bash
 
+SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
 ALERT_SENT_FILE="/var/lib/takguard/db_alert_sent"
 LAST_RESTART_FILE="/var/lib/takguard/last_restart_time"
 
@@ -19,9 +20,10 @@ if ! systemctl is-active --quiet postgresql 2>/dev/null; then
       
       TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
       
-      SUBJ="TAK Server Database Alert on $(hostname)"
+      SUBJ="TAK Server Database Alert on $SERVER_IDENTIFIER"
       BODY="PostgreSQL service is not running.
 
+Server: $SERVER_IDENTIFIER
 Time (UTC): $TS
 
 This will cause:

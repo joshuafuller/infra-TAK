@@ -2331,6 +2331,17 @@ def mediamtx_page():
 guarddog_deploy_log = []
 guarddog_deploy_status = {'running': False, 'complete': False, 'error': False}
 
+def _guarddog_server_identifier(settings):
+    """Build the server identifier string for Guard Dog alerts (nickname and/or IP/FQDN)."""
+    nickname = (settings.get('guarddog_server_nickname') or '').strip()
+    server_ip = (settings.get('server_ip') or '').strip()
+    fqdn = (settings.get('fqdn') or '').split(':')[0].strip()
+    base = f"{fqdn} ({server_ip})" if (fqdn and server_ip) else (server_ip or fqdn or '')
+    if nickname:
+        return f"{nickname} ({base})" if base else nickname
+    return base
+
+
 def _guarddog_health_url(settings):
     """Build the health endpoint URL for this server (for Uptime Robot / display)."""
     fqdn = (settings.get('fqdn') or '').strip()
@@ -2405,6 +2416,7 @@ def guarddog_page():
     return render_template_string(GUARDDOG_TEMPLATE,
         settings=settings, gd=gd, tak=tak, version=VERSION,
         guarddog_alert_email=settings.get('guarddog_alert_email', ''),
+        guarddog_server_nickname=settings.get('guarddog_server_nickname', ''),
         guarddog_sms=settings.get('guarddog_sms', {}),
         guarddog_services=guarddog_services,
         guarddog_docs_url=guarddog_docs_url,
@@ -2426,6 +2438,8 @@ def guarddog_deploy_api():
         alert_email = (settings.get('guarddog_alert_email') or '').strip()
     # Allow deploy with no email (monitors run; alerts only after user configures email)
     settings['guarddog_alert_email'] = alert_email
+    nickname = (data.get('server_nickname') or '').strip()
+    settings['guarddog_server_nickname'] = nickname
     save_settings(settings)
     guarddog_deploy_log.clear()
     guarddog_deploy_status.update({'running': True, 'complete': False, 'error': False})
@@ -3134,6 +3148,26 @@ def guarddog_test_email():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
+@app.route('/api/guarddog/notifications/save', methods=['POST'])
+@login_required
+def guarddog_notifications_save():
+    """Save alert email and server nickname; if Guard Dog is installed, write server_identifier so alerts use the nickname without redeploy."""
+    data = request.json or {}
+    settings = load_settings()
+    email = (data.get('alert_email') or '').strip()
+    nickname = (data.get('server_nickname') or '').strip()
+    settings['guarddog_alert_email'] = email
+    settings['guarddog_server_nickname'] = nickname
+    save_settings(settings)
+    if os.path.exists('/opt/tak-guarddog'):
+        try:
+            ident = _guarddog_server_identifier(settings)
+            with open('/opt/tak-guarddog/server_identifier', 'w') as f:
+                f.write(ident)
+        except Exception:
+            pass
+    return jsonify({'success': True, 'message': 'Saved. Alerts will use the server nickname.'})
+
 @app.route('/api/guarddog/sms/save', methods=['POST'])
 @login_required
 def guarddog_sms_save():
@@ -3416,6 +3450,11 @@ def run_guarddog_deploy(alert_email):
             gd_conf = {'two_server': True, 'db_host': s1_host, 'db_port': int(db_port)}
         with open('/opt/tak-guarddog/guarddog.conf', 'w') as f:
             json.dump(gd_conf, f)
+        # Server identifier for alerts (nickname and/or IP/FQDN) so multi-server monitoring can tell which host
+        server_identifier = _guarddog_server_identifier(settings)
+        with open('/opt/tak-guarddog/server_identifier', 'w') as f:
+            f.write(server_identifier)
+        plog("✓ Server identifier written (for alert subject/body)")
         units = [
             ('tak8089guard.service', '[Unit]\nDescription=TAK 8089 Health Guard Dog\nAfter=network-online.target\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-8089-watch.sh\n'),
             ('tak8089guard.timer', '[Unit]\nDescription=Run TAK 8089 guard dog every 1 minute\n\n[Timer]\nOnBootSec=10min\nOnUnitActiveSec=1min\nUnit=tak8089guard.service\n\n[Install]\nWantedBy=timers.target\n'),
@@ -11426,6 +11465,12 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     {% endif %}
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:16px">Configure email, Uptime Robot, and optional SMS (Twilio or Brevo) for Guard Dog alerts.</p>
     <div class="gd-section" style="margin-bottom:20px">
+      <div class="form-label">Server nickname</div>
+      <p style="font-size:12px;color:var(--text-dim);margin-bottom:8px">Optional. Shown in alert subject and body so you can tell which server when monitoring multiple (e.g. Production, Staging).</p>
+      <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:16px">
+        <input class="form-input" type="text" id="gd-server-nickname" placeholder="e.g. Production, Staging" value="{{ guarddog_server_nickname | e }}" style="max-width:220px" maxlength="64">
+        <button class="btn btn-ghost" id="gd-save-notify-btn" onclick="gdSaveNotifications()">Save email &amp; nickname</button>
+      </div>
       <div class="form-label">Email</div>
       {% if email_relay_configured %}<p style="font-size:12px;color:var(--green);margin-bottom:8px">Using Email Relay (e.g. Brevo SMTP). Alerts are sent through your configured relay.</p>{% endif %}
       <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center">
@@ -11433,6 +11478,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
         <button class="btn btn-ghost" id="gd-test-email-btn" onclick="gdTestEmail()">Send test email</button>
       </div>
       <div id="gd-test-email-msg" style="margin-top:8px;font-size:12px"></div>
+      <div id="gd-save-notify-msg" style="margin-top:8px;font-size:12px"></div>
     </div>
     <div class="gd-section" style="margin-bottom:20px">
       <div class="form-label">Uptime Robot (outside-in monitoring)</div>
@@ -21047,6 +21093,10 @@ def _auto_update_guarddog():
             print(f"Guard Dog: {updated} script(s) updated on console startup.")
         else:
             print("Guard Dog: scripts up to date.")
+        # Keep server_identifier in sync (nickname / IP / FQDN)
+        ident = _guarddog_server_identifier(settings)
+        with open('/opt/tak-guarddog/server_identifier', 'w') as f:
+            f.write(ident)
     except Exception as e:
         print(f"Guard Dog auto-update skipped: {e}")
 

@@ -3,6 +3,7 @@
 # Root CA and Intermediate CA certificate expiry monitor
 # Notification milestones: 90, 75, 60, 45, 30 days, then daily until 0 (expired)
 
+SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
 STATE_DIR="/var/lib/takguard"
 LOG="/var/log/takguard/restarts.log"
 
@@ -77,13 +78,13 @@ check_cert() {
   fi
 
   if [ "$DAYS_LEFT" -le 0 ]; then
-    SUBJ="[$URGENCY] TAK $LABEL HAS EXPIRED - $(hostname)"
+    SUBJ="[$URGENCY] TAK $LABEL HAS EXPIRED - $SERVER_IDENTIFIER"
     BODY="TAK Server $LABEL has expired.
 
 The $LABEL expired on $EXPIRY_HUMAN.
 All TAK connections using this certificate chain will fail.
 
-Host: $(hostname)
+Server: $SERVER_IDENTIFIER
 Certificate: $CERT_FILE
 Severity: $URGENCY
 
@@ -91,12 +92,12 @@ Action Required:
   Generate new certificates immediately and redeploy to all clients.
 "
   elif [ "$DAYS_LEFT" -eq 1 ]; then
-    SUBJ="[$URGENCY] TAK $LABEL expires TOMORROW - $(hostname)"
+    SUBJ="[$URGENCY] TAK $LABEL expires TOMORROW - $SERVER_IDENTIFIER"
     BODY="You have 1 day until the TAK Server $LABEL expires.
 
 Expiry date: $EXPIRY_HUMAN
 
-Host: $(hostname)
+Server: $SERVER_IDENTIFIER
 Certificate: $CERT_FILE
 Severity: $URGENCY
 
@@ -107,12 +108,12 @@ Action Required:
   Generate new certificates and redeploy to all clients.
 "
   else
-    SUBJ="[$URGENCY] TAK $LABEL expires in $DAYS_LEFT days - $(hostname)"
+    SUBJ="[$URGENCY] TAK $LABEL expires in $DAYS_LEFT days - $SERVER_IDENTIFIER"
     BODY="You have $DAYS_LEFT days until the TAK Server $LABEL expires.
 
 Expiry date: $EXPIRY_HUMAN
 
-Host: $(hostname)
+Server: $SERVER_IDENTIFIER
 Certificate: $CERT_FILE
 Severity: $URGENCY
 

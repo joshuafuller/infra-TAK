@@ -12,6 +12,7 @@
 #   SSH_USER_PLACEHOLDER       → SSH user for Server One
 #   ALERT_EMAIL_PLACEHOLDER    → Alert email (empty = no email)
 
+SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
 DB_HOST="DB_HOST_PLACEHOLDER"
 DB_PORT="DB_PORT_PLACEHOLDER"
 SSH_KEY="SSH_KEY_PLACEHOLDER"
@@ -124,9 +125,10 @@ touch "$ALERT_SENT_FILE"
 TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
 if $RESYNCED; then
-  SUBJ="TAK Server DB Credential Auto-Resynced on $(hostname)"
+  SUBJ="TAK Server DB Credential Auto-Resynced on $SERVER_IDENTIFIER"
   BODY="CREDENTIAL DRIFT DETECTED AND AUTO-FIXED.
 
+Server: $SERVER_IDENTIFIER
 Time (UTC): $TS
 Consecutive failures before fix: $FAIL_COUNT
 
@@ -140,9 +142,10 @@ No action required — TAK Server should be back online within 60 seconds.
 A backup was saved to ${CORE_CONFIG}.pre-resync.bak.
 "
 else
-  SUBJ="TAK Server DB Credential Alert on $(hostname)"
+  SUBJ="TAK Server DB Credential Alert on $SERVER_IDENTIFIER"
   BODY="CREDENTIAL DRIFT DETECTED — AUTO-RESYNC FAILED.
 
+Server: $SERVER_IDENTIFIER
 Time (UTC): $TS
 Consecutive failures: $FAIL_COUNT
 Resync result: $RESYNC_MSG

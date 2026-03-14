@@ -1,5 +1,6 @@
 #!/bin/bash
 
+SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
 ALERT_SENT_FILE="/var/lib/takguard/network_alert_sent"
 FAIL_COUNT_FILE="/var/lib/takguard/network_fail_count"
 
@@ -29,9 +30,10 @@ if [ "$CLOUDFLARE_UP" = false ] && [ "$GOOGLE_UP" = false ]; then
       
       TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
       
-      SUBJ="TAK Server Network Alert on $(hostname)"
+      SUBJ="TAK Server Network Alert on $SERVER_IDENTIFIER"
       BODY="Server cannot reach the internet.
 
+Server: $SERVER_IDENTIFIER
 Time (UTC): $TS
 
 Tested:

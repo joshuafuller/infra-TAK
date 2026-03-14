@@ -1,5 +1,6 @@
 #!/bin/bash
 
+SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
 ALERT_SENT_FILE="/var/lib/takguard/process_alert_sent"
 FAIL_COUNT_FILE="/var/lib/takguard/process_fail_count"
 LAST_RESTART_FILE="/var/lib/takguard/last_restart_time"
@@ -68,9 +69,10 @@ if [ ${#MISSING_PROCESSES[@]} -gt 0 ]; then
       TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
       MISSING_LIST=$(IFS=,; echo "${MISSING_PROCESSES[*]}")
       
-      SUBJ="TAK Server Process Alert on $(hostname)"
+      SUBJ="TAK Server Process Alert on $SERVER_IDENTIFIER"
       BODY="TAK Server processes are missing - RESTARTING.
 
+Server: $SERVER_IDENTIFIER
 Time (UTC): $TS
 
 Service Status: Running (but incomplete)
