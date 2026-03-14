@@ -657,7 +657,7 @@ print(json.dumps(out))
         return None
 
 def _get_unattended_upgrades_status():
-    """Return dict with 'enabled' (bool) and 'running' (bool) for unattended-upgrades."""
+    """Return dict with 'enabled' (bool) and 'running' (bool). 'running' = upgrade in progress, not just shutdown-waiter."""
     enabled = False
     try:
         r = subprocess.run('systemctl is-enabled unattended-upgrades 2>/dev/null',
@@ -667,18 +667,18 @@ def _get_unattended_upgrades_status():
         pass
     running = False
     try:
-        # pgrep matches full command line (unattended-upgrade script or binary)
-        proc = subprocess.run('pgrep -f "unattended-upgrade" >/dev/null 2>&1', shell=True, timeout=5)
-        running = proc.returncode == 0
+        # "Running" = upgrade job active or lock held; ignore unattended-upgrade-shutdown (idle waiter)
+        r = subprocess.run('systemctl is-active apt-daily-upgrade.service 2>/dev/null',
+            shell=True, capture_output=True, text=True, timeout=5)
+        if r.stdout and r.stdout.strip() == 'active':
+            running = True
     except Exception:
         pass
-    if not running and enabled:
-        # When the script runs apt/dpkg, the main CPU may show as "apt"; the lock file indicates UU is active
+    if not running:
         try:
             running = os.path.exists('/var/run/unattended-upgrades.lock')
         except Exception:
             pass
-    # Only show "running" when auto-updates are enabled; otherwise timer/cron can run the binary and confuse the UI
     if not enabled:
         running = False
     return {'enabled': enabled, 'running': running}
@@ -690,7 +690,7 @@ def _get_unattended_upgrades_status_remote(remote_cfg):
         return {'error': 'no host'}
     cmd = (
         'e=$(systemctl is-enabled unattended-upgrades 2>/dev/null); '
-        'r=1; pgrep -f "unattended-upgrade" >/dev/null 2>&1 && r=0; '
+        'r=1; systemctl is-active apt-daily-upgrade.service 2>/dev/null | grep -q active && r=0; '
         '[ -f /var/run/unattended-upgrades.lock ] && r=0; '
         'echo "ENABLED=$e"; echo "RUNNING=$r"'
     )
