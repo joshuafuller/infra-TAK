@@ -554,26 +554,29 @@ async function togglePkgLock(){
     btn.style.opacity='0.7';
     btn.textContent=isUnlock?'Unlocking...':'Locking...';
     if(label)label.innerHTML='<span style="color:var(--text-dim)">…</span>';
+    var d;
     try{
         var endpoint=isUnlock?'/api/takserver/unpin-packages':'/api/takserver/pin-packages';
         var r=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
         var text=await r.text();
-        var d;
         try{d=JSON.parse(text);}catch(_){ d={success:false,message:r.ok?'Invalid response':('HTTP '+r.status)}; }
         if(!r.ok&&d.message===undefined){ d.message='HTTP '+r.status; }
         if(d.success){ await checkPkgLockStatus(); }
         else{
             var msg=(d.message||(d.results&&JSON.stringify(d.results))||'Unlock failed');
-            if(label)label.innerHTML='<span style="color:var(--error)">'+escapeHtml(String(msg))+'</span>';
+            if(label)label.innerHTML='<span style="color:var(--red);font-size:11px">'+escapeHtml(String(msg))+'</span>';
             alert('Failed: '+msg);
+            btn.innerHTML='<span class="material-symbols-outlined" style="font-size:18px;vertical-align:middle">lock</span> Unlock';
         }
     }catch(e){
-        if(label)label.innerHTML='<span style="color:var(--error)">Error: '+escapeHtml(e.message)+'</span>';
+        d=null;
+        if(label)label.innerHTML='<span style="color:var(--red);font-size:11px">Error: '+escapeHtml(e.message)+'</span>';
         alert('Error: '+e.message);
+        btn.innerHTML='<span class="material-symbols-outlined" style="font-size:18px;vertical-align:middle">lock</span> Unlock';
     }
     btn.disabled=false;
     btn.style.opacity='1';
-    renderPkgLock();
+    if(d&&d.success) renderPkgLock();
 }
 function escapeHtml(s){ var d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
 function renderPkgLock(){

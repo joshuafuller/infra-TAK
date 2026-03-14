@@ -1778,7 +1778,7 @@ def takserver_unpin_packages():
         'UA_CONF="/etc/apt/apt.conf.d/50unattended-upgrades"; '
         'if [ ! -f "$UA_CONF" ]; then echo NO_UA; exit 0; fi; '
         'if ! grep -q "takserver" "$UA_CONF" 2>/dev/null; then echo ALREADY_UNPINNED; exit 0; fi; '
-        'sudo sed -i \'/"takserver\\*"/d;/"postgresql\\*"/d\' "$UA_CONF" 2>/dev/null; '
+        'sudo sed -i -e \'/"takserver\\*"/d\' -e \'/"postgresql\\*"/d\' "$UA_CONF" 2>/dev/null; '
         'if grep -q "takserver" "$UA_CONF" 2>/dev/null; then echo FAILED; else echo UNPINNED; fi'
     )
 
@@ -1814,7 +1814,14 @@ def takserver_unpin_packages():
                 results['server_one'] = f'error: {str(e)[:100]}'
 
     all_ok = all(v in ('unpinned', 'already_unpinned', 'no_unattended_upgrades') for v in results.values())
-    return jsonify({'success': all_ok, 'results': results})
+    msgs = []
+    for server, status in results.items():
+        label = 'Server One (DB)' if server == 'server_one' else 'This host'
+        if status in ('unpinned', 'already_unpinned', 'no_unattended_upgrades'):
+            continue
+        msgs.append(f'{label}: {status}')
+    message = '; '.join(msgs) if msgs else ('Unlocked on all hosts' if all_ok else 'Unlock failed')
+    return jsonify({'success': all_ok, 'results': results, 'message': message})
 
 
 @app.route('/mediamtx')
