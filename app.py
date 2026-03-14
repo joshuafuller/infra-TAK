@@ -12816,6 +12816,11 @@ async function saveDomains(){
         btn.disabled=false;btn.textContent='Save & Reload Caddy';btn.style.opacity='1';
     }
 }
+function fmtCaddyCertDays(days){
+    var y=Math.floor(days/365),r=days%365,m=Math.floor(r/30),dd=r%30;
+    var p=[];if(y>0)p.push(y+'y');if(m>0)p.push(m+'mo');if(dd>0||p.length===0)p.push(dd+'d');
+    return p.join(' ');
+}
 async function loadCaddyCertDays(){
     var el=document.getElementById('caddy-cert-days-banner');
     if(!el)return;
@@ -12826,7 +12831,7 @@ async function loadCaddyCertDays(){
         if(days==null){el.textContent='';return;}
         var c='var(--text-dim)';
         if(color==='green')c='var(--green)';else if(color==='yellow')c='var(--yellow)';else if(color==='red')c='var(--red)';
-        el.innerHTML='Let\'s Encrypt cert: <span style="color:'+c+';font-weight:600">'+days+' day'+(days!==1?'s':'')+' left</span>';
+        el.innerHTML='Let\'s Encrypt cert: <span style="color:'+c+';font-weight:600">'+fmtCaddyCertDays(days)+'</span>';
     }catch(e){el.textContent='';}
 }
 loadServiceDomains();
@@ -19948,13 +19953,18 @@ function loadTakCertExpiry(){
         el.innerHTML=parts.join(' &nbsp;&middot;&nbsp; ');
     }).catch(function(){});
 }
+function fmtCertDays(days){
+    var y=Math.floor(days/365),r=days%365,m=Math.floor(r/30),dd=r%30;
+    var p=[];if(y>0)p.push(y+'y');if(m>0)p.push(m+'mo');if(dd>0||p.length===0)p.push(dd+'d');
+    return p.join(' ');
+}
 function loadCaddyCertDays(){
     var el=document.getElementById('caddy-card-cert-days');
     if(!el)return;
     fetch('/api/caddy/cert-days').then(function(r){return r.json()}).then(function(d){
         var days=d.days_left,color=d.color;
         if(days==null){el.textContent='Cert: —';el.style.color='var(--text-dim)';return;}
-        el.textContent='Cert: '+days+' day'+(days!==1?'s':'')+' left';
+        el.textContent='Cert: '+fmtCertDays(days);
         if(color==='green')el.style.color='var(--green)';
         else if(color==='yellow')el.style.color='var(--yellow)';
         else if(color==='red')el.style.color='var(--red)';
