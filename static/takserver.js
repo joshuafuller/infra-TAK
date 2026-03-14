@@ -553,7 +553,7 @@ async function togglePkgLock(){
     try{
         var r=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
         var d=await r.json();
-        if(d.success){_pkgLocked=!_pkgLocked;renderPkgLock();}
+        if(d.success){ await checkPkgLockStatus(); }
         else{alert('Failed: '+(d.message||JSON.stringify(d.results)));}
     }catch(e){alert('Error: '+e.message);}
     btn.disabled=false;btn.style.opacity='1';

@@ -1773,11 +1773,13 @@ def takserver_unpin_packages():
     is_two_server = cfg.get('mode') == 'two_server'
     results = {}
 
+    # Remove blacklist lines; verify after so we only report UNPINNED when "takserver" is really gone.
     unpin_script = (
         'UA_CONF="/etc/apt/apt.conf.d/50unattended-upgrades"; '
         'if [ ! -f "$UA_CONF" ]; then echo NO_UA; exit 0; fi; '
         'if ! grep -q "takserver" "$UA_CONF" 2>/dev/null; then echo ALREADY_UNPINNED; exit 0; fi; '
-        'sudo sed -i \'/"takserver\\*"/d;/"postgresql\\*"/d\' "$UA_CONF" 2>/dev/null && echo UNPINNED || echo FAILED'
+        'sudo sed -i \'/"takserver\\*"/d;/"postgresql\\*"/d\' "$UA_CONF" 2>/dev/null; '
+        'if grep -q "takserver" "$UA_CONF" 2>/dev/null; then echo FAILED; else echo UNPINNED; fi'
     )
 
     try:
