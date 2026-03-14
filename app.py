@@ -825,6 +825,83 @@ def _get_disk_io_remote(remote_cfg):
         return None
 
 
+# Temp file for disk speed test (256 MiB, direct I/O). Same path locally and over SSH.
+_DISK_SPEED_TEST_FILE = '/var/tmp/infra_tak_disk_speed_test'
+_DISK_SPEED_TEST_SIZE_MB = 256
+
+
+def _parse_dd_speed_mbs(stderr_or_stdout):
+    """Parse dd output for 'copied, X.XXX s, YYY MB/s' or 'YYY MiB/s'. Return float MB/s or None."""
+    if not stderr_or_stdout:
+        return None
+    m = re.search(r'copied,\s*[\d.]+\s*s,\s*([\d.]+)\s*(?:MiB|MB)/s', stderr_or_stdout)
+    if m:
+        return round(float(m.group(1)), 1)
+    return None
+
+
+def _run_disk_speed_test_local():
+    """Run 256 MiB write then read with direct I/O; return (read_mbs, write_mbs) or None. Takes ~2–10s."""
+    try:
+        rw = subprocess.run(
+            ['dd', 'if=/dev/zero', 'of=' + _DISK_SPEED_TEST_FILE,
+             'bs=1M', 'count=' + str(_DISK_SPEED_TEST_SIZE_MB), 'oflag=direct'],
+            capture_output=True, text=True, timeout=60
+        )
+        write_mbs = _parse_dd_speed_mbs((rw.stdout or '') + (rw.stderr or ''))
+        if write_mbs is None:
+            return None
+        rr = subprocess.run(
+            ['dd', 'if=' + _DISK_SPEED_TEST_FILE, 'of=/dev/null', 'bs=1M', 'iflag=direct'],
+            capture_output=True, text=True, timeout=60
+        )
+        read_mbs = _parse_dd_speed_mbs((rr.stdout or '') + (rr.stderr or ''))
+        try:
+            os.unlink(_DISK_SPEED_TEST_FILE)
+        except Exception:
+            pass
+        if read_mbs is None:
+            return None
+        return (read_mbs, write_mbs)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        try:
+            os.unlink(_DISK_SPEED_TEST_FILE)
+        except Exception:
+            pass
+        return None
+
+
+def _run_disk_speed_test_remote(remote_cfg):
+    """Run same 256 MiB disk speed test on remote host via SSH. Returns (read_mbs, write_mbs) or None."""
+    if not remote_cfg or not (remote_cfg.get('host') or '').strip():
+        return None
+    script = (
+        'f="' + _DISK_SPEED_TEST_FILE + '"; '
+        'dd if=/dev/zero of="$f" bs=1M count=' + str(_DISK_SPEED_TEST_SIZE_MB) + ' oflag=direct 2>&1; '
+        'dd if="$f" of=/dev/null bs=1M iflag=direct 2>&1; '
+        'rm -f "$f"'
+    )
+    try:
+        ok, out = _ssh_probe(remote_cfg, script, timeout=90)
+        if not ok or not out:
+            return None
+        # Output is: write dd output, then read dd output. First "copied" = write, second = read.
+        write_mbs = read_mbs = None
+        for line in out.strip().split('\n'):
+            m = re.search(r'copied,\s*[\d.]+\s*s,\s*([\d.]+)\s*(?:MiB|MB)/s', line)
+            if m:
+                if write_mbs is None:
+                    write_mbs = round(float(m.group(1)), 1)
+                else:
+                    read_mbs = round(float(m.group(1)), 1)
+                    break
+        if write_mbs is None or read_mbs is None:
+            return None
+        return (read_mbs, write_mbs)
+    except Exception:
+        return None
+
+
 def _friendly_process_name(args):
     """Derive a recognizable name from process args (e.g. takserver, authentik, cloudtak, caddy, containers)."""
     a = (args or '').lower()
@@ -886,6 +963,9 @@ def _top_processes_local():
         disk_io = _get_disk_io_local()
         if disk_io is not None:
             result['disk_io_read_mbs'], result['disk_io_write_mbs'] = disk_io
+        disk_speed = _run_disk_speed_test_local()
+        if disk_speed is not None:
+            result['disk_speed_test_read_mbs'], result['disk_speed_test_write_mbs'] = disk_speed
         return result
     except Exception:
         return {'cpu_top': [], 'mem_top': []}
@@ -927,6 +1007,9 @@ def _top_processes_remote(remote_cfg):
         disk_io = _get_disk_io_remote(remote_cfg)
         if disk_io is not None:
             result['disk_io_read_mbs'], result['disk_io_write_mbs'] = disk_io
+        disk_speed = _run_disk_speed_test_remote(remote_cfg)
+        if disk_speed is not None:
+            result['disk_speed_test_read_mbs'], result['disk_speed_test_write_mbs'] = disk_speed
         return result
     except Exception as e:
         return {'cpu_top': [], 'mem_top': [], 'error': str(e)[:80]}
@@ -20223,13 +20306,14 @@ async function toggleUU(cb){
 }
 function formatRamGb(memPct,totalRamGb){if(totalRamGb==null)return '';var gb=(Number(memPct||0)/100)*totalRamGb;if(gb>=1)return gb.toFixed(1)+' GB';return (gb*1024).toFixed(0)+' MB';}
 function renderResourceBreakdown(div,data){
-    var err=data.error,cpuTop=data.cpu_top,memTop=data.mem_top,totalRamGb=data.total_ram_gb,processor=data.processor,diskRead=data.disk_io_read_mbs,diskWrite=data.disk_io_write_mbs;
+    var err=data.error,cpuTop=data.cpu_top,memTop=data.mem_top,totalRamGb=data.total_ram_gb,processor=data.processor,diskRead=data.disk_io_read_mbs,diskWrite=data.disk_io_write_mbs,speedRead=data.disk_speed_test_read_mbs,speedWrite=data.disk_speed_test_write_mbs;
     if(err){div.innerHTML='<span style="color:var(--red)">'+escapeHtml(err)+'</span>';return;}
     var tbl='width:100%;border-collapse:collapse;font-size:10px;text-align:left', th='padding:2px 8px 2px 0;color:var(--cyan);font-weight:600;border-bottom:1px solid var(--border)', td='padding:2px 8px 2px 0;border-bottom:1px solid rgba(255,255,255,0.06)', r='text-align:right';
     var html='';
     if(processor)html+='<div style="margin-bottom:4px;color:var(--text-dim);font-size:10px">Processor: '+escapeHtml(processor)+'</div>';
     if(totalRamGb!=null)html+='<div style="margin-bottom:4px;color:var(--text-dim)">Total RAM: '+totalRamGb+' GB</div>';
-    if(diskRead!=null&&diskWrite!=null)html+='<div style="margin-bottom:6px;color:var(--text-dim);font-size:10px">Disk I/O: '+Number(diskRead).toFixed(2)+' MB/s read, '+Number(diskWrite).toFixed(2)+' MB/s write</div>';
+    if(diskRead!=null&&diskWrite!=null)html+='<div style="margin-bottom:4px;color:var(--text-dim);font-size:10px">Disk I/O (current): '+Number(diskRead).toFixed(2)+' MB/s read, '+Number(diskWrite).toFixed(2)+' MB/s write</div>';
+    if(speedRead!=null&&speedWrite!=null)html+='<div style="margin-bottom:6px;color:var(--cyan);font-size:10px">Disk speed test (256 MiB): <strong>'+Number(speedRead).toFixed(0)+' MB/s</strong> read, <strong>'+Number(speedWrite).toFixed(0)+' MB/s</strong> write</div>';
     if(cpuTop&&cpuTop.length){
         html+='<div style="margin-bottom:10px"><strong style="color:var(--cyan)">Top by CPU</strong><table style="'+tbl+';margin-top:4px"><thead><tr><th style="'+th+'">Process</th><th style="'+th+';'+r+'">CPU %</th><th style="'+th+';'+r+'">RAM %</th>'+(totalRamGb!=null?'<th style="'+th+';'+r+'">RAM</th>':'')+'</tr></thead><tbody>';
         cpuTop.forEach(function(p){var ramStr=formatRamGb(p.mem_pct,totalRamGb);html+='<tr><td style="'+td+'">'+escapeHtml(p.name||'')+'</td><td style="'+td+';'+r+';color:var(--green)">'+Number(p.cpu_pct||0).toFixed(1)+'%</td><td style="'+td+';'+r+'">'+Number(p.mem_pct||0).toFixed(1)+'%</td>'+(totalRamGb!=null?'<td style="'+td+';'+r+';color:var(--text-dim)">'+ramStr+'</td>':'')+'</tr>';});
@@ -20248,7 +20332,7 @@ async function toggleResourceBreakdown(hostId){
     var div=document.getElementById('resource-breakdown-'+hostId);if(!div)return;
     if(div.style.display==='block'){div.style.display='none';return;}
     if(!div.getAttribute('data-loaded')){
-        div.style.display='block';div.textContent='Loading...';
+        div.style.display='block';div.textContent='Loading… (disk speed test ~5–30s)';
         try{
             var r=await fetch('/api/host-resource-usage?target='+encodeURIComponent(hostId));var d=await r.json();
             renderResourceBreakdown(div,d);div.setAttribute('data-loaded','1');
