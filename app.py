@@ -2570,20 +2570,7 @@ def guarddog_apply_docker_log_limits():
 @app.route('/api/guarddog/update', methods=['POST'])
 @login_required
 def guarddog_update():
-    """Re-deploy Guard Dog scripts and reload timers from latest console version."""
-    if not os.path.exists('/opt/tak-guarddog'):
-        return jsonify({'success': False, 'error': 'Guard Dog not installed'}), 400
-    try:
-        _auto_update_guarddog()
-        return jsonify({'success': True, 'message': 'Guard Dog scripts updated and timers reloaded.'})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)[:300]}), 500
-
-
-@app.route('/api/guarddog/update', methods=['POST'])
-@login_required
-def guarddog_update():
-    """Re-deploy Guard Dog scripts and timers from latest console version without full deploy."""
+    """Re-deploy Guard Dog scripts and timers from latest console version."""
     if not os.path.exists('/opt/tak-guarddog'):
         return jsonify({'success': False, 'error': 'Guard Dog not installed'}), 400
     try:
