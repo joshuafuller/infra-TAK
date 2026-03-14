@@ -544,6 +544,49 @@ async function syncTakDbPassword(){
     }catch(e){alert('Failed: '+e.message);btns.forEach(b=>{b.disabled=false;b.style.opacity='1'});}
 }
 
+async function pinPackages(){
+    var btn=document.getElementById('pin-packages-btn');
+    var status=document.getElementById('pin-packages-status');
+    if(!btn)return;
+    btn.disabled=true;btn.style.opacity='0.5';
+    if(status)status.textContent='Applying...';
+    try{
+        var r=await fetch('/api/takserver/pin-packages',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
+        var d=await r.json();
+        if(d.success){
+            if(status)status.innerHTML='<span style="color:var(--success)">✓ '+d.message+'</span>';
+            btn.style.opacity='1';btn.disabled=false;
+        }else{
+            if(status)status.innerHTML='<span style="color:var(--error)">'+(d.message||'Failed')+'</span>';
+            btn.style.opacity='1';btn.disabled=false;
+        }
+    }catch(e){
+        if(status)status.innerHTML='<span style="color:var(--error)">Error: '+e.message+'</span>';
+        btn.style.opacity='1';btn.disabled=false;
+    }
+}
+
+async function checkPinStatus(){
+    var btn=document.getElementById('pin-packages-btn');
+    var status=document.getElementById('pin-packages-status');
+    if(!btn||!status)return;
+    try{
+        var r=await fetch('/api/takserver/pin-packages/status');
+        var d=await r.json();
+        if(d.pinned){
+            status.innerHTML='<span style="color:var(--success)">✓ Packages pinned — auto-updates blocked</span>';
+        }else{
+            var parts=[];
+            if(d.results){
+                if(d.results.server_two==='not_pinned')parts.push('This host: not pinned');
+                if(d.results.server_one==='not_pinned')parts.push('Server One: not pinned');
+            }
+            status.innerHTML='<span style="color:var(--warning)">'+(parts.length?parts.join('; '):'Not pinned — click to protect')+'</span>';
+        }
+    }catch(e){}
+}
+if(document.getElementById('pin-packages-btn')){checkPinStatus();}
+
 async function takUpdateConfig(){
     var btn=document.getElementById('tak-update-config-btn');
     if(!btn)return;

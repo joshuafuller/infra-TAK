@@ -1651,6 +1651,118 @@ def takserver_two_server_sync_db_password():
     return jsonify({'success': True, 'message': 'DB password updated and TAK Server restarted. Try 8443/8446 again in a minute.'})
 
 
+@app.route('/api/takserver/pin-packages', methods=['POST'])
+@login_required
+def takserver_pin_packages():
+    """Add takserver* and postgresql* to the unattended-upgrades blacklist on both Server Two (local) and Server One (SSH).
+    Prevents automatic apt upgrades from breaking the DB connection or regenerating credentials."""
+    settings = load_settings()
+    cfg = _get_tak_deployment_config(settings)
+    is_two_server = cfg.get('mode') == 'two_server'
+    results = {}
+
+    pin_snippet = (
+        'UA_CONF="/etc/apt/apt.conf.d/50unattended-upgrades"; '
+        'if [ ! -f "$UA_CONF" ]; then echo NO_UA; '
+        'elif grep -q "takserver" "$UA_CONF" 2>/dev/null; then echo ALREADY_PINNED; '
+        'else '
+        'sudo sed -i \'/Unattended-Upgrade::Package-Blacklist/a\\        "takserver*";\\n        "postgresql*";\' "$UA_CONF" 2>/dev/null && echo PINNED || echo FAILED; '
+        'fi'
+    )
+
+    try:
+        r = subprocess.run(pin_snippet, shell=True, capture_output=True, text=True, timeout=15)
+        out = (r.stdout or '').strip()
+        if 'PINNED' in out:
+            results['server_two'] = 'pinned'
+        elif 'ALREADY_PINNED' in out:
+            results['server_two'] = 'already_pinned'
+        elif 'NO_UA' in out:
+            results['server_two'] = 'no_unattended_upgrades'
+        else:
+            results['server_two'] = 'failed'
+    except Exception as e:
+        results['server_two'] = f'error: {str(e)[:100]}'
+
+    if is_two_server:
+        s1 = cfg.get('server_one', {})
+        if (s1.get('host') or '').strip():
+            try:
+                ok, out = _ssh_probe(s1, pin_snippet, timeout=15)
+                out_s = (out or '').strip()
+                if ok and 'PINNED' in out_s:
+                    results['server_one'] = 'pinned'
+                elif ok and 'ALREADY_PINNED' in out_s:
+                    results['server_one'] = 'already_pinned'
+                elif ok and 'NO_UA' in out_s:
+                    results['server_one'] = 'no_unattended_upgrades'
+                else:
+                    results['server_one'] = f'failed: {out_s[:100]}'
+            except Exception as e:
+                results['server_one'] = f'error: {str(e)[:100]}'
+        else:
+            results['server_one'] = 'no_host_configured'
+
+    all_ok = all(v in ('pinned', 'already_pinned', 'no_unattended_upgrades') for v in results.values())
+    msgs = []
+    for server, status in results.items():
+        label = 'Server One (DB)' if server == 'server_one' else 'This host'
+        if status == 'pinned':
+            msgs.append(f'{label}: packages pinned')
+        elif status == 'already_pinned':
+            msgs.append(f'{label}: already pinned')
+        elif status == 'no_unattended_upgrades':
+            msgs.append(f'{label}: unattended-upgrades not installed (safe)')
+        else:
+            msgs.append(f'{label}: {status}')
+
+    return jsonify({'success': all_ok, 'results': results, 'message': '; '.join(msgs)})
+
+
+@app.route('/api/takserver/pin-packages/status')
+@login_required
+def takserver_pin_packages_status():
+    """Check if takserver/postgresql packages are already pinned on both hosts."""
+    settings = load_settings()
+    cfg = _get_tak_deployment_config(settings)
+    is_two_server = cfg.get('mode') == 'two_server'
+    results = {}
+
+    check_cmd = (
+        'UA_CONF="/etc/apt/apt.conf.d/50unattended-upgrades"; '
+        'if [ ! -f "$UA_CONF" ]; then echo NO_UA; '
+        'elif grep -q "takserver" "$UA_CONF" 2>/dev/null; then echo PINNED; '
+        'else echo NOT_PINNED; fi'
+    )
+
+    try:
+        r = subprocess.run(check_cmd, shell=True, capture_output=True, text=True, timeout=10)
+        out = (r.stdout or '').strip()
+        results['server_two'] = 'pinned' if 'PINNED' in out else ('safe' if 'NO_UA' in out else 'not_pinned')
+    except Exception:
+        results['server_two'] = 'unknown'
+
+    if is_two_server:
+        s1 = cfg.get('server_one', {})
+        if (s1.get('host') or '').strip():
+            try:
+                ok, out = _ssh_probe(s1, check_cmd, timeout=10)
+                out_s = (out or '').strip()
+                if ok and 'PINNED' in out_s:
+                    results['server_one'] = 'pinned'
+                elif ok and 'NO_UA' in out_s:
+                    results['server_one'] = 'safe'
+                elif ok:
+                    results['server_one'] = 'not_pinned'
+                else:
+                    results['server_one'] = 'unknown'
+            except Exception:
+                results['server_one'] = 'unknown'
+
+    all_pinned = all(v in ('pinned', 'safe') for v in results.values())
+    return jsonify({'pinned': all_pinned, 'results': results})
+
+
 @app.route('/mediamtx')
 @login_required
 def mediamtx_page():
@@ -19739,6 +19851,13 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <label for="sync-db-password-input" style="font-size:12px;color:var(--text-secondary)">DB password (from Server One):</label>
 <input type="password" id="sync-db-password-input" placeholder="Paste or leave blank to use saved" autocomplete="off" style="width:200px;padding:6px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:'JetBrains Mono',monospace;font-size:12px" />
 <span style="font-size:11px;color:var(--text-dim)">Paste from Server One if 8443/8446 fail; leave blank to use saved.</span>
+</div>
+{% endif %}
+{% if two_server_mode %}
+<div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--border);display:flex;align-items:center;flex-wrap:wrap;gap:10px">
+<button class="control-btn" id="pin-packages-btn" onclick="pinPackages()" title="Prevent unattended-upgrades from auto-updating TAK Server and PostgreSQL packages on both servers">📌 Pin Packages</button>
+<span id="pin-packages-status" style="font-size:12px;color:var(--text-dim)"></span>
+<span style="font-size:11px;color:var(--text-dim)">Optional — blocks automatic PG/TAK upgrades that can break the DB connection overnight. Security patches will need manual apply.</span>
 </div>
 {% endif %}
 </div>
