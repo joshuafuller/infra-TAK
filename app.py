@@ -781,6 +781,50 @@ def _get_cpu_model_remote(remote_cfg):
     return None
 
 
+def _get_disk_io_local():
+    """Return (read_mbs, write_mbs) from vmstat 1 2 (1-second sample). Blocks are 512 bytes. None on failure."""
+    try:
+        r = subprocess.run(
+            'vmstat 1 2 2>/dev/null | tail -1 | awk \'{print $9,$10}\'',
+            shell=True, capture_output=True, text=True, timeout=5
+        )
+        if r.returncode != 0 or not (r.stdout or '').strip():
+            return None
+        parts = (r.stdout or '').strip().split()
+        if len(parts) < 2:
+            return None
+        bi, bo = int(parts[0]), int(parts[1])
+        # blocks/s, 512 bytes per block -> MB/s
+        read_mbs = round((bi * 512) / (1024 * 1024), 2)
+        write_mbs = round((bo * 512) / (1024 * 1024), 2)
+        return (read_mbs, write_mbs)
+    except Exception:
+        return None
+
+
+def _get_disk_io_remote(remote_cfg):
+    """Return (read_mbs, write_mbs) on remote host from vmstat 1 2, or None."""
+    if not remote_cfg or not (remote_cfg.get('host') or '').strip():
+        return None
+    try:
+        ok, out = _ssh_probe(
+            remote_cfg,
+            "vmstat 1 2 2>/dev/null | tail -1 | awk '{print $9,$10}'",
+            timeout=8
+        )
+        if not ok or not out:
+            return None
+        parts = out.strip().split()
+        if len(parts) < 2:
+            return None
+        bi, bo = int(parts[0]), int(parts[1])
+        read_mbs = round((bi * 512) / (1024 * 1024), 2)
+        write_mbs = round((bo * 512) / (1024 * 1024), 2)
+        return (read_mbs, write_mbs)
+    except Exception:
+        return None
+
+
 def _friendly_process_name(args):
     """Derive a recognizable name from process args (e.g. takserver, authentik, cloudtak, caddy, containers)."""
     a = (args or '').lower()
@@ -839,6 +883,9 @@ def _top_processes_local():
         cpu_model = _get_cpu_model_local()
         if cpu_model:
             result['processor'] = cpu_model
+        disk_io = _get_disk_io_local()
+        if disk_io is not None:
+            result['disk_io_read_mbs'], result['disk_io_write_mbs'] = disk_io
         return result
     except Exception:
         return {'cpu_top': [], 'mem_top': []}
@@ -877,6 +924,9 @@ def _top_processes_remote(remote_cfg):
         cpu_model = _get_cpu_model_remote(remote_cfg)
         if cpu_model:
             result['processor'] = cpu_model
+        disk_io = _get_disk_io_remote(remote_cfg)
+        if disk_io is not None:
+            result['disk_io_read_mbs'], result['disk_io_write_mbs'] = disk_io
         return result
     except Exception as e:
         return {'cpu_top': [], 'mem_top': [], 'error': str(e)[:80]}
@@ -20173,12 +20223,13 @@ async function toggleUU(cb){
 }
 function formatRamGb(memPct,totalRamGb){if(totalRamGb==null)return '';var gb=(Number(memPct||0)/100)*totalRamGb;if(gb>=1)return gb.toFixed(1)+' GB';return (gb*1024).toFixed(0)+' MB';}
 function renderResourceBreakdown(div,data){
-    var err=data.error,cpuTop=data.cpu_top,memTop=data.mem_top,totalRamGb=data.total_ram_gb,processor=data.processor;
+    var err=data.error,cpuTop=data.cpu_top,memTop=data.mem_top,totalRamGb=data.total_ram_gb,processor=data.processor,diskRead=data.disk_io_read_mbs,diskWrite=data.disk_io_write_mbs;
     if(err){div.innerHTML='<span style="color:var(--red)">'+escapeHtml(err)+'</span>';return;}
     var tbl='width:100%;border-collapse:collapse;font-size:10px;text-align:left', th='padding:2px 8px 2px 0;color:var(--cyan);font-weight:600;border-bottom:1px solid var(--border)', td='padding:2px 8px 2px 0;border-bottom:1px solid rgba(255,255,255,0.06)', r='text-align:right';
     var html='';
     if(processor)html+='<div style="margin-bottom:4px;color:var(--text-dim);font-size:10px">Processor: '+escapeHtml(processor)+'</div>';
-    if(totalRamGb!=null)html+='<div style="margin-bottom:6px;color:var(--text-dim)">Total RAM: '+totalRamGb+' GB</div>';
+    if(totalRamGb!=null)html+='<div style="margin-bottom:4px;color:var(--text-dim)">Total RAM: '+totalRamGb+' GB</div>';
+    if(diskRead!=null&&diskWrite!=null)html+='<div style="margin-bottom:6px;color:var(--text-dim);font-size:10px">Disk I/O: '+Number(diskRead).toFixed(2)+' MB/s read, '+Number(diskWrite).toFixed(2)+' MB/s write</div>';
     if(cpuTop&&cpuTop.length){
         html+='<div style="margin-bottom:10px"><strong style="color:var(--cyan)">Top by CPU</strong><table style="'+tbl+';margin-top:4px"><thead><tr><th style="'+th+'">Process</th><th style="'+th+';'+r+'">CPU %</th><th style="'+th+';'+r+'">RAM %</th>'+(totalRamGb!=null?'<th style="'+th+';'+r+'">RAM</th>':'')+'</tr></thead><tbody>';
         cpuTop.forEach(function(p){var ramStr=formatRamGb(p.mem_pct,totalRamGb);html+='<tr><td style="'+td+'">'+escapeHtml(p.name||'')+'</td><td style="'+td+';'+r+';color:var(--green)">'+Number(p.cpu_pct||0).toFixed(1)+'%</td><td style="'+td+';'+r+'">'+Number(p.mem_pct||0).toFixed(1)+'%</td>'+(totalRamGb!=null?'<td style="'+td+';'+r+';color:var(--text-dim)">'+ramStr+'</td>':'')+'</tr>';});
