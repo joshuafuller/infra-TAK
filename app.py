@@ -18296,9 +18296,43 @@ def takserver_revoke_old_ca():
             shell=True, capture_output=True, text=True, timeout=15)
 
         subprocess.run('systemctl restart takserver 2>&1', shell=True, capture_output=True, text=True, timeout=30)
+
+        # 4) Update TAK Portal certs so it can talk to TAK Server (new server cert / chain)
+        portal_running = subprocess.run('docker ps --format "{{.Names}}" 2>/dev/null | grep -q tak-portal', shell=True, capture_output=True).returncode == 0
+        if portal_running:
+            subprocess.run('docker exec tak-portal mkdir -p /usr/src/app/data/certs', shell=True, capture_output=True, text=True)
+            admin_p12 = os.path.join(cert_dir, 'admin.p12')
+            modern_p12 = '/tmp/tak-portal-admin-modern.p12'
+            subprocess.run(
+                f'openssl pkcs12 -in {admin_p12} -passin pass:{cert_pass} -nodes -legacy 2>/dev/null | '
+                f'openssl pkcs12 -export -passout pass:{cert_pass} -out {modern_p12}',
+                shell=True, capture_output=True, text=True, timeout=30)
+            if os.path.exists(modern_p12) and os.path.getsize(modern_p12) > 0:
+                subprocess.run(f'docker cp {modern_p12} tak-portal:/usr/src/app/data/certs/tak-client.p12', shell=True, capture_output=True, text=True)
+                os.remove(modern_p12)
+            else:
+                subprocess.run(f'docker cp {admin_p12} tak-portal:/usr/src/app/data/certs/tak-client.p12', shell=True, capture_output=True, text=True)
+            takserver_pem = os.path.join(cert_dir, 'takserver.pem')
+            if os.path.isfile(takserver_pem):
+                subprocess.run(f'docker cp {takserver_pem} tak-portal:/usr/src/app/data/certs/tak-ca.pem', shell=True, capture_output=True, text=True)
+            else:
+                bundle = '/tmp/tak-ca-bundle-revoke.pem'
+                int_pem = os.path.join(cert_dir, 'ca.pem')
+                root_pem = os.path.join(cert_dir, 'root-ca.pem')
+                if os.path.isfile(int_pem) and os.path.isfile(root_pem):
+                    with open(bundle, 'w') as f:
+                        f.write(open(int_pem).read())
+                        f.write(open(root_pem).read())
+                    subprocess.run(f'docker cp {bundle} tak-portal:/usr/src/app/data/certs/tak-ca.pem', shell=True, capture_output=True, text=True)
+                    try:
+                        os.remove(bundle)
+                    except Exception:
+                        pass
+            subprocess.run('docker restart tak-portal 2>/dev/null', shell=True, capture_output=True, text=True)
+
         msg = (f'Removed {old_ca_alias} from truststore and restarted TAK Server. '
                f'Server cert is now signed by the new CA (clients who re-enrolled via CloudTAK/QR can connect). '
-               f'Clients still using certs signed by {old_ca_alias} must re-enroll.')
+               f'TAK Portal certs updated. Clients still using certs signed by {old_ca_alias} must re-enroll.')
         if os.path.isfile(le_jks):
             msg = (f'Removed {old_ca_alias} from truststore and restarted TAK Server. '
                    f'(Server TLS is Let\'s Encrypt; unchanged.) Clients with certs signed by {old_ca_alias} must re-enroll.')
