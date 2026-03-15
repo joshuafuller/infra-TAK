@@ -8894,6 +8894,18 @@ def run_cloudtak_deploy(cfg=None):
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
         plog("✓ Repository ready")
+        # Log version on disk so we can confirm clone got the right tag (vs UI showing something else)
+        for _pkg in ['api/package.json', 'web/package.json', 'package.json']:
+            _p = os.path.join(cloudtak_dir, _pkg)
+            if os.path.isfile(_p):
+                try:
+                    with open(_p) as _f:
+                        _v = (json.load(_f).get('version') or '').strip()
+                    if _v:
+                        plog(f"  Version on disk ({_pkg}): {_v}")
+                        break
+                except Exception:
+                    pass
 
         # Ensure compose file exists (fix partial/bad clone)
         compose_yml = os.path.join(cloudtak_dir, 'docker-compose.yml')
