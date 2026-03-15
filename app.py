@@ -19635,6 +19635,39 @@ def download_truststore():
                 return send_from_directory(p, f, as_attachment=True)
     return jsonify({'error': 'truststore not found'}), 404
 
+
+@app.route('/api/takserver/sync-portal-ca', methods=['POST'])
+@login_required
+def takserver_sync_portal_ca():
+    """Copy current server CA chain to TAK Portal and restart. Use when enrollment says success but ATAK shows 'host not trusted'."""
+    cert_dir = '/opt/tak/certs/files'
+    r = subprocess.run('docker ps --format "{{.Names}}" 2>/dev/null | grep -q tak-portal', shell=True, capture_output=True, text=True)
+    if r.returncode != 0:
+        return jsonify({'success': False, 'error': 'TAK Portal container is not running. Start it first.'}), 400
+    subprocess.run('docker exec tak-portal mkdir -p /usr/src/app/data/certs', shell=True, capture_output=True, text=True)
+    takserver_pem = os.path.join(cert_dir, 'takserver.pem')
+    if os.path.isfile(takserver_pem):
+        cp = subprocess.run(f'docker cp {takserver_pem} tak-portal:/usr/src/app/data/certs/tak-ca.pem', shell=True, capture_output=True, text=True, timeout=10)
+    else:
+        int_pem = os.path.join(cert_dir, 'ca.pem')
+        root_pem = os.path.join(cert_dir, 'root-ca.pem')
+        if not os.path.isfile(int_pem) or not os.path.isfile(root_pem):
+            return jsonify({'success': False, 'error': 'No takserver.pem or ca.pem/root-ca.pem in certs/files'}), 500
+        bundle = '/tmp/tak-portal-sync-ca.pem'
+        with open(bundle, 'w') as f:
+            f.write(open(int_pem).read())
+            f.write(open(root_pem).read())
+        cp = subprocess.run(f'docker cp {bundle} tak-portal:/usr/src/app/data/certs/tak-ca.pem', shell=True, capture_output=True, text=True, timeout=10)
+        try:
+            os.remove(bundle)
+        except Exception:
+            pass
+    if cp.returncode != 0:
+        return jsonify({'success': False, 'error': (cp.stderr or cp.stdout or 'docker cp failed').strip()[:200]}), 500
+    subprocess.run('docker restart tak-portal 2>/dev/null', shell=True, capture_output=True, text=True, timeout=30)
+    return jsonify({'success': True, 'message': 'Server CA copied to TAK Portal and portal restarted. Try enrolling again; if ATAK still says host not trusted, delete the connection in ATAK and enroll again.'})
+
+
 @app.route('/api/certs/list')
 @login_required
 def list_cert_files():
@@ -20822,7 +20855,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div id="deploy-log" style="background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary);max-height:500px;overflow-y:auto;line-height:1.7;white-space:pre-wrap">Reconnecting to deployment log...</div>
 <div id="deploy-log-area" style="display:block"></div>
 {% if deploy_done %}
-<div id="cert-download-area" style="margin-top:20px"><div class="section-title">Download Certificates</div><div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px"><div class="cert-downloads"><a href="/api/download/admin-cert" class="cert-btn cert-btn-secondary">⬇ admin.p12</a><a href="/api/download/user-cert" class="cert-btn cert-btn-secondary">⬇ user.p12</a><a href="/api/download/truststore" class="cert-btn cert-btn-secondary">⬇ truststore.p12</a></div><div style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim);margin-top:12px">Certificate password: <span style="color:var(--cyan)">{{ settings.get('tak_cert_password','atakatak') }}</span></div></div></div>
+<div id="cert-download-area" style="margin-top:20px"><div class="section-title">Download Certificates</div><div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px"><div class="cert-downloads"><a href="/api/download/admin-cert" class="cert-btn cert-btn-secondary">⬇ admin.p12</a><a href="/api/download/user-cert" class="cert-btn cert-btn-secondary">⬇ user.p12</a><a href="/api/download/truststore" class="cert-btn cert-btn-secondary">⬇ truststore.p12</a></div><div style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim);margin-top:12px">Certificate password: <span style="color:var(--cyan)">{{ settings.get('tak_cert_password','atakatak') }}</span></div><div style="margin-top:16px;padding-top:16px;border-top:1px solid var(--border)"><div style="font-size:11px;color:var(--text-dim);margin-bottom:8px">If TAK Portal enrollment says success but ATAK shows <em>host not trusted</em>, sync the server CA to the portal then try again (or delete the connection in ATAK and re-enroll).</div><button type="button" id="sync-portal-ca-btn" onclick="syncPortalCA()" class="cert-btn cert-btn-secondary">Sync server CA to TAK Portal</button><span id="sync-portal-ca-msg" style="margin-left:10px;font-size:12px"></span></div></div></div>
 {% endif %}
 {% elif tak.installed %}
 {% if show_connect_ldap %}
