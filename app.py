@@ -13477,7 +13477,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div class="section-title" style="margin-top:20px">Controls</div>
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:24px">
 <div class="controls" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
-{% if portal.running %}<button class="control-btn" onclick="portalControl('restart')">↻ Restart</button><button class="control-btn" onclick="portalReconfigure()" title="Refresh Authentik/TAK Server settings and restart container">🔄 Update config</button><button class="control-btn btn-update" id="update-btn" onclick="portalUpdate()"{% if portal_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if portal_update_available %} <span style="color:var(--cyan)" title="Update available: v{{ portal_latest }}">●</span>{% endif %}</button><button class="control-btn btn-stop" onclick="portalControl('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('portal-uninstall-modal').classList.add('open')">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="portalControl('start')">▶ Start</button><button class="control-btn" onclick="portalReconfigure()" title="Refresh Authentik/TAK Server settings and restart container">🔄 Update config</button><button class="control-btn btn-update" id="update-btn" onclick="portalUpdate()"{% if portal_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if portal_update_available %} <span style="color:var(--cyan)" title="Update available: v{{ portal_latest }}">●</span>{% endif %}</button><button class="control-btn btn-remove" onclick="document.getElementById('portal-uninstall-modal').classList.add('open')">🗑 Remove</button>{% endif %}
+{% if portal.running %}<button class="control-btn" onclick="portalControl('restart')">↻ Restart</button><button class="control-btn" onclick="portalReconfigure()" title="Refresh Authentik/TAK Server settings and restart container">🔄 Update config</button><button class="control-btn" onclick="syncPortalCA()" id="sync-portal-ca-btn" title="Copy TAK Server CA to portal and restart. Use when enrollment succeeds but ATAK says host not trusted.">🔒 Sync server CA</button><button class="control-btn btn-update" id="update-btn" onclick="portalUpdate()"{% if portal_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if portal_update_available %} <span style="color:var(--cyan)" title="Update available: v{{ portal_latest }}">●</span>{% endif %}</button><button class="control-btn btn-stop" onclick="portalControl('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('portal-uninstall-modal').classList.add('open')">🗑 Remove</button><span id="sync-portal-ca-msg" style="margin-left:8px;font-size:12px"></span>{% else %}<button class="control-btn btn-start" onclick="portalControl('start')">▶ Start</button><button class="control-btn" onclick="portalReconfigure()" title="Refresh Authentik/TAK Server settings and restart container">🔄 Update config</button><button class="control-btn" onclick="syncPortalCA()" id="sync-portal-ca-btn" title="Copy TAK Server CA to portal and restart. Use when enrollment succeeds but ATAK says host not trusted.">🔒 Sync server CA</button><button class="control-btn btn-update" id="update-btn" onclick="portalUpdate()"{% if portal_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if portal_update_available %} <span style="color:var(--cyan)" title="Update available: v{{ portal_latest }}">●</span>{% endif %}</button><button class="control-btn btn-remove" onclick="document.getElementById('portal-uninstall-modal').classList.add('open')">🗑 Remove</button><span id="sync-portal-ca-msg" style="margin-left:8px;font-size:12px"></span>{% endif %}
 </div>
 <div id="update-status" style="display:none;margin-top:12px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary)"></div>
 </div>
@@ -13618,6 +13618,24 @@ async function portalReconfigure(){
         if(status){status.style.color='var(--red)';status.textContent='✗ '+e.message;}
         btns.forEach(function(b){b.disabled=false;b.style.opacity='1';});
     }
+}
+async function syncPortalCA(){
+    var btn=document.getElementById('sync-portal-ca-btn');
+    var msgEl=document.getElementById('sync-portal-ca-msg');
+    if(btn)btn.disabled=true;
+    if(msgEl){msgEl.textContent='Syncing...';msgEl.style.color='var(--text-dim)';}
+    try{
+        var r=await fetch('/api/takserver/sync-portal-ca',{method:'POST',headers:{'Content-Type':'application/json'}});
+        var d=await r.json();
+        if(d.success){
+            if(msgEl){msgEl.textContent=d.message||'Done. Try enrolling again.';msgEl.style.color='var(--green)';}
+        }else{
+            if(msgEl){msgEl.textContent=d.error||'Failed';msgEl.style.color='var(--red)';}
+        }
+    }catch(e){
+        if(msgEl){msgEl.textContent='Error: '+e.message;msgEl.style.color='var(--red)';}
+    }
+    if(btn)btn.disabled=false;
 }
 async function portalUpdate(){
     var btn=document.getElementById('update-btn');
@@ -20855,7 +20873,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div id="deploy-log" style="background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary);max-height:500px;overflow-y:auto;line-height:1.7;white-space:pre-wrap">Reconnecting to deployment log...</div>
 <div id="deploy-log-area" style="display:block"></div>
 {% if deploy_done %}
-<div id="cert-download-area" style="margin-top:20px"><div class="section-title">Download Certificates</div><div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px"><div class="cert-downloads"><a href="/api/download/admin-cert" class="cert-btn cert-btn-secondary">⬇ admin.p12</a><a href="/api/download/user-cert" class="cert-btn cert-btn-secondary">⬇ user.p12</a><a href="/api/download/truststore" class="cert-btn cert-btn-secondary">⬇ truststore.p12</a></div><div style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim);margin-top:12px">Certificate password: <span style="color:var(--cyan)">{{ settings.get('tak_cert_password','atakatak') }}</span></div><div style="margin-top:16px;padding-top:16px;border-top:1px solid var(--border)"><div style="font-size:11px;color:var(--text-dim);margin-bottom:8px">If TAK Portal enrollment says success but ATAK shows <em>host not trusted</em>, sync the server CA to the portal then try again (or delete the connection in ATAK and re-enroll).</div><button type="button" id="sync-portal-ca-btn" onclick="syncPortalCA()" class="cert-btn cert-btn-secondary">Sync server CA to TAK Portal</button><span id="sync-portal-ca-msg" style="margin-left:10px;font-size:12px"></span></div></div></div>
+<div id="cert-download-area" style="margin-top:20px"><div class="section-title">Download Certificates</div><div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px"><div class="cert-downloads"><a href="/api/download/admin-cert" class="cert-btn cert-btn-secondary">⬇ admin.p12</a><a href="/api/download/user-cert" class="cert-btn cert-btn-secondary">⬇ user.p12</a><a href="/api/download/truststore" class="cert-btn cert-btn-secondary">⬇ truststore.p12</a></div><div style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim);margin-top:12px">Certificate password: <span style="color:var(--cyan)">{{ settings.get('tak_cert_password','atakatak') }}</span></div></div></div>
 {% endif %}
 {% elif tak.installed %}
 {% if show_connect_ldap %}

@@ -447,25 +447,6 @@ async function revokeOldCA(alias){
   }
 }
 
-async function syncPortalCA(){
-  var btn=document.getElementById('sync-portal-ca-btn');
-  var msgEl=document.getElementById('sync-portal-ca-msg');
-  if(btn)btn.disabled=true;
-  if(msgEl){msgEl.textContent='Syncing...';msgEl.style.color='var(--text-dim)';}
-  try{
-    var r=await fetch('/api/takserver/sync-portal-ca',{method:'POST',headers:{'Content-Type':'application/json'}});
-    var d=await r.json();
-    if(d.success){
-      if(msgEl){msgEl.textContent=d.message||'Done. Try enrolling again.';msgEl.style.color='var(--green)';}
-    }else{
-      if(msgEl){msgEl.textContent=d.error||'Failed';msgEl.style.color='var(--red)';}
-    }
-  }catch(e){
-    if(msgEl){msgEl.textContent='Error: '+e.message;msgEl.style.color='var(--red)';}
-  }
-  if(btn)btn.disabled=false;
-}
-
 async function rotateRootCA(){
   var rootInput=document.getElementById('rotate-root-name');
   var intInput=document.getElementById('rotate-root-int-name');
