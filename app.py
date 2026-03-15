@@ -18153,8 +18153,10 @@ def takserver_rotate_intca():
             log(f"✓ Intermediate CA {new_ca_name} created")
 
             log("")
-            log("Step 3/7: Keeping existing server TLS certificate (signed by old CA)...")
-            log("  (Server cert is NOT replaced so existing ATAK clients keep connecting.)")
+            log("Step 3/7: Creating new server certificate (signed by new CA)...")
+            if not run(f'cd /opt/tak/certs && echo "y" | sudo -u tak ./makeCert.sh server takserver 2>&1'):
+                raise Exception('Failed to create new server certificate')
+            log("✓ Server certificate regenerated (signed by new CA)")
 
             log("")
             log("Step 4/7: Regenerating all client certificates...")
@@ -18264,11 +18266,11 @@ def takserver_rotate_intca():
 
             log("")
             log("━━━ ROTATION COMPLETE ━━━")
-            log(f"  New signing CA: {new_ca_name} (new client certs use this)")
-            log(f"  Server TLS cert unchanged (still signed by {old_ca_name}) — existing ATAK clients keep working")
-            log(f"  Old CA ({old_ca_name}) remains in truststore so server accepts both old and new client certs")
-            log(f"  New admin.p12 and user.p12 regenerated (signed by new CA); re-import admin.p12 for 8443/CloudTAK")
-            log(f"  When everyone has re-enrolled (new CA), use 'Revoke Old CA' to remove {old_ca_name}")
+            log(f"  New CA: {new_ca_name}")
+            log(f"  Server cert + all client certs signed by new CA")
+            log(f"  Old CA ({old_ca_name}) in truststore — server still accepts old client certs during transition")
+            log(f"  Existing ATAK clients must re-enroll (new QR) to get the new CA")
+            log(f"  When everyone has re-enrolled, use 'Revoke Old CA' to remove {old_ca_name}")
             rotate_intca_status.update({'running': False, 'complete': True, 'error': False})
         except Exception as e:
             log(f"")
