@@ -18213,22 +18213,37 @@ def takserver_rotate_intca():
                 else:
                     run(f'docker cp {admin_p12} tak-portal:/usr/src/app/data/certs/tak-client.p12', check=False)
                     log("  ✓ admin.p12 copied to TAK Portal")
-                # Transition bundle: both old and new intermediate CAs so clients trust server cert before and after Revoke (see mytecknet.com/tak-pki-intermediateca/)
-                int_pem = os.path.join(cert_dir, 'ca.pem')
-                root_pem = os.path.join(cert_dir, 'root-ca.pem')
-                bundle = '/tmp/tak-ca-transition.pem'
-                if os.path.exists(old_pem):
-                    # Old intermediate FIRST so server (still presenting old cert) is trusted by Portal and clients right after Rotate
-                    run(f'cat {old_pem} {int_pem} {root_pem} > {bundle} 2>/dev/null', check=False)
+                # Keep TAK Portal CA source identical to original deploy behavior:
+                # prefer takserver.pem (full server chain), fallback to ca.pem + root-ca.pem.
+                tak_ca_src = None
+                takserver_pem = os.path.join(cert_dir, 'takserver.pem')
+                if os.path.exists(takserver_pem):
+                    tak_ca_src = takserver_pem
+                    log("  Using takserver.pem (full chain)")
                 else:
-                    run(f'cat {int_pem} {root_pem} > {bundle} 2>/dev/null', check=False)
-                if os.path.exists(bundle) and os.path.getsize(bundle) > 0:
-                    run(f'docker cp {bundle} tak-portal:/usr/src/app/data/certs/tak-ca.pem', check=False)
-                    os.remove(bundle)
-                    if os.path.exists(old_pem):
-                        log("  ✓ CA bundle (old + new intermediate + root) copied to TAK Portal — trust preserved until Revoke")
-                    else:
-                        log("  ✓ CA bundle (new intermediate + root) copied to TAK Portal")
+                    int_ca = os.path.join(cert_dir, 'ca.pem')
+                    root_ca = os.path.join(cert_dir, 'root-ca.pem')
+                    bundle_parts = []
+                    for ca_file in [int_ca, root_ca]:
+                        if os.path.exists(ca_file):
+                            with open(ca_file, 'r') as f:
+                                content = f.read().strip()
+                            if 'BEGIN CERTIFICATE' in content and 'TRUSTED' not in content:
+                                bundle_parts.append(content)
+                    if bundle_parts:
+                        ca_bundle_path = '/tmp/tak-ca-bundle-rotate.pem'
+                        with open(ca_bundle_path, 'w') as f:
+                            f.write('\n'.join(bundle_parts) + '\n')
+                        tak_ca_src = ca_bundle_path
+                        log(f"  Built CA bundle from ca.pem + root-ca.pem ({len(bundle_parts)} certs)")
+                if tak_ca_src:
+                    run(f'docker cp {tak_ca_src} tak-portal:/usr/src/app/data/certs/tak-ca.pem', check=False)
+                    if tak_ca_src.startswith('/tmp/'):
+                        try:
+                            os.remove(tak_ca_src)
+                        except Exception:
+                            pass
+                    log("  ✓ CA chain copied to TAK Portal")
                 run('docker restart tak-portal 2>/dev/null', check=False)
                 log("  ✓ TAK Portal restarted with new certificates")
             else:
