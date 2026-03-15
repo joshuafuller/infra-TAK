@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""infra-TAK v0.2.1 - TAK Infrastructure Platform"""
+"""infra-TAK v0.2.2 - TAK Infrastructure Platform"""
 
 # === Auto-upgrade: seamlessly switch from Flask dev server to gunicorn ===
 # When the old systemd service runs "python3 app.py", this block installs
@@ -106,17 +106,37 @@ def _is_rate_limited(key, limit, window_seconds):
         return False
 
 
+def _effective_request_host():
+    """Host the browser sees when behind a reverse proxy. Use X-Forwarded-* when present."""
+    xfh = (request.headers.get('X-Forwarded-Host') or '').strip()
+    if xfh:
+        xfp = (request.headers.get('X-Forwarded-Port') or '').strip()
+        if xfp and xfp != '443' and xfp != '80':
+            return f'{xfh}:{xfp}' if ':' not in xfh else xfh
+        return xfh
+    return (request.host or '').strip()
+
+
 def _same_origin_ok():
     """CSRF baseline: allow only same-origin state-changing browser requests.
-    Accepts exact Origin host match, or Referer prefix match when Origin is absent."""
-    host = (request.host or '').strip()
+    Accepts exact Origin host match, or Referer prefix match when Origin is absent.
+    Uses X-Forwarded-Host when behind Caddy/nginx so proxied requests pass."""
+    host = _effective_request_host()
     if not host:
         return False
+    # Normalize for comparison: treat host and "host:443" / "host:80" as same
+    def norm(n):
+        if not n:
+            return ''
+        if n.endswith(':443') or n.endswith(':80'):
+            return n.rsplit(':', 1)[0]
+        return n
     origin = (request.headers.get('Origin') or '').strip()
     if origin:
         try:
             po = urllib.parse.urlparse(origin)
-            if po.netloc == host:
+            onet = (po.netloc or '').strip()
+            if onet == host or norm(onet) == norm(host):
                 return True
         except Exception:
             return False
@@ -124,7 +144,8 @@ def _same_origin_ok():
     if referer:
         try:
             pr = urllib.parse.urlparse(referer)
-            if pr.netloc == host:
+            rnet = (pr.netloc or '').strip()
+            if rnet == host or norm(rnet) == norm(host):
                 return True
         except Exception:
             return False
@@ -249,7 +270,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.2.1-alpha"
+VERSION = "0.2.2-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -5887,6 +5908,9 @@ def _get_cloudtak_latest_release_tag(use_cache=True):
                 _cloudtak_release_cache['ts'] = _time.time()
             return tag
     except Exception:
+        # During deploy (use_cache=False) do not use stale cache — return None so we clone default branch
+        if not use_cache:
+            return None
         return _cloudtak_release_cache.get('tag')
 
 
@@ -8625,6 +8649,9 @@ def run_cloudtak_deploy(cfg=None):
         entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
         cloudtak_deploy_log.append(entry)
         print(entry, flush=True)
+    # Clear release tag cache so we fetch fresh "latest" from GitHub (avoid deploying an old tag)
+    _cloudtak_release_cache['tag'] = None
+    _cloudtak_release_cache['ts'] = 0
     try:
         settings = load_settings()
         cfg = cfg or _get_cloudtak_deployment_config(settings)
@@ -8736,7 +8763,7 @@ def run_cloudtak_deploy(cfg=None):
             plog("━━━ Step 5/6: Building/Starting remote containers ━━━")
             run_cmd = (
                 "cd ~/CloudTAK && "
-                "docker compose build && "
+                "docker compose build --no-cache && "
                 "docker compose up -d"
             )
             ok, out = _ssh_probe(remote_cfg, run_cmd, timeout=3600)
@@ -8744,6 +8771,7 @@ def run_cloudtak_deploy(cfg=None):
                 plog(f"✗ Remote build/start failed: {(out or '')[:220]}")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
+            plog("✓ Containers built and restarted.")
             fw_cmd = (
                 "sudo ufw allow 5000/tcp >/dev/null 2>&1 || true; "
                 "sudo ufw allow 5002/tcp >/dev/null 2>&1 || true; "
@@ -8790,6 +8818,7 @@ def run_cloudtak_deploy(cfg=None):
             settings['cloudtak_deployment'] = _normalize_cloudtak_deployment_config(cfg)
             save_settings(settings)
             plog("✓ CloudTAK remote deployment complete")
+            plog("Deploy finished — CloudTAK is running.")
             cloudtak_deploy_status.update({'running': False, 'complete': True, 'error': False})
             return
 
@@ -8922,7 +8951,7 @@ def run_cloudtak_deploy(cfg=None):
         plog("━━━ Step 4/7: Building Docker Images ━━━")
         plog("  This may take 5-10 minutes on first run...")
         proc = subprocess.Popen(
-            'docker compose build 2>&1',
+            'docker compose build --no-cache 2>&1',
             shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=cloudtak_dir, bufsize=1
         )
         def _read_build():
@@ -8963,6 +8992,7 @@ def run_cloudtak_deploy(cfg=None):
             cloudtak_deploy_status.update({'running': False, 'error': True})
             return
         plog("✓ Containers started")
+        plog("✓ Restart complete.")
 
         # Open port 5000 (and 5002 for tiles) so http://ip:5000 works when no domain or before Caddy is used
         for port in ['5000/tcp', '5002/tcp']:
@@ -9084,6 +9114,7 @@ def run_cloudtak_deploy(cfg=None):
             plog(f"🎉 CloudTAK deployed! Open http://{server_ip}:5000 in your browser")
         plog(f"   Log in and go to Admin → Connections to configure your TAK Server")
         plog("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        plog("Deploy finished — CloudTAK is running and ready.")
         cfg['deployed'] = True
         settings['cloudtak_deployment'] = _normalize_cloudtak_deployment_config(cfg)
         save_settings(settings)
@@ -9301,7 +9332,7 @@ def run_cloudtak_update():
         plog("")
         plog("━━━ Step 3/3: Rebuilding and restarting ━━━")
         if is_remote:
-            build_cmd = "cd ~/CloudTAK && docker compose up -d --build"
+            build_cmd = "cd ~/CloudTAK && docker compose build --no-cache && docker compose up -d"
             ok, out = _ssh_probe(remote_cfg, build_cmd, timeout=2700)
             if not ok:
                 plog(f"✗ Build/restart failed on remote: {(out or '')[:220]}")
@@ -9310,11 +9341,11 @@ def run_cloudtak_update():
         else:
             cloudtak_dir = os.path.expanduser('~/CloudTAK')
             r = subprocess.run(
-                'docker compose up -d --build 2>&1',
+                'docker compose build --no-cache && docker compose up -d 2>&1',
                 shell=True, capture_output=True, text=True, timeout=2700, cwd=cloudtak_dir)
             if r.returncode != 0:
                 r = subprocess.run(
-                    'docker-compose up -d --build 2>&1',
+                    'docker-compose build --no-cache && docker-compose up -d 2>&1',
                     shell=True, capture_output=True, text=True, timeout=2700, cwd=cloudtak_dir)
             if r.returncode != 0:
                 plog(f"✗ Build/restart failed: {(r.stderr or r.stdout or 'unknown')[:300]}")
@@ -9323,6 +9354,7 @@ def run_cloudtak_update():
         plog("✓ Containers rebuilt and restarted")
         plog("")
         plog(f"✓ CloudTAK updated to {release_tag}")
+        plog("Update finished — CloudTAK is running.")
         _update_boot_stagger_service()
         cloudtak_deploy_status.update({'running': False, 'complete': True, 'error': False})
     except Exception as e:
@@ -12565,8 +12597,8 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <div id="control-status" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
   </div>
 
-  {% if cloudtak.running %}
-  <!-- Access -->
+  {% if cloudtak.running and not deploying %}
+  <!-- Access (only when install/deploy is complete) -->
   <div class="card">
     <div class="card-title">Access</div>
     <div class="info-grid">
