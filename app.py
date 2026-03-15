@@ -8701,11 +8701,7 @@ def run_cloudtak_deploy(cfg=None):
             if remote_release_tag:
                 plog(f"  Target: stable release {remote_release_tag}")
                 prep_cmd = (
-                    "if [ -d ~/CloudTAK/.git ]; then "
-                    f"cd ~/CloudTAK && git fetch --depth 1 origin tag {remote_release_tag} && git checkout {remote_release_tag}; "
-                    "else "
-                    f"rm -rf ~/CloudTAK && git clone --depth 1 --branch {remote_release_tag} https://github.com/dfpc-coe/CloudTAK.git ~/CloudTAK; "
-                    "fi; "
+                    f"rm -rf ~/CloudTAK && git clone --depth 1 --branch {remote_release_tag} https://github.com/dfpc-coe/CloudTAK.git ~/CloudTAK && "
                     "test -f ~/CloudTAK/docker-compose.yml -o -f ~/CloudTAK/compose.yaml"
                 )
             else:
@@ -8843,18 +8839,17 @@ def run_cloudtak_deploy(cfg=None):
         # Step 2: Clone or update repo
         plog("")
         plog("━━━ Step 2/7: Cloning CloudTAK ━━━")
+        release_tag = _get_cloudtak_latest_release_tag(use_cache=False)
         if os.path.exists(cloudtak_dir):
-            release_tag = _get_cloudtak_latest_release_tag(use_cache=False)
             if release_tag:
-                plog(f"  ~/CloudTAK exists — updating to stable {release_tag}...")
-                r = subprocess.run(
-                    f'cd {cloudtak_dir} && git fetch --depth 1 origin tag {release_tag} && git checkout {release_tag}',
-                    shell=True, capture_output=True, text=True, timeout=120)
+                plog(f"  ~/CloudTAK exists — re-cloning {release_tag} so version is correct...")
+                subprocess.run(f'rm -rf {cloudtak_dir}', shell=True, capture_output=True, timeout=30)
+                clone_cmd = f'git clone --depth 1 --branch {release_tag} https://github.com/dfpc-coe/CloudTAK.git {cloudtak_dir}'
+                r = subprocess.run(clone_cmd, shell=True, capture_output=True, text=True, timeout=600)
                 if r.returncode != 0:
-                    plog(f"  ⚠ git fetch/checkout warning: {r.stderr.strip()[:100]} — falling back to pull")
-                    subprocess.run(
-                        f'cd {cloudtak_dir} && git -c safe.directory={cloudtak_dir} pull --rebase --autostash',
-                        shell=True, capture_output=True, text=True, timeout=120)
+                    plog(f"✗ Re-clone failed: {(r.stderr or r.stdout or '').strip()[:200]}")
+                    cloudtak_deploy_status.update({'running': False, 'error': True})
+                    return
             else:
                 plog("  ~/CloudTAK exists — pulling latest (could not fetch release tag)...")
                 r = subprocess.run(
