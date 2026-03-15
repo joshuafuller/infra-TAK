@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""infra-TAK v0.2.0 - TAK Infrastructure Platform"""
+"""infra-TAK v0.2.1 - TAK Infrastructure Platform"""
 
 # === Auto-upgrade: seamlessly switch from Flask dev server to gunicorn ===
 # When the old systemd service runs "python3 app.py", this block installs
@@ -249,7 +249,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.2.0-alpha"
+VERSION = "0.2.1-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
