@@ -18113,6 +18113,12 @@ def takserver_rotate_intca():
             log(f"  New CA: {new_ca_name}")
             log("")
 
+            # Save current (old) intermediate to a named file before we overwrite ca.pem — needed for transition bundle and truststore
+            old_pem = os.path.join(cert_dir, f'{old_ca_name}.pem')
+            if not os.path.exists(old_pem):
+                run(f'cp {cert_dir}/ca.pem {old_pem}')
+                log(f"  Saved current CA to {old_ca_name}.pem for transition bundle")
+
             log("Step 1/7: Restoring Root CA as working CA...")
             run(f'cp {cert_dir}/root-ca.pem {cert_dir}/ca.pem')
             run(f'cp {cert_dir}/root-ca-do-not-share.key {cert_dir}/ca-do-not-share.key')
@@ -18194,7 +18200,8 @@ def takserver_rotate_intca():
                 root_pem = os.path.join(cert_dir, 'root-ca.pem')
                 bundle = '/tmp/tak-ca-transition.pem'
                 if os.path.exists(old_pem):
-                    run(f'cat {old_pem} {int_pem} {root_pem} > {bundle} 2>/dev/null', check=False)
+                    # New intermediate first so clients prefer it when validating server cert after Revoke
+                    run(f'cat {int_pem} {old_pem} {root_pem} > {bundle} 2>/dev/null', check=False)
                 else:
                     run(f'cat {int_pem} {root_pem} > {bundle} 2>/dev/null', check=False)
                 if os.path.exists(bundle) and os.path.getsize(bundle) > 0:
