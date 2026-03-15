@@ -187,6 +187,16 @@ if(document.getElementById('ldap-drift-banner')){checkLdapDrift();}
 if(document.getElementById('cot-db-size')){refreshCotSize();}
 if(document.getElementById('cert-expiry-info')){loadCertExpiry();}
 if(document.getElementById('rotate-ca-info')){loadCAInfo();}
+function refreshTakServerCAState(){
+  if(document.getElementById('cert-expiry-info'))loadCertExpiry();
+  if(document.getElementById('rotate-ca-info'))loadCAInfo();
+}
+document.addEventListener('visibilitychange',function(){
+  if(document.visibilityState==='visible')refreshTakServerCAState();
+});
+window.addEventListener('pageshow',function(ev){
+  if(ev.persisted)refreshTakServerCAState();
+});
 async function loadGroups(){
   var el=document.getElementById('cc-groups-list');if(!el)return;
   el.innerHTML='<span style="color:var(--text-dim)">Loading groups...</span>';
@@ -349,19 +359,23 @@ async function loadCAInfo(){
     if(rootNameInput&&d.suggested_new_root_name&&!rootNameInput.value)rootNameInput.value=d.suggested_new_root_name;
     var rootIntInput=document.getElementById('rotate-root-int-name');
     if(rootIntInput&&d.suggested_new_root_int_name&&!rootIntInput.value)rootIntInput.value=d.suggested_new_root_int_name;
-    if(revokeEl&&d.old_cas_in_truststore&&d.old_cas_in_truststore.length>0){
-      revokeEl.style.display='block';
-      var listEl=document.getElementById('revoke-ca-list');
-      if(listEl){
-        var rh='';
-        for(var i=0;i<d.old_cas_in_truststore.length;i++){
-          var alias=d.old_cas_in_truststore[i];
-          rh+='<div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">';
-          rh+='<span style="color:var(--yellow)">'+alias+'</span>';
-          rh+='<button type="button" onclick="revokeOldCA(\''+alias.replace(/'/g,"\\'")+'\')" style="padding:6px 14px;background:rgba(239,68,68,0.15);color:var(--red);border:1px solid rgba(239,68,68,0.3);border-radius:6px;font-family:\'JetBrains Mono\',monospace;font-size:11px;cursor:pointer">Revoke</button>';
-          rh+='</div>';
+    if(revokeEl){
+      if(d.old_cas_in_truststore&&d.old_cas_in_truststore.length>0){
+        revokeEl.style.display='block';
+        var listEl=document.getElementById('revoke-ca-list');
+        if(listEl){
+          var rh='';
+          for(var i=0;i<d.old_cas_in_truststore.length;i++){
+            var alias=d.old_cas_in_truststore[i];
+            rh+='<div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">';
+            rh+='<span style="color:var(--yellow)">'+alias+'</span>';
+            rh+='<button type="button" onclick="revokeOldCA(\''+alias.replace(/'/g,"\\'")+'\')" style="padding:6px 14px;background:rgba(239,68,68,0.15);color:var(--red);border:1px solid rgba(239,68,68,0.3);border-radius:6px;font-family:\'JetBrains Mono\',monospace;font-size:11px;cursor:pointer">Revoke</button>';
+            rh+='</div>';
+          }
+          listEl.innerHTML=rh;
         }
-        listEl.innerHTML=rh;
+      }else{
+        revokeEl.style.display='none';
       }
     }
   }catch(e){infoEl.textContent='Failed to load CA info';}
