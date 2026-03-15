@@ -18189,19 +18189,21 @@ def takserver_rotate_intca():
                 else:
                     run(f'docker cp {admin_p12} tak-portal:/usr/src/app/data/certs/tak-client.p12', check=False)
                     log("  ✓ admin.p12 copied to TAK Portal")
-                takserver_pem = os.path.join(cert_dir, 'takserver.pem')
-                if os.path.exists(takserver_pem):
-                    run(f'docker cp {takserver_pem} tak-portal:/usr/src/app/data/certs/tak-ca.pem', check=False)
-                    log("  ✓ CA chain copied to TAK Portal")
+                # Transition bundle: both old and new intermediate CAs so clients trust server cert before and after Revoke (see mytecknet.com/tak-pki-intermediateca/)
+                int_pem = os.path.join(cert_dir, 'ca.pem')
+                root_pem = os.path.join(cert_dir, 'root-ca.pem')
+                bundle = '/tmp/tak-ca-transition.pem'
+                if os.path.exists(old_pem):
+                    run(f'cat {old_pem} {int_pem} {root_pem} > {bundle} 2>/dev/null', check=False)
                 else:
-                    int_pem = os.path.join(cert_dir, 'ca.pem')
-                    root_pem = os.path.join(cert_dir, 'root-ca.pem')
-                    bundle = '/tmp/tak-ca-bundle.pem'
                     run(f'cat {int_pem} {root_pem} > {bundle} 2>/dev/null', check=False)
-                    if os.path.exists(bundle) and os.path.getsize(bundle) > 0:
-                        run(f'docker cp {bundle} tak-portal:/usr/src/app/data/certs/tak-ca.pem', check=False)
-                        os.remove(bundle)
-                        log("  ✓ CA bundle copied to TAK Portal")
+                if os.path.exists(bundle) and os.path.getsize(bundle) > 0:
+                    run(f'docker cp {bundle} tak-portal:/usr/src/app/data/certs/tak-ca.pem', check=False)
+                    os.remove(bundle)
+                    if os.path.exists(old_pem):
+                        log("  ✓ CA bundle (old + new intermediate + root) copied to TAK Portal — clients trust both CAs until Revoke")
+                    else:
+                        log("  ✓ CA bundle (new intermediate + root) copied to TAK Portal")
                 run('docker restart tak-portal 2>/dev/null', check=False)
                 log("  ✓ TAK Portal restarted with new certificates")
             else:
