@@ -1,6 +1,7 @@
 #!/bin/bash
 # Guard Dog: Authentik container health. On 3 consecutive failures: alert and restart containers.
 
+SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
 STATE_DIR="/var/lib/takguard"
 FAIL_FILE="$STATE_DIR/authentik.failcount"
 COOLDOWN_FILE="$STATE_DIR/authentik_last_restart"
@@ -44,9 +45,10 @@ TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 mkdir -p /var/log/takguard
 echo "$TS | restart | Authentik unhealthy (HTTP $CODE) — restarting containers" >> /var/log/takguard/restarts.log
 
-SUBJ="Guard Dog: Authentik restarted on $(hostname)"
+SUBJ="Guard Dog: Authentik restarted on $SERVER_IDENTIFIER"
 BODY="Authentik failed health check (HTTP $CODE) for $FAILS consecutive checks.
 
+Server: $SERVER_IDENTIFIER
 Time (UTC): $TS
 Action: Restarting Authentik containers (docker compose restart).
 

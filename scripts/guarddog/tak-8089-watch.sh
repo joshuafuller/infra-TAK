@@ -1,5 +1,6 @@
 #!/bin/bash
 
+SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
 STATE_DIR="/var/lib/takguard"
 FAIL_FILE="$STATE_DIR/8089.failcount"
 COOLDOWN_FILE="$STATE_DIR/last_restart"
@@ -103,9 +104,10 @@ MSGPID="$(ps -ef | grep takserver.war | grep messaging | grep -v grep | awk '{pr
 echo "$TS | restart | 8089 unhealthy | load=$LOAD | mem_free=$MEMFREE | msg_pid=${MSGPID:-na}" >> "$LOGFILE"
 
 # Send alerts
-SUBJ="TAK Guard Dog Restart on $(hostname)"
+SUBJ="TAK Guard Dog Restart on $SERVER_IDENTIFIER"
 BODY="TAK Server was automatically restarted by the guard dog.
 
+Server: $SERVER_IDENTIFIER
 Reason: TCP 8089 unhealthy for $FAILS consecutive checks.
 Time (UTC): $TS
 

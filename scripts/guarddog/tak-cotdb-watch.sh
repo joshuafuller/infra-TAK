@@ -4,6 +4,7 @@
 # does not free disk until VACUUM runs; large row counts (e.g. 44M rows) can mean
 # retention is running but disk is not reclaimed without VACUUM/REINDEX.
 
+SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
 ALERT_SENT_FILE="/var/lib/takguard/cotdb_alert_sent"
 # Alert when CoT DB size exceeds this (bytes). 25GB = 26843545600
 SIZE_THRESHOLD_GB=25
@@ -47,9 +48,10 @@ if [ "$COT_SIZE" -ge "$CRITICAL_THRESHOLD" ]; then
   LEVEL="CRITICAL"
 fi
 
-SUBJ="TAK Server CoT Database Size Alert ($LEVEL) on $(hostname)"
+SUBJ="TAK Server CoT Database Size Alert ($LEVEL) on $SERVER_IDENTIFIER"
 BODY="The TAK Server CoT (Cursor on Target) database is using ${COT_GB}GB of disk.
 
+Server: $SERVER_IDENTIFIER
 Time (UTC): $TS
 Database: cot
 Size: ${COT_GB}GB (threshold: ${SIZE_THRESHOLD_GB}GB warning, ${CRITICAL_THRESHOLD_GB}GB critical)

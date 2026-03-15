@@ -1,5 +1,6 @@
 #!/bin/bash
 
+SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
 ALERT_SENT_FILE="/var/lib/takguard/cert_alert_sent"
 CERT_PASS="CERT_PASS_PLACEHOLDER"
 
@@ -21,9 +22,10 @@ if [ -f "/opt/tak/certs/files/takserver-le.jks" ]; then
         
         TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
         
-        SUBJ="TAK Server Certificate Expiring on $(hostname)"
+        SUBJ="TAK Server Certificate Expiring on $SERVER_IDENTIFIER"
         BODY="TAK Server Let's Encrypt certificate will expire soon.
 
+Server: $SERVER_IDENTIFIER
 Time (UTC): $TS
 Days Remaining: $DAYS_LEFT
 Expires: $EXPIRY_DATE

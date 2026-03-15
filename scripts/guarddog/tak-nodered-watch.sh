@@ -1,6 +1,7 @@
 #!/bin/bash
 # Guard Dog: Node-RED container health. On 3 consecutive failures: alert and restart containers.
 
+SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
 STATE_DIR="/var/lib/takguard"
 FAIL_FILE="$STATE_DIR/nodered.failcount"
 COOLDOWN_FILE="$STATE_DIR/nodered_last_restart"
@@ -45,9 +46,10 @@ TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 mkdir -p /var/log/takguard
 echo "$TS | restart | Node-RED unhealthy (HTTP $CODE) — restarting container" >> /var/log/takguard/restarts.log
 
-SUBJ="Guard Dog: Node-RED restarted on $(hostname)"
+SUBJ="Guard Dog: Node-RED restarted on $SERVER_IDENTIFIER"
 BODY="Node-RED failed health check (HTTP $CODE) for $FAILS consecutive checks.
 
+Server: $SERVER_IDENTIFIER
 Time (UTC): $TS
 Action: Restarting Node-RED container (docker compose restart).
 

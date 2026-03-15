@@ -1,5 +1,6 @@
 #!/bin/bash
 
+SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
 ALERT_SENT_FILE="/var/lib/takguard/disk_alert_sent"
 ALERT_THRESHOLD=80
 CRITICAL_THRESHOLD=90
@@ -32,9 +33,10 @@ if $NEED_ALERT; then
     
     TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     
-    SUBJ="TAK Server Disk Space Alert on $(hostname)"
+    SUBJ="TAK Server Disk Space Alert on $SERVER_IDENTIFIER"
     BODY="TAK Server disk space is running low.
 
+Server: $SERVER_IDENTIFIER
 Time (UTC): $TS
 
 ${ALERT_MSG}

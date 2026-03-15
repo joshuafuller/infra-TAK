@@ -187,6 +187,16 @@ if(document.getElementById('ldap-drift-banner')){checkLdapDrift();}
 if(document.getElementById('cot-db-size')){refreshCotSize();}
 if(document.getElementById('cert-expiry-info')){loadCertExpiry();}
 if(document.getElementById('rotate-ca-info')){loadCAInfo();}
+function refreshTakServerCAState(){
+  if(document.getElementById('cert-expiry-info'))loadCertExpiry();
+  if(document.getElementById('rotate-ca-info'))loadCAInfo();
+}
+document.addEventListener('visibilitychange',function(){
+  if(document.visibilityState==='visible')refreshTakServerCAState();
+});
+window.addEventListener('pageshow',function(ev){
+  if(ev.persisted)refreshTakServerCAState();
+});
 async function loadGroups(){
   var el=document.getElementById('cc-groups-list');if(!el)return;
   el.innerHTML='<span style="color:var(--text-dim)">Loading groups...</span>';
@@ -349,19 +359,23 @@ async function loadCAInfo(){
     if(rootNameInput&&d.suggested_new_root_name&&!rootNameInput.value)rootNameInput.value=d.suggested_new_root_name;
     var rootIntInput=document.getElementById('rotate-root-int-name');
     if(rootIntInput&&d.suggested_new_root_int_name&&!rootIntInput.value)rootIntInput.value=d.suggested_new_root_int_name;
-    if(revokeEl&&d.old_cas_in_truststore&&d.old_cas_in_truststore.length>0){
-      revokeEl.style.display='block';
-      var listEl=document.getElementById('revoke-ca-list');
-      if(listEl){
-        var rh='';
-        for(var i=0;i<d.old_cas_in_truststore.length;i++){
-          var alias=d.old_cas_in_truststore[i];
-          rh+='<div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">';
-          rh+='<span style="color:var(--yellow)">'+alias+'</span>';
-          rh+='<button type="button" onclick="revokeOldCA(\''+alias.replace(/'/g,"\\'")+'\')" style="padding:6px 14px;background:rgba(239,68,68,0.15);color:var(--red);border:1px solid rgba(239,68,68,0.3);border-radius:6px;font-family:\'JetBrains Mono\',monospace;font-size:11px;cursor:pointer">Revoke</button>';
-          rh+='</div>';
+    if(revokeEl){
+      if(d.old_cas_in_truststore&&d.old_cas_in_truststore.length>0){
+        revokeEl.style.display='block';
+        var listEl=document.getElementById('revoke-ca-list');
+        if(listEl){
+          var rh='';
+          for(var i=0;i<d.old_cas_in_truststore.length;i++){
+            var alias=d.old_cas_in_truststore[i];
+            rh+='<div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">';
+            rh+='<span style="color:var(--yellow)">'+alias+'</span>';
+            rh+='<button type="button" onclick="revokeOldCA(\''+alias.replace(/'/g,"\\'")+'\')" style="padding:6px 14px;background:rgba(239,68,68,0.15);color:var(--red);border:1px solid rgba(239,68,68,0.3);border-radius:6px;font-family:\'JetBrains Mono\',monospace;font-size:11px;cursor:pointer">Revoke</button>';
+            rh+='</div>';
+          }
+          listEl.innerHTML=rh;
         }
-        listEl.innerHTML=rh;
+      }else{
+        revokeEl.style.display='none';
       }
     }
   }catch(e){infoEl.textContent='Failed to load CA info';}
@@ -543,6 +557,115 @@ async function syncTakDbPassword(){
         else{alert(d.error||'Sync failed');btns.forEach(b=>{b.disabled=false;b.style.opacity='1'});}
     }catch(e){alert('Failed: '+e.message);btns.forEach(b=>{b.disabled=false;b.style.opacity='1'});}
 }
+
+function _setHeapBtnsDisabled(disabled){
+    var b1=document.getElementById('set-heap-btn'),b2=document.getElementById('set-heap-apply-btn');
+    if(b1)b1.disabled=disabled;
+    if(b2)b2.disabled=disabled;
+}
+async function setTakHeap(){
+    var msgEl=document.getElementById('set-heap-msg');
+    _setHeapBtnsDisabled(true);
+    if(msgEl)msgEl.textContent='Setting…';
+    try{
+        var r=await fetch('/api/takserver/set-heap',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
+        var d=await r.json();
+        if(d.success){
+            if(msgEl){msgEl.style.color='var(--green)';msgEl.textContent=d.message||'Heap set; TAK Server restarting.';}
+            setTimeout(function(){window.location.reload();},3000);
+        }else{
+            if(msgEl){msgEl.style.color='var(--red)';msgEl.textContent=d.error||'Failed';}
+            _setHeapBtnsDisabled(false);
+        }
+    }catch(e){
+        if(msgEl){msgEl.style.color='var(--red)';msgEl.textContent='Error: '+e.message;}
+        _setHeapBtnsDisabled(false);
+    }
+}
+async function setTakHeapCustom(){
+    var input=document.getElementById('heap-custom-gb');
+    var msgEl=document.getElementById('set-heap-msg');
+    if(!input){return;}
+    var gb=parseInt(input.value,10);
+    if(isNaN(gb)||gb<2||gb>32){if(msgEl){msgEl.style.color='var(--red)';msgEl.textContent='Enter a value between 2 and 32 GB';}return;}
+    _setHeapBtnsDisabled(true);
+    if(msgEl)msgEl.textContent='Setting '+gb+' GB…';
+    try{
+        var r=await fetch('/api/takserver/set-heap',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({heap_gb:gb})});
+        var d=await r.json();
+        if(d.success){
+            if(msgEl){msgEl.style.color='var(--green)';msgEl.textContent=d.message||'Heap set; TAK Server restarting.';}
+            setTimeout(function(){window.location.reload();},3000);
+        }else{
+            if(msgEl){msgEl.style.color='var(--red)';msgEl.textContent=d.error||'Failed';}
+            _setHeapBtnsDisabled(false);
+        }
+    }catch(e){
+        if(msgEl){msgEl.style.color='var(--red)';msgEl.textContent='Error: '+e.message;}
+        _setHeapBtnsDisabled(false);
+    }
+}
+
+var _pkgLocked=null;
+async function togglePkgLock(){
+    var btn=document.getElementById('pkg-lock-btn');
+    var label=document.getElementById('pkg-lock-status-label');
+    if(!btn||btn.disabled)return;
+    var isUnlock=_pkgLocked;
+    btn.disabled=true;
+    btn.style.opacity='0.7';
+    btn.textContent=isUnlock?'Unlocking...':'Locking...';
+    if(label)label.innerHTML='<span style="color:var(--text-dim)">…</span>';
+    var d;
+    try{
+        var endpoint=isUnlock?'/api/takserver/unpin-packages':'/api/takserver/pin-packages';
+        var r=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
+        var text=await r.text();
+        try{d=JSON.parse(text);}catch(_){ d={success:false,message:r.ok?'Invalid response':('HTTP '+r.status)}; }
+        if(!r.ok&&d.message===undefined){ d.message='HTTP '+r.status; }
+        if(d.success){ await checkPkgLockStatus(); }
+        else{
+            var msg=(d.message||(d.results&&JSON.stringify(d.results))||'Unlock failed');
+            if(label)label.innerHTML='<span style="color:var(--red);font-size:11px">'+escapeHtml(String(msg))+'</span>';
+            alert('Failed: '+msg);
+            btn.innerHTML='<span class="material-symbols-outlined" style="font-size:18px;vertical-align:middle">lock</span> Unlock';
+        }
+    }catch(e){
+        d=null;
+        if(label)label.innerHTML='<span style="color:var(--red);font-size:11px">Error: '+escapeHtml(e.message)+'</span>';
+        alert('Error: '+e.message);
+        btn.innerHTML='<span class="material-symbols-outlined" style="font-size:18px;vertical-align:middle">lock</span> Unlock';
+    }
+    btn.disabled=false;
+    btn.style.opacity='1';
+    if(d&&d.success) renderPkgLock();
+}
+function escapeHtml(s){ var d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
+function renderPkgLock(){
+    var btn=document.getElementById('pkg-lock-btn');
+    var label=document.getElementById('pkg-lock-status-label');
+    if(!btn)return;
+    if(_pkgLocked){
+        btn.innerHTML='<span class="material-symbols-outlined" style="font-size:18px;vertical-align:middle">lock</span> Unlock';
+        if(label)label.innerHTML='<span style="color:var(--success)">Locked — auto-updates blocked</span>'+( _pkgLockBreakdown ? '<span style="display:block;font-size:10px;color:var(--text-dim);margin-top:2px">'+escapeHtml(_pkgLockBreakdown)+'</span>' : '');
+    }else{
+        btn.innerHTML='<span class="material-symbols-outlined" style="font-size:18px;vertical-align:middle">lock_open_right</span> Lock';
+        if(label)label.innerHTML='<span style="color:var(--text-dim)">Unlocked — auto-updates active</span>'+( _pkgLockBreakdown ? '<span style="display:block;font-size:10px;color:var(--text-dim);margin-top:2px">'+escapeHtml(_pkgLockBreakdown)+'</span>' : '');
+    }
+}
+var _pkgLockBreakdown=null;
+async function checkPkgLockStatus(){
+    var btn=document.getElementById('pkg-lock-btn');
+    if(!btn)return;
+    try{
+        var r=await fetch('/api/takserver/pin-packages/status');
+        var d=await r.json();
+        _pkgLocked=d.pinned;
+        _pkgLockBreakdown=d.breakdown||null;
+        renderPkgLock();
+    }catch(e){_pkgLocked=false;_pkgLockBreakdown=null;renderPkgLock();}
+}
+if(document.getElementById('pkg-lock-btn')){checkPkgLockStatus();}
 
 async function takUpdateConfig(){
     var btn=document.getElementById('tak-update-config-btn');

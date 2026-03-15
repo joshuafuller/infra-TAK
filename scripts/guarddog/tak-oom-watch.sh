@@ -1,5 +1,6 @@
 #!/bin/bash
 
+SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
 LOGFILE="/opt/tak/logs/takserver-messaging.log"
 STATEFILE="/var/run/tak_oom.state"
 SERVICE="takserver"
@@ -24,9 +25,10 @@ if grep -q "OutOfMemoryError: Java heap space" "$LOGFILE" 2>/dev/null; then
     mkdir -p /var/log/takguard
     echo "$TS | restart | OOM detected | load=$LOAD | mem_free=$MEMFREE" >> /var/log/takguard/restarts.log
     
-    SUBJ="TAK OOM Restart on $(hostname)"
+    SUBJ="TAK OOM Restart on $SERVER_IDENTIFIER"
     BODY="TAK Server experienced Out of Memory error and was restarted.
 
+Server: $SERVER_IDENTIFIER
 Time (UTC): $TS
 Load: $LOAD
 Free Memory: $MEMFREE

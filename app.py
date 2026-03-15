@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""infra-TAK v0.2.0 - TAK Infrastructure Platform"""
+"""infra-TAK v0.2.1 - TAK Infrastructure Platform"""
 
 # === Auto-upgrade: seamlessly switch from Flask dev server to gunicorn ===
 # When the old systemd service runs "python3 app.py", this block installs
@@ -56,11 +56,13 @@ if __name__ == '__main__':
 from flask import (Flask, render_template_string, request, jsonify,
     redirect, url_for, session, send_from_directory, make_response)
 from werkzeug.security import check_password_hash, generate_password_hash
+from werkzeug.utils import secure_filename
 from functools import wraps
-import os, re, ssl, json, secrets, subprocess, time, psutil, threading, html, shutil, copy, tempfile
+import os, re, ssl, json, secrets, subprocess, time, psutil, threading, html, shutil, copy, tempfile, shlex
 import urllib.request
 import urllib.parse
 from datetime import datetime
+from collections import defaultdict, deque
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(32)
@@ -76,6 +78,57 @@ def _set_session_cookie_domain():
     except Exception:
         pass
 _set_session_cookie_domain()
+
+# In-memory rate limiter (per-process). Good baseline protection without extra deps.
+_RATE_LOCK = threading.Lock()
+_RATE_HITS = defaultdict(deque)  # key -> deque[timestamps]
+
+
+def _client_ip():
+    """Best-effort client IP for rate limiting."""
+    xff = (request.headers.get('X-Forwarded-For') or '').strip()
+    if xff:
+        return xff.split(',')[0].strip()
+    return (request.remote_addr or 'unknown').strip()
+
+
+def _is_rate_limited(key, limit, window_seconds):
+    """Return True when key exceeded limit within rolling window."""
+    now = time.time()
+    cutoff = now - window_seconds
+    with _RATE_LOCK:
+        q = _RATE_HITS[key]
+        while q and q[0] < cutoff:
+            q.popleft()
+        if len(q) >= limit:
+            return True
+        q.append(now)
+        return False
+
+
+def _same_origin_ok():
+    """CSRF baseline: allow only same-origin state-changing browser requests.
+    Accepts exact Origin host match, or Referer prefix match when Origin is absent."""
+    host = (request.host or '').strip()
+    if not host:
+        return False
+    origin = (request.headers.get('Origin') or '').strip()
+    if origin:
+        try:
+            po = urllib.parse.urlparse(origin)
+            if po.netloc == host:
+                return True
+        except Exception:
+            return False
+    referer = (request.headers.get('Referer') or '').strip()
+    if referer:
+        try:
+            pr = urllib.parse.urlparse(referer)
+            if pr.netloc == host:
+                return True
+        except Exception:
+            return False
+    return False
 
 @app.context_processor
 def inject_cloudtak_icon():
@@ -145,16 +198,58 @@ def ensure_session_cookie_domain():
     """When access is via IP (backdoor), do not set cookie domain so the cookie is sent. Otherwise use FQDN for cross-subdomain."""
     if _request_host_is_ip():
         app.config['SESSION_COOKIE_DOMAIN'] = False
-        return
-    if app.config.get('SESSION_COOKIE_DOMAIN'):
-        return
-    try:
-        s = load_settings()
-        if s.get('fqdn'):
-            app.config['SESSION_COOKIE_DOMAIN'] = '.' + s['fqdn'].split(':')[0]
-    except Exception:
-        pass
-VERSION = "0.2.0-alpha"
+    elif not app.config.get('SESSION_COOKIE_DOMAIN'):
+        try:
+            s = load_settings()
+            if s.get('fqdn'):
+                app.config['SESSION_COOKIE_DOMAIN'] = '.' + s['fqdn'].split(':')[0]
+        except Exception:
+            pass
+
+    # Baseline rate limiting
+    ip = _client_ip()
+    if request.method == 'POST' and request.path in ('/login', '/'):
+        if _is_rate_limited(f'login:{ip}', limit=12, window_seconds=300):
+            return jsonify({'error': 'Too many login attempts. Please wait a few minutes.'}), 429
+    if request.method in ('POST', 'PUT', 'PATCH', 'DELETE') and request.path.startswith('/api/'):
+        if _is_rate_limited(f'apiw:{ip}', limit=240, window_seconds=60):
+            return jsonify({'error': 'Too many requests. Please slow down.'}), 429
+
+    # CSRF baseline for state-changing API calls (same-origin only).
+    # Exempt localhost-only Guard Dog script endpoint (not browser/session driven).
+    if request.method in ('POST', 'PUT', 'PATCH', 'DELETE') and request.path.startswith('/api/'):
+        if request.path != '/api/guarddog/send-sms':
+            if not _same_origin_ok():
+                return jsonify({'error': 'CSRF validation failed (same-origin required).'}), 403
+
+
+@app.after_request
+def apply_security_headers(response):
+    """Baseline browser hardening headers with compatibility for current inline-heavy UI."""
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    response.headers['Permissions-Policy'] = 'geolocation=(), microphone=(), camera=()'
+    # Keep CSP compatible with existing templates (inline script/style, CDN assets, data URLs).
+    # We can tighten this later by removing inline JS/CSS and adding nonces.
+    csp = (
+        "default-src 'self' https: data: blob:; "
+        "script-src 'self' 'unsafe-inline' 'unsafe-eval' https:; "
+        "style-src 'self' 'unsafe-inline' https:; "
+        "img-src 'self' data: https:; "
+        "font-src 'self' data: https:; "
+        "connect-src 'self' https: wss:; "
+        "frame-ancestors 'none'; "
+        "base-uri 'self'; "
+        "form-action 'self'"
+    )
+    response.headers['Content-Security-Policy'] = csp
+    # HSTS only when request itself is HTTPS (direct or via trusted proxy header).
+    xf_proto = (request.headers.get('X-Forwarded-Proto') or '').lower()
+    if request.is_secure or xf_proto == 'https':
+        response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    return response
+VERSION = "0.2.1-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -214,6 +309,10 @@ def save_auth(auth_dict):
 
 def _apply_authentik_session():
     """If request has Authentik headers (from Caddy forward_auth), set session so we treat user as logged in."""
+    # Trust Authentik headers only when request came from local reverse proxy.
+    # Prevents direct-to-app header spoofing when 5001 is exposed.
+    if request.remote_addr not in ('127.0.0.1', '::1'):
+        return False
     uname = request.headers.get('X-Authentik-Username')
     if uname:
         session['authenticated'] = True
@@ -558,25 +657,403 @@ print(json.dumps(out))
         return None
 
 def _get_unattended_upgrades_status():
-    """Return dict with 'enabled' (bool) and 'running' (bool) for unattended-upgrades."""
+    """Return dict with 'enabled' (bool) and 'running' (bool). 'running' = upgrade job active (not shutdown-waiter)."""
     enabled = False
     try:
         r = subprocess.run('systemctl is-enabled unattended-upgrades 2>/dev/null',
             shell=True, capture_output=True, text=True, timeout=5)
-        enabled = r.stdout.strip() == 'enabled'
+        enabled = (r.stdout or '').strip() == 'enabled'
     except Exception:
         pass
     running = False
     try:
-        proc = subprocess.run('ps aux | grep -E "unattended-upgrade|unattended-upgr" | grep -v shutdown | grep -v grep',
+        # Only "Running" when the timer-started upgrade job is active (apt-daily-upgrade.service)
+        r = subprocess.run('systemctl is-active apt-daily-upgrade.service 2>/dev/null',
             shell=True, capture_output=True, text=True, timeout=5)
-        running = bool(proc.stdout.strip())
+        running = (r.stdout or '').strip() == 'active'
     except Exception:
         pass
-    # Only show "running" when auto-updates are enabled; otherwise timer/cron can run the binary and confuse the UI
     if not enabled:
         running = False
     return {'enabled': enabled, 'running': running}
+
+
+def _get_unattended_upgrades_status_remote(remote_cfg):
+    """Return {enabled, running} for unattended-upgrades on a remote host via SSH, or {error: str}."""
+    if not remote_cfg or not (remote_cfg.get('host') or '').strip():
+        return {'error': 'no host'}
+    cmd = (
+        'e=$(systemctl is-enabled unattended-upgrades 2>/dev/null); '
+        'r=1; systemctl is-active apt-daily-upgrade.service 2>/dev/null | grep -qx active && r=0; '
+        'echo "ENABLED=$e"; echo "RUNNING=$r"'
+    )
+    try:
+        ok, out = _ssh_probe(remote_cfg, cmd, timeout=10)
+        if not ok:
+            return {'error': (out or 'ssh failed')[:80]}
+        enabled = 'enabled' in (out or '')
+        running = 'RUNNING=0' in (out or '')  # remote script: RUNNING=0 when process is running
+        return {'enabled': enabled, 'running': running}
+    except Exception as e:
+        return {'error': str(e)[:80]}
+
+
+def _build_uu_hosts(metrics, settings):
+    """Build list of {id, label, enabled, running} for main console UU per-host cards."""
+    hosts = [{
+        'id': 'this_host',
+        'label': 'This host',
+        'enabled': metrics.get('unattended_upgrades', {}).get('enabled', False),
+        'running': metrics.get('unattended_upgrades', {}).get('running', False),
+    }]
+    cfg = _get_tak_deployment_config(settings)
+    if cfg.get('mode') == 'two_server':
+        s1 = cfg.get('server_one', {})
+        h = (s1.get('host') or '').strip()
+        if h:
+            remote = _get_unattended_upgrades_status_remote(s1)
+            hosts.append({
+                'id': 'tak_db',
+                'label': 'TAK DB (' + h + ')',
+                'enabled': remote.get('enabled', False) if 'error' not in remote else False,
+                'running': remote.get('running', False) if 'error' not in remote else False,
+                'error': remote.get('error'),
+            })
+    return hosts
+
+
+def _get_total_ram_gb_local():
+    """Return total RAM in GB from /proc/meminfo MemTotal (kB), or None."""
+    try:
+        with open('/proc/meminfo', 'r') as f:
+            for line in f:
+                if line.startswith('MemTotal:'):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return round(int(parts[1]) / (1024 * 1024), 2)  # kB -> GB
+    except Exception:
+        pass
+    return None
+
+
+def _get_total_ram_gb_remote(remote_cfg):
+    """Return total RAM in GB on remote host via SSH, or None."""
+    try:
+        ok, out = _ssh_probe(remote_cfg, "awk '/MemTotal/{print $2/1024/1024}' /proc/meminfo 2>/dev/null", timeout=5)
+        if ok and out:
+            return round(float(out.strip()), 2)
+    except Exception:
+        pass
+    return None
+
+
+def _get_cpu_model_local():
+    """Return CPU model name from /proc/cpuinfo (e.g. 'Intel Xeon ...'), or None."""
+    try:
+        with open('/proc/cpuinfo', 'r') as f:
+            for line in f:
+                if line.startswith('model name') or line.startswith('Processor'):
+                    # "model name\t: Intel(R) Xeon(R) ..." or "Processor\t: ARMv7 ..."
+                    idx = line.find(':')
+                    if idx >= 0:
+                        return line[idx + 1:].strip()
+                    break
+    except Exception:
+        pass
+    return None
+
+
+def _get_cpu_model_remote(remote_cfg):
+    """Return CPU model name on remote host via SSH, or None."""
+    try:
+        ok, out = _ssh_probe(remote_cfg, "grep -m1 -E 'model name|Processor' /proc/cpuinfo 2>/dev/null | sed 's/^[^:]*:[[:space:]]*//'", timeout=5)
+        if ok and out:
+            return out.strip() or None
+    except Exception:
+        pass
+    return None
+
+
+def _get_disk_io_local():
+    """Return (read_mbs, write_mbs) from vmstat 1 2 (1-second sample). Blocks are 512 bytes. None on failure."""
+    try:
+        r = subprocess.run(
+            'vmstat 1 2 2>/dev/null | tail -1 | awk \'{print $9,$10}\'',
+            shell=True, capture_output=True, text=True, timeout=5
+        )
+        if r.returncode != 0 or not (r.stdout or '').strip():
+            return None
+        parts = (r.stdout or '').strip().split()
+        if len(parts) < 2:
+            return None
+        bi, bo = int(parts[0]), int(parts[1])
+        # blocks/s, 512 bytes per block -> MB/s
+        read_mbs = round((bi * 512) / (1024 * 1024), 2)
+        write_mbs = round((bo * 512) / (1024 * 1024), 2)
+        return (read_mbs, write_mbs)
+    except Exception:
+        return None
+
+
+def _get_disk_io_remote(remote_cfg):
+    """Return (read_mbs, write_mbs) on remote host from vmstat 1 2, or None."""
+    if not remote_cfg or not (remote_cfg.get('host') or '').strip():
+        return None
+    try:
+        ok, out = _ssh_probe(
+            remote_cfg,
+            "vmstat 1 2 2>/dev/null | tail -1 | awk '{print $9,$10}'",
+            timeout=8
+        )
+        if not ok or not out:
+            return None
+        parts = out.strip().split()
+        if len(parts) < 2:
+            return None
+        bi, bo = int(parts[0]), int(parts[1])
+        read_mbs = round((bi * 512) / (1024 * 1024), 2)
+        write_mbs = round((bo * 512) / (1024 * 1024), 2)
+        return (read_mbs, write_mbs)
+    except Exception:
+        return None
+
+
+# Disk speed test: 256 MiB. Prefer /var/tmp (on-disk); fallback to gettempdir() (may be tmpfs).
+_DISK_SPEED_TEST_SIZE_MB = 256
+
+
+def _disk_speed_test_path():
+    """Return a writable path for the disk test file (local only). Prefer /var/tmp."""
+    for d in ('/var/tmp', tempfile.gettempdir()):
+        if d and os.path.isdir(d) and os.access(d, os.W_OK):
+            return os.path.join(d, 'infra_tak_disk_speed_test')
+    return None
+
+
+def _parse_dd_speed_mbs(stderr_or_stdout):
+    """Parse dd output for speed in MB/s, MiB/s, or GB/s. Returns MB/s."""
+    if not stderr_or_stdout:
+        return None
+    text = (stderr_or_stdout or '').replace(',', '.')
+
+    def to_mbs(num_str, unit_str):
+        n = float(num_str)
+        if unit_str and 'GB' in unit_str:
+            return round(n * 1024, 1)
+        return round(n, 1)
+
+    m = re.search(r'copied,\s*[\d.]+\s*s,\s*([\d.]+)\s*(MiB|MB|GB)/s', text)
+    if m:
+        return to_mbs(m.group(1), m.group(2))
+    for m in re.finditer(r'([\d.]+)\s*(MiB|MB|GB)/s', text):
+        pass
+    if m:
+        return to_mbs(m.group(1), m.group(2))
+    return None
+
+
+def _run_disk_speed_test_local():
+    """Run 256 MiB write then read. Returns dict with disk_speed_test_read_mbs/write_mbs or disk_speed_test_error."""
+    path = _disk_speed_test_path()
+    if not path:
+        return {'disk_speed_test_error': 'no writable temp dir'}
+    dd = '/usr/bin/dd' if os.path.isfile('/usr/bin/dd') else 'dd'
+    try:
+        rw = subprocess.run(
+            [dd, 'if=/dev/zero', 'of=' + path,
+             'bs=1M', 'count=' + str(_DISK_SPEED_TEST_SIZE_MB), 'oflag=direct'],
+            capture_output=True, text=True, timeout=60
+        )
+        out_w = (rw.stdout or '') + (rw.stderr or '')
+        write_mbs = _parse_dd_speed_mbs(out_w)
+        if write_mbs is None and rw.returncode != 0:
+            rw2 = subprocess.run(
+                [dd, 'if=/dev/zero', 'of=' + path, 'bs=1M', 'count=' + str(_DISK_SPEED_TEST_SIZE_MB)],
+                capture_output=True, text=True, timeout=60
+            )
+            write_mbs = _parse_dd_speed_mbs((rw2.stdout or '') + (rw2.stderr or ''))
+        if write_mbs is None:
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
+            err = (out_w.strip() or 'write failed')[:120]
+            return {'disk_speed_test_error': err}
+        rr = subprocess.run(
+            [dd, 'if=' + path, 'of=/dev/null', 'bs=1M', 'iflag=direct'],
+            capture_output=True, text=True, timeout=60
+        )
+        out_r = (rr.stdout or '') + (rr.stderr or '')
+        read_mbs = _parse_dd_speed_mbs(out_r)
+        if read_mbs is None and rr.returncode != 0:
+            rr2 = subprocess.run(
+                [dd, 'if=' + path, 'of=/dev/null', 'bs=1M'],
+                capture_output=True, text=True, timeout=60
+            )
+            read_mbs = _parse_dd_speed_mbs((rr2.stdout or '') + (rr2.stderr or ''))
+        try:
+            os.unlink(path)
+        except Exception:
+            pass
+        if read_mbs is None:
+            return {'disk_speed_test_error': (out_r.strip() or 'read failed')[:120]}
+        return {'disk_speed_test_read_mbs': read_mbs, 'disk_speed_test_write_mbs': write_mbs}
+    except subprocess.TimeoutExpired:
+        try:
+            os.unlink(path)
+        except Exception:
+            pass
+        return {'disk_speed_test_error': 'timeout'}
+    except FileNotFoundError:
+        return {'disk_speed_test_error': 'dd not found'}
+    except OSError as e:
+        return {'disk_speed_test_error': str(e)[:80]}
+
+
+def _run_disk_speed_test_remote(remote_cfg):
+    """Run same 256 MiB disk speed test on remote host via SSH. Returns dict with speeds or disk_speed_test_error."""
+    if not remote_cfg or not (remote_cfg.get('host') or '').strip():
+        return {'disk_speed_test_error': 'no host'}
+    script = (
+        'f=/var/tmp/infra_tak_disk_speed_test; '
+        'touch "$f" 2>/dev/null || f=/tmp/infra_tak_disk_speed_test; '
+        'dd if=/dev/zero of="$f" bs=1M count=' + str(_DISK_SPEED_TEST_SIZE_MB) + ' oflag=direct 2>&1; '
+        'dd if="$f" of=/dev/null bs=1M iflag=direct 2>&1; '
+        'rm -f /var/tmp/infra_tak_disk_speed_test /tmp/infra_tak_disk_speed_test 2>/dev/null'
+    )
+    try:
+        ok, out = _ssh_probe(remote_cfg, script, timeout=90)
+        if not ok:
+            return {'disk_speed_test_error': (out or 'ssh failed')[:120]}
+        if not out:
+            return {'disk_speed_test_error': 'no output'}
+        text = out.replace(',', '.')
+        # Parse MB/s, MiB/s, or GB/s (convert GB to MB)
+        all_speeds = []
+        for match in re.finditer(r'([\d.]+)\s*(?:MiB|MB|GB)/s', text):
+            num, suffix = float(match.group(1)), match.group(0)
+            all_speeds.append(round(num * 1024, 1) if 'GB/s' in suffix else round(num, 1))
+        if len(all_speeds) >= 2:
+            return {'disk_speed_test_read_mbs': all_speeds[1], 'disk_speed_test_write_mbs': all_speeds[0]}
+        # Fallback: "copied, X.XXX s" or truncated "copied, 0.3" (no " s"). Speed = 256/time.
+        times = re.findall(r'copied,\s*([\d.]+)(?:\s*s)?', text)
+        if len(times) >= 2:
+            write_mbs = round(_DISK_SPEED_TEST_SIZE_MB / float(times[0]), 1)
+            read_mbs = round(_DISK_SPEED_TEST_SIZE_MB / float(times[1]), 1)
+            return {'disk_speed_test_read_mbs': read_mbs, 'disk_speed_test_write_mbs': write_mbs}
+        return {'disk_speed_test_error': ('parse failed: ' + out.strip()[:80])}
+    except Exception as e:
+        return {'disk_speed_test_error': str(e)[:80]}
+
+
+def _friendly_process_name(args):
+    """Derive a recognizable name from process args (e.g. takserver, authentik, cloudtak, caddy, containers)."""
+    a = (args or '').lower()
+    if 'takserver' in a or 'tak-server' in a or 'core-api' in a or 'messaging' in a:
+        return 'takserver'
+    if 'authentik' in a:
+        return 'authentik'
+    if 'cloudtak' in a:
+        return 'cloudtak'
+    if 'caddy' in a:
+        return 'caddy'
+    if 'postgres' in a:
+        return 'postgres'
+    if 'redis' in a:
+        return 'redis'
+    if 'containerd' in a or 'runc' in a:
+        return 'containerd/docker'
+    if 'dockerd' in a or 'docker' in a:
+        return 'docker'
+    if 'guarddog' in a or 'guard_dog' in a:
+        return 'guarddog'
+    first = (args or '').strip().split(None, 1)[0] if (args or '').strip() else '?'
+    return first.split('/')[-1] if first else '?'
+
+
+def _top_processes_local():
+    """Return { cpu_top, mem_top, total_ram_gb } with friendly names (takserver, authentik, etc.) and percentages."""
+    try:
+        total_ram_gb = _get_total_ram_gb_local()
+        r = subprocess.run(
+            'ps -eo pcpu,pmem,args --no-headers 2>/dev/null',
+            shell=True, capture_output=True, text=True, timeout=5
+        )
+        out = (r.stdout or '').strip()
+        by_name = {}
+        for line in out.split('\n'):
+            parts = line.split(None, 2)
+            if len(parts) < 3:
+                continue
+            try:
+                cpu = float(parts[0])
+                mem = float(parts[1])
+                name = _friendly_process_name((parts[2] or '').strip())
+                if name and name != '?':
+                    by_name[name] = by_name.get(name, {'cpu': 0, 'mem': 0})
+                    by_name[name]['cpu'] += cpu
+                    by_name[name]['mem'] += mem
+            except (ValueError, IndexError):
+                continue
+        items = [{'name': n, 'cpu_pct': round(v['cpu'], 1), 'mem_pct': round(v['mem'], 1)} for n, v in by_name.items()]
+        cpu_top = sorted(items, key=lambda x: -x['cpu_pct'])[:12]
+        mem_top = sorted(items, key=lambda x: -x['mem_pct'])[:12]
+        result = {'cpu_top': cpu_top, 'mem_top': mem_top}
+        if total_ram_gb is not None:
+            result['total_ram_gb'] = total_ram_gb
+        cpu_model = _get_cpu_model_local()
+        if cpu_model:
+            result['processor'] = cpu_model
+        disk_io = _get_disk_io_local()
+        if disk_io is not None:
+            result['disk_io_read_mbs'], result['disk_io_write_mbs'] = disk_io
+        result.update(_run_disk_speed_test_local())
+        return result
+    except Exception:
+        return {'cpu_top': [], 'mem_top': []}
+
+
+def _top_processes_remote(remote_cfg):
+    """Return { cpu_top, mem_top, total_ram_gb?, error? } with friendly names for remote host via SSH."""
+    if not remote_cfg or not (remote_cfg.get('host') or '').strip():
+        return {'cpu_top': [], 'mem_top': [], 'error': 'no host'}
+    try:
+        total_ram_gb = _get_total_ram_gb_remote(remote_cfg)
+        ok, out = _ssh_probe(remote_cfg, 'ps -eo pcpu,pmem,args --no-headers 2>/dev/null', timeout=10)
+        if not ok or not out:
+            return {'cpu_top': [], 'mem_top': [], 'error': (out or 'ssh failed')[:80]}
+        by_name = {}
+        for line in (out or '').strip().split('\n'):
+            parts = line.split(None, 2)
+            if len(parts) < 3:
+                continue
+            try:
+                cpu = float(parts[0])
+                mem = float(parts[1])
+                name = _friendly_process_name((parts[2] or '').strip())
+                if name and name != '?':
+                    by_name[name] = by_name.get(name, {'cpu': 0, 'mem': 0})
+                    by_name[name]['cpu'] += cpu
+                    by_name[name]['mem'] += mem
+            except (ValueError, IndexError):
+                continue
+        items = [{'name': n, 'cpu_pct': round(v['cpu'], 1), 'mem_pct': round(v['mem'], 1)} for n, v in by_name.items()]
+        cpu_top = sorted(items, key=lambda x: -x['cpu_pct'])[:12]
+        mem_top = sorted(items, key=lambda x: -x['mem_pct'])[:12]
+        result = {'cpu_top': cpu_top, 'mem_top': mem_top}
+        if total_ram_gb is not None:
+            result['total_ram_gb'] = total_ram_gb
+        cpu_model = _get_cpu_model_remote(remote_cfg)
+        if cpu_model:
+            result['processor'] = cpu_model
+        disk_io = _get_disk_io_remote(remote_cfg)
+        if disk_io is not None:
+            result['disk_io_read_mbs'], result['disk_io_write_mbs'] = disk_io
+        result.update(_run_disk_speed_test_remote(remote_cfg))
+        return result
+    except Exception as e:
+        return {'cpu_top': [], 'mem_top': [], 'error': str(e)[:80]}
+
 
 # === Routes ===
 
@@ -651,10 +1128,12 @@ def console_page():
     all_modules = detect_modules()
     modules = {k: m for k, m in all_modules.items() if m.get('installed')}
     module_versions = get_all_module_versions()
+    metrics = get_system_metrics()
+    uu_hosts = _build_uu_hosts(metrics, settings)
     resp = render_template_string(CONSOLE_TEMPLATE,
-        settings=settings, modules=modules, metrics=get_system_metrics(), version=VERSION,
+        settings=settings, modules=modules, metrics=metrics, version=VERSION,
         module_versions=module_versions, authentik_base_url=_get_authentik_base_url(settings),
-        takserver_base_url=_get_takserver_base_url(settings))
+        takserver_base_url=_get_takserver_base_url(settings), uu_hosts=uu_hosts)
     from flask import make_response
     r = make_response(resp)
     r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
@@ -778,6 +1257,9 @@ def takserver_page():
     _tak_cfg = _get_tak_deployment_config(_settings)
     _is_two_server = _tak_cfg.get('mode') == 'two_server'
     _s1_host = (_tak_cfg.get('server_one', {}).get('host') or '').strip() if _is_two_server else ''
+    _total_ram = _get_total_ram_gb_local() if tak.get('installed') else None
+    _recommended_heap = _recommended_takserver_heap_gb(_total_ram) if _total_ram is not None else 4
+    _current_heap = _get_current_takserver_heap_gb() if tak.get('installed') else None
     return render_template_string(TAKSERVER_TEMPLATE,
         settings=_settings, modules=modules, tak=tak, tak_version=tak_version,
         show_connect_ldap=show_connect_ldap, ldap_connected=ldap_connected,
@@ -787,7 +1269,8 @@ def takserver_page():
         deploy_done=deploy_status.get('complete', False), deploy_error=deploy_status.get('error', False),
         upgrading=upgrade_status.get('running', False), upgrade_done=upgrade_status.get('complete', False),
         upgrade_error=upgrade_status.get('error', False),
-        two_server_mode=_is_two_server, s1_host=_s1_host)
+        two_server_mode=_is_two_server, s1_host=_s1_host,
+        total_ram_gb=_total_ram, recommended_heap_gb=_recommended_heap, current_heap_gb=_current_heap)
 
 @app.route('/api/takserver/deployment-config', methods=['GET'])
 @login_required
@@ -1110,7 +1593,7 @@ def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
         "printf \"\\nlisten_addresses = '*'\\n\" | sudo tee -a \"$PG_MAIN/postgresql.conf\" > /dev/null && "
         'sudo sed -i "s/md5host/md5\\nhost/g" "$PG_MAIN/pg_hba.conf" && '
         f'(grep -q "^host.*{core_ip}/32" "$PG_MAIN/pg_hba.conf" 2>/dev/null || '
-        f'printf "\\nhost    all    all    {core_ip}/32    scram-sha-256\\n" | sudo tee -a "$PG_MAIN/pg_hba.conf" > /dev/null) && '
+        f'printf "\\nhost    all    all    {core_ip}/32    md5\\n" | sudo tee -a "$PG_MAIN/pg_hba.conf" > /dev/null) && '
         '(sudo pg_ctlcluster 15 main restart 2>/dev/null || sudo systemctl restart postgresql 2>/dev/null || true)'
     )
     ok, out = _ssh_probe(s1, pg_config_cmd, timeout=30)
@@ -1137,6 +1620,12 @@ def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
     db_password, _ = _fetch_db_password_from_server_one(s1)
     if db_password:
         log.append('Captured DB password from Server One.')
+        pw_ok, pw_msg = _verify_server_one_db_password(s1, db_password, db_port=db_port)
+        if pw_ok:
+            log.append('DB credential verified on Server One.')
+        else:
+            log.append(f'Warning: captured password failed validation ({pw_msg}). '
+                       'Use Sync DB Password after deploy if TAK Server cannot connect.')
     else:
         log.append('Warning: could not read DB password from Server One — CoreConfig may need manual password fix.')
 
@@ -1157,8 +1646,11 @@ def _fetch_db_password_from_server_one(s1_cfg):
             continue
         if not (out or '').strip():
             continue
-        # Prefer Python regex (allow single or double quotes, optional spaces)
+        # Prefer JDBC <connection ...> password first (avoid matching unrelated
+        # password fields like LDAP/service-account credentials in CoreConfig).
         for pattern in (
+            r'<connection[^>]*url\s*=\s*["\']jdbc:postgresql://[^"\']+/cot["\'][^>]*password\s*=\s*["\']([^"\']*)["\']',
+            r'<connection[^>]*username\s*=\s*["\']martiuser["\'][^>]*password\s*=\s*["\']([^"\']*)["\']',
             r'password\s*=\s*["\']([^"\']*)["\']',
             r'password=["\']([^"\']*)["\']',
         ):
@@ -1178,6 +1670,39 @@ def _fetch_db_password_from_server_one(s1_cfg):
     if first_ssh_error:
         return '', f'SSH to Server One failed: {first_ssh_error}'
     return '', 'No password= found in CoreConfig.example.xml or CoreConfig.xml on Server One (or password was empty).'
+
+
+def _verify_server_one_db_password(s1_cfg, db_password, db_port=5432, db_user='martiuser', db_name='cot'):
+    """Validate DB credentials directly on Server One via psql.
+    Returns (True, msg) when auth works, else (False, reason)."""
+    if not (db_password or '').strip():
+        return False, 'empty DB password'
+    try:
+        port = int(db_port or 5432)
+    except Exception:
+        port = 5432
+    pw_q = shlex.quote((db_password or '').strip())
+    user_q = shlex.quote((db_user or 'martiuser').strip() or 'martiuser')
+    db_q = shlex.quote((db_name or 'cot').strip() or 'cot')
+    cmd = (
+        "if ! command -v psql >/dev/null 2>&1; then "
+        "echo NO_PSQL; "
+        f"elif PGPASSWORD={pw_q} psql -h 127.0.0.1 -p {port} -U {user_q} -d {db_q} -tAc \"select 1\" 2>/dev/null | "
+        "tr -d '[:space:]' | grep -qx 1; then "
+        "echo AUTH_OK; "
+        "else "
+        "echo AUTH_FAIL; "
+        "fi"
+    )
+    ok, out = _ssh_probe(s1_cfg, cmd, timeout=15)
+    out_s = (out or '').strip()
+    if not ok:
+        return False, (out_s[:200] or 'SSH validation failed')
+    if 'AUTH_OK' in out_s:
+        return True, 'DB auth verified on Server One'
+    if 'NO_PSQL' in out_s:
+        return False, 'psql not available on Server One for credential validation'
+    return False, 'DB password rejected by PostgreSQL on Server One'
 
 
 @app.route('/api/takserver/two-server/open-db-firewall', methods=['POST'])
@@ -1382,6 +1907,20 @@ def takserver_two_server_deploy_server_two():
                 'detail': (fetch_err or '')[:200],
             }), 400
 
+    # Validate DB password against Server One before patching CoreConfig.
+    db_user = (cfg.get('database', {}).get('user') or 'martiuser').strip() or 'martiuser'
+    db_name = (cfg.get('database', {}).get('name') or 'cot').strip() or 'cot'
+    ok_pw, msg_pw = _verify_server_one_db_password(s1, db_password, db_port=db_port, db_user=db_user, db_name=db_name)
+    if not ok_pw:
+        return jsonify({
+            'success': False,
+            'error': (
+                'DB credential validation failed on Server One. '
+                'Use Sync DB Password with the current martiuser password from Server One, then retry.'
+            ),
+            'detail': msg_pw,
+        }), 400
+
     # Increase concurrent TCP connections per TAK guide
     try:
         subprocess.run(
@@ -1460,6 +1999,23 @@ def takserver_two_server_sync_db_password():
             'error': 'No DB password provided. Paste the martiuser password from Server One in the "DB password" field (from /opt/tak/CoreConfig.example.xml on Server One), or add it in Settings → TAK deployment → Server One / Database.'
         }), 400
 
+    # Validate the provided password against Server One before writing CoreConfig.
+    s1 = cfg.get('server_one', {})
+    db_port = int(cfg.get('database', {}).get('port') or 5432)
+    db_user = (cfg.get('database', {}).get('user') or 'martiuser').strip() or 'martiuser'
+    db_name = (cfg.get('database', {}).get('name') or 'cot').strip() or 'cot'
+    if (s1.get('host') or '').strip():
+        ok_pw, msg_pw = _verify_server_one_db_password(s1, db_pass, db_port=db_port, db_user=db_user, db_name=db_name)
+        if not ok_pw:
+            return jsonify({
+                'success': False,
+                'error': (
+                    'Password was not accepted by PostgreSQL on Server One. '
+                    'Paste the current martiuser password and try again.'
+                ),
+                'detail': msg_pw,
+            }), 400
+
     try:
         r = subprocess.run(['sudo', 'cat', '/opt/tak/CoreConfig.xml'], capture_output=True, text=True, timeout=5)
         content = r.stdout or ''
@@ -1477,6 +2033,281 @@ def takserver_two_server_sync_db_password():
         return jsonify({'success': False, 'error': str(e)[:300]}), 500
 
     return jsonify({'success': True, 'message': 'DB password updated and TAK Server restarted. Try 8443/8446 again in a minute.'})
+
+
+@app.route('/api/takserver/pin-packages', methods=['POST'])
+@login_required
+def takserver_pin_packages():
+    """Add takserver* and postgresql* to the unattended-upgrades blacklist on both Server Two (local) and Server One (SSH).
+    Prevents automatic apt upgrades from breaking the DB connection or regenerating credentials."""
+    settings = load_settings()
+    cfg = _get_tak_deployment_config(settings)
+    is_two_server = cfg.get('mode') == 'two_server'
+    results = {}
+
+    pin_snippet = (
+        'UA_CONF="/etc/apt/apt.conf.d/50unattended-upgrades"; '
+        'if [ ! -f "$UA_CONF" ]; then echo NO_UA; '
+        'elif grep -q "takserver" "$UA_CONF" 2>/dev/null; then echo ALREADY_PINNED; '
+        'else '
+        'sudo sed -i \'/Unattended-Upgrade::Package-Blacklist/a\\        "takserver*";\\n        "postgresql*";\' "$UA_CONF" 2>/dev/null && echo PINNED || echo FAILED; '
+        'fi'
+    )
+
+    try:
+        r = subprocess.run(pin_snippet, shell=True, capture_output=True, text=True, timeout=15)
+        out = (r.stdout or '').strip()
+        if 'PINNED' in out:
+            results['server_two'] = 'pinned'
+        elif 'ALREADY_PINNED' in out:
+            results['server_two'] = 'already_pinned'
+        elif 'NO_UA' in out:
+            results['server_two'] = 'no_unattended_upgrades'
+        else:
+            results['server_two'] = 'failed'
+    except Exception as e:
+        results['server_two'] = f'error: {str(e)[:100]}'
+
+    if is_two_server:
+        s1 = cfg.get('server_one', {})
+        if (s1.get('host') or '').strip():
+            try:
+                ok, out = _ssh_probe(s1, pin_snippet, timeout=15)
+                out_s = (out or '').strip()
+                if ok and 'PINNED' in out_s:
+                    results['server_one'] = 'pinned'
+                elif ok and 'ALREADY_PINNED' in out_s:
+                    results['server_one'] = 'already_pinned'
+                elif ok and 'NO_UA' in out_s:
+                    results['server_one'] = 'no_unattended_upgrades'
+                else:
+                    results['server_one'] = f'failed: {out_s[:100]}'
+            except Exception as e:
+                results['server_one'] = f'error: {str(e)[:100]}'
+        else:
+            results['server_one'] = 'no_host_configured'
+
+    all_ok = all(v in ('pinned', 'already_pinned', 'no_unattended_upgrades') for v in results.values())
+    msgs = []
+    for server, status in results.items():
+        label = 'Server One (DB)' if server == 'server_one' else 'This host'
+        if status == 'pinned':
+            msgs.append(f'{label}: packages pinned')
+        elif status == 'already_pinned':
+            msgs.append(f'{label}: already pinned')
+        elif status == 'no_unattended_upgrades':
+            msgs.append(f'{label}: unattended-upgrades not installed (safe)')
+        else:
+            msgs.append(f'{label}: {status}')
+
+    return jsonify({'success': all_ok, 'results': results, 'message': '; '.join(msgs)})
+
+
+def _pin_status_short(s):
+    """Short label for pin status for UI breakdown."""
+    return {'pinned': 'locked', 'not_pinned': 'unlocked', 'safe': 'unlocked (no UA)', 'unknown': '?'}.get(s, s)
+
+
+@app.route('/api/takserver/pin-packages/status')
+@login_required
+def takserver_pin_packages_status():
+    """Check if takserver/postgresql packages are already pinned on both hosts."""
+    settings = load_settings()
+    cfg = _get_tak_deployment_config(settings)
+    is_two_server = cfg.get('mode') == 'two_server'
+    results = {}
+
+    check_cmd = (
+        'UA_CONF="/etc/apt/apt.conf.d/50unattended-upgrades"; '
+        'if [ ! -f "$UA_CONF" ]; then echo NO_UA; '
+        'elif grep -q "takserver" "$UA_CONF" 2>/dev/null; then echo PINNED; '
+        'else echo NOT_PINNED; fi'
+    )
+
+    try:
+        r = subprocess.run(check_cmd, shell=True, capture_output=True, text=True, timeout=10)
+        out = (r.stdout or '').strip()
+        results['server_two'] = 'pinned' if 'PINNED' in out else ('safe' if 'NO_UA' in out else 'not_pinned')
+    except Exception:
+        results['server_two'] = 'unknown'
+
+    if is_two_server:
+        s1 = cfg.get('server_one', {})
+        if (s1.get('host') or '').strip():
+            try:
+                ok, out = _ssh_probe(s1, check_cmd, timeout=10)
+                out_s = (out or '').strip()
+                if ok and 'PINNED' in out_s:
+                    results['server_one'] = 'pinned'
+                elif ok and 'NO_UA' in out_s:
+                    results['server_one'] = 'safe'
+                elif ok:
+                    results['server_one'] = 'not_pinned'
+                else:
+                    results['server_one'] = 'unknown'
+            except Exception:
+                results['server_one'] = 'unknown'
+
+    # Only show "Locked" when blacklist is actually present. 'safe' (no UA file) = show Unlocked.
+    all_pinned = all(v == 'pinned' for v in results.values())
+    # Per-host breakdown for two-server so UI can show which host is still pinned.
+    breakdown = []
+    if results.get('server_two') is not None:
+        breakdown.append('This host: ' + _pin_status_short(results['server_two']))
+    if results.get('server_one') is not None:
+        breakdown.append('DB host: ' + _pin_status_short(results['server_one']))
+    return jsonify({'pinned': all_pinned, 'results': results, 'breakdown': ' · '.join(breakdown) if breakdown else None})
+
+
+def _recommended_takserver_heap_gb(total_ram_gb):
+    """Suggest -Xmx heap in GB from total system RAM (TAK Server core runs on this host)."""
+    if total_ram_gb is None or total_ram_gb <= 0:
+        return 4
+    if total_ram_gb >= 32:
+        return 12
+    if total_ram_gb >= 16:
+        return 8
+    if total_ram_gb >= 8:
+        return 4
+    return 2
+
+
+def _get_current_takserver_heap_gb():
+    """Return current -Xmx heap in GB from systemd drop-in if set, else None."""
+    import re
+    dropin = '/etc/systemd/system/takserver.service.d/heap.conf'
+    content = None
+    try:
+        with open(dropin, 'r') as f:
+            content = f.read()
+    except (OSError, IOError):
+        try:
+            r = subprocess.run(f'sudo cat {dropin} 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
+            if r.returncode == 0 and r.stdout:
+                content = r.stdout
+        except Exception:
+            pass
+    if content:
+        m = re.search(r'-Xmx(\d+)g', content, re.IGNORECASE)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+@app.route('/api/takserver/heap-info')
+@login_required
+def takserver_heap_info():
+    """Return total RAM, recommended heap, and current heap (if set via drop-in) for this host."""
+    total = _get_total_ram_gb_local()
+    recommended = _recommended_takserver_heap_gb(total)
+    current = _get_current_takserver_heap_gb()
+    return jsonify({'total_ram_gb': total, 'recommended_heap_gb': recommended, 'current_heap_gb': current})
+
+
+@app.route('/api/takserver/set-heap', methods=['POST'])
+@login_required
+def takserver_set_heap():
+    """Set TAK Server JVM heap via systemd drop-in and restart. Applies on this host (where core runs)."""
+    data = request.get_json() or {}
+    heap_gb = data.get('heap_gb')
+    total_ram_gb = _get_total_ram_gb_local()
+    if heap_gb is None:
+        heap_gb = _recommended_takserver_heap_gb(total_ram_gb)
+    try:
+        heap_gb = int(heap_gb)
+        if heap_gb < 2 or heap_gb > 32:
+            return jsonify({'success': False, 'error': 'heap_gb must be between 2 and 32'}), 400
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'heap_gb must be an integer'}), 400
+    xms = max(2, heap_gb // 2)
+    opts = f'-Xms{xms}g -Xmx{heap_gb}g'
+    dropin_dir = '/etc/systemd/system/takserver.service.d'
+    dropin_file = os.path.join(dropin_dir, 'heap.conf')
+    cmd_mkdir = f'sudo mkdir -p {dropin_dir}'
+    cmd_write = f'echo \'[Service]\nEnvironment="CATALINA_OPTS={opts}"\' | sudo tee {dropin_file}'
+    cmd_reload = 'sudo systemctl daemon-reload'
+    cmd_restart = 'sudo systemctl restart takserver'
+    try:
+        for c in (cmd_mkdir, cmd_write, cmd_reload, cmd_restart):
+            r = subprocess.run(c, shell=True, capture_output=True, text=True, timeout=30)
+            if r.returncode != 0 and c == cmd_restart:
+                return jsonify({
+                    'success': False,
+                    'error': f'Restart failed: {(r.stderr or r.stdout or "unknown").strip()[:200]}'
+                }), 500
+            if r.returncode != 0:
+                return jsonify({'success': False, 'error': (r.stderr or r.stdout or '').strip()[:200]}), 500
+    except subprocess.TimeoutExpired:
+        return jsonify({'success': False, 'error': 'Command timed out'}), 500
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)[:200]}), 500
+    return jsonify({
+        'success': True,
+        'message': f'TAK Server heap set to -Xmx{heap_gb}g and restarted.',
+        'heap_gb': heap_gb,
+        'current_heap_gb': heap_gb,
+        'total_ram_gb': total_ram_gb,
+    })
+
+
+@app.route('/api/takserver/unpin-packages', methods=['POST'])
+@login_required
+def takserver_unpin_packages():
+    """Remove takserver* and postgresql* from unattended-upgrades blacklist on both servers."""
+    settings = load_settings()
+    cfg = _get_tak_deployment_config(settings)
+    is_two_server = cfg.get('mode') == 'two_server'
+    results = {}
+
+    # Remove blacklist lines; verify after so we only report UNPINNED when "takserver" is really gone.
+    unpin_script = (
+        'UA_CONF="/etc/apt/apt.conf.d/50unattended-upgrades"; '
+        'if [ ! -f "$UA_CONF" ]; then echo NO_UA; exit 0; fi; '
+        'if ! grep -q "takserver" "$UA_CONF" 2>/dev/null; then echo ALREADY_UNPINNED; exit 0; fi; '
+        'sudo sed -i -e \'/"takserver\\*"/d\' -e \'/"postgresql\\*"/d\' "$UA_CONF" 2>/dev/null; '
+        'if grep -q "takserver" "$UA_CONF" 2>/dev/null; then echo FAILED; else echo UNPINNED; fi'
+    )
+
+    try:
+        r = subprocess.run(unpin_script, shell=True, capture_output=True, text=True, timeout=15)
+        out = (r.stdout or '').strip()
+        if 'UNPINNED' in out:
+            results['server_two'] = 'unpinned'
+        elif 'ALREADY_UNPINNED' in out:
+            results['server_two'] = 'already_unpinned'
+        elif 'NO_UA' in out:
+            results['server_two'] = 'no_unattended_upgrades'
+        else:
+            results['server_two'] = 'failed'
+    except Exception as e:
+        results['server_two'] = f'error: {str(e)[:100]}'
+
+    if is_two_server:
+        s1 = cfg.get('server_one', {})
+        if (s1.get('host') or '').strip():
+            try:
+                ok, out = _ssh_probe(s1, unpin_script, timeout=15)
+                out_s = (out or '').strip()
+                if ok and 'UNPINNED' in out_s:
+                    results['server_one'] = 'unpinned'
+                elif ok and 'ALREADY_UNPINNED' in out_s:
+                    results['server_one'] = 'already_unpinned'
+                elif ok and 'NO_UA' in out_s:
+                    results['server_one'] = 'no_unattended_upgrades'
+                else:
+                    results['server_one'] = f'failed: {out_s[:100]}'
+            except Exception as e:
+                results['server_one'] = f'error: {str(e)[:100]}'
+
+    all_ok = all(v in ('unpinned', 'already_unpinned', 'no_unattended_upgrades') for v in results.values())
+    msgs = []
+    for server, status in results.items():
+        label = 'Server One (DB)' if server == 'server_one' else 'This host'
+        if status in ('unpinned', 'already_unpinned', 'no_unattended_upgrades'):
+            continue
+        msgs.append(f'{label}: {status}')
+    message = '; '.join(msgs) if msgs else ('Unlocked on all hosts' if all_ok else 'Unlock failed')
+    return jsonify({'success': all_ok, 'results': results, 'message': message})
 
 
 @app.route('/mediamtx')
@@ -1499,6 +2330,17 @@ def mediamtx_page():
 # ── Guard Dog (TAK Server hardening / 7 monitors) ─────────────────────────────
 guarddog_deploy_log = []
 guarddog_deploy_status = {'running': False, 'complete': False, 'error': False}
+
+def _guarddog_server_identifier(settings):
+    """Build the server identifier string for Guard Dog alerts (nickname and/or IP/FQDN)."""
+    nickname = (settings.get('guarddog_server_nickname') or '').strip()
+    server_ip = (settings.get('server_ip') or '').strip()
+    fqdn = (settings.get('fqdn') or '').split(':')[0].strip()
+    base = f"{fqdn} ({server_ip})" if (fqdn and server_ip) else (server_ip or fqdn or '')
+    if nickname:
+        return f"{nickname} ({base})" if base else nickname
+    return base
+
 
 def _guarddog_health_url(settings):
     """Build the health endpoint URL for this server (for Uptime Robot / display)."""
@@ -1559,8 +2401,9 @@ def guarddog_page():
     ]
     if is_two_server and s1_host:
         guarddog_services.append({'id': 'remotedb', 'name': f'Remote Database ({s1_host})', 'monitored': gd.get('installed'), 'monitors': [
-            {'name': 'TCP + SSH', 'id': 'remotedb_tcp', 'interval': '2 min', 'desc': f'Checks port 5432 on {s1_host} is reachable and PostgreSQL cluster is up. Auto-restarts PG via SSH after 3 consecutive failures. Alerts on persistent failure.'},
-            {'name': 'Health Agent', 'id': 'remotedb_agent', 'interval': 'Always', 'desc': f'Lightweight health endpoint on {s1_host}:8080/health — checks PG ready, cot database, disk usage. If red, click "Deploy health agent to Server One" below.'},
+            {'name': 'TCP + SSH', 'id': 'remotedb_tcp', 'interval': '2 min', 'desc': f'Checks port 5432 on Server One / remote server ({s1_host}) is reachable and PostgreSQL cluster is up. Auto-restarts PG via SSH after 3 consecutive failures. Alerts on persistent failure.'},
+            {'name': 'Health Agent', 'id': 'remotedb_agent', 'interval': 'Always', 'desc': f'Lightweight health endpoint on Server One / remote server ({s1_host}:8080/health) — checks PG ready, cot database, disk usage. If red, click "Deploy health agent to Server One / remote server" below.'},
+            {'name': 'DB Auth', 'id': 'remotedb_auth', 'interval': '2 min', 'desc': f'Validates martiuser password from CoreConfig.xml against PostgreSQL on Server One / remote server ({s1_host}). Red means credential drift — Guard Dog auto-resyncs and notifies you.'},
         ]})
     guarddog_services.extend([
         {'id': 'authentik', 'name': 'Authentik', 'monitored': modules.get('authentik', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'id': 'authentik_http', 'interval': '1 min', 'desc': 'Checks Authentik HTTP (9090). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
@@ -1573,6 +2416,7 @@ def guarddog_page():
     return render_template_string(GUARDDOG_TEMPLATE,
         settings=settings, gd=gd, tak=tak, version=VERSION,
         guarddog_alert_email=settings.get('guarddog_alert_email', ''),
+        guarddog_server_nickname=settings.get('guarddog_server_nickname', ''),
         guarddog_sms=settings.get('guarddog_sms', {}),
         guarddog_services=guarddog_services,
         guarddog_docs_url=guarddog_docs_url,
@@ -1594,6 +2438,8 @@ def guarddog_deploy_api():
         alert_email = (settings.get('guarddog_alert_email') or '').strip()
     # Allow deploy with no email (monitors run; alerts only after user configures email)
     settings['guarddog_alert_email'] = alert_email
+    nickname = (data.get('server_nickname') or '').strip()
+    settings['guarddog_server_nickname'] = nickname
     save_settings(settings)
     guarddog_deploy_log.clear()
     guarddog_deploy_status.update({'running': True, 'complete': False, 'error': False})
@@ -1786,7 +2632,7 @@ def _guarddog_service_monitor_ids(settings):
     takserver_ids.extend(['oom', 'disk', 'cert', 'intca'])
     multi = {
         'takserver': takserver_ids,
-        'remotedb': ['remotedb_tcp', 'remotedb_agent'],
+        'remotedb': ['remotedb_tcp', 'remotedb_agent', 'remotedb_auth'],
         'authentik': ['authentik_http'],
         'mediamtx': ['mediamtx_svc'],
         'nodered': ['nodered_http'],
@@ -2059,6 +2905,32 @@ def _monitor_health_check(monitor_id):
                 return resp.status == 200
             except Exception:
                 return False
+        if monitor_id == 'remotedb_auth':
+            settings = load_settings()
+            tak_cfg = _get_tak_deployment_config(settings)
+            if tak_cfg.get('mode') != 'two_server':
+                return None
+            s1_cfg = tak_cfg.get('server_one', {})
+            # Read password from LOCAL CoreConfig.xml (what TAK Server actually uses)
+            local_pw = ''
+            try:
+                r = subprocess.run(['sudo', 'cat', '/opt/tak/CoreConfig.xml'], capture_output=True, text=True, timeout=5)
+                cc = r.stdout or ''
+                for pat in (
+                    r'<connection[^>]*url\s*=\s*["\']jdbc:postgresql://[^"\']+/cot["\'][^>]*password\s*=\s*["\']([^"\']*)["\']',
+                    r'<connection[^>]*username\s*=\s*["\']martiuser["\'][^>]*password\s*=\s*["\']([^"\']*)["\']',
+                    r'<connection[^>]*password\s*=\s*["\']([^"\']*)["\']',
+                ):
+                    m = re.search(pat, cc)
+                    if m and (m.group(1) or '').strip():
+                        local_pw = m.group(1).strip()
+                        break
+            except Exception:
+                pass
+            if not local_pw:
+                return False
+            ok, _ = _verify_server_one_db_password(s1_cfg, local_pw)
+            return ok
         if monitor_id == 'authentik_http':
             settings = load_settings()
             ak_url = _get_authentik_api_url(settings)
@@ -2205,6 +3077,19 @@ def guarddog_apply_docker_log_limits():
         'message': 'Docker log limits applied (50 MB × 3 files per container).' + (' Docker was restarted — start other containers from their pages if needed.' if restarted else ' Limits were already set.')
     })
 
+@app.route('/api/guarddog/update', methods=['POST'])
+@login_required
+def guarddog_update():
+    """Re-deploy Guard Dog scripts and timers from latest console version."""
+    if not os.path.exists('/opt/tak-guarddog'):
+        return jsonify({'success': False, 'error': 'Guard Dog not installed'}), 400
+    try:
+        _auto_update_guarddog()
+        return jsonify({'success': True, 'message': 'Guard Dog scripts updated and timers reloaded.'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)[:300]}), 500
+
+
 @app.route('/api/guarddog/uninstall', methods=['POST'])
 @login_required
 def guarddog_uninstall():
@@ -2262,6 +3147,26 @@ def guarddog_test_email():
         return jsonify({'success': True, 'message': f'Test email sent to {to_addr}'})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/guarddog/notifications/save', methods=['POST'])
+@login_required
+def guarddog_notifications_save():
+    """Save alert email and server nickname; if Guard Dog is installed, write server_identifier so alerts use the nickname without redeploy."""
+    data = request.json or {}
+    settings = load_settings()
+    email = (data.get('alert_email') or '').strip()
+    nickname = (data.get('server_nickname') or '').strip()
+    settings['guarddog_alert_email'] = email
+    settings['guarddog_server_nickname'] = nickname
+    save_settings(settings)
+    if os.path.exists('/opt/tak-guarddog'):
+        try:
+            ident = _guarddog_server_identifier(settings)
+            with open('/opt/tak-guarddog/server_identifier', 'w') as f:
+                f.write(ident)
+        except Exception:
+            pass
+    return jsonify({'success': True, 'message': 'Saved. Alerts will use the server nickname.'})
 
 @app.route('/api/guarddog/sms/save', methods=['POST'])
 @login_required
@@ -2501,6 +3406,7 @@ def run_guarddog_deploy(alert_email):
         # Two-server: replace local PG monitors with remote DB monitor
         if is_two_server and s1_host:
             script_files.append('tak-remotedb-watch.sh')
+            script_files.append('tak-remotedb-auth-watch.sh')
         else:
             script_files.extend(['tak-db-watch.sh', 'tak-cotdb-watch.sh'])
         # Optional: monitors for other services (only install if that service is present)
@@ -2527,7 +3433,7 @@ def run_guarddog_deploy(alert_email):
                 .replace('ALERT_EMAIL_PLACEHOLDER', alert_email)
                 .replace('ALERT_SMS_PLACEHOLDER', alert_sms or '')
                 .replace('CERT_PASS_PLACEHOLDER', cert_pass))
-            if is_two_server and name == 'tak-remotedb-watch.sh':
+            if is_two_server and name in ('tak-remotedb-watch.sh', 'tak-remotedb-auth-watch.sh'):
                 content = content.replace('DB_HOST_PLACEHOLDER', s1_host)
                 content = content.replace('DB_PORT_PLACEHOLDER', db_port)
                 content = content.replace('SSH_KEY_PLACEHOLDER', ssh_key_path)
@@ -2544,6 +3450,11 @@ def run_guarddog_deploy(alert_email):
             gd_conf = {'two_server': True, 'db_host': s1_host, 'db_port': int(db_port)}
         with open('/opt/tak-guarddog/guarddog.conf', 'w') as f:
             json.dump(gd_conf, f)
+        # Server identifier for alerts (nickname and/or IP/FQDN) so multi-server monitoring can tell which host
+        server_identifier = _guarddog_server_identifier(settings)
+        with open('/opt/tak-guarddog/server_identifier', 'w') as f:
+            f.write(server_identifier)
+        plog("✓ Server identifier written (for alert subject/body)")
         units = [
             ('tak8089guard.service', '[Unit]\nDescription=TAK 8089 Health Guard Dog\nAfter=network-online.target\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-8089-watch.sh\n'),
             ('tak8089guard.timer', '[Unit]\nDescription=Run TAK 8089 guard dog every 1 minute\n\n[Timer]\nOnBootSec=10min\nOnUnitActiveSec=1min\nUnit=tak8089guard.service\n\n[Install]\nWantedBy=timers.target\n'),
@@ -2566,6 +3477,8 @@ def run_guarddog_deploy(alert_email):
             units.extend([
                 ('takremotedbguard.service', '[Unit]\nDescription=Guard Dog Remote Database Monitor\nAfter=network-online.target\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-remotedb-watch.sh\n'),
                 ('takremotedbguard.timer', '[Unit]\nDescription=Run remote DB monitor every 2 minutes\n\n[Timer]\nOnBootSec=5min\nOnUnitActiveSec=2min\nUnit=takremotedbguard.service\n\n[Install]\nWantedBy=timers.target\n'),
+                ('takremotedbauthguard.service', '[Unit]\nDescription=Guard Dog Remote DB Auth Monitor\nAfter=network-online.target\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-remotedb-auth-watch.sh\n'),
+                ('takremotedbauthguard.timer', '[Unit]\nDescription=Validate DB credentials every 2 minutes\n\n[Timer]\nOnBootSec=3min\nOnUnitActiveSec=2min\nUnit=takremotedbauthguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ])
         else:
             units.extend([
@@ -2680,7 +3593,7 @@ def run_guarddog_deploy(alert_email):
 
         # Two-server: deploy health agent to Server One via SSH/SCP
         if is_two_server and s1_host and os.path.exists(ssh_key_path):
-            plog(f"Deploying health agent to Server One ({s1_host})...")
+            plog(f"Deploying health agent to Server One / remote server ({s1_host})...")
             s1_cfg = tak_cfg.get('server_one', {})
             agent_src = os.path.join(scripts_dir, 'tak-db-health-agent.py')
             if os.path.isfile(agent_src):
@@ -2804,6 +3717,98 @@ def cloudtak_page():
 def cloudtak_page_js():
     return app.response_class(CLOUDTAK_PAGE_JS, mimetype='application/javascript')
 
+def _caddy_letsencrypt_days_left(settings):
+    """Return days until Let's Encrypt cert expires (for primary FQDN), or None if unavailable."""
+    fqdn = (settings.get('fqdn') or '').strip().split(':')[0]
+    if not fqdn:
+        return None
+    from datetime import datetime
+    # Try s_client with servername (Caddy may serve cert for base domain or infratak.<fqdn>)
+    for servername in (fqdn, f'infratak.{fqdn}'):
+        try:
+            cmd = (
+                f'echo | openssl s_client -connect localhost:443 -servername {servername} 2>/dev/null '
+                '| openssl x509 -noout -enddate 2>/dev/null'
+            )
+            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+            out = (r.stdout or '').strip()
+            if not out or 'notAfter=' not in out:
+                continue
+            date_str = out.replace('notAfter=', '').strip()
+            # Accept GMT or UTC
+            for fmt in ('%b %d %H:%M:%S %Y %Z', '%b %d %H:%M:%S %Y GMT', '%b %d %H:%M:%S %Y UTC'):
+                try:
+                    expiry = datetime.strptime(date_str, fmt)
+                    break
+                except ValueError:
+                    continue
+            else:
+                continue
+            now = datetime.utcnow()
+            if getattr(expiry, 'tzinfo', None):
+                expiry = expiry.replace(tzinfo=None)
+            delta = expiry - now
+            return max(0, delta.days)
+        except Exception:
+            continue
+    # Fallback: read cert from Caddy's storage (primary domain or infratak)
+    cert_base = '/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory'
+    for name in (fqdn, f'infratak.{fqdn}'):
+        crt = os.path.join(cert_base, name, f'{name}.crt')
+        if not os.path.isfile(crt):
+            continue
+        try:
+            r = subprocess.run(
+                ['openssl', 'x509', '-enddate', '-noout', '-in', crt],
+                capture_output=True, text=True, timeout=5
+            )
+            if r.returncode != 0:
+                continue
+            raw = (r.stdout or '').strip().split('=', 1)[-1]
+            for fmt in ('%b %d %H:%M:%S %Y %Z', '%b %d %H:%M:%S %Y GMT', '%b %d %H:%M:%S %Y UTC'):
+                try:
+                    expiry = datetime.strptime(raw, fmt)
+                    break
+                except ValueError:
+                    continue
+            else:
+                continue
+            now = datetime.utcnow()
+            return max(0, (expiry - now).days)
+        except Exception:
+            continue
+    return None
+
+
+def _caddy_cert_days_color(days_left):
+    """Return color for cert days display; matches Guard Dog Certificate monitor (alert at 40 days)."""
+    if days_left is None:
+        return None
+    if days_left <= 14:
+        return 'red'   # critical
+    if days_left <= 40:
+        return 'yellow'  # Guard Dog fires email at <= 40 days
+    return 'green'
+
+
+def _fmt_caddy_cert_days(days_left):
+    """Format days like dashboard card: e.g. '42d' or '1y 2mo 5d'. Returns (text, None) for no cert."""
+    if days_left is None:
+        return None, None
+    y = days_left // 365
+    r = days_left % 365
+    m = r // 30
+    dd = r % 30
+    parts = []
+    if y > 0:
+        parts.append(f'{y}y')
+    if m > 0:
+        parts.append(f'{m}mo')
+    if dd > 0 or not parts:
+        parts.append(f'{dd}d')
+    return ' '.join(parts), _caddy_cert_days_color(days_left)
+
+
 def _caddy_configured_urls(settings, modules):
     """Build list of configured subdomain → service for the Caddy page. Only when FQDN is set."""
     fqdn = settings.get('fqdn', '').strip()
@@ -2853,9 +3858,14 @@ def caddy_page():
         except Exception:
             pass
     configured_urls = _caddy_configured_urls(settings, modules)
+    cert_days = _caddy_letsencrypt_days_left(settings)
+    cert_days_color = _caddy_cert_days_color(cert_days)
+    cert_days_fmt, _ = _fmt_caddy_cert_days(cert_days)  # same format as dashboard card
     return render_template_string(CADDY_TEMPLATE,
         settings=settings, caddy=caddy, caddyfile=caddyfile_content,
         configured_urls=configured_urls,
+        cert_days_left=cert_days, cert_days_color=cert_days_color,
+        cert_days_fmt=cert_days_fmt,
         version=VERSION, deploying=caddy_deploy_status.get('running', False),
         deploy_done=caddy_deploy_status.get('complete', False))
 
@@ -2880,6 +3890,16 @@ def caddy_deploy():
     caddy_deploy_status.update({'running': True, 'complete': False, 'error': False})
     threading.Thread(target=run_caddy_deploy, args=(domain,), daemon=True).start()
     return jsonify({'success': True})
+
+@app.route('/api/caddy/cert-days')
+@login_required
+def caddy_cert_days():
+    """Days until Let's Encrypt cert expires; color matches Guard Dog (yellow <=40d, red <=14d)."""
+    settings = load_settings()
+    days = _caddy_letsencrypt_days_left(settings)
+    color = _caddy_cert_days_color(days)
+    return jsonify({'days_left': days, 'color': color})
+
 
 @app.route('/api/caddy/log')
 @login_required
@@ -4205,10 +5225,14 @@ def generate_caddyfile(settings=None):
         ct_tiles = sd['cloudtak_tiles']
         ct_video = sd['cloudtak_video']
         ct_up = _get_cloudtak_upstreams(settings)
-        lines.append(f"# CloudTAK Web UI (flush for SSE channels / WebSocket)")
+        lines.append(f"# CloudTAK Web UI (flush for SSE channels / WebSocket; longer timeouts for channel sync)")
         lines.append(f"{ct_map} {{")
         lines.append(f"    reverse_proxy {ct_up['map']} {{")
         lines.append(f"        flush_interval -1")
+        lines.append(f"        transport http {{")
+        lines.append(f"            read_timeout 120s")
+        lines.append(f"            write_timeout 120s")
+        lines.append(f"        }}")
         lines.append(f"    }}")
         lines.append(f"}}")
         lines.append("")
@@ -5096,7 +6120,9 @@ def takportal_control():
         running = 'Up' in (r.stdout or '')
         return jsonify({'success': True, 'running': running, 'action': action, 'message': 'Config updated and portal restarted.'})
     elif action == 'update':
-        pull = subprocess.run(f'cd {portal_dir} && git pull --rebase --autostash', shell=True, capture_output=True, text=True, timeout=60)
+        pull = subprocess.run(
+            f'cd {portal_dir} && git -c safe.directory={portal_dir} pull --rebase --autostash',
+            shell=True, capture_output=True, text=True, timeout=60)
         pull_msg = pull.stdout.strip().split('\n')[-1] if pull.stdout.strip() else ''
         build = subprocess.run(f'cd {portal_dir} && docker compose up -d --build', shell=True, capture_output=True, text=True, timeout=180)
         if build.returncode != 0:
@@ -5261,7 +6287,9 @@ def run_takportal_deploy():
         plog("\u2501\u2501\u2501 Step 2/6: Cloning TAK Portal \u2501\u2501\u2501")
         if os.path.exists(portal_dir):
             plog("  TAK-Portal directory already exists, pulling latest...")
-            subprocess.run(f'cd {portal_dir} && git pull --rebase --autostash', shell=True, capture_output=True, text=True, timeout=60)
+            subprocess.run(
+                f'cd {portal_dir} && git -c safe.directory={portal_dir} pull --rebase --autostash',
+                shell=True, capture_output=True, text=True, timeout=60)
         else:
             plog("  Cloning from GitHub (shallow, latest only)...")
             r = subprocess.run(f'git clone --depth 1 https://github.com/AdventureSeeker423/TAK-Portal.git {portal_dir}', shell=True, capture_output=True, text=True, timeout=180)
@@ -5585,25 +6613,46 @@ def run_takportal_deploy():
                         else:
                             plog(f"  \u26a0 Application error: {str(e)[:80]}")
 
-                    # Add to embedded outpost (main: direct PATCH)
-                    try:
-                        req = _urlreq.Request(f'{_ak_url}/api/v3/outposts/instances/?search=embedded', headers=_ak_headers)
-                        resp = _urlreq.urlopen(req, timeout=10)
-                        outposts = json_mod.loads(resp.read().decode())['results']
-                        embedded = next((o for o in outposts if 'embed' in o.get('name','').lower() or o.get('type') == 'proxy'), None)
-                        if embedded:
-                            current_providers = embedded.get('providers', [])
-                            if provider_pk not in current_providers:
-                                current_providers.append(provider_pk)
-                            req = _urlreq.Request(f'{_ak_url}/api/v3/outposts/instances/{embedded["pk"]}/',
-                                data=json_mod.dumps({'providers': current_providers}).encode(),
-                                headers=_ak_headers, method='PATCH')
-                            _urlreq.urlopen(req, timeout=10)
+                    # Add to embedded outpost (retry-safe; API can still be warming up)
+                    outpost_ok = False
+                    for attempt in range(1, 4):
+                        try:
+                            req = _urlreq.Request(f'{_ak_url}/api/v3/outposts/instances/?search=embedded', headers=_ak_headers)
+                            resp = _urlreq.urlopen(req, timeout=15)
+                            outposts = json_mod.loads(resp.read().decode())['results']
+                            embedded = next((o for o in outposts if 'embed' in o.get('name','').lower() or o.get('type') == 'proxy'), None)
+                            if not embedded:
+                                plog(f"  \u26a0 No embedded outpost found")
+                                break
+                            detail_req = _urlreq.Request(f'{_ak_url}/api/v3/outposts/instances/{embedded["pk"]}/', headers=_ak_headers)
+                            detail = _urlreq.urlopen(detail_req, timeout=15)
+                            full = json_mod.loads(detail.read().decode())
+                            raw = full.get('providers') or []
+                            current_pks = []
+                            for p in raw:
+                                if isinstance(p, int):
+                                    current_pks.append(p)
+                                elif isinstance(p, dict):
+                                    pk = p.get('pk') or p.get('id')
+                                    if pk is not None:
+                                        current_pks.append(pk)
+                            if provider_pk not in current_pks:
+                                current_pks.append(provider_pk)
+                                patch_req = _urlreq.Request(f'{_ak_url}/api/v3/outposts/instances/{embedded["pk"]}/',
+                                    data=json_mod.dumps({'providers': current_pks}).encode(),
+                                    headers=_ak_headers, method='PATCH')
+                                _urlreq.urlopen(patch_req, timeout=15)
+                            outpost_ok = True
                             plog(f"  \u2713 TAK Portal added to embedded outpost")
-                        else:
-                            plog(f"  \u26a0 No embedded outpost found")
-                    except Exception as e:
-                        plog(f"  \u26a0 Outpost error: {str(e)[:80]}")
+                            break
+                        except Exception as e:
+                            if attempt < 3:
+                                plog(f"  \u26a0 Outpost error: {str(e)[:80]} (retry {attempt}/2)")
+                                time.sleep(3)
+                            else:
+                                plog(f"  \u26a0 Outpost error: {str(e)[:80]}")
+                    if not outpost_ok:
+                        plog("  \u26a0 Continuing -- outpost attach can self-heal on Authentik reconfigure")
             except Exception as e:
                 plog(f"  \u26a0 Forward auth setup error: {str(e)[:100]}")
 
@@ -7353,7 +8402,10 @@ def cloudtak_control():
 @login_required
 def cloudtak_container_logs():
     lines = request.args.get('lines', 80, type=int)
+    lines = max(1, min(lines if lines is not None else 80, 500))
     container = request.args.get('container', '').strip()
+    if container and not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9_.-]*$', container):
+        return jsonify({'entries': ['Invalid container name']}), 400
     settings = load_settings()
     cfg = _get_cloudtak_deployment_config(settings)
     if cfg.get('target_mode') == 'remote':
@@ -7374,7 +8426,8 @@ def cloudtak_container_logs():
     if not os.path.exists(compose_yml):
         compose_yml = os.path.join(cloudtak_dir, 'compose.yaml')
     if container:
-        r = subprocess.run(f'docker logs {container} --tail {lines} 2>&1', shell=True, capture_output=True, text=True, timeout=15)
+        r = subprocess.run(['docker', 'logs', container, '--tail', str(lines)],
+            capture_output=True, text=True, timeout=15)
     else:
         if os.path.exists(compose_yml):
             r = subprocess.run(f'docker compose -f "{compose_yml}" logs --tail {lines} 2>&1', shell=True, capture_output=True, text=True, timeout=15, cwd=cloudtak_dir)
@@ -7769,10 +8822,14 @@ def run_cloudtak_deploy(cfg=None):
                     shell=True, capture_output=True, text=True, timeout=120)
                 if r.returncode != 0:
                     plog(f"  ⚠ git fetch/checkout warning: {r.stderr.strip()[:100]} — falling back to pull")
-                    subprocess.run(f'cd {cloudtak_dir} && git pull --rebase --autostash', shell=True, capture_output=True, text=True, timeout=120)
+                    subprocess.run(
+                        f'cd {cloudtak_dir} && git -c safe.directory={cloudtak_dir} pull --rebase --autostash',
+                        shell=True, capture_output=True, text=True, timeout=120)
             else:
                 plog("  ~/CloudTAK exists — pulling latest (could not fetch release tag)...")
-                r = subprocess.run(f'cd {cloudtak_dir} && git pull --rebase --autostash', shell=True, capture_output=True, text=True, timeout=120)
+                r = subprocess.run(
+                    f'cd {cloudtak_dir} && git -c safe.directory={cloudtak_dir} pull --rebase --autostash',
+                    shell=True, capture_output=True, text=True, timeout=120)
                 if r.returncode != 0:
                     plog(f"  ⚠ git pull warning: {r.stderr.strip()[:100]}")
         else:
@@ -10359,8 +11416,8 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 {{ sidebar_html }}
 <div class="main">
   <div class="page-header"><h1 style="display:flex;align-items:center;gap:10px"><span class="nav-icon" style="font-size:22px;line-height:1">🐕</span><span>Guard Dog</span></h1><p>TAK Server health monitoring and auto-recovery. Runs automatically after TAK Server deploy; configure notifications below.</p></div>
-  {% if gd.running %}<div class="status-banner running" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px"><div style="display:flex;align-items:center;gap:12px"><div class="dot"></div>Guard Dog is running</div><button type="button" class="btn btn-ghost" style="border-color:var(--yellow);color:var(--yellow)" onclick="gdSetEnabled(false, this)">Disable</button></div>
-  {% elif gd.installed %}<div class="status-banner stopped" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px"><div style="display:flex;align-items:center;gap:12px"><div class="dot"></div>Guard Dog is disabled</div><button type="button" class="btn btn-primary" onclick="gdSetEnabled(true, this)">Enable</button></div>
+  {% if gd.running %}<div class="status-banner running" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px"><div style="display:flex;align-items:center;gap:12px"><div class="dot"></div>Guard Dog is running</div><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><button type="button" class="btn btn-ghost" id="gd-update-btn" onclick="gdUpdate()" title="Re-deploy scripts and timers from latest console version">↻ Update</button><button type="button" class="btn btn-ghost" style="border-color:var(--yellow);color:var(--yellow)" onclick="gdSetEnabled(false, this)">Disable</button><button class="btn btn-ghost" style="color:var(--red);border-color:var(--red)" onclick="document.getElementById('gd-uninstall-modal').classList.add('open')">Uninstall</button><span id="gd-update-msg" style="font-size:12px"></span></div></div>
+  {% elif gd.installed %}<div class="status-banner stopped" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px"><div style="display:flex;align-items:center;gap:12px"><div class="dot"></div>Guard Dog is disabled</div><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><button type="button" class="btn btn-ghost" id="gd-update-btn" onclick="gdUpdate()">↻ Update</button><button type="button" class="btn btn-primary" onclick="gdSetEnabled(true, this)">Enable</button><button class="btn btn-ghost" style="color:var(--red);border-color:var(--red)" onclick="document.getElementById('gd-uninstall-modal').classList.add('open')">Uninstall</button><span id="gd-update-msg" style="font-size:12px"></span></div></div>
   {% else %}<div class="status-banner not-installed"><div class="dot"></div>Guard Dog is not installed (it will install automatically when you deploy TAK Server)</div>{% endif %}
 
   <div class="card">
@@ -10398,8 +11455,8 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
           </div>
           {% if svc.id == 'remotedb' and m.id == 'remotedb_agent' %}
           <div class="guard-item" style="align-items:center;gap:8px;padding-left:28px;margin-top:-4px;margin-bottom:8px">
-            <span class="guard-item-desc" style="flex:1">Install or reinstall the health agent on Server One (use if the Health Agent check above is red):</span>
-            <button type="button" class="btn btn-ghost gd-deploy-agent-btn" onclick="gdDeployHealthAgent()" style="padding:6px 14px;font-size:12px;flex-shrink:0">Deploy health agent to Server One</button>
+            <span class="guard-item-desc" style="flex:1">Install or reinstall the health agent on the remote database server (use if the Health Agent check above is red):</span>
+            <button type="button" class="btn btn-ghost gd-deploy-agent-btn" onclick="gdDeployHealthAgent()" style="padding:6px 14px;font-size:12px;flex-shrink:0">Deploy health agent to Server One / remote server</button>
             <span class="gd-deploy-agent-msg-inline" style="font-size:12px;min-width:80px"></span>
           </div>
           {% endif %}
@@ -10411,12 +11468,12 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     </div>
     {% for svc in guarddog_services %}
     {% if svc.id == 'remotedb' %}
-    <p style="margin-top:12px;font-size:12px;color:var(--text-secondary)">If <strong>Health Agent</strong> is red, the agent may not be on Server One. <button type="button" class="btn btn-ghost" id="gd-deploy-agent-btn" onclick="gdDeployHealthAgent()" style="padding:6px 14px;font-size:12px">Deploy health agent to Server One</button> <span id="gd-deploy-agent-msg"></span></p>
+    <p style="margin-top:12px;font-size:12px;color:var(--text-secondary)">If <strong>Health Agent</strong> is red, the agent may not be installed on Server One / remote server. <button type="button" class="btn btn-ghost" id="gd-deploy-agent-btn" onclick="gdDeployHealthAgent()" style="padding:6px 14px;font-size:12px">Deploy health agent to Server One / remote server</button> <span id="gd-deploy-agent-msg"></span></p>
     {% endif %}
     {% endfor %}
     <p style="margin-top:14px;font-size:12px;color:var(--text-dim)">Health endpoint (for Uptime Robot): <code style="color:var(--cyan);word-break:break-all">{{ health_url }}</code></p>
     <p style="margin-top:10px;font-size:12px;color:var(--text-dim)"><a href="{{ guarddog_docs_url }}" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);text-decoration:none;font-weight:500">How Guard Dog works</a> (delays, soft start, restart-loop protection) → docs</p>
-    <p style="margin-top:16px"><button class="btn btn-ghost" style="color:var(--red);border-color:var(--red)" onclick="document.getElementById('gd-uninstall-modal').classList.add('open')">Uninstall Guard Dog</button></p>
+    
   </div>
   {% endif %}
 
@@ -10428,6 +11485,12 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     {% endif %}
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:16px">Configure email, Uptime Robot, and optional SMS (Twilio or Brevo) for Guard Dog alerts.</p>
     <div class="gd-section" style="margin-bottom:20px">
+      <div class="form-label">Server nickname</div>
+      <p style="font-size:12px;color:var(--text-dim);margin-bottom:8px">Optional. Shown in alert subject and body so you can tell which server when monitoring multiple (e.g. Production, Staging).</p>
+      <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:16px">
+        <input class="form-input" type="text" id="gd-server-nickname" placeholder="e.g. Production, Staging" value="{{ guarddog_server_nickname | e }}" style="max-width:220px" maxlength="64">
+        <button class="btn btn-ghost" id="gd-save-notify-btn" onclick="gdSaveNotifications()">Save email &amp; nickname</button>
+      </div>
       <div class="form-label">Email</div>
       {% if email_relay_configured %}<p style="font-size:12px;color:var(--green);margin-bottom:8px">Using Email Relay (e.g. Brevo SMTP). Alerts are sent through your configured relay.</p>{% endif %}
       <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center">
@@ -10435,6 +11498,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
         <button class="btn btn-ghost" id="gd-test-email-btn" onclick="gdTestEmail()">Send test email</button>
       </div>
       <div id="gd-test-email-msg" style="margin-top:8px;font-size:12px"></div>
+      <div id="gd-save-notify-msg" style="margin-top:8px;font-size:12px"></div>
     </div>
     <div class="gd-section" style="margin-bottom:20px">
       <div class="form-label">Uptime Robot (outside-in monitoring)</div>
@@ -11304,8 +12368,12 @@ window.control = function(action) {
     headers: {"Content-Type": "application/json"},
     body: JSON.stringify({action: action})
   }).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.error) {
+      document.getElementById("control-status").textContent = "Error: " + (d.error || "failed");
+      return;
+    }
     document.getElementById("control-status").textContent = d.running ? "Running" : "Stopped";
-    setTimeout(function() { document.getElementById("control-status").textContent = ""; }, 3000);
+    setTimeout(function() { window.location.href = window.location.pathname + "?t=" + Date.now(); }, 1500);
   });
 };
 
@@ -11531,6 +12599,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     <div class="card-title">Container Logs <span id="log-filter-label" style="font-size:11px;color:var(--cyan);margin-left:8px"></span></div>
     <div class="log-box" id="container-logs">Loading...</div>
   </div>
+  <p style="margin-top:12px;font-size:12px;color:var(--text-dim)">Channel status / constant prompts? <a href="https://github.com/takwerx/infra-TAK/blob/main/docs/DEBUG-CLOUDTAK-CHANNEL-STATUS.md" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);text-decoration:none">Debug guide</a> (LDAP traffic, workarounds, reporting upstream).</p>
   {% endif %}
 
   {% else %}
@@ -12043,9 +13112,9 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div class="main">
 <div class="status-banner">
 {% if caddy.installed and caddy.running %}
-<div class="status-info"><div class="status-logo-wrap"><img src="{{ caddy_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--green)">Running</div><div class="status-detail">Caddy is active{% if settings.get('fqdn') %} · {{ settings.get('fqdn') }}{% endif %}</div></div></div>
+<div class="status-info"><div class="status-logo-wrap"><img src="{{ caddy_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--green)">Running</div><div class="status-detail">Caddy is active{% if settings.get('fqdn') %} · {{ settings.get('fqdn') }}{% endif %}</div><div style="font-family:'JetBrains Mono',monospace;font-size:10px;margin-top:4px;color:{% if cert_days_fmt %}{% if cert_days_color == 'green' %}var(--green){% elif cert_days_color == 'yellow' %}var(--yellow){% elif cert_days_color == 'red' %}var(--red){% else %}var(--text-dim){% endif %}{% else %}var(--text-dim){% endif %}">Cert: {% if cert_days_fmt %}{{ cert_days_fmt }}{% else %}—{% endif %}</div></div></div>
 {% elif caddy.installed %}
-<div class="status-info"><div class="status-logo-wrap"><img src="{{ caddy_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--red)">Stopped</div><div class="status-detail">Caddy is installed but not running</div></div></div>
+<div class="status-info"><div class="status-logo-wrap"><img src="{{ caddy_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--red)">Stopped</div><div class="status-detail">Caddy is installed but not running</div><div style="font-family:'JetBrains Mono',monospace;font-size:10px;margin-top:4px;color:var(--text-dim)">Cert: {% if cert_days_fmt %}{{ cert_days_fmt }}{% else %}—{% endif %}</div></div></div>
 {% else %}
 <div class="status-info"><div class="status-logo-wrap"><img src="{{ caddy_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--text-dim)">Not Installed</div><div class="status-detail">Set up a domain for full functionality</div></div></div>
 {% endif %}
@@ -12409,7 +13478,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div class="section-title" style="margin-top:20px">Controls</div>
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:24px">
 <div class="controls" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
-{% if portal.running %}<button class="control-btn" onclick="portalControl('restart')">↻ Restart</button><button class="control-btn" onclick="portalReconfigure()" title="Refresh Authentik/TAK Server settings and restart container">🔄 Update config</button><button class="control-btn btn-update" id="update-btn" onclick="portalUpdate()"{% if portal_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if portal_update_available %} <span style="color:var(--cyan)" title="Update available: v{{ portal_latest }}">●</span>{% endif %}</button><button class="control-btn btn-stop" onclick="portalControl('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('portal-uninstall-modal').classList.add('open')">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="portalControl('start')">▶ Start</button><button class="control-btn" onclick="portalReconfigure()" title="Refresh Authentik/TAK Server settings and restart container">🔄 Update config</button><button class="control-btn btn-update" id="update-btn" onclick="portalUpdate()"{% if portal_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if portal_update_available %} <span style="color:var(--cyan)" title="Update available: v{{ portal_latest }}">●</span>{% endif %}</button><button class="control-btn btn-remove" onclick="document.getElementById('portal-uninstall-modal').classList.add('open')">🗑 Remove</button>{% endif %}
+{% if portal.running %}<button class="control-btn" onclick="portalControl('restart')">↻ Restart</button><button class="control-btn" onclick="portalReconfigure()" title="Refresh Authentik/TAK Server settings and restart container">🔄 Update config</button><button class="control-btn" onclick="syncPortalCA()" id="sync-portal-ca-btn" title="Copy TAK Server CA to portal and restart. Use when enrollment succeeds but ATAK says host not trusted.">🔄 Sync TAK Server CA</button><button class="control-btn btn-update" id="update-btn" onclick="portalUpdate()"{% if portal_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if portal_update_available %} <span style="color:var(--cyan)" title="Update available: v{{ portal_latest }}">●</span>{% endif %}</button><button class="control-btn btn-stop" onclick="portalControl('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('portal-uninstall-modal').classList.add('open')">🗑 Remove</button><span id="sync-portal-ca-msg" style="margin-left:8px;font-size:12px"></span>{% else %}<button class="control-btn btn-start" onclick="portalControl('start')">▶ Start</button><button class="control-btn" onclick="portalReconfigure()" title="Refresh Authentik/TAK Server settings and restart container">🔄 Update config</button><button class="control-btn" onclick="syncPortalCA()" id="sync-portal-ca-btn" title="Copy TAK Server CA to portal and restart. Use when enrollment succeeds but ATAK says host not trusted.">🔄 Sync TAK Server CA</button><button class="control-btn btn-update" id="update-btn" onclick="portalUpdate()"{% if portal_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if portal_update_available %} <span style="color:var(--cyan)" title="Update available: v{{ portal_latest }}">●</span>{% endif %}</button><button class="control-btn btn-remove" onclick="document.getElementById('portal-uninstall-modal').classList.add('open')">🗑 Remove</button><span id="sync-portal-ca-msg" style="margin-left:8px;font-size:12px"></span>{% endif %}
 </div>
 <div id="update-status" style="display:none;margin-top:12px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary)"></div>
 </div>
@@ -12550,6 +13619,24 @@ async function portalReconfigure(){
         if(status){status.style.color='var(--red)';status.textContent='✗ '+e.message;}
         btns.forEach(function(b){b.disabled=false;b.style.opacity='1';});
     }
+}
+async function syncPortalCA(){
+    var btn=document.getElementById('sync-portal-ca-btn');
+    var msgEl=document.getElementById('sync-portal-ca-msg');
+    if(btn)btn.disabled=true;
+    if(msgEl){msgEl.textContent='Syncing...';msgEl.style.color='var(--text-dim)';}
+    try{
+        var r=await fetch('/api/takserver/sync-portal-ca',{method:'POST',headers:{'Content-Type':'application/json'}});
+        var d=await r.json();
+        if(d.success){
+            if(msgEl){msgEl.textContent=d.message||'Done. Try enrolling again.';msgEl.style.color='var(--green)';}
+        }else{
+            if(msgEl){msgEl.textContent=d.error||'Failed';msgEl.style.color='var(--red)';}
+        }
+    }catch(e){
+        if(msgEl){msgEl.textContent='Error: '+e.message;msgEl.style.color='var(--red)';}
+    }
+    if(btn)btn.disabled=false;
 }
 async function portalUpdate(){
     var btn=document.getElementById('update-btn');
@@ -16966,7 +18053,10 @@ def takserver_ca_info():
             current_cn = (info['intermediate_ca'] or {}).get('name', '').lower()
             root_cn = (info['root_ca'] or {}).get('name', '').lower()
             old_cas = []
+            skip_aliases = {'mykey'}  # legacy default alias, not a CA to revoke
             for a in trusted_aliases:
+                if a.lower() in skip_aliases:
+                    continue
                 if a.lower() != current_cn.lower() and a.lower() != 'root-ca' and a.lower() != root_cn.lower():
                     old_cas.append(a)
             info['old_cas_in_truststore'] = old_cas
@@ -17042,6 +18132,12 @@ def takserver_rotate_intca():
             log(f"  New CA: {new_ca_name}")
             log("")
 
+            # Save current (old) intermediate to a named file before we overwrite ca.pem — needed for transition bundle and truststore
+            old_pem = os.path.join(cert_dir, f'{old_ca_name}.pem')
+            if not os.path.exists(old_pem):
+                run(f'cp {cert_dir}/ca.pem {old_pem}')
+                log(f"  Saved current CA to {old_ca_name}.pem for transition bundle")
+
             log("Step 1/7: Restoring Root CA as working CA...")
             run(f'cp {cert_dir}/root-ca.pem {cert_dir}/ca.pem')
             run(f'cp {cert_dir}/root-ca-do-not-share.key {cert_dir}/ca-do-not-share.key')
@@ -17058,10 +18154,10 @@ def takserver_rotate_intca():
             log(f"✓ Intermediate CA {new_ca_name} created")
 
             log("")
-            log("Step 3/7: Creating new server certificate...")
-            if not run('cd /opt/tak/certs && echo "y" | sudo -u tak ./makeCert.sh server takserver 2>&1'):
-                raise Exception('Failed to create server certificate')
-            log("✓ Server certificate created (signed by new CA)")
+            log("Step 3/7: Creating new server certificate (signed by new CA)...")
+            if not run(f'cd /opt/tak/certs && echo "y" | sudo -u tak ./makeCert.sh server takserver 2>&1'):
+                raise Exception('Failed to create new server certificate')
+            log("✓ Server certificate regenerated (signed by new CA)")
 
             log("")
             log("Step 4/7: Regenerating all client certificates...")
@@ -17102,7 +18198,7 @@ def takserver_rotate_intca():
             log("✓ CoreConfig.xml updated")
 
             log("")
-            log("Step 7/8: Updating TAK Portal certificates...")
+            log("Step 7/7: Updating TAK Portal certificates...")
             portal_running = subprocess.run('docker ps --format "{{.Names}}" 2>/dev/null | grep -q tak-portal',
                                             shell=True, capture_output=True).returncode == 0
             if portal_running:
@@ -17120,26 +18216,44 @@ def takserver_rotate_intca():
                 else:
                     run(f'docker cp {admin_p12} tak-portal:/usr/src/app/data/certs/tak-client.p12', check=False)
                     log("  ✓ admin.p12 copied to TAK Portal")
+                # Keep TAK Portal CA source identical to original deploy behavior:
+                # prefer takserver.pem (full server chain), fallback to ca.pem + root-ca.pem.
+                tak_ca_src = None
                 takserver_pem = os.path.join(cert_dir, 'takserver.pem')
                 if os.path.exists(takserver_pem):
-                    run(f'docker cp {takserver_pem} tak-portal:/usr/src/app/data/certs/tak-ca.pem', check=False)
-                    log("  ✓ CA chain copied to TAK Portal")
+                    tak_ca_src = takserver_pem
+                    log("  Using takserver.pem (full chain)")
                 else:
-                    int_pem = os.path.join(cert_dir, 'ca.pem')
-                    root_pem = os.path.join(cert_dir, 'root-ca.pem')
-                    bundle = '/tmp/tak-ca-bundle.pem'
-                    run(f'cat {int_pem} {root_pem} > {bundle} 2>/dev/null', check=False)
-                    if os.path.exists(bundle) and os.path.getsize(bundle) > 0:
-                        run(f'docker cp {bundle} tak-portal:/usr/src/app/data/certs/tak-ca.pem', check=False)
-                        os.remove(bundle)
-                        log("  ✓ CA bundle copied to TAK Portal")
+                    int_ca = os.path.join(cert_dir, 'ca.pem')
+                    root_ca = os.path.join(cert_dir, 'root-ca.pem')
+                    bundle_parts = []
+                    for ca_file in [int_ca, root_ca]:
+                        if os.path.exists(ca_file):
+                            with open(ca_file, 'r') as f:
+                                content = f.read().strip()
+                            if 'BEGIN CERTIFICATE' in content and 'TRUSTED' not in content:
+                                bundle_parts.append(content)
+                    if bundle_parts:
+                        ca_bundle_path = '/tmp/tak-ca-bundle-rotate.pem'
+                        with open(ca_bundle_path, 'w') as f:
+                            f.write('\n'.join(bundle_parts) + '\n')
+                        tak_ca_src = ca_bundle_path
+                        log(f"  Built CA bundle from ca.pem + root-ca.pem ({len(bundle_parts)} certs)")
+                if tak_ca_src:
+                    run(f'docker cp {tak_ca_src} tak-portal:/usr/src/app/data/certs/tak-ca.pem', check=False)
+                    if tak_ca_src.startswith('/tmp/'):
+                        try:
+                            os.remove(tak_ca_src)
+                        except Exception:
+                            pass
+                    log("  ✓ CA chain copied to TAK Portal")
                 run('docker restart tak-portal 2>/dev/null', check=False)
                 log("  ✓ TAK Portal restarted with new certificates")
             else:
                 log("  TAK Portal not running — will update on next deploy")
 
             log("")
-            log("Step 8/8: Restarting TAK Server...")
+            log("Restarting TAK Server...")
             ne_changed, ne_msg = _sanitize_coreconfig_name_entries()
             if ne_changed:
                 log(f"  NameEntry fix: {ne_msg}")
@@ -17153,11 +18267,11 @@ def takserver_rotate_intca():
 
             log("")
             log("━━━ ROTATION COMPLETE ━━━")
-            log(f"  New signing CA: {new_ca_name}")
-            log(f"  Old CA ({old_ca_name}) is still trusted for existing clients")
-            log(f"  New admin.p12 and user.p12 have been regenerated")
-            log(f"  ⚠ Re-import admin.p12 in your browser for CloudTAK/8443 access")
-            log(f"  When ready, use 'Revoke Old CA' to remove {old_ca_name} from the truststore")
+            log(f"  New CA: {new_ca_name}")
+            log(f"  Server cert + all client certs signed by new CA")
+            log(f"  Old CA ({old_ca_name}) in truststore — server still accepts old client certs during transition")
+            log(f"  Existing ATAK clients must re-enroll (new QR) to get the new CA")
+            log(f"  When everyone has re-enrolled, use 'Revoke Old CA' to remove {old_ca_name}")
             rotate_intca_status.update({'running': False, 'complete': True, 'error': False})
         except Exception as e:
             log(f"")
@@ -17178,7 +18292,7 @@ def takserver_rotate_intca_status():
 @app.route('/api/takserver/revoke-old-ca', methods=['POST'])
 @login_required
 def takserver_revoke_old_ca():
-    """Remove an old intermediate CA from the truststore, cutting off clients with old certs."""
+    """Create new server cert (signed by current/new CA), remove old CA from truststore, restart. Cuts off clients with old certs."""
     data = request.json or {}
     old_ca_alias = (data.get('old_ca_alias') or '').strip()
     if not old_ca_alias:
@@ -17194,6 +18308,24 @@ def takserver_revoke_old_ca():
     ts_path = ts_files[-1]
 
     try:
+        # 1) Create new server cert (signed by current = new CA) so server presents new chain. Skip if using Let's Encrypt.
+        le_jks = os.path.join(cert_dir, 'takserver-le.jks')
+        if not os.path.isfile(le_jks):
+            r = subprocess.run(
+                'cd /opt/tak/certs && echo "y" | sudo -u tak ./makeCert.sh server takserver 2>&1',
+                shell=True, capture_output=True, text=True, timeout=120)
+            if r.returncode != 0:
+                return jsonify({'error': f'Creating new server cert failed: {(r.stderr or r.stdout or "")[:200]}'}), 500
+            # Build JKS from new takserver.p12 so server can use it (CoreConfig may reference takserver.jks or we update connector)
+            p12 = os.path.join(cert_dir, 'takserver.p12')
+            jks = os.path.join(cert_dir, 'takserver.jks')
+            if os.path.isfile(p12):
+                subprocess.run(
+                    f'keytool -importkeystore -srcstoretype PKCS12 -srckeystore {p12} -srcstorepass "{cert_pass}" '
+                    f'-deststoretype JKS -destkeystore {jks} -deststorepass "{cert_pass}" -noprompt 2>&1',
+                    shell=True, capture_output=True, text=True, timeout=30)
+
+        # 2) Remove old CA from truststore
         r = subprocess.run(
             ['keytool', '-delete', '-alias', old_ca_alias,
              '-keystore', ts_path, '-storepass', cert_pass],
@@ -17201,7 +18333,7 @@ def takserver_revoke_old_ca():
         if r.returncode != 0:
             return jsonify({'error': f'keytool failed: {r.stderr or r.stdout}'}), 500
 
-        # Also regenerate the .p12 truststore from the .jks
+        # 3) Regenerate .p12 truststore
         ts_p12 = ts_path.replace('.jks', '.p12')
         subprocess.run(
             f'keytool -importkeystore -srckeystore {ts_path} -destkeystore {ts_p12} '
@@ -17209,11 +18341,47 @@ def takserver_revoke_old_ca():
             shell=True, capture_output=True, text=True, timeout=15)
 
         subprocess.run('systemctl restart takserver 2>&1', shell=True, capture_output=True, text=True, timeout=30)
-        return jsonify({
-            'success': True,
-            'message': f'Removed {old_ca_alias} from truststore and restarted TAK Server. '
-                       f'Clients with certificates signed by {old_ca_alias} will no longer be able to connect.'
-        })
+
+        # 4) Update TAK Portal certs so it can talk to TAK Server (new server cert / chain)
+        portal_running = subprocess.run('docker ps --format "{{.Names}}" 2>/dev/null | grep -q tak-portal', shell=True, capture_output=True).returncode == 0
+        if portal_running:
+            subprocess.run('docker exec tak-portal mkdir -p /usr/src/app/data/certs', shell=True, capture_output=True, text=True)
+            admin_p12 = os.path.join(cert_dir, 'admin.p12')
+            modern_p12 = '/tmp/tak-portal-admin-modern.p12'
+            subprocess.run(
+                f'openssl pkcs12 -in {admin_p12} -passin pass:{cert_pass} -nodes -legacy 2>/dev/null | '
+                f'openssl pkcs12 -export -passout pass:{cert_pass} -out {modern_p12}',
+                shell=True, capture_output=True, text=True, timeout=30)
+            if os.path.exists(modern_p12) and os.path.getsize(modern_p12) > 0:
+                subprocess.run(f'docker cp {modern_p12} tak-portal:/usr/src/app/data/certs/tak-client.p12', shell=True, capture_output=True, text=True)
+                os.remove(modern_p12)
+            else:
+                subprocess.run(f'docker cp {admin_p12} tak-portal:/usr/src/app/data/certs/tak-client.p12', shell=True, capture_output=True, text=True)
+            takserver_pem = os.path.join(cert_dir, 'takserver.pem')
+            if os.path.isfile(takserver_pem):
+                subprocess.run(f'docker cp {takserver_pem} tak-portal:/usr/src/app/data/certs/tak-ca.pem', shell=True, capture_output=True, text=True)
+            else:
+                bundle = '/tmp/tak-ca-bundle-revoke.pem'
+                int_pem = os.path.join(cert_dir, 'ca.pem')
+                root_pem = os.path.join(cert_dir, 'root-ca.pem')
+                if os.path.isfile(int_pem) and os.path.isfile(root_pem):
+                    with open(bundle, 'w') as f:
+                        f.write(open(int_pem).read())
+                        f.write(open(root_pem).read())
+                    subprocess.run(f'docker cp {bundle} tak-portal:/usr/src/app/data/certs/tak-ca.pem', shell=True, capture_output=True, text=True)
+                    try:
+                        os.remove(bundle)
+                    except Exception:
+                        pass
+            subprocess.run('docker restart tak-portal 2>/dev/null', shell=True, capture_output=True, text=True)
+
+        msg = (f'Removed {old_ca_alias} from truststore and restarted TAK Server. '
+               f'Server cert is now signed by the new CA (clients who re-enrolled via CloudTAK/QR can connect). '
+               f'TAK Portal certs updated. Clients still using certs signed by {old_ca_alias} must re-enroll.')
+        if os.path.isfile(le_jks):
+            msg = (f'Removed {old_ca_alias} from truststore and restarted TAK Server. '
+                   f'(Server TLS is Let\'s Encrypt; unchanged.) Clients with certs signed by {old_ca_alias} must re-enroll.')
+        return jsonify({'success': True, 'message': msg})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -17763,8 +18931,10 @@ def upload_takserver_package():
     os_type = load_settings().get('os_type', '')
     results = {'packages': [], 'gpg_key': None, 'policy': None}
     for f in files:
-        fn = f.filename
-        if not fn: continue
+        raw_name = f.filename or ''
+        fn = secure_filename(raw_name)
+        if not fn:
+            return jsonify({'error': f'Invalid filename: {raw_name[:64]}'}), 400
         fp = os.path.join(UPLOAD_DIR, fn)
         f.save(fp)
         sz = round(os.path.getsize(fp) / (1024*1024), 1)
@@ -18004,6 +19174,35 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
                 upgrade_status.update({'running': False, 'complete': False, 'error': True})
                 return
         ulog("✓ Database package upgraded on Server One")
+
+        # Re-fetch password from Server One — the DB package upgrade may have regenerated it
+        fresh_pw, _pw_err = _fetch_db_password_from_server_one(s1_cfg)
+        if fresh_pw and fresh_pw != db_password:
+            pw_ok, pw_msg = _verify_server_one_db_password(s1_cfg, fresh_pw, db_port=db_port)
+            if pw_ok:
+                ulog("⚠ DB password changed during upgrade — re-patching CoreConfig.xml")
+                try:
+                    with open('/opt/tak/CoreConfig.xml', 'r') as f:
+                        cc = f.read()
+                    cc = _re.sub(r'(<connection[^>]*password=")[^"]*(")', lambda m: m.group(1) + fresh_pw + m.group(2), cc)
+                    with open('/opt/tak/CoreConfig.xml', 'w') as f:
+                        f.write(cc)
+                    db_password = fresh_pw
+                    tak_cfg.setdefault('database', {})['password'] = fresh_pw
+                    settings = load_settings()
+                    settings['tak_deployment'] = tak_cfg
+                    save_settings(settings)
+                    ulog("✓ CoreConfig.xml and saved settings updated with new DB password")
+                except Exception as e:
+                    ulog(f"⚠ Could not update CoreConfig with new password: {e}")
+            else:
+                ulog(f"⚠ Fresh password from Server One also failed validation ({pw_msg})")
+        elif fresh_pw:
+            pw_ok, pw_msg = _verify_server_one_db_password(s1_cfg, fresh_pw, db_port=db_port)
+            if pw_ok:
+                ulog("✓ DB credential verified after upgrade")
+            else:
+                ulog(f"⚠ DB credential check failed after upgrade: {pw_msg}")
 
         # Step 4: Start TAK Server
         ulog("")
@@ -18472,6 +19671,49 @@ def download_truststore():
                 return send_from_directory(p, f, as_attachment=True)
     return jsonify({'error': 'truststore not found'}), 404
 
+
+@app.route('/api/takserver/sync-portal-ca', methods=['POST'])
+@login_required
+def takserver_sync_portal_ca():
+    """Copy current server CA to TAK Portal exactly like deploy Step 5: tak-ca.pem only (TAK_CA_PATH). Same source: takserver.pem or ca.pem+root-ca.pem bundle."""
+    cert_dir = '/opt/tak/certs/files'
+    r = subprocess.run('docker ps --format "{{.Names}}" 2>/dev/null | grep -q tak-portal', shell=True, capture_output=True, text=True)
+    if r.returncode != 0:
+        return jsonify({'success': False, 'error': 'TAK Portal container is not running. Start it first.'}), 400
+    subprocess.run('docker exec tak-portal mkdir -p /usr/src/app/data/certs', shell=True, capture_output=True, text=True)
+    # Same CA source logic as deploy Step 5: takserver.pem (full chain) or build from ca.pem + root-ca.pem
+    tak_ca_src = None
+    takserver_pem = os.path.join(cert_dir, 'takserver.pem')
+    if os.path.isfile(takserver_pem):
+        tak_ca_src = takserver_pem
+    else:
+        int_ca = os.path.join(cert_dir, 'ca.pem')
+        root_ca = os.path.join(cert_dir, 'root-ca.pem')
+        bundle_parts = []
+        for ca_file in [int_ca, root_ca]:
+            if os.path.isfile(ca_file):
+                with open(ca_file, 'r') as f:
+                    content = f.read().strip()
+                if 'BEGIN CERTIFICATE' in content and 'TRUSTED' not in content:
+                    bundle_parts.append(content)
+        if not bundle_parts:
+            return jsonify({'success': False, 'error': 'No takserver.pem or valid ca.pem/root-ca.pem in certs/files'}), 500
+        ca_bundle_path = '/tmp/tak-portal-sync-ca.pem'
+        with open(ca_bundle_path, 'w') as f:
+            f.write('\n'.join(bundle_parts) + '\n')
+        tak_ca_src = ca_bundle_path
+    cp = subprocess.run(f'docker cp {tak_ca_src} tak-portal:/usr/src/app/data/certs/tak-ca.pem', shell=True, capture_output=True, text=True, timeout=10)
+    if tak_ca_src.startswith('/tmp/'):
+        try:
+            os.remove(tak_ca_src)
+        except Exception:
+            pass
+    if cp.returncode != 0:
+        return jsonify({'success': False, 'error': (cp.stderr or cp.stdout or 'docker cp failed').strip()[:200]}), 500
+    subprocess.run('docker restart tak-portal 2>/dev/null', shell=True, capture_output=True, text=True, timeout=30)
+    return jsonify({'success': True, 'message': 'Server CA copied to data/certs/tak-ca.pem and portal restarted (same as deploy).'})
+
+
 @app.route('/api/certs/list')
 @login_required
 def list_cert_files():
@@ -18576,21 +19818,89 @@ body::after{content:'';position:fixed;top:0;left:0;right:0;height:2px;background
 
 # === API Routes ===
 
+@app.route('/api/host-resource-usage')
+@login_required
+def api_host_resource_usage():
+    """Top processes by CPU and RAM for this host or a remote (target=tak_db). Same hosts as UU cards."""
+    target = request.args.get('target', 'this_host')
+    if target == 'tak_db':
+        settings = load_settings()
+        cfg = _get_tak_deployment_config(settings)
+        if cfg.get('mode') != 'two_server':
+            return jsonify({'cpu_top': [], 'mem_top': [], 'error': 'Not two-server'})
+        s1 = cfg.get('server_one', {})
+        if not (s1.get('host') or '').strip():
+            return jsonify({'cpu_top': [], 'mem_top': [], 'error': 'No DB host'})
+        return jsonify(_top_processes_remote(s1))
+    return jsonify(_top_processes_local())
+
+
 @app.route('/api/metrics')
 @login_required
 def api_metrics():
-    return jsonify(get_system_metrics())
+    metrics = get_system_metrics()
+    try:
+        settings = load_settings()
+        metrics['unattended_upgrades_hosts'] = _build_uu_hosts(metrics, settings)
+    except Exception:
+        metrics['unattended_upgrades_hosts'] = [{
+            'id': 'this_host', 'label': 'This host',
+            'enabled': metrics.get('unattended_upgrades', {}).get('enabled', False),
+            'running': metrics.get('unattended_upgrades', {}).get('running', False),
+        }]
+    return jsonify(metrics)
+
+def _run_unattended_upgrades_remote(remote_cfg, action):
+    """Run enable/disable unattended-upgrades on remote host via SSH. Returns (success, result_dict)."""
+    if action == 'disable':
+        script = (
+            'pkill -TERM -f "/usr/bin/unattended-upgrade" 2>/dev/null; true; '
+            'systemctl stop unattended-upgrades 2>/dev/null; systemctl disable unattended-upgrades 2>/dev/null; '
+            'systemctl stop apt-daily-upgrade.timer 2>/dev/null; systemctl disable apt-daily-upgrade.timer 2>/dev/null; true; '
+            'e=$(systemctl is-enabled unattended-upgrades 2>/dev/null); echo "ENABLED=$e"'
+        )
+    else:
+        script = (
+            'systemctl enable unattended-upgrades 2>/dev/null; systemctl start unattended-upgrades 2>/dev/null; '
+            'systemctl enable apt-daily-upgrade.timer 2>/dev/null; systemctl start apt-daily-upgrade.timer 2>/dev/null; true; '
+            'e=$(systemctl is-enabled unattended-upgrades 2>/dev/null); echo "ENABLED=$e"'
+        )
+    try:
+        ok, out = _ssh_probe(remote_cfg, script, timeout=30)
+        if not ok:
+            return False, {'error': (out or 'ssh failed')[:100]}
+        uu = _get_unattended_upgrades_status_remote(remote_cfg)
+        if 'error' in uu:
+            return False, uu
+        return True, uu
+    except Exception as e:
+        return False, {'error': str(e)[:100]}
+
 
 @app.route('/api/unattended-upgrades', methods=['POST'])
 @login_required
 def api_toggle_unattended_upgrades():
-    """Enable or disable unattended-upgrades service."""
-    action = request.json.get('action') if request.is_json else None
+    """Enable or disable unattended-upgrades service on this host or a remote (target)."""
+    data = request.json if request.is_json else {}
+    action = data.get('action')
+    target = data.get('target', 'this_host')
     if action not in ('enable', 'disable'):
         return jsonify({'success': False, 'error': 'action must be enable or disable'}), 400
+    if target == 'tak_db':
+        settings = load_settings()
+        cfg = _get_tak_deployment_config(settings)
+        if cfg.get('mode') != 'two_server':
+            return jsonify({'success': False, 'error': 'Not two-server'}), 400
+        s1 = cfg.get('server_one', {})
+        if not (s1.get('host') or '').strip():
+            return jsonify({'success': False, 'error': 'No DB host'}), 400
+        ok, result = _run_unattended_upgrades_remote(s1, action)
+        if ok:
+            return jsonify({'success': True, 'target': 'tak_db', 'enabled': result['enabled'], 'running': result['running']})
+        return jsonify({'success': False, 'error': result.get('error', 'unknown')}), 500
+    # this_host
     try:
         if action == 'disable':
-            # Kill in-flight process first so systemctl stop doesn't hang waiting for it
             subprocess.run('pkill -TERM -f "/usr/bin/unattended-upgrade" 2>/dev/null; true', shell=True, timeout=5)
             for _ in range(15):
                 time.sleep(1)
@@ -18610,7 +19920,7 @@ def api_toggle_unattended_upgrades():
             subprocess.run('systemctl enable apt-daily-upgrade.timer 2>/dev/null; systemctl start apt-daily-upgrade.timer 2>/dev/null; true',
                 shell=True, timeout=10)
         uu = _get_unattended_upgrades_status()
-        return jsonify({'success': True, 'enabled': uu['enabled'], 'running': uu['running']})
+        return jsonify({'success': True, 'target': 'this_host', 'enabled': uu['enabled'], 'running': uu['running']})
     except subprocess.CalledProcessError as e:
         return jsonify({'success': False, 'error': e.stderr or str(e)}), 500
     except Exception as e:
@@ -19148,21 +20458,28 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div class="metric-card"><div class="metric-label">Memory</div><div class="metric-value" id="ram-value">{{ metrics.ram_percent }}%</div><div class="metric-detail">{{ metrics.ram_used_gb }}GB / {{ metrics.ram_total_gb }}GB</div></div>
 <div class="metric-card"><div class="metric-label">Disk</div><div class="metric-value" id="disk-value">{{ metrics.disk_percent }}%</div><div class="metric-detail">{{ metrics.disk_used_gb }}GB / {{ metrics.disk_total_gb }}GB</div></div>
 <div class="metric-card"><div class="metric-label">Uptime</div><div class="metric-value" id="uptime-value" style="font-size:18px">{{ metrics.uptime }}</div></div>
-<div class="metric-card" style="position:relative" title="Automatic OS/apt package upgrades on this server. Does not control infra-TAK or module updates.">
-<div class="metric-label" style="display:flex;align-items:center;gap:6px">Unattended server upgrades
-{% if metrics.unattended_upgrades.enabled and metrics.unattended_upgrades.running %}<span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--cyan);animation:pulse 2s infinite" title="OS upgrade in progress"></span>{% endif %}
+{% for host in uu_hosts %}
+<div class="metric-card" style="position:relative" title="OS/apt automatic upgrades on this host." data-uu-target="{{ host.id }}">
+<div style="min-height:52px">
+<div class="metric-label" style="display:flex;align-items:center;gap:6px">Unattended upgrades — {{ host.label }}
+{% if host.enabled and host.running %}<span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--cyan);animation:pulse 2s infinite" title="Upgrade in progress"></span>{% endif %}
 </div>
-<div class="metric-detail" style="margin-top:2px;font-size:10px;color:var(--text-dim)">OS/apt — not console or modules</div>
+{% if host.get('error') %}<div class="metric-detail" style="color:var(--red);font-size:10px;margin-top:2px">{{ host.error }}</div>{% endif %}
+<div class="metric-detail" style="margin-top:2px;font-size:10px;color:var(--text-dim)">OS/apt</div>
+</div>
 <div style="display:flex;align-items:center;gap:8px;margin-top:6px">
 <label style="position:relative;display:inline-block;width:36px;height:20px;cursor:pointer;margin:0">
-<input type="checkbox" id="uu-toggle" {% if metrics.unattended_upgrades.enabled %}checked{% endif %} onchange="toggleUU(this)" style="opacity:0;width:0;height:0">
-<span style="position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:{% if metrics.unattended_upgrades.enabled %}var(--green){% else %}rgba(71,85,105,0.5){% endif %};border-radius:20px;transition:.3s" id="uu-slider"></span>
-<span style="position:absolute;content:'';height:16px;width:16px;left:{% if metrics.unattended_upgrades.enabled %}18px{% else %}2px{% endif %};bottom:2px;background:#fff;border-radius:50%;transition:.3s" id="uu-knob"></span>
+<input type="checkbox" class="uu-toggle" data-target="{{ host.id }}" {% if host.enabled %}checked{% endif %} onchange="toggleUU(this)" style="opacity:0;width:0;height:0">
+<span class="uu-slider" data-target="{{ host.id }}" style="position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:{% if host.enabled %}var(--green){% else %}rgba(71,85,105,0.5){% endif %};border-radius:20px;transition:.3s"></span>
+<span class="uu-knob" data-target="{{ host.id }}" style="position:absolute;height:16px;width:16px;left:{% if host.enabled %}18px{% else %}2px{% endif %};bottom:2px;background:#fff;border-radius:50%;transition:.3s"></span>
 </label>
-<span id="uu-spinner" class="uu-spinner" style="display:none"></span>
-<span id="uu-label" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:{% if metrics.unattended_upgrades.enabled %}var(--green){% else %}var(--text-dim){% endif %}">{% if metrics.unattended_upgrades.enabled and metrics.unattended_upgrades.running %}Running...{% elif metrics.unattended_upgrades.enabled %}Enabled{% else %}Disabled{% endif %}</span>
+<span class="uu-spinner" data-target="{{ host.id }}" style="display:none"></span>
+<span class="uu-label" id="uu-label-{{ host.id }}" data-target="{{ host.id }}" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:{% if host.enabled %}var(--green){% else %}var(--text-dim){% endif %}">{% if host.enabled and host.running %}Running...{% elif host.enabled %}Enabled{% else %}Disabled{% endif %}</span>
 </div>
+<button type="button" onclick="event.stopPropagation();toggleResourceBreakdown('{{ host.id }}')" style="margin-top:8px;padding:4px 10px;background:rgba(59,130,246,0.15);color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">What's using CPU/RAM?</button>
+<div id="resource-breakdown-{{ host.id }}" style="display:none;margin-top:8px;padding-top:8px;border-top:1px solid var(--border);font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);max-height:200px;overflow-y:auto"></div>
 </div>
+{% endfor %}
 </div>
 <div class="section-title">Console</div>
 <div class="meta-line">v{{ version }} | {{ settings.get('os_name', 'Unknown OS') }} | {{ settings.get('server_ip', 'N/A') }}{% if settings.get('fqdn') %} | {{ settings.get('fqdn') }}{% endif %}</div>
@@ -19183,35 +20500,87 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% if module_versions.get(key) %}{% set v = module_versions.get(key) %}{% if v.version or v.update_available %}<div class="meta-line module-version-line" id="module-version-{{ key }}" style="margin-bottom:4px">{% if v.version %}v{{ v.version }}{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% endif %}</div>{% endif %}{% endif %}
 <span class="module-status status-{% if mod.installed and mod.running %}running{% elif mod.installed %}stopped{% else %}not-installed{% endif %}" id="module-status-{{ key }}" data-module="{{ key }}" data-gd-overall="{% if key == 'guarddog' and mod.installed and mod.running %}fetch{% endif %}">{% if mod.installed and mod.running %}<span class="status-dot"></span> Running{% elif mod.installed %}<span class="status-dot"></span> Stopped{% else %}Not Installed{% endif %}</span>
 {% if key == 'takserver' and mod.installed %}<div id="takserver-card-cert-expiry" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
+{% if key == 'caddy' and mod.installed %}<div id="caddy-card-cert-days" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
 </a>
 {% endfor %}
 {% endif %}
 </div>
 <script>
-function updateUU(uu){
+function updateUUHost(hostId,uu){
     if(!uu)return;
-    var tog=document.getElementById('uu-toggle'),sl=document.getElementById('uu-slider'),kn=document.getElementById('uu-knob'),lb=document.getElementById('uu-label');
+    var tog=document.querySelector('.uu-toggle[data-target="'+hostId+'"]'),sl=document.querySelector('.uu-slider[data-target="'+hostId+'"]'),kn=document.querySelector('.uu-knob[data-target="'+hostId+'"]'),lb=document.getElementById('uu-label-'+hostId);
     if(!tog)return;
     tog.checked=uu.enabled;
-    sl.style.background=uu.enabled?'var(--green)':'rgba(71,85,105,0.5)';
-    kn.style.left=uu.enabled?'18px':'2px';
-    lb.style.color=uu.enabled?'var(--green)':'var(--text-dim)';
-    lb.textContent=(uu.enabled&&uu.running)?'Running...':uu.enabled?'Enabled':'Disabled';
+    if(sl)sl.style.background=uu.enabled?'var(--green)':'rgba(71,85,105,0.5)';
+    if(kn)kn.style.left=uu.enabled?'18px':'2px';
+    if(lb){lb.style.color=uu.enabled?'var(--green)':'var(--text-dim)';lb.textContent=(uu.enabled&&uu.running)?'Running...':uu.enabled?'Enabled':'Disabled';}
+}
+function updateUUHosts(hosts){
+    if(!hosts||!hosts.length)return;
+    hosts.forEach(function(h){updateUUHost(h.id,{enabled:h.enabled,running:h.running});});
 }
 async function toggleUU(cb){
+    var target=cb.getAttribute('data-target')||'this_host';
     var action=cb.checked?'enable':'disable';
-    var lb=document.getElementById('uu-label'),sp=document.getElementById('uu-spinner');
+    var lb=document.getElementById('uu-label-'+target),sp=document.querySelector('.uu-spinner[data-target="'+target+'"]');
     if(sp)sp.style.display='inline-block';
-    lb.textContent=cb.checked?'Enabling...':'Disabling...';lb.style.color='var(--cyan)';
+    if(lb){lb.textContent=cb.checked?'Enabling...':'Disabling...';lb.style.color='var(--cyan)';}
     try{
-        var r=await fetch('/api/unattended-upgrades',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:action})});
+        var r=await fetch('/api/unattended-upgrades',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:action,target:target})});
         var d=await r.json();
         if(sp)sp.style.display='none';
-        if(d.success){updateUU(d)}
-        else{cb.checked=!cb.checked;lb.textContent=(action==='disable'?'Disable failed — try again':('Error: '+(d.error||'unknown')));lb.style.color='var(--red)'}
-    }catch(e){if(sp)sp.style.display='none';cb.checked=!cb.checked;lb.textContent=(action==='disable'?'Disable failed — try again':'Error');lb.style.color='var(--red)'}
+        if(d.success){updateUUHost(target,d);}
+        else{cb.checked=!cb.checked;if(lb){lb.textContent=(action==='disable'?'Disable failed':'Error: '+(d.error||'unknown'));lb.style.color='var(--red)';}}
+    }catch(e){if(sp)sp.style.display='none';cb.checked=!cb.checked;if(lb){lb.textContent='Error';lb.style.color='var(--red)';}}
 }
-setInterval(async()=>{try{const r=await fetch('/api/metrics');const d=await r.json();document.getElementById('cpu-value').textContent=d.cpu_percent+'%';document.getElementById('ram-value').textContent=d.ram_percent+'%';document.getElementById('disk-value').textContent=d.disk_percent+'%';document.getElementById('uptime-value').textContent=d.uptime;updateUU(d.unattended_upgrades)}catch(e){}},5000);
+function formatRamGb(memPct,totalRamGb){if(totalRamGb==null)return '';var gb=(Number(memPct||0)/100)*totalRamGb;return gb.toFixed(2)+' GB';}
+function cpuColor(pct){var n=Number(pct||0);if(n>=90)return 'var(--red)';if(n>=70)return '#eab308';return 'var(--green)';}
+function diskIoColor(currentMbs,speedTestMbs){var c=Number(currentMbs||0);var s=Number(speedTestMbs);if(s>0){var pct=(c/s)*100;if(pct>=75)return 'var(--red)';if(pct>=40)return '#eab308';return 'var(--green)';}if(c>=100)return 'var(--red)';if(c>=30)return '#eab308';return 'var(--green)';}
+function renderResourceBreakdown(div,data,hostId){
+    var err=data.error,cpuTop=data.cpu_top,memTop=data.mem_top,totalRamGb=data.total_ram_gb,processor=data.processor,diskRead=data.disk_io_read_mbs,diskWrite=data.disk_io_write_mbs,speedRead=data.disk_speed_test_read_mbs,speedWrite=data.disk_speed_test_write_mbs,speedErr=data.disk_speed_test_error;
+    if(err){div.innerHTML='<span style="color:var(--red)">'+escapeHtml(err)+'</span>'+(hostId?' <button type="button" onclick="refreshResourceBreakdown(\\''+hostId+'\\')" style="margin-left:8px;padding:2px 8px;font-size:10px;background:rgba(59,130,246,0.2);color:var(--cyan);border:1px solid var(--border);border-radius:4px;cursor:pointer">Refresh</button>':'');return;}
+    var tbl='width:100%;border-collapse:collapse;font-size:10px;text-align:left', th='padding:2px 8px 2px 0;color:var(--cyan);font-weight:600;border-bottom:1px solid var(--border)', td='padding:2px 8px 2px 0;border-bottom:1px solid rgba(255,255,255,0.06)', r='text-align:right';
+    var html='';
+    if(processor)html+='<div style="margin-bottom:4px;color:var(--text-dim);font-size:10px">Processor: '+escapeHtml(processor)+'</div>';
+    if(totalRamGb!=null)html+='<div style="margin-bottom:4px;color:var(--text-dim)">Total RAM: '+totalRamGb+' GB</div>';
+    if(diskRead!=null&&diskWrite!=null){var dr=Number(diskRead),dw=Number(diskWrite);var cr=diskIoColor(dr,speedRead),cw=diskIoColor(dw,speedWrite);html+='<div style="margin-bottom:4px;font-size:10px">Disk I/O (current): <span style="color:'+cr+'">'+dr.toFixed(2)+' MB/s</span> read, <span style="color:'+cw+'">'+dw.toFixed(2)+' MB/s</span> write</div>';}
+    if(speedRead!=null&&speedWrite!=null)html+='<div style="margin-bottom:6px;color:var(--cyan);font-size:10px">Disk speed test (256 MiB): <strong>'+Number(speedRead).toFixed(0)+' MB/s</strong> read, <strong>'+Number(speedWrite).toFixed(0)+' MB/s</strong> write</div>';
+    else if(speedErr)html+='<div style="margin-bottom:6px;color:var(--text-dim);font-size:10px">Disk speed test: <span style="color:var(--red)">'+escapeHtml(speedErr)+'</span></div>';
+    var ramCell='padding:2px 8px 2px 0;border-bottom:1px solid rgba(255,255,255,0.06);text-align:right;color:var(--text-dim);white-space:nowrap';
+    if(cpuTop&&cpuTop.length){
+        html+='<div style="margin-bottom:10px"><strong style="color:var(--cyan)">Top by CPU</strong><table style="'+tbl+';margin-top:4px"><thead><tr><th style="'+th+'">Process</th><th style="'+th+';'+r+'">CPU %</th><th style="'+th+';'+r+'">RAM %</th>'+(totalRamGb!=null?'<th style="'+th+';'+r+'">RAM</th>':'')+'</tr></thead><tbody>';
+        cpuTop.forEach(function(p){var ramStr=formatRamGb(p.mem_pct,totalRamGb);var cpuPct=Number(p.cpu_pct||0);html+='<tr><td style="'+td+'">'+escapeHtml(p.name||'')+'</td><td style="'+td+';'+r+';color:'+cpuColor(cpuPct)+'">'+cpuPct.toFixed(1)+'%</td><td style="'+td+';'+r+'">'+Number(p.mem_pct||0).toFixed(1)+'%</td>'+(totalRamGb!=null?'<td style="'+ramCell+'">'+ramStr+'</td>':'')+'</tr>';});
+        html+='</tbody></table></div>';
+    }
+    if(memTop&&memTop.length){
+        html+='<div><strong style="color:var(--cyan)">Top by RAM</strong><table style="'+tbl+';margin-top:4px"><thead><tr><th style="'+th+'">Process</th><th style="'+th+';'+r+'">RAM %</th>'+(totalRamGb!=null?'<th style="'+th+';'+r+'">RAM</th>':'')+'<th style="'+th+';'+r+'">CPU %</th></tr></thead><tbody>';
+        memTop.forEach(function(p){var ramStr=formatRamGb(p.mem_pct,totalRamGb);var cpuPct=Number(p.cpu_pct||0);html+='<tr><td style="'+td+'">'+escapeHtml(p.name||'')+'</td><td style="'+td+';'+r+'">'+Number(p.mem_pct||0).toFixed(1)+'%</td>'+(totalRamGb!=null?'<td style="'+ramCell+'">'+ramStr+'</td>':'')+'<td style="'+td+';'+r+';color:'+cpuColor(cpuPct)+'">'+cpuPct.toFixed(1)+'%</td></tr>';});
+        html+='</tbody></table></div>';
+    }
+    if(!html)html='No process data.';
+    if(hostId)html+='<div style="margin-top:8px"><button type="button" onclick="refreshResourceBreakdown(\\''+hostId+'\\')" style="padding:4px 10px;font-size:10px;background:rgba(59,130,246,0.15);color:var(--cyan);border:1px solid var(--border);border-radius:6px;cursor:pointer">Refresh</button></div>';
+    div.innerHTML=html;
+}
+async function refreshResourceBreakdown(hostId){
+    var div=document.getElementById('resource-breakdown-'+hostId);if(!div)return;
+    div.removeAttribute('data-loaded');div.style.display='block';div.textContent='Loading… (disk speed test ~5–30s)';
+    try{var r=await fetch('/api/host-resource-usage?target='+encodeURIComponent(hostId));var d=await r.json();renderResourceBreakdown(div,d,hostId);div.setAttribute('data-loaded','1');}catch(e){div.innerHTML='<span style="color:var(--red)">Request failed</span>';div.setAttribute('data-loaded','1');}
+}
+function escapeHtml(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML;}
+async function toggleResourceBreakdown(hostId){
+    var div=document.getElementById('resource-breakdown-'+hostId);if(!div)return;
+    if(div.style.display==='block'){div.style.display='none';return;}
+    if(!div.getAttribute('data-loaded')){
+        div.style.display='block';div.textContent='Loading… (disk speed test ~5–30s)';
+        try{
+            var r=await fetch('/api/host-resource-usage?target='+encodeURIComponent(hostId));var d=await r.json();
+            renderResourceBreakdown(div,d,hostId);div.setAttribute('data-loaded','1');
+        }catch(e){div.innerHTML='<span style="color:var(--red)">Request failed</span>';div.setAttribute('data-loaded','1');}
+        return;
+    }
+    div.style.display='block';
+}
+setInterval(async()=>{try{const r=await fetch('/api/metrics');const d=await r.json();document.getElementById('cpu-value').textContent=d.cpu_percent+'%';document.getElementById('ram-value').textContent=d.ram_percent+'%';document.getElementById('disk-value').textContent=d.disk_percent+'%';document.getElementById('uptime-value').textContent=d.uptime;if(d.unattended_upgrades_hosts)updateUUHosts(d.unattended_upgrades_hosts);}catch(e){}},5000);
 function refreshModuleCards(){
     fetch('/api/modules').then(r=>r.json()).then(function(mods){
         for(var k in mods){
@@ -19278,7 +20647,26 @@ function loadTakCertExpiry(){
         el.innerHTML=parts.join(' &nbsp;&middot;&nbsp; ');
     }).catch(function(){});
 }
+function fmtCertDays(days){
+    var y=Math.floor(days/365),r=days%365,m=Math.floor(r/30),dd=r%30;
+    var p=[];if(y>0)p.push(y+'y');if(m>0)p.push(m+'mo');if(dd>0||p.length===0)p.push(dd+'d');
+    return p.join(' ');
+}
+function loadCaddyCertDays(){
+    var el=document.getElementById('caddy-card-cert-days');
+    if(!el)return;
+    fetch('/api/caddy/cert-days').then(function(r){return r.json()}).then(function(d){
+        var days=d.days_left,color=d.color;
+        if(days==null){el.textContent='Cert: —';el.style.color='var(--text-dim)';return;}
+        el.textContent='Cert: '+fmtCertDays(days);
+        if(color==='green')el.style.color='var(--green)';
+        else if(color==='yellow')el.style.color='var(--yellow)';
+        else if(color==='red')el.style.color='var(--red)';
+        else el.style.color='var(--text-dim)';
+    }).catch(function(){el.textContent='Cert: —';el.style.color='var(--text-dim)';});
+}
 loadTakCertExpiry();
+loadCaddyCertDays();
 var updateBody='';
 async function checkUpdate(){
     try{
@@ -19491,6 +20879,20 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <span style="font-size:11px;color:var(--text-dim)">Paste from Server One if 8443/8446 fail; leave blank to use saved.</span>
 </div>
 {% endif %}
+<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);font-size:11px;color:var(--text-dim)">Unattended-upgrades (each host) are controlled on the <a href="/" style="color:var(--cyan);text-decoration:none">main dashboard</a>.</div>
+<div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">
+<div style="font-size:12px;color:var(--text-secondary);margin-bottom:6px">JVM heap</div>
+<p style="font-size:11px;color:var(--text-dim);margin-bottom:10px;line-height:1.5">If CloudTAK or 8446 return HTTP 500 with <code style="font-size:10px">OutOfMemoryError: Java heap space</code>, TAK Server's JVM heap may be too small. <span id="heap-why" style="display:none">TAK Server uses a fixed heap limit (-Xmx), often 2–4 GB by default; it does not auto-scale. With many CloudTAK tabs or connections, the active-groups cache can exceed that and trigger OOM. This button sets a systemd drop-in so the service can use more memory (and restarts TAK Server).</span><button type="button" onclick="var e=document.getElementById('heap-why');e.style.display=e.style.display?'none':'block'" style="background:none;border:none;color:var(--cyan);cursor:pointer;font-size:11px;padding:0;margin-left:4px">Why?</button></p>
+<div style="margin-bottom:10px;font-family:'JetBrains Mono',monospace;font-size:12px">Current: <span id="heap-current-display" style="color:var(--green)">{% if current_heap_gb %}{{ current_heap_gb }} GB <span style="color:var(--text-dim);font-weight:400">(set via drop-in)</span>{% else %}<span style="color:var(--text-dim)">Not set (package default)</span>{% endif %}</span></div>
+<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px">
+<button type="button" id="set-heap-btn" onclick="setTakHeap()" class="control-btn">Set recommended ({{ recommended_heap_gb }} GB)</button>
+<label style="font-size:11px;color:var(--text-dim);margin-left:8px">or set to:</label>
+<input type="number" id="heap-custom-gb" min="2" max="32" value="{{ current_heap_gb or recommended_heap_gb }}" style="width:52px;padding:6px 8px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:12px" />
+<span style="font-size:11px;color:var(--text-dim)">GB</span>
+<button type="button" id="set-heap-apply-btn" onclick="setTakHeapCustom()" class="control-btn">Apply</button>
+</div>
+<span id="set-heap-msg" style="font-size:12px;color:var(--text-dim);display:block;margin-top:4px"></span>
+</div>
 </div>
 {% endif %}
 
@@ -19636,7 +21038,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <span id="rotate-ca-toggle-icon" style="font-size:18px;color:var(--text-dim);transition:transform 0.2s ease">&#9662;</span>
 </div>
 <div id="rotate-ca-body" style="display:none;padding:0 24px 24px 24px;border-top:1px solid var(--border)">
-<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">Create a new Intermediate CA signed by your Root CA. The old CA stays in the truststore so existing clients remain connected during transition. Once all clients have re-enrolled, revoke the old CA.</p>
+<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">Create a new Intermediate CA signed by your Root CA. The server TLS cert is <strong>not</strong> replaced, so existing ATAK clients keep connecting. The old CA stays in the truststore; new client certs are signed by the new CA. When everyone has re-enrolled, use Revoke Old CA.</p>
 <div id="rotate-ca-info" style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim);margin-bottom:16px">Loading CA info...</div>
 <div id="rotate-ca-controls" style="display:none">
 <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
@@ -19651,7 +21053,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div id="rotate-ca-log" style="display:none;background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:400px;overflow-y:auto;line-height:1.6;white-space:pre-wrap;margin-bottom:16px"></div>
 <div id="revoke-ca-section" style="display:none;background:rgba(239,68,68,0.06);border:1px solid rgba(239,68,68,0.2);border-radius:10px;padding:16px">
 <div style="font-size:13px;font-weight:600;color:var(--red);margin-bottom:8px">Revoke Old CA</div>
-<p style="font-size:12px;color:var(--text-secondary);line-height:1.5;margin-bottom:12px">Remove the old CA from the truststore. Clients with certificates signed by the old CA will be disconnected and must re-enroll.</p>
+<p style="font-size:12px;color:var(--text-secondary);line-height:1.5;margin-bottom:12px">Final step: create new server cert (signed by new CA), remove the old CA from the truststore, restart. After this, only clients who re-enrolled (e.g. new CloudTAK QR) can connect. Do this when everyone has re-enrolled.</p>
 <div id="revoke-ca-list" style="margin-bottom:12px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim)"></div>
 <div id="revoke-ca-msg" style="font-size:12px;margin-top:8px"></div>
 </div>
@@ -19774,6 +21176,74 @@ if _fqdn:
     print(f"FQDN: {_fqdn}")
 print(f"Port: {_port}")
 print("=" * 50)
+
+# === Auto-update Guard Dog scripts on console startup ===
+def _auto_update_guarddog():
+    """If Guard Dog is installed, re-copy scripts and reload timers so updates take effect on console restart."""
+    if not os.path.exists('/opt/tak-guarddog'):
+        return
+    if not os.path.exists('/opt/tak'):
+        return
+    scripts_dir = os.path.join(BASE_DIR, 'scripts', 'guarddog')
+    if not os.path.isdir(scripts_dir):
+        return
+    try:
+        settings = load_settings()
+        tak_cfg = _get_tak_deployment_config(settings)
+        is_two_server = tak_cfg.get('mode') == 'two_server'
+        s1_host = (tak_cfg.get('server_one', {}).get('host') or '').strip() if is_two_server else ''
+        s1_user = (tak_cfg.get('server_one', {}).get('user') or 'root').strip() if is_two_server else ''
+        ssh_key_path = (tak_cfg.get('server_one', {}).get('ssh_key_path') or '').strip() if is_two_server else ''
+        db_port = str(tak_cfg.get('database', {}).get('port') or 5432) if is_two_server else '5432'
+        alert_email = (settings.get('guarddog_alert_email') or '').strip()
+        cert_pass = _get_tak_cert_password(settings)
+        script_files = [f for f in os.listdir(scripts_dir) if f.endswith(('.sh', '.py'))]
+        updated = 0
+        for name in script_files:
+            src = os.path.join(scripts_dir, name)
+            if not os.path.isfile(src):
+                continue
+            if not is_two_server and 'remotedb' in name:
+                continue
+            if is_two_server and name in ('tak-db-watch.sh', 'tak-cotdb-watch.sh'):
+                continue
+            with open(src) as f:
+                content = f.read()
+            content = (content
+                .replace('ALERT_EMAIL_PLACEHOLDER', alert_email)
+                .replace('ALERT_SMS_PLACEHOLDER', '')
+                .replace('CERT_PASS_PLACEHOLDER', cert_pass))
+            if is_two_server and name in ('tak-remotedb-watch.sh', 'tak-remotedb-auth-watch.sh'):
+                content = content.replace('DB_HOST_PLACEHOLDER', s1_host)
+                content = content.replace('DB_PORT_PLACEHOLDER', db_port)
+                content = content.replace('SSH_KEY_PLACEHOLDER', ssh_key_path)
+                content = content.replace('SSH_USER_PLACEHOLDER', s1_user)
+            dest = os.path.join('/opt/tak-guarddog', name)
+            try:
+                with open(dest) as f:
+                    existing = f.read()
+                if existing == content:
+                    continue
+            except Exception:
+                pass
+            with open(dest, 'w') as f:
+                f.write(content)
+            os.chmod(dest, 0o755)
+            updated += 1
+        if updated > 0:
+            subprocess.run('systemctl daemon-reload', shell=True, capture_output=True, timeout=10)
+            subprocess.run('systemctl restart takremotedbauthguard.timer 2>/dev/null; true', shell=True, capture_output=True, timeout=10)
+            print(f"Guard Dog: {updated} script(s) updated on console startup.")
+        else:
+            print("Guard Dog: scripts up to date.")
+        # Keep server_identifier in sync (nickname / IP / FQDN)
+        ident = _guarddog_server_identifier(settings)
+        with open('/opt/tak-guarddog/server_identifier', 'w') as f:
+            f.write(ident)
+    except Exception as e:
+        print(f"Guard Dog auto-update skipped: {e}")
+
+_auto_update_guarddog()
 
 # === Main Entry Point (fallback for direct python3 app.py) ===
 if __name__ == '__main__':

@@ -1,8 +1,8 @@
 .venv/
 .config/
 CoreConfig.ldap-patch.xml
-uploads/*.deb
-uploads/*.rpm
+uploads/
+ignite/
 __pycache__/
 *.pyc
 .DS_Store
