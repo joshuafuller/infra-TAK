@@ -344,27 +344,27 @@ def main():
             src = ''.join(lines)
             changed = True
 
-    # 4. Fix duplicate shared_stream_page (infra-TAK overlay + core both register it -> Flask AssertionError)
-    idxs = [m.start() for m in re.finditer(r'\bdef shared_stream_page\s*\(', src)]
-    if len(idxs) >= 2:
-        # Patch the route that decorates the *second* definition (the one that would overwrite)
-        chunk = src[max(0, idxs[1] - 800):idxs[1]]
-        route_matches = list(re.finditer(r"@app\.route\s*\(\s*['\"](/shared/[^'\"]*)['\"]([^)]*)\)", chunk))
-        if route_matches and 'endpoint=' not in route_matches[-1].group(0):
-            last = route_matches[-1]
-            old = last.group(0)
-            new = old[:-1] + ", endpoint='shared_stream_page_2')"
-            src = src.replace(old, new, 1)
-            changed = True
-    elif len(idxs) == 1:
-        # Single definition but overlay may have registered same endpoint: patch the only route so it uses a unique endpoint
-        chunk = src[max(0, idxs[0] - 800):idxs[0]]
-        route_match = re.search(r"@app\.route\s*\(\s*['\"](/shared/[^'\"]*)['\"]([^)]*)\)", chunk)
-        if route_match and 'endpoint=' not in route_match.group(0):
-            old = route_match.group(0)
-            new = old[:-1] + ", endpoint='shared_stream_page_core')"
-            src = src.replace(old, new, 1)
-            changed = True
+    # 4. Fix duplicate endpoints (infra-TAK overlay + core -> Flask AssertionError): shared_stream_page, shared_hls_proxy
+    lines = src.splitlines(keepends=True)
+    for def_pat, route_substr, endpoint_val in (
+            (r'\bdef shared_stream_page\s*\(', '/shared/', 'shared_stream_page_core'),
+            (r'\bdef shared_hls_proxy\s*\(', '/shared-hls/', 'shared_hls_proxy_core'),
+    ):
+        for i in range(len(lines) - 1, -1, -1):
+            if re.search(def_pat, lines[i]):
+                j = i - 1
+                while j >= 0 and j >= i - 20:
+                    line = lines[j]
+                    if '@app.route' in line and route_substr in line and 'endpoint=' not in line:
+                        if line.rstrip().endswith(')'):
+                            lines[j] = line.rstrip()[:-1] + ", endpoint='" + endpoint_val + "')\n"
+                        else:
+                            lines[j] = line.rstrip().rstrip(')') + ", endpoint='" + endpoint_val + "')\n"
+                        src = ''.join(lines)
+                        changed = True
+                        break
+                    j -= 1
+                break
 
     if changed:
         with open(EDITOR, 'w') as f:
