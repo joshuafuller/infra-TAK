@@ -77,6 +77,7 @@ def main():
             (r'\bdef shared_hls_proxy\s*\(', ('/shared-hls/', 'shared-hls', 'shared_hls'), 'shared_hls_proxy_core'),
             (r'\bdef api_share_links_list\s*\(', ('/api/share-links', 'share-links'), 'api_share_links_list_core'),
             (r'\bdef api_share_links_generate\s*\(', ('/api/share-links/generate', 'share-links/generate'), 'api_share_links_generate_core'),
+            (r'\bdef api_share_links_revoke\s*\(', ('/api/share-links/revoke', 'share-links/revoke'), 'api_share_links_revoke_core'),
     ):
         for i in range(len(lines) - 1, -1, -1):
             if not re.search(def_pat, lines[i]):
