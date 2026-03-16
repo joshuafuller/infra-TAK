@@ -7014,11 +7014,23 @@ def mediamtx_recovery():
         ok_copy = _module_copy(deploy_cfg, tmp_f.name, '/tmp/ensure_overlay.py', timeout=15)
         if not ok_copy:
             return jsonify({'error': 'Failed to copy overlay script to target'}), 500
-        cmd = 'mv /tmp/ensure_overlay.py /opt/mediamtx-webeditor/ensure_overlay.py && chmod 755 /opt/mediamtx-webeditor/ensure_overlay.py && (systemctl restart mediamtx-webeditor 2>/dev/null || true)'
-        ok_run, out = _module_run(deploy_cfg, cmd, timeout=20)
+        # Install script, make ExecStartPre best-effort so a failing pre-step cannot block start, then restart
+        cmd = (
+            'mv /tmp/ensure_overlay.py /opt/mediamtx-webeditor/ensure_overlay.py && chmod 755 /opt/mediamtx-webeditor/ensure_overlay.py && '
+            "sed -i 's|^ExecStartPre=/usr/bin/python3|ExecStartPre=-/usr/bin/python3|' /etc/systemd/system/mediamtx-webeditor.service 2>/dev/null; "
+            'systemctl daemon-reload 2>/dev/null; systemctl restart mediamtx-webeditor 2>/dev/null; true'
+        )
+        ok_run, out = _module_run(deploy_cfg, cmd, timeout=25)
         if not ok_run:
             return jsonify({'error': 'Failed to install or restart web editor', 'detail': (out or '')[:500]}), 500
-        return jsonify({'success': True, 'message': 'Web editor recovery applied; mediamtx-webeditor restarted.'})
+        # Check if web editor actually came up
+        ok_check, check_out = _module_run(deploy_cfg, 'systemctl is-active mediamtx-webeditor 2>/dev/null', timeout=10)
+        active = ok_check and (check_out or '').strip() == 'active'
+        msg = 'Web editor recovery applied; mediamtx-webeditor restarted and is running.' if active else (
+            'Recovery applied and service restarted, but mediamtx-webeditor may still be down. '
+            'Click Logs on this page or on the server run: journalctl -u mediamtx-webeditor -n 80'
+        )
+        return jsonify({'success': True, 'message': msg, 'webeditor_running': active})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
     finally:
@@ -7033,13 +7045,14 @@ def mediamtx_recovery():
 @login_required
 def mediamtx_logs():
     lines = request.args.get('lines', 60, type=int)
+    unit = request.args.get('unit', 'mediamtx')
     settings = load_settings()
     deploy_cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
     if deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip():
-        ok, out = _ssh_probe(deploy_cfg['remote'], f'journalctl -u mediamtx --no-pager -n {lines} 2>&1', timeout=15)
+        ok, out = _ssh_probe(deploy_cfg['remote'], f'journalctl -u {unit} --no-pager -n {lines} 2>&1', timeout=15)
         entries = [l for l in (out.strip().split('\n') if out and out.strip() else []) if l.strip()] if ok else []
         return jsonify({'entries': entries})
-    r = subprocess.run(f'journalctl -u mediamtx --no-pager -n {lines} 2>&1', shell=True, capture_output=True, text=True, timeout=10)
+    r = subprocess.run(f'journalctl -u {unit} --no-pager -n {lines} 2>&1', shell=True, capture_output=True, text=True, timeout=10)
     entries = [l for l in (r.stdout.strip().split('\n') if r.stdout.strip() else []) if l.strip()]
     return jsonify({'entries': entries})
 
@@ -7900,7 +7913,8 @@ WantedBy=multi-user.target
 
         exec_start_pre = ''
         if ldap_available:
-            exec_start_pre = f'ExecStartPre=/usr/bin/python3 {webeditor_dir}/ensure_overlay.py\n'
+            # Dash prefix: pre-step failure must not block the editor from starting
+            exec_start_pre = f'ExecStartPre=-/usr/bin/python3 {webeditor_dir}/ensure_overlay.py\n'
 
         editor_file = f'{webeditor_dir}/mediamtx_config_editor.py'
         if os.path.exists(editor_file):
@@ -11927,7 +11941,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <div class="section-title" style="margin-top:20px">Controls</div>
   <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:24px">
   <div class="controls" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
-  {% if mtx.running %}<button class="control-btn" onclick="control('restart')">↻ Restart</button><button class="control-btn" onclick="loadLogs()">📋 Logs</button><button class="control-btn" onclick="runRecovery()" id="recovery-btn" title="Fix web editor if stream URL won't load after an update">🔧 Fix web editor</button><button class="control-btn btn-stop" onclick="control('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="control('start')">▶ Start</button><button class="control-btn" onclick="loadLogs()">📋 Logs</button><button class="control-btn" onclick="runRecovery()" id="recovery-btn" title="Fix web editor if stream URL won&#39;t load after an update">🔧 Fix web editor</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% endif %}
+  {% if mtx.running %}<button class="control-btn" onclick="control('restart')">↻ Restart</button><button class="control-btn" onclick="loadLogs('mediamtx')">📋 Logs</button><button class="control-btn" onclick="loadLogs('mediamtx-webeditor')">📋 Web editor logs</button><button class="control-btn" onclick="runRecovery()" id="recovery-btn" title="Fix web editor if stream URL won't load after an update">🔧 Fix web editor</button><button class="control-btn btn-stop" onclick="control('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="control('start')">▶ Start</button><button class="control-btn" onclick="loadLogs('mediamtx')">📋 Logs</button><button class="control-btn" onclick="loadLogs('mediamtx-webeditor')">📋 Web editor logs</button><button class="control-btn" onclick="runRecovery()" id="recovery-btn" title="Fix web editor if stream URL won&#39;t load after an update">🔧 Fix web editor</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% endif %}
   </div>
   <p style="margin-top:10px;font-size:12px;color:var(--text-dim)">If the <strong>Web Console</strong> link below won’t load (e.g. after an editor update), click <strong>Fix web editor</strong> to repair and restart the stream config UI.</p>
   <div id="control-status" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
@@ -11950,7 +11964,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 
   <!-- Container logs -->
   <div class="card" id="logs-card" style="display:none">
-    <div class="card-title">Service Logs</div>
+    <div class="card-title" id="logs-card-title">Service Logs</div>
     <div class="log-box" id="service-logs">Loading...</div>
   </div>
 
@@ -12216,10 +12230,14 @@ function control(action) {
   });
 }
 
-function loadLogs() {
+function loadLogs(unit) {
+  unit = unit || 'mediamtx';
   const card = document.getElementById('logs-card');
+  const titleEl = document.getElementById('logs-card-title');
   card.style.display = 'block';
-  fetch('/api/mediamtx/logs?lines=80').then(r => r.json()).then(d => {
+  if (titleEl) titleEl.textContent = unit === 'mediamtx-webeditor' ? 'Web editor logs' : 'Service logs';
+  document.getElementById('service-logs').textContent = 'Loading...';
+  fetch('/api/mediamtx/logs?lines=80&unit=' + encodeURIComponent(unit)).then(r => r.json()).then(d => {
     document.getElementById('service-logs').textContent = d.entries.join(String.fromCharCode(10)) || '(no output)';
   });
 }
