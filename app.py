@@ -350,6 +350,7 @@ def main():
             (r'\bdef shared_stream_page\s*\(', ('/shared/',), 'shared_stream_page_core'),
             (r'\bdef shared_hls_proxy\s*\(', ('/shared-hls/', 'shared-hls', 'shared_hls'), 'shared_hls_proxy_core'),
             (r'\bdef api_share_links_list\s*\(', ('/api/share-links', 'share-links'), 'api_share_links_list_core'),
+            (r'\bdef api_share_links_generate\s*\(', ('/api/share-links/generate', 'share-links/generate'), 'api_share_links_generate_core'),
     ):
         for i in range(len(lines) - 1, -1, -1):
             if not re.search(def_pat, lines[i]):
@@ -4572,6 +4573,7 @@ def _mediamtx_editor_endpoint_patch(src):
             (r'\bdef shared_stream_page\s*\(', ('/shared/',), 'shared_stream_page_core'),
             (r'\bdef shared_hls_proxy\s*\(', ('/shared-hls/', 'shared-hls', 'shared_hls'), 'shared_hls_proxy_core'),
             (r'\bdef api_share_links_list\s*\(', ('/api/share-links', 'share-links'), 'api_share_links_list_core'),
+            (r'\bdef api_share_links_generate\s*\(', ('/api/share-links/generate', 'share-links/generate'), 'api_share_links_generate_core'),
     ):
         for i in range(len(lines) - 1, -1, -1):
             if not re.search(def_pat, lines[i]):
@@ -7428,7 +7430,7 @@ paths:
                     "f='/opt/mediamtx-webeditor/mediamtx_config_editor.py'\n"
                     "with open(f) as h: src=h.read()\n"
                     "lines=src.splitlines(keepends=True)\n"
-                    "for (dp,rh,ev) in [(r'\\\\bdef shared_stream_page\\\\s*\\\\(',('/shared/',),'shared_stream_page_core'),(r'\\\\bdef shared_hls_proxy\\\\s*\\\\(',('/shared-hls','shared_hls'),'shared_hls_proxy_core'),(r'\\\\bdef api_share_links_list\\\\s*\\\\(',('/api/share-links','share-links'),'api_share_links_list_core')]:\n"
+                    "for (dp,rh,ev) in [(r'\\\\bdef shared_stream_page\\\\s*\\\\(',('/shared/',),'shared_stream_page_core'),(r'\\\\bdef shared_hls_proxy\\\\s*\\\\(',('/shared-hls','shared_hls'),'shared_hls_proxy_core'),(r'\\\\bdef api_share_links_list\\\\s*\\\\(',('/api/share-links','share-links'),'api_share_links_list_core'),(r'\\\\bdef api_share_links_generate\\\\s*\\\\(',('/api/share-links/generate','share-links/generate'),'api_share_links_generate_core')]:\n"
                     " for i in range(len(lines)-1,-1,-1):\n"
                     "  if not re.search(dp,lines[i]): continue\n"
                     "  for j in range(i-1,max(-1,i-20),-1):\n"
