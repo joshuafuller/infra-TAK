@@ -2432,6 +2432,7 @@ def guarddog_page():
         {'id': 'mediamtx', 'name': 'MediaMTX', 'monitored': modules.get('mediamtx', {}).get('installed'), 'monitors': [{'name': 'Service', 'id': 'mediamtx_svc', 'interval': '1 min', 'desc': 'Checks systemd mediamtx. Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'nodered', 'name': 'Node-RED', 'monitored': modules.get('nodered', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'id': 'nodered_http', 'interval': '1 min', 'desc': 'Checks Node-RED HTTP (1880). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'cloudtak', 'name': 'CloudTAK', 'monitored': modules.get('cloudtak', {}).get('installed'), 'monitors': [{'name': 'Container', 'id': 'cloudtak_ctr', 'interval': '1 min', 'desc': 'Checks CloudTAK container. Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
+        {'id': 'updates', 'name': 'Updates', 'monitored': gd.get('installed'), 'monitors': [{'name': 'Update check', 'id': 'updates_check', 'interval': '6 h', 'desc': 'Checks for newer versions of infra-TAK, Authentik, MediaMTX, CloudTAK, and TAK Portal (same sources as the console update icons). Sends one email when any update is available (or when the set of available updates changes). Uses same alert email as other monitors.'}]},
     ])
     guarddog_docs_url = f'https://github.com/{GITHUB_REPO}/blob/main/docs/GUARDDOG.md'
     notifications_configured = bool((settings.get('guarddog_alert_email') or '').strip())
@@ -3423,7 +3424,8 @@ def run_guarddog_deploy(alert_email):
             plog(f"Two-server mode detected — DB on {s1_host}:{db_port}")
         script_files = [
             'tak-8089-watch.sh', 'tak-oom-watch.sh', 'tak-disk-watch.sh',
-            'tak-network-watch.sh', 'tak-process-watch.sh', 'tak-cert-watch.sh', 'tak-intca-watch.sh', 'tak-health-endpoint.py'
+            'tak-network-watch.sh', 'tak-process-watch.sh', 'tak-cert-watch.sh', 'tak-intca-watch.sh', 'tak-health-endpoint.py',
+            'tak-updates-watch.sh'
         ]
         # Two-server: replace local PG monitors with remote DB monitor
         if is_two_server and s1_host:
@@ -3454,7 +3456,8 @@ def run_guarddog_deploy(alert_email):
             content = (content
                 .replace('ALERT_EMAIL_PLACEHOLDER', alert_email)
                 .replace('ALERT_SMS_PLACEHOLDER', alert_sms or '')
-                .replace('CERT_PASS_PLACEHOLDER', cert_pass))
+                .replace('CERT_PASS_PLACEHOLDER', cert_pass)
+                .replace('CONSOLE_VERSION_PLACEHOLDER', VERSION))
             if is_two_server and name in ('tak-remotedb-watch.sh', 'tak-remotedb-auth-watch.sh'):
                 content = content.replace('DB_HOST_PLACEHOLDER', s1_host)
                 content = content.replace('DB_PORT_PLACEHOLDER', db_port)
@@ -3530,6 +3533,10 @@ def run_guarddog_deploy(alert_email):
                 ('takcloudtakguard.service', '[Unit]\nDescription=Guard Dog CloudTAK Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-cloudtak-watch.sh\n'),
                 ('takcloudtakguard.timer', '[Unit]\nDescription=Run CloudTAK guard every 1 minute\n\n[Timer]\nOnBootSec=15min\nOnUnitActiveSec=1min\nUnit=takcloudtakguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ])
+        units.extend([
+            ('takupdatesguard.service', '[Unit]\nDescription=Guard Dog Updates Check (infra-TAK, Authentik, MediaMTX, CloudTAK)\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-updates-watch.sh\n'),
+            ('takupdatesguard.timer', '[Unit]\nDescription=Check for updates every 6 hours\n\n[Timer]\nOnBootSec=30min\nOnUnitActiveSec=6h\nUnit=takupdatesguard.service\n\n[Install]\nWantedBy=timers.target\n'),
+        ])
         for name, content in units:
             path = os.path.join('/etc/systemd/system', name)
             with open(path, 'w') as f:
@@ -3588,6 +3595,7 @@ def run_guarddog_deploy(alert_email):
             timers.append('taknoderedguard.timer')
         if 'tak-cloudtak-watch.sh' in script_files:
             timers.append('takcloudtakguard.timer')
+        timers.append('takupdatesguard.timer')
         for t in timers:
             re = subprocess.run(['systemctl', 'enable', t], capture_output=True, text=True, timeout=5)
             if re.returncode != 0:
@@ -7590,6 +7598,21 @@ WantedBy=multi-user.target
                         plog("✓ LDAP overlay already present")
                 else:
                     plog("⚠ mediamtx_ldap_overlay.py not found next to app.py — LDAP overlay skipped")
+            # Deploy Ku-band simulator scripts so "Simulate link" in the editor works (Web Editor v1.1.8+)
+            simulator_src = os.path.join(clone_dir, 'scripts', 'ku-band-simulator')
+            simulator_dst = os.path.join(webeditor_dir, 'ku-band-simulator')
+            if os.path.isdir(simulator_src):
+                os.makedirs(simulator_dst, exist_ok=True)
+                for name in os.listdir(simulator_src):
+                    if name == 'ku_band_simulator.conf':
+                        continue  # Don't overwrite existing config
+                    src_path = os.path.join(simulator_src, name)
+                    dst_path = os.path.join(simulator_dst, name)
+                    if os.path.isfile(src_path):
+                        _shutil.copy2(src_path, dst_path)
+                        if name.endswith('.sh'):
+                            os.chmod(dst_path, 0o755)
+                plog("✓ Ku-band simulator scripts installed")
         else:
             plog("⚠ mediamtx_config_editor.py not found (clone failed and no local file)")
             plog("  Place it next to app.py or in config-editor/, or fix repo access, then redeploy")
@@ -8701,11 +8724,7 @@ def run_cloudtak_deploy(cfg=None):
             if remote_release_tag:
                 plog(f"  Target: stable release {remote_release_tag}")
                 prep_cmd = (
-                    "if [ -d ~/CloudTAK/.git ]; then "
-                    f"cd ~/CloudTAK && git fetch --depth 1 origin tag {remote_release_tag} && git checkout {remote_release_tag}; "
-                    "else "
-                    f"rm -rf ~/CloudTAK && git clone --depth 1 --branch {remote_release_tag} https://github.com/dfpc-coe/CloudTAK.git ~/CloudTAK; "
-                    "fi; "
+                    f"rm -rf ~/CloudTAK && git clone --depth 1 --branch {remote_release_tag} https://github.com/dfpc-coe/CloudTAK.git ~/CloudTAK && "
                     "test -f ~/CloudTAK/docker-compose.yml -o -f ~/CloudTAK/compose.yaml"
                 )
             else:
@@ -8843,18 +8862,17 @@ def run_cloudtak_deploy(cfg=None):
         # Step 2: Clone or update repo
         plog("")
         plog("━━━ Step 2/7: Cloning CloudTAK ━━━")
+        release_tag = _get_cloudtak_latest_release_tag(use_cache=False)
         if os.path.exists(cloudtak_dir):
-            release_tag = _get_cloudtak_latest_release_tag(use_cache=False)
             if release_tag:
-                plog(f"  ~/CloudTAK exists — updating to stable {release_tag}...")
-                r = subprocess.run(
-                    f'cd {cloudtak_dir} && git fetch --depth 1 origin tag {release_tag} && git checkout {release_tag}',
-                    shell=True, capture_output=True, text=True, timeout=120)
+                plog(f"  ~/CloudTAK exists — re-cloning {release_tag} so version is correct...")
+                subprocess.run(f'rm -rf {cloudtak_dir}', shell=True, capture_output=True, timeout=30)
+                clone_cmd = f'git clone --depth 1 --branch {release_tag} https://github.com/dfpc-coe/CloudTAK.git {cloudtak_dir}'
+                r = subprocess.run(clone_cmd, shell=True, capture_output=True, text=True, timeout=600)
                 if r.returncode != 0:
-                    plog(f"  ⚠ git fetch/checkout warning: {r.stderr.strip()[:100]} — falling back to pull")
-                    subprocess.run(
-                        f'cd {cloudtak_dir} && git -c safe.directory={cloudtak_dir} pull --rebase --autostash',
-                        shell=True, capture_output=True, text=True, timeout=120)
+                    plog(f"✗ Re-clone failed: {(r.stderr or r.stdout or '').strip()[:200]}")
+                    cloudtak_deploy_status.update({'running': False, 'error': True})
+                    return
             else:
                 plog("  ~/CloudTAK exists — pulling latest (could not fetch release tag)...")
                 r = subprocess.run(
@@ -8891,6 +8909,18 @@ def run_cloudtak_deploy(cfg=None):
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
         plog("✓ Repository ready")
+        # Log version on disk so we can confirm clone got the right tag (vs UI showing something else)
+        for _pkg in ['api/package.json', 'web/package.json', 'package.json']:
+            _p = os.path.join(cloudtak_dir, _pkg)
+            if os.path.isfile(_p):
+                try:
+                    with open(_p) as _f:
+                        _v = (json.load(_f).get('version') or '').strip()
+                    if _v:
+                        plog(f"  Version on disk ({_pkg}): {_v}")
+                        break
+                except Exception:
+                    pass
 
         # Ensure compose file exists (fix partial/bad clone)
         compose_yml = os.path.join(cloudtak_dir, 'docker-compose.yml')
@@ -11516,7 +11546,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     {% if notifications_configured %}
     <div id="gd-notify-banner" class="status-banner running" style="margin-bottom:12px"><div class="dot"></div>Notifications configured</div>
     {% endif %}
-    <p style="font-size:12px;color:var(--text-dim);margin-bottom:16px">Configure email, Uptime Robot, and optional SMS (Twilio or Brevo) for Guard Dog alerts.</p>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:16px">Configure email, Uptime Robot, and optional SMS (Twilio or Brevo) for Guard Dog alerts. The same email receives <strong>update notifications</strong> when a newer version of infra-TAK, Authentik, MediaMTX, CloudTAK, or TAK Portal is available (checked every 6 hours; one email per change so you are not spammed).</p>
     <div class="gd-section" style="margin-bottom:20px">
       <div class="form-label">Server nickname</div>
       <p style="font-size:12px;color:var(--text-dim);margin-bottom:8px">Optional. Shown in alert subject and body so you can tell which server when monitoring multiple (e.g. Production, Staging).</p>
