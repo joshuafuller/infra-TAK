@@ -7039,7 +7039,7 @@ def mediamtx_control():
 @app.route('/api/mediamtx/recovery', methods=['POST'])
 @login_required
 def mediamtx_recovery():
-    """Fix web editor: install fail-safe overlay script and restart mediamtx-webeditor. One-click from MediaMTX page."""
+    """Patch web editor: install fail-safe overlay script and restart mediamtx-webeditor. One-click from MediaMTX page."""
     import tempfile
     settings = load_settings()
     deploy_cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
@@ -7063,9 +7063,9 @@ def mediamtx_recovery():
         # Check if web editor actually came up
         ok_check, check_out = _module_run(deploy_cfg, 'systemctl is-active mediamtx-webeditor 2>/dev/null', timeout=10)
         active = ok_check and (check_out or '').strip() == 'active'
-        msg = 'Web editor recovery applied; mediamtx-webeditor restarted and is running.' if active else (
-            'Recovery applied and service restarted, but mediamtx-webeditor may still be down. '
-            'Click Logs on this page or on the server run: journalctl -u mediamtx-webeditor -n 80'
+        msg = 'Web editor patched; mediamtx-webeditor restarted and is running.' if active else (
+            'Patch applied and service restarted, but mediamtx-webeditor may still be down. '
+            'Click **Web editor logs** on this page to see why.'
         )
         return jsonify({'success': True, 'message': msg, 'webeditor_running': active})
     except Exception as e:
@@ -11978,9 +11978,9 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <div class="section-title" style="margin-top:20px">Controls</div>
   <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:24px">
   <div class="controls" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
-  {% if mtx.running %}<button class="control-btn" onclick="control('restart')">↻ Restart</button><button class="control-btn" onclick="loadLogs('mediamtx')">📋 Logs</button><button class="control-btn" onclick="loadLogs('mediamtx-webeditor')">📋 Web editor logs</button><button class="control-btn" onclick="runRecovery()" id="recovery-btn" title="Fix web editor if stream URL won't load after an update">🔧 Fix web editor</button><button class="control-btn btn-stop" onclick="control('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="control('start')">▶ Start</button><button class="control-btn" onclick="loadLogs('mediamtx')">📋 Logs</button><button class="control-btn" onclick="loadLogs('mediamtx-webeditor')">📋 Web editor logs</button><button class="control-btn" onclick="runRecovery()" id="recovery-btn" title="Fix web editor if stream URL won&#39;t load after an update">🔧 Fix web editor</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% endif %}
+  {% if mtx.running %}<button class="control-btn" onclick="control('restart')">↻ Restart</button><button class="control-btn" onclick="loadLogs('mediamtx')">📋 Logs</button><button class="control-btn" onclick="loadLogs('mediamtx-webeditor')">📋 Web editor logs</button><button class="control-btn" onclick="runRecovery()" id="recovery-btn" title="Patch web editor if stream URL won't load after an update">🔧 Patch web editor</button><button class="control-btn btn-stop" onclick="control('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="control('start')">▶ Start</button><button class="control-btn" onclick="loadLogs('mediamtx')">📋 Logs</button><button class="control-btn" onclick="loadLogs('mediamtx-webeditor')">📋 Web editor logs</button><button class="control-btn" onclick="runRecovery()" id="recovery-btn" title="Patch web editor if stream URL won&#39;t load after an update">🔧 Patch web editor</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% endif %}
   </div>
-  <p style="margin-top:10px;font-size:12px;color:var(--text-dim)">If the <strong>Web Console</strong> link below won’t load (e.g. after an editor update), click <strong>Fix web editor</strong> to repair and restart the stream config UI.</p>
+  <p style="margin-top:10px;font-size:12px;color:var(--text-dim)">If the <strong>Web Console</strong> link below won’t load (e.g. after an editor update), click <strong>Patch web editor</strong> to patch and restart the stream config UI.</p>
   <div id="control-status" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
   </div>
 
@@ -12283,15 +12283,15 @@ function runRecovery() {
   const statusEl = document.getElementById('control-status');
   const btn = document.getElementById('recovery-btn');
   if (btn) btn.disabled = true;
-  statusEl.textContent = 'Fixing web editor…';
+  statusEl.textContent = 'Patching web editor…';
   fetch('/api/mediamtx/recovery', { method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin' })
     .then(r => r.json())
     .then(d => {
       if (d.success) {
-        statusEl.textContent = (d.message || '✓ Recovery applied. Web editor restarted.');
+        statusEl.textContent = (d.message || '✓ Patched. Web editor restarted.');
         statusEl.style.color = 'var(--green)';
       } else {
-        statusEl.textContent = d.error || 'Recovery failed';
+        statusEl.textContent = d.error || 'Patch failed';
         statusEl.style.color = 'var(--red)';
       }
       setTimeout(() => { statusEl.textContent = ''; statusEl.style.color = ''; }, 6000);
