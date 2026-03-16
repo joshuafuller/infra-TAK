@@ -11929,6 +11929,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <div class="controls" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
   {% if mtx.running %}<button class="control-btn" onclick="control('restart')">↻ Restart</button><button class="control-btn" onclick="loadLogs()">📋 Logs</button><button class="control-btn" onclick="runRecovery()" id="recovery-btn" title="Fix web editor if stream URL won't load after an update">🔧 Fix web editor</button><button class="control-btn btn-stop" onclick="control('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="control('start')">▶ Start</button><button class="control-btn" onclick="loadLogs()">📋 Logs</button><button class="control-btn" onclick="runRecovery()" id="recovery-btn" title="Fix web editor if stream URL won&#39;t load after an update">🔧 Fix web editor</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% endif %}
   </div>
+  <p style="margin-top:10px;font-size:12px;color:var(--text-dim)">If the <strong>Web Console</strong> link below won’t load (e.g. after an editor update), click <strong>Fix web editor</strong> to repair and restart the stream config UI.</p>
   <div id="control-status" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
   </div>
 
