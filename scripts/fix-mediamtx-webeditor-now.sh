@@ -72,25 +72,39 @@ def main():
 
     # 4. Fix duplicate endpoints (shared_stream_page, shared_hls_proxy) -> Flask AssertionError
     lines = src.splitlines(keepends=True)
-    for def_pat, route_substr, endpoint_val in (
-            (r'\bdef shared_stream_page\s*\(', '/shared/', 'shared_stream_page_core'),
-            (r'\bdef shared_hls_proxy\s*\(', '/shared-hls/', 'shared_hls_proxy_core'),
+    for def_pat, route_hints, endpoint_val in (
+            (r'\bdef shared_stream_page\s*\(', ('/shared/',), 'shared_stream_page_core'),
+            (r'\bdef shared_hls_proxy\s*\(', ('/shared-hls/', 'shared-hls', 'shared_hls'), 'shared_hls_proxy_core'),
     ):
         for i in range(len(lines) - 1, -1, -1):
-            if re.search(def_pat, lines[i]):
+            if not re.search(def_pat, lines[i]):
+                continue
+            j = i - 1
+            while j >= 0 and j >= i - 20:
+                line = lines[j]
+                if '@app.route' in line and 'endpoint=' not in line and any(h in line for h in route_hints):
+                    if line.rstrip().endswith(')'):
+                        lines[j] = line.rstrip()[:-1] + ", endpoint='" + endpoint_val + "')\n"
+                    else:
+                        lines[j] = line.rstrip().rstrip(')') + ", endpoint='" + endpoint_val + "')\n"
+                    src = ''.join(lines)
+                    changed = True
+                    break
+                j -= 1
+            else:
                 j = i - 1
                 while j >= 0 and j >= i - 20:
-                    line = lines[j]
-                    if '@app.route' in line and route_substr in line and 'endpoint=' not in line:
-                        if line.rstrip().endswith(')'):
-                            lines[j] = line.rstrip()[:-1] + ", endpoint='" + endpoint_val + "')\n"
+                    if '@app.route' in lines[j] and 'endpoint=' not in lines[j]:
+                        l = lines[j]
+                        if l.rstrip().endswith(')'):
+                            lines[j] = l.rstrip()[:-1] + ", endpoint='" + endpoint_val + "')\n"
                         else:
-                            lines[j] = line.rstrip().rstrip(')') + ", endpoint='" + endpoint_val + "')\n"
+                            lines[j] = l.rstrip().rstrip(')') + ", endpoint='" + endpoint_val + "')\n"
                         src = ''.join(lines)
                         changed = True
                         break
                     j -= 1
-                break
+            break
 
     if changed:
         with open(EDITOR, 'w') as f:
