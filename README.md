@@ -170,6 +170,16 @@ start.sh                    ← One CLI command to launch everything
 
 ## Changelog
 
+### v0.2.3-alpha — 2026-03-15
+
+**Guard Dog**
+- Update check runs every **6 hours** (configurable). When the set of available updates changes, Guard Dog sends **one email** with the full list so you're notified without inbox spam.
+
+**Ku-band (MediaMTX web editor)**
+- When the console installs or updates the **web editor**, it now copies the **simulator scripts** into the editor install so the **Simulate** link works without manual copying.
+
+---
+
 ### v0.2.2-alpha — 2026-03-14
 
 **CSRF behind Caddy**
