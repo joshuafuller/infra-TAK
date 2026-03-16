@@ -344,6 +344,17 @@ def main():
             src = ''.join(lines)
             changed = True
 
+    # 4. Fix duplicate shared_stream_page (upstream editor can register it twice -> Flask AssertionError)
+    idxs = [m.start() for m in re.finditer(r'\bdef shared_stream_page\s*\(', src)]
+    if len(idxs) >= 2:
+        before_second = src[:idxs[1]]
+        route_match = re.search(r"@app\.route\s*\(\s*['\"]/shared/[^'\"]*['\"]([^)]*)\)", before_second)
+        if route_match and 'endpoint=' not in route_match.group(0):
+            old = route_match.group(0)
+            new = old[:-1] + ", endpoint='shared_stream_page_2')"
+            src = src.replace(old, new, 1)
+            changed = True
+
     if changed:
         with open(EDITOR, 'w') as f:
             f.write(src)
