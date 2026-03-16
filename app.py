@@ -283,6 +283,78 @@ MEDIAMTX_LOGO_URL = "https://raw.githubusercontent.com/bluenviron/mediamtx/main/
 MEDIAMTX_EDITOR_REPO = "https://github.com/takwerx/mediamtx-installer.git"
 MEDIAMTX_EDITOR_PATH = "config-editor"  # subdir containing mediamtx_config_editor.py
 MEDIAMTX_EDITOR_LDAP_BRANCH = None  # LDAP behavior comes from mediamtx_ldap_overlay.py in this repo; use repo default branch
+# Fail-safe overlay script: never exits failure so ExecStartPre cannot block the web editor from starting
+MEDIAMTX_ENSURE_OVERLAY_SCRIPT = r'''#!/usr/bin/env python3
+"""Pre-start hook: ensure infra-TAK LDAP overlay is injected into the editor.
+
+Runs as ExecStartPre so that upstream self-updates (Versions tab) don't
+silently remove the overlay.  Idempotent — does nothing if already patched.
+Never exits with failure so the main editor always gets to start.
+"""
+import os, re, sys
+
+def main():
+    EDITOR  = '/opt/mediamtx-webeditor/mediamtx_config_editor.py'
+    OVERLAY = '/opt/mediamtx-webeditor/mediamtx_ldap_overlay.py'
+    MARKER  = '# --- infra-TAK LDAP overlay ---'
+
+    if not os.path.exists(EDITOR) or not os.path.exists(OVERLAY):
+        return
+
+    with open(EDITOR, 'r') as f:
+        src = f.read()
+
+    changed = False
+
+    # 1. Port patch: ensure PORT env var override
+    if 'port=5000' in src and 'os.environ.get("PORT"' not in src:
+        src = src.replace('port=5000', 'port=int(os.environ.get("PORT", 5080))', 1)
+        changed = True
+
+    # 2. API port patch: 9997 -> 9898
+    if '9997' in src:
+        src = src.replace('9997', '9898')
+        changed = True
+
+    # 3. LDAP overlay import injection
+    if MARKER not in src:
+        inject = (
+            "\n" + MARKER + "\n"
+            "import os as _os\n"
+            "if _os.environ.get('LDAP_ENABLED'):\n"
+            "    import sys as _sys; _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))\n"
+            "    from mediamtx_ldap_overlay import apply_ldap_overlay\n"
+            "    apply_ldap_overlay(app)\n"
+            "# --- end LDAP overlay ---\n"
+        )
+        lines = src.splitlines(keepends=True)
+        inserted = False
+        for i, line in enumerate(lines):
+            if 'app = Flask(' in line:
+                lines.insert(i + 1, '\n' + inject)
+                inserted = True
+                break
+        if not inserted:
+            for i, line in enumerate(lines):
+                if 'app.run(' in line:
+                    lines.insert(i, '\n' + inject)
+                    inserted = True
+                    break
+        if inserted:
+            src = ''.join(lines)
+            changed = True
+
+    if changed:
+        with open(EDITOR, 'w') as f:
+            f.write(src)
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception:
+        pass
+    sys.exit(0)
+'''
 # Node-RED official icons (https://nodered.org/about/resources/media/)
 NODERED_LOGO_URL = "https://nodered.org/about/resources/media/node-red-icon.png"       # icon only (e.g. small nav)
 NODERED_LOGO_URL_2 = "https://nodered.org/about/resources/media/node-red-icon-2.png"   # icon + "Node-RED" text (card, sidebar)
@@ -6926,6 +6998,37 @@ def mediamtx_control():
     running = r.stdout.strip() == 'active'
     return jsonify({'success': True, 'running': running})
 
+
+@app.route('/api/mediamtx/recovery', methods=['POST'])
+@login_required
+def mediamtx_recovery():
+    """Fix web editor: install fail-safe overlay script and restart mediamtx-webeditor. One-click from MediaMTX page."""
+    import tempfile
+    settings = load_settings()
+    deploy_cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
+    tmp_f = None
+    try:
+        tmp_f = tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False)
+        tmp_f.write(MEDIAMTX_ENSURE_OVERLAY_SCRIPT)
+        tmp_f.close()
+        ok_copy = _module_copy(deploy_cfg, tmp_f.name, '/tmp/ensure_overlay.py', timeout=15)
+        if not ok_copy:
+            return jsonify({'error': 'Failed to copy overlay script to target'}), 500
+        cmd = 'mv /tmp/ensure_overlay.py /opt/mediamtx-webeditor/ensure_overlay.py && chmod 755 /opt/mediamtx-webeditor/ensure_overlay.py && (systemctl restart mediamtx-webeditor 2>/dev/null || true)'
+        ok_run, out = _module_run(deploy_cfg, cmd, timeout=20)
+        if not ok_run:
+            return jsonify({'error': 'Failed to install or restart web editor', 'detail': (out or '')[:500]}), 500
+        return jsonify({'success': True, 'message': 'Web editor recovery applied; mediamtx-webeditor restarted.'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if tmp_f and os.path.exists(tmp_f.name):
+            try:
+                os.unlink(tmp_f.name)
+            except Exception:
+                pass
+
+
 @app.route('/api/mediamtx/logs')
 @login_required
 def mediamtx_logs():
@@ -7789,71 +7892,9 @@ WantedBy=multi-user.target
         # Write self-healing overlay script — runs before every service start
         # Re-injects LDAP overlay + patches (port, API) if the upstream editor self-updated
         if ldap_available:
-            heal_script = r'''#!/usr/bin/env python3
-"""Pre-start hook: ensure infra-TAK LDAP overlay is injected into the editor.
-
-Runs as ExecStartPre so that upstream self-updates (Versions tab) don't
-silently remove the overlay.  Idempotent — does nothing if already patched.
-"""
-import os, re, sys
-
-EDITOR  = '/opt/mediamtx-webeditor/mediamtx_config_editor.py'
-OVERLAY = '/opt/mediamtx-webeditor/mediamtx_ldap_overlay.py'
-MARKER  = '# --- infra-TAK LDAP overlay ---'
-
-if not os.path.exists(EDITOR) or not os.path.exists(OVERLAY):
-    sys.exit(0)
-
-with open(EDITOR, 'r') as f:
-    src = f.read()
-
-changed = False
-
-# 1. Port patch: ensure PORT env var override
-if 'port=5000' in src and 'os.environ.get("PORT"' not in src:
-    src = src.replace('port=5000', 'port=int(os.environ.get("PORT", 5080))', 1)
-    changed = True
-
-# 2. API port patch: 9997 -> 9898
-if '9997' in src:
-    src = src.replace('9997', '9898')
-    changed = True
-
-# 3. LDAP overlay import injection
-if MARKER not in src:
-    inject = (
-        "\n" + MARKER + "\n"
-        "import os as _os\n"
-        "if _os.environ.get('LDAP_ENABLED'):\n"
-        "    import sys as _sys; _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))\n"
-        "    from mediamtx_ldap_overlay import apply_ldap_overlay\n"
-        "    apply_ldap_overlay(app)\n"
-        "# --- end LDAP overlay ---\n"
-    )
-    lines = src.splitlines(keepends=True)
-    inserted = False
-    for i, line in enumerate(lines):
-        if 'app = Flask(' in line:
-            lines.insert(i + 1, '\n' + inject)
-            inserted = True
-            break
-    if not inserted:
-        for i, line in enumerate(lines):
-            if 'app.run(' in line:
-                lines.insert(i, '\n' + inject)
-                inserted = True
-                break
-    if inserted:
-        src = ''.join(lines)
-        changed = True
-
-if changed:
-    with open(EDITOR, 'w') as f:
-        f.write(src)
-'''
             heal_path = f'{webeditor_dir}/ensure_overlay.py'
             with open(heal_path, 'w') as hf:
-                hf.write(heal_script)
+                hf.write(MEDIAMTX_ENSURE_OVERLAY_SCRIPT)
             os.chmod(heal_path, 0o755)
             plog("✓ Self-healing overlay script installed (runs on every service start)")
 
@@ -11886,7 +11927,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <div class="section-title" style="margin-top:20px">Controls</div>
   <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:24px">
   <div class="controls" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
-  {% if mtx.running %}<button class="control-btn" onclick="control('restart')">↻ Restart</button><button class="control-btn" onclick="loadLogs()">📋 Logs</button><button class="control-btn btn-stop" onclick="control('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="control('start')">▶ Start</button><button class="control-btn" onclick="loadLogs()">📋 Logs</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% endif %}
+  {% if mtx.running %}<button class="control-btn" onclick="control('restart')">↻ Restart</button><button class="control-btn" onclick="loadLogs()">📋 Logs</button><button class="control-btn" onclick="runRecovery()" id="recovery-btn" title="Fix web editor if stream URL won't load after an update">🔧 Fix web editor</button><button class="control-btn btn-stop" onclick="control('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="control('start')">▶ Start</button><button class="control-btn" onclick="loadLogs()">📋 Logs</button><button class="control-btn" onclick="runRecovery()" id="recovery-btn" title="Fix web editor if stream URL won&#39;t load after an update">🔧 Fix web editor</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% endif %}
   </div>
   <div id="control-status" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
   </div>
@@ -12180,6 +12221,31 @@ function loadLogs() {
   fetch('/api/mediamtx/logs?lines=80').then(r => r.json()).then(d => {
     document.getElementById('service-logs').textContent = d.entries.join(String.fromCharCode(10)) || '(no output)';
   });
+}
+
+function runRecovery() {
+  const statusEl = document.getElementById('control-status');
+  const btn = document.getElementById('recovery-btn');
+  if (btn) btn.disabled = true;
+  statusEl.textContent = 'Fixing web editor…';
+  fetch('/api/mediamtx/recovery', { method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin' })
+    .then(r => r.json())
+    .then(d => {
+      if (d.success) {
+        statusEl.textContent = (d.message || '✓ Recovery applied. Web editor restarted.');
+        statusEl.style.color = 'var(--green)';
+      } else {
+        statusEl.textContent = d.error || 'Recovery failed';
+        statusEl.style.color = 'var(--red)';
+      }
+      setTimeout(() => { statusEl.textContent = ''; statusEl.style.color = ''; }, 6000);
+    })
+    .catch(e => {
+      statusEl.textContent = e.message || 'Request failed';
+      statusEl.style.color = 'var(--red)';
+      setTimeout(() => { statusEl.textContent = ''; statusEl.style.color = ''; }, 5000);
+    })
+    .finally(() => { if (btn) btn.disabled = false; });
 }
 
 function doUninstall() {
