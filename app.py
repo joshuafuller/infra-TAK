@@ -7598,6 +7598,21 @@ WantedBy=multi-user.target
                         plog("✓ LDAP overlay already present")
                 else:
                     plog("⚠ mediamtx_ldap_overlay.py not found next to app.py — LDAP overlay skipped")
+            # Deploy Ku-band simulator scripts so "Simulate link" in the editor works (Web Editor v1.1.8+)
+            simulator_src = os.path.join(clone_dir, 'scripts', 'ku-band-simulator')
+            simulator_dst = os.path.join(webeditor_dir, 'ku-band-simulator')
+            if os.path.isdir(simulator_src):
+                os.makedirs(simulator_dst, exist_ok=True)
+                for name in os.listdir(simulator_src):
+                    if name == 'ku_band_simulator.conf':
+                        continue  # Don't overwrite existing config
+                    src_path = os.path.join(simulator_src, name)
+                    dst_path = os.path.join(simulator_dst, name)
+                    if os.path.isfile(src_path):
+                        _shutil.copy2(src_path, dst_path)
+                        if name.endswith('.sh'):
+                            os.chmod(dst_path, 0o755)
+                plog("✓ Ku-band simulator scripts installed")
         else:
             plog("⚠ mediamtx_config_editor.py not found (clone failed and no local file)")
             plog("  Place it next to app.py or in config-editor/, or fix repo access, then redeploy")
