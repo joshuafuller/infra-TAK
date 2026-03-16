@@ -349,6 +349,7 @@ def main():
     for def_pat, route_hints, endpoint_val in (
             (r'\bdef shared_stream_page\s*\(', ('/shared/',), 'shared_stream_page_core'),
             (r'\bdef shared_hls_proxy\s*\(', ('/shared-hls/', 'shared-hls', 'shared_hls'), 'shared_hls_proxy_core'),
+            (r'\bdef api_share_links_list\s*\(', ('/api/share-links', 'share-links'), 'api_share_links_list_core'),
     ):
         for i in range(len(lines) - 1, -1, -1):
             if not re.search(def_pat, lines[i]):
@@ -4563,13 +4564,14 @@ def _get_cloudtak_upstreams(settings):
 
 
 def _mediamtx_editor_endpoint_patch(src):
-    """Patch duplicate Flask endpoints (shared_stream_page, shared_hls_proxy) so infra-TAK overlay + core don't conflict. Returns modified source."""
+    """Patch duplicate Flask endpoints so infra-TAK overlay + core don't conflict. Returns modified source."""
     import re
     lines = src.splitlines(keepends=True)
     changed = False
     for def_pat, route_hints, endpoint_val in (
             (r'\bdef shared_stream_page\s*\(', ('/shared/',), 'shared_stream_page_core'),
             (r'\bdef shared_hls_proxy\s*\(', ('/shared-hls/', 'shared-hls', 'shared_hls'), 'shared_hls_proxy_core'),
+            (r'\bdef api_share_links_list\s*\(', ('/api/share-links', 'share-links'), 'api_share_links_list_core'),
     ):
         for i in range(len(lines) - 1, -1, -1):
             if not re.search(def_pat, lines[i]):
@@ -7426,7 +7428,7 @@ paths:
                     "f='/opt/mediamtx-webeditor/mediamtx_config_editor.py'\n"
                     "with open(f) as h: src=h.read()\n"
                     "lines=src.splitlines(keepends=True)\n"
-                    "for (dp,rh,ev) in [(r'\\\\bdef shared_stream_page\\\\s*\\\\(',('/shared/',),'shared_stream_page_core'),(r'\\\\bdef shared_hls_proxy\\\\s*\\\\(',('/shared-hls','shared_hls'),'shared_hls_proxy_core')]:\n"
+                    "for (dp,rh,ev) in [(r'\\\\bdef shared_stream_page\\\\s*\\\\(',('/shared/',),'shared_stream_page_core'),(r'\\\\bdef shared_hls_proxy\\\\s*\\\\(',('/shared-hls','shared_hls'),'shared_hls_proxy_core'),(r'\\\\bdef api_share_links_list\\\\s*\\\\(',('/api/share-links','share-links'),'api_share_links_list_core')]:\n"
                     " for i in range(len(lines)-1,-1,-1):\n"
                     "  if not re.search(dp,lines[i]): continue\n"
                     "  for j in range(i-1,max(-1,i-20),-1):\n"

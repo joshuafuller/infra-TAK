@@ -75,6 +75,7 @@ def main():
     for def_pat, route_hints, endpoint_val in (
             (r'\bdef shared_stream_page\s*\(', ('/shared/',), 'shared_stream_page_core'),
             (r'\bdef shared_hls_proxy\s*\(', ('/shared-hls/', 'shared-hls', 'shared_hls'), 'shared_hls_proxy_core'),
+            (r'\bdef api_share_links_list\s*\(', ('/api/share-links', 'share-links'), 'api_share_links_list_core'),
     ):
         for i in range(len(lines) - 1, -1, -1):
             if not re.search(def_pat, lines[i]):
