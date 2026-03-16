@@ -4562,6 +4562,45 @@ def _get_cloudtak_upstreams(settings):
     }
 
 
+def _mediamtx_editor_endpoint_patch(src):
+    """Patch duplicate Flask endpoints (shared_stream_page, shared_hls_proxy) so infra-TAK overlay + core don't conflict. Returns modified source."""
+    import re
+    lines = src.splitlines(keepends=True)
+    changed = False
+    for def_pat, route_hints, endpoint_val in (
+            (r'\bdef shared_stream_page\s*\(', ('/shared/',), 'shared_stream_page_core'),
+            (r'\bdef shared_hls_proxy\s*\(', ('/shared-hls/', 'shared-hls', 'shared_hls'), 'shared_hls_proxy_core'),
+    ):
+        for i in range(len(lines) - 1, -1, -1):
+            if not re.search(def_pat, lines[i]):
+                continue
+            j = i - 1
+            while j >= 0 and j >= i - 20:
+                line = lines[j]
+                if '@app.route' in line and 'endpoint=' not in line and any(h in line for h in route_hints):
+                    if line.rstrip().endswith(')'):
+                        lines[j] = line.rstrip()[:-1] + ", endpoint='" + endpoint_val + "')\n"
+                    else:
+                        lines[j] = line.rstrip().rstrip(')') + ", endpoint='" + endpoint_val + "')\n"
+                    changed = True
+                    break
+                j -= 1
+            else:
+                j = i - 1
+                while j >= 0 and j >= i - 20:
+                    if '@app.route' in lines[j] and 'endpoint=' not in lines[j]:
+                        l = lines[j]
+                        if l.rstrip().endswith(')'):
+                            lines[j] = l.rstrip()[:-1] + ", endpoint='" + endpoint_val + "')\n"
+                        else:
+                            lines[j] = l.rstrip().rstrip(')') + ", endpoint='" + endpoint_val + "')\n"
+                        changed = True
+                        break
+                    j -= 1
+            break
+    return ''.join(lines) if changed else src
+
+
 def _get_mediamtx_upstream(settings):
     """Return MediaMTX web console upstream for Caddy (127.0.0.1:5080 or remote_host:5080)."""
     cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
@@ -7381,6 +7420,35 @@ paths:
                 except Exception:
                     pass
                 plog("✓ LDAP overlay applied (Authentik header auth)")
+                # Endpoint patch so shared_stream_page / shared_hls_proxy don't duplicate (Flask AssertionError)
+                ep_script = (
+                    "import re\n"
+                    "f='/opt/mediamtx-webeditor/mediamtx_config_editor.py'\n"
+                    "with open(f) as h: src=h.read()\n"
+                    "lines=src.splitlines(keepends=True)\n"
+                    "for (dp,rh,ev) in [(r'\\\\bdef shared_stream_page\\\\s*\\\\(',('/shared/',),'shared_stream_page_core'),(r'\\\\bdef shared_hls_proxy\\\\s*\\\\(',('/shared-hls','shared_hls'),'shared_hls_proxy_core')]:\n"
+                    " for i in range(len(lines)-1,-1,-1):\n"
+                    "  if not re.search(dp,lines[i]): continue\n"
+                    "  for j in range(i-1,max(-1,i-20),-1):\n"
+                    "   L=lines[j]\n"
+                    "   if '@app.route' in L and 'endpoint=' not in L and any(h in L for h in rh):\n"
+                    "    lines[j]=L.rstrip()[:-1]+\", endpoint='\"+ev+\"')\\n\"; break\n"
+                    "  else:\n"
+                    "   for j in range(i-1,max(-1,i-20),-1):\n"
+                    "    if '@app.route' in lines[j] and 'endpoint=' not in lines[j]:\n"
+                    "     L=lines[j]; lines[j]=L.rstrip()[:-1]+\", endpoint='\"+ev+\"')\\n\"; break\n"
+                    "  break\n"
+                    "with open(f,'w') as h: h.write(''.join(lines))\n"
+                )
+                with open('/tmp/mtx_endpoint_patch.py', 'w') as pf:
+                    pf.write(ep_script)
+                _module_copy(deploy_cfg, '/tmp/mtx_endpoint_patch.py', '/tmp/mtx_endpoint_patch.py', log_fn=plog)
+                _module_run(deploy_cfg, 'python3 /tmp/mtx_endpoint_patch.py && rm -f /tmp/mtx_endpoint_patch.py', timeout=15)
+                try:
+                    os.remove('/tmp/mtx_endpoint_patch.py')
+                except Exception:
+                    pass
+                plog("✓ Endpoint patch applied (shared_stream_page, shared_hls_proxy)")
             else:
                 plog("⚠ Failed to copy LDAP overlay to remote")
         else:
@@ -7885,6 +7953,19 @@ WantedBy=multi-user.target
                         plog("✓ LDAP overlay already present")
                 else:
                     plog("⚠ mediamtx_ldap_overlay.py not found next to app.py — LDAP overlay skipped")
+                # Avoid duplicate Flask endpoints (shared_stream_page, shared_hls_proxy) so editor starts
+                try:
+                    _editor_path = f'{webeditor_dir}/mediamtx_config_editor.py'
+                    if os.path.exists(_editor_path):
+                        with open(_editor_path, 'r') as ef:
+                            esrc = ef.read()
+                        patched = _mediamtx_editor_endpoint_patch(esrc)
+                        if patched != esrc:
+                            with open(_editor_path, 'w') as ef:
+                                ef.write(patched)
+                            plog("✓ Endpoint patch applied (shared_stream_page, shared_hls_proxy)")
+                except Exception:
+                    pass
             # Deploy Ku-band simulator scripts so "Simulate link" in the editor works (Web Editor v1.1.8+)
             simulator_src = os.path.join(clone_dir, 'scripts', 'ku-band-simulator')
             simulator_dst = os.path.join(webeditor_dir, 'ku-band-simulator')
