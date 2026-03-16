@@ -344,14 +344,25 @@ def main():
             src = ''.join(lines)
             changed = True
 
-    # 4. Fix duplicate shared_stream_page (upstream editor can register it twice -> Flask AssertionError)
+    # 4. Fix duplicate shared_stream_page (infra-TAK overlay + core both register it -> Flask AssertionError)
     idxs = [m.start() for m in re.finditer(r'\bdef shared_stream_page\s*\(', src)]
     if len(idxs) >= 2:
-        before_second = src[:idxs[1]]
-        route_match = re.search(r"@app\.route\s*\(\s*['\"]/shared/[^'\"]*['\"]([^)]*)\)", before_second)
+        # Patch the route that decorates the *second* definition (the one that would overwrite)
+        chunk = src[max(0, idxs[1] - 800):idxs[1]]
+        route_matches = list(re.finditer(r"@app\.route\s*\(\s*['\"](/shared/[^'\"]*)['\"]([^)]*)\)", chunk))
+        if route_matches and 'endpoint=' not in route_matches[-1].group(0):
+            last = route_matches[-1]
+            old = last.group(0)
+            new = old[:-1] + ", endpoint='shared_stream_page_2')"
+            src = src.replace(old, new, 1)
+            changed = True
+    elif len(idxs) == 1:
+        # Single definition but overlay may have registered same endpoint: patch the only route so it uses a unique endpoint
+        chunk = src[max(0, idxs[0] - 800):idxs[0]]
+        route_match = re.search(r"@app\.route\s*\(\s*['\"](/shared/[^'\"]*)['\"]([^)]*)\)", chunk)
         if route_match and 'endpoint=' not in route_match.group(0):
             old = route_match.group(0)
-            new = old[:-1] + ", endpoint='shared_stream_page_2')"
+            new = old[:-1] + ", endpoint='shared_stream_page_core')"
             src = src.replace(old, new, 1)
             changed = True
 
