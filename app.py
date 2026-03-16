@@ -1182,6 +1182,15 @@ def help_page():
     current_ssh_port = _get_current_ssh_port()
     return render_template_string(HELP_TEMPLATE, settings=settings, version=VERSION, current_ssh_port=current_ssh_port)
 
+def _update_check_response(data):
+    """Return JSON response with no-cache headers so FQDN/proxy path never serves stale update badge."""
+    from flask import make_response
+    r = make_response(jsonify(data))
+    r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    r.headers['Pragma'] = 'no-cache'
+    return r
+
+
 @app.route('/api/update/check')
 @login_required
 def update_check():
@@ -1194,9 +1203,11 @@ def update_check():
     if not force and update_cache['latest'] and (now - update_cache['checked']) < 600:
         try:
             cached_newer = _parse_version_tuple(update_cache['latest']) > _parse_version_tuple(VERSION)
+            if update_cache['latest'].strip() == VERSION.strip():
+                cached_newer = False
         except (ValueError, IndexError):
             cached_newer = False
-        return jsonify({'current': VERSION, 'latest': update_cache['latest'], 'notes': update_cache['notes'],
+        return _update_check_response({'current': VERSION, 'latest': update_cache['latest'], 'notes': update_cache['notes'],
             'update_available': cached_newer})
     try:
         req = urllib.request.Request(
@@ -1206,7 +1217,7 @@ def update_check():
         resp = urllib.request.urlopen(req, timeout=5)
         data = json.loads(resp.read().decode())
         if not data:
-            return jsonify({'current': VERSION, 'latest': None, 'error': 'No tags found', 'update_available': False})
+            return _update_check_response({'current': VERSION, 'latest': None, 'error': 'No tags found', 'update_available': False})
         versions = []
         for tag in data:
             name = tag.get('name', '').lstrip('v').replace('-alpha','').replace('-beta','')
@@ -1216,7 +1227,7 @@ def update_check():
             except (ValueError, IndexError):
                 continue
         if not versions:
-            return jsonify({'current': VERSION, 'latest': None, 'error': 'No version tags', 'update_available': False})
+            return _update_check_response({'current': VERSION, 'latest': None, 'error': 'No version tags', 'update_available': False})
         versions.sort(key=lambda x: x[0], reverse=True)
         latest_tag = versions[0][1]
         latest = latest_tag.get('name', '').lstrip('v')
@@ -1226,12 +1237,15 @@ def update_check():
             is_newer = latest_tuple > current_tuple
         except (ValueError, IndexError):
             is_newer = False
+        # Never show "update available" when current and latest are the same (avoid stale badge after update)
+        if latest.strip() == VERSION.strip():
+            is_newer = False
         notes = f"Version {latest_tag.get('name', '')}"
         update_cache.update({'latest': latest, 'checked': now, 'notes': notes})
-        return jsonify({'current': VERSION, 'latest': latest, 'notes': notes, 'body': '',
+        return _update_check_response({'current': VERSION, 'latest': latest, 'notes': notes, 'body': '',
             'update_available': is_newer})
     except Exception as e:
-        return jsonify({'current': VERSION, 'latest': None, 'error': str(e), 'update_available': False})
+        return _update_check_response({'current': VERSION, 'latest': None, 'error': str(e), 'update_available': False})
 
 @app.route('/api/update/apply', methods=['POST'])
 @login_required
@@ -1254,7 +1268,12 @@ def update_apply():
         _ensure_gunicorn_upgrade(console_dir)
         subprocess.Popen('sleep 2 && systemctl restart takwerx-console', shell=True,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return jsonify({'success': True, 'output': (r.stdout or '').strip(), 'restart_required': True})
+        return jsonify({
+            'success': True,
+            'output': (r.stdout or '').strip(),
+            'restart_required': True,
+            'restart_message': 'Console is restarting. You may see 502 briefly — wait 10–15 seconds then refresh the page.'
+        })
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
@@ -2342,12 +2361,19 @@ def mediamtx_page():
     mediamtx_deploy_cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
     if mtx.get('installed') and not mediamtx_deploy_status.get('running', False):
         mediamtx_deploy_status.update({'complete': False, 'error': False})
+    mtx_vinfo = _get_mediamtx_version_info() if mtx.get('installed') else {}
     return render_template_string(MEDIAMTX_TEMPLATE,
         settings=settings, mtx=mtx, version=VERSION,
         cloudtak_installed=cloudtak_installed,
         mediamtx_deploy_cfg=mediamtx_deploy_cfg,
         deploying=mediamtx_deploy_status.get('running', False),
-        deploy_done=mediamtx_deploy_status.get('complete', False))
+        deploy_done=mediamtx_deploy_status.get('complete', False),
+        mediamtx_version=mtx_vinfo.get('version') or '',
+        mediamtx_update_available=mtx_vinfo.get('update_available', False),
+        mediamtx_latest=mtx_vinfo.get('latest') or '',
+        editor_version=mtx_vinfo.get('editor_version') or '',
+        editor_update_available=mtx_vinfo.get('editor_update_available', False),
+        editor_latest=mtx_vinfo.get('editor_latest') or '')
 
 # ── Guard Dog (TAK Server hardening / 7 monitors) ─────────────────────────────
 guarddog_deploy_log = []
@@ -5964,6 +5990,112 @@ def _get_cloudtak_version_info():
     return out
 
 
+def _get_mediamtx_editor_version_info(deploy_cfg):
+    """Return {version: str, update_available: bool, latest: str|None} for MediaMTX web editor (takwerx/mediamtx-installer).
+    Current from CURRENT_VERSION in /opt/mediamtx-webeditor/mediamtx_config_editor.py on target."""
+    import re as _re
+    out = {'version': '', 'update_available': False, 'latest': None}
+    # Current: grep CURRENT_VERSION from editor script on target
+    cmd = 'grep -oE \'CURRENT_VERSION = "[^"]+"\' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null | head -1'
+    if deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip():
+        ok, raw = _module_run(deploy_cfg, cmd, timeout=10)
+        if ok and raw:
+            m = _re.search(r'"([^"]+)"', raw)
+            if m:
+                out['version'] = m.group(1).lstrip('vV')
+    else:
+        editor_path = '/opt/mediamtx-webeditor/mediamtx_config_editor.py'
+        if os.path.isfile(editor_path):
+            try:
+                with open(editor_path) as f:
+                    for line in f:
+                        if 'CURRENT_VERSION' in line:
+                            m = _re.search(r'["\']([vV]?[^"\']+)["\']', line)
+                            if m:
+                                out['version'] = m.group(1).lstrip('vV')
+                            break
+            except Exception:
+                pass
+    # Latest from takwerx/mediamtx-installer releases/latest
+    try:
+        req = _ur.Request(
+            'https://api.github.com/repos/takwerx/mediamtx-installer/releases/latest',
+            headers={'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'infra-TAK'})
+        with _ur.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+        tag = (data or {}).get('tag_name') or ''
+        if tag:
+            out['latest'] = tag.lstrip('vV')
+            if out['version'] and out['latest']:
+                cur_parts = [int(x) for x in _re.findall(r'\d+', out['version'])[:3]]
+                lat_parts = [int(x) for x in _re.findall(r'\d+', out['latest'])[:3]]
+                while len(cur_parts) < 3:
+                    cur_parts.append(0)
+                while len(lat_parts) < 3:
+                    lat_parts.append(0)
+                if lat_parts > cur_parts:
+                    out['update_available'] = True
+            elif out['latest']:
+                out['update_available'] = True
+    except Exception:
+        pass
+    return out
+
+
+def _get_mediamtx_version_info():
+    """Return version/update for MediaMTX binary (bluenviron/mediamtx) and web editor (takwerx/mediamtx-installer).
+    Card shows update if either has an update; page shows both."""
+    import re as _re
+    out = {'version': '', 'update_available': False, 'latest': None,
+           'editor_version': '', 'editor_update_available': False, 'editor_latest': None}
+    settings = load_settings()
+    deploy_cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
+    # Binary: current from target, latest from bluenviron/mediamtx
+    if deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip():
+        ok, raw = _module_run(deploy_cfg, '/usr/local/bin/mediamtx -version 2>/dev/null', timeout=10)
+        if ok and raw:
+            m = _re.search(r'v?(\d+\.\d+\.\d+)', raw)
+            if m:
+                out['version'] = m.group(1)
+    else:
+        if os.path.isfile('/usr/local/bin/mediamtx') and os.access('/usr/local/bin/mediamtx', os.X_OK):
+            r = subprocess.run('/usr/local/bin/mediamtx -version 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
+            if r.returncode == 0 and (r.stdout or r.stderr):
+                m = _re.search(r'v?(\d+\.\d+\.\d+)', (r.stdout or '') + (r.stderr or ''))
+                if m:
+                    out['version'] = m.group(1)
+    try:
+        req = _ur.Request(
+            'https://api.github.com/repos/bluenviron/mediamtx/releases/latest',
+            headers={'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'infra-TAK'})
+        with _ur.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+        tag = (data or {}).get('tag_name') or ''
+        if tag:
+            out['latest'] = tag.lstrip('vV')
+            if out['version'] and out['latest']:
+                cur_parts = [int(x) for x in _re.findall(r'\d+', out['version'])[:3]]
+                lat_parts = [int(x) for x in _re.findall(r'\d+', out['latest'])[:3]]
+                while len(cur_parts) < 3:
+                    cur_parts.append(0)
+                while len(lat_parts) < 3:
+                    lat_parts.append(0)
+                if lat_parts > cur_parts:
+                    out['update_available'] = True
+            elif out['latest']:
+                out['update_available'] = True
+    except Exception:
+        pass
+    # Web editor: current from CURRENT_VERSION on target, latest from takwerx/mediamtx-installer
+    editor_info = _get_mediamtx_editor_version_info(deploy_cfg)
+    out['editor_version'] = editor_info.get('version') or ''
+    out['editor_update_available'] = editor_info.get('update_available', False)
+    out['editor_latest'] = editor_info.get('latest')
+    if out['editor_update_available']:
+        out['update_available'] = True
+    return out
+
+
 def get_all_module_versions():
     """Return dict of module_key -> {version, update_available, latest?} for console cards."""
     modules = detect_modules()
@@ -5976,6 +6108,8 @@ def get_all_module_versions():
         result['nodered'] = _get_nodered_version_info()
     if modules.get('cloudtak', {}).get('installed'):
         result['cloudtak'] = _get_cloudtak_version_info()
+    if modules.get('mediamtx', {}).get('installed'):
+        result['mediamtx'] = _get_mediamtx_version_info()
     if modules.get('takportal', {}).get('installed'):
         result['takportal'] = _get_takportal_version_info()
     if modules.get('takserver', {}).get('installed'):
@@ -11735,14 +11869,14 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 {{ sidebar_html }}
 <div class="main">
   <div class="page-header">
-    <h1><img src="{{ mediamtx_logo_url }}" alt="MediaMTX" style="height:28px;vertical-align:middle"></h1>
-    <p>Video Streaming Server</p>
+    <h1><img src="{{ mediamtx_logo_url }}" alt="MediaMTX" style="height:28px;vertical-align:middle;margin-right:8px">MediaMTX{% if mediamtx_version or editor_version %} <span style="font-weight:500;color:var(--text-dim);font-size:16px">· binary v{{ mediamtx_version }}{% if editor_version %} / editor v{{ editor_version }}{% endif %}</span>{% endif %}{% if mediamtx_update_available and mediamtx_latest %} <span style="font-size:12px;color:var(--cyan);font-weight:600;margin-left:8px">binary v{{ mediamtx_latest }} available</span>{% endif %}{% if editor_update_available and editor_latest %} <span style="font-size:12px;color:var(--cyan);font-weight:600;margin-left:8px">editor v{{ editor_latest }} available</span>{% endif %}</h1>
+    <p>Video Streaming Server (bluenviron) + Web Editor (takwerx)</p>
   </div>
 
   {% if mtx.running %}
-  <div class="status-banner running"><div class="dot"></div>MediaMTX is running</div>
+  <div class="status-banner running"><div class="dot"></div>MediaMTX is running{% if mediamtx_version %} · binary v{{ mediamtx_version }}{% endif %}{% if editor_version %} · editor v{{ editor_version }}{% endif %}{% if mediamtx_update_available and mediamtx_latest %} · <span style="color:var(--cyan)">binary v{{ mediamtx_latest }} available</span>{% endif %}{% if editor_update_available and editor_latest %} · <span style="color:var(--cyan)">editor v{{ editor_latest }} available</span>{% endif %}</div>
   {% elif mtx.installed %}
-  <div class="status-banner stopped"><div class="dot"></div>MediaMTX is installed but stopped</div>
+  <div class="status-banner stopped"><div class="dot"></div>MediaMTX is installed but stopped{% if mediamtx_version %} · binary v{{ mediamtx_version }}{% endif %}{% if editor_version %} · editor v{{ editor_version }}{% endif %}{% if mediamtx_update_available and mediamtx_latest %} · <span style="color:var(--cyan)">binary v{{ mediamtx_latest }} available</span>{% endif %}{% if editor_update_available and editor_latest %} · <span style="color:var(--cyan)">editor v{{ editor_latest }} available</span>{% endif %}</div>
   {% else %}
   <div class="status-banner not-installed"><div class="dot"></div>MediaMTX is not installed</div>
   {% endif %}
@@ -11850,7 +11984,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
       Web editor will be available at <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">https://stream.{{ settings.fqdn }}</span>
     </div>
     {% endif %}
-    <button class="btn btn-primary" id="deploy-btn" onclick="startDeploy()">🚀 Deploy MediaMTX</button>
+    <button class="btn btn-primary" id="deploy-btn" onclick="startDeploy()"{% if mediamtx_update_available %} style="border:1px solid var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>{% if mediamtx_update_available %}⬆ Update MediaMTX{% if mediamtx_latest %} <span style="color:var(--cyan)" title="Update available: v{{ mediamtx_latest }}">●</span>{% endif %}{% else %}🚀 Deploy MediaMTX{% endif %}</button>
   </div>
   {% endif %}
 
@@ -20735,7 +20869,8 @@ async function checkUpdate(forceRefresh){
     if(btn){btn.disabled=true;btn.textContent='Checking...';}
     try{
         var url='/api/update/check';if(forceRefresh)url+='?refresh=1';
-        var r=await fetch(url);var d=await r.json();
+        var r=await fetch(url,{credentials:'same-origin',cache:'no-store'});
+        var d=await r.json();
         if(d.update_available){
             document.getElementById('update-banner').style.display='block';
             document.getElementById('update-info').textContent='v'+d.current+' -> v'+d.latest+(d.notes?' - '+d.notes:'');
@@ -20759,7 +20894,8 @@ async function applyUpdate(){
         if(d.success){
             status.style.color='var(--green)';
             status.textContent='OK Updated! Restarting console...';
-            setTimeout(function(){window.location.reload()},5000);
+            if(d.restart_message){status.innerHTML=status.textContent+'<br><small style=\"opacity:0.9;display:block;margin-top:6px\">'+d.restart_message+'</small>';}
+            setTimeout(function(){window.location.reload()},12000);
         }else{
             status.style.color='var(--red)';status.textContent='Error: '+d.error;
             if(d.workaround){status.innerHTML=status.textContent+'<br><small style=\"opacity:0.9\">'+d.workaround+'</small>';}
@@ -21278,7 +21414,8 @@ def _auto_update_guarddog():
             content = (content
                 .replace('ALERT_EMAIL_PLACEHOLDER', alert_email)
                 .replace('ALERT_SMS_PLACEHOLDER', '')
-                .replace('CERT_PASS_PLACEHOLDER', cert_pass))
+                .replace('CERT_PASS_PLACEHOLDER', cert_pass)
+                .replace('CONSOLE_VERSION_PLACEHOLDER', VERSION))
             if is_two_server and name in ('tak-remotedb-watch.sh', 'tak-remotedb-auth-watch.sh'):
                 content = content.replace('DB_HOST_PLACEHOLDER', s1_host)
                 content = content.replace('DB_PORT_PLACEHOLDER', db_port)
