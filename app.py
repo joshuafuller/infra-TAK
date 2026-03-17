@@ -437,6 +437,37 @@ def main():
         if pill_done:
             changed = True
 
+    # 7. DOM normalize: after external-sources render, force one badge in Name and one link button in URL
+    if '_extSourcesDomNormalize' not in src and "container.innerHTML = html;" in src:
+        src = src.replace(
+            "container.innerHTML = html;",
+            "container.innerHTML = html;\\n"
+            "                    /* _extSourcesDomNormalize */\\n"
+            "                    try {\\n"
+            "                        const rows = container.querySelectorAll('tbody tr');\\n"
+            "                        rows.forEach(row => {\\n"
+            "                            const tds = row.querySelectorAll('td');\\n"
+            "                            if (!tds || tds.length < 2) return;\\n"
+            "                            const nameCell = tds[0];\\n"
+            "                            const urlCell = tds[1];\\n"
+            "                            const badges = row.querySelectorAll('.share-mode-badge-ext');\\n"
+            "                            if (badges.length) {\\n"
+            "                                const keepBadge = badges[0];\\n"
+            "                                if (keepBadge.parentElement !== nameCell) nameCell.appendChild(keepBadge);\\n"
+            "                                badges.forEach((b, i) => { if (i > 0) b.remove(); });\\n"
+            "                            }\\n"
+            "                            const links = row.querySelectorAll('.external-copy-link-btn');\\n"
+            "                            if (links.length) {\\n"
+            "                                const keepLink = links[0];\\n"
+            "                                if (keepLink.parentElement !== urlCell) urlCell.appendChild(keepLink);\\n"
+            "                                links.forEach((b, i) => { if (i > 0) b.remove(); });\\n"
+            "                            }\\n"
+            "                        });\\n"
+            "                    } catch(e) {}",
+            1
+        )
+        changed = True
+
     if changed:
         with open(EDITOR, 'w') as f:
             f.write(src)
@@ -535,6 +566,39 @@ MEDIAMTX_REMOTE_EXT_PILL_STYLE_SCRIPT = (
     "    new_s='style=\"background: \\' + statusColor + \\'; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\"'\n"
     "    if old_m not in c: raise SystemExit(0)\n"
     "    c=c.replace(old_m, new_m, 1).replace(old_s, new_s, 1)\n"
+    "with open(f,'w') as h: h.write(c)\n"
+)
+# Normalize External Sources DOM after render: keep exactly one badge in Name and one link button in URL.
+MEDIAMTX_REMOTE_EXT_DOM_NORMALIZE_SCRIPT = (
+    "f='/opt/mediamtx-webeditor/mediamtx_config_editor.py'\n"
+    "with open(f) as h: c=h.read()\n"
+    "if '_extSourcesDomNormalize' in c: raise SystemExit(0)\n"
+    "hook='container.innerHTML = html;'\n"
+    "if hook not in c: raise SystemExit(0)\n"
+    "ins = \"container.innerHTML = html;\\n\"\n"
+    "ins += \"                    /* _extSourcesDomNormalize */\\n\"\n"
+    "ins += \"                    try {\\n\"\n"
+    "ins += \"                        const rows = container.querySelectorAll('tbody tr');\\n\"\n"
+    "ins += \"                        rows.forEach(row => {\\n\"\n"
+    "ins += \"                            const tds = row.querySelectorAll('td');\\n\"\n"
+    "ins += \"                            if (!tds || tds.length < 2) return;\\n\"\n"
+    "ins += \"                            const nameCell = tds[0];\\n\"\n"
+    "ins += \"                            const urlCell = tds[1];\\n\"\n"
+    "ins += \"                            const badges = row.querySelectorAll('.share-mode-badge-ext');\\n\"\n"
+    "ins += \"                            if (badges.length) {\\n\"\n"
+    "ins += \"                                const keepBadge = badges[0];\\n\"\n"
+    "ins += \"                                if (keepBadge.parentElement !== nameCell) nameCell.appendChild(keepBadge);\\n\"\n"
+    "ins += \"                                badges.forEach((b, i) => { if (i > 0) b.remove(); });\\n\"\n"
+    "ins += \"                            }\\n\"\n"
+    "ins += \"                            const links = row.querySelectorAll('.external-copy-link-btn');\\n\"\n"
+    "ins += \"                            if (links.length) {\\n\"\n"
+    "ins += \"                                const keepLink = links[0];\\n\"\n"
+    "ins += \"                                if (keepLink.parentElement !== urlCell) urlCell.appendChild(keepLink);\\n\"\n"
+    "ins += \"                                links.forEach((b, i) => { if (i > 0) b.remove(); });\\n\"\n"
+    "ins += \"                            }\\n\"\n"
+    "ins += \"                        });\\n\"\n"
+    "ins += \"                    } catch(e) {}\\n\"\n"
+    "c=c.replace(hook, ins, 1)\n"
     "with open(f,'w') as h: h.write(c)\n"
 )
 # Node-RED official icons (https://nodered.org/about/resources/media/)
@@ -4827,6 +4891,42 @@ def _mediamtx_editor_external_sources_single_container_patch(src):
     return src
 
 
+def _mediamtx_editor_external_sources_dom_normalize_patch(src):
+    """After rendering External Sources table, normalize each row to one badge in Name and one link button in URL."""
+    marker = '_extSourcesDomNormalize'
+    if marker in src:
+        return src
+    hook = "container.innerHTML = html;"
+    if hook not in src:
+        return src
+    normalize_js = (
+        "container.innerHTML = html;\n"
+        "                    /* _extSourcesDomNormalize */\n"
+        "                    try {\n"
+        "                        const rows = container.querySelectorAll('tbody tr');\n"
+        "                        rows.forEach(row => {\n"
+        "                            const tds = row.querySelectorAll('td');\n"
+        "                            if (!tds || tds.length < 2) return;\n"
+        "                            const nameCell = tds[0];\n"
+        "                            const urlCell = tds[1];\n"
+        "                            const badges = row.querySelectorAll('.share-mode-badge-ext');\n"
+        "                            if (badges.length) {\n"
+        "                                const keepBadge = badges[0];\n"
+        "                                if (keepBadge.parentElement !== nameCell) nameCell.appendChild(keepBadge);\n"
+        "                                badges.forEach((b, i) => { if (i > 0) b.remove(); });\n"
+        "                            }\n"
+        "                            const links = row.querySelectorAll('.external-copy-link-btn');\n"
+        "                            if (links.length) {\n"
+        "                                const keepLink = links[0];\n"
+        "                                if (keepLink.parentElement !== urlCell) urlCell.appendChild(keepLink);\n"
+        "                                links.forEach((b, i) => { if (i > 0) b.remove(); });\n"
+        "                            }\n"
+        "                        });\n"
+        "                    } catch(e) {}\n"
+    )
+    return src.replace(hook, normalize_js, 1)
+
+
 def _mediamtx_editor_external_sources_pill_style_patch(src):
     """Make Mode/Status use pill styling (background badge). Works for any editor format: plain text or color-only span."""
     import re
@@ -7418,6 +7518,7 @@ def mediamtx_recovery():
                 ('mtx_ext_lock_patch', MEDIAMTX_REMOTE_EXT_LOCK_SCRIPT),
                 ('mtx_ext_single_container', MEDIAMTX_REMOTE_EXT_SINGLE_CONTAINER_SCRIPT),
                 ('mtx_ext_pill_style', MEDIAMTX_REMOTE_EXT_PILL_STYLE_SCRIPT),
+                ('mtx_ext_dom_normalize', MEDIAMTX_REMOTE_EXT_DOM_NORMALIZE_SCRIPT),
             ]:
                 with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as pf:
                     pf.write(script)
@@ -7438,6 +7539,7 @@ def mediamtx_recovery():
                 src = _mediamtx_editor_external_sources_lock_patch(src)
                 src = _mediamtx_editor_external_sources_single_container_patch(src)
                 src = _mediamtx_editor_external_sources_pill_style_patch(src)
+                src = _mediamtx_editor_external_sources_dom_normalize_patch(src)
                 with open(editor_path, 'w') as f:
                     f.write(src)
         tmp_f = tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False)
@@ -7823,6 +7925,15 @@ paths:
                 except Exception:
                     pass
                 plog("✓ External Sources pill style (Mode/Status) patch applied")
+                with open('/tmp/mtx_ext_dom_normalize.py', 'w') as pf:
+                    pf.write(MEDIAMTX_REMOTE_EXT_DOM_NORMALIZE_SCRIPT)
+                _module_copy(deploy_cfg, '/tmp/mtx_ext_dom_normalize.py', '/tmp/mtx_ext_dom_normalize.py', log_fn=plog)
+                _module_run(deploy_cfg, 'python3 /tmp/mtx_ext_dom_normalize.py 2>/dev/null; rm -f /tmp/mtx_ext_dom_normalize.py', timeout=10)
+                try:
+                    os.remove('/tmp/mtx_ext_dom_normalize.py')
+                except Exception:
+                    pass
+                plog("✓ External Sources DOM normalize patch applied")
             else:
                 plog("⚠ Failed to copy LDAP overlay to remote")
         else:
@@ -8358,6 +8469,11 @@ WantedBy=multi-user.target
                             with open(_editor_path, 'w') as ef:
                                 ef.write(patched5)
                             plog("✓ External Sources pill style (Mode/Status) patch applied")
+                        patched6 = _mediamtx_editor_external_sources_dom_normalize_patch(patched5)
+                        if patched6 != patched5:
+                            with open(_editor_path, 'w') as ef:
+                                ef.write(patched6)
+                            plog("✓ External Sources DOM normalize patch applied")
                 except Exception:
                     pass
             # Deploy Ku-band simulator scripts so "Simulate link" in the editor works (Web Editor v1.1.8+)
