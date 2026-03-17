@@ -6316,10 +6316,10 @@ def get_all_module_versions():
         result['cloudtak'] = _get_cloudtak_version_info()
     if modules.get('mediamtx', {}).get('installed'):
         mtx = _get_mediamtx_version_info()
-        # Card expects single 'version' string and update_available; label so binary vs editor are clear
+        # Card expects single 'version' string and update_available; label so MediaMTX vs editor are clear
         parts = []
         if mtx.get('version'):
-            parts.append('binary v' + mtx['version'])
+            parts.append('MediaMTX v' + mtx['version'])
         if mtx.get('editor_version'):
             parts.append('editor v' + mtx['editor_version'])
         mtx['version'] = ' · '.join(parts) if parts else (mtx.get('editor_version') or mtx.get('version') or '')
@@ -12108,14 +12108,14 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 {{ sidebar_html }}
 <div class="main">
   <div class="page-header">
-    <h1><img src="{{ mediamtx_logo_url }}" alt="MediaMTX" style="height:28px;vertical-align:middle;margin-right:8px">MediaMTX{% if mediamtx_version or editor_version %} <span style="font-weight:500;color:var(--text-dim);font-size:16px">· binary v{{ mediamtx_version }}{% if editor_version %} / editor v{{ editor_version }}{% endif %}</span>{% endif %}{% if mediamtx_update_available and mediamtx_latest %} <span style="font-size:12px;color:var(--cyan);font-weight:600;margin-left:8px">binary v{{ mediamtx_latest }} available</span>{% endif %}{% if editor_update_available and editor_latest %} <span style="font-size:12px;color:var(--cyan);font-weight:600;margin-left:8px">editor v{{ editor_latest }} available</span>{% endif %}</h1>
+    <h1><img src="{{ mediamtx_logo_url }}" alt="MediaMTX" style="height:28px;vertical-align:middle;margin-right:8px">MediaMTX{% if mediamtx_version or editor_version %} <span style="font-weight:500;color:var(--text-dim);font-size:16px">· MediaMTX v{{ mediamtx_version }}{% if editor_version %} / editor v{{ editor_version }}{% endif %}</span>{% endif %}{% if mediamtx_update_available and mediamtx_latest %} <span style="font-size:12px;color:var(--cyan);font-weight:600;margin-left:8px">MediaMTX v{{ mediamtx_latest }} available</span>{% endif %}{% if editor_update_available and editor_latest %} <span style="font-size:12px;color:var(--cyan);font-weight:600;margin-left:8px">editor v{{ editor_latest }} available</span>{% endif %}</h1>
     <p>Video Streaming Server (bluenviron) + Web Editor (takwerx)</p>
   </div>
 
   {% if mtx.running %}
-  <div class="status-banner running"><div class="dot"></div>MediaMTX is running{% if mediamtx_version %} · binary v{{ mediamtx_version }}{% endif %}{% if editor_version %} · editor v{{ editor_version }}{% endif %}{% if mediamtx_update_available and mediamtx_latest %} · <span style="color:var(--cyan)">binary v{{ mediamtx_latest }} available</span>{% endif %}{% if editor_update_available and editor_latest %} · <span style="color:var(--cyan)">editor v{{ editor_latest }} available</span>{% endif %}</div>
+  <div class="status-banner running"><div class="dot"></div>MediaMTX is running{% if mediamtx_version %} · MediaMTX v{{ mediamtx_version }}{% endif %}{% if editor_version %} · editor v{{ editor_version }}{% endif %}{% if mediamtx_update_available and mediamtx_latest %} · <span style="color:var(--cyan)">MediaMTX v{{ mediamtx_latest }} available</span>{% endif %}{% if editor_update_available and editor_latest %} · <span style="color:var(--cyan)">editor v{{ editor_latest }} available</span>{% endif %}</div>
   {% elif mtx.installed %}
-  <div class="status-banner stopped"><div class="dot"></div>MediaMTX is installed but stopped{% if mediamtx_version %} · binary v{{ mediamtx_version }}{% endif %}{% if editor_version %} · editor v{{ editor_version }}{% endif %}{% if mediamtx_update_available and mediamtx_latest %} · <span style="color:var(--cyan)">binary v{{ mediamtx_latest }} available</span>{% endif %}{% if editor_update_available and editor_latest %} · <span style="color:var(--cyan)">editor v{{ editor_latest }} available</span>{% endif %}</div>
+  <div class="status-banner stopped"><div class="dot"></div>MediaMTX is installed but stopped{% if mediamtx_version %} · MediaMTX v{{ mediamtx_version }}{% endif %}{% if editor_version %} · editor v{{ editor_version }}{% endif %}{% if mediamtx_update_available and mediamtx_latest %} · <span style="color:var(--cyan)">MediaMTX v{{ mediamtx_latest }} available</span>{% endif %}{% if editor_update_available and editor_latest %} · <span style="color:var(--cyan)">editor v{{ editor_latest }} available</span>{% endif %}</div>
   {% else %}
   <div class="status-banner not-installed"><div class="dot"></div>MediaMTX is not installed</div>
   {% endif %}
@@ -20962,7 +20962,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% if not mod.get('icon_url') or key == 'takportal' or key == 'emailrelay' %}<div class="module-name">{{ mod.name }}</div>{% endif %}
 </div>
 <div class="module-desc">{{ mod.description }}</div>
-{% if module_versions.get(key) %}{% set v = module_versions.get(key) %}{% if v.version or v.update_available %}<div class="meta-line module-version-line" id="module-version-{{ key }}" style="margin-bottom:4px">{% if v.version %}v{{ v.version }}{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% endif %}</div>{% endif %}{% endif %}
+{% if module_versions.get(key) %}{% set v = module_versions.get(key) %}{% if v.version or v.update_available %}<div class="meta-line module-version-line" id="module-version-{{ key }}" style="margin-bottom:4px">{% if v.version %}{% if key == 'mediamtx' %}{{ v.version }}{% else %}v{{ v.version }}{% endif %}{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% endif %}</div>{% endif %}{% endif %}
 <span class="module-status status-{% if mod.installed and mod.running %}running{% elif mod.installed %}stopped{% else %}not-installed{% endif %}" id="module-status-{{ key }}" data-module="{{ key }}" data-gd-overall="{% if key == 'guarddog' and mod.installed and mod.running %}fetch{% endif %}">{% if mod.installed and mod.running %}<span class="status-dot"></span> Running{% elif mod.installed %}<span class="status-dot"></span> Stopped{% else %}Not Installed{% endif %}</span>
 {% if key == 'takserver' and mod.installed %}<div id="takserver-card-cert-expiry" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
 {% if key == 'caddy' and mod.installed %}<div id="caddy-card-cert-days" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
