@@ -2838,6 +2838,7 @@ def _guarddog_service_monitor_ids(settings):
         'mediamtx': ['mediamtx_svc'],
         'nodered': ['nodered_http'],
         'cloudtak': ['cloudtak_ctr'],
+        'updates': ['updates_check'],
     }
     return multi
 
@@ -2860,6 +2861,8 @@ def _guarddog_monitored_service_ids(settings):
         ids.append('nodered')
     if modules.get('cloudtak', {}).get('installed'):
         ids.append('cloudtak')
+    if modules.get('guarddog', {}).get('installed'):
+        ids.append('updates')
     return ids
 
 
@@ -3167,6 +3170,10 @@ def _monitor_health_check(monitor_id):
                 return bool(ok and out and 'Up' in out)
             r = subprocess.run('docker ps --filter name=cloudtak-api --format "{{.Status}}"', shell=True, capture_output=True, text=True, timeout=5)
             return bool(r.stdout and 'Up' in r.stdout)
+        if monitor_id == 'updates_check':
+            # Updates monitor: green when the 6h timer is enabled (script will run and email on change)
+            r = subprocess.run(['systemctl', 'is-enabled', 'takupdatesguard.timer'], capture_output=True, text=True, timeout=3)
+            return r.returncode == 0 and (r.stdout or '').strip() == 'enabled'
     except Exception:
         return False
     return None
@@ -6252,12 +6259,17 @@ def _get_mediamtx_version_info():
             if m:
                 out['version'] = m.group(1)
     else:
-        if os.path.isfile('/usr/local/bin/mediamtx') and os.access('/usr/local/bin/mediamtx', os.X_OK):
-            r = subprocess.run('/usr/local/bin/mediamtx -version 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
-            if r.returncode == 0 and (r.stdout or r.stderr):
-                m = _re.search(r'v?(\d+\.\d+\.\d+)', (r.stdout or '') + (r.stderr or ''))
-                if m:
-                    out['version'] = m.group(1)
+        # Local: try /usr/local/bin/mediamtx then PATH; capture both stdout and stderr; try --version if -version fails
+        def _run_ver(cmd):
+            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=5)
+            combined = (r.stdout or '') + (r.stderr or '')
+            match = _re.search(r'v?(\d+\.\d+\.\d+)', combined)
+            return match.group(1) if match else None
+        for bin_path in ('/usr/local/bin/mediamtx', 'mediamtx'):
+            if bin_path == 'mediamtx' or (os.path.isfile(bin_path) and os.access(bin_path, os.X_OK)):
+                out['version'] = _run_ver(f'{bin_path} -version 2>&1') or _run_ver(f'{bin_path} --version 2>&1')
+                if out['version']:
+                    break
     try:
         req = _ur.Request(
             'https://api.github.com/repos/bluenviron/mediamtx/releases/latest',
@@ -6303,7 +6315,15 @@ def get_all_module_versions():
     if modules.get('cloudtak', {}).get('installed'):
         result['cloudtak'] = _get_cloudtak_version_info()
     if modules.get('mediamtx', {}).get('installed'):
-        result['mediamtx'] = _get_mediamtx_version_info()
+        mtx = _get_mediamtx_version_info()
+        # Card expects single 'version' string and update_available; show binary / editor like the MediaMTX page
+        parts = []
+        if mtx.get('version'):
+            parts.append(mtx['version'])
+        if mtx.get('editor_version'):
+            parts.append(mtx['editor_version'])
+        mtx['version'] = ' / '.join(parts) if parts else (mtx.get('editor_version') or mtx.get('version') or '')
+        result['mediamtx'] = mtx
     if modules.get('takportal', {}).get('installed'):
         result['takportal'] = _get_takportal_version_info()
     if modules.get('takserver', {}).get('installed'):
