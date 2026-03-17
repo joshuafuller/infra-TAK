@@ -6316,13 +6316,13 @@ def get_all_module_versions():
         result['cloudtak'] = _get_cloudtak_version_info()
     if modules.get('mediamtx', {}).get('installed'):
         mtx = _get_mediamtx_version_info()
-        # Card expects single 'version' string and update_available; show binary / editor like the MediaMTX page
+        # Card expects single 'version' string and update_available; label so binary vs editor are clear
         parts = []
         if mtx.get('version'):
-            parts.append(mtx['version'])
+            parts.append('binary v' + mtx['version'])
         if mtx.get('editor_version'):
-            parts.append(mtx['editor_version'])
-        mtx['version'] = ' / '.join(parts) if parts else (mtx.get('editor_version') or mtx.get('version') or '')
+            parts.append('editor v' + mtx['editor_version'])
+        mtx['version'] = ' · '.join(parts) if parts else (mtx.get('editor_version') or mtx.get('version') or '')
         result['mediamtx'] = mtx
     if modules.get('takportal', {}).get('installed'):
         result['takportal'] = _get_takportal_version_info()
