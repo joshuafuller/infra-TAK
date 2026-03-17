@@ -7337,6 +7337,8 @@ def mediamtx_recovery():
                     src = f.read()
                 src = _mediamtx_editor_endpoint_patch(src)
                 src = _mediamtx_editor_external_sources_clear_patch(src)
+                src = _mediamtx_editor_external_sources_lock_patch(src)
+                src = _mediamtx_editor_external_sources_single_container_patch(src)
                 with open(editor_path, 'w') as f:
                     f.write(src)
         tmp_f = tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False)
