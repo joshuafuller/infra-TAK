@@ -170,6 +170,17 @@ start.sh                    ← One CLI command to launch everything
 
 ## Changelog
 
+### v0.2.5-alpha — 2026-03-16
+
+**MediaMTX web editor — stale overlay self-heal**
+- Some upgraded infra-TAK installs had an older `/opt/mediamtx-webeditor/mediamtx_ldap_overlay.py` still injecting legacy UI logic into External Sources (duplicate Private/Share controls and broken layout). **Patch web editor** now always syncs the live overlay file from the current infra-TAK repo before restarting the web editor, so existing installs converge to the same behavior as clean deploys.
+
+**Guard Dog — Updates monitor recovery**
+- **↻ Update Guard Dog** now reinstalls `takupdatesguard.service` and `takupdatesguard.timer`, runs `daemon-reload`, and enables/starts the timer. This fixes boxes where the Updates monitor stayed red because the timer unit was missing.
+- Guard Dog update UX is clearer: button text is now **↻ Update Guard Dog** and the success message auto-clears after a few seconds.
+
+---
+
 ### v0.2.4-alpha — 2026-03-16
 
 **MediaMTX web editor — duplicate endpoint patch**
