@@ -466,19 +466,22 @@ MEDIAMTX_REMOTE_EXT_SINGLE_CONTAINER_SCRIPT = (
     "        break\n"
     "with open(f,'w') as h: h.writelines(lines)\n"
 )
-# Pill style: (A) plain modeText/statusText or (B) color-only span -> background pill
+# Pill style: (A) plain modeText/statusText or (B) replace color-only style value with pill (flexible for all formats)
 MEDIAMTX_REMOTE_EXT_PILL_STYLE_SCRIPT = (
     "f='/opt/mediamtx-webeditor/mediamtx_config_editor.py'\n"
     "with open(f) as h: c=h.read()\n"
     "if '_extSourcesPillStyle' in c: raise SystemExit(0)\n"
-    "if 'padding: 4px 10px' in c and \"background: ' + modeColor + '\" in c: raise SystemExit(0)\n"
+    "if 'padding: 4px 10px' in c and \"modeColor\" in c and \"background:\" in c: raise SystemExit(0)\n"
     "if \"html += ' ' + modeText + ' ';\" in c:\n"
     "    c=c.replace(\"html += ' ' + modeText + ' ';\", \"html += '<span style=\\\"background: ' + modeColor + '; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\\\">' + modeText + '</span>'; /* _extSourcesPillStyle */\", 1)\n"
     "    c=c.replace(\"html += ' ' + statusText + ' ';\", \"html += '<span style=\\\"background: ' + statusColor + '; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\\\">' + statusText + '</span>';\", 1)\n"
-    "elif \"style=\\\"color: ' + modeColor + '; font-weight: bold;\\\"\" in c:\n"
-    "    c=c.replace(\"style=\\\"color: ' + modeColor + '; font-weight: bold;\\\"\", \"style=\\\"background: ' + modeColor + '; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\\\" /* _extSourcesPillStyle */\", 1)\n"
-    "    c=c.replace(\"style=\\\"color: ' + statusColor + '; font-weight: bold;\\\"\", \"style=\\\"background: ' + statusColor + '; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\\\"\", 1)\n"
-    "else: raise SystemExit(0)\n"
+    "else:\n"
+    "    old_m='style=\"color: \\' + modeColor + \\'; font-weight: bold;\"'\n"
+    "    new_m='style=\"background: \\' + modeColor + \\'; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\" /* _extSourcesPillStyle */'\n"
+    "    old_s='style=\"color: \\' + statusColor + \\'; font-weight: bold;\"'\n"
+    "    new_s='style=\"background: \\' + statusColor + \\'; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\"'\n"
+    "    if old_m not in c: raise SystemExit(0)\n"
+    "    c=c.replace(old_m, new_m, 1).replace(old_s, new_s, 1)\n"
     "with open(f,'w') as h: h.write(c)\n"
 )
 # Node-RED official icons (https://nodered.org/about/resources/media/)
@@ -4772,20 +4775,29 @@ def _mediamtx_editor_external_sources_single_container_patch(src):
 
 
 def _mediamtx_editor_external_sources_pill_style_patch(src):
-    """Make Mode/Status use pill styling (background badge). Handles: (A) plain ' ' + modeText, (B) existing span with color-only style."""
-    if '_extSourcesPillStyle' in src or ("background: ' + modeColor + '" in src and "padding: 4px 10px" in src):
+    """Make Mode/Status use pill styling (background badge). Works for any editor format: plain text or color-only span."""
+    import re
+    if '_extSourcesPillStyle' in src or (re.search(r"background:\s*'\s*\+\s*modeColor", src) and "padding: 4px 10px" in src):
         return src  # already patched
+    pill_css = "background: ' + {var} + '; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;"
+    out = src
     # Format A: upstream raw html += ' ' + modeText + ' ';
     if "html += ' ' + modeText + ' ';" in src:
-        out = src.replace("html += ' ' + modeText + ' ';", "html += '<span style=\"background: ' + modeColor + '; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\">' + modeText + '</span>'; /* _extSourcesPillStyle */", 1)
-        out = out.replace("html += ' ' + statusText + ' ';", "html += '<span style=\"background: ' + statusColor + '; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\">' + statusText + '</span>';", 1)
+        out = out.replace("html += ' ' + modeText + ' ';", "html += '<span style=\"" + pill_css.format(var="modeColor") + "\">' + modeText + '</span>'; /* _extSourcesPillStyle */", 1)
+        out = out.replace("html += ' ' + statusText + ' ';", "html += '<span style=\"" + pill_css.format(var="statusColor") + "\">' + statusText + '</span>';", 1)
         return out
-    # Format B: server has <span style="color: ' + modeColor + '; font-weight: bold;"> - upgrade to pill (background badge)
-    if "style=\"color: ' + modeColor + '; font-weight: bold;\"" in src:
-        out = src.replace("style=\"color: ' + modeColor + '; font-weight: bold;\"", "style=\"background: ' + modeColor + '; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\" /* _extSourcesPillStyle */", 1)
-        out = out.replace("style=\"color: ' + statusColor + '; font-weight: bold;\"", "style=\"background: ' + statusColor + '; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\"", 1)
-        return out
-    return src
+    # Format B: any span that uses only color (not background) for modeColor/statusColor -> upgrade to pill
+    # Match style="...color: ' + modeColor + '..." (allow optional spaces/quoting)
+    for var, marker in (("modeColor", " /* _extSourcesPillStyle */"), ("statusColor", "")):
+        pattern = re.compile(
+            r"style=\"color:\s*'\s*\+\s*" + re.escape(var) + r"\s*\+\s*';\s*font-weight:\s*bold;\"",
+            re.IGNORECASE,
+        )
+        repl = "style=\"" + pill_css.format(var=var) + "\"" + marker
+        new_out = pattern.sub(repl, out, count=1)
+        if new_out != out:
+            out = new_out
+    return out
 
 
 def _mediamtx_editor_external_sources_lock_patch(src):
