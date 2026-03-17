@@ -395,6 +395,37 @@ if __name__ == '__main__':
         pass
     sys.exit(0)
 '''
+# Scripts run on remote target to patch editor (endpoint + external-sources clear). Used by deploy and by "Patch web editor".
+MEDIAMTX_REMOTE_EP_PATCH_SCRIPT = (
+    "import re\n"
+    "f='/opt/mediamtx-webeditor/mediamtx_config_editor.py'\n"
+    "with open(f) as h: src=h.read()\n"
+    "lines=src.splitlines(keepends=True)\n"
+    "for (dp,rh,ev) in [(r'\\\\bdef shared_stream_page\\\\s*\\\\(',('/shared/',),'shared_stream_page_core'),(r'\\\\bdef shared_hls_proxy\\\\s*\\\\(',('/shared-hls','shared_hls'),'shared_hls_proxy_core'),(r'\\\\bdef api_share_links_list\\\\s*\\\\(',('/api/share-links','share-links'),'api_share_links_list_core'),(r'\\\\bdef api_share_links_generate\\\\s*\\\\(',('/api/share-links/generate','share-links/generate'),'api_share_links_generate_core'),(r'\\\\bdef api_share_links_revoke\\\\s*\\\\(',('/api/share-links/revoke','share-links/revoke'),'api_share_links_revoke_core')]:\n"
+    " for i in range(len(lines)-1,-1,-1):\n"
+    "  if not re.search(dp,lines[i]): continue\n"
+    "  for j in range(i-1,max(-1,i-20),-1):\n"
+    "   L=lines[j]\n"
+    "   if '@app.route' in L and 'endpoint=' not in L and any(h in L for h in rh):\n"
+    "    lines[j]=L.rstrip()[:-1]+\", endpoint='\"+ev+\"')\\n\"; break\n"
+    "  else:\n"
+    "   for j in range(i-1,max(-1,i-20),-1):\n"
+    "    if '@app.route' in lines[j] and 'endpoint=' not in lines[j]:\n"
+    "     L=lines[j]; lines[j]=L.rstrip()[:-1]+\", endpoint='\"+ev+\"')\\n\"; break\n"
+    "  break\n"
+    "with open(f,'w') as h: h.write(''.join(lines))\n"
+)
+MEDIAMTX_REMOTE_EXT_CLEAR_SCRIPT = (
+    "f='/opt/mediamtx-webeditor/mediamtx_config_editor.py'\n"
+    "with open(f) as h: lines=h.readlines()\n"
+    "for i, line in enumerate(lines):\n"
+    "    if 'external-sources-list' in line and 'getElementById' in line and 'container' in line:\n"
+    "        if i+1 < len(lines) and \"innerHTML = ''\" in lines[i+1]: break\n"
+    "        indent = line[:len(line)-len(line.lstrip())]\n"
+    "        lines.insert(i+1, indent + \"container.innerHTML = '';\\n\")\n"
+    "        break\n"
+    "with open(f,'w') as h: h.writelines(lines)\n"
+)
 # Node-RED official icons (https://nodered.org/about/resources/media/)
 NODERED_LOGO_URL = "https://nodered.org/about/resources/media/node-red-icon.png"       # icon only (e.g. small nav)
 NODERED_LOGO_URL_2 = "https://nodered.org/about/resources/media/node-red-icon-2.png"   # icon + "Node-RED" text (card, sidebar)
@@ -7158,12 +7189,34 @@ def mediamtx_control():
 @app.route('/api/mediamtx/recovery', methods=['POST'])
 @login_required
 def mediamtx_recovery():
-    """Patch web editor: install fail-safe overlay script and restart mediamtx-webeditor. One-click from MediaMTX page."""
+    """Patch web editor: apply endpoint + external-sources clear patches, install fail-safe overlay script, restart mediamtx-webeditor."""
     import tempfile
     settings = load_settings()
     deploy_cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
     tmp_f = None
+    editor_path = '/opt/mediamtx-webeditor/mediamtx_config_editor.py'
     try:
+        # Apply endpoint + external-sources clear patches so stream URLs and External Sources table behave correctly
+        if deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip():
+            for name, script in [('mtx_endpoint_patch', MEDIAMTX_REMOTE_EP_PATCH_SCRIPT), ('mtx_ext_clear_patch', MEDIAMTX_REMOTE_EXT_CLEAR_SCRIPT)]:
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as pf:
+                    pf.write(script)
+                    tmp_patch = pf.name
+                ok_copy = _module_copy(deploy_cfg, tmp_patch, f'/tmp/{name}.py', timeout=15)
+                try:
+                    os.unlink(tmp_patch)
+                except Exception:
+                    pass
+                if ok_copy:
+                    _module_run(deploy_cfg, f'python3 /tmp/{name}.py && rm -f /tmp/{name}.py', timeout=15)
+        else:
+            if os.path.isfile(editor_path):
+                with open(editor_path) as f:
+                    src = f.read()
+                src = _mediamtx_editor_endpoint_patch(src)
+                src = _mediamtx_editor_external_sources_clear_patch(src)
+                with open(editor_path, 'w') as f:
+                    f.write(src)
         tmp_f = tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False)
         tmp_f.write(MEDIAMTX_ENSURE_OVERLAY_SCRIPT)
         tmp_f.close()
@@ -7501,27 +7554,8 @@ paths:
                     pass
                 plog("✓ LDAP overlay applied (Authentik header auth)")
                 # Endpoint patch so shared_stream_page / shared_hls_proxy don't duplicate (Flask AssertionError)
-                ep_script = (
-                    "import re\n"
-                    "f='/opt/mediamtx-webeditor/mediamtx_config_editor.py'\n"
-                    "with open(f) as h: src=h.read()\n"
-                    "lines=src.splitlines(keepends=True)\n"
-                    "for (dp,rh,ev) in [(r'\\\\bdef shared_stream_page\\\\s*\\\\(',('/shared/',),'shared_stream_page_core'),(r'\\\\bdef shared_hls_proxy\\\\s*\\\\(',('/shared-hls','shared_hls'),'shared_hls_proxy_core'),(r'\\\\bdef api_share_links_list\\\\s*\\\\(',('/api/share-links','share-links'),'api_share_links_list_core'),(r'\\\\bdef api_share_links_generate\\\\s*\\\\(',('/api/share-links/generate','share-links/generate'),'api_share_links_generate_core'),(r'\\\\bdef api_share_links_revoke\\\\s*\\\\(',('/api/share-links/revoke','share-links/revoke'),'api_share_links_revoke_core')]:\n"
-                    " for i in range(len(lines)-1,-1,-1):\n"
-                    "  if not re.search(dp,lines[i]): continue\n"
-                    "  for j in range(i-1,max(-1,i-20),-1):\n"
-                    "   L=lines[j]\n"
-                    "   if '@app.route' in L and 'endpoint=' not in L and any(h in L for h in rh):\n"
-                    "    lines[j]=L.rstrip()[:-1]+\", endpoint='\"+ev+\"')\\n\"; break\n"
-                    "  else:\n"
-                    "   for j in range(i-1,max(-1,i-20),-1):\n"
-                    "    if '@app.route' in lines[j] and 'endpoint=' not in lines[j]:\n"
-                    "     L=lines[j]; lines[j]=L.rstrip()[:-1]+\", endpoint='\"+ev+\"')\\n\"; break\n"
-                    "  break\n"
-                    "with open(f,'w') as h: h.write(''.join(lines))\n"
-                )
                 with open('/tmp/mtx_endpoint_patch.py', 'w') as pf:
-                    pf.write(ep_script)
+                    pf.write(MEDIAMTX_REMOTE_EP_PATCH_SCRIPT)
                 _module_copy(deploy_cfg, '/tmp/mtx_endpoint_patch.py', '/tmp/mtx_endpoint_patch.py', log_fn=plog)
                 _module_run(deploy_cfg, 'python3 /tmp/mtx_endpoint_patch.py && rm -f /tmp/mtx_endpoint_patch.py', timeout=15)
                 try:
@@ -7530,19 +7564,8 @@ paths:
                     pass
                 plog("✓ Endpoint patch applied (shared_stream_page, shared_hls_proxy)")
                 # External Sources list clear patch (avoids duplicate rows when load runs twice)
-                ext_clear_script = (
-                    "f='/opt/mediamtx-webeditor/mediamtx_config_editor.py'\n"
-                    "with open(f) as h: lines=h.readlines()\n"
-                    "for i, line in enumerate(lines):\n"
-                    "    if 'external-sources-list' in line and 'getElementById' in line and 'container' in line:\n"
-                    "        if i+1 < len(lines) and \"innerHTML = ''\" in lines[i+1]: break\n"
-                    "        indent = line[:len(line)-len(line.lstrip())]\n"
-                    "        lines.insert(i+1, indent + \"container.innerHTML = '';\\n\")\n"
-                    "        break\n"
-                    "with open(f,'w') as h: h.writelines(lines)\n"
-                )
                 with open('/tmp/mtx_ext_clear_patch.py', 'w') as pf:
-                    pf.write(ext_clear_script)
+                    pf.write(MEDIAMTX_REMOTE_EXT_CLEAR_SCRIPT)
                 _module_copy(deploy_cfg, '/tmp/mtx_ext_clear_patch.py', '/tmp/mtx_ext_clear_patch.py', log_fn=plog)
                 _module_run(deploy_cfg, 'python3 /tmp/mtx_ext_clear_patch.py && rm -f /tmp/mtx_ext_clear_patch.py', timeout=10)
                 try:
