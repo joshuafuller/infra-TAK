@@ -47,6 +47,18 @@ Then open your browser to the URL shown and log in.
 
 **Password not working after update?** Use the **backdoor**: **https://&lt;VPS_IP&gt;:5001**. If login spins or fails, on the server run (from the directory where you do `git pull`, e.g. `/root/infra-TAK`): **`sudo ./fix-console-after-pull.sh`** — it pins the config path in the systemd unit and prompts you to set a new password so you can log in again. Alternatively run `sudo ./reset-console-password.sh` from that same directory. After pulling, open the Caddy module and re-save your domain once so the Caddyfile (login bypass) is applied.
 
+## Update stuck? (rebase / merge conflict)
+
+If you clicked **Update Now** and the console shows an error like `could not apply ... Add files via upload`, `Pulling is not possible because you have unmerged files`, or any rebase/merge conflict message, run this single command on your server:
+
+```bash
+cd $(grep -oP 'WorkingDirectory=\K.*' /etc/systemd/system/takwerx-console.service) && git fetch --tags origin && git checkout --force v0.2.6-alpha && sudo systemctl restart takwerx-console
+```
+
+This clears the stuck state and puts you on v0.2.6-alpha, which fixes the updater so it won't happen again. No data or config is lost — your `.config/` directory is untouched.
+
+**What happened:** Versions v0.2.4 and v0.2.5 used `git pull --rebase` internally, which can fail on installs with non-standard git state. v0.2.6 replaces this with a safe `fetch + force checkout` that works regardless of local git state.
+
 ## Recovery / backdoor (when Authentik or Caddy is broken)
 
 If Authentik or Caddy is down and you can't reach **https://infratak.yourdomain.com**:
