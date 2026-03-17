@@ -426,6 +426,34 @@ MEDIAMTX_REMOTE_EXT_CLEAR_SCRIPT = (
     "        break\n"
     "with open(f,'w') as h: h.writelines(lines)\n"
 )
+# Re-entry lock for loadExternalSources (avoids messed-up layout when 5s refresh overlaps)
+MEDIAMTX_REMOTE_EXT_LOCK_SCRIPT = (
+    "f='/opt/mediamtx-webeditor/mediamtx_config_editor.py'\n"
+    "with open(f) as h: content=h.read()\n"
+    "if '_loadExtSrcLock' in content:\n"
+    "    raise SystemExit(0)\n"
+    "lines=content.splitlines(keepends=True)\n"
+    "did_finally=False\n"
+    "for i, line in enumerate(lines):\n"
+    "    if 'Error loading sources:' in line and 'external-sources-list' in line and 'innerHTML' in line:\n"
+    "        for j in range(i+1, min(i+4, len(lines))):\n"
+    "            s=lines[j].rstrip()\n"
+    "            if s.endswith('});') and 'false' not in s:\n"
+    "                ind=lines[j][:len(lines[j])-len(lines[j].lstrip())]\n"
+    "                lines[j]=ind+\").finally(function(){window._loadExtSrcLock=false;});\\n\"\n"
+    "                did_finally=True\n"
+    "                break\n"
+    "        break\n"
+    "if not did_finally:\n"
+    "    raise SystemExit(0)\n"
+    "for i, line in enumerate(lines):\n"
+    "    if 'external-sources-list' in line and 'getElementById' in line and 'container' in line:\n"
+    "        indent=line[:len(line)-len(line.lstrip())]\n"
+    "        lines.insert(i, indent+'if (window._loadExtSrcLock) return;\\n')\n"
+    "        lines.insert(i+1, indent+'window._loadExtSrcLock = true;\\n')\n"
+    "        break\n"
+    "with open(f,'w') as h: h.writelines(lines)\n"
+)
 # Node-RED official icons (https://nodered.org/about/resources/media/)
 NODERED_LOGO_URL = "https://nodered.org/about/resources/media/node-red-icon.png"       # icon only (e.g. small nav)
 NODERED_LOGO_URL_2 = "https://nodered.org/about/resources/media/node-red-icon-2.png"   # icon + "Node-RED" text (card, sidebar)
@@ -4699,6 +4727,36 @@ def _mediamtx_editor_external_sources_clear_patch(src):
     return src
 
 
+def _mediamtx_editor_external_sources_lock_patch(src):
+    """Add re-entry lock to loadExternalSources so 5s refresh cannot overlap and cause messed-up layout."""
+    if '_loadExtSrcLock' in src:
+        return src  # already patched
+    lines = src.splitlines(keepends=True)
+    # Insert lock at start of .then callback (right before "const container = document.getElementById('external-sources-list')")
+    for i, line in enumerate(lines):
+        if 'external-sources-list' in line and 'getElementById' in line and 'container' in line:
+            indent = line[: len(line) - len(line.lstrip())]
+            lines.insert(i, indent + "if (window._loadExtSrcLock) return;\n")
+            lines.insert(i + 1, indent + "window._loadExtSrcLock = true;\n")
+            break
+    else:
+        return src
+    # Add .finally(() => { window._loadExtSrcLock = false; }) after the .catch for loadExternalSources
+    for i, line in enumerate(lines):
+        if 'Error loading sources:' in line and 'external-sources-list' in line and 'innerHTML' in line:
+            # Next line is typically "                });" - we need "                }).finally(function(){window._loadExtSrcLock=false;});"
+            j = i + 1
+            while j < len(lines) and j <= i + 3:
+                stripped = lines[j].rstrip()
+                if stripped.endswith('});') and not stripped.rstrip(');').endswith('false'):
+                    indent = lines[j][: len(lines[j]) - len(lines[j].lstrip())]
+                    lines[j] = indent + "}).finally(function(){window._loadExtSrcLock=false;});\n"
+                    return ''.join(lines)
+                j += 1
+            break
+    return ''.join(lines)
+
+
 def _get_mediamtx_upstream(settings):
     """Return MediaMTX web console upstream for Caddy (127.0.0.1:5080 or remote_host:5080)."""
     cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
@@ -7226,9 +7284,13 @@ def mediamtx_recovery():
                 )
             except Exception:
                 pass  # keep existing file and just re-apply patches
-        # 2) Apply endpoint + external-sources clear patches
+        # 2) Apply endpoint + external-sources clear + re-entry lock patches
         if deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip():
-            for name, script in [('mtx_endpoint_patch', MEDIAMTX_REMOTE_EP_PATCH_SCRIPT), ('mtx_ext_clear_patch', MEDIAMTX_REMOTE_EXT_CLEAR_SCRIPT)]:
+            for name, script in [
+                ('mtx_endpoint_patch', MEDIAMTX_REMOTE_EP_PATCH_SCRIPT),
+                ('mtx_ext_clear_patch', MEDIAMTX_REMOTE_EXT_CLEAR_SCRIPT),
+                ('mtx_ext_lock_patch', MEDIAMTX_REMOTE_EXT_LOCK_SCRIPT),
+            ]:
                 with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as pf:
                     pf.write(script)
                     tmp_patch = pf.name
@@ -7603,6 +7665,15 @@ paths:
                 except Exception:
                     pass
                 plog("✓ External Sources list clear patch applied")
+                with open('/tmp/mtx_ext_lock_patch.py', 'w') as pf:
+                    pf.write(MEDIAMTX_REMOTE_EXT_LOCK_SCRIPT)
+                _module_copy(deploy_cfg, '/tmp/mtx_ext_lock_patch.py', '/tmp/mtx_ext_lock_patch.py', log_fn=plog)
+                _module_run(deploy_cfg, 'python3 /tmp/mtx_ext_lock_patch.py 2>/dev/null; rm -f /tmp/mtx_ext_lock_patch.py', timeout=10)
+                try:
+                    os.remove('/tmp/mtx_ext_lock_patch.py')
+                except Exception:
+                    pass
+                plog("✓ External Sources re-entry lock patch applied")
             else:
                 plog("⚠ Failed to copy LDAP overlay to remote")
         else:
@@ -8123,6 +8194,11 @@ WantedBy=multi-user.target
                             with open(_editor_path, 'w') as ef:
                                 ef.write(patched2)
                             plog("✓ External Sources list clear patch applied")
+                        patched3 = _mediamtx_editor_external_sources_lock_patch(patched2)
+                        if patched3 != patched2:
+                            with open(_editor_path, 'w') as ef:
+                                ef.write(patched3)
+                            plog("✓ External Sources re-entry lock patch applied")
                 except Exception:
                     pass
             # Deploy Ku-band simulator scripts so "Simulate link" in the editor works (Web Editor v1.1.8+)
