@@ -409,68 +409,6 @@ def main():
                     break
         changed = True
 
-    # 6/7. External Sources scoped patches (only inside loadExternalSources)
-    ls = src.find('function loadExternalSources()')
-    if ls != -1:
-        le = src.find('\n        function ', ls + 1)
-        if le == -1:
-            le = src.find('\nfunction ', ls + 1)
-        if le == -1:
-            le = len(src)
-        blk = src[ls:le]
-        b2 = blk
-        # Pill style
-        if '_extSourcesPillStyle' not in b2:
-            if "html += ' ' + modeText + ' ';" in b2:
-                b2 = b2.replace(
-                    "html += ' ' + modeText + ' ';",
-                    "html += '<span style=\"background: ' + modeColor + '; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\">' + modeText + '</span>'; /* _extSourcesPillStyle */",
-                    1)
-                b2 = b2.replace(
-                    "html += ' ' + statusText + ' ';",
-                    "html += '<span style=\"background: ' + statusColor + '; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\">' + statusText + '</span>';",
-                    1)
-            elif 'style="color: \' + modeColor + \'; font-weight: bold;"' in b2:
-                b2 = b2.replace(
-                    'style="color: \' + modeColor + \'; font-weight: bold;"',
-                    'style="background: \' + modeColor + \'; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;" /* _extSourcesPillStyle */',
-                    1)
-                b2 = b2.replace(
-                    'style="color: \' + statusColor + \'; font-weight: bold;"',
-                    'style="background: \' + statusColor + \'; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;"',
-                    1)
-        # DOM normalize
-        if '_extSourcesDomNormalize' not in b2 and "container.innerHTML = html;" in b2:
-            b2 = b2.replace(
-                "container.innerHTML = html;",
-                "container.innerHTML = html;\\n"
-                "                    /* _extSourcesDomNormalize */\\n"
-                "                    try {\\n"
-                "                        const rows = container.querySelectorAll('tbody tr');\\n"
-                "                        rows.forEach(row => {\\n"
-                "                            const tds = row.querySelectorAll('td');\\n"
-                "                            if (!tds || tds.length < 2) return;\\n"
-                "                            const nameCell = tds[0];\\n"
-                "                            const urlCell = tds[1];\\n"
-                "                            const badges = row.querySelectorAll('.share-mode-badge-ext');\\n"
-                "                            if (badges.length) {\\n"
-                "                                const keepBadge = badges[0];\\n"
-                "                                if (keepBadge.parentElement !== nameCell) nameCell.appendChild(keepBadge);\\n"
-                "                                badges.forEach((b, i) => { if (i > 0) b.remove(); });\\n"
-                "                            }\\n"
-                "                            const links = row.querySelectorAll('.external-copy-link-btn');\\n"
-                "                            if (links.length) {\\n"
-                "                                const keepLink = links[0];\\n"
-                "                                if (keepLink.parentElement !== urlCell) urlCell.appendChild(keepLink);\\n"
-                "                                links.forEach((b, i) => { if (i > 0) b.remove(); });\\n"
-                "                            }\\n"
-                "                        });\\n"
-                "                    } catch(e) {}",
-                1)
-        if b2 != blk:
-            src = src[:ls] + b2 + src[le:]
-            changed = True
-
     if changed:
         with open(EDITOR, 'w') as f:
             f.write(src)
@@ -7561,15 +7499,10 @@ def mediamtx_recovery():
                 )
             except Exception:
                 pass  # keep existing file and just re-apply patches
-        # 2) Apply endpoint + external-sources clear + re-entry lock patches
+        # 2) Apply endpoint patch only (keep core External Sources rendering unchanged)
         if deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip():
             for name, script in [
                 ('mtx_endpoint_patch', MEDIAMTX_REMOTE_EP_PATCH_SCRIPT),
-                ('mtx_ext_clear_patch', MEDIAMTX_REMOTE_EXT_CLEAR_SCRIPT),
-                ('mtx_ext_lock_patch', MEDIAMTX_REMOTE_EXT_LOCK_SCRIPT),
-                ('mtx_ext_single_container', MEDIAMTX_REMOTE_EXT_SINGLE_CONTAINER_SCRIPT),
-                ('mtx_ext_pill_style', MEDIAMTX_REMOTE_EXT_PILL_STYLE_SCRIPT),
-                ('mtx_ext_dom_normalize', MEDIAMTX_REMOTE_EXT_DOM_NORMALIZE_SCRIPT),
             ]:
                 with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as pf:
                     pf.write(script)
@@ -7586,11 +7519,6 @@ def mediamtx_recovery():
                 with open(editor_path) as f:
                     src = f.read()
                 src = _mediamtx_editor_endpoint_patch(src)
-                src = _mediamtx_editor_external_sources_clear_patch(src)
-                src = _mediamtx_editor_external_sources_lock_patch(src)
-                src = _mediamtx_editor_external_sources_single_container_patch(src)
-                src = _mediamtx_editor_external_sources_pill_style_patch(src)
-                src = _mediamtx_editor_external_sources_dom_normalize_patch(src)
                 with open(editor_path, 'w') as f:
                     f.write(src)
         tmp_f = tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False)
@@ -7939,52 +7867,6 @@ paths:
                 except Exception:
                     pass
                 plog("✓ Endpoint patch applied (shared_stream_page, shared_hls_proxy)")
-                # External Sources list clear patch (avoids duplicate rows when load runs twice)
-                with open('/tmp/mtx_ext_clear_patch.py', 'w') as pf:
-                    pf.write(MEDIAMTX_REMOTE_EXT_CLEAR_SCRIPT)
-                _module_copy(deploy_cfg, '/tmp/mtx_ext_clear_patch.py', '/tmp/mtx_ext_clear_patch.py', log_fn=plog)
-                _module_run(deploy_cfg, 'python3 /tmp/mtx_ext_clear_patch.py && rm -f /tmp/mtx_ext_clear_patch.py', timeout=10)
-                try:
-                    os.remove('/tmp/mtx_ext_clear_patch.py')
-                except Exception:
-                    pass
-                plog("✓ External Sources list clear patch applied")
-                with open('/tmp/mtx_ext_lock_patch.py', 'w') as pf:
-                    pf.write(MEDIAMTX_REMOTE_EXT_LOCK_SCRIPT)
-                _module_copy(deploy_cfg, '/tmp/mtx_ext_lock_patch.py', '/tmp/mtx_ext_lock_patch.py', log_fn=plog)
-                _module_run(deploy_cfg, 'python3 /tmp/mtx_ext_lock_patch.py 2>/dev/null; rm -f /tmp/mtx_ext_lock_patch.py', timeout=10)
-                try:
-                    os.remove('/tmp/mtx_ext_lock_patch.py')
-                except Exception:
-                    pass
-                plog("✓ External Sources re-entry lock patch applied")
-                with open('/tmp/mtx_ext_single_container.py', 'w') as pf:
-                    pf.write(MEDIAMTX_REMOTE_EXT_SINGLE_CONTAINER_SCRIPT)
-                _module_copy(deploy_cfg, '/tmp/mtx_ext_single_container.py', '/tmp/mtx_ext_single_container.py', log_fn=plog)
-                _module_run(deploy_cfg, 'python3 /tmp/mtx_ext_single_container.py 2>/dev/null; rm -f /tmp/mtx_ext_single_container.py', timeout=10)
-                try:
-                    os.remove('/tmp/mtx_ext_single_container.py')
-                except Exception:
-                    pass
-                plog("✓ External Sources single-container patch applied")
-                with open('/tmp/mtx_ext_pill_style.py', 'w') as pf:
-                    pf.write(MEDIAMTX_REMOTE_EXT_PILL_STYLE_SCRIPT)
-                _module_copy(deploy_cfg, '/tmp/mtx_ext_pill_style.py', '/tmp/mtx_ext_pill_style.py', log_fn=plog)
-                _module_run(deploy_cfg, 'python3 /tmp/mtx_ext_pill_style.py 2>/dev/null; rm -f /tmp/mtx_ext_pill_style.py', timeout=10)
-                try:
-                    os.remove('/tmp/mtx_ext_pill_style.py')
-                except Exception:
-                    pass
-                plog("✓ External Sources pill style (Mode/Status) patch applied")
-                with open('/tmp/mtx_ext_dom_normalize.py', 'w') as pf:
-                    pf.write(MEDIAMTX_REMOTE_EXT_DOM_NORMALIZE_SCRIPT)
-                _module_copy(deploy_cfg, '/tmp/mtx_ext_dom_normalize.py', '/tmp/mtx_ext_dom_normalize.py', log_fn=plog)
-                _module_run(deploy_cfg, 'python3 /tmp/mtx_ext_dom_normalize.py 2>/dev/null; rm -f /tmp/mtx_ext_dom_normalize.py', timeout=10)
-                try:
-                    os.remove('/tmp/mtx_ext_dom_normalize.py')
-                except Exception:
-                    pass
-                plog("✓ External Sources DOM normalize patch applied")
             else:
                 plog("⚠ Failed to copy LDAP overlay to remote")
         else:
@@ -8500,31 +8382,6 @@ WantedBy=multi-user.target
                             with open(_editor_path, 'w') as ef:
                                 ef.write(patched)
                             plog("✓ Endpoint patch applied (shared_stream_page, shared_hls_proxy)")
-                        patched2 = _mediamtx_editor_external_sources_clear_patch(patched)
-                        if patched2 != patched:
-                            with open(_editor_path, 'w') as ef:
-                                ef.write(patched2)
-                            plog("✓ External Sources list clear patch applied")
-                        patched3 = _mediamtx_editor_external_sources_lock_patch(patched2)
-                        if patched3 != patched2:
-                            with open(_editor_path, 'w') as ef:
-                                ef.write(patched3)
-                            plog("✓ External Sources re-entry lock patch applied")
-                        patched4 = _mediamtx_editor_external_sources_single_container_patch(patched3)
-                        if patched4 != patched3:
-                            with open(_editor_path, 'w') as ef:
-                                ef.write(patched4)
-                            plog("✓ External Sources single-container patch applied")
-                        patched5 = _mediamtx_editor_external_sources_pill_style_patch(patched4)
-                        if patched5 != patched4:
-                            with open(_editor_path, 'w') as ef:
-                                ef.write(patched5)
-                            plog("✓ External Sources pill style (Mode/Status) patch applied")
-                        patched6 = _mediamtx_editor_external_sources_dom_normalize_patch(patched5)
-                        if patched6 != patched5:
-                            with open(_editor_path, 'w') as ef:
-                                ef.write(patched6)
-                            plog("✓ External Sources DOM normalize patch applied")
                 except Exception:
                     pass
             # Deploy Ku-band simulator scripts so "Simulate link" in the editor works (Web Editor v1.1.8+)
