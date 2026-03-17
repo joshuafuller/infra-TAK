@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""infra-TAK v0.2.2 - TAK Infrastructure Platform"""
+"""infra-TAK v0.2.4 - TAK Infrastructure Platform"""
 
 # === Auto-upgrade: seamlessly switch from Flask dev server to gunicorn ===
 # When the old systemd service runs "python3 app.py", this block installs
@@ -270,7 +270,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.2.2-alpha"
+VERSION = "0.2.4-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -283,6 +283,118 @@ MEDIAMTX_LOGO_URL = "https://raw.githubusercontent.com/bluenviron/mediamtx/main/
 MEDIAMTX_EDITOR_REPO = "https://github.com/takwerx/mediamtx-installer.git"
 MEDIAMTX_EDITOR_PATH = "config-editor"  # subdir containing mediamtx_config_editor.py
 MEDIAMTX_EDITOR_LDAP_BRANCH = None  # LDAP behavior comes from mediamtx_ldap_overlay.py in this repo; use repo default branch
+# Fail-safe overlay script: never exits failure so ExecStartPre cannot block the web editor from starting
+MEDIAMTX_ENSURE_OVERLAY_SCRIPT = r'''#!/usr/bin/env python3
+"""Pre-start hook: ensure infra-TAK LDAP overlay is injected into the editor.
+
+Runs as ExecStartPre so that upstream self-updates (Versions tab) don't
+silently remove the overlay.  Idempotent — does nothing if already patched.
+Never exits with failure so the main editor always gets to start.
+"""
+import os, re, sys
+
+def main():
+    EDITOR  = '/opt/mediamtx-webeditor/mediamtx_config_editor.py'
+    OVERLAY = '/opt/mediamtx-webeditor/mediamtx_ldap_overlay.py'
+    MARKER  = '# --- infra-TAK LDAP overlay ---'
+
+    if not os.path.exists(EDITOR) or not os.path.exists(OVERLAY):
+        return
+
+    with open(EDITOR, 'r') as f:
+        src = f.read()
+
+    changed = False
+
+    # 1. Port patch: ensure PORT env var override
+    if 'port=5000' in src and 'os.environ.get("PORT"' not in src:
+        src = src.replace('port=5000', 'port=int(os.environ.get("PORT", 5080))', 1)
+        changed = True
+
+    # 2. API port patch: 9997 -> 9898
+    if '9997' in src:
+        src = src.replace('9997', '9898')
+        changed = True
+
+    # 3. LDAP overlay import injection
+    if MARKER not in src:
+        inject = (
+            "\n" + MARKER + "\n"
+            "import os as _os\n"
+            "if _os.environ.get('LDAP_ENABLED'):\n"
+            "    import sys as _sys; _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))\n"
+            "    from mediamtx_ldap_overlay import apply_ldap_overlay\n"
+            "    apply_ldap_overlay(app)\n"
+            "# --- end LDAP overlay ---\n"
+        )
+        lines = src.splitlines(keepends=True)
+        inserted = False
+        for i, line in enumerate(lines):
+            if 'app = Flask(' in line:
+                lines.insert(i + 1, '\n' + inject)
+                inserted = True
+                break
+        if not inserted:
+            for i, line in enumerate(lines):
+                if 'app.run(' in line:
+                    lines.insert(i, '\n' + inject)
+                    inserted = True
+                    break
+        if inserted:
+            src = ''.join(lines)
+            changed = True
+
+    # 4. Fix duplicate endpoints (infra-TAK overlay + core -> Flask AssertionError)
+    lines = src.splitlines(keepends=True)
+    for def_pat, route_hints, endpoint_val in (
+            (r'\bdef shared_stream_page\s*\(', ('/shared/',), 'shared_stream_page_core'),
+            (r'\bdef shared_hls_proxy\s*\(', ('/shared-hls/', 'shared-hls', 'shared_hls'), 'shared_hls_proxy_core'),
+            (r'\bdef api_share_links_list\s*\(', ('/api/share-links', 'share-links'), 'api_share_links_list_core'),
+            (r'\bdef api_share_links_generate\s*\(', ('/api/share-links/generate', 'share-links/generate'), 'api_share_links_generate_core'),
+            (r'\bdef api_share_links_revoke\s*\(', ('/api/share-links/revoke', 'share-links/revoke'), 'api_share_links_revoke_core'),
+    ):
+        for i in range(len(lines) - 1, -1, -1):
+            if not re.search(def_pat, lines[i]):
+                continue
+            j = i - 1
+            while j >= 0 and j >= i - 20:
+                line = lines[j]
+                if '@app.route' in line and 'endpoint=' not in line and any(h in line for h in route_hints):
+                    if line.rstrip().endswith(')'):
+                        lines[j] = line.rstrip()[:-1] + ", endpoint='" + endpoint_val + "')\n"
+                    else:
+                        lines[j] = line.rstrip().rstrip(')') + ", endpoint='" + endpoint_val + "')\n"
+                    src = ''.join(lines)
+                    changed = True
+                    break
+                j -= 1
+            else:
+                # Fallback: patch the nearest @app.route above this def (same route block)
+                j = i - 1
+                while j >= 0 and j >= i - 20:
+                    if '@app.route' in lines[j] and 'endpoint=' not in lines[j]:
+                        l = lines[j]
+                        if l.rstrip().endswith(')'):
+                            lines[j] = l.rstrip()[:-1] + ", endpoint='" + endpoint_val + "')\n"
+                        else:
+                            lines[j] = l.rstrip().rstrip(')') + ", endpoint='" + endpoint_val + "')\n"
+                        src = ''.join(lines)
+                        changed = True
+                        break
+                    j -= 1
+            break
+
+    if changed:
+        with open(EDITOR, 'w') as f:
+            f.write(src)
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception:
+        pass
+    sys.exit(0)
+'''
 # Node-RED official icons (https://nodered.org/about/resources/media/)
 NODERED_LOGO_URL = "https://nodered.org/about/resources/media/node-red-icon.png"       # icon only (e.g. small nav)
 NODERED_LOGO_URL_2 = "https://nodered.org/about/resources/media/node-red-icon-2.png"   # icon + "Node-RED" text (card, sidebar)
@@ -1182,6 +1294,15 @@ def help_page():
     current_ssh_port = _get_current_ssh_port()
     return render_template_string(HELP_TEMPLATE, settings=settings, version=VERSION, current_ssh_port=current_ssh_port)
 
+def _update_check_response(data):
+    """Return JSON response with no-cache headers so FQDN/proxy path never serves stale update badge."""
+    from flask import make_response
+    r = make_response(jsonify(data))
+    r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    r.headers['Pragma'] = 'no-cache'
+    return r
+
+
 @app.route('/api/update/check')
 @login_required
 def update_check():
@@ -1194,9 +1315,11 @@ def update_check():
     if not force and update_cache['latest'] and (now - update_cache['checked']) < 600:
         try:
             cached_newer = _parse_version_tuple(update_cache['latest']) > _parse_version_tuple(VERSION)
+            if update_cache['latest'].strip() == VERSION.strip():
+                cached_newer = False
         except (ValueError, IndexError):
             cached_newer = False
-        return jsonify({'current': VERSION, 'latest': update_cache['latest'], 'notes': update_cache['notes'],
+        return _update_check_response({'current': VERSION, 'latest': update_cache['latest'], 'notes': update_cache['notes'],
             'update_available': cached_newer})
     try:
         req = urllib.request.Request(
@@ -1206,7 +1329,7 @@ def update_check():
         resp = urllib.request.urlopen(req, timeout=5)
         data = json.loads(resp.read().decode())
         if not data:
-            return jsonify({'current': VERSION, 'latest': None, 'error': 'No tags found', 'update_available': False})
+            return _update_check_response({'current': VERSION, 'latest': None, 'error': 'No tags found', 'update_available': False})
         versions = []
         for tag in data:
             name = tag.get('name', '').lstrip('v').replace('-alpha','').replace('-beta','')
@@ -1216,7 +1339,7 @@ def update_check():
             except (ValueError, IndexError):
                 continue
         if not versions:
-            return jsonify({'current': VERSION, 'latest': None, 'error': 'No version tags', 'update_available': False})
+            return _update_check_response({'current': VERSION, 'latest': None, 'error': 'No version tags', 'update_available': False})
         versions.sort(key=lambda x: x[0], reverse=True)
         latest_tag = versions[0][1]
         latest = latest_tag.get('name', '').lstrip('v')
@@ -1226,22 +1349,55 @@ def update_check():
             is_newer = latest_tuple > current_tuple
         except (ValueError, IndexError):
             is_newer = False
+        # Never show "update available" when current and latest are the same (avoid stale badge after update)
+        if latest.strip() == VERSION.strip():
+            is_newer = False
         notes = f"Version {latest_tag.get('name', '')}"
         update_cache.update({'latest': latest, 'checked': now, 'notes': notes})
-        return jsonify({'current': VERSION, 'latest': latest, 'notes': notes, 'body': '',
+        return _update_check_response({'current': VERSION, 'latest': latest, 'notes': notes, 'body': '',
             'update_available': is_newer})
     except Exception as e:
-        return jsonify({'current': VERSION, 'latest': None, 'error': str(e), 'update_available': False})
+        return _update_check_response({'current': VERSION, 'latest': None, 'error': str(e), 'update_available': False})
+
+def _fetch_latest_tag_name():
+    """Return the latest release tag name (e.g. 'v0.2.3-alpha') from GitHub, or None on error."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            f'https://api.github.com/repos/{GITHUB_REPO}/tags',
+            headers={'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'infra-TAK'}
+        )
+        resp = urllib.request.urlopen(req, timeout=5)
+        data = json.loads(resp.read().decode())
+        if not data:
+            return None
+        versions = []
+        for tag in data:
+            name = tag.get('name', '').lstrip('v').replace('-alpha', '').replace('-beta', '')
+            parts = name.split('.')
+            try:
+                versions.append((tuple(int(p) for p in parts), tag.get('name', '')))
+            except (ValueError, IndexError):
+                continue
+        if not versions:
+            return None
+        versions.sort(key=lambda x: x[0], reverse=True)
+        return versions[0][1]  # full tag name e.g. v0.2.3-alpha
+    except Exception:
+        return None
+
 
 @app.route('/api/update/apply', methods=['POST'])
 @login_required
 def update_apply():
     console_dir = os.path.dirname(os.path.abspath(__file__))
+    git_env = {'GIT_TERMINAL_PROMPT': '0'}
+    git_cfg = ['git', '-c', f'safe.directory={console_dir}']
     try:
         # Git 2.35.2+ refuses to run when repo owner != process user (CVE-2022-24765). Use -c safe.directory
         # so Update Now works when the app runs as root but the repo was cloned by another user.
-        cmd = ['git', '-c', f'safe.directory={console_dir}', 'pull', '--rebase', '--autostash']
-        r = subprocess.run(cmd, cwd=console_dir, capture_output=True, text=True, timeout=60)
+        r = subprocess.run(git_cfg + ['pull', '--rebase', '--autostash'], cwd=console_dir,
+                          capture_output=True, text=True, timeout=60, env={**os.environ, **git_env})
         if r.returncode != 0:
             err = (r.stderr or '').strip() or (r.stdout or '').strip()
             out = {'success': False, 'error': err}
@@ -1250,11 +1406,26 @@ def update_apply():
                     f'On the server run: sudo git config --global --add safe.directory {console_dir}'
                 )
             return jsonify(out)
+        # Checkout latest release tag so the restarted process runs that version (fixes "update then still see banner" loop)
+        tag_name = _fetch_latest_tag_name()
+        if tag_name:
+            fetch = subprocess.run(git_cfg + ['fetch', 'origin', 'tag', tag_name, '--no-tags'],
+                                  cwd=console_dir, capture_output=True, text=True, timeout=30, env={**os.environ, **git_env})
+            if fetch.returncode == 0:
+                checkout = subprocess.run(git_cfg + ['checkout', '--force', tag_name],
+                                         cwd=console_dir, capture_output=True, text=True, timeout=30, env={**os.environ, **git_env})
+                if checkout.returncode != 0:
+                    pass  # non-fatal: we already pulled; restart may still run newer branch tip
         update_cache.update({'latest': None, 'checked': 0})
         _ensure_gunicorn_upgrade(console_dir)
         subprocess.Popen('sleep 2 && systemctl restart takwerx-console', shell=True,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return jsonify({'success': True, 'output': (r.stdout or '').strip(), 'restart_required': True})
+        return jsonify({
+            'success': True,
+            'output': (r.stdout or '').strip(),
+            'restart_required': True,
+            'restart_message': 'Console is restarting. You may see 502 briefly — wait 10–15 seconds then refresh the page.'
+        })
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
@@ -2342,12 +2513,19 @@ def mediamtx_page():
     mediamtx_deploy_cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
     if mtx.get('installed') and not mediamtx_deploy_status.get('running', False):
         mediamtx_deploy_status.update({'complete': False, 'error': False})
+    mtx_vinfo = _get_mediamtx_version_info() if mtx.get('installed') else {}
     return render_template_string(MEDIAMTX_TEMPLATE,
         settings=settings, mtx=mtx, version=VERSION,
         cloudtak_installed=cloudtak_installed,
         mediamtx_deploy_cfg=mediamtx_deploy_cfg,
         deploying=mediamtx_deploy_status.get('running', False),
-        deploy_done=mediamtx_deploy_status.get('complete', False))
+        deploy_done=mediamtx_deploy_status.get('complete', False),
+        mediamtx_version=mtx_vinfo.get('version') or '',
+        mediamtx_update_available=mtx_vinfo.get('update_available', False),
+        mediamtx_latest=mtx_vinfo.get('latest') or '',
+        editor_version=mtx_vinfo.get('editor_version') or '',
+        editor_update_available=mtx_vinfo.get('editor_update_available', False),
+        editor_latest=mtx_vinfo.get('editor_latest') or '')
 
 # ── Guard Dog (TAK Server hardening / 7 monitors) ─────────────────────────────
 guarddog_deploy_log = []
@@ -4427,6 +4605,48 @@ def _get_cloudtak_upstreams(settings):
     }
 
 
+def _mediamtx_editor_endpoint_patch(src):
+    """Patch duplicate Flask endpoints so infra-TAK overlay + core don't conflict. Returns modified source."""
+    import re
+    lines = src.splitlines(keepends=True)
+    changed = False
+    for def_pat, route_hints, endpoint_val in (
+            (r'\bdef shared_stream_page\s*\(', ('/shared/',), 'shared_stream_page_core'),
+            (r'\bdef shared_hls_proxy\s*\(', ('/shared-hls/', 'shared-hls', 'shared_hls'), 'shared_hls_proxy_core'),
+            (r'\bdef api_share_links_list\s*\(', ('/api/share-links', 'share-links'), 'api_share_links_list_core'),
+            (r'\bdef api_share_links_generate\s*\(', ('/api/share-links/generate', 'share-links/generate'), 'api_share_links_generate_core'),
+            (r'\bdef api_share_links_revoke\s*\(', ('/api/share-links/revoke', 'share-links/revoke'), 'api_share_links_revoke_core'),
+    ):
+        for i in range(len(lines) - 1, -1, -1):
+            if not re.search(def_pat, lines[i]):
+                continue
+            j = i - 1
+            while j >= 0 and j >= i - 20:
+                line = lines[j]
+                if '@app.route' in line and 'endpoint=' not in line and any(h in line for h in route_hints):
+                    if line.rstrip().endswith(')'):
+                        lines[j] = line.rstrip()[:-1] + ", endpoint='" + endpoint_val + "')\n"
+                    else:
+                        lines[j] = line.rstrip().rstrip(')') + ", endpoint='" + endpoint_val + "')\n"
+                    changed = True
+                    break
+                j -= 1
+            else:
+                j = i - 1
+                while j >= 0 and j >= i - 20:
+                    if '@app.route' in lines[j] and 'endpoint=' not in lines[j]:
+                        l = lines[j]
+                        if l.rstrip().endswith(')'):
+                            lines[j] = l.rstrip()[:-1] + ", endpoint='" + endpoint_val + "')\n"
+                        else:
+                            lines[j] = l.rstrip().rstrip(')') + ", endpoint='" + endpoint_val + "')\n"
+                        changed = True
+                        break
+                    j -= 1
+            break
+    return ''.join(lines) if changed else src
+
+
 def _get_mediamtx_upstream(settings):
     """Return MediaMTX web console upstream for Caddy (127.0.0.1:5080 or remote_host:5080)."""
     cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
@@ -5964,6 +6184,112 @@ def _get_cloudtak_version_info():
     return out
 
 
+def _get_mediamtx_editor_version_info(deploy_cfg):
+    """Return {version: str, update_available: bool, latest: str|None} for MediaMTX web editor (takwerx/mediamtx-installer).
+    Current from CURRENT_VERSION in /opt/mediamtx-webeditor/mediamtx_config_editor.py on target."""
+    import re as _re
+    out = {'version': '', 'update_available': False, 'latest': None}
+    # Current: grep CURRENT_VERSION from editor script on target
+    cmd = 'grep -oE \'CURRENT_VERSION = "[^"]+"\' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null | head -1'
+    if deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip():
+        ok, raw = _module_run(deploy_cfg, cmd, timeout=10)
+        if ok and raw:
+            m = _re.search(r'"([^"]+)"', raw)
+            if m:
+                out['version'] = m.group(1).lstrip('vV')
+    else:
+        editor_path = '/opt/mediamtx-webeditor/mediamtx_config_editor.py'
+        if os.path.isfile(editor_path):
+            try:
+                with open(editor_path) as f:
+                    for line in f:
+                        if 'CURRENT_VERSION' in line:
+                            m = _re.search(r'["\']([vV]?[^"\']+)["\']', line)
+                            if m:
+                                out['version'] = m.group(1).lstrip('vV')
+                            break
+            except Exception:
+                pass
+    # Latest from takwerx/mediamtx-installer releases/latest
+    try:
+        req = _ur.Request(
+            'https://api.github.com/repos/takwerx/mediamtx-installer/releases/latest',
+            headers={'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'infra-TAK'})
+        with _ur.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+        tag = (data or {}).get('tag_name') or ''
+        if tag:
+            out['latest'] = tag.lstrip('vV')
+            if out['version'] and out['latest']:
+                cur_parts = [int(x) for x in _re.findall(r'\d+', out['version'])[:3]]
+                lat_parts = [int(x) for x in _re.findall(r'\d+', out['latest'])[:3]]
+                while len(cur_parts) < 3:
+                    cur_parts.append(0)
+                while len(lat_parts) < 3:
+                    lat_parts.append(0)
+                if lat_parts > cur_parts:
+                    out['update_available'] = True
+            elif out['latest']:
+                out['update_available'] = True
+    except Exception:
+        pass
+    return out
+
+
+def _get_mediamtx_version_info():
+    """Return version/update for MediaMTX binary (bluenviron/mediamtx) and web editor (takwerx/mediamtx-installer).
+    Card shows update if either has an update; page shows both."""
+    import re as _re
+    out = {'version': '', 'update_available': False, 'latest': None,
+           'editor_version': '', 'editor_update_available': False, 'editor_latest': None}
+    settings = load_settings()
+    deploy_cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
+    # Binary: current from target, latest from bluenviron/mediamtx
+    if deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip():
+        ok, raw = _module_run(deploy_cfg, '/usr/local/bin/mediamtx -version 2>/dev/null', timeout=10)
+        if ok and raw:
+            m = _re.search(r'v?(\d+\.\d+\.\d+)', raw)
+            if m:
+                out['version'] = m.group(1)
+    else:
+        if os.path.isfile('/usr/local/bin/mediamtx') and os.access('/usr/local/bin/mediamtx', os.X_OK):
+            r = subprocess.run('/usr/local/bin/mediamtx -version 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
+            if r.returncode == 0 and (r.stdout or r.stderr):
+                m = _re.search(r'v?(\d+\.\d+\.\d+)', (r.stdout or '') + (r.stderr or ''))
+                if m:
+                    out['version'] = m.group(1)
+    try:
+        req = _ur.Request(
+            'https://api.github.com/repos/bluenviron/mediamtx/releases/latest',
+            headers={'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'infra-TAK'})
+        with _ur.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+        tag = (data or {}).get('tag_name') or ''
+        if tag:
+            out['latest'] = tag.lstrip('vV')
+            if out['version'] and out['latest']:
+                cur_parts = [int(x) for x in _re.findall(r'\d+', out['version'])[:3]]
+                lat_parts = [int(x) for x in _re.findall(r'\d+', out['latest'])[:3]]
+                while len(cur_parts) < 3:
+                    cur_parts.append(0)
+                while len(lat_parts) < 3:
+                    lat_parts.append(0)
+                if lat_parts > cur_parts:
+                    out['update_available'] = True
+            elif out['latest']:
+                out['update_available'] = True
+    except Exception:
+        pass
+    # Web editor: current from CURRENT_VERSION on target, latest from takwerx/mediamtx-installer
+    editor_info = _get_mediamtx_editor_version_info(deploy_cfg)
+    out['editor_version'] = editor_info.get('version') or ''
+    out['editor_update_available'] = editor_info.get('update_available', False)
+    out['editor_latest'] = editor_info.get('latest')
+    if out['editor_update_available']:
+        out['update_available'] = True
+    return out
+
+
 def get_all_module_versions():
     """Return dict of module_key -> {version, update_available, latest?} for console cards."""
     modules = detect_modules()
@@ -5976,6 +6302,8 @@ def get_all_module_versions():
         result['nodered'] = _get_nodered_version_info()
     if modules.get('cloudtak', {}).get('installed'):
         result['cloudtak'] = _get_cloudtak_version_info()
+    if modules.get('mediamtx', {}).get('installed'):
+        result['mediamtx'] = _get_mediamtx_version_info()
     if modules.get('takportal', {}).get('installed'):
         result['takportal'] = _get_takportal_version_info()
     if modules.get('takserver', {}).get('installed'):
@@ -6792,17 +7120,61 @@ def mediamtx_control():
     running = r.stdout.strip() == 'active'
     return jsonify({'success': True, 'running': running})
 
+
+@app.route('/api/mediamtx/recovery', methods=['POST'])
+@login_required
+def mediamtx_recovery():
+    """Patch web editor: install fail-safe overlay script and restart mediamtx-webeditor. One-click from MediaMTX page."""
+    import tempfile
+    settings = load_settings()
+    deploy_cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
+    tmp_f = None
+    try:
+        tmp_f = tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False)
+        tmp_f.write(MEDIAMTX_ENSURE_OVERLAY_SCRIPT)
+        tmp_f.close()
+        ok_copy = _module_copy(deploy_cfg, tmp_f.name, '/tmp/ensure_overlay.py', timeout=15)
+        if not ok_copy:
+            return jsonify({'error': 'Failed to copy overlay script to target'}), 500
+        # Install script, make ExecStartPre best-effort so a failing pre-step cannot block start, then restart
+        cmd = (
+            'mv /tmp/ensure_overlay.py /opt/mediamtx-webeditor/ensure_overlay.py && chmod 755 /opt/mediamtx-webeditor/ensure_overlay.py && '
+            "sed -i 's|^ExecStartPre=/usr/bin/python3|ExecStartPre=-/usr/bin/python3|' /etc/systemd/system/mediamtx-webeditor.service 2>/dev/null; "
+            'systemctl daemon-reload 2>/dev/null; systemctl restart mediamtx-webeditor 2>/dev/null; true'
+        )
+        ok_run, out = _module_run(deploy_cfg, cmd, timeout=25)
+        if not ok_run:
+            return jsonify({'error': 'Failed to install or restart web editor', 'detail': (out or '')[:500]}), 500
+        # Check if web editor actually came up
+        ok_check, check_out = _module_run(deploy_cfg, 'systemctl is-active mediamtx-webeditor 2>/dev/null', timeout=10)
+        active = ok_check and (check_out or '').strip() == 'active'
+        msg = 'Web editor patched; mediamtx-webeditor restarted and is running.' if active else (
+            'Patch applied and service restarted, but mediamtx-webeditor may still be down. '
+            'Click **Web editor logs** on this page to see why.'
+        )
+        return jsonify({'success': True, 'message': msg, 'webeditor_running': active})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if tmp_f and os.path.exists(tmp_f.name):
+            try:
+                os.unlink(tmp_f.name)
+            except Exception:
+                pass
+
+
 @app.route('/api/mediamtx/logs')
 @login_required
 def mediamtx_logs():
     lines = request.args.get('lines', 60, type=int)
+    unit = request.args.get('unit', 'mediamtx')
     settings = load_settings()
     deploy_cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
     if deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip():
-        ok, out = _ssh_probe(deploy_cfg['remote'], f'journalctl -u mediamtx --no-pager -n {lines} 2>&1', timeout=15)
+        ok, out = _ssh_probe(deploy_cfg['remote'], f'journalctl -u {unit} --no-pager -n {lines} 2>&1', timeout=15)
         entries = [l for l in (out.strip().split('\n') if out and out.strip() else []) if l.strip()] if ok else []
         return jsonify({'entries': entries})
-    r = subprocess.run(f'journalctl -u mediamtx --no-pager -n {lines} 2>&1', shell=True, capture_output=True, text=True, timeout=10)
+    r = subprocess.run(f'journalctl -u {unit} --no-pager -n {lines} 2>&1', shell=True, capture_output=True, text=True, timeout=10)
     entries = [l for l in (r.stdout.strip().split('\n') if r.stdout.strip() else []) if l.strip()]
     return jsonify({'entries': entries})
 
@@ -7094,6 +7466,35 @@ paths:
                 except Exception:
                     pass
                 plog("✓ LDAP overlay applied (Authentik header auth)")
+                # Endpoint patch so shared_stream_page / shared_hls_proxy don't duplicate (Flask AssertionError)
+                ep_script = (
+                    "import re\n"
+                    "f='/opt/mediamtx-webeditor/mediamtx_config_editor.py'\n"
+                    "with open(f) as h: src=h.read()\n"
+                    "lines=src.splitlines(keepends=True)\n"
+                    "for (dp,rh,ev) in [(r'\\\\bdef shared_stream_page\\\\s*\\\\(',('/shared/',),'shared_stream_page_core'),(r'\\\\bdef shared_hls_proxy\\\\s*\\\\(',('/shared-hls','shared_hls'),'shared_hls_proxy_core'),(r'\\\\bdef api_share_links_list\\\\s*\\\\(',('/api/share-links','share-links'),'api_share_links_list_core'),(r'\\\\bdef api_share_links_generate\\\\s*\\\\(',('/api/share-links/generate','share-links/generate'),'api_share_links_generate_core'),(r'\\\\bdef api_share_links_revoke\\\\s*\\\\(',('/api/share-links/revoke','share-links/revoke'),'api_share_links_revoke_core')]:\n"
+                    " for i in range(len(lines)-1,-1,-1):\n"
+                    "  if not re.search(dp,lines[i]): continue\n"
+                    "  for j in range(i-1,max(-1,i-20),-1):\n"
+                    "   L=lines[j]\n"
+                    "   if '@app.route' in L and 'endpoint=' not in L and any(h in L for h in rh):\n"
+                    "    lines[j]=L.rstrip()[:-1]+\", endpoint='\"+ev+\"')\\n\"; break\n"
+                    "  else:\n"
+                    "   for j in range(i-1,max(-1,i-20),-1):\n"
+                    "    if '@app.route' in lines[j] and 'endpoint=' not in lines[j]:\n"
+                    "     L=lines[j]; lines[j]=L.rstrip()[:-1]+\", endpoint='\"+ev+\"')\\n\"; break\n"
+                    "  break\n"
+                    "with open(f,'w') as h: h.write(''.join(lines))\n"
+                )
+                with open('/tmp/mtx_endpoint_patch.py', 'w') as pf:
+                    pf.write(ep_script)
+                _module_copy(deploy_cfg, '/tmp/mtx_endpoint_patch.py', '/tmp/mtx_endpoint_patch.py', log_fn=plog)
+                _module_run(deploy_cfg, 'python3 /tmp/mtx_endpoint_patch.py && rm -f /tmp/mtx_endpoint_patch.py', timeout=15)
+                try:
+                    os.remove('/tmp/mtx_endpoint_patch.py')
+                except Exception:
+                    pass
+                plog("✓ Endpoint patch applied (shared_stream_page, shared_hls_proxy)")
             else:
                 plog("⚠ Failed to copy LDAP overlay to remote")
         else:
@@ -7598,6 +7999,19 @@ WantedBy=multi-user.target
                         plog("✓ LDAP overlay already present")
                 else:
                     plog("⚠ mediamtx_ldap_overlay.py not found next to app.py — LDAP overlay skipped")
+                # Avoid duplicate Flask endpoints (shared_stream_page, shared_hls_proxy) so editor starts
+                try:
+                    _editor_path = f'{webeditor_dir}/mediamtx_config_editor.py'
+                    if os.path.exists(_editor_path):
+                        with open(_editor_path, 'r') as ef:
+                            esrc = ef.read()
+                        patched = _mediamtx_editor_endpoint_patch(esrc)
+                        if patched != esrc:
+                            with open(_editor_path, 'w') as ef:
+                                ef.write(patched)
+                            plog("✓ Endpoint patch applied (shared_stream_page, shared_hls_proxy)")
+                except Exception:
+                    pass
             # Deploy Ku-band simulator scripts so "Simulate link" in the editor works (Web Editor v1.1.8+)
             simulator_src = os.path.join(clone_dir, 'scripts', 'ku-band-simulator')
             simulator_dst = os.path.join(webeditor_dir, 'ku-band-simulator')
@@ -7655,77 +8069,16 @@ WantedBy=multi-user.target
         # Write self-healing overlay script — runs before every service start
         # Re-injects LDAP overlay + patches (port, API) if the upstream editor self-updated
         if ldap_available:
-            heal_script = r'''#!/usr/bin/env python3
-"""Pre-start hook: ensure infra-TAK LDAP overlay is injected into the editor.
-
-Runs as ExecStartPre so that upstream self-updates (Versions tab) don't
-silently remove the overlay.  Idempotent — does nothing if already patched.
-"""
-import os, re, sys
-
-EDITOR  = '/opt/mediamtx-webeditor/mediamtx_config_editor.py'
-OVERLAY = '/opt/mediamtx-webeditor/mediamtx_ldap_overlay.py'
-MARKER  = '# --- infra-TAK LDAP overlay ---'
-
-if not os.path.exists(EDITOR) or not os.path.exists(OVERLAY):
-    sys.exit(0)
-
-with open(EDITOR, 'r') as f:
-    src = f.read()
-
-changed = False
-
-# 1. Port patch: ensure PORT env var override
-if 'port=5000' in src and 'os.environ.get("PORT"' not in src:
-    src = src.replace('port=5000', 'port=int(os.environ.get("PORT", 5080))', 1)
-    changed = True
-
-# 2. API port patch: 9997 -> 9898
-if '9997' in src:
-    src = src.replace('9997', '9898')
-    changed = True
-
-# 3. LDAP overlay import injection
-if MARKER not in src:
-    inject = (
-        "\n" + MARKER + "\n"
-        "import os as _os\n"
-        "if _os.environ.get('LDAP_ENABLED'):\n"
-        "    import sys as _sys; _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))\n"
-        "    from mediamtx_ldap_overlay import apply_ldap_overlay\n"
-        "    apply_ldap_overlay(app)\n"
-        "# --- end LDAP overlay ---\n"
-    )
-    lines = src.splitlines(keepends=True)
-    inserted = False
-    for i, line in enumerate(lines):
-        if 'app = Flask(' in line:
-            lines.insert(i + 1, '\n' + inject)
-            inserted = True
-            break
-    if not inserted:
-        for i, line in enumerate(lines):
-            if 'app.run(' in line:
-                lines.insert(i, '\n' + inject)
-                inserted = True
-                break
-    if inserted:
-        src = ''.join(lines)
-        changed = True
-
-if changed:
-    with open(EDITOR, 'w') as f:
-        f.write(src)
-'''
             heal_path = f'{webeditor_dir}/ensure_overlay.py'
             with open(heal_path, 'w') as hf:
-                hf.write(heal_script)
+                hf.write(MEDIAMTX_ENSURE_OVERLAY_SCRIPT)
             os.chmod(heal_path, 0o755)
             plog("✓ Self-healing overlay script installed (runs on every service start)")
 
         exec_start_pre = ''
         if ldap_available:
-            exec_start_pre = f'ExecStartPre=/usr/bin/python3 {webeditor_dir}/ensure_overlay.py\n'
+            # Dash prefix: pre-step failure must not block the editor from starting
+            exec_start_pre = f'ExecStartPre=-/usr/bin/python3 {webeditor_dir}/ensure_overlay.py\n'
 
         editor_file = f'{webeditor_dir}/mediamtx_config_editor.py'
         if os.path.exists(editor_file):
@@ -11735,14 +12088,14 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 {{ sidebar_html }}
 <div class="main">
   <div class="page-header">
-    <h1><img src="{{ mediamtx_logo_url }}" alt="MediaMTX" style="height:28px;vertical-align:middle"></h1>
-    <p>Video Streaming Server</p>
+    <h1><img src="{{ mediamtx_logo_url }}" alt="MediaMTX" style="height:28px;vertical-align:middle;margin-right:8px">MediaMTX{% if mediamtx_version or editor_version %} <span style="font-weight:500;color:var(--text-dim);font-size:16px">· binary v{{ mediamtx_version }}{% if editor_version %} / editor v{{ editor_version }}{% endif %}</span>{% endif %}{% if mediamtx_update_available and mediamtx_latest %} <span style="font-size:12px;color:var(--cyan);font-weight:600;margin-left:8px">binary v{{ mediamtx_latest }} available</span>{% endif %}{% if editor_update_available and editor_latest %} <span style="font-size:12px;color:var(--cyan);font-weight:600;margin-left:8px">editor v{{ editor_latest }} available</span>{% endif %}</h1>
+    <p>Video Streaming Server (bluenviron) + Web Editor (takwerx)</p>
   </div>
 
   {% if mtx.running %}
-  <div class="status-banner running"><div class="dot"></div>MediaMTX is running</div>
+  <div class="status-banner running"><div class="dot"></div>MediaMTX is running{% if mediamtx_version %} · binary v{{ mediamtx_version }}{% endif %}{% if editor_version %} · editor v{{ editor_version }}{% endif %}{% if mediamtx_update_available and mediamtx_latest %} · <span style="color:var(--cyan)">binary v{{ mediamtx_latest }} available</span>{% endif %}{% if editor_update_available and editor_latest %} · <span style="color:var(--cyan)">editor v{{ editor_latest }} available</span>{% endif %}</div>
   {% elif mtx.installed %}
-  <div class="status-banner stopped"><div class="dot"></div>MediaMTX is installed but stopped</div>
+  <div class="status-banner stopped"><div class="dot"></div>MediaMTX is installed but stopped{% if mediamtx_version %} · binary v{{ mediamtx_version }}{% endif %}{% if editor_version %} · editor v{{ editor_version }}{% endif %}{% if mediamtx_update_available and mediamtx_latest %} · <span style="color:var(--cyan)">binary v{{ mediamtx_latest }} available</span>{% endif %}{% if editor_update_available and editor_latest %} · <span style="color:var(--cyan)">editor v{{ editor_latest }} available</span>{% endif %}</div>
   {% else %}
   <div class="status-banner not-installed"><div class="dot"></div>MediaMTX is not installed</div>
   {% endif %}
@@ -11752,8 +12105,9 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <div class="section-title" style="margin-top:20px">Controls</div>
   <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:24px">
   <div class="controls" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
-  {% if mtx.running %}<button class="control-btn" onclick="control('restart')">↻ Restart</button><button class="control-btn" onclick="loadLogs()">📋 Logs</button><button class="control-btn btn-stop" onclick="control('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="control('start')">▶ Start</button><button class="control-btn" onclick="loadLogs()">📋 Logs</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% endif %}
+  {% if mtx.running %}<button class="control-btn" onclick="control('restart')">↻ Restart</button><button class="control-btn" onclick="loadLogs('mediamtx')">📋 Logs</button><button class="control-btn" onclick="loadLogs('mediamtx-webeditor')">📋 Web editor logs</button><button class="control-btn" onclick="runRecovery()" id="recovery-btn" title="Patch web editor if stream URL won't load after an update">🔧 Patch web editor</button><button class="control-btn btn-stop" onclick="control('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="control('start')">▶ Start</button><button class="control-btn" onclick="loadLogs('mediamtx')">📋 Logs</button><button class="control-btn" onclick="loadLogs('mediamtx-webeditor')">📋 Web editor logs</button><button class="control-btn" onclick="runRecovery()" id="recovery-btn" title="Patch web editor if stream URL won&#39;t load after an update">🔧 Patch web editor</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% endif %}
   </div>
+  <p style="margin-top:10px;font-size:12px;color:var(--text-dim)">If the <strong>Web Console</strong> link below won’t load (e.g. after an editor update), click <strong>Patch web editor</strong> to patch and restart the stream config UI.</p>
   <div id="control-status" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
   </div>
 
@@ -11774,7 +12128,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 
   <!-- Container logs -->
   <div class="card" id="logs-card" style="display:none">
-    <div class="card-title">Service Logs</div>
+    <div class="card-title" id="logs-card-title">Service Logs</div>
     <div class="log-box" id="service-logs">Loading...</div>
   </div>
 
@@ -11850,7 +12204,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
       Web editor will be available at <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">https://stream.{{ settings.fqdn }}</span>
     </div>
     {% endif %}
-    <button class="btn btn-primary" id="deploy-btn" onclick="startDeploy()">🚀 Deploy MediaMTX</button>
+    <button class="btn btn-primary" id="deploy-btn" onclick="startDeploy()"{% if mediamtx_update_available %} style="border:1px solid var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>{% if mediamtx_update_available %}⬆ Update MediaMTX{% if mediamtx_latest %} <span style="color:var(--cyan)" title="Update available: v{{ mediamtx_latest }}">●</span>{% endif %}{% else %}🚀 Deploy MediaMTX{% endif %}</button>
   </div>
   {% endif %}
 
@@ -12040,12 +12394,41 @@ function control(action) {
   });
 }
 
-function loadLogs() {
+function loadLogs(unit) {
+  unit = unit || 'mediamtx';
   const card = document.getElementById('logs-card');
+  const titleEl = document.getElementById('logs-card-title');
   card.style.display = 'block';
-  fetch('/api/mediamtx/logs?lines=80').then(r => r.json()).then(d => {
+  if (titleEl) titleEl.textContent = unit === 'mediamtx-webeditor' ? 'Web editor logs' : 'Service logs';
+  document.getElementById('service-logs').textContent = 'Loading...';
+  fetch('/api/mediamtx/logs?lines=80&unit=' + encodeURIComponent(unit)).then(r => r.json()).then(d => {
     document.getElementById('service-logs').textContent = d.entries.join(String.fromCharCode(10)) || '(no output)';
   });
+}
+
+function runRecovery() {
+  const statusEl = document.getElementById('control-status');
+  const btn = document.getElementById('recovery-btn');
+  if (btn) btn.disabled = true;
+  statusEl.textContent = 'Patching web editor…';
+  fetch('/api/mediamtx/recovery', { method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin' })
+    .then(r => r.json())
+    .then(d => {
+      if (d.success) {
+        statusEl.textContent = (d.message || '✓ Patched. Web editor restarted.');
+        statusEl.style.color = 'var(--green)';
+      } else {
+        statusEl.textContent = d.error || 'Patch failed';
+        statusEl.style.color = 'var(--red)';
+      }
+      setTimeout(() => { statusEl.textContent = ''; statusEl.style.color = ''; }, 6000);
+    })
+    .catch(e => {
+      statusEl.textContent = e.message || 'Request failed';
+      statusEl.style.color = 'var(--red)';
+      setTimeout(() => { statusEl.textContent = ''; statusEl.style.color = ''; }, 5000);
+    })
+    .finally(() => { if (btn) btn.disabled = false; });
 }
 
 function doUninstall() {
@@ -20735,7 +21118,8 @@ async function checkUpdate(forceRefresh){
     if(btn){btn.disabled=true;btn.textContent='Checking...';}
     try{
         var url='/api/update/check';if(forceRefresh)url+='?refresh=1';
-        var r=await fetch(url);var d=await r.json();
+        var r=await fetch(url,{credentials:'same-origin',cache:'no-store'});
+        var d=await r.json();
         if(d.update_available){
             document.getElementById('update-banner').style.display='block';
             document.getElementById('update-info').textContent='v'+d.current+' -> v'+d.latest+(d.notes?' - '+d.notes:'');
@@ -20759,7 +21143,8 @@ async function applyUpdate(){
         if(d.success){
             status.style.color='var(--green)';
             status.textContent='OK Updated! Restarting console...';
-            setTimeout(function(){window.location.reload()},5000);
+            if(d.restart_message){status.innerHTML=status.textContent+'<br><small style=\"opacity:0.9;display:block;margin-top:6px\">'+d.restart_message+'</small>';}
+            setTimeout(function(){window.location.reload()},12000);
         }else{
             status.style.color='var(--red)';status.textContent='Error: '+d.error;
             if(d.workaround){status.innerHTML=status.textContent+'<br><small style=\"opacity:0.9\">'+d.workaround+'</small>';}
@@ -21278,7 +21663,8 @@ def _auto_update_guarddog():
             content = (content
                 .replace('ALERT_EMAIL_PLACEHOLDER', alert_email)
                 .replace('ALERT_SMS_PLACEHOLDER', '')
-                .replace('CERT_PASS_PLACEHOLDER', cert_pass))
+                .replace('CERT_PASS_PLACEHOLDER', cert_pass)
+                .replace('CONSOLE_VERSION_PLACEHOLDER', VERSION))
             if is_two_server and name in ('tak-remotedb-watch.sh', 'tak-remotedb-auth-watch.sh'):
                 content = content.replace('DB_HOST_PLACEHOLDER', s1_host)
                 content = content.replace('DB_PORT_PLACEHOLDER', db_port)

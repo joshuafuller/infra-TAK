@@ -40,10 +40,10 @@ need_update() {
 UPDATES=""
 SIG=""
 
-# infra-TAK
+# infra-TAK (skip if placeholders not replaced; never report update when current equals latest)
 latest_console=$(latest_infratak)
 cur_console="$CONSOLE_VERSION"
-if need_update "$cur_console" "$latest_console"; then
+if [ "$cur_console" != "CONSOLE_VERSION_PLACEHOLDER" ] && [ -n "$cur_console" ] && [ -n "$latest_console" ] && [ "$cur_console" != "$latest_console" ] && need_update "$cur_console" "$latest_console"; then
   UPDATES="${UPDATES}  - infra-TAK: current ${cur_console:-unknown}, latest ${latest_console}\n"
   SIG="${SIG}infratak:${latest_console};"
 fi
@@ -58,14 +58,24 @@ if [ -f "$HOME/authentik/.env" ]; then
   fi
 fi
 
-# MediaMTX (only if binary present)
+# MediaMTX binary (only if present)
 if [ -x "/usr/local/bin/mediamtx" ]; then
   cur_mtx=$(/usr/local/bin/mediamtx -version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1 | sed 's/^v//')
   [ -z "$cur_mtx" ] && cur_mtx=$(strings /usr/local/bin/mediamtx 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
   latest_mtx=$(latest_tag "bluenviron/mediamtx")
   if need_update "$cur_mtx" "$latest_mtx"; then
-    UPDATES="${UPDATES}  - MediaMTX: current ${cur_mtx:-unknown}, latest ${latest_mtx}\n"
+    UPDATES="${UPDATES}  - MediaMTX (binary): current ${cur_mtx:-unknown}, latest ${latest_mtx}\n"
     SIG="${SIG}mediamtx:${latest_mtx};"
+  fi
+fi
+
+# MediaMTX web editor (takwerx/mediamtx-installer; only if installed)
+if [ -f "/opt/mediamtx-webeditor/mediamtx_config_editor.py" ]; then
+  cur_ed=$(grep -oE 'CURRENT_VERSION = "[^"]+"' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null | head -1 | sed 's/.*"\([^"]*\)".*/\1/' | sed 's/^v//')
+  latest_ed=$(latest_tag "takwerx/mediamtx-installer")
+  if need_update "$cur_ed" "$latest_ed"; then
+    UPDATES="${UPDATES}  - MediaMTX (web editor): current ${cur_ed:-unknown}, latest ${latest_ed}\n"
+    SIG="${SIG}mediamtx_editor:${latest_ed};"
   fi
 fi
 
@@ -121,7 +131,7 @@ $(printf '%b' "$UPDATES")
 To update:
 - infra-TAK: Console → Update Now (or pull + restart)
 - Authentik: Authentik page → Update
-- MediaMTX: MediaMTX page → Update / redeploy
+- MediaMTX: MediaMTX page → Deploy / Update (binary + web editor)
 - CloudTAK: CloudTAK page → Update
 - TAK Portal: TAK Portal page → Update
 "
