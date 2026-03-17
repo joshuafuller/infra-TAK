@@ -384,6 +384,59 @@ def main():
                     j -= 1
             break
 
+    # 5. No-cache headers so browsers/proxies never serve stale editor pages
+    NO_CACHE_MARKER = '# --- infra-TAK no-cache ---'
+    if NO_CACHE_MARKER not in src:
+        snippet = (
+            "\n" + NO_CACHE_MARKER + "\n"
+            "@app.after_request\n"
+            "def _infra_tak_no_cache(response):\n"
+            "    if response.content_type and 'text/html' in response.content_type:\n"
+            "        response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'\n"
+            "        response.headers['Pragma'] = 'no-cache'\n"
+            "        response.headers['Expires'] = '0'\n"
+            "    return response\n"
+            "# --- end no-cache ---\n"
+        )
+        # Inject after the LDAP overlay block (or after app = Flask)
+        if '# --- end LDAP overlay ---' in src:
+            src = src.replace('# --- end LDAP overlay ---\n', '# --- end LDAP overlay ---\n' + snippet, 1)
+        else:
+            for ii, ll in enumerate(lines):
+                if 'app = Flask(' in ll:
+                    lines.insert(ii + 1, '\n' + snippet)
+                    src = ''.join(lines)
+                    break
+        changed = True
+
+    # 6. Pill style: Mode/Status use colored-background badge instead of text-only color
+    if '_extSourcesPillStyle' not in src:
+        pill_done = False
+        # Format A: plain modeText/statusText concatenation
+        if "html += ' ' + modeText + ' ';" in src:
+            src = src.replace(
+                "html += ' ' + modeText + ' ';",
+                "html += '<span style=\"background: ' + modeColor + '; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\">' + modeText + '</span>'; /* _extSourcesPillStyle */",
+                1)
+            src = src.replace(
+                "html += ' ' + statusText + ' ';",
+                "html += '<span style=\"background: ' + statusColor + '; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\">' + statusText + '</span>';",
+                1)
+            pill_done = True
+        # Format B: color-only span -> pill
+        if not pill_done and 'style="color: \' + modeColor + \'; font-weight: bold;"' in src:
+            src = src.replace(
+                'style="color: \' + modeColor + \'; font-weight: bold;"',
+                'style="background: \' + modeColor + \'; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;" /* _extSourcesPillStyle */',
+                1)
+            src = src.replace(
+                'style="color: \' + statusColor + \'; font-weight: bold;"',
+                'style="background: \' + statusColor + \'; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;"',
+                1)
+            pill_done = True
+        if pill_done:
+            changed = True
+
     if changed:
         with open(EDITOR, 'w') as f:
             f.write(src)
