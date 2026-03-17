@@ -4654,6 +4654,20 @@ def _mediamtx_editor_endpoint_patch(src):
     return ''.join(lines) if changed else src
 
 
+def _mediamtx_editor_external_sources_clear_patch(src):
+    """Insert container.innerHTML = '' right after getElementById('external-sources-list')
+    so the External Sources list is cleared before each fill; avoids duplicate rows when load runs twice."""
+    lines = src.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        if 'external-sources-list' in line and 'getElementById' in line and 'container' in line:
+            if i + 1 < len(lines) and "innerHTML = ''" in lines[i + 1] and 'container' in lines[i + 1]:
+                return src  # already patched
+            indent = line[: len(line) - len(line.lstrip())]
+            lines.insert(i + 1, indent + "container.innerHTML = '';\n")
+            return ''.join(lines)
+    return src
+
+
 def _get_mediamtx_upstream(settings):
     """Return MediaMTX web console upstream for Caddy (127.0.0.1:5080 or remote_host:5080)."""
     cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
@@ -7515,6 +7529,27 @@ paths:
                 except Exception:
                     pass
                 plog("✓ Endpoint patch applied (shared_stream_page, shared_hls_proxy)")
+                # External Sources list clear patch (avoids duplicate rows when load runs twice)
+                ext_clear_script = (
+                    "f='/opt/mediamtx-webeditor/mediamtx_config_editor.py'\n"
+                    "with open(f) as h: lines=h.readlines()\n"
+                    "for i, line in enumerate(lines):\n"
+                    "    if 'external-sources-list' in line and 'getElementById' in line and 'container' in line:\n"
+                    "        if i+1 < len(lines) and \"innerHTML = ''\" in lines[i+1]: break\n"
+                    "        indent = line[:len(line)-len(line.lstrip())]\n"
+                    "        lines.insert(i+1, indent + \"container.innerHTML = '';\\n\")\n"
+                    "        break\n"
+                    "with open(f,'w') as h: h.writelines(lines)\n"
+                )
+                with open('/tmp/mtx_ext_clear_patch.py', 'w') as pf:
+                    pf.write(ext_clear_script)
+                _module_copy(deploy_cfg, '/tmp/mtx_ext_clear_patch.py', '/tmp/mtx_ext_clear_patch.py', log_fn=plog)
+                _module_run(deploy_cfg, 'python3 /tmp/mtx_ext_clear_patch.py && rm -f /tmp/mtx_ext_clear_patch.py', timeout=10)
+                try:
+                    os.remove('/tmp/mtx_ext_clear_patch.py')
+                except Exception:
+                    pass
+                plog("✓ External Sources list clear patch applied")
             else:
                 plog("⚠ Failed to copy LDAP overlay to remote")
         else:
@@ -8030,6 +8065,11 @@ WantedBy=multi-user.target
                             with open(_editor_path, 'w') as ef:
                                 ef.write(patched)
                             plog("✓ Endpoint patch applied (shared_stream_page, shared_hls_proxy)")
+                        patched2 = _mediamtx_editor_external_sources_clear_patch(patched)
+                        if patched2 != patched:
+                            with open(_editor_path, 'w') as ef:
+                                ef.write(patched2)
+                            plog("✓ External Sources list clear patch applied")
                 except Exception:
                     pass
             # Deploy Ku-band simulator scripts so "Simulate link" in the editor works (Web Editor v1.1.8+)
