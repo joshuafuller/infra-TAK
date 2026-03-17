@@ -409,64 +409,67 @@ def main():
                     break
         changed = True
 
-    # 6. Pill style: Mode/Status use colored-background badge instead of text-only color
-    if '_extSourcesPillStyle' not in src:
-        pill_done = False
-        # Format A: plain modeText/statusText concatenation
-        if "html += ' ' + modeText + ' ';" in src:
-            src = src.replace(
-                "html += ' ' + modeText + ' ';",
-                "html += '<span style=\"background: ' + modeColor + '; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\">' + modeText + '</span>'; /* _extSourcesPillStyle */",
+    # 6/7. External Sources scoped patches (only inside loadExternalSources)
+    ls = src.find('function loadExternalSources()')
+    if ls != -1:
+        le = src.find('\n        function ', ls + 1)
+        if le == -1:
+            le = src.find('\nfunction ', ls + 1)
+        if le == -1:
+            le = len(src)
+        blk = src[ls:le]
+        b2 = blk
+        # Pill style
+        if '_extSourcesPillStyle' not in b2:
+            if "html += ' ' + modeText + ' ';" in b2:
+                b2 = b2.replace(
+                    "html += ' ' + modeText + ' ';",
+                    "html += '<span style=\"background: ' + modeColor + '; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\">' + modeText + '</span>'; /* _extSourcesPillStyle */",
+                    1)
+                b2 = b2.replace(
+                    "html += ' ' + statusText + ' ';",
+                    "html += '<span style=\"background: ' + statusColor + '; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\">' + statusText + '</span>';",
+                    1)
+            elif 'style="color: \' + modeColor + \'; font-weight: bold;"' in b2:
+                b2 = b2.replace(
+                    'style="color: \' + modeColor + \'; font-weight: bold;"',
+                    'style="background: \' + modeColor + \'; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;" /* _extSourcesPillStyle */',
+                    1)
+                b2 = b2.replace(
+                    'style="color: \' + statusColor + \'; font-weight: bold;"',
+                    'style="background: \' + statusColor + \'; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;"',
+                    1)
+        # DOM normalize
+        if '_extSourcesDomNormalize' not in b2 and "container.innerHTML = html;" in b2:
+            b2 = b2.replace(
+                "container.innerHTML = html;",
+                "container.innerHTML = html;\\n"
+                "                    /* _extSourcesDomNormalize */\\n"
+                "                    try {\\n"
+                "                        const rows = container.querySelectorAll('tbody tr');\\n"
+                "                        rows.forEach(row => {\\n"
+                "                            const tds = row.querySelectorAll('td');\\n"
+                "                            if (!tds || tds.length < 2) return;\\n"
+                "                            const nameCell = tds[0];\\n"
+                "                            const urlCell = tds[1];\\n"
+                "                            const badges = row.querySelectorAll('.share-mode-badge-ext');\\n"
+                "                            if (badges.length) {\\n"
+                "                                const keepBadge = badges[0];\\n"
+                "                                if (keepBadge.parentElement !== nameCell) nameCell.appendChild(keepBadge);\\n"
+                "                                badges.forEach((b, i) => { if (i > 0) b.remove(); });\\n"
+                "                            }\\n"
+                "                            const links = row.querySelectorAll('.external-copy-link-btn');\\n"
+                "                            if (links.length) {\\n"
+                "                                const keepLink = links[0];\\n"
+                "                                if (keepLink.parentElement !== urlCell) urlCell.appendChild(keepLink);\\n"
+                "                                links.forEach((b, i) => { if (i > 0) b.remove(); });\\n"
+                "                            }\\n"
+                "                        });\\n"
+                "                    } catch(e) {}",
                 1)
-            src = src.replace(
-                "html += ' ' + statusText + ' ';",
-                "html += '<span style=\"background: ' + statusColor + '; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\">' + statusText + '</span>';",
-                1)
-            pill_done = True
-        # Format B: color-only span -> pill
-        if not pill_done and 'style="color: \' + modeColor + \'; font-weight: bold;"' in src:
-            src = src.replace(
-                'style="color: \' + modeColor + \'; font-weight: bold;"',
-                'style="background: \' + modeColor + \'; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;" /* _extSourcesPillStyle */',
-                1)
-            src = src.replace(
-                'style="color: \' + statusColor + \'; font-weight: bold;"',
-                'style="background: \' + statusColor + \'; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;"',
-                1)
-            pill_done = True
-        if pill_done:
+        if b2 != blk:
+            src = src[:ls] + b2 + src[le:]
             changed = True
-
-    # 7. DOM normalize: after external-sources render, force one badge in Name and one link button in URL
-    if '_extSourcesDomNormalize' not in src and "container.innerHTML = html;" in src:
-        src = src.replace(
-            "container.innerHTML = html;",
-            "container.innerHTML = html;\\n"
-            "                    /* _extSourcesDomNormalize */\\n"
-            "                    try {\\n"
-            "                        const rows = container.querySelectorAll('tbody tr');\\n"
-            "                        rows.forEach(row => {\\n"
-            "                            const tds = row.querySelectorAll('td');\\n"
-            "                            if (!tds || tds.length < 2) return;\\n"
-            "                            const nameCell = tds[0];\\n"
-            "                            const urlCell = tds[1];\\n"
-            "                            const badges = row.querySelectorAll('.share-mode-badge-ext');\\n"
-            "                            if (badges.length) {\\n"
-            "                                const keepBadge = badges[0];\\n"
-            "                                if (keepBadge.parentElement !== nameCell) nameCell.appendChild(keepBadge);\\n"
-            "                                badges.forEach((b, i) => { if (i > 0) b.remove(); });\\n"
-            "                            }\\n"
-            "                            const links = row.querySelectorAll('.external-copy-link-btn');\\n"
-            "                            if (links.length) {\\n"
-            "                                const keepLink = links[0];\\n"
-            "                                if (keepLink.parentElement !== urlCell) urlCell.appendChild(keepLink);\\n"
-            "                                links.forEach((b, i) => { if (i > 0) b.remove(); });\\n"
-            "                            }\\n"
-            "                        });\\n"
-            "                    } catch(e) {}",
-            1
-        )
-        changed = True
 
     if changed:
         with open(EDITOR, 'w') as f:
@@ -501,14 +504,19 @@ MEDIAMTX_REMOTE_EP_PATCH_SCRIPT = (
 )
 MEDIAMTX_REMOTE_EXT_CLEAR_SCRIPT = (
     "f='/opt/mediamtx-webeditor/mediamtx_config_editor.py'\n"
-    "with open(f) as h: lines=h.readlines()\n"
-    "for i, line in enumerate(lines):\n"
-    "    if 'external-sources-list' in line and 'getElementById' in line and 'container' in line:\n"
-    "        if i+1 < len(lines) and \"innerHTML = ''\" in lines[i+1]: break\n"
-    "        indent = line[:len(line)-len(line.lstrip())]\n"
-    "        lines.insert(i+1, indent + \"container.innerHTML = '';\\n\")\n"
-    "        break\n"
-    "with open(f,'w') as h: h.writelines(lines)\n"
+    "with open(f) as h: c=h.read()\n"
+    "s=c.find('function loadExternalSources()')\n"
+    "if s==-1: raise SystemExit(0)\n"
+    "e=c.find('\\n        function ', s+1)\n"
+    "if e==-1: e=c.find('\\nfunction ', s+1)\n"
+    "if e==-1: e=len(c)\n"
+    "b=c[s:e]\n"
+    "line=\"const container = document.getElementById('external-sources-list');\"\n"
+    "if line not in b: raise SystemExit(0)\n"
+    "if \"container.innerHTML = '';\" in b: raise SystemExit(0)\n"
+    "b=b.replace(line, line+\"\\n                    container.innerHTML = '';\", 1)\n"
+    "c=c[:s]+b+c[e:]\n"
+    "with open(f,'w') as h: h.write(c)\n"
 )
 # Re-entry lock for loadExternalSources (avoids messed-up layout when 5s refresh overlaps)
 MEDIAMTX_REMOTE_EXT_LOCK_SCRIPT = (
@@ -516,7 +524,13 @@ MEDIAMTX_REMOTE_EXT_LOCK_SCRIPT = (
     "with open(f) as h: content=h.read()\n"
     "if '_loadExtSrcLock' in content:\n"
     "    raise SystemExit(0)\n"
-    "lines=content.splitlines(keepends=True)\n"
+    "s=content.find('function loadExternalSources()')\n"
+    "if s==-1: raise SystemExit(0)\n"
+    "e=content.find('\\n        function ', s+1)\n"
+    "if e==-1: e=content.find('\\nfunction ', s+1)\n"
+    "if e==-1: e=len(content)\n"
+    "blk=content[s:e]\n"
+    "lines=blk.splitlines(keepends=True)\n"
     "did_finally=False\n"
     "for i, line in enumerate(lines):\n"
     "    if 'Error loading sources:' in line and 'external-sources-list' in line and 'innerHTML' in line:\n"
@@ -536,36 +550,50 @@ MEDIAMTX_REMOTE_EXT_LOCK_SCRIPT = (
     "        lines.insert(i, indent+'if (window._loadExtSrcLock) return;\\n')\n"
     "        lines.insert(i+1, indent+'window._loadExtSrcLock = true;\\n')\n"
     "        break\n"
-    "with open(f,'w') as h: h.writelines(lines)\n"
+    "blk=''.join(lines)\n"
+    "content=content[:s]+blk+content[e:]\n"
+    "with open(f,'w') as h: h.write(content)\n"
 )
 # Use first #external-sources-list only, hide duplicates (fixes duplicate-id layout)
 MEDIAMTX_REMOTE_EXT_SINGLE_CONTAINER_SCRIPT = (
     "f='/opt/mediamtx-webeditor/mediamtx_config_editor.py'\n"
-    "with open(f) as h: lines=h.readlines()\n"
-    "if any('_extListAll' in L for L in lines): raise SystemExit(0)\n"
-    "for i, line in enumerate(lines):\n"
-    "    if \"getElementById('external-sources-list')\" in line and 'container' in line and 'const' in line:\n"
-    "        indent=line[:len(line)-len(line.lstrip())]\n"
-    "        lines[i]=indent+\"var _extListAll = document.querySelectorAll('[id=\\\"external-sources-list\\\"]');\\n\"+indent+\"if (_extListAll.length > 1) { for (var _i = 1; _i < _extListAll.length; _i++) _extListAll[_i].style.display = 'none'; }\\n\"+indent+\"const container = _extListAll[0];\\n\"\n"
-    "        break\n"
-    "with open(f,'w') as h: h.writelines(lines)\n"
+    "with open(f) as h: c=h.read()\n"
+    "if '_extListAll' in c: raise SystemExit(0)\n"
+    "s=c.find('function loadExternalSources()')\n"
+    "if s==-1: raise SystemExit(0)\n"
+    "e=c.find('\\n        function ', s+1)\n"
+    "if e==-1: e=c.find('\\nfunction ', s+1)\n"
+    "if e==-1: e=len(c)\n"
+    "b=c[s:e]\n"
+    "old=\"const container = document.getElementById('external-sources-list');\"\n"
+    "if old not in b: raise SystemExit(0)\n"
+    "b=b.replace(old, \"var _extListAll = document.querySelectorAll('[id=\\\\\\\"external-sources-list\\\\\\\"]');\\n                    if (_extListAll.length > 1) { for (var _i = 1; _i < _extListAll.length; _i++) _extListAll[_i].style.display = 'none'; }\\n                    const container = _extListAll[0];\", 1)\n"
+    "c=c[:s]+b+c[e:]\n"
+    "with open(f,'w') as h: h.write(c)\n"
 )
 # Pill style: (A) plain modeText/statusText or (B) replace color-only style value with pill (flexible for all formats)
 MEDIAMTX_REMOTE_EXT_PILL_STYLE_SCRIPT = (
     "f='/opt/mediamtx-webeditor/mediamtx_config_editor.py'\n"
     "with open(f) as h: c=h.read()\n"
     "if '_extSourcesPillStyle' in c: raise SystemExit(0)\n"
-    "if 'padding: 4px 10px' in c and \"modeColor\" in c and \"background:\" in c: raise SystemExit(0)\n"
-    "if \"html += ' ' + modeText + ' ';\" in c:\n"
-    "    c=c.replace(\"html += ' ' + modeText + ' ';\", \"html += '<span style=\\\"background: ' + modeColor + '; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\\\">' + modeText + '</span>'; /* _extSourcesPillStyle */\", 1)\n"
-    "    c=c.replace(\"html += ' ' + statusText + ' ';\", \"html += '<span style=\\\"background: ' + statusColor + '; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\\\">' + statusText + '</span>';\", 1)\n"
+    "s=c.find('function loadExternalSources()')\n"
+    "if s==-1: raise SystemExit(0)\n"
+    "e=c.find('\\n        function ', s+1)\n"
+    "if e==-1: e=c.find('\\nfunction ', s+1)\n"
+    "if e==-1: e=len(c)\n"
+    "b=c[s:e]\n"
+    "if 'padding: 4px 10px' in b and \"modeColor\" in b and \"background:\" in b: raise SystemExit(0)\n"
+    "if \"html += ' ' + modeText + ' ';\" in b:\n"
+    "    b=b.replace(\"html += ' ' + modeText + ' ';\", \"html += '<span style=\\\"background: ' + modeColor + '; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\\\">' + modeText + '</span>'; /* _extSourcesPillStyle */\", 1)\n"
+    "    b=b.replace(\"html += ' ' + statusText + ' ';\", \"html += '<span style=\\\"background: ' + statusColor + '; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\\\">' + statusText + '</span>';\", 1)\n"
     "else:\n"
     "    old_m='style=\"color: \\' + modeColor + \\'; font-weight: bold;\"'\n"
     "    new_m='style=\"background: \\' + modeColor + \\'; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\" /* _extSourcesPillStyle */'\n"
     "    old_s='style=\"color: \\' + statusColor + \\'; font-weight: bold;\"'\n"
     "    new_s='style=\"background: \\' + statusColor + \\'; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\"'\n"
-    "    if old_m not in c: raise SystemExit(0)\n"
-    "    c=c.replace(old_m, new_m, 1).replace(old_s, new_s, 1)\n"
+    "    if old_m not in b: raise SystemExit(0)\n"
+    "    b=b.replace(old_m, new_m, 1).replace(old_s, new_s, 1)\n"
+    "c=c[:s]+b+c[e:]\n"
     "with open(f,'w') as h: h.write(c)\n"
 )
 # Normalize External Sources DOM after render: keep exactly one badge in Name and one link button in URL.
@@ -573,8 +601,14 @@ MEDIAMTX_REMOTE_EXT_DOM_NORMALIZE_SCRIPT = (
     "f='/opt/mediamtx-webeditor/mediamtx_config_editor.py'\n"
     "with open(f) as h: c=h.read()\n"
     "if '_extSourcesDomNormalize' in c: raise SystemExit(0)\n"
+    "s=c.find('function loadExternalSources()')\n"
+    "if s==-1: raise SystemExit(0)\n"
+    "e=c.find('\\n        function ', s+1)\n"
+    "if e==-1: e=c.find('\\nfunction ', s+1)\n"
+    "if e==-1: e=len(c)\n"
+    "b=c[s:e]\n"
     "hook='container.innerHTML = html;'\n"
-    "if hook not in c: raise SystemExit(0)\n"
+    "if hook not in b: raise SystemExit(0)\n"
     "ins = \"container.innerHTML = html;\\n\"\n"
     "ins += \"                    /* _extSourcesDomNormalize */\\n\"\n"
     "ins += \"                    try {\\n\"\n"
@@ -598,7 +632,8 @@ MEDIAMTX_REMOTE_EXT_DOM_NORMALIZE_SCRIPT = (
     "ins += \"                            }\\n\"\n"
     "ins += \"                        });\\n\"\n"
     "ins += \"                    } catch(e) {}\\n\"\n"
-    "c=c.replace(hook, ins, 1)\n"
+    "b=b.replace(hook, ins, 1)\n"
+    "c=c[:s]+b+c[e:]\n"
     "with open(f,'w') as h: h.write(c)\n"
 )
 # Node-RED official icons (https://nodered.org/about/resources/media/)
@@ -4860,127 +4895,143 @@ def _mediamtx_editor_endpoint_patch(src):
     return ''.join(lines) if changed else src
 
 
+def _mtx_patch_within_load_external_sources(src, patcher):
+    start = src.find('function loadExternalSources()')
+    if start == -1:
+        return src
+    end = src.find('\n        function ', start + 1)
+    if end == -1:
+        end = src.find('\nfunction ', start + 1)
+    if end == -1:
+        end = len(src)
+    block = src[start:end]
+    new_block = patcher(block)
+    if new_block == block:
+        return src
+    return src[:start] + new_block + src[end:]
+
+
 def _mediamtx_editor_external_sources_clear_patch(src):
-    """Insert container.innerHTML = '' right after getElementById('external-sources-list')
-    so the External Sources list is cleared before each fill; avoids duplicate rows when load runs twice."""
-    lines = src.splitlines(keepends=True)
-    for i, line in enumerate(lines):
-        if 'external-sources-list' in line and 'getElementById' in line and 'container' in line:
-            if i + 1 < len(lines) and "innerHTML = ''" in lines[i + 1] and 'container' in lines[i + 1]:
-                return src  # already patched
-            indent = line[: len(line) - len(line.lstrip())]
-            lines.insert(i + 1, indent + "container.innerHTML = '';\n")
-            return ''.join(lines)
-    return src
+    """Clear external-sources container before fill; scoped to loadExternalSources only."""
+    def _patch(block):
+        lines = block.splitlines(keepends=True)
+        for i, line in enumerate(lines):
+            if 'external-sources-list' in line and 'getElementById' in line and 'container' in line:
+                if i + 1 < len(lines) and "innerHTML = ''" in lines[i + 1]:
+                    return block
+                indent = line[: len(line) - len(line.lstrip())]
+                lines.insert(i + 1, indent + "container.innerHTML = '';\n")
+                return ''.join(lines)
+        return block
+    return _mtx_patch_within_load_external_sources(src, _patch)
 
 
 def _mediamtx_editor_external_sources_single_container_patch(src):
-    """Use first #external-sources-list only and hide duplicates; fixes messed-up layout when HTML has duplicate ids."""
+    """Use first #external-sources-list only and hide duplicates; scoped to loadExternalSources only."""
     if '_extListAll' in src:
-        return src  # already patched
-    lines = src.splitlines(keepends=True)
-    for i, line in enumerate(lines):
-        if "getElementById('external-sources-list')" in line and 'container' in line and 'const' in line:
-            indent = line[: len(line) - len(line.lstrip())]
-            lines[i] = (
-                indent + "var _extListAll = document.querySelectorAll('[id=\"external-sources-list\"]');\n"
-                + indent + "if (_extListAll.length > 1) { for (var _i = 1; _i < _extListAll.length; _i++) _extListAll[_i].style.display = 'none'; }\n"
-                + indent + "const container = _extListAll[0];\n"
-            )
-            return ''.join(lines)
-    return src
+        return src
+    def _patch(block):
+        lines = block.splitlines(keepends=True)
+        for i, line in enumerate(lines):
+            if "getElementById('external-sources-list')" in line and 'container' in line and 'const' in line:
+                indent = line[: len(line) - len(line.lstrip())]
+                lines[i] = (
+                    indent + "var _extListAll = document.querySelectorAll('[id=\"external-sources-list\"]');\n"
+                    + indent + "if (_extListAll.length > 1) { for (var _i = 1; _i < _extListAll.length; _i++) _extListAll[_i].style.display = 'none'; }\n"
+                    + indent + "const container = _extListAll[0];\n"
+                )
+                return ''.join(lines)
+        return block
+    return _mtx_patch_within_load_external_sources(src, _patch)
 
 
 def _mediamtx_editor_external_sources_dom_normalize_patch(src):
-    """After rendering External Sources table, normalize each row to one badge in Name and one link button in URL."""
-    marker = '_extSourcesDomNormalize'
-    if marker in src:
+    """Normalize rows after render: keep one badge in Name and one copy/share button in URL; scoped to loadExternalSources."""
+    if '_extSourcesDomNormalize' in src:
         return src
-    hook = "container.innerHTML = html;"
-    if hook not in src:
-        return src
-    normalize_js = (
-        "container.innerHTML = html;\n"
-        "                    /* _extSourcesDomNormalize */\n"
-        "                    try {\n"
-        "                        const rows = container.querySelectorAll('tbody tr');\n"
-        "                        rows.forEach(row => {\n"
-        "                            const tds = row.querySelectorAll('td');\n"
-        "                            if (!tds || tds.length < 2) return;\n"
-        "                            const nameCell = tds[0];\n"
-        "                            const urlCell = tds[1];\n"
-        "                            const badges = row.querySelectorAll('.share-mode-badge-ext');\n"
-        "                            if (badges.length) {\n"
-        "                                const keepBadge = badges[0];\n"
-        "                                if (keepBadge.parentElement !== nameCell) nameCell.appendChild(keepBadge);\n"
-        "                                badges.forEach((b, i) => { if (i > 0) b.remove(); });\n"
-        "                            }\n"
-        "                            const links = row.querySelectorAll('.external-copy-link-btn');\n"
-        "                            if (links.length) {\n"
-        "                                const keepLink = links[0];\n"
-        "                                if (keepLink.parentElement !== urlCell) urlCell.appendChild(keepLink);\n"
-        "                                links.forEach((b, i) => { if (i > 0) b.remove(); });\n"
-        "                            }\n"
-        "                        });\n"
-        "                    } catch(e) {}\n"
-    )
-    return src.replace(hook, normalize_js, 1)
+    def _patch(block):
+        hook = "container.innerHTML = html;"
+        if hook not in block:
+            return block
+        normalize_js = (
+            "container.innerHTML = html;\n"
+            "                    /* _extSourcesDomNormalize */\n"
+            "                    try {\n"
+            "                        const rows = container.querySelectorAll('tbody tr');\n"
+            "                        rows.forEach(row => {\n"
+            "                            const tds = row.querySelectorAll('td');\n"
+            "                            if (!tds || tds.length < 2) return;\n"
+            "                            const nameCell = tds[0];\n"
+            "                            const urlCell = tds[1];\n"
+            "                            const badges = row.querySelectorAll('.share-mode-badge-ext');\n"
+            "                            if (badges.length) {\n"
+            "                                const keepBadge = badges[0];\n"
+            "                                if (keepBadge.parentElement !== nameCell) nameCell.appendChild(keepBadge);\n"
+            "                                badges.forEach((b, i) => { if (i > 0) b.remove(); });\n"
+            "                            }\n"
+            "                            const links = row.querySelectorAll('.external-copy-link-btn');\n"
+            "                            if (links.length) {\n"
+            "                                const keepLink = links[0];\n"
+            "                                if (keepLink.parentElement !== urlCell) urlCell.appendChild(keepLink);\n"
+            "                                links.forEach((b, i) => { if (i > 0) b.remove(); });\n"
+            "                            }\n"
+            "                        });\n"
+            "                    } catch(e) {}\n"
+        )
+        return block.replace(hook, normalize_js, 1)
+    return _mtx_patch_within_load_external_sources(src, _patch)
 
 
 def _mediamtx_editor_external_sources_pill_style_patch(src):
-    """Make Mode/Status use pill styling (background badge). Works for any editor format: plain text or color-only span."""
+    """Mode/Status pills in external sources rows; scoped to loadExternalSources."""
     import re
-    if '_extSourcesPillStyle' in src or (re.search(r"background:\s*'\s*\+\s*modeColor", src) and "padding: 4px 10px" in src):
-        return src  # already patched
-    pill_css = "background: ' + {var} + '; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;"
-    out = src
-    # Format A: upstream raw html += ' ' + modeText + ' ';
-    if "html += ' ' + modeText + ' ';" in src:
-        out = out.replace("html += ' ' + modeText + ' ';", "html += '<span style=\"" + pill_css.format(var="modeColor") + "\">' + modeText + '</span>'; /* _extSourcesPillStyle */", 1)
-        out = out.replace("html += ' ' + statusText + ' ';", "html += '<span style=\"" + pill_css.format(var="statusColor") + "\">' + statusText + '</span>';", 1)
+    if '_extSourcesPillStyle' in src:
+        return src
+    def _patch(block):
+        pill_css = "background: ' + {var} + '; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;"
+        out = block
+        if "html += ' ' + modeText + ' ';" in out:
+            out = out.replace("html += ' ' + modeText + ' ';", "html += '<span style=\"" + pill_css.format(var="modeColor") + "\">' + modeText + '</span>'; /* _extSourcesPillStyle */", 1)
+            out = out.replace("html += ' ' + statusText + ' ';", "html += '<span style=\"" + pill_css.format(var="statusColor") + "\">' + statusText + '</span>';", 1)
+            return out
+        for var, marker in (("modeColor", " /* _extSourcesPillStyle */"), ("statusColor", "")):
+            pattern = re.compile(
+                r"style=\"color:\s*'\s*\+\s*" + re.escape(var) + r"\s*\+\s*';\s*font-weight:\s*bold;\"",
+                re.IGNORECASE,
+            )
+            out = pattern.sub("style=\"" + pill_css.format(var=var) + "\"" + marker, out, count=1)
         return out
-    # Format B: any span that uses only color (not background) for modeColor/statusColor -> upgrade to pill
-    # Match style="...color: ' + modeColor + '..." (allow optional spaces/quoting)
-    for var, marker in (("modeColor", " /* _extSourcesPillStyle */"), ("statusColor", "")):
-        pattern = re.compile(
-            r"style=\"color:\s*'\s*\+\s*" + re.escape(var) + r"\s*\+\s*';\s*font-weight:\s*bold;\"",
-            re.IGNORECASE,
-        )
-        repl = "style=\"" + pill_css.format(var=var) + "\"" + marker
-        new_out = pattern.sub(repl, out, count=1)
-        if new_out != out:
-            out = new_out
-    return out
+    return _mtx_patch_within_load_external_sources(src, _patch)
 
 
 def _mediamtx_editor_external_sources_lock_patch(src):
-    """Add re-entry lock to loadExternalSources so 5s refresh cannot overlap and cause messed-up layout."""
+    """Guard against overlapping 5s refresh; scoped to loadExternalSources."""
     if '_loadExtSrcLock' in src:
-        return src  # already patched
-    lines = src.splitlines(keepends=True)
-    # Insert lock at start of .then callback (right before "const container = document.getElementById('external-sources-list')")
-    for i, line in enumerate(lines):
-        if 'external-sources-list' in line and 'getElementById' in line and 'container' in line:
-            indent = line[: len(line) - len(line.lstrip())]
-            lines.insert(i, indent + "if (window._loadExtSrcLock) return;\n")
-            lines.insert(i + 1, indent + "window._loadExtSrcLock = true;\n")
-            break
-    else:
         return src
-    # Add .finally(() => { window._loadExtSrcLock = false; }) after the .catch for loadExternalSources
-    for i, line in enumerate(lines):
-        if 'Error loading sources:' in line and 'external-sources-list' in line and 'innerHTML' in line:
-            # Next line is typically "                });" - we need "                }).finally(function(){window._loadExtSrcLock=false;});"
-            j = i + 1
-            while j < len(lines) and j <= i + 3:
-                stripped = lines[j].rstrip()
-                if stripped.endswith('});') and not stripped.rstrip(');').endswith('false'):
-                    indent = lines[j][: len(lines[j]) - len(lines[j].lstrip())]
-                    lines[j] = indent + "}).finally(function(){window._loadExtSrcLock=false;});\n"
-                    return ''.join(lines)
-                j += 1
-            break
-    return ''.join(lines)
+    def _patch(block):
+        lines = block.splitlines(keepends=True)
+        inserted = False
+        for i, line in enumerate(lines):
+            if 'external-sources-list' in line and 'getElementById' in line and 'container' in line:
+                indent = line[: len(line) - len(line.lstrip())]
+                lines.insert(i, indent + "if (window._loadExtSrcLock) return;\n")
+                lines.insert(i + 1, indent + "window._loadExtSrcLock = true;\n")
+                inserted = True
+                break
+        if not inserted:
+            return block
+        for i, line in enumerate(lines):
+            if 'Error loading sources:' in line and 'external-sources-list' in line and 'innerHTML' in line:
+                j = i + 1
+                while j < len(lines) and j <= i + 4:
+                    if lines[j].rstrip().endswith('});'):
+                        indent = lines[j][: len(lines[j]) - len(lines[j].lstrip())]
+                        lines[j] = indent + "}).finally(function(){window._loadExtSrcLock=false;});\n"
+                        return ''.join(lines)
+                    j += 1
+                break
+        return ''.join(lines)
+    return _mtx_patch_within_load_external_sources(src, _patch)
 
 
 def _get_mediamtx_upstream(settings):
