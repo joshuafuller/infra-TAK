@@ -466,23 +466,18 @@ MEDIAMTX_REMOTE_EXT_SINGLE_CONTAINER_SCRIPT = (
     "        break\n"
     "with open(f,'w') as h: h.writelines(lines)\n"
 )
-# Pill style for non-SRT Mode and Status in external sources table (core sets modeColor/statusColor but doesn't use them)
+# Pill style for non-SRT Mode and Status (exact string replace so no line-format dependency)
 MEDIAMTX_REMOTE_EXT_PILL_STYLE_SCRIPT = (
     "f='/opt/mediamtx-webeditor/mediamtx_config_editor.py'\n"
     "with open(f) as h: c=h.read()\n"
     "if '_extSourcesPillStyle' in c: raise SystemExit(0)\n"
-    "lines=c.splitlines(keepends=True)\n"
-    "for i, L in enumerate(lines):\n"
-    "    if 'modeText' in L and 'html +=' in L and 'modeColor' not in L and '<span' not in L:\n"
-    "        indent=L[:len(L)-len(L.lstrip())]\n"
-    "        lines[i]=indent+\"html += '<span style=\\\"background: ' + modeColor + '; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\\\">' + modeText + '</span>'; /* _extSourcesPillStyle */\\n\"\n"
-    "        break\n"
-    "for i, L in enumerate(lines):\n"
-    "    if 'statusText' in L and 'html +=' in L and 'statusColor' not in L and '<span' not in L and 'source.status' not in L and 'getElementById' not in L:\n"
-    "        indent=L[:len(L)-len(L.lstrip())]\n"
-    "        lines[i]=indent+\"html += '<span style=\\\"background: ' + statusColor + '; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\\\">' + statusText + '</span>';\\n\"\n"
-    "        break\n"
-    "with open(f,'w') as h: h.writelines(lines)\n"
+    "mode_old=\"html += ' ' + modeText + ' ';\"\n"
+    "mode_new=\"html += '<span style=\\\"background: ' + modeColor + '; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\\\">' + modeText + '</span>'; /* _extSourcesPillStyle */\"\n"
+    "status_old=\"html += ' ' + statusText + ' ';\"\n"
+    "status_new=\"html += '<span style=\\\"background: ' + statusColor + '; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\\\">' + statusText + '</span>';\"\n"
+    "if mode_old not in c: raise SystemExit(0)\n"
+    "c=c.replace(mode_old, mode_new, 1).replace(status_old, status_new, 1)\n"
+    "with open(f,'w') as h: h.write(c)\n"
 )
 # Node-RED official icons (https://nodered.org/about/resources/media/)
 NODERED_LOGO_URL = "https://nodered.org/about/resources/media/node-red-icon.png"       # icon only (e.g. small nav)
@@ -4778,20 +4773,14 @@ def _mediamtx_editor_external_sources_pill_style_patch(src):
     """Core sets modeColor/statusColor but never uses them for non-SRT Mode and Status; add pill spans so all rows match SRT styling."""
     if '_extSourcesPillStyle' in src:
         return src  # already patched
-    lines = src.splitlines(keepends=True)
-    for i, line in enumerate(lines):
-        # Non-SRT Mode: replace plain "html += ' ' + modeText + ' ';" with pill span
-        if "modeText" in line and "html +=" in line and "modeColor" not in line and "<span" not in line:
-            indent = line[: len(line) - len(line.lstrip())]
-            lines[i] = indent + "html += '<span style=\"background: ' + modeColor + '; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\">' + modeText + '</span>'; /* _extSourcesPillStyle */\n"
-            break
-    for i, line in enumerate(lines):
-        # Status: replace plain "html += ' ' + statusText + ' ';" with pill span (external sources table only)
-        if "statusText" in line and "html +=" in line and "statusColor" not in line and "<span" not in line and "source.status" not in line and "getElementById" not in line:
-            indent = line[: len(line) - len(line.lstrip())]
-            lines[i] = indent + "html += '<span style=\"background: ' + statusColor + '; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\">' + statusText + '</span>';\n"
-            break
-    return ''.join(lines)
+    mode_old = "html += ' ' + modeText + ' ';"
+    mode_new = "html += '<span style=\"background: ' + modeColor + '; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\">' + modeText + '</span>'; /* _extSourcesPillStyle */"
+    status_old = "html += ' ' + statusText + ' ';"
+    status_new = "html += '<span style=\"background: ' + statusColor + '; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\">' + statusText + '</span>';"
+    if mode_old not in src:
+        return src
+    out = src.replace(mode_old, mode_new, 1).replace(status_old, status_new, 1)
+    return out
 
 
 def _mediamtx_editor_external_sources_lock_patch(src):
