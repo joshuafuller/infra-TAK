@@ -466,6 +466,24 @@ MEDIAMTX_REMOTE_EXT_SINGLE_CONTAINER_SCRIPT = (
     "        break\n"
     "with open(f,'w') as h: h.writelines(lines)\n"
 )
+# Pill style for non-SRT Mode and Status in external sources table (core sets modeColor/statusColor but doesn't use them)
+MEDIAMTX_REMOTE_EXT_PILL_STYLE_SCRIPT = (
+    "f='/opt/mediamtx-webeditor/mediamtx_config_editor.py'\n"
+    "with open(f) as h: c=h.read()\n"
+    "if '_extSourcesPillStyle' in c: raise SystemExit(0)\n"
+    "lines=c.splitlines(keepends=True)\n"
+    "for i, L in enumerate(lines):\n"
+    "    if 'modeText' in L and 'html +=' in L and 'modeColor' not in L and '<span' not in L:\n"
+    "        indent=L[:len(L)-len(L.lstrip())]\n"
+    "        lines[i]=indent+\"html += '<span style=\\\"background: ' + modeColor + '; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\\\">' + modeText + '</span>'; /* _extSourcesPillStyle */\\n\"\n"
+    "        break\n"
+    "for i, L in enumerate(lines):\n"
+    "    if 'statusText' in L and 'html +=' in L and 'statusColor' not in L and '<span' not in L and 'source.status' not in L and 'getElementById' not in L:\n"
+    "        indent=L[:len(L)-len(L.lstrip())]\n"
+    "        lines[i]=indent+\"html += '<span style=\\\"background: ' + statusColor + '; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\\\">' + statusText + '</span>';\\n\"\n"
+    "        break\n"
+    "with open(f,'w') as h: h.writelines(lines)\n"
+)
 # Node-RED official icons (https://nodered.org/about/resources/media/)
 NODERED_LOGO_URL = "https://nodered.org/about/resources/media/node-red-icon.png"       # icon only (e.g. small nav)
 NODERED_LOGO_URL_2 = "https://nodered.org/about/resources/media/node-red-icon-2.png"   # icon + "Node-RED" text (card, sidebar)
@@ -4756,6 +4774,26 @@ def _mediamtx_editor_external_sources_single_container_patch(src):
     return src
 
 
+def _mediamtx_editor_external_sources_pill_style_patch(src):
+    """Core sets modeColor/statusColor but never uses them for non-SRT Mode and Status; add pill spans so all rows match SRT styling."""
+    if '_extSourcesPillStyle' in src:
+        return src  # already patched
+    lines = src.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        # Non-SRT Mode: replace plain "html += ' ' + modeText + ' ';" with pill span
+        if "modeText" in line and "html +=" in line and "modeColor" not in line and "<span" not in line:
+            indent = line[: len(line) - len(line.lstrip())]
+            lines[i] = indent + "html += '<span style=\"background: ' + modeColor + '; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\">' + modeText + '</span>'; /* _extSourcesPillStyle */\n"
+            break
+    for i, line in enumerate(lines):
+        # Status: replace plain "html += ' ' + statusText + ' ';" with pill span (external sources table only)
+        if "statusText" in line and "html +=" in line and "statusColor" not in line and "<span" not in line and "source.status" not in line and "getElementById" not in line:
+            indent = line[: len(line) - len(line.lstrip())]
+            lines[i] = indent + "html += '<span style=\"background: ' + statusColor + '; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\">' + statusText + '</span>';\n"
+            break
+    return ''.join(lines)
+
+
 def _mediamtx_editor_external_sources_lock_patch(src):
     """Add re-entry lock to loadExternalSources so 5s refresh cannot overlap and cause messed-up layout."""
     if '_loadExtSrcLock' in src:
@@ -7320,6 +7358,7 @@ def mediamtx_recovery():
                 ('mtx_ext_clear_patch', MEDIAMTX_REMOTE_EXT_CLEAR_SCRIPT),
                 ('mtx_ext_lock_patch', MEDIAMTX_REMOTE_EXT_LOCK_SCRIPT),
                 ('mtx_ext_single_container', MEDIAMTX_REMOTE_EXT_SINGLE_CONTAINER_SCRIPT),
+                ('mtx_ext_pill_style', MEDIAMTX_REMOTE_EXT_PILL_STYLE_SCRIPT),
             ]:
                 with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as pf:
                     pf.write(script)
@@ -7339,6 +7378,7 @@ def mediamtx_recovery():
                 src = _mediamtx_editor_external_sources_clear_patch(src)
                 src = _mediamtx_editor_external_sources_lock_patch(src)
                 src = _mediamtx_editor_external_sources_single_container_patch(src)
+                src = _mediamtx_editor_external_sources_pill_style_patch(src)
                 with open(editor_path, 'w') as f:
                     f.write(src)
         tmp_f = tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False)
@@ -7715,6 +7755,15 @@ paths:
                 except Exception:
                     pass
                 plog("✓ External Sources single-container patch applied")
+                with open('/tmp/mtx_ext_pill_style.py', 'w') as pf:
+                    pf.write(MEDIAMTX_REMOTE_EXT_PILL_STYLE_SCRIPT)
+                _module_copy(deploy_cfg, '/tmp/mtx_ext_pill_style.py', '/tmp/mtx_ext_pill_style.py', log_fn=plog)
+                _module_run(deploy_cfg, 'python3 /tmp/mtx_ext_pill_style.py 2>/dev/null; rm -f /tmp/mtx_ext_pill_style.py', timeout=10)
+                try:
+                    os.remove('/tmp/mtx_ext_pill_style.py')
+                except Exception:
+                    pass
+                plog("✓ External Sources pill style (Mode/Status) patch applied")
             else:
                 plog("⚠ Failed to copy LDAP overlay to remote")
         else:
@@ -8245,6 +8294,11 @@ WantedBy=multi-user.target
                             with open(_editor_path, 'w') as ef:
                                 ef.write(patched4)
                             plog("✓ External Sources single-container patch applied")
+                        patched5 = _mediamtx_editor_external_sources_pill_style_patch(patched4)
+                        if patched5 != patched4:
+                            with open(_editor_path, 'w') as ef:
+                                ef.write(patched5)
+                            plog("✓ External Sources pill style (Mode/Status) patch applied")
                 except Exception:
                     pass
             # Deploy Ku-band simulator scripts so "Simulate link" in the editor works (Web Editor v1.1.8+)
