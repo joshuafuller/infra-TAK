@@ -2790,7 +2790,7 @@ def guarddog_page():
         {'id': 'mediamtx', 'name': 'MediaMTX', 'monitored': modules.get('mediamtx', {}).get('installed'), 'monitors': [{'name': 'Service', 'id': 'mediamtx_svc', 'interval': '1 min', 'desc': 'Checks systemd mediamtx. Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'nodered', 'name': 'Node-RED', 'monitored': modules.get('nodered', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'id': 'nodered_http', 'interval': '1 min', 'desc': 'Checks Node-RED HTTP (1880). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'cloudtak', 'name': 'CloudTAK', 'monitored': modules.get('cloudtak', {}).get('installed'), 'monitors': [{'name': 'Container', 'id': 'cloudtak_ctr', 'interval': '1 min', 'desc': 'Checks CloudTAK container. Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
-        {'id': 'updates', 'name': 'Updates', 'monitored': gd.get('installed'), 'monitors': [{'name': 'Update check', 'id': 'updates_check', 'interval': '6 h', 'desc': 'Checks for newer versions of infra-TAK, Authentik, MediaMTX, CloudTAK, and TAK Portal (same sources as the console update icons). Sends one email when any update is available (or when the set of available updates changes). Uses same alert email as other monitors.'}]},
+        {'id': 'updates', 'name': 'Updates', 'monitored': gd.get('installed'), 'monitors': [{'name': 'Update check', 'id': 'updates_check', 'interval': '6 h', 'desc': 'Checks for newer versions of infra-TAK, Authentik, MediaMTX, CloudTAK, and TAK Portal (same sources as the console update icons). Sends one email when any update is available (or when the set of available updates changes). Uses same alert email as other monitors. If this monitor is red or missing, click Update Guard Dog above to reinstall/update timers and scripts.'}]},
     ])
     guarddog_docs_url = f'https://github.com/{GITHUB_REPO}/blob/main/docs/GUARDDOG.md'
     notifications_configured = bool((settings.get('guarddog_alert_email') or '').strip())
@@ -3473,7 +3473,39 @@ def guarddog_update():
         return jsonify({'success': False, 'error': 'Guard Dog not installed'}), 400
     try:
         _auto_update_guarddog()
-        return jsonify({'success': True, 'message': 'Guard Dog scripts updated and timers reloaded.'})
+        # Ensure update-check units exist and are enabled.
+        # Older installs may have scripts but miss takupdatesguard.timer, which keeps Updates monitor red.
+        service_path = '/etc/systemd/system/takupdatesguard.service'
+        timer_path = '/etc/systemd/system/takupdatesguard.timer'
+        service_content = (
+            '[Unit]\n'
+            'Description=Guard Dog Updates Check (infra-TAK, Authentik, MediaMTX, CloudTAK)\n\n'
+            '[Service]\n'
+            'Type=oneshot\n'
+            'ExecStart=/opt/tak-guarddog/tak-updates-watch.sh\n'
+        )
+        timer_content = (
+            '[Unit]\n'
+            'Description=Check for updates every 6 hours\n\n'
+            '[Timer]\n'
+            'OnBootSec=30min\n'
+            'OnUnitActiveSec=6h\n'
+            'Unit=takupdatesguard.service\n\n'
+            '[Install]\n'
+            'WantedBy=timers.target\n'
+        )
+        with open(service_path, 'w') as f:
+            f.write(service_content)
+        with open(timer_path, 'w') as f:
+            f.write(timer_content)
+        subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=10)
+        re = subprocess.run(['systemctl', 'enable', '--now', 'takupdatesguard.timer'], capture_output=True, text=True, timeout=10)
+        if re.returncode != 0:
+            err = (re.stderr or re.stdout or '').strip() or 'could not enable takupdatesguard.timer'
+            return jsonify({'success': False, 'error': err}), 500
+        # Refresh Guard Dog monitor cache so UI flips without waiting for background refresh.
+        _guarddog_refresh_page_cache()
+        return jsonify({'success': True, 'message': 'Guard Dog scripts updated, updates timer reinstalled, and timers reloaded.'})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)[:300]}), 500
 
@@ -7466,7 +7498,7 @@ MEDIAMTX_EDITOR_RAW_URL = f'https://raw.githubusercontent.com/takwerx/mediamtx-i
 @app.route('/api/mediamtx/recovery', methods=['POST'])
 @login_required
 def mediamtx_recovery():
-    """Patch web editor: refresh editor from upstream, apply endpoint + external-sources clear patches, overlay script, restart."""
+    """Patch web editor: refresh editor, apply endpoint patch, sync overlay file, install prestart script, restart."""
     import tempfile
     import urllib.request
     settings = load_settings()
@@ -7522,6 +7554,20 @@ def mediamtx_recovery():
                 src = _mediamtx_editor_endpoint_patch(src)
                 with open(editor_path, 'w') as f:
                     f.write(src)
+        # 3) Always sync live overlay file from current infra-TAK repo to target.
+        # This prevents stale overlay scripts on existing installs from injecting old UI logic.
+        try:
+            overlay_src = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mediamtx_ldap_overlay.py')
+            if os.path.exists(overlay_src):
+                _module_run(deploy_cfg, 'mkdir -p /opt/mediamtx-webeditor', timeout=10)
+                _module_copy(
+                    deploy_cfg,
+                    overlay_src,
+                    '/opt/mediamtx-webeditor/mediamtx_ldap_overlay.py',
+                    timeout=20
+                )
+        except Exception:
+            pass
         tmp_f = tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False)
         tmp_f.write(MEDIAMTX_ENSURE_OVERLAY_SCRIPT)
         tmp_f.close()
@@ -12205,8 +12251,8 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 {{ sidebar_html }}
 <div class="main">
   <div class="page-header"><h1 style="display:flex;align-items:center;gap:10px"><span class="nav-icon" style="font-size:22px;line-height:1">🐕</span><span>Guard Dog</span></h1><p>TAK Server health monitoring and auto-recovery. Runs automatically after TAK Server deploy; configure notifications below.</p></div>
-  {% if gd.running %}<div class="status-banner running" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px"><div style="display:flex;align-items:center;gap:12px"><div class="dot"></div>Guard Dog is running</div><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><button type="button" class="btn btn-ghost" id="gd-update-btn" onclick="gdUpdate()" title="Re-deploy scripts and timers from latest console version">↻ Update</button><button type="button" class="btn btn-ghost" style="border-color:var(--yellow);color:var(--yellow)" onclick="gdSetEnabled(false, this)">Disable</button><button class="btn btn-ghost" style="color:var(--red);border-color:var(--red)" onclick="document.getElementById('gd-uninstall-modal').classList.add('open')">Uninstall</button><span id="gd-update-msg" style="font-size:12px"></span></div></div>
-  {% elif gd.installed %}<div class="status-banner stopped" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px"><div style="display:flex;align-items:center;gap:12px"><div class="dot"></div>Guard Dog is disabled</div><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><button type="button" class="btn btn-ghost" id="gd-update-btn" onclick="gdUpdate()">↻ Update</button><button type="button" class="btn btn-primary" onclick="gdSetEnabled(true, this)">Enable</button><button class="btn btn-ghost" style="color:var(--red);border-color:var(--red)" onclick="document.getElementById('gd-uninstall-modal').classList.add('open')">Uninstall</button><span id="gd-update-msg" style="font-size:12px"></span></div></div>
+  {% if gd.running %}<div class="status-banner running" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px"><div style="display:flex;align-items:center;gap:12px"><div class="dot"></div>Guard Dog is running</div><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><button type="button" class="btn btn-ghost" id="gd-update-btn" onclick="gdUpdate()" title="Re-deploy scripts and timers from latest console version">↻ Update Guard Dog</button><button type="button" class="btn btn-ghost" style="border-color:var(--yellow);color:var(--yellow)" onclick="gdSetEnabled(false, this)">Disable</button><button class="btn btn-ghost" style="color:var(--red);border-color:var(--red)" onclick="document.getElementById('gd-uninstall-modal').classList.add('open')">Uninstall</button><span id="gd-update-msg" style="font-size:12px"></span></div></div>
+  {% elif gd.installed %}<div class="status-banner stopped" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px"><div style="display:flex;align-items:center;gap:12px"><div class="dot"></div>Guard Dog is disabled</div><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><button type="button" class="btn btn-ghost" id="gd-update-btn" onclick="gdUpdate()">↻ Update Guard Dog</button><button type="button" class="btn btn-primary" onclick="gdSetEnabled(true, this)">Enable</button><button class="btn btn-ghost" style="color:var(--red);border-color:var(--red)" onclick="document.getElementById('gd-uninstall-modal').classList.add('open')">Uninstall</button><span id="gd-update-msg" style="font-size:12px"></span></div></div>
   {% else %}<div class="status-banner not-installed"><div class="dot"></div>Guard Dog is not installed (it will install automatically when you deploy TAK Server)</div>{% endif %}
 
   <div class="card">
