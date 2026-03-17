@@ -282,6 +282,7 @@ MEDIAMTX_LOGO_URL = "https://raw.githubusercontent.com/bluenviron/mediamtx/main/
 # MediaMTX web editor: regular repo (no LDAP); when Authentik/LDAP is installed we use LDAP branch if set
 MEDIAMTX_EDITOR_REPO = "https://github.com/takwerx/mediamtx-installer.git"
 MEDIAMTX_EDITOR_PATH = "config-editor"  # subdir containing mediamtx_config_editor.py
+MEDIAMTX_EDITOR_REF = "main"  # set to release tag (e.g. v1.1.9) for deterministic editor deploys
 MEDIAMTX_EDITOR_LDAP_BRANCH = None  # LDAP behavior comes from mediamtx_ldap_overlay.py in this repo; use repo default branch
 # Fail-safe overlay script: never exits failure so ExecStartPre cannot block the web editor from starting
 MEDIAMTX_ENSURE_OVERLAY_SCRIPT = r'''#!/usr/bin/env python3
@@ -384,6 +385,31 @@ def main():
                     j -= 1
             break
 
+    # 5. No-cache headers so browsers/proxies never serve stale editor pages
+    NO_CACHE_MARKER = '# --- infra-TAK no-cache ---'
+    if NO_CACHE_MARKER not in src:
+        snippet = (
+            "\n" + NO_CACHE_MARKER + "\n"
+            "@app.after_request\n"
+            "def _infra_tak_no_cache(response):\n"
+            "    if response.content_type and 'text/html' in response.content_type:\n"
+            "        response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'\n"
+            "        response.headers['Pragma'] = 'no-cache'\n"
+            "        response.headers['Expires'] = '0'\n"
+            "    return response\n"
+            "# --- end no-cache ---\n"
+        )
+        # Inject after the LDAP overlay block (or after app = Flask)
+        if '# --- end LDAP overlay ---' in src:
+            src = src.replace('# --- end LDAP overlay ---\n', '# --- end LDAP overlay ---\n' + snippet, 1)
+        else:
+            for ii, ll in enumerate(lines):
+                if 'app = Flask(' in ll:
+                    lines.insert(ii + 1, '\n' + snippet)
+                    src = ''.join(lines)
+                    break
+        changed = True
+
     if changed:
         with open(EDITOR, 'w') as f:
             f.write(src)
@@ -395,6 +421,160 @@ if __name__ == '__main__':
         pass
     sys.exit(0)
 '''
+# Scripts run on remote target to patch editor (endpoint + external-sources clear). Used by deploy and by "Patch web editor".
+MEDIAMTX_REMOTE_EP_PATCH_SCRIPT = (
+    "import re\n"
+    "f='/opt/mediamtx-webeditor/mediamtx_config_editor.py'\n"
+    "with open(f) as h: src=h.read()\n"
+    "lines=src.splitlines(keepends=True)\n"
+    "for (dp,rh,ev) in [(r'\\\\bdef shared_stream_page\\\\s*\\\\(',('/shared/',),'shared_stream_page_core'),(r'\\\\bdef shared_hls_proxy\\\\s*\\\\(',('/shared-hls','shared_hls'),'shared_hls_proxy_core'),(r'\\\\bdef api_share_links_list\\\\s*\\\\(',('/api/share-links','share-links'),'api_share_links_list_core'),(r'\\\\bdef api_share_links_generate\\\\s*\\\\(',('/api/share-links/generate','share-links/generate'),'api_share_links_generate_core'),(r'\\\\bdef api_share_links_revoke\\\\s*\\\\(',('/api/share-links/revoke','share-links/revoke'),'api_share_links_revoke_core')]:\n"
+    " for i in range(len(lines)-1,-1,-1):\n"
+    "  if not re.search(dp,lines[i]): continue\n"
+    "  for j in range(i-1,max(-1,i-20),-1):\n"
+    "   L=lines[j]\n"
+    "   if '@app.route' in L and 'endpoint=' not in L and any(h in L for h in rh):\n"
+    "    lines[j]=L.rstrip()[:-1]+\", endpoint='\"+ev+\"')\\n\"; break\n"
+    "  else:\n"
+    "   for j in range(i-1,max(-1,i-20),-1):\n"
+    "    if '@app.route' in lines[j] and 'endpoint=' not in lines[j]:\n"
+    "     L=lines[j]; lines[j]=L.rstrip()[:-1]+\", endpoint='\"+ev+\"')\\n\"; break\n"
+    "  break\n"
+    "with open(f,'w') as h: h.write(''.join(lines))\n"
+)
+MEDIAMTX_REMOTE_EXT_CLEAR_SCRIPT = (
+    "f='/opt/mediamtx-webeditor/mediamtx_config_editor.py'\n"
+    "with open(f) as h: c=h.read()\n"
+    "s=c.find('function loadExternalSources()')\n"
+    "if s==-1: raise SystemExit(0)\n"
+    "e=c.find('\\n        function ', s+1)\n"
+    "if e==-1: e=c.find('\\nfunction ', s+1)\n"
+    "if e==-1: e=len(c)\n"
+    "b=c[s:e]\n"
+    "line=\"const container = document.getElementById('external-sources-list');\"\n"
+    "if line not in b: raise SystemExit(0)\n"
+    "if \"container.innerHTML = '';\" in b: raise SystemExit(0)\n"
+    "b=b.replace(line, line+\"\\n                    container.innerHTML = '';\", 1)\n"
+    "c=c[:s]+b+c[e:]\n"
+    "with open(f,'w') as h: h.write(c)\n"
+)
+# Re-entry lock for loadExternalSources (avoids messed-up layout when 5s refresh overlaps)
+MEDIAMTX_REMOTE_EXT_LOCK_SCRIPT = (
+    "f='/opt/mediamtx-webeditor/mediamtx_config_editor.py'\n"
+    "with open(f) as h: content=h.read()\n"
+    "if '_loadExtSrcLock' in content:\n"
+    "    raise SystemExit(0)\n"
+    "s=content.find('function loadExternalSources()')\n"
+    "if s==-1: raise SystemExit(0)\n"
+    "e=content.find('\\n        function ', s+1)\n"
+    "if e==-1: e=content.find('\\nfunction ', s+1)\n"
+    "if e==-1: e=len(content)\n"
+    "blk=content[s:e]\n"
+    "lines=blk.splitlines(keepends=True)\n"
+    "did_finally=False\n"
+    "for i, line in enumerate(lines):\n"
+    "    if 'Error loading sources:' in line and 'external-sources-list' in line and 'innerHTML' in line:\n"
+    "        for j in range(i+1, min(i+4, len(lines))):\n"
+    "            s=lines[j].rstrip()\n"
+    "            if s.endswith('});') and 'false' not in s:\n"
+    "                ind=lines[j][:len(lines[j])-len(lines[j].lstrip())]\n"
+    "                lines[j]=ind+\").finally(function(){window._loadExtSrcLock=false;});\\n\"\n"
+    "                did_finally=True\n"
+    "                break\n"
+    "        break\n"
+    "if not did_finally:\n"
+    "    raise SystemExit(0)\n"
+    "for i, line in enumerate(lines):\n"
+    "    if 'external-sources-list' in line and 'getElementById' in line and 'container' in line:\n"
+    "        indent=line[:len(line)-len(line.lstrip())]\n"
+    "        lines.insert(i, indent+'if (window._loadExtSrcLock) return;\\n')\n"
+    "        lines.insert(i+1, indent+'window._loadExtSrcLock = true;\\n')\n"
+    "        break\n"
+    "blk=''.join(lines)\n"
+    "content=content[:s]+blk+content[e:]\n"
+    "with open(f,'w') as h: h.write(content)\n"
+)
+# Use first #external-sources-list only, hide duplicates (fixes duplicate-id layout)
+MEDIAMTX_REMOTE_EXT_SINGLE_CONTAINER_SCRIPT = (
+    "f='/opt/mediamtx-webeditor/mediamtx_config_editor.py'\n"
+    "with open(f) as h: c=h.read()\n"
+    "if '_extListAll' in c: raise SystemExit(0)\n"
+    "s=c.find('function loadExternalSources()')\n"
+    "if s==-1: raise SystemExit(0)\n"
+    "e=c.find('\\n        function ', s+1)\n"
+    "if e==-1: e=c.find('\\nfunction ', s+1)\n"
+    "if e==-1: e=len(c)\n"
+    "b=c[s:e]\n"
+    "old=\"const container = document.getElementById('external-sources-list');\"\n"
+    "if old not in b: raise SystemExit(0)\n"
+    "b=b.replace(old, \"var _extListAll = document.querySelectorAll('[id=\\\\\\\"external-sources-list\\\\\\\"]');\\n                    if (_extListAll.length > 1) { for (var _i = 1; _i < _extListAll.length; _i++) _extListAll[_i].style.display = 'none'; }\\n                    const container = _extListAll[0];\", 1)\n"
+    "c=c[:s]+b+c[e:]\n"
+    "with open(f,'w') as h: h.write(c)\n"
+)
+# Pill style: (A) plain modeText/statusText or (B) replace color-only style value with pill (flexible for all formats)
+MEDIAMTX_REMOTE_EXT_PILL_STYLE_SCRIPT = (
+    "f='/opt/mediamtx-webeditor/mediamtx_config_editor.py'\n"
+    "with open(f) as h: c=h.read()\n"
+    "if '_extSourcesPillStyle' in c: raise SystemExit(0)\n"
+    "s=c.find('function loadExternalSources()')\n"
+    "if s==-1: raise SystemExit(0)\n"
+    "e=c.find('\\n        function ', s+1)\n"
+    "if e==-1: e=c.find('\\nfunction ', s+1)\n"
+    "if e==-1: e=len(c)\n"
+    "b=c[s:e]\n"
+    "if 'padding: 4px 10px' in b and \"modeColor\" in b and \"background:\" in b: raise SystemExit(0)\n"
+    "if \"html += ' ' + modeText + ' ';\" in b:\n"
+    "    b=b.replace(\"html += ' ' + modeText + ' ';\", \"html += '<span style=\\\"background: ' + modeColor + '; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\\\">' + modeText + '</span>'; /* _extSourcesPillStyle */\", 1)\n"
+    "    b=b.replace(\"html += ' ' + statusText + ' ';\", \"html += '<span style=\\\"background: ' + statusColor + '; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\\\">' + statusText + '</span>';\", 1)\n"
+    "else:\n"
+    "    old_m='style=\"color: \\' + modeColor + \\'; font-weight: bold;\"'\n"
+    "    new_m='style=\"background: \\' + modeColor + \\'; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\" /* _extSourcesPillStyle */'\n"
+    "    old_s='style=\"color: \\' + statusColor + \\'; font-weight: bold;\"'\n"
+    "    new_s='style=\"background: \\' + statusColor + \\'; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;\"'\n"
+    "    if old_m not in b: raise SystemExit(0)\n"
+    "    b=b.replace(old_m, new_m, 1).replace(old_s, new_s, 1)\n"
+    "c=c[:s]+b+c[e:]\n"
+    "with open(f,'w') as h: h.write(c)\n"
+)
+# Normalize External Sources DOM after render: keep exactly one badge in Name and one link button in URL.
+MEDIAMTX_REMOTE_EXT_DOM_NORMALIZE_SCRIPT = (
+    "f='/opt/mediamtx-webeditor/mediamtx_config_editor.py'\n"
+    "with open(f) as h: c=h.read()\n"
+    "if '_extSourcesDomNormalize' in c: raise SystemExit(0)\n"
+    "s=c.find('function loadExternalSources()')\n"
+    "if s==-1: raise SystemExit(0)\n"
+    "e=c.find('\\n        function ', s+1)\n"
+    "if e==-1: e=c.find('\\nfunction ', s+1)\n"
+    "if e==-1: e=len(c)\n"
+    "b=c[s:e]\n"
+    "hook='container.innerHTML = html;'\n"
+    "if hook not in b: raise SystemExit(0)\n"
+    "ins = \"container.innerHTML = html;\\n\"\n"
+    "ins += \"                    /* _extSourcesDomNormalize */\\n\"\n"
+    "ins += \"                    try {\\n\"\n"
+    "ins += \"                        const rows = container.querySelectorAll('tbody tr');\\n\"\n"
+    "ins += \"                        rows.forEach(row => {\\n\"\n"
+    "ins += \"                            const tds = row.querySelectorAll('td');\\n\"\n"
+    "ins += \"                            if (!tds || tds.length < 2) return;\\n\"\n"
+    "ins += \"                            const nameCell = tds[0];\\n\"\n"
+    "ins += \"                            const urlCell = tds[1];\\n\"\n"
+    "ins += \"                            const badges = row.querySelectorAll('.share-mode-badge-ext');\\n\"\n"
+    "ins += \"                            if (badges.length) {\\n\"\n"
+    "ins += \"                                const keepBadge = badges[0];\\n\"\n"
+    "ins += \"                                if (keepBadge.parentElement !== nameCell) nameCell.appendChild(keepBadge);\\n\"\n"
+    "ins += \"                                badges.forEach((b, i) => { if (i > 0) b.remove(); });\\n\"\n"
+    "ins += \"                            }\\n\"\n"
+    "ins += \"                            const links = row.querySelectorAll('.external-copy-link-btn');\\n\"\n"
+    "ins += \"                            if (links.length) {\\n\"\n"
+    "ins += \"                                const keepLink = links[0];\\n\"\n"
+    "ins += \"                                if (keepLink.parentElement !== urlCell) urlCell.appendChild(keepLink);\\n\"\n"
+    "ins += \"                                links.forEach((b, i) => { if (i > 0) b.remove(); });\\n\"\n"
+    "ins += \"                            }\\n\"\n"
+    "ins += \"                        });\\n\"\n"
+    "ins += \"                    } catch(e) {}\\n\"\n"
+    "b=b.replace(hook, ins, 1)\n"
+    "c=c[:s]+b+c[e:]\n"
+    "with open(f,'w') as h: h.write(c)\n"
+)
 # Node-RED official icons (https://nodered.org/about/resources/media/)
 NODERED_LOGO_URL = "https://nodered.org/about/resources/media/node-red-icon.png"       # icon only (e.g. small nav)
 NODERED_LOGO_URL_2 = "https://nodered.org/about/resources/media/node-red-icon-2.png"   # icon + "Node-RED" text (card, sidebar)
@@ -2610,7 +2790,7 @@ def guarddog_page():
         {'id': 'mediamtx', 'name': 'MediaMTX', 'monitored': modules.get('mediamtx', {}).get('installed'), 'monitors': [{'name': 'Service', 'id': 'mediamtx_svc', 'interval': '1 min', 'desc': 'Checks systemd mediamtx. Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'nodered', 'name': 'Node-RED', 'monitored': modules.get('nodered', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'id': 'nodered_http', 'interval': '1 min', 'desc': 'Checks Node-RED HTTP (1880). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'cloudtak', 'name': 'CloudTAK', 'monitored': modules.get('cloudtak', {}).get('installed'), 'monitors': [{'name': 'Container', 'id': 'cloudtak_ctr', 'interval': '1 min', 'desc': 'Checks CloudTAK container. Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
-        {'id': 'updates', 'name': 'Updates', 'monitored': gd.get('installed'), 'monitors': [{'name': 'Update check', 'id': 'updates_check', 'interval': '6 h', 'desc': 'Checks for newer versions of infra-TAK, Authentik, MediaMTX, CloudTAK, and TAK Portal (same sources as the console update icons). Sends one email when any update is available (or when the set of available updates changes). Uses same alert email as other monitors.'}]},
+        {'id': 'updates', 'name': 'Updates', 'monitored': gd.get('installed'), 'monitors': [{'name': 'Update check', 'id': 'updates_check', 'interval': '6 h', 'desc': 'Checks for newer versions of infra-TAK, Authentik, MediaMTX, CloudTAK, and TAK Portal (same sources as the console update icons). Sends one email when any update is available (or when the set of available updates changes). Uses same alert email as other monitors. If this monitor is red or missing, click Update Guard Dog above to reinstall/update timers and scripts.'}]},
     ])
     guarddog_docs_url = f'https://github.com/{GITHUB_REPO}/blob/main/docs/GUARDDOG.md'
     notifications_configured = bool((settings.get('guarddog_alert_email') or '').strip())
@@ -2838,6 +3018,7 @@ def _guarddog_service_monitor_ids(settings):
         'mediamtx': ['mediamtx_svc'],
         'nodered': ['nodered_http'],
         'cloudtak': ['cloudtak_ctr'],
+        'updates': ['updates_check'],
     }
     return multi
 
@@ -2860,6 +3041,8 @@ def _guarddog_monitored_service_ids(settings):
         ids.append('nodered')
     if modules.get('cloudtak', {}).get('installed'):
         ids.append('cloudtak')
+    if modules.get('guarddog', {}).get('installed'):
+        ids.append('updates')
     return ids
 
 
@@ -3167,6 +3350,10 @@ def _monitor_health_check(monitor_id):
                 return bool(ok and out and 'Up' in out)
             r = subprocess.run('docker ps --filter name=cloudtak-api --format "{{.Status}}"', shell=True, capture_output=True, text=True, timeout=5)
             return bool(r.stdout and 'Up' in r.stdout)
+        if monitor_id == 'updates_check':
+            # Updates monitor: green when the 6h timer is enabled (script will run and email on change)
+            r = subprocess.run(['systemctl', 'is-enabled', 'takupdatesguard.timer'], capture_output=True, text=True, timeout=3)
+            return r.returncode == 0 and (r.stdout or '').strip() == 'enabled'
     except Exception:
         return False
     return None
@@ -3286,7 +3473,39 @@ def guarddog_update():
         return jsonify({'success': False, 'error': 'Guard Dog not installed'}), 400
     try:
         _auto_update_guarddog()
-        return jsonify({'success': True, 'message': 'Guard Dog scripts updated and timers reloaded.'})
+        # Ensure update-check units exist and are enabled.
+        # Older installs may have scripts but miss takupdatesguard.timer, which keeps Updates monitor red.
+        service_path = '/etc/systemd/system/takupdatesguard.service'
+        timer_path = '/etc/systemd/system/takupdatesguard.timer'
+        service_content = (
+            '[Unit]\n'
+            'Description=Guard Dog Updates Check (infra-TAK, Authentik, MediaMTX, CloudTAK)\n\n'
+            '[Service]\n'
+            'Type=oneshot\n'
+            'ExecStart=/opt/tak-guarddog/tak-updates-watch.sh\n'
+        )
+        timer_content = (
+            '[Unit]\n'
+            'Description=Check for updates every 6 hours\n\n'
+            '[Timer]\n'
+            'OnBootSec=30min\n'
+            'OnUnitActiveSec=6h\n'
+            'Unit=takupdatesguard.service\n\n'
+            '[Install]\n'
+            'WantedBy=timers.target\n'
+        )
+        with open(service_path, 'w') as f:
+            f.write(service_content)
+        with open(timer_path, 'w') as f:
+            f.write(timer_content)
+        subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=10)
+        re = subprocess.run(['systemctl', 'enable', '--now', 'takupdatesguard.timer'], capture_output=True, text=True, timeout=10)
+        if re.returncode != 0:
+            err = (re.stderr or re.stdout or '').strip() or 'could not enable takupdatesguard.timer'
+            return jsonify({'success': False, 'error': err}), 500
+        # Refresh Guard Dog monitor cache so UI flips without waiting for background refresh.
+        _guarddog_refresh_page_cache()
+        return jsonify({'success': True, 'message': 'Guard Dog scripts updated, updates timer reinstalled, and timers reloaded.'})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)[:300]}), 500
 
@@ -4645,6 +4864,145 @@ def _mediamtx_editor_endpoint_patch(src):
                     j -= 1
             break
     return ''.join(lines) if changed else src
+
+
+def _mtx_patch_within_load_external_sources(src, patcher):
+    start = src.find('function loadExternalSources()')
+    if start == -1:
+        return src
+    end = src.find('\n        function ', start + 1)
+    if end == -1:
+        end = src.find('\nfunction ', start + 1)
+    if end == -1:
+        end = len(src)
+    block = src[start:end]
+    new_block = patcher(block)
+    if new_block == block:
+        return src
+    return src[:start] + new_block + src[end:]
+
+
+def _mediamtx_editor_external_sources_clear_patch(src):
+    """Clear external-sources container before fill; scoped to loadExternalSources only."""
+    def _patch(block):
+        lines = block.splitlines(keepends=True)
+        for i, line in enumerate(lines):
+            if 'external-sources-list' in line and 'getElementById' in line and 'container' in line:
+                if i + 1 < len(lines) and "innerHTML = ''" in lines[i + 1]:
+                    return block
+                indent = line[: len(line) - len(line.lstrip())]
+                lines.insert(i + 1, indent + "container.innerHTML = '';\n")
+                return ''.join(lines)
+        return block
+    return _mtx_patch_within_load_external_sources(src, _patch)
+
+
+def _mediamtx_editor_external_sources_single_container_patch(src):
+    """Use first #external-sources-list only and hide duplicates; scoped to loadExternalSources only."""
+    if '_extListAll' in src:
+        return src
+    def _patch(block):
+        lines = block.splitlines(keepends=True)
+        for i, line in enumerate(lines):
+            if "getElementById('external-sources-list')" in line and 'container' in line and 'const' in line:
+                indent = line[: len(line) - len(line.lstrip())]
+                lines[i] = (
+                    indent + "var _extListAll = document.querySelectorAll('[id=\"external-sources-list\"]');\n"
+                    + indent + "if (_extListAll.length > 1) { for (var _i = 1; _i < _extListAll.length; _i++) _extListAll[_i].style.display = 'none'; }\n"
+                    + indent + "const container = _extListAll[0];\n"
+                )
+                return ''.join(lines)
+        return block
+    return _mtx_patch_within_load_external_sources(src, _patch)
+
+
+def _mediamtx_editor_external_sources_dom_normalize_patch(src):
+    """Normalize rows after render: keep one badge in Name and one copy/share button in URL; scoped to loadExternalSources."""
+    if '_extSourcesDomNormalize' in src:
+        return src
+    def _patch(block):
+        hook = "container.innerHTML = html;"
+        if hook not in block:
+            return block
+        normalize_js = (
+            "container.innerHTML = html;\n"
+            "                    /* _extSourcesDomNormalize */\n"
+            "                    try {\n"
+            "                        const rows = container.querySelectorAll('tbody tr');\n"
+            "                        rows.forEach(row => {\n"
+            "                            const tds = row.querySelectorAll('td');\n"
+            "                            if (!tds || tds.length < 2) return;\n"
+            "                            const nameCell = tds[0];\n"
+            "                            const urlCell = tds[1];\n"
+            "                            const badges = row.querySelectorAll('.share-mode-badge-ext');\n"
+            "                            if (badges.length) {\n"
+            "                                const keepBadge = badges[0];\n"
+            "                                if (keepBadge.parentElement !== nameCell) nameCell.appendChild(keepBadge);\n"
+            "                                badges.forEach((b, i) => { if (i > 0) b.remove(); });\n"
+            "                            }\n"
+            "                            const links = row.querySelectorAll('.external-copy-link-btn');\n"
+            "                            if (links.length) {\n"
+            "                                const keepLink = links[0];\n"
+            "                                if (keepLink.parentElement !== urlCell) urlCell.appendChild(keepLink);\n"
+            "                                links.forEach((b, i) => { if (i > 0) b.remove(); });\n"
+            "                            }\n"
+            "                        });\n"
+            "                    } catch(e) {}\n"
+        )
+        return block.replace(hook, normalize_js, 1)
+    return _mtx_patch_within_load_external_sources(src, _patch)
+
+
+def _mediamtx_editor_external_sources_pill_style_patch(src):
+    """Mode/Status pills in external sources rows; scoped to loadExternalSources."""
+    import re
+    if '_extSourcesPillStyle' in src:
+        return src
+    def _patch(block):
+        pill_css = "background: ' + {var} + '; color: white; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold;"
+        out = block
+        if "html += ' ' + modeText + ' ';" in out:
+            out = out.replace("html += ' ' + modeText + ' ';", "html += '<span style=\"" + pill_css.format(var="modeColor") + "\">' + modeText + '</span>'; /* _extSourcesPillStyle */", 1)
+            out = out.replace("html += ' ' + statusText + ' ';", "html += '<span style=\"" + pill_css.format(var="statusColor") + "\">' + statusText + '</span>';", 1)
+            return out
+        for var, marker in (("modeColor", " /* _extSourcesPillStyle */"), ("statusColor", "")):
+            pattern = re.compile(
+                r"style=\"color:\s*'\s*\+\s*" + re.escape(var) + r"\s*\+\s*';\s*font-weight:\s*bold;\"",
+                re.IGNORECASE,
+            )
+            out = pattern.sub("style=\"" + pill_css.format(var=var) + "\"" + marker, out, count=1)
+        return out
+    return _mtx_patch_within_load_external_sources(src, _patch)
+
+
+def _mediamtx_editor_external_sources_lock_patch(src):
+    """Guard against overlapping 5s refresh; scoped to loadExternalSources."""
+    if '_loadExtSrcLock' in src:
+        return src
+    def _patch(block):
+        lines = block.splitlines(keepends=True)
+        inserted = False
+        for i, line in enumerate(lines):
+            if 'external-sources-list' in line and 'getElementById' in line and 'container' in line:
+                indent = line[: len(line) - len(line.lstrip())]
+                lines.insert(i, indent + "if (window._loadExtSrcLock) return;\n")
+                lines.insert(i + 1, indent + "window._loadExtSrcLock = true;\n")
+                inserted = True
+                break
+        if not inserted:
+            return block
+        for i, line in enumerate(lines):
+            if 'Error loading sources:' in line and 'external-sources-list' in line and 'innerHTML' in line:
+                j = i + 1
+                while j < len(lines) and j <= i + 4:
+                    if lines[j].rstrip().endswith('});'):
+                        indent = lines[j][: len(lines[j]) - len(lines[j].lstrip())]
+                        lines[j] = indent + "}).finally(function(){window._loadExtSrcLock=false;});\n"
+                        return ''.join(lines)
+                    j += 1
+                break
+        return ''.join(lines)
+    return _mtx_patch_within_load_external_sources(src, _patch)
 
 
 def _get_mediamtx_upstream(settings):
@@ -6252,12 +6610,17 @@ def _get_mediamtx_version_info():
             if m:
                 out['version'] = m.group(1)
     else:
-        if os.path.isfile('/usr/local/bin/mediamtx') and os.access('/usr/local/bin/mediamtx', os.X_OK):
-            r = subprocess.run('/usr/local/bin/mediamtx -version 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
-            if r.returncode == 0 and (r.stdout or r.stderr):
-                m = _re.search(r'v?(\d+\.\d+\.\d+)', (r.stdout or '') + (r.stderr or ''))
-                if m:
-                    out['version'] = m.group(1)
+        # Local: try /usr/local/bin/mediamtx then PATH; capture both stdout and stderr; try --version if -version fails
+        def _run_ver(cmd):
+            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=5)
+            combined = (r.stdout or '') + (r.stderr or '')
+            match = _re.search(r'v?(\d+\.\d+\.\d+)', combined)
+            return match.group(1) if match else None
+        for bin_path in ('/usr/local/bin/mediamtx', 'mediamtx'):
+            if bin_path == 'mediamtx' or (os.path.isfile(bin_path) and os.access(bin_path, os.X_OK)):
+                out['version'] = _run_ver(f'{bin_path} -version 2>&1') or _run_ver(f'{bin_path} --version 2>&1')
+                if out['version']:
+                    break
     try:
         req = _ur.Request(
             'https://api.github.com/repos/bluenviron/mediamtx/releases/latest',
@@ -6303,7 +6666,15 @@ def get_all_module_versions():
     if modules.get('cloudtak', {}).get('installed'):
         result['cloudtak'] = _get_cloudtak_version_info()
     if modules.get('mediamtx', {}).get('installed'):
-        result['mediamtx'] = _get_mediamtx_version_info()
+        mtx = _get_mediamtx_version_info()
+        # Card expects single 'version' string and update_available; label so MediaMTX vs editor are clear
+        parts = []
+        if mtx.get('version'):
+            parts.append('MediaMTX v' + mtx['version'])
+        if mtx.get('editor_version'):
+            parts.append('editor v' + mtx['editor_version'])
+        mtx['version'] = ' · '.join(parts) if parts else (mtx.get('editor_version') or mtx.get('version') or '')
+        result['mediamtx'] = mtx
     if modules.get('takportal', {}).get('installed'):
         result['takportal'] = _get_takportal_version_info()
     if modules.get('takserver', {}).get('installed'):
@@ -7121,15 +7492,82 @@ def mediamtx_control():
     return jsonify({'success': True, 'running': running})
 
 
+MEDIAMTX_EDITOR_RAW_URL = f'https://raw.githubusercontent.com/takwerx/mediamtx-installer/{MEDIAMTX_EDITOR_REF}/config-editor/mediamtx_config_editor.py'
+
+
 @app.route('/api/mediamtx/recovery', methods=['POST'])
 @login_required
 def mediamtx_recovery():
-    """Patch web editor: install fail-safe overlay script and restart mediamtx-webeditor. One-click from MediaMTX page."""
+    """Patch web editor: refresh editor, apply endpoint patch, sync overlay file, install prestart script, restart."""
     import tempfile
+    import urllib.request
     settings = load_settings()
     deploy_cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
     tmp_f = None
+    editor_path = '/opt/mediamtx-webeditor/mediamtx_config_editor.py'
     try:
+        # 1) Refresh editor from upstream so we fix corruption / duplicate UI from old or patched copies
+        if deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip():
+            _module_run(
+                deploy_cfg,
+                "mkdir -p /opt/mediamtx-webeditor && curl -sL '" + MEDIAMTX_EDITOR_RAW_URL + "' -o /opt/mediamtx-webeditor/mediamtx_config_editor.py",
+                timeout=90,
+            )
+            _module_run(
+                deploy_cfg,
+                "sed -i 's/port=5000/port=5080/' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null; sed -i 's/9997/9898/g' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null",
+                timeout=10,
+            )
+        else:
+            try:
+                with urllib.request.urlopen(MEDIAMTX_EDITOR_RAW_URL, timeout=60) as r:
+                    content = r.read().decode('utf-8')
+                with open(editor_path, 'w') as f:
+                    f.write(content)
+                subprocess.run(
+                    f"sed -i 's/port=5000/port=5080/' {editor_path} 2>/dev/null; sed -i 's/9997/9898/g' {editor_path} 2>/dev/null",
+                    shell=True,
+                    capture_output=True,
+                    timeout=10,
+                )
+            except Exception:
+                pass  # keep existing file and just re-apply patches
+        # 2) Apply endpoint patch only (keep core External Sources rendering unchanged)
+        if deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip():
+            for name, script in [
+                ('mtx_endpoint_patch', MEDIAMTX_REMOTE_EP_PATCH_SCRIPT),
+            ]:
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as pf:
+                    pf.write(script)
+                    tmp_patch = pf.name
+                ok_copy = _module_copy(deploy_cfg, tmp_patch, f'/tmp/{name}.py', timeout=15)
+                try:
+                    os.unlink(tmp_patch)
+                except Exception:
+                    pass
+                if ok_copy:
+                    _module_run(deploy_cfg, f'python3 /tmp/{name}.py && rm -f /tmp/{name}.py', timeout=15)
+        else:
+            if os.path.isfile(editor_path):
+                with open(editor_path) as f:
+                    src = f.read()
+                src = _mediamtx_editor_endpoint_patch(src)
+                with open(editor_path, 'w') as f:
+                    f.write(src)
+        # 3) Always sync live overlay file from current infra-TAK repo to target.
+        # This prevents stale overlay scripts on existing installs from injecting old UI logic.
+        try:
+            overlay_src = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mediamtx_ldap_overlay.py')
+            if os.path.exists(overlay_src):
+                _module_run(deploy_cfg, 'mkdir -p /opt/mediamtx-webeditor', timeout=10)
+                _module_copy(
+                    deploy_cfg,
+                    overlay_src,
+                    '/opt/mediamtx-webeditor/mediamtx_ldap_overlay.py',
+                    timeout=20
+                )
+        except Exception:
+            pass
         tmp_f = tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False)
         tmp_f.write(MEDIAMTX_ENSURE_OVERLAY_SCRIPT)
         tmp_f.close()
@@ -7386,7 +7824,7 @@ paths:
     _module_run(deploy_cfg, 'sudo mv /tmp/mediamtx.service /etc/systemd/system/mediamtx.service || mv /tmp/mediamtx.service /etc/systemd/system/mediamtx.service', timeout=10)
     # Web editor: clone on remote and install
     _module_run(deploy_cfg, 'mkdir -p /opt/mediamtx-webeditor', timeout=10)
-    ok, _ = _module_run(deploy_cfg, f'rm -rf /tmp/mediamtx_editor_clone && git clone --depth 1 "{MEDIAMTX_EDITOR_REPO}" /tmp/mediamtx_editor_clone', timeout=90)
+    ok, _ = _module_run(deploy_cfg, f'rm -rf /tmp/mediamtx_editor_clone && git clone --depth 1 --branch "{MEDIAMTX_EDITOR_REF}" "{MEDIAMTX_EDITOR_REPO}" /tmp/mediamtx_editor_clone', timeout=90)
     if ok:
         _module_run(deploy_cfg, 'cp /tmp/mediamtx_editor_clone/config-editor/mediamtx_config_editor.py /opt/mediamtx-webeditor/ 2>/dev/null; rm -rf /tmp/mediamtx_editor_clone', timeout=15)
         _module_run(deploy_cfg, "sed -i 's/port=5000/port=5080/' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null; sed -i 's/9997/9898/g' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null", timeout=10)
@@ -7467,27 +7905,8 @@ paths:
                     pass
                 plog("✓ LDAP overlay applied (Authentik header auth)")
                 # Endpoint patch so shared_stream_page / shared_hls_proxy don't duplicate (Flask AssertionError)
-                ep_script = (
-                    "import re\n"
-                    "f='/opt/mediamtx-webeditor/mediamtx_config_editor.py'\n"
-                    "with open(f) as h: src=h.read()\n"
-                    "lines=src.splitlines(keepends=True)\n"
-                    "for (dp,rh,ev) in [(r'\\\\bdef shared_stream_page\\\\s*\\\\(',('/shared/',),'shared_stream_page_core'),(r'\\\\bdef shared_hls_proxy\\\\s*\\\\(',('/shared-hls','shared_hls'),'shared_hls_proxy_core'),(r'\\\\bdef api_share_links_list\\\\s*\\\\(',('/api/share-links','share-links'),'api_share_links_list_core'),(r'\\\\bdef api_share_links_generate\\\\s*\\\\(',('/api/share-links/generate','share-links/generate'),'api_share_links_generate_core'),(r'\\\\bdef api_share_links_revoke\\\\s*\\\\(',('/api/share-links/revoke','share-links/revoke'),'api_share_links_revoke_core')]:\n"
-                    " for i in range(len(lines)-1,-1,-1):\n"
-                    "  if not re.search(dp,lines[i]): continue\n"
-                    "  for j in range(i-1,max(-1,i-20),-1):\n"
-                    "   L=lines[j]\n"
-                    "   if '@app.route' in L and 'endpoint=' not in L and any(h in L for h in rh):\n"
-                    "    lines[j]=L.rstrip()[:-1]+\", endpoint='\"+ev+\"')\\n\"; break\n"
-                    "  else:\n"
-                    "   for j in range(i-1,max(-1,i-20),-1):\n"
-                    "    if '@app.route' in lines[j] and 'endpoint=' not in lines[j]:\n"
-                    "     L=lines[j]; lines[j]=L.rstrip()[:-1]+\", endpoint='\"+ev+\"')\\n\"; break\n"
-                    "  break\n"
-                    "with open(f,'w') as h: h.write(''.join(lines))\n"
-                )
                 with open('/tmp/mtx_endpoint_patch.py', 'w') as pf:
-                    pf.write(ep_script)
+                    pf.write(MEDIAMTX_REMOTE_EP_PATCH_SCRIPT)
                 _module_copy(deploy_cfg, '/tmp/mtx_endpoint_patch.py', '/tmp/mtx_endpoint_patch.py', log_fn=plog)
                 _module_run(deploy_cfg, 'python3 /tmp/mtx_endpoint_patch.py && rm -f /tmp/mtx_endpoint_patch.py', timeout=15)
                 try:
@@ -7885,7 +8304,7 @@ WantedBy=multi-user.target
         try:
             subprocess.run(f'rm -rf {clone_dir}', shell=True, capture_output=True)
             os.makedirs(clone_dir, exist_ok=True)
-            r = subprocess.run(f'git clone --depth 1 "{MEDIAMTX_EDITOR_REPO}" {clone_dir}',
+            r = subprocess.run(f'git clone --depth 1 --branch "{MEDIAMTX_EDITOR_REF}" "{MEDIAMTX_EDITOR_REPO}" {clone_dir}',
                 shell=True, capture_output=True, text=True, timeout=60)
             if r.returncode == 0:
                 candidate = os.path.join(clone_dir, MEDIAMTX_EDITOR_PATH, 'mediamtx_config_editor.py')
@@ -11832,8 +12251,8 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 {{ sidebar_html }}
 <div class="main">
   <div class="page-header"><h1 style="display:flex;align-items:center;gap:10px"><span class="nav-icon" style="font-size:22px;line-height:1">🐕</span><span>Guard Dog</span></h1><p>TAK Server health monitoring and auto-recovery. Runs automatically after TAK Server deploy; configure notifications below.</p></div>
-  {% if gd.running %}<div class="status-banner running" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px"><div style="display:flex;align-items:center;gap:12px"><div class="dot"></div>Guard Dog is running</div><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><button type="button" class="btn btn-ghost" id="gd-update-btn" onclick="gdUpdate()" title="Re-deploy scripts and timers from latest console version">↻ Update</button><button type="button" class="btn btn-ghost" style="border-color:var(--yellow);color:var(--yellow)" onclick="gdSetEnabled(false, this)">Disable</button><button class="btn btn-ghost" style="color:var(--red);border-color:var(--red)" onclick="document.getElementById('gd-uninstall-modal').classList.add('open')">Uninstall</button><span id="gd-update-msg" style="font-size:12px"></span></div></div>
-  {% elif gd.installed %}<div class="status-banner stopped" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px"><div style="display:flex;align-items:center;gap:12px"><div class="dot"></div>Guard Dog is disabled</div><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><button type="button" class="btn btn-ghost" id="gd-update-btn" onclick="gdUpdate()">↻ Update</button><button type="button" class="btn btn-primary" onclick="gdSetEnabled(true, this)">Enable</button><button class="btn btn-ghost" style="color:var(--red);border-color:var(--red)" onclick="document.getElementById('gd-uninstall-modal').classList.add('open')">Uninstall</button><span id="gd-update-msg" style="font-size:12px"></span></div></div>
+  {% if gd.running %}<div class="status-banner running" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px"><div style="display:flex;align-items:center;gap:12px"><div class="dot"></div>Guard Dog is running</div><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><button type="button" class="btn btn-ghost" id="gd-update-btn" onclick="gdUpdate()" title="Re-deploy scripts and timers from latest console version">↻ Update Guard Dog</button><button type="button" class="btn btn-ghost" style="border-color:var(--yellow);color:var(--yellow)" onclick="gdSetEnabled(false, this)">Disable</button><button class="btn btn-ghost" style="color:var(--red);border-color:var(--red)" onclick="document.getElementById('gd-uninstall-modal').classList.add('open')">Uninstall</button><span id="gd-update-msg" style="font-size:12px"></span></div></div>
+  {% elif gd.installed %}<div class="status-banner stopped" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px"><div style="display:flex;align-items:center;gap:12px"><div class="dot"></div>Guard Dog is disabled</div><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><button type="button" class="btn btn-ghost" id="gd-update-btn" onclick="gdUpdate()">↻ Update Guard Dog</button><button type="button" class="btn btn-primary" onclick="gdSetEnabled(true, this)">Enable</button><button class="btn btn-ghost" style="color:var(--red);border-color:var(--red)" onclick="document.getElementById('gd-uninstall-modal').classList.add('open')">Uninstall</button><span id="gd-update-msg" style="font-size:12px"></span></div></div>
   {% else %}<div class="status-banner not-installed"><div class="dot"></div>Guard Dog is not installed (it will install automatically when you deploy TAK Server)</div>{% endif %}
 
   <div class="card">
@@ -12088,14 +12507,14 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 {{ sidebar_html }}
 <div class="main">
   <div class="page-header">
-    <h1><img src="{{ mediamtx_logo_url }}" alt="MediaMTX" style="height:28px;vertical-align:middle;margin-right:8px">MediaMTX{% if mediamtx_version or editor_version %} <span style="font-weight:500;color:var(--text-dim);font-size:16px">· binary v{{ mediamtx_version }}{% if editor_version %} / editor v{{ editor_version }}{% endif %}</span>{% endif %}{% if mediamtx_update_available and mediamtx_latest %} <span style="font-size:12px;color:var(--cyan);font-weight:600;margin-left:8px">binary v{{ mediamtx_latest }} available</span>{% endif %}{% if editor_update_available and editor_latest %} <span style="font-size:12px;color:var(--cyan);font-weight:600;margin-left:8px">editor v{{ editor_latest }} available</span>{% endif %}</h1>
+    <h1><img src="{{ mediamtx_logo_url }}" alt="MediaMTX" style="height:28px;vertical-align:middle;margin-right:8px">MediaMTX{% if mediamtx_version or editor_version %} <span style="font-weight:500;color:var(--text-dim);font-size:16px">· MediaMTX v{{ mediamtx_version }}{% if editor_version %} / editor v{{ editor_version }}{% endif %}</span>{% endif %}{% if mediamtx_update_available and mediamtx_latest %} <span style="font-size:12px;color:var(--cyan);font-weight:600;margin-left:8px">MediaMTX v{{ mediamtx_latest }} available</span>{% endif %}{% if editor_update_available and editor_latest %} <span style="font-size:12px;color:var(--cyan);font-weight:600;margin-left:8px">editor v{{ editor_latest }} available</span>{% endif %}</h1>
     <p>Video Streaming Server (bluenviron) + Web Editor (takwerx)</p>
   </div>
 
   {% if mtx.running %}
-  <div class="status-banner running"><div class="dot"></div>MediaMTX is running{% if mediamtx_version %} · binary v{{ mediamtx_version }}{% endif %}{% if editor_version %} · editor v{{ editor_version }}{% endif %}{% if mediamtx_update_available and mediamtx_latest %} · <span style="color:var(--cyan)">binary v{{ mediamtx_latest }} available</span>{% endif %}{% if editor_update_available and editor_latest %} · <span style="color:var(--cyan)">editor v{{ editor_latest }} available</span>{% endif %}</div>
+  <div class="status-banner running"><div class="dot"></div>MediaMTX is running{% if mediamtx_version %} · MediaMTX v{{ mediamtx_version }}{% endif %}{% if editor_version %} · editor v{{ editor_version }}{% endif %}{% if mediamtx_update_available and mediamtx_latest %} · <span style="color:var(--cyan)">MediaMTX v{{ mediamtx_latest }} available</span>{% endif %}{% if editor_update_available and editor_latest %} · <span style="color:var(--cyan)">editor v{{ editor_latest }} available</span>{% endif %}</div>
   {% elif mtx.installed %}
-  <div class="status-banner stopped"><div class="dot"></div>MediaMTX is installed but stopped{% if mediamtx_version %} · binary v{{ mediamtx_version }}{% endif %}{% if editor_version %} · editor v{{ editor_version }}{% endif %}{% if mediamtx_update_available and mediamtx_latest %} · <span style="color:var(--cyan)">binary v{{ mediamtx_latest }} available</span>{% endif %}{% if editor_update_available and editor_latest %} · <span style="color:var(--cyan)">editor v{{ editor_latest }} available</span>{% endif %}</div>
+  <div class="status-banner stopped"><div class="dot"></div>MediaMTX is installed but stopped{% if mediamtx_version %} · MediaMTX v{{ mediamtx_version }}{% endif %}{% if editor_version %} · editor v{{ editor_version }}{% endif %}{% if mediamtx_update_available and mediamtx_latest %} · <span style="color:var(--cyan)">MediaMTX v{{ mediamtx_latest }} available</span>{% endif %}{% if editor_update_available and editor_latest %} · <span style="color:var(--cyan)">editor v{{ editor_latest }} available</span>{% endif %}</div>
   {% else %}
   <div class="status-banner not-installed"><div class="dot"></div>MediaMTX is not installed</div>
   {% endif %}
@@ -20942,7 +21361,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% if not mod.get('icon_url') or key == 'takportal' or key == 'emailrelay' %}<div class="module-name">{{ mod.name }}</div>{% endif %}
 </div>
 <div class="module-desc">{{ mod.description }}</div>
-{% if module_versions.get(key) %}{% set v = module_versions.get(key) %}{% if v.version or v.update_available %}<div class="meta-line module-version-line" id="module-version-{{ key }}" style="margin-bottom:4px">{% if v.version %}v{{ v.version }}{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% endif %}</div>{% endif %}{% endif %}
+{% if module_versions.get(key) %}{% set v = module_versions.get(key) %}{% if v.version or v.update_available %}<div class="meta-line module-version-line" id="module-version-{{ key }}" style="margin-bottom:4px">{% if v.version %}{% if key == 'mediamtx' %}{{ v.version }}{% else %}v{{ v.version }}{% endif %}{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% endif %}</div>{% endif %}{% endif %}
 <span class="module-status status-{% if mod.installed and mod.running %}running{% elif mod.installed %}stopped{% else %}not-installed{% endif %}" id="module-status-{{ key }}" data-module="{{ key }}" data-gd-overall="{% if key == 'guarddog' and mod.installed and mod.running %}fetch{% endif %}">{% if mod.installed and mod.running %}<span class="status-dot"></span> Running{% elif mod.installed %}<span class="status-dot"></span> Stopped{% else %}Not Installed{% endif %}</span>
 {% if key == 'takserver' and mod.installed %}<div id="takserver-card-cert-expiry" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
 {% if key == 'caddy' and mod.installed %}<div id="caddy-card-cert-days" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}

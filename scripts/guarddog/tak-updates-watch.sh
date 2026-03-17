@@ -102,7 +102,10 @@ if [ -f "$HOME/TAK-Portal/package.json" ]; then
   fi
 fi
 
-[ -z "$UPDATES" ] && exit 0
+LOG_FILE="/var/log/takguard/updates.log"
+log_msg() { mkdir -p /var/log/takguard 2>/dev/null; echo "$(date -u '+%Y-%m-%d %H:%M:%S UTC') $*" >> "$LOG_FILE" 2>/dev/null; }
+
+[ -z "$UPDATES" ] && { log_msg "No updates available"; exit 0; }
 
 # Only send if we haven't sent for this exact set of updates, or last send was >7 days ago
 mkdir -p /var/lib/takguard
@@ -115,6 +118,7 @@ else
   old_sig=$(cat "$STATE_FILE" 2>/dev/null)
   [ "$old_sig" != "$SIG" ] && SHOULD_SEND=true
 fi
+[ "$SHOULD_SEND" = false ] && log_msg "Updates available but already notified (same set); next email in 7 days or when set changes"
 
 if $SHOULD_SEND; then
   printf '%s' "$SIG" > "$STATE_FILE"
@@ -136,7 +140,15 @@ To update:
 - TAK Portal: TAK Portal page → Update
 "
 
-  [ -n "$ALERT_EMAIL" ] && echo -e "$BODY" | mail -s "$SUBJ" "$ALERT_EMAIL"
+  if [ -n "$ALERT_EMAIL" ]; then
+    if echo -e "$BODY" | mail -s "$SUBJ" "$ALERT_EMAIL" 2>/dev/null; then
+      log_msg "Updates email sent to $ALERT_EMAIL"
+    else
+      log_msg "Updates email FAILED to $ALERT_EMAIL (check MTA: mail, sendmail, or Email Relay)"
+    fi
+  else
+    log_msg "Updates available but ALERT_EMAIL not set — save email in Guard Dog → Notifications and Update Guard Dog"
+  fi
   if [ -f /opt/tak-guarddog/sms_send.sh ]; then
     TMPF="/tmp/gd-updates-$$.txt"
     printf '%s' "$BODY" > "$TMPF"
