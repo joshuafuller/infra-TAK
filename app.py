@@ -270,7 +270,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.2.4-alpha"
+VERSION = "0.2.6-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -1573,36 +1573,66 @@ def update_apply():
     console_dir = os.path.dirname(os.path.abspath(__file__))
     git_env = {'GIT_TERMINAL_PROMPT': '0'}
     git_cfg = ['git', '-c', f'safe.directory={console_dir}']
+
+    def _git(args, timeout=60):
+        return subprocess.run(
+            git_cfg + args,
+            cwd=console_dir,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env={**os.environ, **git_env}
+        )
+
+    def _git_err(r):
+        return (r.stderr or '').strip() or (r.stdout or '').strip() or 'git command failed'
+
+    def _error_payload(err):
+        out = {'success': False, 'error': err}
+        if 'dubious ownership' in err.lower() or 'safe.directory' in err.lower():
+            out['workaround'] = f'On the server run: sudo git config --global --add safe.directory {console_dir}'
+        return out
+
     try:
-        # Git 2.35.2+ refuses to run when repo owner != process user (CVE-2022-24765). Use -c safe.directory
-        # so Update Now works when the app runs as root but the repo was cloned by another user.
-        r = subprocess.run(git_cfg + ['pull', '--rebase', '--autostash'], cwd=console_dir,
-                          capture_output=True, text=True, timeout=60, env={**os.environ, **git_env})
-        if r.returncode != 0:
-            err = (r.stderr or '').strip() or (r.stdout or '').strip()
-            out = {'success': False, 'error': err}
-            if 'dubious ownership' in err.lower() or 'safe.directory' in err.lower():
-                out['workaround'] = (
-                    f'On the server run: sudo git config --global --add safe.directory {console_dir}'
-                )
-            return jsonify(out)
-        # Checkout latest release tag so the restarted process runs that version (fixes "update then still see banner" loop)
+        # Never use pull --rebase in Update Now.
+        # Field installs can be detached/tagged or have stale rebase metadata; rebase causes customer-facing conflicts.
+        for abort_args in (['rebase', '--abort'], ['merge', '--abort'], ['cherry-pick', '--abort']):
+            try:
+                _git(abort_args, timeout=15)
+            except Exception:
+                pass
+
+        fetch_all = _git(['fetch', '--tags', 'origin'], timeout=60)
+        if fetch_all.returncode != 0:
+            return jsonify(_error_payload(_git_err(fetch_all)))
+
+        # Checkout latest release tag so the restarted process runs that version.
+        target_ref = None
         tag_name = _fetch_latest_tag_name()
         if tag_name:
-            fetch = subprocess.run(git_cfg + ['fetch', 'origin', 'tag', tag_name, '--no-tags'],
-                                  cwd=console_dir, capture_output=True, text=True, timeout=30, env={**os.environ, **git_env})
-            if fetch.returncode == 0:
-                checkout = subprocess.run(git_cfg + ['checkout', '--force', tag_name],
-                                         cwd=console_dir, capture_output=True, text=True, timeout=30, env={**os.environ, **git_env})
-                if checkout.returncode != 0:
-                    pass  # non-fatal: we already pulled; restart may still run newer branch tip
+            _git(['fetch', 'origin', 'tag', tag_name, '--no-tags'], timeout=30)
+            verify_tag = _git(['rev-parse', '-q', '--verify', f'refs/tags/{tag_name}'], timeout=15)
+            if verify_tag.returncode == 0:
+                target_ref = f'refs/tags/{tag_name}'
+
+        # Fallback: track origin/main if tag lookup fails.
+        if not target_ref:
+            fetch_main = _git(['fetch', 'origin', 'main:refs/remotes/origin/main'], timeout=30)
+            if fetch_main.returncode != 0:
+                return jsonify(_error_payload(_git_err(fetch_main)))
+            target_ref = 'refs/remotes/origin/main'
+
+        checkout = _git(['checkout', '--force', target_ref], timeout=30)
+        if checkout.returncode != 0:
+            return jsonify(_error_payload(_git_err(checkout)))
+
         update_cache.update({'latest': None, 'checked': 0})
         _ensure_gunicorn_upgrade(console_dir)
         subprocess.Popen('sleep 2 && systemctl restart takwerx-console', shell=True,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return jsonify({
             'success': True,
-            'output': (r.stdout or '').strip(),
+            'output': f'Updated to {tag_name or "origin/main"}',
             'restart_required': True,
             'restart_message': 'Console is restarting. You may see 502 briefly — wait 10–15 seconds then refresh the page.'
         })
