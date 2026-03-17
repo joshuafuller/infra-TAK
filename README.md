@@ -170,6 +170,16 @@ start.sh                    ← One CLI command to launch everything
 
 ## Changelog
 
+### v0.2.4-alpha — 2026-03-16
+
+**MediaMTX web editor — duplicate endpoint patch**
+- After deploying the LDAP overlay, the web editor could crash with Flask "View function mapping is overwriting an existing endpoint" for shared and share-links routes. The console now applies an **endpoint patch** (shared_stream_page, shared_hls_proxy, api_share_links_list, api_share_links_generate, api_share_links_revoke) so the overlay and core don't conflict. Use **Patch web editor** on the MediaMTX page if the editor is in a restart loop; the same patch runs automatically on deploy and via the heal script at service start.
+
+**Console Update Now — no more "still see update" loop**
+- **Update Now** used to only run `git pull` on the current branch. If the latest release was a tag (e.g. v0.2.3-alpha) and the branch wasn't at that commit, the restarted app still showed the old version and "Update Available" stayed. Update Now now **fetches and checks out the latest release tag** after pull, so the restarted process runs the tagged version and the banner disappears after refresh.
+
+---
+
 ### v0.2.3-alpha — 2026-03-15
 
 **Guard Dog**

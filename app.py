@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""infra-TAK v0.2.2 - TAK Infrastructure Platform"""
+"""infra-TAK v0.2.4 - TAK Infrastructure Platform"""
 
 # === Auto-upgrade: seamlessly switch from Flask dev server to gunicorn ===
 # When the old systemd service runs "python3 app.py", this block installs
@@ -270,7 +270,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.2.2-alpha"
+VERSION = "0.2.4-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -1359,15 +1359,45 @@ def update_check():
     except Exception as e:
         return _update_check_response({'current': VERSION, 'latest': None, 'error': str(e), 'update_available': False})
 
+def _fetch_latest_tag_name():
+    """Return the latest release tag name (e.g. 'v0.2.3-alpha') from GitHub, or None on error."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            f'https://api.github.com/repos/{GITHUB_REPO}/tags',
+            headers={'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'infra-TAK'}
+        )
+        resp = urllib.request.urlopen(req, timeout=5)
+        data = json.loads(resp.read().decode())
+        if not data:
+            return None
+        versions = []
+        for tag in data:
+            name = tag.get('name', '').lstrip('v').replace('-alpha', '').replace('-beta', '')
+            parts = name.split('.')
+            try:
+                versions.append((tuple(int(p) for p in parts), tag.get('name', '')))
+            except (ValueError, IndexError):
+                continue
+        if not versions:
+            return None
+        versions.sort(key=lambda x: x[0], reverse=True)
+        return versions[0][1]  # full tag name e.g. v0.2.3-alpha
+    except Exception:
+        return None
+
+
 @app.route('/api/update/apply', methods=['POST'])
 @login_required
 def update_apply():
     console_dir = os.path.dirname(os.path.abspath(__file__))
+    git_env = {'GIT_TERMINAL_PROMPT': '0'}
+    git_cfg = ['git', '-c', f'safe.directory={console_dir}']
     try:
         # Git 2.35.2+ refuses to run when repo owner != process user (CVE-2022-24765). Use -c safe.directory
         # so Update Now works when the app runs as root but the repo was cloned by another user.
-        cmd = ['git', '-c', f'safe.directory={console_dir}', 'pull', '--rebase', '--autostash']
-        r = subprocess.run(cmd, cwd=console_dir, capture_output=True, text=True, timeout=60)
+        r = subprocess.run(git_cfg + ['pull', '--rebase', '--autostash'], cwd=console_dir,
+                          capture_output=True, text=True, timeout=60, env={**os.environ, **git_env})
         if r.returncode != 0:
             err = (r.stderr or '').strip() or (r.stdout or '').strip()
             out = {'success': False, 'error': err}
@@ -1376,6 +1406,16 @@ def update_apply():
                     f'On the server run: sudo git config --global --add safe.directory {console_dir}'
                 )
             return jsonify(out)
+        # Checkout latest release tag so the restarted process runs that version (fixes "update then still see banner" loop)
+        tag_name = _fetch_latest_tag_name()
+        if tag_name:
+            fetch = subprocess.run(git_cfg + ['fetch', 'origin', 'tag', tag_name, '--no-tags'],
+                                  cwd=console_dir, capture_output=True, text=True, timeout=30, env={**os.environ, **git_env})
+            if fetch.returncode == 0:
+                checkout = subprocess.run(git_cfg + ['checkout', '--force', tag_name],
+                                         cwd=console_dir, capture_output=True, text=True, timeout=30, env={**os.environ, **git_env})
+                if checkout.returncode != 0:
+                    pass  # non-fatal: we already pulled; restart may still run newer branch tip
         update_cache.update({'latest': None, 'checked': 0})
         _ensure_gunicorn_upgrade(console_dir)
         subprocess.Popen('sleep 2 && systemctl restart takwerx-console', shell=True,
