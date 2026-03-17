@@ -282,6 +282,7 @@ MEDIAMTX_LOGO_URL = "https://raw.githubusercontent.com/bluenviron/mediamtx/main/
 # MediaMTX web editor: regular repo (no LDAP); when Authentik/LDAP is installed we use LDAP branch if set
 MEDIAMTX_EDITOR_REPO = "https://github.com/takwerx/mediamtx-installer.git"
 MEDIAMTX_EDITOR_PATH = "config-editor"  # subdir containing mediamtx_config_editor.py
+MEDIAMTX_EDITOR_REF = "main"  # set to release tag (e.g. v1.1.9) for deterministic editor deploys
 MEDIAMTX_EDITOR_LDAP_BRANCH = None  # LDAP behavior comes from mediamtx_ldap_overlay.py in this repo; use repo default branch
 # Fail-safe overlay script: never exits failure so ExecStartPre cannot block the web editor from starting
 MEDIAMTX_ENSURE_OVERLAY_SCRIPT = r'''#!/usr/bin/env python3
@@ -7459,7 +7460,7 @@ def mediamtx_control():
     return jsonify({'success': True, 'running': running})
 
 
-MEDIAMTX_EDITOR_RAW_URL = 'https://raw.githubusercontent.com/takwerx/mediamtx-installer/main/config-editor/mediamtx_config_editor.py'
+MEDIAMTX_EDITOR_RAW_URL = f'https://raw.githubusercontent.com/takwerx/mediamtx-installer/{MEDIAMTX_EDITOR_REF}/config-editor/mediamtx_config_editor.py'
 
 
 @app.route('/api/mediamtx/recovery', methods=['POST'])
@@ -7777,7 +7778,7 @@ paths:
     _module_run(deploy_cfg, 'sudo mv /tmp/mediamtx.service /etc/systemd/system/mediamtx.service || mv /tmp/mediamtx.service /etc/systemd/system/mediamtx.service', timeout=10)
     # Web editor: clone on remote and install
     _module_run(deploy_cfg, 'mkdir -p /opt/mediamtx-webeditor', timeout=10)
-    ok, _ = _module_run(deploy_cfg, f'rm -rf /tmp/mediamtx_editor_clone && git clone --depth 1 "{MEDIAMTX_EDITOR_REPO}" /tmp/mediamtx_editor_clone', timeout=90)
+    ok, _ = _module_run(deploy_cfg, f'rm -rf /tmp/mediamtx_editor_clone && git clone --depth 1 --branch "{MEDIAMTX_EDITOR_REF}" "{MEDIAMTX_EDITOR_REPO}" /tmp/mediamtx_editor_clone', timeout=90)
     if ok:
         _module_run(deploy_cfg, 'cp /tmp/mediamtx_editor_clone/config-editor/mediamtx_config_editor.py /opt/mediamtx-webeditor/ 2>/dev/null; rm -rf /tmp/mediamtx_editor_clone', timeout=15)
         _module_run(deploy_cfg, "sed -i 's/port=5000/port=5080/' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null; sed -i 's/9997/9898/g' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null", timeout=10)
@@ -8257,7 +8258,7 @@ WantedBy=multi-user.target
         try:
             subprocess.run(f'rm -rf {clone_dir}', shell=True, capture_output=True)
             os.makedirs(clone_dir, exist_ok=True)
-            r = subprocess.run(f'git clone --depth 1 "{MEDIAMTX_EDITOR_REPO}" {clone_dir}',
+            r = subprocess.run(f'git clone --depth 1 --branch "{MEDIAMTX_EDITOR_REF}" "{MEDIAMTX_EDITOR_REPO}" {clone_dir}',
                 shell=True, capture_output=True, text=True, timeout=60)
             if r.returncode == 0:
                 candidate = os.path.join(clone_dir, MEDIAMTX_EDITOR_PATH, 'mediamtx_config_editor.py')
