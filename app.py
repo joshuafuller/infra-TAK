@@ -7186,17 +7186,47 @@ def mediamtx_control():
     return jsonify({'success': True, 'running': running})
 
 
+MEDIAMTX_EDITOR_RAW_URL = 'https://raw.githubusercontent.com/takwerx/mediamtx-installer/main/config-editor/mediamtx_config_editor.py'
+
+
 @app.route('/api/mediamtx/recovery', methods=['POST'])
 @login_required
 def mediamtx_recovery():
-    """Patch web editor: apply endpoint + external-sources clear patches, install fail-safe overlay script, restart mediamtx-webeditor."""
+    """Patch web editor: refresh editor from upstream, apply endpoint + external-sources clear patches, overlay script, restart."""
     import tempfile
+    import urllib.request
     settings = load_settings()
     deploy_cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
     tmp_f = None
     editor_path = '/opt/mediamtx-webeditor/mediamtx_config_editor.py'
     try:
-        # Apply endpoint + external-sources clear patches so stream URLs and External Sources table behave correctly
+        # 1) Refresh editor from upstream so we fix corruption / duplicate UI from old or patched copies
+        if deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip():
+            _module_run(
+                deploy_cfg,
+                "mkdir -p /opt/mediamtx-webeditor && curl -sL '" + MEDIAMTX_EDITOR_RAW_URL + "' -o /opt/mediamtx-webeditor/mediamtx_config_editor.py",
+                timeout=90,
+            )
+            _module_run(
+                deploy_cfg,
+                "sed -i 's/port=5000/port=5080/' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null; sed -i 's/9997/9898/g' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null",
+                timeout=10,
+            )
+        else:
+            try:
+                with urllib.request.urlopen(MEDIAMTX_EDITOR_RAW_URL, timeout=60) as r:
+                    content = r.read().decode('utf-8')
+                with open(editor_path, 'w') as f:
+                    f.write(content)
+                subprocess.run(
+                    f"sed -i 's/port=5000/port=5080/' {editor_path} 2>/dev/null; sed -i 's/9997/9898/g' {editor_path} 2>/dev/null",
+                    shell=True,
+                    capture_output=True,
+                    timeout=10,
+                )
+            except Exception:
+                pass  # keep existing file and just re-apply patches
+        # 2) Apply endpoint + external-sources clear patches
         if deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip():
             for name, script in [('mtx_endpoint_patch', MEDIAMTX_REMOTE_EP_PATCH_SCRIPT), ('mtx_ext_clear_patch', MEDIAMTX_REMOTE_EXT_CLEAR_SCRIPT)]:
                 with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as pf:
