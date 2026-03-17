@@ -170,6 +170,15 @@ start.sh                    ← One CLI command to launch everything
 
 ## Changelog
 
+### v0.2.6-alpha — 2026-03-16
+
+**Update Now hotfix (no rebase conflicts)**
+- Fixed a field-update failure where **Update Now** could trigger rebase/cherry-pick conflict errors (`could not apply ... Add files via upload`) on some customer installs.
+- Update flow now uses a deterministic **fetch + force checkout** path (latest tag, fallback `origin/main`) and first clears stale in-progress git operations (rebase/merge/cherry-pick abort attempts).
+- This prevents customer boxes from getting stuck mid-update due to local branch/rebase state.
+
+---
+
 ### v0.2.5-alpha — 2026-03-16
 
 **MediaMTX web editor — stale overlay self-heal**
