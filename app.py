@@ -454,6 +454,18 @@ MEDIAMTX_REMOTE_EXT_LOCK_SCRIPT = (
     "        break\n"
     "with open(f,'w') as h: h.writelines(lines)\n"
 )
+# Use first #external-sources-list only, hide duplicates (fixes duplicate-id layout)
+MEDIAMTX_REMOTE_EXT_SINGLE_CONTAINER_SCRIPT = (
+    "f='/opt/mediamtx-webeditor/mediamtx_config_editor.py'\n"
+    "with open(f) as h: lines=h.readlines()\n"
+    "if any('_extListAll' in L for L in lines): raise SystemExit(0)\n"
+    "for i, line in enumerate(lines):\n"
+    "    if \"getElementById('external-sources-list')\" in line and 'container' in line and 'const' in line:\n"
+    "        indent=line[:len(line)-len(line.lstrip())]\n"
+    "        lines[i]=indent+\"var _extListAll = document.querySelectorAll('[id=\\\"external-sources-list\\\"]');\\n\"+indent+\"if (_extListAll.length > 1) { for (var _i = 1; _i < _extListAll.length; _i++) _extListAll[_i].style.display = 'none'; }\\n\"+indent+\"const container = _extListAll[0];\\n\"\n"
+    "        break\n"
+    "with open(f,'w') as h: h.writelines(lines)\n"
+)
 # Node-RED official icons (https://nodered.org/about/resources/media/)
 NODERED_LOGO_URL = "https://nodered.org/about/resources/media/node-red-icon.png"       # icon only (e.g. small nav)
 NODERED_LOGO_URL_2 = "https://nodered.org/about/resources/media/node-red-icon-2.png"   # icon + "Node-RED" text (card, sidebar)
@@ -4727,6 +4739,23 @@ def _mediamtx_editor_external_sources_clear_patch(src):
     return src
 
 
+def _mediamtx_editor_external_sources_single_container_patch(src):
+    """Use first #external-sources-list only and hide duplicates; fixes messed-up layout when HTML has duplicate ids."""
+    if '_extListAll' in src:
+        return src  # already patched
+    lines = src.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        if "getElementById('external-sources-list')" in line and 'container' in line and 'const' in line:
+            indent = line[: len(line) - len(line.lstrip())]
+            lines[i] = (
+                indent + "var _extListAll = document.querySelectorAll('[id=\"external-sources-list\"]');\n"
+                + indent + "if (_extListAll.length > 1) { for (var _i = 1; _i < _extListAll.length; _i++) _extListAll[_i].style.display = 'none'; }\n"
+                + indent + "const container = _extListAll[0];\n"
+            )
+            return ''.join(lines)
+    return src
+
+
 def _mediamtx_editor_external_sources_lock_patch(src):
     """Add re-entry lock to loadExternalSources so 5s refresh cannot overlap and cause messed-up layout."""
     if '_loadExtSrcLock' in src:
@@ -7290,6 +7319,7 @@ def mediamtx_recovery():
                 ('mtx_endpoint_patch', MEDIAMTX_REMOTE_EP_PATCH_SCRIPT),
                 ('mtx_ext_clear_patch', MEDIAMTX_REMOTE_EXT_CLEAR_SCRIPT),
                 ('mtx_ext_lock_patch', MEDIAMTX_REMOTE_EXT_LOCK_SCRIPT),
+                ('mtx_ext_single_container', MEDIAMTX_REMOTE_EXT_SINGLE_CONTAINER_SCRIPT),
             ]:
                 with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as pf:
                     pf.write(script)
@@ -7674,6 +7704,15 @@ paths:
                 except Exception:
                     pass
                 plog("✓ External Sources re-entry lock patch applied")
+                with open('/tmp/mtx_ext_single_container.py', 'w') as pf:
+                    pf.write(MEDIAMTX_REMOTE_EXT_SINGLE_CONTAINER_SCRIPT)
+                _module_copy(deploy_cfg, '/tmp/mtx_ext_single_container.py', '/tmp/mtx_ext_single_container.py', log_fn=plog)
+                _module_run(deploy_cfg, 'python3 /tmp/mtx_ext_single_container.py 2>/dev/null; rm -f /tmp/mtx_ext_single_container.py', timeout=10)
+                try:
+                    os.remove('/tmp/mtx_ext_single_container.py')
+                except Exception:
+                    pass
+                plog("✓ External Sources single-container patch applied")
             else:
                 plog("⚠ Failed to copy LDAP overlay to remote")
         else:
@@ -8199,6 +8238,11 @@ WantedBy=multi-user.target
                             with open(_editor_path, 'w') as ef:
                                 ef.write(patched3)
                             plog("✓ External Sources re-entry lock patch applied")
+                        patched4 = _mediamtx_editor_external_sources_single_container_patch(patched3)
+                        if patched4 != patched3:
+                            with open(_editor_path, 'w') as ef:
+                                ef.write(patched4)
+                            plog("✓ External Sources single-container patch applied")
                 except Exception:
                     pass
             # Deploy Ku-band simulator scripts so "Simulate link" in the editor works (Web Editor v1.1.8+)
