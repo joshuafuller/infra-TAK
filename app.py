@@ -18999,6 +18999,28 @@ def takserver_rotate_intca():
     if new_ca_name == old_ca_name:
         return jsonify({'error': f'New CA name must be different from current ({old_ca_name})'}), 400
 
+    # Root CA days left — cap new intermediate validity to this
+    root_days_left = None
+    try:
+        r = subprocess.run(['openssl', 'x509', '-enddate', '-noout', '-in', os.path.join(cert_dir, 'root-ca.pem')],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout:
+            from datetime import datetime
+            expiry_raw = r.stdout.strip().split('=', 1)[-1].strip()
+            exp_dt = datetime.strptime(expiry_raw, '%b %d %H:%M:%S %Y %Z')
+            root_days_left = (exp_dt - datetime.utcnow()).days
+    except Exception:
+        pass
+
+    try:
+        requested_validity = int(data.get('intermediate_validity_days') or 730)
+        requested_validity = max(1, min(3652, requested_validity))
+    except (TypeError, ValueError):
+        requested_validity = 730
+    int_validity_days = min(requested_validity, root_days_left) if root_days_left is not None and root_days_left > 0 else requested_validity
+    if root_days_left is not None and requested_validity > root_days_left:
+        pass  # already capped to root_days_left in int_validity_days
+
     rotate_intca_log.clear()
     rotate_intca_status.update({'running': True, 'complete': False, 'error': False})
 
@@ -19043,6 +19065,9 @@ def takserver_rotate_intca():
             log("")
             log(f"Step 2/7: Creating new Intermediate CA: {new_ca_name}...")
             run('chmod +r /opt/tak/certs/cert-metadata.sh 2>/dev/null')
+            run(f'grep -qE "^CA_VALIDITY=" /opt/tak/certs/cert-metadata.sh 2>/dev/null && sed -i "s/^CA_VALIDITY=.*/CA_VALIDITY={int_validity_days}/" /opt/tak/certs/cert-metadata.sh || true', check=False)
+            run(f'grep -qE "^INTERMEDIATE_VALIDITY" /opt/tak/certs/cert-metadata.sh 2>/dev/null && sed -i "s/^INTERMEDIATE_VALIDITY.*/INTERMEDIATE_VALIDITY={int_validity_days}/" /opt/tak/certs/cert-metadata.sh || true', check=False)
+            log(f"  New intermediate validity: {int_validity_days} days (capped by root if needed)")
             if not run(f'cd /opt/tak/certs && echo "y" | sudo -u tak ./makeCert.sh ca "{new_ca_name}" 2>&1'):
                 raise Exception('Failed to create new intermediate CA')
             log(f"✓ Intermediate CA {new_ca_name} created")
@@ -19889,6 +19914,64 @@ deploy_status = {'running': False, 'complete': False, 'error': False, 'cancelled
 upgrade_log = []
 upgrade_status = {'running': False, 'complete': False, 'error': False}
 
+
+@app.route('/api/takserver/security-config')
+@login_required
+def takserver_security_config_get():
+    """Read issued cert validity (validityDays) from CoreConfig TAKServerCAConfig. Lets you change it anytime (e.g. 90 days = re-enroll by scanning QR)."""
+    coreconfig_path = '/opt/tak/CoreConfig.xml'
+    if not os.path.exists(coreconfig_path):
+        return jsonify({'error': 'TAK Server not installed'}), 400
+    try:
+        r = subprocess.run(['sudo', 'cat', coreconfig_path], capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            return jsonify({'error': 'Could not read CoreConfig.xml'}), 500
+        content = r.stdout or ''
+    except Exception as e:
+        return jsonify({'error': str(e)[:200]}), 500
+    import re
+    m = re.search(r'<TAKServerCAConfig[^>]*validityDays="(\d+)"', content)
+    validity_days = int(m.group(1)) if m else 3650
+    return jsonify({'validity_days': validity_days})
+
+
+@app.route('/api/takserver/security-config', methods=['POST'])
+@login_required
+def takserver_security_config_post():
+    """Update issued cert validity (validityDays) in CoreConfig and restart TAK Server. E.g. set to 90 to force re-enrollment (scan QR again); or rotate CA / revoke client cert from TAK Server."""
+    data = request.get_json() or {}
+    try:
+        validity_days = int(data.get('validity_days', 0))
+        if validity_days < 1 or validity_days > 3652:
+            return jsonify({'error': 'validity_days must be between 1 and 3652'}), 400
+    except (TypeError, ValueError):
+        return jsonify({'error': 'validity_days must be a number'}), 400
+    coreconfig_path = '/opt/tak/CoreConfig.xml'
+    if not os.path.exists(coreconfig_path):
+        return jsonify({'error': 'TAK Server not installed'}), 400
+    try:
+        r = subprocess.run(['sudo', 'cat', coreconfig_path], capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            return jsonify({'error': 'Could not read CoreConfig.xml'}), 500
+        content = r.stdout or ''
+    except Exception as e:
+        return jsonify({'error': str(e)[:200]}), 500
+    import re
+    if not re.search(r'<TAKServerCAConfig[^>]*validityDays="\d+"', content):
+        return jsonify({'error': 'TAKServerCAConfig / validityDays not found in CoreConfig (certificate enrollment may not be enabled)'}), 400
+    new_content = re.sub(r'(<TAKServerCAConfig[^>]*validityDays=")\d+(")', rf'\g<1>{validity_days}\g<2>', content, count=1)
+    if new_content == content:
+        return jsonify({'error': 'No change applied'}), 400
+    try:
+        proc = subprocess.run(['sudo', 'tee', coreconfig_path], input=new_content, capture_output=True, text=True, timeout=5)
+        if proc.returncode != 0:
+            return jsonify({'error': 'Failed to write CoreConfig.xml'}), 500
+    except Exception as e:
+        return jsonify({'error': str(e)[:200]}), 500
+    subprocess.run(['sudo', 'systemctl', 'restart', 'takserver'], capture_output=True, timeout=30)
+    return jsonify({'success': True, 'validity_days': validity_days, 'message': f'Issued cert validity set to {validity_days} days. TAK Server restarted.'})
+
+
 @app.route('/api/takserver/update', methods=['POST'])
 @login_required
 def takserver_update():
@@ -20163,6 +20246,21 @@ def deploy_takserver():
         selected_pkg = core_pkg
     else:
         selected_pkg = pkg_files[0]
+    try:
+        intermediate_days = int(data.get('intermediate_ca_validity_days') or 730)
+        intermediate_days = max(1, min(3652, intermediate_days))
+    except (TypeError, ValueError):
+        intermediate_days = 730
+    issued_days_raw = data.get('issued_cert_validity_days')
+    if issued_days_raw not in (None, ''):
+        try:
+            issued_days = max(1, min(3652, int(issued_days_raw)))
+        except (TypeError, ValueError):
+            issued_days = intermediate_days
+    else:
+        issued_days = intermediate_days
+    if issued_days > intermediate_days:
+        return jsonify({'error': f'Issued cert validity ({issued_days} days) cannot exceed intermediate CA validity ({intermediate_days} days)'}), 400
     config = {
         'package_path': os.path.join(UPLOAD_DIR, selected_pkg),
         'two_server': is_two_server,
@@ -20171,6 +20269,8 @@ def deploy_takserver():
         'cert_city': data.get('cert_city', ''), 'cert_org': data.get('cert_org', ''),
         'cert_ou': data.get('cert_ou', ''), 'root_ca_name': data.get('root_ca_name', 'ROOT-CA-01'),
         'intermediate_ca_name': data.get('intermediate_ca_name', 'INTERMEDIATE-CA-01'),
+        'intermediate_ca_validity_days': intermediate_days,
+        'issued_cert_validity_days': issued_days,
         'enable_admin_ui': data.get('enable_admin_ui', False),
         'enable_webtak': data.get('enable_webtak', False),
         'enable_nonadmin_ui': data.get('enable_nonadmin_ui', False),
@@ -20340,6 +20440,12 @@ def run_takserver_deploy(config):
             if val:
                 run_cmd(f'''sed -i 's/^{var}=.*/{var}="{val}"/' /opt/tak/certs/cert-metadata.sh''', check=False)
 
+        # Patch intermediate CA validity if cert-metadata.sh has a variable for it (e.g. CA_VALIDITY=730)
+        int_validity_days = config.get('intermediate_ca_validity_days', 730)
+        run_cmd(f'grep -qE "^CA_VALIDITY=" /opt/tak/certs/cert-metadata.sh 2>/dev/null && sed -i "s/^CA_VALIDITY=.*/CA_VALIDITY={int_validity_days}/" /opt/tak/certs/cert-metadata.sh || true', check=False)
+        run_cmd(f'grep -qE "^INTERMEDIATE_VALIDITY" /opt/tak/certs/cert-metadata.sh 2>/dev/null && sed -i "s/^INTERMEDIATE_VALIDITY.*/INTERMEDIATE_VALIDITY={int_validity_days}/" /opt/tak/certs/cert-metadata.sh || true', check=False)
+        log_step(f"  Intermediate CA validity: {int_validity_days} days (issued cert will default to same; change anytime in Certificate signing)")
+
         _patch_openssl_string_mask(log_step)
 
         run_cmd('chown -R tak:tak /opt/tak/certs/')
@@ -20375,12 +20481,13 @@ def run_takserver_deploy(config):
         log_step(""); log_step("━━━ Step 8/9: Configuring CoreConfig.xml ━━━")
         run_cmd('sed -i \'s|<input auth="anonymous" _name="stdtcp" protocol="tcp" port="8087"/>|<input auth="x509" _name="stdssl" protocol="tls" port="8089"/>|g\' /opt/tak/CoreConfig.xml', "Enabling X.509 auth on 8089...")
         run_cmd(f'sed -i "s|truststoreFile=\\"certs/files/truststore-root.jks|truststoreFile=\\"certs/files/truststore-{int_ca}.jks|g" /opt/tak/CoreConfig.xml', "Setting intermediate CA truststore...")
+        issued_days = config.get('issued_cert_validity_days') or config.get('intermediate_ca_validity_days', 730)
         cert_block = (f'<certificateSigning CA="TAKServer"><certificateConfig>\\n'
             f'<nameEntries>\\n<nameEntry name="O" value="{config["cert_org"]}"/>\\n'
             f'<nameEntry name="OU" value="{config["cert_ou"]}"/>\\n</nameEntries>\\n'
             f'</certificateConfig>\\n<TAKServerCAConfig keystore="JKS" '
             f'keystoreFile="certs/files/{int_ca}-signing.jks" keystorePass="{cert_pass}" '
-            f'validityDays="3650" signatureAlg="SHA256WithRSA" />\\n'
+            f'validityDays="{issued_days}" signatureAlg="SHA256WithRSA" />\\n'
             f'</certificateSigning>\\n<vbm enabled="false"/>')
         run_cmd(f'sed -i \'s|<vbm enabled="false"/>|{cert_block}|g\' /opt/tak/CoreConfig.xml', "Enabling certificate enrollment...")
         run_cmd('sed -i \'s|<auth>|<auth x509useGroupCache="true">|g\' /opt/tak/CoreConfig.xml')
@@ -21930,6 +22037,16 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <span id="tak-cert-password-msg" style="font-size:12px;color:var(--text-dim)"></span>
 </div>
 <div id="cert-expiry-info" style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim)">Loading certificate expiry...</div>
+<div style="margin-top:20px;padding-top:20px;border-top:1px solid var(--border)">
+<div style="font-size:13px;font-weight:600;color:var(--text-secondary);margin-bottom:8px">Certificate signing (issued cert validity)</div>
+<p style="font-size:12px;color:var(--text-dim);line-height:1.5;margin-bottom:12px">How long certs issued via enrollment (QR code) are valid. Shorten to force re-enrollment (e.g. 90 days). After a breach you can rotate the CA or revoke that client cert from TAK Server.</p>
+<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+<span style="font-size:12px;color:var(--text-secondary)">Validity (days):</span>
+<input type="number" id="security-config-validity-days" min="1" max="3652" placeholder="3650" style="width:100px;padding:8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px">
+<button type="button" id="security-config-save-btn" onclick="saveSecurityConfig()" style="padding:8px 18px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer">Save</button>
+<span id="security-config-msg" style="font-size:12px;color:var(--text-dim)"></span>
+</div>
+</div>
 </div>
 </div>
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:24px">
@@ -21943,7 +22060,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div id="rotate-ca-controls" style="display:none">
 <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
 <div class="form-field"><label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">New Intermediate CA Name</label><input type="text" id="rotate-ca-name" placeholder="e.g. INTERMEDIATE-CA-02" maxlength="64" style="width:100%;padding:10px 14px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px;box-sizing:border-box"></div>
-<div></div>
+<div class="form-field"><label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">New intermediate validity (days)</label><input type="number" id="rotate-ca-validity-days" placeholder="730" min="1" max="3652" style="width:120px;padding:10px 14px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px;box-sizing:border-box"> <span id="rotate-ca-validity-hint" style="font-size:11px;color:var(--text-dim)">Capped by root CA remaining</span></div>
 </div>
 <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:16px">
 <button type="button" id="rotate-ca-btn" onclick="rotateIntCA()" style="padding:12px 24px;background:linear-gradient(135deg,#b45309,#92400e);color:#fff;border:none;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:14px;font-weight:600;cursor:pointer">Rotate Intermediate CA</button>
