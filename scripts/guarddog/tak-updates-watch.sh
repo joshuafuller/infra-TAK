@@ -5,9 +5,16 @@ SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo 
 ALERT_EMAIL="ALERT_EMAIL_PLACEHOLDER"
 CONSOLE_VERSION="CONSOLE_VERSION_PLACEHOLDER"
 STATE_FILE="/var/lib/takguard/updates_notified"
+LOG_FILE="/var/log/takguard/updates.log"
 CURL_TIMEOUT=15
 
-[ -z "$ALERT_EMAIL" ] || [ "$ALERT_EMAIL" = "ALERT_EMAIL_PLACEHOLDER" ] && exit 0
+log_msg() { mkdir -p /var/log/takguard 2>/dev/null; echo "$(date -u '+%Y-%m-%d %H:%M:%S UTC') $*" >> "$LOG_FILE" 2>/dev/null; }
+
+# Skip only when empty or not a real address (no @). Deploy replaces ALERT_EMAIL_PLACEHOLDER globally, so we must not compare to that literal.
+if [ -z "$ALERT_EMAIL" ] || ! echo "$ALERT_EMAIL" | grep -q '@'; then
+  log_msg "Alert email not configured; skipping. Set email in Guard Dog → Notifications and click Update Guard Dog."
+  exit 0
+fi
 
 # Fetch latest tag from GitHub (repo = org/repo). Strips version/ and v prefix.
 latest_tag() {
@@ -27,11 +34,11 @@ latest_infratak() {
     grep -o '"name":[[:space:]]*"v[^"]*"' | head -1 | sed 's/.*"v\([^"]*\)".*/\1/'
 }
 
-# Return 0 if update available (cur empty or cur < latest), 1 otherwise.
+# Return 0 if update available (cur < latest). If we don't know cur, don't report (avoid false "update" when already current).
 need_update() {
   local cur="$1" latest="$2"
   [ -z "$latest" ] && return 1
-  [ -z "$cur" ] && return 0
+  [ -z "$cur" ] && return 1
   max=$(printf '%s\n%s\n' "${cur}" "${latest}" | sort -V 2>/dev/null | tail -1)
   [ "$max" = "$latest" ] && [ "$cur" != "$latest" ] && return 0
   return 1
@@ -48,9 +55,13 @@ if [ "$cur_console" != "CONSOLE_VERSION_PLACEHOLDER" ] && [ -n "$cur_console" ] 
   SIG="${SIG}infratak:${latest_console};"
 fi
 
-# Authentik (only if installed)
-if [ -f "$HOME/authentik/.env" ]; then
-  cur_ak=$(grep -E '^AUTHENTIK_TAG=' "$HOME/authentik/.env" 2>/dev/null | cut -d= -f2- | tr -d '"' | sed 's/^v//')
+# Authentik (only if installed) — read version from docker-compose.yml (same as dashboard), then .env
+cur_ak=""
+if [ -f "$HOME/authentik/docker-compose.yml" ]; then
+  cur_ak=$(grep -oE 'AUTHENTIK_TAG:-[^}[:space:]]+' "$HOME/authentik/docker-compose.yml" 2>/dev/null | head -1 | sed 's/AUTHENTIK_TAG:-//' | sed 's/^v//')
+fi
+[ -z "$cur_ak" ] && [ -f "$HOME/authentik/.env" ] && cur_ak=$(grep -E '^AUTHENTIK_TAG=' "$HOME/authentik/.env" 2>/dev/null | cut -d= -f2- | tr -d '"' | sed 's/^v//')
+if [ -f "$HOME/authentik/docker-compose.yml" ] || [ -f "$HOME/authentik/.env" ]; then
   latest_ak=$(latest_tag "goauthentik/authentik")
   if need_update "$cur_ak" "$latest_ak"; then
     UPDATES="${UPDATES}  - Authentik: current ${cur_ak:-unknown}, latest ${latest_ak}\n"
@@ -102,49 +113,35 @@ if [ -f "$HOME/TAK-Portal/package.json" ]; then
   fi
 fi
 
-LOG_FILE="/var/log/takguard/updates.log"
-log_msg() { mkdir -p /var/log/takguard 2>/dev/null; echo "$(date -u '+%Y-%m-%d %H:%M:%S UTC') $*" >> "$LOG_FILE" 2>/dev/null; }
-
 [ -z "$UPDATES" ] && { log_msg "No updates available"; exit 0; }
 
-# Only send if we haven't sent for this exact set of updates, or last send was >7 days ago
+# Only send if we haven't sent for this exact set of updates, or last send was >1 day ago
 mkdir -p /var/lib/takguard
 SHOULD_SEND=false
 if [ ! -f "$STATE_FILE" ]; then
   SHOULD_SEND=true
-elif [ -n "$(find "$STATE_FILE" -mtime +7 2>/dev/null)" ]; then
+elif [ -n "$(find "$STATE_FILE" -mtime +1 2>/dev/null)" ]; then
   SHOULD_SEND=true
 else
   old_sig=$(cat "$STATE_FILE" 2>/dev/null)
   [ "$old_sig" != "$SIG" ] && SHOULD_SEND=true
 fi
-[ "$SHOULD_SEND" = false ] && log_msg "Updates available but already notified (same set); next email in 7 days or when set changes"
+[ "$SHOULD_SEND" = false ] && log_msg "Updates available but already notified (same set); next email in 24h or when set changes"
 
 if $SHOULD_SEND; then
   printf '%s' "$SIG" > "$STATE_FILE"
   TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   SUBJ="infra-TAK: Updates available on $SERVER_IDENTIFIER"
-  BODY="One or more updates are available for your infra-TAK stack.
+  BODY="Updates available on $SERVER_IDENTIFIER ($(date -u '+%Y-%m-%d %H:%M UTC')):
 
-Server: $SERVER_IDENTIFIER
-Time (UTC): $TS
-
-Updates available:
 $(printf '%b' "$UPDATES")
-
-To update:
-- infra-TAK: Console → Update Now (or pull + restart)
-- Authentik: Authentik page → Update
-- MediaMTX: MediaMTX page → Deploy / Update (binary + web editor)
-- CloudTAK: CloudTAK page → Update
-- TAK Portal: TAK Portal page → Update
 "
 
   if [ -n "$ALERT_EMAIL" ]; then
-    if echo -e "$BODY" | mail -s "$SUBJ" "$ALERT_EMAIL" 2>/dev/null; then
+    if echo -e "$BODY" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ" "$ALERT_EMAIL" 2>/dev/null; then
       log_msg "Updates email sent to $ALERT_EMAIL"
     else
-      log_msg "Updates email FAILED to $ALERT_EMAIL (check MTA: mail, sendmail, or Email Relay)"
+      log_msg "Updates email FAILED to $ALERT_EMAIL (console/relay unreachable or check Guard Dog page)"
     fi
   else
     log_msg "Updates available but ALERT_EMAIL not set — save email in Guard Dog → Notifications and Update Guard Dog"

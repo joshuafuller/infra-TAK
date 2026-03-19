@@ -359,6 +359,14 @@ async function loadCAInfo(){
     if(rootNameInput&&d.suggested_new_root_name&&!rootNameInput.value)rootNameInput.value=d.suggested_new_root_name;
     var rootIntInput=document.getElementById('rotate-root-int-name');
     if(rootIntInput&&d.suggested_new_root_int_name&&!rootIntInput.value)rootIntInput.value=d.suggested_new_root_int_name;
+    var rotValInput=document.getElementById('rotate-ca-validity-days');
+    var rotValHint=document.getElementById('rotate-ca-validity-hint');
+    if(rotValInput&&d.root_ca&&d.root_ca.days_left!=null){
+      var cap=Math.max(1,Math.min(730,d.root_ca.days_left));
+      if(!rotValInput.value)rotValInput.value=cap;
+      rotValInput.placeholder=cap;
+      if(rotValHint)rotValHint.textContent='Root has '+d.root_ca.days_left+' days left; validity capped to that.';
+    }
     if(revokeEl){
       if(d.old_cas_in_truststore&&d.old_cas_in_truststore.length>0){
         revokeEl.style.display='block';
@@ -378,7 +386,48 @@ async function loadCAInfo(){
         revokeEl.style.display='none';
       }
     }
+    // Current cert password (masked) for rotate cards
+    try{
+      var pwR=await fetch('/api/takserver/cert-password');
+      var pwD=await pwR.json();
+      var disp=pwD.password_display||'****';
+      var caCur=document.getElementById('rotate-ca-current-password');
+      var rootCur=document.getElementById('rotate-root-current-password');
+      if(caCur)caCur.textContent=disp;
+      if(rootCur)rootCur.textContent=disp;
+    }catch(e){}
   }catch(e){infoEl.textContent='Failed to load CA info';}
+  loadSecurityConfig();
+}
+
+async function loadSecurityConfig(){
+  var input=document.getElementById('security-config-validity-days');
+  var msg=document.getElementById('security-config-msg');
+  if(!input)return;
+  try{
+    var r=await fetch('/api/takserver/security-config');
+    var d=await r.json();
+    if(d.validity_days!=null){input.value=d.validity_days;}
+    if(msg)msg.textContent='';
+  }catch(e){if(msg)msg.textContent='Could not load';}
+}
+
+async function saveSecurityConfig(){
+  var input=document.getElementById('security-config-validity-days');
+  var btn=document.getElementById('security-config-save-btn');
+  var msg=document.getElementById('security-config-msg');
+  if(!input||!msg)return;
+  var v=parseInt(input.value,10);
+  if(isNaN(v)||v<1||v>3652){msg.textContent='Enter 1–3652';msg.style.color='var(--red)';return;}
+  if(btn)btn.disabled=true;
+  msg.textContent='Saving...';msg.style.color='var(--text-dim)';
+  try{
+    var r=await fetch('/api/takserver/security-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({validity_days:v})});
+    var d=await r.json();
+    if(d.success){msg.textContent=d.message||'Saved. TAK Server restarted.';msg.style.color='var(--green)';}
+    else{msg.textContent=d.error||'Failed';msg.style.color='var(--red)';}
+  }catch(e){msg.textContent=e.message||'Request failed';msg.style.color='var(--red)';}
+  if(btn)btn.disabled=false;
 }
 
 async function rotateIntCA(){
@@ -386,6 +435,13 @@ async function rotateIntCA(){
   var newName=(nameInput?nameInput.value:'').trim();
   if(!newName){alert('Enter a name for the new Intermediate CA');return;}
   if(!confirm('This will create a new Intermediate CA "'+newName+'", regenerate server/admin/user certificates, and restart TAK Server. Existing clients will remain connected via the old CA in the truststore.\n\nContinue?'))return;
+  var validityEl=document.getElementById('rotate-ca-validity-days');
+  var validityDays=validityEl&&validityEl.value.trim()!==''?parseInt(validityEl.value,10):730;
+  if(isNaN(validityDays)||validityDays<1)validityDays=730;
+  var newPwEl=document.getElementById('rotate-ca-new-password');
+  var newPw=(newPwEl&&newPwEl.value)?newPwEl.value.trim():'';
+  var payload={new_ca_name:newName,intermediate_validity_days:validityDays};
+  if(newPw)payload.new_cert_password=newPw;
   var btn=document.getElementById('rotate-ca-btn');
   var msg=document.getElementById('rotate-ca-msg');
   var logEl=document.getElementById('rotate-ca-log');
@@ -393,7 +449,7 @@ async function rotateIntCA(){
   if(msg){msg.textContent='Starting rotation...';msg.style.color='var(--text-dim)';}
   if(logEl){logEl.style.display='block';logEl.textContent='Starting...\n';}
   try{
-    var r=await fetch('/api/takserver/rotate-intca',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({new_ca_name:newName})});
+    var r=await fetch('/api/takserver/rotate-intca',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
     var d=await r.json();
     if(d.error){
       if(msg){msg.textContent=d.error;msg.style.color='var(--red)';}
@@ -458,11 +514,15 @@ async function rotateRootCA(){
   var btn=document.getElementById('rotate-root-btn');
   var msg=document.getElementById('rotate-root-msg');
   var logEl=document.getElementById('rotate-root-log');
+  var newPwEl=document.getElementById('rotate-root-new-password');
+  var newPw=(newPwEl&&newPwEl.value)?newPwEl.value.trim():'';
+  var payload={new_root_name:newRoot,new_int_name:newInt};
+  if(newPw)payload.new_cert_password=newPw;
   if(btn)btn.disabled=true;
   if(msg){msg.textContent='Starting Root CA rotation...';msg.style.color='var(--text-dim)';}
   if(logEl){logEl.style.display='block';logEl.textContent='Starting...\n';}
   try{
-    var r=await fetch('/api/takserver/rotate-rootca',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({new_root_name:newRoot,new_int_name:newInt})});
+    var r=await fetch('/api/takserver/rotate-rootca',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
     var d=await r.json();
     if(d.error){
       if(msg){msg.textContent=d.error;msg.style.color='var(--red)';}
@@ -924,6 +984,13 @@ function showDeployConfig(){
       '<div class="form-field"><label>Root CA Name</label><input type="text" id="root_ca_name" placeholder="ROOT-CA-01" style="text-transform:uppercase"></div>',
       '<div class="form-field"><label>Intermediate CA Name</label><input type="text" id="intermediate_ca_name" placeholder="INTERMEDIATE-CA-01" style="text-transform:uppercase"></div>',
       '</div>',
+      '<div style="font-family:\'JetBrains Mono\',monospace;font-size:13px;color:var(--text-dim);margin:24px 0 20px;text-transform:uppercase;letter-spacing:1px;font-weight:600">Certificate validity (days)</div>',
+      '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:8px">',
+      '<div class="form-field"><label>Intermediate CA validity (days)</label><input type="number" id="intermediate_ca_validity_days" placeholder="730" min="1" max="3652" value="730" style="width:120px"> <span style="font-size:11px;color:var(--text-dim)">Default 730 (2 years)</span></div>',
+      '<div class="form-field"><label>Issued cert validity (days)</label><input type="number" id="issued_cert_validity_days" placeholder="Same as intermediate" min="1" max="3652" style="width:120px"> <span style="font-size:11px;color:var(--text-dim)">Blank = same. Shorten anytime in Certificate signing.</span></div>',
+      '</div>',
+      '<div style="font-family:\'JetBrains Mono\',monospace;font-size:13px;color:var(--text-dim);margin:24px 0 20px;text-transform:uppercase;letter-spacing:1px;font-weight:600">Certificate password</div>',
+      '<div class="form-field" style="margin-bottom:8px"><label>Keystore / truststore password</label><input type="password" id="cert_password" placeholder="atakatak (default)" autocomplete="new-password" style="width:200px;padding:8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px"> <span style="font-size:11px;color:var(--text-dim)">Leave blank to use default atakatak. Used for CA keystores and CoreConfig.</span></div>',
       '<div style="font-family:\'JetBrains Mono\',monospace;font-size:13px;color:var(--text-dim);margin:24px 0 20px;text-transform:uppercase;letter-spacing:1px;font-weight:600">WebTAK Options (Port 8446)</div>',
       '<div style="display:flex;flex-direction:column;gap:14px">',
       '<label style="display:flex;align-items:center;gap:10px;color:var(--text-secondary);cursor:pointer;font-size:14px"><input type="checkbox" id="enable_admin_ui" onchange="toggleWebadminPassword()" style="width:18px;height:18px;accent-color:var(--accent)"> Enable Admin UI <span style="color:var(--text-dim);font-size:12px">- Browser admin (no cert needed)</span></label>',
@@ -1370,7 +1437,15 @@ async function startDeploy(){
     if(aui){const p=document.getElementById('webadmin_password').value;const pc=document.getElementById('webadmin_password_confirm').value;if(!p){alert('Please set a webadmin password.');return}if(p!==pc){alert('Passwords do not match.');return}if(!validatePassword()){alert('Password does not meet requirements.');return}}
     const btn=document.getElementById('deploy-btn');btn.disabled=true;btn.textContent='Deploying...';btn.style.opacity='0.6';btn.style.cursor='not-allowed';
     document.querySelectorAll('.form-field input,input[type="checkbox"]').forEach(el=>el.disabled=true);
-    const cfg={cert_country:document.getElementById('cert_country').value.toUpperCase(),cert_state:document.getElementById('cert_state').value.toUpperCase(),cert_city:document.getElementById('cert_city').value.toUpperCase(),cert_org:document.getElementById('cert_org').value.toUpperCase(),cert_ou:document.getElementById('cert_ou').value.toUpperCase(),root_ca_name:document.getElementById('root_ca_name').value.toUpperCase(),intermediate_ca_name:document.getElementById('intermediate_ca_name').value.toUpperCase(),enable_admin_ui:document.getElementById('enable_admin_ui').checked,enable_webtak:document.getElementById('enable_webtak').checked,enable_nonadmin_ui:document.getElementById('enable_nonadmin_ui').checked,webadmin_password:aui?document.getElementById('webadmin_password').value:'',deployment_mode:deploymentMode};
+    var intValEl=document.getElementById('intermediate_ca_validity_days');
+    var issValEl=document.getElementById('issued_cert_validity_days');
+    var intVal=intValEl?parseInt(intValEl.value,10):730;
+    if(isNaN(intVal)||intVal<1)intVal=730;
+    var issVal=issValEl&&issValEl.value.trim()!==''?parseInt(issValEl.value,10):null;
+    if(issVal!=null&&(isNaN(issVal)||issVal<1))issVal=null;
+    var certPwEl=document.getElementById('cert_password');
+    var certPw=certPwEl?(certPwEl.value||'').trim():'';
+    const cfg={cert_country:document.getElementById('cert_country').value.toUpperCase(),cert_state:document.getElementById('cert_state').value.toUpperCase(),cert_city:document.getElementById('cert_city').value.toUpperCase(),cert_org:document.getElementById('cert_org').value.toUpperCase(),cert_ou:document.getElementById('cert_ou').value.toUpperCase(),root_ca_name:document.getElementById('root_ca_name').value.toUpperCase(),intermediate_ca_name:document.getElementById('intermediate_ca_name').value.toUpperCase(),intermediate_ca_validity_days:intVal,issued_cert_validity_days:issVal!=null?issVal:'',cert_password:certPw||undefined,enable_admin_ui:document.getElementById('enable_admin_ui').checked,enable_webtak:document.getElementById('enable_webtak').checked,enable_nonadmin_ui:document.getElementById('enable_nonadmin_ui').checked,webadmin_password:aui?document.getElementById('webadmin_password').value:'',deployment_mode:deploymentMode};
     document.getElementById('deploy-log-area').style.display='block';
     try{const r=await fetch('/api/deploy/takserver',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});const d=await r.json();if(d.success)pollDeployLog();else{document.getElementById('deploy-log').textContent='✗ '+d.error;btn.disabled=false;btn.textContent='🚀 Deploy TAK Server';btn.style.opacity='1';btn.style.cursor='pointer'}}
     catch(e){document.getElementById('deploy-log').textContent='✗ '+e.message}
