@@ -5,9 +5,15 @@ SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo 
 ALERT_EMAIL="ALERT_EMAIL_PLACEHOLDER"
 CONSOLE_VERSION="CONSOLE_VERSION_PLACEHOLDER"
 STATE_FILE="/var/lib/takguard/updates_notified"
+LOG_FILE="/var/log/takguard/updates.log"
 CURL_TIMEOUT=15
 
-[ -z "$ALERT_EMAIL" ] || [ "$ALERT_EMAIL" = "ALERT_EMAIL_PLACEHOLDER" ] && exit 0
+log_msg() { mkdir -p /var/log/takguard 2>/dev/null; echo "$(date -u '+%Y-%m-%d %H:%M:%S UTC') $*" >> "$LOG_FILE" 2>/dev/null; }
+
+if [ -z "$ALERT_EMAIL" ] || [ "$ALERT_EMAIL" = "ALERT_EMAIL_PLACEHOLDER" ]; then
+  log_msg "Alert email not configured; skipping. Set email in Guard Dog → Notifications and click Update Guard Dog."
+  exit 0
+fi
 
 # Fetch latest tag from GitHub (repo = org/repo). Strips version/ and v prefix.
 latest_tag() {
@@ -102,23 +108,20 @@ if [ -f "$HOME/TAK-Portal/package.json" ]; then
   fi
 fi
 
-LOG_FILE="/var/log/takguard/updates.log"
-log_msg() { mkdir -p /var/log/takguard 2>/dev/null; echo "$(date -u '+%Y-%m-%d %H:%M:%S UTC') $*" >> "$LOG_FILE" 2>/dev/null; }
-
 [ -z "$UPDATES" ] && { log_msg "No updates available"; exit 0; }
 
-# Only send if we haven't sent for this exact set of updates, or last send was >7 days ago
+# Only send if we haven't sent for this exact set of updates, or last send was >1 day ago
 mkdir -p /var/lib/takguard
 SHOULD_SEND=false
 if [ ! -f "$STATE_FILE" ]; then
   SHOULD_SEND=true
-elif [ -n "$(find "$STATE_FILE" -mtime +7 2>/dev/null)" ]; then
+elif [ -n "$(find "$STATE_FILE" -mtime +1 2>/dev/null)" ]; then
   SHOULD_SEND=true
 else
   old_sig=$(cat "$STATE_FILE" 2>/dev/null)
   [ "$old_sig" != "$SIG" ] && SHOULD_SEND=true
 fi
-[ "$SHOULD_SEND" = false ] && log_msg "Updates available but already notified (same set); next email in 7 days or when set changes"
+[ "$SHOULD_SEND" = false ] && log_msg "Updates available but already notified (same set); next email in 24h or when set changes"
 
 if $SHOULD_SEND; then
   printf '%s' "$SIG" > "$STATE_FILE"

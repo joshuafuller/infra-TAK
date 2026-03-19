@@ -3507,11 +3507,13 @@ def guarddog_update():
         # Older installs may have scripts but miss takupdatesguard.timer, which keeps Updates monitor red.
         service_path = '/etc/systemd/system/takupdatesguard.service'
         timer_path = '/etc/systemd/system/takupdatesguard.timer'
+        _updates_home = os.path.expanduser('~')
         service_content = (
             '[Unit]\n'
             'Description=Guard Dog Updates Check (infra-TAK, Authentik, MediaMTX, CloudTAK)\n\n'
             '[Service]\n'
             'Type=oneshot\n'
+            f'Environment=HOME={_updates_home}\n'
             'ExecStart=/opt/tak-guarddog/tak-updates-watch.sh\n'
         )
         timer_content = (
@@ -3960,8 +3962,9 @@ def run_guarddog_deploy(alert_email):
                 ('takcloudtakguard.service', '[Unit]\nDescription=Guard Dog CloudTAK Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-cloudtak-watch.sh\n'),
                 ('takcloudtakguard.timer', '[Unit]\nDescription=Run CloudTAK guard every 1 minute\n\n[Timer]\nOnBootSec=15min\nOnUnitActiveSec=1min\nUnit=takcloudtakguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ])
+        _updates_home = os.path.expanduser('~')
         units.extend([
-            ('takupdatesguard.service', '[Unit]\nDescription=Guard Dog Updates Check (infra-TAK, Authentik, MediaMTX, CloudTAK)\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-updates-watch.sh\n'),
+            ('takupdatesguard.service', f'[Unit]\nDescription=Guard Dog Updates Check (infra-TAK, Authentik, MediaMTX, CloudTAK)\n\n[Service]\nType=oneshot\nEnvironment=HOME={_updates_home}\nExecStart=/opt/tak-guarddog/tak-updates-watch.sh\n'),
             ('takupdatesguard.timer', '[Unit]\nDescription=Check for updates every 6 hours\n\n[Timer]\nOnBootSec=30min\nOnUnitActiveSec=6h\nUnit=takupdatesguard.service\n\n[Install]\nWantedBy=timers.target\n'),
         ])
         for name, content in units:
