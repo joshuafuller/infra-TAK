@@ -128,20 +128,9 @@ if $SHOULD_SEND; then
   printf '%s' "$SIG" > "$STATE_FILE"
   TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   SUBJ="infra-TAK: Updates available on $SERVER_IDENTIFIER"
-  BODY="One or more updates are available for your infra-TAK stack.
+  BODY="Updates available on $SERVER_IDENTIFIER ($(date -u '+%Y-%m-%d %H:%M UTC')):
 
-Server: $SERVER_IDENTIFIER
-Time (UTC): $TS
-
-Updates available:
 $(printf '%b' "$UPDATES")
-
-To update:
-- infra-TAK: Console → Update Now (or pull + restart)
-- Authentik: Authentik page → Update
-- MediaMTX: MediaMTX page → Deploy / Update (binary + web editor)
-- CloudTAK: CloudTAK page → Update
-- TAK Portal: TAK Portal page → Update
 "
 
   if [ -n "$ALERT_EMAIL" ]; then
