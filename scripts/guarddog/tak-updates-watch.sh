@@ -34,11 +34,11 @@ latest_infratak() {
     grep -o '"name":[[:space:]]*"v[^"]*"' | head -1 | sed 's/.*"v\([^"]*\)".*/\1/'
 }
 
-# Return 0 if update available (cur empty or cur < latest), 1 otherwise.
+# Return 0 if update available (cur < latest). If we don't know cur, don't report (avoid false "update" when already current).
 need_update() {
   local cur="$1" latest="$2"
   [ -z "$latest" ] && return 1
-  [ -z "$cur" ] && return 0
+  [ -z "$cur" ] && return 1
   max=$(printf '%s\n%s\n' "${cur}" "${latest}" | sort -V 2>/dev/null | tail -1)
   [ "$max" = "$latest" ] && [ "$cur" != "$latest" ] && return 0
   return 1
@@ -55,9 +55,13 @@ if [ "$cur_console" != "CONSOLE_VERSION_PLACEHOLDER" ] && [ -n "$cur_console" ] 
   SIG="${SIG}infratak:${latest_console};"
 fi
 
-# Authentik (only if installed)
-if [ -f "$HOME/authentik/.env" ]; then
-  cur_ak=$(grep -E '^AUTHENTIK_TAG=' "$HOME/authentik/.env" 2>/dev/null | cut -d= -f2- | tr -d '"' | sed 's/^v//')
+# Authentik (only if installed) — read version from docker-compose.yml (same as dashboard), then .env
+cur_ak=""
+if [ -f "$HOME/authentik/docker-compose.yml" ]; then
+  cur_ak=$(grep -oE 'AUTHENTIK_TAG:-[^}[:space:]]+' "$HOME/authentik/docker-compose.yml" 2>/dev/null | head -1 | sed 's/AUTHENTIK_TAG:-//' | sed 's/^v//')
+fi
+[ -z "$cur_ak" ] && [ -f "$HOME/authentik/.env" ] && cur_ak=$(grep -E '^AUTHENTIK_TAG=' "$HOME/authentik/.env" 2>/dev/null | cut -d= -f2- | tr -d '"' | sed 's/^v//')
+if [ -f "$HOME/authentik/docker-compose.yml" ] || [ -f "$HOME/authentik/.env" ]; then
   latest_ak=$(latest_tag "goauthentik/authentik")
   if need_update "$cur_ak" "$latest_ak"; then
     UPDATES="${UPDATES}  - Authentik: current ${cur_ak:-unknown}, latest ${latest_ak}\n"
