@@ -10,7 +10,8 @@ CURL_TIMEOUT=15
 
 log_msg() { mkdir -p /var/log/takguard 2>/dev/null; echo "$(date -u '+%Y-%m-%d %H:%M:%S UTC') $*" >> "$LOG_FILE" 2>/dev/null; }
 
-if [ -z "$ALERT_EMAIL" ] || [ "$ALERT_EMAIL" = "ALERT_EMAIL_PLACEHOLDER" ]; then
+# Skip only when empty or not a real address (no @). Deploy replaces ALERT_EMAIL_PLACEHOLDER globally, so we must not compare to that literal.
+if [ -z "$ALERT_EMAIL" ] || ! echo "$ALERT_EMAIL" | grep -q '@'; then
   log_msg "Alert email not configured; skipping. Set email in Guard Dog → Notifications and click Update Guard Dog."
   exit 0
 fi
