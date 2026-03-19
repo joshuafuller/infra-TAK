@@ -144,10 +144,10 @@ To update:
 "
 
   if [ -n "$ALERT_EMAIL" ]; then
-    if echo -e "$BODY" | mail -s "$SUBJ" "$ALERT_EMAIL" 2>/dev/null; then
+    if echo -e "$BODY" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ" "$ALERT_EMAIL" 2>/dev/null; then
       log_msg "Updates email sent to $ALERT_EMAIL"
     else
-      log_msg "Updates email FAILED to $ALERT_EMAIL (check MTA: mail, sendmail, or Email Relay)"
+      log_msg "Updates email FAILED to $ALERT_EMAIL (console/relay unreachable or check Guard Dog page)"
     fi
   else
     log_msg "Updates available but ALERT_EMAIL not set — save email in Guard Dog → Notifications and Update Guard Dog"

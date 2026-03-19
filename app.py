@@ -239,7 +239,7 @@ def ensure_session_cookie_domain():
     # CSRF baseline for state-changing API calls (same-origin only).
     # Exempt localhost-only Guard Dog script endpoint (not browser/session driven).
     if request.method in ('POST', 'PUT', 'PATCH', 'DELETE') and request.path.startswith('/api/'):
-        if request.path != '/api/guarddog/send-sms':
+        if request.path not in ('/api/guarddog/send-sms', '/api/guarddog/send-alert-email'):
             if not _same_origin_ok():
                 return jsonify({'error': 'CSRF validation failed (same-origin required).'}), 403
 
@@ -3572,6 +3572,40 @@ def guarddog_uninstall():
     subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=10)
     return jsonify({'success': True})
 
+def _guarddog_send_alert_email_via_relay(to_addr, subject, body):
+    """Send email via Email Relay (localhost:25 → Postfix → Brevo). Used by test email and send-alert-email endpoint."""
+    import smtplib
+    from email.mime.text import MIMEText
+    settings = load_settings()
+    relay = settings.get('email_relay', {})
+    from_addr = relay.get('from_addr', 'noreply@localhost')
+    from_name = relay.get('from_name', 'Guard Dog')
+    msg = MIMEText(body or '', 'plain', 'utf-8')
+    msg['From'] = f'{from_name} <{from_addr}>'
+    msg['To'] = to_addr
+    msg['Subject'] = subject or 'Guard Dog Alert'
+    with smtplib.SMTP('localhost', 25, timeout=15) as s:
+        s.sendmail(from_addr, [to_addr], msg.as_string())
+
+
+@app.route('/api/guarddog/send-alert-email', methods=['POST'])
+def guarddog_send_alert_email():
+    """Called by Guard Dog scripts (localhost only) to send alerts via Email Relay (same path as test email)."""
+    if request.remote_addr not in ('127.0.0.1', '::1'):
+        return jsonify({'error': 'Forbidden'}), 403
+    data = request.get_json(silent=True) or {}
+    to_addr = (data.get('to') or '').strip() or (load_settings().get('guarddog_alert_email') or '').strip()
+    if not to_addr:
+        return jsonify({'error': 'No recipient'}), 400
+    subject = (data.get('subject') or 'Guard Dog Alert')[:200]
+    body = (data.get('body') or '')[:50000]
+    try:
+        _guarddog_send_alert_email_via_relay(to_addr, subject, body)
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/guarddog/test-email', methods=['POST'])
 @login_required
 def guarddog_test_email():
@@ -3585,17 +3619,10 @@ def guarddog_test_email():
         settings['guarddog_alert_email'] = to_addr
         save_settings(settings)
     try:
-        import smtplib
-        from email.mime.text import MIMEText
-        relay = settings.get('email_relay', {})
-        from_addr = relay.get('from_addr', 'noreply@localhost')
-        from_name = relay.get('from_name', 'Guard Dog')
-        msg = MIMEText('Test alert from infra-TAK Guard Dog.\n\nIf you received this, email notifications are working (via Email Relay/Brevo when deployed).', 'plain')
-        msg['From'] = f'{from_name} <{from_addr}>'
-        msg['To'] = to_addr
-        msg['Subject'] = 'Guard Dog Test Alert'
-        with smtplib.SMTP('localhost', 25, timeout=15) as s:
-            s.sendmail(from_addr, [to_addr], msg.as_string())
+        _guarddog_send_alert_email_via_relay(
+            to_addr, 'Guard Dog Test Alert',
+            'Test alert from infra-TAK Guard Dog.\n\nIf you received this, email notifications are working (via Email Relay/Brevo when deployed).'
+        )
         return jsonify({'success': True, 'message': f'Test email sent to {to_addr}'})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -3852,6 +3879,7 @@ def run_guarddog_deploy(alert_email):
         if is_two_server and s1_host:
             plog(f"Two-server mode detected — DB on {s1_host}:{db_port}")
         script_files = [
+            'send-alert-email.sh',
             'tak-8089-watch.sh', 'tak-oom-watch.sh', 'tak-disk-watch.sh',
             'tak-network-watch.sh', 'tak-process-watch.sh', 'tak-cert-watch.sh', 'tak-intca-watch.sh', 'tak-health-endpoint.py',
             'tak-updates-watch.sh'

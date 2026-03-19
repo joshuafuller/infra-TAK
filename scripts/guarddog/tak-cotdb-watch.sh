@@ -73,7 +73,7 @@ Things to check:
 5. Row count: sudo -u postgres psql -d cot -t -c \"SELECT relname, n_live_tup FROM pg_stat_user_tables ORDER BY n_live_tup DESC LIMIT 5;\"
 "
 
-[ -n "ALERT_EMAIL_PLACEHOLDER" ] && echo -e "$BODY" | mail -s "$SUBJ" "ALERT_EMAIL_PLACEHOLDER"
+[ -n "ALERT_EMAIL_PLACEHOLDER" ] && echo -e "$BODY" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ" "ALERT_EMAIL_PLACEHOLDER"
 if [ -f /opt/tak-guarddog/sms_send.sh ]; then
   TMPF="/tmp/gd-sms-$$.txt"
   printf '%s' "$BODY" > "$TMPF"

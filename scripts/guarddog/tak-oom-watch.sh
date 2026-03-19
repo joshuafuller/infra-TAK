@@ -43,7 +43,7 @@ Check /opt/tak/logs/takserver-messaging.log for details.
 Consider reviewing Data Retention settings in TAK Server UI.
 "
 
-    [ -n "ALERT_EMAIL_PLACEHOLDER" ] && echo -e "$BODY" | mail -s "$SUBJ" "ALERT_EMAIL_PLACEHOLDER"
+    [ -n "ALERT_EMAIL_PLACEHOLDER" ] && echo -e "$BODY" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ" "ALERT_EMAIL_PLACEHOLDER"
     [ -n "ALERT_SMS_PLACEHOLDER" ] && echo -e "$BODY" | mail -s "$SUBJ" "ALERT_SMS_PLACEHOLDER"
     if [ -f /opt/tak-guarddog/sms_send.sh ]; then
       TMPF="/tmp/gd-sms-$$.txt"
