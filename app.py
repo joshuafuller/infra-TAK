@@ -5298,6 +5298,28 @@ def _get_tak_cert_password(settings):
     return (settings.get('tak_cert_password') or 'atakatak').strip() or 'atakatak'
 
 
+def _patch_cert_metadata_password(cert_pass):
+    """Patch cert-metadata.sh with the given password so makeCert.sh creates JKS with it. Tries common variable names."""
+    path = '/opt/tak/certs/cert-metadata.sh'
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, 'r') as f:
+            lines = f.readlines()
+        changed = False
+        for var in ('CERT_PASS', 'PASSWORD', 'KEYSTORE_PASS', 'CA_PASS', 'JKS_PASS'):
+            for i, line in enumerate(lines):
+                if line.strip().startswith(var + '='):
+                    lines[i] = f'{var}="{cert_pass.replace(chr(34), chr(92)+chr(34))}"\n'
+                    changed = True
+                    break
+        if changed:
+            with open(path, 'w') as f:
+                f.writelines(lines)
+    except Exception:
+        pass
+
+
 import re as _re_module
 _ASN1_PRINTABLE_RE = _re_module.compile(r"^[A-Za-z0-9 '()+,\-./:=?]*$")
 
@@ -6709,6 +6731,18 @@ def get_all_module_versions():
         result['takportal'] = _get_takportal_version_info()
     if modules.get('takserver', {}).get('installed'):
         result['takserver'] = _get_takserver_version_info()
+    # Guard Dog: version/update follow infra-TAK (scripts ship with console; "Update Guard Dog" uses same codebase)
+    if modules.get('guarddog', {}).get('installed'):
+        gd_latest = update_cache.get('latest')
+        gd_update = False
+        if gd_latest and (update_cache.get('checked') or 0) > 0:
+            try:
+                def _tv(v):
+                    return tuple(int(p) for p in (v or '').replace('-alpha', '').replace('-beta', '').split('.')[:3])
+                gd_update = _tv(gd_latest) > _tv(VERSION) and gd_latest.strip() != (VERSION or '').strip()
+            except (ValueError, IndexError):
+                pass
+        result['guarddog'] = {'version': VERSION, 'update_available': gd_update, 'latest': gd_latest}
     return result
 
 
@@ -18977,7 +19011,6 @@ def takserver_rotate_intca():
         return jsonify({'error': 'CA name can only contain letters, numbers, dots, hyphens, underscores'}), 400
 
     cert_dir = '/opt/tak/certs/files'
-    cert_pass = _get_tak_cert_password(load_settings())
     if not os.path.exists(os.path.join(cert_dir, 'root-ca.pem')):
         return jsonify({'error': 'root-ca.pem not found — cannot rotate without a Root CA'}), 400
     if not os.path.exists(os.path.join(cert_dir, 'ca.pem')):
@@ -18998,6 +19031,14 @@ def takserver_rotate_intca():
         return jsonify({'error': 'Could not detect current intermediate CA name from ca.pem'}), 500
     if new_ca_name == old_ca_name:
         return jsonify({'error': f'New CA name must be different from current ({old_ca_name})'}), 400
+
+    # Optional new cert password (save so thread uses it for new keystores)
+    new_cert_password = (data.get('new_cert_password') or '').strip()
+    if new_cert_password:
+        settings = load_settings()
+        settings['tak_cert_password'] = new_cert_password
+        save_settings(settings)
+    cert_pass = _get_tak_cert_password(load_settings())
 
     # Root CA days left — cap new intermediate validity to this
     root_days_left = None
@@ -19068,6 +19109,7 @@ def takserver_rotate_intca():
             run(f'grep -qE "^CA_VALIDITY=" /opt/tak/certs/cert-metadata.sh 2>/dev/null && sed -i "s/^CA_VALIDITY=.*/CA_VALIDITY={int_validity_days}/" /opt/tak/certs/cert-metadata.sh || true', check=False)
             run(f'grep -qE "^INTERMEDIATE_VALIDITY" /opt/tak/certs/cert-metadata.sh 2>/dev/null && sed -i "s/^INTERMEDIATE_VALIDITY.*/INTERMEDIATE_VALIDITY={int_validity_days}/" /opt/tak/certs/cert-metadata.sh || true', check=False)
             log(f"  New intermediate validity: {int_validity_days} days (capped by root if needed)")
+            _patch_cert_metadata_password(cert_pass)
             if not run(f'cd /opt/tak/certs && echo "y" | sudo -u tak ./makeCert.sh ca "{new_ca_name}" 2>&1'):
                 raise Exception('Failed to create new intermediate CA')
             log(f"✓ Intermediate CA {new_ca_name} created")
@@ -19324,8 +19366,15 @@ def takserver_rotate_rootca():
         if not re.match(r'^[a-zA-Z0-9._-]+$', name):
             return jsonify({'error': f'CA name "{name}" can only contain letters, numbers, dots, hyphens, underscores'}), 400
 
-    cert_dir = '/opt/tak/certs/files'
+    # Optional new cert password (save so thread uses it for new keystores)
+    new_cert_password = (data.get('new_cert_password') or '').strip()
+    if new_cert_password:
+        settings = load_settings()
+        settings['tak_cert_password'] = new_cert_password
+        save_settings(settings)
     cert_pass = _get_tak_cert_password(load_settings())
+
+    cert_dir = '/opt/tak/certs/files'
     if not os.path.exists(os.path.join(cert_dir, 'root-ca.pem')):
         return jsonify({'error': 'root-ca.pem not found — no current Root CA detected'}), 400
 
@@ -19395,6 +19444,7 @@ def takserver_rotate_rootca():
             log("")
             log(f"Step 2/8: Creating new Root CA: {new_root_name}...")
             run('chmod +r /opt/tak/certs/cert-metadata.sh 2>/dev/null')
+            _patch_cert_metadata_password(cert_pass)
             if not run(f'cd /opt/tak/certs && echo "{new_root_name}" | sudo -u tak ./makeRootCa.sh 2>&1'):
                 raise Exception('Failed to create new Root CA')
             log(f"✓ Root CA {new_root_name} created")
@@ -19915,6 +19965,13 @@ upgrade_log = []
 upgrade_status = {'running': False, 'complete': False, 'error': False}
 
 
+@app.route('/api/takserver/cert-password')
+@login_required
+def takserver_cert_password_get():
+    """Return masked cert password for display on rotate cards (never the real password)."""
+    return jsonify({'password_display': '****'})
+
+
 @app.route('/api/takserver/security-config')
 @login_required
 def takserver_security_config_get():
@@ -20279,6 +20336,12 @@ def deploy_takserver():
     for ext, key in [('.key', 'gpg_key_path'), ('.pol', 'policy_path')]:
         matches = [f for f in os.listdir(UPLOAD_DIR) if f.endswith(ext)]
         if matches: config[key] = os.path.join(UPLOAD_DIR, matches[0])
+    # Optional certificate password at deploy (default atakatak); persist so deploy uses it for keystores/CoreConfig
+    cert_password = (data.get('cert_password') or data.get('tak_cert_password') or '').strip()
+    if cert_password:
+        settings = load_settings()
+        settings['tak_cert_password'] = cert_password
+        save_settings(settings)
     deploy_log.clear()
     deploy_status.update({'running': True, 'complete': False, 'error': False})
     threading.Thread(target=run_takserver_deploy, args=(config,), daemon=True).start()
@@ -22062,6 +22125,8 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div class="form-field"><label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">New Intermediate CA Name</label><input type="text" id="rotate-ca-name" placeholder="e.g. INTERMEDIATE-CA-02" maxlength="64" style="width:100%;padding:10px 14px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px;box-sizing:border-box"></div>
 <div class="form-field"><label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">New intermediate validity (days)</label><input type="number" id="rotate-ca-validity-days" placeholder="730" min="1" max="3652" style="width:120px;padding:10px 14px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px;box-sizing:border-box"> <span id="rotate-ca-validity-hint" style="font-size:11px;color:var(--text-dim)">Capped by root CA remaining</span></div>
 </div>
+<div class="form-field" style="margin-bottom:16px"><label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">Current certificate password</label><span id="rotate-ca-current-password" style="font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--text-dim)">****</span></div>
+<div class="form-field" style="margin-bottom:16px"><label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">New password (optional; leave blank to keep current)</label><input type="password" id="rotate-ca-new-password" placeholder="Leave blank to keep" autocomplete="new-password" style="width:100%;max-width:280px;padding:10px 14px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px;box-sizing:border-box"></div>
 <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:16px">
 <button type="button" id="rotate-ca-btn" onclick="rotateIntCA()" style="padding:12px 24px;background:linear-gradient(135deg,#b45309,#92400e);color:#fff;border:none;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:14px;font-weight:600;cursor:pointer">Rotate Intermediate CA</button>
 <span id="rotate-ca-msg" style="font-size:12px;color:var(--text-dim)"></span>
@@ -22088,6 +22153,8 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div class="form-field"><label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">New Root CA Name</label><input type="text" id="rotate-root-name" placeholder="e.g. ROOT-CA-02" maxlength="64" style="width:100%;padding:10px 14px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px;box-sizing:border-box"></div>
 <div class="form-field"><label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">New Intermediate CA Name</label><input type="text" id="rotate-root-int-name" placeholder="e.g. INT-CA-01" maxlength="64" style="width:100%;padding:10px 14px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px;box-sizing:border-box"></div>
 </div>
+<div class="form-field" style="margin-bottom:16px"><label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">Current certificate password</label><span id="rotate-root-current-password" style="font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--text-dim)">****</span></div>
+<div class="form-field" style="margin-bottom:16px"><label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">New password (optional; leave blank to keep current)</label><input type="password" id="rotate-root-new-password" placeholder="Leave blank to keep" autocomplete="new-password" style="width:100%;max-width:280px;padding:10px 14px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px;box-sizing:border-box"></div>
 <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
 <button type="button" id="rotate-root-btn" onclick="rotateRootCA()" style="padding:12px 24px;background:linear-gradient(135deg,#991b1b,#7f1d1d);color:#fff;border:none;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:14px;font-weight:600;cursor:pointer">Rotate Root CA</button>
 <span id="rotate-root-msg" style="font-size:12px;color:var(--text-dim)"></span>
