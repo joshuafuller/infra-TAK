@@ -1466,16 +1466,51 @@ function pollDeployLog(){
 }
 var upgradeLogIndex=0;
 var upgradeXhr=null,upgradeFileReady=false;
-function cancelUpgradeUpload(){
-  if(upgradeXhr){upgradeXhr.abort();upgradeXhr=null;}
-  upgradeFileReady=false;
-  var pa=document.getElementById('upgrade-progress-area');if(pa)pa.innerHTML='';
-  var ua=document.getElementById('upgrade-upload-area');if(ua){ua.style.maxHeight='';ua.style.padding='';}
+var upgradeUploadedPackages=[];
+
+function isUpgradeTwoServerMode(){
+  var input=document.getElementById('upgrade-file-input');
+  return input&&input.hasAttribute('multiple');
 }
+function updateUpgradeFileReady(){
+  var twoServer=isUpgradeTwoServerMode();
+  if(twoServer){
+    var hasCore=upgradeUploadedPackages.some(function(p){return /core/.test(p.filename);});
+    var hasDb=upgradeUploadedPackages.some(function(p){return /database/.test(p.filename);});
+    upgradeFileReady=hasCore&&hasDb;
+  }else{
+    upgradeFileReady=upgradeUploadedPackages.length>=1;
+  }
+  var msg=document.getElementById('tak-update-msg');
+  if(msg){
+    if(upgradeFileReady)msg.textContent='';
+    else if(twoServer&&upgradeUploadedPackages.length>0)msg.textContent='Upload both core and database .deb packages.';
+  }
+}
+
+function cancelUpgradeUpload(rowToRemove){
+  if(upgradeXhr){upgradeXhr.abort();upgradeXhr=null;}
+  if(rowToRemove&&rowToRemove.parentNode){rowToRemove.parentNode.removeChild(rowToRemove);}
+  var pa=document.getElementById('upgrade-progress-area');
+  if(pa&&pa.children.length===0){var ua=document.getElementById('upgrade-upload-area');if(ua){ua.style.maxHeight='';ua.style.padding='';}}
+}
+
+async function removeUpgradeFile(filename){
+  try{
+    var r=await fetch('/api/upload/takserver/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:filename}),credentials:'same-origin'});
+    var d=await r.json();
+    if(!d.success){var m=document.getElementById('tak-update-msg');if(m){m.textContent=d.error||'Remove failed';m.style.color='var(--red)';}return;}
+  }catch(e){var m=document.getElementById('tak-update-msg');if(m){m.textContent='Error: '+e.message;m.style.color='var(--red)';}return;}
+  upgradeUploadedPackages=upgradeUploadedPackages.filter(function(p){return p.filename!==filename;});
+  var pa=document.getElementById('upgrade-progress-area');
+  if(pa){var rows=pa.querySelectorAll('.progress-item[data-filename]');for(var i=0;i<rows.length;i++){if(rows[i].getAttribute('data-filename')===filename){rows[i].remove();break;}}}
+  if(pa&&pa.children.length===0){var ua=document.getElementById('upgrade-upload-area');if(ua){ua.style.maxHeight='';ua.style.padding='';}}
+  updateUpgradeFileReady();
+}
+
 function uploadUpgradeDeb(file){
   if(!file||!file.name.toLowerCase().endsWith('.deb')){var m=document.getElementById('tak-update-msg');if(m){m.textContent='Select a .deb file.';m.style.color='var(--red)';}return;}
   var pa=document.getElementById('upgrade-progress-area');
-  pa.innerHTML='';
   var fnEl=document.getElementById('upgrade-filename');if(fnEl){fnEl.style.display='none';}
   var ua=document.getElementById('upgrade-upload-area');if(ua){ua.style.maxHeight='80px';ua.style.padding='16px';}
   var row=document.createElement('div');row.className='progress-item';
@@ -1484,27 +1519,37 @@ function uploadUpgradeDeb(file){
   var right=document.createElement('span');right.style.cssText='display:flex;align-items:center;gap:8px';
   var pct=document.createElement('span');pct.style.cssText='font-family:JetBrains Mono,monospace;font-size:12px;color:var(--cyan)';pct.textContent='0%';
   var cancelBtn=document.createElement('span');cancelBtn.textContent='\u2717';cancelBtn.style.cssText='color:var(--red);cursor:pointer;font-size:14px';cancelBtn.title='Cancel upload';
-  cancelBtn.onclick=function(){cancelUpgradeUpload();};
+  cancelBtn.onclick=function(){if(row._xhr){row._xhr.abort();row._xhr=null;}cancelUpgradeUpload(row);};
   right.appendChild(pct);right.appendChild(cancelBtn);top.appendChild(lbl);top.appendChild(right);
   var barOuter=document.createElement('div');barOuter.className='progress-bar-outer';
   var barInner=document.createElement('div');barInner.className='progress-bar-inner';barInner.style.width='0%';
   barOuter.appendChild(barInner);row.appendChild(top);row.appendChild(barOuter);pa.appendChild(row);
   var fd=new FormData();fd.append('files',file);
   var xhr=new XMLHttpRequest();
-  upgradeXhr=xhr;
+  row._xhr=xhr;upgradeXhr=xhr;
   xhr.upload.onprogress=function(e){if(e.lengthComputable){var p=Math.round((e.loaded/e.total)*100);barInner.style.width=p+'%';pct.textContent=p+'%';}};
   xhr.onload=function(){
-    upgradeXhr=null;barInner.style.width='100%';cancelBtn.remove();
+    row._xhr=null;upgradeXhr=null;barInner.style.width='100%';cancelBtn.remove();
     if(xhr.status===200){var d=JSON.parse(xhr.responseText);if(d.error){barInner.style.background='var(--red)';pct.textContent=d.error;pct.style.color='var(--red)';return;}
+      var pkg=(d.packages&&d.packages.length)?d.packages[0]:d.package;
+      var filename=pkg?pkg.filename:file.name;
+      var sizeMb=pkg&&pkg.size_mb!=null?pkg.size_mb:(file.size/(1024*1024)).toFixed(1);
+      var pa=document.getElementById('upgrade-progress-area');
+      if(pa){var rows=pa.querySelectorAll('.progress-item[data-filename]');for(var i=0;i<rows.length;i++){if(rows[i]!==row&&rows[i].getAttribute('data-filename')===filename){rows[i].remove();break;}}}
+      if(!upgradeUploadedPackages.some(function(p){return p.filename===filename;}))upgradeUploadedPackages.push({filename:filename,size_mb:sizeMb});
+      row.setAttribute('data-filename',filename);
       barInner.style.background='var(--green)';pct.style.color='var(--green)';pct.textContent='\u2713 ';
-      var rBtn=document.createElement('span');rBtn.textContent='\u2717';rBtn.style.cssText='color:var(--red);cursor:pointer;margin-left:8px;font-size:14px';rBtn.title='Remove';rBtn.onclick=function(){cancelUpgradeUpload();};pct.appendChild(rBtn);
-      upgradeFileReady=true;if(fnEl){fnEl.textContent=file.name;fnEl.style.display='block';}var m=document.getElementById('tak-update-msg');if(m)m.textContent='';}
+      var rBtn=document.createElement('span');rBtn.textContent='\u2717';rBtn.style.cssText='color:var(--red);cursor:pointer;margin-left:8px;font-size:14px';rBtn.title='Remove';rBtn.onclick=function(){removeUpgradeFile(filename);};
+      pct.appendChild(rBtn);
+      updateUpgradeFileReady();
+      var m=document.getElementById('tak-update-msg');if(m)m.textContent='';
+    }
     else{barInner.style.background='var(--red)';pct.textContent='\u2717';pct.style.color='var(--red)';}
   };
-  xhr.onerror=function(){upgradeXhr=null;barInner.style.background='var(--red)';pct.textContent='\u2717 Failed';pct.style.color='var(--red)';};
-  xhr.onabort=function(){upgradeXhr=null;};
+  xhr.onerror=function(){row._xhr=null;upgradeXhr=null;barInner.style.background='var(--red)';pct.textContent='\u2717 Failed';pct.style.color='var(--red)';};
+  xhr.onabort=function(){row._xhr=null;upgradeXhr=null;};
   xhr.timeout=1800000;
-  xhr.ontimeout=function(){upgradeXhr=null;barInner.style.background='var(--red)';pct.textContent='Timeout';pct.style.color='var(--red)';};
+  xhr.ontimeout=function(){row._xhr=null;upgradeXhr=null;barInner.style.background='var(--red)';pct.textContent='Timeout';pct.style.color='var(--red)';};
   xhr.open('POST','/api/upload/takserver');xhr.send(fd);
 }
 function handleUpgradeFile(ev){
@@ -1517,11 +1562,37 @@ function handleUpgradeDrop(ev){
   var files=ev.dataTransfer.files;
   for(var i=0;i<files.length;i++){uploadUpgradeDeb(files[i]);}
 }
+
+function loadExistingUpgradeFiles(){
+  var pa=document.getElementById('upgrade-progress-area');
+  if(!pa)return;
+  fetch('/api/upload/takserver/existing',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    var pkgs=(d.packages||[]).filter(function(p){return (p.filename||'').toLowerCase().endsWith('.deb');});
+    if(pkgs.length===0)return;
+    upgradeUploadedPackages=pkgs.slice();
+    var ua=document.getElementById('upgrade-upload-area');if(ua){ua.style.maxHeight='80px';ua.style.padding='16px';}
+    pkgs.forEach(function(p){
+      var row=document.createElement('div');row.className='progress-item';row.setAttribute('data-filename',p.filename);
+      var top=document.createElement('div');top.style.cssText='display:flex;justify-content:space-between;align-items:center';
+      var lbl=document.createElement('span');lbl.style.cssText='font-family:JetBrains Mono,monospace;font-size:13px;color:var(--text-secondary)';lbl.textContent=p.filename+' ('+p.size_mb+' MB)';
+      var right=document.createElement('span');right.style.cssText='display:flex;align-items:center;gap:8px';
+      var pct=document.createElement('span');pct.style.cssText='font-family:JetBrains Mono,monospace;font-size:12px;color:var(--green)';pct.textContent='\u2713 ';
+      var rBtn=document.createElement('span');rBtn.textContent='\u2717';rBtn.style.cssText='color:var(--red);cursor:pointer;margin-left:8px;font-size:14px';rBtn.title='Remove';rBtn.onclick=function(){removeUpgradeFile(p.filename);};
+      pct.appendChild(rBtn);top.appendChild(lbl);top.appendChild(right);right.appendChild(pct);
+      var barOuter=document.createElement('div');barOuter.className='progress-bar-outer';
+      var barInner=document.createElement('div');barInner.className='progress-bar-inner';barInner.style.width='100%';barInner.style.background='var(--green)';
+      barOuter.appendChild(barInner);row.appendChild(top);row.appendChild(barOuter);pa.appendChild(row);
+    });
+    updateUpgradeFileReady();
+  }).catch(function(){});
+}
+if(document.getElementById('upgrade-progress-area')){loadExistingUpgradeFiles();}
+
 function takToggleUpdate(){takToggleSection('tak-update');}
 function takToggleSection(id){var body=document.getElementById(id+'-body');var icon=document.getElementById(id+'-toggle-icon');if(!body)return;var show=body.style.display==='none';body.style.display=show?'block':'none';if(icon)icon.style.transform=show?'rotate(180deg)':'';}
 async function startTakUpdate(){
   var btn=document.getElementById('tak-update-btn');var msg=document.getElementById('tak-update-msg');
-  if(!upgradeFileReady){if(msg){msg.textContent='Upload a .deb package first.';msg.style.color='var(--red)';}return;}
+  if(!upgradeFileReady){if(msg){msg.textContent=isUpgradeTwoServerMode()?'Upload both core and database .deb packages first.':'Upload a .deb package first.';msg.style.color='var(--red)';}return;}
   if(btn)btn.disabled=true;if(msg){msg.textContent='Starting update...';msg.style.color='var(--text-dim)';}
   try{
     var r=await fetch('/api/takserver/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({}),credentials:'same-origin'});
