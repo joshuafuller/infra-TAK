@@ -1623,10 +1623,12 @@ async function startTakUpdate(){
 function pollUpgradeLog(){
   var el=document.getElementById('upgrade-log');
   if(!el)return;
+  var retriesLeft=5;
   function poll(){
     fetch('/api/takserver/update/log?index='+upgradeLogIndex,{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
       if(d.entries&&d.entries.length){if(upgradeLogIndex===0)el.textContent='';el.textContent+=d.entries.join(String.fromCharCode(10))+String.fromCharCode(10);el.scrollTop=el.scrollHeight;upgradeLogIndex=d.total;}
-      if(!d.running){var btn=document.getElementById('tak-update-btn');if(btn)btn.disabled=false;if(d.complete){if(btn)btn.textContent='Update complete';var m=document.getElementById('tak-update-msg');if(m)m.textContent='Done. Refreshing...';setTimeout(function(){location.reload();},2000);}else if(d.error){var m=document.getElementById('tak-update-msg');if(m){m.textContent='Update failed';m.style.color='var(--red)';}}}else{setTimeout(poll,800);}
+      if(!d.running){var btn=document.getElementById('tak-update-btn');if(btn)btn.disabled=false;if(d.complete){if(btn)btn.textContent='Update complete';var m=document.getElementById('tak-update-msg');if(m)m.textContent='Done. Refreshing...';setTimeout(function(){window.location.reload();},1200);}else if(d.error){var m=document.getElementById('tak-update-msg');if(m){m.textContent='Update failed';m.style.color='var(--red)';}}else if(retriesLeft>0){retriesLeft--;setTimeout(poll,400);}}
+      else{setTimeout(poll,800);}
     });
   }
   poll();

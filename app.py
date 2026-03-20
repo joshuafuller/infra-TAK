@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.2.9-alpha"
+VERSION = "0.3.0-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -1677,6 +1677,9 @@ def takserver_page():
     _total_ram = _get_total_ram_gb_local() if tak.get('installed') else None
     _recommended_heap = _recommended_takserver_heap_gb(_total_ram) if _total_ram is not None else 4
     _current_heap = _get_current_takserver_heap_gb() if tak.get('installed') else None
+    _upgrade_done = upgrade_status.get('complete', False)
+    if _upgrade_done and not upgrade_status.get('running'):
+        upgrade_status.update({'complete': False})
     return render_template_string(TAKSERVER_TEMPLATE,
         settings=_settings, modules=modules, tak=tak, tak_version=tak_version,
         show_connect_ldap=show_connect_ldap, ldap_connected=ldap_connected,
@@ -1684,7 +1687,7 @@ def takserver_page():
         takserver_base_url=_get_takserver_base_url(_settings),
         metrics=get_system_metrics(), version=VERSION, deploying=deploy_status.get('running', False),
         deploy_done=deploy_status.get('complete', False), deploy_error=deploy_status.get('error', False),
-        upgrading=upgrade_status.get('running', False), upgrade_done=upgrade_status.get('complete', False),
+        upgrading=upgrade_status.get('running', False), upgrade_done=_upgrade_done,
         upgrade_error=upgrade_status.get('error', False),
         two_server_mode=_is_two_server, s1_host=_s1_host,
         total_ram_gb=_total_ram, recommended_heap_gb=_recommended_heap, current_heap_gb=_current_heap)
@@ -22216,6 +22219,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div id="upgrade-log-wrap" style="display:{{ 'block' if upgrading or upgrade_done or upgrade_error else 'none' }};margin-top:20px">
 <div class="section-title">Update log</div>
 <div id="upgrade-log" style="background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary);max-height:400px;overflow-y:auto;line-height:1.7;white-space:pre-wrap;margin-top:8px">{% if upgrading %}Connecting...{% else %}{% if upgrade_done %}Done.{% elif upgrade_error %}Update failed.{% endif %}{% endif %}</div>
+{% if upgrade_done %}<p style="margin-top:12px;font-size:13px;color:var(--text-secondary)">Update complete. <button type="button" onclick="window.location.reload()" style="padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer">Refresh page</button> to see the new version.</p>{% endif %}
 </div>
 </div>
 </div>
