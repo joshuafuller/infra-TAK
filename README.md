@@ -56,7 +56,7 @@ Then open your browser to the URL shown and log in.
 If you clicked **Update Now** and the console shows an error like `could not apply ... Add files via upload`, `Pulling is not possible because you have unmerged files`, or any rebase/merge conflict message, run this single command on your server:
 
 ```bash
-cd $(grep -oP 'WorkingDirectory=\K.*' /etc/systemd/system/takwerx-console.service) && git fetch --tags origin && git checkout --force v0.2.8-alpha && sudo systemctl restart takwerx-console
+cd $(grep -oP 'WorkingDirectory=\K.*' /etc/systemd/system/takwerx-console.service) && git fetch --tags origin && git checkout --force v0.2.9-alpha && sudo systemctl restart takwerx-console
 ```
 
 This clears the stuck state and puts you on a current tag with the safe updater. No data or config is lost — your `.config/` directory is untouched.
@@ -186,6 +186,15 @@ start.sh                    ← One CLI command to launch everything
 ---
 
 ## Changelog
+
+### v0.2.9-alpha — 2026-03-15
+
+**Deep security hardening**
+- Comprehensive security audit and remediation: shell injection fixes (CRITICAL/HIGH), credential handling (hardcoded passwords removed, `sshpass -e`, cert password validation), session security (cookie flags, fixation prevention, POST-only logout, XFF trust), file permissions (`settings.json` 0o600, `tempfile.mkstemp()` for sensitive temp files), information disclosure (exception truncation, secret masking in logs), and input validation (FQDN, version, `StrictHostKeyChecking`). Recommended upgrade for all deployments.
+
+Full notes: [docs/RELEASE-v0.2.9-alpha.md](docs/RELEASE-v0.2.9-alpha.md).
+
+---
 
 ### v0.2.8-alpha — 2026-03-20
 

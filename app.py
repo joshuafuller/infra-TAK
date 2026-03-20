@@ -66,6 +66,8 @@ from collections import defaultdict, deque
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(32)
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024 * 1024
 # When using domain (infratak.*) set cookie domain for session; when using IP (backdoor) use no domain so cookie is sent
 def _set_session_cookie_domain():
@@ -86,9 +88,10 @@ _RATE_HITS = defaultdict(deque)  # key -> deque[timestamps]
 
 def _client_ip():
     """Best-effort client IP for rate limiting."""
-    xff = (request.headers.get('X-Forwarded-For') or '').strip()
-    if xff:
-        return xff.split(',')[0].strip()
+    if request.remote_addr in ('127.0.0.1', '::1'):
+        xff = (request.headers.get('X-Forwarded-For') or '').strip()
+        if xff:
+            return xff.split(',')[0].strip()
     return (request.remote_addr or 'unknown').strip()
 
 
@@ -270,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.2.8-alpha"
+VERSION = "0.2.9-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -592,11 +595,20 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 def load_settings():
     p = os.path.join(CONFIG_DIR, 'settings.json')
-    return json.load(open(p)) if os.path.exists(p) else {}
+    if os.path.exists(p):
+        with open(p) as f:
+            return json.load(f)
+    return {}
 
 def save_settings(s):
     os.makedirs(CONFIG_DIR, exist_ok=True)
-    json.dump(s, open(os.path.join(CONFIG_DIR, 'settings.json'), 'w'), indent=2)
+    p = os.path.join(CONFIG_DIR, 'settings.json')
+    with open(p, 'w') as f:
+        json.dump(s, f, indent=2)
+    try:
+        os.chmod(p, 0o600)
+    except Exception:
+        pass
 
 def load_auth():
     """Load auth.json from CONFIG_DIR. Never raises — returns {} on missing file or error."""
@@ -946,7 +958,8 @@ out = {
 }
 print(json.dumps(out))
 '''
-    tmp_path = '/tmp/infra_tak_remote_metrics.py'
+    fd_m, tmp_path = tempfile.mkstemp(suffix='.py', prefix='infra_tak_metrics_')
+    os.close(fd_m)
     try:
         with open(tmp_path, 'w') as f:
             f.write(script_content)
@@ -1389,12 +1402,13 @@ def login():
                 error='Password not set or wrong install path. Use backdoor: https://YOUR_SERVER_IP:5001 and run ./reset-console-password.sh from the install directory.',
                 version=VERSION, login_logo_url=logo_url)
         if check_password_hash(auth['password_hash'], request.form.get('password', '')):
+            session.clear()
             session['authenticated'] = True
             return redirect(url_for('console_page'))
         return render_template_string(LOGIN_TEMPLATE, error='Invalid password', version=VERSION, login_logo_url=logo_url)
     return render_template_string(LOGIN_TEMPLATE, error=None, version=VERSION, login_logo_url=logo_url)
 
-@app.route('/logout')
+@app.route('/logout', methods=['POST'])
 def logout():
     session.clear()
     return redirect(url_for('index'))
@@ -1537,7 +1551,7 @@ def update_check():
         return _update_check_response({'current': VERSION, 'latest': latest, 'notes': notes, 'body': '',
             'update_available': is_newer})
     except Exception as e:
-        return _update_check_response({'current': VERSION, 'latest': None, 'error': str(e), 'update_available': False})
+        return _update_check_response({'current': VERSION, 'latest': None, 'error': str(e)[:200], 'update_available': False})
 
 def _fetch_latest_tag_name():
     """Return the latest release tag name (e.g. 'v0.2.3-alpha') from GitHub, or None on error."""
@@ -1637,7 +1651,7 @@ def update_apply():
             'restart_message': 'Console is restarting. You may see 502 briefly — wait 10–15 seconds then refresh the page.'
         })
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+        return jsonify({'success': False, 'error': str(e)[:200]})
 
 @app.route('/takserver')
 @login_required
@@ -1861,9 +1875,10 @@ def takserver_two_server_install_ssh_key():
         return jsonify({'success': False, 'error': 'sshpass not installed. Run: apt install sshpass (or use manual ssh-copy-id)'}), 400
     try:
         r = subprocess.run(
-            ['sshpass', '-p', password, 'ssh-copy-id', '-i', pub_path,
+            ['sshpass', '-e', 'ssh-copy-id', '-i', pub_path,
              '-o', 'StrictHostKeyChecking=accept-new', '-p', str(port), f'{user}@{host}'],
             capture_output=True, text=True, timeout=30,
+            env={**os.environ, 'SSHPASS': password},
         )
         if r.returncode != 0:
             err = (r.stderr or r.stdout or 'Unknown error').strip()[:500]
@@ -2337,7 +2352,7 @@ def takserver_two_server_deploy_server_two():
     # Install core .deb
     try:
         r = subprocess.run(
-            f'cd {UPLOAD_DIR} && sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ./{core_pkg}',
+            f'cd {shlex.quote(UPLOAD_DIR)} && sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ./{shlex.quote(core_pkg)}',
             shell=True, capture_output=True, text=True, timeout=600
         )
         log.append(r.stdout or '')
@@ -3603,7 +3618,7 @@ def guarddog_send_alert_email():
         _guarddog_send_alert_email_via_relay(to_addr, subject, body)
         return jsonify({'success': True})
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': str(e)[:200]}), 500
 
 
 @app.route('/api/guarddog/test-email', methods=['POST'])
@@ -3625,7 +3640,7 @@ def guarddog_test_email():
         )
         return jsonify({'success': True, 'message': f'Test email sent to {to_addr}'})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': str(e)[:200]}), 500
 
 @app.route('/api/guarddog/notifications/save', methods=['POST'])
 @login_required
@@ -3809,7 +3824,7 @@ def guarddog_brevo_sms_events():
             msg = body[:200] or f'HTTP {e.code}'
         return jsonify({'error': f'Brevo: {msg}'}), 400
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': str(e)[:200]}), 500
     events = data.get('events') or []
     return jsonify({'events': events})
 
@@ -3828,7 +3843,7 @@ def guarddog_test_sms():
             msg += f' Brevo message ID: {info["brevo_message_id"]} (check Brevo SMS logs if the text did not arrive).'
         return jsonify({'success': True, 'message': msg})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': str(e)[:200]}), 500
 
 @app.route('/api/guarddog/send-sms', methods=['POST'])
 def guarddog_send_sms():
@@ -3846,7 +3861,7 @@ def guarddog_send_sms():
         _guarddog_send_sms_now(sms, f"{subj}: {body}")
         return jsonify({'success': True})
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': str(e)[:200]}), 500
 
 def run_guarddog_deploy(alert_email):
     """Deploy Guard Dog: monitors + health endpoint. Requires TAK Server at /opt/tak. Alert email optional (alerts only when set)."""
@@ -4372,6 +4387,8 @@ def caddy_deploy():
     domain = data.get('domain', '').strip().lower()
     if not domain:
         return jsonify({'success': False, 'error': 'Domain is required'})
+    if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]$', domain):
+        return jsonify({'success': False, 'error': 'Invalid domain/FQDN format'})
     # Save domain to settings
     settings = load_settings()
     settings['fqdn'] = domain
@@ -4406,6 +4423,8 @@ def caddy_update_domain():
     domain = data.get('domain', '').strip().lower()
     if not domain:
         return jsonify({'success': False, 'error': 'Domain is required'})
+    if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]$', domain):
+        return jsonify({'success': False, 'error': 'Invalid domain/FQDN format'})
     settings = load_settings()
     settings['fqdn'] = domain
     save_settings(settings)
@@ -4716,7 +4735,7 @@ def _module_run(deploy_cfg, cmd, timeout=120, log_fn=None):
             r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
             return r.returncode == 0, (r.stdout or '') + (r.stderr or '')
         except Exception as e:
-            return False, str(e)
+            return False, str(e)[:200]
 
 
 def _module_copy(deploy_cfg, local_path, remote_path, timeout=30, log_fn=None):
@@ -4737,7 +4756,7 @@ def _module_copy(deploy_cfg, local_path, remote_path, timeout=30, log_fn=None):
             shutil.copy2(local_path, remote_path)
             return True, 'ok'
         except Exception as e:
-            return False, str(e)
+            return False, str(e)[:200]
 
 
 def _register_module_remote_routes(module_name, settings_key):
@@ -4829,10 +4848,13 @@ def _register_module_remote_routes(module_name, settings_key):
             return jsonify({'success': False, 'error': 'No public key found. Generate one first.'}), 400
         if not host:
             return jsonify({'success': False, 'error': 'Remote host is required'}), 400
-        cmd = ['sshpass', '-p', pwd, 'ssh-copy-id', '-i', pub,
-               '-o', 'StrictHostKeyChecking=no', '-p', str(port), f'{user}@{host}']
+        cmd = ['sshpass', '-e', 'ssh-copy-id', '-i', pub,
+               '-o', 'StrictHostKeyChecking=accept-new', '-p', str(port), f'{user}@{host}']
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            r = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=30,
+                env={**os.environ, 'SSHPASS': pwd},
+            )
             if r.returncode != 0:
                 return jsonify({'success': False, 'error': (r.stderr or r.stdout or 'ssh-copy-id failed')[:400]}), 400
         except Exception as e:
@@ -5401,8 +5423,8 @@ def _patch_openssl_string_mask(log_fn=None):
         with open(cnf, 'w') as f:
             f.write(patched)
     except PermissionError:
-        tmp = '/tmp/_openssl_cnf_patch.txt'
-        with open(tmp, 'w') as f:
+        fd_ssl, tmp = tempfile.mkstemp(suffix='.txt', prefix='openssl_cnf_')
+        with os.fdopen(fd_ssl, 'w') as f:
             f.write(patched)
         subprocess.run(['sudo', 'cp', tmp, cnf], capture_output=True, timeout=10)
         os.remove(tmp)
@@ -5721,7 +5743,8 @@ def _ssh_probe(host_cfg, cmd='echo ok', timeout=15):
             return False, 'auth_method=password but ssh_password is empty'
         if shutil.which('sshpass') is None:
             return False, 'sshpass not installed on infra host (required for password-based preflight)'
-        ssh_cmd = ['sshpass', '-p', ssh_password] + ssh_cmd
+        ssh_cmd = ['sshpass', '-e'] + ssh_cmd
+        ssh_run_env = {**os.environ, 'SSHPASS': ssh_password}
     elif key_path:
         expanded = os.path.expanduser(key_path)
         if os.path.exists(expanded):
@@ -5730,7 +5753,10 @@ def _ssh_probe(host_cfg, cmd='echo ok', timeout=15):
             return False, f'ssh key not found: {expanded}'
     ssh_cmd.extend([f'{user}@{host}', cmd])
     try:
-        r = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=timeout)
+        run_kw = dict(capture_output=True, text=True, timeout=timeout)
+        if auth_method == 'password':
+            run_kw['env'] = ssh_run_env
+        r = subprocess.run(ssh_cmd, **run_kw)
         if r.returncode == 0:
             return True, (r.stdout or '').strip()
         return False, ((r.stderr or '') + '\n' + (r.stdout or '')).strip()
@@ -5759,14 +5785,18 @@ def _scp_to_host(host_cfg, local_path, remote_path, timeout=120):
         pw = (host_cfg.get('ssh_password') or '').strip()
         if not pw or not shutil.which('sshpass'):
             return False, 'password auth requires sshpass'
-        scp_cmd = ['sshpass', '-p', pw] + scp_cmd
+        scp_cmd = ['sshpass', '-e'] + scp_cmd
+        scp_run_env = {**os.environ, 'SSHPASS': pw}
     elif key_path:
         expanded = os.path.expanduser(key_path)
         if os.path.exists(expanded):
             scp_cmd.extend(['-i', expanded])
     scp_cmd.extend([local_path, f'{user}@{host}:{remote_path}'])
     try:
-        r = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=timeout)
+        run_kw = dict(capture_output=True, text=True, timeout=timeout)
+        if auth_method == 'password':
+            run_kw['env'] = scp_run_env
+        r = subprocess.run(scp_cmd, **run_kw)
         out = (r.stdout or r.stderr or '').strip()
         return r.returncode == 0, out
     except Exception as e:
@@ -6939,10 +6969,16 @@ def takportal_control():
         settings = load_settings()
         settings_json = _takportal_merged_settings_json(settings)
         try:
-            with open('/tmp/tak-portal-settings.json', 'w') as f:
-                f.write(settings_json)
-            cp = subprocess.run('docker cp /tmp/tak-portal-settings.json tak-portal:/usr/src/app/data/settings.json', shell=True, capture_output=True, text=True, timeout=20)
-            os.remove('/tmp/tak-portal-settings.json')
+            fd, tmp_settings = tempfile.mkstemp(suffix='.json', prefix='tak-portal-')
+            try:
+                with os.fdopen(fd, 'w') as f:
+                    f.write(settings_json)
+                cp = subprocess.run(f'docker cp {shlex.quote(tmp_settings)} tak-portal:/usr/src/app/data/settings.json', shell=True, capture_output=True, text=True, timeout=20)
+            finally:
+                try:
+                    os.remove(tmp_settings)
+                except OSError:
+                    pass
             if cp.returncode != 0:
                 return jsonify({'success': False, 'error': (cp.stderr or cp.stdout or 'docker cp failed').strip()[:300]}), 500
             subprocess.run('docker restart tak-portal', shell=True, capture_output=True, text=True, timeout=30)
@@ -6976,10 +7012,16 @@ def takportal_control():
                 cloudtak_url = portal_settings.get('CLOUDTAK_URL', '')
             except Exception:
                 pass
-            with open('/tmp/tak-portal-settings.json', 'w') as f:
-                f.write(settings_json)
-            cp = subprocess.run('docker cp /tmp/tak-portal-settings.json tak-portal:/usr/src/app/data/settings.json', shell=True, capture_output=True, text=True, timeout=20)
-            os.remove('/tmp/tak-portal-settings.json')
+            fd, tmp_settings = tempfile.mkstemp(suffix='.json', prefix='tak-portal-')
+            try:
+                with os.fdopen(fd, 'w') as f:
+                    f.write(settings_json)
+                cp = subprocess.run(f'docker cp {shlex.quote(tmp_settings)} tak-portal:/usr/src/app/data/settings.json', shell=True, capture_output=True, text=True, timeout=20)
+            finally:
+                try:
+                    os.remove(tmp_settings)
+                except OSError:
+                    pass
             if cp.returncode == 0:
                 subprocess.run('docker restart tak-portal', shell=True, capture_output=True, text=True, timeout=30)
                 settings_synced = True
@@ -7242,17 +7284,25 @@ def run_takportal_deploy():
         if os.path.exists(webadmin_p12):
             # Re-encode P12 with modern encryption (AES-256-CBC) — TAK Server generates
             # legacy RC2-40-CBC which Node.js 22+ / OpenSSL 3.x rejects
-            modern_p12 = '/tmp/tak-portal-admin-modern.p12'
+            fd_p12, modern_p12 = tempfile.mkstemp(suffix='.p12', prefix='tak-portal-admin-')
+            os.close(fd_p12)
             cert_pass = _get_tak_cert_password(load_settings())
             r = subprocess.run(
                 f'openssl pkcs12 -in {shlex.quote(webadmin_p12)} -passin pass:{shlex.quote(cert_pass)} -nodes -legacy 2>/dev/null | '
                 f'openssl pkcs12 -export -passout pass:{shlex.quote(cert_pass)} -out {shlex.quote(modern_p12)}',
                 shell=True, capture_output=True, text=True, timeout=30)
             if os.path.exists(modern_p12) and os.path.getsize(modern_p12) > 0:
-                subprocess.run(f'docker cp {modern_p12} tak-portal:/usr/src/app/data/certs/tak-client.p12', shell=True, capture_output=True, text=True)
-                os.remove(modern_p12)
+                subprocess.run(f'docker cp {shlex.quote(modern_p12)} tak-portal:/usr/src/app/data/certs/tak-client.p12', shell=True, capture_output=True, text=True)
+                try:
+                    os.remove(modern_p12)
+                except OSError:
+                    pass
                 plog(f"  Copied {os.path.basename(webadmin_p12)} -> data/certs/tak-client.p12 (re-encoded for modern OpenSSL)")
             else:
+                try:
+                    os.remove(modern_p12)
+                except OSError:
+                    pass
                 subprocess.run(f'docker cp {webadmin_p12} tak-portal:/usr/src/app/data/certs/tak-client.p12', shell=True, capture_output=True, text=True)
                 plog(f"  Copied {os.path.basename(webadmin_p12)} -> data/certs/tak-client.p12 (legacy format, re-encode failed)")
         else:
@@ -7262,6 +7312,7 @@ def run_takportal_deploy():
         # (server + intermediate + root) which is what TAK Portal expects.
         # Fallback to building a bundle from ca.pem + root-ca.pem if needed.
         tak_ca_src = None
+        ca_bundle_path = None
         takserver_pem = os.path.join(cert_dir, 'takserver.pem')
         if os.path.exists(takserver_pem):
             tak_ca_src = takserver_pem
@@ -7278,15 +7329,18 @@ def run_takportal_deploy():
                     if 'BEGIN CERTIFICATE' in content and 'TRUSTED' not in content:
                         bundle_parts.append(content)
             if bundle_parts:
-                ca_bundle_path = '/tmp/tak-ca-bundle.pem'
-                with open(ca_bundle_path, 'w') as f:
+                fd_ca, ca_bundle_path = tempfile.mkstemp(suffix='.pem', prefix='tak-ca-bundle-')
+                with os.fdopen(fd_ca, 'w') as f:
                     f.write('\n'.join(bundle_parts) + '\n')
                 tak_ca_src = ca_bundle_path
                 plog(f"  Built CA bundle from ca.pem + root-ca.pem ({len(bundle_parts)} certs)")
         if tak_ca_src:
             subprocess.run(f'docker cp {tak_ca_src} tak-portal:/usr/src/app/data/certs/tak-ca.pem', shell=True, capture_output=True, text=True)
-            if tak_ca_src.startswith('/tmp/'):
-                os.remove(tak_ca_src)
+            if ca_bundle_path is not None and tak_ca_src == ca_bundle_path:
+                try:
+                    os.remove(tak_ca_src)
+                except OSError:
+                    pass
             plog(f"  -> data/certs/tak-ca.pem")
         else:
             plog("\u26a0 No CA cert files found in /opt/tak/certs/files/")
@@ -7304,10 +7358,16 @@ def run_takportal_deploy():
         portal_settings = _takportal_build_settings_dict(settings)
         ak_token = portal_settings.get('AUTHENTIK_TOKEN', '')
         settings_json = json_mod.dumps(portal_settings, indent=2)
-        with open('/tmp/tak-portal-settings.json', 'w') as f:
-            f.write(settings_json)
-        subprocess.run('docker cp /tmp/tak-portal-settings.json tak-portal:/usr/src/app/data/settings.json', shell=True, capture_output=True, text=True)
-        os.remove('/tmp/tak-portal-settings.json')
+        fd, tmp_settings = tempfile.mkstemp(suffix='.json', prefix='tak-portal-')
+        try:
+            with os.fdopen(fd, 'w') as f:
+                f.write(settings_json)
+            subprocess.run(f'docker cp {shlex.quote(tmp_settings)} tak-portal:/usr/src/app/data/settings.json', shell=True, capture_output=True, text=True)
+        finally:
+            try:
+                os.remove(tmp_settings)
+            except OSError:
+                pass
         plog(f"  AUTHENTIK_URL (internal): {portal_settings['AUTHENTIK_URL']}")
         plog(f"  AUTHENTIK_PUBLIC_URL: {portal_settings.get('AUTHENTIK_PUBLIC_URL', '')}")
         plog(f"  TAK Server URL: {portal_settings['TAK_URL']}")
@@ -7695,7 +7755,7 @@ def mediamtx_recovery():
         )
         return jsonify({'success': True, 'message': msg, 'webeditor_running': active})
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': str(e)[:200]}), 500
     finally:
         if tmp_f and os.path.exists(tmp_f.name):
             try:
@@ -7910,7 +7970,7 @@ paths:
     if not ok:
         _module_run(deploy_cfg, 'mv /tmp/mediamtx.yml /usr/local/etc/mediamtx.yml', timeout=10)
     plog("✓ Configuration written")
-    plog(f"  HLS viewer password: {hls_pass}")
+    plog(f"  HLS viewer password: {'*' * max(0, len(hls_pass) - 4) + hls_pass[-4:]}")
 
     # Step 5: systemd mediamtx.service
     plog("")
@@ -8187,7 +8247,7 @@ paths:
     if domain:
         plog(f"   Web Console: https://stream.{domain.split(':')[0]}")
     plog(f"   Remote: http://{host}:5080")
-    plog(f"   HLS viewer password: {hls_pass}")
+    plog(f"   HLS viewer password: {'*' * max(0, len(hls_pass) - 4) + hls_pass[-4:]}")
     if ssl_ok:
         plog(f"   RTSPS: rtsps://stream.{domain.split(':')[0]}:8322")
     plog("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -8370,7 +8430,7 @@ paths:
         with open('/usr/local/etc/mediamtx.yml', 'w') as f:
             f.write(mediamtx_yml)
         plog("✓ Configuration written to /usr/local/etc/mediamtx.yml")
-        plog(f"  HLS viewer password: {hls_pass}")
+        plog(f"  HLS viewer password: {'*' * max(0, len(hls_pass) - 4) + hls_pass[-4:]}")
 
         # Step 5: Create mediamtx systemd service
         plog("")
@@ -8452,10 +8512,12 @@ WantedBy=multi-user.target
             # Only replace URL-like patterns (//video. or video.<domain>) — not JS vars like video.src / video.canPlayType
             if domain:
                 base = domain.split(':')[0]
-                base_esc = base.replace('.', '\\.')
-                subprocess.run(f"sed -i 's|video\\.{base_esc}|stream.{base_esc}|g' {webeditor_dir}/mediamtx_config_editor.py", shell=True)
-                subprocess.run(f"sed -i 's|//video\\.|//stream.|g' {webeditor_dir}/mediamtx_config_editor.py", shell=True)
-                plog("  Stream URL host set to stream.*")
+                if re.match(r'^[a-zA-Z0-9][a-zA-Z0-9.-]*$', base):
+                    base_esc = base.replace('.', '\\.')
+                    _editor_py = shlex.quote(f'{webeditor_dir}/mediamtx_config_editor.py')
+                    subprocess.run(f"sed -i 's|video\\.{base_esc}|stream.{base_esc}|g' {_editor_py}", shell=True)
+                    subprocess.run(f"sed -i 's|//video\\.|//stream.|g' {_editor_py}", shell=True)
+                    plog("  Stream URL host set to stream.*")
             plog("✓ Web editor installed (port 5080, API 9898)")
 
             # Patch HLS URLs to go through Caddy /hls-proxy/ instead of direct port 8888 (avoids mixed content)
@@ -8763,7 +8825,7 @@ WantedBy=multi-user.target
                 plog(f"   Web Editor: http://{settings.get('server_ip','server')}:5080")
             plog(f"   RTSP: rtsp://[server]:8554/[stream]")
             plog(f"   SRT:  srt://[server]:8890?streamid=[stream]")
-            plog(f"   HLS viewer password: {hls_pass}")
+            plog(f"   HLS viewer password: {'*' * max(0, len(hls_pass) - 4) + hls_pass[-4:]}")
             plog("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
             mediamtx_deploy_status.update({'running': False, 'complete': True, 'error': False})
         else:
@@ -8905,9 +8967,10 @@ def cloudtak_remote_install_ssh_key():
         return jsonify({'success': False, 'error': 'sshpass is not installed on infra-TAK host. Install it first (apt install sshpass).'}), 400
     try:
         r = subprocess.run(
-            ['sshpass', '-p', password, 'ssh-copy-id', '-i', pub_path,
+            ['sshpass', '-e', 'ssh-copy-id', '-i', pub_path,
              '-o', 'StrictHostKeyChecking=accept-new', '-p', str(port), f'{user}@{host}'],
             capture_output=True, text=True, timeout=30,
+            env={**os.environ, 'SSHPASS': password},
         )
         if r.returncode != 0:
             err = (r.stderr or r.stdout or 'Unknown error').strip()[:500]
@@ -9433,7 +9496,7 @@ def cloudtak_uninstall():
         except subprocess.TimeoutExpired:
             cloudtak_uninstall_status.update({'running': False, 'done': True, 'error': 'Uninstall timed out'})
         except Exception as e:
-            cloudtak_uninstall_status.update({'running': False, 'done': True, 'error': str(e)})
+            cloudtak_uninstall_status.update({'running': False, 'done': True, 'error': str(e)[:200]})
     threading.Thread(target=do_uninstall, daemon=True).start()
     return jsonify({'success': True, 'message': 'Uninstall started'})
 
@@ -10500,7 +10563,7 @@ def emailrelay_test():
             s.sendmail(from_addr, [to_addr], msg.as_string())
         return jsonify({'success': True, 'output': f'Test email sent to {to_addr}'})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+        return jsonify({'success': False, 'error': str(e)[:200]})
 
 @app.route('/api/emailrelay/swap', methods=['POST'])
 @login_required
@@ -10938,7 +11001,7 @@ def _ensure_authentik_recovery_flow(ak_url, ak_headers):
     except urllib.error.HTTPError as e:
         return False, _err(e), None
     except Exception as e:
-        return False, str(e), None
+        return False, str(e)[:200], None
 
 
 @app.route('/api/emailrelay/configure-authentik', methods=['POST'])
@@ -10956,7 +11019,7 @@ def emailrelay_configure_authentik():
         message = _configure_authentik_smtp_and_recovery(relay.get('from_addr', ''))
         return jsonify({'success': True, 'message': message})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': str(e)[:200]}), 500
 
 
 # ── Docker log limits (prevents Node-RED / Authentik LDAP etc. from filling disk) ──
@@ -11232,7 +11295,7 @@ def nodered_uninstall():
             steps.append('Caddyfile updated')
         return jsonify({'success': True, 'steps': steps})
     except Exception as e:
-        return jsonify({'error': f'Uninstall failed: {str(e)}'}), 500
+        return jsonify({'error': f'Uninstall failed: {str(e)[:200]}'}), 500
 
 
 def _is_module_deployed(settings, module_key):
@@ -15789,8 +15852,8 @@ volumes:
     plog(f"🎉 Authentik deployed on remote host {host}!")
     if fqdn:
         plog(f"   URL: {ak_base}")
-    plog(f"   Admin: akadmin / {bootstrap_pass}")
-    plog(f"   API Token: {bootstrap_token}")
+    plog(f"   Admin: akadmin / {'*' * max(0, len(bootstrap_pass) - 4) + bootstrap_pass[-4:]}")
+    plog(f"   API Token: {'*' * max(0, len(bootstrap_token) - 4) + bootstrap_token[-4:]}")
     plog("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     authentik_deploy_status.update({'running': False, 'complete': True, 'error': False})
 
@@ -16678,8 +16741,10 @@ entries:
                             tak_s = json.load(f)
                             webadmin_pass = tak_s.get('webadmin_password', '')
                     if not webadmin_pass:
-                        webadmin_pass = 'TakserverAtak1!'
-                        plog(f"  ⚠ webadmin_password not found in settings.json — using default: TakserverAtak1!")
+                        webadmin_pass = secrets.token_urlsafe(16)
+                        plog(f"  ⚠ webadmin_password not in settings — generated random password")
+                        settings['webadmin_password'] = webadmin_pass
+                        save_settings(settings)
                 else:
                     plog("  ℹ TAK Server not installed — skipping webadmin user (optional; used for TAK Server admin)")
 
@@ -17233,12 +17298,12 @@ entries:
         plog(f"  Admin UI: {_get_authentik_base_url(settings)}")
         plog(f"  Admin user: akadmin")
         if bootstrap_pass_display:
-            plog(f"  Admin password: {bootstrap_pass_display}")
+            plog(f"  Admin password: {'*' * max(0, len(bootstrap_pass_display) - 4) + bootstrap_pass_display[-4:]}")
         plog("")
         plog("  LDAP Configuration:")
         plog(f"  - Service account: adm_ldapservice")
         if ldap_svc_pass:
-            plog(f"  - Service password: {ldap_svc_pass}")
+            plog(f"  - Service password: {'*' * max(0, len(ldap_svc_pass) - 4) + ldap_svc_pass[-4:]}")
         plog(f"  - Base DN: DC=takldap")
         plog(f"  - LDAP port: 389")
         # Regenerate Caddyfile if Caddy is configured — wait for HTTP 9090 first so Caddy doesn't get 502s
@@ -18439,7 +18504,11 @@ def _ensure_authentik_webadmin():
     ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
     if not ak_token:
         return False, 'Authentik .env not found'
-    webadmin_pass = settings.get('webadmin_password', '') or 'TakserverAtak1!'
+    webadmin_pass = settings.get('webadmin_password', '')
+    if not webadmin_pass:
+        webadmin_pass = secrets.token_urlsafe(16)
+        settings['webadmin_password'] = webadmin_pass
+        save_settings(settings)
     url = _get_authentik_api_url(settings)
     headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
     try:
@@ -18821,7 +18890,7 @@ def takserver_vacuum():
     except subprocess.TimeoutExpired:
         return jsonify({'success': False, 'error': 'VACUUM timed out (database may be very large)'}), 400
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': str(e)[:200]}), 500
 
 
 @app.route('/api/takserver/cot-db-size')
@@ -18854,7 +18923,7 @@ def takserver_cot_db_size():
             human = f'{size} B'
         return jsonify({'size_bytes': size, 'size_human': human})
     except Exception as e:
-        return jsonify({'size_bytes': 0, 'size_human': 'N/A', 'error': str(e)})
+        return jsonify({'size_bytes': 0, 'size_human': 'N/A', 'error': str(e)[:200]})
 
 
 @app.route('/api/takserver/cert-expiry')
@@ -18887,7 +18956,7 @@ def takserver_cert_expiry():
                 'days_left': days_left
             }
         except Exception as e:
-            results[label] = {'error': str(e)}
+            results[label] = {'error': str(e)[:200]}
     return jsonify(results)
 
 
@@ -18988,7 +19057,7 @@ def takserver_groups():
             return jsonify({'groups': groups, 'warnings': warnings})
         return jsonify({'groups': groups})
     except Exception as e:
-        return jsonify({'error': str(e), 'groups': []})
+        return jsonify({'error': str(e)[:200], 'groups': []})
     finally:
         for f in ['/tmp/tak-admin-curl.pem', '/tmp/tak-admin-curl.key']:
             try:
@@ -19433,7 +19502,7 @@ def takserver_revoke_old_ca():
                    f'(Server TLS is Let\'s Encrypt; unchanged.) Clients with certs signed by {old_ca_alias} must re-enroll.')
         return jsonify({'success': True, 'message': msg})
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': str(e)[:200]}), 500
 
 
 rotate_rootca_log = []
@@ -19699,10 +19768,10 @@ def takserver_create_client_cert():
             pem_path = os.path.join(cert_dir, f'{cert_name}.pem')
             cmd = f'java -jar /opt/tak/utils/UserManager.jar certmod'
             for g in groups_in:
-                cmd += f' -ig {g}'
+                cmd += f' -ig {shlex.quote(g)}'
             for g in groups_out:
-                cmd += f' -og {g}'
-            cmd += f' {pem_path} 2>&1'
+                cmd += f' -og {shlex.quote(g)}'
+            cmd += f' {shlex.quote(pem_path)} 2>&1'
             gr = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=15)
             if gr.returncode != 0:
                 pass  # cert still created, group assignment is best-effort
@@ -19716,7 +19785,7 @@ def takserver_create_client_cert():
             'groups_out': groups_out
         })
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': str(e)[:200]}), 500
 
 
 def _sync_webadmin_after_authentik_reconfigure(plog):
@@ -19765,7 +19834,7 @@ def takserver_update_config():
         try:
             _run_takserver_update_config()
         except Exception as e:
-            takserver_update_config_status.update({'running': False, 'complete': True, 'error': True, 'message': str(e)})
+            takserver_update_config_status.update({'running': False, 'complete': True, 'error': True, 'message': str(e)[:200]})
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({'success': True, 'message': 'Update config started. Caddy and 8446 cert (if applicable) will be updated; TAK Server will restart.'})
 
@@ -19837,7 +19906,7 @@ def takserver_log():
         else:
             return jsonify({'entries': [], 'offset': offset, 'size': size})
     except Exception as e:
-        return jsonify({'entries': [f'Error reading log: {str(e)}'], 'offset': offset, 'size': 0})
+        return jsonify({'entries': [f'Error reading log: {str(e)[:200]}'], 'offset': offset, 'size': 0})
 
 @app.route('/api/takserver/services')
 @login_required
@@ -19915,7 +19984,7 @@ def takserver_services():
                 'status': 'running' if pg.stdout.strip() == 'active' else 'stopped'
             })
     except Exception as e:
-        services.append({'name': 'Error', 'icon': '❌', 'status': str(e)})
+        services.append({'name': 'Error', 'icon': '❌', 'status': str(e)[:200]})
     return jsonify({'services': services, 'count': len([s for s in services if s['status'] == 'running'])})
 
 
@@ -20383,7 +20452,7 @@ def deploy_takserver():
                            ('Organizational Unit', 'cert_ou')]:
             _sanitize_cert_field(data.get(key, ''), field)
     except ValueError as e:
-        return jsonify({'error': str(e)}), 400
+        return jsonify({'error': str(e)[:200]}), 400
     pkg_files = [f for f in os.listdir(UPLOAD_DIR) if f.endswith('.deb') or f.endswith('.rpm')]
     if not pkg_files: return jsonify({'error': 'No package file found.'}), 400
     # For two-server, prefer the core .deb (database is on Server One)
@@ -21075,9 +21144,9 @@ def api_toggle_unattended_upgrades():
         uu = _get_unattended_upgrades_status()
         return jsonify({'success': True, 'target': 'this_host', 'enabled': uu['enabled'], 'running': uu['running']})
     except subprocess.CalledProcessError as e:
-        return jsonify({'success': False, 'error': e.stderr or str(e)}), 500
+        return jsonify({'success': False, 'error': (e.stderr or str(e))[:200]}), 500
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': str(e)[:200]}), 500
 
 @app.route('/api/modules')
 @login_required
@@ -21235,8 +21304,8 @@ def run_full_uninstall():
         full_uninstall_status.update({'running': False, 'done': True, 'error': 'Uninstall timed out'})
         full_uninstall_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] ✗ Timeout")
     except Exception as e:
-        full_uninstall_status.update({'running': False, 'done': True, 'error': str(e)})
-        full_uninstall_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] ✗ {str(e)}")
+        full_uninstall_status.update({'running': False, 'done': True, 'error': str(e)[:200]})
+        full_uninstall_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] ✗ {str(e)[:200]}")
 
 @app.route('/api/console/uninstall-all/validate', methods=['POST'])
 @login_required
