@@ -4213,9 +4213,11 @@ def _caddy_letsencrypt_days_left(settings):
     from datetime import datetime
     # Try s_client with servername (Caddy may serve cert for base domain or infratak.<fqdn>)
     for servername in (fqdn, f'infratak.{fqdn}'):
+        if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9._-]*$', servername):
+            continue
         try:
             cmd = (
-                f'echo | openssl s_client -connect localhost:443 -servername {servername} 2>/dev/null '
+                f'echo | openssl s_client -connect localhost:443 -servername {shlex.quote(servername)} 2>/dev/null '
                 '| openssl x509 -noout -enddate 2>/dev/null'
             )
             r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
@@ -5324,9 +5326,15 @@ def _cloudtak_bootstrap_preflight(cfg, tak_host, cot_port, marti_port, webtak_po
     return healthy, result
 
 
+_CERT_PASS_SAFE_RE = re.compile(r'^[a-zA-Z0-9!@#%^+=_.,:-]+$')
+
 def _get_tak_cert_password(settings):
     """Current TAK cert export password (default atakatak)."""
     return (settings.get('tak_cert_password') or 'atakatak').strip() or 'atakatak'
+
+def _validate_cert_password(pw):
+    """Return True if password is safe for shell interpolation (no metacharacters like $, `, ;, &, |, etc.)."""
+    return bool(pw) and bool(_CERT_PASS_SAFE_RE.match(pw))
 
 
 def _patch_cert_metadata_password(cert_pass):
@@ -6103,8 +6111,8 @@ def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
 
     # Step A: LE cert → PKCS12
     r = subprocess.run(
-        f'openssl pkcs12 -export -in "{cert_crt}" -inkey "{cert_key}" '
-        f'-out /tmp/takserver-le.p12 -name "{takserver_host}" -password pass:{cert_pass} 2>&1',
+        f'openssl pkcs12 -export -in {shlex.quote(cert_crt)} -inkey {shlex.quote(cert_key)} '
+        f'-out /tmp/takserver-le.p12 -name {shlex.quote(takserver_host)} -password pass:{shlex.quote(cert_pass)} 2>&1',
         shell=True, capture_output=True, text=True)
     if r.returncode != 0:
         log_fn(f"  ⚠ PKCS12 conversion failed: {r.stderr.strip()[:200]}")
@@ -6113,7 +6121,7 @@ def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
 
     # Step B: PKCS12 → JKS
     r = subprocess.run(
-        f'keytool -importkeystore -srcstorepass "{cert_pass}" -deststorepass "{cert_pass}" '
+        f'keytool -importkeystore -srcstorepass {shlex.quote(cert_pass)} -deststorepass {shlex.quote(cert_pass)} '
         f'-destkeystore /tmp/takserver-le.jks -srckeystore /tmp/takserver-le.p12 '
         f'-srcstoretype pkcs12 2>&1',
         shell=True, capture_output=True, text=True)
@@ -6188,9 +6196,9 @@ fi
 sleep 15
 
 openssl pkcs12 -export -in "$CERT_CRT" -inkey "$CERT_KEY" \\
-  -out /tmp/takserver-le.p12 -name "$TAK_DOMAIN" -password pass:{cert_pass}
+  -out /tmp/takserver-le.p12 -name "$TAK_DOMAIN" -password pass:{shlex.quote(cert_pass)}
 
-keytool -importkeystore -srcstorepass {cert_pass} -deststorepass {cert_pass} \\
+keytool -importkeystore -srcstorepass {shlex.quote(cert_pass)} -deststorepass {shlex.quote(cert_pass)} \\
   -destkeystore /tmp/takserver-le.jks -srckeystore /tmp/takserver-le.p12 \\
   -srcstoretype pkcs12
 
@@ -7237,8 +7245,8 @@ def run_takportal_deploy():
             modern_p12 = '/tmp/tak-portal-admin-modern.p12'
             cert_pass = _get_tak_cert_password(load_settings())
             r = subprocess.run(
-                f'openssl pkcs12 -in {webadmin_p12} -passin pass:{cert_pass} -nodes -legacy 2>/dev/null | '
-                f'openssl pkcs12 -export -passout pass:{cert_pass} -out {modern_p12}',
+                f'openssl pkcs12 -in {shlex.quote(webadmin_p12)} -passin pass:{shlex.quote(cert_pass)} -nodes -legacy 2>/dev/null | '
+                f'openssl pkcs12 -export -passout pass:{shlex.quote(cert_pass)} -out {shlex.quote(modern_p12)}',
                 shell=True, capture_output=True, text=True, timeout=30)
             if os.path.exists(modern_p12) and os.path.getsize(modern_p12) > 0:
                 subprocess.run(f'docker cp {modern_p12} tak-portal:/usr/src/app/data/certs/tak-client.p12', shell=True, capture_output=True, text=True)
@@ -7696,18 +7704,22 @@ def mediamtx_recovery():
                 pass
 
 
+_MEDIAMTX_LOG_UNITS = {'mediamtx', 'mediamtx-webeditor'}
+
 @app.route('/api/mediamtx/logs')
 @login_required
 def mediamtx_logs():
-    lines = request.args.get('lines', 60, type=int)
+    lines = min(max(request.args.get('lines', 60, type=int), 1), 10000)
     unit = request.args.get('unit', 'mediamtx')
+    if unit not in _MEDIAMTX_LOG_UNITS:
+        return jsonify({'error': 'Invalid unit'}), 400
     settings = load_settings()
     deploy_cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
     if deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip():
         ok, out = _ssh_probe(deploy_cfg['remote'], f'journalctl -u {unit} --no-pager -n {lines} 2>&1', timeout=15)
         entries = [l for l in (out.strip().split('\n') if out and out.strip() else []) if l.strip()] if ok else []
         return jsonify({'entries': entries})
-    r = subprocess.run(f'journalctl -u {unit} --no-pager -n {lines} 2>&1', shell=True, capture_output=True, text=True, timeout=10)
+    r = subprocess.run(['journalctl', '-u', unit, '--no-pager', '-n', str(lines)], capture_output=True, text=True, timeout=10)
     entries = [l for l in (r.stdout.strip().split('\n') if r.stdout.strip() else []) if l.strip()]
     return jsonify({'entries': entries})
 
@@ -8114,14 +8126,15 @@ paths:
                 ssh_key  = (rcfg.get('ssh_key_path') or '').strip()
                 ssh_key_expanded = os.path.expanduser(ssh_key) if ssh_key else ''
                 key_flag = f'-i {ssh_key_expanded}' if ssh_key_expanded and os.path.exists(ssh_key_expanded) else ''
+                _sq = shlex.quote
                 sync_script = (
                     f"#!/bin/bash\n"
                     f"# Auto-generated: sync Caddy certs to remote MediaMTX\n"
-                    f"CERT='{cert_file}'\n"
-                    f"KEY='{key_file}'\n"
-                    f"REMOTE='{ssh_user}@{host}'\n"
-                    f"PORT='{ssh_port}'\n"
-                    f"KEY_FLAG='{key_flag}'\n"
+                    f"CERT={_sq(cert_file)}\n"
+                    f"KEY={_sq(key_file)}\n"
+                    f"REMOTE={_sq(f'{ssh_user}@{host}')}\n"
+                    f"PORT={_sq(str(ssh_port))}\n"
+                    f"KEY_FLAG={_sq(key_flag)}\n"
                     f"[ -f \"$CERT\" ] || exit 0\n"
                     f"scp -P $PORT $KEY_FLAG -o StrictHostKeyChecking=accept-new -o BatchMode=yes "
                     f"\"$CERT\" \"$REMOTE:/etc/mediamtx/certs/stream.crt\" 2>/dev/null\n"
@@ -14965,11 +14978,15 @@ def authentik_remote_metrics():
     return jsonify(metrics)
 
 
+_AK_CONTAINER_RE = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_.-]*$')
+
 @app.route('/api/authentik/logs')
 @login_required
 def authentik_container_logs():
-    lines = request.args.get('lines', 50, type=int)
+    lines = min(max(request.args.get('lines', 50, type=int), 1), 10000)
     container = request.args.get('container', '').strip()
+    if container and not _AK_CONTAINER_RE.match(container):
+        return jsonify({'error': 'Invalid container name'}), 400
     settings = load_settings()
     deploy_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
     if deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip():
@@ -14980,9 +14997,9 @@ def authentik_container_logs():
         entries = [l for l in (out.strip().split('\n') if out and out.strip() else []) if l.strip()] if ok else []
         return jsonify({'entries': entries})
     if container:
-        r = subprocess.run(f'docker logs {container} --tail {lines} 2>&1', shell=True, capture_output=True, text=True, timeout=10)
+        r = subprocess.run(['docker', 'logs', container, '--tail', str(lines)], capture_output=True, text=True, timeout=10)
     else:
-        r = subprocess.run(f'cd ~/authentik && docker compose logs --tail {lines} 2>&1', shell=True, capture_output=True, text=True, timeout=10)
+        r = subprocess.run('cd ~/authentik && docker compose logs --tail ' + str(lines) + ' 2>&1', shell=True, capture_output=True, text=True, timeout=10)
     entries = r.stdout.strip().split('\n') if r.stdout.strip() else []
     return jsonify({'entries': entries})
 
@@ -15240,6 +15257,7 @@ def _run_authentik_deploy_remote(settings, deploy_cfg, plog):
     plog("━━━ Step 2/8: Setting Up Directory (remote) ━━━")
     _module_run(deploy_cfg, 'mkdir -p ~/authentik/blueprints', timeout=10)
     plog("✓ Directory ready")
+    _ensure_authentik_starter_branding(None, deploy_cfg, plog)
 
     # Step 3: Generate .env and copy to remote
     plog("")
@@ -15858,6 +15876,42 @@ def _find_authentik_install_dir():
     return (None, None, None)
 
 
+def _ensure_authentik_starter_branding(ak_dir, deploy_cfg, plog=None):
+    """Copy starter TAK branding (shield SVG from tak.gov, same asset as TAK_LOGO_URL) into Authentik's
+    host media tree: <ak_dir>/media/public/infra-tak-defaults/. Official compose mounts ./media -> /media.
+    Authentik still registers uploads via the UI/API; this gives a on-disk file to upload or reference."""
+    src = os.path.join(BASE_DIR, 'static', 'authentik-branding', 'tak-gov-brand.svg')
+    if not os.path.isfile(src):
+        return
+    sub, fn = 'infra-tak-defaults', 'tak-gov-brand.svg'
+    if deploy_cfg.get('target_mode') == 'remote':
+        ok_m, _ = _module_run(deploy_cfg, f'mkdir -p ~/authentik/media/public/{sub}', timeout=10)
+        if not ok_m:
+            if plog:
+                plog("  \u26a0 Could not create ~/authentik/media/public/ for starter branding")
+            return
+        remote_tmp = '/tmp/infra-tak-ak-brand.svg'
+        ok, err = _module_copy(deploy_cfg, src, remote_tmp, log_fn=plog)
+        if ok:
+            _module_run(deploy_cfg, f'mv {remote_tmp} ~/authentik/media/public/{sub}/{fn}', timeout=10)
+            if plog:
+                plog(f"  \u2713 Starter branding on Authentik host: ~/authentik/media/public/{sub}/{fn}")
+        elif plog:
+            plog(f"  \u26a0 Starter branding SCP failed: {(err or '')[:120]}")
+        return
+    if not ak_dir:
+        return
+    dest_dir = os.path.join(ak_dir, 'media', 'public', sub)
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+        shutil.copy2(src, os.path.join(dest_dir, fn))
+        if plog:
+            plog(f"  \u2713 Starter branding: {dest_dir}/{fn}")
+    except Exception as e:
+        if plog:
+            plog(f"  \u26a0 Starter branding: {e}")
+
+
 def run_authentik_deploy(reconfigure=False):
     def plog(msg):
         entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
@@ -15893,6 +15947,7 @@ def run_authentik_deploy(reconfigure=False):
                         ldap_svc_pass = line.strip().split('=', 1)[1].strip()
                         break
             plog("\u2501\u2501\u2501 Reconfigure: Updating LDAP, CoreConfig, Forward Auth (no removal) \u2501\u2501\u2501")
+            _ensure_authentik_starter_branding(ak_dir, deploy_cfg, plog)
             subprocess.run(f'cd {ak_dir} && docker compose up -d 2>&1', shell=True, capture_output=True, text=True, timeout=120)
             plog("  Ensured containers are up")
             fqdn = settings.get('fqdn', '')
@@ -16041,6 +16096,7 @@ def run_authentik_deploy(reconfigure=False):
             os.makedirs(ak_dir, exist_ok=True)
             plog(f"  Directory: {ak_dir}")
             plog("\u2713 Directory ready")
+            _ensure_authentik_starter_branding(ak_dir, deploy_cfg, plog)
 
             # Step 3: Generate secrets and .env
             plog("")
@@ -18555,6 +18611,8 @@ def takserver_set_cert_password():
     pw = (data.get('password') or '').strip()
     if not pw:
         return jsonify({'success': False, 'error': 'Password required'}), 400
+    if not _validate_cert_password(pw):
+        return jsonify({'success': False, 'error': 'Password contains unsupported characters (avoid $, `, ;, &, |, quotes, spaces, etc.)'}), 400
     settings = load_settings()
     settings['tak_cert_password'] = pw
     save_settings(settings)
@@ -18854,10 +18912,10 @@ def takserver_groups():
         admin_pem = '/tmp/tak-admin-curl.pem'
         admin_key = '/tmp/tak-admin-curl.key'
         subprocess.run(
-            f'openssl pkcs12 -in {admin_p12} -passin pass:{cert_pass} -clcerts -nokeys -legacy 2>/dev/null > {admin_pem}',
+            f'openssl pkcs12 -in {admin_p12} -passin pass:{shlex.quote(cert_pass)} -clcerts -nokeys -legacy 2>/dev/null > {admin_pem}',
             shell=True, capture_output=True, text=True, timeout=10)
         subprocess.run(
-            f'openssl pkcs12 -in {admin_p12} -passin pass:{cert_pass} -nocerts -nodes -legacy 2>/dev/null > {admin_key}',
+            f'openssl pkcs12 -in {admin_p12} -passin pass:{shlex.quote(cert_pass)} -nocerts -nodes -legacy 2>/dev/null > {admin_key}',
             shell=True, capture_output=True, text=True, timeout=10)
         if not os.path.exists(admin_pem) or os.path.getsize(admin_pem) == 0:
             return jsonify({'error': 'Failed to extract PEM from admin.p12 (legacy conversion)', 'groups': []})
@@ -19171,12 +19229,12 @@ def takserver_rotate_intca():
             log("Step 5/7: Updating truststore...")
             ts_jks = os.path.join(cert_dir, f'truststore-{new_ca_name}.jks')
             run(f'keytool -import -alias root-ca -file {cert_dir}/root-ca.pem '
-                f'-keystore {ts_jks} -storepass "{cert_pass}" -noprompt 2>&1', check=False)
+                f'-keystore {ts_jks} -storepass {shlex.quote(cert_pass)} -noprompt 2>&1', check=False)
             log("  Root CA imported into new truststore")
             old_pem = os.path.join(cert_dir, f'{old_ca_name}.pem')
             if os.path.exists(old_pem):
                 run(f'keytool -import -trustcacerts -file {old_pem} '
-                    f'-keystore {ts_jks} -alias "{old_ca_name}" -deststorepass "{cert_pass}" -noprompt 2>&1',
+                    f'-keystore {ts_jks} -alias "{old_ca_name}" -deststorepass {shlex.quote(cert_pass)} -noprompt 2>&1',
                     check=False)
                 log(f"  Old CA ({old_ca_name}) imported into new truststore (transition period)")
             else:
@@ -19198,8 +19256,8 @@ def takserver_rotate_intca():
                 admin_p12 = os.path.join(cert_dir, 'admin.p12')
                 modern_p12 = '/tmp/tak-portal-admin-modern.p12'
                 subprocess.run(
-                    f'openssl pkcs12 -in {admin_p12} -passin pass:{cert_pass} -nodes -legacy 2>/dev/null | '
-                    f'openssl pkcs12 -export -passout pass:{cert_pass} -out {modern_p12}',
+                    f'openssl pkcs12 -in {admin_p12} -passin pass:{shlex.quote(cert_pass)} -nodes -legacy 2>/dev/null | '
+                    f'openssl pkcs12 -export -passout pass:{shlex.quote(cert_pass)} -out {modern_p12}',
                     shell=True, capture_output=True, text=True, timeout=30)
                 if os.path.exists(modern_p12) and os.path.getsize(modern_p12) > 0:
                     run(f'docker cp {modern_p12} tak-portal:/usr/src/app/data/certs/tak-client.p12', check=False)
@@ -19313,8 +19371,8 @@ def takserver_revoke_old_ca():
             jks = os.path.join(cert_dir, 'takserver.jks')
             if os.path.isfile(p12):
                 subprocess.run(
-                    f'keytool -importkeystore -srcstoretype PKCS12 -srckeystore {p12} -srcstorepass "{cert_pass}" '
-                    f'-deststoretype JKS -destkeystore {jks} -deststorepass "{cert_pass}" -noprompt 2>&1',
+                    f'keytool -importkeystore -srcstoretype PKCS12 -srckeystore {p12} -srcstorepass {shlex.quote(cert_pass)} '
+                    f'-deststoretype JKS -destkeystore {jks} -deststorepass {shlex.quote(cert_pass)} -noprompt 2>&1',
                     shell=True, capture_output=True, text=True, timeout=30)
 
         # 2) Remove old CA from truststore
@@ -19329,7 +19387,7 @@ def takserver_revoke_old_ca():
         ts_p12 = ts_path.replace('.jks', '.p12')
         subprocess.run(
             f'keytool -importkeystore -srckeystore {ts_path} -destkeystore {ts_p12} '
-            f'-srcstoretype JKS -deststoretype PKCS12 -srcstorepass "{cert_pass}" -deststorepass "{cert_pass}" -noprompt 2>&1',
+            f'-srcstoretype JKS -deststoretype PKCS12 -srcstorepass {shlex.quote(cert_pass)} -deststorepass {shlex.quote(cert_pass)} -noprompt 2>&1',
             shell=True, capture_output=True, text=True, timeout=15)
 
         subprocess.run('systemctl restart takserver 2>&1', shell=True, capture_output=True, text=True, timeout=30)
@@ -19341,8 +19399,8 @@ def takserver_revoke_old_ca():
             admin_p12 = os.path.join(cert_dir, 'admin.p12')
             modern_p12 = '/tmp/tak-portal-admin-modern.p12'
             subprocess.run(
-                f'openssl pkcs12 -in {admin_p12} -passin pass:{cert_pass} -nodes -legacy 2>/dev/null | '
-                f'openssl pkcs12 -export -passout pass:{cert_pass} -out {modern_p12}',
+                f'openssl pkcs12 -in {admin_p12} -passin pass:{shlex.quote(cert_pass)} -nodes -legacy 2>/dev/null | '
+                f'openssl pkcs12 -export -passout pass:{shlex.quote(cert_pass)} -out {modern_p12}',
                 shell=True, capture_output=True, text=True, timeout=30)
             if os.path.exists(modern_p12) and os.path.getsize(modern_p12) > 0:
                 subprocess.run(f'docker cp {modern_p12} tak-portal:/usr/src/app/data/certs/tak-client.p12', shell=True, capture_output=True, text=True)
@@ -19510,7 +19568,7 @@ def takserver_rotate_rootca():
             log("Step 6/8: Updating truststore...")
             ts_jks = os.path.join(cert_dir, f'truststore-{new_int_name}.jks')
             run(f'keytool -import -alias root-ca -file {cert_dir}/root-ca.pem '
-                f'-keystore {ts_jks} -storepass "{cert_pass}" -noprompt 2>&1', check=False)
+                f'-keystore {ts_jks} -storepass {shlex.quote(cert_pass)} -noprompt 2>&1', check=False)
             log("  Root CA imported into truststore")
             log("✓ Truststore updated")
 
@@ -19544,8 +19602,8 @@ def takserver_rotate_rootca():
                 admin_p12 = os.path.join(cert_dir, 'admin.p12')
                 modern_p12 = '/tmp/tak-portal-admin-modern.p12'
                 r_enc = subprocess.run(
-                    f'openssl pkcs12 -in {admin_p12} -passin pass:{cert_pass} -nodes -legacy 2>/dev/null | '
-                    f'openssl pkcs12 -export -passout pass:{cert_pass} -out {modern_p12}',
+                    f'openssl pkcs12 -in {admin_p12} -passin pass:{shlex.quote(cert_pass)} -nodes -legacy 2>/dev/null | '
+                    f'openssl pkcs12 -export -passout pass:{shlex.quote(cert_pass)} -out {modern_p12}',
                     shell=True, capture_output=True, text=True, timeout=30)
                 if os.path.exists(modern_p12) and os.path.getsize(modern_p12) > 0:
                     run(f'docker cp {modern_p12} tak-portal:/usr/src/app/data/certs/tak-client.p12', check=False)
@@ -20555,7 +20613,7 @@ def run_takserver_deploy(config):
         run_cmd('cd /opt/tak/certs && sudo -u tak ./makeCert.sh client user 2>&1', quiet=True)
         log_step("✓ All certificates created")
         log_step("Importing root CA into TAK clients truststore...")
-        run_cmd(f'keytool -import -alias root-ca -file /opt/tak/certs/files/root-ca.pem -keystore /opt/tak/certs/files/truststore-{int_ca}.jks -storepass "{cert_pass}" -noprompt 2>&1', check=False)
+        run_cmd(f'keytool -import -alias root-ca -file /opt/tak/certs/files/root-ca.pem -keystore /opt/tak/certs/files/truststore-{int_ca}.jks -storepass {shlex.quote(cert_pass)} -noprompt 2>&1', check=False)
         log_step("✓ Root CA imported into truststore (TAK clients trust chain complete)")
         log_step("Restarting TAK Server...")
         ne_changed, ne_msg = _sanitize_coreconfig_name_entries()
