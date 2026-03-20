@@ -56,7 +56,7 @@ Then open your browser to the URL shown and log in.
 If you clicked **Update Now** and the console shows an error like `could not apply ... Add files via upload`, `Pulling is not possible because you have unmerged files`, or any rebase/merge conflict message, run this single command on your server:
 
 ```bash
-cd $(grep -oP 'WorkingDirectory=\K.*' /etc/systemd/system/takwerx-console.service) && git fetch --tags origin && git checkout --force v0.2.7-alpha && sudo systemctl restart takwerx-console
+cd $(grep -oP 'WorkingDirectory=\K.*' /etc/systemd/system/takwerx-console.service) && git fetch --tags origin && git checkout --force v0.2.8-alpha && sudo systemctl restart takwerx-console
 ```
 
 This clears the stuck state and puts you on a current tag with the safe updater. No data or config is lost — your `.config/` directory is untouched.
@@ -179,12 +179,25 @@ start.sh                    ← One CLI command to launch everything
 ## Design notes
 
 - **[References](docs/REFERENCES.md)** — Canonical links (e.g. [TAK Server API](https://docs.tak.gov/api/takserver)) for development and integration.
+- **[Authentik login branding](docs/AUTHENTIK-LOGIN-BRANDING.md)** — Custom CSS vs **Brand → Attributes** (`theme: dark`), black backgrounds, flow wording; links to official Authentik docs and community guides.
 - **[Guard Dog](docs/GUARDDOG.md)** — How Guard Dog works: monitors, 15‑minute boot delay and cooldowns, TAK Server soft start (after PostgreSQL and network), 4GB swap on deploy for memory stability, and restart-loop protection. Apply Docker container log limits from the Guard Dog page without redeploying a module.
 - **[MediaMTX access driven by TAK Portal / LDAP](docs/MEDIAMTX-TAKPORTAL-ACCESS.md)** — How stream.fqdn admin vs viewer logic can be driven from TAK Portal (one place to manage users, no separate MediaMTX or Authentik user management). **Do not configure the email/SMTP portion of MediaMTX** — request access and approval notifications are handled by TAK Portal's open request-access page and Email Relay.
 
 ---
 
 ## Changelog
+
+### v0.2.8-alpha — 2026-03-20
+
+**Security hardening**
+- Input validation and sanitization across console API endpoints and internal shell commands. All user-supplied and settings-derived values that reach system commands are now validated, whitelisted, or escaped. Recommended upgrade for all deployments.
+
+**Authentik branding**
+- Starter TAK logo (`tak-gov-brand.svg`) shipped with the repo and copied to the Authentik media directory on deploy. See [docs/AUTHENTIK-LOGIN-BRANDING.md](docs/AUTHENTIK-LOGIN-BRANDING.md) for CSS, theme, and flow customization.
+
+Full notes: [docs/RELEASE-v0.2.8-alpha.md](docs/RELEASE-v0.2.8-alpha.md).
+
+---
 
 ### v0.2.7-alpha — 2026-03-19
 
