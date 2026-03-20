@@ -1510,6 +1510,10 @@ async function removeUpgradeFile(filename){
 
 function uploadUpgradeDeb(file){
   if(!file||!file.name.toLowerCase().endsWith('.deb')){var m=document.getElementById('tak-update-msg');if(m){m.textContent='Select a .deb file.';m.style.color='var(--red)';}return;}
+  if(isUpgradeTwoServerMode()){
+    var n=file.name.toLowerCase();
+    if(n.indexOf('core')===-1&&n.indexOf('database')===-1){var m=document.getElementById('tak-update-msg');if(m){m.textContent='Split mode: only takserver-core and takserver-database .deb are allowed.';m.style.color='var(--red)';}return;}
+  }
   var pa=document.getElementById('upgrade-progress-area');
   var fnEl=document.getElementById('upgrade-filename');if(fnEl){fnEl.style.display='none';}
   var ua=document.getElementById('upgrade-upload-area');if(ua){ua.style.maxHeight='80px';ua.style.padding='16px';}
@@ -1567,7 +1571,7 @@ function loadExistingUpgradeFiles(){
   var pa=document.getElementById('upgrade-progress-area');
   if(!pa)return;
   fetch('/api/upload/takserver/existing',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
-    var pkgs=(d.packages||[]).filter(function(p){return (p.filename||'').toLowerCase().endsWith('.deb');});
+    var pkgs=(d.packages||[]).filter(function(p){var n=(p.filename||'').toLowerCase();if(!n.endsWith('.deb'))return false;if(isUpgradeTwoServerMode())return n.indexOf('core')!==-1||n.indexOf('database')!==-1;return true;});
     if(pkgs.length===0)return;
     upgradeUploadedPackages=pkgs.slice();
     var ua=document.getElementById('upgrade-upload-area');if(ua){ua.style.maxHeight='80px';ua.style.padding='16px';}
