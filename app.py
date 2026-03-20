@@ -22205,7 +22205,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% endif %}
 <div class="upload-area" id="upgrade-upload-area" style="padding:24px;margin-bottom:16px" onclick="document.getElementById('upgrade-file-input').click()" ondrop="handleUpgradeDrop(event)" ondragover="event.preventDefault();this.classList.add('dragover')" ondragleave="event.preventDefault();this.classList.remove('dragover')">
 <input type="file" id="upgrade-file-input" style="display:none" accept=".deb" {% if two_server_mode %}multiple{% endif %} onchange="handleUpgradeFile(event)">
-<div id="upgrade-upload-text" style="color:var(--text-dim);font-size:13px">{% if two_server_mode %}Click or drop to select both core and database .deb packages{% else %}Click or drop to select upgrade package (.deb){% endif %}</div>
+<div id="upgrade-upload-text" style="color:var(--text-dim);font-size:13px">{% if two_server_mode %}Click or drop to select both core and database .deb packages. <span style="color:var(--yellow)">Only takserver-core and takserver-database .deb are accepted</span> — the single takserver .deb will be rejected.{% else %}Click or drop to select upgrade package (.deb){% endif %}</div>
 <div id="upgrade-filename" style="display:none;font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--cyan);margin-top:8px"></div>
 </div>
 <div id="upgrade-progress-area" style="margin-bottom:16px"></div>
