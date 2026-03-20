@@ -930,7 +930,17 @@ function uploadFile(file){
         delete window['xhr_'+id];
         const bar=document.getElementById(id+'-bar');const pc=document.getElementById(id+'-pct');bar.style.width='100%';
         var cb=document.getElementById(id+'-cancel');if(cb)cb.remove();
-        if(xhr.status===200){const d=JSON.parse(xhr.responseText);bar.style.background='var(--green)';pc.style.color='var(--green)';if(d.packages&&d.packages.length)d.packages.forEach(function(p){if(!uploadedFiles.packages.some(function(x){return x.filename===p.filename}))uploadedFiles.packages.push(p)});else if(d.package){var p=d.package;if(!uploadedFiles.packages.some(function(x){return x.filename===p.filename}))uploadedFiles.packages.push({filename:p.filename,filepath:p.filepath,size_mb:p.size_mb})}if(d.gpg_key)uploadedFiles.gpg_key=d.gpg_key;if(d.policy)uploadedFiles.policy=d.policy;var rBtn=document.createElement('span');rBtn.textContent=' \u2717';rBtn.style.cssText='color:var(--red);cursor:pointer;margin-left:8px';rBtn.title='Remove';rBtn.onclick=function(ev){ev.stopPropagation();removeFile(file.name,id)};pc.textContent='\u2713 ';pc.appendChild(rBtn);updateUploadSummary();applyUploadsModeDetection();}
+        if(xhr.status===200){
+            const d=JSON.parse(xhr.responseText);
+            if(d.gpg_key)uploadedFiles.gpg_key=d.gpg_key;if(d.policy)uploadedFiles.policy=d.policy;
+            var mode=getTakDeploymentMode();
+            function allowed(p){var n=(p.filename||'').toLowerCase();var hasCore=n.indexOf('core')!==-1;var hasDb=n.indexOf('database')!==-1;if(mode==='two_server')return hasCore||hasDb;return !hasCore&&!hasDb;}
+            function reject(msg){bar.style.background='var(--red)';pc.style.color='var(--red)';pc.textContent=msg;}
+            var added=0;
+            if(d.packages&&d.packages.length){d.packages.forEach(function(p){if(!allowed(p)){reject(mode==='two_server'?'Split deploy: only core and database .deb accepted.':'One-server deploy: only the single takserver .deb accepted.');return;}if(!uploadedFiles.packages.some(function(x){return x.filename===p.filename})){uploadedFiles.packages.push(p);added++;}});}
+            else if(d.package){var p=d.package;if(!allowed(p)){reject(mode==='two_server'?'Split deploy: only core and database .deb accepted.':'One-server deploy: only the single takserver .deb accepted.');}else if(!uploadedFiles.packages.some(function(x){return x.filename===p.filename})){uploadedFiles.packages.push({filename:p.filename,filepath:p.filepath,size_mb:p.size_mb});added++;}}
+            if(added>0||(d.gpg_key||d.policy)){bar.style.background='var(--green)';pc.style.color='var(--green)';var rBtn=document.createElement('span');rBtn.textContent=' \u2717';rBtn.style.cssText='color:var(--red);cursor:pointer;margin-left:8px';rBtn.title='Remove';rBtn.onclick=function(ev){ev.stopPropagation();removeFile(file.name,id)};pc.textContent='\u2713 ';pc.appendChild(rBtn);updateUploadSummary();applyUploadsModeDetection();}
+        }
         else{bar.style.background='var(--red)';pc.textContent='\u2717';pc.style.color='var(--red)'}
         uploadsInProgress--;if(uploadsInProgress===0)updateUploadSummary()
     };
@@ -1510,9 +1520,11 @@ async function removeUpgradeFile(filename){
 
 function uploadUpgradeDeb(file){
   if(!file||!file.name.toLowerCase().endsWith('.deb')){var m=document.getElementById('tak-update-msg');if(m){m.textContent='Select a .deb file.';m.style.color='var(--red)';}return;}
+  var n=file.name.toLowerCase();
   if(isUpgradeTwoServerMode()){
-    var n=file.name.toLowerCase();
     if(n.indexOf('core')===-1&&n.indexOf('database')===-1){var m=document.getElementById('tak-update-msg');if(m){m.textContent='Split mode: only takserver-core and takserver-database .deb are allowed.';m.style.color='var(--red)';}return;}
+  }else{
+    if(n.indexOf('core')!==-1||n.indexOf('database')!==-1){var m=document.getElementById('tak-update-msg');if(m){m.textContent='One-server upgrade: use the single takserver .deb, not core or database packages.';m.style.color='var(--red)';}return;}
   }
   var pa=document.getElementById('upgrade-progress-area');
   var fnEl=document.getElementById('upgrade-filename');if(fnEl){fnEl.style.display='none';}
@@ -1571,7 +1583,8 @@ function loadExistingUpgradeFiles(){
   var pa=document.getElementById('upgrade-progress-area');
   if(!pa)return;
   fetch('/api/upload/takserver/existing',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
-    var pkgs=(d.packages||[]).filter(function(p){var n=(p.filename||'').toLowerCase();if(!n.endsWith('.deb'))return false;if(isUpgradeTwoServerMode())return n.indexOf('core')!==-1||n.indexOf('database')!==-1;return true;});
+    var twoServer=isUpgradeTwoServerMode();
+    var pkgs=(d.packages||[]).filter(function(p){var n=(p.filename||'').toLowerCase();if(!n.endsWith('.deb'))return false;if(twoServer)return n.indexOf('core')!==-1||n.indexOf('database')!==-1;return n.indexOf('core')===-1&&n.indexOf('database')===-1;});
     if(pkgs.length===0)return;
     upgradeUploadedPackages=pkgs.slice();
     var ua=document.getElementById('upgrade-upload-area');if(ua){ua.style.maxHeight='80px';ua.style.padding='16px';}
