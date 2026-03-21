@@ -1859,7 +1859,8 @@ def takserver_two_server_ensure_ssh_key():
 @app.route('/api/takserver/two-server/install-ssh-key', methods=['POST'])
 @login_required
 def takserver_two_server_install_ssh_key():
-    """Copy this host's SSH public key to Server One using ssh-copy-id (one-time password). Password not stored."""
+    """Copy this host's SSH public key to Server One using ssh-copy-id (one-time password). Password not stored.
+    Optional body keys install_host, install_user, install_port — copy to that host instead (e.g. new Server One before DB migration)."""
     data = request.get_json() or {}
     password = (data.get('password') or '').strip()
     if not password:
@@ -1869,11 +1870,26 @@ def takserver_two_server_install_ssh_key():
     if isinstance(data.get('config'), dict):
         cfg = _normalize_tak_deployment_config(_deep_merge_dict(cfg, data.get('config')))
     s1 = cfg.get('server_one', {})
-    host = (s1.get('host') or '').strip()
-    if not host:
-        return jsonify({'success': False, 'error': 'Server One host not set'}), 400
-    user = (s1.get('ssh_user') or 'root').strip() or 'root'
-    port = int(s1.get('ssh_port') or 22)
+    install_host = (data.get('install_host') or '').strip()
+    if install_host:
+        if not _safe_migration_db_host(install_host):
+            return jsonify({'success': False, 'error': 'Invalid install_host (use IPv4 or hostname)'}), 400
+        host = install_host
+        user = (data.get('install_user') or s1.get('ssh_user') or 'root').strip() or 'root'
+        raw_port = data.get('install_port')
+        if raw_port is not None and str(raw_port).strip():
+            try:
+                port = int(raw_port)
+            except (TypeError, ValueError):
+                return jsonify({'success': False, 'error': 'install_port must be a number'}), 400
+        else:
+            port = int(s1.get('ssh_port') or 22)
+    else:
+        host = (s1.get('host') or '').strip()
+        if not host:
+            return jsonify({'success': False, 'error': 'Server One host not set'}), 400
+        user = (s1.get('ssh_user') or 'root').strip() or 'root'
+        port = int(s1.get('ssh_port') or 22)
     key_path = (s1.get('ssh_key_path') or '').strip() or os.path.expanduser('~/.ssh/id_rsa')
     key_path = os.path.expanduser(key_path)
     pub_path = key_path + '.pub'
@@ -1893,6 +1909,8 @@ def takserver_two_server_install_ssh_key():
             return jsonify({'success': False, 'error': err}), 400
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)[:400]}), 400
+    if install_host:
+        return jsonify({'success': True, 'message': f'Key installed on {user}@{host}:{port}. Next: Deploy Server One on that host, then Start migration.'})
     return jsonify({'success': True, 'message': 'Key installed on Server One. Next: 4. Deploy Server One (DB).'})
 
 
@@ -22539,10 +22557,17 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <span id="tak-db-migrate-toggle-icon" style="font-size:18px;color:var(--text-dim);transition:transform 0.2s ease{% if migrating or migrate_done or migrate_error %};transform:rotate(180deg){% endif %}">&#9662;</span>
 </div>
 <div id="tak-db-migrate-body" style="display:{{ 'block' if migrating or migrate_done or migrate_error else 'none' }};padding:0 24px 24px 24px;border-top:1px solid var(--border)">
-<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:12px;padding-top:16px"><span style="color:var(--yellow);font-weight:600">Automated migration.</span> Copies the <code style="font-size:12px">cot</code> database from the current Server One (<span style="color:var(--cyan)">{{ s1_host }}</span>) to a <strong>new</strong> host, updates CoreConfig and saved settings, and restarts TAK Server. <strong>Prerequisites:</strong> (1) New VM has the same SSH key in <code>authorized_keys</code> as the current Server One. (2) Run <strong>Deploy Server One</strong> (or equivalent) on the new host first so PostgreSQL and <code>takserver-database</code> are installed — the <code>cot</code> DB there will be <strong>replaced</strong> by this migration.</p>
+<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:12px;padding-top:16px"><span style="color:var(--yellow);font-weight:600">Automated migration.</span> Copies the <code style="font-size:12px">cot</code> database from the current Server One (<span style="color:var(--cyan)">{{ s1_host }}</span>) to a <strong>new</strong> host, updates CoreConfig and saved settings, and restarts TAK Server.</p>
+<p style="font-size:12px;color:var(--text-dim);line-height:1.5;margin-bottom:12px"><strong>Prerequisites:</strong> (1) <strong>Same SSH flow as Split Server Wizard</strong> — enter the <em>new</em> host below, then <strong>2. Setup SSH key</strong> (ensures a key on this console) and <strong>3. Copy key to new host</strong> (one-time password via <code>ssh-copy-id</code>, same API as step 3 in the wizard). (2) Run <strong>4. Deploy Server One</strong> on the <em>new</em> IP (Split Server Wizard: set Server One host to the new IP, Save Config, then step 4) so PostgreSQL and <code>takserver-database</code> are installed — <code>cot</code> there will be <strong>replaced</strong>.</p>
 <div style="display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end;margin-bottom:12px">
 <div class="form-field" style="min-width:200px"><label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px">New Server One host (IP or DNS)</label><input type="text" id="db-migrate-new-host" placeholder="e.g. 203.0.113.50" autocomplete="off" style="width:100%;padding:8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px" /></div>
 <div class="form-field" style="min-width:140px"><label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px">SSH user (optional)</label><input type="text" id="db-migrate-ssh-user" placeholder="root" autocomplete="off" style="width:100%;padding:8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px" /></div>
+<div class="form-field" style="min-width:100px"><label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px">SSH port</label><input type="number" id="db-migrate-ssh-port" placeholder="22" min="1" max="65535" autocomplete="off" style="width:100%;padding:8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px" /></div>
+</div>
+<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:14px">
+<button type="button" onclick="dbMigrateEnsureSshKey()" style="padding:8px 14px;background:rgba(139,92,246,0.15);color:var(--purple, #a78bfa);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer;font-family:'DM Sans',sans-serif">2. Setup SSH key</button>
+<button type="button" onclick="dbMigrateInstallSshKey()" style="padding:8px 14px;background:rgba(245,158,11,0.15);color:var(--amber, #f59e0b);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer;font-family:'DM Sans',sans-serif">3. Copy key to new host</button>
+<span style="font-size:11px;color:var(--text-dim);max-width:420px">Uses saved Server One key path (or defaults). Requires <code>sshpass</code> on this host — same as wizard step 3.</span>
 </div>
 <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px">
 <button type="button" id="db-migrate-start-btn" onclick="startDbMigrate()" style="padding:12px 24px;background:linear-gradient(135deg,#b45309,#92400e);color:#fff;border:none;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:14px;font-weight:600;cursor:pointer">Start migration</button>

@@ -1639,10 +1639,48 @@ if(document.body.getAttribute('data-tak-upgrading')==='true' && document.getElem
 function takToggleDbMigrate(){
   var body=document.getElementById('tak-db-migrate-body');var icon=document.getElementById('tak-db-migrate-toggle-icon');if(!body)return;var show=body.style.display==='none';body.style.display=show?'block':'none';if(icon)icon.style.transform=show?'rotate(180deg)':'';
 }
+async function dbMigrateEnsureSshKey(){
+  var msg=document.getElementById('db-migrate-msg');
+  try{
+    var r=await fetch('/api/takserver/two-server/ensure-ssh-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({}),credentials:'same-origin'});
+    var d=await r.json();
+    if(!d.success)throw new Error(d.error||'Setup failed');
+    if(msg){msg.textContent='\u2713 '+(d.message||'Key ready')+(d.fingerprint?' \u2014 '+d.fingerprint:'');msg.style.color='var(--green)';}
+    return d;
+  }catch(e){
+    if(msg){msg.textContent='\u2717 '+e.message;msg.style.color='var(--red)';}
+    throw e;
+  }
+}
+async function dbMigrateInstallSshKey(){
+  var msg=document.getElementById('db-migrate-msg');
+  var hostEl=document.getElementById('db-migrate-new-host');
+  var userEl=document.getElementById('db-migrate-ssh-user');
+  var portEl=document.getElementById('db-migrate-ssh-port');
+  var host=hostEl&&hostEl.value?hostEl.value.trim():'';
+  if(!host){if(msg){msg.textContent='Enter the new Server One host first.';msg.style.color='var(--red)';}return;}
+  var password=prompt('New host SSH password (one-time; not stored) — same as wizard step 3:');
+  if(password==null)return;
+  if(!password.trim()){if(msg){msg.textContent='No password entered.';msg.style.color='var(--yellow)';}return;}
+  try{
+    var body={password:password,install_host:host};
+    if(userEl&&userEl.value.trim())body.install_user=userEl.value.trim();
+    if(portEl&&String(portEl.value).trim()!=='')body.install_port=parseInt(portEl.value,10);
+    var r=await fetch('/api/takserver/two-server/install-ssh-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),credentials:'same-origin'});
+    var d=await r.json();
+    if(!d.success)throw new Error(d.error||'Install failed');
+    if(msg){msg.textContent='\u2713 '+(d.message||'Key installed on new host');msg.style.color='var(--green)';}
+    return d;
+  }catch(e){
+    if(msg){msg.textContent='\u2717 '+e.message;msg.style.color='var(--red)';}
+    throw e;
+  }
+}
 var migrateLogIndex=0;
 async function startDbMigrate(){
   var hostEl=document.getElementById('db-migrate-new-host');
   var userEl=document.getElementById('db-migrate-ssh-user');
+  var portEl=document.getElementById('db-migrate-ssh-port');
   var msg=document.getElementById('db-migrate-msg');
   var btn=document.getElementById('db-migrate-start-btn');
   var host=hostEl&&hostEl.value?hostEl.value.trim():'';
@@ -1653,6 +1691,7 @@ async function startDbMigrate(){
   try{
     var payload={new_host:host};
     if(userEl&&userEl.value.trim())payload.new_ssh_user=userEl.value.trim();
+    if(portEl&&String(portEl.value).trim()!==''){var pp=parseInt(portEl.value,10);if(!isNaN(pp))payload.new_ssh_port=pp;}
     var r=await fetch('/api/takserver/two-server/migrate-database/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload),credentials:'same-origin'});
     var d=await r.json();
     if(d.error){if(msg){msg.textContent=d.error;msg.style.color='var(--red)';}if(btn)btn.disabled=false;return;}
