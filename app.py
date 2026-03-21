@@ -1680,6 +1680,9 @@ def takserver_page():
     _upgrade_done = upgrade_status.get('complete', False)
     if _upgrade_done and not upgrade_status.get('running'):
         upgrade_status.update({'complete': False})
+    _migrate_done = tak_migrate_status.get('complete', False)
+    if _migrate_done and not tak_migrate_status.get('running'):
+        tak_migrate_status.update({'complete': False})
     return render_template_string(TAKSERVER_TEMPLATE,
         settings=_settings, modules=modules, tak=tak, tak_version=tak_version,
         show_connect_ldap=show_connect_ldap, ldap_connected=ldap_connected,
@@ -1689,6 +1692,8 @@ def takserver_page():
         deploy_done=deploy_status.get('complete', False), deploy_error=deploy_status.get('error', False),
         upgrading=upgrade_status.get('running', False), upgrade_done=_upgrade_done,
         upgrade_error=upgrade_status.get('error', False),
+        migrating=tak_migrate_status.get('running', False), migrate_done=_migrate_done,
+        migrate_error=tak_migrate_status.get('error', False),
         two_server_mode=_is_two_server, s1_host=_s1_host,
         total_ram_gb=_total_ram, recommended_heap_gb=_recommended_heap, current_heap_gb=_current_heap)
 
@@ -2454,6 +2459,74 @@ def takserver_two_server_sync_db_password():
         return jsonify({'success': False, 'error': str(e)[:300]}), 500
 
     return jsonify({'success': True, 'message': 'DB password updated and TAK Server restarted. Try 8443/8446 again in a minute.'})
+
+
+@app.route('/api/takserver/two-server/migrate-database/start', methods=['POST'])
+@login_required
+def takserver_two_server_migrate_database_start():
+    """Start background migration: dump cot on current Server One, restore on new host, point Core + settings."""
+    if tak_migrate_status.get('running'):
+        return jsonify({'error': 'Database migration already in progress'}), 409
+    if not os.path.exists('/opt/tak/CoreConfig.xml'):
+        return jsonify({'error': 'TAK Server not installed'}), 400
+    data = request.get_json() or {}
+    new_host = (data.get('new_host') or '').strip()
+    if not new_host:
+        return jsonify({'error': 'new_host is required (IP or hostname of the new Server One)'}), 400
+    if not _safe_migration_db_host(new_host):
+        return jsonify({'error': 'Invalid new_host (use IPv4 or hostname, letters/digits/dots/hyphens only)'}), 400
+    settings = load_settings()
+    cfg = _get_tak_deployment_config(settings)
+    if cfg.get('mode') != 'two_server':
+        return jsonify({'error': 'Not in two-server mode'}), 400
+    old_s1 = dict(cfg.get('server_one', {}))
+    old_host = (old_s1.get('host') or '').strip()
+    if not old_host:
+        return jsonify({'error': 'Current Server One host not configured'}), 400
+    if new_host.lower() == old_host.lower():
+        return jsonify({'error': 'new_host must differ from current Server One host'}), 400
+    core_ip = _resolve_core_ip(settings, cfg)
+    if not core_ip:
+        return jsonify({'error': 'Server Two (Core) IP unknown — set Server IP in Settings'}), 400
+    new_ssh_user = (data.get('new_ssh_user') or '').strip()
+    new_ssh_port = data.get('new_ssh_port')
+    new_s1 = dict(old_s1)
+    new_s1['host'] = new_host
+    if new_ssh_user:
+        new_s1['ssh_user'] = new_ssh_user
+    if new_ssh_port is not None and str(new_ssh_port).strip():
+        try:
+            new_s1['ssh_port'] = int(new_ssh_port)
+        except (TypeError, ValueError):
+            return jsonify({'error': 'new_ssh_port must be a number'}), 400
+    key_path = _find_ssh_key_for_server_one(old_s1)
+    if key_path:
+        new_s1['ssh_key_path'] = key_path
+    db_port = int(cfg.get('database', {}).get('port') or 5432)
+    db_user = (cfg.get('database', {}).get('user') or 'martiuser').strip() or 'martiuser'
+    db_name = (cfg.get('database', {}).get('name') or 'cot').strip() or 'cot'
+    tak_snap = copy.deepcopy(cfg)
+    tak_migrate_log.clear()
+    tak_migrate_status.update({'running': True, 'complete': False, 'error': False})
+    threading.Thread(
+        target=run_takserver_two_server_db_migrate,
+        args=(dict(old_s1), dict(new_s1), tak_snap, core_ip, db_port, db_user, db_name),
+        daemon=True,
+    ).start()
+    return jsonify({'success': True})
+
+
+@app.route('/api/takserver/two-server/migrate-database/log')
+@login_required
+def takserver_two_server_migrate_database_log():
+    idx = int(request.args.get('index', 0))
+    return jsonify({
+        'entries': tak_migrate_log[idx:],
+        'total': len(tak_migrate_log),
+        'running': tak_migrate_status['running'],
+        'complete': tak_migrate_status['complete'],
+        'error': tak_migrate_status['error'],
+    })
 
 
 @app.route('/api/takserver/pin-packages', methods=['POST'])
@@ -5804,6 +5877,57 @@ def _scp_to_host(host_cfg, local_path, remote_path, timeout=120):
         return r.returncode == 0, out
     except Exception as e:
         return False, str(e)
+
+
+def _scp_from_host(host_cfg, remote_path, local_path, timeout=600):
+    """Copy remote_path on host to local_path. Returns (ok, output)."""
+    host = (host_cfg.get('host') or '').strip()
+    user = (host_cfg.get('ssh_user') or 'root').strip() or 'root'
+    port = int(host_cfg.get('ssh_port') or 22)
+    if not host:
+        return False, 'host not set'
+    is_local = bool(host_cfg.get('use_localhost')) or host in ('127.0.0.1', 'localhost', '::1')
+    if is_local:
+        try:
+            shutil.copy2(remote_path, local_path)
+            return True, ''
+        except Exception as e:
+            return False, str(e)
+    scp_cmd = ['scp', '-o', 'StrictHostKeyChecking=accept-new', '-o', 'ConnectTimeout=15', '-P', str(port)]
+    key_path = (host_cfg.get('ssh_key_path') or '').strip()
+    auth_method = (host_cfg.get('auth_method') or 'ssh_key').strip().lower()
+    if auth_method == 'password':
+        pw = (host_cfg.get('ssh_password') or '').strip()
+        if not pw or not shutil.which('sshpass'):
+            return False, 'password auth requires sshpass'
+        scp_cmd = ['sshpass', '-e'] + scp_cmd
+        scp_run_env = {**os.environ, 'SSHPASS': pw}
+    elif key_path:
+        expanded = os.path.expanduser(key_path)
+        if os.path.exists(expanded):
+            scp_cmd.extend(['-i', expanded])
+    scp_cmd.extend([f'{user}@{host}:{remote_path}', local_path])
+    try:
+        run_kw = dict(capture_output=True, text=True, timeout=timeout)
+        if auth_method == 'password':
+            run_kw['env'] = scp_run_env
+        r = subprocess.run(scp_cmd, **run_kw)
+        out = (r.stdout or r.stderr or '').strip()
+        return r.returncode == 0, out
+    except Exception as e:
+        return False, str(e)
+
+
+def _safe_migration_db_host(hostname):
+    """Allow IPv4 or simple DNS hostname for new Server One (SSH/SCP target)."""
+    h = (hostname or '').strip()
+    if not h or len(h) > 253:
+        return False
+    if re.match(r'^(\d{1,3}\.){3}\d{1,3}$', h):
+        return True
+    if re.match(r'^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$', h):
+        return True
+    return False
 
 
 def generate_caddyfile(settings=None):
@@ -20125,6 +20249,9 @@ deploy_status = {'running': False, 'complete': False, 'error': False, 'cancelled
 upgrade_log = []
 upgrade_status = {'running': False, 'complete': False, 'error': False}
 
+tak_migrate_log = []
+tak_migrate_status = {'running': False, 'complete': False, 'error': False}
+
 
 @app.route('/api/takserver/cert-password')
 @login_required
@@ -20425,6 +20552,215 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
     except Exception as e:
         ulog(f"✗ Error: {str(e)}")
         upgrade_status.update({'running': False, 'complete': False, 'error': True})
+
+
+def run_takserver_two_server_db_migrate(old_s1_cfg, new_s1_cfg, tak_cfg_snapshot, core_ip, db_port, db_user, db_name):
+    """Background job: pg_dump on old Server One, restore on new, re-point Core + settings, start takserver.
+    Prerequisite: new host already has PostgreSQL + takserver-database (Deploy Server One) with empty/scratch cot."""
+    def mlog(msg):
+        entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
+        tak_migrate_log.append(entry)
+        print(entry, flush=True)
+
+    remote_dump = '/tmp/cot_migrate_infra_tak.dump'
+    stopped_tak = False
+    new_host = (new_s1_cfg.get('host') or '').strip()
+    old_host = (old_s1_cfg.get('host') or '').strip()
+
+    try:
+        mlog('=' * 50)
+        mlog('Two-server database migration (Server One → new host)')
+        mlog(f'  From: {old_host}')
+        mlog(f'  To:   {new_host}')
+        mlog('=' * 50)
+
+        ok, out = _ssh_probe(old_s1_cfg, 'echo OLD_SSH_OK', timeout=20)
+        if not ok:
+            mlog(f'✗ SSH to current Server One failed: {(out or "")[:300]}')
+            tak_migrate_status.update({'running': False, 'complete': False, 'error': True})
+            return
+        mlog('✓ SSH to current Server One OK')
+
+        ok, out = _ssh_probe(new_s1_cfg, 'echo NEW_SSH_OK', timeout=20)
+        if not ok:
+            mlog(f'✗ SSH to new Server One failed. Install the same SSH key on the new host: {(out or "")[:300]}')
+            tak_migrate_status.update({'running': False, 'complete': False, 'error': True})
+            return
+        mlog('✓ SSH to new Server One OK')
+
+        db_pass = (tak_cfg_snapshot.get('database', {}).get('password') or '').strip()
+        if not db_pass and os.path.exists('/opt/tak/CoreConfig.xml'):
+            try:
+                r = subprocess.run(['sudo', 'cat', '/opt/tak/CoreConfig.xml'], capture_output=True, text=True, timeout=8)
+                cc = r.stdout or ''
+                for pattern in (
+                    r'<connection[^>]*url\s*=\s*["\']jdbc:postgresql://[^"\']+/cot["\'][^>]*password\s*=\s*["\']([^"\']*)["\']',
+                    r'<connection[^>]*username\s*=\s*["\']martiuser["\'][^>]*password\s*=\s*["\']([^"\']*)["\']',
+                ):
+                    m = re.search(pattern, cc)
+                    if m and (m.group(1) or '').strip():
+                        db_pass = m.group(1).strip()
+                        break
+            except Exception:
+                pass
+        if not db_pass:
+            mlog('✗ Could not determine DB password (saved settings or CoreConfig). Set DB password in TAK deployment settings or use Sync DB password, then retry.')
+            tak_migrate_status.update({'running': False, 'complete': False, 'error': True})
+            return
+
+        mlog('')
+        mlog('━━━ Stopping TAK Server (this host) ━━━')
+        subprocess.run('systemctl stop takserver', shell=True, capture_output=True, text=True, timeout=45)
+        stopped_tak = True
+        mlog('✓ TAK Server stopped')
+
+        mlog('')
+        mlog('━━━ Dumping database on old Server One ━━━')
+        dump_cmd = f'sudo rm -f {remote_dump} && sudo -u postgres pg_dump -Fc cot -f {remote_dump} && test -s {remote_dump} && echo DUMP_OK'
+        ok, out = _ssh_probe(old_s1_cfg, dump_cmd, timeout=3600)
+        if not ok or 'DUMP_OK' not in (out or ''):
+            mlog(f'✗ pg_dump failed: {(out or "")[:800]}')
+            tak_migrate_status.update({'running': False, 'complete': False, 'error': True})
+            return
+        mlog('✓ pg_dump complete on old Server One')
+
+        os.makedirs(UPLOAD_DIR, exist_ok=True)
+        local_dump = os.path.join(UPLOAD_DIR, 'cot_migrate_infra_tak.dump')
+        try:
+            if os.path.isfile(local_dump):
+                os.remove(local_dump)
+        except OSError:
+            pass
+
+        mlog('')
+        mlog('━━━ Copying dump to console ━━━')
+        ok, scp_out = _scp_from_host(old_s1_cfg, remote_dump, local_dump, timeout=3600)
+        if not ok or not os.path.isfile(local_dump) or os.path.getsize(local_dump) < 100:
+            mlog(f'✗ SCP from old Server One failed: {(scp_out or "")[:400]}')
+            tak_migrate_status.update({'running': False, 'complete': False, 'error': True})
+            return
+        mlog(f'✓ Dump copied to console ({os.path.getsize(local_dump) // (1024 * 1024)} MB)')
+
+        mlog('')
+        mlog('━━━ Copying dump to new Server One ━━━')
+        ok, scp_out = _scp_to_host(new_s1_cfg, local_dump, '/tmp/', timeout=3600)
+        if not ok:
+            mlog(f'✗ SCP to new Server One failed: {(scp_out or "")[:400]}')
+            tak_migrate_status.update({'running': False, 'complete': False, 'error': True})
+            return
+        mlog('✓ Dump on new Server One /tmp/')
+
+        mlog('')
+        mlog('━━━ Replacing cot database on new Server One ━━━')
+        pw_q = shlex.quote(db_pass)
+        usr_q = shlex.quote(db_user)
+        dbn_q = shlex.quote(db_name)
+        owner_sql = db_user if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', db_user or '') else usr_q
+        restore_script = (
+            'sudo -u postgres psql -tAc "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = \'cot\' AND pid <> pg_backend_pid();" >/dev/null 2>&1 || true; '
+            'sudo -u postgres psql -c "DROP DATABASE IF EXISTS cot WITH (FORCE);" 2>/dev/null || '
+            'sudo -u postgres psql -c "DROP DATABASE IF EXISTS cot;" 2>/dev/null || true; '
+            f'sudo -u postgres psql -c "CREATE DATABASE cot OWNER {owner_sql};" && '
+            f'sudo -u postgres pg_restore --no-privileges -d cot --no-owner --role={usr_q} {remote_dump} 2>&1 | tail -40; '
+            f'if PGPASSWORD={pw_q} psql -h 127.0.0.1 -p {int(db_port)} -U {usr_q} -d {dbn_q} -tAc "select 1" 2>/dev/null | tr -d "[:space:]" | grep -qx 1; '
+            'then echo RESTORE_OK; else echo RESTORE_FAIL; fi'
+        )
+        ok, rout = _ssh_probe(new_s1_cfg, restore_script, timeout=7200)
+        if rout:
+            for line in (rout or '').strip().split('\n')[-45:]:
+                if line.strip():
+                    tak_migrate_log.append('  ' + line[:500])
+        if 'RESTORE_OK' not in (rout or ''):
+            mlog('✗ Restore or post-restore DB check failed (see lines above). Old Server One unchanged.')
+            tak_migrate_status.update({'running': False, 'complete': False, 'error': True})
+            return
+        mlog('✓ Database restored and verified on new Server One')
+
+        mlog('')
+        mlog('━━━ PostgreSQL remote access on new Server One ━━━')
+        ok_pg, log_lines, _pw_unused = _setup_server_one(new_s1_cfg, core_ip, db_port, None, None)
+        for line in log_lines:
+            mlog(line)
+        if not ok_pg:
+            mlog('✗ Could not configure PostgreSQL on new Server One')
+            tak_migrate_status.update({'running': False, 'complete': False, 'error': True})
+            return
+
+        mlog('')
+        mlog('━━━ Verifying DB auth on new Server One ━━━')
+        pw_verify = db_pass
+        ok_v, msg_v = _verify_server_one_db_password(new_s1_cfg, pw_verify, db_port=db_port, db_user=db_user, db_name=db_name)
+        if not ok_v:
+            mlog(f'✗ DB auth check on new host failed: {msg_v}')
+            mlog('  (Restored DB keeps the martiuser password from the old server — ensure saved/CoreConfig password matches.)')
+            tak_migrate_status.update({'running': False, 'complete': False, 'error': True})
+            return
+        mlog('✓ martiuser can connect to cot on new Server One')
+
+        jdbc_url = f'jdbc:postgresql://{new_host}:{db_port}/{db_name}'
+        mlog('')
+        mlog('━━━ Updating CoreConfig.xml (this host) ━━━')
+        try:
+            r = subprocess.run(['sudo', 'cat', '/opt/tak/CoreConfig.xml'], capture_output=True, text=True, timeout=8)
+            cc = r.stdout or ''
+            if not cc.strip():
+                raise RuntimeError('empty CoreConfig')
+            cc = re.sub(r'jdbc:postgresql://[^"\']+', jdbc_url, cc, count=1)
+            cc = re.sub(r'(<connection[^>]*password=")[^"]*(")', lambda m: m.group(1) + pw_verify + m.group(2), cc, count=1)
+            proc = subprocess.run(['sudo', 'tee', '/opt/tak/CoreConfig.xml'], input=cc, capture_output=True, text=True, timeout=10)
+            if proc.returncode != 0:
+                raise RuntimeError((proc.stderr or '')[:200])
+            mlog(f'✓ JDBC → {new_host}:{db_port}')
+        except Exception as e:
+            mlog(f'✗ CoreConfig update failed: {e}')
+            tak_migrate_status.update({'running': False, 'complete': False, 'error': True})
+            return
+
+        mlog('')
+        mlog('━━━ Saving deployment settings ━━━')
+        settings = load_settings()
+        cfg = _get_tak_deployment_config(settings)
+        cfg['server_one'] = dict(new_s1_cfg)
+        cfg.setdefault('database', {})['password'] = pw_verify
+        settings['tak_deployment'] = cfg
+        save_settings(settings)
+        mlog('✓ Server One host updated in settings')
+
+        mlog('')
+        mlog('━━━ Starting TAK Server ━━━')
+        subprocess.run('systemctl start takserver', shell=True, capture_output=True, text=True, timeout=45)
+        stopped_tak = False
+        mlog('✓ TAK Server start issued')
+
+        mlog('')
+        mlog('━━━ Health agent on new Server One ━━━')
+        ha_ok, ha_msg = _deploy_health_agent_to_server_one(new_s1_cfg)
+        mlog(ha_msg if ha_ok else f'⚠ {ha_msg}')
+
+        mlog('')
+        mlog('Cleaning temp files...')
+        _ssh_probe(old_s1_cfg, f'sudo rm -f {remote_dump}', timeout=15)
+        _ssh_probe(new_s1_cfg, f'sudo rm -f {remote_dump}', timeout=15)
+        try:
+            if os.path.isfile(local_dump):
+                os.remove(local_dump)
+        except OSError:
+            pass
+
+        mlog('')
+        mlog('=' * 50)
+        mlog('✓ Migration complete — TAK Server now uses new database host')
+        mlog(f'  You may decommission the old Server One ({old_host}) when ready.')
+        mlog('=' * 50)
+        tak_migrate_status.update({'running': False, 'complete': True, 'error': False})
+    except Exception as e:
+        mlog(f'✗ Error: {str(e)}')
+        tak_migrate_status.update({'running': False, 'complete': False, 'error': True})
+    finally:
+        if stopped_tak:
+            mlog('⚠ Restarting TAK Server (migration did not finish cleanly)')
+            subprocess.run('systemctl start takserver', shell=True, capture_output=True, text=True, timeout=45)
+
 
 @app.route('/api/deploy/cancel', methods=['POST'])
 @login_required
@@ -22082,7 +22418,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 .metric-label{font-family:'JetBrains Mono',monospace;font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--text-dim);margin-bottom:6px}
 .metric-value{font-family:'JetBrains Mono',monospace;font-size:24px;font-weight:700;color:var(--text-primary)}
 .metric-detail{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:4px}
-</style></head><body data-tak-deploying="{{ 'true' if deploying or deploy_done or deploy_error else 'false' }}" data-tak-upgrading="{{ 'true' if upgrading else 'false' }}">
+</style></head><body data-tak-deploying="{{ 'true' if deploying or deploy_done or deploy_error else 'false' }}" data-tak-upgrading="{{ 'true' if upgrading else 'false' }}" data-tak-migrating="{{ 'true' if migrating else 'false' }}">
 {{ sidebar_html }}
 <div class="main">
   <div class="page-header"><h1><img src="{{ tak_logo_url }}" alt="" style="height:28px;vertical-align:middle;margin-right:8px;object-fit:contain"> TAK Server</h1><p>Team Awareness Kit Server</p></div>
@@ -22193,6 +22529,30 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div class="metric-card"><div class="metric-label">MEMORY</div><div class="metric-value" id="tak-remote-ram-value">—</div><div class="metric-detail" id="tak-remote-ram-detail"></div></div>
 <div class="metric-card"><div class="metric-label">DISK</div><div class="metric-value" id="tak-remote-disk-value">—</div><div class="metric-detail" id="tak-remote-disk-detail"></div></div>
 <div class="metric-card"><div class="metric-label">UPTIME</div><div class="metric-value" id="tak-remote-uptime-value" style="font-size:18px">—</div></div>
+</div>
+</div>
+{% endif %}
+{% if two_server_mode and s1_host and tak.installed %}
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:24px;border-color:rgba(234,179,8,0.35)">
+<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;padding:16px 24px;cursor:pointer" onclick="takToggleDbMigrate()" id="tak-db-migrate-header">
+<span class="section-title" style="margin-bottom:0">Migrate database to new Server One</span>
+<span id="tak-db-migrate-toggle-icon" style="font-size:18px;color:var(--text-dim);transition:transform 0.2s ease{% if migrating or migrate_done or migrate_error %};transform:rotate(180deg){% endif %}">&#9662;</span>
+</div>
+<div id="tak-db-migrate-body" style="display:{{ 'block' if migrating or migrate_done or migrate_error else 'none' }};padding:0 24px 24px 24px;border-top:1px solid var(--border)">
+<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:12px;padding-top:16px"><span style="color:var(--yellow);font-weight:600">Automated migration.</span> Copies the <code style="font-size:12px">cot</code> database from the current Server One (<span style="color:var(--cyan)">{{ s1_host }}</span>) to a <strong>new</strong> host, updates CoreConfig and saved settings, and restarts TAK Server. <strong>Prerequisites:</strong> (1) New VM has the same SSH key in <code>authorized_keys</code> as the current Server One. (2) Run <strong>Deploy Server One</strong> (or equivalent) on the new host first so PostgreSQL and <code>takserver-database</code> are installed — the <code>cot</code> DB there will be <strong>replaced</strong> by this migration.</p>
+<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end;margin-bottom:12px">
+<div class="form-field" style="min-width:200px"><label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px">New Server One host (IP or DNS)</label><input type="text" id="db-migrate-new-host" placeholder="e.g. 203.0.113.50" autocomplete="off" style="width:100%;padding:8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px" /></div>
+<div class="form-field" style="min-width:140px"><label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px">SSH user (optional)</label><input type="text" id="db-migrate-ssh-user" placeholder="root" autocomplete="off" style="width:100%;padding:8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px" /></div>
+</div>
+<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px">
+<button type="button" id="db-migrate-start-btn" onclick="startDbMigrate()" style="padding:12px 24px;background:linear-gradient(135deg,#b45309,#92400e);color:#fff;border:none;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:14px;font-weight:600;cursor:pointer">Start migration</button>
+<span id="db-migrate-msg" style="font-size:12px;color:var(--text-dim)"></span>
+</div>
+<div id="db-migrate-log-wrap" style="display:{{ 'block' if migrating or migrate_done or migrate_error else 'none' }};margin-top:8px">
+<div class="section-title" style="font-size:13px">Migration log</div>
+<div id="db-migrate-log" style="background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary);max-height:400px;overflow-y:auto;line-height:1.7;white-space:pre-wrap;margin-top:8px">{% if migrating %}Starting...{% else %}{% if migrate_done %}Done.{% elif migrate_error %}Failed.{% endif %}{% endif %}</div>
+{% if migrate_done %}<p style="margin-top:12px;font-size:13px;color:var(--text-secondary)">Migration complete. <button type="button" onclick="window.location.reload()" style="padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer">Refresh page</button> to refresh Server One display. Decommission the old DB host when ready.</p>{% endif %}
+</div>
 </div>
 </div>
 {% endif %}

@@ -1635,3 +1635,43 @@ function pollUpgradeLog(){
 }
 if(document.body.getAttribute('data-tak-deploying')==='true' && document.getElementById('deploy-log')){ pollDeployLog(); }
 if(document.body.getAttribute('data-tak-upgrading')==='true' && document.getElementById('upgrade-log')){ upgradeLogIndex=0; pollUpgradeLog(); }
+
+function takToggleDbMigrate(){
+  var body=document.getElementById('tak-db-migrate-body');var icon=document.getElementById('tak-db-migrate-toggle-icon');if(!body)return;var show=body.style.display==='none';body.style.display=show?'block':'none';if(icon)icon.style.transform=show?'rotate(180deg)':'';
+}
+var migrateLogIndex=0;
+async function startDbMigrate(){
+  var hostEl=document.getElementById('db-migrate-new-host');
+  var userEl=document.getElementById('db-migrate-ssh-user');
+  var msg=document.getElementById('db-migrate-msg');
+  var btn=document.getElementById('db-migrate-start-btn');
+  var host=hostEl&&hostEl.value?hostEl.value.trim():'';
+  if(!host){if(msg){msg.textContent='Enter the new Server One host.';msg.style.color='var(--red)';}return;}
+  if(!confirm('This will STOP TAK Server, copy the cot database to the new host, replace cot on the new host, and point TAK at the new database. Continue?'))return;
+  if(btn)btn.disabled=true;
+  if(msg){msg.textContent='Starting...';msg.style.color='var(--text-dim)';}
+  try{
+    var payload={new_host:host};
+    if(userEl&&userEl.value.trim())payload.new_ssh_user=userEl.value.trim();
+    var r=await fetch('/api/takserver/two-server/migrate-database/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload),credentials:'same-origin'});
+    var d=await r.json();
+    if(d.error){if(msg){msg.textContent=d.error;msg.style.color='var(--red)';}if(btn)btn.disabled=false;return;}
+    var wrap=document.getElementById('db-migrate-log-wrap');if(wrap)wrap.style.display='block';
+    var el=document.getElementById('db-migrate-log');if(el)el.textContent='Connecting...';
+    migrateLogIndex=0;pollMigrateLog();
+  }catch(e){if(msg){msg.textContent='Error: '+e.message;msg.style.color='var(--red)';}if(btn)btn.disabled=false;}
+}
+function pollMigrateLog(){
+  var el=document.getElementById('db-migrate-log');
+  if(!el)return;
+  var retriesLeft=5;
+  function poll(){
+    fetch('/api/takserver/two-server/migrate-database/log?index='+migrateLogIndex,{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+      if(d.entries&&d.entries.length){if(migrateLogIndex===0)el.textContent='';el.textContent+=d.entries.join(String.fromCharCode(10))+String.fromCharCode(10);el.scrollTop=el.scrollHeight;migrateLogIndex=d.total;}
+      if(!d.running){var btn=document.getElementById('db-migrate-start-btn');if(btn)btn.disabled=false;if(d.complete){var m=document.getElementById('db-migrate-msg');if(m){m.textContent='Done. Refreshing...';m.style.color='var(--green)';}setTimeout(function(){window.location.reload();},1800);}else if(d.error){var m2=document.getElementById('db-migrate-msg');if(m2){m2.textContent='Migration failed — see log';m2.style.color='var(--red)';}}else if(retriesLeft>0){retriesLeft--;setTimeout(poll,400);}}
+      else{setTimeout(poll,800);}
+    });
+  }
+  poll();
+}
+if(document.body.getAttribute('data-tak-migrating')==='true' && document.getElementById('db-migrate-log')){migrateLogIndex=0;pollMigrateLog();}
