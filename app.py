@@ -1910,7 +1910,7 @@ def takserver_two_server_install_ssh_key():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)[:400]}), 400
     if install_host:
-        return jsonify({'success': True, 'message': f'Key installed on {user}@{host}:{port}. Next: Deploy Server One on that host, then Start migration.'})
+        return jsonify({'success': True, 'message': f'Key installed on {user}@{host}:{port}. Next: 4. Deploy Server One (DB) on new host (this page), then Start migration.'})
     return jsonify({'success': True, 'message': 'Key installed on Server One. Next: 4. Deploy Server One (DB).'})
 
 
@@ -2250,7 +2250,9 @@ def takserver_two_server_runbook():
 @app.route('/api/takserver/two-server/deploy-server-one', methods=['POST'])
 @login_required
 def takserver_two_server_deploy_server_one():
-    """Full Server One deploy: SCP database .deb, install, configure PG for remote, open UFW, capture DB password."""
+    """Full Server One deploy: SCP database .deb, install, configure PG for remote, open UFW, capture DB password.
+    Optional body: deploy_target_host (+ deploy_target_user, deploy_target_port) — deploy to that host only while
+    keeping saved server_one.host unchanged (for DB migration: prepare new VM before Start migration)."""
     data = request.get_json() or {}
     settings = load_settings()
     cfg = _get_tak_deployment_config(settings)
@@ -2258,7 +2260,26 @@ def takserver_two_server_deploy_server_one():
         cfg = _normalize_tak_deployment_config(_deep_merge_dict(cfg, data.get('config')))
     if cfg.get('mode') != 'two_server':
         return jsonify({'success': False, 'error': 'Deployment mode is not two_server'}), 400
-    s1 = cfg.get('server_one', {})
+    s1 = dict(cfg.get('server_one', {}))
+    deploy_alt = (data.get('deploy_target_host') or '').strip()
+    preserve_saved_host = False
+    if deploy_alt:
+        if not _safe_migration_db_host(deploy_alt):
+            return jsonify({'success': False, 'error': 'Invalid deploy_target_host'}), 400
+        saved_host = (s1.get('host') or '').strip()
+        if saved_host and deploy_alt.lower() == saved_host.lower():
+            return jsonify({'success': False, 'error': 'deploy_target_host is the same as saved Server One — use normal step 4 without deploy_target_host.'}), 400
+        s1['host'] = deploy_alt
+        du = (data.get('deploy_target_user') or '').strip()
+        if du:
+            s1['ssh_user'] = du
+        dp = data.get('deploy_target_port')
+        if dp is not None and str(dp).strip():
+            try:
+                s1['ssh_port'] = int(dp)
+            except (TypeError, ValueError):
+                return jsonify({'success': False, 'error': 'deploy_target_port must be a number'}), 400
+        preserve_saved_host = True
     if not (s1.get('host') or '').strip():
         return jsonify({'success': False, 'error': 'Server One host not set'}), 400
     db_port = int(cfg.get('database', {}).get('port') or 5432)
@@ -2287,9 +2308,18 @@ def takserver_two_server_deploy_server_one():
     ok, log, db_password = _setup_server_one(s1, core_ip, db_port,
                                               db_pkg_path=local_deb, db_pkg_name=db_pkg)
     if db_password:
-        cfg['database']['password'] = db_password
-        settings['tak_deployment'] = cfg
-        save_settings(settings)
+        if preserve_saved_host:
+            # Do not persist alternate host — migration still needs saved Server One = current DB source.
+            settings = load_settings()
+            cfg_save = _get_tak_deployment_config(settings)
+            cfg_save.setdefault('database', {})['password'] = db_password
+            settings['tak_deployment'] = cfg_save
+            save_settings(settings)
+            log.append('Note: Saved Server One host unchanged (alternate deploy). Use Start migration when ready.')
+        else:
+            cfg['database']['password'] = db_password
+            settings['tak_deployment'] = cfg
+            save_settings(settings)
 
     if not ok:
         return jsonify({'success': False, 'error': log[-1] if log else 'Deploy failed on Server One', 'log': log}), 400
@@ -22558,7 +22588,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 <div id="tak-db-migrate-body" style="display:{{ 'block' if migrating or migrate_done or migrate_error else 'none' }};padding:0 24px 24px 24px;border-top:1px solid var(--border)">
 <p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:12px;padding-top:16px"><span style="color:var(--yellow);font-weight:600">Automated migration.</span> Copies the <code style="font-size:12px">cot</code> database from the current Server One (<span style="color:var(--cyan)">{{ s1_host }}</span>) to a <strong>new</strong> host, updates CoreConfig and saved settings, and restarts TAK Server.</p>
-<p style="font-size:12px;color:var(--text-dim);line-height:1.5;margin-bottom:12px"><strong>Prerequisites:</strong> (1) <strong>Same SSH flow as Split Server Wizard</strong> — enter the <em>new</em> host below, then <strong>2. Setup SSH key</strong> (ensures a key on this console) and <strong>3. Copy key to new host</strong> (one-time password via <code>ssh-copy-id</code>, same API as step 3 in the wizard). (2) Run <strong>4. Deploy Server One</strong> on the <em>new</em> IP (Split Server Wizard: set Server One host to the new IP, Save Config, then step 4) so PostgreSQL and <code>takserver-database</code> are installed — <code>cot</code> there will be <strong>replaced</strong>.</p>
+<p style="font-size:12px;color:var(--text-dim);line-height:1.5;margin-bottom:12px"><strong>Steps:</strong> (1) Enter the <em>new</em> host below. (2–3) <strong>Setup SSH key</strong> and <strong>Copy key to new host</strong> (same as Split Server Wizard). (4) <strong>Deploy Server One (DB) on new host</strong> — installs PostgreSQL + <code>takserver-database</code> on that IP using your uploaded <code>.deb</code>; your <strong>saved</strong> Server One stays the <em>current</em> DB until migration finishes. (5) <strong>Start migration</strong> copies <code>cot</code> from the current Server One to the new host and <em>then</em> switches settings + Core to the new IP. <strong>Start migration</strong> does not install packages — it only dumps/restores + reconfigures.</p>
 <div style="display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end;margin-bottom:12px">
 <div class="form-field" style="min-width:200px"><label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px">New Server One host (IP or DNS)</label><input type="text" id="db-migrate-new-host" placeholder="e.g. 203.0.113.50" autocomplete="off" style="width:100%;padding:8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px" /></div>
 <div class="form-field" style="min-width:140px"><label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px">SSH user (optional)</label><input type="text" id="db-migrate-ssh-user" placeholder="root" autocomplete="off" style="width:100%;padding:8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px" /></div>
@@ -22567,7 +22597,8 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:14px">
 <button type="button" onclick="dbMigrateEnsureSshKey()" style="padding:8px 14px;background:rgba(139,92,246,0.15);color:var(--purple, #a78bfa);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer;font-family:'DM Sans',sans-serif">2. Setup SSH key</button>
 <button type="button" onclick="dbMigrateInstallSshKey()" style="padding:8px 14px;background:rgba(245,158,11,0.15);color:var(--amber, #f59e0b);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer;font-family:'DM Sans',sans-serif">3. Copy key to new host</button>
-<span style="font-size:11px;color:var(--text-dim);max-width:420px">Uses saved Server One key path (or defaults). Requires <code>sshpass</code> on this host — same as wizard step 3.</span>
+<button type="button" onclick="dbMigrateDeployServerOne()" style="padding:8px 14px;background:rgba(99,102,241,0.2);color:var(--indigo,#6366f1);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer;font-family:'DM Sans',sans-serif">4. Deploy Server One (DB) on new host</button>
+<span style="font-size:11px;color:var(--text-dim);max-width:100%">Steps 2–3: <code>sshpass</code> same as wizard. Step 4: requires <code>takserver-database</code> .deb uploaded (same as wizard). Saved “current” Server One host is not changed until migration completes.</span>
 </div>
 <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px">
 <button type="button" id="db-migrate-start-btn" onclick="startDbMigrate()" style="padding:12px 24px;background:linear-gradient(135deg,#b45309,#92400e);color:#fff;border:none;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:14px;font-weight:600;cursor:pointer">Start migration</button>

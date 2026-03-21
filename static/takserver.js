@@ -1676,6 +1676,29 @@ async function dbMigrateInstallSshKey(){
     throw e;
   }
 }
+async function dbMigrateDeployServerOne(){
+  var msg=document.getElementById('db-migrate-msg');
+  var hostEl=document.getElementById('db-migrate-new-host');
+  var userEl=document.getElementById('db-migrate-ssh-user');
+  var portEl=document.getElementById('db-migrate-ssh-port');
+  var host=hostEl&&hostEl.value?hostEl.value.trim():'';
+  if(!host){if(msg){msg.textContent='Enter the new Server One host first.';msg.style.color='var(--red)';}return;}
+  if(!confirm('Install takserver-database on '+host+'? Upload area must already have the database .deb (same as Split Server wizard). Saved current Server One is not switched yet.'))return;
+  if(msg){msg.textContent='Deploying database package to new host\u2026';msg.style.color='var(--cyan)';}
+  try{
+    var body={deploy_target_host:host};
+    if(userEl&&userEl.value.trim())body.deploy_target_user=userEl.value.trim();
+    if(portEl&&String(portEl.value).trim()!==''){var pp=parseInt(portEl.value,10);if(!isNaN(pp))body.deploy_target_port=pp;}
+    var r=await fetch('/api/takserver/two-server/deploy-server-one',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),credentials:'same-origin'});
+    var d=await r.json();
+    if(!d.success)throw new Error(d.error||'Deploy failed');
+    if(msg){msg.textContent='\u2713 '+(d.message||'Deploy complete')+(d.log&&d.log.length?'\n'+d.log.slice(-5).join('\n'):'');msg.style.color='var(--green)';}
+    return d;
+  }catch(e){
+    if(msg){msg.textContent='\u2717 '+e.message;msg.style.color='var(--red)';}
+    throw e;
+  }
+}
 var migrateLogIndex=0;
 async function startDbMigrate(){
   var hostEl=document.getElementById('db-migrate-new-host');
