@@ -1636,8 +1636,73 @@ function pollUpgradeLog(){
 if(document.body.getAttribute('data-tak-deploying')==='true' && document.getElementById('deploy-log')){ pollDeployLog(); }
 if(document.body.getAttribute('data-tak-upgrading')==='true' && document.getElementById('upgrade-log')){ upgradeLogIndex=0; pollUpgradeLog(); }
 
+function refreshDbMigrateDebStatus(){
+  var statusEl=document.getElementById('db-migrate-deb-status');
+  var panel=document.getElementById('db-migrate-deb-panel');
+  if(!statusEl)return;
+  fetch('/api/takserver/two-server/migration-database-deb-status',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    if(d.file_missing){
+      statusEl.innerHTML='<span style="color:var(--red)">Uploads list \u201c'+d.filename+'\u201d but the file is missing \u2014 upload the .deb again below.</span>';
+      if(panel)panel.style.borderColor='rgba(239,68,68,0.45)';
+      return;
+    }
+    if(d.has_database_deb){
+      var v=d.deb_version?' (Version '+d.deb_version+')':'';
+      statusEl.innerHTML='\u2713 Ready: <span style="color:var(--green)">'+d.filename+'</span>'+v+' \u2014 must match current Server One at step 4 / Start migration.';
+      if(panel)panel.style.borderColor='rgba(34,197,94,0.35)';
+    }else{
+      statusEl.innerHTML='<span style="color:var(--yellow)">No takserver-database .deb in uploads yet.</span> Drop it below or use the main Deploy/Upgrade upload area at the top of this page.';
+      if(panel)panel.style.borderColor='rgba(234,179,8,0.55)';
+    }
+  }).catch(function(){statusEl.textContent='Could not load upload status.';});
+}
+function dbMigrateUploadDrop(e){
+  e.preventDefault();
+  var a=document.getElementById('db-migrate-upload-area');
+  if(a)a.classList.remove('dragover');
+  if(e.dataTransfer&&e.dataTransfer.files&&e.dataTransfer.files.length){dbMigrateQueueDbDebUpload(e.dataTransfer.files[0]);}
+}
+function dbMigrateFileInputChange(e){
+  var f=e.target&&e.target.files&&e.target.files[0];
+  if(f)dbMigrateQueueDbDebUpload(f);
+  if(e.target)e.target.value='';
+}
+function dbMigrateQueueDbDebUpload(file){
+  var msg=document.getElementById('db-migrate-msg');
+  var n=(file.name||'').toLowerCase();
+  if(!n.endsWith('.deb')){
+    if(msg){msg.textContent='Use a .deb file (takserver-database).';msg.style.color='var(--red)';}
+    return;
+  }
+  if(n.indexOf('database')===-1){
+    if(msg){msg.textContent='Upload takserver-database (filename should contain \u201cdatabase\u201d).';msg.style.color='var(--red)';}
+    return;
+  }
+  var prog=document.getElementById('db-migrate-upload-progress');
+  if(!prog)return;
+  prog.innerHTML='';
+  var id='dm-'+Date.now();
+  var row=document.createElement('div');row.id=id;row.style.cssText='font-size:12px;font-family:JetBrains Mono,monospace;margin-top:6px;color:var(--text-secondary)';
+  row.textContent=file.name+' \u2014 uploading\u2026';
+  prog.appendChild(row);
+  var fd=new FormData();fd.append('files',file);
+  var xhr=new XMLHttpRequest();
+  xhr.onload=function(){
+    if(xhr.status===200){
+      try{
+        var d=JSON.parse(xhr.responseText);
+        if(d.success){row.textContent=file.name+' \u2713 uploaded';row.style.color='var(--green)';refreshDbMigrateDebStatus();}
+        else{row.textContent=d.error||'Upload failed';row.style.color='var(--red)';}
+      }catch(ex){row.textContent='Bad response';row.style.color='var(--red)';}
+    }else{row.textContent='Upload failed ('+xhr.status+')';row.style.color='var(--red)';}
+  };
+  xhr.onerror=function(){row.textContent='Network error';row.style.color='var(--red)';};
+  xhr.open('POST','/api/upload/takserver');
+  xhr.send(fd);
+}
 function takToggleDbMigrate(){
   var body=document.getElementById('tak-db-migrate-body');var icon=document.getElementById('tak-db-migrate-toggle-icon');if(!body)return;var show=body.style.display==='none';body.style.display=show?'block':'none';if(icon)icon.style.transform=show?'rotate(180deg)':'';
+  if(show)refreshDbMigrateDebStatus();
 }
 async function dbMigrateEnsureSshKey(){
   var msg=document.getElementById('db-migrate-msg');
@@ -1683,7 +1748,15 @@ async function dbMigrateDeployServerOne(){
   var portEl=document.getElementById('db-migrate-ssh-port');
   var host=hostEl&&hostEl.value?hostEl.value.trim():'';
   if(!host){if(msg){msg.textContent='Enter the new Server One host first.';msg.style.color='var(--red)';}return;}
-  if(!confirm('Install takserver-database on '+host+'? Upload area must already have the database .deb (same as Split Server wizard). Saved current Server One is not switched yet.'))return;
+  try{
+    var st=await fetch('/api/takserver/two-server/migration-database-deb-status',{credentials:'same-origin'}).then(function(r){return r.json();});
+    if(!st.has_database_deb||st.file_missing){
+      if(msg){msg.textContent=st.file_missing?'Database .deb missing on disk \u2014 upload again in the panel above.':'Upload takserver-database .deb in the panel above first.';msg.style.color='var(--red)';}
+      refreshDbMigrateDebStatus();
+      return;
+    }
+  }catch(e){}
+  if(!confirm('Install takserver-database on '+host+'? The uploaded database .deb must match the version on your current Server One (enforced). Saved current Server One is not switched until after migration.'))return;
   if(msg){msg.textContent='Deploying database package to new host\u2026';msg.style.color='var(--cyan)';}
   try{
     var body={deploy_target_host:host};
@@ -1693,6 +1766,7 @@ async function dbMigrateDeployServerOne(){
     var d=await r.json();
     if(!d.success)throw new Error(d.error||'Deploy failed');
     if(msg){msg.textContent='\u2713 '+(d.message||'Deploy complete')+(d.log&&d.log.length?'\n'+d.log.slice(-5).join('\n'):'');msg.style.color='var(--green)';}
+    refreshDbMigrateDebStatus();
     return d;
   }catch(e){
     if(msg){msg.textContent='\u2717 '+e.message;msg.style.color='var(--red)';}
@@ -1708,6 +1782,14 @@ async function startDbMigrate(){
   var btn=document.getElementById('db-migrate-start-btn');
   var host=hostEl&&hostEl.value?hostEl.value.trim():'';
   if(!host){if(msg){msg.textContent='Enter the new Server One host.';msg.style.color='var(--red)';}return;}
+  try{
+    var st=await fetch('/api/takserver/two-server/migration-database-deb-status',{credentials:'same-origin'}).then(function(r){return r.json();});
+    if(!st.has_database_deb||st.file_missing){
+      if(msg){msg.textContent=st.file_missing?'Database .deb missing \u2014 upload again in the panel above.':'Upload takserver-database .deb in the panel above before starting migration.';msg.style.color='var(--red)';}
+      refreshDbMigrateDebStatus();
+      return;
+    }
+  }catch(e){}
   if(!confirm('This will STOP TAK Server, copy the cot database to the new host, replace cot on the new host, and point TAK at the new database. Continue?'))return;
   if(btn)btn.disabled=true;
   if(msg){msg.textContent='Starting...';msg.style.color='var(--text-dim)';}
@@ -1737,3 +1819,4 @@ function pollMigrateLog(){
   poll();
 }
 if(document.body.getAttribute('data-tak-migrating')==='true' && document.getElementById('db-migrate-log')){migrateLogIndex=0;pollMigrateLog();}
+if(document.getElementById('db-migrate-deb-panel')){refreshDbMigrateDebStatus();}

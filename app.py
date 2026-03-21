@@ -2260,6 +2260,7 @@ def takserver_two_server_deploy_server_one():
         cfg = _normalize_tak_deployment_config(_deep_merge_dict(cfg, data.get('config')))
     if cfg.get('mode') != 'two_server':
         return jsonify({'success': False, 'error': 'Deployment mode is not two_server'}), 400
+    s1_saved = dict(cfg.get('server_one', {}))
     s1 = dict(cfg.get('server_one', {}))
     deploy_alt = (data.get('deploy_target_host') or '').strip()
     preserve_saved_host = False
@@ -2300,10 +2301,21 @@ def takserver_two_server_deploy_server_one():
     uploaded = [f for f in os.listdir(UPLOAD_DIR) if f.endswith('.deb') or f.endswith('.rpm')]
     db_pkg = next((f for f in uploaded if 'database' in f.lower()), '')
     if not db_pkg:
-        return jsonify({'success': False, 'error': 'No database package uploaded. Upload takserver-database .deb first.'}), 400
+        return jsonify({
+            'success': False,
+            'error': 'No takserver-database .deb in uploads — add the file on this TAK Server page (drag/drop or browse) so we can deploy it. If it was deleted, upload it again from tak.gov.',
+        }), 400
     local_deb = os.path.join(UPLOAD_DIR, db_pkg)
     if not os.path.isfile(local_deb):
-        return jsonify({'success': False, 'error': f'Package not found: {db_pkg}'}), 400
+        return jsonify({
+            'success': False,
+            'error': f'Uploads list "{db_pkg}" but the file is gone from disk — upload the takserver-database .deb again.',
+        }), 400
+
+    if preserve_saved_host:
+        ok_ver, ver_err = _assert_uploaded_db_deb_matches_server_one(s1_saved, local_deb, db_pkg)
+        if not ok_ver:
+            return jsonify({'success': False, 'error': ver_err}), 400
 
     ok, log, db_password = _setup_server_one(s1, core_ip, db_port,
                                               db_pkg_path=local_deb, db_pkg_name=db_pkg)
@@ -2553,6 +2565,20 @@ def takserver_two_server_migrate_database_start():
     db_port = int(cfg.get('database', {}).get('port') or 5432)
     db_user = (cfg.get('database', {}).get('user') or 'martiuser').strip() or 'martiuser'
     db_name = (cfg.get('database', {}).get('name') or 'cot').strip() or 'cot'
+    uploaded_m = [f for f in os.listdir(UPLOAD_DIR) if f.endswith('.deb') or f.endswith('.rpm')]
+    db_pkg_m = next((f for f in uploaded_m if 'database' in f.lower()), '')
+    if not db_pkg_m:
+        return jsonify({
+            'error': 'No takserver-database .deb in uploads — upload it again on this page (it may have been removed). It must match the version on your current Server One.',
+        }), 400
+    local_deb_m = os.path.join(UPLOAD_DIR, db_pkg_m)
+    if not os.path.isfile(local_deb_m):
+        return jsonify({
+            'error': f'Uploads reference "{db_pkg_m}" but the file is missing — upload the takserver-database .deb again before starting migration.',
+        }), 400
+    ok_ver_m, ver_err_m = _assert_uploaded_db_deb_matches_server_one(old_s1, local_deb_m, db_pkg_m)
+    if not ok_ver_m:
+        return jsonify({'error': ver_err_m}), 400
     tak_snap = copy.deepcopy(cfg)
     tak_migrate_log.clear()
     tak_migrate_status.update({'running': True, 'complete': False, 'error': False})
@@ -2575,6 +2601,31 @@ def takserver_two_server_migrate_database_log():
         'complete': tak_migrate_status['complete'],
         'error': tak_migrate_status['error'],
     })
+
+
+@app.route('/api/takserver/two-server/migration-database-deb-status', methods=['GET'])
+@login_required
+def takserver_migration_database_deb_status():
+    """Report whether uploads include takserver-database .deb (same dir as deploy/upgrade). Uses dpkg-deb locally; no SSH."""
+    uploaded = [f for f in os.listdir(UPLOAD_DIR) if f.endswith('.deb') or f.endswith('.rpm')]
+    db_pkg = next((f for f in uploaded if 'database' in f.lower()), '')
+    out = {
+        'has_database_deb': False,
+        'filename': None,
+        'deb_version': None,
+        'file_missing': False,
+    }
+    if not db_pkg:
+        return jsonify(out)
+    local_path = os.path.join(UPLOAD_DIR, db_pkg)
+    out['filename'] = db_pkg
+    if not os.path.isfile(local_path):
+        out['file_missing'] = True
+        return jsonify(out)
+    out['has_database_deb'] = True
+    _pkg, ver = _local_deb_control_fields(local_path)
+    out['deb_version'] = ver
+    return jsonify(out)
 
 
 @app.route('/api/takserver/pin-packages', methods=['POST'])
@@ -5886,6 +5937,59 @@ def _ssh_probe(host_cfg, cmd='echo ok', timeout=15):
         return False, ((r.stderr or '') + '\n' + (r.stdout or '')).strip()
     except Exception as e:
         return False, str(e)
+
+
+def _remote_takserver_database_version(host_cfg):
+    """Installed takserver-database Version on host via SSH, or None if missing/unreadable."""
+    cmd = r"dpkg-query -W -f '${Version}' takserver-database 2>/dev/null || true"
+    ok, out = _ssh_probe(host_cfg, cmd, timeout=25)
+    if not ok:
+        return None, (out or 'ssh failed')[:300]
+    v = (out or '').strip()
+    return (v if v else None), None
+
+
+def _local_deb_control_fields(deb_path):
+    """Return (package_name, version) from .deb control, or (None, None)."""
+    try:
+        if not deb_path or not os.path.isfile(deb_path):
+            return None, None
+        rp = subprocess.run(['dpkg-deb', '-f', deb_path, 'Package'], capture_output=True, text=True, timeout=30)
+        rv = subprocess.run(['dpkg-deb', '-f', deb_path, 'Version'], capture_output=True, text=True, timeout=30)
+        if rp.returncode != 0 or rv.returncode != 0:
+            return None, None
+        pkg = (rp.stdout or '').strip()
+        ver = (rv.stdout or '').strip()
+        return (pkg or None, ver or None)
+    except Exception:
+        return None, None
+
+
+def _assert_uploaded_db_deb_matches_server_one(s1_ref_cfg, local_deb_path, deb_filename):
+    """
+    Ensure uploaded takserver-database .deb Version matches installed package on current Server One.
+    s1_ref_cfg: SSH config for the existing DB host (saved server_one, not the migrate target).
+    Returns (ok, error_message).
+    """
+    pkg, deb_ver = _local_deb_control_fields(local_deb_path)
+    if not deb_ver:
+        return False, f'Could not read Version from uploaded {deb_filename} (dpkg-deb -f failed).'
+    if pkg and 'database' not in pkg.lower():
+        return False, f'Uploaded .deb is package "{pkg}" — use takserver-database for this check.'
+    remote_ver, qerr = _remote_takserver_database_version(s1_ref_cfg)
+    if qerr:
+        return False, f'Could not read takserver-database version on current Server One: {qerr}'
+    if not remote_ver:
+        return False, (
+            'takserver-database does not appear to be installed on the current Server One (no dpkg version). '
+            'Confirm SSH/key points at the live DB host, or install the package there first.'
+        )
+    if remote_ver != deb_ver:
+        return False, (
+            f'takserver-database version mismatch: current Server One has {remote_ver}, '
+            f'uploaded .deb is {deb_ver}. Upload the matching database .deb from tak.gov, then retry.'
+        )
+    return True, None
 
 
 def _scp_to_host(host_cfg, local_path, remote_path, timeout=120):
@@ -22589,6 +22693,15 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div id="tak-db-migrate-body" style="display:{{ 'block' if migrating or migrate_done or migrate_error else 'none' }};padding:0 24px 24px 24px;border-top:1px solid var(--border)">
 <p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:12px;padding-top:16px"><span style="color:var(--yellow);font-weight:600">Automated migration.</span> Copies the <code style="font-size:12px">cot</code> database from the current Server One (<span style="color:var(--cyan)">{{ s1_host }}</span>) to a <strong>new</strong> host, updates CoreConfig and saved settings, and restarts TAK Server.</p>
 <p style="font-size:12px;color:var(--text-dim);line-height:1.5;margin-bottom:12px"><strong>Steps:</strong> (1) Enter the <em>new</em> host below. (2–3) <strong>Setup SSH key</strong> and <strong>Copy key to new host</strong> (same as Split Server Wizard). (4) <strong>Deploy Server One (DB) on new host</strong> — installs PostgreSQL + <code>takserver-database</code> on that IP using your uploaded <code>.deb</code>; your <strong>saved</strong> Server One stays the <em>current</em> DB until migration finishes. (5) <strong>Start migration</strong> copies <code>cot</code> from the current Server One to the new host and <em>then</em> switches settings + Core to the new IP. <strong>Start migration</strong> does not install packages — it only dumps/restores + reconfigures.</p>
+<div id="db-migrate-deb-panel" style="margin-bottom:14px;padding:14px;background:rgba(234,179,8,0.06);border:1px solid rgba(234,179,8,0.35);border-radius:10px">
+<div style="font-size:12px;font-weight:600;color:var(--yellow);margin-bottom:6px">takserver-database .deb (steps 4–5)</div>
+<div id="db-migrate-deb-status" style="font-size:11px;color:var(--text-dim);margin-bottom:10px;line-height:1.5;font-family:'JetBrains Mono',monospace">Loading upload status…</div>
+<div id="db-migrate-upload-area" class="upload-area" style="padding:14px 16px;cursor:pointer;margin:0" onclick="document.getElementById('db-migrate-file-input').click()" ondrop="dbMigrateUploadDrop(event)" ondragover="event.preventDefault();this.classList.add('dragover')" ondragleave="event.preventDefault();this.classList.remove('dragover')">
+<input type="file" id="db-migrate-file-input" accept=".deb" style="display:none" onchange="dbMigrateFileInputChange(event)" />
+<span style="font-size:12px;color:var(--text-secondary)">Drop <strong style="color:var(--cyan)">takserver-database</strong> .deb here or click to browse — same upload folder as deploy/upgrade if you already added it there.</span>
+</div>
+<div id="db-migrate-upload-progress" style="margin-top:8px"></div>
+</div>
 <div style="display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end;margin-bottom:12px">
 <div class="form-field" style="min-width:200px"><label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px">New Server One host (IP or DNS)</label><input type="text" id="db-migrate-new-host" placeholder="e.g. 203.0.113.50" autocomplete="off" style="width:100%;padding:8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px" /></div>
 <div class="form-field" style="min-width:140px"><label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px">SSH user (optional)</label><input type="text" id="db-migrate-ssh-user" placeholder="root" autocomplete="off" style="width:100%;padding:8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:13px" /></div>
@@ -22598,7 +22711,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <button type="button" onclick="dbMigrateEnsureSshKey()" style="padding:8px 14px;background:rgba(139,92,246,0.15);color:var(--purple, #a78bfa);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer;font-family:'DM Sans',sans-serif">2. Setup SSH key</button>
 <button type="button" onclick="dbMigrateInstallSshKey()" style="padding:8px 14px;background:rgba(245,158,11,0.15);color:var(--amber, #f59e0b);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer;font-family:'DM Sans',sans-serif">3. Copy key to new host</button>
 <button type="button" onclick="dbMigrateDeployServerOne()" style="padding:8px 14px;background:rgba(99,102,241,0.2);color:var(--indigo,#6366f1);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer;font-family:'DM Sans',sans-serif">4. Deploy Server One (DB) on new host</button>
-<span style="font-size:11px;color:var(--text-dim);max-width:100%">Steps 2–3: <code>sshpass</code> same as wizard. Step 4: requires <code>takserver-database</code> .deb uploaded (same as wizard). Saved “current” Server One host is not changed until migration completes.</span>
+<span style="font-size:11px;color:var(--text-dim);max-width:100%">Steps 2–3: <code>sshpass</code> same as wizard. Step 4 &amp; Start migration: uploaded <code>takserver-database</code> .deb must match <code>dpkg-query</code> version on the <strong>current</strong> Server One (same release as production DB). Saved “current” Server One host is not changed until migration completes.</span>
 </div>
 <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px">
 <button type="button" id="db-migrate-start-btn" onclick="startDbMigrate()" style="padding:12px 24px;background:linear-gradient(135deg,#b45309,#92400e);color:#fff;border:none;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:14px;font-weight:600;cursor:pointer">Start migration</button>
