@@ -930,7 +930,17 @@ function uploadFile(file){
         delete window['xhr_'+id];
         const bar=document.getElementById(id+'-bar');const pc=document.getElementById(id+'-pct');bar.style.width='100%';
         var cb=document.getElementById(id+'-cancel');if(cb)cb.remove();
-        if(xhr.status===200){const d=JSON.parse(xhr.responseText);bar.style.background='var(--green)';pc.style.color='var(--green)';if(d.packages&&d.packages.length)d.packages.forEach(function(p){if(!uploadedFiles.packages.some(function(x){return x.filename===p.filename}))uploadedFiles.packages.push(p)});else if(d.package){var p=d.package;if(!uploadedFiles.packages.some(function(x){return x.filename===p.filename}))uploadedFiles.packages.push({filename:p.filename,filepath:p.filepath,size_mb:p.size_mb})}if(d.gpg_key)uploadedFiles.gpg_key=d.gpg_key;if(d.policy)uploadedFiles.policy=d.policy;var rBtn=document.createElement('span');rBtn.textContent=' \u2717';rBtn.style.cssText='color:var(--red);cursor:pointer;margin-left:8px';rBtn.title='Remove';rBtn.onclick=function(ev){ev.stopPropagation();removeFile(file.name,id)};pc.textContent='\u2713 ';pc.appendChild(rBtn);updateUploadSummary();applyUploadsModeDetection();}
+        if(xhr.status===200){
+            const d=JSON.parse(xhr.responseText);
+            if(d.gpg_key)uploadedFiles.gpg_key=d.gpg_key;if(d.policy)uploadedFiles.policy=d.policy;
+            var mode=getTakDeploymentMode();
+            function allowed(p){var n=(p.filename||'').toLowerCase();var hasCore=n.indexOf('core')!==-1;var hasDb=n.indexOf('database')!==-1;if(mode==='two_server')return hasCore||hasDb;return !hasCore&&!hasDb;}
+            function reject(msg){bar.style.background='var(--red)';pc.style.color='var(--red)';pc.textContent=msg;}
+            var added=0;
+            if(d.packages&&d.packages.length){d.packages.forEach(function(p){if(!allowed(p)){reject(mode==='two_server'?'Split deploy: only core and database .deb accepted.':'One-server deploy: only the single takserver .deb accepted.');return;}if(!uploadedFiles.packages.some(function(x){return x.filename===p.filename})){uploadedFiles.packages.push(p);added++;}});}
+            else if(d.package){var p=d.package;if(!allowed(p)){reject(mode==='two_server'?'Split deploy: only core and database .deb accepted.':'One-server deploy: only the single takserver .deb accepted.');}else if(!uploadedFiles.packages.some(function(x){return x.filename===p.filename})){uploadedFiles.packages.push({filename:p.filename,filepath:p.filepath,size_mb:p.size_mb});added++;}}
+            if(added>0||(d.gpg_key||d.policy)){bar.style.background='var(--green)';pc.style.color='var(--green)';var rBtn=document.createElement('span');rBtn.textContent=' \u2717';rBtn.style.cssText='color:var(--red);cursor:pointer;margin-left:8px';rBtn.title='Remove';rBtn.onclick=function(ev){ev.stopPropagation();removeFile(file.name,id)};pc.textContent='\u2713 ';pc.appendChild(rBtn);updateUploadSummary();applyUploadsModeDetection();}
+        }
         else{bar.style.background='var(--red)';pc.textContent='\u2717';pc.style.color='var(--red)'}
         uploadsInProgress--;if(uploadsInProgress===0)updateUploadSummary()
     };
@@ -1466,16 +1476,57 @@ function pollDeployLog(){
 }
 var upgradeLogIndex=0;
 var upgradeXhr=null,upgradeFileReady=false;
-function cancelUpgradeUpload(){
-  if(upgradeXhr){upgradeXhr.abort();upgradeXhr=null;}
-  upgradeFileReady=false;
-  var pa=document.getElementById('upgrade-progress-area');if(pa)pa.innerHTML='';
-  var ua=document.getElementById('upgrade-upload-area');if(ua){ua.style.maxHeight='';ua.style.padding='';}
+var upgradeUploadedPackages=[];
+
+function isUpgradeTwoServerMode(){
+  var input=document.getElementById('upgrade-file-input');
+  return input&&input.hasAttribute('multiple');
 }
+function updateUpgradeFileReady(){
+  var twoServer=isUpgradeTwoServerMode();
+  if(twoServer){
+    var hasCore=upgradeUploadedPackages.some(function(p){return /core/.test(p.filename);});
+    var hasDb=upgradeUploadedPackages.some(function(p){return /database/.test(p.filename);});
+    upgradeFileReady=hasCore&&hasDb;
+  }else{
+    upgradeFileReady=upgradeUploadedPackages.length>=1;
+  }
+  var msg=document.getElementById('tak-update-msg');
+  if(msg){
+    if(upgradeFileReady)msg.textContent='';
+    else if(twoServer&&upgradeUploadedPackages.length>0)msg.textContent='Upload both core and database .deb packages.';
+  }
+}
+
+function cancelUpgradeUpload(rowToRemove){
+  if(upgradeXhr){upgradeXhr.abort();upgradeXhr=null;}
+  if(rowToRemove&&rowToRemove.parentNode){rowToRemove.parentNode.removeChild(rowToRemove);}
+  var pa=document.getElementById('upgrade-progress-area');
+  if(pa&&pa.children.length===0){var ua=document.getElementById('upgrade-upload-area');if(ua){ua.style.maxHeight='';ua.style.padding='';}}
+}
+
+async function removeUpgradeFile(filename){
+  try{
+    var r=await fetch('/api/upload/takserver/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:filename}),credentials:'same-origin'});
+    var d=await r.json();
+    if(!d.success){var m=document.getElementById('tak-update-msg');if(m){m.textContent=d.error||'Remove failed';m.style.color='var(--red)';}return;}
+  }catch(e){var m=document.getElementById('tak-update-msg');if(m){m.textContent='Error: '+e.message;m.style.color='var(--red)';}return;}
+  upgradeUploadedPackages=upgradeUploadedPackages.filter(function(p){return p.filename!==filename;});
+  var pa=document.getElementById('upgrade-progress-area');
+  if(pa){var rows=pa.querySelectorAll('.progress-item[data-filename]');for(var i=0;i<rows.length;i++){if(rows[i].getAttribute('data-filename')===filename){rows[i].remove();break;}}}
+  if(pa&&pa.children.length===0){var ua=document.getElementById('upgrade-upload-area');if(ua){ua.style.maxHeight='';ua.style.padding='';}}
+  updateUpgradeFileReady();
+}
+
 function uploadUpgradeDeb(file){
   if(!file||!file.name.toLowerCase().endsWith('.deb')){var m=document.getElementById('tak-update-msg');if(m){m.textContent='Select a .deb file.';m.style.color='var(--red)';}return;}
+  var n=file.name.toLowerCase();
+  if(isUpgradeTwoServerMode()){
+    if(n.indexOf('core')===-1&&n.indexOf('database')===-1){var m=document.getElementById('tak-update-msg');if(m){m.textContent='Split mode: only takserver-core and takserver-database .deb are allowed.';m.style.color='var(--red)';}return;}
+  }else{
+    if(n.indexOf('core')!==-1||n.indexOf('database')!==-1){var m=document.getElementById('tak-update-msg');if(m){m.textContent='One-server upgrade: use the single takserver .deb, not core or database packages.';m.style.color='var(--red)';}return;}
+  }
   var pa=document.getElementById('upgrade-progress-area');
-  pa.innerHTML='';
   var fnEl=document.getElementById('upgrade-filename');if(fnEl){fnEl.style.display='none';}
   var ua=document.getElementById('upgrade-upload-area');if(ua){ua.style.maxHeight='80px';ua.style.padding='16px';}
   var row=document.createElement('div');row.className='progress-item';
@@ -1484,27 +1535,37 @@ function uploadUpgradeDeb(file){
   var right=document.createElement('span');right.style.cssText='display:flex;align-items:center;gap:8px';
   var pct=document.createElement('span');pct.style.cssText='font-family:JetBrains Mono,monospace;font-size:12px;color:var(--cyan)';pct.textContent='0%';
   var cancelBtn=document.createElement('span');cancelBtn.textContent='\u2717';cancelBtn.style.cssText='color:var(--red);cursor:pointer;font-size:14px';cancelBtn.title='Cancel upload';
-  cancelBtn.onclick=function(){cancelUpgradeUpload();};
+  cancelBtn.onclick=function(){if(row._xhr){row._xhr.abort();row._xhr=null;}cancelUpgradeUpload(row);};
   right.appendChild(pct);right.appendChild(cancelBtn);top.appendChild(lbl);top.appendChild(right);
   var barOuter=document.createElement('div');barOuter.className='progress-bar-outer';
   var barInner=document.createElement('div');barInner.className='progress-bar-inner';barInner.style.width='0%';
   barOuter.appendChild(barInner);row.appendChild(top);row.appendChild(barOuter);pa.appendChild(row);
   var fd=new FormData();fd.append('files',file);
   var xhr=new XMLHttpRequest();
-  upgradeXhr=xhr;
+  row._xhr=xhr;upgradeXhr=xhr;
   xhr.upload.onprogress=function(e){if(e.lengthComputable){var p=Math.round((e.loaded/e.total)*100);barInner.style.width=p+'%';pct.textContent=p+'%';}};
   xhr.onload=function(){
-    upgradeXhr=null;barInner.style.width='100%';cancelBtn.remove();
+    row._xhr=null;upgradeXhr=null;barInner.style.width='100%';cancelBtn.remove();
     if(xhr.status===200){var d=JSON.parse(xhr.responseText);if(d.error){barInner.style.background='var(--red)';pct.textContent=d.error;pct.style.color='var(--red)';return;}
+      var pkg=(d.packages&&d.packages.length)?d.packages[0]:d.package;
+      var filename=pkg?pkg.filename:file.name;
+      var sizeMb=pkg&&pkg.size_mb!=null?pkg.size_mb:(file.size/(1024*1024)).toFixed(1);
+      var pa=document.getElementById('upgrade-progress-area');
+      if(pa){var rows=pa.querySelectorAll('.progress-item[data-filename]');for(var i=0;i<rows.length;i++){if(rows[i]!==row&&rows[i].getAttribute('data-filename')===filename){rows[i].remove();break;}}}
+      if(!upgradeUploadedPackages.some(function(p){return p.filename===filename;}))upgradeUploadedPackages.push({filename:filename,size_mb:sizeMb});
+      row.setAttribute('data-filename',filename);
       barInner.style.background='var(--green)';pct.style.color='var(--green)';pct.textContent='\u2713 ';
-      var rBtn=document.createElement('span');rBtn.textContent='\u2717';rBtn.style.cssText='color:var(--red);cursor:pointer;margin-left:8px;font-size:14px';rBtn.title='Remove';rBtn.onclick=function(){cancelUpgradeUpload();};pct.appendChild(rBtn);
-      upgradeFileReady=true;if(fnEl){fnEl.textContent=file.name;fnEl.style.display='block';}var m=document.getElementById('tak-update-msg');if(m)m.textContent='';}
+      var rBtn=document.createElement('span');rBtn.textContent='\u2717';rBtn.style.cssText='color:var(--red);cursor:pointer;margin-left:8px;font-size:14px';rBtn.title='Remove';rBtn.onclick=function(){removeUpgradeFile(filename);};
+      pct.appendChild(rBtn);
+      updateUpgradeFileReady();
+      var m=document.getElementById('tak-update-msg');if(m)m.textContent='';
+    }
     else{barInner.style.background='var(--red)';pct.textContent='\u2717';pct.style.color='var(--red)';}
   };
-  xhr.onerror=function(){upgradeXhr=null;barInner.style.background='var(--red)';pct.textContent='\u2717 Failed';pct.style.color='var(--red)';};
-  xhr.onabort=function(){upgradeXhr=null;};
+  xhr.onerror=function(){row._xhr=null;upgradeXhr=null;barInner.style.background='var(--red)';pct.textContent='\u2717 Failed';pct.style.color='var(--red)';};
+  xhr.onabort=function(){row._xhr=null;upgradeXhr=null;};
   xhr.timeout=1800000;
-  xhr.ontimeout=function(){upgradeXhr=null;barInner.style.background='var(--red)';pct.textContent='Timeout';pct.style.color='var(--red)';};
+  xhr.ontimeout=function(){row._xhr=null;upgradeXhr=null;barInner.style.background='var(--red)';pct.textContent='Timeout';pct.style.color='var(--red)';};
   xhr.open('POST','/api/upload/takserver');xhr.send(fd);
 }
 function handleUpgradeFile(ev){
@@ -1517,11 +1578,38 @@ function handleUpgradeDrop(ev){
   var files=ev.dataTransfer.files;
   for(var i=0;i<files.length;i++){uploadUpgradeDeb(files[i]);}
 }
+
+function loadExistingUpgradeFiles(){
+  var pa=document.getElementById('upgrade-progress-area');
+  if(!pa)return;
+  fetch('/api/upload/takserver/existing',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    var twoServer=isUpgradeTwoServerMode();
+    var pkgs=(d.packages||[]).filter(function(p){var n=(p.filename||'').toLowerCase();if(!n.endsWith('.deb'))return false;if(twoServer)return n.indexOf('core')!==-1||n.indexOf('database')!==-1;return n.indexOf('core')===-1&&n.indexOf('database')===-1;});
+    if(pkgs.length===0)return;
+    upgradeUploadedPackages=pkgs.slice();
+    var ua=document.getElementById('upgrade-upload-area');if(ua){ua.style.maxHeight='80px';ua.style.padding='16px';}
+    pkgs.forEach(function(p){
+      var row=document.createElement('div');row.className='progress-item';row.setAttribute('data-filename',p.filename);
+      var top=document.createElement('div');top.style.cssText='display:flex;justify-content:space-between;align-items:center';
+      var lbl=document.createElement('span');lbl.style.cssText='font-family:JetBrains Mono,monospace;font-size:13px;color:var(--text-secondary)';lbl.textContent=p.filename+' ('+p.size_mb+' MB)';
+      var right=document.createElement('span');right.style.cssText='display:flex;align-items:center;gap:8px';
+      var pct=document.createElement('span');pct.style.cssText='font-family:JetBrains Mono,monospace;font-size:12px;color:var(--green)';pct.textContent='\u2713 ';
+      var rBtn=document.createElement('span');rBtn.textContent='\u2717';rBtn.style.cssText='color:var(--red);cursor:pointer;margin-left:8px;font-size:14px';rBtn.title='Remove';rBtn.onclick=function(){removeUpgradeFile(p.filename);};
+      pct.appendChild(rBtn);top.appendChild(lbl);top.appendChild(right);right.appendChild(pct);
+      var barOuter=document.createElement('div');barOuter.className='progress-bar-outer';
+      var barInner=document.createElement('div');barInner.className='progress-bar-inner';barInner.style.width='100%';barInner.style.background='var(--green)';
+      barOuter.appendChild(barInner);row.appendChild(top);row.appendChild(barOuter);pa.appendChild(row);
+    });
+    updateUpgradeFileReady();
+  }).catch(function(){});
+}
+if(document.getElementById('upgrade-progress-area')){loadExistingUpgradeFiles();}
+
 function takToggleUpdate(){takToggleSection('tak-update');}
 function takToggleSection(id){var body=document.getElementById(id+'-body');var icon=document.getElementById(id+'-toggle-icon');if(!body)return;var show=body.style.display==='none';body.style.display=show?'block':'none';if(icon)icon.style.transform=show?'rotate(180deg)':'';}
 async function startTakUpdate(){
   var btn=document.getElementById('tak-update-btn');var msg=document.getElementById('tak-update-msg');
-  if(!upgradeFileReady){if(msg){msg.textContent='Upload a .deb package first.';msg.style.color='var(--red)';}return;}
+  if(!upgradeFileReady){if(msg){msg.textContent=isUpgradeTwoServerMode()?'Upload both core and database .deb packages first.':'Upload a .deb package first.';msg.style.color='var(--red)';}return;}
   if(btn)btn.disabled=true;if(msg){msg.textContent='Starting update...';msg.style.color='var(--text-dim)';}
   try{
     var r=await fetch('/api/takserver/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({}),credentials:'same-origin'});
@@ -1535,13 +1623,214 @@ async function startTakUpdate(){
 function pollUpgradeLog(){
   var el=document.getElementById('upgrade-log');
   if(!el)return;
+  var retriesLeft=5;
   function poll(){
     fetch('/api/takserver/update/log?index='+upgradeLogIndex,{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
       if(d.entries&&d.entries.length){if(upgradeLogIndex===0)el.textContent='';el.textContent+=d.entries.join(String.fromCharCode(10))+String.fromCharCode(10);el.scrollTop=el.scrollHeight;upgradeLogIndex=d.total;}
-      if(!d.running){var btn=document.getElementById('tak-update-btn');if(btn)btn.disabled=false;if(d.complete){if(btn)btn.textContent='Update complete';var m=document.getElementById('tak-update-msg');if(m)m.textContent='Done. Refreshing...';setTimeout(function(){location.reload();},2000);}else if(d.error){var m=document.getElementById('tak-update-msg');if(m){m.textContent='Update failed';m.style.color='var(--red)';}}}else{setTimeout(poll,800);}
+      if(!d.running){var btn=document.getElementById('tak-update-btn');if(btn)btn.disabled=false;if(d.complete){if(btn)btn.textContent='Update complete';var m=document.getElementById('tak-update-msg');if(m)m.textContent='Done. Refreshing...';setTimeout(function(){window.location.reload();},1200);}else if(d.error){var m=document.getElementById('tak-update-msg');if(m){m.textContent='Update failed';m.style.color='var(--red)';}}else if(retriesLeft>0){retriesLeft--;setTimeout(poll,400);}}
+      else{setTimeout(poll,800);}
     });
   }
   poll();
 }
 if(document.body.getAttribute('data-tak-deploying')==='true' && document.getElementById('deploy-log')){ pollDeployLog(); }
 if(document.body.getAttribute('data-tak-upgrading')==='true' && document.getElementById('upgrade-log')){ upgradeLogIndex=0; pollUpgradeLog(); }
+
+function refreshDbMigrateDebStatus(){
+  var statusEl=document.getElementById('db-migrate-deb-status');
+  var panel=document.getElementById('db-migrate-deb-panel');
+  if(!statusEl)return;
+  fetch('/api/takserver/two-server/migration-database-deb-status',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    if(d.file_missing){
+      statusEl.innerHTML='<span style="color:var(--red)">Uploads list \u201c'+d.filename+'\u201d but the file is missing \u2014 upload the .deb again below.</span>';
+      if(panel)panel.style.borderColor='rgba(239,68,68,0.45)';
+      return;
+    }
+    if(d.has_database_deb){
+      var v=d.deb_version?' (Version '+d.deb_version+')':'';
+      statusEl.innerHTML='\u2713 Ready: <span style="color:var(--green)">'+d.filename+'</span>'+v+' \u2014 must match current Server One at step 4 / Start migration.';
+      if(panel)panel.style.borderColor='rgba(34,197,94,0.35)';
+    }else{
+      statusEl.innerHTML='<span style="color:var(--yellow)">No takserver-database .deb in uploads yet.</span> Drop it below or use the main Deploy/Upgrade upload area at the top of this page.';
+      if(panel)panel.style.borderColor='rgba(234,179,8,0.55)';
+    }
+  }).catch(function(){statusEl.textContent='Could not load upload status.';});
+}
+function dbMigrateUploadDrop(e){
+  e.preventDefault();
+  var a=document.getElementById('db-migrate-upload-area');
+  if(a)a.classList.remove('dragover');
+  if(e.dataTransfer&&e.dataTransfer.files&&e.dataTransfer.files.length){dbMigrateQueueDbDebUpload(e.dataTransfer.files[0]);}
+}
+function dbMigrateFileInputChange(e){
+  var f=e.target&&e.target.files&&e.target.files[0];
+  if(f)dbMigrateQueueDbDebUpload(f);
+  if(e.target)e.target.value='';
+}
+function dbMigrateQueueDbDebUpload(file){
+  var msg=document.getElementById('db-migrate-msg');
+  var n=(file.name||'').toLowerCase();
+  if(!n.endsWith('.deb')){
+    if(msg){msg.textContent='Use a .deb file (takserver-database).';msg.style.color='var(--red)';}
+    return;
+  }
+  if(n.indexOf('database')===-1){
+    if(msg){msg.textContent='Upload takserver-database (filename should contain \u201cdatabase\u201d).';msg.style.color='var(--red)';}
+    return;
+  }
+  var prog=document.getElementById('db-migrate-upload-progress');
+  if(!prog)return;
+  prog.innerHTML='';
+  var id='dm-'+Date.now();
+  var row=document.createElement('div');row.id=id;row.style.cssText='font-size:12px;font-family:JetBrains Mono,monospace;margin-top:6px;color:var(--text-secondary)';
+  row.textContent=file.name+' \u2014 uploading\u2026';
+  prog.appendChild(row);
+  var fd=new FormData();fd.append('files',file);
+  var xhr=new XMLHttpRequest();
+  xhr.onload=function(){
+    if(xhr.status===200){
+      try{
+        var d=JSON.parse(xhr.responseText);
+        if(d.success){row.textContent=file.name+' \u2713 uploaded';row.style.color='var(--green)';refreshDbMigrateDebStatus();}
+        else{row.textContent=d.error||'Upload failed';row.style.color='var(--red)';}
+      }catch(ex){row.textContent='Bad response';row.style.color='var(--red)';}
+    }else{row.textContent='Upload failed ('+xhr.status+')';row.style.color='var(--red)';}
+  };
+  xhr.onerror=function(){row.textContent='Network error';row.style.color='var(--red)';};
+  xhr.open('POST','/api/upload/takserver');
+  xhr.send(fd);
+}
+function takToggleDbMigrate(){
+  var body=document.getElementById('tak-db-migrate-body');var icon=document.getElementById('tak-db-migrate-toggle-icon');if(!body)return;var show=body.style.display==='none';body.style.display=show?'block':'none';if(icon)icon.style.transform=show?'rotate(180deg)':'';
+  if(show)refreshDbMigrateDebStatus();
+}
+async function dbMigrateEnsureSshKey(){
+  var msg=document.getElementById('db-migrate-msg');
+  try{
+    var r=await fetch('/api/takserver/two-server/ensure-ssh-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({}),credentials:'same-origin'});
+    var d=await r.json();
+    if(!d.success)throw new Error(d.error||'Setup failed');
+    if(msg){msg.textContent='\u2713 '+(d.message||'Key ready')+(d.fingerprint?' \u2014 '+d.fingerprint:'');msg.style.color='var(--green)';}
+    return d;
+  }catch(e){
+    if(msg){msg.textContent='\u2717 '+e.message;msg.style.color='var(--red)';}
+    throw e;
+  }
+}
+async function dbMigrateInstallSshKey(){
+  var msg=document.getElementById('db-migrate-msg');
+  var hostEl=document.getElementById('db-migrate-new-host');
+  var userEl=document.getElementById('db-migrate-ssh-user');
+  var portEl=document.getElementById('db-migrate-ssh-port');
+  var host=hostEl&&hostEl.value?hostEl.value.trim():'';
+  if(!host){if(msg){msg.textContent='Enter the new Server One host first.';msg.style.color='var(--red)';}return;}
+  var password=prompt('New host SSH password (one-time; not stored) — same as wizard step 3:');
+  if(password==null)return;
+  if(!password.trim()){if(msg){msg.textContent='No password entered.';msg.style.color='var(--yellow)';}return;}
+  try{
+    var body={password:password,install_host:host};
+    if(userEl&&userEl.value.trim())body.install_user=userEl.value.trim();
+    if(portEl&&String(portEl.value).trim()!=='')body.install_port=parseInt(portEl.value,10);
+    var r=await fetch('/api/takserver/two-server/install-ssh-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),credentials:'same-origin'});
+    var d=await r.json();
+    if(!d.success)throw new Error(d.error||'Install failed');
+    if(msg){msg.textContent='\u2713 '+(d.message||'Key installed on new host');msg.style.color='var(--green)';}
+    return d;
+  }catch(e){
+    if(msg){msg.textContent='\u2717 '+e.message;msg.style.color='var(--red)';}
+    throw e;
+  }
+}
+async function dbMigrateDeployServerOne(){
+  var msg=document.getElementById('db-migrate-msg');
+  var hostEl=document.getElementById('db-migrate-new-host');
+  var userEl=document.getElementById('db-migrate-ssh-user');
+  var portEl=document.getElementById('db-migrate-ssh-port');
+  var host=hostEl&&hostEl.value?hostEl.value.trim():'';
+  if(!host){if(msg){msg.textContent='Enter the new Server One host first.';msg.style.color='var(--red)';}return;}
+  try{
+    var st=await fetch('/api/takserver/two-server/migration-database-deb-status',{credentials:'same-origin'}).then(function(r){return r.json();});
+    if(!st.has_database_deb||st.file_missing){
+      if(msg){msg.textContent=st.file_missing?'Database .deb missing on disk \u2014 upload again in the panel above.':'Upload takserver-database .deb in the panel above first.';msg.style.color='var(--red)';}
+      refreshDbMigrateDebStatus();
+      return;
+    }
+  }catch(e){}
+  if(!confirm('Install takserver-database on '+host+'? The uploaded database .deb must match the version on your current Server One (enforced). Saved current Server One is not switched until after migration.'))return;
+  if(msg){msg.textContent='Deploying database package to new host\u2026';msg.style.color='var(--cyan)';}
+  try{
+    var body={deploy_target_host:host};
+    if(userEl&&userEl.value.trim())body.deploy_target_user=userEl.value.trim();
+    if(portEl&&String(portEl.value).trim()!==''){var pp=parseInt(portEl.value,10);if(!isNaN(pp))body.deploy_target_port=pp;}
+    var r=await fetch('/api/takserver/two-server/deploy-server-one',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),credentials:'same-origin'});
+    var d=await r.json();
+    if(!d.success)throw new Error(d.error||'Deploy failed');
+    if(msg){msg.textContent='\u2713 '+(d.message||'Deploy complete')+(d.log&&d.log.length?'\n'+d.log.slice(-5).join('\n'):'');msg.style.color='var(--green)';}
+    refreshDbMigrateDebStatus();
+    return d;
+  }catch(e){
+    if(msg){msg.textContent='\u2717 '+e.message;msg.style.color='var(--red)';}
+    throw e;
+  }
+}
+var migrateLogIndex=0;
+async function startDbMigrate(){
+  var hostEl=document.getElementById('db-migrate-new-host');
+  var userEl=document.getElementById('db-migrate-ssh-user');
+  var portEl=document.getElementById('db-migrate-ssh-port');
+  var msg=document.getElementById('db-migrate-msg');
+  var btn=document.getElementById('db-migrate-start-btn');
+  var host=hostEl&&hostEl.value?hostEl.value.trim():'';
+  if(!host){if(msg){msg.textContent='Enter the new Server One host.';msg.style.color='var(--red)';}return;}
+  try{
+    var st=await fetch('/api/takserver/two-server/migration-database-deb-status',{credentials:'same-origin'}).then(function(r){return r.json();});
+    if(!st.has_database_deb||st.file_missing){
+      if(msg){msg.textContent=st.file_missing?'Database .deb missing \u2014 upload again in the panel above.':'Upload takserver-database .deb in the panel above before starting migration.';msg.style.color='var(--red)';}
+      refreshDbMigrateDebStatus();
+      return;
+    }
+  }catch(e){}
+  if(!confirm('This will STOP TAK Server, copy the cot database to the new host, replace cot on the new host, and point TAK at the new database. Continue?'))return;
+  if(btn)btn.disabled=true;
+  if(msg){msg.textContent='Starting...';msg.style.color='var(--text-dim)';}
+  try{
+    var payload={new_host:host};
+    if(userEl&&userEl.value.trim())payload.new_ssh_user=userEl.value.trim();
+    if(portEl&&String(portEl.value).trim()!==''){var pp2=parseInt(portEl.value,10);if(!isNaN(pp2))payload.new_ssh_port=pp2;}
+    var r;
+    try{
+      r=await fetch('/api/takserver/two-server/migrate-database/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload),credentials:'same-origin'});
+    }catch(net){
+      if(msg){msg.textContent='Cannot reach this site (network or proxy timeout). If you use Caddy/nginx, allow long requests or pull latest infra-TAK — migration work now starts in the background immediately.';msg.style.color='var(--red)';}
+      if(btn)btn.disabled=false;
+      return;
+    }
+    var raw=await r.text();
+    var d={};
+    try{d=raw?JSON.parse(raw):{};}catch(pe){
+      if(msg){msg.textContent='HTTP '+r.status+': '+(raw?raw.slice(0,200):'empty response');msg.style.color='var(--red)';}
+      if(btn)btn.disabled=false;
+      return;
+    }
+    if(d.error){if(msg){msg.textContent=d.error;msg.style.color='var(--red)';}if(btn)btn.disabled=false;return;}
+    if(!r.ok){if(msg){msg.textContent=(d.error||d.message||'HTTP '+r.status);msg.style.color='var(--red)';}if(btn)btn.disabled=false;return;}
+    var wrap=document.getElementById('db-migrate-log-wrap');if(wrap)wrap.style.display='block';
+    var el=document.getElementById('db-migrate-log');if(el)el.textContent='Connecting...';
+    migrateLogIndex=0;pollMigrateLog();
+  }catch(e){if(msg){msg.textContent='Error: '+(e.message||String(e));msg.style.color='var(--red)';}if(btn)btn.disabled=false;}
+}
+function pollMigrateLog(){
+  var el=document.getElementById('db-migrate-log');
+  if(!el)return;
+  var retriesLeft=5;
+  function poll(){
+    fetch('/api/takserver/two-server/migrate-database/log?index='+migrateLogIndex,{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+      if(d.entries&&d.entries.length){if(migrateLogIndex===0)el.textContent='';el.textContent+=d.entries.join(String.fromCharCode(10))+String.fromCharCode(10);el.scrollTop=el.scrollHeight;migrateLogIndex=d.total;}
+      if(!d.running){var btn=document.getElementById('db-migrate-start-btn');if(btn)btn.disabled=false;if(d.complete){var m=document.getElementById('db-migrate-msg');if(m){m.textContent='Done. Refreshing...';m.style.color='var(--green)';}setTimeout(function(){window.location.reload();},1800);}else if(d.error){var m2=document.getElementById('db-migrate-msg');if(m2){m2.textContent='Migration failed — see log';m2.style.color='var(--red)';}}else if(retriesLeft>0){retriesLeft--;setTimeout(poll,400);}}
+      else{setTimeout(poll,800);}
+    });
+  }
+  poll();
+}
+if(document.body.getAttribute('data-tak-migrating')==='true' && document.getElementById('db-migrate-log')){migrateLogIndex=0;pollMigrateLog();}
+if(document.getElementById('db-migrate-deb-panel')){refreshDbMigrateDebStatus();}
