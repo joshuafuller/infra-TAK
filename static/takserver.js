@@ -1796,14 +1796,28 @@ async function startDbMigrate(){
   try{
     var payload={new_host:host};
     if(userEl&&userEl.value.trim())payload.new_ssh_user=userEl.value.trim();
-    if(portEl&&String(portEl.value).trim()!==''){var pp=parseInt(portEl.value,10);if(!isNaN(pp))payload.new_ssh_port=pp;}
-    var r=await fetch('/api/takserver/two-server/migrate-database/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload),credentials:'same-origin'});
-    var d=await r.json();
+    if(portEl&&String(portEl.value).trim()!==''){var pp2=parseInt(portEl.value,10);if(!isNaN(pp2))payload.new_ssh_port=pp2;}
+    var r;
+    try{
+      r=await fetch('/api/takserver/two-server/migrate-database/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload),credentials:'same-origin'});
+    }catch(net){
+      if(msg){msg.textContent='Cannot reach this site (network or proxy timeout). If you use Caddy/nginx, allow long requests or pull latest infra-TAK — migration work now starts in the background immediately.';msg.style.color='var(--red)';}
+      if(btn)btn.disabled=false;
+      return;
+    }
+    var raw=await r.text();
+    var d={};
+    try{d=raw?JSON.parse(raw):{};}catch(pe){
+      if(msg){msg.textContent='HTTP '+r.status+': '+(raw?raw.slice(0,200):'empty response');msg.style.color='var(--red)';}
+      if(btn)btn.disabled=false;
+      return;
+    }
     if(d.error){if(msg){msg.textContent=d.error;msg.style.color='var(--red)';}if(btn)btn.disabled=false;return;}
+    if(!r.ok){if(msg){msg.textContent=(d.error||d.message||'HTTP '+r.status);msg.style.color='var(--red)';}if(btn)btn.disabled=false;return;}
     var wrap=document.getElementById('db-migrate-log-wrap');if(wrap)wrap.style.display='block';
     var el=document.getElementById('db-migrate-log');if(el)el.textContent='Connecting...';
     migrateLogIndex=0;pollMigrateLog();
-  }catch(e){if(msg){msg.textContent='Error: '+e.message;msg.style.color='var(--red)';}if(btn)btn.disabled=false;}
+  }catch(e){if(msg){msg.textContent='Error: '+(e.message||String(e));msg.style.color='var(--red)';}if(btn)btn.disabled=false;}
 }
 function pollMigrateLog(){
   var el=document.getElementById('db-migrate-log');

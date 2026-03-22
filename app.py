@@ -2576,15 +2576,14 @@ def takserver_two_server_migrate_database_start():
         return jsonify({
             'error': f'Uploads reference "{db_pkg_m}" but the file is missing — upload the takserver-database .deb again before starting migration.',
         }), 400
-    ok_ver_m, ver_err_m = _assert_uploaded_db_deb_matches_server_one(old_s1, local_deb_m, db_pkg_m)
-    if not ok_ver_m:
-        return jsonify({'error': ver_err_m}), 400
+    # Version match uses SSH to current Server One — run in worker so this POST returns fast
+    # (reverse proxies often timeout slow requests → browser "Failed to fetch").
     tak_snap = copy.deepcopy(cfg)
     tak_migrate_log.clear()
     tak_migrate_status.update({'running': True, 'complete': False, 'error': False})
     threading.Thread(
         target=run_takserver_two_server_db_migrate,
-        args=(dict(old_s1), dict(new_s1), tak_snap, core_ip, db_port, db_user, db_name),
+        args=(dict(old_s1), dict(new_s1), tak_snap, core_ip, db_port, db_user, db_name, local_deb_m, db_pkg_m),
         daemon=True,
     ).start()
     return jsonify({'success': True})
@@ -20706,9 +20705,13 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
         upgrade_status.update({'running': False, 'complete': False, 'error': True})
 
 
-def run_takserver_two_server_db_migrate(old_s1_cfg, new_s1_cfg, tak_cfg_snapshot, core_ip, db_port, db_user, db_name):
+def run_takserver_two_server_db_migrate(
+    old_s1_cfg, new_s1_cfg, tak_cfg_snapshot, core_ip, db_port, db_user, db_name,
+    local_db_deb_path=None, local_db_deb_filename=None,
+):
     """Background job: pg_dump on old Server One, restore on new, re-point Core + settings, start takserver.
-    Prerequisite: new host already has PostgreSQL + takserver-database (Deploy Server One) with empty/scratch cot."""
+    Prerequisite: new host already has PostgreSQL + takserver-database (Deploy Server One) with empty/scratch cot.
+    local_db_deb_path: optional path to uploaded takserver-database .deb for version check vs current Server One."""
     def mlog(msg):
         entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
         tak_migrate_log.append(entry)
@@ -20739,6 +20742,20 @@ def run_takserver_two_server_db_migrate(old_s1_cfg, new_s1_cfg, tak_cfg_snapshot
             tak_migrate_status.update({'running': False, 'complete': False, 'error': True})
             return
         mlog('✓ SSH to new Server One OK')
+
+        if local_db_deb_path and local_db_deb_filename:
+            if not os.path.isfile(local_db_deb_path):
+                mlog(f'✗ Database .deb no longer on console: {local_db_deb_filename}. Upload again and retry.')
+                tak_migrate_status.update({'running': False, 'complete': False, 'error': True})
+                return
+            ok_ver, ver_err = _assert_uploaded_db_deb_matches_server_one(
+                old_s1_cfg, local_db_deb_path, local_db_deb_filename,
+            )
+            if not ok_ver:
+                mlog(f'✗ {ver_err}')
+                tak_migrate_status.update({'running': False, 'complete': False, 'error': True})
+                return
+            mlog('✓ takserver-database .deb version matches current Server One')
 
         db_pass = (tak_cfg_snapshot.get('database', {}).get('password') or '').strip()
         if not db_pass and os.path.exists('/opt/tak/CoreConfig.xml'):
