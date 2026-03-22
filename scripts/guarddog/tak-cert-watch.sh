@@ -4,18 +4,25 @@ SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo 
 ALERT_SENT_FILE="/var/lib/takguard/cert_alert_sent"
 CERT_PASS="CERT_PASS_PLACEHOLDER"
 
-if [ -f "/opt/tak/certs/files/takserver-le.jks" ]; then
+JKS="/opt/tak/certs/files/takserver-le.jks"
+if [ -f "$JKS" ]; then
   TEMP_CERT="/tmp/takserver-le-temp.pem"
-  keytool -exportcert -keystore /opt/tak/certs/files/takserver-le.jks -storepass "$CERT_PASS" -alias takserver -rfc > "$TEMP_CERT" 2>/dev/null
-  
-  if [ -f "$TEMP_CERT" ]; then
+  # install_le_cert_on_8446() creates the LE JKS with alias = TAK hostname (e.g. takserver.example.com),
+  # not the literal string "takserver". Wrong alias => empty export => bogus DAYS_LEFT and false alert emails.
+  ALIAS=$(keytool -list -keystore "$JKS" -storepass "$CERT_PASS" 2>/dev/null | awk -F', ' '/PrivateKeyEntry/ {print $1; exit}')
+  if [ -z "$ALIAS" ]; then
+    ALIAS="takserver"
+  fi
+  keytool -exportcert -keystore "$JKS" -storepass "$CERT_PASS" -alias "$ALIAS" -rfc > "$TEMP_CERT" 2>/dev/null
+
+  if [ -s "$TEMP_CERT" ] && openssl x509 -in "$TEMP_CERT" -noout -enddate >/dev/null 2>&1; then
     EXPIRY_DATE=$(openssl x509 -enddate -noout -in "$TEMP_CERT" | cut -d= -f2)
     EXPIRY_EPOCH=$(date -d "$EXPIRY_DATE" +%s 2>/dev/null || date -j -f "%b %d %T %Y %Z" "$EXPIRY_DATE" +%s 2>/dev/null)
     NOW_EPOCH=$(date +%s)
     DAYS_LEFT=$(( (EXPIRY_EPOCH - NOW_EPOCH) / 86400 ))
-    
+
     rm -f "$TEMP_CERT"
-    
+
     if [ "$DAYS_LEFT" -le 40 ]; then
       if [ ! -f "$ALERT_SENT_FILE" ] || [ "$(find $ALERT_SENT_FILE -mtime +7 2>/dev/null)" ]; then
         touch "$ALERT_SENT_FILE"
@@ -51,5 +58,7 @@ If renewal fails, clients will be unable to connect after expiration.
     else
       rm -f "$ALERT_SENT_FILE"
     fi
+  else
+    rm -f "$TEMP_CERT"
   fi
 fi

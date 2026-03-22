@@ -4,7 +4,7 @@ Tea Awarness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Latest release: v0.3.1-alpha** — Two-server **migrate database to new Server One** (wizard-aligned SSH + deploy, version-matched `.deb`, upload area on migrate card), plus v0.3.0-alpha upgrade UX. See [docs/RELEASE-v0.3.1-alpha.md](docs/RELEASE-v0.3.1-alpha.md).
+**Latest release: v0.3.2-alpha** — **Guard Dog:** fixes false **TAK LE certificate expiry** emails (`tak-cert-watch.sh` now uses the real keystore alias). **After upgrading the console, click ↻ Update Guard Dog** so `/opt/tak-guarddog/` scripts match the release. See [docs/RELEASE-v0.3.2-alpha.md](docs/RELEASE-v0.3.2-alpha.md). Prior: [v0.3.1-alpha](docs/RELEASE-v0.3.1-alpha.md) (two-server DB migration).
 
 **Goal: universal installer.** Currently supported platform: **Ubuntu 22.04 LTS**.
 
@@ -43,9 +43,9 @@ The script will:
 
 Then open your browser to the URL shown and log in.
 
-**Updating:** After `git pull`, restart the console with `sudo systemctl restart takwerx-console`. Your password and config live in the install directory's `.config/`. If you run `start.sh` from a different clone or path, the service keeps using the original install directory so your password continues to work.
+**Updating:** After `git pull` or **Update Now**, restart the console with `sudo systemctl restart takwerx-console`. Your password and config live in the install directory's `.config/`. If you run `start.sh` from a different clone or path, the service keeps using the original install directory so your password continues to work.
 
-**Guard Dog (v0.2.7-alpha+):** After you upgrade infra-TAK, open **Guard Dog** once and click **↻ Update Guard Dog** so alert and “updates available” emails use your **Email Relay** (same as **Send test email**). Set your alert address under **Notifications** and save; use **Send test email** to verify delivery. Details: [docs/GUARDDOG.md](docs/GUARDDOG.md).
+**Guard Dog — always after a console upgrade:** If **Guard Dog** is installed, open **Guard Dog** and click **↻ Update Guard Dog** every time you upgrade infra-TAK. That **rewrites the watch scripts** under `/opt/tak-guarddog/` from the current repo (certificate monitor, 8089/process/DB/disk/network, optional service monitors, updates check, etc.). Without this, the console is new but **on-disk scripts can stay old**, so fixes and behavior won’t match the release. Also ensures alert and “updates available” emails use your **Email Relay** (v0.2.7-alpha+). Set **Notifications** → alert email and use **Send test email** to verify. Details: [docs/GUARDDOG.md](docs/GUARDDOG.md).
 
 **Testing Update Now before you ship a release:** Maintainers should follow [docs/TESTING-UPDATES.md](docs/TESTING-UPDATES.md) on a test VPS (fake low `VERSION`, click **Update Now**, then restore). Pushing a Git **tag** is what shows customers “Update Available”; test the button before pushing the tag.
 
