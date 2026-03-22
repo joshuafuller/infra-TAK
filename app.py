@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.3.0-alpha"
+VERSION = "0.3.1-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -3101,6 +3101,80 @@ def _find_ssh_key_for_server_one(s1_cfg):
     return None
 
 
+def _sync_guarddog_remote_db_from_settings(settings=None):
+    """Rewrite guarddog.conf + tak-remotedb-*.sh from saved TAK deployment (fixes stale IP after DB migration).
+    Also try-restarts tak-health.service so it reloads guarddog.conf (endpoint reads conf at startup)."""
+    if settings is None:
+        settings = load_settings()
+    tak_cfg = _get_tak_deployment_config(settings)
+    if tak_cfg.get('mode') != 'two_server':
+        return True, 'skipped (not two-server)'
+    s1_host = (tak_cfg.get('server_one', {}).get('host') or '').strip()
+    if not s1_host:
+        return False, 'no Server One host in settings'
+    gd_dir = '/opt/tak-guarddog'
+    scripts_dir = os.path.join(BASE_DIR, 'scripts', 'guarddog')
+    if not os.path.isdir(gd_dir):
+        return True, 'skipped (Guard Dog not installed)'
+    s1 = dict(tak_cfg.get('server_one', {}))
+    s1_user = (s1.get('ssh_user') or 'root').strip() or 'root'
+    db_port = str(int(tak_cfg.get('database', {}).get('port') or 5432))
+    kp = _find_ssh_key_for_server_one(s1) or ''
+    ssh_key_path = os.path.expanduser(kp) if kp else ''
+    alert_email = (settings.get('guarddog_alert_email') or '').strip()
+    try:
+        gd_conf = {'two_server': True, 'db_host': s1_host, 'db_port': int(db_port)}
+        with open(os.path.join(gd_dir, 'guarddog.conf'), 'w') as f:
+            json.dump(gd_conf, f)
+    except Exception as e:
+        return False, f'guarddog.conf: {e}'
+    cert_pass = _get_tak_cert_password(settings)
+    for name in ('tak-remotedb-watch.sh', 'tak-remotedb-auth-watch.sh'):
+        src = os.path.join(scripts_dir, name)
+        dest = os.path.join(gd_dir, name)
+        if not os.path.isfile(src):
+            continue
+        try:
+            content = open(src, 'r', encoding='utf-8').read()
+            content = (content
+                .replace('ALERT_EMAIL_PLACEHOLDER', alert_email)
+                .replace('ALERT_SMS_PLACEHOLDER', '')
+                .replace('CERT_PASS_PLACEHOLDER', cert_pass)
+                .replace('CONSOLE_VERSION_PLACEHOLDER', VERSION))
+            content = (content
+                .replace('DB_HOST_PLACEHOLDER', s1_host)
+                .replace('DB_PORT_PLACEHOLDER', db_port)
+                .replace('SSH_KEY_PLACEHOLDER', ssh_key_path)
+                .replace('SSH_USER_PLACEHOLDER', s1_user))
+            with open(dest, 'w', encoding='utf-8') as f:
+                f.write(content)
+            os.chmod(dest, 0o755)
+        except Exception as e:
+            return False, f'{name}: {e}'
+    try:
+        subprocess.run(
+            ['sudo', 'systemctl', 'try-restart', 'tak-health.service'],
+            capture_output=True, text=True, timeout=20,
+        )
+    except Exception:
+        pass
+    return True, f'synced remote DB monitors to {s1_host}:{db_port}'
+
+
+def _remotedb_host_port_from_tak_settings():
+    """Current Server One DB endpoint from saved tak_deployment (source of truth after migration)."""
+    settings = load_settings()
+    tak_cfg = _get_tak_deployment_config(settings)
+    if tak_cfg.get('mode') != 'two_server':
+        return '', 0
+    h = (tak_cfg.get('server_one', {}).get('host') or '').strip()
+    try:
+        p = int(tak_cfg.get('database', {}).get('port') or 5432)
+    except (TypeError, ValueError):
+        p = 5432
+    return h, p
+
+
 @app.route('/api/guarddog/deploy-health-agent', methods=['POST'])
 @login_required
 def guarddog_deploy_health_agent_api():
@@ -3126,7 +3200,12 @@ def guarddog_deploy_health_agent_api():
     ok, msg = _deploy_health_agent_to_server_one(s1_cfg)
     if not ok:
         return jsonify({'success': False, 'error': msg}), 400
-    return jsonify({'success': True, 'message': f'Health agent deployed on {s1_host}. It may take a moment to show green.'})
+    _sg_ok, _sg_msg = _sync_guarddog_remote_db_from_settings(load_settings())
+    extra = f' {_sg_msg}' if _sg_ok and 'synced' in (_sg_msg or '') else ''
+    return jsonify({
+        'success': True,
+        'message': f'Health agent deployed on {s1_host}. It may take a moment to show green.{extra}',
+    })
 
 @app.route('/api/guarddog/deploy/log')
 @login_required
@@ -3206,13 +3285,15 @@ def _guarddog_health_check(service_id):
             return bool(r.stdout and 'Up' in r.stdout)
         if service_id == 'remotedb':
             import socket
-            conf_path = '/opt/tak-guarddog/guarddog.conf'
-            if not os.path.isfile(conf_path):
-                return None
-            with open(conf_path) as f:
-                conf = json.load(f)
-            db_host = conf.get('db_host', '')
-            db_port = int(conf.get('db_port', 0))
+            db_host, db_port = _remotedb_host_port_from_tak_settings()
+            if not db_host or not db_port:
+                conf_path = '/opt/tak-guarddog/guarddog.conf'
+                if not os.path.isfile(conf_path):
+                    return None
+                with open(conf_path) as f:
+                    conf = json.load(f)
+                db_host = conf.get('db_host', '')
+                db_port = int(conf.get('db_port', 0))
             if not db_host or not db_port:
                 return None
             s = socket.create_connection((db_host, db_port), timeout=5)
@@ -3481,25 +3562,29 @@ def _monitor_health_check(monitor_id):
                         return False
             return True
         if monitor_id == 'remotedb_tcp':
-            conf_path = '/opt/tak-guarddog/guarddog.conf'
-            if not os.path.isfile(conf_path):
-                return None
-            with open(conf_path) as f:
-                conf = json.load(f)
-            db_host = conf.get('db_host', '')
-            db_port = int(conf.get('db_port', 0))
+            db_host, db_port = _remotedb_host_port_from_tak_settings()
+            if not db_host or not db_port:
+                conf_path = '/opt/tak-guarddog/guarddog.conf'
+                if not os.path.isfile(conf_path):
+                    return None
+                with open(conf_path) as f:
+                    conf = json.load(f)
+                db_host = conf.get('db_host', '')
+                db_port = int(conf.get('db_port', 0))
             if not db_host or not db_port:
                 return None
             s = socket.create_connection((db_host, db_port), timeout=5)
             s.close()
             return True
         if monitor_id == 'remotedb_agent':
-            conf_path = '/opt/tak-guarddog/guarddog.conf'
-            if not os.path.isfile(conf_path):
-                return None
-            with open(conf_path) as f:
-                conf = json.load(f)
-            db_host = conf.get('db_host', '')
+            db_host, _dbp = _remotedb_host_port_from_tak_settings()
+            if not db_host:
+                conf_path = '/opt/tak-guarddog/guarddog.conf'
+                if not os.path.isfile(conf_path):
+                    return None
+                with open(conf_path) as f:
+                    conf = json.load(f)
+                db_host = conf.get('db_host', '')
             if not db_host:
                 return None
             try:
@@ -20894,6 +20979,8 @@ def run_takserver_two_server_db_migrate(
         settings['tak_deployment'] = cfg
         save_settings(settings)
         mlog('✓ Server One host updated in settings')
+        sg_ok, sg_msg = _sync_guarddog_remote_db_from_settings(settings)
+        mlog(f'{"✓" if sg_ok else "⚠"} Guard Dog remote DB config: {sg_msg}')
 
         mlog('')
         mlog('━━━ Starting TAK Server ━━━')
@@ -22702,7 +22789,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 {% endif %}
 {% if two_server_mode and s1_host and tak.installed %}
-<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:24px;border-color:rgba(234,179,8,0.35)">
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:24px">
 <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;padding:16px 24px;cursor:pointer" onclick="takToggleDbMigrate()" id="tak-db-migrate-header">
 <span class="section-title" style="margin-bottom:0">Migrate database to new Server One</span>
 <span id="tak-db-migrate-toggle-icon" style="font-size:18px;color:var(--text-dim);transition:transform 0.2s ease{% if migrating or migrate_done or migrate_error %};transform:rotate(180deg){% endif %}">&#9662;</span>
@@ -22737,7 +22824,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div id="db-migrate-log-wrap" style="display:{{ 'block' if migrating or migrate_done or migrate_error else 'none' }};margin-top:8px">
 <div class="section-title" style="font-size:13px">Migration log</div>
 <div id="db-migrate-log" style="background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary);max-height:400px;overflow-y:auto;line-height:1.7;white-space:pre-wrap;margin-top:8px">{% if migrating %}Starting...{% else %}{% if migrate_done %}Done.{% elif migrate_error %}Failed.{% endif %}{% endif %}</div>
-{% if migrate_done %}<p style="margin-top:12px;font-size:13px;color:var(--text-secondary)">Migration complete. <button type="button" onclick="window.location.reload()" style="padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer">Refresh page</button> to refresh Server One display. Decommission the old DB host when ready.</p>{% endif %}
+{% if migrate_done %}<p style="margin-top:12px;font-size:13px;color:var(--text-secondary)">Migration complete. <button type="button" onclick="window.location.reload()" style="padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer">Refresh page</button> to refresh Server One display. Decommission the old DB host when ready. Guard Dog remote DB config is synced automatically; if <strong>Remote Database</strong> still looks wrong, open <a href="/guarddog" style="color:var(--cyan)">Guard Dog</a> → <strong>Deploy health agent</strong> or <strong>Update Guard Dog</strong>.</p>{% endif %}
 </div>
 </div>
 </div>

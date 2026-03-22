@@ -4,7 +4,7 @@ Tea Awarness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Latest release: v0.3.0-alpha** — Two-server TAK Server upgrade from the console, package-type enforcement (split vs one-server), and post-upgrade refresh. See [docs/RELEASE-v0.3.0-alpha.md](docs/RELEASE-v0.3.0-alpha.md).
+**Latest release: v0.3.1-alpha** — Two-server **migrate database to new Server One** (wizard-aligned SSH + deploy, version-matched `.deb`, upload area on migrate card), plus v0.3.0-alpha upgrade UX. See [docs/RELEASE-v0.3.1-alpha.md](docs/RELEASE-v0.3.1-alpha.md).
 
 **Goal: universal installer.** Currently supported platform: **Ubuntu 22.04 LTS**.
 
@@ -58,7 +58,7 @@ Then open your browser to the URL shown and log in.
 If you clicked **Update Now** and the console shows an error like `could not apply ... Add files via upload`, `Pulling is not possible because you have unmerged files`, or any rebase/merge conflict message, run this single command on your server:
 
 ```bash
-cd $(grep -oP 'WorkingDirectory=\K.*' /etc/systemd/system/takwerx-console.service) && git fetch --tags origin && git checkout --force v0.3.0-alpha && sudo systemctl restart takwerx-console
+cd $(grep -oP 'WorkingDirectory=\K.*' /etc/systemd/system/takwerx-console.service) && git fetch --tags origin && git checkout --force v0.3.1-alpha && sudo systemctl restart takwerx-console
 ```
 
 This clears the stuck state and puts you on a current tag with the safe updater. No data or config is lost — your `.config/` directory is untouched.
