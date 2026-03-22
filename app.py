@@ -590,7 +590,7 @@ TAK_LOGO_URL = "https://tak.gov/assets/logos/brand-06b80939.svg"
 # Login page logo: put your TAKWERX logo at static/takwerx-logo.png
 # For sharp display (no fuzz): export at 2x display size — e.g. 960px wide or 400–500px height (PNG, transparent).
 LOGIN_LOGO_FILENAME = "takwerx-logo.png"
-update_cache = {'latest': None, 'checked': 0, 'notes': ''}
+update_cache = {'latest': None, 'checked': 0, 'notes': '', 'body': ''}
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 def load_settings():
@@ -1497,6 +1497,48 @@ def _update_check_response(data):
     return r
 
 
+def _github_release_notes_for_tag(tag_name: str) -> str:
+    """Return human-readable update details for the dashboard Details panel.
+
+    Prefer GitHub **Release** body (same tag). Tags-only releases return 404 — then link to
+    docs/RELEASE-*.md and the tag URL on GitHub so operators always see something useful.
+    """
+    import urllib.request
+    import urllib.error
+    import urllib.parse
+    if not tag_name or not tag_name.strip():
+        return ''
+    tag_name = tag_name.strip()
+    base = f'https://github.com/{GITHUB_REPO}'
+    doc_slug = tag_name if tag_name.startswith('v') else f'v{tag_name}'
+    fallback = (
+        f'Release notes (markdown in repo): {base}/blob/main/docs/RELEASE-{doc_slug}.md\n'
+        f'Tag on GitHub: {base}/releases/tag/{urllib.parse.quote(tag_name)}'
+    )
+    try:
+        url = f'https://api.github.com/repos/{GITHUB_REPO}/releases/tags/{urllib.parse.quote(tag_name)}'
+        req = urllib.request.Request(
+            url,
+            headers={'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'infra-TAK'}
+        )
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            data = json.loads(resp.read().decode())
+        body = (data.get('body') or '').strip()
+        if body:
+            # Cap size for JSON/UI; panel scrolls but avoid huge payloads
+            if len(body) > 12000:
+                body = body[:12000].rstrip() + '\n\n… (truncated)'
+            html_url = (data.get('html_url') or '').strip()
+            extra = f'\n\n---\nOn GitHub: {html_url}' if html_url else ''
+            return body + extra
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            return fallback + f'\n\n(Release API: HTTP {e.code})'
+    except Exception:
+        pass
+    return fallback
+
+
 @app.route('/api/update/check')
 @login_required
 def update_check():
@@ -1514,6 +1556,7 @@ def update_check():
         except (ValueError, IndexError):
             cached_newer = False
         return _update_check_response({'current': VERSION, 'latest': update_cache['latest'], 'notes': update_cache['notes'],
+            'body': update_cache.get('body') or '',
             'update_available': cached_newer})
     try:
         req = urllib.request.Request(
@@ -1523,7 +1566,7 @@ def update_check():
         resp = urllib.request.urlopen(req, timeout=5)
         data = json.loads(resp.read().decode())
         if not data:
-            return _update_check_response({'current': VERSION, 'latest': None, 'error': 'No tags found', 'update_available': False})
+            return _update_check_response({'current': VERSION, 'latest': None, 'error': 'No tags found', 'body': '', 'update_available': False})
         versions = []
         for tag in data:
             name = tag.get('name', '').lstrip('v').replace('-alpha','').replace('-beta','')
@@ -1533,7 +1576,7 @@ def update_check():
             except (ValueError, IndexError):
                 continue
         if not versions:
-            return _update_check_response({'current': VERSION, 'latest': None, 'error': 'No version tags', 'update_available': False})
+            return _update_check_response({'current': VERSION, 'latest': None, 'error': 'No version tags', 'body': '', 'update_available': False})
         versions.sort(key=lambda x: x[0], reverse=True)
         latest_tag = versions[0][1]
         latest = latest_tag.get('name', '').lstrip('v')
@@ -1547,11 +1590,13 @@ def update_check():
         if latest.strip() == VERSION.strip():
             is_newer = False
         notes = f"Version {latest_tag.get('name', '')}"
-        update_cache.update({'latest': latest, 'checked': now, 'notes': notes})
-        return _update_check_response({'current': VERSION, 'latest': latest, 'notes': notes, 'body': '',
+        tag_full = (latest_tag.get('name') or '').strip()
+        body = _github_release_notes_for_tag(tag_full) if is_newer else ''
+        update_cache.update({'latest': latest, 'checked': now, 'notes': notes, 'body': body})
+        return _update_check_response({'current': VERSION, 'latest': latest, 'notes': notes, 'body': body,
             'update_available': is_newer})
     except Exception as e:
-        return _update_check_response({'current': VERSION, 'latest': None, 'error': str(e)[:200], 'update_available': False})
+        return _update_check_response({'current': VERSION, 'latest': None, 'error': str(e)[:200], 'body': '', 'update_available': False})
 
 def _fetch_latest_tag_name():
     """Return the latest release tag name (e.g. 'v0.2.3-alpha') from GitHub, or None on error."""
@@ -1640,7 +1685,7 @@ def update_apply():
         if checkout.returncode != 0:
             return jsonify(_error_payload(_git_err(checkout)))
 
-        update_cache.update({'latest': None, 'checked': 0})
+        update_cache.update({'latest': None, 'checked': 0, 'notes': '', 'body': ''})
         _ensure_gunicorn_upgrade(console_dir)
         subprocess.Popen('sleep 2 && systemctl restart takwerx-console', shell=True,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
