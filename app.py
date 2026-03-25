@@ -4687,8 +4687,8 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
         plog('━━━ Prepare /opt/tak/federation-hub/policies (vendor preinst) ━━━')
         prep_policies = (
             'sudo mkdir -p /opt/tak/federation-hub/policies && '
-            'if [ -z "$(ls -A /opt/tak/federation-hub/policies 2>/dev/null)" ]; then '
-            'sudo touch /opt/tak/federation-hub/policies/.fedhub-install-placeholder; fi'
+            'if [ -z "$(ls /opt/tak/federation-hub/policies 2>/dev/null)" ]; then '
+            'sudo touch /opt/tak/federation-hub/policies/fedhub-install-placeholder; fi'
         )
         ok_prep, prep_out = _ssh_probe(remote, prep_policies, timeout=30)
         if not ok_prep:
