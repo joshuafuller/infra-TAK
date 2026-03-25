@@ -4683,6 +4683,18 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
             status_dict.update({'running': False, 'complete': True, 'error': True})
             return
         plog('✓ Copied to target /tmp/')
+        # takserver-fed-hub preinst backs up policies/*; missing dir or empty glob makes cp fail (first install).
+        plog('━━━ Prepare /opt/tak/federation-hub/policies (vendor preinst) ━━━')
+        prep_policies = (
+            'sudo mkdir -p /opt/tak/federation-hub/policies && '
+            'if [ -z "$(ls -A /opt/tak/federation-hub/policies 2>/dev/null)" ]; then '
+            'sudo touch /opt/tak/federation-hub/policies/.fedhub-install-placeholder; fi'
+        )
+        ok_prep, prep_out = _ssh_probe(remote, prep_policies, timeout=30)
+        if not ok_prep:
+            plog(f'✗ Could not prepare policies dir: {prep_out or "ssh failed"}')
+            status_dict.update({'running': False, 'complete': True, 'error': True})
+            return
         # Local .deb must be ./name.deb or apt treats the name as a repository package (and fails to locate it).
         fnq = shlex.quote('./' + deb_fn)
         install_cmd = (
@@ -4695,7 +4707,9 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
             tail = out_inst[-4500:] if len(out_inst) > 4500 else out_inst
             plog(tail)
         if not ok_inst:
-            plog('⚠ apt-get returned non-zero — continuing to verify service…')
+            plog('✗ apt-get install failed — fix errors on target, then redeploy or update')
+            status_dict.update({'running': False, 'complete': True, 'error': True})
+            return
         plog('━━━ systemd federation-hub ━━━')
         _ssh_probe(remote, 'sudo systemctl daemon-reload', timeout=30)
         _ssh_probe(remote, 'sudo systemctl enable federation-hub 2>/dev/null; true', timeout=30)
