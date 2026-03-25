@@ -4683,7 +4683,8 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
             status_dict.update({'running': False, 'complete': True, 'error': True})
             return
         plog('✓ Copied to target /tmp/')
-        fnq = shlex.quote(deb_fn)
+        # Local .deb must be ./name.deb or apt treats the name as a repository package (and fails to locate it).
+        fnq = shlex.quote('./' + deb_fn)
         install_cmd = (
             f'cd /tmp && sudo apt-get update -qq && '
             f'sudo DEBIAN_FRONTEND=noninteractive apt-get install -y {fnq}'
@@ -13468,6 +13469,9 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 .upload-area{border:2px dashed var(--border);border-radius:10px;padding:22px;text-align:center;cursor:pointer;transition:all .2s;background:rgba(15,23,42,.25);margin-bottom:12px}
 .upload-area:hover,.upload-area.dragover{border-color:var(--accent);background:rgba(59,130,246,.08)}
 .log-box{background:#070a12;border:1px solid var(--border);border-radius:8px;padding:16px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:360px;overflow-y:auto;line-height:1.6;white-space:pre-wrap}
+.progress-item{background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:12px 16px;margin-bottom:8px}
+.progress-bar-outer{width:100%;height:4px;background:rgba(59,130,246,0.1);border-radius:2px;margin-top:8px;overflow:hidden}
+.progress-bar-inner{height:100%;border-radius:2px;background:linear-gradient(90deg,var(--accent),var(--cyan));transition:width 0.25s ease}
 </style></head>
 <body>
 {{ sidebar_html }}
@@ -13500,7 +13504,8 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
       <div class="form-hint" style="margin-top:8px">Validation uses <code>dpkg-deb</code> on this host (Linux console recommended).</div>
     </div>
     <input type="file" id="fedhub-file-input" accept=".deb" style="display:none" onchange="fedhubFilePicked(this.files)">
-    <div id="fedhub-pkg-line" style="font-size:13px;color:var(--text-dim);margin-bottom:10px">{% if fedhub_pkg_filename %}Selected: <strong style="color:var(--text-primary)">{{ fedhub_pkg_filename }}</strong>{% if fedhub_pkg_size_mb is not none %} ({{ fedhub_pkg_size_mb }} MB){% endif %} <button type="button" class="btn btn-ghost" style="margin-left:8px;padding:6px 12px;font-size:12px" onclick="fedhubRemoveUpload()">Remove</button>{% else %}<span id="fedhub-pkg-empty">No package uploaded yet.</span>{% endif %}</div>
+    <div id="fedhub-progress-area" style="margin-bottom:12px" aria-live="polite"></div>
+    <p id="fedhub-upload-hint-empty" class="form-hint" style="margin-bottom:10px{% if fedhub_pkg_filename %};display:none{% endif %}">No package uploaded yet — progress appears below when you select a file.</p>
     <div class="controls">
       <button class="btn btn-primary" type="button" id="fedhub-deploy-btn" onclick="fedhubStartDeploy()">Deploy to remote host</button>
     </div>
@@ -13601,7 +13606,8 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
         <div style="font-size:13px;color:var(--text-secondary)">Drop replacement .deb here or click (same upload store as above)</div>
       </div>
       <input type="file" id="fedhub-upgrade-file-input" accept=".deb" style="display:none" onchange="fedhubUpgradeFilePicked(this.files)">
-      <div id="fedhub-upgrade-pkg-line" style="font-size:13px;color:var(--text-dim);margin-bottom:12px">{% if fedhub_pkg_filename %}Selected: <strong style="color:var(--text-primary)">{{ fedhub_pkg_filename }}</strong>{% if fedhub_pkg_size_mb is not none %} ({{ fedhub_pkg_size_mb }} MB){% endif %} <button type="button" class="btn btn-ghost" style="margin-left:8px;padding:6px 12px;font-size:12px" onclick="fedhubRemoveUpload()">Remove</button>{% else %}<span>No package uploaded yet.</span>{% endif %}</div>
+      <div id="fedhub-upgrade-progress-area" style="margin-bottom:12px" aria-live="polite"></div>
+      <p id="fedhub-upgrade-hint-empty" class="form-hint" style="margin-bottom:12px{% if fedhub_pkg_filename %};display:none{% endif %}">No package in the upload store — drop a newer .deb here (same as main upload).</p>
       <div class="controls" style="align-items:center;flex-wrap:wrap;gap:12px">
         <button type="button" id="fedhub-update-btn" class="btn btn-primary" onclick="fedhubStartUpdate()">Update Federation Hub</button>
         <span id="fedhub-update-msg" class="form-hint" style="margin:0"></span>
@@ -13631,45 +13637,217 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 <script>
 var fedhubLogIndex=0,fedhubLogInterval=null;
 var fedhubUpgradeLogIndex=0,fedhubUpgradeLogInterval=null;
-function fedhubDrop(ev){ev.preventDefault();var z=document.getElementById('fedhub-upload-area');if(z)z.classList.remove('dragover');if(ev.dataTransfer&&ev.dataTransfer.files&&ev.dataTransfer.files.length)fedhubDoUpload(ev.dataTransfer.files);}
-function fedhubDropUpgrade(ev){ev.preventDefault();var z=document.getElementById('fedhub-upgrade-upload-area');if(z)z.classList.remove('dragover');if(ev.dataTransfer&&ev.dataTransfer.files&&ev.dataTransfer.files.length)fedhubDoUpload(ev.dataTransfer.files);}
-function fedhubFilePicked(files){if(files&&files.length)fedhubDoUpload(files);}
-function fedhubUpgradeFilePicked(files){if(files&&files.length)fedhubDoUpload(files);}
-function fedhubDoUpload(fileList){
-  var fd=new FormData();
-  for(var i=0;i<fileList.length;i++)fd.append('files',fileList[i]);
+var fedhubUploadXhr=null;
+function fedhubFormatSize(b){
+  if(b==null||isNaN(+b))return'';
+  b=+b;
+  if(b<1024)return b+' B';
+  if(b<1048576)return (b/1024).toFixed(1)+' KB';
+  return (b/(1024*1024)).toFixed(1)+' MB';
+}
+function fedhubToggleEmptyHints(hasFile){
+  var h1=document.getElementById('fedhub-upload-hint-empty');
+  var h2=document.getElementById('fedhub-upgrade-hint-empty');
+  if(h1)h1.style.display=hasFile?'none':'block';
+  if(h2)h2.style.display=hasFile?'none':'block';
+}
+function fedhubMaybeResetUploadZones(){
+  var p1=document.getElementById('fedhub-progress-area');
+  var p2=document.getElementById('fedhub-upgrade-progress-area');
+  var empty=(!p1||!p1.children.length)&&(!p2||!p2.children.length);
+  if(empty){
+    var ua=document.getElementById('fedhub-upload-area');
+    if(ua){ua.style.maxHeight='';ua.style.padding='';}
+    var u2=document.getElementById('fedhub-upgrade-upload-area');
+    if(u2){u2.style.maxHeight='';u2.style.padding='';}
+    fedhubToggleEmptyHints(false);
+  }
+}
+function fedhubShrinkZonesWhenHasPackage(){
+  var p1=document.getElementById('fedhub-progress-area');
+  var p2=document.getElementById('fedhub-upgrade-progress-area');
+  var has=(p1&&p1.children.length)||(p2&&p2.children.length);
+  if(!has)return;
   var ua=document.getElementById('fedhub-upload-area');
-  var ua2=document.getElementById('fedhub-upgrade-upload-area');
-  if(ua)ua.style.opacity='0.6';
-  if(ua2)ua2.style.opacity='0.6';
-  fetch('/api/upload/fedhub',{method:'POST',body:fd,credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
-    if(ua)ua.style.opacity='1';
-    if(ua2)ua2.style.opacity='1';
-    if(!d||!d.success){alert((d&&d.error)||'Upload failed');return;}
-    var p=d.packages&&d.packages[0];
-    if(p)fedhubSetPkgLine(p.filename,p.size_mb);
-    else location.reload();
-  }).catch(function(){if(ua)ua.style.opacity='1';if(ua2)ua2.style.opacity='1';alert('Upload failed');});
+  if(ua){ua.style.maxHeight='72px';ua.style.padding='16px';}
+  var u2=document.getElementById('fedhub-upgrade-upload-area');
+  if(u2){u2.style.maxHeight='72px';u2.style.padding='14px';}
+  fedhubToggleEmptyHints(true);
 }
-function fedhubPkgLineHtml(fn,szMb){
-  var esc=String(fn).replace(/</g,'&lt;');
-  return 'Selected: <strong style="color:var(--text-primary)">'+esc+'</strong>'+(szMb!=null?' ('+szMb+' MB)':'')+' <button type="button" class="btn btn-ghost" style="margin-left:8px;padding:6px 12px;font-size:12px" onclick="fedhubRemoveUpload()">Remove</button>';
+function fedhubCancelUploadRow(row){
+  if(row&&row._xhr){try{row._xhr.abort();}catch(e){}row._xhr=null;}
+  if(fedhubUploadXhr&&row&&row._xhr===fedhubUploadXhr)fedhubUploadXhr=null;
+  fedhubUploadXhr=null;
+  if(row&&row.parentNode)row.parentNode.removeChild(row);
+  fedhubMaybeResetUploadZones();
 }
-function fedhubSetPkgLine(fn,szMb){
-  var el=document.getElementById('fedhub-pkg-line');
-  var el2=document.getElementById('fedhub-upgrade-pkg-line');
-  if(el)el.innerHTML=fn?fedhubPkgLineHtml(fn,szMb):'<span id="fedhub-pkg-empty">No package uploaded yet.</span>';
-  if(el2)el2.innerHTML=fn?fedhubPkgLineHtml(fn,szMb):'<span>No package uploaded yet.</span>';
+function fedhubAppendCompleteRow(pa,filename,sizeMb){
+  if(!pa)return;
+  var row=document.createElement('div');
+  row.className='progress-item';
+  row.setAttribute('data-filename',filename);
+  var top=document.createElement('div');
+  top.style.cssText='display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px';
+  var lbl=document.createElement('span');
+  lbl.style.cssText='font-family:JetBrains Mono,monospace;font-size:13px;color:var(--text-secondary);word-break:break-all';
+  lbl.textContent=filename+(sizeMb!=null?' ('+sizeMb+' MB)':'');
+  var right=document.createElement('span');
+  right.style.cssText='display:flex;align-items:center;gap:8px';
+  var pct=document.createElement('span');
+  pct.style.cssText='font-family:JetBrains Mono,monospace;font-size:12px;color:var(--green)';
+  pct.textContent='\u2713 ';
+  var rBtn=document.createElement('span');
+  rBtn.textContent='\u2717';
+  rBtn.style.cssText='color:var(--red);cursor:pointer;margin-left:8px;font-size:14px';
+  rBtn.title='Remove';
+  rBtn.onclick=function(){fedhubRemoveUploadFile(filename);};
+  pct.appendChild(rBtn);
+  top.appendChild(lbl);
+  top.appendChild(right);
+  right.appendChild(pct);
+  var barOuter=document.createElement('div');
+  barOuter.className='progress-bar-outer';
+  var barInner=document.createElement('div');
+  barInner.className='progress-bar-inner';
+  barInner.style.width='100%';
+  barInner.style.background='var(--green)';
+  barOuter.appendChild(barInner);
+  row.appendChild(top);
+  row.appendChild(barOuter);
+  pa.appendChild(row);
+}
+function fedhubRemoveUploadFile(filename){
+  fetch('/api/upload/fedhub/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:filename}),credentials:'same-origin'})
+    .then(function(r){return r.json();})
+    .then(function(x){
+      if(x&&x.success)fedhubRefreshPackageRowsFromServer();
+      else alert((x&&x.error)||'Remove failed');
+    }).catch(function(){alert('Remove failed');});
+}
+function fedhubRefreshPackageRowsFromServer(){
+  fetch('/api/upload/fedhub/package',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    var p1=document.getElementById('fedhub-progress-area');
+    var p2=document.getElementById('fedhub-upgrade-progress-area');
+    if(p1)p1.innerHTML='';
+    if(p2)p2.innerHTML='';
+    if(d&&d.filename){
+      if(p1)fedhubAppendCompleteRow(p1,d.filename,d.size_mb);
+      if(p2)fedhubAppendCompleteRow(p2,d.filename,d.size_mb);
+      fedhubShrinkZonesWhenHasPackage();
+    }else{
+      fedhubMaybeResetUploadZones();
+    }
+  }).catch(function(){fedhubMaybeResetUploadZones();});
+}
+function fedhubDoUpload(fileList,source){
+  source=source||'main';
+  var files=[];
+  for(var i=0;i<fileList.length;i++){
+    var f=fileList[i];
+    if(f&&f.name&&f.name.toLowerCase().endsWith('.deb'))files.push(f);
+  }
+  if(!files.length){alert('Select a Federation Hub .deb file.');return;}
+  var paId=source==='upgrade'?'fedhub-upgrade-progress-area':'fedhub-progress-area';
+  var pa=document.getElementById(paId);
+  var ua=document.getElementById(source==='upgrade'?'fedhub-upgrade-upload-area':'fedhub-upload-area');
+  if(ua){ua.style.maxHeight='72px';ua.style.padding=source==='upgrade'?'14px':'16px';}
+  if(pa)pa.innerHTML='';
+  if(fedhubUploadXhr){try{fedhubUploadXhr.abort();}catch(e){}}
+  var row=document.createElement('div');
+  row.className='progress-item';
+  var top=document.createElement('div');
+  top.style.cssText='display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px';
+  var names=files.map(function(f){return f.name;}).join(', ');
+  var totalBytes=0;
+  for(var j=0;j<files.length;j++)totalBytes+=files[j].size||0;
+  var lbl=document.createElement('span');
+  lbl.style.cssText='font-family:JetBrains Mono,monospace;font-size:13px;color:var(--text-secondary);word-break:break-all';
+  lbl.textContent=names+' ('+fedhubFormatSize(totalBytes)+')';
+  var right=document.createElement('span');
+  right.style.cssText='display:flex;align-items:center;gap:8px';
+  var pct=document.createElement('span');
+  pct.style.cssText='font-family:JetBrains Mono,monospace;font-size:12px;color:var(--cyan)';
+  pct.textContent='0%';
+  var cancelBtn=document.createElement('span');
+  cancelBtn.textContent='\u2717';
+  cancelBtn.style.cssText='color:var(--red);cursor:pointer;font-size:14px';
+  cancelBtn.title='Cancel upload';
+  cancelBtn.onclick=function(){fedhubCancelUploadRow(row);};
+  right.appendChild(pct);
+  right.appendChild(cancelBtn);
+  top.appendChild(lbl);
+  top.appendChild(right);
+  var barOuter=document.createElement('div');
+  barOuter.className='progress-bar-outer';
+  var barInner=document.createElement('div');
+  barInner.className='progress-bar-inner';
+  barInner.style.width='0%';
+  barOuter.appendChild(barInner);
+  row.appendChild(top);
+  row.appendChild(barOuter);
+  if(pa)pa.appendChild(row);
+  var fd=new FormData();
+  for(var k=0;k<files.length;k++)fd.append('files',files[k]);
+  var xhr=new XMLHttpRequest();
+  fedhubUploadXhr=xhr;
+  row._xhr=xhr;
+  xhr.upload.onprogress=function(e){
+    if(e.lengthComputable){
+      var pr=Math.round((e.loaded/e.total)*100);
+      barInner.style.width=pr+'%';
+      pct.textContent=pr+'%';
+    }
+  };
+  xhr.onload=function(){
+    row._xhr=null;
+    fedhubUploadXhr=null;
+    cancelBtn.remove();
+    if(xhr.status===200){
+      try{
+        var resp=JSON.parse(xhr.responseText);
+        if(!resp||!resp.success){
+          barInner.style.background='var(--red)';
+          pct.textContent=(resp&&resp.error)||'Upload failed';
+          pct.style.color='var(--red)';
+          return;
+        }
+        barInner.style.width='100%';
+        fedhubRefreshPackageRowsFromServer();
+      }catch(ex){
+        barInner.style.background='var(--red)';
+        pct.textContent='Bad response';
+        pct.style.color='var(--red)';
+      }
+    }else{
+      barInner.style.background='var(--red)';
+      pct.textContent='HTTP '+xhr.status;
+      pct.style.color='var(--red)';
+    }
+  };
+  xhr.onerror=function(){row._xhr=null;fedhubUploadXhr=null;barInner.style.background='var(--red)';pct.textContent='Failed';pct.style.color='var(--red)';};
+  xhr.onabort=function(){row._xhr=null;fedhubUploadXhr=null;};
+  xhr.timeout=1800000;
+  xhr.ontimeout=function(){row._xhr=null;fedhubUploadXhr=null;barInner.style.background='var(--red)';pct.textContent='Timeout';pct.style.color='var(--red)';};
+  xhr.open('POST','/api/upload/fedhub');
+  xhr.send(fd);
+}
+function fedhubDrop(ev){ev.preventDefault();var z=document.getElementById('fedhub-upload-area');if(z)z.classList.remove('dragover');if(ev.dataTransfer&&ev.dataTransfer.files&&ev.dataTransfer.files.length)fedhubDoUpload(ev.dataTransfer.files,'main');}
+function fedhubDropUpgrade(ev){ev.preventDefault();var z=document.getElementById('fedhub-upgrade-upload-area');if(z)z.classList.remove('dragover');if(ev.dataTransfer&&ev.dataTransfer.files&&ev.dataTransfer.files.length)fedhubDoUpload(ev.dataTransfer.files,'upgrade');}
+function fedhubFilePicked(files){
+  if(files&&files.length)fedhubDoUpload(files,'main');
+  var inp=document.getElementById('fedhub-file-input');
+  if(inp)setTimeout(function(){inp.value='';},100);
+}
+function fedhubUpgradeFilePicked(files){
+  if(files&&files.length)fedhubDoUpload(files,'upgrade');
+  var inp=document.getElementById('fedhub-upgrade-file-input');
+  if(inp)setTimeout(function(){inp.value='';},100);
 }
 function fedhubRemoveUpload(){
   fetch('/api/upload/fedhub/package',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
-    if(!d||!d.filename){fedhubSetPkgLine(null,null);return;}
-    fetch('/api/upload/fedhub/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:d.filename}),credentials:'same-origin'})
-      .then(function(r){return r.json();}).then(function(x){
-        if(x&&x.success)fedhubSetPkgLine(null,null);
-        else alert((x&&x.error)||'Remove failed');
-      });
-  }).catch(function(){alert('Remove failed');});
+    if(!d||!d.filename){fedhubRefreshPackageRowsFromServer();return;}
+    fedhubRemoveUploadFile(d.filename);
+  }).catch(function(){fedhubRefreshPackageRowsFromServer();});
 }
 function fedhubStartDeploy(){
   var host=(document.getElementById('fedhub-remote-host')||{}).value||'';
@@ -13874,6 +14052,7 @@ function fedhubRefreshStatus(){
   }).catch(function(){});
 }
 document.addEventListener('DOMContentLoaded',function(){
+  if(document.getElementById('fedhub-progress-area'))fedhubRefreshPackageRowsFromServer();
   if(document.getElementById('fedhub-svc-state'))fedhubRefreshStatus();
   {% if fedhub_deploying %}
   fedhubLogIndex=0;
