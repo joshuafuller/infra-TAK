@@ -4560,6 +4560,7 @@ def federation_hub_page():
     _fqdn = (settings.get('fqdn') or '').strip()
     _fedhub_host = _get_service_domain(settings, 'fedhub') if _fqdn else ''
     _fedhub_public_url = f'https://{_fedhub_host}' if _fedhub_host else ''
+    _ak = modules.get('authentik', {})
     resp = make_response(render_template_string(FEDHUB_TEMPLATE,
         settings=settings, fh=fh, fedhub_deploy_cfg=fedhub_deploy_cfg, version=VERSION,
         fedhub_public_url=_fedhub_public_url,
@@ -4571,7 +4572,8 @@ def federation_hub_page():
         fedhub_deploy_error=fedhub_deploy_status.get('error', False),
         fedhub_upgrading=fedhub_upgrade_status.get('running', False),
         fedhub_upgrade_done=_fedhub_upgrade_done,
-        fedhub_upgrade_error=fedhub_upgrade_status.get('error', False)))
+        fedhub_upgrade_error=fedhub_upgrade_status.get('error', False),
+        authentik_installed=_ak.get('installed', False)))
     resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
     return resp
 
@@ -4649,6 +4651,71 @@ def fedhub_control_api():
         return jsonify({'success': False, 'error': 'Unknown action'}), 400
     ok, out = _module_run(cfg, cmd, timeout=90)
     return jsonify({'success': ok, 'output': (out or '')[:800]})
+
+
+@app.route('/api/fedhub/enable-authentik', methods=['POST'])
+@login_required
+def fedhub_enable_authentik_api():
+    """Create an OAuth2/OIDC app in Authentik and patch federation-hub-ui.yml on the remote for SSO login."""
+    settings = load_settings()
+    cfg = _get_fedhub_deployment_config(settings)
+    if not cfg.get('deployed') or cfg.get('target_mode') != 'remote':
+        return jsonify({'success': False, 'error': 'Federation Hub must be deployed first.'}), 400
+    remote = cfg.get('remote', {})
+    if not (remote.get('host') or '').strip():
+        return jsonify({'success': False, 'error': 'Remote host not configured.'}), 400
+
+    reachable, err = _check_authentik_api_reachable(settings)
+    if not reachable:
+        return jsonify({'success': False, 'error': f'Cannot reach Authentik API: {err}'}), 400
+
+    steps = []
+    client_id, client_secret, auth_url, token_url = _ensure_authentik_fedhub_oauth_app(settings, plog=lambda m: steps.append(m))
+    if not client_id or not client_secret:
+        return jsonify({'success': False, 'error': 'Failed to create OAuth app in Authentik', 'steps': steps}), 500
+
+    ak_public = _get_authentik_base_url(settings)
+    fh_domain = _get_service_domain(settings, 'fedhub') if settings.get('fqdn') else ''
+    fh_host = fh_domain or (remote.get('host') or '').strip()
+    redirect_uri = f'https://{fh_host}:9100/login/redirect'
+
+    fh_dir = '/opt/tak/federation-hub'
+    patch_cmd = (
+        f'cd {fh_dir}/configs && '
+        f'sudo sed -i "s/^allowOauth:.*/allowOauth: true/" federation-hub-ui.yml && '
+        f'sudo sed -i "s|^keycloakServerName:.*|keycloakServerName: {ak_public}|" federation-hub-ui.yml && '
+        f'sudo sed -i "s|^keycloakClientId:.*|keycloakClientId: {shlex.quote(client_id)}|" federation-hub-ui.yml && '
+        f'sudo sed -i "s|^keycloakSecret:.*|keycloakSecret: {shlex.quote(client_secret)}|" federation-hub-ui.yml && '
+        f'sudo sed -i "s|^keycloakrRedirectUri:.*|keycloakrRedirectUri: {redirect_uri}|" federation-hub-ui.yml && '
+        f'sudo sed -i "s|^keycloakAuthEndpoint:.*|keycloakAuthEndpoint: {auth_url}|" federation-hub-ui.yml && '
+        f'sudo sed -i "s|^keycloakTokenEndpoint:.*|keycloakTokenEndpoint: {token_url}|" federation-hub-ui.yml && '
+        f'sudo sed -i "s|^keycloakClaimName:.*|keycloakClaimName: groups|" federation-hub-ui.yml && '
+        f'sudo sed -i "s|^keycloakAdminClaimValue:.*|keycloakAdminClaimValue: authentik Admins|" federation-hub-ui.yml'
+    )
+    ok_patch, patch_out = _ssh_probe(remote, patch_cmd, timeout=30)
+    if not ok_patch:
+        steps.append(f'  ⚠ Config patch failed: {patch_out}')
+        return jsonify({'success': False, 'error': 'Failed to patch federation-hub-ui.yml on remote', 'steps': steps}), 500
+    steps.append('  ✓ federation-hub-ui.yml patched with Authentik OAuth settings')
+
+    ok_restart, _ = _ssh_probe(remote, 'sudo systemctl restart federation-hub 2>&1', timeout=90)
+    if ok_restart:
+        steps.append('  ✓ federation-hub restarted')
+    else:
+        steps.append('  ⚠ Restart returned non-zero — check service status')
+
+    # Open OAuth port
+    _ssh_probe(remote, 'sudo ufw allow 8446/tcp > /dev/null 2>&1; true', timeout=15)
+    steps.append('  ✓ UFW: port 8446 allowed')
+
+    return jsonify({
+        'success': True,
+        'steps': steps,
+        'client_id': client_id,
+        'auth_url': auth_url,
+        'redirect_uri': redirect_uri,
+        'message': f'Authentik SSO enabled. Users in the "authentik Admins" group can log in at https://{fh_host}:9100 (OAuth port 8446).',
+    })
 
 
 def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deploy'):
@@ -12532,6 +12599,99 @@ def _ensure_authentik_console_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
         return False
 
 
+def _ensure_authentik_fedhub_oauth_app(settings, plog=None):
+    """Create an OAuth2/OIDC provider + application in Authentik for Federation Hub UI login.
+    Returns (client_id, client_secret, authorize_url, token_url) or (None,...) on failure."""
+    import urllib.request as _urlreq
+    import urllib.error
+    def log(msg):
+        if plog:
+            plog(msg)
+    ak_url = _get_authentik_api_url(settings)
+    token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
+    if not token:
+        log('  ✗ No Authentik API token found in .env')
+        return None, None, None, None
+    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+    ak_public = _get_authentik_base_url(settings)
+
+    try:
+        # Get authorization flow
+        req = _urlreq.Request(f'{ak_url}/api/v3/flows/instances/?designation=authorization&ordering=slug', headers=headers)
+        resp = _urlreq.urlopen(req, timeout=15)
+        flows = json.loads(resp.read().decode())['results']
+        flow_pk = next((f['pk'] for f in flows if 'implicit' in f.get('slug', '')), flows[0]['pk'] if flows else None)
+        if not flow_pk:
+            log('  ✗ No authorization flow found in Authentik')
+            return None, None, None, None
+
+        # Check if provider already exists
+        slug = 'fedhub'
+        provider_name = 'Federation Hub'
+        req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/?search={provider_name}', headers=headers)
+        resp = _urlreq.urlopen(req, timeout=15)
+        existing = json.loads(resp.read().decode())['results']
+        if existing:
+            p = existing[0]
+            client_id = p.get('client_id', '')
+            client_secret = p.get('client_secret', '')
+            log(f'  ✓ OAuth2 provider already exists: {provider_name}')
+        else:
+            # Determine redirect URI from Fed Hub config
+            fh_cfg = _get_fedhub_deployment_config(settings)
+            fh_host = (fh_cfg.get('remote', {}).get('host') or '').strip()
+            fh_domain = _get_service_domain(settings, 'fedhub') if settings.get('fqdn') else ''
+            redirect_host = fh_domain or fh_host or 'localhost'
+            redirect_uri = f'https://{redirect_host}:9100/login/redirect'
+
+            payload = {
+                'name': provider_name,
+                'authorization_flow': flow_pk,
+                'client_type': 'confidential',
+                'redirect_uris': redirect_uri,
+                'signing_key': None,
+                'property_mappings': [],
+                'sub_mode': 'hashed_user_id',
+            }
+            req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/',
+                data=json.dumps(payload).encode(), headers=headers, method='POST')
+            resp = _urlreq.urlopen(req, timeout=15)
+            p = json.loads(resp.read().decode())
+            client_id = p.get('client_id', '')
+            client_secret = p.get('client_secret', '')
+            log(f'  ✓ OAuth2 provider created: {provider_name}')
+
+        provider_pk = p.get('pk')
+
+        # Ensure application exists
+        try:
+            req = _urlreq.Request(f'{ak_url}/api/v3/core/applications/',
+                data=json.dumps({'name': provider_name, 'slug': slug, 'provider': provider_pk}).encode(),
+                headers=headers, method='POST')
+            _urlreq.urlopen(req, timeout=10)
+            log(f'  ✓ Application created: {provider_name}')
+        except urllib.error.HTTPError as e:
+            if e.code == 400:
+                try:
+                    req = _urlreq.Request(f'{ak_url}/api/v3/core/applications/{slug}/',
+                        data=json.dumps({'provider': provider_pk}).encode(),
+                        headers=headers, method='PATCH')
+                    _urlreq.urlopen(req, timeout=10)
+                except Exception:
+                    pass
+                log(f'  ✓ Application already exists: {provider_name}')
+            else:
+                log(f'  ⚠ Application error: {e}')
+
+        authorize_url = f'{ak_public}/application/o/authorize/'
+        token_url = f'{ak_public}/application/o/token/'
+        return client_id, client_secret, authorize_url, token_url
+
+    except Exception as e:
+        log(f'  ✗ Authentik OAuth setup failed: {str(e)[:200]}')
+        return None, None, None, None
+
+
 def _ensure_proxy_providers_cookie_domain(ak_url, ak_headers, fqdn, plog=None):
     """Set cookie_domain on all proxy providers so session is shared across subdomains (avoids stream. redirect loop)."""
     if not fqdn:
@@ -13753,9 +13913,24 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
       <input id="fedhub-web-ui-port" class="form-input" type="number" min="1" max="65535" value="{{ fedhub_deploy_cfg.web_ui_port }}">
       <div class="form-hint">Must match the hub UI port on the target (default <strong>9100</strong>, configured in <code style="font-size:11px">/opt/tak/federation-hub/configs/federation-hub-ui.yml</code>). The hub must listen on an IP reachable from <strong>this console</strong> (not only <code style="font-size:11px">127.0.0.1</code>). Caddy proxies to <code style="font-size:11px">SSH host:port</code>.</div>
     </div>
-    <p style="font-size:12px;color:var(--text-secondary);line-height:1.5;margin-bottom:10px"><strong>Hub login (username / password):</strong> configured on the Federation Hub itself during official setup (wizard / security configuration). infra-TAK does <em>not</em> store Hub credentials — only this console’s login. See the <a href="https://tak.gov/documentation/resources/civ-documentation/tak-server-documentation/federation-hub" target="_blank" rel="noopener noreferrer" style="color:var(--cyan)">TAK.gov Federation Hub documentation</a>.</p>
+    <p style="font-size:12px;color:var(--text-secondary);line-height:1.5;margin-bottom:10px"><strong>Hub login:</strong> Import <code style="font-size:11px">webadmin-fed.p12</code> (generated during deploy, in <code style="font-size:11px">/root/</code> on the target) into your browser. Password = TAK cert password (default <code style="font-size:11px">atakatak</code>). Or enable <strong>Authentik SSO</strong> below for username/password login. See the <a href="https://tak.gov/documentation/resources/civ-documentation/tak-server-documentation/federation-hub" target="_blank" rel="noopener noreferrer" style="color:var(--cyan)">TAK.gov docs</a>.</p>
     <div class="form-hint" style="margin-bottom:8px">Saving the SSH target (or port) below updates settings and regenerates the Caddyfile when a base FQDN is set.</div>
   </div>
+
+  {% if fh.installed and authentik_installed %}
+  <div class="card" style="border-color:rgba(59,130,246,.3);background:rgba(59,130,246,.05)">
+    <div class="card-title">Authentik SSO login</div>
+    <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:14px">Enable <strong>Authentik OAuth</strong> on the Federation Hub UI so users can log in with their Authentik credentials instead of importing a client certificate. Creates an OAuth2/OIDC application in Authentik and patches <code style="font-size:11px">federation-hub-ui.yml</code> on the remote host. Users in the <strong>authentik Admins</strong> group get admin access.</p>
+    <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:14px">Client cert login (<code style="font-size:11px">webadmin-fed.p12</code>) continues to work alongside OAuth.</p>
+    <button class="btn btn-primary" type="button" onclick="fedhubEnableAuthentik()" id="fedhub-ak-btn">Enable Authentik login</button>
+    <div id="fedhub-ak-msg" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
+  </div>
+  {% elif fh.installed and not authentik_installed %}
+  <div class="card">
+    <div class="card-title">Authentik SSO login</div>
+    <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:14px">Deploy <strong>Authentik</strong> from the Marketplace first, then return here to enable OAuth login for the Federation Hub UI.</p>
+  </div>
+  {% endif %}
 
   {% if fh.installed %}
   <div class="card">
@@ -14202,6 +14377,21 @@ function fedhubMarkDeployed(){
       if(el)el.textContent=(d&&d.error)||'Failed';
       if(d&&d.detail&&el)el.textContent+=' — '+(d.detail||'').substring(0,200);
     }).catch(function(e){if(el)el.textContent='Request failed';});
+}
+function fedhubEnableAuthentik(){
+  var btn=document.getElementById('fedhub-ak-btn');
+  var el=document.getElementById('fedhub-ak-msg');
+  if(btn)btn.disabled=true;
+  if(el){el.style.color='var(--text-dim)';el.textContent='Creating OAuth app in Authentik and patching config...';}
+  fetch('/api/fedhub/enable-authentik',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}',credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(d){
+      if(btn)btn.disabled=false;
+      if(d&&d.success){
+        if(el){el.style.color='var(--green)';el.textContent=d.message||'Authentik SSO enabled';}
+      } else {
+        if(el){el.style.color='var(--red)';el.textContent=(d&&d.error)||'Failed';}
+      }
+    }).catch(function(e){if(btn)btn.disabled=false;if(el){el.style.color='var(--red)';el.textContent='Request failed';}});
 }
 function fedhubClearRegistration(){
   if(!confirm('Remove Federation Hub from this console only?'))return;
