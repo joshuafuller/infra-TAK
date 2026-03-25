@@ -4710,25 +4710,190 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
             plog('✗ apt-get install failed — fix errors on target, then redeploy or update')
             status_dict.update({'running': False, 'complete': True, 'error': True})
             return
-        plog('━━━ systemd federation-hub ━━━')
-        _ssh_probe(remote, 'sudo systemctl daemon-reload', timeout=30)
-        _ssh_probe(remote, 'sudo systemctl enable federation-hub 2>/dev/null; true', timeout=30)
-        _ssh_probe(remote, 'sudo systemctl restart federation-hub 2>&1', timeout=90)
-        time.sleep(2)
-        ok_st, st_out = _ssh_probe(remote, 'systemctl is-active federation-hub 2>/dev/null', timeout=20)
-        st = (st_out or '').strip()
-        if st != 'active':
-            plog(f'✗ federation-hub not active after install (state: {st or "empty"})')
+        fh_dir = '/opt/tak/federation-hub'
+        ok_d, _dout = _ssh_probe(remote, f'test -d {fh_dir} && echo OK', timeout=15)
+        if not (ok_d and 'OK' in (_dout or '')):
+            plog(f'✗ {fh_dir} not found after install — package may be broken')
             status_dict.update({'running': False, 'complete': True, 'error': True})
             return
-        plog('✓ federation-hub is active')
-        ok_d, _dout = _ssh_probe(remote, 'test -d /opt/tak/federation-hub && echo OK', timeout=15)
-        if not (ok_d and 'OK' in (_dout or '')):
-            plog('⚠ /opt/tak/federation-hub not found — check package layout on target')
+
+        # --- MongoDB (required by Federation Hub) ---
+        plog('━━━ Install & start MongoDB ━━━')
+        mongo_cmds = (
+            'if ! command -v mongod >/dev/null 2>&1; then '
+            '  distro_codename=$(awk -F= "/^VERSION_CODENAME=/{ print tolower(\\$2) }" /etc/*-release | tr -d \'\\"\'); '
+            '  rm -f /usr/share/keyrings/mongodb-server-8.0.gpg; '
+            '  curl -fsSL https://www.mongodb.org/static/pgp/server-8.0.asc | gpg --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg; '
+            '  echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg ] https://repo.mongodb.org/apt/ubuntu ${distro_codename}/mongodb-org/8.0 multiverse" '
+            '    > /etc/apt/sources.list.d/mongodb-org-8.0.list; '
+            '  apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y mongodb-org; '
+            'fi && '
+            'systemctl daemon-reload && systemctl enable mongod && systemctl start mongod && '
+            'sleep 2 && systemctl is-active mongod'
+        )
+        ok_mg, mg_out = _ssh_probe(remote, f'sudo bash -c {shlex.quote(mongo_cmds)}', timeout=300)
+        if mg_out:
+            plog(mg_out[-2000:] if len(mg_out) > 2000 else mg_out)
+        if not ok_mg or 'active' not in (mg_out or ''):
+            plog('✗ MongoDB install/start failed — Federation Hub requires MongoDB')
+            status_dict.update({'running': False, 'complete': True, 'error': True})
+            return
+        plog('✓ MongoDB is active')
+
+        # --- MongoDB password → federation-hub-broker.yml ---
+        plog('━━━ Configure MongoDB password ━━━')
+        mongo_pass_cmd = (
+            f'cd {fh_dir}/configs && '
+            'if ! grep -qE "^dbPassword: .+" federation-hub-broker.yml 2>/dev/null; then '
+            '  DBPW=$(openssl rand -base64 14 | tr -dc a-zA-Z0-9); '
+            '  sed -i "s/^dbPassword:.*/dbPassword: ${DBPW}/" federation-hub-broker.yml; '
+            '  echo "SET:${DBPW}"; '
+            'else echo "EXISTS"; fi'
+        )
+        ok_dbpw, dbpw_out = _ssh_probe(remote, f'sudo bash -c {shlex.quote(mongo_pass_cmd)}', timeout=30)
+        if not ok_dbpw:
+            plog(f'⚠ MongoDB password patch warning: {dbpw_out}')
+        else:
+            plog('✓ MongoDB password configured in broker.yml')
+
+        # --- Run vendor DB configure script ---
+        db_script = f'{fh_dir}/scripts/db/configure.sh'
+        ok_dbcfg, dbcfg_out = _ssh_probe(remote, f'test -x {db_script} && sudo {db_script} 2>&1 || echo SKIP', timeout=60)
+        if dbcfg_out and 'SKIP' not in dbcfg_out:
+            plog(dbcfg_out[-1500:] if len(dbcfg_out) > 1500 else dbcfg_out)
+        plog('✓ MongoDB configured')
+
+        # --- Certificate generation (mirrors installTAK fedWizard) ---
+        plog('━━━ Generate Federation Hub certificates ━━━')
+        settings = load_settings()
+        cert_pass = (settings.get('tak_cert_password') or 'atakatak').strip() or 'atakatak'
+        root_ca = (settings.get('fedhub_root_ca') or settings.get('root_ca_name') or 'FEDHUB-ROOT-CA').strip()
+        int_ca = (settings.get('fedhub_intermediate_ca') or settings.get('intermediate_ca_name') or 'FEDHUB-INT-CA').strip()
+        plog(f'  Root CA: {root_ca} | Intermediate CA: {int_ca}')
+
+        hostname_ok, hostname_out = _ssh_probe(remote, 'hostname', timeout=10)
+        remote_hostname = (hostname_out or 'fedhub').strip() or 'fedhub'
+
+        cert_cmds = (
+            f'cd {fh_dir}/certs && '
+            f'if [ -f files/{shlex.quote(remote_hostname)}.jks ]; then echo "CERTS_EXIST"; exit 0; fi && '
+            f'sudo chown -R tak:tak {fh_dir} && '
+            f'sudo -u tak ./makeRootCa.sh --ca-name {shlex.quote(root_ca)} 2>&1 && '
+            f'echo y | sudo -u tak ./makeCert.sh ca {shlex.quote(int_ca)} 2>&1 && '
+            f'sudo -u tak ./makeCert.sh server {shlex.quote(remote_hostname)} 2>&1 && '
+            f'echo y | sudo -u tak ./makeCert.sh client webadmin-fed 2>&1'
+        )
+        ok_cert, cert_out = _ssh_probe(remote, cert_cmds, timeout=120)
+        if cert_out:
+            plog(cert_out[-3000:] if len(cert_out) > 3000 else cert_out)
+        if not ok_cert:
+            plog('✗ Certificate generation failed')
+            status_dict.update({'running': False, 'complete': True, 'error': True})
+            return
+        certs_existed = 'CERTS_EXIST' in (cert_out or '')
+        if certs_existed:
+            plog('✓ Certificates already exist — skipping generation')
+        else:
+            plog('✓ Certificates generated')
+
+        # --- Patch config YAMLs: truststore name + keystore name ---
+        if not certs_existed:
+            plog('━━━ Patch Federation Hub config files ━━━')
+            patch_cmds = (
+                f'cd {fh_dir}/configs && '
+                f'sudo sed -i "s/truststore-root/truststore-{shlex.quote(int_ca)}/g" federation-hub-ui.yml && '
+                f'sudo sed -i "s/takserver\\.jks/{shlex.quote(remote_hostname)}.jks/g" federation-hub-broker.yml && '
+                f'sudo sed -i "s/takserver\\.jks/{shlex.quote(remote_hostname)}.jks/g" federation-hub-ui.yml'
+            )
+            ok_patch, patch_out = _ssh_probe(remote, patch_cmds, timeout=30)
+            if not ok_patch:
+                plog(f'⚠ Config patch warning: {patch_out}')
+            else:
+                plog('✓ Config files patched (truststore + keystore names)')
+
+            # Cert password: if non-default, replace atakatak in broker.yml + ui.yml
+            if cert_pass and cert_pass != 'atakatak':
+                pw_cmd = (
+                    f'cd {fh_dir}/configs && '
+                    f'sudo sed -i "s/atakatak/{shlex.quote(cert_pass)}/g" federation-hub-broker.yml && '
+                    f'sudo sed -i "s/atakatak/{shlex.quote(cert_pass)}/g" federation-hub-ui.yml'
+                )
+                _ssh_probe(remote, pw_cmd, timeout=20)
+                plog('✓ Certificate password applied to config files')
+
+        # --- chown + systemd ---
+        plog('━━━ Start Federation Hub services ━━━')
+        _ssh_probe(remote, f'sudo chown -R tak:tak {fh_dir}', timeout=30)
+        _ssh_probe(remote, 'sudo systemctl daemon-reload', timeout=30)
+        _ssh_probe(remote, 'sudo systemctl enable federation-hub 2>/dev/null; true', timeout=30)
+        _ssh_probe(remote, f'sudo touch {fh_dir}/logs/federation-hub-ui.log && sudo chown tak:tak {fh_dir}/logs/federation-hub-ui.log', timeout=15)
+        _ssh_probe(remote, 'sudo systemctl restart federation-hub 2>&1', timeout=90)
+
+        # Wait for UI to start (up to ~90s, checking log for "Started FederationHubUIServer")
+        plog('Waiting for Federation Hub UI to start…')
+        ui_started = False
+        for attempt in range(18):
+            time.sleep(5)
+            ok_log, log_out = _ssh_probe(remote, f'tail -20 {fh_dir}/logs/federation-hub-ui.log 2>/dev/null', timeout=15)
+            if log_out and 'Started FederationHubUIServer' in log_out:
+                ui_started = True
+                break
+            if log_out and 'Application run failed' in log_out:
+                plog(f'✗ Federation Hub UI failed to start:\n{log_out[-1500:]}')
+                status_dict.update({'running': False, 'complete': True, 'error': True})
+                return
+        if not ui_started:
+            ok_st2, st2_out = _ssh_probe(remote, 'systemctl is-active federation-hub 2>/dev/null', timeout=15)
+            if (st2_out or '').strip() == 'active':
+                plog('⚠ federation-hub active but UI startup message not yet seen — may still be loading')
+            else:
+                plog(f'✗ federation-hub not active (state: {(st2_out or "").strip() or "unknown"})')
+                status_dict.update({'running': False, 'complete': True, 'error': True})
+                return
+        else:
+            plog('✓ Federation Hub UI started on port 9100')
+
+        # --- Register webadmin cert ---
+        if not certs_existed:
+            plog('━━━ Register admin certificate ━━━')
+            mgr_cmd = (
+                f'sudo -u tak java -jar {fh_dir}/jars/federation-hub-manager.jar '
+                f'{fh_dir}/certs/files/webadmin-fed.pem 2>&1'
+            )
+            ok_adm, adm_out = _ssh_probe(remote, mgr_cmd, timeout=60)
+            if adm_out:
+                plog(adm_out[-1000:] if len(adm_out) > 1000 else adm_out)
+            if ok_adm:
+                plog('✓ webadmin-fed certificate registered')
+            else:
+                plog('⚠ Admin cert registration returned non-zero — you may need to register manually')
+            # Copy webadmin-fed.p12 to /root/ for easy download
+            _ssh_probe(remote, f'sudo cp {fh_dir}/certs/files/webadmin-fed.p12 /root/ 2>/dev/null; true', timeout=15)
+
+        # --- Firewall ---
+        plog('━━━ Firewall (UFW) ━━━')
+        for p in ['9100/tcp', '9101/tcp', '9102/tcp', '9103/tcp']:
+            _ssh_probe(remote, f'sudo ufw allow {p} > /dev/null 2>&1; true', timeout=15)
+        _ssh_probe(remote, 'sudo ufw --force enable > /dev/null 2>&1; true', timeout=15)
+        plog('✓ Firewall configured (9100-9103)')
+
+        plog('━━━ Verify ━━━')
+        ok_9100, out_9100 = _ssh_probe(remote, 'ss -tlnp | grep :9100 || true', timeout=15)
+        if out_9100 and '9100' in out_9100:
+            plog('✓ Port 9100 is listening (Federation Hub UI)')
+        else:
+            plog('⚠ Port 9100 not yet listening — UI may still be starting')
+
         cfg2 = {**cfg, 'deployed': True, 'target_mode': 'remote'}
+        settings = load_settings()
         settings['fedhub_deployment'] = _normalize_module_deployment_config(cfg2)
         save_settings(settings)
         plog('✓ Console registration updated (deployed)')
+        plog('')
+        plog('━━━ Complete ━━━')
+        plog(f'Federation Hub UI: https://{remote.get("host")}:9100')
+        plog('Import webadmin-fed.p12 (in /root/ on the target) into your browser to log in.')
+        plog('Password: ' + cert_pass)
         plog('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
         status_dict.update({'running': False, 'complete': True, 'error': False})
         _caddy_regenerate_if_fqdn()
@@ -5318,9 +5483,9 @@ def _get_fedhub_deployment_config(settings):
     """fedhub_deployment plus web_ui_port (HTTP port on the remote hub host for Caddy reverse_proxy)."""
     c = _normalize_module_deployment_config(settings.get('fedhub_deployment', {}))
     try:
-        p = int(c.get('web_ui_port') if c.get('web_ui_port') is not None else 8080)
+        p = int(c.get('web_ui_port') if c.get('web_ui_port') is not None else 9100)
     except (TypeError, ValueError):
-        p = 8080
+        p = 9100
     c['web_ui_port'] = max(1, min(65535, p))
     return c
 
@@ -6813,7 +6978,7 @@ def generate_caddyfile(settings=None):
         fh_remote = (fhcfg.get('remote', {}).get('host') or '').strip()
         if fh_remote and fhcfg.get('target_mode') == 'remote':
             fh_host = sd['fedhub']
-            fh_port = int(fhcfg.get('web_ui_port') or 8080)
+            fh_port = int(fhcfg.get('web_ui_port') or 9100)
             fh_upstream = f'{fh_remote}:{fh_port}'
             lines.append("# TAK Federation Hub — TLS terminates here; proxy to HTTP UI on the hub host (admin user/password per TAK.gov)")
             lines.append(f"{fh_host} {{")
@@ -13586,7 +13751,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     <div class="form-group">
       <label class="form-label">Hub web UI port (on remote host, HTTP)</label>
       <input id="fedhub-web-ui-port" class="form-input" type="number" min="1" max="65535" value="{{ fedhub_deploy_cfg.web_ui_port }}">
-      <div class="form-hint">Must match the hub process on the target (check TAK.gov Federation Hub docs and <code style="font-size:11px">/opt/tak/federation-hub</code> config — often Spring Boot <code style="font-size:11px">server.port</code>, commonly <strong>8080</strong>). The hub must listen on an IP reachable from <strong>this console</strong> (not only <code style="font-size:11px">127.0.0.1</code>). Caddy proxies to <code style="font-size:11px">SSH host:port</code>.</div>
+      <div class="form-hint">Must match the hub UI port on the target (default <strong>9100</strong>, configured in <code style="font-size:11px">/opt/tak/federation-hub/configs/federation-hub-ui.yml</code>). The hub must listen on an IP reachable from <strong>this console</strong> (not only <code style="font-size:11px">127.0.0.1</code>). Caddy proxies to <code style="font-size:11px">SSH host:port</code>.</div>
     </div>
     <p style="font-size:12px;color:var(--text-secondary);line-height:1.5;margin-bottom:10px"><strong>Hub login (username / password):</strong> configured on the Federation Hub itself during official setup (wizard / security configuration). infra-TAK does <em>not</em> store Hub credentials — only this console’s login. See the <a href="https://tak.gov/documentation/resources/civ-documentation/tak-server-documentation/federation-hub" target="_blank" rel="noopener noreferrer" style="color:var(--cyan)">TAK.gov Federation Hub documentation</a>.</p>
     <div class="form-hint" style="margin-bottom:8px">Saving the SSH target (or port) below updates settings and regenerates the Caddyfile when a base FQDN is set.</div>
@@ -13985,7 +14150,7 @@ function collectFedhubDeployConfig(){
   var wup=(document.getElementById('fedhub-web-ui-port')||{}).value;
   var wp=parseInt(wup,10);
   var dep=document.getElementById('fedhub-deployed-flag');
-  return{target_mode:'remote',deployed:dep&&dep.value==='1',web_ui_port:isNaN(wp)?8080:wp,remote:{host:host.trim(),ssh_user:(user||'root').trim(),ssh_port:isNaN(p)?22:p,ssh_key_path:key.trim()}};
+  return{target_mode:'remote',deployed:dep&&dep.value==='1',web_ui_port:isNaN(wp)?9100:wp,remote:{host:host.trim(),ssh_user:(user||'root').trim(),ssh_port:isNaN(p)?22:p,ssh_key_path:key.trim()}};
 }
 function _fedhubSshMsg(msg,err,ok){
   var el=document.getElementById('fedhub-ssh-status');
