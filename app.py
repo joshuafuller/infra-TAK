@@ -1058,6 +1058,19 @@ def _build_uu_hosts(metrics, settings):
                 'running': remote.get('running', False) if 'error' not in remote else False,
                 'error': remote.get('error'),
             })
+    # Federation Hub remote host
+    fh_cfg = _get_fedhub_deployment_config(settings)
+    if fh_cfg.get('target_mode') == 'remote' and fh_cfg.get('deployed'):
+        fh_host = (fh_cfg.get('remote', {}).get('host') or '').strip()
+        if fh_host:
+            fh_remote = _get_unattended_upgrades_status_remote(fh_cfg.get('remote', {}))
+            hosts.append({
+                'id': 'fedhub',
+                'label': 'Fed Hub (' + fh_host + ')',
+                'enabled': fh_remote.get('enabled', False) if 'error' not in fh_remote else False,
+                'running': fh_remote.get('running', False) if 'error' not in fh_remote else False,
+                'error': fh_remote.get('error'),
+            })
     return hosts
 
 
@@ -3062,6 +3075,17 @@ def guarddog_page():
             {'name': 'Health Agent', 'id': 'remotedb_agent', 'interval': 'Always', 'desc': f'Lightweight health endpoint on Server One / remote server ({s1_host}:8080/health) — checks PG ready, cot database, disk usage. If red, click "Deploy health agent to Server One / remote server" below.'},
             {'name': 'DB Auth', 'id': 'remotedb_auth', 'interval': '2 min', 'desc': f'Validates martiuser password from CoreConfig.xml against PostgreSQL on Server One / remote server ({s1_host}). Red means credential drift — Guard Dog auto-resyncs and notifies you.'},
         ]})
+    fh_cfg = _get_fedhub_deployment_config(settings)
+    fh_deployed = fh_cfg.get('deployed') and fh_cfg.get('target_mode') == 'remote'
+    fh_host = (fh_cfg.get('remote', {}).get('host') or '').strip() if fh_deployed else ''
+    if fh_deployed and fh_host:
+        guarddog_services.append({'id': 'federation_hub', 'name': f'Federation Hub ({fh_host})', 'monitored': gd.get('installed'), 'monitors': [
+            {'name': 'Service', 'id': 'fedhub_svc', 'interval': '1 min', 'desc': f'Checks federation-hub systemd service on {fh_host} via SSH. Auto-restarts after 3 consecutive failures.'},
+            {'name': 'Port 9100 (UI)', 'id': 'fedhub_port', 'interval': '1 min', 'desc': f'Checks that Federation Hub UI port 9100 is listening on {fh_host}. Alerts after 3 failures.'},
+            {'name': 'MongoDB', 'id': 'fedhub_mongo', 'interval': '5 min', 'desc': f'Checks mongod service is active on {fh_host}. Alerts on failure.'},
+            {'name': 'Disk', 'id': 'fedhub_disk', 'interval': '1 hour', 'desc': f'Checks root filesystem usage on {fh_host}. Alert at 80%+ (warning) or 90%+ (critical).'},
+            {'name': 'Certificate', 'id': 'fedhub_cert', 'interval': 'Daily', 'desc': f'Checks Federation Hub server cert expiry on {fh_host}. Alert when 40 days or less remaining.'},
+        ]})
     guarddog_services.extend([
         {'id': 'authentik', 'name': 'Authentik', 'monitored': modules.get('authentik', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'id': 'authentik_http', 'interval': '1 min', 'desc': 'Checks Authentik HTTP (9090). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'mediamtx', 'name': 'MediaMTX', 'monitored': modules.get('mediamtx', {}).get('installed'), 'monitors': [{'name': 'Service', 'id': 'mediamtx_svc', 'interval': '1 min', 'desc': 'Checks systemd mediamtx. Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
@@ -3341,6 +3365,16 @@ def _guarddog_health_check(service_id):
                 return False
             r = subprocess.run('docker ps --filter name=cloudtak-api --format "{{.Status}}"', shell=True, capture_output=True, text=True, timeout=5)
             return bool(r.stdout and 'Up' in r.stdout)
+        if service_id == 'federation_hub':
+            settings = load_settings()
+            fh_cfg = _get_fedhub_deployment_config(settings)
+            if not fh_cfg.get('deployed') or fh_cfg.get('target_mode') != 'remote':
+                return None
+            fh_remote = fh_cfg.get('remote', {})
+            if not (fh_remote.get('host') or '').strip():
+                return None
+            ok, out = _ssh_probe(fh_remote, 'systemctl is-active federation-hub 2>/dev/null', timeout=8)
+            return bool(ok and out and out.strip() == 'active')
         if service_id == 'remotedb':
             import socket
             db_host, db_port = _remotedb_host_port_from_tak_settings()
@@ -3372,6 +3406,7 @@ def _guarddog_service_monitor_ids(settings):
     multi = {
         'takserver': takserver_ids,
         'remotedb': ['remotedb_tcp', 'remotedb_agent', 'remotedb_auth'],
+        'federation_hub': ['fedhub_svc', 'fedhub_port', 'fedhub_mongo', 'fedhub_disk', 'fedhub_cert'],
         'authentik': ['authentik_http'],
         'mediamtx': ['mediamtx_svc'],
         'nodered': ['nodered_http'],
@@ -3391,6 +3426,9 @@ def _guarddog_monitored_service_ids(settings):
     ids = ['takserver']
     if is_two_server and s1_host:
         ids.append('remotedb')
+    fh_cfg = _get_fedhub_deployment_config(settings)
+    if fh_cfg.get('deployed') and fh_cfg.get('target_mode') == 'remote' and (fh_cfg.get('remote', {}).get('host') or '').strip():
+        ids.append('federation_hub')
     if modules.get('authentik', {}).get('installed'):
         ids.append('authentik')
     if modules.get('mediamtx', {}).get('installed'):
@@ -3713,9 +3751,48 @@ def _monitor_health_check(monitor_id):
             r = subprocess.run('docker ps --filter name=cloudtak-api --format "{{.Status}}"', shell=True, capture_output=True, text=True, timeout=5)
             return bool(r.stdout and 'Up' in r.stdout)
         if monitor_id == 'updates_check':
-            # Updates monitor: green when the 6h timer is enabled (script will run and email on change)
             r = subprocess.run(['systemctl', 'is-enabled', 'takupdatesguard.timer'], capture_output=True, text=True, timeout=3)
             return r.returncode == 0 and (r.stdout or '').strip() == 'enabled'
+        # Federation Hub monitors (all remote via SSH)
+        if monitor_id.startswith('fedhub_'):
+            settings = load_settings()
+            fh_cfg = _get_fedhub_deployment_config(settings)
+            if not fh_cfg.get('deployed') or fh_cfg.get('target_mode') != 'remote':
+                return None
+            fh_remote = fh_cfg.get('remote', {})
+            if not (fh_remote.get('host') or '').strip():
+                return None
+            if monitor_id == 'fedhub_svc':
+                ok, out = _ssh_probe(fh_remote, 'systemctl is-active federation-hub 2>/dev/null', timeout=8)
+                return bool(ok and out and out.strip() == 'active')
+            if monitor_id == 'fedhub_port':
+                ok, out = _ssh_probe(fh_remote, 'ss -ltn "sport = :9100" 2>/dev/null', timeout=8)
+                return bool(ok and out and 'LISTEN' in out)
+            if monitor_id == 'fedhub_mongo':
+                ok, out = _ssh_probe(fh_remote, 'systemctl is-active mongod 2>/dev/null', timeout=8)
+                return bool(ok and out and out.strip() == 'active')
+            if monitor_id == 'fedhub_disk':
+                ok, out = _ssh_probe(fh_remote, "df / --output=pcent 2>/dev/null | tail -1", timeout=8)
+                if not ok or not out:
+                    return None
+                try:
+                    pct = int(out.strip().rstrip('%'))
+                    return pct < 80
+                except ValueError:
+                    return None
+            if monitor_id == 'fedhub_cert':
+                ok, out = _ssh_probe(fh_remote,
+                    'find /opt/tak/federation-hub/certs/files/ -maxdepth 1 -name "*.pem" -type f 2>/dev/null | head -1',
+                    timeout=8)
+                if not ok or not (out or '').strip():
+                    return None
+                cert_path = out.strip()
+                ok2, out2 = _ssh_probe(fh_remote,
+                    f'openssl x509 -in {cert_path} -checkend 3456000 2>/dev/null; echo $?',
+                    timeout=8)
+                if not ok2 or not out2:
+                    return None
+                return out2.strip().endswith('0')
     except Exception:
         return False
     return None
@@ -3780,7 +3857,8 @@ def _guarddog_timer_list():
     return ['tak8089guard.timer', 'takoomguard.timer', 'takdiskguard.timer', 'takdbguard.timer',
             'takcotdbguard.timer', 'taknetguard.timer', 'takprocessguard.timer', 'takcertguard.timer',
             'takintcaguard.timer',
-            'takauthentikguard.timer', 'takmediamtxguard.timer', 'taknoderedguard.timer', 'takcloudtakguard.timer']
+            'takauthentikguard.timer', 'takmediamtxguard.timer', 'taknoderedguard.timer', 'takcloudtakguard.timer',
+            'takfedhubguard.timer']
 
 def _guarddog_is_enabled():
     """True if Guard Dog timers are enabled (at least the core 8089 timer)."""
@@ -4234,6 +4312,11 @@ def run_guarddog_deploy(alert_email):
             script_files.append('tak-nodered-watch.sh')
         if os.path.exists(cloudtak_dir) and os.path.exists(os.path.join(cloudtak_dir, 'docker-compose.yml')):
             script_files.append('tak-cloudtak-watch.sh')
+        fh_cfg = _get_fedhub_deployment_config(settings)
+        fh_deployed = fh_cfg.get('deployed') and fh_cfg.get('target_mode') == 'remote'
+        fh_host = (fh_cfg.get('remote', {}).get('host') or '').strip() if fh_deployed else ''
+        if fh_deployed and fh_host:
+            script_files.append('tak-fedhub-watch.sh')
         # Scripts (e.g. tak-cert-watch.sh) live in repo scripts/guarddog/ — read from disk each deploy.
         for name in script_files:
             src = os.path.join(scripts_dir, name)
@@ -4253,6 +4336,13 @@ def run_guarddog_deploy(alert_email):
                 content = content.replace('DB_PORT_PLACEHOLDER', db_port)
                 content = content.replace('SSH_KEY_PLACEHOLDER', ssh_key_path)
                 content = content.replace('SSH_USER_PLACEHOLDER', s1_user)
+            if name == 'tak-fedhub-watch.sh' and fh_deployed and fh_host:
+                fh_remote = fh_cfg.get('remote', {})
+                fh_ssh_key = (fh_remote.get('ssh_key_path') or '').strip()
+                fh_ssh_user = (fh_remote.get('username') or 'root').strip()
+                content = content.replace('FEDHUB_HOST_PLACEHOLDER', fh_host)
+                content = content.replace('SSH_KEY_PLACEHOLDER', fh_ssh_key)
+                content = content.replace('SSH_USER_PLACEHOLDER', fh_ssh_user)
             dest = os.path.join('/opt/tak-guarddog', name)
             with open(dest, 'w') as f:
                 f.write(content)
@@ -4323,6 +4413,11 @@ def run_guarddog_deploy(alert_email):
                 ('takcloudtakguard.service', '[Unit]\nDescription=Guard Dog CloudTAK Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-cloudtak-watch.sh\n'),
                 ('takcloudtakguard.timer', '[Unit]\nDescription=Run CloudTAK guard every 1 minute\n\n[Timer]\nOnBootSec=15min\nOnUnitActiveSec=1min\nUnit=takcloudtakguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ])
+        if 'tak-fedhub-watch.sh' in script_files:
+            units.extend([
+                ('takfedhubguard.service', '[Unit]\nDescription=Guard Dog Federation Hub Monitor\nAfter=network-online.target\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-fedhub-watch.sh\n'),
+                ('takfedhubguard.timer', '[Unit]\nDescription=Run Federation Hub guard every 1 minute\n\n[Timer]\nOnBootSec=15min\nOnUnitActiveSec=1min\nUnit=takfedhubguard.service\n\n[Install]\nWantedBy=timers.target\n'),
+            ])
         _updates_home = os.path.expanduser('~')
         units.extend([
             ('takupdatesguard.service', f'[Unit]\nDescription=Guard Dog Updates Check (infra-TAK, Authentik, MediaMTX, CloudTAK)\n\n[Service]\nType=oneshot\nEnvironment=HOME={_updates_home}\nExecStart=/opt/tak-guarddog/tak-updates-watch.sh\n'),
@@ -4386,6 +4481,8 @@ def run_guarddog_deploy(alert_email):
             timers.append('taknoderedguard.timer')
         if 'tak-cloudtak-watch.sh' in script_files:
             timers.append('takcloudtakguard.timer')
+        if 'tak-fedhub-watch.sh' in script_files:
+            timers.append('takfedhubguard.timer')
         timers.append('takupdatesguard.timer')
         for t in timers:
             re = subprocess.run(['systemctl', 'enable', t], capture_output=True, text=True, timeout=5)
@@ -4573,7 +4670,8 @@ def federation_hub_page():
         fedhub_upgrading=fedhub_upgrade_status.get('running', False),
         fedhub_upgrade_done=_fedhub_upgrade_done,
         fedhub_upgrade_error=fedhub_upgrade_status.get('error', False),
-        authentik_installed=_ak.get('installed', False)))
+        authentik_installed=_ak.get('installed', False),
+        fedhub_remote_host=(fedhub_deploy_cfg.get('remote', {}).get('host') or '').strip() if fedhub_deploy_cfg.get('target_mode') == 'remote' and fedhub_deploy_cfg.get('deployed') else ''))
     resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
     return resp
 
@@ -4651,6 +4749,20 @@ def fedhub_control_api():
         return jsonify({'success': False, 'error': 'Unknown action'}), 400
     ok, out = _module_run(cfg, cmd, timeout=90)
     return jsonify({'success': ok, 'output': (out or '')[:800]})
+
+
+@app.route('/api/fedhub/remote-metrics')
+@login_required
+def fedhub_remote_metrics():
+    """Return CPU/memory/disk/uptime for the Federation Hub remote host."""
+    settings = load_settings()
+    cfg = _get_fedhub_deployment_config(settings)
+    if cfg.get('target_mode') != 'remote' or not (cfg.get('remote', {}).get('host') or '').strip():
+        return jsonify({'error': 'Not remote'}), 404
+    metrics = _get_remote_host_metrics(cfg.get('remote', {}))
+    if metrics is None:
+        return jsonify({'error': 'Could not fetch remote metrics'}), 503
+    return jsonify(metrics)
 
 
 @app.route('/api/fedhub/enable-authentik', methods=['POST'])
@@ -4960,10 +5072,11 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
 
         # --- Firewall ---
         plog('━━━ Firewall (UFW) ━━━')
+        _ssh_probe(remote, 'sudo ufw allow 22/tcp > /dev/null 2>&1; true', timeout=15)
         for p in ['9100/tcp', '9101/tcp', '9102/tcp', '9103/tcp']:
             _ssh_probe(remote, f'sudo ufw allow {p} > /dev/null 2>&1; true', timeout=15)
         _ssh_probe(remote, 'sudo ufw --force enable > /dev/null 2>&1; true', timeout=15)
-        plog('✓ Firewall configured (9100-9103)')
+        plog('✓ Firewall configured (22, 9100-9103)')
 
         plog('━━━ Verify ━━━')
         ok_9100, out_9100 = _ssh_probe(remote, 'ss -tlnp | grep :9100 || true', timeout=15)
@@ -13953,6 +14066,19 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   </div>
   {% endif %}
 
+  {% if fedhub_remote_host %}
+  <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
+  <div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-bottom:12px"><span style="color:var(--text-secondary)">Remote host:</span> <span style="color:var(--cyan)" id="fedhub-remote-host-ip">{{ fedhub_remote_host }}</span></div>
+  <div class="card-title" style="margin-top:16px;margin-bottom:8px">Remote host health</div>
+  <div class="metrics-bar" id="fedhub-remote-metrics-bar">
+  <div class="metric-card"><div class="metric-label">CPU</div><div class="metric-value" id="fedhub-remote-cpu-value">—</div></div>
+  <div class="metric-card"><div class="metric-label">Memory</div><div class="metric-value" id="fedhub-remote-ram-value">—</div><div class="metric-detail" id="fedhub-remote-ram-detail"></div></div>
+  <div class="metric-card"><div class="metric-label">Disk</div><div class="metric-value" id="fedhub-remote-disk-value">—</div><div class="metric-detail" id="fedhub-remote-disk-detail"></div></div>
+  <div class="metric-card"><div class="metric-label">Uptime</div><div class="metric-value" id="fedhub-remote-uptime-value" style="font-size:18px">—</div></div>
+  </div>
+  </div>
+  {% endif %}
+
   {% if fh.installed %}
   <div class="card">
     <div class="card-title">Controls (remote)</div>
@@ -14463,7 +14589,9 @@ document.addEventListener('DOMContentLoaded',function(){
     fedhubUpgradeLogIndex=d.total||0;
   });
   {% endif %}
+  if(document.getElementById('fedhub-remote-metrics-bar')){loadFedhubRemoteMetrics();setInterval(loadFedhubRemoteMetrics,5000);}
 });
+async function loadFedhubRemoteMetrics(){var bar=document.getElementById('fedhub-remote-metrics-bar');if(!bar)return;try{var r=await fetch('/api/fedhub/remote-metrics');if(!r.ok){document.getElementById('fedhub-remote-cpu-value').textContent='—';document.getElementById('fedhub-remote-ram-value').textContent='—';document.getElementById('fedhub-remote-disk-value').textContent='—';document.getElementById('fedhub-remote-uptime-value').textContent='—';return;}var d=await r.json();var cpu=document.getElementById('fedhub-remote-cpu-value');if(cpu)cpu.textContent=(d.cpu_percent!=null?d.cpu_percent:'—')+'%';var ram=document.getElementById('fedhub-remote-ram-value');if(ram)ram.textContent=(d.ram_percent!=null?d.ram_percent:'—')+'%';var ramD=document.getElementById('fedhub-remote-ram-detail');if(ramD)ramD.textContent=(d.ram_used_gb!=null&&d.ram_total_gb!=null)?(d.ram_used_gb+'GB / '+d.ram_total_gb+'GB'):'';var disk=document.getElementById('fedhub-remote-disk-value');if(disk)disk.textContent=(d.disk_percent!=null?d.disk_percent:'—')+'%';var diskD=document.getElementById('fedhub-remote-disk-detail');if(diskD)diskD.textContent=(d.disk_used_gb!=null&&d.disk_total_gb!=null)?(d.disk_used_gb+'GB / '+d.disk_total_gb+'GB'):'';var up=document.getElementById('fedhub-remote-uptime-value');if(up)up.textContent=d.uptime||'—';}catch(e){}}
 </script>
 </body></html>
 '''
@@ -23191,7 +23319,7 @@ body::after{content:'';position:fixed;top:0;left:0;right:0;height:2px;background
 @app.route('/api/host-resource-usage')
 @login_required
 def api_host_resource_usage():
-    """Top processes by CPU and RAM for this host or a remote (target=tak_db). Same hosts as UU cards."""
+    """Top processes by CPU and RAM for this host or a remote (target=tak_db|fedhub). Same hosts as UU cards."""
     target = request.args.get('target', 'this_host')
     if target == 'tak_db':
         settings = load_settings()
@@ -23202,6 +23330,15 @@ def api_host_resource_usage():
         if not (s1.get('host') or '').strip():
             return jsonify({'cpu_top': [], 'mem_top': [], 'error': 'No DB host'})
         return jsonify(_top_processes_remote(s1))
+    if target == 'fedhub':
+        settings = load_settings()
+        fh_cfg = _get_fedhub_deployment_config(settings)
+        if not fh_cfg.get('deployed') or fh_cfg.get('target_mode') != 'remote':
+            return jsonify({'cpu_top': [], 'mem_top': [], 'error': 'Fed Hub not deployed'})
+        fh_remote = fh_cfg.get('remote', {})
+        if not (fh_remote.get('host') or '').strip():
+            return jsonify({'cpu_top': [], 'mem_top': [], 'error': 'No Fed Hub host'})
+        return jsonify(_top_processes_remote(fh_remote))
     return jsonify(_top_processes_local())
 
 
@@ -23267,6 +23404,18 @@ def api_toggle_unattended_upgrades():
         ok, result = _run_unattended_upgrades_remote(s1, action)
         if ok:
             return jsonify({'success': True, 'target': 'tak_db', 'enabled': result['enabled'], 'running': result['running']})
+        return jsonify({'success': False, 'error': result.get('error', 'unknown')}), 500
+    if target == 'fedhub':
+        settings = load_settings()
+        fh_cfg = _get_fedhub_deployment_config(settings)
+        if not fh_cfg.get('deployed') or fh_cfg.get('target_mode') != 'remote':
+            return jsonify({'success': False, 'error': 'Fed Hub not deployed'}), 400
+        fh_remote = fh_cfg.get('remote', {})
+        if not (fh_remote.get('host') or '').strip():
+            return jsonify({'success': False, 'error': 'No Fed Hub host'}), 400
+        ok, result = _run_unattended_upgrades_remote(fh_remote, action)
+        if ok:
+            return jsonify({'success': True, 'target': 'fedhub', 'enabled': result['enabled'], 'running': result['running']})
         return jsonify({'success': False, 'error': result.get('error', 'unknown')}), 500
     # this_host
     try:
@@ -24639,6 +24788,10 @@ def _auto_update_guarddog():
                 continue
             if is_two_server and name in ('tak-db-watch.sh', 'tak-cotdb-watch.sh'):
                 continue
+            if name == 'tak-fedhub-watch.sh':
+                _au_fh_cfg = _get_fedhub_deployment_config(settings)
+                if not (_au_fh_cfg.get('deployed') and _au_fh_cfg.get('target_mode') == 'remote' and (_au_fh_cfg.get('remote', {}).get('host') or '').strip()):
+                    continue
             with open(src) as f:
                 content = f.read()
             content = (content
@@ -24651,6 +24804,12 @@ def _auto_update_guarddog():
                 content = content.replace('DB_PORT_PLACEHOLDER', db_port)
                 content = content.replace('SSH_KEY_PLACEHOLDER', ssh_key_path)
                 content = content.replace('SSH_USER_PLACEHOLDER', s1_user)
+            if name == 'tak-fedhub-watch.sh':
+                _fh_cfg = _get_fedhub_deployment_config(settings)
+                _fh_remote = _fh_cfg.get('remote', {})
+                content = content.replace('FEDHUB_HOST_PLACEHOLDER', (_fh_remote.get('host') or '').strip())
+                content = content.replace('SSH_KEY_PLACEHOLDER', (_fh_remote.get('ssh_key_path') or '').strip())
+                content = content.replace('SSH_USER_PLACEHOLDER', (_fh_remote.get('username') or 'root').strip())
             dest = os.path.join('/opt/tak-guarddog', name)
             try:
                 with open(dest) as f:
