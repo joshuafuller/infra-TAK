@@ -4841,6 +4841,27 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
         hostname_ok, hostname_out = _ssh_probe(remote, 'hostname', timeout=10)
         remote_hostname = (hostname_out or 'fedhub').strip() or 'fedhub'
 
+        # Patch cert-metadata.sh (same as TAK Server deploy does for /opt/tak/certs/cert-metadata.sh)
+        meta_subs = [
+            ('COUNTRY', settings.get('cert_country') or 'US'),
+            ('STATE', settings.get('cert_state') or 'State'),
+            ('CITY', settings.get('cert_city') or 'City'),
+            ('ORGANIZATION', settings.get('cert_org') or 'TAK'),
+            ('ORGANIZATIONAL_UNIT', settings.get('cert_ou') or 'FederationHub'),
+        ]
+        meta_cmds = f'cd {fh_dir}/certs && sudo cp cert-metadata.sh cert-metadata.sh.bak 2>/dev/null; true'
+        for var, val in meta_subs:
+            safe_val = shlex.quote(val)
+            meta_cmds += f" && sudo sed -i 's/^{var}=.*/{var}={safe_val}/' cert-metadata.sh"
+        if cert_pass and cert_pass != 'atakatak':
+            meta_cmds += f" && sudo sed -i 's/^CAPASS=.*/CAPASS={shlex.quote(cert_pass)}/' cert-metadata.sh"
+            meta_cmds += f" && sudo sed -i 's/^PASS=.*/PASS={shlex.quote(cert_pass)}/' cert-metadata.sh"
+        ok_meta, meta_out = _ssh_probe(remote, meta_cmds, timeout=30)
+        if not ok_meta:
+            plog(f'⚠ cert-metadata.sh patch warning: {meta_out}')
+        else:
+            plog(f'  cert-metadata.sh patched (COUNTRY={meta_subs[0][1]}, STATE={meta_subs[1][1]}, CITY={meta_subs[2][1]}, ORG={meta_subs[3][1]}, OU={meta_subs[4][1]})')
+
         cert_cmds = (
             f'cd {fh_dir}/certs && '
             f'if [ -f files/{shlex.quote(remote_hostname)}.jks ]; then echo "CERTS_EXIST"; exit 0; fi && '
