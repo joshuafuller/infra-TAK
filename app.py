@@ -787,7 +787,7 @@ def detect_modules():
     modules['cloudtak'] = {'name': 'CloudTAK', 'installed': cloudtak_installed, 'running': cloudtak_running,
         'description': 'Web-based TAK client — browser access to TAK', 'icon': '☁️', 'icon_data': CLOUDTAK_ICON, 'route': '/cloudtak', 'priority': 7}
     # Federation Hub (always a separate target host; Ubuntu .deb path first — see TAK.gov Federation Hub doc)
-    fh_cfg = _get_module_deployment_config(settings, 'fedhub_deployment')
+    fh_cfg = _get_fedhub_deployment_config(settings)
     fh_installed = False
     fh_running = False
     if fh_cfg.get('target_mode') == 'remote' and fh_cfg.get('deployed') and (fh_cfg.get('remote', {}).get('host') or '').strip():
@@ -4547,12 +4547,31 @@ def federation_hub_page():
     settings = load_settings()
     modules = detect_modules()
     fh = modules.get('fedhub', {})
-    fedhub_deploy_cfg = _get_module_deployment_config(settings, 'fedhub_deployment')
+    fedhub_deploy_cfg = _get_fedhub_deployment_config(settings)
     if (fedhub_deploy_cfg.get('target_mode') or 'local') != 'remote':
         fedhub_deploy_cfg = _normalize_module_deployment_config({
             **fedhub_deploy_cfg, 'target_mode': 'remote'})
+        fedhub_deploy_cfg = _get_fedhub_deployment_config({'fedhub_deployment': fedhub_deploy_cfg})
+    _fpkg_fn, fpkg_fp = _find_fedhub_deb_in_uploads()
+    fpkg_size = round(os.path.getsize(fpkg_fp) / (1024 * 1024), 1) if fpkg_fp else None
+    _fedhub_upgrade_done = fedhub_upgrade_status.get('complete', False)
+    if _fedhub_upgrade_done and not fedhub_upgrade_status.get('running'):
+        fedhub_upgrade_status.update({'complete': False})
+    _fqdn = (settings.get('fqdn') or '').strip()
+    _fedhub_host = _get_service_domain(settings, 'fedhub') if _fqdn else ''
+    _fedhub_public_url = f'https://{_fedhub_host}' if _fedhub_host else ''
     resp = make_response(render_template_string(FEDHUB_TEMPLATE,
-        settings=settings, fh=fh, fedhub_deploy_cfg=fedhub_deploy_cfg, version=VERSION))
+        settings=settings, fh=fh, fedhub_deploy_cfg=fedhub_deploy_cfg, version=VERSION,
+        fedhub_public_url=_fedhub_public_url,
+        fedhub_service_domain=_fedhub_host,
+        fedhub_pkg_filename=_fpkg_fn or '',
+        fedhub_pkg_size_mb=fpkg_size,
+        fedhub_deploying=fedhub_deploy_status.get('running', False),
+        fedhub_deploy_done=fedhub_deploy_status.get('complete', False),
+        fedhub_deploy_error=fedhub_deploy_status.get('error', False),
+        fedhub_upgrading=fedhub_upgrade_status.get('running', False),
+        fedhub_upgrade_done=_fedhub_upgrade_done,
+        fedhub_upgrade_error=fedhub_upgrade_status.get('error', False)))
     resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
     return resp
 
@@ -4561,7 +4580,7 @@ def federation_hub_page():
 @login_required
 def fedhub_mark_deployed_api():
     settings = load_settings()
-    cfg = _get_module_deployment_config(settings, 'fedhub_deployment')
+    cfg = _get_fedhub_deployment_config(settings)
     if cfg.get('target_mode') != 'remote' or not (cfg.get('remote', {}).get('host') or '').strip():
         return jsonify({'success': False, 'error': 'Set remote host and save SSH settings first.'}), 400
     ok, out = _ssh_probe(cfg['remote'], 'test -d /opt/tak/federation-hub && echo OK', timeout=20)
@@ -4574,6 +4593,7 @@ def fedhub_mark_deployed_api():
     cfg = {**cfg, 'deployed': True, 'target_mode': 'remote'}
     settings['fedhub_deployment'] = _normalize_module_deployment_config(cfg)
     save_settings(settings)
+    _caddy_regenerate_if_fqdn()
     return jsonify({'success': True})
 
 
@@ -4581,10 +4601,11 @@ def fedhub_mark_deployed_api():
 @login_required
 def fedhub_clear_registration_api():
     settings = load_settings()
-    cfg = _get_module_deployment_config(settings, 'fedhub_deployment')
+    cfg = _get_fedhub_deployment_config(settings)
     cfg = {**cfg, 'deployed': False}
     settings['fedhub_deployment'] = _normalize_module_deployment_config(cfg)
     save_settings(settings)
+    _caddy_regenerate_if_fqdn()
     return jsonify({'success': True})
 
 
@@ -4592,7 +4613,7 @@ def fedhub_clear_registration_api():
 @login_required
 def fedhub_status_api():
     settings = load_settings()
-    cfg = _get_module_deployment_config(settings, 'fedhub_deployment')
+    cfg = _get_fedhub_deployment_config(settings)
     if not cfg.get('deployed') or not (cfg.get('remote', {}).get('host') or '').strip():
         return jsonify({'registered': False})
     r = cfg.get('remote', {})
@@ -4613,7 +4634,7 @@ def fedhub_control_api():
     data = request.get_json() or {}
     action = (data.get('action') or '').strip().lower()
     settings = load_settings()
-    cfg = _get_module_deployment_config(settings, 'fedhub_deployment')
+    cfg = _get_fedhub_deployment_config(settings)
     if not cfg.get('deployed'):
         return jsonify({'success': False, 'error': 'Federation Hub is not registered for this console.'}), 400
     if cfg.get('target_mode') != 'remote':
@@ -4628,6 +4649,156 @@ def fedhub_control_api():
         return jsonify({'success': False, 'error': 'Unknown action'}), 400
     ok, out = _module_run(cfg, cmd, timeout=90)
     return jsonify({'success': ok, 'output': (out or '')[:800]})
+
+
+def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deploy'):
+    """SCP Federation Hub .deb from UPLOAD_DIR to remote, apt install, restart service; register console when successful."""
+    def plog(msg):
+        entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
+        log_list.append(entry)
+        print(entry, flush=True)
+    try:
+        plog(f'━━━ Federation Hub — {phase_label} ━━━')
+        settings = load_settings()
+        cfg = _get_fedhub_deployment_config(settings)
+        if cfg.get('target_mode') != 'remote' or not (cfg.get('remote', {}).get('host') or '').strip():
+            plog('✗ Remote host not configured — save the SSH target on this page first.')
+            status_dict.update({'running': False, 'complete': True, 'error': True})
+            return
+        remote = cfg['remote']
+        deb_fn, deb_path = _find_fedhub_deb_in_uploads()
+        if not deb_path:
+            plog('✗ No Federation Hub .deb in uploads. Upload takserver-fed-hub from TAK.gov here first.')
+            status_dict.update({'running': False, 'complete': True, 'error': True})
+            return
+        plog(f'Package: {deb_fn}')
+        plog('━━━ Apt lock cleanup on target ━━━')
+        _ok_u, out_u = _ssh_probe(remote, _fedhub_remote_apt_unlock_cmd(), timeout=90)
+        if out_u:
+            plog(out_u[:2000])
+        plog('━━━ SCP to /tmp/ ━━━')
+        ok_scp, scp_out = _scp_to_host(remote, deb_path, '/tmp/', timeout=300)
+        if not ok_scp:
+            plog(f'✗ SCP failed: {scp_out or "unknown"}')
+            status_dict.update({'running': False, 'complete': True, 'error': True})
+            return
+        plog('✓ Copied to target /tmp/')
+        fnq = shlex.quote(deb_fn)
+        install_cmd = (
+            f'cd /tmp && sudo apt-get update -qq && '
+            f'sudo DEBIAN_FRONTEND=noninteractive apt-get install -y {fnq}'
+        )
+        plog('━━━ apt-get install ━━━')
+        ok_inst, out_inst = _ssh_probe(remote, install_cmd, timeout=600)
+        if out_inst:
+            tail = out_inst[-4500:] if len(out_inst) > 4500 else out_inst
+            plog(tail)
+        if not ok_inst:
+            plog('⚠ apt-get returned non-zero — continuing to verify service…')
+        plog('━━━ systemd federation-hub ━━━')
+        _ssh_probe(remote, 'sudo systemctl daemon-reload', timeout=30)
+        _ssh_probe(remote, 'sudo systemctl enable federation-hub 2>/dev/null; true', timeout=30)
+        _ssh_probe(remote, 'sudo systemctl restart federation-hub 2>&1', timeout=90)
+        time.sleep(2)
+        ok_st, st_out = _ssh_probe(remote, 'systemctl is-active federation-hub 2>/dev/null', timeout=20)
+        st = (st_out or '').strip()
+        if st != 'active':
+            plog(f'✗ federation-hub not active after install (state: {st or "empty"})')
+            status_dict.update({'running': False, 'complete': True, 'error': True})
+            return
+        plog('✓ federation-hub is active')
+        ok_d, _dout = _ssh_probe(remote, 'test -d /opt/tak/federation-hub && echo OK', timeout=15)
+        if not (ok_d and 'OK' in (_dout or '')):
+            plog('⚠ /opt/tak/federation-hub not found — check package layout on target')
+        cfg2 = {**cfg, 'deployed': True, 'target_mode': 'remote'}
+        settings['fedhub_deployment'] = _normalize_module_deployment_config(cfg2)
+        save_settings(settings)
+        plog('✓ Console registration updated (deployed)')
+        plog('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
+        status_dict.update({'running': False, 'complete': True, 'error': False})
+        _caddy_regenerate_if_fqdn()
+    except Exception as e:
+        plog(f'✗ {e}')
+        status_dict.update({'running': False, 'complete': True, 'error': True})
+
+
+def run_fedhub_remote_deploy():
+    _fedhub_run_remote_package_install(fedhub_deploy_log, fedhub_deploy_status, phase_label='Deploy')
+
+
+def run_fedhub_remote_update():
+    _fedhub_run_remote_package_install(fedhub_upgrade_log, fedhub_upgrade_status, phase_label='Update')
+
+
+@app.route('/api/fedhub/deploy', methods=['POST'])
+@login_required
+def fedhub_deploy_api():
+    if fedhub_deploy_status.get('running'):
+        return jsonify({'error': 'Deployment already in progress'}), 409
+    if fedhub_upgrade_status.get('running'):
+        return jsonify({'error': 'An update is already in progress — wait for it to finish.'}), 409
+    data = request.get_json() or {}
+    if data.get('config'):
+        settings = load_settings()
+        base = _get_fedhub_deployment_config(settings)
+        inc = data.get('config') if isinstance(data.get('config'), dict) else {}
+        cfg = _normalize_module_deployment_config(_deep_merge_dict(base, inc))
+        settings['fedhub_deployment'] = cfg
+        save_settings(settings)
+        _caddy_regenerate_if_fqdn()
+    fedhub_deploy_log.clear()
+    fedhub_deploy_status.update({'running': True, 'complete': False, 'error': False})
+    threading.Thread(target=run_fedhub_remote_deploy, daemon=True).start()
+    return jsonify({'success': True})
+
+
+@app.route('/api/fedhub/deploy/log')
+@login_required
+def fedhub_deploy_log_api():
+    idx = request.args.get('index', 0, type=int)
+    return jsonify({
+        'entries': fedhub_deploy_log[idx:], 'total': len(fedhub_deploy_log),
+        'running': fedhub_deploy_status['running'], 'complete': fedhub_deploy_status['complete'],
+        'error': fedhub_deploy_status['error'],
+    })
+
+
+@app.route('/api/fedhub/update', methods=['POST'])
+@login_required
+def fedhub_update_api():
+    if fedhub_upgrade_status.get('running'):
+        return jsonify({'error': 'Update already in progress'}), 409
+    if fedhub_deploy_status.get('running'):
+        return jsonify({'error': 'A deploy is already in progress — wait for it to finish.'}), 409
+    settings = load_settings()
+    cfg = _get_fedhub_deployment_config(settings)
+    if not cfg.get('deployed'):
+        return jsonify({
+            'error': 'Federation Hub is not registered yet. Use Deploy to remote host first (or Confirm install if you installed manually).',
+        }), 400
+    data = request.get_json() or {}
+    if data.get('config'):
+        base = _get_fedhub_deployment_config(settings)
+        inc = data.get('config') if isinstance(data.get('config'), dict) else {}
+        cfg = _normalize_module_deployment_config(_deep_merge_dict(base, inc))
+        settings['fedhub_deployment'] = cfg
+        save_settings(settings)
+        _caddy_regenerate_if_fqdn()
+    fedhub_upgrade_log.clear()
+    fedhub_upgrade_status.update({'running': True, 'complete': False, 'error': False})
+    threading.Thread(target=run_fedhub_remote_update, daemon=True).start()
+    return jsonify({'success': True})
+
+
+@app.route('/api/fedhub/update/log')
+@login_required
+def fedhub_update_log_api():
+    idx = request.args.get('index', 0, type=int)
+    return jsonify({
+        'entries': fedhub_upgrade_log[idx:], 'total': len(fedhub_upgrade_log),
+        'running': fedhub_upgrade_status['running'], 'complete': fedhub_upgrade_status['complete'],
+        'error': fedhub_upgrade_status['error'],
+    })
 
 
 def _caddy_letsencrypt_days_left(settings):
@@ -4753,6 +4924,9 @@ def _caddy_configured_urls(settings, modules):
     mtx = modules.get('mediamtx', {})
     if mtx.get('installed'):
         urls.append({'name': 'MediaMTX', 'host': sd['mediamtx'], 'url': f'https://{sd["mediamtx"]}', 'desc': 'Stream web console & HLS'})
+    fedhub = modules.get('fedhub', {})
+    if fedhub.get('installed'):
+        urls.append({'name': 'Federation Hub', 'host': sd['fedhub'], 'url': f'https://{sd["fedhub"]}', 'desc': 'Hub web UI (TLS at Caddy; see TAK.gov for admin login)'})
     return urls
 
 @app.route('/caddy')
@@ -4959,6 +5133,7 @@ def caddy_get_domains():
         ('cloudtak_tiles', 'CloudTAK Tiles', 'cloudtak', modules.get('cloudtak', {}).get('installed', False)),
         ('cloudtak_video', 'CloudTAK Video', 'cloudtak', modules.get('cloudtak', {}).get('installed', False)),
         ('mediamtx', 'MediaMTX', 'mediamtx', modules.get('mediamtx', {}).get('installed', False)),
+        ('fedhub', 'Federation Hub', 'fedhub', modules.get('fedhub', {}).get('installed', False)),
     ]
     for key, label, mod_key, installed in svc_defs:
         setting_key = f'{key}_domain' if key != 'mediamtx' else 'mediamtx_domain'
@@ -5002,6 +5177,7 @@ SERVICE_DOMAIN_DEFAULTS = {
     'cloudtak_tiles': 'tiles.map',
     'cloudtak_video': 'video',
     'mediamtx': 'stream',
+    'fedhub': 'fedhub',
 }
 
 def _get_service_domain(settings, service_key):
@@ -5123,6 +5299,17 @@ def _get_module_deployment_config(settings, key):
     return _normalize_module_deployment_config(settings.get(key, {}))
 
 
+def _get_fedhub_deployment_config(settings):
+    """fedhub_deployment plus web_ui_port (HTTP port on the remote hub host for Caddy reverse_proxy)."""
+    c = _normalize_module_deployment_config(settings.get('fedhub_deployment', {}))
+    try:
+        p = int(c.get('web_ui_port') if c.get('web_ui_port') is not None else 8080)
+    except (TypeError, ValueError):
+        p = 8080
+    c['web_ui_port'] = max(1, min(65535, p))
+    return c
+
+
 def _module_deployment_settings_key(module_name):
     """Settings key for a module's deployment config. e.g. 'takportal' -> 'takportal_deployment'."""
     return f'{module_name}_deployment'
@@ -5169,7 +5356,7 @@ def _module_copy(deploy_cfg, local_path, remote_path, timeout=30, log_fn=None):
             return False, str(e)[:200]
 
 
-def _register_module_remote_routes(module_name, settings_key):
+def _register_module_remote_routes(module_name, settings_key, get_config_fn=None):
     """Register generic deployment-config, SSH key, and test routes for a module.
 
     Creates:
@@ -5178,32 +5365,51 @@ def _register_module_remote_routes(module_name, settings_key):
       POST /api/{module}/remote/ensure-ssh-key
       POST /api/{module}/remote/install-ssh-key
       POST /api/{module}/remote/test
+
+    get_config_fn: optional callable(settings) -> dict (e.g. _get_fedhub_deployment_config).
     """
     key_label = f'infra-tak-{module_name}-remote'
     default_key_path = os.path.expanduser(f'~/.ssh/infra-tak-{module_name}')
+
+    def _read_cfg(settings):
+        if get_config_fn:
+            return get_config_fn(settings)
+        return _get_module_deployment_config(settings, settings_key)
 
     @app.route(f'/api/{module_name}/deployment-config', methods=['GET'], endpoint=f'{module_name}_get_deploy_cfg')
     @login_required
     def get_cfg():
         settings = load_settings()
-        return jsonify(_get_module_deployment_config(settings, settings_key))
+        return jsonify(_read_cfg(settings))
 
     @app.route(f'/api/{module_name}/deployment-config', methods=['POST'], endpoint=f'{module_name}_save_deploy_cfg')
     @login_required
     def save_cfg():
         data = request.get_json() or {}
         settings = load_settings()
-        cfg = _normalize_module_deployment_config(data.get('config') or data)
+        base = _read_cfg(settings)
+        incoming = data.get('config') or data
+        if not isinstance(incoming, dict):
+            incoming = {}
+        cfg = _normalize_module_deployment_config(_deep_merge_dict(base, incoming))
         settings[settings_key] = cfg
         save_settings(settings)
-        return jsonify(cfg)
+        settings_after = load_settings()
+        out = _read_cfg(settings_after)
+        if module_name == 'fedhub' and (settings_after.get('fqdn') or '').strip():
+            try:
+                generate_caddyfile(settings_after)
+                threading.Thread(target=_caddy_restart_after_response, daemon=True).start()
+            except Exception:
+                pass
+        return jsonify(out)
 
     @app.route(f'/api/{module_name}/remote/ensure-ssh-key', methods=['POST'], endpoint=f'{module_name}_ensure_ssh_key')
     @login_required
     def ensure_key():
         data = request.get_json() or {}
         settings = load_settings()
-        cfg = _get_module_deployment_config(settings, settings_key)
+        cfg = _read_cfg(settings)
         if isinstance(data.get('config'), dict):
             cfg = _normalize_module_deployment_config(_deep_merge_dict(cfg, data['config']))
         rcfg = cfg.get('remote', {})
@@ -5234,7 +5440,7 @@ def _register_module_remote_routes(module_name, settings_key):
         settings[settings_key] = _normalize_module_deployment_config(cfg)
         save_settings(settings)
         return jsonify({'success': True, 'key_path': kp, 'public_key': pk, 'fingerprint': fp,
-                        'config': settings[settings_key]})
+                        'config': _read_cfg(load_settings())})
 
     @app.route(f'/api/{module_name}/remote/install-ssh-key', methods=['POST'], endpoint=f'{module_name}_install_ssh_key')
     @login_required
@@ -5244,7 +5450,7 @@ def _register_module_remote_routes(module_name, settings_key):
         if not pwd:
             return jsonify({'success': False, 'error': 'Password is required'}), 400
         settings = load_settings()
-        cfg = _get_module_deployment_config(settings, settings_key)
+        cfg = _read_cfg(settings)
         if isinstance(data.get('config'), dict):
             cfg = _normalize_module_deployment_config(_deep_merge_dict(cfg, data['config']))
         rcfg = cfg.get('remote', {})
@@ -5274,14 +5480,14 @@ def _register_module_remote_routes(module_name, settings_key):
         cfg['target_mode'] = 'remote'
         settings[settings_key] = _normalize_module_deployment_config(cfg)
         save_settings(settings)
-        return jsonify({'success': True, 'message': 'SSH key installed', 'config': settings[settings_key]})
+        return jsonify({'success': True, 'message': 'SSH key installed', 'config': _read_cfg(load_settings())})
 
     @app.route(f'/api/{module_name}/remote/test', methods=['POST'], endpoint=f'{module_name}_test_ssh')
     @login_required
     def test_ssh():
         data = request.get_json() or {}
         settings = load_settings()
-        cfg = _get_module_deployment_config(settings, settings_key)
+        cfg = _read_cfg(settings)
         if isinstance(data.get('config'), dict):
             cfg = _normalize_module_deployment_config(_deep_merge_dict(cfg, data['config']))
         rcfg = cfg.get('remote', {})
@@ -5297,7 +5503,7 @@ _register_module_remote_routes('takportal', 'takportal_deployment')
 _register_module_remote_routes('authentik', 'authentik_deployment')
 _register_module_remote_routes('mediamtx', 'mediamtx_deployment')
 _register_module_remote_routes('nodered', 'nodered_deployment')
-_register_module_remote_routes('fedhub', 'fedhub_deployment')
+_register_module_remote_routes('fedhub', 'fedhub_deployment', get_config_fn=_get_fedhub_deployment_config)
 
 
 def _get_cloudtak_upstreams(settings):
@@ -6201,6 +6407,52 @@ def _local_deb_control_fields(deb_path):
         return None, None
 
 
+def _validate_fedhub_deb_path(deb_path):
+    """True if .deb is the TAK Federation Hub package (dpkg-deb Package contains fed + hub)."""
+    pkg, _ver = _local_deb_control_fields(deb_path)
+    if not pkg:
+        return False, 'Could not read package name from .deb (dpkg-deb -f). Run upload from a Linux console host.'
+    pl = pkg.lower()
+    if 'fed' in pl and 'hub' in pl:
+        return True, None
+    return False, f'Wrong package: "{pkg}" — upload takserver-fed-hub .deb from TAK.gov'
+
+
+def _find_fedhub_deb_in_uploads():
+    """Newest valid Federation Hub .deb in UPLOAD_DIR. Returns (filename, full_path) or (None, None)."""
+    candidates = []
+    try:
+        names = os.listdir(UPLOAD_DIR)
+    except OSError:
+        return None, None
+    for fn in names:
+        if not fn.endswith('.deb'):
+            continue
+        fp = os.path.join(UPLOAD_DIR, fn)
+        if not os.path.isfile(fp):
+            continue
+        ok_m, _err = _validate_fedhub_deb_path(fp)
+        if ok_m:
+            candidates.append((fn, fp, os.path.getmtime(fp)))
+    if not candidates:
+        return None, None
+    candidates.sort(key=lambda x: x[2], reverse=True)
+    return candidates[0][0], candidates[0][1]
+
+
+def _fedhub_remote_apt_unlock_cmd():
+    """Same lock cleanup pattern as TAK Server One database deploy."""
+    return (
+        'sudo killall -q apt-get dpkg unattended-upgr 2>/dev/null; '
+        'for i in 1 2 3 4 5 6; do '
+        'fuser /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || break; '
+        'echo "Waiting for apt lock ($i)…"; sleep 5; done; '
+        'sudo rm -f /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock 2>/dev/null; '
+        'sudo dpkg --configure -a 2>/dev/null; '
+        'sudo apt-get -f install -y 2>/dev/null; true'
+    )
+
+
 def _assert_uploaded_db_deb_matches_server_one(s1_ref_cfg, local_deb_path, deb_filename):
     """
     Ensure uploaded takserver-database .deb Version matches installed package on current Server One.
@@ -6540,6 +6792,28 @@ def generate_caddyfile(settings=None):
         lines.append(f"}}")
         lines.append("")
 
+    fedhub = modules.get('fedhub', {})
+    if fedhub.get('installed'):
+        fhcfg = _get_fedhub_deployment_config(settings)
+        fh_remote = (fhcfg.get('remote', {}).get('host') or '').strip()
+        if fh_remote and fhcfg.get('target_mode') == 'remote':
+            fh_host = sd['fedhub']
+            fh_port = int(fhcfg.get('web_ui_port') or 8080)
+            fh_upstream = f'{fh_remote}:{fh_port}'
+            lines.append("# TAK Federation Hub — TLS terminates here; proxy to HTTP UI on the hub host (admin user/password per TAK.gov)")
+            lines.append(f"{fh_host} {{")
+            lines.append(f"    reverse_proxy {fh_upstream} {{")
+            lines.append(f"        header_up Host {{host}}")
+            lines.append(f"        header_up X-Forwarded-Proto https")
+            lines.append(f"        header_up X-Forwarded-Host {{host}}")
+            lines.append(f"        transport http {{")
+            lines.append(f"            read_timeout 120s")
+            lines.append(f"            write_timeout 120s")
+            lines.append(f"        }}")
+            lines.append(f"    }}")
+            lines.append(f"}}")
+            lines.append("")
+
     caddyfile = '\n'.join(lines)
     # Preserve user-added blocks (e.g. health.tntak.net for Uptime Robot) that sit below the marker.
     if os.path.exists(CADDYFILE_PATH):
@@ -6556,6 +6830,19 @@ def generate_caddyfile(settings=None):
     with open(CADDYFILE_PATH, 'w') as f:
         f.write(caddyfile)
     return caddyfile
+
+
+def _caddy_regenerate_if_fqdn():
+    """Rewrite Caddyfile and reload Caddy when a base FQDN is set (e.g. after Fed Hub register/deploy)."""
+    try:
+        s = load_settings()
+        if not (s.get('fqdn') or '').strip():
+            return
+        generate_caddyfile(s)
+        threading.Thread(target=_caddy_restart_after_response, daemon=True).start()
+    except Exception:
+        pass
+
 
 def wait_for_apt_lock(log_fn, log_list):
     """
@@ -8115,6 +8402,12 @@ def certs_page():
 # ── MediaMTX ──────────────────────────────────────────────────────────────────
 mediamtx_deploy_log = []
 mediamtx_deploy_status = {'running': False, 'complete': False, 'error': False}
+
+fedhub_deploy_log = []
+fedhub_deploy_status = {'running': False, 'complete': False, 'error': False}
+
+fedhub_upgrade_log = []
+fedhub_upgrade_status = {'running': False, 'complete': False, 'error': False}
 
 @app.route('/api/mediamtx/deploy', methods=['POST'])
 @login_required
@@ -13172,6 +13465,9 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 .info-item{background:#0a0e1a;border-radius:8px;padding:12px 14px}
 .info-label{font-size:11px;color:var(--text-dim);margin-bottom:3px;text-transform:uppercase;letter-spacing:.05em}
 .info-value{font-size:13px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;word-break:break-all}
+.upload-area{border:2px dashed var(--border);border-radius:10px;padding:22px;text-align:center;cursor:pointer;transition:all .2s;background:rgba(15,23,42,.25);margin-bottom:12px}
+.upload-area:hover,.upload-area.dragover{border-color:var(--accent);background:rgba(59,130,246,.08)}
+.log-box{background:#070a12;border:1px solid var(--border);border-radius:8px;padding:16px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:360px;overflow-y:auto;line-height:1.6;white-space:pre-wrap}
 </style></head>
 <body>
 {{ sidebar_html }}
@@ -13186,13 +13482,35 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   {% elif fh.installed %}
   <div class="status-banner stopped"><div class="dot"></div>Registered on {{ fedhub_deploy_cfg.remote.host }} — service not active (check target)</div>
   {% else %}
-  <div class="status-banner not-installed"><div class="dot"></div>Not registered — configure SSH to the Ubuntu target, install per TAK.gov, then confirm below</div>
+  <div class="status-banner not-installed"><div class="dot"></div>Not registered — upload the .deb, set SSH below, then <strong>Deploy to remote host</strong> (or confirm manually)</div>
   {% endif %}
 
   <div class="card">
     <div class="card-title">Documentation</div>
     <p style="font-size:13px;color:var(--text-secondary);line-height:1.55;margin-bottom:12px">Follow the <strong>Federation Hub</strong> section on TAK.gov for Ubuntu (.deb), Java, optional MongoDB, certificates, and <code style="font-size:12px">systemctl</code> service <code style="font-size:12px">federation-hub</code>.</p>
     <a href="https://tak.gov/documentation/resources/civ-documentation/tak-server-documentation/federation-hub" target="_blank" rel="noopener noreferrer" class="btn btn-primary" style="text-decoration:none">Open TAK.gov Federation Hub guide ↗</a>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Package upload &amp; remote install</div>
+    <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:14px">Same idea as <strong>split-mode</strong> TAK database deploy: upload <code style="font-size:12px">takserver-fed-hub</code> .deb on this console, then infra-TAK <strong>SCP</strong>s it to the target and runs <code style="font-size:12px">apt-get install</code> there.</p>
+    <div id="fedhub-upload-area" class="upload-area" onclick="var i=document.getElementById('fedhub-file-input');if(i){i.value='';i.click();}" ondrop="fedhubDrop(event)" ondragover="event.preventDefault();this.classList.add('dragover')" ondragleave="event.preventDefault();this.classList.remove('dragover')">
+      <div style="font-size:28px;margin-bottom:8px">📦</div>
+      <div style="font-size:14px;color:var(--text-secondary)">Drop .deb here or click to upload</div>
+      <div class="form-hint" style="margin-top:8px">Validation uses <code>dpkg-deb</code> on this host (Linux console recommended).</div>
+    </div>
+    <input type="file" id="fedhub-file-input" accept=".deb" style="display:none" onchange="fedhubFilePicked(this.files)">
+    <div id="fedhub-pkg-line" style="font-size:13px;color:var(--text-dim);margin-bottom:10px">{% if fedhub_pkg_filename %}Selected: <strong style="color:var(--text-primary)">{{ fedhub_pkg_filename }}</strong>{% if fedhub_pkg_size_mb is not none %} ({{ fedhub_pkg_size_mb }} MB){% endif %} <button type="button" class="btn btn-ghost" style="margin-left:8px;padding:6px 12px;font-size:12px" onclick="fedhubRemoveUpload()">Remove</button>{% else %}<span id="fedhub-pkg-empty">No package uploaded yet.</span>{% endif %}</div>
+    <div class="controls">
+      <button class="btn btn-primary" type="button" id="fedhub-deploy-btn" onclick="fedhubStartDeploy()">Deploy to remote host</button>
+    </div>
+    {% if fh.installed %}
+    <p class="form-hint" style="margin-top:12px">This host is already registered. Use <strong>Update Federation Hub</strong> (below) to push a newer official .deb; the button above is for re-deploy or another target after you clear registration.</p>
+    {% endif %}
+    <div id="fedhub-deploy-log-card" style="display:{% if fedhub_deploying or (fedhub_deploy_done and fedhub_deploy_error) %}block{% else %}none{% endif %};margin-top:18px;padding-top:18px;border-top:1px solid var(--border)">
+      <div class="card-title" style="margin-bottom:10px">Deploy log</div>
+      <div class="log-box" id="fedhub-deploy-log">{% if fedhub_deploying %}Starting…{% endif %}</div>
+    </div>
   </div>
 
   <div class="card">
@@ -13237,6 +13555,24 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     </div>
   </div>
 
+  <div class="card">
+    <div class="card-title">HTTPS access (Caddy on this console)</div>
+    <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:14px">Federation Hub is a <strong>separate web app</strong> on the remote host. This console’s <strong>Caddy</strong> can terminate TLS at <code style="font-size:12px">https://fedhub.&lt;your FQDN&gt;</code> and reverse-proxy to the hub’s HTTP port (same pattern as <code style="font-size:12px">stream.*</code> → MediaMTX).</p>
+    {% if settings.fqdn and fedhub_public_url %}
+    <p style="font-size:13px;margin-bottom:12px">When the module is registered and Caddy is deployed, open: <a href="{{ fedhub_public_url }}" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);font-family:'JetBrains Mono',monospace;font-size:12px">{{ fedhub_public_url }}</a></p>
+    <p class="form-hint" style="margin-bottom:14px">DNS: point <code style="font-size:11px">{{ fedhub_service_domain }}</code> (A/AAAA) to this <strong>console</strong> public IP — same as <code style="font-size:11px">infratak.*</code> / other subdomains — not the private Fed Hub IP.</p>
+    {% else %}
+    <p class="form-hint" style="margin-bottom:14px">Set the base <strong>FQDN</strong> in Console settings and run <strong>Caddy SSL</strong> deploy so subdomains get certificates. Then add DNS for <code style="font-size:11px">fedhub.&lt;FQDN&gt;</code> to this server.</p>
+    {% endif %}
+    <div class="form-group">
+      <label class="form-label">Hub web UI port (on remote host, HTTP)</label>
+      <input id="fedhub-web-ui-port" class="form-input" type="number" min="1" max="65535" value="{{ fedhub_deploy_cfg.web_ui_port }}">
+      <div class="form-hint">Must match the hub process on the target (check TAK.gov Federation Hub docs and <code style="font-size:11px">/opt/tak/federation-hub</code> config — often Spring Boot <code style="font-size:11px">server.port</code>, commonly <strong>8080</strong>). The hub must listen on an IP reachable from <strong>this console</strong> (not only <code style="font-size:11px">127.0.0.1</code>). Caddy proxies to <code style="font-size:11px">SSH host:port</code>.</div>
+    </div>
+    <p style="font-size:12px;color:var(--text-secondary);line-height:1.5;margin-bottom:10px"><strong>Hub login (username / password):</strong> configured on the Federation Hub itself during official setup (wizard / security configuration). infra-TAK does <em>not</em> store Hub credentials — only this console’s login. See the <a href="https://tak.gov/documentation/resources/civ-documentation/tak-server-documentation/federation-hub" target="_blank" rel="noopener noreferrer" style="color:var(--cyan)">TAK.gov Federation Hub documentation</a>.</p>
+    <div class="form-hint" style="margin-bottom:8px">Saving the SSH target (or port) below updates settings and regenerates the Caddyfile when a base FQDN is set.</div>
+  </div>
+
   {% if fh.installed %}
   <div class="card">
     <div class="card-title">Controls (remote)</div>
@@ -13250,6 +13586,33 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
       <div class="info-item"><div class="info-label">Install dir</div><div class="info-value" id="fedhub-dir-state">—</div></div>
     </div>
   </div>
+
+  <div class="card" style="padding:0;overflow:hidden">
+    <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;padding:16px 24px;cursor:pointer" onclick="fedhubToggleUpdate()" id="fedhub-update-header">
+      <div style="min-width:0">
+        <div class="card-title" style="margin-bottom:4px">Update Federation Hub</div>
+        <p class="form-hint" style="margin:0;line-height:1.45">Upload a newer <code style="font-size:11px">takserver-fed-hub</code> .deb and push it to the same remote host (same pattern as <strong>Update TAK Server</strong>).</p>
+      </div>
+      <span id="fedhub-update-toggle-icon" style="font-size:18px;color:var(--text-dim);transition:transform 0.2s ease;flex-shrink:0{% if fedhub_upgrading or fedhub_upgrade_done or fedhub_upgrade_error %};transform:rotate(180deg){% endif %}">&#9662;</span>
+    </div>
+    <div id="fedhub-update-body" style="display:{% if fedhub_upgrading or fedhub_upgrade_done or fedhub_upgrade_error %}block{% else %}none{% endif %};padding:0 24px 24px;border-top:1px solid var(--border)">
+      <div id="fedhub-upgrade-upload-area" class="upload-area" style="margin-top:16px" onclick="var i=document.getElementById('fedhub-upgrade-file-input');if(i){i.value='';i.click();}" ondrop="fedhubDropUpgrade(event)" ondragover="event.preventDefault();this.classList.add('dragover')" ondragleave="event.preventDefault();this.classList.remove('dragover')">
+        <div style="font-size:22px;margin-bottom:6px">⬆</div>
+        <div style="font-size:13px;color:var(--text-secondary)">Drop replacement .deb here or click (same upload store as above)</div>
+      </div>
+      <input type="file" id="fedhub-upgrade-file-input" accept=".deb" style="display:none" onchange="fedhubUpgradeFilePicked(this.files)">
+      <div id="fedhub-upgrade-pkg-line" style="font-size:13px;color:var(--text-dim);margin-bottom:12px">{% if fedhub_pkg_filename %}Selected: <strong style="color:var(--text-primary)">{{ fedhub_pkg_filename }}</strong>{% if fedhub_pkg_size_mb is not none %} ({{ fedhub_pkg_size_mb }} MB){% endif %} <button type="button" class="btn btn-ghost" style="margin-left:8px;padding:6px 12px;font-size:12px" onclick="fedhubRemoveUpload()">Remove</button>{% else %}<span>No package uploaded yet.</span>{% endif %}</div>
+      <div class="controls" style="align-items:center;flex-wrap:wrap;gap:12px">
+        <button type="button" id="fedhub-update-btn" class="btn btn-primary" onclick="fedhubStartUpdate()">Update Federation Hub</button>
+        <span id="fedhub-update-msg" class="form-hint" style="margin:0"></span>
+      </div>
+      <div id="fedhub-upgrade-log-wrap" style="display:{% if fedhub_upgrading or fedhub_upgrade_done or fedhub_upgrade_error %}block{% else %}none{% endif %};margin-top:18px">
+        <div class="card-title" style="margin-bottom:8px">Update log</div>
+        <div class="log-box" id="fedhub-upgrade-log">{% if fedhub_upgrading %}Connecting…{% elif fedhub_upgrade_done %}Done.{% elif fedhub_upgrade_error %}Update failed.{% endif %}</div>
+      </div>
+    </div>
+  </div>
+
   <div class="card">
     <div class="card-title">Console registration</div>
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Remove this module from the sidebar and Marketplace &quot;installed&quot; state without touching packages on the target.</p>
@@ -13258,22 +13621,179 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   </div>
   {% else %}
   <div class="card">
-    <div class="card-title">Register after install</div>
-    <p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:14px">When the Ubuntu host has <code style="font-size:12px">/opt/tak/federation-hub</code> (from the official .deb) and you can SSH from this console, click below to add Federation Hub to the sidebar.</p>
+    <div class="card-title">Register without automated install</div>
+    <p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:14px">If you installed the .deb manually on the Ubuntu host and <code style="font-size:12px">/opt/tak/federation-hub</code> exists, you can register the module without re-running deploy.</p>
     <button class="btn btn-primary" type="button" onclick="fedhubMarkDeployed()">Confirm install on target</button>
     <div id="fedhub-mark-msg" style="margin-top:12px;font-size:13px;color:var(--text-dim)"></div>
   </div>
   {% endif %}
 </div>
 <script>
+var fedhubLogIndex=0,fedhubLogInterval=null;
+var fedhubUpgradeLogIndex=0,fedhubUpgradeLogInterval=null;
+function fedhubDrop(ev){ev.preventDefault();var z=document.getElementById('fedhub-upload-area');if(z)z.classList.remove('dragover');if(ev.dataTransfer&&ev.dataTransfer.files&&ev.dataTransfer.files.length)fedhubDoUpload(ev.dataTransfer.files);}
+function fedhubDropUpgrade(ev){ev.preventDefault();var z=document.getElementById('fedhub-upgrade-upload-area');if(z)z.classList.remove('dragover');if(ev.dataTransfer&&ev.dataTransfer.files&&ev.dataTransfer.files.length)fedhubDoUpload(ev.dataTransfer.files);}
+function fedhubFilePicked(files){if(files&&files.length)fedhubDoUpload(files);}
+function fedhubUpgradeFilePicked(files){if(files&&files.length)fedhubDoUpload(files);}
+function fedhubDoUpload(fileList){
+  var fd=new FormData();
+  for(var i=0;i<fileList.length;i++)fd.append('files',fileList[i]);
+  var ua=document.getElementById('fedhub-upload-area');
+  var ua2=document.getElementById('fedhub-upgrade-upload-area');
+  if(ua)ua.style.opacity='0.6';
+  if(ua2)ua2.style.opacity='0.6';
+  fetch('/api/upload/fedhub',{method:'POST',body:fd,credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    if(ua)ua.style.opacity='1';
+    if(ua2)ua2.style.opacity='1';
+    if(!d||!d.success){alert((d&&d.error)||'Upload failed');return;}
+    var p=d.packages&&d.packages[0];
+    if(p)fedhubSetPkgLine(p.filename,p.size_mb);
+    else location.reload();
+  }).catch(function(){if(ua)ua.style.opacity='1';if(ua2)ua2.style.opacity='1';alert('Upload failed');});
+}
+function fedhubPkgLineHtml(fn,szMb){
+  var esc=String(fn).replace(/</g,'&lt;');
+  return 'Selected: <strong style="color:var(--text-primary)">'+esc+'</strong>'+(szMb!=null?' ('+szMb+' MB)':'')+' <button type="button" class="btn btn-ghost" style="margin-left:8px;padding:6px 12px;font-size:12px" onclick="fedhubRemoveUpload()">Remove</button>';
+}
+function fedhubSetPkgLine(fn,szMb){
+  var el=document.getElementById('fedhub-pkg-line');
+  var el2=document.getElementById('fedhub-upgrade-pkg-line');
+  if(el)el.innerHTML=fn?fedhubPkgLineHtml(fn,szMb):'<span id="fedhub-pkg-empty">No package uploaded yet.</span>';
+  if(el2)el2.innerHTML=fn?fedhubPkgLineHtml(fn,szMb):'<span>No package uploaded yet.</span>';
+}
+function fedhubRemoveUpload(){
+  fetch('/api/upload/fedhub/package',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    if(!d||!d.filename){fedhubSetPkgLine(null,null);return;}
+    fetch('/api/upload/fedhub/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:d.filename}),credentials:'same-origin'})
+      .then(function(r){return r.json();}).then(function(x){
+        if(x&&x.success)fedhubSetPkgLine(null,null);
+        else alert((x&&x.error)||'Remove failed');
+      });
+  }).catch(function(){alert('Remove failed');});
+}
+function fedhubStartDeploy(){
+  var host=(document.getElementById('fedhub-remote-host')||{}).value||'';
+  if(!host.trim()){alert('Set remote host first');return;}
+  var btn=document.getElementById('fedhub-deploy-btn');
+  fetch('/api/upload/fedhub/package',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    if(!d||!d.filename){alert('Upload the Federation Hub .deb first');return;}
+    if(btn)btn.disabled=true;
+    var lc=document.getElementById('fedhub-deploy-log-card');var lg=document.getElementById('fedhub-deploy-log');
+    if(lc)lc.style.display='block';if(lg)lg.textContent='Starting deployment...';
+    fedhubLogIndex=0;if(fedhubLogInterval){clearInterval(fedhubLogInterval);fedhubLogInterval=null;}
+    fetch('/api/fedhub/deploy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:collectFedhubDeployConfig()}),credentials:'same-origin'})
+      .then(function(r){return r.json();}).then(function(res){
+        if(res&&res.error){
+          if(lg)lg.textContent='Error: '+res.error;
+          if(btn)btn.disabled=false;
+          return;
+        }
+        fedhubPollLog();
+      }).catch(function(e){if(lg)lg.textContent='Request failed';if(btn)btn.disabled=false;});
+  });
+}
+function fedhubPollLog(){
+  fedhubLogInterval=setInterval(function(){
+    fetch('/api/fedhub/deploy/log?index='+fedhubLogIndex,{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+      var box=document.getElementById('fedhub-deploy-log');
+      if(d.entries&&d.entries.length){
+        if(fedhubLogIndex===0&&box)box.textContent='';
+        if(box)box.textContent+=d.entries.join(String.fromCharCode(10))+String.fromCharCode(10);
+        if(box)box.scrollTop=box.scrollHeight;
+        fedhubLogIndex+=d.entries.length;
+      }
+      if(!d.running){
+        clearInterval(fedhubLogInterval);fedhubLogInterval=null;
+        var btn=document.getElementById('fedhub-deploy-btn');
+        if(d.complete&&!d.error){
+          if(btn){btn.textContent='Done — reloading';btn.style.background='var(--green)';}
+          location.reload();
+        }else if(d.error){
+          if(btn){btn.disabled=false;btn.textContent='Retry deploy';}
+        }else if(btn){btn.disabled=false;}
+      }
+    });
+  },800);
+}
+function fedhubResumeErrorLog(){
+  fetch('/api/fedhub/deploy/log?index=0',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    var box=document.getElementById('fedhub-deploy-log');
+    if(box&&d.entries&&d.entries.length)box.textContent=d.entries.join(String.fromCharCode(10));
+    if(box)box.scrollTop=box.scrollHeight;
+    fedhubLogIndex=d.total||0;
+  });
+}
+function fedhubToggleUpdate(){
+  var body=document.getElementById('fedhub-update-body');
+  var icon=document.getElementById('fedhub-update-toggle-icon');
+  if(!body)return;
+  var isHidden=body.style.display==='none'||body.style.display==='';
+  body.style.display=isHidden?'block':'none';
+  if(icon)icon.style.transform=isHidden?'rotate(180deg)':'';
+}
+function fedhubStartUpdate(){
+  var host=(document.getElementById('fedhub-remote-host')||{}).value||'';
+  if(!host.trim()){alert('Set remote host first');return;}
+  var btn=document.getElementById('fedhub-update-btn');
+  var msg=document.getElementById('fedhub-update-msg');
+  fetch('/api/upload/fedhub/package',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    if(!d||!d.filename){alert('Upload the new Federation Hub .deb first');return;}
+    if(btn)btn.disabled=true;
+    if(msg){msg.textContent='';msg.style.color='var(--text-dim)';}
+    var wrap=document.getElementById('fedhub-upgrade-log-wrap');
+    var lg=document.getElementById('fedhub-upgrade-log');
+    if(wrap)wrap.style.display='block';
+    if(lg)lg.textContent='Starting update...';
+    fedhubUpgradeLogIndex=0;
+    if(fedhubUpgradeLogInterval){clearInterval(fedhubUpgradeLogInterval);fedhubUpgradeLogInterval=null;}
+    fetch('/api/fedhub/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:collectFedhubDeployConfig()}),credentials:'same-origin'})
+      .then(function(r){return r.json();}).then(function(res){
+        if(res&&res.error){
+          if(lg)lg.textContent='Error: '+res.error;
+          if(btn)btn.disabled=false;
+          if(msg){msg.textContent=res.error;msg.style.color='var(--red)';}
+          return;
+        }
+        fedhubPollUpgradeLog();
+      }).catch(function(e){if(lg)lg.textContent='Request failed';if(btn)btn.disabled=false;});
+  });
+}
+function fedhubPollUpgradeLog(){
+  fedhubUpgradeLogInterval=setInterval(function(){
+    fetch('/api/fedhub/update/log?index='+fedhubUpgradeLogIndex,{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+      var box=document.getElementById('fedhub-upgrade-log');
+      if(d.entries&&d.entries.length){
+        if(fedhubUpgradeLogIndex===0&&box)box.textContent='';
+        if(box)box.textContent+=d.entries.join(String.fromCharCode(10))+String.fromCharCode(10);
+        if(box)box.scrollTop=box.scrollHeight;
+        fedhubUpgradeLogIndex=d.total||0;
+      }
+      if(!d.running){
+        clearInterval(fedhubUpgradeLogInterval);fedhubUpgradeLogInterval=null;
+        var btn=document.getElementById('fedhub-update-btn');
+        var msg=document.getElementById('fedhub-update-msg');
+        if(d.complete&&!d.error){
+          if(btn){btn.textContent='Update complete';btn.style.background='var(--green)';}
+          if(msg){msg.textContent='Done. Refreshing...';msg.style.color='var(--green)';}
+          setTimeout(function(){location.reload();},1200);
+        }else if(d.error){
+          if(btn){btn.disabled=false;btn.textContent='Retry update';}
+          if(msg){msg.textContent='Update failed';msg.style.color='var(--red)';}
+        }else if(btn){btn.disabled=false;}
+      }
+    });
+  },800);
+}
 function collectFedhubDeployConfig(){
   var host=(document.getElementById('fedhub-remote-host')||{}).value||'';
   var user=(document.getElementById('fedhub-remote-user')||{}).value||'root';
   var key=(document.getElementById('fedhub-remote-key')||{}).value||'';
   var portVal=(document.getElementById('fedhub-remote-port')||{}).value||'22';
   var p=parseInt(portVal,10);
+  var wup=(document.getElementById('fedhub-web-ui-port')||{}).value;
+  var wp=parseInt(wup,10);
   var dep=document.getElementById('fedhub-deployed-flag');
-  return{target_mode:'remote',deployed:dep&&dep.value==='1',remote:{host:host.trim(),ssh_user:(user||'root').trim(),ssh_port:isNaN(p)?22:p,ssh_key_path:key.trim()}};
+  return{target_mode:'remote',deployed:dep&&dep.value==='1',web_ui_port:isNaN(wp)?8080:wp,remote:{host:host.trim(),ssh_user:(user||'root').trim(),ssh_port:isNaN(p)?22:p,ssh_key_path:key.trim()}};
 }
 function _fedhubSshMsg(msg,err,ok){
   var el=document.getElementById('fedhub-ssh-status');
@@ -13355,6 +13875,25 @@ function fedhubRefreshStatus(){
 }
 document.addEventListener('DOMContentLoaded',function(){
   if(document.getElementById('fedhub-svc-state'))fedhubRefreshStatus();
+  {% if fedhub_deploying %}
+  fedhubLogIndex=0;
+  fedhubPollLog();
+  {% elif fedhub_deploy_done and fedhub_deploy_error %}
+  fedhubResumeErrorLog();
+  {% endif %}
+  {% if fedhub_upgrading %}
+  fedhubUpgradeLogIndex=0;
+  var uw=document.getElementById('fedhub-upgrade-log-wrap');
+  if(uw)uw.style.display='block';
+  fedhubPollUpgradeLog();
+  {% elif fedhub_upgrade_done or fedhub_upgrade_error %}
+  fetch('/api/fedhub/update/log?index=0',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    var box=document.getElementById('fedhub-upgrade-log');
+    if(box&&d.entries&&d.entries.length)box.textContent=d.entries.join(String.fromCharCode(10));
+    if(box)box.scrollTop=box.scrollHeight;
+    fedhubUpgradeLogIndex=d.total||0;
+  });
+  {% endif %}
 });
 </script>
 </body></html>
@@ -20866,6 +21405,61 @@ def check_existing_uploads():
         elif fn.endswith('.pol') or 'policy' in fn.lower():
             files['policy'] = {'filename': fn, 'filepath': fp, 'size_mb': sz_mb}
     return jsonify(files)
+
+
+@app.route('/api/upload/fedhub', methods=['POST'])
+@login_required
+def upload_fedhub_package():
+    if 'files' not in request.files:
+        return jsonify({'error': 'No files uploaded'}), 400
+    files = request.files.getlist('files')
+    if not files or all((f.filename or '') == '' for f in files):
+        return jsonify({'error': 'No files selected'}), 400
+    results = []
+    for f in files:
+        raw_name = f.filename or ''
+        fn = secure_filename(raw_name)
+        if not fn:
+            return jsonify({'error': f'Invalid filename: {raw_name[:64]}'}), 400
+        if not fn.endswith('.deb'):
+            return jsonify({'error': 'Federation Hub upload must be a .deb file'}), 400
+        fp = os.path.join(UPLOAD_DIR, fn)
+        f.save(fp)
+        ok_m, err = _validate_fedhub_deb_path(fp)
+        if not ok_m:
+            try:
+                os.remove(fp)
+            except OSError:
+                pass
+            return jsonify({'error': err}), 400
+        sz = round(os.path.getsize(fp) / (1024 * 1024), 1)
+        results.append({'filename': fn, 'size_mb': sz})
+    return jsonify({'success': True, 'packages': results})
+
+
+@app.route('/api/upload/fedhub/delete', methods=['POST'])
+@login_required
+def delete_fedhub_upload():
+    fn = (request.json or {}).get('filename', '')
+    if not fn or not re.match(r'^[a-zA-Z0-9._-]+$', fn):
+        return jsonify({'error': 'Invalid filename'}), 400
+    fp = os.path.join(UPLOAD_DIR, fn)
+    if os.path.isfile(fp):
+        ok_m, _ = _validate_fedhub_deb_path(fp)
+        if not ok_m:
+            return jsonify({'error': 'File is not a recognized Federation Hub package'}), 400
+        os.remove(fp)
+        return jsonify({'success': True, 'filename': fn})
+    return jsonify({'error': 'File not found'}), 404
+
+
+@app.route('/api/upload/fedhub/package')
+@login_required
+def fedhub_uploaded_package_info():
+    fn, fp = _find_fedhub_deb_in_uploads()
+    if not fp:
+        return jsonify({'filename': None})
+    return jsonify({'filename': fn, 'size_mb': round(os.path.getsize(fp) / (1024 * 1024), 1)})
 
 # === TAK Server Deployment ===
 
