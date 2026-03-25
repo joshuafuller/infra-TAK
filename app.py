@@ -786,6 +786,16 @@ def detect_modules():
             cloudtak_installed = True  # container up but dir missing (e.g. different user) — show as installed so card is accurate
     modules['cloudtak'] = {'name': 'CloudTAK', 'installed': cloudtak_installed, 'running': cloudtak_running,
         'description': 'Web-based TAK client — browser access to TAK', 'icon': '☁️', 'icon_data': CLOUDTAK_ICON, 'route': '/cloudtak', 'priority': 7}
+    # Federation Hub (always a separate target host; Ubuntu .deb path first — see TAK.gov Federation Hub doc)
+    fh_cfg = _get_module_deployment_config(settings, 'fedhub_deployment')
+    fh_installed = False
+    fh_running = False
+    if fh_cfg.get('target_mode') == 'remote' and fh_cfg.get('deployed') and (fh_cfg.get('remote', {}).get('host') or '').strip():
+        fh_installed = True
+        ok_fh, out_fh = _ssh_probe(fh_cfg.get('remote', {}), 'systemctl is-active federation-hub 2>/dev/null', timeout=12)
+        fh_running = bool(ok_fh and out_fh and out_fh.strip() == 'active')
+    modules['fedhub'] = {'name': 'Federation Hub', 'installed': fh_installed, 'running': fh_running,
+        'description': 'TAK Federation Hub on a dedicated Ubuntu host (SSH)', 'icon': '🌐', 'route': '/federation-hub', 'priority': 8}
     # Email Relay (Postfix)
     email_installed = subprocess.run(['which', 'postfix'], capture_output=True).returncode == 0
     email_running = False
@@ -793,7 +803,7 @@ def detect_modules():
         r = subprocess.run(['systemctl', 'is-active', 'postfix'], capture_output=True, text=True)
         email_running = r.stdout.strip() == 'active'
     modules['emailrelay'] = {'name': 'Email Relay', 'installed': email_installed, 'running': email_running,
-        'description': 'Postfix relay — notifications for TAK Portal & MediaMTX', 'icon': '📧', 'route': '/emailrelay', 'priority': 8}
+        'description': 'Postfix relay — notifications for TAK Portal & MediaMTX', 'icon': '📧', 'route': '/emailrelay', 'priority': 9}
     return dict(sorted(modules.items(), key=lambda x: x[1].get('priority', 99)))
 
 def render_sidebar(modules, active_path, takwerx_logo_url=None):
@@ -828,6 +838,9 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
     cloudtak = modules.get('cloudtak', {})
     if cloudtak.get('installed'):
         parts.append(link('/cloudtak', f'<img src="{html.escape(CLOUDTAK_ICON)}" alt="" class="nav-icon" style="height:24px;width:auto;max-width:72px;object-fit:contain;display:block"><span>CloudTAK</span>'))
+    fedhub = modules.get('fedhub', {})
+    if fedhub.get('installed'):
+        parts.append(link('/federation-hub', '<span class="nav-icon material-symbols-outlined" style="font-size:22px">hub</span><span>Federation Hub</span>', 'Federation Hub'))
     mtx = modules.get('mediamtx', {})
     if mtx.get('installed'):
         parts.append(link('/mediamtx', f'<img src="{html.escape(MEDIAMTX_LOGO_URL)}" alt="MediaMTX" class="nav-icon" style="height:48px;width:auto;max-width:100px;object-fit:contain;display:block">', 'MediaMTX'))
@@ -4525,6 +4538,98 @@ def cloudtak_page():
 def cloudtak_page_js():
     return app.response_class(CLOUDTAK_PAGE_JS, mimetype='application/javascript')
 
+
+@app.route('/federation-hub')
+@login_required
+def federation_hub_page():
+    """Federation Hub module — Ubuntu .deb on a dedicated remote host (SSH). Install steps: TAK.gov Federation Hub doc."""
+    from flask import make_response
+    settings = load_settings()
+    modules = detect_modules()
+    fh = modules.get('fedhub', {})
+    fedhub_deploy_cfg = _get_module_deployment_config(settings, 'fedhub_deployment')
+    if (fedhub_deploy_cfg.get('target_mode') or 'local') != 'remote':
+        fedhub_deploy_cfg = _normalize_module_deployment_config({
+            **fedhub_deploy_cfg, 'target_mode': 'remote'})
+    resp = make_response(render_template_string(FEDHUB_TEMPLATE,
+        settings=settings, fh=fh, fedhub_deploy_cfg=fedhub_deploy_cfg, version=VERSION))
+    resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
+    return resp
+
+
+@app.route('/api/fedhub/mark-deployed', methods=['POST'])
+@login_required
+def fedhub_mark_deployed_api():
+    settings = load_settings()
+    cfg = _get_module_deployment_config(settings, 'fedhub_deployment')
+    if cfg.get('target_mode') != 'remote' or not (cfg.get('remote', {}).get('host') or '').strip():
+        return jsonify({'success': False, 'error': 'Set remote host and save SSH settings first.'}), 400
+    ok, out = _ssh_probe(cfg['remote'], 'test -d /opt/tak/federation-hub && echo OK', timeout=20)
+    if not ok or 'OK' not in (out or ''):
+        return jsonify({
+            'success': False,
+            'error': 'Could not find /opt/tak/federation-hub on the target. Install the Federation Hub .deb on Ubuntu per TAK.gov first.',
+            'detail': (out or '')[:400],
+        }), 400
+    cfg = {**cfg, 'deployed': True, 'target_mode': 'remote'}
+    settings['fedhub_deployment'] = _normalize_module_deployment_config(cfg)
+    save_settings(settings)
+    return jsonify({'success': True})
+
+
+@app.route('/api/fedhub/clear-registration', methods=['POST'])
+@login_required
+def fedhub_clear_registration_api():
+    settings = load_settings()
+    cfg = _get_module_deployment_config(settings, 'fedhub_deployment')
+    cfg = {**cfg, 'deployed': False}
+    settings['fedhub_deployment'] = _normalize_module_deployment_config(cfg)
+    save_settings(settings)
+    return jsonify({'success': True})
+
+
+@app.route('/api/fedhub/status', methods=['GET'])
+@login_required
+def fedhub_status_api():
+    settings = load_settings()
+    cfg = _get_module_deployment_config(settings, 'fedhub_deployment')
+    if not cfg.get('deployed') or not (cfg.get('remote', {}).get('host') or '').strip():
+        return jsonify({'registered': False})
+    r = cfg.get('remote', {})
+    ok_d, out_d = _ssh_probe(r, 'test -d /opt/tak/federation-hub && echo OK', timeout=15)
+    ok_s, out_s = _ssh_probe(r, 'systemctl is-active federation-hub 2>/dev/null', timeout=15)
+    st = (out_s or '').strip()
+    return jsonify({
+        'registered': True,
+        'dir_ok': bool(ok_d and 'OK' in (out_d or '')),
+        'service_active': st == 'active',
+        'service_state': st or 'unknown',
+    })
+
+
+@app.route('/api/fedhub/control', methods=['POST'])
+@login_required
+def fedhub_control_api():
+    data = request.get_json() or {}
+    action = (data.get('action') or '').strip().lower()
+    settings = load_settings()
+    cfg = _get_module_deployment_config(settings, 'fedhub_deployment')
+    if not cfg.get('deployed'):
+        return jsonify({'success': False, 'error': 'Federation Hub is not registered for this console.'}), 400
+    if cfg.get('target_mode') != 'remote':
+        return jsonify({'success': False, 'error': 'Remote target only.'}), 400
+    if action == 'restart':
+        cmd = 'sudo systemctl restart federation-hub'
+    elif action == 'start':
+        cmd = 'sudo systemctl start federation-hub'
+    elif action == 'stop':
+        cmd = 'sudo systemctl stop federation-hub'
+    else:
+        return jsonify({'success': False, 'error': 'Unknown action'}), 400
+    ok, out = _module_run(cfg, cmd, timeout=90)
+    return jsonify({'success': ok, 'output': (out or '')[:800]})
+
+
 def _caddy_letsencrypt_days_left(settings):
     """Return days until Let's Encrypt cert expires (for primary FQDN), or None if unavailable."""
     fqdn = (settings.get('fqdn') or '').strip().split(':')[0]
@@ -5192,6 +5297,7 @@ _register_module_remote_routes('takportal', 'takportal_deployment')
 _register_module_remote_routes('authentik', 'authentik_deployment')
 _register_module_remote_routes('mediamtx', 'mediamtx_deployment')
 _register_module_remote_routes('nodered', 'nodered_deployment')
+_register_module_remote_routes('fedhub', 'fedhub_deployment')
 
 
 def _get_cloudtak_upstreams(settings):
@@ -13013,6 +13119,244 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <div class="card" id="gd-log-card" style="display:none"><div class="card-title">Deploy log</div><div class="log-box" id="gd-deploy-log">Initializing...</div></div>
 </div>
 <script src="/guarddog.js?v={{ version }}"></script>
+</body></html>
+'''
+
+
+FEDHUB_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Federation Hub — infra-TAK</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet">
+<style>
+:root{--bg-deep:#080b14;--bg-surface:#0f1219;--bg-card:#161b26;--border:#1e2736;--border-hover:#2a3548;--text-primary:#f1f5f9;--text-secondary:#cbd5e1;--text-dim:#94a3b8;--accent:#3b82f6;--cyan:#06b6d4;--green:#10b981;--red:#ef4444;--yellow:#eab308}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',sans-serif;min-height:100vh;display:flex;flex-direction:row}
+.sidebar{width:220px;min-width:220px;background:var(--bg-surface);border-right:1px solid var(--border);padding:24px 0;display:flex;flex-direction:column;flex-shrink:0}
+.material-symbols-outlined{font-family:'Material Symbols Outlined';font-weight:400;font-style:normal;font-size:20px;line-height:1;letter-spacing:normal;white-space:nowrap;direction:ltr;-webkit-font-smoothing:antialiased}
+.nav-icon.material-symbols-outlined{font-size:22px;width:22px;text-align:center}
+.sidebar-logo{padding:0 20px 24px;border-bottom:1px solid var(--border);margin-bottom:16px}
+.sidebar-logo span{font-size:15px;font-weight:700;letter-spacing:.05em;color:var(--text-primary)}
+.sidebar-logo small{display:block;font-size:10px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;margin-top:2px}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;color:var(--text-secondary);text-decoration:none;font-size:13px;font-weight:500;transition:all .15s;border-left:2px solid transparent}
+.nav-item:hover{color:var(--text-primary);background:rgba(255,255,255,.03);border-left-color:var(--border-hover)}
+.nav-item.active{color:var(--cyan);background:rgba(6,182,212,.06);border-left-color:var(--cyan)}
+.nav-icon{font-size:15px;width:18px;text-align:center}
+.main{flex:1;min-width:0;overflow-y:auto;padding:32px}
+.page-header{margin-bottom:28px}
+.page-header h1{font-size:22px;font-weight:700}
+.page-header p{color:var(--text-secondary);font-size:13px;margin-top:4px}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:20px}
+.card-title{font-size:13px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:16px}
+.status-banner{display:flex;align-items:center;gap:12px;padding:14px 18px;border-radius:10px;margin-bottom:20px;font-size:13px;font-weight:500}
+.status-banner.running{background:rgba(16,185,129,.08);border:1px solid rgba(16,185,129,.2);color:var(--green)}
+.status-banner.stopped{background:rgba(234,179,8,.08);border:1px solid rgba(234,179,8,.2);color:var(--yellow)}
+.status-banner.not-installed{background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.2);color:var(--accent)}
+.dot{width:8px;height:8px;border-radius:50%;background:currentColor;flex-shrink:0}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:10px 20px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:none;transition:all .15s}
+.btn-primary{background:var(--accent);color:#fff}.btn-primary:hover{background:#2563eb}
+.btn-ghost{background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border)}.btn-ghost:hover{color:var(--text-primary);border-color:var(--border-hover)}
+.btn-danger{background:var(--red);color:#fff}.btn-danger:hover{background:#dc2626}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.controls{display:flex;gap:10px;flex-wrap:wrap}
+.control-btn{padding:10px 20px;border:1px solid var(--border);border-radius:8px;background:var(--bg-card);color:var(--text-secondary);font-family:'JetBrains Mono',monospace;font-size:13px;cursor:pointer;transition:all 0.2s}
+.control-btn:hover{border-color:var(--border-hover);color:var(--text-primary)}
+.control-btn.btn-stop{border-color:rgba(239,68,68,0.3)}.control-btn.btn-stop:hover{background:rgba(239,68,68,0.1);color:var(--red)}
+.control-btn.btn-start{border-color:rgba(16,185,129,0.3)}.control-btn.btn-start:hover{background:rgba(16,185,129,0.1);color:var(--green)}
+.form-group{margin-bottom:16px}
+.form-label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em}
+.form-input{width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px;color:var(--text-primary);font-size:13px;font-family:'DM Sans',sans-serif;outline:none;transition:border-color .15s}
+.form-input:focus{border-color:var(--accent)}
+.form-hint{font-size:11px;color:var(--text-dim);margin-top:4px}
+.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.info-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.info-item{background:#0a0e1a;border-radius:8px;padding:12px 14px}
+.info-label{font-size:11px;color:var(--text-dim);margin-bottom:3px;text-transform:uppercase;letter-spacing:.05em}
+.info-value{font-size:13px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;word-break:break-all}
+</style></head>
+<body>
+{{ sidebar_html }}
+<div class="main">
+  <div class="page-header">
+    <h1><span class="material-symbols-outlined" style="vertical-align:middle;margin-right:8px;font-size:32px">hub</span>Federation Hub</h1>
+    <p>TAK Federation Hub on a dedicated <strong>Ubuntu</strong> host (remote SSH). Starting point: official TAK.gov install guide.</p>
+  </div>
+
+  {% if fh.running %}
+  <div class="status-banner running"><div class="dot"></div>federation-hub service is <strong>active</strong> on {{ fedhub_deploy_cfg.remote.host }}</div>
+  {% elif fh.installed %}
+  <div class="status-banner stopped"><div class="dot"></div>Registered on {{ fedhub_deploy_cfg.remote.host }} — service not active (check target)</div>
+  {% else %}
+  <div class="status-banner not-installed"><div class="dot"></div>Not registered — configure SSH to the Ubuntu target, install per TAK.gov, then confirm below</div>
+  {% endif %}
+
+  <div class="card">
+    <div class="card-title">Documentation</div>
+    <p style="font-size:13px;color:var(--text-secondary);line-height:1.55;margin-bottom:12px">Follow the <strong>Federation Hub</strong> section on TAK.gov for Ubuntu (.deb), Java, optional MongoDB, certificates, and <code style="font-size:12px">systemctl</code> service <code style="font-size:12px">federation-hub</code>.</p>
+    <a href="https://tak.gov/documentation/resources/civ-documentation/tak-server-documentation/federation-hub" target="_blank" rel="noopener noreferrer" class="btn btn-primary" style="text-decoration:none">Open TAK.gov Federation Hub guide ↗</a>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Deployment target (SSH)</div>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:16px">This module is built for a <strong>separate</strong> machine from this console. Use the same SSH patterns as MediaMTX/Authentik remote deploy.</p>
+    <input type="hidden" id="fedhub-deployed-flag" value="{% if fedhub_deploy_cfg.deployed %}1{% else %}0{% endif %}">
+    <div class="grid-2">
+      <div class="form-group">
+        <label class="form-label">Remote host / IP</label>
+        <input id="fedhub-remote-host" class="form-input" type="text" placeholder="10.0.0.50" value="{{ fedhub_deploy_cfg.remote.host or '' }}">
+      </div>
+      <div class="form-group">
+        <label class="form-label">SSH port</label>
+        <input id="fedhub-remote-port" class="form-input" type="number" min="1" max="65535" value="{{ fedhub_deploy_cfg.remote.port or 22 }}">
+      </div>
+    </div>
+    <div class="grid-2">
+      <div class="form-group">
+        <label class="form-label">SSH user</label>
+        <input id="fedhub-remote-user" class="form-input" type="text" placeholder="root" value="{{ fedhub_deploy_cfg.remote.username or 'root' }}">
+      </div>
+      <div class="form-group">
+        <label class="form-label">SSH private key path</label>
+        <input id="fedhub-remote-key" class="form-input" type="text" placeholder="~/.ssh/infra-tak-fedhub" value="{{ fedhub_deploy_cfg.remote.ssh_key_path or '' }}">
+      </div>
+    </div>
+    <div class="form-group">
+      <label class="form-label">One-time password (for Install SSH key only)</label>
+      <input id="fedhub-remote-password" class="form-input" type="password" placeholder="Not stored" autocomplete="off">
+      <div class="form-hint">Used only for ssh-copy-id; never saved in settings.</div>
+    </div>
+    <div class="controls" style="margin-top:8px">
+      <button class="btn btn-ghost" type="button" onclick="fedhubEnsureKey()">Generate SSH key</button>
+      <button class="btn btn-ghost" type="button" onclick="fedhubInstallKey()">Install SSH key</button>
+      <button class="btn btn-ghost" type="button" onclick="fedhubTestSsh()">Test SSH</button>
+      <button class="btn btn-ghost" type="button" onclick="fedhubSaveTarget()">Save target</button>
+    </div>
+    <div id="fedhub-ssh-status" style="margin-top:10px;font-size:12px;color:var(--text-dim)"></div>
+    <div class="form-group" style="margin-top:12px">
+      <label class="form-label">Public key (manual fallback)</label>
+      <textarea id="fedhub-public-key" class="form-input" rows="3" readonly placeholder="Generate SSH key"></textarea>
+    </div>
+  </div>
+
+  {% if fh.installed %}
+  <div class="card">
+    <div class="card-title">Controls (remote)</div>
+    <div class="controls">
+      {% if fh.running %}<button class="control-btn" onclick="fedhubControl('restart')">↻ Restart</button><button class="control-btn btn-stop" onclick="fedhubControl('stop')">■ Stop</button>{% else %}<button class="control-btn btn-start" onclick="fedhubControl('start')">▶ Start</button><button class="control-btn" onclick="fedhubControl('restart')">↻ Restart</button>{% endif %}
+      <button class="btn btn-ghost" type="button" onclick="fedhubRefreshStatus()">Refresh status</button>
+    </div>
+    <div id="fedhub-control-msg" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
+    <div class="info-grid" style="margin-top:16px">
+      <div class="info-item"><div class="info-label">Service</div><div class="info-value" id="fedhub-svc-state">—</div></div>
+      <div class="info-item"><div class="info-label">Install dir</div><div class="info-value" id="fedhub-dir-state">—</div></div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-title">Console registration</div>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Remove this module from the sidebar and Marketplace &quot;installed&quot; state without touching packages on the target.</p>
+    <button class="btn btn-danger" type="button" onclick="fedhubClearRegistration()">Remove from console</button>
+    <div id="fedhub-clear-msg" style="margin-top:10px;font-size:12px"></div>
+  </div>
+  {% else %}
+  <div class="card">
+    <div class="card-title">Register after install</div>
+    <p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:14px">When the Ubuntu host has <code style="font-size:12px">/opt/tak/federation-hub</code> (from the official .deb) and you can SSH from this console, click below to add Federation Hub to the sidebar.</p>
+    <button class="btn btn-primary" type="button" onclick="fedhubMarkDeployed()">Confirm install on target</button>
+    <div id="fedhub-mark-msg" style="margin-top:12px;font-size:13px;color:var(--text-dim)"></div>
+  </div>
+  {% endif %}
+</div>
+<script>
+function collectFedhubDeployConfig(){
+  var host=(document.getElementById('fedhub-remote-host')||{}).value||'';
+  var user=(document.getElementById('fedhub-remote-user')||{}).value||'root';
+  var key=(document.getElementById('fedhub-remote-key')||{}).value||'';
+  var portVal=(document.getElementById('fedhub-remote-port')||{}).value||'22';
+  var p=parseInt(portVal,10);
+  var dep=document.getElementById('fedhub-deployed-flag');
+  return{target_mode:'remote',deployed:dep&&dep.value==='1',remote:{host:host.trim(),ssh_user:(user||'root').trim(),ssh_port:isNaN(p)?22:p,ssh_key_path:key.trim()}};
+}
+function _fedhubSshMsg(msg,err,ok){
+  var el=document.getElementById('fedhub-ssh-status');
+  if(el){el.style.color=err?'var(--red)':ok?'var(--green)':'var(--text-dim)';el.textContent=msg||'';}
+}
+function fedhubSaveTarget(){
+  var msg=document.getElementById('fedhub-ssh-status');
+  if(msg)msg.textContent='Saving...';
+  fetch('/api/fedhub/deployment-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:collectFedhubDeployConfig()}),credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(d){
+      if(d&&(d.target_mode!==undefined||d.remote)){_fedhubSshMsg('Saved',false,true);setTimeout(function(){_fedhubSshMsg('',false,false);},1500);}
+      else _fedhubSshMsg((d&&d.error)||'Save failed',true);
+    }).catch(function(e){_fedhubSshMsg('Save failed',true);});
+}
+function fedhubEnsureKey(){
+  _fedhubSshMsg('Generating...',false,false);
+  fetch('/api/fedhub/remote/ensure-ssh-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:collectFedhubDeployConfig()}),credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(d){
+      if(!d||!d.success){_fedhubSshMsg((d&&d.error)||'Failed',true);return;}
+      var kp=document.getElementById('fedhub-remote-key');if(d.key_path&&kp)kp.value=d.key_path;
+      var pk=document.getElementById('fedhub-public-key');if(pk)pk.value=d.public_key||'';
+      _fedhubSshMsg('SSH key ready'+(d.fingerprint?' | '+d.fingerprint:''),false,true);
+    }).catch(function(e){_fedhubSshMsg('Failed',true);});
+}
+function fedhubInstallKey(){
+  var pw=(document.getElementById('fedhub-remote-password')||{}).value||'';
+  if(!pw){_fedhubSshMsg('Enter password for ssh-copy-id',true);return;}
+  _fedhubSshMsg('Installing key...',false,false);
+  fetch('/api/fedhub/remote/install-ssh-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw,config:collectFedhubDeployConfig()}),credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(d){
+      if(d&&d.success)_fedhubSshMsg('SSH key installed',false,true);
+      else _fedhubSshMsg((d&&d.error)||'Install failed',true);
+    }).catch(function(e){_fedhubSshMsg('Install failed',true);});
+}
+function fedhubTestSsh(){
+  _fedhubSshMsg('Testing...',false,false);
+  fetch('/api/fedhub/remote/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:collectFedhubDeployConfig()}),credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(d){
+      if(d&&d.success)_fedhubSshMsg('SSH OK',false,true);
+      else _fedhubSshMsg((d&&d.error)||(d&&d.output)||'Test failed',true);
+    }).catch(function(e){_fedhubSshMsg('Test failed',true);});
+}
+function fedhubMarkDeployed(){
+  var el=document.getElementById('fedhub-mark-msg');
+  if(el)el.textContent='Checking target...';
+  fetch('/api/fedhub/mark-deployed',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}',credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(d){
+      if(d&&d.success){location.reload();return;}
+      if(el)el.textContent=(d&&d.error)||'Failed';
+      if(d&&d.detail&&el)el.textContent+=' — '+(d.detail||'').substring(0,200);
+    }).catch(function(e){if(el)el.textContent='Request failed';});
+}
+function fedhubClearRegistration(){
+  if(!confirm('Remove Federation Hub from this console only?'))return;
+  var el=document.getElementById('fedhub-clear-msg');
+  fetch('/api/fedhub/clear-registration',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}',credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(d){
+      if(d&&d.success){location.reload();return;}
+      if(el){el.style.color='var(--red)';el.textContent=(d&&d.error)||'Failed';}
+    }).catch(function(e){if(el){el.style.color='var(--red)';el.textContent='Failed';}});
+}
+function fedhubControl(act){
+  var el=document.getElementById('fedhub-control-msg');
+  if(el){el.style.color='var(--text-dim)';el.textContent='Running...';}
+  fetch('/api/fedhub/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:act}),credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(d){
+      if(el){el.style.color=d&&d.success?'var(--green)':'var(--red)';el.textContent=(d&&d.success)?'OK':((d&&d.error)||'Failed');if(d&&d.output)el.textContent+=' '+(d.output||'').substring(0,200);}
+      fedhubRefreshStatus();
+    }).catch(function(e){if(el){el.style.color='var(--red)';el.textContent='Failed';}});
+}
+function fedhubRefreshStatus(){
+  fetch('/api/fedhub/status',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    var s=document.getElementById('fedhub-svc-state');
+    var di=document.getElementById('fedhub-dir-state');
+    if(!d.registered)return;
+    if(s)s.textContent=d.service_state||'—';
+    if(di)di.textContent=d.dir_ok?'/opt/tak/federation-hub present':'missing';
+  }).catch(function(){});
+}
+document.addEventListener('DOMContentLoaded',function(){
+  if(document.getElementById('fedhub-svc-state'))fedhubRefreshStatus();
+});
+</script>
 </body></html>
 '''
 
@@ -22356,8 +22700,8 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% else %}
 {% for key, mod in modules.items() %}
 <a class="module-card" href="{{ mod.route }}" data-module="{{ key }}">
-<div class="module-header{% if mod.get('icon_url') %} module-header--logo{% endif %}">{% if mod.icon_data %}<img src="{{ mod.icon_data }}" alt="" class="module-icon" style="width:24px;height:24px;object-fit:contain">{% elif key == 'takportal' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">group</span>{% elif key == 'emailrelay' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">outgoing_mail</span>{% elif mod.get('icon_url') %}<img src="{{ mod.icon_url }}" alt="" class="module-icon" style="height:36px;width:auto;max-width:{% if key == 'takserver' %}72px{% else %}100px{% endif %};object-fit:contain">{% else %}<span class="module-icon">{{ mod.icon }}</span>{% endif %}
-{% if not mod.get('icon_url') or key == 'takportal' or key == 'emailrelay' %}<div class="module-name">{{ mod.name }}</div>{% endif %}
+<div class="module-header{% if mod.get('icon_url') %} module-header--logo{% endif %}">{% if mod.icon_data %}<img src="{{ mod.icon_data }}" alt="" class="module-icon" style="width:24px;height:24px;object-fit:contain">{% elif key == 'takportal' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">group</span>{% elif key == 'fedhub' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">hub</span>{% elif key == 'emailrelay' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">outgoing_mail</span>{% elif mod.get('icon_url') %}<img src="{{ mod.icon_url }}" alt="" class="module-icon" style="height:36px;width:auto;max-width:{% if key == 'takserver' %}72px{% else %}100px{% endif %};object-fit:contain">{% else %}<span class="module-icon">{{ mod.icon }}</span>{% endif %}
+{% if not mod.get('icon_url') or key == 'takportal' or key == 'fedhub' or key == 'emailrelay' %}<div class="module-name">{{ mod.name }}</div>{% endif %}
 </div>
 <div class="module-desc">{{ mod.description }}</div>
 {% if module_versions.get(key) %}{% set v = module_versions.get(key) %}{% if v.version or v.update_available %}<div class="meta-line module-version-line" id="module-version-{{ key }}" style="margin-bottom:4px">{% if v.version %}{% if key == 'mediamtx' %}{{ v.version }}{% else %}v{{ v.version }}{% endif %}{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% endif %}</div>{% endif %}{% endif %}
@@ -22646,8 +22990,8 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% else %}
 {% for key, mod in modules.items() %}
 <a class="module-card" href="{{ mod.route }}" data-module="{{ key }}">
-<div class="module-header{% if mod.get('icon_url') %} module-header--logo{% endif %}">{% if mod.icon_data %}<img src="{{ mod.icon_data }}" alt="" class="module-icon" style="width:24px;height:24px;object-fit:contain">{% elif key == 'takportal' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">group</span>{% elif key == 'emailrelay' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">outgoing_mail</span>{% elif mod.get('icon_url') %}<img src="{{ mod.icon_url }}" alt="" class="module-icon" style="height:36px;width:auto;max-width:{% if key == 'takserver' %}72px{% else %}100px{% endif %};object-fit:contain">{% else %}<span class="module-icon">{{ mod.icon }}</span>{% endif %}
-{% if not mod.get('icon_url') or key == 'takportal' or key == 'emailrelay' %}<div class="module-name">{{ mod.name }}</div>{% endif %}
+<div class="module-header{% if mod.get('icon_url') %} module-header--logo{% endif %}">{% if mod.icon_data %}<img src="{{ mod.icon_data }}" alt="" class="module-icon" style="width:24px;height:24px;object-fit:contain">{% elif key == 'takportal' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">group</span>{% elif key == 'fedhub' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">hub</span>{% elif key == 'emailrelay' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">outgoing_mail</span>{% elif mod.get('icon_url') %}<img src="{{ mod.icon_url }}" alt="" class="module-icon" style="height:36px;width:auto;max-width:{% if key == 'takserver' %}72px{% else %}100px{% endif %};object-fit:contain">{% else %}<span class="module-icon">{{ mod.icon }}</span>{% endif %}
+{% if not mod.get('icon_url') or key == 'takportal' or key == 'fedhub' or key == 'emailrelay' %}<div class="module-name">{{ mod.name }}</div>{% endif %}
 </div>
 <div class="module-desc">{{ mod.description }}</div>
 <span class="module-status status-not-installed" id="module-status-{{ key }}" data-module="{{ key }}">Not Installed</span>
