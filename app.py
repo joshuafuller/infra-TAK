@@ -4768,7 +4768,7 @@ def fedhub_remote_metrics():
 @app.route('/api/fedhub/enable-authentik', methods=['POST'])
 @login_required
 def fedhub_enable_authentik_api():
-    """Enable Authentik for Federation Hub: create proxy provider (forward_auth), patch client-auth, regen Caddy.
+    """Enable Authentik for Federation Hub: create proxy provider (forward_auth) and regen Caddy.
     Same approach as Node-RED / MediaMTX — Caddy forward_auth protects the route."""
     settings = load_settings()
     cfg = _get_fedhub_deployment_config(settings)
@@ -4787,13 +4787,8 @@ def fedhub_enable_authentik_api():
 
     steps = []
 
-    # 1) Patch client-auth: need → want so Caddy can connect without a client cert
+    # 1) Hub config path
     fh_dir = '/opt/tak/federation-hub'
-    ok_ca, _ = _ssh_probe(remote, f'sudo sed -i "s/client-auth:.*/client-auth: want/" {fh_dir}/configs/federation-hub-ui.yml', timeout=15)
-    if ok_ca:
-        steps.append('  ✓ client-auth set to "want" on remote')
-    else:
-        steps.append('  ⚠ Could not patch client-auth — Caddy may not be able to connect')
 
     # 2) Also set up Fed Hub's built-in OAuth (belt-and-suspenders with forward_auth)
     client_id, client_secret, auth_url, token_url = _ensure_authentik_fedhub_oauth_app(settings, plog=lambda m: steps.append(m))
@@ -4821,7 +4816,7 @@ def fedhub_enable_authentik_api():
         else:
             steps.append('  ⚠ OAuth config patch warning (forward_auth still works)')
 
-    # 3) Restart federation-hub to pick up client-auth + OAuth changes
+    # 3) Restart federation-hub to pick up OAuth changes
     ok_restart, _ = _ssh_probe(remote, 'sudo systemctl restart federation-hub 2>&1', timeout=90)
     steps.append('  ✓ federation-hub restarted' if ok_restart else '  ⚠ Restart returned non-zero')
 
@@ -5025,10 +5020,6 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
                 plog(f'⚠ Config patch warning: {patch_out}')
             else:
                 plog('✓ Config files patched (truststore + keystore names)')
-
-            # Allow Caddy (and browsers without client cert) to complete TLS handshake
-            _ssh_probe(remote, f'cd {fh_dir}/configs && sudo sed -i "s/client-auth:.*/client-auth: want/" federation-hub-ui.yml', timeout=15)
-            plog('✓ client-auth set to "want" (Caddy + OAuth can connect without client cert)')
 
             # Cert password: if non-default, replace atakatak in broker.yml + ui.yml
             if cert_pass and cert_pass != 'atakatak':
@@ -5703,9 +5694,9 @@ def _get_fedhub_deployment_config(settings):
     """fedhub_deployment plus web_ui_port (HTTP port on the remote hub host for Caddy reverse_proxy)."""
     c = _normalize_module_deployment_config(settings.get('fedhub_deployment', {}))
     try:
-        p = int(c.get('web_ui_port') if c.get('web_ui_port') is not None else 9100)
+        p = int(c.get('web_ui_port') if c.get('web_ui_port') is not None else 8080)
     except (TypeError, ValueError):
-        p = 9100
+        p = 8080
     c['web_ui_port'] = max(1, min(65535, p))
     return c
 
@@ -7198,10 +7189,11 @@ def generate_caddyfile(settings=None):
         fh_remote = (fhcfg.get('remote', {}).get('host') or '').strip()
         if fh_remote and fhcfg.get('target_mode') == 'remote':
             fh_host = sd['fedhub']
-            fh_port = int(fhcfg.get('web_ui_port') or 9100)
+            fh_port = int(fhcfg.get('web_ui_port') or 8080)
             fh_upstream = f'{fh_remote}:{fh_port}'
-            lines.append("# TAK Federation Hub — Caddy terminates public TLS; upstream is HTTPS (self-signed)")
+            lines.append("# TAK Federation Hub — Caddy terminates public TLS; upstream uses configured hub web port")
             lines.append(f"{fh_host} {{")
+            fh_upstream_scheme = 'https' if fh_port == 9100 else 'http'
             if ak.get('installed'):
                 lines.append(f"    route {{")
                 lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
@@ -7210,20 +7202,26 @@ def generate_caddyfile(settings=None):
                 lines.append(f"            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid")
                 lines.append(f"            trusted_proxies private_ranges")
                 lines.append(f"        }}")
-                lines.append(f"        reverse_proxy https://{fh_upstream} {{")
+                # Fed Hub still renders a "Login with Keycloak" page after edge auth.
+                # Skip the extra click by sending /login directly to the OAuth redirect endpoint.
+                lines.append(f"        @fh_login path /login")
+                lines.append(f"        redir @fh_login /login/redirect 302")
+                lines.append(f"        reverse_proxy {fh_upstream_scheme}://{fh_upstream} {{")
                 lines.append(f"            transport http {{")
-                lines.append(f"                tls")
-                lines.append(f"                tls_insecure_skip_verify")
+                if fh_upstream_scheme == 'https':
+                    lines.append(f"                tls")
+                    lines.append(f"                tls_insecure_skip_verify")
                 lines.append(f"                read_timeout 120s")
                 lines.append(f"                write_timeout 120s")
                 lines.append(f"            }}")
                 lines.append(f"        }}")
                 lines.append(f"    }}")
             else:
-                lines.append(f"    reverse_proxy https://{fh_upstream} {{")
+                lines.append(f"    reverse_proxy {fh_upstream_scheme}://{fh_upstream} {{")
                 lines.append(f"        transport http {{")
-                lines.append(f"            tls")
-                lines.append(f"            tls_insecure_skip_verify")
+                if fh_upstream_scheme == 'https':
+                    lines.append(f"            tls")
+                    lines.append(f"            tls_insecure_skip_verify")
                 lines.append(f"            read_timeout 120s")
                 lines.append(f"            write_timeout 120s")
                 lines.append(f"        }}")
@@ -14240,7 +14238,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     <div class="form-group">
       <label class="form-label">Hub web UI port (on remote host, HTTP)</label>
       <input id="fedhub-web-ui-port" class="form-input" type="number" min="1" max="65535" value="{{ fedhub_deploy_cfg.web_ui_port }}">
-      <div class="form-hint">Must match the hub UI port on the target (default <strong>9100</strong>, configured in <code style="font-size:11px">/opt/tak/federation-hub/configs/federation-hub-ui.yml</code>). The hub must listen on an IP reachable from <strong>this console</strong> (not only <code style="font-size:11px">127.0.0.1</code>). Caddy proxies to <code style="font-size:11px">SSH host:port</code>.</div>
+      <div class="form-hint">Must match the hub web port on the target (recommended <strong>8080</strong> for Caddy upstream). The hub must listen on an IP reachable from <strong>this console</strong> (not only <code style="font-size:11px">127.0.0.1</code>). Caddy proxies to <code style="font-size:11px">SSH host:port</code>.</div>
     </div>
     <p style="font-size:12px;color:var(--text-secondary);line-height:1.5;margin-bottom:10px"><strong>Hub login:</strong> Import <code style="font-size:11px">webadmin-fed.p12</code> (generated during deploy, in <code style="font-size:11px">/root/</code> on the target) into your browser. Password = TAK cert password (default <code style="font-size:11px">atakatak</code>). Or enable <strong>Authentik SSO</strong> below for username/password login. See the <a href="https://tak.gov/documentation/resources/civ-documentation/tak-server-documentation/federation-hub" target="_blank" rel="noopener noreferrer" style="color:var(--cyan)">TAK.gov docs</a>.</p>
     <div class="form-hint" style="margin-bottom:8px">Saving the SSH target (or port) below updates settings and regenerates the Caddyfile when a base FQDN is set.</div>
@@ -14667,7 +14665,7 @@ function collectFedhubDeployConfig(){
   var wup=(document.getElementById('fedhub-web-ui-port')||{}).value;
   var wp=parseInt(wup,10);
   var dep=document.getElementById('fedhub-deployed-flag');
-  return{target_mode:'remote',deployed:dep&&dep.value==='1',web_ui_port:isNaN(wp)?9100:wp,remote:{host:host.trim(),ssh_user:(user||'root').trim(),ssh_port:isNaN(p)?22:p,ssh_key_path:key.trim()}};
+  return{target_mode:'remote',deployed:dep&&dep.value==='1',web_ui_port:isNaN(wp)?8080:wp,remote:{host:host.trim(),ssh_user:(user||'root').trim(),ssh_port:isNaN(p)?22:p,ssh_key_path:key.trim()}};
 }
 function _fedhubSshMsg(msg,err,ok){
   var el=document.getElementById('fedhub-ssh-status');
@@ -25040,41 +25038,22 @@ def _startup_migrations():
         s = load_settings()
         settings_dirty = False
 
-        # Fix fedhub web_ui_port if bad
+        # Fix fedhub web_ui_port default for Caddy upstream (use HTTP 8080)
         fh_raw = s.get('fedhub_deployment', {})
-        if fh_raw.get('deployed') or fh_raw.get('web_ui_port') in (8080, '8080'):
+        if fh_raw.get('deployed') or fh_raw.get('web_ui_port') in (9100, '9100', None):
             wp = fh_raw.get('web_ui_port')
-            if wp in (8080, '8080', None):
-                fh_raw['web_ui_port'] = 9100
+            if wp in (9100, '9100', None):
+                fh_raw['web_ui_port'] = 8080
                 s['fedhub_deployment'] = fh_raw
                 settings_dirty = True
-                print("Startup migration: fixed fedhub web_ui_port → 9100")
+                print("Startup migration: fixed fedhub web_ui_port → 8080")
 
         if settings_dirty:
             save_settings(s)
             s = load_settings()
 
-        # Fix Fed Hub client-auth on remote (need → want) so Caddy can connect without client cert
+        # Build normalized cfg after settings normalization
         fh_cfg = _get_fedhub_deployment_config(s)
-        if fh_cfg.get('deployed') and fh_cfg.get('target_mode') == 'remote':
-            remote = fh_cfg.get('remote', {})
-            fh_host = (remote.get('host') or '').strip()
-            if fh_host:
-                print(f"Startup migration: checking fedhub client-auth on {fh_host}...")
-                ok, out = _ssh_probe(remote, 'grep "client-auth:" /opt/tak/federation-hub/configs/federation-hub-ui.yml 2>/dev/null', timeout=10)
-                if ok and out and 'need' in out:
-                    ok2, _ = _ssh_probe(remote,
-                        'sudo sed -i "s/client-auth:.*/client-auth: want/" /opt/tak/federation-hub/configs/federation-hub-ui.yml && '
-                        'sudo systemctl restart federation-hub 2>/dev/null; true',
-                        timeout=60)
-                    if ok2:
-                        print("Startup migration: fixed fedhub client-auth need → want + restarted")
-                    else:
-                        print("Startup migration: SSH to fix client-auth failed")
-                elif ok and out and 'want' in out:
-                    print("Startup migration: fedhub client-auth already 'want' — good")
-                elif not ok:
-                    print(f"Startup migration: could not SSH to {fh_host} to check client-auth")
 
         # Always regenerate Caddyfile when Fed Hub is deployed (picks up forward_auth, port fixes, etc.)
         if fh_cfg.get('deployed') and (s.get('fqdn') or '').strip():
