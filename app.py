@@ -4784,7 +4784,8 @@ def fedhub_enable_authentik_api():
     steps = []
     client_id, client_secret, auth_url, token_url = _ensure_authentik_fedhub_oauth_app(settings, plog=lambda m: steps.append(m))
     if not client_id or not client_secret:
-        return jsonify({'success': False, 'error': 'Failed to create OAuth app in Authentik', 'steps': steps}), 500
+        detail = steps[-1] if steps else 'No detail'
+        return jsonify({'success': False, 'error': f'Failed to create OAuth app in Authentik: {detail}', 'steps': steps}), 500
 
     ak_public = _get_authentik_base_url(settings)
     fh_domain = _get_service_domain(settings, 'fedhub') if settings.get('fqdn') else ''
@@ -14536,7 +14537,9 @@ function fedhubEnableAuthentik(){
       if(d&&d.success){
         if(el){el.style.color='var(--green)';el.textContent=d.message||'Authentik SSO enabled';}
       } else {
-        if(el){el.style.color='var(--red)';el.textContent=(d&&d.error)||'Failed';}
+        var msg=(d&&d.error)||'Failed';
+        if(d&&d.steps&&d.steps.length)msg+='\n'+d.steps.join('\n');
+        if(el){el.style.color='var(--red)';el.textContent=msg;el.style.whiteSpace='pre-wrap';}
       }
     }).catch(function(e){if(btn)btn.disabled=false;if(el){el.style.color='var(--red)';el.textContent='Request failed';}});
 }
