@@ -4823,7 +4823,9 @@ def fedhub_enable_authentik_api():
             f'sudo sed -i "s|^keycloakAuthEndpoint:.*|keycloakAuthEndpoint: {auth_url}|" federation-hub-ui.yml && '
             f'sudo sed -i "s|^keycloakTokenEndpoint:.*|keycloakTokenEndpoint: {token_url}|" federation-hub-ui.yml && '
             f'sudo sed -i "s|^keycloakClaimName:.*|keycloakClaimName: groups|" federation-hub-ui.yml && '
-            f'sudo sed -i "s|^keycloakAdminClaimValue:.*|keycloakAdminClaimValue: authentik Admins|" federation-hub-ui.yml'
+            f'sudo sed -i "s|^keycloakAdminClaimValue:.*|keycloakAdminClaimValue: authentik Admins|" federation-hub-ui.yml && '
+            f'sudo sed -i "s|^keycloakDerLocation:.*|keycloakTlsCertFile: /opt/tak/certs/keycloak.der|" federation-hub-ui.yml && '
+            f'sudo sed -i "s|^keycloakTlsCertFile:.*|keycloakTlsCertFile: /opt/tak/certs/keycloak.der|" federation-hub-ui.yml'
         )
         ok_patch, _ = _ssh_probe(remote, patch_cmd, timeout=30)
         if ok_patch:
