@@ -12763,7 +12763,7 @@ def _ensure_authentik_fedhub_oauth_app(settings, plog=None):
         # Check if provider already exists
         slug = 'fedhub'
         provider_name = 'Federation Hub'
-        req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/?search={provider_name}', headers=headers)
+        req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/?search={urllib.parse.quote(provider_name)}', headers=headers)
         resp = _urlreq.urlopen(req, timeout=15)
         existing = json.loads(resp.read().decode())['results']
         if existing:
