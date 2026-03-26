@@ -12736,6 +12736,7 @@ def _ensure_authentik_console_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
 
 def _ensure_authentik_fedhub_oauth_app(settings, plog=None):
     """Create an OAuth2/OIDC provider + application in Authentik for Federation Hub UI login.
+    Follows the same pattern as _ensure_authentik_nodered_app / TAK Portal proxy providers.
     Returns (client_id, client_secret, authorize_url, token_url) or (None,...) on failure."""
     import urllib.request as _urlreq
     import urllib.error
@@ -12747,47 +12748,44 @@ def _ensure_authentik_fedhub_oauth_app(settings, plog=None):
     if not token:
         log('  ✗ No Authentik API token found in .env')
         return None, None, None, None
-    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+    _ak_headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
     ak_public = _get_authentik_base_url(settings)
 
+    slug = 'fedhub'
+    provider_name = 'Federation Hub'
+
     try:
-        # Get authorization flow
-        req = _urlreq.Request(f'{ak_url}/api/v3/flows/instances/?designation=authorization&ordering=slug', headers=headers)
-        resp = _urlreq.urlopen(req, timeout=15)
-        flows = json.loads(resp.read().decode())['results']
-        flow_pk = next((f['pk'] for f in flows if 'implicit' in f.get('slug', '')), flows[0]['pk'] if flows else None)
-        if not flow_pk:
-            log('  ✗ No authorization flow found in Authentik')
+        # Get authorization + invalidation flows (same pattern as Node-RED / TAK Portal)
+        flow_pk, inv_flow_pk = None, None
+        for attempt in range(6):
+            try:
+                req = _urlreq.Request(f'{ak_url}/api/v3/flows/instances/?designation=authorization&ordering=slug', headers=_ak_headers)
+                auth_flows = json.loads(_urlreq.urlopen(req, timeout=15).read().decode())['results']
+                flow_pk = next((f['pk'] for f in auth_flows if 'implicit' in f.get('slug', '')), auth_flows[0]['pk'] if auth_flows else None)
+                req = _urlreq.Request(f'{ak_url}/api/v3/flows/instances/?designation=invalidation&ordering=slug', headers=_ak_headers)
+                inv_flows = json.loads(_urlreq.urlopen(req, timeout=15).read().decode())['results']
+                inv_flow_pk = inv_flows[0]['pk'] if inv_flows else None
+            except Exception:
+                pass
+            if flow_pk and inv_flow_pk:
+                break
+            time.sleep(5)
+        if not flow_pk or not inv_flow_pk:
+            log(f'  ✗ Missing flows: auth={flow_pk}, invalidation={inv_flow_pk}')
             return None, None, None, None
+        log('  ✓ Got authorization and invalidation flows')
 
-        # Get invalidation flow
-        req = _urlreq.Request(f'{ak_url}/api/v3/flows/instances/?designation=invalidation&ordering=slug', headers=headers)
-        resp = _urlreq.urlopen(req, timeout=15)
-        inv_flows = json.loads(resp.read().decode())['results']
-        inv_flow_pk = inv_flows[0]['pk'] if inv_flows else None
-        if not inv_flow_pk:
-            log('  ✗ No invalidation flow found in Authentik')
-            return None, None, None, None
+        # Determine redirect URI
+        fh_cfg = _get_fedhub_deployment_config(settings)
+        fh_host = (fh_cfg.get('remote', {}).get('host') or '').strip()
+        fh_domain = _get_service_domain(settings, 'fedhub') if settings.get('fqdn') else ''
+        redirect_host = fh_domain or fh_host or 'localhost'
+        redirect_uri = f'https://{redirect_host}:9100/login/redirect'
 
-        # Check if provider already exists
-        slug = 'fedhub'
-        provider_name = 'Federation Hub'
-        req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/?search={urllib.parse.quote(provider_name)}', headers=headers)
-        resp = _urlreq.urlopen(req, timeout=15)
-        existing = json.loads(resp.read().decode())['results']
-        if existing:
-            p = existing[0]
-            client_id = p.get('client_id', '')
-            client_secret = p.get('client_secret', '')
-            log(f'  ✓ OAuth2 provider already exists: {provider_name}')
-        else:
-            # Determine redirect URI from Fed Hub config
-            fh_cfg = _get_fedhub_deployment_config(settings)
-            fh_host = (fh_cfg.get('remote', {}).get('host') or '').strip()
-            fh_domain = _get_service_domain(settings, 'fedhub') if settings.get('fqdn') else ''
-            redirect_host = fh_domain or fh_host or 'localhost'
-            redirect_uri = f'https://{redirect_host}:9100/login/redirect'
-
+        # Create OAuth2 provider (or find existing)
+        provider_pk = None
+        client_id, client_secret = '', ''
+        try:
             payload = {
                 'name': provider_name,
                 'authorization_flow': flow_pk,
@@ -12796,43 +12794,62 @@ def _ensure_authentik_fedhub_oauth_app(settings, plog=None):
                 'redirect_uris': [redirect_uri],
             }
             req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/',
-                data=json.dumps(payload).encode(), headers=headers, method='POST')
-            try:
+                data=json.dumps(payload).encode(), headers=_ak_headers, method='POST')
+            resp = _urlreq.urlopen(req, timeout=15)
+            p = json.loads(resp.read().decode())
+            provider_pk = p.get('pk')
+            client_id = p.get('client_id', '')
+            client_secret = p.get('client_secret', '')
+            log(f'  ✓ OAuth2 provider created')
+        except Exception as e:
+            if hasattr(e, 'code') and e.code == 400:
+                req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/?search={urllib.parse.quote(provider_name)}', headers=_ak_headers)
                 resp = _urlreq.urlopen(req, timeout=15)
-            except urllib.error.HTTPError as e:
+                results = json.loads(resp.read().decode())['results']
+                if results:
+                    p = results[0]
+                    provider_pk = p.get('pk')
+                    client_id = p.get('client_id', '')
+                    client_secret = p.get('client_secret', '')
+                    try:
+                        req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/{provider_pk}/',
+                            data=json.dumps({'redirect_uris': [redirect_uri]}).encode(),
+                            headers=_ak_headers, method='PATCH')
+                        _urlreq.urlopen(req, timeout=10)
+                    except Exception:
+                        pass
+                log(f'  ✓ OAuth2 provider already exists (redirect_uris updated)')
+            else:
                 body = ''
                 try:
                     body = e.read().decode()[:500]
                 except Exception:
                     pass
-                log(f'  ✗ Provider create failed ({e.code}): {body}')
-                return None, None, None, None
-            p = json.loads(resp.read().decode())
-            client_id = p.get('client_id', '')
-            client_secret = p.get('client_secret', '')
-            log(f'  ✓ OAuth2 provider created: {provider_name}')
+                log(f'  ✗ OAuth2 provider error ({getattr(e, "code", "?")}): {body or str(e)[:200]}')
 
-        provider_pk = p.get('pk')
+        if not provider_pk or not client_id:
+            log('  ✗ No OAuth2 provider — cannot continue')
+            return None, None, None, None
 
-        # Ensure application exists
+        # Create application (same pattern as Node-RED / TAK Portal)
         try:
             req = _urlreq.Request(f'{ak_url}/api/v3/core/applications/',
                 data=json.dumps({'name': provider_name, 'slug': slug, 'provider': provider_pk}).encode(),
-                headers=headers, method='POST')
+                headers=_ak_headers, method='POST')
             _urlreq.urlopen(req, timeout=10)
-            log(f'  ✓ Application created: {provider_name}')
-        except urllib.error.HTTPError as e:
-            if e.code == 400:
+            log(f'  ✓ Application created')
+        except Exception as e:
+            if hasattr(e, 'code') and e.code == 400:
                 try:
                     req = _urlreq.Request(f'{ak_url}/api/v3/core/applications/{slug}/',
                         data=json.dumps({'provider': provider_pk}).encode(),
-                        headers=headers, method='PATCH')
+                        headers=_ak_headers, method='PATCH')
                     _urlreq.urlopen(req, timeout=10)
                 except Exception:
                     pass
-                log(f'  ✓ Application already exists: {provider_name}')
+                log(f'  ✓ Application already exists')
             else:
-                log(f'  ⚠ Application error: {e}')
+                log(f'  ⚠ Application error: {str(e)[:80]}')
 
         authorize_url = f'{ak_public}/application/o/authorize/'
         token_url = f'{ak_public}/application/o/token/'
