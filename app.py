@@ -4790,7 +4790,8 @@ def fedhub_enable_authentik_api():
     ak_public = _get_authentik_base_url(settings)
     fh_domain = _get_service_domain(settings, 'fedhub') if settings.get('fqdn') else ''
     fh_host = fh_domain or (remote.get('host') or '').strip()
-    redirect_uri = f'https://{fh_host}:9100/login/redirect'
+    # Via Caddy (FQDN): no port (443). Direct IP: port 9100.
+    redirect_uri = f'https://{fh_host}/login/redirect' if fh_domain else f'https://{fh_host}:9100/login/redirect'
 
     fh_dir = '/opt/tak/federation-hub'
     patch_cmd = (
@@ -4827,7 +4828,7 @@ def fedhub_enable_authentik_api():
         'client_id': client_id,
         'auth_url': auth_url,
         'redirect_uri': redirect_uri,
-        'message': f'Authentik SSO enabled. Users in the "authentik Admins" group can log in at https://{fh_host}:9100 (OAuth port 8446).',
+        'message': f'Authentik SSO enabled for Federation Hub ({redirect_uri.rsplit("/login/redirect",1)[0]}). Users in the "authentik Admins" group can log in.',
     })
 
 
@@ -7182,13 +7183,15 @@ def generate_caddyfile(settings=None):
             fh_host = sd['fedhub']
             fh_port = int(fhcfg.get('web_ui_port') or 9100)
             fh_upstream = f'{fh_remote}:{fh_port}'
-            lines.append("# TAK Federation Hub — TLS terminates here; proxy to HTTP UI on the hub host (admin user/password per TAK.gov)")
+            lines.append("# TAK Federation Hub — Caddy terminates public TLS; upstream is HTTPS (self-signed)")
             lines.append(f"{fh_host} {{")
-            lines.append(f"    reverse_proxy {fh_upstream} {{")
+            lines.append(f"    reverse_proxy https://{fh_upstream} {{")
             lines.append(f"        header_up Host {{host}}")
             lines.append(f"        header_up X-Forwarded-Proto https")
             lines.append(f"        header_up X-Forwarded-Host {{host}}")
             lines.append(f"        transport http {{")
+            lines.append(f"            tls")
+            lines.append(f"            tls_insecure_skip_verify")
             lines.append(f"            read_timeout 120s")
             lines.append(f"            write_timeout 120s")
             lines.append(f"        }}")
@@ -12780,7 +12783,8 @@ def _ensure_authentik_fedhub_oauth_app(settings, plog=None):
         fh_host = (fh_cfg.get('remote', {}).get('host') or '').strip()
         fh_domain = _get_service_domain(settings, 'fedhub') if settings.get('fqdn') else ''
         redirect_host = fh_domain or fh_host or 'localhost'
-        redirect_uri = f'https://{redirect_host}:9100/login/redirect'
+        # Via Caddy (FQDN set): standard HTTPS port. Direct IP: port 9100.
+        redirect_uri = f'https://{redirect_host}/login/redirect' if fh_domain else f'https://{redirect_host}:9100/login/redirect'
         redirect_uris_obj = [{'matching_mode': 'strict', 'url': redirect_uri}]
 
         # Check if provider already exists; if so, delete the stale one and recreate
