@@ -4768,7 +4768,8 @@ def fedhub_remote_metrics():
 @app.route('/api/fedhub/enable-authentik', methods=['POST'])
 @login_required
 def fedhub_enable_authentik_api():
-    """Create an OAuth2/OIDC app in Authentik and patch federation-hub-ui.yml on the remote for SSO login."""
+    """Enable Authentik for Federation Hub: create proxy provider (forward_auth), patch client-auth, regen Caddy.
+    Same approach as Node-RED / MediaMTX — Caddy forward_auth protects the route."""
     settings = load_settings()
     cfg = _get_fedhub_deployment_config(settings)
     if not cfg.get('deployed') or cfg.get('target_mode') != 'remote':
@@ -4776,59 +4777,71 @@ def fedhub_enable_authentik_api():
     remote = cfg.get('remote', {})
     if not (remote.get('host') or '').strip():
         return jsonify({'success': False, 'error': 'Remote host not configured.'}), 400
+    fqdn = (settings.get('fqdn') or '').strip()
+    if not fqdn:
+        return jsonify({'success': False, 'error': 'Set the base FQDN in Console settings first.'}), 400
 
     reachable, err = _check_authentik_api_reachable(settings)
     if not reachable:
         return jsonify({'success': False, 'error': f'Cannot reach Authentik API: {err}'}), 400
 
     steps = []
-    client_id, client_secret, auth_url, token_url = _ensure_authentik_fedhub_oauth_app(settings, plog=lambda m: steps.append(m))
-    if not client_id or not client_secret:
-        detail = steps[-1] if steps else 'No detail'
-        return jsonify({'success': False, 'error': f'Failed to create OAuth app in Authentik: {detail}', 'steps': steps}), 500
 
+    # 1) Patch client-auth: need → want so Caddy can connect without a client cert
+    fh_dir = '/opt/tak/federation-hub'
+    ok_ca, _ = _ssh_probe(remote, f'sudo sed -i "s/client-auth:.*/client-auth: want/" {fh_dir}/configs/federation-hub-ui.yml', timeout=15)
+    if ok_ca:
+        steps.append('  ✓ client-auth set to "want" on remote')
+    else:
+        steps.append('  ⚠ Could not patch client-auth — Caddy may not be able to connect')
+
+    # 2) Also set up Fed Hub's built-in OAuth (belt-and-suspenders with forward_auth)
+    client_id, client_secret, auth_url, token_url = _ensure_authentik_fedhub_oauth_app(settings, plog=lambda m: steps.append(m))
     ak_public = _get_authentik_base_url(settings)
-    fh_domain = _get_service_domain(settings, 'fedhub') if settings.get('fqdn') else ''
+    fh_domain = _get_service_domain(settings, 'fedhub')
     fh_host = fh_domain or (remote.get('host') or '').strip()
-    # Via Caddy (FQDN): no port (443). Direct IP: port 9100.
     redirect_uri = f'https://{fh_host}/login/redirect' if fh_domain else f'https://{fh_host}:9100/login/redirect'
 
-    fh_dir = '/opt/tak/federation-hub'
-    patch_cmd = (
-        f'cd {fh_dir}/configs && '
-        f'sudo sed -i "s/^allowOauth:.*/allowOauth: true/" federation-hub-ui.yml && '
-        f'sudo sed -i "s|^keycloakServerName:.*|keycloakServerName: {ak_public}|" federation-hub-ui.yml && '
-        f'sudo sed -i "s|^keycloakClientId:.*|keycloakClientId: {shlex.quote(client_id)}|" federation-hub-ui.yml && '
-        f'sudo sed -i "s|^keycloakSecret:.*|keycloakSecret: {shlex.quote(client_secret)}|" federation-hub-ui.yml && '
-        f'sudo sed -i "s|^keycloakrRedirectUri:.*|keycloakrRedirectUri: {redirect_uri}|" federation-hub-ui.yml && '
-        f'sudo sed -i "s|^keycloakAuthEndpoint:.*|keycloakAuthEndpoint: {auth_url}|" federation-hub-ui.yml && '
-        f'sudo sed -i "s|^keycloakTokenEndpoint:.*|keycloakTokenEndpoint: {token_url}|" federation-hub-ui.yml && '
-        f'sudo sed -i "s|^keycloakClaimName:.*|keycloakClaimName: groups|" federation-hub-ui.yml && '
-        f'sudo sed -i "s|^keycloakAdminClaimValue:.*|keycloakAdminClaimValue: authentik Admins|" federation-hub-ui.yml'
-    )
-    ok_patch, patch_out = _ssh_probe(remote, patch_cmd, timeout=30)
-    if not ok_patch:
-        steps.append(f'  ⚠ Config patch failed: {patch_out}')
-        return jsonify({'success': False, 'error': 'Failed to patch federation-hub-ui.yml on remote', 'steps': steps}), 500
-    steps.append('  ✓ federation-hub-ui.yml patched with Authentik OAuth settings')
+    if client_id and client_secret:
+        patch_cmd = (
+            f'cd {fh_dir}/configs && '
+            f'sudo sed -i "s/^allowOauth:.*/allowOauth: true/" federation-hub-ui.yml && '
+            f'sudo sed -i "s|^keycloakServerName:.*|keycloakServerName: {ak_public}|" federation-hub-ui.yml && '
+            f'sudo sed -i "s|^keycloakClientId:.*|keycloakClientId: {shlex.quote(client_id)}|" federation-hub-ui.yml && '
+            f'sudo sed -i "s|^keycloakSecret:.*|keycloakSecret: {shlex.quote(client_secret)}|" federation-hub-ui.yml && '
+            f'sudo sed -i "s|^keycloakrRedirectUri:.*|keycloakrRedirectUri: {redirect_uri}|" federation-hub-ui.yml && '
+            f'sudo sed -i "s|^keycloakAuthEndpoint:.*|keycloakAuthEndpoint: {auth_url}|" federation-hub-ui.yml && '
+            f'sudo sed -i "s|^keycloakTokenEndpoint:.*|keycloakTokenEndpoint: {token_url}|" federation-hub-ui.yml && '
+            f'sudo sed -i "s|^keycloakClaimName:.*|keycloakClaimName: groups|" federation-hub-ui.yml && '
+            f'sudo sed -i "s|^keycloakAdminClaimValue:.*|keycloakAdminClaimValue: authentik Admins|" federation-hub-ui.yml'
+        )
+        ok_patch, _ = _ssh_probe(remote, patch_cmd, timeout=30)
+        if ok_patch:
+            steps.append('  ✓ federation-hub-ui.yml patched with OAuth settings')
+        else:
+            steps.append('  ⚠ OAuth config patch warning (forward_auth still works)')
 
+    # 3) Restart federation-hub to pick up client-auth + OAuth changes
     ok_restart, _ = _ssh_probe(remote, 'sudo systemctl restart federation-hub 2>&1', timeout=90)
-    if ok_restart:
-        steps.append('  ✓ federation-hub restarted')
+    steps.append('  ✓ federation-hub restarted' if ok_restart else '  ⚠ Restart returned non-zero')
+
+    # 4) Create Authentik proxy provider + application for Caddy forward_auth
+    ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+    if ak_token and fqdn:
+        _ensure_authentik_fedhub_proxy_app(fqdn, ak_token, plog=lambda m: steps.append(m), settings=settings)
     else:
-        steps.append('  ⚠ Restart returned non-zero — check service status')
+        steps.append('  ⚠ No Authentik token — skipped proxy provider creation')
 
-    # Open OAuth port
-    _ssh_probe(remote, 'sudo ufw allow 8446/tcp > /dev/null 2>&1; true', timeout=15)
-    steps.append('  ✓ UFW: port 8446 allowed')
+    # 5) Regenerate Caddyfile (now includes forward_auth) + reload Caddy
+    generate_caddyfile(settings)
+    threading.Thread(target=_caddy_restart_after_response, daemon=True).start()
+    steps.append('  ✓ Caddyfile regenerated with forward_auth + Caddy reloading')
 
+    fedhub_url = f'https://{fh_domain}' if fh_domain else f'https://{fh_host}:9100'
     return jsonify({
         'success': True,
         'steps': steps,
-        'client_id': client_id,
-        'auth_url': auth_url,
-        'redirect_uri': redirect_uri,
-        'message': f'Authentik SSO enabled for Federation Hub ({redirect_uri.rsplit("/login/redirect",1)[0]}). Users in the "authentik Admins" group can log in.',
+        'message': f'Authentik enabled for Federation Hub. Access via {fedhub_url} — Authentik login required.',
     })
 
 
@@ -5012,6 +5025,10 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
                 plog(f'⚠ Config patch warning: {patch_out}')
             else:
                 plog('✓ Config files patched (truststore + keystore names)')
+
+            # Allow Caddy (and browsers without client cert) to complete TLS handshake
+            _ssh_probe(remote, f'cd {fh_dir}/configs && sudo sed -i "s/client-auth:.*/client-auth: want/" federation-hub-ui.yml', timeout=15)
+            plog('✓ client-auth set to "want" (Caddy + OAuth can connect without client cert)')
 
             # Cert password: if non-default, replace atakatak in broker.yml + ui.yml
             if cert_pass and cert_pass != 'atakatak':
@@ -7185,17 +7202,32 @@ def generate_caddyfile(settings=None):
             fh_upstream = f'{fh_remote}:{fh_port}'
             lines.append("# TAK Federation Hub — Caddy terminates public TLS; upstream is HTTPS (self-signed)")
             lines.append(f"{fh_host} {{")
-            lines.append(f"    reverse_proxy https://{fh_upstream} {{")
-            lines.append(f"        header_up Host {{host}}")
-            lines.append(f"        header_up X-Forwarded-Proto https")
-            lines.append(f"        header_up X-Forwarded-Host {{host}}")
-            lines.append(f"        transport http {{")
-            lines.append(f"            tls")
-            lines.append(f"            tls_insecure_skip_verify")
-            lines.append(f"            read_timeout 120s")
-            lines.append(f"            write_timeout 120s")
-            lines.append(f"        }}")
-            lines.append(f"    }}")
+            if ak.get('installed'):
+                lines.append(f"    route {{")
+                lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
+                lines.append(f"        forward_auth {ak_up} {{")
+                lines.append(f"            uri /outpost.goauthentik.io/auth/caddy")
+                lines.append(f"            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid")
+                lines.append(f"            trusted_proxies private_ranges")
+                lines.append(f"        }}")
+                lines.append(f"        reverse_proxy https://{fh_upstream} {{")
+                lines.append(f"            transport http {{")
+                lines.append(f"                tls")
+                lines.append(f"                tls_insecure_skip_verify")
+                lines.append(f"                read_timeout 120s")
+                lines.append(f"                write_timeout 120s")
+                lines.append(f"            }}")
+                lines.append(f"        }}")
+                lines.append(f"    }}")
+            else:
+                lines.append(f"    reverse_proxy https://{fh_upstream} {{")
+                lines.append(f"        transport http {{")
+                lines.append(f"            tls")
+                lines.append(f"            tls_insecure_skip_verify")
+                lines.append(f"            read_timeout 120s")
+                lines.append(f"            write_timeout 120s")
+                lines.append(f"        }}")
+                lines.append(f"    }}")
             lines.append(f"}}")
             lines.append("")
 
@@ -12610,6 +12642,102 @@ def _ensure_authentik_nodered_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
             _outpost_add_providers_safe(_ak_url, _ak_headers, [provider_pk], plog=log)
         else:
             log("  ⚠ Could not create or find Node-RED proxy provider")
+    except Exception as e:
+        log(f"  ⚠ Forward auth setup error: {str(e)[:100]}")
+    return True
+
+def _ensure_authentik_fedhub_proxy_app(fqdn, ak_token, plog=None, flow_pk=None, inv_flow_pk=None, settings=None):
+    """Create Federation Hub proxy provider + application in Authentik, add to embedded outpost.
+    Same pattern as Node-RED / MediaMTX — Caddy forward_auth protects the route."""
+    if not fqdn or not ak_token:
+        return False
+    def log(msg):
+        if plog:
+            plog(msg)
+    import urllib.request as _urlreq
+    import urllib.error
+    _ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+    _ak_url = _get_authentik_api_url(settings) if settings else 'http://127.0.0.1:9090'
+
+    try:
+        if not flow_pk or not inv_flow_pk:
+            for attempt in range(36):
+                try:
+                    req = _urlreq.Request(f'{_ak_url}/api/v3/flows/instances/?designation=authorization&ordering=slug', headers=_ak_headers)
+                    resp = _urlreq.urlopen(req, timeout=10)
+                    flows = json.loads(resp.read().decode())['results']
+                    flow_pk = next((f['pk'] for f in flows if 'implicit' in f.get('slug', '')), flows[0]['pk'] if flows else None)
+                    if flow_pk:
+                        req = _urlreq.Request(f'{_ak_url}/api/v3/flows/instances/?designation=invalidation', headers=_ak_headers)
+                        resp = _urlreq.urlopen(req, timeout=10)
+                        inv_flows = json.loads(resp.read().decode())['results']
+                        inv_flow_pk = next((f['pk'] for f in inv_flows if 'provider' not in f.get('slug', '')), inv_flows[0]['pk'] if inv_flows else None)
+                        if inv_flow_pk:
+                            break
+                except Exception:
+                    pass
+                if attempt % 6 == 0:
+                    log(f"  ⏳ Waiting for authorization flow... ({attempt * 5}s)")
+                time.sleep(5)
+            if not flow_pk or not inv_flow_pk:
+                log("  ⚠ No authorization/invalidation flow — skipping Federation Hub proxy provider")
+                return False
+            log("  ✓ Got authorization and invalidation flows")
+
+        fedhub_domain = _get_service_domain(settings, 'fedhub') if settings else f'fedhub.{fqdn}'
+        provider_pk = None
+        try:
+            req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/',
+                data=json.dumps({'name': 'Federation Hub Proxy', 'authorization_flow': flow_pk,
+                    'invalidation_flow': inv_flow_pk,
+                    'external_host': f'https://{fedhub_domain}', 'mode': 'forward_single',
+                    'token_validity': 'hours=24', 'cookie_domain': f'.{fqdn.split(":")[0]}'}).encode(),
+                headers=_ak_headers, method='POST')
+            resp = _urlreq.urlopen(req, timeout=10)
+            provider_pk = json.loads(resp.read().decode())['pk']
+            log("  ✓ Federation Hub proxy provider created")
+        except Exception as e:
+            if hasattr(e, 'code') and e.code == 400:
+                req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/?search={urllib.parse.quote("Federation Hub")}', headers=_ak_headers)
+                resp = _urlreq.urlopen(req, timeout=10)
+                results = json.loads(resp.read().decode())['results']
+                if results:
+                    provider_pk = results[0]['pk']
+                    try:
+                        req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/{provider_pk}/',
+                            data=json.dumps({'external_host': f'https://{fedhub_domain}', 'cookie_domain': f'.{fqdn.split(":")[0]}'}).encode(),
+                            headers=_ak_headers, method='PATCH')
+                        _urlreq.urlopen(req, timeout=10)
+                    except Exception:
+                        pass
+                log("  ✓ Federation Hub proxy provider already exists (external_host updated)")
+            else:
+                log(f"  ⚠ Proxy provider error: {str(e)[:100]}")
+
+        if provider_pk:
+            try:
+                req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/',
+                    data=json.dumps({'name': 'Federation Hub', 'slug': 'federation-hub',
+                        'provider': provider_pk}).encode(),
+                    headers=_ak_headers, method='POST')
+                _urlreq.urlopen(req, timeout=10)
+                log("  ✓ Application 'Federation Hub' created")
+            except Exception as e:
+                if hasattr(e, 'code') and e.code == 400:
+                    try:
+                        req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/federation-hub/',
+                            data=json.dumps({'provider': provider_pk}).encode(),
+                            headers=_ak_headers, method='PATCH')
+                        _urlreq.urlopen(req, timeout=10)
+                    except Exception:
+                        pass
+                    log("  ✓ Application 'Federation Hub' updated")
+                else:
+                    log(f"  ⚠ Application error: {str(e)[:80]}")
+
+            _outpost_add_providers_safe(_ak_url, _ak_headers, [provider_pk], plog=log)
+        else:
+            log("  ⚠ Could not create or find Federation Hub proxy provider")
     except Exception as e:
         log(f"  ⚠ Forward auth setup error: {str(e)[:100]}")
     return True
@@ -24919,10 +25047,22 @@ def _startup_migrations():
             print("Startup migration: fixed fedhub web_ui_port → 9100")
         if changed:
             save_settings(s)
-            if s.get('fqdn'):
-                generate_caddyfile(s)
-                subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
-                print("Startup migration: Caddyfile regenerated + Caddy reloaded")
+
+        # Fix Fed Hub client-auth on the remote host (need → want) so Caddy can connect
+        if fh.get('deployed') and fh.get('target_mode') == 'remote':
+            remote = fh.get('remote', {})
+            if (remote.get('host') or '').strip():
+                ok, out = _ssh_probe(remote, 'grep "client-auth:" /opt/tak/federation-hub/configs/federation-hub-ui.yml 2>/dev/null', timeout=10)
+                if ok and out and 'need' in out:
+                    ok2, _ = _ssh_probe(remote, 'sudo sed -i "s/client-auth:.*/client-auth: want/" /opt/tak/federation-hub/configs/federation-hub-ui.yml && sudo systemctl restart federation-hub 2>/dev/null; true', timeout=30)
+                    if ok2:
+                        print("Startup migration: fixed fedhub client-auth need → want + restarted")
+                        changed = True
+
+        if changed and s.get('fqdn'):
+            generate_caddyfile(s)
+            subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
+            print("Startup migration: Caddyfile regenerated + Caddy reloaded")
     except Exception as e:
         print(f"Startup migration skipped: {e}")
 
