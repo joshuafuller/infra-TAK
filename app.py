@@ -14538,7 +14538,7 @@ function fedhubEnableAuthentik(){
         if(el){el.style.color='var(--green)';el.textContent=d.message||'Authentik SSO enabled';}
       } else {
         var msg=(d&&d.error)||'Failed';
-        if(d&&d.steps&&d.steps.length)msg+='\n'+d.steps.join('\n');
+        if(d&&d.steps&&d.steps.length)msg+=String.fromCharCode(10)+d.steps.join(String.fromCharCode(10));
         if(el){el.style.color='var(--red)';el.textContent=msg;el.style.whiteSpace='pre-wrap';}
       }
     }).catch(function(e){if(btn)btn.disabled=false;if(el){el.style.color='var(--red)';el.textContent='Request failed';}});
