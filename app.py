@@ -4797,6 +4797,21 @@ def fedhub_enable_authentik_api():
     fh_host = fh_domain or (remote.get('host') or '').strip()
     redirect_uri = f'https://{fh_host}/login/redirect' if fh_domain else f'https://{fh_host}:9100/login/redirect'
 
+    # Generate keycloak.der — Fed Hub needs this to trust the OAuth provider's TLS cert
+    ak_host = f'authentik.{fqdn}'
+    der_cmd = (
+        f'echo | openssl s_client -connect {ak_host}:443 -servername {ak_host} 2>/dev/null '
+        f'| openssl x509 -outform DER -out /opt/tak/certs/keycloak.der 2>/dev/null && '
+        f'chown tak:tak /opt/tak/certs/keycloak.der && '
+        f'chmod 644 /opt/tak/certs/keycloak.der && '
+        f'ls -la /opt/tak/certs/keycloak.der'
+    )
+    ok_der, out_der = _ssh_probe(remote, der_cmd, timeout=30)
+    if ok_der:
+        steps.append(f'  ✓ keycloak.der generated from {ak_host}')
+    else:
+        steps.append(f'  ⚠ keycloak.der generation failed — OAuth login may 500')
+
     if client_id and client_secret:
         patch_cmd = (
             f'cd {fh_dir}/configs && '
@@ -7202,10 +7217,6 @@ def generate_caddyfile(settings=None):
                 lines.append(f"            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid")
                 lines.append(f"            trusted_proxies private_ranges")
                 lines.append(f"        }}")
-                # Fed Hub still renders a "Login with Keycloak" page after edge auth.
-                # Skip the extra click by sending /login directly to the OAuth redirect endpoint.
-                lines.append(f"        @fh_login path /login")
-                lines.append(f"        redir @fh_login /login/redirect 302")
                 lines.append(f"        reverse_proxy {fh_upstream_scheme}://{fh_upstream} {{")
                 lines.append(f"            transport http {{")
                 if fh_upstream_scheme == 'https':
