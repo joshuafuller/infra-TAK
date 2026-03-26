@@ -24906,6 +24906,28 @@ def _auto_update_guarddog():
 
 _auto_update_guarddog()
 
+# === Startup migrations: fix known bad settings and regenerate Caddy if needed ===
+def _startup_migrations():
+    try:
+        s = load_settings()
+        changed = False
+        fh = s.get('fedhub_deployment', {})
+        if fh.get('deployed') and fh.get('web_ui_port') in (8080, '8080', None):
+            fh['web_ui_port'] = 9100
+            s['fedhub_deployment'] = fh
+            changed = True
+            print("Startup migration: fixed fedhub web_ui_port → 9100")
+        if changed:
+            save_settings(s)
+            if s.get('fqdn'):
+                generate_caddyfile(s)
+                subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
+                print("Startup migration: Caddyfile regenerated + Caddy reloaded")
+    except Exception as e:
+        print(f"Startup migration skipped: {e}")
+
+_startup_migrations()
+
 # === Main Entry Point (fallback for direct python3 app.py) ===
 if __name__ == '__main__':
     cert_dir = os.path.join(CONFIG_DIR, 'ssl')
