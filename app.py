@@ -12760,6 +12760,15 @@ def _ensure_authentik_fedhub_oauth_app(settings, plog=None):
             log('  ✗ No authorization flow found in Authentik')
             return None, None, None, None
 
+        # Get invalidation flow
+        req = _urlreq.Request(f'{ak_url}/api/v3/flows/instances/?designation=invalidation&ordering=slug', headers=headers)
+        resp = _urlreq.urlopen(req, timeout=15)
+        inv_flows = json.loads(resp.read().decode())['results']
+        inv_flow_pk = inv_flows[0]['pk'] if inv_flows else None
+        if not inv_flow_pk:
+            log('  ✗ No invalidation flow found in Authentik')
+            return None, None, None, None
+
         # Check if provider already exists
         slug = 'fedhub'
         provider_name = 'Federation Hub'
@@ -12782,8 +12791,9 @@ def _ensure_authentik_fedhub_oauth_app(settings, plog=None):
             payload = {
                 'name': provider_name,
                 'authorization_flow': flow_pk,
+                'invalidation_flow': inv_flow_pk,
                 'client_type': 'confidential',
-                'redirect_uris': redirect_uri,
+                'redirect_uris': [redirect_uri],
             }
             req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/',
                 data=json.dumps(payload).encode(), headers=headers, method='POST')
