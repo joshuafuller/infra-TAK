@@ -25038,33 +25038,52 @@ _auto_update_guarddog()
 def _startup_migrations():
     try:
         s = load_settings()
-        changed = False
-        fh = s.get('fedhub_deployment', {})
-        if fh.get('deployed') and fh.get('web_ui_port') in (8080, '8080', None):
-            fh['web_ui_port'] = 9100
-            s['fedhub_deployment'] = fh
-            changed = True
-            print("Startup migration: fixed fedhub web_ui_port → 9100")
-        if changed:
-            save_settings(s)
+        settings_dirty = False
 
-        # Fix Fed Hub client-auth on the remote host (need → want) so Caddy can connect
-        if fh.get('deployed') and fh.get('target_mode') == 'remote':
-            remote = fh.get('remote', {})
-            if (remote.get('host') or '').strip():
+        # Fix fedhub web_ui_port if bad
+        fh_raw = s.get('fedhub_deployment', {})
+        if fh_raw.get('deployed') or fh_raw.get('web_ui_port') in (8080, '8080'):
+            wp = fh_raw.get('web_ui_port')
+            if wp in (8080, '8080', None):
+                fh_raw['web_ui_port'] = 9100
+                s['fedhub_deployment'] = fh_raw
+                settings_dirty = True
+                print("Startup migration: fixed fedhub web_ui_port → 9100")
+
+        if settings_dirty:
+            save_settings(s)
+            s = load_settings()
+
+        # Fix Fed Hub client-auth on remote (need → want) so Caddy can connect without client cert
+        fh_cfg = _get_fedhub_deployment_config(s)
+        if fh_cfg.get('deployed') and fh_cfg.get('target_mode') == 'remote':
+            remote = fh_cfg.get('remote', {})
+            fh_host = (remote.get('host') or '').strip()
+            if fh_host:
+                print(f"Startup migration: checking fedhub client-auth on {fh_host}...")
                 ok, out = _ssh_probe(remote, 'grep "client-auth:" /opt/tak/federation-hub/configs/federation-hub-ui.yml 2>/dev/null', timeout=10)
                 if ok and out and 'need' in out:
-                    ok2, _ = _ssh_probe(remote, 'sudo sed -i "s/client-auth:.*/client-auth: want/" /opt/tak/federation-hub/configs/federation-hub-ui.yml && sudo systemctl restart federation-hub 2>/dev/null; true', timeout=30)
+                    ok2, _ = _ssh_probe(remote,
+                        'sudo sed -i "s/client-auth:.*/client-auth: want/" /opt/tak/federation-hub/configs/federation-hub-ui.yml && '
+                        'sudo systemctl restart federation-hub 2>/dev/null; true',
+                        timeout=60)
                     if ok2:
                         print("Startup migration: fixed fedhub client-auth need → want + restarted")
-                        changed = True
+                    else:
+                        print("Startup migration: SSH to fix client-auth failed")
+                elif ok and out and 'want' in out:
+                    print("Startup migration: fedhub client-auth already 'want' — good")
+                elif not ok:
+                    print(f"Startup migration: could not SSH to {fh_host} to check client-auth")
 
-        if changed and s.get('fqdn'):
+        # Always regenerate Caddyfile when Fed Hub is deployed (picks up forward_auth, port fixes, etc.)
+        if fh_cfg.get('deployed') and (s.get('fqdn') or '').strip():
             generate_caddyfile(s)
             subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
             print("Startup migration: Caddyfile regenerated + Caddy reloaded")
     except Exception as e:
-        print(f"Startup migration skipped: {e}")
+        print(f"Startup migration error: {e}")
+        import traceback; traceback.print_exc()
 
 _startup_migrations()
 
