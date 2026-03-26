@@ -12781,53 +12781,72 @@ def _ensure_authentik_fedhub_oauth_app(settings, plog=None):
         fh_domain = _get_service_domain(settings, 'fedhub') if settings.get('fqdn') else ''
         redirect_host = fh_domain or fh_host or 'localhost'
         redirect_uri = f'https://{redirect_host}:9100/login/redirect'
+        redirect_uris_obj = [{'matching_mode': 'strict', 'url': redirect_uri}]
 
-        # Create OAuth2 provider (or find existing)
+        # Check if provider already exists; if so, delete the stale one and recreate
         provider_pk = None
         client_id, client_secret = '', ''
         try:
+            req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/?search={urllib.parse.quote(provider_name)}', headers=_ak_headers)
+            resp = _urlreq.urlopen(req, timeout=15)
+            existing = json.loads(resp.read().decode())['results']
+            for ex in existing:
+                if ex.get('name') == provider_name:
+                    ex_pk = ex.get('pk')
+                    # Detail GET to check if it has valid credentials
+                    req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/{ex_pk}/', headers=_ak_headers)
+                    detail = json.loads(_urlreq.urlopen(req, timeout=15).read().decode())
+                    if detail.get('client_id') and detail.get('client_secret'):
+                        provider_pk = ex_pk
+                        client_id = detail['client_id']
+                        client_secret = detail['client_secret']
+                        # Update redirect_uris
+                        try:
+                            req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/{ex_pk}/',
+                                data=json.dumps({'redirect_uris': redirect_uris_obj}).encode(),
+                                headers=_ak_headers, method='PATCH')
+                            _urlreq.urlopen(req, timeout=10)
+                        except Exception:
+                            pass
+                        log(f'  ✓ Existing OAuth2 provider reused (client_id={client_id[:8]}...)')
+                    else:
+                        # Stale provider without credentials — delete and recreate
+                        try:
+                            req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/{ex_pk}/',
+                                headers=_ak_headers, method='DELETE')
+                            _urlreq.urlopen(req, timeout=10)
+                            log(f'  ✓ Deleted stale provider (pk={ex_pk})')
+                        except Exception:
+                            pass
+                    break
+        except Exception:
+            pass
+
+        # Create provider if we don't already have one
+        if not provider_pk:
             payload = {
                 'name': provider_name,
                 'authorization_flow': flow_pk,
                 'invalidation_flow': inv_flow_pk,
                 'client_type': 'confidential',
-                'redirect_uris': [redirect_uri],
+                'redirect_uris': redirect_uris_obj,
             }
-            req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/',
-                data=json.dumps(payload).encode(), headers=_ak_headers, method='POST')
-            resp = _urlreq.urlopen(req, timeout=15)
-            p = json.loads(resp.read().decode())
-            provider_pk = p.get('pk')
-            client_id = p.get('client_id', '')
-            client_secret = p.get('client_secret', '')
-            log(f'  ✓ OAuth2 provider created')
-        except Exception as e:
-            if hasattr(e, 'code') and e.code == 400:
-                req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/?search={urllib.parse.quote(provider_name)}', headers=_ak_headers)
+            try:
+                req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/',
+                    data=json.dumps(payload).encode(), headers=_ak_headers, method='POST')
                 resp = _urlreq.urlopen(req, timeout=15)
-                results = json.loads(resp.read().decode())['results']
-                if results:
-                    provider_pk = results[0].get('pk')
-                    # Detail GET to retrieve client_id and client_secret
-                    req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/{provider_pk}/', headers=_ak_headers)
-                    detail = json.loads(_urlreq.urlopen(req, timeout=15).read().decode())
-                    client_id = detail.get('client_id', '')
-                    client_secret = detail.get('client_secret', '')
-                    try:
-                        req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/{provider_pk}/',
-                            data=json.dumps({'redirect_uris': [redirect_uri]}).encode(),
-                            headers=_ak_headers, method='PATCH')
-                        _urlreq.urlopen(req, timeout=10)
-                    except Exception:
-                        pass
-                log(f'  ✓ OAuth2 provider already exists (client_id={client_id[:8]}..., redirect_uris updated)')
-            else:
+                p = json.loads(resp.read().decode())
+                provider_pk = p.get('pk')
+                client_id = p.get('client_id', '')
+                client_secret = p.get('client_secret', '')
+                log(f'  ✓ OAuth2 provider created (client_id={client_id[:8]}...)')
+            except Exception as e:
                 body = ''
                 try:
                     body = e.read().decode()[:500]
                 except Exception:
                     pass
-                log(f'  ✗ OAuth2 provider error ({getattr(e, "code", "?")}): {body or str(e)[:200]}')
+                log(f'  ✗ OAuth2 provider create failed ({getattr(e, "code", "?")}): {body or str(e)[:200]}')
 
         if not provider_pk or not client_id:
             log('  ✗ No OAuth2 provider — cannot continue')
