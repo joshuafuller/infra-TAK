@@ -12807,10 +12807,12 @@ def _ensure_authentik_fedhub_oauth_app(settings, plog=None):
                 resp = _urlreq.urlopen(req, timeout=15)
                 results = json.loads(resp.read().decode())['results']
                 if results:
-                    p = results[0]
-                    provider_pk = p.get('pk')
-                    client_id = p.get('client_id', '')
-                    client_secret = p.get('client_secret', '')
+                    provider_pk = results[0].get('pk')
+                    # Detail GET to retrieve client_id and client_secret
+                    req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/{provider_pk}/', headers=_ak_headers)
+                    detail = json.loads(_urlreq.urlopen(req, timeout=15).read().decode())
+                    client_id = detail.get('client_id', '')
+                    client_secret = detail.get('client_secret', '')
                     try:
                         req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/{provider_pk}/',
                             data=json.dumps({'redirect_uris': [redirect_uri]}).encode(),
@@ -12818,7 +12820,7 @@ def _ensure_authentik_fedhub_oauth_app(settings, plog=None):
                         _urlreq.urlopen(req, timeout=10)
                     except Exception:
                         pass
-                log(f'  ✓ OAuth2 provider already exists (redirect_uris updated)')
+                log(f'  ✓ OAuth2 provider already exists (client_id={client_id[:8]}..., redirect_uris updated)')
             else:
                 body = ''
                 try:
