@@ -12784,13 +12784,19 @@ def _ensure_authentik_fedhub_oauth_app(settings, plog=None):
                 'authorization_flow': flow_pk,
                 'client_type': 'confidential',
                 'redirect_uris': redirect_uri,
-                'signing_key': None,
-                'property_mappings': [],
-                'sub_mode': 'hashed_user_id',
             }
             req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/',
                 data=json.dumps(payload).encode(), headers=headers, method='POST')
-            resp = _urlreq.urlopen(req, timeout=15)
+            try:
+                resp = _urlreq.urlopen(req, timeout=15)
+            except urllib.error.HTTPError as e:
+                body = ''
+                try:
+                    body = e.read().decode()[:500]
+                except Exception:
+                    pass
+                log(f'  ✗ Provider create failed ({e.code}): {body}')
+                return None, None, None, None
             p = json.loads(resp.read().decode())
             client_id = p.get('client_id', '')
             client_secret = p.get('client_secret', '')
@@ -12822,6 +12828,14 @@ def _ensure_authentik_fedhub_oauth_app(settings, plog=None):
         token_url = f'{ak_public}/application/o/token/'
         return client_id, client_secret, authorize_url, token_url
 
+    except urllib.error.HTTPError as e:
+        body = ''
+        try:
+            body = e.read().decode()[:500]
+        except Exception:
+            pass
+        log(f'  ✗ Authentik OAuth setup failed: HTTP {e.code}: {body}')
+        return None, None, None, None
     except Exception as e:
         log(f'  ✗ Authentik OAuth setup failed: {str(e)[:200]}')
         return None, None, None, None
