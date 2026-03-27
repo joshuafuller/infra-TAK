@@ -14232,6 +14232,11 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 .info-item{background:#0a0e1a;border-radius:8px;padding:12px 14px}
 .info-label{font-size:11px;color:var(--text-dim);margin-bottom:3px;text-transform:uppercase;letter-spacing:.05em}
 .info-value{font-size:13px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;word-break:break-all}
+.metrics-bar{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:8px}
+.metric-card{background:var(--bg-surface);border:1px solid var(--border);border-radius:12px;padding:18px;text-align:center}
+.metric-label{font-family:'JetBrains Mono',monospace;font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--text-dim);margin-bottom:6px}
+.metric-value{font-family:'JetBrains Mono',monospace;font-size:24px;font-weight:700;color:var(--text-primary)}
+.metric-detail{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:2px}
 .upload-area{border:2px dashed var(--border);border-radius:10px;padding:22px;text-align:center;cursor:pointer;transition:all .2s;background:rgba(15,23,42,.25);margin-bottom:12px}
 .upload-area:hover,.upload-area.dragover{border-color:var(--accent);background:rgba(59,130,246,.08)}
 .log-box{background:#070a12;border:1px solid var(--border);border-radius:8px;padding:16px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:360px;overflow-y:auto;line-height:1.6;white-space:pre-wrap}
@@ -14244,6 +14249,8 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 .fh-section>summary .chev{transition:transform .2s ease;color:var(--text-dim)}
 .fh-section[open]>summary .chev{transform:rotate(180deg)}
 .fh-section-body{padding:0 24px 24px;border-top:1px solid var(--border)}
+@media(max-width:1000px){.metrics-bar{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:700px){.metrics-bar{grid-template-columns:1fr}}
 </style></head>
 <body>
 {{ sidebar_html }}
@@ -14292,7 +14299,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   {% endif %}
 
   {% if not fh.installed %}
-  <details class="fh-section" open>
+  <details class="fh-section">
     <summary><span>Package upload &amp; remote install</span><span class="chev">&#9662;</span></summary>
     <div class="fh-section-body">
     <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:14px">Same idea as <strong>split-mode</strong> TAK database deploy: upload <code style="font-size:12px">takserver-fed-hub</code> .deb on this console, then infra-TAK <strong>SCP</strong>s it to the target and runs <code style="font-size:12px">apt-get install</code> there.</p>
@@ -14307,9 +14314,6 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     <div class="controls">
       <button class="btn btn-primary" type="button" id="fedhub-deploy-btn" onclick="fedhubStartDeploy()">Deploy to remote host</button>
     </div>
-    {% if fh.installed %}
-    <p class="form-hint" style="margin-top:12px">This host is already registered. Use <strong>Update Federation Hub</strong> (below) to push a newer official .deb; the button above is for re-deploy or another target after you clear registration.</p>
-    {% endif %}
     <div id="fedhub-deploy-log-card" style="display:{% if fedhub_deploying or (fedhub_deploy_done and fedhub_deploy_error) %}block{% else %}none{% endif %};margin-top:18px;padding-top:18px;border-top:1px solid var(--border)">
       <div class="card-title" style="margin-bottom:10px">Deploy log</div>
       <div class="log-box" id="fedhub-deploy-log">{% if fedhub_deploying %}Starting…{% endif %}</div>
@@ -14318,7 +14322,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   </details>
   {% endif %}
 
-  <details class="fh-section" open>
+  <details class="fh-section">
     <summary><span>Deployment target (SSH)</span><span class="chev">&#9662;</span></summary>
     <div class="fh-section-body">
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:16px">This module is built for a <strong>separate</strong> machine from this console. Use the same SSH patterns as MediaMTX/Authentik remote deploy.</p>
@@ -14362,7 +14366,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     </div>
   </details>
 
-  <details class="fh-section" open>
+  <details class="fh-section">
     <summary><span>HTTPS access (Caddy on this console)</span><span class="chev">&#9662;</span></summary>
     <div class="fh-section-body">
     <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:14px">Federation Hub is a <strong>separate web app</strong> on the remote host. This console’s <strong>Caddy</strong> can terminate TLS at <code style="font-size:12px">https://fedhub.&lt;your FQDN&gt;</code> and reverse-proxy to the hub’s HTTP port (same pattern as <code style="font-size:12px">stream.*</code> → MediaMTX).</p>
