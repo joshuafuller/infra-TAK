@@ -14630,7 +14630,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     <summary><span>Update Federation Hub</span><span class="chev">&#9662;</span></summary>
     <div class="fh-section-body">
       <p class="form-hint" style="margin:14px 0 12px;line-height:1.45">Upload a newer <code style="font-size:11px">takserver-fed-hub</code> .deb and push it to the same remote host (same pattern as <strong>Update TAK Server</strong>).</p>
-    <div id="fedhub-update-body" style="display:{% if fedhub_upgrading or fedhub_upgrade_done or fedhub_upgrade_error %}block{% else %}none{% endif %}">
+    <div id="fedhub-update-body">
       <div id="fedhub-upgrade-upload-area" class="upload-area" style="margin-top:16px" onclick="var i=document.getElementById('fedhub-upgrade-file-input');if(i){i.value='';i.click();}" ondrop="fedhubDropUpgrade(event)" ondragover="event.preventDefault();this.classList.add('dragover')" ondragleave="event.preventDefault();this.classList.remove('dragover')">
         <div style="font-size:22px;margin-bottom:6px">⬆</div>
         <div style="font-size:13px;color:var(--text-secondary)">Drop replacement .deb here or click (same upload store as above)</div>
