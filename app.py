@@ -5713,10 +5713,10 @@ def _get_module_deployment_config(settings, key):
 
 
 def _get_fedhub_deployment_config(settings):
-    """fedhub_deployment plus web_ui_port (HTTP port on the remote hub host for Caddy reverse_proxy)."""
+    """fedhub_deployment plus web_ui_port (OAuth-enabled HTTPS port on the remote hub host for Caddy reverse_proxy)."""
     c = _normalize_module_deployment_config(settings.get('fedhub_deployment', {}))
     try:
-        p = int(c.get('web_ui_port') if c.get('web_ui_port') is not None else 8080)
+        p = int(c.get('web_ui_port') if c.get('web_ui_port') is not None else 8446)
     except (TypeError, ValueError):
         p = 8080
     c['web_ui_port'] = max(1, min(65535, p))
@@ -7211,11 +7211,11 @@ def generate_caddyfile(settings=None):
         fh_remote = (fhcfg.get('remote', {}).get('host') or '').strip()
         if fh_remote and fhcfg.get('target_mode') == 'remote':
             fh_host = sd['fedhub']
-            fh_port = int(fhcfg.get('web_ui_port') or 8080)
+            fh_port = int(fhcfg.get('web_ui_port') or 8446)
             fh_upstream = f'{fh_remote}:{fh_port}'
-            lines.append("# TAK Federation Hub — Caddy terminates public TLS; Fed Hub handles its own OAuth with Authentik")
+            lines.append("# TAK Federation Hub — Caddy terminates public TLS; Fed Hub handles its own OAuth via port 8446")
             lines.append(f"{fh_host} {{")
-            fh_upstream_scheme = 'https' if fh_port == 9100 else 'http'
+            fh_upstream_scheme = 'https' if fh_port in (9100, 8446) else 'http'
             lines.append(f"    reverse_proxy {fh_upstream_scheme}://{fh_upstream} {{")
             lines.append(f"        transport http {{")
             if fh_upstream_scheme == 'https':
