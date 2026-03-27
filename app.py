@@ -7213,37 +7213,18 @@ def generate_caddyfile(settings=None):
             fh_host = sd['fedhub']
             fh_port = int(fhcfg.get('web_ui_port') or 8080)
             fh_upstream = f'{fh_remote}:{fh_port}'
-            lines.append("# TAK Federation Hub — Caddy terminates public TLS; upstream uses configured hub web port")
+            lines.append("# TAK Federation Hub — Caddy terminates public TLS; Fed Hub handles its own OAuth with Authentik")
             lines.append(f"{fh_host} {{")
             fh_upstream_scheme = 'https' if fh_port == 9100 else 'http'
-            if ak.get('installed'):
-                lines.append(f"    route {{")
-                lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
-                lines.append(f"        forward_auth {ak_up} {{")
-                lines.append(f"            uri /outpost.goauthentik.io/auth/caddy")
-                lines.append(f"            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid")
-                lines.append(f"            trusted_proxies private_ranges")
-                lines.append(f"        }}")
-                lines.append(f"        reverse_proxy {fh_upstream_scheme}://{fh_upstream} {{")
-                lines.append(f"            transport http {{")
-                if fh_upstream_scheme == 'https':
-                    lines.append(f"                tls")
-                    lines.append(f"                tls_insecure_skip_verify")
-                lines.append(f"                read_timeout 120s")
-                lines.append(f"                write_timeout 120s")
-                lines.append(f"            }}")
-                lines.append(f"        }}")
-                lines.append(f"    }}")
-            else:
-                lines.append(f"    reverse_proxy {fh_upstream_scheme}://{fh_upstream} {{")
-                lines.append(f"        transport http {{")
-                if fh_upstream_scheme == 'https':
-                    lines.append(f"            tls")
-                    lines.append(f"            tls_insecure_skip_verify")
-                lines.append(f"            read_timeout 120s")
-                lines.append(f"            write_timeout 120s")
-                lines.append(f"        }}")
-                lines.append(f"    }}")
+            lines.append(f"    reverse_proxy {fh_upstream_scheme}://{fh_upstream} {{")
+            lines.append(f"        transport http {{")
+            if fh_upstream_scheme == 'https':
+                lines.append(f"            tls")
+                lines.append(f"            tls_insecure_skip_verify")
+            lines.append(f"            read_timeout 120s")
+            lines.append(f"            write_timeout 120s")
+            lines.append(f"        }}")
+            lines.append(f"    }}")
             lines.append(f"}}")
             lines.append("")
 
