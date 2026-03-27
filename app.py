@@ -4654,6 +4654,9 @@ def federation_hub_page():
     _fedhub_upgrade_done = fedhub_upgrade_status.get('complete', False)
     if _fedhub_upgrade_done and not fedhub_upgrade_status.get('running'):
         fedhub_upgrade_status.update({'complete': False})
+    _fedhub_rotate_done = fedhub_rotate_status.get('complete', False)
+    if _fedhub_rotate_done and not fedhub_rotate_status.get('running'):
+        fedhub_rotate_status.update({'complete': False})
     _fqdn = (settings.get('fqdn') or '').strip()
     _fedhub_host = _get_service_domain(settings, 'fedhub') if _fqdn else ''
     _fedhub_public_url = f'https://{_fedhub_host}' if _fedhub_host else ''
@@ -4672,6 +4675,9 @@ def federation_hub_page():
         fedhub_upgrading=fedhub_upgrade_status.get('running', False),
         fedhub_upgrade_done=_fedhub_upgrade_done,
         fedhub_upgrade_error=fedhub_upgrade_status.get('error', False),
+        fedhub_rotating=fedhub_rotate_status.get('running', False),
+        fedhub_rotate_done=_fedhub_rotate_done,
+        fedhub_rotate_error=fedhub_rotate_status.get('error', False),
         authentik_installed=_ak.get('installed', False),
         fedhub_remote_host=(fedhub_deploy_cfg.get('remote', {}).get('host') or '').strip() if fedhub_deploy_cfg.get('target_mode') == 'remote' and fedhub_deploy_cfg.get('deployed') else ''))
     resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
@@ -5271,6 +5277,189 @@ def fedhub_update_log_api():
         'entries': fedhub_upgrade_log[idx:], 'total': len(fedhub_upgrade_log),
         'running': fedhub_upgrade_status['running'], 'complete': fedhub_upgrade_status['complete'],
         'error': fedhub_upgrade_status['error'],
+    })
+
+
+def run_fedhub_remote_rotate_ca(new_root_ca=None, new_int_ca=None):
+    def plog(msg):
+        fedhub_rotate_log.append(msg)
+
+    try:
+        settings = load_settings()
+        cfg = _get_fedhub_deployment_config(settings)
+        if not cfg.get('deployed'):
+            plog('✗ Federation Hub is not registered. Deploy first.')
+            fedhub_rotate_status.update({'running': False, 'complete': True, 'error': True})
+            return
+        if cfg.get('target_mode') != 'remote':
+            plog('✗ Rotate CA is only supported for remote Federation Hub targets.')
+            fedhub_rotate_status.update({'running': False, 'complete': True, 'error': True})
+            return
+        remote = cfg.get('remote', {})
+        if not (remote.get('host') or '').strip():
+            plog('✗ Remote host is not configured.')
+            fedhub_rotate_status.update({'running': False, 'complete': True, 'error': True})
+            return
+
+        fh_dir = '/opt/tak/federation-hub'
+        ok_dir, out_dir = _ssh_probe(remote, f'test -d {fh_dir} && echo OK', timeout=20)
+        if not ok_dir or 'OK' not in (out_dir or ''):
+            plog(f'✗ {fh_dir} not found on target host')
+            fedhub_rotate_status.update({'running': False, 'complete': True, 'error': True})
+            return
+
+        ts = datetime.utcnow().strftime('%Y%m%d-%H%M%S')
+        base_root = (new_root_ca or settings.get('fedhub_root_ca') or settings.get('root_ca_name') or 'FEDHUB-ROOT-CA').strip()
+        base_int = (new_int_ca or settings.get('fedhub_intermediate_ca') or settings.get('intermediate_ca_name') or 'FEDHUB-INT-CA').strip()
+        if not new_root_ca:
+            base_root = f'{base_root}-{ts}'
+        if not new_int_ca:
+            base_int = f'{base_int}-{ts}'
+        safe_root = re.sub(r'[^a-zA-Z0-9._-]', '-', base_root).strip('-') or f'FEDHUB-ROOT-CA-{ts}'
+        safe_int = re.sub(r'[^a-zA-Z0-9._-]', '-', base_int).strip('-') or f'FEDHUB-INT-CA-{ts}'
+        cert_pass = (settings.get('tak_cert_password') or 'atakatak').strip() or 'atakatak'
+
+        ok_host, host_out = _ssh_probe(remote, 'hostname', timeout=10)
+        remote_hostname = (host_out or 'fedhub').strip() or 'fedhub'
+
+        plog('━━━ Rotate Federation Hub CA ━━━')
+        plog(f'  Host: {remote.get("host")}')
+        plog(f'  New Root CA: {safe_root}')
+        plog(f'  New Intermediate CA: {safe_int}')
+
+        backup_cmd = (
+            f'cd {fh_dir}/certs && '
+            f'sudo mkdir -p backups && '
+            f'sudo tar -czf backups/pre-rotate-{ts}.tgz files 2>/dev/null || true'
+        )
+        _ssh_probe(remote, backup_cmd, timeout=45)
+        plog(f'✓ Backup created: {fh_dir}/certs/backups/pre-rotate-{ts}.tgz')
+
+        meta_subs = [
+            ('COUNTRY', settings.get('cert_country') or 'US'),
+            ('STATE', settings.get('cert_state') or 'State'),
+            ('CITY', settings.get('cert_city') or 'City'),
+            ('ORGANIZATION', settings.get('cert_org') or 'TAK'),
+            ('ORGANIZATIONAL_UNIT', settings.get('cert_ou') or 'FederationHub'),
+        ]
+        meta_cmds = f'cd {fh_dir}/certs && sudo cp cert-metadata.sh cert-metadata.sh.bak 2>/dev/null; true'
+        for var, val in meta_subs:
+            meta_cmds += f" && sudo sed -i 's/^{var}=.*/{var}={shlex.quote(val)}/' cert-metadata.sh"
+        if cert_pass and cert_pass != 'atakatak':
+            meta_cmds += f" && sudo sed -i 's/^CAPASS=.*/CAPASS={shlex.quote(cert_pass)}/' cert-metadata.sh"
+            meta_cmds += f" && sudo sed -i 's/^PASS=.*/PASS={shlex.quote(cert_pass)}/' cert-metadata.sh"
+        ok_meta, meta_out = _ssh_probe(remote, meta_cmds, timeout=30)
+        if not ok_meta:
+            plog(f'⚠ cert-metadata patch warning: {(meta_out or "")[:240]}')
+        else:
+            plog('✓ cert-metadata patched')
+
+        cert_cmds = (
+            f'cd {fh_dir}/certs && '
+            f'sudo chown -R tak:tak {fh_dir} && '
+            f'sudo -u tak ./makeRootCa.sh --ca-name {shlex.quote(safe_root)} 2>&1 && '
+            f'echo y | sudo -u tak ./makeCert.sh ca {shlex.quote(safe_int)} 2>&1 && '
+            f'sudo -u tak ./makeCert.sh server {shlex.quote(remote_hostname)} 2>&1 && '
+            f'echo y | sudo -u tak ./makeCert.sh client webadmin-fed 2>&1'
+        )
+        ok_cert, cert_out = _ssh_probe(remote, cert_cmds, timeout=180)
+        if cert_out:
+            plog(cert_out[-3000:] if len(cert_out) > 3000 else cert_out)
+        if not ok_cert:
+            plog('✗ Certificate rotation failed')
+            fedhub_rotate_status.update({'running': False, 'complete': True, 'error': True})
+            return
+        plog('✓ New CA + server + webadmin-fed cert generated')
+
+        patch_cfg_cmd = (
+            f'cd {fh_dir}/configs && '
+            f'sudo sed -i -E "s|truststore-[A-Za-z0-9._-]+|truststore-{safe_int}|g" federation-hub-ui.yml && '
+            f'sudo sed -i "s/takserver\\.jks/{shlex.quote(remote_hostname)}.jks/g" federation-hub-broker.yml && '
+            f'sudo sed -i "s/takserver\\.jks/{shlex.quote(remote_hostname)}.jks/g" federation-hub-ui.yml'
+        )
+        ok_cfg, cfg_out = _ssh_probe(remote, patch_cfg_cmd, timeout=30)
+        if not ok_cfg:
+            plog(f'⚠ Config patch warning: {(cfg_out or "")[:240]}')
+        else:
+            plog('✓ Federation Hub config files updated')
+
+        if cert_pass and cert_pass != 'atakatak':
+            pw_cmd = (
+                f'cd {fh_dir}/configs && '
+                f'sudo sed -i "s/atakatak/{shlex.quote(cert_pass)}/g" federation-hub-broker.yml && '
+                f'sudo sed -i "s/atakatak/{shlex.quote(cert_pass)}/g" federation-hub-ui.yml'
+            )
+            _ssh_probe(remote, pw_cmd, timeout=20)
+            plog('✓ Certificate password re-applied to config files')
+
+        mgr_cmd = (
+            f'sudo -u tak java -jar {fh_dir}/jars/federation-hub-manager.jar '
+            f'{fh_dir}/certs/files/webadmin-fed.pem 2>&1'
+        )
+        ok_mgr, mgr_out = _ssh_probe(remote, mgr_cmd, timeout=60)
+        if mgr_out:
+            plog(mgr_out[-1000:] if len(mgr_out) > 1000 else mgr_out)
+        if ok_mgr:
+            plog('✓ webadmin-fed certificate re-registered')
+        else:
+            plog('⚠ webadmin-fed registration returned non-zero')
+
+        _ssh_probe(remote, f'sudo cp {fh_dir}/certs/files/webadmin-fed.p12 /root/ 2>/dev/null; true', timeout=15)
+        plog('✓ webadmin-fed.p12 copied to /root/')
+
+        ok_restart, restart_out = _ssh_probe(remote, 'sudo systemctl restart federation-hub 2>&1', timeout=90)
+        if restart_out:
+            plog(restart_out[-800:] if len(restart_out) > 800 else restart_out)
+        if not ok_restart:
+            plog('✗ federation-hub restart failed')
+            fedhub_rotate_status.update({'running': False, 'complete': True, 'error': True})
+            return
+
+        ok_state, state_out = _ssh_probe(remote, 'systemctl is-active federation-hub 2>/dev/null', timeout=20)
+        state = (state_out or '').strip()
+        if state != 'active':
+            plog(f'✗ federation-hub state is {state or "unknown"} after restart')
+            fedhub_rotate_status.update({'running': False, 'complete': True, 'error': True})
+            return
+
+        settings = load_settings()
+        settings['fedhub_root_ca'] = safe_root
+        settings['fedhub_intermediate_ca'] = safe_int
+        save_settings(settings)
+
+        plog('✓ federation-hub is active')
+        plog('━━━ Rotation complete ━━━')
+        plog('Import the new webadmin-fed.p12 in your browser before next login.')
+        fedhub_rotate_status.update({'running': False, 'complete': True, 'error': False})
+    except Exception as e:
+        plog(f'✗ {e}')
+        fedhub_rotate_status.update({'running': False, 'complete': True, 'error': True})
+
+
+@app.route('/api/fedhub/rotate-ca', methods=['POST'])
+@login_required
+def fedhub_rotate_ca_api():
+    if fedhub_rotate_status.get('running'):
+        return jsonify({'error': 'CA rotation already in progress'}), 409
+    if fedhub_deploy_status.get('running') or fedhub_upgrade_status.get('running'):
+        return jsonify({'error': 'Wait for deploy/update to finish before rotating CA.'}), 409
+    data = request.get_json() or {}
+    new_root_ca = (data.get('new_root_ca') or '').strip() or None
+    new_int_ca = (data.get('new_int_ca') or '').strip() or None
+    fedhub_rotate_log.clear()
+    fedhub_rotate_status.update({'running': True, 'complete': False, 'error': False})
+    threading.Thread(target=run_fedhub_remote_rotate_ca, args=(new_root_ca, new_int_ca), daemon=True).start()
+    return jsonify({'success': True})
+
+
+@app.route('/api/fedhub/rotate-ca/log')
+@login_required
+def fedhub_rotate_ca_log_api():
+    idx = request.args.get('index', 0, type=int)
+    return jsonify({
+        'entries': fedhub_rotate_log[idx:], 'total': len(fedhub_rotate_log),
+        'running': fedhub_rotate_status['running'], 'complete': fedhub_rotate_status['complete'],
+        'error': fedhub_rotate_status['error'],
     })
 
 
@@ -8886,6 +9075,9 @@ fedhub_deploy_status = {'running': False, 'complete': False, 'error': False}
 
 fedhub_upgrade_log = []
 fedhub_upgrade_status = {'running': False, 'complete': False, 'error': False}
+
+fedhub_rotate_log = []
+fedhub_rotate_status = {'running': False, 'complete': False, 'error': False}
 
 @app.route('/api/mediamtx/deploy', methods=['POST'])
 @login_required
@@ -14298,6 +14490,23 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   </div>
   {% endif %}
 
+  {% if fh.installed %}
+  <details class="fh-section">
+    <summary><span>Certificates &amp; CA rotation</span><span class="chev">&#9662;</span></summary>
+    <div class="fh-section-body">
+      <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:14px">Generate a new Federation Hub root/intermediate CA pair and new server/admin certs. This restarts Federation Hub and requires re-importing the new <code style="font-size:11px">webadmin-fed.p12</code> in browsers.</p>
+      <div class="controls" style="align-items:center;flex-wrap:wrap;gap:12px">
+        <button type="button" id="fedhub-rotate-btn" class="btn btn-primary" onclick="fedhubStartRotateCa()">Rotate CA + regenerate certs</button>
+        <span id="fedhub-rotate-msg" class="form-hint" style="margin:0"></span>
+      </div>
+      <div id="fedhub-rotate-log-wrap" style="display:{% if fedhub_rotating or fedhub_rotate_done or fedhub_rotate_error %}block{% else %}none{% endif %};margin-top:16px">
+        <div class="card-title" style="margin-bottom:8px">Rotation log</div>
+        <div class="log-box" id="fedhub-rotate-log">{% if fedhub_rotating %}Starting…{% elif fedhub_rotate_done %}Done.{% elif fedhub_rotate_error %}Rotation failed.{% endif %}</div>
+      </div>
+    </div>
+  </details>
+  {% endif %}
+
   {% if not fh.installed %}
   <details class="fh-section">
     <summary><span>Package upload &amp; remote install</span><span class="chev">&#9662;</span></summary>
@@ -14462,6 +14671,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 <script>
 var fedhubLogIndex=0,fedhubLogInterval=null;
 var fedhubUpgradeLogIndex=0,fedhubUpgradeLogInterval=null;
+var fedhubRotateLogIndex=0,fedhubRotateLogInterval=null;
 var fedhubUploadXhr=null;
 function fedhubFormatSize(b){
   if(b==null||isNaN(+b))return'';
@@ -14881,6 +15091,52 @@ function fedhubDownloadWebadminCert(){
   window.location='/api/fedhub/download-webadmin-cert';
   if(el){setTimeout(function(){el.textContent='';},2500);}
 }
+function fedhubPollRotateLog(){
+  if(fedhubRotateLogInterval)clearInterval(fedhubRotateLogInterval);
+  fedhubRotateLogInterval=setInterval(function(){
+    fetch('/api/fedhub/rotate-ca/log?index='+fedhubRotateLogIndex,{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+      var box=document.getElementById('fedhub-rotate-log');
+      if(box&&d.entries&&d.entries.length){
+        var t=(box.textContent||'');
+        if(t&&t.slice(-1)!=='\n')t+='\n';
+        box.textContent=t+d.entries.join('\n');
+        box.scrollTop=box.scrollHeight;
+        fedhubRotateLogIndex=d.total||fedhubRotateLogIndex;
+      }
+      if(d.complete){
+        clearInterval(fedhubRotateLogInterval);fedhubRotateLogInterval=null;
+        var btn=document.getElementById('fedhub-rotate-btn');
+        var msg=document.getElementById('fedhub-rotate-msg');
+        if(btn){btn.disabled=false;btn.textContent=d.error?'Retry CA rotation':'Rotate CA + regenerate certs';}
+        if(msg){msg.style.color=d.error?'var(--red)':'var(--green)';msg.textContent=d.error?'Rotation failed':'Rotation complete. Re-import webadmin-fed.p12 before next login.';}
+      }
+    });
+  },1200);
+}
+function fedhubStartRotateCa(){
+  if(!confirm('Rotate Federation Hub CA and regenerate certs now? This restarts federation-hub and requires importing a new webadmin-fed.p12.'))return;
+  var btn=document.getElementById('fedhub-rotate-btn');
+  var msg=document.getElementById('fedhub-rotate-msg');
+  var wrap=document.getElementById('fedhub-rotate-log-wrap');
+  var box=document.getElementById('fedhub-rotate-log');
+  if(btn){btn.disabled=true;btn.textContent='Rotating...';}
+  if(msg){msg.style.color='var(--text-dim)';msg.textContent='Starting rotation...';}
+  if(wrap)wrap.style.display='block';
+  if(box)box.textContent='';
+  fedhubRotateLogIndex=0;
+  fetch('/api/fedhub/rotate-ca',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}',credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(d){
+      if(!d||!d.success){
+        if(btn){btn.disabled=false;btn.textContent='Rotate CA + regenerate certs';}
+        if(msg){msg.style.color='var(--red)';msg.textContent=(d&&d.error)||'Failed to start rotation';}
+        return;
+      }
+      fedhubPollRotateLog();
+    }).catch(function(){
+      if(btn){btn.disabled=false;btn.textContent='Rotate CA + regenerate certs';}
+      if(msg){msg.style.color='var(--red)';msg.textContent='Request failed';}
+    });
+}
 function fedhubControl(act){
   var el=document.getElementById('fedhub-control-msg');
   if(el){el.style.color='var(--text-dim)';el.textContent='Running...';}
@@ -14919,6 +15175,19 @@ document.addEventListener('DOMContentLoaded',function(){
     if(box&&d.entries&&d.entries.length)box.textContent=d.entries.join(String.fromCharCode(10));
     if(box)box.scrollTop=box.scrollHeight;
     fedhubUpgradeLogIndex=d.total||0;
+  });
+  {% endif %}
+  {% if fedhub_rotating %}
+  fedhubRotateLogIndex=0;
+  var rw=document.getElementById('fedhub-rotate-log-wrap');
+  if(rw)rw.style.display='block';
+  fedhubPollRotateLog();
+  {% elif fedhub_rotate_done or fedhub_rotate_error %}
+  fetch('/api/fedhub/rotate-ca/log?index=0',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    var box=document.getElementById('fedhub-rotate-log');
+    if(box&&d.entries&&d.entries.length)box.textContent=d.entries.join(String.fromCharCode(10));
+    if(box)box.scrollTop=box.scrollHeight;
+    fedhubRotateLogIndex=d.total||0;
   });
   {% endif %}
   if(document.getElementById('fedhub-remote-metrics-bar')){loadFedhubRemoteMetrics();setInterval(loadFedhubRemoteMetrics,5000);}
