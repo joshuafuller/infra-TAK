@@ -829,6 +829,9 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
     tak = modules.get('takserver', {})
     if tak.get('installed'):
         parts.append(link('/takserver', f'<img src="{html.escape(TAK_LOGO_URL)}" alt="TAK Server" class="nav-icon" style="height:24px;width:auto;max-width:48px;object-fit:contain;display:block"><span>TAK Server</span>', 'TAK Server'))
+    fedhub = modules.get('fedhub', {})
+    if fedhub.get('installed'):
+        parts.append(link('/federation-hub', '<span class="nav-icon material-symbols-outlined" style="font-size:22px">hub</span><span>Federation Hub</span>', 'Federation Hub'))
     ak = modules.get('authentik', {})
     if ak.get('installed'):
         parts.append(link('/authentik', f'<img src="{html.escape(AUTHENTIK_LOGO_URL)}" alt="Authentik" class="nav-icon" style="height:48px;width:auto;max-width:100px;object-fit:contain;display:block">', 'Authentik'))
@@ -838,9 +841,6 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
     cloudtak = modules.get('cloudtak', {})
     if cloudtak.get('installed'):
         parts.append(link('/cloudtak', f'<img src="{html.escape(CLOUDTAK_ICON)}" alt="" class="nav-icon" style="height:24px;width:auto;max-width:72px;object-fit:contain;display:block"><span>CloudTAK</span>'))
-    fedhub = modules.get('fedhub', {})
-    if fedhub.get('installed'):
-        parts.append(link('/federation-hub', '<span class="nav-icon material-symbols-outlined" style="font-size:22px">hub</span><span>Federation Hub</span>', 'Federation Hub'))
     mtx = modules.get('mediamtx', {})
     if mtx.get('installed'):
         parts.append(link('/mediamtx', f'<img src="{html.escape(MEDIAMTX_LOGO_URL)}" alt="MediaMTX" class="nav-icon" style="height:48px;width:auto;max-width:100px;object-fit:contain;display:block">', 'MediaMTX'))
@@ -4657,10 +4657,12 @@ def federation_hub_page():
     _fqdn = (settings.get('fqdn') or '').strip()
     _fedhub_host = _get_service_domain(settings, 'fedhub') if _fqdn else ''
     _fedhub_public_url = f'https://{_fedhub_host}' if _fedhub_host else ''
+    _fedhub_sso_prime_url = f'https://tak.{_fqdn}' if _fqdn else ''
     _ak = modules.get('authentik', {})
     resp = make_response(render_template_string(FEDHUB_TEMPLATE,
         settings=settings, fh=fh, fedhub_deploy_cfg=fedhub_deploy_cfg, version=VERSION,
         fedhub_public_url=_fedhub_public_url,
+        fedhub_sso_prime_url=_fedhub_sso_prime_url,
         fedhub_service_domain=_fedhub_host,
         fedhub_pkg_filename=_fpkg_fn or '',
         fedhub_pkg_size_mb=fpkg_size,
@@ -4763,6 +4765,53 @@ def fedhub_remote_metrics():
     if metrics is None:
         return jsonify({'error': 'Could not fetch remote metrics'}), 503
     return jsonify(metrics)
+
+@app.route('/api/fedhub/download-webadmin-cert')
+@login_required
+def fedhub_download_webadmin_cert():
+    """Download webadmin-fed.p12 from Federation Hub target host."""
+    settings = load_settings()
+    cfg = _get_fedhub_deployment_config(settings)
+    if not cfg.get('deployed') or cfg.get('target_mode') != 'remote':
+        return jsonify({'success': False, 'error': 'Federation Hub must be deployed to a remote host first.'}), 400
+    remote = cfg.get('remote', {})
+    if not (remote.get('host') or '').strip():
+        return jsonify({'success': False, 'error': 'Remote host not configured.'}), 400
+    cmd = (
+        "python3 - <<'PY'\n"
+        "import base64,sys,os\n"
+        "candidates=[\n"
+        " '/root/webadmin-fed.p12',\n"
+        " '/opt/tak/federation-hub/certs/files/webadmin-fed.p12',\n"
+        "]\n"
+        "for p in candidates:\n"
+        "  if os.path.exists(p):\n"
+        "    try:\n"
+        "      b=open(p,'rb').read()\n"
+        "      print(base64.b64encode(b).decode())\n"
+        "      sys.exit(0)\n"
+        "    except Exception as e:\n"
+        "      print('ERR:'+str(e))\n"
+        "      sys.exit(1)\n"
+        "print('ERR:webadmin-fed.p12 not found')\n"
+        "sys.exit(1)\n"
+        "PY"
+    )
+    ok, out = _ssh_probe(remote, cmd, timeout=25)
+    if not ok or not (out or '').strip():
+        return jsonify({'success': False, 'error': (out or 'Could not read remote certificate file')[:260]}), 404
+    try:
+        import base64
+        data = base64.b64decode((out or '').strip().splitlines()[-1])
+    except Exception:
+        return jsonify({'success': False, 'error': 'Failed decoding remote certificate payload'}), 500
+    if not data:
+        return jsonify({'success': False, 'error': 'Remote certificate file was empty'}), 404
+    resp = make_response(data)
+    resp.headers['Content-Type'] = 'application/x-pkcs12'
+    resp.headers['Content-Disposition'] = 'attachment; filename=webadmin-fed.p12'
+    resp.headers['Content-Length'] = str(len(data))
+    return resp
 
 
 @app.route('/api/fedhub/enable-authentik', methods=['POST'])
@@ -14189,6 +14238,12 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 .progress-item{background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:12px 16px;margin-bottom:8px}
 .progress-bar-outer{width:100%;height:4px;background:rgba(59,130,246,0.1);border-radius:2px;margin-top:8px;overflow:hidden}
 .progress-bar-inner{height:100%;border-radius:2px;background:linear-gradient(90deg,var(--accent),var(--cyan));transition:width 0.25s ease}
+.fh-section{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:20px;overflow:hidden}
+.fh-section>summary{list-style:none;cursor:pointer;padding:16px 24px;display:flex;align-items:center;justify-content:space-between;color:var(--text-secondary);font-size:13px;font-weight:600;letter-spacing:.06em;text-transform:uppercase}
+.fh-section>summary::-webkit-details-marker{display:none}
+.fh-section>summary .chev{transition:transform .2s ease;color:var(--text-dim)}
+.fh-section[open]>summary .chev{transform:rotate(180deg)}
+.fh-section-body{padding:0 24px 24px;border-top:1px solid var(--border)}
 </style></head>
 <body>
 {{ sidebar_html }}
@@ -14206,14 +14261,40 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <div class="status-banner not-installed"><div class="dot"></div>Not registered — upload the .deb, set SSH below, then <strong>Deploy to remote host</strong> (or confirm manually)</div>
   {% endif %}
 
+  {% if fedhub_remote_host %}
   <div class="card">
-    <div class="card-title">Documentation</div>
-    <p style="font-size:13px;color:var(--text-secondary);line-height:1.55;margin-bottom:12px">Follow the <strong>Federation Hub</strong> section on TAK.gov for Ubuntu (.deb), Java, optional MongoDB, certificates, and <code style="font-size:12px">systemctl</code> service <code style="font-size:12px">federation-hub</code>.</p>
-    <a href="https://tak.gov/documentation/resources/civ-documentation/tak-server-documentation/federation-hub" target="_blank" rel="noopener noreferrer" class="btn btn-primary" style="text-decoration:none">Open TAK.gov Federation Hub guide ↗</a>
+    <div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-bottom:12px"><span style="color:var(--text-secondary)">Remote host:</span> <span style="color:var(--cyan)" id="fedhub-remote-host-ip">{{ fedhub_remote_host }}</span></div>
+    <div class="card-title" style="margin-top:16px;margin-bottom:8px">Remote host health</div>
+    <div class="metrics-bar" id="fedhub-remote-metrics-bar">
+      <div class="metric-card"><div class="metric-label">CPU</div><div class="metric-value" id="fedhub-remote-cpu-value">—</div></div>
+      <div class="metric-card"><div class="metric-label">Memory</div><div class="metric-value" id="fedhub-remote-ram-value">—</div><div class="metric-detail" id="fedhub-remote-ram-detail"></div></div>
+      <div class="metric-card"><div class="metric-label">Disk</div><div class="metric-value" id="fedhub-remote-disk-value">—</div><div class="metric-detail" id="fedhub-remote-disk-detail"></div></div>
+      <div class="metric-card"><div class="metric-label">Uptime</div><div class="metric-value" id="fedhub-remote-uptime-value" style="font-size:18px">—</div></div>
+    </div>
   </div>
+  {% endif %}
 
+  {% if fh.installed %}
   <div class="card">
-    <div class="card-title">Package upload &amp; remote install</div>
+    <div class="card-title">Controls (remote)</div>
+    <div class="controls">
+      {% if fh.running %}<button class="control-btn" onclick="fedhubControl('restart')">↻ Restart</button><button class="control-btn btn-stop" onclick="fedhubControl('stop')">■ Stop</button>{% else %}<button class="control-btn btn-start" onclick="fedhubControl('start')">▶ Start</button><button class="control-btn" onclick="fedhubControl('restart')">↻ Restart</button>{% endif %}
+      <button class="btn btn-ghost" type="button" onclick="fedhubRefreshStatus()">Refresh status</button>
+      <button class="btn btn-danger" type="button" onclick="fedhubClearRegistration()">Remove from console</button>
+    </div>
+    <div id="fedhub-control-msg" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
+    <div class="info-grid" style="margin-top:16px">
+      <div class="info-item"><div class="info-label">Service</div><div class="info-value" id="fedhub-svc-state">—</div></div>
+      <div class="info-item"><div class="info-label">Install dir</div><div class="info-value" id="fedhub-dir-state">—</div></div>
+    </div>
+    <div id="fedhub-clear-msg" style="margin-top:10px;font-size:12px"></div>
+  </div>
+  {% endif %}
+
+  {% if not fh.installed %}
+  <details class="fh-section" open>
+    <summary><span>Package upload &amp; remote install</span><span class="chev">&#9662;</span></summary>
+    <div class="fh-section-body">
     <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:14px">Same idea as <strong>split-mode</strong> TAK database deploy: upload <code style="font-size:12px">takserver-fed-hub</code> .deb on this console, then infra-TAK <strong>SCP</strong>s it to the target and runs <code style="font-size:12px">apt-get install</code> there.</p>
     <div id="fedhub-upload-area" class="upload-area" onclick="var i=document.getElementById('fedhub-file-input');if(i){i.value='';i.click();}" ondrop="fedhubDrop(event)" ondragover="event.preventDefault();this.classList.add('dragover')" ondragleave="event.preventDefault();this.classList.remove('dragover')">
       <div style="font-size:28px;margin-bottom:8px">📦</div>
@@ -14233,10 +14314,13 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
       <div class="card-title" style="margin-bottom:10px">Deploy log</div>
       <div class="log-box" id="fedhub-deploy-log">{% if fedhub_deploying %}Starting…{% endif %}</div>
     </div>
-  </div>
+    </div>
+  </details>
+  {% endif %}
 
-  <div class="card">
-    <div class="card-title">Deployment target (SSH)</div>
+  <details class="fh-section" open>
+    <summary><span>Deployment target (SSH)</span><span class="chev">&#9662;</span></summary>
+    <div class="fh-section-body">
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:16px">This module is built for a <strong>separate</strong> machine from this console. Use the same SSH patterns as MediaMTX/Authentik remote deploy.</p>
     <input type="hidden" id="fedhub-deployed-flag" value="{% if fedhub_deploy_cfg.deployed %}1{% else %}0{% endif %}">
     <div class="grid-2">
@@ -14275,13 +14359,20 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
       <label class="form-label">Public key (manual fallback)</label>
       <textarea id="fedhub-public-key" class="form-input" rows="3" readonly placeholder="Generate SSH key"></textarea>
     </div>
-  </div>
+    </div>
+  </details>
 
-  <div class="card">
-    <div class="card-title">HTTPS access (Caddy on this console)</div>
+  <details class="fh-section" open>
+    <summary><span>HTTPS access (Caddy on this console)</span><span class="chev">&#9662;</span></summary>
+    <div class="fh-section-body">
     <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:14px">Federation Hub is a <strong>separate web app</strong> on the remote host. This console’s <strong>Caddy</strong> can terminate TLS at <code style="font-size:12px">https://fedhub.&lt;your FQDN&gt;</code> and reverse-proxy to the hub’s HTTP port (same pattern as <code style="font-size:12px">stream.*</code> → MediaMTX).</p>
     {% if settings.fqdn and fedhub_public_url %}
     <p style="font-size:13px;margin-bottom:12px">When the module is registered and Caddy is deployed, open: <a href="{{ fedhub_public_url }}" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);font-family:'JetBrains Mono',monospace;font-size:12px">{{ fedhub_public_url }}</a></p>
+    <div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:12px">
+      <a href="{{ fedhub_sso_prime_url }}" target="_blank" rel="noopener noreferrer" class="btn btn-ghost" style="text-decoration:none">Open TAK SSO first ↗</a>
+      <a href="{{ fedhub_public_url }}" target="_blank" rel="noopener noreferrer" class="btn btn-primary" style="text-decoration:none">Open Fed Hub ↗</a>
+    </div>
+    <p class="form-hint" style="margin-bottom:12px">Recommended flow: open <code style="font-size:11px">{{ fedhub_sso_prime_url }}</code> first, then open <code style="font-size:11px">{{ fedhub_public_url }}</code> to avoid repeated login prompts.</p>
     <p class="form-hint" style="margin-bottom:14px">DNS: point <code style="font-size:11px">{{ fedhub_service_domain }}</code> (A/AAAA) to this <strong>console</strong> public IP — same as <code style="font-size:11px">infratak.*</code> / other subdomains — not the private Fed Hub IP.</p>
     {% else %}
     <p class="form-hint" style="margin-bottom:14px">Set the base <strong>FQDN</strong> in Console settings and run <strong>Caddy SSL</strong> deploy so subdomains get certificates. Then add DNS for <code style="font-size:11px">fedhub.&lt;FQDN&gt;</code> to this server.</p>
@@ -14292,50 +14383,33 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
       <div class="form-hint">Must match the hub web port on the target (recommended <strong>8080</strong> for Caddy upstream). The hub must listen on an IP reachable from <strong>this console</strong> (not only <code style="font-size:11px">127.0.0.1</code>). Caddy proxies to <code style="font-size:11px">SSH host:port</code>.</div>
     </div>
     <p style="font-size:12px;color:var(--text-secondary);line-height:1.5;margin-bottom:10px"><strong>Hub login:</strong> Import <code style="font-size:11px">webadmin-fed.p12</code> (generated during deploy, in <code style="font-size:11px">/root/</code> on the target) into your browser. Password = TAK cert password (default <code style="font-size:11px">atakatak</code>). Or enable <strong>Authentik SSO</strong> below for username/password login. See the <a href="https://tak.gov/documentation/resources/civ-documentation/tak-server-documentation/federation-hub" target="_blank" rel="noopener noreferrer" style="color:var(--cyan)">TAK.gov docs</a>.</p>
+    {% if fh.installed %}
+    <div class="controls" style="margin:8px 0 10px">
+      <button class="btn btn-ghost" type="button" onclick="fedhubDownloadWebadminCert()">⬇ Download webadmin-fed.p12</button>
+    </div>
+    {% endif %}
     <div class="form-hint" style="margin-bottom:8px">Saving the SSH target (or port) below updates settings and regenerates the Caddyfile when a base FQDN is set.</div>
-  </div>
+    </div>
+  </details>
 
   {% if fh.installed and authentik_installed %}
-  <div class="card" style="border-color:rgba(59,130,246,.3);background:rgba(59,130,246,.05)">
-    <div class="card-title">Authentik SSO login</div>
+  <details class="fh-section">
+    <summary><span>Authentik SSO login</span><span class="chev">&#9662;</span></summary>
+    <div class="fh-section-body" style="background:rgba(59,130,246,.05)">
     <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:14px">Enable <strong>Authentik OAuth</strong> on the Federation Hub UI so users can log in with their Authentik credentials instead of importing a client certificate. Creates an OAuth2/OIDC application in Authentik and patches <code style="font-size:11px">federation-hub-ui.yml</code> on the remote host. Users in the <strong>authentik Admins</strong> group get admin access.</p>
     <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:14px">Client cert login (<code style="font-size:11px">webadmin-fed.p12</code>) continues to work alongside OAuth.</p>
     <button class="btn btn-primary" type="button" onclick="fedhubEnableAuthentik()" id="fedhub-ak-btn">Enable Authentik login</button>
     <div id="fedhub-ak-msg" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
-  </div>
+    </div>
+  </details>
   {% elif fh.installed and not authentik_installed %}
-  <div class="card">
-    <div class="card-title">Authentik SSO login</div>
+  <details class="fh-section">
+    <summary><span>Authentik SSO login</span><span class="chev">&#9662;</span></summary>
+    <div class="fh-section-body">
     <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:14px">Deploy <strong>Authentik</strong> from the Marketplace first, then return here to enable OAuth login for the Federation Hub UI.</p>
-  </div>
-  {% endif %}
-
-  {% if fedhub_remote_host %}
-  <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
-  <div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-bottom:12px"><span style="color:var(--text-secondary)">Remote host:</span> <span style="color:var(--cyan)" id="fedhub-remote-host-ip">{{ fedhub_remote_host }}</span></div>
-  <div class="card-title" style="margin-top:16px;margin-bottom:8px">Remote host health</div>
-  <div class="metrics-bar" id="fedhub-remote-metrics-bar">
-  <div class="metric-card"><div class="metric-label">CPU</div><div class="metric-value" id="fedhub-remote-cpu-value">—</div></div>
-  <div class="metric-card"><div class="metric-label">Memory</div><div class="metric-value" id="fedhub-remote-ram-value">—</div><div class="metric-detail" id="fedhub-remote-ram-detail"></div></div>
-  <div class="metric-card"><div class="metric-label">Disk</div><div class="metric-value" id="fedhub-remote-disk-value">—</div><div class="metric-detail" id="fedhub-remote-disk-detail"></div></div>
-  <div class="metric-card"><div class="metric-label">Uptime</div><div class="metric-value" id="fedhub-remote-uptime-value" style="font-size:18px">—</div></div>
-  </div>
-  </div>
-  {% endif %}
-
-  {% if fh.installed %}
-  <div class="card">
-    <div class="card-title">Controls (remote)</div>
-    <div class="controls">
-      {% if fh.running %}<button class="control-btn" onclick="fedhubControl('restart')">↻ Restart</button><button class="control-btn btn-stop" onclick="fedhubControl('stop')">■ Stop</button>{% else %}<button class="control-btn btn-start" onclick="fedhubControl('start')">▶ Start</button><button class="control-btn" onclick="fedhubControl('restart')">↻ Restart</button>{% endif %}
-      <button class="btn btn-ghost" type="button" onclick="fedhubRefreshStatus()">Refresh status</button>
     </div>
-    <div id="fedhub-control-msg" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
-    <div class="info-grid" style="margin-top:16px">
-      <div class="info-item"><div class="info-label">Service</div><div class="info-value" id="fedhub-svc-state">—</div></div>
-      <div class="info-item"><div class="info-label">Install dir</div><div class="info-value" id="fedhub-dir-state">—</div></div>
-    </div>
-  </div>
+  </details>
+  {% endif %}
 
   <div class="card" style="padding:0;overflow:hidden">
     <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;padding:16px 24px;cursor:pointer" onclick="fedhubToggleUpdate()" id="fedhub-update-header">
@@ -14363,13 +14437,6 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
       </div>
     </div>
   </div>
-
-  <div class="card">
-    <div class="card-title">Console registration</div>
-    <p style="font-size:12px;color:var(--text-dim);margin-bottom:12px">Remove this module from the sidebar and Marketplace &quot;installed&quot; state without touching packages on the target.</p>
-    <button class="btn btn-danger" type="button" onclick="fedhubClearRegistration()">Remove from console</button>
-    <div id="fedhub-clear-msg" style="margin-top:10px;font-size:12px"></div>
-  </div>
   {% else %}
   <div class="card">
     <div class="card-title">Register without automated install</div>
@@ -14378,6 +14445,14 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     <div id="fedhub-mark-msg" style="margin-top:12px;font-size:13px;color:var(--text-dim)"></div>
   </div>
   {% endif %}
+
+  <details class="fh-section">
+    <summary><span>Documentation</span><span class="chev">&#9662;</span></summary>
+    <div class="fh-section-body">
+      <p style="font-size:13px;color:var(--text-secondary);line-height:1.55;margin:14px 0 12px">Follow the <strong>Federation Hub</strong> section on TAK.gov for Ubuntu (.deb), Java, optional MongoDB, certificates, and <code style="font-size:12px">systemctl</code> service <code style="font-size:12px">federation-hub</code>.</p>
+      <a href="https://tak.gov/documentation/resources/civ-documentation/tak-server-documentation/federation-hub" target="_blank" rel="noopener noreferrer" class="btn btn-primary" style="text-decoration:none">Open TAK.gov Federation Hub guide ↗</a>
+    </div>
+  </details>
 </div>
 <script>
 var fedhubLogIndex=0,fedhubLogInterval=null;
@@ -14794,6 +14869,12 @@ function fedhubClearRegistration(){
       if(d&&d.success){location.reload();return;}
       if(el){el.style.color='var(--red)';el.textContent=(d&&d.error)||'Failed';}
     }).catch(function(e){if(el){el.style.color='var(--red)';el.textContent='Failed';}});
+}
+function fedhubDownloadWebadminCert(){
+  var el=document.getElementById('fedhub-control-msg');
+  if(el){el.style.color='var(--text-dim)';el.textContent='Preparing certificate download...';}
+  window.location='/api/fedhub/download-webadmin-cert';
+  if(el){setTimeout(function(){el.textContent='';},2500);}
 }
 function fedhubControl(act){
   var el=document.getElementById('fedhub-control-msg');
@@ -23607,16 +23688,16 @@ def _run_unattended_upgrades_remote(remote_cfg, action):
     """Run enable/disable unattended-upgrades on remote host via SSH. Returns (success, result_dict)."""
     if action == 'disable':
         script = (
-            'pkill -TERM -f "/usr/bin/unattended-upgrade" 2>/dev/null; true; '
-            'systemctl stop unattended-upgrades 2>/dev/null; systemctl disable unattended-upgrades 2>/dev/null; '
-            'systemctl stop apt-daily-upgrade.timer 2>/dev/null; systemctl disable apt-daily-upgrade.timer 2>/dev/null; true; '
-            'e=$(systemctl is-enabled unattended-upgrades 2>/dev/null); echo "ENABLED=$e"'
+            'sudo pkill -TERM -f "/usr/bin/unattended-upgrade" 2>/dev/null; true; '
+            'sudo systemctl stop unattended-upgrades 2>/dev/null; sudo systemctl disable unattended-upgrades 2>/dev/null; '
+            'sudo systemctl stop apt-daily-upgrade.timer 2>/dev/null; sudo systemctl disable apt-daily-upgrade.timer 2>/dev/null; true; '
+            'e=$(sudo systemctl is-enabled unattended-upgrades 2>/dev/null); echo "ENABLED=$e"'
         )
     else:
         script = (
-            'systemctl enable unattended-upgrades 2>/dev/null; systemctl start unattended-upgrades 2>/dev/null; '
-            'systemctl enable apt-daily-upgrade.timer 2>/dev/null; systemctl start apt-daily-upgrade.timer 2>/dev/null; true; '
-            'e=$(systemctl is-enabled unattended-upgrades 2>/dev/null); echo "ENABLED=$e"'
+            'sudo systemctl enable unattended-upgrades 2>/dev/null; sudo systemctl start unattended-upgrades 2>/dev/null; '
+            'sudo systemctl enable apt-daily-upgrade.timer 2>/dev/null; sudo systemctl start apt-daily-upgrade.timer 2>/dev/null; true; '
+            'e=$(sudo systemctl is-enabled unattended-upgrades 2>/dev/null); echo "ENABLED=$e"'
         )
     try:
         ok, out = _ssh_probe(remote_cfg, script, timeout=30)
