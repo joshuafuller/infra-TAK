@@ -4815,10 +4815,14 @@ def fedhub_enable_authentik_api():
 
     # OIDC discovery URL — Fed Hub v5.7+ dynamically discovers auth/token/jwks endpoints from here
     oidc_config_url = f'{ak_public}/application/o/fedhub/.well-known/openid-configuration'
+    auth_endpoint_url = f'{ak_public}/application/o/authorize/'
+    token_endpoint_url = f'{ak_public}/application/o/token/'
 
     if client_id and client_secret:
         patch_cmd = (
             f'cd {fh_dir}/configs && '
+            # Normalize known OAuth keys first (including malformed "key : value" variants)
+            f'sudo sed -i -E "/^keycloak(Auth|Token)Endpoint[[:space:]]*:/d; /^keycloak(Access|Refresh)TokenName[[:space:]]*:/d" federation-hub-ui.yml && '
             f'sudo sed -i "s/^allowOauth:.*/allowOauth: true/" federation-hub-ui.yml && '
             f'sudo sed -i "s|^keycloakServerName:.*|keycloakServerName: {ak_public}|" federation-hub-ui.yml && '
             f'sudo sed -i "s|^keycloakClientId:.*|keycloakClientId: {shlex.quote(client_id)}|" federation-hub-ui.yml && '
@@ -4829,8 +4833,11 @@ def fedhub_enable_authentik_api():
             f'sudo sed -i "s|^keycloakAdminClaimValue:.*|keycloakAdminClaimValue: authentik Admins|" federation-hub-ui.yml && '
             f'sudo sed -i "s|^keycloakDerLocation:.*|keycloakTlsCertFile: /opt/tak/certs/keycloak.der|" federation-hub-ui.yml && '
             f'sudo sed -i "s|^keycloakTlsCertFile:.*|keycloakTlsCertFile: /opt/tak/certs/keycloak.der|" federation-hub-ui.yml && '
-            f'sudo sed -i "/^keycloakAuthEndpoint:/d; /^keycloakTokenEndpoint:/d; /^keycloakAccessTokenName:/d; /^keycloakRefreshTokenName:/d" federation-hub-ui.yml && '
             f'sudo sed -i "s|^keycloakConfigurationEndpoint:.*|keycloakConfigurationEndpoint: {oidc_config_url}|" federation-hub-ui.yml && '
+            f'grep -q "^keycloakAuthEndpoint:" federation-hub-ui.yml || echo "keycloakAuthEndpoint: {auth_endpoint_url}" | sudo tee -a federation-hub-ui.yml > /dev/null && '
+            f'grep -q "^keycloakTokenEndpoint:" federation-hub-ui.yml || echo "keycloakTokenEndpoint: {token_endpoint_url}" | sudo tee -a federation-hub-ui.yml > /dev/null && '
+            f'grep -q "^keycloakAccessTokenName:" federation-hub-ui.yml || echo "keycloakAccessTokenName: access_token" | sudo tee -a federation-hub-ui.yml > /dev/null && '
+            f'grep -q "^keycloakRefreshTokenName:" federation-hub-ui.yml || echo "keycloakRefreshTokenName: refresh_token" | sudo tee -a federation-hub-ui.yml > /dev/null && '
             f'grep -q "^keycloakRedirectUri:" federation-hub-ui.yml || echo "keycloakRedirectUri: {redirect_uri}" | sudo tee -a federation-hub-ui.yml > /dev/null && '
             f'grep -q "^keycloakrRedirectUri:" federation-hub-ui.yml || echo "keycloakrRedirectUri: {redirect_uri}" | sudo tee -a federation-hub-ui.yml > /dev/null && '
             f'grep -q "^keycloakConfigurationEndpoint:" federation-hub-ui.yml || echo "keycloakConfigurationEndpoint: {oidc_config_url}" | sudo tee -a federation-hub-ui.yml > /dev/null'
