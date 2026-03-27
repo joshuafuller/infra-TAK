@@ -7217,6 +7217,8 @@ def generate_caddyfile(settings=None):
             lines.append(f"{fh_host} {{")
             fh_upstream_scheme = 'https' if fh_port in (9100, 8446) else 'http'
             lines.append(f"    reverse_proxy {fh_upstream_scheme}://{fh_upstream} {{")
+            lines.append(f"        header_up X-Forwarded-Port 443")
+            lines.append(f"        header_up X-Forwarded-Proto https")
             lines.append(f"        transport http {{")
             if fh_upstream_scheme == 'https':
                 lines.append(f"            tls")
