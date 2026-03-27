@@ -14626,15 +14626,11 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   {% endif %}
 
   {% if fh.installed %}
-  <div class="card" style="padding:0;overflow:hidden">
-    <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;padding:16px 24px;cursor:pointer" onclick="fedhubToggleUpdate()" id="fedhub-update-header">
-      <div style="min-width:0">
-        <div class="card-title" style="margin-bottom:4px">Update Federation Hub</div>
-        <p class="form-hint" style="margin:0;line-height:1.45">Upload a newer <code style="font-size:11px">takserver-fed-hub</code> .deb and push it to the same remote host (same pattern as <strong>Update TAK Server</strong>).</p>
-      </div>
-      <span id="fedhub-update-toggle-icon" style="font-size:18px;color:var(--text-dim);transition:transform 0.2s ease;flex-shrink:0{% if fedhub_upgrading or fedhub_upgrade_done or fedhub_upgrade_error %};transform:rotate(180deg){% endif %}">&#9662;</span>
-    </div>
-    <div id="fedhub-update-body" style="display:{% if fedhub_upgrading or fedhub_upgrade_done or fedhub_upgrade_error %}block{% else %}none{% endif %};padding:0 24px 24px;border-top:1px solid var(--border)">
+  <details class="fh-section"{% if fedhub_upgrading or fedhub_upgrade_done or fedhub_upgrade_error %} open{% endif %}>
+    <summary><span>Update Federation Hub</span><span class="chev">&#9662;</span></summary>
+    <div class="fh-section-body">
+      <p class="form-hint" style="margin:14px 0 12px;line-height:1.45">Upload a newer <code style="font-size:11px">takserver-fed-hub</code> .deb and push it to the same remote host (same pattern as <strong>Update TAK Server</strong>).</p>
+    <div id="fedhub-update-body" style="display:{% if fedhub_upgrading or fedhub_upgrade_done or fedhub_upgrade_error %}block{% else %}none{% endif %}">
       <div id="fedhub-upgrade-upload-area" class="upload-area" style="margin-top:16px" onclick="var i=document.getElementById('fedhub-upgrade-file-input');if(i){i.value='';i.click();}" ondrop="fedhubDropUpgrade(event)" ondragover="event.preventDefault();this.classList.add('dragover')" ondragleave="event.preventDefault();this.classList.remove('dragover')">
         <div style="font-size:22px;margin-bottom:6px">⬆</div>
         <div style="font-size:13px;color:var(--text-secondary)">Drop replacement .deb here or click (same upload store as above)</div>
@@ -14651,7 +14647,8 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
         <div class="log-box" id="fedhub-upgrade-log">{% if fedhub_upgrading %}Connecting…{% elif fedhub_upgrade_done %}Done.{% elif fedhub_upgrade_error %}Update failed.{% endif %}</div>
       </div>
     </div>
-  </div>
+    </div>
+  </details>
   {% else %}
   <div class="card">
     <div class="card-title">Register without automated install</div>
