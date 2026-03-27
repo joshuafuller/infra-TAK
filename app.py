@@ -14411,6 +14411,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   </details>
   {% endif %}
 
+  {% if fh.installed %}
   <div class="card" style="padding:0;overflow:hidden">
     <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;padding:16px 24px;cursor:pointer" onclick="fedhubToggleUpdate()" id="fedhub-update-header">
       <div style="min-width:0">
