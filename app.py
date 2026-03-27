@@ -4794,7 +4794,8 @@ def fedhub_enable_authentik_api():
     client_id, client_secret, auth_url, token_url = _ensure_authentik_fedhub_oauth_app(settings, plog=lambda m: steps.append(m))
     fh_domain = _get_service_domain(settings, 'fedhub')
     fh_host = fh_domain or (remote.get('host') or '').strip()
-    redirect_uri = f'https://{fh_host}/login/redirect' if fh_domain else f'https://{fh_host}:9100/login/redirect'
+    # Fed Hub OAuth callback is handled by backend API endpoint, not SPA route.
+    redirect_uri = f'https://{fh_host}/api/oauth/login/redirect' if fh_domain else f'https://{fh_host}:9100/api/oauth/login/redirect'
 
     # Generate keycloak.der — Fed Hub needs this to trust the OAuth provider's TLS cert
     # Use the same Authentik host for cert generation and OIDC URLs (consistency prevents domain mismatch)
@@ -12951,8 +12952,9 @@ def _ensure_authentik_fedhub_oauth_app(settings, plog=None):
         fh_host = (fh_cfg.get('remote', {}).get('host') or '').strip()
         fh_domain = _get_service_domain(settings, 'fedhub') if settings.get('fqdn') else ''
         redirect_host = fh_domain or fh_host or 'localhost'
+        # Fed Hub OAuth callback is backend API endpoint; SPA route /login/redirect does not complete auth.
         # Via Caddy (FQDN set): standard HTTPS port. Direct IP: port 9100.
-        redirect_uri = f'https://{redirect_host}/login/redirect' if fh_domain else f'https://{redirect_host}:9100/login/redirect'
+        redirect_uri = f'https://{redirect_host}/api/oauth/login/redirect' if fh_domain else f'https://{redirect_host}:9100/api/oauth/login/redirect'
         redirect_uris_obj = [{'matching_mode': 'strict', 'url': redirect_uri}]
 
         # Build the patch payload used both for updating existing providers and creating new ones
