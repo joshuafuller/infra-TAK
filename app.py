@@ -4792,13 +4792,14 @@ def fedhub_enable_authentik_api():
 
     # 2) Also set up Fed Hub's built-in OAuth (belt-and-suspenders with forward_auth)
     client_id, client_secret, auth_url, token_url = _ensure_authentik_fedhub_oauth_app(settings, plog=lambda m: steps.append(m))
-    ak_public = _get_authentik_base_url(settings)
     fh_domain = _get_service_domain(settings, 'fedhub')
     fh_host = fh_domain or (remote.get('host') or '').strip()
     redirect_uri = f'https://{fh_host}/login/redirect' if fh_domain else f'https://{fh_host}:9100/login/redirect'
 
     # Generate keycloak.der — Fed Hub needs this to trust the OAuth provider's TLS cert
-    ak_host = f'authentik.{fqdn}'
+    # Use the same Authentik host for cert generation and OIDC URLs (consistency prevents domain mismatch)
+    ak_host = _get_authentik_host(settings) or f'authentik.{fqdn}'
+    ak_public = f'https://{ak_host}'
     der_cmd = (
         f'echo | openssl s_client -connect {ak_host}:443 -servername {ak_host} 2>/dev/null '
         f'| openssl x509 -outform DER -out /opt/tak/certs/keycloak.der 2>/dev/null && '
