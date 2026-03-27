@@ -4708,13 +4708,24 @@ def fedhub_mark_deployed_api():
 @app.route('/api/fedhub/clear-registration', methods=['POST'])
 @login_required
 def fedhub_clear_registration_api():
-    settings = load_settings()
-    cfg = _get_fedhub_deployment_config(settings)
-    cfg = {**cfg, 'deployed': False}
-    settings['fedhub_deployment'] = _normalize_module_deployment_config(cfg)
-    save_settings(settings)
-    _caddy_regenerate_if_fqdn()
-    return jsonify({'success': True})
+    try:
+        settings = load_settings()
+        cfg = _get_fedhub_deployment_config(settings)
+        cfg = {**cfg, 'deployed': False}
+        settings['fedhub_deployment'] = _normalize_module_deployment_config(cfg)
+        save_settings(settings)
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'Failed saving settings: {str(e)[:220]}'}), 500
+
+    # Registration should still clear even if Caddy regeneration has a warning.
+    try:
+        _caddy_regenerate_if_fqdn()
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({
+            'success': True,
+            'warning': f'Registration cleared, but Caddy regeneration returned: {str(e)[:220]}'
+        })
 
 
 @app.route('/api/fedhub/status', methods=['GET'])
