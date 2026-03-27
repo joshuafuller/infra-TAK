@@ -15099,8 +15099,8 @@ function fedhubPollRotateLog(){
       var box=document.getElementById('fedhub-rotate-log');
       if(box&&d.entries&&d.entries.length){
         var t=(box.textContent||'');
-        if(t&&t.slice(-1)!=='\n')t+='\n';
-        box.textContent=t+d.entries.join('\n');
+        if(t&&t.slice(-1)!==String.fromCharCode(10))t+=String.fromCharCode(10);
+        box.textContent=t+d.entries.join(String.fromCharCode(10));
         box.scrollTop=box.scrollHeight;
         fedhubRotateLogIndex=d.total||fedhubRotateLogIndex;
       }
