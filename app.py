@@ -4765,9 +4765,10 @@ def fedhub_remote_metrics():
     """Return CPU/memory/disk/uptime for the Federation Hub remote host."""
     settings = load_settings()
     cfg = _get_fedhub_deployment_config(settings)
-    if cfg.get('target_mode') != 'remote' or not (cfg.get('remote', {}).get('host') or '').strip():
-        return jsonify({'error': 'Not remote'}), 404
-    metrics = _get_remote_host_metrics(cfg.get('remote', {}))
+    remote = cfg.get('remote', {}) if isinstance(cfg.get('remote'), dict) else {}
+    if not (remote.get('host') or '').strip():
+        return jsonify({'error': 'Remote host not configured'}), 404
+    metrics = _get_remote_host_metrics(remote)
     if metrics is None:
         return jsonify({'error': 'Could not fetch remote metrics'}), 503
     return jsonify(metrics)
@@ -15192,7 +15193,7 @@ document.addEventListener('DOMContentLoaded',function(){
   {% endif %}
   if(document.getElementById('fedhub-remote-metrics-bar')){loadFedhubRemoteMetrics();setInterval(loadFedhubRemoteMetrics,5000);}
 });
-async function loadFedhubRemoteMetrics(){var bar=document.getElementById('fedhub-remote-metrics-bar');if(!bar)return;try{var r=await fetch('/api/fedhub/remote-metrics');if(!r.ok){document.getElementById('fedhub-remote-cpu-value').textContent='—';document.getElementById('fedhub-remote-ram-value').textContent='—';document.getElementById('fedhub-remote-disk-value').textContent='—';document.getElementById('fedhub-remote-uptime-value').textContent='—';return;}var d=await r.json();var cpu=document.getElementById('fedhub-remote-cpu-value');if(cpu)cpu.textContent=(d.cpu_percent!=null?d.cpu_percent:'—')+'%';var ram=document.getElementById('fedhub-remote-ram-value');if(ram)ram.textContent=(d.ram_percent!=null?d.ram_percent:'—')+'%';var ramD=document.getElementById('fedhub-remote-ram-detail');if(ramD)ramD.textContent=(d.ram_used_gb!=null&&d.ram_total_gb!=null)?(d.ram_used_gb+'GB / '+d.ram_total_gb+'GB'):'';var disk=document.getElementById('fedhub-remote-disk-value');if(disk)disk.textContent=(d.disk_percent!=null?d.disk_percent:'—')+'%';var diskD=document.getElementById('fedhub-remote-disk-detail');if(diskD)diskD.textContent=(d.disk_used_gb!=null&&d.disk_total_gb!=null)?(d.disk_used_gb+'GB / '+d.disk_total_gb+'GB'):'';var up=document.getElementById('fedhub-remote-uptime-value');if(up)up.textContent=d.uptime||'—';}catch(e){}}
+async function loadFedhubRemoteMetrics(){var bar=document.getElementById('fedhub-remote-metrics-bar');if(!bar)return;try{var r=await fetch('/api/fedhub/remote-metrics',{credentials:'same-origin'});if(!r.ok){document.getElementById('fedhub-remote-cpu-value').textContent='—';document.getElementById('fedhub-remote-ram-value').textContent='—';document.getElementById('fedhub-remote-disk-value').textContent='—';document.getElementById('fedhub-remote-uptime-value').textContent='—';return;}var d=await r.json();var cpu=document.getElementById('fedhub-remote-cpu-value');if(cpu)cpu.textContent=(d.cpu_percent!=null?d.cpu_percent:'—')+'%';var ram=document.getElementById('fedhub-remote-ram-value');if(ram)ram.textContent=(d.ram_percent!=null?d.ram_percent:'—')+'%';var ramD=document.getElementById('fedhub-remote-ram-detail');if(ramD)ramD.textContent=(d.ram_used_gb!=null&&d.ram_total_gb!=null)?(d.ram_used_gb+'GB / '+d.ram_total_gb+'GB'):'';var disk=document.getElementById('fedhub-remote-disk-value');if(disk)disk.textContent=(d.disk_percent!=null?d.disk_percent:'—')+'%';var diskD=document.getElementById('fedhub-remote-disk-detail');if(diskD)diskD.textContent=(d.disk_used_gb!=null&&d.disk_total_gb!=null)?(d.disk_used_gb+'GB / '+d.disk_total_gb+'GB'):'';var up=document.getElementById('fedhub-remote-uptime-value');if(up)up.textContent=d.uptime||'—';}catch(e){}}
 </script>
 </body></html>
 '''
@@ -19262,7 +19263,6 @@ entries:
             if ak_token:
                 ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
                 ak_url = f'http://127.0.0.1:9090'
-                import urllib.request
 
                 # Verify bootstrap token actually works before proceeding
                 # The worker runs apply_blueprint system/bootstrap.yaml before starting
@@ -19688,7 +19688,6 @@ entries:
                 if ak_token:
                     ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
                     ak_url = 'http://127.0.0.1:9090'
-                    import urllib.request
 
                     # 12a: Update Brand domain
                     plog("  Updating Authentik brand domain...")
