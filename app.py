@@ -14702,7 +14702,7 @@ function collectFedhubDeployConfig(){
   var wup=(document.getElementById('fedhub-web-ui-port')||{}).value;
   var wp=parseInt(wup,10);
   var dep=document.getElementById('fedhub-deployed-flag');
-  return{target_mode:'remote',deployed:dep&&dep.value==='1',web_ui_port:isNaN(wp)?8080:wp,remote:{host:host.trim(),ssh_user:(user||'root').trim(),ssh_port:isNaN(p)?22:p,ssh_key_path:key.trim()}};
+  return{target_mode:'remote',deployed:dep&&dep.value==='1',web_ui_port:isNaN(wp)?8446:wp,remote:{host:host.trim(),ssh_user:(user||'root').trim(),ssh_port:isNaN(p)?22:p,ssh_key_path:key.trim()}};
 }
 function _fedhubSshMsg(msg,err,ok){
   var el=document.getElementById('fedhub-ssh-status');
@@ -25075,15 +25075,15 @@ def _startup_migrations():
         s = load_settings()
         settings_dirty = False
 
-        # Fix fedhub web_ui_port default for Caddy upstream (use HTTP 8080)
+        # Fix fedhub web_ui_port default for Caddy upstream (use OAuth-enabled HTTPS 8446)
         fh_raw = s.get('fedhub_deployment', {})
-        if fh_raw.get('deployed') or fh_raw.get('web_ui_port') in (9100, '9100', None):
+        if fh_raw.get('deployed') or fh_raw.get('web_ui_port') in (9100, '9100', 8080, '8080', None):
             wp = fh_raw.get('web_ui_port')
-            if wp in (9100, '9100', None):
-                fh_raw['web_ui_port'] = 8080
+            if wp in (9100, '9100', 8080, '8080', None):
+                fh_raw['web_ui_port'] = 8446
                 s['fedhub_deployment'] = fh_raw
                 settings_dirty = True
-                print("Startup migration: fixed fedhub web_ui_port → 8080")
+                print("Startup migration: fixed fedhub web_ui_port → 8446")
 
         if settings_dirty:
             save_settings(s)
