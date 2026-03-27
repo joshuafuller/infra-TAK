@@ -4812,6 +4812,9 @@ def fedhub_enable_authentik_api():
     else:
         steps.append(f'  ⚠ keycloak.der generation failed — OAuth login may 500')
 
+    # OIDC discovery URL — Fed Hub v5.7+ dynamically discovers auth/token/jwks endpoints from here
+    oidc_config_url = f'{ak_public}/application/o/fedhub/.well-known/openid-configuration'
+
     if client_id and client_secret:
         patch_cmd = (
             f'cd {fh_dir}/configs && '
@@ -4820,12 +4823,13 @@ def fedhub_enable_authentik_api():
             f'sudo sed -i "s|^keycloakClientId:.*|keycloakClientId: {shlex.quote(client_id)}|" federation-hub-ui.yml && '
             f'sudo sed -i "s|^keycloakSecret:.*|keycloakSecret: {shlex.quote(client_secret)}|" federation-hub-ui.yml && '
             f'sudo sed -i "s|^keycloakrRedirectUri:.*|keycloakrRedirectUri: {redirect_uri}|" federation-hub-ui.yml && '
-            f'sudo sed -i "s|^keycloakAuthEndpoint:.*|keycloakAuthEndpoint: {auth_url}|" federation-hub-ui.yml && '
-            f'sudo sed -i "s|^keycloakTokenEndpoint:.*|keycloakTokenEndpoint: {token_url}|" federation-hub-ui.yml && '
             f'sudo sed -i "s|^keycloakClaimName:.*|keycloakClaimName: groups|" federation-hub-ui.yml && '
             f'sudo sed -i "s|^keycloakAdminClaimValue:.*|keycloakAdminClaimValue: authentik Admins|" federation-hub-ui.yml && '
             f'sudo sed -i "s|^keycloakDerLocation:.*|keycloakTlsCertFile: /opt/tak/certs/keycloak.der|" federation-hub-ui.yml && '
-            f'sudo sed -i "s|^keycloakTlsCertFile:.*|keycloakTlsCertFile: /opt/tak/certs/keycloak.der|" federation-hub-ui.yml'
+            f'sudo sed -i "s|^keycloakTlsCertFile:.*|keycloakTlsCertFile: /opt/tak/certs/keycloak.der|" federation-hub-ui.yml && '
+            f'sudo sed -i "/^keycloakAuthEndpoint:/d; /^keycloakTokenEndpoint:/d; /^keycloakAccessTokenName:/d; /^keycloakRefreshTokenName:/d" federation-hub-ui.yml && '
+            f'sudo sed -i "s|^keycloakConfigurationEndpoint:.*|keycloakConfigurationEndpoint: {oidc_config_url}|" federation-hub-ui.yml && '
+            f'grep -q "^keycloakConfigurationEndpoint:" federation-hub-ui.yml || echo "keycloakConfigurationEndpoint: {oidc_config_url}" | sudo tee -a federation-hub-ui.yml > /dev/null'
         )
         ok_patch, _ = _ssh_probe(remote, patch_cmd, timeout=30)
         if ok_patch:
@@ -12917,6 +12921,35 @@ def _ensure_authentik_fedhub_oauth_app(settings, plog=None):
             return None, None, None, None
         log('  ✓ Got authorization and invalidation flows')
 
+        # Look up Authentik's signing key (certificate-key pair) for RS256 token signing
+        signing_key_pk = None
+        try:
+            req = _urlreq.Request(f'{ak_url}/api/v3/crypto/certificatekeypairs/?has_key=true&ordering=name&page_size=50', headers=_ak_headers)
+            certs = json.loads(_urlreq.urlopen(req, timeout=15).read().decode()).get('results', [])
+            signing_key_pk = next((c['pk'] for c in certs if 'authentik' in (c.get('name') or '').lower() and 'self-signed' in (c.get('name') or '').lower()), None)
+            if not signing_key_pk and certs:
+                signing_key_pk = certs[0]['pk']
+            if signing_key_pk:
+                log('  ✓ Got signing key for RS256 token signing')
+            else:
+                log('  ⚠ No signing key found — tokens will use HS256')
+        except Exception:
+            log('  ⚠ Could not look up signing keys')
+
+        # Look up OAuth2 scope property mappings (openid, email, profile)
+        scope_mapping_pks = []
+        try:
+            req = _urlreq.Request(f'{ak_url}/api/v3/propertymappings/provider/scope/?ordering=scope_name&page_size=50', headers=_ak_headers)
+            mappings = json.loads(_urlreq.urlopen(req, timeout=15).read().decode()).get('results', [])
+            wanted_scopes = {'openid', 'email', 'profile'}
+            scope_mapping_pks = [m['pk'] for m in mappings if m.get('scope_name') in wanted_scopes]
+            if scope_mapping_pks:
+                log(f'  ✓ Got {len(scope_mapping_pks)} scope mappings (openid/email/profile)')
+            else:
+                log('  ⚠ No scope mappings found')
+        except Exception:
+            log('  ⚠ Could not look up scope mappings')
+
         # Determine redirect URI
         fh_cfg = _get_fedhub_deployment_config(settings)
         fh_host = (fh_cfg.get('remote', {}).get('host') or '').strip()
@@ -12926,7 +12959,14 @@ def _ensure_authentik_fedhub_oauth_app(settings, plog=None):
         redirect_uri = f'https://{redirect_host}/login/redirect' if fh_domain else f'https://{redirect_host}:9100/login/redirect'
         redirect_uris_obj = [{'matching_mode': 'strict', 'url': redirect_uri}]
 
-        # Check if provider already exists; if so, delete the stale one and recreate
+        # Build the patch payload used both for updating existing providers and creating new ones
+        _provider_extras = {}
+        if signing_key_pk:
+            _provider_extras['signing_key'] = signing_key_pk
+        if scope_mapping_pks:
+            _provider_extras['property_mappings'] = scope_mapping_pks
+
+        # Check if provider already exists; if so, update it (add signing key + scopes + redirect)
         provider_pk = None
         client_id, client_secret = '', ''
         try:
@@ -12936,24 +12976,23 @@ def _ensure_authentik_fedhub_oauth_app(settings, plog=None):
             for ex in existing:
                 if ex.get('name') == provider_name:
                     ex_pk = ex.get('pk')
-                    # Detail GET to check if it has valid credentials
                     req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/{ex_pk}/', headers=_ak_headers)
                     detail = json.loads(_urlreq.urlopen(req, timeout=15).read().decode())
                     if detail.get('client_id') and detail.get('client_secret'):
                         provider_pk = ex_pk
                         client_id = detail['client_id']
                         client_secret = detail['client_secret']
-                        # Update redirect_uris
+                        patch_data = {'redirect_uris': redirect_uris_obj}
+                        patch_data.update(_provider_extras)
                         try:
                             req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/{ex_pk}/',
-                                data=json.dumps({'redirect_uris': redirect_uris_obj}).encode(),
+                                data=json.dumps(patch_data).encode(),
                                 headers=_ak_headers, method='PATCH')
                             _urlreq.urlopen(req, timeout=10)
                         except Exception:
                             pass
-                        log(f'  ✓ Existing OAuth2 provider reused (client_id={client_id[:8]}...)')
+                        log(f'  ✓ Existing OAuth2 provider updated (signing key + scopes + redirect, client_id={client_id[:8]}...)')
                     else:
-                        # Stale provider without credentials — delete and recreate
                         try:
                             req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/{ex_pk}/',
                                 headers=_ak_headers, method='DELETE')
@@ -12974,6 +13013,7 @@ def _ensure_authentik_fedhub_oauth_app(settings, plog=None):
                 'client_type': 'confidential',
                 'redirect_uris': redirect_uris_obj,
             }
+            payload.update(_provider_extras)
             try:
                 req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/',
                     data=json.dumps(payload).encode(), headers=_ak_headers, method='POST')
