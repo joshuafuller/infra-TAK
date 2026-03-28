@@ -4676,6 +4676,10 @@ def federation_hub_page():
     _fedhub_sso_prime_url = f'https://tak.{_fqdn}' if _fqdn else ''
     _ak = modules.get('authentik', {})
     _fedhub_ver = _get_fedhub_version_info().get('version', '') if fh.get('installed') else ''
+    _fh_dn = _fedhub_cert_dn(settings)
+    _fh_cert_pw_eff = _get_fedhub_cert_password(settings)
+    _fh_root_disp = (settings.get('fedhub_root_ca') or settings.get('root_ca_name') or 'FEDHUB-ROOT-CA').strip()
+    _fh_int_disp = (settings.get('fedhub_intermediate_ca') or settings.get('intermediate_ca_name') or 'FEDHUB-INT-CA').strip()
     resp = make_response(render_template_string(FEDHUB_TEMPLATE,
         settings=settings, fh=fh, fedhub_deploy_cfg=fedhub_deploy_cfg, version=VERSION,
         fedhub_version=_fedhub_ver,
@@ -4694,7 +4698,15 @@ def federation_hub_page():
         fedhub_rotate_done=_fedhub_rotate_done,
         fedhub_rotate_error=fedhub_rotate_status.get('error', False),
         authentik_installed=_ak.get('installed', False),
-        fedhub_remote_host=(fedhub_deploy_cfg.get('remote', {}).get('host') or '').strip() if fedhub_deploy_cfg.get('target_mode') == 'remote' and fedhub_deploy_cfg.get('deployed') else ''))
+        fedhub_remote_host=(fedhub_deploy_cfg.get('remote', {}).get('host') or '').strip() if fedhub_deploy_cfg.get('target_mode') == 'remote' and fedhub_deploy_cfg.get('deployed') else '',
+        fh_cert_country=_fh_dn['country'],
+        fh_cert_state=_fh_dn['state'],
+        fh_cert_city=_fh_dn['city'],
+        fh_cert_org=_fh_dn['org'],
+        fh_cert_ou=_fh_dn['ou'],
+        fh_root_ca=_fh_root_disp,
+        fh_intermediate_ca=_fh_int_disp,
+        fh_cert_password_effective=_fh_cert_pw_eff))
     resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
     return resp
 
@@ -5113,7 +5125,8 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
         # --- Certificate generation (mirrors installTAK fedWizard) ---
         plog('━━━ Generate Federation Hub certificates ━━━')
         settings = load_settings()
-        cert_pass = (settings.get('tak_cert_password') or 'atakatak').strip() or 'atakatak'
+        cert_pass = _get_fedhub_cert_password(settings)
+        dn = _fedhub_cert_dn(settings)
         root_ca = (settings.get('fedhub_root_ca') or settings.get('root_ca_name') or 'FEDHUB-ROOT-CA').strip()
         int_ca = (settings.get('fedhub_intermediate_ca') or settings.get('intermediate_ca_name') or 'FEDHUB-INT-CA').strip()
         plog(f'  Root CA: {root_ca} | Intermediate CA: {int_ca}')
@@ -5123,11 +5136,11 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
 
         # Patch cert-metadata.sh (same as TAK Server deploy does for /opt/tak/certs/cert-metadata.sh)
         meta_subs = [
-            ('COUNTRY', settings.get('cert_country') or 'US'),
-            ('STATE', settings.get('cert_state') or 'State'),
-            ('CITY', settings.get('cert_city') or 'City'),
-            ('ORGANIZATION', settings.get('cert_org') or 'TAK'),
-            ('ORGANIZATIONAL_UNIT', settings.get('cert_ou') or 'FederationHub'),
+            ('COUNTRY', dn['country']),
+            ('STATE', dn['state']),
+            ('CITY', dn['city']),
+            ('ORGANIZATION', dn['org']),
+            ('ORGANIZATIONAL_UNIT', dn['ou']),
         ]
         meta_cmds = f'cd {fh_dir}/certs && sudo cp cert-metadata.sh cert-metadata.sh.bak 2>/dev/null; true'
         for var, val in meta_subs:
@@ -5367,6 +5380,22 @@ def run_fedhub_remote_update():
     _fedhub_run_remote_package_install(fedhub_upgrade_log, fedhub_upgrade_status, phase_label='Update')
 
 
+@app.route('/api/fedhub/cert-settings', methods=['POST'])
+@login_required
+def fedhub_cert_settings_api():
+    """Persist Federation Hub cert DN / CA names / optional password override (console settings)."""
+    data = request.get_json() or {}
+    fc = data.get('fedhub_cert') if isinstance(data.get('fedhub_cert'), dict) else data
+    if not isinstance(fc, dict):
+        return jsonify({'success': False, 'error': 'Expected JSON object or fedhub_cert object.'}), 400
+    settings = load_settings()
+    err = _merge_fedhub_cert_request_into_settings(settings, fc)
+    if err:
+        return jsonify({'success': False, 'error': err}), 400
+    save_settings(settings)
+    return jsonify({'success': True})
+
+
 @app.route('/api/fedhub/deploy', methods=['POST'])
 @login_required
 def fedhub_deploy_api():
@@ -5375,6 +5404,13 @@ def fedhub_deploy_api():
     if fedhub_upgrade_status.get('running'):
         return jsonify({'error': 'An update is already in progress — wait for it to finish.'}), 409
     data = request.get_json() or {}
+    fc = data.get('fedhub_cert')
+    if isinstance(fc, dict):
+        settings = load_settings()
+        err = _merge_fedhub_cert_request_into_settings(settings, fc)
+        if err:
+            return jsonify({'error': err}), 400
+        save_settings(settings)
     if data.get('config'):
         settings = load_settings()
         base = _get_fedhub_deployment_config(settings)
@@ -5414,6 +5450,12 @@ def fedhub_update_api():
             'error': 'Federation Hub is not registered yet. Use Deploy to remote host first (or Confirm install if you installed manually).',
         }), 400
     data = request.get_json() or {}
+    fc = data.get('fedhub_cert')
+    if isinstance(fc, dict):
+        err = _merge_fedhub_cert_request_into_settings(settings, fc)
+        if err:
+            return jsonify({'error': err}), 400
+        save_settings(settings)
     if data.get('config'):
         base = _get_fedhub_deployment_config(settings)
         inc = data.get('config') if isinstance(data.get('config'), dict) else {}
@@ -5495,7 +5537,8 @@ def run_fedhub_remote_rotate_ca(new_root_ca=None, new_int_ca=None):
                 r'[^a-zA-Z0-9._-]', '-',
                 _fedhub_next_numbered_ca_name(base_int, 'FEDHUB-INT-CA'),
             ).strip('-') or 'FEDHUB-INT-CA-01'
-        cert_pass = (settings.get('tak_cert_password') or 'atakatak').strip() or 'atakatak'
+        cert_pass = _get_fedhub_cert_password(settings)
+        dn = _fedhub_cert_dn(settings)
 
         ok_host, host_out = _ssh_probe(remote, 'hostname', timeout=10)
         remote_hostname = (host_out or 'fedhub').strip() or 'fedhub'
@@ -5514,11 +5557,11 @@ def run_fedhub_remote_rotate_ca(new_root_ca=None, new_int_ca=None):
         plog(f'✓ Backup created: {fh_dir}/certs/backups/pre-rotate-{ts}.tgz')
 
         meta_subs = [
-            ('COUNTRY', settings.get('cert_country') or 'US'),
-            ('STATE', settings.get('cert_state') or 'State'),
-            ('CITY', settings.get('cert_city') or 'City'),
-            ('ORGANIZATION', settings.get('cert_org') or 'TAK'),
-            ('ORGANIZATIONAL_UNIT', settings.get('cert_ou') or 'FederationHub'),
+            ('COUNTRY', dn['country']),
+            ('STATE', dn['state']),
+            ('CITY', dn['city']),
+            ('ORGANIZATION', dn['org']),
+            ('ORGANIZATIONAL_UNIT', dn['ou']),
         ]
         meta_cmds = f'cd {fh_dir}/certs && sudo cp cert-metadata.sh cert-metadata.sh.bak 2>/dev/null; true'
         for var, val in meta_subs:
@@ -6810,6 +6853,82 @@ _CERT_PASS_SAFE_RE = re.compile(r'^[a-zA-Z0-9!@#%^+=_.,:-]+$')
 def _get_tak_cert_password(settings):
     """Current TAK cert export password (default atakatak)."""
     return (settings.get('tak_cert_password') or 'atakatak').strip() or 'atakatak'
+
+
+def _get_fedhub_cert_password(settings):
+    """Fed Hub keystore / webadmin.p12 password: optional override, else TAK console password."""
+    return (
+        (settings.get('fedhub_cert_password') or settings.get('tak_cert_password') or 'atakatak').strip()
+        or 'atakatak'
+    )
+
+
+def _fedhub_cert_dn(settings):
+    """Resolved DN fields for Federation Hub cert-metadata (fedhub_* overrides, else console cert_*)."""
+    def pick(fed_key, global_key, default):
+        v = (settings.get(fed_key) or settings.get(global_key) or default or '').strip()
+        return v if v else default
+
+    return {
+        'country': pick('fedhub_cert_country', 'cert_country', 'US'),
+        'state': pick('fedhub_cert_state', 'cert_state', 'State'),
+        'city': pick('fedhub_cert_city', 'cert_city', 'City'),
+        'org': pick('fedhub_cert_org', 'cert_org', 'TAK'),
+        'ou': pick('fedhub_cert_ou', 'cert_ou', 'FederationHub'),
+    }
+
+
+def _merge_fedhub_cert_request_into_settings(settings, fc):
+    """Apply fedhub_cert dict from JSON into settings. Returns error string or None."""
+    if not isinstance(fc, dict):
+        return None
+    errs = []
+    mapping = [
+        ('cert_country', 'fedhub_cert_country', 'Country'),
+        ('cert_state', 'fedhub_cert_state', 'State'),
+        ('cert_city', 'fedhub_cert_city', 'City'),
+        ('cert_org', 'fedhub_cert_org', 'Organization'),
+        ('cert_ou', 'fedhub_cert_ou', 'Org Unit'),
+    ]
+    for json_key, set_key, label in mapping:
+        if json_key not in fc:
+            continue
+        raw = (fc.get(json_key) or '').strip()
+        if not raw:
+            settings.pop(set_key, None)
+            continue
+        try:
+            settings[set_key] = _sanitize_cert_field(raw, label).upper()
+        except ValueError as e:
+            errs.append(str(e))
+    for json_key, set_key, default in [
+        ('root_ca_name', 'fedhub_root_ca', 'FEDHUB-ROOT-CA'),
+        ('intermediate_ca_name', 'fedhub_intermediate_ca', 'FEDHUB-INT-CA'),
+    ]:
+        if json_key not in fc:
+            continue
+        raw = (fc.get(json_key) or '').strip()
+        if not raw:
+            settings.pop(set_key, None)
+            continue
+        safe = re.sub(r'[^a-zA-Z0-9._-]', '-', raw).strip('-') or default
+        settings[set_key] = safe
+    if 'cert_password' in fc:
+        pw = (fc.get('cert_password') or '').strip()
+        if pw:
+            if not _validate_cert_password(pw):
+                errs.append(
+                    'Certificate password contains unsupported characters for remote shell scripts '
+                    '(use letters, digits, and limited punctuation only).'
+                )
+            else:
+                settings['fedhub_cert_password'] = pw
+        else:
+            settings.pop('fedhub_cert_password', None)
+    if errs:
+        return '; '.join(errs)[:800]
+    return None
+
 
 def _validate_cert_password(pw):
     """Return True if password is safe for shell interpolation (no metacharacters like $, `, ;, &, |, etc.)."""
@@ -14831,7 +14950,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     <summary><span>Certificates &amp; CA rotation</span><span class="chev">&#9662;</span></summary>
     <div class="fh-section-body">
       <div id="fedhub-cert-expiry-section" style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim);margin-bottom:14px;line-height:1.5;min-height:1.2em"></div>
-      <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:10px"><strong>Browser admin cert:</strong> Import <code style="font-size:11px">webadmin-fed.p12</code> (from deploy or CA rotation, also under <code style="font-size:11px">/root/</code> on the Fed Hub host). Password = TAK cert password (default <code style="font-size:11px">atakatak</code>). Or use <strong>Authentik SSO</strong> below.</p>
+      <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:10px"><strong>Browser admin cert:</strong> Import <code style="font-size:11px">webadmin-fed.p12</code> (from deploy or CA rotation, also under <code style="font-size:11px">/root/</code> on the Fed Hub host). Keystore / P12 password (effective): <code style="font-size:11px;font-family:'JetBrains Mono',monospace">{{ fh_cert_password_effective }}</code> — set under <strong>Certificate metadata</strong> below (or inherits TAK console cert password). Or use <strong>Authentik SSO</strong> below.</p>
       <div class="controls" style="align-items:center;flex-wrap:wrap;gap:12px;margin-bottom:16px">
         <button class="btn btn-ghost" type="button" onclick="fedhubDownloadWebadminCert()">⬇ Download webadmin-fed.p12</button>
         <span id="fedhub-cert-download-msg" style="font-size:12px;color:var(--text-dim)"></span>
@@ -14872,6 +14991,52 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     </div>
   </details>
   {% endif %}
+
+  <details class="fh-section"{% if not fh.installed %} open{% endif %}>
+    <summary><span>Certificate metadata (Federation Hub)</span><span class="chev">&#9662;</span></summary>
+    <div class="fh-section-body">
+    <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:14px">Used when generating certs on the remote host (<strong>Deploy</strong>, <strong>Update</strong> if certs are recreated, and <strong>Rotate CA</strong>). Values are saved in console settings; empty fields fall back to the same DN as <strong>TAK Server</strong> deploy defaults where applicable. Certificate fields must use only printable ASN.1 characters (same rules as TAK deploy).</p>
+    <p style="font-size:11px;color:var(--text-dim);margin:-6px 0 14px;line-height:1.45">Effective P12 / keystore password (read-only here): <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">{{ fh_cert_password_effective }}</span>. Set a Fed Hub&ndash;specific password below, or leave blank to use the TAK console cert password.</p>
+    <div class="grid-2">
+      <div class="form-group">
+        <label class="form-label">Country (C)</label>
+        <input id="fedhub-cert-country" class="form-input" type="text" maxlength="64" value="{{ fh_cert_country }}" placeholder="US" autocomplete="off">
+      </div>
+      <div class="form-group">
+        <label class="form-label">State (ST)</label>
+        <input id="fedhub-cert-state" class="form-input" type="text" maxlength="64" value="{{ fh_cert_state }}" placeholder="CA" autocomplete="off">
+      </div>
+      <div class="form-group">
+        <label class="form-label">City (L)</label>
+        <input id="fedhub-cert-city" class="form-input" type="text" maxlength="64" value="{{ fh_cert_city }}" placeholder="City" autocomplete="off">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Organization (O)</label>
+        <input id="fedhub-cert-org" class="form-input" type="text" maxlength="64" value="{{ fh_cert_org }}" placeholder="Org" autocomplete="off">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Organizational unit (OU)</label>
+        <input id="fedhub-cert-ou" class="form-input" type="text" maxlength="64" value="{{ fh_cert_ou }}" placeholder="FederationHub" autocomplete="off">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Fed Hub keystore password (optional)</label>
+        <input id="fedhub-cert-password" class="form-input" type="password" placeholder="Leave blank = TAK cert password" autocomplete="new-password">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Root CA name</label>
+        <input id="fedhub-root-ca" class="form-input" type="text" value="{{ fh_root_ca }}" placeholder="FEDHUB-ROOT-CA" autocomplete="off">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Intermediate CA name</label>
+        <input id="fedhub-intermediate-ca" class="form-input" type="text" value="{{ fh_intermediate_ca }}" placeholder="FEDHUB-INT-CA" autocomplete="off">
+      </div>
+    </div>
+    <div class="controls" style="align-items:center;flex-wrap:wrap;gap:12px;margin-top:8px">
+      <button class="btn btn-ghost" type="button" onclick="fedhubSaveCertSettings()">Save certificate settings</button>
+      <span id="fedhub-cert-settings-msg" style="font-size:12px;color:var(--text-dim)"></span>
+    </div>
+    </div>
+  </details>
 
   <details class="fh-section">
     <summary><span>Deployment target (SSH)</span><span class="chev">&#9662;</span></summary>
@@ -15220,9 +15385,63 @@ function fedhubRemoveUpload(){
     fedhubRemoveUploadFile(d.filename);
   }).catch(function(){fedhubRefreshPackageRowsFromServer();});
 }
+function _fhCertV(id){
+  var el=document.getElementById(id);
+  return el?(el.value||'').trim():'';
+}
+function collectFedhubCertPayload(forSave){
+  var o={
+    cert_country:_fhCertV('fedhub-cert-country').toUpperCase(),
+    cert_state:_fhCertV('fedhub-cert-state').toUpperCase(),
+    cert_city:_fhCertV('fedhub-cert-city').toUpperCase(),
+    cert_org:_fhCertV('fedhub-cert-org').toUpperCase(),
+    cert_ou:_fhCertV('fedhub-cert-ou').toUpperCase(),
+    root_ca_name:_fhCertV('fedhub-root-ca'),
+    intermediate_ca_name:_fhCertV('fedhub-intermediate-ca')
+  };
+  var pw=_fhCertV('fedhub-cert-password');
+  if(forSave)o.cert_password=pw;
+  else if(pw)o.cert_password=pw;
+  return o;
+}
+function validateFedhubCertFields(){
+  var rf=[{id:'fedhub-cert-country',l:'Country'},{id:'fedhub-cert-state',l:'State'},{id:'fedhub-cert-city',l:'City'},{id:'fedhub-cert-org',l:'Organization'},{id:'fedhub-cert-ou',l:'Org Unit'},{id:'fedhub-root-ca',l:'Root CA'},{id:'fedhub-intermediate-ca',l:'Intermediate CA'}];
+  var empty=rf.filter(function(f){var el=document.getElementById(f.id);return !el||!el.value.trim();});
+  if(empty.length>0){
+    alert('Please fill in: '+empty.map(function(f){return f.l;}).join(', '));
+    empty.forEach(function(f){var el=document.getElementById(f.id);if(el){el.style.borderColor='var(--red)';el.addEventListener('input',function(){el.style.borderColor='';},{once:true});}});
+    return false;
+  }
+  var asn1ok=/^[A-Za-z0-9 '()+,./:=?-]*$/;
+  var certFields=[{id:'fedhub-cert-country',l:'Country'},{id:'fedhub-cert-state',l:'State'},{id:'fedhub-cert-city',l:'City'},{id:'fedhub-cert-org',l:'Organization'},{id:'fedhub-cert-ou',l:'Org Unit'}];
+  var bad=certFields.filter(function(f){var el=document.getElementById(f.id);var v=el?(el.value||'').trim():'';return v&&!asn1ok.test(v);});
+  if(bad.length>0){
+    alert('Invalid characters in: '+bad.map(function(f){return f.l;}).join(', ')+'\n\nCertificate fields only allow: A-Z, 0-9, spaces, and \' ( ) + , - . / : = ?\n\nNo underscores, @, #, ! or special characters.');
+    bad.forEach(function(f){var el=document.getElementById(f.id);if(el){el.style.borderColor='var(--red)';el.addEventListener('input',function(){el.style.borderColor='';},{once:true});}});
+    return false;
+  }
+  var pwt=_fhCertV('fedhub-cert-password');
+  if(pwt&&!/^[a-zA-Z0-9!@#%^+=_.,:-]+$/.test(pwt)){
+    alert('Fed Hub keystore password contains unsupported characters for the remote install scripts. Use letters, digits, and limited punctuation only.');
+    var pe=document.getElementById('fedhub-cert-password');if(pe){pe.style.borderColor='var(--red)';pe.addEventListener('input',function(){pe.style.borderColor='';},{once:true});}
+    return false;
+  }
+  return true;
+}
+function fedhubSaveCertSettings(){
+  var msg=document.getElementById('fedhub-cert-settings-msg');
+  if(msg){msg.textContent='Saving...';msg.style.color='var(--text-dim)';}
+  fetch('/api/fedhub/cert-settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fedhub_cert:collectFedhubCertPayload(true)}),credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(d){
+      if(d&&d.success){
+        if(msg){msg.textContent='Saved. Reload the page to refresh the effective password hint if you changed the password.';msg.style.color='var(--green)';}
+      }else{if(msg){msg.textContent=(d&&d.error)||'Save failed';msg.style.color='var(--red)';}}
+    }).catch(function(e){if(msg){msg.textContent='Save failed';msg.style.color='var(--red)';}});
+}
 function fedhubStartDeploy(){
   var host=(document.getElementById('fedhub-remote-host')||{}).value||'';
   if(!host.trim()){alert('Set remote host first');return;}
+  if(!validateFedhubCertFields())return;
   var btn=document.getElementById('fedhub-deploy-btn');
   fetch('/api/upload/fedhub/package',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
     if(!d||!d.filename){alert('Upload the Federation Hub .deb first');return;}
@@ -15230,7 +15449,7 @@ function fedhubStartDeploy(){
     var lc=document.getElementById('fedhub-deploy-log-card');var lg=document.getElementById('fedhub-deploy-log');
     if(lc)lc.style.display='block';if(lg)lg.textContent='Starting deployment...';
     fedhubLogIndex=0;if(fedhubLogInterval){clearInterval(fedhubLogInterval);fedhubLogInterval=null;}
-    fetch('/api/fedhub/deploy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:collectFedhubDeployConfig()}),credentials:'same-origin'})
+    fetch('/api/fedhub/deploy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:collectFedhubDeployConfig(),fedhub_cert:collectFedhubCertPayload(false)}),credentials:'same-origin'})
       .then(function(r){return r.json();}).then(function(res){
         if(res&&res.error){
           if(lg)lg.textContent='Error: '+res.error;
@@ -15283,6 +15502,7 @@ function fedhubToggleUpdate(){
 function fedhubStartUpdate(){
   var host=(document.getElementById('fedhub-remote-host')||{}).value||'';
   if(!host.trim()){alert('Set remote host first');return;}
+  if(!validateFedhubCertFields())return;
   var btn=document.getElementById('fedhub-update-btn');
   var msg=document.getElementById('fedhub-update-msg');
   fetch('/api/upload/fedhub/package',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
@@ -15295,7 +15515,7 @@ function fedhubStartUpdate(){
     if(lg)lg.textContent='Starting update...';
     fedhubUpgradeLogIndex=0;
     if(fedhubUpgradeLogInterval){clearInterval(fedhubUpgradeLogInterval);fedhubUpgradeLogInterval=null;}
-    fetch('/api/fedhub/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:collectFedhubDeployConfig()}),credentials:'same-origin'})
+    fetch('/api/fedhub/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:collectFedhubDeployConfig(),fedhub_cert:collectFedhubCertPayload(false)}),credentials:'same-origin'})
       .then(function(r){return r.json();}).then(function(res){
         if(res&&res.error){
           if(lg)lg.textContent='Error: '+res.error;
