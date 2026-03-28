@@ -18850,6 +18850,10 @@ def _run_authentik_reconfigure_remote(settings, deploy_cfg, plog):
     if _is_module_deployed(settings, 'nodered'):
         plog("  Configuring Authentik for Node-RED...")
         _ensure_authentik_nodered_app(fqdn, ak_token, plog, settings=settings)
+    fh_cfg = _get_fedhub_deployment_config(settings)
+    if fh_cfg.get('deployed') and (fh_cfg.get('remote', {}).get('host') or '').strip():
+        plog("  Configuring Authentik for Federation Hub (forward auth)...")
+        _ensure_authentik_fedhub_proxy_app(fqdn, ak_token, plog, settings=settings)
     plog("  Configuring Authentik for infra-TAK Console (infra-TAK + MediaMTX if deployed)...")
     _ensure_authentik_console_app(fqdn, ak_token, plog)
     plog("  Ensuring all app providers on embedded outpost...")
@@ -19015,6 +19019,10 @@ def run_authentik_deploy(reconfigure=False):
                         if _is_module_deployed(settings, 'nodered'):
                             plog("  Configuring Authentik for Node-RED...")
                             _ensure_authentik_nodered_app(fqdn, ak_token, plog, settings=settings)
+                        fh_cfg = _get_fedhub_deployment_config(settings)
+                        if fh_cfg.get('deployed') and (fh_cfg.get('remote', {}).get('host') or '').strip():
+                            plog("  Configuring Authentik for Federation Hub (forward auth)...")
+                            _ensure_authentik_fedhub_proxy_app(fqdn, ak_token, plog, settings=settings)
                         plog("  Configuring Authentik for infra-TAK Console (infra-TAK + MediaMTX if deployed)...")
                         _ensure_authentik_console_app(fqdn, ak_token, plog)
                         plog("  Ensuring all app providers on embedded outpost...")
@@ -19075,6 +19083,7 @@ def run_authentik_deploy(reconfigure=False):
                                         break
                                 plog("  \u2713 Authentik domain synced (env, compose, brand, outpost)")
                                 _sync_authentik_provider_external_hosts(ak_url, ak_headers, fqdn, ak_base, plog)
+                                plog("  Recreating LDAP + restarting Authentik server/worker (no log output for up to ~2 min)...")
                                 subprocess.run(f'cd {ak_dir} && docker compose up -d --force-recreate ldap 2>&1', shell=True, capture_output=True, text=True, timeout=60)
                                 subprocess.run(f'cd {ak_dir} && docker compose restart server worker 2>&1', shell=True, capture_output=True, text=True, timeout=90)
                                 plog("  \u2713 Restarted Authentik (LDAP + server/worker to pick up new domain)")
