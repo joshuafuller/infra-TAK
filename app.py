@@ -15416,7 +15416,7 @@ function validateFedhubCertFields(){
   var certFields=[{id:'fedhub-cert-country',l:'Country'},{id:'fedhub-cert-state',l:'State'},{id:'fedhub-cert-city',l:'City'},{id:'fedhub-cert-org',l:'Organization'},{id:'fedhub-cert-ou',l:'Org Unit'}];
   var bad=certFields.filter(function(f){var el=document.getElementById(f.id);var v=el?(el.value||'').trim():'';return v&&!asn1ok.test(v);});
   if(bad.length>0){
-    alert('Invalid characters in: '+bad.map(function(f){return f.l;}).join(', ')+'\n\nCertificate fields only allow: A-Z, 0-9, spaces, and \' ( ) + , - . / : = ?\n\nNo underscores, @, #, ! or special characters.');
+    alert("Invalid characters in: "+bad.map(function(f){return f.l;}).join(", ")+"\n\nCertificate fields only allow: A-Z, 0-9, spaces, and ' ( ) + , - . / : = ?\n\nNo underscores, @, #, ! or special characters.");
     bad.forEach(function(f){var el=document.getElementById(f.id);if(el){el.style.borderColor='var(--red)';el.addEventListener('input',function(){el.style.borderColor='';},{once:true});}});
     return false;
   }
