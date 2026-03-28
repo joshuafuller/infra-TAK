@@ -24614,15 +24614,16 @@ def _run_unattended_upgrades_remote(remote_cfg, action):
     """Run enable/disable unattended-upgrades on remote host via SSH. Returns (success, result_dict)."""
     if action == 'disable':
         # Mirror the local approach: kill process, wait for it to die, force-kill, then stop/disable.
-        # systemctl stop blocks if the process is mid-update, so we must kill first.
+        # IMPORTANT: use [d] regex trick so pkill/pgrep don't match the SSH session
+        # whose own cmdline contains "unattended-upgrade" (would kill the SSH connection).
         script = (
-            'sudo pkill -TERM -f "/usr/bin/unattended-upgrade" 2>/dev/null; true; '
+            'sudo pkill -TERM -f "unattended-upgra[d]e" 2>/dev/null; true; '
             'for i in $(seq 1 15); do '
-            '  pgrep -f "/usr/bin/unattended-upgrade" >/dev/null 2>&1 || break; '
+            '  pgrep -f "unattended-upgra[d]e" >/dev/null 2>&1 || break; '
             '  sleep 1; '
             'done; '
-            'pgrep -f "/usr/bin/unattended-upgrade" >/dev/null 2>&1 && '
-            '  sudo pkill -9 -f "/usr/bin/unattended-upgrade" 2>/dev/null && sleep 3; true; '
+            'pgrep -f "unattended-upgra[d]e" >/dev/null 2>&1 && '
+            '  sudo pkill -9 -f "unattended-upgra[d]e" 2>/dev/null && sleep 3; true; '
             'sudo systemctl stop unattended-upgrades 2>/dev/null; '
             'sudo systemctl disable unattended-upgrades 2>/dev/null; '
             'sudo systemctl stop apt-daily-upgrade.timer 2>/dev/null; '
