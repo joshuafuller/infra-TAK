@@ -4835,8 +4835,8 @@ def fedhub_download_webadmin_cert():
 @app.route('/api/fedhub/enable-authentik', methods=['POST'])
 @login_required
 def fedhub_enable_authentik_api():
-    """Enable Authentik OIDC for Federation Hub UI: OAuth2 provider + patch remote federation-hub-ui.yml + Caddy regen.
-    Fed Hub login is a single OIDC flow to Authentik (Caddy does not use forward_auth for fedhub — avoids duplicate apps and cookie fights)."""
+    """Enable Authentik for Fed Hub: OAuth2 provider (Fed Hub OIDC) + Proxy provider (Caddy forward_auth) + patch remote YAML + Caddy regen.
+    Opening Fed Hub from Authentik after tak.<fqdn> login uses forward_auth so the edge session matches — often no Fed Hub ‘Keycloak’ step."""
     settings = load_settings()
     cfg = _get_fedhub_deployment_config(settings)
     if not cfg.get('deployed') or cfg.get('target_mode') != 'remote':
@@ -4857,7 +4857,7 @@ def fedhub_enable_authentik_api():
     # 1) Hub config path
     fh_dir = '/opt/tak/federation-hub'
 
-    # 2) Fed Hub built-in OIDC → Authentik (single login path; Caddy is TLS + reverse_proxy only)
+    # 2) Fed Hub built-in OIDC → Authentik (direct visits / callbacks); Caddy forward_auth handles Authentik-first flow
     client_id, client_secret, auth_url, token_url = _ensure_authentik_fedhub_oauth_app(settings, plog=lambda m: steps.append(m))
     fh_domain = _get_service_domain(settings, 'fedhub')
     fh_host = fh_domain or (remote.get('host') or '').strip()
@@ -4923,23 +4923,29 @@ def fedhub_enable_authentik_api():
     ok_restart, _ = _ssh_probe(remote, 'sudo systemctl restart federation-hub 2>&1', timeout=90)
     steps.append('  ✓ federation-hub restarted' if ok_restart else '  ⚠ Restart returned non-zero')
 
-    # 4) Caddy: Fed Hub uses OIDC only (no separate Authentik Proxy app for forward_auth).
+    # 4) Authentik Proxy provider + app for Caddy forward_auth (same pattern as Node-RED)
     ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
-    if ak_token:
-        steps.append('  ✓ Authentik OAuth provider is used for Fed Hub login (no forward_auth vhost layer)')
+    if ak_token and fqdn:
+        _ensure_authentik_fedhub_proxy_app(fqdn, ak_token, plog=lambda m: steps.append(m), settings=settings)
+        try:
+            ak_url = _get_authentik_api_url(settings)
+            ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+            _repair_embedded_outpost_all_apps(ak_url, ak_headers, settings, plog=lambda m: steps.append(m))
+        except Exception as e:
+            steps.append(f'  ⚠ Outpost repair: {str(e)[:120]}')
     else:
-        steps.append('  ⚠ No Authentik token — OAuth app steps above may have failed')
+        steps.append('  ⚠ No Authentik token — skipped Fed Hub proxy provider')
 
     # 5) Regenerate Caddyfile + reload Caddy
     generate_caddyfile(settings)
     threading.Thread(target=_caddy_restart_after_response, daemon=True).start()
-    steps.append('  ✓ Caddyfile regenerated + Caddy reloading')
+    steps.append('  ✓ Caddyfile regenerated (forward_auth + proxy) + Caddy reloading')
 
     fedhub_url = f'https://{fh_domain}' if fh_domain else f'https://{fh_host}:9100'
     return jsonify({
         'success': True,
         'steps': steps,
-        'message': f'Authentik OIDC enabled for Federation Hub. Open {fedhub_url} — use the Fed Hub login (OIDC to Authentik). Tip: open tak.<your FQDN> first for a smoother session.',
+        'message': f'Authentik enabled for Federation Hub. Use tak.<FQDN> then open Fed Hub from Authentik apps, or {fedhub_url} — forward_auth + OIDC configured.',
     })
 
 
@@ -5272,6 +5278,15 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
                         else:
                             plog('⚠ Auto OAuth patch failed — use "Enable Authentik login" button')
 
+                    ak_token2 = _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+                    if ak_token2 and fqdn:
+                        _ensure_authentik_fedhub_proxy_app(fqdn, ak_token2, plog=plog, settings=settings)
+                        try:
+                            ak_url = _get_authentik_api_url(settings)
+                            ak_headers = {'Authorization': f'Bearer {ak_token2}', 'Content-Type': 'application/json'}
+                            _repair_embedded_outpost_all_apps(ak_url, ak_headers, settings, plog=plog)
+                        except Exception as e:
+                            plog(f'⚠ Outpost repair after FedHub: {str(e)[:120]}')
                     _caddy_regenerate_if_fqdn()
             else:
                 plog('AuthentiK auto OAuth step skipped (Authentik not installed or FQDN missing).')
@@ -7606,12 +7621,25 @@ def generate_caddyfile(settings=None):
             fh_rp_block.append(f"    }}")
             fh_rp_block.append(f"}}")
 
-            # Fed Hub: TLS at Caddy, plain reverse_proxy only. Auth is Fed Hub built-in OIDC → Authentik
-            # (one login path). Caddy forward_auth here duplicated Authentik apps and fought OAuth cookies.
+            # Fed Hub: Caddy forward_auth (Authentik) when Authentik is installed — matches “My applications”
+            # launch after tak.<fqdn> login (session already at edge; often skips Fed Hub’s local OIDC screen).
+            # OAuth provider + federation-hub-ui.yml still used for Fed Hub’s own OIDC when needed.
             lines.append(f"# TAK Federation Hub — Caddy terminates public TLS and proxies to remote hub web port")
             lines.append(f"{fh_host} {{")
-            for rp_line in fh_rp_block:
-                lines.append(f"    {rp_line}")
+            if ak.get('installed'):
+                lines.append(f"    route {{")
+                lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
+                lines.append(f"        forward_auth {ak_up} {{")
+                lines.append(f"            uri /outpost.goauthentik.io/auth/caddy")
+                lines.append(f"            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid")
+                lines.append(f"            trusted_proxies private_ranges")
+                lines.append(f"        }}")
+                for rp_line in fh_rp_block:
+                    lines.append(f"        {rp_line}")
+                lines.append(f"    }}")
+            else:
+                for rp_line in fh_rp_block:
+                    lines.append(f"    {rp_line}")
             lines.append(f"}}")
             lines.append("")
 
@@ -13526,7 +13554,7 @@ def _outpost_add_providers_safe(ak_url, ak_headers, provider_pks_to_add, plog=No
 
 
 def _repair_embedded_outpost_all_apps(ak_url, ak_headers, settings, plog=None):
-    """Ensure embedded outpost includes providers for deployed apps only: infra-TAK, MediaMTX (if deployed), Node-RED (if deployed), TAK Portal (if deployed)."""
+    """Ensure embedded outpost includes providers for deployed apps only: infra-TAK, MediaMTX, Node-RED, TAK Portal, Fed Hub proxy (if deployed)."""
     import urllib.request as _req
     _log = plog or (lambda m: None)
     slug_to_module = [('infratak', 'infratak'), ('stream', 'mediamtx'), ('node-red', 'nodered'), ('tak-portal', 'takportal')]
@@ -13543,6 +13571,16 @@ def _repair_embedded_outpost_all_apps(ak_url, ak_headers, settings, plog=None):
                     provider_pks.append(pk)
             except Exception:
                 pass
+        try:
+            fh_cfg = _get_fedhub_deployment_config(settings)
+            if fh_cfg.get('deployed') and fh_cfg.get('target_mode') == 'remote' and (fh_cfg.get('remote', {}).get('host') or '').strip():
+                r = _req.Request(f'{ak_url}/api/v3/core/applications/federation-hub/', headers=ak_headers)
+                data = json.loads(_req.urlopen(r, timeout=10).read().decode())
+                pk = data.get('provider')
+                if pk and pk not in provider_pks:
+                    provider_pks.append(pk)
+        except Exception:
+            pass
         if provider_pks:
             _outpost_add_providers_safe(ak_url, ak_headers, provider_pks, plog=_log)
     except Exception as e:
