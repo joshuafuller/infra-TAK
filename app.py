@@ -4835,8 +4835,8 @@ def fedhub_download_webadmin_cert():
 @app.route('/api/fedhub/enable-authentik', methods=['POST'])
 @login_required
 def fedhub_enable_authentik_api():
-    """Enable Authentik for Federation Hub: create proxy provider (forward_auth) and regen Caddy.
-    Same approach as Node-RED / MediaMTX — Caddy forward_auth protects the route."""
+    """Enable Authentik OIDC for Federation Hub UI: OAuth2 provider + patch remote federation-hub-ui.yml + Caddy regen.
+    Fed Hub login is a single OIDC flow to Authentik (Caddy does not use forward_auth for fedhub — avoids duplicate apps and cookie fights)."""
     settings = load_settings()
     cfg = _get_fedhub_deployment_config(settings)
     if not cfg.get('deployed') or cfg.get('target_mode') != 'remote':
@@ -4857,7 +4857,7 @@ def fedhub_enable_authentik_api():
     # 1) Hub config path
     fh_dir = '/opt/tak/federation-hub'
 
-    # 2) Also set up Fed Hub's built-in OAuth (belt-and-suspenders with forward_auth)
+    # 2) Fed Hub built-in OIDC → Authentik (single login path; Caddy is TLS + reverse_proxy only)
     client_id, client_secret, auth_url, token_url = _ensure_authentik_fedhub_oauth_app(settings, plog=lambda m: steps.append(m))
     fh_domain = _get_service_domain(settings, 'fedhub')
     fh_host = fh_domain or (remote.get('host') or '').strip()
@@ -4917,29 +4917,29 @@ def fedhub_enable_authentik_api():
         if ok_patch:
             steps.append('  ✓ federation-hub-ui.yml patched with OAuth settings')
         else:
-            steps.append('  ⚠ OAuth config patch warning (forward_auth still works)')
+            steps.append('  ⚠ OAuth config patch warning — Fed Hub UI login may be incomplete until fixed')
 
     # 3) Restart federation-hub to pick up OAuth changes
     ok_restart, _ = _ssh_probe(remote, 'sudo systemctl restart federation-hub 2>&1', timeout=90)
     steps.append('  ✓ federation-hub restarted' if ok_restart else '  ⚠ Restart returned non-zero')
 
-    # 4) Create Authentik proxy provider + application for Caddy forward_auth
+    # 4) Caddy: Fed Hub uses OIDC only (no separate Authentik Proxy app for forward_auth).
     ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
-    if ak_token and fqdn:
-        _ensure_authentik_fedhub_proxy_app(fqdn, ak_token, plog=lambda m: steps.append(m), settings=settings)
+    if ak_token:
+        steps.append('  ✓ Authentik OAuth provider is used for Fed Hub login (no forward_auth vhost layer)')
     else:
-        steps.append('  ⚠ No Authentik token — skipped proxy provider creation')
+        steps.append('  ⚠ No Authentik token — OAuth app steps above may have failed')
 
-    # 5) Regenerate Caddyfile (now includes forward_auth) + reload Caddy
+    # 5) Regenerate Caddyfile + reload Caddy
     generate_caddyfile(settings)
     threading.Thread(target=_caddy_restart_after_response, daemon=True).start()
-    steps.append('  ✓ Caddyfile regenerated with forward_auth + Caddy reloading')
+    steps.append('  ✓ Caddyfile regenerated + Caddy reloading')
 
     fedhub_url = f'https://{fh_domain}' if fh_domain else f'https://{fh_host}:9100'
     return jsonify({
         'success': True,
         'steps': steps,
-        'message': f'Authentik enabled for Federation Hub. Access via {fedhub_url} — Authentik login required.',
+        'message': f'Authentik OIDC enabled for Federation Hub. Open {fedhub_url} — use the Fed Hub login (OIDC to Authentik). Tip: open tak.<your FQDN> first for a smoother session.',
     })
 
 
@@ -5272,9 +5272,6 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
                         else:
                             plog('⚠ Auto OAuth patch failed — use "Enable Authentik login" button')
 
-                    ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
-                    if ak_token and fqdn:
-                        _ensure_authentik_fedhub_proxy_app(fqdn, ak_token, plog=plog, settings=settings)
                     _caddy_regenerate_if_fqdn()
             else:
                 plog('AuthentiK auto OAuth step skipped (Authentik not installed or FQDN missing).')
@@ -7609,22 +7606,12 @@ def generate_caddyfile(settings=None):
             fh_rp_block.append(f"    }}")
             fh_rp_block.append(f"}}")
 
+            # Fed Hub: TLS at Caddy, plain reverse_proxy only. Auth is Fed Hub built-in OIDC → Authentik
+            # (one login path). Caddy forward_auth here duplicated Authentik apps and fought OAuth cookies.
             lines.append(f"# TAK Federation Hub — Caddy terminates public TLS and proxies to remote hub web port")
             lines.append(f"{fh_host} {{")
-            if ak.get('installed'):
-                lines.append(f"    route {{")
-                lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
-                lines.append(f"        forward_auth {ak_up} {{")
-                lines.append(f"            uri /outpost.goauthentik.io/auth/caddy")
-                lines.append(f"            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid")
-                lines.append(f"            trusted_proxies private_ranges")
-                lines.append(f"        }}")
-                for rp_line in fh_rp_block:
-                    lines.append(f"        {rp_line}")
-                lines.append(f"    }}")
-            else:
-                for rp_line in fh_rp_block:
-                    lines.append(f"    {rp_line}")
+            for rp_line in fh_rp_block:
+                lines.append(f"    {rp_line}")
             lines.append(f"}}")
             lines.append("")
 
@@ -13335,15 +13322,23 @@ def _ensure_authentik_fedhub_oauth_app(settings, plog=None):
         except Exception:
             log('  ⚠ Could not look up scope mappings')
 
-        # Determine redirect URI
+        # Determine redirect URIs (strict matching in Authentik — include :443 variants; legacy /login/redirect for older FedHub builds)
         fh_cfg = _get_fedhub_deployment_config(settings)
         fh_host = (fh_cfg.get('remote', {}).get('host') or '').strip()
         fh_domain = _get_service_domain(settings, 'fedhub') if settings.get('fqdn') else ''
         redirect_host = fh_domain or fh_host or 'localhost'
-        # Fed Hub OAuth callback is backend API endpoint; SPA route /login/redirect does not complete auth.
-        # Via Caddy (FQDN set): standard HTTPS port. Direct IP: port 9100.
-        redirect_uri = f'https://{redirect_host}/api/oauth/login/redirect' if fh_domain else f'https://{redirect_host}:9100/api/oauth/login/redirect'
-        redirect_uris_obj = [{'matching_mode': 'strict', 'url': redirect_uri}]
+        if fh_domain:
+            base = f'https://{fh_domain}'
+            redirect_uris_obj = [
+                {'matching_mode': 'strict', 'url': f'{base}/api/oauth/login/redirect'},
+                {'matching_mode': 'strict', 'url': f'{base}:443/api/oauth/login/redirect'},
+                {'matching_mode': 'strict', 'url': f'{base}/login/redirect'},
+                {'matching_mode': 'strict', 'url': f'{base}:443/login/redirect'},
+            ]
+        else:
+            # Direct IP: Fed Hub OAuth callback is backend API endpoint; port 9100.
+            redirect_uri = f'https://{redirect_host}:9100/api/oauth/login/redirect'
+            redirect_uris_obj = [{'matching_mode': 'strict', 'url': redirect_uri}]
 
         # Build the patch payload used both for updating existing providers and creating new ones
         _provider_extras = {}
@@ -25603,7 +25598,7 @@ def _startup_migrations():
         # Build normalized cfg after settings normalization
         fh_cfg = _get_fedhub_deployment_config(s)
 
-        # Always regenerate Caddyfile when Fed Hub is deployed (picks up forward_auth, port fixes, etc.)
+        # Always regenerate Caddyfile when Fed Hub is deployed (port fixes, Fed Hub vhost, etc.)
         if fh_cfg.get('deployed') and (s.get('fqdn') or '').strip():
             generate_caddyfile(s)
             subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
