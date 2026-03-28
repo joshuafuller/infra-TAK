@@ -5255,7 +5255,10 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
                             f'grep -q "^keycloakAuthEndpoint:" federation-hub-ui.yml || echo "keycloakAuthEndpoint: {auth_endpoint_url}" | sudo tee -a federation-hub-ui.yml > /dev/null && '
                             f'grep -q "^keycloakTokenEndpoint:" federation-hub-ui.yml || echo "keycloakTokenEndpoint: {token_endpoint_url}" | sudo tee -a federation-hub-ui.yml > /dev/null && '
                             f'grep -q "^keycloakAccessTokenName:" federation-hub-ui.yml || echo "keycloakAccessTokenName: access_token" | sudo tee -a federation-hub-ui.yml > /dev/null && '
-                            f'grep -q "^keycloakRefreshTokenName:" federation-hub-ui.yml || echo "keycloakRefreshTokenName: refresh_token" | sudo tee -a federation-hub-ui.yml > /dev/null'
+                            f'grep -q "^keycloakRefreshTokenName:" federation-hub-ui.yml || echo "keycloakRefreshTokenName: refresh_token" | sudo tee -a federation-hub-ui.yml > /dev/null && '
+                            f'grep -q "^keycloakRedirectUri:" federation-hub-ui.yml || echo "keycloakRedirectUri: {redirect_uri}" | sudo tee -a federation-hub-ui.yml > /dev/null && '
+                            f'grep -q "^keycloakrRedirectUri:" federation-hub-ui.yml || echo "keycloakrRedirectUri: {redirect_uri}" | sudo tee -a federation-hub-ui.yml > /dev/null && '
+                            f'grep -q "^keycloakConfigurationEndpoint:" federation-hub-ui.yml || echo "keycloakConfigurationEndpoint: {oidc_config_url}" | sudo tee -a federation-hub-ui.yml > /dev/null'
                         )
                         ok_patch, _ = _ssh_probe(remote, patch_cmd, timeout=30)
                         if ok_patch:
