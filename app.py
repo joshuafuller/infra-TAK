@@ -14938,7 +14938,6 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
       <div class="metric-card"><div class="metric-label">Disk</div><div class="metric-value" id="fedhub-remote-disk-value">—</div><div class="metric-detail" id="fedhub-remote-disk-detail"></div></div>
       <div class="metric-card"><div class="metric-label">Uptime</div><div class="metric-value" id="fedhub-remote-uptime-value" style="font-size:18px">—</div></div>
     </div>
-    <p id="fedhub-remote-metrics-hint" style="font-size:11px;color:var(--text-dim);margin-top:10px;line-height:1.45;min-height:1.2em"></p>
   </div>
   {% endif %}
 
@@ -15746,79 +15745,13 @@ function fedhubControl(act){
     }).catch(function(e){if(el){el.style.color='var(--red)';el.textContent='Failed';}});
 }
 function fedhubRefreshStatus(){
-  var s=document.getElementById('fedhub-svc-state');
-  var di=document.getElementById('fedhub-dir-state');
-  fetch('/api/fedhub/status',{credentials:'same-origin'}).then(function(r){
-    return r.text().then(function(t){
-      var d=null;
-      try{d=t?JSON.parse(t):null;}catch(e){d=null;}
-      return {ok:r.ok,status:r.status,d:d};
-    });
-  }).then(function(x){
-    if(!s&&!di)return;
-    if(!x.ok||!x.d||typeof x.d!=='object'||!('registered' in x.d)){
-      if(s)s.textContent='\u2014';
-      if(di)di.textContent='\u2014';
-      return;
-    }
-    if(!x.d.registered){
-      if(s)s.textContent='\u2014';
-      if(di)di.textContent='\u2014';
-      return;
-    }
-    if(s)s.textContent=x.d.service_state||'\u2014';
-    if(di)di.textContent=x.d.dir_ok?'/opt/tak/federation-hub present':'missing';
-  }).catch(function(){
-    if(s)s.textContent='\u2014';
-    if(di)di.textContent='\u2014';
-  });
-}
-function loadFedhubRemoteMetrics(){
-  var bar=document.getElementById('fedhub-remote-metrics-bar');
-  if(!bar)return;
-  var hint=document.getElementById('fedhub-remote-metrics-hint');
-  function setDash(){
-    var ids=['fedhub-remote-cpu-value','fedhub-remote-ram-value','fedhub-remote-disk-value','fedhub-remote-uptime-value'];
-    for(var i=0;i<ids.length;i++){var el=document.getElementById(ids[i]);if(el)el.textContent='\u2014';}
-    var ramD=document.getElementById('fedhub-remote-ram-detail');if(ramD)ramD.textContent='';
-    var diskD=document.getElementById('fedhub-remote-disk-detail');if(diskD)diskD.textContent='';
-  }
-  fetch('/api/fedhub/remote-metrics',{credentials:'same-origin'}).then(function(r){
-    return r.text().then(function(t){
-      var d=null;
-      try{d=t?JSON.parse(t):null;}catch(e){d=null;}
-      return {ok:r.ok,status:r.status,d:d,raw:t};
-    });
-  }).then(function(x){
-    if(!x.ok){
-      setDash();
-      if(hint){
-        var msg=(x.d&&x.d.error)?x.d.error:'Metrics unavailable';
-        if(x.status===404)msg='Remote host not saved in settings.';
-        else if(x.status===401||x.status===403)msg='Session expired — refresh the page and sign in again.';
-        else if(x.status===503)msg=(x.d&&x.d.error)?x.d.error:'Could not reach the Fed Hub host over SSH (key path, network, or python3 on the target).';
-        hint.textContent=msg;
-        hint.style.color='var(--yellow)';
-      }
-      return;
-    }
-    var d=x.d;
-    if(!d||typeof d!=='object'||!('cpu_percent' in d)){
-      setDash();
-      if(hint){hint.textContent='Bad response from server — refresh the page or sign in again.';hint.style.color='var(--yellow)';}
-      return;
-    }
-    if(hint){hint.textContent='';hint.style.color='var(--text-dim)';}
-    var cpu=document.getElementById('fedhub-remote-cpu-value');if(cpu)cpu.textContent=(d.cpu_percent!=null?d.cpu_percent:'\u2014')+'%';
-    var ram=document.getElementById('fedhub-remote-ram-value');if(ram)ram.textContent=(d.ram_percent!=null?d.ram_percent:'\u2014')+'%';
-    var ramD=document.getElementById('fedhub-remote-ram-detail');if(ramD)ramD.textContent=(d.ram_used_gb!=null&&d.ram_total_gb!=null)?(d.ram_used_gb+'GB / '+d.ram_total_gb+'GB'):'';
-    var disk=document.getElementById('fedhub-remote-disk-value');if(disk)disk.textContent=(d.disk_percent!=null?d.disk_percent:'\u2014')+'%';
-    var diskD=document.getElementById('fedhub-remote-disk-detail');if(diskD)diskD.textContent=(d.disk_used_gb!=null&&d.disk_total_gb!=null)?(d.disk_used_gb+'GB / '+d.disk_total_gb+'GB'):'';
-    var up=document.getElementById('fedhub-remote-uptime-value');if(up)up.textContent=d.uptime||'\u2014';
-  }).catch(function(){
-    setDash();
-    if(hint){hint.textContent='Could not load metrics (network or server error).';hint.style.color='var(--red)';}
-  });
+  fetch('/api/fedhub/status',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    var s=document.getElementById('fedhub-svc-state');
+    var di=document.getElementById('fedhub-dir-state');
+    if(!d.registered)return;
+    if(s)s.textContent=d.service_state||'—';
+    if(di)di.textContent=d.dir_ok?'/opt/tak/federation-hub present':'missing';
+  }).catch(function(){});
 }
 document.addEventListener('DOMContentLoaded',function(){
   if(document.getElementById('fedhub-progress-area'))fedhubRefreshPackageRowsFromServer();
@@ -15861,6 +15794,7 @@ document.addEventListener('DOMContentLoaded',function(){
     setInterval(loadFedhubCertExpiry,60000);
   }
 });
+async function loadFedhubRemoteMetrics(){var bar=document.getElementById('fedhub-remote-metrics-bar');if(!bar)return;try{var r=await fetch('/api/fedhub/remote-metrics',{credentials:'same-origin'});if(!r.ok){document.getElementById('fedhub-remote-cpu-value').textContent='\u2014';document.getElementById('fedhub-remote-ram-value').textContent='\u2014';document.getElementById('fedhub-remote-disk-value').textContent='\u2014';document.getElementById('fedhub-remote-uptime-value').textContent='\u2014';return;}var d=await r.json();var cpu=document.getElementById('fedhub-remote-cpu-value');if(cpu)cpu.textContent=(d.cpu_percent!=null?d.cpu_percent:'\u2014')+'%';var ram=document.getElementById('fedhub-remote-ram-value');if(ram)ram.textContent=(d.ram_percent!=null?d.ram_percent:'\u2014')+'%';var ramD=document.getElementById('fedhub-remote-ram-detail');if(ramD)ramD.textContent=(d.ram_used_gb!=null&&d.ram_total_gb!=null)?(d.ram_used_gb+'GB / '+d.ram_total_gb+'GB'):'';var disk=document.getElementById('fedhub-remote-disk-value');if(disk)disk.textContent=(d.disk_percent!=null?d.disk_percent:'\u2014')+'%';var diskD=document.getElementById('fedhub-remote-disk-detail');if(diskD)diskD.textContent=(d.disk_used_gb!=null&&d.disk_total_gb!=null)?(d.disk_used_gb+'GB / '+d.disk_total_gb+'GB'):'';var up=document.getElementById('fedhub-remote-uptime-value');if(up)up.textContent=d.uptime||'\u2014';}catch(e){}}
 </script>
 </body></html>
 '''
