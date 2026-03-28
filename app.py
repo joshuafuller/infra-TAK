@@ -7085,24 +7085,60 @@ def _get_authentik_env_value(settings, key):
     return None
 
 
-def _authentik_application_open_in_new_tab(ak_url, ak_headers, slug):
-    """PATCH Authentik application so My applications opens the launch URL in a new tab (core API; ignore errors)."""
+def _authentik_application_open_in_new_tab(ak_url, ak_headers, slug, plog=None):
+    """PATCH Authentik application so My applications uses target=_blank for the launch URL.
+    Logs HTTP/parse failures via plog when provided (previously all errors were swallowed)."""
     import urllib.request as _ur
+    import urllib.error as _ue
     import urllib.parse as _uparse
+    _log = plog or (lambda _m: None)
     if not ak_url or not ak_headers or not slug:
         return
     slug = str(slug).strip().strip('/')
     if not slug:
         return
+    enc = _uparse.quote(slug, safe='')
+    url = f'{ak_url.rstrip("/")}/api/v3/core/applications/{enc}/'
+    headers = dict(ak_headers)
+    headers.setdefault('Accept', 'application/json')
     try:
-        enc = _uparse.quote(slug, safe='')
         req = _ur.Request(
-            f'{ak_url.rstrip("/")}/api/v3/core/applications/{enc}/',
+            url,
             data=json.dumps({'open_in_new_tab': True}).encode(),
-            headers=ak_headers, method='PATCH')
-        _ur.urlopen(req, timeout=10)
-    except Exception:
-        pass
+            headers=headers, method='PATCH')
+        with _ur.urlopen(req, timeout=10) as resp:
+            raw = (resp.read() or b'').decode()
+        data = {}
+        if raw.strip():
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                _log(f"  ⚠ open_in_new_tab ({slug}): PATCH response not JSON ({raw[:80]!r})")
+                return
+        else:
+            try:
+                gr = _ur.Request(url, headers=headers, method='GET')
+                with _ur.urlopen(gr, timeout=10) as grsp:
+                    data = json.loads((grsp.read() or b'{}').decode())
+            except Exception as ge:
+                _log(f"  ⚠ open_in_new_tab ({slug}): empty PATCH body, GET verify failed: {str(ge)[:100]}")
+                return
+        oint = data.get('open_in_new_tab')
+        if oint is None:
+            oint = data.get('openInNewTab')
+        if oint is not True:
+            _log(
+                f"  ⚠ open_in_new_tab ({slug}): field still false after PATCH "
+                f"(got {oint!r}) — check Authentik version / API token permissions"
+            )
+    except _ue.HTTPError as e:
+        try:
+            err_body = (e.read() or b'').decode()[:400]
+        except Exception:
+            err_body = ''
+        _log(f"  ⚠ open_in_new_tab ({slug}): HTTP {e.code} {err_body}")
+    except Exception as ex:
+        _log(f"  ⚠ open_in_new_tab ({slug}): {str(ex)[:160]}")
 
 
 def _tak_deployment_defaults():
@@ -9231,7 +9267,7 @@ def run_takportal_deploy():
                             plog(f"  \u2713 Application 'TAK Portal' already exists")
                         else:
                             plog(f"  \u26a0 Application error: {str(e)[:80]}")
-                    _authentik_application_open_in_new_tab(_ak_url, _ak_headers, 'tak-portal')
+                    _authentik_application_open_in_new_tab(_ak_url, _ak_headers, 'tak-portal', plog=plog)
 
                     # Add to embedded outpost (retry-safe; API can still be warming up)
                     outpost_ok = False
@@ -13149,7 +13185,7 @@ def _ensure_authentik_nodered_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
 
             # 5) Add to embedded outpost
             _outpost_add_providers_safe(_ak_url, _ak_headers, [provider_pk], plog=log)
-            _authentik_application_open_in_new_tab(_ak_url, _ak_headers, 'node-red')
+            _authentik_application_open_in_new_tab(_ak_url, _ak_headers, 'node-red', plog=log)
         else:
             log("  ⚠ Could not create or find Node-RED proxy provider")
     except Exception as e:
@@ -13246,7 +13282,7 @@ def _ensure_authentik_fedhub_proxy_app(fqdn, ak_token, plog=None, flow_pk=None, 
                     log(f"  ⚠ Application error: {str(e)[:80]}")
 
             _outpost_add_providers_safe(_ak_url, _ak_headers, [provider_pk], plog=log)
-            _authentik_application_open_in_new_tab(_ak_url, _ak_headers, 'federation-hub')
+            _authentik_application_open_in_new_tab(_ak_url, _ak_headers, 'federation-hub', plog=log)
         else:
             log("  ⚠ Could not create or find Federation Hub proxy provider")
     except Exception as e:
@@ -13369,7 +13405,7 @@ def _ensure_authentik_console_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
                         pass
 
         for _name, _slug, _host in entries:
-            _authentik_application_open_in_new_tab(_ak_url, _ak_headers, _slug)
+            _authentik_application_open_in_new_tab(_ak_url, _ak_headers, _slug, plog=log)
         if provider_pks:
             _outpost_add_providers_safe(_ak_url, _ak_headers, provider_pks, plog=log)
         return True
@@ -13700,8 +13736,9 @@ def _repair_embedded_outpost_all_apps(ak_url, ak_headers, settings, plog=None):
         _log(f"  ⚠ Repair outpost: {str(e)[:80]}")
 
 
-def _sync_authentik_takportal_provider_url(settings):
+def _sync_authentik_takportal_provider_url(settings, plog=None):
     """Set TAK Portal Proxy external_host/cookie_domain, ensure provider+app exist and are on embedded outpost (fixes 404 on takportal.fqdn)."""
+    _tp_log = plog or (lambda _m: None)
     import urllib.request as _req
     import urllib.error
     fqdn = (settings.get('fqdn') or '').strip()
@@ -13776,7 +13813,7 @@ def _sync_authentik_takportal_provider_url(settings):
                 except urllib.error.HTTPError as e:
                     if e.code != 400:
                         pass
-                _authentik_application_open_in_new_tab(ak_url, ak_headers, 'tak-portal')
+                _authentik_application_open_in_new_tab(ak_url, ak_headers, 'tak-portal', plog=_tp_log)
         # Ensure TAK Portal Proxy is on the embedded outpost so takportal.fqdn is matched (else 404).
         if provider_pk is not None:
             _outpost_add_providers_safe(ak_url, ak_headers, [provider_pk])
@@ -18808,7 +18845,7 @@ def _run_authentik_reconfigure_remote(settings, deploy_cfg, plog):
     _ensure_proxy_providers_cookie_domain(ak_url, ak_headers, fqdn, plog)
     if _is_module_deployed(settings, 'takportal'):
         plog("  Syncing TAK Portal provider URL and outpost...")
-        _sync_authentik_takportal_provider_url(settings)
+        _sync_authentik_takportal_provider_url(settings, plog=plog)
     if _is_module_deployed(settings, 'nodered'):
         plog("  Configuring Authentik for Node-RED...")
         _ensure_authentik_nodered_app(fqdn, ak_token, plog, settings=settings)
@@ -18973,7 +19010,7 @@ def run_authentik_deploy(reconfigure=False):
                         _ensure_proxy_providers_cookie_domain(ak_url, ak_headers, fqdn, plog)
                         if _is_module_deployed(settings, 'takportal'):
                             plog("  Syncing TAK Portal provider URL and outpost...")
-                            _sync_authentik_takportal_provider_url(settings)
+                            _sync_authentik_takportal_provider_url(settings, plog=plog)
                         if _is_module_deployed(settings, 'nodered'):
                             plog("  Configuring Authentik for Node-RED...")
                             _ensure_authentik_nodered_app(fqdn, ak_token, plog, settings=settings)
@@ -19823,7 +19860,7 @@ entries:
                                     plog(f"  ✓ LDAP application already exists")
                                 else:
                                     plog(f"  ⚠ LDAP application error: {e.code} {e.read().decode()[:100]}")
-                            _authentik_application_open_in_new_tab(ak_url, ak_headers, 'ldap')
+                            _authentik_application_open_in_new_tab(ak_url, ak_headers, 'ldap', plog=plog)
 
                             # Get or create LDAP outpost (blueprint may have created it)
                             outpost_token_id = None
@@ -20129,7 +20166,7 @@ entries:
                                 app_slug = 'tak-portal'
                             else:
                                 plog(f"  ⚠ Application error: {e.code}")
-                        _authentik_application_open_in_new_tab(ak_url, ak_headers, 'tak-portal')
+                        _authentik_application_open_in_new_tab(ak_url, ak_headers, 'tak-portal', plog=plog)
 
                     # 12e: Add to embedded outpost
                     if app_slug:
