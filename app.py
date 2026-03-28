@@ -5183,10 +5183,10 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
         # --- Firewall ---
         plog('━━━ Firewall (UFW) ━━━')
         _ssh_probe(remote, 'sudo ufw allow 22/tcp > /dev/null 2>&1; true', timeout=15)
-        for p in ['9100/tcp', '9101/tcp', '9102/tcp', '9103/tcp']:
+        for p in ['8080/tcp', '9100/tcp', '9101/tcp', '9102/tcp', '9103/tcp']:
             _ssh_probe(remote, f'sudo ufw allow {p} > /dev/null 2>&1; true', timeout=15)
         _ssh_probe(remote, 'sudo ufw --force enable > /dev/null 2>&1; true', timeout=15)
-        plog('✓ Firewall configured (22, 9100-9103)')
+        plog('✓ Firewall configured (22, 8080, 9100-9103)')
 
         plog('━━━ Verify ━━━')
         ok_9100, out_9100 = _ssh_probe(remote, 'ss -tlnp | grep :9100 || true', timeout=15)
@@ -7476,9 +7476,9 @@ def generate_caddyfile(settings=None):
             fh_upstream = f'{fh_remote}:{fh_port}'
             lines.append("# TAK Federation Hub — Caddy terminates public TLS and proxies to remote hub web port")
             lines.append(f"{fh_host} {{")
-            # Federation Hub deploy flow exposes HTTP web UI on 8080/9100 by default.
-            # Keep TLS upstream only when explicitly configured to legacy 8446.
-            fh_upstream_scheme = 'https' if fh_port == 8446 else 'http'
+            # Federation Hub commonly exposes HTTP on 8080 and TLS on 9100.
+            # Keep legacy 8446 as TLS as well.
+            fh_upstream_scheme = 'https' if fh_port in (9100, 8446) else 'http'
             lines.append(f"    reverse_proxy {fh_upstream_scheme}://{fh_upstream} {{")
             lines.append(f"        header_up X-Forwarded-Port 443")
             lines.append(f"        header_up X-Forwarded-Proto https")
