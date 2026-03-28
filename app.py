@@ -977,10 +977,15 @@ print(json.dumps(out))
         with open(tmp_path, 'w') as f:
             f.write(script_content)
         deploy_cfg = {'target_mode': 'remote', 'remote': remote_cfg}
-        ok_copy = _module_copy(deploy_cfg, tmp_path, tmp_path, timeout=15)
-        if not ok_copy:
+        copy_ok, _copy_msg = _module_copy(deploy_cfg, tmp_path, tmp_path, timeout=15)
+        if not copy_ok:
             return None
-        ok, out = _ssh_probe(remote_cfg, f'python3 {tmp_path} 2>/dev/null; rm -f {tmp_path}', timeout=20)
+        rp = shlex.quote(tmp_path)
+        ok, out = _ssh_probe(
+            remote_cfg,
+            f'command -v python3 >/dev/null 2>&1 && python3 {rp} 2>/dev/null || python {rp} 2>/dev/null; rm -f {rp}',
+            timeout=25,
+        )
     except Exception:
         return None
     finally:
@@ -990,10 +995,18 @@ print(json.dumps(out))
             pass
     if not ok or not out:
         return None
+    raw = (out or '').strip()
     try:
-        return json.loads(out.strip())
+        return json.loads(raw)
     except Exception:
-        return None
+        pass
+    try:
+        i, j = raw.find('{'), raw.rfind('}')
+        if i >= 0 and j > i:
+            return json.loads(raw[i : j + 1])
+    except Exception:
+        pass
+    return None
 
 def _get_unattended_upgrades_status():
     """Return dict with 'enabled' (bool) and 'running' (bool). 'running' = upgrade job active (not shutdown-waiter)."""
@@ -9592,12 +9605,12 @@ def mediamtx_recovery():
                 with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as pf:
                     pf.write(script)
                     tmp_patch = pf.name
-                ok_copy = _module_copy(deploy_cfg, tmp_patch, f'/tmp/{name}.py', timeout=15)
+                copy_ok, _cm = _module_copy(deploy_cfg, tmp_patch, f'/tmp/{name}.py', timeout=15)
                 try:
                     os.unlink(tmp_patch)
                 except Exception:
                     pass
-                if ok_copy:
+                if copy_ok:
                     _module_run(deploy_cfg, f'python3 /tmp/{name}.py && rm -f /tmp/{name}.py', timeout=15)
         else:
             if os.path.isfile(editor_path):
@@ -9623,8 +9636,8 @@ def mediamtx_recovery():
         tmp_f = tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False)
         tmp_f.write(MEDIAMTX_ENSURE_OVERLAY_SCRIPT)
         tmp_f.close()
-        ok_copy = _module_copy(deploy_cfg, tmp_f.name, '/tmp/ensure_overlay.py', timeout=15)
-        if not ok_copy:
+        copy_ok, _cm = _module_copy(deploy_cfg, tmp_f.name, '/tmp/ensure_overlay.py', timeout=15)
+        if not copy_ok:
             return jsonify({'error': 'Failed to copy overlay script to target'}), 500
         # Install script, make ExecStartPre best-effort so a failing pre-step cannot block start, then restart
         cmd = (
@@ -12943,8 +12956,8 @@ print("OK_RESTARTED")
     try:
         with open(tmp_path, 'w') as f:
             f.write(script_content)
-        ok_copy = _module_copy({'target_mode': 'remote', 'remote': remote_cfg}, tmp_path, tmp_path, timeout=15)
-        if not ok_copy:
+        copy_ok, _cm = _module_copy({'target_mode': 'remote', 'remote': remote_cfg}, tmp_path, tmp_path, timeout=15)
+        if not copy_ok:
             if log_fn:
                 log_fn("  ⚠ Could not copy Docker log-limits script to remote")
             return False, False
@@ -14925,6 +14938,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
       <div class="metric-card"><div class="metric-label">Disk</div><div class="metric-value" id="fedhub-remote-disk-value">—</div><div class="metric-detail" id="fedhub-remote-disk-detail"></div></div>
       <div class="metric-card"><div class="metric-label">Uptime</div><div class="metric-value" id="fedhub-remote-uptime-value" style="font-size:18px">—</div></div>
     </div>
+    <p id="fedhub-remote-metrics-hint" style="font-size:11px;color:var(--text-dim);margin-top:10px;line-height:1.45;min-height:1.2em"></p>
   </div>
   {% endif %}
 
@@ -15740,6 +15754,48 @@ function fedhubRefreshStatus(){
     if(di)di.textContent=d.dir_ok?'/opt/tak/federation-hub present':'missing';
   }).catch(function(){});
 }
+function loadFedhubRemoteMetrics(){
+  var bar=document.getElementById('fedhub-remote-metrics-bar');
+  if(!bar)return;
+  var hint=document.getElementById('fedhub-remote-metrics-hint');
+  function setDash(){
+    var ids=['fedhub-remote-cpu-value','fedhub-remote-ram-value','fedhub-remote-disk-value','fedhub-remote-uptime-value'];
+    for(var i=0;i<ids.length;i++){var el=document.getElementById(ids[i]);if(el)el.textContent='\u2014';}
+    var ramD=document.getElementById('fedhub-remote-ram-detail');if(ramD)ramD.textContent='';
+    var diskD=document.getElementById('fedhub-remote-disk-detail');if(diskD)diskD.textContent='';
+  }
+  fetch('/api/fedhub/remote-metrics',{credentials:'same-origin'}).then(function(r){
+    return r.text().then(function(t){
+      var d=null;
+      try{d=t?JSON.parse(t):null;}catch(e){d=null;}
+      return {ok:r.ok,status:r.status,d:d,raw:t};
+    });
+  }).then(function(x){
+    if(!x.ok){
+      setDash();
+      if(hint){
+        var msg=(x.d&&x.d.error)?x.d.error:'Metrics unavailable';
+        if(x.status===404)msg='Remote host not saved in settings.';
+        else if(x.status===401||x.status===403)msg='Session expired — refresh the page and sign in again.';
+        else if(x.status===503)msg=(x.d&&x.d.error)?x.d.error:'Could not reach the Fed Hub host over SSH (key path, network, or python3 on the target).';
+        hint.textContent=msg;
+        hint.style.color='var(--yellow)';
+      }
+      return;
+    }
+    if(hint){hint.textContent='';hint.style.color='var(--text-dim)';}
+    var d=x.d||{};
+    var cpu=document.getElementById('fedhub-remote-cpu-value');if(cpu)cpu.textContent=(d.cpu_percent!=null?d.cpu_percent:'\u2014')+'%';
+    var ram=document.getElementById('fedhub-remote-ram-value');if(ram)ram.textContent=(d.ram_percent!=null?d.ram_percent:'\u2014')+'%';
+    var ramD=document.getElementById('fedhub-remote-ram-detail');if(ramD)ramD.textContent=(d.ram_used_gb!=null&&d.ram_total_gb!=null)?(d.ram_used_gb+'GB / '+d.ram_total_gb+'GB'):'';
+    var disk=document.getElementById('fedhub-remote-disk-value');if(disk)disk.textContent=(d.disk_percent!=null?d.disk_percent:'\u2014')+'%';
+    var diskD=document.getElementById('fedhub-remote-disk-detail');if(diskD)diskD.textContent=(d.disk_used_gb!=null&&d.disk_total_gb!=null)?(d.disk_used_gb+'GB / '+d.disk_total_gb+'GB'):'';
+    var up=document.getElementById('fedhub-remote-uptime-value');if(up)up.textContent=d.uptime||'\u2014';
+  }).catch(function(){
+    setDash();
+    if(hint){hint.textContent='Could not load metrics (network or server error).';hint.style.color='var(--red)';}
+  });
+}
 document.addEventListener('DOMContentLoaded',function(){
   if(document.getElementById('fedhub-progress-area'))fedhubRefreshPackageRowsFromServer();
   if(document.getElementById('fedhub-svc-state'))fedhubRefreshStatus();
@@ -15781,7 +15837,6 @@ document.addEventListener('DOMContentLoaded',function(){
     setInterval(loadFedhubCertExpiry,60000);
   }
 });
-async function loadFedhubRemoteMetrics(){var bar=document.getElementById('fedhub-remote-metrics-bar');if(!bar)return;try{var r=await fetch('/api/fedhub/remote-metrics',{credentials:'same-origin'});if(!r.ok){document.getElementById('fedhub-remote-cpu-value').textContent='—';document.getElementById('fedhub-remote-ram-value').textContent='—';document.getElementById('fedhub-remote-disk-value').textContent='—';document.getElementById('fedhub-remote-uptime-value').textContent='—';return;}var d=await r.json();var cpu=document.getElementById('fedhub-remote-cpu-value');if(cpu)cpu.textContent=(d.cpu_percent!=null?d.cpu_percent:'—')+'%';var ram=document.getElementById('fedhub-remote-ram-value');if(ram)ram.textContent=(d.ram_percent!=null?d.ram_percent:'—')+'%';var ramD=document.getElementById('fedhub-remote-ram-detail');if(ramD)ramD.textContent=(d.ram_used_gb!=null&&d.ram_total_gb!=null)?(d.ram_used_gb+'GB / '+d.ram_total_gb+'GB'):'';var disk=document.getElementById('fedhub-remote-disk-value');if(disk)disk.textContent=(d.disk_percent!=null?d.disk_percent:'—')+'%';var diskD=document.getElementById('fedhub-remote-disk-detail');if(diskD)diskD.textContent=(d.disk_used_gb!=null&&d.disk_total_gb!=null)?(d.disk_used_gb+'GB / '+d.disk_total_gb+'GB'):'';var up=document.getElementById('fedhub-remote-uptime-value');if(up)up.textContent=d.uptime||'—';}catch(e){}}
 </script>
 </body></html>
 '''
