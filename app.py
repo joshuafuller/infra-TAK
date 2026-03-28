@@ -13444,25 +13444,40 @@ def _ensure_authentik_fedhub_oauth_app(settings, plog=None):
             log('  ✗ No OAuth2 provider — cannot continue')
             return None, None, None, None
 
-        # Create application (same pattern as Node-RED / TAK Portal)
+        # Create application (same pattern as Node-RED / TAK Portal).
+        # OAuth app is only for Fed Hub's "Login with Keycloak" client — hide from user app list so
+        # only the Proxy app (forward_auth) appears on "My applications" (Authentik: meta_launch_url blank://blank).
+        _app_body = {
+            'name': provider_name,
+            'slug': slug,
+            'provider': provider_pk,
+            'meta_launch_url': 'blank://blank',
+        }
         try:
             req = _urlreq.Request(f'{ak_url}/api/v3/core/applications/',
-                data=json.dumps({'name': provider_name, 'slug': slug, 'provider': provider_pk}).encode(),
+                data=json.dumps(_app_body).encode(),
                 headers=_ak_headers, method='POST')
             _urlreq.urlopen(req, timeout=10)
-            log(f'  ✓ Application created')
+            log(f'  ✓ Application created (hidden from user launcher)')
         except Exception as e:
             if hasattr(e, 'code') and e.code == 400:
                 try:
                     req = _urlreq.Request(f'{ak_url}/api/v3/core/applications/{slug}/',
-                        data=json.dumps({'provider': provider_pk}).encode(),
+                        data=json.dumps({'provider': provider_pk, 'meta_launch_url': 'blank://blank'}).encode(),
                         headers=_ak_headers, method='PATCH')
                     _urlreq.urlopen(req, timeout=10)
                 except Exception:
                     pass
-                log(f'  ✓ Application already exists')
+                log(f'  ✓ Application already exists (launcher URL updated)')
             else:
                 log(f'  ⚠ Application error: {str(e)[:80]}')
+        try:
+            req = _urlreq.Request(f'{ak_url}/api/v3/core/applications/{slug}/',
+                data=json.dumps({'meta_launch_url': 'blank://blank'}).encode(),
+                headers=_ak_headers, method='PATCH')
+            _urlreq.urlopen(req, timeout=10)
+        except Exception:
+            pass
 
         authorize_url = f'{ak_public}/application/o/authorize/'
         token_url = f'{ak_public}/application/o/token/'
