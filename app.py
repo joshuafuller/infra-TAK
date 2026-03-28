@@ -7724,7 +7724,7 @@ def generate_caddyfile(settings=None):
             lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
             lines.append(f"")
             lines.append(f"        @public {{")
-            lines.append(f"            path /request-access* /lookup* /styles.css /favicon.ico /branding/* /public/*")
+            lines.append(f"            path /request-access* /lookup* /locate/* /styles.css /favicon.ico /branding/* /public/*")
             lines.append(f"        }}")
             lines.append(f"")
             lines.append(f"        handle @public {{")
@@ -24609,28 +24609,40 @@ def api_metrics():
 def _run_unattended_upgrades_remote(remote_cfg, action):
     """Run enable/disable unattended-upgrades on remote host via SSH. Returns (success, result_dict)."""
     if action == 'disable':
+        # Mirror the local approach: kill process, wait for it to die, force-kill, then stop/disable.
+        # systemctl stop blocks if the process is mid-update, so we must kill first.
         script = (
             'sudo pkill -TERM -f "/usr/bin/unattended-upgrade" 2>/dev/null; true; '
-            'sudo systemctl stop unattended-upgrades 2>/dev/null; sudo systemctl disable unattended-upgrades 2>/dev/null; '
-            'sudo systemctl stop apt-daily-upgrade.timer 2>/dev/null; sudo systemctl disable apt-daily-upgrade.timer 2>/dev/null; true; '
+            'for i in $(seq 1 15); do '
+            '  pgrep -f "/usr/bin/unattended-upgrade" >/dev/null 2>&1 || break; '
+            '  sleep 1; '
+            'done; '
+            'pgrep -f "/usr/bin/unattended-upgrade" >/dev/null 2>&1 && '
+            '  sudo pkill -9 -f "/usr/bin/unattended-upgrade" 2>/dev/null && sleep 3; true; '
+            'sudo systemctl stop unattended-upgrades 2>/dev/null; '
+            'sudo systemctl disable unattended-upgrades 2>/dev/null; '
+            'sudo systemctl stop apt-daily-upgrade.timer 2>/dev/null; '
+            'sudo systemctl disable apt-daily-upgrade.timer 2>/dev/null; true; '
             'e=$(sudo systemctl is-enabled unattended-upgrades 2>/dev/null); echo "ENABLED=$e"'
         )
+        ssh_timeout = 60
     else:
         script = (
             'sudo systemctl enable unattended-upgrades 2>/dev/null; sudo systemctl start unattended-upgrades 2>/dev/null; '
             'sudo systemctl enable apt-daily-upgrade.timer 2>/dev/null; sudo systemctl start apt-daily-upgrade.timer 2>/dev/null; true; '
             'e=$(sudo systemctl is-enabled unattended-upgrades 2>/dev/null); echo "ENABLED=$e"'
         )
+        ssh_timeout = 30
     try:
-        ok, out = _ssh_probe(remote_cfg, script, timeout=30)
+        ok, out = _ssh_probe(remote_cfg, script, timeout=ssh_timeout)
         if not ok:
-            return False, {'error': (out or 'ssh failed')[:100]}
+            return False, {'error': (out or 'ssh failed')[:200]}
         uu = _get_unattended_upgrades_status_remote(remote_cfg)
         if 'error' in uu:
             return False, uu
         return True, uu
     except Exception as e:
-        return False, {'error': str(e)[:100]}
+        return False, {'error': str(e)[:200]}
 
 
 @app.route('/api/unattended-upgrades', methods=['POST'])
@@ -25299,7 +25311,7 @@ async function toggleUU(cb){
         var d=await r.json();
         if(sp)sp.style.display='none';
         if(d.success){updateUUHost(target,d);}
-        else{cb.checked=!cb.checked;if(lb){lb.textContent=(action==='disable'?'Disable failed':'Error: '+(d.error||'unknown'));lb.style.color='var(--red)';}}
+        else{cb.checked=!cb.checked;if(lb){lb.textContent=(action==='disable'?'Disable failed: ':'Enable failed: ')+(d.error||'unknown');lb.style.color='var(--red)';}}
     }catch(e){if(sp)sp.style.display='none';cb.checked=!cb.checked;if(lb){lb.textContent='Error';lb.style.color='var(--red)';}}
 }
 function formatRamGb(memPct,totalRamGb){if(totalRamGb==null)return '';var gb=(Number(memPct||0)/100)*totalRamGb;return gb.toFixed(2)+' GB';}
