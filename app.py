@@ -7405,7 +7405,11 @@ def _ssh_probe(host_cfg, cmd='echo ok', timeout=15):
         r = subprocess.run(ssh_cmd, **run_kw)
         if r.returncode == 0:
             return True, (r.stdout or '').strip()
-        return False, ((r.stderr or '') + '\n' + (r.stdout or '')).strip()
+        combined = ((r.stderr or '') + '\n' + (r.stdout or '')).strip()
+        if not combined:
+            safe_cmd = ' '.join(ssh_cmd[:ssh_cmd.index(f'{user}@{host}') + 1]) + ' <cmd>'
+            combined = f'exit {r.returncode}, no output. cmd: {safe_cmd}'
+        return False, combined
     except Exception as e:
         return False, str(e)
 
