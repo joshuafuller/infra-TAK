@@ -4869,6 +4869,8 @@ def fedhub_enable_authentik_api():
     ak_host = _get_authentik_host(settings) or f'authentik.{fqdn}'
     ak_public = f'https://{ak_host}'
     der_cmd = (
+        f'sudo mkdir -p /opt/tak/certs && '
+        f'sudo chown tak:tak /opt/tak/certs && '
         f'echo | openssl s_client -connect {ak_host}:443 -servername {ak_host} 2>/dev/null '
         f'| openssl x509 -outform DER -out /opt/tak/certs/keycloak.der 2>/dev/null && '
         f'chown tak:tak /opt/tak/certs/keycloak.der && '
@@ -5225,6 +5227,8 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
                     token_endpoint_url = f'{ak_public}/application/o/token/'
 
                     der_cmd = (
+                        f'sudo mkdir -p /opt/tak/certs && '
+                        f'sudo chown tak:tak /opt/tak/certs && '
                         f'echo | openssl s_client -connect {ak_host}:443 -servername {ak_host} 2>/dev/null '
                         f'| openssl x509 -outform DER -out /opt/tak/certs/keycloak.der 2>/dev/null && '
                         f'chown tak:tak /opt/tak/certs/keycloak.der && '
