@@ -7589,24 +7589,38 @@ def generate_caddyfile(settings=None):
             fh_host = sd['fedhub']
             fh_port = int(fhcfg.get('web_ui_port') or 8080)
             fh_upstream = f'{fh_remote}:{fh_port}'
-            lines.append("# TAK Federation Hub — Caddy terminates public TLS and proxies to remote hub web port")
-            lines.append(f"{fh_host} {{")
-            # Federation Hub commonly exposes HTTP on 8080 and TLS on 9100.
-            # Keep legacy 8446 as TLS as well.
             fh_upstream_scheme = 'https' if fh_port in (9100, 8446) else 'http'
-            lines.append(f"    reverse_proxy {fh_upstream_scheme}://{fh_upstream} {{")
-            lines.append(f"        header_up X-Forwarded-Port 443")
-            lines.append(f"        header_up X-Forwarded-Proto https")
-            lines.append(f"        header_up X-Forwarded-Host {{host}}")
-            lines.append(f"        header_up Host {{host}}")
-            lines.append(f"        transport http {{")
+            fh_rp_block = []
+            fh_rp_block.append(f"reverse_proxy {fh_upstream_scheme}://{fh_upstream} {{")
+            fh_rp_block.append(f"    header_up X-Forwarded-Port 443")
+            fh_rp_block.append(f"    header_up X-Forwarded-Proto https")
+            fh_rp_block.append(f"    header_up X-Forwarded-Host {{host}}")
+            fh_rp_block.append(f"    header_up Host {{host}}")
+            fh_rp_block.append(f"    transport http {{")
             if fh_upstream_scheme == 'https':
-                lines.append(f"            tls")
-                lines.append(f"            tls_insecure_skip_verify")
-            lines.append(f"            read_timeout 120s")
-            lines.append(f"            write_timeout 120s")
-            lines.append(f"        }}")
-            lines.append(f"    }}")
+                fh_rp_block.append(f"        tls")
+                fh_rp_block.append(f"        tls_insecure_skip_verify")
+            fh_rp_block.append(f"        read_timeout 120s")
+            fh_rp_block.append(f"        write_timeout 120s")
+            fh_rp_block.append(f"    }}")
+            fh_rp_block.append(f"}}")
+
+            lines.append(f"# TAK Federation Hub — Caddy terminates public TLS and proxies to remote hub web port")
+            lines.append(f"{fh_host} {{")
+            if ak.get('installed'):
+                lines.append(f"    route {{")
+                lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
+                lines.append(f"        forward_auth {ak_up} {{")
+                lines.append(f"            uri /outpost.goauthentik.io/auth/caddy")
+                lines.append(f"            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid")
+                lines.append(f"            trusted_proxies private_ranges")
+                lines.append(f"        }}")
+                for rp_line in fh_rp_block:
+                    lines.append(f"        {rp_line}")
+                lines.append(f"    }}")
+            else:
+                for rp_line in fh_rp_block:
+                    lines.append(f"    {rp_line}")
             lines.append(f"}}")
             lines.append("")
 
