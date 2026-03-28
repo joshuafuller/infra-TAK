@@ -13813,9 +13813,10 @@ def _sync_authentik_takportal_provider_url(settings, plog=None):
                 except urllib.error.HTTPError as e:
                     if e.code != 400:
                         pass
-                _authentik_application_open_in_new_tab(ak_url, ak_headers, 'tak-portal', plog=_tp_log)
-        # Ensure TAK Portal Proxy is on the embedded outpost so takportal.fqdn is matched (else 404).
+        # Always PATCH open_in_new_tab when the proxy exists (was only done inside the
+        # "create provider" branch, so existing installs never got tak-portal updated).
         if provider_pk is not None:
+            _authentik_application_open_in_new_tab(ak_url, ak_headers, 'tak-portal', plog=_tp_log)
             _outpost_add_providers_safe(ak_url, ak_headers, [provider_pk])
         # Ensure all deployed apps (infra-TAK, MediaMTX, Node-RED, TAK Portal) are on the outpost
         _repair_embedded_outpost_all_apps(ak_url, ak_headers, settings)
