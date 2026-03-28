@@ -4991,6 +4991,20 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
             f'sudo DEBIAN_FRONTEND=noninteractive apt-get install -y {fnq}'
         )
         plog('━━━ apt-get install ━━━')
+        plog('This step installs Federation Hub on the remote host.')
+        plog('If unattended-upgrades or apt lock cleanup is active, this can take 5-20+ minutes.')
+        lock_diag_cmd = (
+            "sudo bash -lc '"
+            "if systemctl is-active --quiet unattended-upgrades; then echo \"unattended-upgrades: active\"; "
+            "else echo \"unattended-upgrades: inactive\"; fi; "
+            "if command -v fuser >/dev/null 2>&1; then "
+            "fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock 2>/dev/null || true; "
+            "fi'"
+        )
+        _ok_lock, out_lock = _ssh_probe(remote, lock_diag_cmd, timeout=20)
+        if out_lock:
+            plog(('APT lock status:\n' + out_lock.strip())[:1200])
+        plog('Running apt-get now...')
         ok_inst, out_inst = _ssh_probe(remote, install_cmd, timeout=600)
         if out_inst:
             tail = out_inst[-4500:] if len(out_inst) > 4500 else out_inst
