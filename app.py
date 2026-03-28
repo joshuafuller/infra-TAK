@@ -5423,6 +5423,18 @@ def fedhub_update_log_api():
     })
 
 
+def _fedhub_next_numbered_ca_name(current_name, default_stem):
+    """Next PKI name for Fed Hub rotation: …-01, …-02 (two-digit). Unnumbered stem gets -01 first."""
+    name = (current_name or '').strip() or default_stem
+    head, sep, tail = name.rpartition('-')
+    if sep and len(tail) == 2 and tail.isdigit():
+        n = int(tail, 10) + 1
+        if n <= 99:
+            return f'{head}-{n:02d}'
+        return f'{head}-{n}'
+    return f'{name}-01'
+
+
 def run_fedhub_remote_rotate_ca(new_root_ca=None, new_int_ca=None):
     def plog(msg):
         fedhub_rotate_log.append(msg)
@@ -5454,12 +5466,20 @@ def run_fedhub_remote_rotate_ca(new_root_ca=None, new_int_ca=None):
         ts = datetime.utcnow().strftime('%Y%m%d-%H%M%S')
         base_root = (new_root_ca or settings.get('fedhub_root_ca') or settings.get('root_ca_name') or 'FEDHUB-ROOT-CA').strip()
         base_int = (new_int_ca or settings.get('fedhub_intermediate_ca') or settings.get('intermediate_ca_name') or 'FEDHUB-INT-CA').strip()
-        if not new_root_ca:
-            base_root = f'{base_root}-{ts}'
-        if not new_int_ca:
-            base_int = f'{base_int}-{ts}'
-        safe_root = re.sub(r'[^a-zA-Z0-9._-]', '-', base_root).strip('-') or f'FEDHUB-ROOT-CA-{ts}'
-        safe_int = re.sub(r'[^a-zA-Z0-9._-]', '-', base_int).strip('-') or f'FEDHUB-INT-CA-{ts}'
+        if new_root_ca:
+            safe_root = re.sub(r'[^a-zA-Z0-9._-]', '-', base_root).strip('-') or 'FEDHUB-ROOT-CA'
+        else:
+            safe_root = re.sub(
+                r'[^a-zA-Z0-9._-]', '-',
+                _fedhub_next_numbered_ca_name(base_root, 'FEDHUB-ROOT-CA'),
+            ).strip('-') or 'FEDHUB-ROOT-CA-01'
+        if new_int_ca:
+            safe_int = re.sub(r'[^a-zA-Z0-9._-]', '-', base_int).strip('-') or 'FEDHUB-INT-CA'
+        else:
+            safe_int = re.sub(
+                r'[^a-zA-Z0-9._-]', '-',
+                _fedhub_next_numbered_ca_name(base_int, 'FEDHUB-INT-CA'),
+            ).strip('-') or 'FEDHUB-INT-CA-01'
         cert_pass = (settings.get('tak_cert_password') or 'atakatak').strip() or 'atakatak'
 
         ok_host, host_out = _ssh_probe(remote, 'hostname', timeout=10)
@@ -7627,15 +7647,26 @@ def generate_caddyfile(settings=None):
             lines.append(f"# TAK Federation Hub — Caddy terminates public TLS and proxies to remote hub web port")
             lines.append(f"{fh_host} {{")
             if ak.get('installed'):
+                # Static/UI assets must not go through forward_auth — Authentik returns HTML and the browser
+                # rejects CSS/JS as wrong MIME type. Fed Hub also serves some files from site root (poly-*.js, PNG).
                 lines.append(f"    route {{")
-                lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
-                lines.append(f"        forward_auth {ak_up} {{")
-                lines.append(f"            uri /outpost.goauthentik.io/auth/caddy")
-                lines.append(f"            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid")
-                lines.append(f"            trusted_proxies private_ranges")
+                lines.append(f"        @fh_pub {{")
+                lines.append(f"            path /static/* /favicon.ico /Parsons_TAK.png /poly-*")
                 lines.append(f"        }}")
+                lines.append(f"        handle @fh_pub {{")
                 for rp_line in fh_rp_block:
-                    lines.append(f"        {rp_line}")
+                    lines.append(f"            {rp_line}")
+                lines.append(f"        }}")
+                lines.append(f"        handle {{")
+                lines.append(f"            reverse_proxy /outpost.goauthentik.io/* {ak_up}")
+                lines.append(f"            forward_auth {ak_up} {{")
+                lines.append(f"                uri /outpost.goauthentik.io/auth/caddy")
+                lines.append(f"                copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid")
+                lines.append(f"                trusted_proxies private_ranges")
+                lines.append(f"            }}")
+                for rp_line in fh_rp_block:
+                    lines.append(f"            {rp_line}")
+                lines.append(f"        }}")
                 lines.append(f"    }}")
             else:
                 for rp_line in fh_rp_block:
@@ -14689,7 +14720,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <details class="fh-section">
     <summary><span>Certificates &amp; CA rotation</span><span class="chev">&#9662;</span></summary>
     <div class="fh-section-body">
-      <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:14px">Generate a new Federation Hub root/intermediate CA pair and new server/admin certs. This restarts Federation Hub and requires re-importing the new <code style="font-size:11px">webadmin-fed.p12</code> in browsers.</p>
+      <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:14px">Generate a new Federation Hub root/intermediate CA pair and new server/admin certs. Auto-named CAs use <code style="font-size:11px">…-01</code>, <code style="font-size:11px">…-02</code>, etc. (from saved names in settings). This restarts Federation Hub and requires re-importing the new <code style="font-size:11px">webadmin-fed.p12</code> in browsers.</p>
       <div class="controls" style="align-items:center;flex-wrap:wrap;gap:12px">
         <button type="button" id="fedhub-rotate-btn" class="btn btn-primary" onclick="fedhubStartRotateCa()">Rotate CA + regenerate certs</button>
         <span id="fedhub-rotate-msg" class="form-hint" style="margin:0"></span>
