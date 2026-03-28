@@ -4955,6 +4955,26 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
             status_dict.update({'running': False, 'complete': True, 'error': True})
             return
         remote = cfg['remote']
+        # On fresh VPS images, unattended-upgrades frequently grabs apt locks.
+        # Disable it up-front so deploy/update doesn't stall for long lock waits.
+        try:
+            uu_before = _get_unattended_upgrades_status_remote(remote) or {}
+            if uu_before.get('error'):
+                plog(f"⚠ Could not read unattended-upgrades status: {uu_before.get('error')}")
+            else:
+                plog(f"Unattended upgrades (before): enabled={uu_before.get('enabled')} running={uu_before.get('running')}")
+            if uu_before.get('enabled') or uu_before.get('running'):
+                plog('Disabling unattended-upgrades temporarily for package install...')
+                ok_uu, uu_res = _run_unattended_upgrades_remote(remote, 'disable')
+                if ok_uu:
+                    plog(f"✓ Unattended upgrades disabled on target (enabled={uu_res.get('enabled')}, running={uu_res.get('running')})")
+                else:
+                    plog(f"⚠ Could not disable unattended-upgrades cleanly: {(uu_res or {}).get('error', 'unknown')}")
+            else:
+                plog('Unattended upgrades already inactive on target.')
+        except Exception as e:
+            plog(f'⚠ Unattended-upgrades pre-check failed: {str(e)[:220]}')
+
         deb_fn, deb_path = _find_fedhub_deb_in_uploads()
         if not deb_path:
             plog('✗ No Federation Hub .deb in uploads. Upload takserver-fed-hub from TAK.gov here first.')
@@ -5219,6 +5239,7 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
         plog(f'Federation Hub UI: https://{remote.get("host")}:9100')
         plog('Import webadmin-fed.p12 (in /root/ on the target) into your browser to log in.')
         plog('Password: ' + cert_pass)
+        plog('Note: unattended-upgrades remains disabled after deploy/update; re-enable from Console > Unattended Upgrades when ready.')
         plog('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
         status_dict.update({'running': False, 'complete': True, 'error': False})
         _caddy_regenerate_if_fqdn()
