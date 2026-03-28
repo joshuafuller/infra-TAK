@@ -3084,7 +3084,8 @@ def guarddog_page():
             {'name': 'Port 9100 (UI)', 'id': 'fedhub_port', 'interval': '1 min', 'desc': f'Checks that Federation Hub UI port 9100 is listening on {fh_host}. Alerts after 3 failures.'},
             {'name': 'MongoDB', 'id': 'fedhub_mongo', 'interval': '5 min', 'desc': f'Checks mongod service is active on {fh_host}. Alerts on failure.'},
             {'name': 'Disk', 'id': 'fedhub_disk', 'interval': '1 hour', 'desc': f'Checks root filesystem usage on {fh_host}. Alert at 80%+ (warning) or 90%+ (critical).'},
-            {'name': 'Certificate', 'id': 'fedhub_cert', 'interval': 'Daily', 'desc': f'Checks Federation Hub server cert expiry on {fh_host}. Alert when 40 days or less remaining.'},
+            {'name': 'TLS certificate', 'id': 'fedhub_cert', 'interval': 'Daily', 'desc': f'Checks Federation Hub server TLS cert (<hostname>.pem) on {fh_host}. Alert when 40 days or less remaining.'},
+            {'name': 'Root CA / Intermediate CA', 'id': 'fedhub_intca', 'interval': 'Escalating', 'desc': f'Monitors Root CA and Intermediate CA expiry on {fh_host} (same 90-day escalation as TAK Server intca).'},
         ]})
     guarddog_services.extend([
         {'id': 'authentik', 'name': 'Authentik', 'monitored': modules.get('authentik', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'id': 'authentik_http', 'interval': '1 min', 'desc': 'Checks Authentik HTTP (9090). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
@@ -3406,7 +3407,7 @@ def _guarddog_service_monitor_ids(settings):
     multi = {
         'takserver': takserver_ids,
         'remotedb': ['remotedb_tcp', 'remotedb_agent', 'remotedb_auth'],
-        'federation_hub': ['fedhub_svc', 'fedhub_port', 'fedhub_mongo', 'fedhub_disk', 'fedhub_cert'],
+        'federation_hub': ['fedhub_svc', 'fedhub_port', 'fedhub_mongo', 'fedhub_disk', 'fedhub_cert', 'fedhub_intca'],
         'authentik': ['authentik_http'],
         'mediamtx': ['mediamtx_svc'],
         'nodered': ['nodered_http'],
@@ -3781,18 +3782,30 @@ def _monitor_health_check(monitor_id):
                 except ValueError:
                     return None
             if monitor_id == 'fedhub_cert':
-                ok, out = _ssh_probe(fh_remote,
-                    'find /opt/tak/federation-hub/certs/files/ -maxdepth 1 -name "*.pem" -type f 2>/dev/null | head -1',
-                    timeout=8)
-                if not ok or not (out or '').strip():
+                ok_h, hn = _ssh_probe(fh_remote, 'hostname 2>/dev/null', timeout=8)
+                hshort = ((hn or '').strip().split('.') or [''])[0]
+                if not hshort:
                     return None
-                cert_path = out.strip()
-                ok2, out2 = _ssh_probe(fh_remote,
-                    f'openssl x509 -in {cert_path} -checkend 3456000 2>/dev/null; echo $?',
-                    timeout=8)
-                if not ok2 or not out2:
+                cert_path = f'/opt/tak/federation-hub/certs/files/{hshort}.pem'
+                ok2, out2 = _ssh_probe(
+                    fh_remote,
+                    f'test -f {shlex.quote(cert_path)} && openssl x509 -in {shlex.quote(cert_path)} -checkend 3456000 >/dev/null 2>&1 && echo OK',
+                    timeout=12,
+                )
+                return bool(ok2 and 'OK' in (out2 or ''))
+            if monitor_id == 'fedhub_intca':
+                rca = '/opt/tak/federation-hub/certs/files/root-ca.pem'
+                ica = '/opt/tak/federation-hub/certs/files/ca.pem'
+                ok2, out2 = _ssh_probe(
+                    fh_remote,
+                    f'test -f {rca} && test -f {ica} && '
+                    f'openssl x509 -in {rca} -checkend 7776000 >/dev/null 2>&1 && '
+                    f'openssl x509 -in {ica} -checkend 7776000 >/dev/null 2>&1 && echo OK',
+                    timeout=15,
+                )
+                if not ok2:
                     return None
-                return out2.strip().endswith('0')
+                return 'OK' in (out2 or '')
     except Exception:
         return False
     return None
@@ -4662,8 +4675,10 @@ def federation_hub_page():
     _fedhub_public_url = f'https://{_fedhub_host}' if _fedhub_host else ''
     _fedhub_sso_prime_url = f'https://tak.{_fqdn}' if _fqdn else ''
     _ak = modules.get('authentik', {})
+    _fedhub_ver = _get_fedhub_version_info().get('version', '') if fh.get('installed') else ''
     resp = make_response(render_template_string(FEDHUB_TEMPLATE,
         settings=settings, fh=fh, fedhub_deploy_cfg=fedhub_deploy_cfg, version=VERSION,
+        fedhub_version=_fedhub_ver,
         fedhub_public_url=_fedhub_public_url,
         fedhub_sso_prime_url=_fedhub_sso_prime_url,
         fedhub_service_domain=_fedhub_host,
@@ -8141,6 +8156,30 @@ def _get_takserver_version_info():
     return out
 
 
+def _get_fedhub_version_info():
+    """Return {version, update_available, latest} for takserver-fed-hub on the remote Fed Hub host (dpkg)."""
+    out = {'version': '', 'update_available': False, 'latest': None}
+    settings = load_settings()
+    cfg = _get_fedhub_deployment_config(settings)
+    if not cfg.get('deployed') or (cfg.get('target_mode') or '') != 'remote':
+        return out
+    remote = cfg.get('remote') or {}
+    if not (remote.get('host') or '').strip():
+        return out
+    pkg = 'takserver-fed-hub'
+    cmd = f"dpkg-query -W -f'${{Version}}' {shlex.quote(pkg)} 2>/dev/null"
+    ok, ver_out = _ssh_probe(remote, cmd, timeout=15)
+    ver = (ver_out or '').strip()
+    if not ver:
+        cmd2 = f"dpkg -s {shlex.quote(pkg)} 2>/dev/null | sed -n 's/^Version: //p'"
+        ok2, ver2 = _ssh_probe(remote, cmd2, timeout=15)
+        if ok2:
+            ver = (ver2 or '').strip()
+    if ver:
+        out['version'] = ver
+    return out
+
+
 def _get_caddy_version_info():
     """Return {version: str, update_available: bool} for Caddy."""
     out = {'version': '', 'update_available': False}
@@ -8462,6 +8501,8 @@ def get_all_module_versions():
         result['takportal'] = _get_takportal_version_info()
     if modules.get('takserver', {}).get('installed'):
         result['takserver'] = _get_takserver_version_info()
+    if modules.get('fedhub', {}).get('installed'):
+        result['fedhub'] = _get_fedhub_version_info()
     # Guard Dog: version/update follow infra-TAK (scripts ship with console; "Update Guard Dog" uses same codebase)
     if modules.get('guarddog', {}).get('installed'):
         gd_latest = update_cache.get('latest')
@@ -14674,16 +14715,20 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 {{ sidebar_html }}
 <div class="main">
   <div class="page-header">
-    <h1><span class="material-symbols-outlined" style="vertical-align:middle;margin-right:8px;font-size:32px">hub</span>Federation Hub</h1>
+    <h1><span class="material-symbols-outlined" style="vertical-align:middle;margin-right:8px;font-size:32px">hub</span>Federation Hub{% if fedhub_version %} <span style="font-weight:500;color:var(--text-dim);font-size:16px">· v{{ fedhub_version }}</span>{% endif %}</h1>
     <p>TAK Federation Hub on a dedicated <strong>Ubuntu</strong> host (remote SSH). Starting point: official TAK.gov install guide.</p>
   </div>
 
   {% if fh.running %}
-  <div class="status-banner running"><div class="dot"></div>federation-hub service is <strong>active</strong> on {{ fedhub_deploy_cfg.remote.host }}</div>
+  <div class="status-banner running"><div class="dot"></div>federation-hub service is <strong>active</strong> on {{ fedhub_deploy_cfg.remote.host }}{% if fedhub_version %} · {{ fedhub_version }}{% endif %}</div>
   {% elif fh.installed %}
-  <div class="status-banner stopped"><div class="dot"></div>Registered on {{ fedhub_deploy_cfg.remote.host }} — service not active (check target)</div>
+  <div class="status-banner stopped"><div class="dot"></div>Registered on {{ fedhub_deploy_cfg.remote.host }}{% if fedhub_version %} · {{ fedhub_version }}{% endif %} — service not active (check target)</div>
   {% else %}
   <div class="status-banner not-installed"><div class="dot"></div>Not registered — upload the .deb, set SSH below, then <strong>Deploy to remote host</strong> (or confirm manually)</div>
+  {% endif %}
+
+  {% if fh.installed %}
+  <div id="fedhub-cert-expiry-banner" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin:-4px 0 18px;line-height:1.5;min-height:1.2em"></div>
   {% endif %}
 
   {% if fedhub_remote_host %}
@@ -14720,6 +14765,12 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <details class="fh-section">
     <summary><span>Certificates &amp; CA rotation</span><span class="chev">&#9662;</span></summary>
     <div class="fh-section-body">
+      <div id="fedhub-cert-expiry-section" style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim);margin-bottom:14px;line-height:1.5;min-height:1.2em"></div>
+      <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:10px"><strong>Browser admin cert:</strong> Import <code style="font-size:11px">webadmin-fed.p12</code> (from deploy or CA rotation, also under <code style="font-size:11px">/root/</code> on the Fed Hub host). Password = TAK cert password (default <code style="font-size:11px">atakatak</code>). Or use <strong>Authentik SSO</strong> below.</p>
+      <div class="controls" style="align-items:center;flex-wrap:wrap;gap:12px;margin-bottom:16px">
+        <button class="btn btn-ghost" type="button" onclick="fedhubDownloadWebadminCert()">⬇ Download webadmin-fed.p12</button>
+        <span id="fedhub-cert-download-msg" style="font-size:12px;color:var(--text-dim)"></span>
+      </div>
       <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:14px">Generate a new Federation Hub root/intermediate CA pair and new server/admin certs. Auto-named CAs use <code style="font-size:11px">…-01</code>, <code style="font-size:11px">…-02</code>, etc. (from saved names in settings). This restarts Federation Hub and requires re-importing the new <code style="font-size:11px">webadmin-fed.p12</code> in browsers.</p>
       <div class="controls" style="align-items:center;flex-wrap:wrap;gap:12px">
         <button type="button" id="fedhub-rotate-btn" class="btn btn-primary" onclick="fedhubStartRotateCa()">Rotate CA + regenerate certs</button>
@@ -14802,9 +14853,9 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   </details>
 
   <details class="fh-section">
-    <summary><span>HTTPS access (Caddy on this console)</span><span class="chev">&#9662;</span></summary>
+    <summary><span>HTTPS access</span><span class="chev">&#9662;</span></summary>
     <div class="fh-section-body">
-    <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:14px">Federation Hub is a <strong>separate web app</strong> on the remote host. This console’s <strong>Caddy</strong> can terminate TLS at <code style="font-size:12px">https://fedhub.&lt;your FQDN&gt;</code> and reverse-proxy to the hub’s HTTP port (same pattern as <code style="font-size:12px">stream.*</code> → MediaMTX).</p>
+    <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:14px">Federation Hub is a <strong>separate web app</strong> on the remote host. <strong>Caddy</strong> on this console can terminate TLS at <code style="font-size:12px">https://fedhub.&lt;your FQDN&gt;</code> and reverse-proxy to the hub’s HTTP port (same pattern as <code style="font-size:12px">stream.*</code> → MediaMTX).</p>
     {% if settings.fqdn and fedhub_public_url %}
     <p style="font-size:13px;margin-bottom:12px">When the module is registered and Caddy is deployed, open: <a href="{{ fedhub_public_url }}" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);font-family:'JetBrains Mono',monospace;font-size:12px">{{ fedhub_public_url }}</a></p>
     <div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:12px">
@@ -14822,12 +14873,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
       <input id="fedhub-web-ui-port" class="form-input" type="number" min="1" max="65535" value="{{ fedhub_deploy_cfg.web_ui_port }}">
       <div class="form-hint">Must match the hub web port on the target (recommended <strong>8080</strong> for Caddy upstream). The hub must listen on an IP reachable from <strong>this console</strong> (not only <code style="font-size:11px">127.0.0.1</code>). Caddy proxies to <code style="font-size:11px">SSH host:port</code>.</div>
     </div>
-    <p style="font-size:12px;color:var(--text-secondary);line-height:1.5;margin-bottom:10px"><strong>Hub login:</strong> Import <code style="font-size:11px">webadmin-fed.p12</code> (generated during deploy, in <code style="font-size:11px">/root/</code> on the target) into your browser. Password = TAK cert password (default <code style="font-size:11px">atakatak</code>). Or enable <strong>Authentik SSO</strong> below for username/password login. See the <a href="https://tak.gov/documentation/resources/civ-documentation/tak-server-documentation/federation-hub" target="_blank" rel="noopener noreferrer" style="color:var(--cyan)">TAK.gov docs</a>.</p>
-    {% if fh.installed %}
-    <div class="controls" style="margin:8px 0 10px">
-      <button class="btn btn-ghost" type="button" onclick="fedhubDownloadWebadminCert()">⬇ Download webadmin-fed.p12</button>
-    </div>
-    {% endif %}
+    <p class="form-hint" style="margin-bottom:10px;line-height:1.45">Client certificate for the hub UI: use <strong>Certificates &amp; CA rotation</strong> → <strong>Download webadmin-fed.p12</strong>. TAK.gov: <a href="https://tak.gov/documentation/resources/civ-documentation/tak-server-documentation/federation-hub" target="_blank" rel="noopener noreferrer" style="color:var(--cyan)">Federation Hub docs</a>.</p>
     <div class="form-hint" style="margin-bottom:8px">Saving the SSH target (or port) below updates settings and regenerates the Caddyfile when a base FQDN is set.</div>
     </div>
   </details>
@@ -15311,10 +15357,39 @@ function fedhubClearRegistration(){
     }).catch(function(e){if(el){el.style.color='var(--red)';el.textContent='Failed';}});
 }
 function fedhubDownloadWebadminCert(){
-  var el=document.getElementById('fedhub-control-msg');
+  var el=document.getElementById('fedhub-cert-download-msg')||document.getElementById('fedhub-control-msg');
   if(el){el.style.color='var(--text-dim)';el.textContent='Preparing certificate download...';}
   window.location='/api/fedhub/download-webadmin-cert';
   if(el){setTimeout(function(){el.textContent='';},2500);}
+}
+function loadFedhubCertExpiry(){
+  function fmt(days){
+    var y=Math.floor(days/365),r=days%365,m=Math.floor(r/30),dd=r%30;
+    var p=[];if(y>0)p.push(y+'y');if(m>0)p.push(m+'mo');if(dd>0||p.length===0)p.push(dd+'d');
+    return p.join(' ');
+  }
+  function fill(el,d){
+    if(!el)return;
+    var parts=[];
+    var certs=[['root_ca','Root'],['intermediate_ca','Int']];
+    for(var i=0;i<certs.length;i++){
+      var key=certs[i][0],label=certs[i][1],c=d[key];
+      if(!c||c.error){parts.push(label+' <span style="color:var(--text-dim)">—</span>');continue;}
+      var days=c.days_left,color='#22c55e';
+      if(days<=90)color='#ef4444';else if(days<=365)color='#eab308';
+      parts.push(label+' <span style="color:'+color+';font-weight:600">'+fmt(days)+'</span>');
+    }
+    el.innerHTML=parts.join(' &nbsp;&middot;&nbsp; ');
+  }
+  fetch('/api/fedhub/cert-expiry',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    fill(document.getElementById('fedhub-cert-expiry-banner'),d);
+    fill(document.getElementById('fedhub-cert-expiry-section'),d);
+  }).catch(function(){
+    var b=document.getElementById('fedhub-cert-expiry-banner');
+    var s=document.getElementById('fedhub-cert-expiry-section');
+    if(b)b.innerHTML='';
+    if(s)s.innerHTML='';
+  });
 }
 function fedhubPollRotateLog(){
   if(fedhubRotateLogInterval)clearInterval(fedhubRotateLogInterval);
@@ -15416,6 +15491,10 @@ document.addEventListener('DOMContentLoaded',function(){
   });
   {% endif %}
   if(document.getElementById('fedhub-remote-metrics-bar')){loadFedhubRemoteMetrics();setInterval(loadFedhubRemoteMetrics,5000);}
+  if(document.getElementById('fedhub-cert-expiry-banner')||document.getElementById('fedhub-cert-expiry-section')){
+    loadFedhubCertExpiry();
+    setInterval(loadFedhubCertExpiry,60000);
+  }
 });
 async function loadFedhubRemoteMetrics(){var bar=document.getElementById('fedhub-remote-metrics-bar');if(!bar)return;try{var r=await fetch('/api/fedhub/remote-metrics',{credentials:'same-origin'});if(!r.ok){document.getElementById('fedhub-remote-cpu-value').textContent='—';document.getElementById('fedhub-remote-ram-value').textContent='—';document.getElementById('fedhub-remote-disk-value').textContent='—';document.getElementById('fedhub-remote-uptime-value').textContent='—';return;}var d=await r.json();var cpu=document.getElementById('fedhub-remote-cpu-value');if(cpu)cpu.textContent=(d.cpu_percent!=null?d.cpu_percent:'—')+'%';var ram=document.getElementById('fedhub-remote-ram-value');if(ram)ram.textContent=(d.ram_percent!=null?d.ram_percent:'—')+'%';var ramD=document.getElementById('fedhub-remote-ram-detail');if(ramD)ramD.textContent=(d.ram_used_gb!=null&&d.ram_total_gb!=null)?(d.ram_used_gb+'GB / '+d.ram_total_gb+'GB'):'';var disk=document.getElementById('fedhub-remote-disk-value');if(disk)disk.textContent=(d.disk_percent!=null?d.disk_percent:'—')+'%';var diskD=document.getElementById('fedhub-remote-disk-detail');if(diskD)diskD.textContent=(d.disk_used_gb!=null&&d.disk_total_gb!=null)?(d.disk_used_gb+'GB / '+d.disk_total_gb+'GB'):'';var up=document.getElementById('fedhub-remote-uptime-value');if(up)up.textContent=d.uptime||'—';}catch(e){}}
 </script>
@@ -21773,6 +21852,42 @@ def takserver_cert_expiry():
     return jsonify(results)
 
 
+@app.route('/api/fedhub/cert-expiry')
+@login_required
+def fedhub_cert_expiry():
+    """Return Federation Hub Root CA and Intermediate CA expiry (remote host via SSH). Same shape as /api/takserver/cert-expiry."""
+    settings = load_settings()
+    cfg = _get_fedhub_deployment_config(settings)
+    if not cfg.get('deployed') or cfg.get('target_mode') != 'remote':
+        return jsonify({'root_ca': {'error': 'Not deployed'}, 'intermediate_ca': {'error': 'Not deployed'}})
+    remote = cfg.get('remote', {})
+    if not (remote.get('host') or '').strip():
+        return jsonify({'root_ca': {'error': 'No host'}, 'intermediate_ca': {'error': 'No host'}})
+    fh_dir = '/opt/tak/federation-hub/certs/files'
+    results = {}
+    for label, filename in [('root_ca', 'root-ca.pem'), ('intermediate_ca', 'ca.pem')]:
+        path = f'{fh_dir}/{filename}'
+        cmd = f'openssl x509 -enddate -noout -in {shlex.quote(path)} 2>/dev/null'
+        ok, out = _ssh_probe(remote, cmd, timeout=15)
+        if not ok or not (out or '').strip() or 'notAfter' not in out:
+            results[label] = {'error': 'Not found', 'file': filename}
+            continue
+        try:
+            raw = out.strip().split('=', 1)[-1].strip()
+            from datetime import datetime
+            expiry = datetime.strptime(raw, '%b %d %H:%M:%S %Y %Z')
+            now = datetime.utcnow()
+            days_left = (expiry - now).days
+            results[label] = {
+                'file': filename,
+                'expires': expiry.strftime('%Y-%m-%d'),
+                'days_left': days_left,
+            }
+        except Exception as e:
+            results[label] = {'error': str(e)[:200], 'file': filename}
+    return jsonify(results)
+
+
 @app.route('/api/takserver/groups')
 @login_required
 def takserver_groups():
@@ -24843,6 +24958,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% if module_versions.get(key) %}{% set v = module_versions.get(key) %}{% if v.version or v.update_available %}<div class="meta-line module-version-line" id="module-version-{{ key }}" style="margin-bottom:4px">{% if v.version %}{% if key == 'mediamtx' %}{{ v.version }}{% else %}v{{ v.version }}{% endif %}{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% endif %}</div>{% endif %}{% endif %}
 <span class="module-status status-{% if mod.installed and mod.running %}running{% elif mod.installed %}stopped{% else %}not-installed{% endif %}" id="module-status-{{ key }}" data-module="{{ key }}" data-gd-overall="{% if key == 'guarddog' and mod.installed and mod.running %}fetch{% endif %}">{% if mod.installed and mod.running %}<span class="status-dot"></span> Running{% elif mod.installed %}<span class="status-dot"></span> Stopped{% else %}Not Installed{% endif %}</span>
 {% if key == 'takserver' and mod.installed %}<div id="takserver-card-cert-expiry" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
+{% if key == 'fedhub' and mod.installed %}<div id="fedhub-card-cert-expiry" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
 {% if key == 'caddy' and mod.installed %}<div id="caddy-card-cert-days" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
 </a>
 {% endfor %}
@@ -25009,6 +25125,31 @@ function loadCaddyCertDays(){
     }).catch(function(){el.textContent='Cert: —';el.style.color='var(--text-dim)';});
 }
 loadTakCertExpiry();
+function loadFedHubCardCertExpiry(){
+  var el=document.getElementById('fedhub-card-cert-expiry');
+  if(!el)return;
+  fetch('/api/fedhub/cert-expiry',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    function fmt(days){
+      var y=Math.floor(days/365),r=days%365,m=Math.floor(r/30),dd=r%30;
+      var p=[];if(y>0)p.push(y+'y');if(m>0)p.push(m+'mo');if(dd>0||p.length===0)p.push(dd+'d');
+      return p.join(' ');
+    }
+    var parts=[];
+    var certs=[['root_ca','Root'],['intermediate_ca','Int']];
+    for(var i=0;i<certs.length;i++){
+      var key=certs[i][0],label=certs[i][1],c=d[key];
+      if(!c||c.error)continue;
+      var days=c.days_left,color='#22c55e';
+      if(days<=90)color='#ef4444';else if(days<=365)color='#eab308';
+      parts.push(label+' <span style="color:'+color+';font-weight:600">'+fmt(days)+'</span>');
+    }
+    el.innerHTML=parts.length?parts.join(' &nbsp;&middot;&nbsp; '):'';
+  }).catch(function(){el.innerHTML='';});
+}
+if(document.getElementById('fedhub-card-cert-expiry')){
+  loadFedHubCardCertExpiry();
+  setInterval(loadFedHubCardCertExpiry,60000);
+}
 loadCaddyCertDays();
 var updateBody='';
 async function checkUpdate(forceRefresh){
