@@ -15746,13 +15746,32 @@ function fedhubControl(act){
     }).catch(function(e){if(el){el.style.color='var(--red)';el.textContent='Failed';}});
 }
 function fedhubRefreshStatus(){
-  fetch('/api/fedhub/status',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
-    var s=document.getElementById('fedhub-svc-state');
-    var di=document.getElementById('fedhub-dir-state');
-    if(!d.registered)return;
-    if(s)s.textContent=d.service_state||'—';
-    if(di)di.textContent=d.dir_ok?'/opt/tak/federation-hub present':'missing';
-  }).catch(function(){});
+  var s=document.getElementById('fedhub-svc-state');
+  var di=document.getElementById('fedhub-dir-state');
+  fetch('/api/fedhub/status',{credentials:'same-origin'}).then(function(r){
+    return r.text().then(function(t){
+      var d=null;
+      try{d=t?JSON.parse(t):null;}catch(e){d=null;}
+      return {ok:r.ok,status:r.status,d:d};
+    });
+  }).then(function(x){
+    if(!s&&!di)return;
+    if(!x.ok||!x.d||typeof x.d!=='object'||!('registered' in x.d)){
+      if(s)s.textContent='\u2014';
+      if(di)di.textContent='\u2014';
+      return;
+    }
+    if(!x.d.registered){
+      if(s)s.textContent='\u2014';
+      if(di)di.textContent='\u2014';
+      return;
+    }
+    if(s)s.textContent=x.d.service_state||'\u2014';
+    if(di)di.textContent=x.d.dir_ok?'/opt/tak/federation-hub present':'missing';
+  }).catch(function(){
+    if(s)s.textContent='\u2014';
+    if(di)di.textContent='\u2014';
+  });
 }
 function loadFedhubRemoteMetrics(){
   var bar=document.getElementById('fedhub-remote-metrics-bar');
@@ -15783,8 +15802,13 @@ function loadFedhubRemoteMetrics(){
       }
       return;
     }
+    var d=x.d;
+    if(!d||typeof d!=='object'||!('cpu_percent' in d)){
+      setDash();
+      if(hint){hint.textContent='Bad response from server — refresh the page or sign in again.';hint.style.color='var(--yellow)';}
+      return;
+    }
     if(hint){hint.textContent='';hint.style.color='var(--text-dim)';}
-    var d=x.d||{};
     var cpu=document.getElementById('fedhub-remote-cpu-value');if(cpu)cpu.textContent=(d.cpu_percent!=null?d.cpu_percent:'\u2014')+'%';
     var ram=document.getElementById('fedhub-remote-ram-value');if(ram)ram.textContent=(d.ram_percent!=null?d.ram_percent:'\u2014')+'%';
     var ramD=document.getElementById('fedhub-remote-ram-detail');if(ramD)ramD.textContent=(d.ram_used_gb!=null&&d.ram_total_gb!=null)?(d.ram_used_gb+'GB / '+d.ram_total_gb+'GB'):'';
