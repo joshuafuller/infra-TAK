@@ -204,17 +204,17 @@ async function loadGroups(){
     var r=await fetch('/api/takserver/groups');var d=await r.json();
     if(d.error&&(!d.groups||!d.groups.length)){el.innerHTML='<span style="color:var(--red)">'+d.error+'</span> <button type="button" onclick="loadGroups()" style="margin-left:8px;padding:4px 12px;background:rgba(59,130,246,0.1);color:var(--accent);border:1px solid var(--border);border-radius:6px;font-size:11px;cursor:pointer">Retry</button>';return;}
     if(!d.groups||d.groups.length===0){el.innerHTML='<span style="color:var(--text-dim)">No groups found. Groups are created in the TAK Server WebGUI or via LDAP.</span>';return;}
-    var h='<div style="display:grid;grid-template-columns:1fr auto auto auto;gap:4px 16px;align-items:center">';
-    h+='<div style="color:var(--text-dim);font-size:11px;font-weight:600;padding-bottom:4px">GROUP</div>';
+    var h='<div style="display:grid;grid-template-columns:auto auto auto 1fr;gap:4px 16px;align-items:center">';
     h+='<div style="color:var(--text-dim);font-size:11px;font-weight:600;text-align:center;padding-bottom:4px">READ</div>';
     h+='<div style="color:var(--text-dim);font-size:11px;font-weight:600;text-align:center;padding-bottom:4px">WRITE</div>';
     h+='<div style="color:var(--text-dim);font-size:11px;font-weight:600;text-align:center;padding-bottom:4px">BOTH</div>';
+    h+='<div style="color:var(--text-dim);font-size:11px;font-weight:600;padding-bottom:4px">GROUP</div>';
     for(var i=0;i<d.groups.length;i++){
       var g=d.groups[i],n=g.name,safe=n.replace(/"/g,'&quot;');
-      h+='<div style="color:var(--text-secondary);padding:4px 0">'+n+'</div>';
       h+='<div style="text-align:center"><input type="checkbox" class="cc-grp-read" data-group="'+safe+'" style="width:16px;height:16px;accent-color:var(--cyan)" onchange="ccGroupChanged(this,\'read\')"></div>';
       h+='<div style="text-align:center"><input type="checkbox" class="cc-grp-write" data-group="'+safe+'" style="width:16px;height:16px;accent-color:var(--cyan)" onchange="ccGroupChanged(this,\'write\')"></div>';
       h+='<div style="text-align:center"><input type="checkbox" class="cc-grp-both" data-group="'+safe+'" style="width:16px;height:16px;accent-color:var(--accent)" onchange="ccGroupChanged(this,\'both\')"></div>';
+      h+='<div style="color:var(--text-secondary);padding:4px 0">'+n+'</div>';
     }
     h+='</div>';
     el.innerHTML=h;
