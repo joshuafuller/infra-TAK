@@ -1834,3 +1834,59 @@ function pollMigrateLog(){
 }
 if(document.body.getAttribute('data-tak-migrating')==='true' && document.getElementById('db-migrate-log')){migrateLogIndex=0;pollMigrateLog();}
 if(document.getElementById('db-migrate-deb-panel')){refreshDbMigrateDebStatus();}
+
+/* ── Federation section ─────────────────────────────────────────────── */
+var _fedInfo=null;
+function loadFederationInfo(){
+  fetch('/api/takserver/federation-info',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    _fedInfo=d;
+    var dot=document.getElementById('fed-v2-status');
+    var lbl=document.getElementById('fed-v2-label');
+    var portLbl=document.getElementById('fed-v2-port-label');
+    if(d.v2_enabled){
+      if(dot)dot.style.background='var(--green)';
+      if(lbl)lbl.textContent='Enabled';
+      if(portLbl)portLbl.textContent='Port '+d.v2_port;
+    }else{
+      if(dot)dot.style.background='var(--red)';
+      if(lbl)lbl.textContent='Not enabled';
+      if(portLbl)portLbl.textContent=d.v2_port?'Port '+d.v2_port+' (disabled)':'Enable V2 in Web Admin → Federation';
+    }
+    var fwDot=document.getElementById('fed-fw-status');
+    var fwLbl=document.getElementById('fed-fw-label');
+    var fwBtn=document.getElementById('fed-fw-btn');
+    if(!d.v2_port){
+      if(fwDot)fwDot.style.background='var(--text-dim)';
+      if(fwLbl)fwLbl.textContent='No federation port detected';
+      if(fwBtn){fwBtn.disabled=true;fwBtn.textContent='N/A';}
+    }else if(d.firewall_open){
+      if(fwDot)fwDot.style.background='var(--green)';
+      if(fwLbl)fwLbl.textContent='Port '+d.v2_port+' open (accepting inbound)';
+      if(fwBtn){fwBtn.disabled=false;fwBtn.textContent='Close port '+d.v2_port;fwBtn.setAttribute('data-action','close');}
+    }else{
+      if(fwDot)fwDot.style.background='var(--yellow, #eab308)';
+      if(fwLbl)fwLbl.textContent='Port '+d.v2_port+' closed (no inbound)';
+      if(fwBtn){fwBtn.disabled=false;fwBtn.textContent='Open port '+d.v2_port;fwBtn.setAttribute('data-action','open');}
+    }
+    var caBtn=document.getElementById('fed-ca-download');
+    var caMsg=document.getElementById('fed-ca-msg');
+    if(!d.ca_exists){
+      if(caBtn)caBtn.style.opacity='0.4';
+      if(caMsg)caMsg.textContent='ca.pem not found — deploy TAK Server first';
+    }
+  }).catch(function(){});
+}
+function toggleFedFirewall(){
+  if(!_fedInfo||!_fedInfo.v2_port)return;
+  var btn=document.getElementById('fed-fw-btn');
+  var msg=document.getElementById('fed-fw-msg');
+  var action=btn?btn.getAttribute('data-action')||'open':'open';
+  if(btn)btn.disabled=true;
+  if(msg){msg.textContent=action==='open'?'Opening...':'Closing...';msg.style.color='var(--text-dim)';}
+  fetch('/api/takserver/federation-firewall',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({port:_fedInfo.v2_port,action:action})}).then(function(r){return r.json();}).then(function(d){
+    if(!d.success){if(msg){msg.textContent=d.error||'Failed';msg.style.color='var(--red)';}if(btn)btn.disabled=false;return;}
+    if(msg){msg.textContent=action==='open'?'Port opened':'Port closed';msg.style.color='var(--green)';}
+    loadFederationInfo();
+  }).catch(function(e){if(msg){msg.textContent='Error: '+e.message;msg.style.color='var(--red)';}if(btn)btn.disabled=false;});
+}
+if(document.getElementById('federation-body')){loadFederationInfo();}

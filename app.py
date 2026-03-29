@@ -24423,6 +24423,73 @@ def download_truststore():
     return jsonify({'error': 'truststore not found'}), 404
 
 
+@app.route('/api/download/ca-pem')
+@login_required
+def download_ca_pem():
+    p = '/opt/tak/certs/files'
+    if os.path.exists(os.path.join(p, 'ca.pem')):
+        return send_from_directory(p, 'ca.pem', as_attachment=True)
+    return jsonify({'error': 'ca.pem not found'}), 404
+
+
+@app.route('/api/takserver/federation-info')
+@login_required
+def takserver_federation_info():
+    """Return V2 federation status: enabled, port, and whether UFW allows that port inbound."""
+    info = {'v2_enabled': False, 'v2_port': None, 'firewall_open': False, 'ca_exists': False}
+    info['ca_exists'] = os.path.exists('/opt/tak/certs/files/ca.pem')
+    cc_path = '/opt/tak/CoreConfig.xml'
+    if not os.path.exists(cc_path):
+        return jsonify(info)
+    try:
+        r = subprocess.run(['sudo', 'cat', cc_path], capture_output=True, text=True, timeout=5)
+        cc = r.stdout or ''
+    except Exception:
+        return jsonify(info)
+    import re as _re
+    m = _re.search(r'<federation-server.*?v2enabled\s*=\s*"true".*?v2port\s*=\s*"(\d+)"', cc, _re.DOTALL | _re.IGNORECASE)
+    if not m:
+        m = _re.search(r'<federation-server.*?v2port\s*=\s*"(\d+)".*?v2enabled\s*=\s*"true"', cc, _re.DOTALL | _re.IGNORECASE)
+    if m:
+        info['v2_enabled'] = True
+        info['v2_port'] = int(m.group(1))
+    else:
+        pm = _re.search(r'v2port\s*=\s*"(\d+)"', cc, _re.IGNORECASE)
+        if pm:
+            info['v2_port'] = int(pm.group(1))
+        info['v2_enabled'] = bool(_re.search(r'v2enabled\s*=\s*"true"', cc, _re.IGNORECASE))
+    if info['v2_port']:
+        try:
+            r = subprocess.run(f'sudo ufw status | grep -w {info["v2_port"]}', shell=True,
+                               capture_output=True, text=True, timeout=10)
+            info['firewall_open'] = 'ALLOW' in (r.stdout or '')
+        except Exception:
+            pass
+    return jsonify(info)
+
+
+@app.route('/api/takserver/federation-firewall', methods=['POST'])
+@login_required
+def takserver_federation_firewall():
+    """Open or close the V2 federation port in UFW."""
+    data = request.json or {}
+    port = data.get('port')
+    action = data.get('action', 'open')
+    if not port or not isinstance(port, int) or port < 1 or port > 65535:
+        return jsonify({'success': False, 'error': 'Invalid port'}), 400
+    try:
+        if action == 'open':
+            subprocess.run(f'sudo ufw allow {port}/tcp', shell=True, capture_output=True, text=True, timeout=10)
+        else:
+            subprocess.run(f'sudo ufw delete allow {port}/tcp', shell=True, capture_output=True, text=True, timeout=10)
+        r = subprocess.run(f'sudo ufw status | grep -w {port}', shell=True,
+                           capture_output=True, text=True, timeout=10)
+        is_open = 'ALLOW' in (r.stdout or '')
+        return jsonify({'success': True, 'firewall_open': is_open})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)[:200]}), 500
+
+
 @app.route('/api/takserver/sync-portal-ca', methods=['POST'])
 @login_required
 def takserver_sync_portal_ca():
@@ -25973,6 +26040,42 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div><span style="color:var(--green);font-weight:600" id="cc-result-name"></span><span style="color:var(--text-dim);font-size:12px;margin-left:8px">Password: {{ settings.get('tak_cert_password','atakatak') }}</span></div>
 <a id="cc-download-link" href="#" class="cert-btn cert-btn-secondary" style="text-decoration:none;font-size:12px;padding:8px 16px">⬇ Download .p12</a>
 </div>
+</div>
+</div>
+</div>
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:24px">
+<div style="display:flex;align-items:center;justify-content:space-between;padding:16px 24px;cursor:pointer" onclick="takToggleSection('federation')">
+<span class="section-title" style="margin-bottom:0">Federation</span>
+<span id="federation-toggle-icon" style="font-size:18px;color:var(--text-dim);transition:transform 0.2s ease">&#9662;</span>
+</div>
+<div id="federation-body" style="display:none;padding:0 24px 24px 24px;border-top:1px solid var(--border)">
+<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">Server-to-server federation lets two TAK Servers share data directly over V2 TLS (port 9001 by default). Exchange CA certificates, then one side creates an outgoing connection to the other. The receiving side needs the federation port open in the firewall.</p>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:20px">
+<div style="background:var(--bg-surface);border:1px solid var(--border);border-radius:10px;padding:16px">
+<div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:1px;font-weight:600;margin-bottom:12px">V2 Federation</div>
+<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+<span id="fed-v2-status" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--text-dim)"></span>
+<span id="fed-v2-label" style="font-size:13px;color:var(--text-secondary)">Checking...</span>
+</div>
+<div style="font-size:12px;color:var(--text-dim)" id="fed-v2-port-label"></div>
+</div>
+<div style="background:var(--bg-surface);border:1px solid var(--border);border-radius:10px;padding:16px">
+<div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:1px;font-weight:600;margin-bottom:12px">Inbound Firewall</div>
+<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+<span id="fed-fw-status" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--text-dim)"></span>
+<span id="fed-fw-label" style="font-size:13px;color:var(--text-secondary)">Checking...</span>
+</div>
+<div style="display:flex;align-items:center;gap:10px;margin-top:10px">
+<button type="button" id="fed-fw-btn" onclick="toggleFedFirewall()" style="padding:8px 18px;background:rgba(59,130,246,0.1);color:var(--accent);border:1px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;cursor:pointer" disabled>Loading...</button>
+<span id="fed-fw-msg" style="font-size:11px;color:var(--text-dim)"></span>
+</div>
+</div>
+</div>
+<div style="margin-bottom:16px">
+<div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:1px;font-weight:600;margin-bottom:10px">CA Certificate</div>
+<p style="font-size:12px;color:var(--text-secondary);line-height:1.5;margin-bottom:10px">Download your CA certificate and send it to the other TAK Server operator. They upload it in Web Admin → Federation → Federate Configuration as a trusted CA. You do the same with theirs.</p>
+<a href="/api/download/ca-pem" id="fed-ca-download" class="cert-btn cert-btn-secondary" style="text-decoration:none;font-size:12px;padding:8px 16px;display:inline-block">⬇ Download ca.pem</a>
+<span id="fed-ca-msg" style="font-size:11px;color:var(--text-dim);margin-left:8px"></span>
 </div>
 </div>
 </div>
