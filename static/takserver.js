@@ -1000,7 +1000,7 @@ function showDeployConfig(){
       '<div class="form-field"><label>Issued cert validity (days)</label><input type="number" id="issued_cert_validity_days" placeholder="Same as intermediate" min="1" max="3652" style="width:120px"> <span style="font-size:11px;color:var(--text-dim)">Blank = same. Shorten anytime in Certificate signing.</span></div>',
       '</div>',
       '<div style="font-family:\'JetBrains Mono\',monospace;font-size:13px;color:var(--text-dim);margin:24px 0 20px;text-transform:uppercase;letter-spacing:1px;font-weight:600">Certificate password</div>',
-      '<div class="form-field" style="margin-bottom:8px"><label>Keystore / truststore password</label><input type="password" id="cert_password" placeholder="atakatak (default)" autocomplete="new-password" style="width:200px;padding:8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px"> <span style="font-size:11px;color:var(--text-dim)">Leave blank to use default atakatak. Used for CA keystores and CoreConfig.</span></div>',
+      '<div class="form-field" style="margin-bottom:8px"><label>Keystore / truststore password</label><div style="position:relative;display:inline-block"><input type="password" id="cert_password" placeholder="atakatak (default)" autocomplete="new-password" style="width:240px;padding:8px 56px 8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px"><button type="button" id="cert-password-toggle" onclick="toggleSinglePassword(\'cert_password\',\'cert-password-toggle\')" style="position:absolute;right:10px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:12px;font-family:JetBrains Mono,monospace">show</button></div> <span style="font-size:11px;color:var(--text-dim)">Leave blank to use default atakatak. Used for CA keystores and CoreConfig.</span></div>',
       '<div style="font-family:\'JetBrains Mono\',monospace;font-size:13px;color:var(--text-dim);margin:24px 0 20px;text-transform:uppercase;letter-spacing:1px;font-weight:600">WebTAK Options (Port 8446)</div>',
       '<div style="display:flex;flex-direction:column;gap:14px">',
       '<label style="display:flex;align-items:center;gap:10px;color:var(--text-secondary);cursor:pointer;font-size:14px"><input type="checkbox" id="enable_admin_ui" onchange="toggleWebadminPassword()" style="width:18px;height:18px;accent-color:var(--accent)"> Enable Admin UI <span style="color:var(--text-dim);font-size:12px">- Browser admin (no cert needed)</span></label>',
@@ -1037,6 +1037,12 @@ function showDeployConfig(){
 }
 
 function toggleWebadminPassword(){const a=document.getElementById('webadmin-password-area');if(a)a.style.display=document.getElementById('enable_admin_ui').checked?'block':'none'}
+
+function toggleSinglePassword(inputId,toggleId){
+    var i=document.getElementById(inputId);var b=document.getElementById(toggleId);if(!i||!b)return;
+    if(i.type==='password'){i.type='text';b.textContent='hide';}
+    else{i.type='password';b.textContent='show';}
+}
 
 function toggleShowPassword(){const p=document.getElementById('webadmin_password');const c=document.getElementById('webadmin_password_confirm');const b=document.getElementById('pw-toggle');if(p.type==='password'){p.type='text';c.type='text';b.textContent='hide'}else{p.type='password';c.type='password';b.textContent='show'}}
 
