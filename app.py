@@ -3365,6 +3365,28 @@ def firewall_open_port_api():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)[:160]}), 500
 
+
+@app.route('/api/firewall/close-port', methods=['POST'])
+@login_required
+def firewall_close_port_api():
+    data = request.json if request.is_json else {}
+    port = data.get('port')
+    proto = (data.get('protocol') or 'tcp').strip().lower()
+    if not isinstance(port, int) or port < 1 or port > 65535:
+        return jsonify({'success': False, 'error': 'Invalid port (1-65535 required)'}), 400
+    if proto not in ('tcp', 'udp'):
+        return jsonify({'success': False, 'error': 'Protocol must be tcp or udp'}), 400
+    st = _firewall_status_local()
+    if not st.get('supported'):
+        return jsonify({'success': False, 'error': st.get('error') or 'UFW not available'}), 400
+    try:
+        cmd = f'sudo ufw --force delete allow {port}/{proto} >/dev/null 2>&1 || ufw --force delete allow {port}/{proto} >/dev/null 2>&1 || true'
+        subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=12)
+        st2 = _firewall_status_local()
+        return jsonify({'success': True, 'message': f'Closed {port}/{proto}', 'status': st2})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)[:160]}), 500
+
 def _parse_guarddog_log_date(line):
     """Return (date, display_str) for a restarts.log line, or (None, line) if unparseable."""
     line = line.strip()
@@ -14723,19 +14745,22 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   </div>
 
   <div class="card">
-    <div class="card-title">Firewall (UFW)</div>
-    <p style="font-size:12px;color:var(--text-secondary);margin-bottom:12px">View currently allowed inbound rules and open additional ports for integrations, without CLI access.</p>
-    <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:10px">
-      <button type="button" class="btn btn-ghost" onclick="gdFirewallRefresh()">Refresh rules</button>
-      <input class="form-input" type="number" id="gd-fw-port" min="1" max="65535" placeholder="Port" style="max-width:110px">
-      <select class="form-input" id="gd-fw-proto" style="max-width:100px">
-        <option value="tcp">tcp</option>
-        <option value="udp">udp</option>
-      </select>
-      <button type="button" class="btn btn-ghost" id="gd-fw-open-btn" onclick="gdFirewallOpenPort()">Open port</button>
-      <span id="gd-fw-msg" style="font-size:12px"></span>
+    <div class="gd-collapse-header" onclick="gdSectionToggle(this)"><span style="margin:0">Firewall (UFW)</span><span class="gd-collapse-toggle">&#9662;</span></div>
+    <div class="gd-collapse-body open">
+      <p style="font-size:12px;color:var(--text-secondary);margin-bottom:12px">View currently allowed inbound rules and open/close ports for integrations, without CLI access.</p>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:10px">
+        <button type="button" class="btn btn-ghost" onclick="gdFirewallRefresh()">Refresh rules</button>
+        <input class="form-input" type="number" id="gd-fw-port" min="1" max="65535" placeholder="Port" style="max-width:110px">
+        <select class="form-input" id="gd-fw-proto" style="max-width:100px">
+          <option value="tcp">tcp</option>
+          <option value="udp">udp</option>
+        </select>
+        <button type="button" class="btn btn-ghost" id="gd-fw-open-btn" onclick="gdFirewallOpenPort()">Open port</button>
+        <button type="button" class="btn btn-ghost" id="gd-fw-close-btn" onclick="gdFirewallClosePort()" style="border-color:var(--yellow);color:var(--yellow)">Close port</button>
+        <span id="gd-fw-msg" style="font-size:12px"></span>
+      </div>
+      <div id="gd-fw-rules" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);background:var(--bg-deep);border:1px solid var(--border);border-radius:8px;padding:10px;white-space:pre-wrap;max-height:180px;overflow:auto">Loading firewall status...</div>
     </div>
-    <div id="gd-fw-rules" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);background:var(--bg-deep);border:1px solid var(--border);border-radius:8px;padding:10px;white-space:pre-wrap;max-height:180px;overflow:auto">Loading firewall status...</div>
   </div>
 
   {% if not tak.installed %}
