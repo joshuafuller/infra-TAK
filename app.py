@@ -3311,6 +3311,60 @@ def guarddog_deploy_log_api():
         'running': guarddog_deploy_status['running'], 'complete': guarddog_deploy_status['complete'],
         'error': guarddog_deploy_status['error']})
 
+def _firewall_status_local():
+    """Return local firewall status for UI (UFW only)."""
+    has_ufw = subprocess.run('command -v ufw >/dev/null 2>&1', shell=True).returncode == 0
+    if not has_ufw:
+        return {'supported': False, 'error': 'UFW not installed on this host', 'enabled': False, 'rules': []}
+    try:
+        r = subprocess.run(
+            'sudo ufw status 2>/dev/null || ufw status 2>/dev/null || true',
+            shell=True, capture_output=True, text=True, timeout=12
+        )
+        out = (r.stdout or '').strip()
+        lines = [ln.rstrip() for ln in out.splitlines() if ln.strip()]
+        enabled = any(ln.lower().startswith('status: active') for ln in lines)
+        rules = []
+        for ln in lines:
+            if ln.lower().startswith('status:'):
+                continue
+            if ln.startswith('To') and 'Action' in ln and 'From' in ln:
+                continue
+            if set(ln.strip()) <= {'-'}:
+                continue
+            rules.append(ln)
+        return {'supported': True, 'enabled': enabled, 'rules': rules, 'raw': out}
+    except Exception as e:
+        return {'supported': False, 'error': str(e)[:160], 'enabled': False, 'rules': []}
+
+
+@app.route('/api/firewall/status')
+@login_required
+def firewall_status_api():
+    return jsonify(_firewall_status_local())
+
+
+@app.route('/api/firewall/open-port', methods=['POST'])
+@login_required
+def firewall_open_port_api():
+    data = request.json if request.is_json else {}
+    port = data.get('port')
+    proto = (data.get('protocol') or 'tcp').strip().lower()
+    if not isinstance(port, int) or port < 1 or port > 65535:
+        return jsonify({'success': False, 'error': 'Invalid port (1-65535 required)'}), 400
+    if proto not in ('tcp', 'udp'):
+        return jsonify({'success': False, 'error': 'Protocol must be tcp or udp'}), 400
+    st = _firewall_status_local()
+    if not st.get('supported'):
+        return jsonify({'success': False, 'error': st.get('error') or 'UFW not available'}), 400
+    try:
+        cmd = f'sudo ufw allow {port}/{proto} >/dev/null 2>&1 || ufw allow {port}/{proto} >/dev/null 2>&1 || true'
+        subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=12)
+        st2 = _firewall_status_local()
+        return jsonify({'success': True, 'message': f'Opened {port}/{proto}', 'status': st2})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)[:160]}), 500
+
 def _parse_guarddog_log_date(line):
     """Return (date, display_str) for a restarts.log line, or (None, line) if unparseable."""
     line = line.strip()
@@ -14668,6 +14722,22 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     <span id="gd-docker-limits-msg" style="margin-left:12px;font-size:12px"></span>
   </div>
 
+  <div class="card">
+    <div class="card-title">Firewall (UFW)</div>
+    <p style="font-size:12px;color:var(--text-secondary);margin-bottom:12px">View currently allowed inbound rules and open additional ports for integrations, without CLI access.</p>
+    <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:10px">
+      <button type="button" class="btn btn-ghost" onclick="gdFirewallRefresh()">Refresh rules</button>
+      <input class="form-input" type="number" id="gd-fw-port" min="1" max="65535" placeholder="Port" style="max-width:110px">
+      <select class="form-input" id="gd-fw-proto" style="max-width:100px">
+        <option value="tcp">tcp</option>
+        <option value="udp">udp</option>
+      </select>
+      <button type="button" class="btn btn-ghost" id="gd-fw-open-btn" onclick="gdFirewallOpenPort()">Open port</button>
+      <span id="gd-fw-msg" style="font-size:12px"></span>
+    </div>
+    <div id="gd-fw-rules" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);background:var(--bg-deep);border:1px solid var(--border);border-radius:8px;padding:10px;white-space:pre-wrap;max-height:180px;overflow:auto">Loading firewall status...</div>
+  </div>
+
   {% if not tak.installed %}
   <div class="card" style="border-color:var(--yellow)">
     <div class="card-title">Requirement</div>
@@ -22212,8 +22282,9 @@ def takserver_groups():
     - /user-management/api/list-groupnames
     so TAK Portal-created groups can still appear in certificate workflows.
     """
+    settings = load_settings()
     cert_dir = '/opt/tak/certs/files'
-    cert_pass = _get_tak_cert_password(load_settings())
+    cert_pass = _get_tak_cert_password(settings)
     admin_p12 = os.path.join(cert_dir, 'admin.p12')
     if not os.path.exists(admin_p12):
         return jsonify({'error': 'admin.p12 not found in /opt/tak/certs/files/', 'groups': []})
@@ -22291,6 +22362,45 @@ def takserver_groups():
                         }
         elif um_err:
             warnings.append(f'user_mgmt_groups:{um_err}')
+
+        # Also pull tak_* groups directly from Authentik so newly-created groups
+        # appear in the picker before first user login hits TAK.
+        ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
+        if ak_token:
+            try:
+                import urllib.request as _req
+                import urllib.parse as _parse
+                ak_url = _get_authentik_api_url(settings)
+                next_url = f'{ak_url}/api/v3/core/groups/?page_size=200&name__istartswith=tak_'
+                seen = 0
+                while next_url and seen < 2000:
+                    req = _req.Request(next_url, headers={'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'})
+                    with _req.urlopen(req, timeout=12) as resp:
+                        page = _json.loads((resp.read() or b'').decode('utf-8', 'replace'))
+                    results = page.get('results', []) if isinstance(page, dict) else []
+                    for g in results:
+                        raw = (g.get('name') or '').strip() if isinstance(g, dict) else ''
+                        if not raw:
+                            continue
+                        name = raw[4:] if raw.lower().startswith('tak_') else raw
+                        if not name or name == '__ANON__':
+                            continue
+                        if name not in merged:
+                            merged[name] = {
+                                'name': name,
+                                'direction': '',
+                                'active': True
+                            }
+                    seen += len(results)
+                    nxt = page.get('next') if isinstance(page, dict) else None
+                    if not nxt:
+                        next_url = None
+                    elif str(nxt).startswith('http'):
+                        next_url = str(nxt)
+                    else:
+                        next_url = _parse.urljoin(ak_url, str(nxt))
+            except Exception as e:
+                warnings.append(f'authentik_groups:{str(e)[:80]}')
 
         groups = sorted(merged.values(), key=lambda x: x['name'].lower())
         if not groups and warnings:
