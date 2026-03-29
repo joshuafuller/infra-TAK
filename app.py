@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.3.2-alpha"
+VERSION = "0.3.3-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -24636,19 +24636,15 @@ def _run_unattended_upgrades_remote(remote_cfg, action):
     host = (remote_cfg.get('host') or '').strip()
     user = (remote_cfg.get('ssh_user') or 'root').strip()
     key = (remote_cfg.get('ssh_key_path') or '').strip()
-    print(f"[UU {action}] target={user}@{host} key={key!r}")
     try:
         ok, out = _ssh_probe(remote_cfg, script, timeout=ssh_timeout)
-        print(f"[UU {action}] ssh_probe ok={ok} out={out!r:.300}")
         if not ok:
             return False, {'error': (out or 'ssh failed')[:300]}
         uu = _get_unattended_upgrades_status_remote(remote_cfg)
-        print(f"[UU {action}] verify={uu}")
         if 'error' in uu:
             return False, uu
         return True, uu
     except Exception as e:
-        print(f"[UU {action}] exception: {e}")
         return False, {'error': str(e)[:300]}
 
 
