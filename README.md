@@ -4,7 +4,7 @@ Tea Awarness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Latest release: v0.3.3-alpha** — **Federation Hub:** full remote deploy-and-manage lifecycle, Authentik SSO integration, certificate metadata, Guard Dog monitor. **TAK Portal:** `/locate/*` public path. **Fix:** remote unattended-upgrades toggle no longer kills its own SSH session. **After upgrading, click ↻ Update Guard Dog** so scripts on disk include the new Fed Hub monitor and fixes. See [docs/RELEASE-v0.3.3-alpha.md](docs/RELEASE-v0.3.3-alpha.md). Prior: [v0.3.2-alpha](docs/RELEASE-v0.3.2-alpha.md) (Guard Dog cert fix).
+**Latest release: v0.3.4-alpha** — **TAK Server:** new Federation section (status, `ca.pem` download, inbound federation-port firewall toggle). **Federation mapping note:** use bare names like `CA-COR ADSB2` (not `cn=tak_*`). **Fed Hub:** deploy already opens required remote ports (`22`, `8080`, `9100-9103`). See [docs/RELEASE-v0.3.4-alpha.md](docs/RELEASE-v0.3.4-alpha.md). Prior: [v0.3.3-alpha](docs/RELEASE-v0.3.3-alpha.md) (Federation Hub module + Guard Dog monitor).
 
 **Goal: universal installer.** Currently supported platform: **Ubuntu 22.04 LTS**.
 
