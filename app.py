@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.3.2-alpha"
+VERSION = "0.3.3-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -786,6 +786,16 @@ def detect_modules():
             cloudtak_installed = True  # container up but dir missing (e.g. different user) — show as installed so card is accurate
     modules['cloudtak'] = {'name': 'CloudTAK', 'installed': cloudtak_installed, 'running': cloudtak_running,
         'description': 'Web-based TAK client — browser access to TAK', 'icon': '☁️', 'icon_data': CLOUDTAK_ICON, 'route': '/cloudtak', 'priority': 7}
+    # Federation Hub (always a separate target host; Ubuntu .deb path first — see TAK.gov Federation Hub doc)
+    fh_cfg = _get_fedhub_deployment_config(settings)
+    fh_installed = False
+    fh_running = False
+    if fh_cfg.get('target_mode') == 'remote' and fh_cfg.get('deployed') and (fh_cfg.get('remote', {}).get('host') or '').strip():
+        fh_installed = True
+        ok_fh, out_fh = _ssh_probe(fh_cfg.get('remote', {}), 'systemctl is-active federation-hub 2>/dev/null', timeout=12)
+        fh_running = bool(ok_fh and out_fh and out_fh.strip() == 'active')
+    modules['fedhub'] = {'name': 'Federation Hub', 'installed': fh_installed, 'running': fh_running,
+        'description': 'TAK Federation Hub on a dedicated Ubuntu host (SSH)', 'icon': '🌐', 'route': '/federation-hub', 'priority': 8}
     # Email Relay (Postfix)
     email_installed = subprocess.run(['which', 'postfix'], capture_output=True).returncode == 0
     email_running = False
@@ -793,7 +803,7 @@ def detect_modules():
         r = subprocess.run(['systemctl', 'is-active', 'postfix'], capture_output=True, text=True)
         email_running = r.stdout.strip() == 'active'
     modules['emailrelay'] = {'name': 'Email Relay', 'installed': email_installed, 'running': email_running,
-        'description': 'Postfix relay — notifications for TAK Portal & MediaMTX', 'icon': '📧', 'route': '/emailrelay', 'priority': 8}
+        'description': 'Postfix relay — notifications for TAK Portal & MediaMTX', 'icon': '📧', 'route': '/emailrelay', 'priority': 9}
     return dict(sorted(modules.items(), key=lambda x: x[1].get('priority', 99)))
 
 def render_sidebar(modules, active_path, takwerx_logo_url=None):
@@ -819,6 +829,9 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
     tak = modules.get('takserver', {})
     if tak.get('installed'):
         parts.append(link('/takserver', f'<img src="{html.escape(TAK_LOGO_URL)}" alt="TAK Server" class="nav-icon" style="height:24px;width:auto;max-width:48px;object-fit:contain;display:block"><span>TAK Server</span>', 'TAK Server'))
+    fedhub = modules.get('fedhub', {})
+    if fedhub.get('installed'):
+        parts.append(link('/federation-hub', '<span class="nav-icon material-symbols-outlined" style="font-size:22px">hub</span><span>Federation Hub</span>', 'Federation Hub'))
     ak = modules.get('authentik', {})
     if ak.get('installed'):
         parts.append(link('/authentik', f'<img src="{html.escape(AUTHENTIK_LOGO_URL)}" alt="Authentik" class="nav-icon" style="height:48px;width:auto;max-width:100px;object-fit:contain;display:block">', 'Authentik'))
@@ -964,10 +977,15 @@ print(json.dumps(out))
         with open(tmp_path, 'w') as f:
             f.write(script_content)
         deploy_cfg = {'target_mode': 'remote', 'remote': remote_cfg}
-        ok_copy = _module_copy(deploy_cfg, tmp_path, tmp_path, timeout=15)
-        if not ok_copy:
+        copy_ok, _copy_msg = _module_copy(deploy_cfg, tmp_path, tmp_path, timeout=15)
+        if not copy_ok:
             return None
-        ok, out = _ssh_probe(remote_cfg, f'python3 {tmp_path} 2>/dev/null; rm -f {tmp_path}', timeout=20)
+        rp = shlex.quote(tmp_path)
+        ok, out = _ssh_probe(
+            remote_cfg,
+            f'command -v python3 >/dev/null 2>&1 && python3 {rp} 2>/dev/null || python {rp} 2>/dev/null; rm -f {rp}',
+            timeout=25,
+        )
     except Exception:
         return None
     finally:
@@ -977,10 +995,18 @@ print(json.dumps(out))
             pass
     if not ok or not out:
         return None
+    raw = (out or '').strip()
     try:
-        return json.loads(out.strip())
+        return json.loads(raw)
     except Exception:
-        return None
+        pass
+    try:
+        i, j = raw.find('{'), raw.rfind('}')
+        if i >= 0 and j > i:
+            return json.loads(raw[i : j + 1])
+    except Exception:
+        pass
+    return None
 
 def _get_unattended_upgrades_status():
     """Return dict with 'enabled' (bool) and 'running' (bool). 'running' = upgrade job active (not shutdown-waiter)."""
@@ -1044,6 +1070,19 @@ def _build_uu_hosts(metrics, settings):
                 'enabled': remote.get('enabled', False) if 'error' not in remote else False,
                 'running': remote.get('running', False) if 'error' not in remote else False,
                 'error': remote.get('error'),
+            })
+    # Federation Hub remote host
+    fh_cfg = _get_fedhub_deployment_config(settings)
+    if fh_cfg.get('target_mode') == 'remote' and fh_cfg.get('deployed'):
+        fh_host = (fh_cfg.get('remote', {}).get('host') or '').strip()
+        if fh_host:
+            fh_remote = _get_unattended_upgrades_status_remote(fh_cfg.get('remote', {}))
+            hosts.append({
+                'id': 'fedhub',
+                'label': 'Fed Hub (' + fh_host + ')',
+                'enabled': fh_remote.get('enabled', False) if 'error' not in fh_remote else False,
+                'running': fh_remote.get('running', False) if 'error' not in fh_remote else False,
+                'error': fh_remote.get('error'),
             })
     return hosts
 
@@ -3049,6 +3088,18 @@ def guarddog_page():
             {'name': 'Health Agent', 'id': 'remotedb_agent', 'interval': 'Always', 'desc': f'Lightweight health endpoint on Server One / remote server ({s1_host}:8080/health) — checks PG ready, cot database, disk usage. If red, click "Deploy health agent to Server One / remote server" below.'},
             {'name': 'DB Auth', 'id': 'remotedb_auth', 'interval': '2 min', 'desc': f'Validates martiuser password from CoreConfig.xml against PostgreSQL on Server One / remote server ({s1_host}). Red means credential drift — Guard Dog auto-resyncs and notifies you.'},
         ]})
+    fh_cfg = _get_fedhub_deployment_config(settings)
+    fh_deployed = fh_cfg.get('deployed') and fh_cfg.get('target_mode') == 'remote'
+    fh_host = (fh_cfg.get('remote', {}).get('host') or '').strip() if fh_deployed else ''
+    if fh_deployed and fh_host:
+        guarddog_services.append({'id': 'federation_hub', 'name': f'Federation Hub ({fh_host})', 'monitored': gd.get('installed'), 'monitors': [
+            {'name': 'Service', 'id': 'fedhub_svc', 'interval': '1 min', 'desc': f'Checks federation-hub systemd service on {fh_host} via SSH. Auto-restarts after 3 consecutive failures.'},
+            {'name': 'Port 9100 (UI)', 'id': 'fedhub_port', 'interval': '1 min', 'desc': f'Checks that Federation Hub UI port 9100 is listening on {fh_host}. Alerts after 3 failures.'},
+            {'name': 'MongoDB', 'id': 'fedhub_mongo', 'interval': '5 min', 'desc': f'Checks mongod service is active on {fh_host}. Alerts on failure.'},
+            {'name': 'Disk', 'id': 'fedhub_disk', 'interval': '1 hour', 'desc': f'Checks root filesystem usage on {fh_host}. Alert at 80%+ (warning) or 90%+ (critical).'},
+            {'name': 'TLS certificate', 'id': 'fedhub_cert', 'interval': 'Daily', 'desc': f'Checks Federation Hub server TLS cert (<hostname>.pem) on {fh_host}. Alert when 40 days or less remaining.'},
+            {'name': 'Root CA / Intermediate CA', 'id': 'fedhub_intca', 'interval': 'Escalating', 'desc': f'Monitors Root CA and Intermediate CA expiry on {fh_host} (same 90-day escalation as TAK Server intca).'},
+        ]})
     guarddog_services.extend([
         {'id': 'authentik', 'name': 'Authentik', 'monitored': modules.get('authentik', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'id': 'authentik_http', 'interval': '1 min', 'desc': 'Checks Authentik HTTP (9090). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'mediamtx', 'name': 'MediaMTX', 'monitored': modules.get('mediamtx', {}).get('installed'), 'monitors': [{'name': 'Service', 'id': 'mediamtx_svc', 'interval': '1 min', 'desc': 'Checks systemd mediamtx. Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
@@ -3328,6 +3379,16 @@ def _guarddog_health_check(service_id):
                 return False
             r = subprocess.run('docker ps --filter name=cloudtak-api --format "{{.Status}}"', shell=True, capture_output=True, text=True, timeout=5)
             return bool(r.stdout and 'Up' in r.stdout)
+        if service_id == 'federation_hub':
+            settings = load_settings()
+            fh_cfg = _get_fedhub_deployment_config(settings)
+            if not fh_cfg.get('deployed') or fh_cfg.get('target_mode') != 'remote':
+                return None
+            fh_remote = fh_cfg.get('remote', {})
+            if not (fh_remote.get('host') or '').strip():
+                return None
+            ok, out = _ssh_probe(fh_remote, 'systemctl is-active federation-hub 2>/dev/null', timeout=8)
+            return bool(ok and out and out.strip() == 'active')
         if service_id == 'remotedb':
             import socket
             db_host, db_port = _remotedb_host_port_from_tak_settings()
@@ -3359,6 +3420,7 @@ def _guarddog_service_monitor_ids(settings):
     multi = {
         'takserver': takserver_ids,
         'remotedb': ['remotedb_tcp', 'remotedb_agent', 'remotedb_auth'],
+        'federation_hub': ['fedhub_svc', 'fedhub_port', 'fedhub_mongo', 'fedhub_disk', 'fedhub_cert', 'fedhub_intca'],
         'authentik': ['authentik_http'],
         'mediamtx': ['mediamtx_svc'],
         'nodered': ['nodered_http'],
@@ -3378,6 +3440,9 @@ def _guarddog_monitored_service_ids(settings):
     ids = ['takserver']
     if is_two_server and s1_host:
         ids.append('remotedb')
+    fh_cfg = _get_fedhub_deployment_config(settings)
+    if fh_cfg.get('deployed') and fh_cfg.get('target_mode') == 'remote' and (fh_cfg.get('remote', {}).get('host') or '').strip():
+        ids.append('federation_hub')
     if modules.get('authentik', {}).get('installed'):
         ids.append('authentik')
     if modules.get('mediamtx', {}).get('installed'):
@@ -3700,9 +3765,60 @@ def _monitor_health_check(monitor_id):
             r = subprocess.run('docker ps --filter name=cloudtak-api --format "{{.Status}}"', shell=True, capture_output=True, text=True, timeout=5)
             return bool(r.stdout and 'Up' in r.stdout)
         if monitor_id == 'updates_check':
-            # Updates monitor: green when the 6h timer is enabled (script will run and email on change)
             r = subprocess.run(['systemctl', 'is-enabled', 'takupdatesguard.timer'], capture_output=True, text=True, timeout=3)
             return r.returncode == 0 and (r.stdout or '').strip() == 'enabled'
+        # Federation Hub monitors (all remote via SSH)
+        if monitor_id.startswith('fedhub_'):
+            settings = load_settings()
+            fh_cfg = _get_fedhub_deployment_config(settings)
+            if not fh_cfg.get('deployed') or fh_cfg.get('target_mode') != 'remote':
+                return None
+            fh_remote = fh_cfg.get('remote', {})
+            if not (fh_remote.get('host') or '').strip():
+                return None
+            if monitor_id == 'fedhub_svc':
+                ok, out = _ssh_probe(fh_remote, 'systemctl is-active federation-hub 2>/dev/null', timeout=8)
+                return bool(ok and out and out.strip() == 'active')
+            if monitor_id == 'fedhub_port':
+                ok, out = _ssh_probe(fh_remote, 'ss -ltn "sport = :9100" 2>/dev/null', timeout=8)
+                return bool(ok and out and 'LISTEN' in out)
+            if monitor_id == 'fedhub_mongo':
+                ok, out = _ssh_probe(fh_remote, 'systemctl is-active mongod 2>/dev/null', timeout=8)
+                return bool(ok and out and out.strip() == 'active')
+            if monitor_id == 'fedhub_disk':
+                ok, out = _ssh_probe(fh_remote, "df / --output=pcent 2>/dev/null | tail -1", timeout=8)
+                if not ok or not out:
+                    return None
+                try:
+                    pct = int(out.strip().rstrip('%'))
+                    return pct < 80
+                except ValueError:
+                    return None
+            if monitor_id == 'fedhub_cert':
+                ok_h, hn = _ssh_probe(fh_remote, 'hostname 2>/dev/null', timeout=8)
+                hshort = ((hn or '').strip().split('.') or [''])[0]
+                if not hshort:
+                    return None
+                cert_path = f'/opt/tak/federation-hub/certs/files/{hshort}.pem'
+                ok2, out2 = _ssh_probe(
+                    fh_remote,
+                    f'test -f {shlex.quote(cert_path)} && openssl x509 -in {shlex.quote(cert_path)} -checkend 3456000 >/dev/null 2>&1 && echo OK',
+                    timeout=12,
+                )
+                return bool(ok2 and 'OK' in (out2 or ''))
+            if monitor_id == 'fedhub_intca':
+                rca = '/opt/tak/federation-hub/certs/files/root-ca.pem'
+                ica = '/opt/tak/federation-hub/certs/files/ca.pem'
+                ok2, out2 = _ssh_probe(
+                    fh_remote,
+                    f'test -f {rca} && test -f {ica} && '
+                    f'openssl x509 -in {rca} -checkend 7776000 >/dev/null 2>&1 && '
+                    f'openssl x509 -in {ica} -checkend 7776000 >/dev/null 2>&1 && echo OK',
+                    timeout=15,
+                )
+                if not ok2:
+                    return None
+                return 'OK' in (out2 or '')
     except Exception:
         return False
     return None
@@ -3767,7 +3883,8 @@ def _guarddog_timer_list():
     return ['tak8089guard.timer', 'takoomguard.timer', 'takdiskguard.timer', 'takdbguard.timer',
             'takcotdbguard.timer', 'taknetguard.timer', 'takprocessguard.timer', 'takcertguard.timer',
             'takintcaguard.timer',
-            'takauthentikguard.timer', 'takmediamtxguard.timer', 'taknoderedguard.timer', 'takcloudtakguard.timer']
+            'takauthentikguard.timer', 'takmediamtxguard.timer', 'taknoderedguard.timer', 'takcloudtakguard.timer',
+            'takfedhubguard.timer']
 
 def _guarddog_is_enabled():
     """True if Guard Dog timers are enabled (at least the core 8089 timer)."""
@@ -4221,6 +4338,11 @@ def run_guarddog_deploy(alert_email):
             script_files.append('tak-nodered-watch.sh')
         if os.path.exists(cloudtak_dir) and os.path.exists(os.path.join(cloudtak_dir, 'docker-compose.yml')):
             script_files.append('tak-cloudtak-watch.sh')
+        fh_cfg = _get_fedhub_deployment_config(settings)
+        fh_deployed = fh_cfg.get('deployed') and fh_cfg.get('target_mode') == 'remote'
+        fh_host = (fh_cfg.get('remote', {}).get('host') or '').strip() if fh_deployed else ''
+        if fh_deployed and fh_host:
+            script_files.append('tak-fedhub-watch.sh')
         # Scripts (e.g. tak-cert-watch.sh) live in repo scripts/guarddog/ — read from disk each deploy.
         for name in script_files:
             src = os.path.join(scripts_dir, name)
@@ -4240,6 +4362,13 @@ def run_guarddog_deploy(alert_email):
                 content = content.replace('DB_PORT_PLACEHOLDER', db_port)
                 content = content.replace('SSH_KEY_PLACEHOLDER', ssh_key_path)
                 content = content.replace('SSH_USER_PLACEHOLDER', s1_user)
+            if name == 'tak-fedhub-watch.sh' and fh_deployed and fh_host:
+                fh_remote = fh_cfg.get('remote', {})
+                fh_ssh_key = (fh_remote.get('ssh_key_path') or '').strip()
+                fh_ssh_user = (fh_remote.get('username') or 'root').strip()
+                content = content.replace('FEDHUB_HOST_PLACEHOLDER', fh_host)
+                content = content.replace('SSH_KEY_PLACEHOLDER', fh_ssh_key)
+                content = content.replace('SSH_USER_PLACEHOLDER', fh_ssh_user)
             dest = os.path.join('/opt/tak-guarddog', name)
             with open(dest, 'w') as f:
                 f.write(content)
@@ -4310,6 +4439,11 @@ def run_guarddog_deploy(alert_email):
                 ('takcloudtakguard.service', '[Unit]\nDescription=Guard Dog CloudTAK Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-cloudtak-watch.sh\n'),
                 ('takcloudtakguard.timer', '[Unit]\nDescription=Run CloudTAK guard every 1 minute\n\n[Timer]\nOnBootSec=15min\nOnUnitActiveSec=1min\nUnit=takcloudtakguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ])
+        if 'tak-fedhub-watch.sh' in script_files:
+            units.extend([
+                ('takfedhubguard.service', '[Unit]\nDescription=Guard Dog Federation Hub Monitor\nAfter=network-online.target\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-fedhub-watch.sh\n'),
+                ('takfedhubguard.timer', '[Unit]\nDescription=Run Federation Hub guard every 1 minute\n\n[Timer]\nOnBootSec=15min\nOnUnitActiveSec=1min\nUnit=takfedhubguard.service\n\n[Install]\nWantedBy=timers.target\n'),
+            ])
         _updates_home = os.path.expanduser('~')
         units.extend([
             ('takupdatesguard.service', f'[Unit]\nDescription=Guard Dog Updates Check (infra-TAK, Authentik, MediaMTX, CloudTAK)\n\n[Service]\nType=oneshot\nEnvironment=HOME={_updates_home}\nExecStart=/opt/tak-guarddog/tak-updates-watch.sh\n'),
@@ -4373,6 +4507,8 @@ def run_guarddog_deploy(alert_email):
             timers.append('taknoderedguard.timer')
         if 'tak-cloudtak-watch.sh' in script_files:
             timers.append('takcloudtakguard.timer')
+        if 'tak-fedhub-watch.sh' in script_files:
+            timers.append('takfedhubguard.timer')
         timers.append('takupdatesguard.timer')
         for t in timers:
             re = subprocess.run(['systemctl', 'enable', t], capture_output=True, text=True, timeout=5)
@@ -4525,6 +4661,1042 @@ def cloudtak_page():
 def cloudtak_page_js():
     return app.response_class(CLOUDTAK_PAGE_JS, mimetype='application/javascript')
 
+
+@app.route('/federation-hub')
+@login_required
+def federation_hub_page():
+    """Federation Hub module — Ubuntu .deb on a dedicated remote host (SSH). Install steps: TAK.gov Federation Hub doc."""
+    from flask import make_response
+    settings = load_settings()
+    modules = detect_modules()
+    fh = modules.get('fedhub', {})
+    fedhub_deploy_cfg = _get_fedhub_deployment_config(settings)
+    if (fedhub_deploy_cfg.get('target_mode') or 'local') != 'remote':
+        fedhub_deploy_cfg = _normalize_module_deployment_config({
+            **fedhub_deploy_cfg, 'target_mode': 'remote'})
+        fedhub_deploy_cfg = _get_fedhub_deployment_config({'fedhub_deployment': fedhub_deploy_cfg})
+    _fpkg_fn, fpkg_fp = _find_fedhub_deb_in_uploads()
+    fpkg_size = round(os.path.getsize(fpkg_fp) / (1024 * 1024), 1) if fpkg_fp else None
+    _fedhub_upgrade_done = fedhub_upgrade_status.get('complete', False)
+    if _fedhub_upgrade_done and not fedhub_upgrade_status.get('running'):
+        fedhub_upgrade_status.update({'complete': False})
+    _fedhub_rotate_done = fedhub_rotate_status.get('complete', False)
+    if _fedhub_rotate_done and not fedhub_rotate_status.get('running'):
+        fedhub_rotate_status.update({'complete': False})
+    _fqdn = (settings.get('fqdn') or '').strip()
+    _fedhub_host = _get_service_domain(settings, 'fedhub') if _fqdn else ''
+    _fedhub_public_url = f'https://{_fedhub_host}' if _fedhub_host else ''
+    _fedhub_sso_prime_url = f'https://tak.{_fqdn}' if _fqdn else ''
+    _ak = modules.get('authentik', {})
+    _fedhub_ver = _get_fedhub_version_info().get('version', '') if fh.get('installed') else ''
+    _fh_dn = _fedhub_cert_dn(settings)
+    _fh_cert_pw_eff = _get_fedhub_cert_password(settings)
+    _fh_root_disp = (settings.get('fedhub_root_ca') or settings.get('root_ca_name') or 'FEDHUB-ROOT-CA').strip()
+    _fh_int_disp = (settings.get('fedhub_intermediate_ca') or settings.get('intermediate_ca_name') or 'FEDHUB-INT-CA').strip()
+    resp = make_response(render_template_string(FEDHUB_TEMPLATE,
+        settings=settings, fh=fh, fedhub_deploy_cfg=fedhub_deploy_cfg, version=VERSION,
+        fedhub_version=_fedhub_ver,
+        fedhub_public_url=_fedhub_public_url,
+        fedhub_sso_prime_url=_fedhub_sso_prime_url,
+        fedhub_service_domain=_fedhub_host,
+        fedhub_pkg_filename=_fpkg_fn or '',
+        fedhub_pkg_size_mb=fpkg_size,
+        fedhub_deploying=fedhub_deploy_status.get('running', False),
+        fedhub_deploy_done=fedhub_deploy_status.get('complete', False),
+        fedhub_deploy_error=fedhub_deploy_status.get('error', False),
+        fedhub_upgrading=fedhub_upgrade_status.get('running', False),
+        fedhub_upgrade_done=_fedhub_upgrade_done,
+        fedhub_upgrade_error=fedhub_upgrade_status.get('error', False),
+        fedhub_rotating=fedhub_rotate_status.get('running', False),
+        fedhub_rotate_done=_fedhub_rotate_done,
+        fedhub_rotate_error=fedhub_rotate_status.get('error', False),
+        authentik_installed=_ak.get('installed', False),
+        fedhub_remote_host=(fedhub_deploy_cfg.get('remote', {}).get('host') or '').strip() if fedhub_deploy_cfg.get('target_mode') == 'remote' and fedhub_deploy_cfg.get('deployed') else '',
+        fh_cert_country=_fh_dn['country'],
+        fh_cert_state=_fh_dn['state'],
+        fh_cert_city=_fh_dn['city'],
+        fh_cert_org=_fh_dn['org'],
+        fh_cert_ou=_fh_dn['ou'],
+        fh_root_ca=_fh_root_disp,
+        fh_intermediate_ca=_fh_int_disp,
+        fh_cert_password_effective=_fh_cert_pw_eff))
+    resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
+    return resp
+
+
+@app.route('/api/fedhub/mark-deployed', methods=['POST'])
+@login_required
+def fedhub_mark_deployed_api():
+    settings = load_settings()
+    cfg = _get_fedhub_deployment_config(settings)
+    if cfg.get('target_mode') != 'remote' or not (cfg.get('remote', {}).get('host') or '').strip():
+        return jsonify({'success': False, 'error': 'Set remote host and save SSH settings first.'}), 400
+    ok, out = _ssh_probe(cfg['remote'], 'test -d /opt/tak/federation-hub && echo OK', timeout=20)
+    if not ok or 'OK' not in (out or ''):
+        return jsonify({
+            'success': False,
+            'error': 'Could not find /opt/tak/federation-hub on the target. Install the Federation Hub .deb on Ubuntu per TAK.gov first.',
+            'detail': (out or '')[:400],
+        }), 400
+    cfg = {**cfg, 'deployed': True, 'target_mode': 'remote'}
+    settings['fedhub_deployment'] = _normalize_module_deployment_config(cfg)
+    save_settings(settings)
+    _caddy_regenerate_if_fqdn()
+    return jsonify({'success': True})
+
+
+@app.route('/api/fedhub/clear-registration', methods=['POST'])
+@login_required
+def fedhub_clear_registration_api():
+    try:
+        settings = load_settings()
+        cfg = _get_fedhub_deployment_config(settings)
+        cfg = {**cfg, 'deployed': False}
+        settings['fedhub_deployment'] = _normalize_module_deployment_config(cfg)
+        save_settings(settings)
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'Failed saving settings: {str(e)[:220]}'}), 500
+
+    # Registration should still clear even if Caddy regeneration has a warning.
+    try:
+        _caddy_regenerate_if_fqdn()
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({
+            'success': True,
+            'warning': f'Registration cleared, but Caddy regeneration returned: {str(e)[:220]}'
+        })
+
+
+@app.route('/api/fedhub/status', methods=['GET'])
+@login_required
+def fedhub_status_api():
+    settings = load_settings()
+    cfg = _get_fedhub_deployment_config(settings)
+    if not cfg.get('deployed') or not (cfg.get('remote', {}).get('host') or '').strip():
+        return jsonify({'registered': False})
+    r = cfg.get('remote', {})
+    ok_d, out_d = _ssh_probe(r, 'test -d /opt/tak/federation-hub && echo OK', timeout=15)
+    ok_s, out_s = _ssh_probe(r, 'systemctl is-active federation-hub 2>/dev/null', timeout=15)
+    st = (out_s or '').strip()
+    return jsonify({
+        'registered': True,
+        'dir_ok': bool(ok_d and 'OK' in (out_d or '')),
+        'service_active': st == 'active',
+        'service_state': st or 'unknown',
+    })
+
+
+@app.route('/api/fedhub/control', methods=['POST'])
+@login_required
+def fedhub_control_api():
+    data = request.get_json() or {}
+    action = (data.get('action') or '').strip().lower()
+    settings = load_settings()
+    cfg = _get_fedhub_deployment_config(settings)
+    if not cfg.get('deployed'):
+        return jsonify({'success': False, 'error': 'Federation Hub is not registered for this console.'}), 400
+    if cfg.get('target_mode') != 'remote':
+        return jsonify({'success': False, 'error': 'Remote target only.'}), 400
+    if action == 'restart':
+        cmd = 'sudo systemctl restart federation-hub'
+    elif action == 'start':
+        cmd = 'sudo systemctl start federation-hub'
+    elif action == 'stop':
+        cmd = 'sudo systemctl stop federation-hub'
+    else:
+        return jsonify({'success': False, 'error': 'Unknown action'}), 400
+    ok, out = _module_run(cfg, cmd, timeout=90)
+    return jsonify({'success': ok, 'output': (out or '')[:800]})
+
+
+@app.route('/api/fedhub/remote-metrics')
+@login_required
+def fedhub_remote_metrics():
+    """Return CPU/memory/disk/uptime for the Federation Hub remote host."""
+    settings = load_settings()
+    cfg = _get_fedhub_deployment_config(settings)
+    remote = cfg.get('remote', {}) if isinstance(cfg.get('remote'), dict) else {}
+    if not (remote.get('host') or '').strip():
+        return jsonify({'error': 'Remote host not configured'}), 404
+    metrics = _get_remote_host_metrics(remote)
+    if metrics is None:
+        return jsonify({'error': 'Could not fetch remote metrics'}), 503
+    return jsonify(metrics)
+
+@app.route('/api/fedhub/download-webadmin-cert')
+@login_required
+def fedhub_download_webadmin_cert():
+    """Download webadmin-fed.p12 from Federation Hub target host."""
+    settings = load_settings()
+    cfg = _get_fedhub_deployment_config(settings)
+    if not cfg.get('deployed') or cfg.get('target_mode') != 'remote':
+        return jsonify({'success': False, 'error': 'Federation Hub must be deployed to a remote host first.'}), 400
+    remote = cfg.get('remote', {})
+    if not (remote.get('host') or '').strip():
+        return jsonify({'success': False, 'error': 'Remote host not configured.'}), 400
+    cmd = (
+        "python3 - <<'PY'\n"
+        "import base64,sys,os\n"
+        "candidates=[\n"
+        " '/root/webadmin-fed.p12',\n"
+        " '/opt/tak/federation-hub/certs/files/webadmin-fed.p12',\n"
+        "]\n"
+        "for p in candidates:\n"
+        "  if os.path.exists(p):\n"
+        "    try:\n"
+        "      b=open(p,'rb').read()\n"
+        "      print(base64.b64encode(b).decode())\n"
+        "      sys.exit(0)\n"
+        "    except Exception as e:\n"
+        "      print('ERR:'+str(e))\n"
+        "      sys.exit(1)\n"
+        "print('ERR:webadmin-fed.p12 not found')\n"
+        "sys.exit(1)\n"
+        "PY"
+    )
+    ok, out = _ssh_probe(remote, cmd, timeout=25)
+    if not ok or not (out or '').strip():
+        return jsonify({'success': False, 'error': (out or 'Could not read remote certificate file')[:260]}), 404
+    try:
+        import base64
+        data = base64.b64decode((out or '').strip().splitlines()[-1])
+    except Exception:
+        return jsonify({'success': False, 'error': 'Failed decoding remote certificate payload'}), 500
+    if not data:
+        return jsonify({'success': False, 'error': 'Remote certificate file was empty'}), 404
+    resp = make_response(data)
+    resp.headers['Content-Type'] = 'application/x-pkcs12'
+    resp.headers['Content-Disposition'] = 'attachment; filename=webadmin-fed.p12'
+    resp.headers['Content-Length'] = str(len(data))
+    return resp
+
+
+@app.route('/api/fedhub/enable-authentik', methods=['POST'])
+@login_required
+def fedhub_enable_authentik_api():
+    """Enable Authentik for Fed Hub: OAuth2 provider (Fed Hub OIDC) + Proxy provider (Caddy forward_auth) + patch remote YAML + Caddy regen.
+    Opening Fed Hub from Authentik after tak.<fqdn> login uses forward_auth so the edge session matches — often no Fed Hub ‘Keycloak’ step."""
+    settings = load_settings()
+    cfg = _get_fedhub_deployment_config(settings)
+    if not cfg.get('deployed') or cfg.get('target_mode') != 'remote':
+        return jsonify({'success': False, 'error': 'Federation Hub must be deployed first.'}), 400
+    remote = cfg.get('remote', {})
+    if not (remote.get('host') or '').strip():
+        return jsonify({'success': False, 'error': 'Remote host not configured.'}), 400
+    fqdn = (settings.get('fqdn') or '').strip()
+    if not fqdn:
+        return jsonify({'success': False, 'error': 'Set the base FQDN in Console settings first.'}), 400
+
+    reachable, err = _check_authentik_api_reachable(settings)
+    if not reachable:
+        return jsonify({'success': False, 'error': f'Cannot reach Authentik API: {err}'}), 400
+
+    steps = []
+
+    # 1) Hub config path
+    fh_dir = '/opt/tak/federation-hub'
+
+    # 2) Fed Hub built-in OIDC → Authentik (direct visits / callbacks); Caddy forward_auth handles Authentik-first flow
+    client_id, client_secret, auth_url, token_url = _ensure_authentik_fedhub_oauth_app(settings, plog=lambda m: steps.append(m))
+    fh_domain = _get_service_domain(settings, 'fedhub')
+    fh_host = fh_domain or (remote.get('host') or '').strip()
+    # Fed Hub OAuth callback is handled by backend API endpoint, not SPA route.
+    redirect_uri = f'https://{fh_host}/api/oauth/login/redirect' if fh_domain else f'https://{fh_host}:9100/api/oauth/login/redirect'
+
+    # Generate keycloak.der — Fed Hub needs this to trust the OAuth provider's TLS cert
+    # Use the same Authentik host for cert generation and OIDC URLs (consistency prevents domain mismatch)
+    ak_host = _get_authentik_host(settings) or f'authentik.{fqdn}'
+    ak_public = f'https://{ak_host}'
+    der_cmd = (
+        f'sudo mkdir -p /opt/tak/certs && '
+        f'sudo chown tak:tak /opt/tak/certs && '
+        f'echo | openssl s_client -connect {ak_host}:443 -servername {ak_host} 2>/dev/null '
+        f'| openssl x509 -outform DER -out /opt/tak/certs/keycloak.der 2>/dev/null && '
+        f'chown tak:tak /opt/tak/certs/keycloak.der && '
+        f'chmod 644 /opt/tak/certs/keycloak.der && '
+        f'ls -la /opt/tak/certs/keycloak.der'
+    )
+    ok_der, out_der = _ssh_probe(remote, der_cmd, timeout=30)
+    if ok_der:
+        steps.append(f'  ✓ keycloak.der generated from {ak_host}')
+    else:
+        steps.append(f'  ⚠ keycloak.der generation failed — OAuth login may 500')
+
+    # OIDC discovery URL — Fed Hub v5.7+ dynamically discovers auth/token/jwks endpoints from here
+    oidc_config_url = f'{ak_public}/application/o/fedhub/.well-known/openid-configuration'
+    auth_endpoint_url = f'{ak_public}/application/o/authorize/'
+    token_endpoint_url = f'{ak_public}/application/o/token/'
+
+    if client_id and client_secret:
+        patch_cmd = (
+            f'cd {fh_dir}/configs && '
+            # Normalize known OAuth keys first (including malformed "key : value" variants)
+            f'sudo sed -i -E "/^keycloak(Auth|Token)Endpoint[[:space:]]*:/d; /^keycloak(Access|Refresh)TokenName[[:space:]]*:/d" federation-hub-ui.yml && '
+            f'sudo sed -i "s/^allowOauth:.*/allowOauth: true/" federation-hub-ui.yml && '
+            f'sudo sed -i "s|^keycloakServerName:.*|keycloakServerName: {ak_public}|" federation-hub-ui.yml && '
+            f'sudo sed -i "s|^keycloakClientId:.*|keycloakClientId: {shlex.quote(client_id)}|" federation-hub-ui.yml && '
+            f'sudo sed -i "s|^keycloakSecret:.*|keycloakSecret: {shlex.quote(client_secret)}|" federation-hub-ui.yml && '
+            f'sudo sed -i "s|^keycloakRedirectUri:.*|keycloakRedirectUri: {redirect_uri}|" federation-hub-ui.yml && '
+            f'sudo sed -i "s|^keycloakrRedirectUri:.*|keycloakrRedirectUri: {redirect_uri}|" federation-hub-ui.yml && '
+            f'sudo sed -i "s|^keycloakClaimName:.*|keycloakClaimName: groups|" federation-hub-ui.yml && '
+            f'sudo sed -i "s|^keycloakAdminClaimValue:.*|keycloakAdminClaimValue: authentik Admins|" federation-hub-ui.yml && '
+            f'sudo sed -i "s|^keycloakDerLocation:.*|keycloakTlsCertFile: /opt/tak/certs/keycloak.der|" federation-hub-ui.yml && '
+            f'sudo sed -i "s|^keycloakTlsCertFile:.*|keycloakTlsCertFile: /opt/tak/certs/keycloak.der|" federation-hub-ui.yml && '
+            f'sudo sed -i "s|^keycloakConfigurationEndpoint:.*|keycloakConfigurationEndpoint: {oidc_config_url}|" federation-hub-ui.yml && '
+            f'sudo sed -i -e \'$a\\\' federation-hub-ui.yml && '
+            f'grep -q "^keycloakAuthEndpoint:" federation-hub-ui.yml || echo "keycloakAuthEndpoint: {auth_endpoint_url}" | sudo tee -a federation-hub-ui.yml > /dev/null && '
+            f'grep -q "^keycloakTokenEndpoint:" federation-hub-ui.yml || echo "keycloakTokenEndpoint: {token_endpoint_url}" | sudo tee -a federation-hub-ui.yml > /dev/null && '
+            f'grep -q "^keycloakAccessTokenName:" federation-hub-ui.yml || echo "keycloakAccessTokenName: access_token" | sudo tee -a federation-hub-ui.yml > /dev/null && '
+            f'grep -q "^keycloakRefreshTokenName:" federation-hub-ui.yml || echo "keycloakRefreshTokenName: refresh_token" | sudo tee -a federation-hub-ui.yml > /dev/null && '
+            f'grep -q "^keycloakRedirectUri:" federation-hub-ui.yml || echo "keycloakRedirectUri: {redirect_uri}" | sudo tee -a federation-hub-ui.yml > /dev/null && '
+            f'grep -q "^keycloakrRedirectUri:" federation-hub-ui.yml || echo "keycloakrRedirectUri: {redirect_uri}" | sudo tee -a federation-hub-ui.yml > /dev/null && '
+            f'grep -q "^keycloakConfigurationEndpoint:" federation-hub-ui.yml || echo "keycloakConfigurationEndpoint: {oidc_config_url}" | sudo tee -a federation-hub-ui.yml > /dev/null'
+        )
+        ok_patch, _ = _ssh_probe(remote, patch_cmd, timeout=30)
+        if ok_patch:
+            steps.append('  ✓ federation-hub-ui.yml patched with OAuth settings')
+        else:
+            steps.append('  ⚠ OAuth config patch warning — Fed Hub UI login may be incomplete until fixed')
+
+    # 3) Restart federation-hub to pick up OAuth changes
+    ok_restart, _ = _ssh_probe(remote, 'sudo systemctl restart federation-hub 2>&1', timeout=90)
+    steps.append('  ✓ federation-hub restarted' if ok_restart else '  ⚠ Restart returned non-zero')
+
+    # 4) Authentik Proxy provider + app for Caddy forward_auth (same pattern as Node-RED)
+    ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+    if ak_token and fqdn:
+        _ensure_authentik_fedhub_proxy_app(fqdn, ak_token, plog=lambda m: steps.append(m), settings=settings)
+        try:
+            ak_url = _get_authentik_api_url(settings)
+            ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+            _repair_embedded_outpost_all_apps(ak_url, ak_headers, settings, plog=lambda m: steps.append(m))
+        except Exception as e:
+            steps.append(f'  ⚠ Outpost repair: {str(e)[:120]}')
+    else:
+        steps.append('  ⚠ No Authentik token — skipped Fed Hub proxy provider')
+
+    # 5) Regenerate Caddyfile + reload Caddy
+    generate_caddyfile(settings)
+    threading.Thread(target=_caddy_restart_after_response, daemon=True).start()
+    steps.append('  ✓ Caddyfile regenerated (forward_auth + proxy) + Caddy reloading')
+
+    fedhub_url = f'https://{fh_domain}' if fh_domain else f'https://{fh_host}:9100'
+    return jsonify({
+        'success': True,
+        'steps': steps,
+        'message': f'Authentik enabled for Federation Hub. Use tak.<FQDN> then open Fed Hub from Authentik apps, or {fedhub_url} — forward_auth + OIDC configured.',
+    })
+
+
+def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deploy'):
+    """SCP Federation Hub .deb from UPLOAD_DIR to remote, apt install, restart service; register console when successful."""
+    def plog(msg):
+        entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
+        log_list.append(entry)
+        print(entry, flush=True)
+    try:
+        plog(f'━━━ Federation Hub — {phase_label} ━━━')
+        settings = load_settings()
+        cfg = _get_fedhub_deployment_config(settings)
+        if cfg.get('target_mode') != 'remote' or not (cfg.get('remote', {}).get('host') or '').strip():
+            plog('✗ Remote host not configured — save the SSH target on this page first.')
+            status_dict.update({'running': False, 'complete': True, 'error': True})
+            return
+        remote = cfg['remote']
+        # On fresh VPS images, unattended-upgrades frequently grabs apt locks.
+        # Disable it up-front so deploy/update doesn't stall for long lock waits.
+        try:
+            uu_before = _get_unattended_upgrades_status_remote(remote) or {}
+            if uu_before.get('error'):
+                plog(f"⚠ Could not read unattended-upgrades status: {uu_before.get('error')}")
+            else:
+                plog(f"Unattended upgrades (before): enabled={uu_before.get('enabled')} running={uu_before.get('running')}")
+            if uu_before.get('enabled') or uu_before.get('running'):
+                plog('Disabling unattended-upgrades temporarily for package install...')
+                ok_uu, uu_res = _run_unattended_upgrades_remote(remote, 'disable')
+                if ok_uu:
+                    plog(f"✓ Unattended upgrades disabled on target (enabled={uu_res.get('enabled')}, running={uu_res.get('running')})")
+                else:
+                    plog(f"⚠ Could not disable unattended-upgrades cleanly: {(uu_res or {}).get('error', 'unknown')}")
+            else:
+                plog('Unattended upgrades already inactive on target.')
+        except Exception as e:
+            plog(f'⚠ Unattended-upgrades pre-check failed: {str(e)[:220]}')
+
+        deb_fn, deb_path = _find_fedhub_deb_in_uploads()
+        if not deb_path:
+            plog('✗ No Federation Hub .deb in uploads. Upload takserver-fed-hub from TAK.gov here first.')
+            status_dict.update({'running': False, 'complete': True, 'error': True})
+            return
+        plog(f'Package: {deb_fn}')
+        plog('━━━ Apt lock cleanup on target ━━━')
+        _ok_u, out_u = _ssh_probe(remote, _fedhub_remote_apt_unlock_cmd(), timeout=90)
+        if out_u:
+            plog(out_u[:2000])
+        plog('━━━ SCP to /tmp/ ━━━')
+        ok_scp, scp_out = _scp_to_host(remote, deb_path, '/tmp/', timeout=300)
+        if not ok_scp:
+            plog(f'✗ SCP failed: {scp_out or "unknown"}')
+            status_dict.update({'running': False, 'complete': True, 'error': True})
+            return
+        plog('✓ Copied to target /tmp/')
+        # takserver-fed-hub preinst backs up policies/*; missing dir or empty glob makes cp fail (first install).
+        plog('━━━ Prepare /opt/tak/federation-hub/policies (vendor preinst) ━━━')
+        prep_policies = (
+            'sudo mkdir -p /opt/tak/federation-hub/policies && '
+            'if [ -z "$(ls /opt/tak/federation-hub/policies 2>/dev/null)" ]; then '
+            'sudo touch /opt/tak/federation-hub/policies/fedhub-install-placeholder; fi'
+        )
+        ok_prep, prep_out = _ssh_probe(remote, prep_policies, timeout=30)
+        if not ok_prep:
+            plog(f'✗ Could not prepare policies dir: {prep_out or "ssh failed"}')
+            status_dict.update({'running': False, 'complete': True, 'error': True})
+            return
+        # Local .deb must be ./name.deb or apt treats the name as a repository package (and fails to locate it).
+        fnq = shlex.quote('./' + deb_fn)
+        install_cmd = (
+            f'cd /tmp && sudo apt-get update -qq && '
+            f'sudo DEBIAN_FRONTEND=noninteractive apt-get install -y {fnq}'
+        )
+        plog('━━━ apt-get install ━━━')
+        plog('This step installs Federation Hub on the remote host.')
+        plog('If unattended-upgrades or apt lock cleanup is active, this can take 5-20+ minutes.')
+        lock_diag_cmd = (
+            "sudo bash -lc '"
+            "if systemctl is-active --quiet unattended-upgrades; then echo \"unattended-upgrades: active\"; "
+            "else echo \"unattended-upgrades: inactive\"; fi; "
+            "if command -v fuser >/dev/null 2>&1; then "
+            "fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock 2>/dev/null || true; "
+            "fi'"
+        )
+        _ok_lock, out_lock = _ssh_probe(remote, lock_diag_cmd, timeout=20)
+        if out_lock:
+            plog(('APT lock status:\n' + out_lock.strip())[:1200])
+        plog('Running apt-get now...')
+        ok_inst, out_inst = _ssh_probe(remote, install_cmd, timeout=600)
+        if out_inst:
+            tail = out_inst[-4500:] if len(out_inst) > 4500 else out_inst
+            plog(tail)
+        if not ok_inst:
+            plog('✗ apt-get install failed — fix errors on target, then redeploy or update')
+            status_dict.update({'running': False, 'complete': True, 'error': True})
+            return
+        fh_dir = '/opt/tak/federation-hub'
+        ok_d, _dout = _ssh_probe(remote, f'test -d {fh_dir} && echo OK', timeout=15)
+        if not (ok_d and 'OK' in (_dout or '')):
+            plog(f'✗ {fh_dir} not found after install — package may be broken')
+            status_dict.update({'running': False, 'complete': True, 'error': True})
+            return
+
+        # --- MongoDB (required by Federation Hub) ---
+        plog('━━━ Install & start MongoDB ━━━')
+        mongo_cmds = (
+            'if ! command -v mongod >/dev/null 2>&1; then '
+            '  distro_codename=$(awk -F= "/^VERSION_CODENAME=/{ print tolower(\\$2) }" /etc/*-release | tr -d \'\\"\'); '
+            '  rm -f /usr/share/keyrings/mongodb-server-8.0.gpg; '
+            '  curl -fsSL https://www.mongodb.org/static/pgp/server-8.0.asc | gpg --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg; '
+            '  echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg ] https://repo.mongodb.org/apt/ubuntu ${distro_codename}/mongodb-org/8.0 multiverse" '
+            '    > /etc/apt/sources.list.d/mongodb-org-8.0.list; '
+            '  apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y mongodb-org; '
+            'fi && '
+            'systemctl daemon-reload && systemctl enable mongod && systemctl start mongod && '
+            'sleep 2 && systemctl is-active mongod'
+        )
+        ok_mg, mg_out = _ssh_probe(remote, f'sudo bash -c {shlex.quote(mongo_cmds)}', timeout=300)
+        if mg_out:
+            plog(mg_out[-2000:] if len(mg_out) > 2000 else mg_out)
+        if not ok_mg or 'active' not in (mg_out or ''):
+            plog('✗ MongoDB install/start failed — Federation Hub requires MongoDB')
+            status_dict.update({'running': False, 'complete': True, 'error': True})
+            return
+        plog('✓ MongoDB is active')
+
+        # --- MongoDB password → federation-hub-broker.yml ---
+        plog('━━━ Configure MongoDB password ━━━')
+        mongo_pass_cmd = (
+            f'cd {fh_dir}/configs && '
+            'if ! grep -qE "^dbPassword: .+" federation-hub-broker.yml 2>/dev/null; then '
+            '  DBPW=$(openssl rand -base64 14 | tr -dc a-zA-Z0-9); '
+            '  sed -i "s/^dbPassword:.*/dbPassword: ${DBPW}/" federation-hub-broker.yml; '
+            '  echo "SET:${DBPW}"; '
+            'else echo "EXISTS"; fi'
+        )
+        ok_dbpw, dbpw_out = _ssh_probe(remote, f'sudo bash -c {shlex.quote(mongo_pass_cmd)}', timeout=30)
+        if not ok_dbpw:
+            plog(f'⚠ MongoDB password patch warning: {dbpw_out}')
+        else:
+            plog('✓ MongoDB password configured in broker.yml')
+
+        # --- Run vendor DB configure script ---
+        db_script = f'{fh_dir}/scripts/db/configure.sh'
+        ok_dbcfg, dbcfg_out = _ssh_probe(remote, f'test -x {db_script} && sudo {db_script} 2>&1 || echo SKIP', timeout=60)
+        if dbcfg_out and 'SKIP' not in dbcfg_out:
+            plog(dbcfg_out[-1500:] if len(dbcfg_out) > 1500 else dbcfg_out)
+        plog('✓ MongoDB configured')
+
+        # --- Certificate generation (mirrors installTAK fedWizard) ---
+        plog('━━━ Generate Federation Hub certificates ━━━')
+        settings = load_settings()
+        cert_pass = _get_fedhub_cert_password(settings)
+        dn = _fedhub_cert_dn(settings)
+        root_ca = (settings.get('fedhub_root_ca') or settings.get('root_ca_name') or 'FEDHUB-ROOT-CA').strip()
+        int_ca = (settings.get('fedhub_intermediate_ca') or settings.get('intermediate_ca_name') or 'FEDHUB-INT-CA').strip()
+        plog(f'  Root CA: {root_ca} | Intermediate CA: {int_ca}')
+
+        hostname_ok, hostname_out = _ssh_probe(remote, 'hostname', timeout=10)
+        remote_hostname = (hostname_out or 'fedhub').strip() or 'fedhub'
+
+        # Patch cert-metadata.sh (same as TAK Server deploy does for /opt/tak/certs/cert-metadata.sh)
+        meta_subs = [
+            ('COUNTRY', dn['country']),
+            ('STATE', dn['state']),
+            ('CITY', dn['city']),
+            ('ORGANIZATION', dn['org']),
+            ('ORGANIZATIONAL_UNIT', dn['ou']),
+        ]
+        meta_cmds = f'cd {fh_dir}/certs && sudo cp cert-metadata.sh cert-metadata.sh.bak 2>/dev/null; true'
+        for var, val in meta_subs:
+            safe_val = shlex.quote(val)
+            meta_cmds += f" && sudo sed -i 's/^{var}=.*/{var}={safe_val}/' cert-metadata.sh"
+        if cert_pass and cert_pass != 'atakatak':
+            meta_cmds += f" && sudo sed -i 's/^CAPASS=.*/CAPASS={shlex.quote(cert_pass)}/' cert-metadata.sh"
+            meta_cmds += f" && sudo sed -i 's/^PASS=.*/PASS={shlex.quote(cert_pass)}/' cert-metadata.sh"
+        ok_meta, meta_out = _ssh_probe(remote, meta_cmds, timeout=30)
+        if not ok_meta:
+            plog(f'⚠ cert-metadata.sh patch warning: {meta_out}')
+        else:
+            plog(f'  cert-metadata.sh patched (COUNTRY={meta_subs[0][1]}, STATE={meta_subs[1][1]}, CITY={meta_subs[2][1]}, ORG={meta_subs[3][1]}, OU={meta_subs[4][1]})')
+
+        cert_cmds = (
+            f'cd {fh_dir}/certs && '
+            f'if [ -f files/{shlex.quote(remote_hostname)}.jks ]; then echo "CERTS_EXIST"; exit 0; fi && '
+            f'sudo chown -R tak:tak {fh_dir} && '
+            f'sudo -u tak ./makeRootCa.sh --ca-name {shlex.quote(root_ca)} 2>&1 && '
+            f'echo y | sudo -u tak ./makeCert.sh ca {shlex.quote(int_ca)} 2>&1 && '
+            f'sudo -u tak ./makeCert.sh server {shlex.quote(remote_hostname)} 2>&1 && '
+            f'echo y | sudo -u tak ./makeCert.sh client webadmin-fed 2>&1'
+        )
+        ok_cert, cert_out = _ssh_probe(remote, cert_cmds, timeout=120)
+        if cert_out:
+            plog(cert_out[-3000:] if len(cert_out) > 3000 else cert_out)
+        if not ok_cert:
+            plog('✗ Certificate generation failed')
+            status_dict.update({'running': False, 'complete': True, 'error': True})
+            return
+        certs_existed = 'CERTS_EXIST' in (cert_out or '')
+        if certs_existed:
+            plog('✓ Certificates already exist — skipping generation')
+        else:
+            plog('✓ Certificates generated')
+
+        # --- Patch config YAMLs: truststore name + keystore name ---
+        if not certs_existed:
+            plog('━━━ Patch Federation Hub config files ━━━')
+            patch_cmds = (
+                f'cd {fh_dir}/configs && '
+                f'sudo sed -i "s/truststore-root/truststore-{shlex.quote(int_ca)}/g" federation-hub-ui.yml && '
+                f'sudo sed -i "s/takserver\\.jks/{shlex.quote(remote_hostname)}.jks/g" federation-hub-broker.yml && '
+                f'sudo sed -i "s/takserver\\.jks/{shlex.quote(remote_hostname)}.jks/g" federation-hub-ui.yml'
+            )
+            ok_patch, patch_out = _ssh_probe(remote, patch_cmds, timeout=30)
+            if not ok_patch:
+                plog(f'⚠ Config patch warning: {patch_out}')
+            else:
+                plog('✓ Config files patched (truststore + keystore names)')
+
+            # Cert password: if non-default, replace atakatak in broker.yml + ui.yml
+            if cert_pass and cert_pass != 'atakatak':
+                pw_cmd = (
+                    f'cd {fh_dir}/configs && '
+                    f'sudo sed -i "s/atakatak/{shlex.quote(cert_pass)}/g" federation-hub-broker.yml && '
+                    f'sudo sed -i "s/atakatak/{shlex.quote(cert_pass)}/g" federation-hub-ui.yml'
+                )
+                _ssh_probe(remote, pw_cmd, timeout=20)
+                plog('✓ Certificate password applied to config files')
+
+        # --- chown + systemd ---
+        plog('━━━ Start Federation Hub services ━━━')
+        _ssh_probe(remote, f'sudo chown -R tak:tak {fh_dir}', timeout=30)
+        _ssh_probe(remote, 'sudo systemctl daemon-reload', timeout=30)
+        _ssh_probe(remote, 'sudo systemctl enable federation-hub 2>/dev/null; true', timeout=30)
+        _ssh_probe(remote, f'sudo touch {fh_dir}/logs/federation-hub-ui.log && sudo chown tak:tak {fh_dir}/logs/federation-hub-ui.log', timeout=15)
+        _ssh_probe(remote, 'sudo systemctl restart federation-hub 2>&1', timeout=90)
+
+        # Wait for UI to start (up to ~90s, checking log for "Started FederationHubUIServer")
+        plog('Waiting for Federation Hub UI to start…')
+        ui_started = False
+        for attempt in range(18):
+            time.sleep(5)
+            ok_log, log_out = _ssh_probe(remote, f'tail -20 {fh_dir}/logs/federation-hub-ui.log 2>/dev/null', timeout=15)
+            if log_out and 'Started FederationHubUIServer' in log_out:
+                ui_started = True
+                break
+            if log_out and 'Application run failed' in log_out:
+                plog(f'✗ Federation Hub UI failed to start:\n{log_out[-1500:]}')
+                status_dict.update({'running': False, 'complete': True, 'error': True})
+                return
+        if not ui_started:
+            ok_st2, st2_out = _ssh_probe(remote, 'systemctl is-active federation-hub 2>/dev/null', timeout=15)
+            if (st2_out or '').strip() == 'active':
+                plog('⚠ federation-hub active but UI startup message not yet seen — may still be loading')
+            else:
+                plog(f'✗ federation-hub not active (state: {(st2_out or "").strip() or "unknown"})')
+                status_dict.update({'running': False, 'complete': True, 'error': True})
+                return
+        else:
+            plog('✓ Federation Hub UI started on port 9100')
+
+        # --- Auto-enable Authentik OAuth on fresh deploys when Authentik is installed ---
+        try:
+            settings = load_settings()
+            fqdn = (settings.get('fqdn') or '').strip()
+            ak_installed = bool(detect_modules().get('authentik', {}).get('installed'))
+            if fqdn and ak_installed:
+                plog('━━━ Enable Authentik OAuth (auto) ━━━')
+                reachable, ak_err = _check_authentik_api_reachable(settings)
+                if not reachable:
+                    plog(f'⚠ Skipping auto OAuth enable: Authentik API unreachable ({ak_err})')
+                else:
+                    client_id, client_secret, _auth_url, _token_url = _ensure_authentik_fedhub_oauth_app(
+                        settings, plog=plog
+                    )
+                    fh_domain = _get_service_domain(settings, 'fedhub')
+                    fh_host = fh_domain or (remote.get('host') or '').strip()
+                    redirect_uri = (
+                        f'https://{fh_host}/api/oauth/login/redirect'
+                        if fh_domain else f'https://{fh_host}:9100/api/oauth/login/redirect'
+                    )
+                    ak_host = _get_authentik_host(settings) or f'authentik.{fqdn}'
+                    ak_public = f'https://{ak_host}'
+                    oidc_config_url = f'{ak_public}/application/o/fedhub/.well-known/openid-configuration'
+                    auth_endpoint_url = f'{ak_public}/application/o/authorize/'
+                    token_endpoint_url = f'{ak_public}/application/o/token/'
+
+                    der_cmd = (
+                        f'sudo mkdir -p /opt/tak/certs && '
+                        f'sudo chown tak:tak /opt/tak/certs && '
+                        f'echo | openssl s_client -connect {ak_host}:443 -servername {ak_host} 2>/dev/null '
+                        f'| openssl x509 -outform DER -out /opt/tak/certs/keycloak.der 2>/dev/null && '
+                        f'chown tak:tak /opt/tak/certs/keycloak.der && '
+                        f'chmod 644 /opt/tak/certs/keycloak.der'
+                    )
+                    ok_der, _ = _ssh_probe(remote, der_cmd, timeout=30)
+                    if ok_der:
+                        plog(f'✓ keycloak.der generated from {ak_host}')
+                    else:
+                        plog('⚠ keycloak.der generation failed (OAuth may fail until fixed)')
+
+                    if client_id and client_secret:
+                        patch_cmd = (
+                            f'cd {fh_dir}/configs && '
+                            f'sudo sed -i -E "/^keycloak(Auth|Token)Endpoint[[:space:]]*:/d; /^keycloak(Access|Refresh)TokenName[[:space:]]*:/d" federation-hub-ui.yml && '
+                            f'sudo sed -i "s/^allowOauth:.*/allowOauth: true/" federation-hub-ui.yml && '
+                            f'sudo sed -i "s|^keycloakServerName:.*|keycloakServerName: {ak_public}|" federation-hub-ui.yml && '
+                            f'sudo sed -i "s|^keycloakClientId:.*|keycloakClientId: {shlex.quote(client_id)}|" federation-hub-ui.yml && '
+                            f'sudo sed -i "s|^keycloakSecret:.*|keycloakSecret: {shlex.quote(client_secret)}|" federation-hub-ui.yml && '
+                            f'sudo sed -i "s|^keycloakRedirectUri:.*|keycloakRedirectUri: {redirect_uri}|" federation-hub-ui.yml && '
+                            f'sudo sed -i "s|^keycloakrRedirectUri:.*|keycloakrRedirectUri: {redirect_uri}|" federation-hub-ui.yml && '
+                            f'sudo sed -i "s|^keycloakClaimName:.*|keycloakClaimName: groups|" federation-hub-ui.yml && '
+                            f'sudo sed -i "s|^keycloakAdminClaimValue:.*|keycloakAdminClaimValue: authentik Admins|" federation-hub-ui.yml && '
+                            f'sudo sed -i "s|^keycloakDerLocation:.*|keycloakTlsCertFile: /opt/tak/certs/keycloak.der|" federation-hub-ui.yml && '
+                            f'sudo sed -i "s|^keycloakTlsCertFile:.*|keycloakTlsCertFile: /opt/tak/certs/keycloak.der|" federation-hub-ui.yml && '
+                            f'sudo sed -i "s|^keycloakConfigurationEndpoint:.*|keycloakConfigurationEndpoint: {oidc_config_url}|" federation-hub-ui.yml && '
+                            f'sudo sed -i -e \'$a\\\' federation-hub-ui.yml && '
+                            f'grep -q "^keycloakAuthEndpoint:" federation-hub-ui.yml || echo "keycloakAuthEndpoint: {auth_endpoint_url}" | sudo tee -a federation-hub-ui.yml > /dev/null && '
+                            f'grep -q "^keycloakTokenEndpoint:" federation-hub-ui.yml || echo "keycloakTokenEndpoint: {token_endpoint_url}" | sudo tee -a federation-hub-ui.yml > /dev/null && '
+                            f'grep -q "^keycloakAccessTokenName:" federation-hub-ui.yml || echo "keycloakAccessTokenName: access_token" | sudo tee -a federation-hub-ui.yml > /dev/null && '
+                            f'grep -q "^keycloakRefreshTokenName:" federation-hub-ui.yml || echo "keycloakRefreshTokenName: refresh_token" | sudo tee -a federation-hub-ui.yml > /dev/null && '
+                            f'grep -q "^keycloakRedirectUri:" federation-hub-ui.yml || echo "keycloakRedirectUri: {redirect_uri}" | sudo tee -a federation-hub-ui.yml > /dev/null && '
+                            f'grep -q "^keycloakrRedirectUri:" federation-hub-ui.yml || echo "keycloakrRedirectUri: {redirect_uri}" | sudo tee -a federation-hub-ui.yml > /dev/null && '
+                            f'grep -q "^keycloakConfigurationEndpoint:" federation-hub-ui.yml || echo "keycloakConfigurationEndpoint: {oidc_config_url}" | sudo tee -a federation-hub-ui.yml > /dev/null'
+                        )
+                        ok_patch, _ = _ssh_probe(remote, patch_cmd, timeout=30)
+                        if ok_patch:
+                            plog('✓ federation-hub-ui.yml patched for Authentik OAuth')
+                            _ssh_probe(remote, 'sudo systemctl restart federation-hub 2>&1', timeout=90)
+                            plog('✓ federation-hub restarted after OAuth patch')
+                        else:
+                            plog('⚠ Auto OAuth patch failed — use "Enable Authentik login" button')
+
+                    ak_token2 = _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+                    if ak_token2 and fqdn:
+                        _ensure_authentik_fedhub_proxy_app(fqdn, ak_token2, plog=plog, settings=settings)
+                        try:
+                            ak_url = _get_authentik_api_url(settings)
+                            ak_headers = {'Authorization': f'Bearer {ak_token2}', 'Content-Type': 'application/json'}
+                            _repair_embedded_outpost_all_apps(ak_url, ak_headers, settings, plog=plog)
+                        except Exception as e:
+                            plog(f'⚠ Outpost repair after FedHub: {str(e)[:120]}')
+                    _caddy_regenerate_if_fqdn()
+            else:
+                plog('AuthentiK auto OAuth step skipped (Authentik not installed or FQDN missing).')
+        except Exception as e:
+            plog(f'⚠ Auto OAuth enable step failed: {str(e)[:240]}')
+
+        # --- Register webadmin cert ---
+        if not certs_existed:
+            plog('━━━ Register admin certificate ━━━')
+            mgr_cmd = (
+                f'sudo -u tak java -jar {fh_dir}/jars/federation-hub-manager.jar '
+                f'{fh_dir}/certs/files/webadmin-fed.pem 2>&1'
+            )
+            ok_adm, adm_out = _ssh_probe(remote, mgr_cmd, timeout=60)
+            if adm_out:
+                plog(adm_out[-1000:] if len(adm_out) > 1000 else adm_out)
+            if ok_adm:
+                plog('✓ webadmin-fed certificate registered')
+            else:
+                plog('⚠ Admin cert registration returned non-zero — you may need to register manually')
+            # Copy webadmin-fed.p12 to /root/ for easy download
+            _ssh_probe(remote, f'sudo cp {fh_dir}/certs/files/webadmin-fed.p12 /root/ 2>/dev/null; true', timeout=15)
+
+        # --- Firewall ---
+        plog('━━━ Firewall (UFW) ━━━')
+        _ssh_probe(remote, 'sudo ufw allow 22/tcp > /dev/null 2>&1; true', timeout=15)
+        for p in ['8080/tcp', '9100/tcp', '9101/tcp', '9102/tcp', '9103/tcp']:
+            _ssh_probe(remote, f'sudo ufw allow {p} > /dev/null 2>&1; true', timeout=15)
+        _ssh_probe(remote, 'sudo ufw --force enable > /dev/null 2>&1; true', timeout=15)
+        plog('✓ Firewall configured (22, 8080, 9100-9103)')
+
+        plog('━━━ Verify ━━━')
+        ok_9100, out_9100 = _ssh_probe(remote, 'ss -tlnp | grep :9100 || true', timeout=15)
+        if out_9100 and '9100' in out_9100:
+            plog('✓ Port 9100 is listening (Federation Hub UI)')
+        else:
+            plog('⚠ Port 9100 not yet listening — UI may still be starting')
+
+        cfg2 = {**cfg, 'deployed': True, 'target_mode': 'remote'}
+        settings = load_settings()
+        settings['fedhub_deployment'] = _normalize_module_deployment_config(cfg2)
+        save_settings(settings)
+        plog('✓ Console registration updated (deployed)')
+        plog('')
+        plog('━━━ Complete ━━━')
+        plog(f'Federation Hub UI: https://{remote.get("host")}:9100')
+        plog('Import webadmin-fed.p12 (in /root/ on the target) into your browser to log in.')
+        plog('Password: ' + cert_pass)
+        plog('Note: unattended-upgrades remains disabled after deploy/update; re-enable from Console > Unattended Upgrades when ready.')
+        plog('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
+        status_dict.update({'running': False, 'complete': True, 'error': False})
+        _caddy_regenerate_if_fqdn()
+    except Exception as e:
+        plog(f'✗ {e}')
+        status_dict.update({'running': False, 'complete': True, 'error': True})
+
+
+def run_fedhub_remote_deploy():
+    _fedhub_run_remote_package_install(fedhub_deploy_log, fedhub_deploy_status, phase_label='Deploy')
+
+
+def run_fedhub_remote_update():
+    _fedhub_run_remote_package_install(fedhub_upgrade_log, fedhub_upgrade_status, phase_label='Update')
+
+
+@app.route('/api/fedhub/cert-settings', methods=['POST'])
+@login_required
+def fedhub_cert_settings_api():
+    """Persist Federation Hub cert DN / CA names / optional password override (console settings)."""
+    data = request.get_json() or {}
+    fc = data.get('fedhub_cert') if isinstance(data.get('fedhub_cert'), dict) else data
+    if not isinstance(fc, dict):
+        return jsonify({'success': False, 'error': 'Expected JSON object or fedhub_cert object.'}), 400
+    settings = load_settings()
+    err = _merge_fedhub_cert_request_into_settings(settings, fc)
+    if err:
+        return jsonify({'success': False, 'error': err}), 400
+    save_settings(settings)
+    return jsonify({'success': True})
+
+
+@app.route('/api/fedhub/deploy', methods=['POST'])
+@login_required
+def fedhub_deploy_api():
+    if fedhub_deploy_status.get('running'):
+        return jsonify({'error': 'Deployment already in progress'}), 409
+    if fedhub_upgrade_status.get('running'):
+        return jsonify({'error': 'An update is already in progress — wait for it to finish.'}), 409
+    data = request.get_json() or {}
+    fc = data.get('fedhub_cert')
+    if isinstance(fc, dict):
+        settings = load_settings()
+        err = _merge_fedhub_cert_request_into_settings(settings, fc)
+        if err:
+            return jsonify({'error': err}), 400
+        save_settings(settings)
+    if data.get('config'):
+        settings = load_settings()
+        base = _get_fedhub_deployment_config(settings)
+        inc = data.get('config') if isinstance(data.get('config'), dict) else {}
+        cfg = _normalize_module_deployment_config(_deep_merge_dict(base, inc))
+        settings['fedhub_deployment'] = cfg
+        save_settings(settings)
+        _caddy_regenerate_if_fqdn()
+    fedhub_deploy_log.clear()
+    fedhub_deploy_status.update({'running': True, 'complete': False, 'error': False})
+    threading.Thread(target=run_fedhub_remote_deploy, daemon=True).start()
+    return jsonify({'success': True})
+
+
+@app.route('/api/fedhub/deploy/log')
+@login_required
+def fedhub_deploy_log_api():
+    idx = request.args.get('index', 0, type=int)
+    return jsonify({
+        'entries': fedhub_deploy_log[idx:], 'total': len(fedhub_deploy_log),
+        'running': fedhub_deploy_status['running'], 'complete': fedhub_deploy_status['complete'],
+        'error': fedhub_deploy_status['error'],
+    })
+
+
+@app.route('/api/fedhub/update', methods=['POST'])
+@login_required
+def fedhub_update_api():
+    if fedhub_upgrade_status.get('running'):
+        return jsonify({'error': 'Update already in progress'}), 409
+    if fedhub_deploy_status.get('running'):
+        return jsonify({'error': 'A deploy is already in progress — wait for it to finish.'}), 409
+    settings = load_settings()
+    cfg = _get_fedhub_deployment_config(settings)
+    if not cfg.get('deployed'):
+        return jsonify({
+            'error': 'Federation Hub is not registered yet. Use Deploy to remote host first (or Confirm install if you installed manually).',
+        }), 400
+    data = request.get_json() or {}
+    fc = data.get('fedhub_cert')
+    if isinstance(fc, dict):
+        err = _merge_fedhub_cert_request_into_settings(settings, fc)
+        if err:
+            return jsonify({'error': err}), 400
+        save_settings(settings)
+    if data.get('config'):
+        base = _get_fedhub_deployment_config(settings)
+        inc = data.get('config') if isinstance(data.get('config'), dict) else {}
+        cfg = _normalize_module_deployment_config(_deep_merge_dict(base, inc))
+        settings['fedhub_deployment'] = cfg
+        save_settings(settings)
+        _caddy_regenerate_if_fqdn()
+    fedhub_upgrade_log.clear()
+    fedhub_upgrade_status.update({'running': True, 'complete': False, 'error': False})
+    threading.Thread(target=run_fedhub_remote_update, daemon=True).start()
+    return jsonify({'success': True})
+
+
+@app.route('/api/fedhub/update/log')
+@login_required
+def fedhub_update_log_api():
+    idx = request.args.get('index', 0, type=int)
+    return jsonify({
+        'entries': fedhub_upgrade_log[idx:], 'total': len(fedhub_upgrade_log),
+        'running': fedhub_upgrade_status['running'], 'complete': fedhub_upgrade_status['complete'],
+        'error': fedhub_upgrade_status['error'],
+    })
+
+
+def _fedhub_next_numbered_ca_name(current_name, default_stem):
+    """Next PKI name for Fed Hub rotation: …-01, …-02 (two-digit). Unnumbered stem gets -01 first."""
+    name = (current_name or '').strip() or default_stem
+    head, sep, tail = name.rpartition('-')
+    if sep and len(tail) == 2 and tail.isdigit():
+        n = int(tail, 10) + 1
+        if n <= 99:
+            return f'{head}-{n:02d}'
+        return f'{head}-{n}'
+    return f'{name}-01'
+
+
+def run_fedhub_remote_rotate_ca(new_root_ca=None, new_int_ca=None):
+    def plog(msg):
+        fedhub_rotate_log.append(msg)
+
+    try:
+        settings = load_settings()
+        cfg = _get_fedhub_deployment_config(settings)
+        if not cfg.get('deployed'):
+            plog('✗ Federation Hub is not registered. Deploy first.')
+            fedhub_rotate_status.update({'running': False, 'complete': True, 'error': True})
+            return
+        if cfg.get('target_mode') != 'remote':
+            plog('✗ Rotate CA is only supported for remote Federation Hub targets.')
+            fedhub_rotate_status.update({'running': False, 'complete': True, 'error': True})
+            return
+        remote = cfg.get('remote', {})
+        if not (remote.get('host') or '').strip():
+            plog('✗ Remote host is not configured.')
+            fedhub_rotate_status.update({'running': False, 'complete': True, 'error': True})
+            return
+
+        fh_dir = '/opt/tak/federation-hub'
+        ok_dir, out_dir = _ssh_probe(remote, f'test -d {fh_dir} && echo OK', timeout=20)
+        if not ok_dir or 'OK' not in (out_dir or ''):
+            plog(f'✗ {fh_dir} not found on target host')
+            fedhub_rotate_status.update({'running': False, 'complete': True, 'error': True})
+            return
+
+        ts = datetime.utcnow().strftime('%Y%m%d-%H%M%S')
+        base_root = (new_root_ca or settings.get('fedhub_root_ca') or settings.get('root_ca_name') or 'FEDHUB-ROOT-CA').strip()
+        base_int = (new_int_ca or settings.get('fedhub_intermediate_ca') or settings.get('intermediate_ca_name') or 'FEDHUB-INT-CA').strip()
+        if new_root_ca:
+            safe_root = re.sub(r'[^a-zA-Z0-9._-]', '-', base_root).strip('-') or 'FEDHUB-ROOT-CA'
+        else:
+            safe_root = re.sub(
+                r'[^a-zA-Z0-9._-]', '-',
+                _fedhub_next_numbered_ca_name(base_root, 'FEDHUB-ROOT-CA'),
+            ).strip('-') or 'FEDHUB-ROOT-CA-01'
+        if new_int_ca:
+            safe_int = re.sub(r'[^a-zA-Z0-9._-]', '-', base_int).strip('-') or 'FEDHUB-INT-CA'
+        else:
+            safe_int = re.sub(
+                r'[^a-zA-Z0-9._-]', '-',
+                _fedhub_next_numbered_ca_name(base_int, 'FEDHUB-INT-CA'),
+            ).strip('-') or 'FEDHUB-INT-CA-01'
+        cert_pass = _get_fedhub_cert_password(settings)
+        dn = _fedhub_cert_dn(settings)
+
+        ok_host, host_out = _ssh_probe(remote, 'hostname', timeout=10)
+        remote_hostname = (host_out or 'fedhub').strip() or 'fedhub'
+
+        plog('━━━ Rotate Federation Hub CA ━━━')
+        plog(f'  Host: {remote.get("host")}')
+        plog(f'  New Root CA: {safe_root}')
+        plog(f'  New Intermediate CA: {safe_int}')
+
+        backup_cmd = (
+            f'cd {fh_dir}/certs && '
+            f'sudo mkdir -p backups && '
+            f'sudo tar -czf backups/pre-rotate-{ts}.tgz files 2>/dev/null || true'
+        )
+        _ssh_probe(remote, backup_cmd, timeout=45)
+        plog(f'✓ Backup created: {fh_dir}/certs/backups/pre-rotate-{ts}.tgz')
+
+        meta_subs = [
+            ('COUNTRY', dn['country']),
+            ('STATE', dn['state']),
+            ('CITY', dn['city']),
+            ('ORGANIZATION', dn['org']),
+            ('ORGANIZATIONAL_UNIT', dn['ou']),
+        ]
+        meta_cmds = f'cd {fh_dir}/certs && sudo cp cert-metadata.sh cert-metadata.sh.bak 2>/dev/null; true'
+        for var, val in meta_subs:
+            meta_cmds += f" && sudo sed -i 's/^{var}=.*/{var}={shlex.quote(val)}/' cert-metadata.sh"
+        if cert_pass and cert_pass != 'atakatak':
+            meta_cmds += f" && sudo sed -i 's/^CAPASS=.*/CAPASS={shlex.quote(cert_pass)}/' cert-metadata.sh"
+            meta_cmds += f" && sudo sed -i 's/^PASS=.*/PASS={shlex.quote(cert_pass)}/' cert-metadata.sh"
+        ok_meta, meta_out = _ssh_probe(remote, meta_cmds, timeout=30)
+        if not ok_meta:
+            plog(f'⚠ cert-metadata patch warning: {(meta_out or "")[:240]}')
+        else:
+            plog('✓ cert-metadata patched')
+
+        cert_cmds = (
+            f'cd {fh_dir}/certs && '
+            f'sudo chown -R tak:tak {fh_dir} && '
+            f'sudo -u tak ./makeRootCa.sh --ca-name {shlex.quote(safe_root)} 2>&1 && '
+            f'echo y | sudo -u tak ./makeCert.sh ca {shlex.quote(safe_int)} 2>&1 && '
+            f'sudo -u tak ./makeCert.sh server {shlex.quote(remote_hostname)} 2>&1 && '
+            f'echo y | sudo -u tak ./makeCert.sh client webadmin-fed 2>&1'
+        )
+        ok_cert, cert_out = _ssh_probe(remote, cert_cmds, timeout=180)
+        if cert_out:
+            plog(cert_out[-3000:] if len(cert_out) > 3000 else cert_out)
+        if not ok_cert:
+            plog('✗ Certificate rotation failed')
+            fedhub_rotate_status.update({'running': False, 'complete': True, 'error': True})
+            return
+        plog('✓ New CA + server + webadmin-fed cert generated')
+
+        patch_cfg_cmd = (
+            f'cd {fh_dir}/configs && '
+            f'sudo sed -i -E "s|truststore-[A-Za-z0-9._-]+|truststore-{safe_int}|g" federation-hub-ui.yml && '
+            f'sudo sed -i "s/takserver\\.jks/{shlex.quote(remote_hostname)}.jks/g" federation-hub-broker.yml && '
+            f'sudo sed -i "s/takserver\\.jks/{shlex.quote(remote_hostname)}.jks/g" federation-hub-ui.yml'
+        )
+        ok_cfg, cfg_out = _ssh_probe(remote, patch_cfg_cmd, timeout=30)
+        if not ok_cfg:
+            plog(f'⚠ Config patch warning: {(cfg_out or "")[:240]}')
+        else:
+            plog('✓ Federation Hub config files updated')
+
+        if cert_pass and cert_pass != 'atakatak':
+            pw_cmd = (
+                f'cd {fh_dir}/configs && '
+                f'sudo sed -i "s/atakatak/{shlex.quote(cert_pass)}/g" federation-hub-broker.yml && '
+                f'sudo sed -i "s/atakatak/{shlex.quote(cert_pass)}/g" federation-hub-ui.yml'
+            )
+            _ssh_probe(remote, pw_cmd, timeout=20)
+            plog('✓ Certificate password re-applied to config files')
+
+        mgr_cmd = (
+            f'sudo -u tak java -jar {fh_dir}/jars/federation-hub-manager.jar '
+            f'{fh_dir}/certs/files/webadmin-fed.pem 2>&1'
+        )
+        ok_mgr, mgr_out = _ssh_probe(remote, mgr_cmd, timeout=60)
+        if mgr_out:
+            plog(mgr_out[-1000:] if len(mgr_out) > 1000 else mgr_out)
+        if ok_mgr:
+            plog('✓ webadmin-fed certificate re-registered')
+        else:
+            plog('⚠ webadmin-fed registration returned non-zero')
+
+        _ssh_probe(remote, f'sudo cp {fh_dir}/certs/files/webadmin-fed.p12 /root/ 2>/dev/null; true', timeout=15)
+        plog('✓ webadmin-fed.p12 copied to /root/')
+
+        ok_restart, restart_out = _ssh_probe(remote, 'sudo systemctl restart federation-hub 2>&1', timeout=90)
+        if restart_out:
+            plog(restart_out[-800:] if len(restart_out) > 800 else restart_out)
+        if not ok_restart:
+            plog('✗ federation-hub restart failed')
+            fedhub_rotate_status.update({'running': False, 'complete': True, 'error': True})
+            return
+
+        ok_state, state_out = _ssh_probe(remote, 'systemctl is-active federation-hub 2>/dev/null', timeout=20)
+        state = (state_out or '').strip()
+        if state != 'active':
+            plog(f'✗ federation-hub state is {state or "unknown"} after restart')
+            fedhub_rotate_status.update({'running': False, 'complete': True, 'error': True})
+            return
+
+        settings = load_settings()
+        settings['fedhub_root_ca'] = safe_root
+        settings['fedhub_intermediate_ca'] = safe_int
+        save_settings(settings)
+
+        plog('✓ federation-hub is active')
+        plog('━━━ Rotation complete ━━━')
+        plog('Import the new webadmin-fed.p12 in your browser before next login.')
+        fedhub_rotate_status.update({'running': False, 'complete': True, 'error': False})
+    except Exception as e:
+        plog(f'✗ {e}')
+        fedhub_rotate_status.update({'running': False, 'complete': True, 'error': True})
+
+
+@app.route('/api/fedhub/rotate-ca', methods=['POST'])
+@login_required
+def fedhub_rotate_ca_api():
+    if fedhub_rotate_status.get('running'):
+        return jsonify({'error': 'CA rotation already in progress'}), 409
+    if fedhub_deploy_status.get('running') or fedhub_upgrade_status.get('running'):
+        return jsonify({'error': 'Wait for deploy/update to finish before rotating CA.'}), 409
+    data = request.get_json() or {}
+    new_root_ca = (data.get('new_root_ca') or '').strip() or None
+    new_int_ca = (data.get('new_int_ca') or '').strip() or None
+    fedhub_rotate_log.clear()
+    fedhub_rotate_status.update({'running': True, 'complete': False, 'error': False})
+    threading.Thread(target=run_fedhub_remote_rotate_ca, args=(new_root_ca, new_int_ca), daemon=True).start()
+    return jsonify({'success': True})
+
+
+@app.route('/api/fedhub/rotate-ca/log')
+@login_required
+def fedhub_rotate_ca_log_api():
+    idx = request.args.get('index', 0, type=int)
+    return jsonify({
+        'entries': fedhub_rotate_log[idx:], 'total': len(fedhub_rotate_log),
+        'running': fedhub_rotate_status['running'], 'complete': fedhub_rotate_status['complete'],
+        'error': fedhub_rotate_status['error'],
+    })
+
+
 def _caddy_letsencrypt_days_left(settings):
     """Return days until Let's Encrypt cert expires (for primary FQDN), or None if unavailable."""
     fqdn = (settings.get('fqdn') or '').strip().split(':')[0]
@@ -4648,6 +5820,9 @@ def _caddy_configured_urls(settings, modules):
     mtx = modules.get('mediamtx', {})
     if mtx.get('installed'):
         urls.append({'name': 'MediaMTX', 'host': sd['mediamtx'], 'url': f'https://{sd["mediamtx"]}', 'desc': 'Stream web console & HLS'})
+    fedhub = modules.get('fedhub', {})
+    if fedhub.get('installed'):
+        urls.append({'name': 'Federation Hub', 'host': sd['fedhub'], 'url': f'https://{sd["fedhub"]}', 'desc': 'Hub web UI (TLS at Caddy; see TAK.gov for admin login)'})
     return urls
 
 @app.route('/caddy')
@@ -4854,6 +6029,7 @@ def caddy_get_domains():
         ('cloudtak_tiles', 'CloudTAK Tiles', 'cloudtak', modules.get('cloudtak', {}).get('installed', False)),
         ('cloudtak_video', 'CloudTAK Video', 'cloudtak', modules.get('cloudtak', {}).get('installed', False)),
         ('mediamtx', 'MediaMTX', 'mediamtx', modules.get('mediamtx', {}).get('installed', False)),
+        ('fedhub', 'Federation Hub', 'fedhub', modules.get('fedhub', {}).get('installed', False)),
     ]
     for key, label, mod_key, installed in svc_defs:
         setting_key = f'{key}_domain' if key != 'mediamtx' else 'mediamtx_domain'
@@ -4897,6 +6073,7 @@ SERVICE_DOMAIN_DEFAULTS = {
     'cloudtak_tiles': 'tiles.map',
     'cloudtak_video': 'video',
     'mediamtx': 'stream',
+    'fedhub': 'fedhub',
 }
 
 def _get_service_domain(settings, service_key):
@@ -5018,6 +6195,17 @@ def _get_module_deployment_config(settings, key):
     return _normalize_module_deployment_config(settings.get(key, {}))
 
 
+def _get_fedhub_deployment_config(settings):
+    """fedhub_deployment plus web_ui_port (remote hub web port for Caddy reverse_proxy)."""
+    c = _normalize_module_deployment_config(settings.get('fedhub_deployment', {}))
+    try:
+        p = int(c.get('web_ui_port') if c.get('web_ui_port') is not None else 8080)
+    except (TypeError, ValueError):
+        p = 8080
+    c['web_ui_port'] = max(1, min(65535, p))
+    return c
+
+
 def _module_deployment_settings_key(module_name):
     """Settings key for a module's deployment config. e.g. 'takportal' -> 'takportal_deployment'."""
     return f'{module_name}_deployment'
@@ -5064,7 +6252,7 @@ def _module_copy(deploy_cfg, local_path, remote_path, timeout=30, log_fn=None):
             return False, str(e)[:200]
 
 
-def _register_module_remote_routes(module_name, settings_key):
+def _register_module_remote_routes(module_name, settings_key, get_config_fn=None):
     """Register generic deployment-config, SSH key, and test routes for a module.
 
     Creates:
@@ -5073,32 +6261,51 @@ def _register_module_remote_routes(module_name, settings_key):
       POST /api/{module}/remote/ensure-ssh-key
       POST /api/{module}/remote/install-ssh-key
       POST /api/{module}/remote/test
+
+    get_config_fn: optional callable(settings) -> dict (e.g. _get_fedhub_deployment_config).
     """
     key_label = f'infra-tak-{module_name}-remote'
     default_key_path = os.path.expanduser(f'~/.ssh/infra-tak-{module_name}')
+
+    def _read_cfg(settings):
+        if get_config_fn:
+            return get_config_fn(settings)
+        return _get_module_deployment_config(settings, settings_key)
 
     @app.route(f'/api/{module_name}/deployment-config', methods=['GET'], endpoint=f'{module_name}_get_deploy_cfg')
     @login_required
     def get_cfg():
         settings = load_settings()
-        return jsonify(_get_module_deployment_config(settings, settings_key))
+        return jsonify(_read_cfg(settings))
 
     @app.route(f'/api/{module_name}/deployment-config', methods=['POST'], endpoint=f'{module_name}_save_deploy_cfg')
     @login_required
     def save_cfg():
         data = request.get_json() or {}
         settings = load_settings()
-        cfg = _normalize_module_deployment_config(data.get('config') or data)
+        base = _read_cfg(settings)
+        incoming = data.get('config') or data
+        if not isinstance(incoming, dict):
+            incoming = {}
+        cfg = _normalize_module_deployment_config(_deep_merge_dict(base, incoming))
         settings[settings_key] = cfg
         save_settings(settings)
-        return jsonify(cfg)
+        settings_after = load_settings()
+        out = _read_cfg(settings_after)
+        if module_name == 'fedhub' and (settings_after.get('fqdn') or '').strip():
+            try:
+                generate_caddyfile(settings_after)
+                threading.Thread(target=_caddy_restart_after_response, daemon=True).start()
+            except Exception:
+                pass
+        return jsonify(out)
 
     @app.route(f'/api/{module_name}/remote/ensure-ssh-key', methods=['POST'], endpoint=f'{module_name}_ensure_ssh_key')
     @login_required
     def ensure_key():
         data = request.get_json() or {}
         settings = load_settings()
-        cfg = _get_module_deployment_config(settings, settings_key)
+        cfg = _read_cfg(settings)
         if isinstance(data.get('config'), dict):
             cfg = _normalize_module_deployment_config(_deep_merge_dict(cfg, data['config']))
         rcfg = cfg.get('remote', {})
@@ -5129,7 +6336,7 @@ def _register_module_remote_routes(module_name, settings_key):
         settings[settings_key] = _normalize_module_deployment_config(cfg)
         save_settings(settings)
         return jsonify({'success': True, 'key_path': kp, 'public_key': pk, 'fingerprint': fp,
-                        'config': settings[settings_key]})
+                        'config': _read_cfg(load_settings())})
 
     @app.route(f'/api/{module_name}/remote/install-ssh-key', methods=['POST'], endpoint=f'{module_name}_install_ssh_key')
     @login_required
@@ -5139,7 +6346,7 @@ def _register_module_remote_routes(module_name, settings_key):
         if not pwd:
             return jsonify({'success': False, 'error': 'Password is required'}), 400
         settings = load_settings()
-        cfg = _get_module_deployment_config(settings, settings_key)
+        cfg = _read_cfg(settings)
         if isinstance(data.get('config'), dict):
             cfg = _normalize_module_deployment_config(_deep_merge_dict(cfg, data['config']))
         rcfg = cfg.get('remote', {})
@@ -5169,14 +6376,14 @@ def _register_module_remote_routes(module_name, settings_key):
         cfg['target_mode'] = 'remote'
         settings[settings_key] = _normalize_module_deployment_config(cfg)
         save_settings(settings)
-        return jsonify({'success': True, 'message': 'SSH key installed', 'config': settings[settings_key]})
+        return jsonify({'success': True, 'message': 'SSH key installed', 'config': _read_cfg(load_settings())})
 
     @app.route(f'/api/{module_name}/remote/test', methods=['POST'], endpoint=f'{module_name}_test_ssh')
     @login_required
     def test_ssh():
         data = request.get_json() or {}
         settings = load_settings()
-        cfg = _get_module_deployment_config(settings, settings_key)
+        cfg = _read_cfg(settings)
         if isinstance(data.get('config'), dict):
             cfg = _normalize_module_deployment_config(_deep_merge_dict(cfg, data['config']))
         rcfg = cfg.get('remote', {})
@@ -5192,6 +6399,7 @@ _register_module_remote_routes('takportal', 'takportal_deployment')
 _register_module_remote_routes('authentik', 'authentik_deployment')
 _register_module_remote_routes('mediamtx', 'mediamtx_deployment')
 _register_module_remote_routes('nodered', 'nodered_deployment')
+_register_module_remote_routes('fedhub', 'fedhub_deployment', get_config_fn=_get_fedhub_deployment_config)
 
 
 def _get_cloudtak_upstreams(settings):
@@ -5659,6 +6867,82 @@ def _get_tak_cert_password(settings):
     """Current TAK cert export password (default atakatak)."""
     return (settings.get('tak_cert_password') or 'atakatak').strip() or 'atakatak'
 
+
+def _get_fedhub_cert_password(settings):
+    """Fed Hub keystore / webadmin.p12 password: optional override, else TAK console password."""
+    return (
+        (settings.get('fedhub_cert_password') or settings.get('tak_cert_password') or 'atakatak').strip()
+        or 'atakatak'
+    )
+
+
+def _fedhub_cert_dn(settings):
+    """Resolved DN fields for Federation Hub cert-metadata (fedhub_* overrides, else console cert_*)."""
+    def pick(fed_key, global_key, default):
+        v = (settings.get(fed_key) or settings.get(global_key) or default or '').strip()
+        return v if v else default
+
+    return {
+        'country': pick('fedhub_cert_country', 'cert_country', 'US'),
+        'state': pick('fedhub_cert_state', 'cert_state', 'State'),
+        'city': pick('fedhub_cert_city', 'cert_city', 'City'),
+        'org': pick('fedhub_cert_org', 'cert_org', 'TAK'),
+        'ou': pick('fedhub_cert_ou', 'cert_ou', 'FederationHub'),
+    }
+
+
+def _merge_fedhub_cert_request_into_settings(settings, fc):
+    """Apply fedhub_cert dict from JSON into settings. Returns error string or None."""
+    if not isinstance(fc, dict):
+        return None
+    errs = []
+    mapping = [
+        ('cert_country', 'fedhub_cert_country', 'Country'),
+        ('cert_state', 'fedhub_cert_state', 'State'),
+        ('cert_city', 'fedhub_cert_city', 'City'),
+        ('cert_org', 'fedhub_cert_org', 'Organization'),
+        ('cert_ou', 'fedhub_cert_ou', 'Org Unit'),
+    ]
+    for json_key, set_key, label in mapping:
+        if json_key not in fc:
+            continue
+        raw = (fc.get(json_key) or '').strip()
+        if not raw:
+            settings.pop(set_key, None)
+            continue
+        try:
+            settings[set_key] = _sanitize_cert_field(raw, label).upper()
+        except ValueError as e:
+            errs.append(str(e))
+    for json_key, set_key, default in [
+        ('root_ca_name', 'fedhub_root_ca', 'FEDHUB-ROOT-CA'),
+        ('intermediate_ca_name', 'fedhub_intermediate_ca', 'FEDHUB-INT-CA'),
+    ]:
+        if json_key not in fc:
+            continue
+        raw = (fc.get(json_key) or '').strip()
+        if not raw:
+            settings.pop(set_key, None)
+            continue
+        safe = re.sub(r'[^a-zA-Z0-9._-]', '-', raw).strip('-') or default
+        settings[set_key] = safe
+    if 'cert_password' in fc:
+        pw = (fc.get('cert_password') or '').strip()
+        if pw:
+            if not _validate_cert_password(pw):
+                errs.append(
+                    'Certificate password contains unsupported characters for remote shell scripts '
+                    '(use letters, digits, and limited punctuation only).'
+                )
+            else:
+                settings['fedhub_cert_password'] = pw
+        else:
+            settings.pop('fedhub_cert_password', None)
+    if errs:
+        return '; '.join(errs)[:800]
+    return None
+
+
 def _validate_cert_password(pw):
     """Return True if password is safe for shell interpolation (no metacharacters like $, `, ;, &, |, etc.)."""
     return bool(pw) and bool(_CERT_PASS_SAFE_RE.match(pw))
@@ -5932,6 +7216,63 @@ def _get_authentik_env_value(settings, key):
             return val
     return None
 
+
+def _authentik_application_open_in_new_tab(ak_url, ak_headers, slug, plog=None):
+    """PATCH Authentik application so My applications uses target=_blank for the launch URL.
+    Logs HTTP/parse failures via plog when provided (previously all errors were swallowed)."""
+    import urllib.request as _ur
+    import urllib.error as _ue
+    import urllib.parse as _uparse
+    _log = plog or (lambda _m: None)
+    if not ak_url or not ak_headers or not slug:
+        return
+    slug = str(slug).strip().strip('/')
+    if not slug:
+        return
+    enc = _uparse.quote(slug, safe='')
+    url = f'{ak_url.rstrip("/")}/api/v3/core/applications/{enc}/'
+    headers = dict(ak_headers)
+    headers.setdefault('Accept', 'application/json')
+    try:
+        req = _ur.Request(
+            url,
+            data=json.dumps({'open_in_new_tab': True}).encode(),
+            headers=headers, method='PATCH')
+        with _ur.urlopen(req, timeout=10) as resp:
+            raw = (resp.read() or b'').decode()
+        data = {}
+        if raw.strip():
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                _log(f"  ⚠ open_in_new_tab ({slug}): PATCH response not JSON ({raw[:80]!r})")
+                return
+        else:
+            try:
+                gr = _ur.Request(url, headers=headers, method='GET')
+                with _ur.urlopen(gr, timeout=10) as grsp:
+                    data = json.loads((grsp.read() or b'{}').decode())
+            except Exception as ge:
+                _log(f"  ⚠ open_in_new_tab ({slug}): empty PATCH body, GET verify failed: {str(ge)[:100]}")
+                return
+        oint = data.get('open_in_new_tab')
+        if oint is None:
+            oint = data.get('openInNewTab')
+        if oint is not True:
+            _log(
+                f"  ⚠ open_in_new_tab ({slug}): field still false after PATCH "
+                f"(got {oint!r}) — check Authentik version / API token permissions"
+            )
+    except _ue.HTTPError as e:
+        try:
+            err_body = (e.read() or b'').decode()[:400]
+        except Exception:
+            err_body = ''
+        _log(f"  ⚠ open_in_new_tab ({slug}): HTTP {e.code} {err_body}")
+    except Exception as ex:
+        _log(f"  ⚠ open_in_new_tab ({slug}): {str(ex)[:160]}")
+
+
 def _tak_deployment_defaults():
     """Default TAK deployment shape (single-server by default, optional two-server fields)."""
     return {
@@ -6064,7 +7405,11 @@ def _ssh_probe(host_cfg, cmd='echo ok', timeout=15):
         r = subprocess.run(ssh_cmd, **run_kw)
         if r.returncode == 0:
             return True, (r.stdout or '').strip()
-        return False, ((r.stderr or '') + '\n' + (r.stdout or '')).strip()
+        combined = ((r.stderr or '') + '\n' + (r.stdout or '')).strip()
+        if not combined:
+            safe_cmd = ' '.join(ssh_cmd[:ssh_cmd.index(f'{user}@{host}') + 1]) + ' <cmd>'
+            combined = f'exit {r.returncode}, no output. cmd: {safe_cmd}'
+        return False, combined
     except Exception as e:
         return False, str(e)
 
@@ -6093,6 +7438,52 @@ def _local_deb_control_fields(deb_path):
         return (pkg or None, ver or None)
     except Exception:
         return None, None
+
+
+def _validate_fedhub_deb_path(deb_path):
+    """True if .deb is the TAK Federation Hub package (dpkg-deb Package contains fed + hub)."""
+    pkg, _ver = _local_deb_control_fields(deb_path)
+    if not pkg:
+        return False, 'Could not read package name from .deb (dpkg-deb -f). Run upload from a Linux console host.'
+    pl = pkg.lower()
+    if 'fed' in pl and 'hub' in pl:
+        return True, None
+    return False, f'Wrong package: "{pkg}" — upload takserver-fed-hub .deb from TAK.gov'
+
+
+def _find_fedhub_deb_in_uploads():
+    """Newest valid Federation Hub .deb in UPLOAD_DIR. Returns (filename, full_path) or (None, None)."""
+    candidates = []
+    try:
+        names = os.listdir(UPLOAD_DIR)
+    except OSError:
+        return None, None
+    for fn in names:
+        if not fn.endswith('.deb'):
+            continue
+        fp = os.path.join(UPLOAD_DIR, fn)
+        if not os.path.isfile(fp):
+            continue
+        ok_m, _err = _validate_fedhub_deb_path(fp)
+        if ok_m:
+            candidates.append((fn, fp, os.path.getmtime(fp)))
+    if not candidates:
+        return None, None
+    candidates.sort(key=lambda x: x[2], reverse=True)
+    return candidates[0][0], candidates[0][1]
+
+
+def _fedhub_remote_apt_unlock_cmd():
+    """Same lock cleanup pattern as TAK Server One database deploy."""
+    return (
+        'sudo killall -q apt-get dpkg unattended-upgr 2>/dev/null; '
+        'for i in 1 2 3 4 5 6; do '
+        'fuser /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || break; '
+        'echo "Waiting for apt lock ($i)…"; sleep 5; done; '
+        'sudo rm -f /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock 2>/dev/null; '
+        'sudo dpkg --configure -a 2>/dev/null; '
+        'sudo apt-get -f install -y 2>/dev/null; true'
+    )
 
 
 def _assert_uploaded_db_deb_matches_server_one(s1_ref_cfg, local_deb_path, deb_filename):
@@ -6337,7 +7728,7 @@ def generate_caddyfile(settings=None):
             lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
             lines.append(f"")
             lines.append(f"        @public {{")
-            lines.append(f"            path /request-access* /lookup* /styles.css /favicon.ico /branding/* /public/*")
+            lines.append(f"            path /request-access* /lookup* /locate/* /styles.css /favicon.ico /branding/* /public/*")
             lines.append(f"        }}")
             lines.append(f"")
             lines.append(f"        handle @public {{")
@@ -6434,6 +7825,63 @@ def generate_caddyfile(settings=None):
         lines.append(f"}}")
         lines.append("")
 
+    fedhub = modules.get('fedhub', {})
+    if fedhub.get('installed'):
+        fhcfg = _get_fedhub_deployment_config(settings)
+        fh_remote = (fhcfg.get('remote', {}).get('host') or '').strip()
+        if fh_remote and fhcfg.get('target_mode') == 'remote':
+            fh_host = sd['fedhub']
+            fh_port = int(fhcfg.get('web_ui_port') or 8080)
+            fh_upstream = f'{fh_remote}:{fh_port}'
+            fh_upstream_scheme = 'https' if fh_port in (9100, 8446) else 'http'
+            fh_rp_block = []
+            fh_rp_block.append(f"reverse_proxy {fh_upstream_scheme}://{fh_upstream} {{")
+            fh_rp_block.append(f"    header_up X-Forwarded-Port 443")
+            fh_rp_block.append(f"    header_up X-Forwarded-Proto https")
+            fh_rp_block.append(f"    header_up X-Forwarded-Host {{host}}")
+            fh_rp_block.append(f"    header_up Host {{host}}")
+            fh_rp_block.append(f"    transport http {{")
+            if fh_upstream_scheme == 'https':
+                fh_rp_block.append(f"        tls")
+                fh_rp_block.append(f"        tls_insecure_skip_verify")
+            fh_rp_block.append(f"        read_timeout 120s")
+            fh_rp_block.append(f"        write_timeout 120s")
+            fh_rp_block.append(f"    }}")
+            fh_rp_block.append(f"}}")
+
+            # Fed Hub: Caddy forward_auth (Authentik) when Authentik is installed — matches “My applications”
+            # launch after tak.<fqdn> login (session already at edge; often skips Fed Hub’s local OIDC screen).
+            # OAuth provider + federation-hub-ui.yml still used for Fed Hub’s own OIDC when needed.
+            lines.append(f"# TAK Federation Hub — Caddy terminates public TLS and proxies to remote hub web port")
+            lines.append(f"{fh_host} {{")
+            if ak.get('installed'):
+                # Static/UI assets must not go through forward_auth — Authentik returns HTML and the browser
+                # rejects CSS/JS as wrong MIME type. Fed Hub also serves some files from site root (poly-*.js, PNG).
+                lines.append(f"    route {{")
+                lines.append(f"        @fh_pub {{")
+                lines.append(f"            path /static/* /favicon.ico /Parsons_TAK.png /poly-*")
+                lines.append(f"        }}")
+                lines.append(f"        handle @fh_pub {{")
+                for rp_line in fh_rp_block:
+                    lines.append(f"            {rp_line}")
+                lines.append(f"        }}")
+                lines.append(f"        handle {{")
+                lines.append(f"            reverse_proxy /outpost.goauthentik.io/* {ak_up}")
+                lines.append(f"            forward_auth {ak_up} {{")
+                lines.append(f"                uri /outpost.goauthentik.io/auth/caddy")
+                lines.append(f"                copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid")
+                lines.append(f"                trusted_proxies private_ranges")
+                lines.append(f"            }}")
+                for rp_line in fh_rp_block:
+                    lines.append(f"            {rp_line}")
+                lines.append(f"        }}")
+                lines.append(f"    }}")
+            else:
+                for rp_line in fh_rp_block:
+                    lines.append(f"    {rp_line}")
+            lines.append(f"}}")
+            lines.append("")
+
     caddyfile = '\n'.join(lines)
     # Preserve user-added blocks (e.g. health.tntak.net for Uptime Robot) that sit below the marker.
     if os.path.exists(CADDYFILE_PATH):
@@ -6450,6 +7898,19 @@ def generate_caddyfile(settings=None):
     with open(CADDYFILE_PATH, 'w') as f:
         f.write(caddyfile)
     return caddyfile
+
+
+def _caddy_regenerate_if_fqdn():
+    """Rewrite Caddyfile and reload Caddy when a base FQDN is set (e.g. after Fed Hub register/deploy)."""
+    try:
+        s = load_settings()
+        if not (s.get('fqdn') or '').strip():
+            return
+        generate_caddyfile(s)
+        threading.Thread(target=_caddy_restart_after_response, daemon=True).start()
+    except Exception:
+        pass
+
 
 def wait_for_apt_lock(log_fn, log_list):
     """
@@ -6888,6 +8349,30 @@ def _get_takserver_version_info():
     return out
 
 
+def _get_fedhub_version_info():
+    """Return {version, update_available, latest} for takserver-fed-hub on the remote Fed Hub host (dpkg)."""
+    out = {'version': '', 'update_available': False, 'latest': None}
+    settings = load_settings()
+    cfg = _get_fedhub_deployment_config(settings)
+    if not cfg.get('deployed') or (cfg.get('target_mode') or '') != 'remote':
+        return out
+    remote = cfg.get('remote') or {}
+    if not (remote.get('host') or '').strip():
+        return out
+    pkg = 'takserver-fed-hub'
+    cmd = f"dpkg-query -W -f'${{Version}}' {shlex.quote(pkg)} 2>/dev/null"
+    ok, ver_out = _ssh_probe(remote, cmd, timeout=15)
+    ver = (ver_out or '').strip()
+    if not ver:
+        cmd2 = f"dpkg -s {shlex.quote(pkg)} 2>/dev/null | sed -n 's/^Version: //p'"
+        ok2, ver2 = _ssh_probe(remote, cmd2, timeout=15)
+        if ok2:
+            ver = (ver2 or '').strip()
+    if ver:
+        out['version'] = ver
+    return out
+
+
 def _get_caddy_version_info():
     """Return {version: str, update_available: bool} for Caddy."""
     out = {'version': '', 'update_available': False}
@@ -7209,6 +8694,8 @@ def get_all_module_versions():
         result['takportal'] = _get_takportal_version_info()
     if modules.get('takserver', {}).get('installed'):
         result['takserver'] = _get_takserver_version_info()
+    if modules.get('fedhub', {}).get('installed'):
+        result['fedhub'] = _get_fedhub_version_info()
     # Guard Dog: version/update follow infra-TAK (scripts ship with console; "Update Guard Dog" uses same codebase)
     if modules.get('guarddog', {}).get('installed'):
         gd_latest = update_cache.get('latest')
@@ -7907,7 +9394,7 @@ def run_takportal_deploy():
                     try:
                         req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/',
                             data=json_mod.dumps({'name': 'TAK Portal', 'slug': 'tak-portal',
-                                'provider': provider_pk}).encode(),
+                                'provider': provider_pk, 'open_in_new_tab': True}).encode(),
                             headers=_ak_headers, method='POST')
                         _urlreq.urlopen(req, timeout=10)
                         plog(f"  \u2713 Application 'TAK Portal' created")
@@ -7916,6 +9403,7 @@ def run_takportal_deploy():
                             plog(f"  \u2713 Application 'TAK Portal' already exists")
                         else:
                             plog(f"  \u26a0 Application error: {str(e)[:80]}")
+                    _authentik_application_open_in_new_tab(_ak_url, _ak_headers, 'tak-portal', plog=plog)
 
                     # Add to embedded outpost (retry-safe; API can still be warming up)
                     outpost_ok = False
@@ -8009,6 +9497,15 @@ def certs_page():
 # ── MediaMTX ──────────────────────────────────────────────────────────────────
 mediamtx_deploy_log = []
 mediamtx_deploy_status = {'running': False, 'complete': False, 'error': False}
+
+fedhub_deploy_log = []
+fedhub_deploy_status = {'running': False, 'complete': False, 'error': False}
+
+fedhub_upgrade_log = []
+fedhub_upgrade_status = {'running': False, 'complete': False, 'error': False}
+
+fedhub_rotate_log = []
+fedhub_rotate_status = {'running': False, 'complete': False, 'error': False}
 
 @app.route('/api/mediamtx/deploy', methods=['POST'])
 @login_required
@@ -8112,12 +9609,12 @@ def mediamtx_recovery():
                 with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as pf:
                     pf.write(script)
                     tmp_patch = pf.name
-                ok_copy = _module_copy(deploy_cfg, tmp_patch, f'/tmp/{name}.py', timeout=15)
+                copy_ok, _cm = _module_copy(deploy_cfg, tmp_patch, f'/tmp/{name}.py', timeout=15)
                 try:
                     os.unlink(tmp_patch)
                 except Exception:
                     pass
-                if ok_copy:
+                if copy_ok:
                     _module_run(deploy_cfg, f'python3 /tmp/{name}.py && rm -f /tmp/{name}.py', timeout=15)
         else:
             if os.path.isfile(editor_path):
@@ -8143,8 +9640,8 @@ def mediamtx_recovery():
         tmp_f = tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False)
         tmp_f.write(MEDIAMTX_ENSURE_OVERLAY_SCRIPT)
         tmp_f.close()
-        ok_copy = _module_copy(deploy_cfg, tmp_f.name, '/tmp/ensure_overlay.py', timeout=15)
-        if not ok_copy:
+        copy_ok, _cm = _module_copy(deploy_cfg, tmp_f.name, '/tmp/ensure_overlay.py', timeout=15)
+        if not copy_ok:
             return jsonify({'error': 'Failed to copy overlay script to target'}), 500
         # Install script, make ExecStartPre best-effort so a failing pre-step cannot block start, then restart
         cmd = (
@@ -11463,8 +12960,8 @@ print("OK_RESTARTED")
     try:
         with open(tmp_path, 'w') as f:
             f.write(script_content)
-        ok_copy = _module_copy({'target_mode': 'remote', 'remote': remote_cfg}, tmp_path, tmp_path, timeout=15)
-        if not ok_copy:
+        copy_ok, _cm = _module_copy({'target_mode': 'remote', 'remote': remote_cfg}, tmp_path, tmp_path, timeout=15)
+        if not copy_ok:
             if log_fn:
                 log_fn("  ⚠ Could not copy Docker log-limits script to remote")
             return False, False
@@ -11805,7 +13302,7 @@ def _ensure_authentik_nodered_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
             try:
                 req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/',
                     data=json.dumps({'name': 'Node-RED', 'slug': 'node-red',
-                        'provider': provider_pk}).encode(),
+                        'provider': provider_pk, 'open_in_new_tab': True}).encode(),
                     headers=_ak_headers, method='POST')
                 _urlreq.urlopen(req, timeout=10)
                 log("  ✓ Application 'Node-RED' created")
@@ -11813,7 +13310,7 @@ def _ensure_authentik_nodered_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
                 if hasattr(e, 'code') and e.code == 400:
                     try:
                         req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/node-red/',
-                            data=json.dumps({'provider': provider_pk}).encode(),
+                            data=json.dumps({'provider': provider_pk, 'open_in_new_tab': True}).encode(),
                             headers=_ak_headers, method='PATCH')
                         _urlreq.urlopen(req, timeout=10)
                     except Exception:
@@ -11824,8 +13321,106 @@ def _ensure_authentik_nodered_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
 
             # 5) Add to embedded outpost
             _outpost_add_providers_safe(_ak_url, _ak_headers, [provider_pk], plog=log)
+            _authentik_application_open_in_new_tab(_ak_url, _ak_headers, 'node-red', plog=log)
         else:
             log("  ⚠ Could not create or find Node-RED proxy provider")
+    except Exception as e:
+        log(f"  ⚠ Forward auth setup error: {str(e)[:100]}")
+    return True
+
+def _ensure_authentik_fedhub_proxy_app(fqdn, ak_token, plog=None, flow_pk=None, inv_flow_pk=None, settings=None):
+    """Create Federation Hub proxy provider + application in Authentik, add to embedded outpost.
+    Same pattern as Node-RED / MediaMTX — Caddy forward_auth protects the route."""
+    if not fqdn or not ak_token:
+        return False
+    def log(msg):
+        if plog:
+            plog(msg)
+    import urllib.request as _urlreq
+    import urllib.error
+    _ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+    _ak_url = _get_authentik_api_url(settings) if settings else 'http://127.0.0.1:9090'
+
+    try:
+        if not flow_pk or not inv_flow_pk:
+            for attempt in range(36):
+                try:
+                    req = _urlreq.Request(f'{_ak_url}/api/v3/flows/instances/?designation=authorization&ordering=slug', headers=_ak_headers)
+                    resp = _urlreq.urlopen(req, timeout=10)
+                    flows = json.loads(resp.read().decode())['results']
+                    flow_pk = next((f['pk'] for f in flows if 'implicit' in f.get('slug', '')), flows[0]['pk'] if flows else None)
+                    if flow_pk:
+                        req = _urlreq.Request(f'{_ak_url}/api/v3/flows/instances/?designation=invalidation', headers=_ak_headers)
+                        resp = _urlreq.urlopen(req, timeout=10)
+                        inv_flows = json.loads(resp.read().decode())['results']
+                        inv_flow_pk = next((f['pk'] for f in inv_flows if 'provider' not in f.get('slug', '')), inv_flows[0]['pk'] if inv_flows else None)
+                        if inv_flow_pk:
+                            break
+                except Exception:
+                    pass
+                if attempt % 6 == 0:
+                    log(f"  ⏳ Waiting for authorization flow... ({attempt * 5}s)")
+                time.sleep(5)
+            if not flow_pk or not inv_flow_pk:
+                log("  ⚠ No authorization/invalidation flow — skipping Federation Hub proxy provider")
+                return False
+            log("  ✓ Got authorization and invalidation flows")
+
+        fedhub_domain = _get_service_domain(settings, 'fedhub') if settings else f'fedhub.{fqdn}'
+        provider_pk = None
+        try:
+            req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/',
+                data=json.dumps({'name': 'Federation Hub Proxy', 'authorization_flow': flow_pk,
+                    'invalidation_flow': inv_flow_pk,
+                    'external_host': f'https://{fedhub_domain}', 'mode': 'forward_single',
+                    'token_validity': 'hours=24', 'cookie_domain': f'.{fqdn.split(":")[0]}'}).encode(),
+                headers=_ak_headers, method='POST')
+            resp = _urlreq.urlopen(req, timeout=10)
+            provider_pk = json.loads(resp.read().decode())['pk']
+            log("  ✓ Federation Hub proxy provider created")
+        except Exception as e:
+            if hasattr(e, 'code') and e.code == 400:
+                req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/?search={urllib.parse.quote("Federation Hub")}', headers=_ak_headers)
+                resp = _urlreq.urlopen(req, timeout=10)
+                results = json.loads(resp.read().decode())['results']
+                if results:
+                    provider_pk = results[0]['pk']
+                    try:
+                        req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/{provider_pk}/',
+                            data=json.dumps({'external_host': f'https://{fedhub_domain}', 'cookie_domain': f'.{fqdn.split(":")[0]}'}).encode(),
+                            headers=_ak_headers, method='PATCH')
+                        _urlreq.urlopen(req, timeout=10)
+                    except Exception:
+                        pass
+                log("  ✓ Federation Hub proxy provider already exists (external_host updated)")
+            else:
+                log(f"  ⚠ Proxy provider error: {str(e)[:100]}")
+
+        if provider_pk:
+            try:
+                req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/',
+                    data=json.dumps({'name': 'Federation Hub', 'slug': 'federation-hub',
+                        'provider': provider_pk, 'open_in_new_tab': True}).encode(),
+                    headers=_ak_headers, method='POST')
+                _urlreq.urlopen(req, timeout=10)
+                log("  ✓ Application 'Federation Hub' created")
+            except Exception as e:
+                if hasattr(e, 'code') and e.code == 400:
+                    try:
+                        req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/federation-hub/',
+                            data=json.dumps({'provider': provider_pk, 'open_in_new_tab': True}).encode(),
+                            headers=_ak_headers, method='PATCH')
+                        _urlreq.urlopen(req, timeout=10)
+                    except Exception:
+                        pass
+                    log("  ✓ Application 'Federation Hub' updated")
+                else:
+                    log(f"  ⚠ Application error: {str(e)[:80]}")
+
+            _outpost_add_providers_safe(_ak_url, _ak_headers, [provider_pk], plog=log)
+            _authentik_application_open_in_new_tab(_ak_url, _ak_headers, 'federation-hub', plog=log)
+        else:
+            log("  ⚠ Could not create or find Federation Hub proxy provider")
     except Exception as e:
         log(f"  ⚠ Forward auth setup error: {str(e)[:100]}")
     return True
@@ -11905,7 +13500,7 @@ def _ensure_authentik_console_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
             if pk:
                 try:
                     req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/',
-                        data=json.dumps({'name': name, 'slug': slug, 'provider': pk}).encode(),
+                        data=json.dumps({'name': name, 'slug': slug, 'provider': pk, 'open_in_new_tab': True}).encode(),
                         headers=_ak_headers, method='POST')
                     _urlreq.urlopen(req, timeout=10)
                     log(f"  ✓ Application created: {name}")
@@ -11913,7 +13508,7 @@ def _ensure_authentik_console_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
                     if hasattr(e, 'code') and e.code == 400:
                         try:
                             req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/{slug}/',
-                                data=json.dumps({'provider': pk}).encode(),
+                                data=json.dumps({'provider': pk, 'open_in_new_tab': True}).encode(),
                                 headers=_ak_headers, method='PATCH')
                             _urlreq.urlopen(req, timeout=10)
                         except Exception:
@@ -11936,7 +13531,7 @@ def _ensure_authentik_console_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
                         if results:
                             pk = results[0]['pk']
                             req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/',
-                                data=json.dumps({'name': name, 'slug': slug, 'provider': pk}).encode(),
+                                data=json.dumps({'name': name, 'slug': slug, 'provider': pk, 'open_in_new_tab': True}).encode(),
                                 headers=_ak_headers, method='POST')
                             _urlreq.urlopen(req, timeout=10)
                             if pk not in provider_pks:
@@ -11945,12 +13540,230 @@ def _ensure_authentik_console_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
                     except Exception:
                         pass
 
+        for _name, _slug, _host in entries:
+            _authentik_application_open_in_new_tab(_ak_url, _ak_headers, _slug, plog=log)
         if provider_pks:
             _outpost_add_providers_safe(_ak_url, _ak_headers, provider_pks, plog=log)
         return True
     except Exception as e:
         log(f"  ⚠ Console forward auth setup: {str(e)[:100]}")
         return False
+
+
+def _ensure_authentik_fedhub_oauth_app(settings, plog=None):
+    """Create an OAuth2/OIDC provider + application in Authentik for Federation Hub UI login.
+    Follows the same pattern as _ensure_authentik_nodered_app / TAK Portal proxy providers.
+    Returns (client_id, client_secret, authorize_url, token_url) or (None,...) on failure."""
+    import urllib.request as _urlreq
+    import urllib.error
+    def log(msg):
+        if plog:
+            plog(msg)
+    ak_url = _get_authentik_api_url(settings)
+    token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
+    if not token:
+        log('  ✗ No Authentik API token found in .env')
+        return None, None, None, None
+    _ak_headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+    ak_public = _get_authentik_base_url(settings)
+
+    slug = 'fedhub'
+    provider_name = 'Federation Hub'
+
+    try:
+        # Get authorization + invalidation flows (same pattern as Node-RED / TAK Portal)
+        flow_pk, inv_flow_pk = None, None
+        for attempt in range(6):
+            try:
+                req = _urlreq.Request(f'{ak_url}/api/v3/flows/instances/?designation=authorization&ordering=slug', headers=_ak_headers)
+                auth_flows = json.loads(_urlreq.urlopen(req, timeout=15).read().decode())['results']
+                flow_pk = next((f['pk'] for f in auth_flows if 'implicit' in f.get('slug', '')), auth_flows[0]['pk'] if auth_flows else None)
+                req = _urlreq.Request(f'{ak_url}/api/v3/flows/instances/?designation=invalidation&ordering=slug', headers=_ak_headers)
+                inv_flows = json.loads(_urlreq.urlopen(req, timeout=15).read().decode())['results']
+                inv_flow_pk = inv_flows[0]['pk'] if inv_flows else None
+            except Exception:
+                pass
+            if flow_pk and inv_flow_pk:
+                break
+            time.sleep(5)
+        if not flow_pk or not inv_flow_pk:
+            log(f'  ✗ Missing flows: auth={flow_pk}, invalidation={inv_flow_pk}')
+            return None, None, None, None
+        log('  ✓ Got authorization and invalidation flows')
+
+        # Look up Authentik's signing key (certificate-key pair) for RS256 token signing
+        signing_key_pk = None
+        try:
+            req = _urlreq.Request(f'{ak_url}/api/v3/crypto/certificatekeypairs/?has_key=true&ordering=name&page_size=50', headers=_ak_headers)
+            certs = json.loads(_urlreq.urlopen(req, timeout=15).read().decode()).get('results', [])
+            signing_key_pk = next((c['pk'] for c in certs if 'authentik' in (c.get('name') or '').lower() and 'self-signed' in (c.get('name') or '').lower()), None)
+            if not signing_key_pk and certs:
+                signing_key_pk = certs[0]['pk']
+            if signing_key_pk:
+                log('  ✓ Got signing key for RS256 token signing')
+            else:
+                log('  ⚠ No signing key found — tokens will use HS256')
+        except Exception:
+            log('  ⚠ Could not look up signing keys')
+
+        # Look up OAuth2 scope property mappings (openid, email, profile)
+        scope_mapping_pks = []
+        try:
+            req = _urlreq.Request(f'{ak_url}/api/v3/propertymappings/provider/scope/?ordering=scope_name&page_size=50', headers=_ak_headers)
+            mappings = json.loads(_urlreq.urlopen(req, timeout=15).read().decode()).get('results', [])
+            wanted_scopes = {'openid', 'email', 'profile'}
+            scope_mapping_pks = [m['pk'] for m in mappings if m.get('scope_name') in wanted_scopes]
+            if scope_mapping_pks:
+                log(f'  ✓ Got {len(scope_mapping_pks)} scope mappings (openid/email/profile)')
+            else:
+                log('  ⚠ No scope mappings found')
+        except Exception:
+            log('  ⚠ Could not look up scope mappings')
+
+        # Determine redirect URIs (strict matching in Authentik — include :443 variants; legacy /login/redirect for older FedHub builds)
+        fh_cfg = _get_fedhub_deployment_config(settings)
+        fh_host = (fh_cfg.get('remote', {}).get('host') or '').strip()
+        fh_domain = _get_service_domain(settings, 'fedhub') if settings.get('fqdn') else ''
+        redirect_host = fh_domain or fh_host or 'localhost'
+        if fh_domain:
+            base = f'https://{fh_domain}'
+            redirect_uris_obj = [
+                {'matching_mode': 'strict', 'url': f'{base}/api/oauth/login/redirect'},
+                {'matching_mode': 'strict', 'url': f'{base}:443/api/oauth/login/redirect'},
+                {'matching_mode': 'strict', 'url': f'{base}/login/redirect'},
+                {'matching_mode': 'strict', 'url': f'{base}:443/login/redirect'},
+            ]
+        else:
+            # Direct IP: Fed Hub OAuth callback is backend API endpoint; port 9100.
+            redirect_uri = f'https://{redirect_host}:9100/api/oauth/login/redirect'
+            redirect_uris_obj = [{'matching_mode': 'strict', 'url': redirect_uri}]
+
+        # Build the patch payload used both for updating existing providers and creating new ones
+        _provider_extras = {}
+        if signing_key_pk:
+            _provider_extras['signing_key'] = signing_key_pk
+        if scope_mapping_pks:
+            _provider_extras['property_mappings'] = scope_mapping_pks
+
+        # Check if provider already exists; if so, update it (add signing key + scopes + redirect)
+        provider_pk = None
+        client_id, client_secret = '', ''
+        try:
+            req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/?search={urllib.parse.quote(provider_name)}', headers=_ak_headers)
+            resp = _urlreq.urlopen(req, timeout=15)
+            existing = json.loads(resp.read().decode())['results']
+            for ex in existing:
+                if ex.get('name') == provider_name:
+                    ex_pk = ex.get('pk')
+                    req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/{ex_pk}/', headers=_ak_headers)
+                    detail = json.loads(_urlreq.urlopen(req, timeout=15).read().decode())
+                    if detail.get('client_id') and detail.get('client_secret'):
+                        provider_pk = ex_pk
+                        client_id = detail['client_id']
+                        client_secret = detail['client_secret']
+                        patch_data = {'redirect_uris': redirect_uris_obj}
+                        patch_data.update(_provider_extras)
+                        try:
+                            req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/{ex_pk}/',
+                                data=json.dumps(patch_data).encode(),
+                                headers=_ak_headers, method='PATCH')
+                            _urlreq.urlopen(req, timeout=10)
+                        except Exception:
+                            pass
+                        log(f'  ✓ Existing OAuth2 provider updated (signing key + scopes + redirect, client_id={client_id[:8]}...)')
+                    else:
+                        try:
+                            req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/{ex_pk}/',
+                                headers=_ak_headers, method='DELETE')
+                            _urlreq.urlopen(req, timeout=10)
+                            log(f'  ✓ Deleted stale provider (pk={ex_pk})')
+                        except Exception:
+                            pass
+                    break
+        except Exception:
+            pass
+
+        # Create provider if we don't already have one
+        if not provider_pk:
+            payload = {
+                'name': provider_name,
+                'authorization_flow': flow_pk,
+                'invalidation_flow': inv_flow_pk,
+                'client_type': 'confidential',
+                'redirect_uris': redirect_uris_obj,
+            }
+            payload.update(_provider_extras)
+            try:
+                req = _urlreq.Request(f'{ak_url}/api/v3/providers/oauth2/',
+                    data=json.dumps(payload).encode(), headers=_ak_headers, method='POST')
+                resp = _urlreq.urlopen(req, timeout=15)
+                p = json.loads(resp.read().decode())
+                provider_pk = p.get('pk')
+                client_id = p.get('client_id', '')
+                client_secret = p.get('client_secret', '')
+                log(f'  ✓ OAuth2 provider created (client_id={client_id[:8]}...)')
+            except Exception as e:
+                body = ''
+                try:
+                    body = e.read().decode()[:500]
+                except Exception:
+                    pass
+                log(f'  ✗ OAuth2 provider create failed ({getattr(e, "code", "?")}): {body or str(e)[:200]}')
+
+        if not provider_pk or not client_id:
+            log('  ✗ No OAuth2 provider — cannot continue')
+            return None, None, None, None
+
+        # Create application (same pattern as Node-RED / TAK Portal).
+        # OAuth app is only for Fed Hub's "Login with Keycloak" client — hide from user app list so
+        # only the Proxy app (forward_auth) appears on "My applications" (Authentik: meta_launch_url blank://blank).
+        _app_body = {
+            'name': provider_name,
+            'slug': slug,
+            'provider': provider_pk,
+            'meta_launch_url': 'blank://blank',
+        }
+        try:
+            req = _urlreq.Request(f'{ak_url}/api/v3/core/applications/',
+                data=json.dumps(_app_body).encode(),
+                headers=_ak_headers, method='POST')
+            _urlreq.urlopen(req, timeout=10)
+            log(f'  ✓ Application created (hidden from user launcher)')
+        except Exception as e:
+            if hasattr(e, 'code') and e.code == 400:
+                try:
+                    req = _urlreq.Request(f'{ak_url}/api/v3/core/applications/{slug}/',
+                        data=json.dumps({'provider': provider_pk, 'meta_launch_url': 'blank://blank'}).encode(),
+                        headers=_ak_headers, method='PATCH')
+                    _urlreq.urlopen(req, timeout=10)
+                except Exception:
+                    pass
+                log(f'  ✓ Application already exists (launcher URL updated)')
+            else:
+                log(f'  ⚠ Application error: {str(e)[:80]}')
+        try:
+            req = _urlreq.Request(f'{ak_url}/api/v3/core/applications/{slug}/',
+                data=json.dumps({'meta_launch_url': 'blank://blank'}).encode(),
+                headers=_ak_headers, method='PATCH')
+            _urlreq.urlopen(req, timeout=10)
+        except Exception:
+            pass
+
+        authorize_url = f'{ak_public}/application/o/authorize/'
+        token_url = f'{ak_public}/application/o/token/'
+        return client_id, client_secret, authorize_url, token_url
+
+    except urllib.error.HTTPError as e:
+        body = ''
+        try:
+            body = e.read().decode()[:500]
+        except Exception:
+            pass
+        log(f'  ✗ Authentik OAuth setup failed: HTTP {e.code}: {body}')
+        return None, None, None, None
+    except Exception as e:
+        log(f'  ✗ Authentik OAuth setup failed: {str(e)[:200]}')
+        return None, None, None, None
 
 
 def _ensure_proxy_providers_cookie_domain(ak_url, ak_headers, fqdn, plog=None):
@@ -12026,7 +13839,7 @@ def _outpost_add_providers_safe(ak_url, ak_headers, provider_pks_to_add, plog=No
 
 
 def _repair_embedded_outpost_all_apps(ak_url, ak_headers, settings, plog=None):
-    """Ensure embedded outpost includes providers for deployed apps only: infra-TAK, MediaMTX (if deployed), Node-RED (if deployed), TAK Portal (if deployed)."""
+    """Ensure embedded outpost includes providers for deployed apps only: infra-TAK, MediaMTX, Node-RED, TAK Portal, Fed Hub proxy (if deployed)."""
     import urllib.request as _req
     _log = plog or (lambda m: None)
     slug_to_module = [('infratak', 'infratak'), ('stream', 'mediamtx'), ('node-red', 'nodered'), ('tak-portal', 'takportal')]
@@ -12043,14 +13856,25 @@ def _repair_embedded_outpost_all_apps(ak_url, ak_headers, settings, plog=None):
                     provider_pks.append(pk)
             except Exception:
                 pass
+        try:
+            fh_cfg = _get_fedhub_deployment_config(settings)
+            if fh_cfg.get('deployed') and fh_cfg.get('target_mode') == 'remote' and (fh_cfg.get('remote', {}).get('host') or '').strip():
+                r = _req.Request(f'{ak_url}/api/v3/core/applications/federation-hub/', headers=ak_headers)
+                data = json.loads(_req.urlopen(r, timeout=10).read().decode())
+                pk = data.get('provider')
+                if pk and pk not in provider_pks:
+                    provider_pks.append(pk)
+        except Exception:
+            pass
         if provider_pks:
             _outpost_add_providers_safe(ak_url, ak_headers, provider_pks, plog=_log)
     except Exception as e:
         _log(f"  ⚠ Repair outpost: {str(e)[:80]}")
 
 
-def _sync_authentik_takportal_provider_url(settings):
+def _sync_authentik_takportal_provider_url(settings, plog=None):
     """Set TAK Portal Proxy external_host/cookie_domain, ensure provider+app exist and are on embedded outpost (fixes 404 on takportal.fqdn)."""
+    _tp_log = plog or (lambda _m: None)
     import urllib.request as _req
     import urllib.error
     fqdn = (settings.get('fqdn') or '').strip()
@@ -12120,13 +13944,15 @@ def _sync_authentik_takportal_provider_url(settings):
             if provider_pk:
                 try:
                     _req.urlopen(_req.Request(f'{ak_url}/api/v3/core/applications/',
-                        data=json.dumps({'name': 'TAK Portal', 'slug': 'tak-portal', 'provider': provider_pk}).encode(),
+                        data=json.dumps({'name': 'TAK Portal', 'slug': 'tak-portal', 'provider': provider_pk, 'open_in_new_tab': True}).encode(),
                         headers=ak_headers, method='POST'), timeout=10)
                 except urllib.error.HTTPError as e:
                     if e.code != 400:
                         pass
-        # Ensure TAK Portal Proxy is on the embedded outpost so takportal.fqdn is matched (else 404).
+        # Always PATCH open_in_new_tab when the proxy exists (was only done inside the
+        # "create provider" branch, so existing installs never got tak-portal updated).
         if provider_pk is not None:
+            _authentik_application_open_in_new_tab(ak_url, ak_headers, 'tak-portal', plog=_tp_log)
             _outpost_add_providers_safe(ak_url, ak_headers, [provider_pk])
         # Ensure all deployed apps (infra-TAK, MediaMTX, Node-RED, TAK Portal) are on the outpost
         _repair_embedded_outpost_all_apps(ak_url, ak_headers, settings)
@@ -13013,6 +14839,967 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <div class="card" id="gd-log-card" style="display:none"><div class="card-title">Deploy log</div><div class="log-box" id="gd-deploy-log">Initializing...</div></div>
 </div>
 <script src="/guarddog.js?v={{ version }}"></script>
+</body></html>
+'''
+
+
+FEDHUB_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Federation Hub — infra-TAK</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet">
+<style>
+:root{--bg-deep:#080b14;--bg-surface:#0f1219;--bg-card:#161b26;--border:#1e2736;--border-hover:#2a3548;--text-primary:#f1f5f9;--text-secondary:#cbd5e1;--text-dim:#94a3b8;--accent:#3b82f6;--cyan:#06b6d4;--green:#10b981;--red:#ef4444;--yellow:#eab308}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',sans-serif;min-height:100vh;display:flex;flex-direction:row}
+.sidebar{width:220px;min-width:220px;background:var(--bg-surface);border-right:1px solid var(--border);padding:24px 0;display:flex;flex-direction:column;flex-shrink:0}
+.material-symbols-outlined{font-family:'Material Symbols Outlined';font-weight:400;font-style:normal;font-size:20px;line-height:1;letter-spacing:normal;white-space:nowrap;direction:ltr;-webkit-font-smoothing:antialiased}
+.nav-icon.material-symbols-outlined{font-size:22px;width:22px;text-align:center}
+.sidebar-logo{padding:0 20px 24px;border-bottom:1px solid var(--border);margin-bottom:16px}
+.sidebar-logo span{font-size:15px;font-weight:700;letter-spacing:.05em;color:var(--text-primary)}
+.sidebar-logo small{display:block;font-size:10px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;margin-top:2px}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;color:var(--text-secondary);text-decoration:none;font-size:13px;font-weight:500;transition:all .15s;border-left:2px solid transparent}
+.nav-item:hover{color:var(--text-primary);background:rgba(255,255,255,.03);border-left-color:var(--border-hover)}
+.nav-item.active{color:var(--cyan);background:rgba(6,182,212,.06);border-left-color:var(--cyan)}
+.nav-icon{font-size:15px;width:18px;text-align:center}
+.main{flex:1;min-width:0;overflow-y:auto;padding:32px}
+.page-header{margin-bottom:28px}
+.page-header h1{font-size:22px;font-weight:700}
+.page-header p{color:var(--text-secondary);font-size:13px;margin-top:4px}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:20px}
+.card-title{font-size:13px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:16px}
+.status-banner{display:flex;align-items:center;gap:12px;padding:14px 18px;border-radius:10px;margin-bottom:20px;font-size:13px;font-weight:500}
+.status-banner.running{background:rgba(16,185,129,.08);border:1px solid rgba(16,185,129,.2);color:var(--green)}
+.status-banner.stopped{background:rgba(234,179,8,.08);border:1px solid rgba(234,179,8,.2);color:var(--yellow)}
+.status-banner.not-installed{background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.2);color:var(--accent)}
+.dot{width:8px;height:8px;border-radius:50%;background:currentColor;flex-shrink:0}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:10px 20px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:none;transition:all .15s}
+.btn-primary{background:var(--accent);color:#fff}.btn-primary:hover{background:#2563eb}
+.btn-ghost{background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border)}.btn-ghost:hover{color:var(--text-primary);border-color:var(--border-hover)}
+.btn-danger{background:var(--red);color:#fff}.btn-danger:hover{background:#dc2626}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.controls{display:flex;gap:10px;flex-wrap:wrap}
+.control-btn{padding:10px 20px;border:1px solid var(--border);border-radius:8px;background:var(--bg-card);color:var(--text-secondary);font-family:'JetBrains Mono',monospace;font-size:13px;cursor:pointer;transition:all 0.2s}
+.control-btn:hover{border-color:var(--border-hover);color:var(--text-primary)}
+.control-btn.btn-stop{border-color:rgba(239,68,68,0.3)}.control-btn.btn-stop:hover{background:rgba(239,68,68,0.1);color:var(--red)}
+.control-btn.btn-start{border-color:rgba(16,185,129,0.3)}.control-btn.btn-start:hover{background:rgba(16,185,129,0.1);color:var(--green)}
+.form-group{margin-bottom:16px}
+.form-label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em}
+.form-input{width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px;color:var(--text-primary);font-size:13px;font-family:'DM Sans',sans-serif;outline:none;transition:border-color .15s}
+.form-input:focus{border-color:var(--accent)}
+.form-hint{font-size:11px;color:var(--text-dim);margin-top:4px}
+.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.info-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.info-item{background:#0a0e1a;border-radius:8px;padding:12px 14px}
+.info-label{font-size:11px;color:var(--text-dim);margin-bottom:3px;text-transform:uppercase;letter-spacing:.05em}
+.info-value{font-size:13px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;word-break:break-all}
+.metrics-bar{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:8px}
+.metric-card{background:var(--bg-surface);border:1px solid var(--border);border-radius:12px;padding:18px;text-align:center}
+.metric-label{font-family:'JetBrains Mono',monospace;font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--text-dim);margin-bottom:6px}
+.metric-value{font-family:'JetBrains Mono',monospace;font-size:24px;font-weight:700;color:var(--text-primary)}
+.metric-detail{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:2px}
+.upload-area{border:2px dashed var(--border);border-radius:10px;padding:22px;text-align:center;cursor:pointer;transition:all .2s;background:rgba(15,23,42,.25);margin-bottom:12px}
+.upload-area:hover,.upload-area.dragover{border-color:var(--accent);background:rgba(59,130,246,.08)}
+.log-box{background:#070a12;border:1px solid var(--border);border-radius:8px;padding:16px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:360px;overflow-y:auto;line-height:1.6;white-space:pre-wrap}
+.progress-item{background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:12px 16px;margin-bottom:8px}
+.progress-bar-outer{width:100%;height:4px;background:rgba(59,130,246,0.1);border-radius:2px;margin-top:8px;overflow:hidden}
+.progress-bar-inner{height:100%;border-radius:2px;background:linear-gradient(90deg,var(--accent),var(--cyan));transition:width 0.25s ease}
+.fh-section{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:20px;overflow:hidden}
+.fh-section>summary{list-style:none;cursor:pointer;padding:16px 24px;display:flex;align-items:center;justify-content:space-between;color:var(--text-secondary);font-size:13px;font-weight:600;letter-spacing:.06em;text-transform:uppercase}
+.fh-section>summary::-webkit-details-marker{display:none}
+.fh-section>summary .chev{transition:transform .2s ease;color:var(--text-dim)}
+.fh-section[open]>summary .chev{transform:rotate(180deg)}
+.fh-section-body{padding:0 24px 24px;border-top:1px solid var(--border)}
+@media(max-width:1000px){.metrics-bar{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:700px){.metrics-bar{grid-template-columns:1fr}}
+</style></head>
+<body>
+{{ sidebar_html }}
+<div class="main">
+  <div class="page-header">
+    <h1><span class="material-symbols-outlined" style="vertical-align:middle;margin-right:8px;font-size:32px">hub</span>Federation Hub{% if fedhub_version %} <span style="font-weight:500;color:var(--text-dim);font-size:16px">· v{{ fedhub_version }}</span>{% endif %}</h1>
+    <p>TAK Federation Hub on a dedicated <strong>Ubuntu</strong> host (remote SSH). Starting point: official TAK.gov install guide.</p>
+  </div>
+
+  {% if fh.running %}
+  <div class="status-banner running"><div class="dot"></div>federation-hub service is <strong>active</strong> on {{ fedhub_deploy_cfg.remote.host }}{% if fedhub_version %} · {{ fedhub_version }}{% endif %}</div>
+  {% elif fh.installed %}
+  <div class="status-banner stopped"><div class="dot"></div>Registered on {{ fedhub_deploy_cfg.remote.host }}{% if fedhub_version %} · {{ fedhub_version }}{% endif %} — service not active (check target)</div>
+  {% else %}
+  <div class="status-banner not-installed"><div class="dot"></div>Not registered — upload the .deb, set SSH below, then <strong>Deploy to remote host</strong> (or confirm manually)</div>
+  {% endif %}
+
+  {% if fh.installed %}
+  <div id="fedhub-cert-expiry-banner" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin:-4px 0 18px;line-height:1.5;min-height:1.2em"></div>
+  {% endif %}
+
+  {% if fedhub_remote_host %}
+  <div class="card">
+    <div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-bottom:12px"><span style="color:var(--text-secondary)">Remote host:</span> <span style="color:var(--cyan)" id="fedhub-remote-host-ip">{{ fedhub_remote_host }}</span></div>
+    <div class="card-title" style="margin-top:16px;margin-bottom:8px">Remote host health</div>
+    <div class="metrics-bar" id="fedhub-remote-metrics-bar">
+      <div class="metric-card"><div class="metric-label">CPU</div><div class="metric-value" id="fedhub-remote-cpu-value">—</div></div>
+      <div class="metric-card"><div class="metric-label">Memory</div><div class="metric-value" id="fedhub-remote-ram-value">—</div><div class="metric-detail" id="fedhub-remote-ram-detail"></div></div>
+      <div class="metric-card"><div class="metric-label">Disk</div><div class="metric-value" id="fedhub-remote-disk-value">—</div><div class="metric-detail" id="fedhub-remote-disk-detail"></div></div>
+      <div class="metric-card"><div class="metric-label">Uptime</div><div class="metric-value" id="fedhub-remote-uptime-value" style="font-size:18px">—</div></div>
+    </div>
+  </div>
+  {% endif %}
+
+  {% if fh.installed %}
+  <div class="card">
+    <div class="card-title">Controls (remote)</div>
+    <div class="controls">
+      {% if fh.running %}<button class="control-btn" onclick="fedhubControl('restart')">↻ Restart</button><button class="control-btn btn-stop" onclick="fedhubControl('stop')">■ Stop</button>{% else %}<button class="control-btn btn-start" onclick="fedhubControl('start')">▶ Start</button><button class="control-btn" onclick="fedhubControl('restart')">↻ Restart</button>{% endif %}
+      <button class="btn btn-ghost" type="button" onclick="fedhubRefreshStatus()">Refresh status</button>
+      <button class="btn btn-danger" type="button" onclick="fedhubClearRegistration()">Remove from console</button>
+    </div>
+    <div id="fedhub-control-msg" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
+    <div class="info-grid" style="margin-top:16px">
+      <div class="info-item"><div class="info-label">Service</div><div class="info-value" id="fedhub-svc-state">—</div></div>
+      <div class="info-item"><div class="info-label">Install dir</div><div class="info-value" id="fedhub-dir-state">—</div></div>
+    </div>
+    <div id="fedhub-clear-msg" style="margin-top:10px;font-size:12px"></div>
+  </div>
+  {% endif %}
+
+  {% if fh.installed %}
+  <details class="fh-section">
+    <summary><span>Certificates &amp; CA rotation</span><span class="chev">&#9662;</span></summary>
+    <div class="fh-section-body">
+      <div id="fedhub-cert-expiry-section" style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim);margin-bottom:14px;line-height:1.5;min-height:1.2em"></div>
+      <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:10px"><strong>Browser admin cert:</strong> Import <code style="font-size:11px">webadmin-fed.p12</code> (from deploy or CA rotation, also under <code style="font-size:11px">/root/</code> on the Fed Hub host). Keystore / P12 password (effective): <code style="font-size:11px;font-family:'JetBrains Mono',monospace">{{ fh_cert_password_effective }}</code> — set under <strong>Certificate metadata</strong> below (or inherits TAK console cert password). Or use <strong>Authentik SSO</strong> below.</p>
+      <div class="controls" style="align-items:center;flex-wrap:wrap;gap:12px;margin-bottom:16px">
+        <button class="btn btn-ghost" type="button" onclick="fedhubDownloadWebadminCert()">⬇ Download webadmin-fed.p12</button>
+        <span id="fedhub-cert-download-msg" style="font-size:12px;color:var(--text-dim)"></span>
+      </div>
+      <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:14px">Generate a new Federation Hub root/intermediate CA pair and new server/admin certs. Auto-named CAs use <code style="font-size:11px">…-01</code>, <code style="font-size:11px">…-02</code>, etc. (from saved names in settings). This restarts Federation Hub and requires re-importing the new <code style="font-size:11px">webadmin-fed.p12</code> in browsers.</p>
+      <div class="controls" style="align-items:center;flex-wrap:wrap;gap:12px">
+        <button type="button" id="fedhub-rotate-btn" class="btn btn-primary" onclick="fedhubStartRotateCa()">Rotate CA + regenerate certs</button>
+        <span id="fedhub-rotate-msg" class="form-hint" style="margin:0"></span>
+      </div>
+      <div id="fedhub-rotate-log-wrap" style="display:{% if fedhub_rotating or fedhub_rotate_done or fedhub_rotate_error %}block{% else %}none{% endif %};margin-top:16px">
+        <div class="card-title" style="margin-bottom:8px">Rotation log</div>
+        <div class="log-box" id="fedhub-rotate-log">{% if fedhub_rotating %}Starting…{% elif fedhub_rotate_done %}Done.{% elif fedhub_rotate_error %}Rotation failed.{% endif %}</div>
+      </div>
+    </div>
+  </details>
+  {% endif %}
+
+  {% if not fh.installed %}
+  <details class="fh-section">
+    <summary><span>Package upload &amp; remote install</span><span class="chev">&#9662;</span></summary>
+    <div class="fh-section-body">
+    <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:14px">Same idea as <strong>split-mode</strong> TAK database deploy: upload <code style="font-size:12px">takserver-fed-hub</code> .deb on this console, then infra-TAK <strong>SCP</strong>s it to the target and runs <code style="font-size:12px">apt-get install</code> there.</p>
+    <div id="fedhub-upload-area" class="upload-area" onclick="var i=document.getElementById('fedhub-file-input');if(i){i.value='';i.click();}" ondrop="fedhubDrop(event)" ondragover="event.preventDefault();this.classList.add('dragover')" ondragleave="event.preventDefault();this.classList.remove('dragover')">
+      <div style="font-size:28px;margin-bottom:8px">📦</div>
+      <div style="font-size:14px;color:var(--text-secondary)">Drop .deb here or click to upload</div>
+      <div class="form-hint" style="margin-top:8px">Validation uses <code>dpkg-deb</code> on this host (Linux console recommended).</div>
+    </div>
+    <input type="file" id="fedhub-file-input" accept=".deb" style="display:none" onchange="fedhubFilePicked(this.files)">
+    <div id="fedhub-progress-area" style="margin-bottom:12px" aria-live="polite"></div>
+    <p id="fedhub-upload-hint-empty" class="form-hint" style="margin-bottom:10px{% if fedhub_pkg_filename %};display:none{% endif %}">No package uploaded yet — progress appears below when you select a file.</p>
+    <div class="controls">
+      <button class="btn btn-primary" type="button" id="fedhub-deploy-btn" onclick="fedhubStartDeploy()">Deploy to remote host</button>
+    </div>
+    <div id="fedhub-deploy-log-card" style="display:{% if fedhub_deploying or (fedhub_deploy_done and fedhub_deploy_error) %}block{% else %}none{% endif %};margin-top:18px;padding-top:18px;border-top:1px solid var(--border)">
+      <div class="card-title" style="margin-bottom:10px">Deploy log</div>
+      <div class="log-box" id="fedhub-deploy-log">{% if fedhub_deploying %}Starting…{% endif %}</div>
+    </div>
+    </div>
+  </details>
+  {% endif %}
+
+  <details class="fh-section"{% if not fh.installed %} open{% endif %}>
+    <summary><span>Certificate metadata (Federation Hub)</span><span class="chev">&#9662;</span></summary>
+    <div class="fh-section-body">
+    <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:14px">Used when generating certs on the remote host (<strong>Deploy</strong>, <strong>Update</strong> if certs are recreated, and <strong>Rotate CA</strong>). Values are saved in console settings; empty fields fall back to the same DN as <strong>TAK Server</strong> deploy defaults where applicable. Certificate fields must use only printable ASN.1 characters (same rules as TAK deploy).</p>
+    <p style="font-size:11px;color:var(--text-dim);margin:-6px 0 14px;line-height:1.45">Effective P12 / keystore password (read-only here): <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">{{ fh_cert_password_effective }}</span>. Set a Fed Hub&ndash;specific password below, or leave blank to use the TAK console cert password.</p>
+    <div class="grid-2">
+      <div class="form-group">
+        <label class="form-label">Country (C)</label>
+        <input id="fedhub-cert-country" class="form-input" type="text" maxlength="64" value="{{ fh_cert_country }}" placeholder="US" autocomplete="off">
+      </div>
+      <div class="form-group">
+        <label class="form-label">State (ST)</label>
+        <input id="fedhub-cert-state" class="form-input" type="text" maxlength="64" value="{{ fh_cert_state }}" placeholder="CA" autocomplete="off">
+      </div>
+      <div class="form-group">
+        <label class="form-label">City (L)</label>
+        <input id="fedhub-cert-city" class="form-input" type="text" maxlength="64" value="{{ fh_cert_city }}" placeholder="City" autocomplete="off">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Organization (O)</label>
+        <input id="fedhub-cert-org" class="form-input" type="text" maxlength="64" value="{{ fh_cert_org }}" placeholder="Org" autocomplete="off">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Organizational unit (OU)</label>
+        <input id="fedhub-cert-ou" class="form-input" type="text" maxlength="64" value="{{ fh_cert_ou }}" placeholder="FederationHub" autocomplete="off">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Fed Hub keystore password (optional)</label>
+        <input id="fedhub-cert-password" class="form-input" type="password" placeholder="Leave blank = TAK cert password" autocomplete="new-password">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Root CA name</label>
+        <input id="fedhub-root-ca" class="form-input" type="text" value="{{ fh_root_ca }}" placeholder="FEDHUB-ROOT-CA" autocomplete="off">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Intermediate CA name</label>
+        <input id="fedhub-intermediate-ca" class="form-input" type="text" value="{{ fh_intermediate_ca }}" placeholder="FEDHUB-INT-CA" autocomplete="off">
+      </div>
+    </div>
+    <div class="controls" style="align-items:center;flex-wrap:wrap;gap:12px;margin-top:8px">
+      <button class="btn btn-ghost" type="button" onclick="fedhubSaveCertSettings()">Save certificate settings</button>
+      <span id="fedhub-cert-settings-msg" style="font-size:12px;color:var(--text-dim)"></span>
+    </div>
+    </div>
+  </details>
+
+  <details class="fh-section">
+    <summary><span>Deployment target (SSH)</span><span class="chev">&#9662;</span></summary>
+    <div class="fh-section-body">
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:16px">This module is built for a <strong>separate</strong> machine from this console. Use the same SSH patterns as MediaMTX/Authentik remote deploy.</p>
+    <input type="hidden" id="fedhub-deployed-flag" value="{% if fedhub_deploy_cfg.deployed %}1{% else %}0{% endif %}">
+    <div class="grid-2">
+      <div class="form-group">
+        <label class="form-label">Remote host / IP</label>
+        <input id="fedhub-remote-host" class="form-input" type="text" placeholder="10.0.0.50" value="{{ fedhub_deploy_cfg.remote.host or '' }}">
+      </div>
+      <div class="form-group">
+        <label class="form-label">SSH port</label>
+        <input id="fedhub-remote-port" class="form-input" type="number" min="1" max="65535" value="{{ fedhub_deploy_cfg.remote.port or 22 }}">
+      </div>
+    </div>
+    <div class="grid-2">
+      <div class="form-group">
+        <label class="form-label">SSH user</label>
+        <input id="fedhub-remote-user" class="form-input" type="text" placeholder="root" value="{{ fedhub_deploy_cfg.remote.username or 'root' }}">
+      </div>
+      <div class="form-group">
+        <label class="form-label">SSH private key path</label>
+        <input id="fedhub-remote-key" class="form-input" type="text" placeholder="~/.ssh/infra-tak-fedhub" value="{{ fedhub_deploy_cfg.remote.ssh_key_path or '' }}">
+      </div>
+    </div>
+    <div class="form-group">
+      <label class="form-label">One-time password (for Install SSH key only)</label>
+      <input id="fedhub-remote-password" class="form-input" type="password" placeholder="Not stored" autocomplete="off">
+      <div class="form-hint">Used only for ssh-copy-id; never saved in settings.</div>
+    </div>
+    <div class="controls" style="margin-top:8px">
+      <button class="btn btn-ghost" type="button" onclick="fedhubEnsureKey()">Generate SSH key</button>
+      <button class="btn btn-ghost" type="button" onclick="fedhubInstallKey()">Install SSH key</button>
+      <button class="btn btn-ghost" type="button" onclick="fedhubTestSsh()">Test SSH</button>
+      <button class="btn btn-ghost" type="button" onclick="fedhubSaveTarget()">Save target</button>
+    </div>
+    <div id="fedhub-ssh-status" style="margin-top:10px;font-size:12px;color:var(--text-dim)"></div>
+    <div class="form-group" style="margin-top:12px">
+      <label class="form-label">Public key (manual fallback)</label>
+      <textarea id="fedhub-public-key" class="form-input" rows="3" readonly placeholder="Generate SSH key"></textarea>
+    </div>
+    </div>
+  </details>
+
+  <details class="fh-section">
+    <summary><span>HTTPS access</span><span class="chev">&#9662;</span></summary>
+    <div class="fh-section-body">
+    <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:14px">Federation Hub is a <strong>separate web app</strong> on the remote host. <strong>Caddy</strong> on this console can terminate TLS at <code style="font-size:12px">https://fedhub.&lt;your FQDN&gt;</code> and reverse-proxy to the hub’s HTTP port (same pattern as <code style="font-size:12px">stream.*</code> → MediaMTX).</p>
+    {% if settings.fqdn and fedhub_public_url %}
+    <p style="font-size:13px;margin-bottom:12px">When the module is registered and Caddy is deployed, open: <a href="{{ fedhub_public_url }}" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);font-family:'JetBrains Mono',monospace;font-size:12px">{{ fedhub_public_url }}</a></p>
+    <div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:12px">
+      <a href="{{ fedhub_sso_prime_url }}" target="_blank" rel="noopener noreferrer" class="btn btn-ghost" style="text-decoration:none">Open TAK SSO first ↗</a>
+      <a href="{{ fedhub_public_url }}" target="_blank" rel="noopener noreferrer" class="btn btn-primary" style="text-decoration:none">Open Fed Hub ↗</a>
+    </div>
+    <p class="form-hint" style="margin-bottom:10px;line-height:1.45">Recommended: open <code style="font-size:11px">{{ fedhub_sso_prime_url }}</code> first, then <code style="font-size:11px">{{ fedhub_public_url }}</code> so Authentik already knows you at the edge.</p>
+    <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:12px">The hub UI may still show <strong>Login with Keycloak</strong> — that redirects through <strong>Authentik</strong> (OIDC). Your browser stores an Authentik <strong>session cookie</strong> for your domain; on a later visit, if that cookie is still valid (same browser, site data not cleared, session not expired), you may go <strong>straight in</strong> without that step. Use a <strong>private window</strong> or clear cookies for your domain to test a cold login.</p>
+    <p class="form-hint" style="margin-bottom:14px">DNS: point <code style="font-size:11px">{{ fedhub_service_domain }}</code> (A/AAAA) to this <strong>console</strong> public IP — same as <code style="font-size:11px">infratak.*</code> / other subdomains — not the private Fed Hub IP.</p>
+    {% else %}
+    <p class="form-hint" style="margin-bottom:14px">Set the base <strong>FQDN</strong> in Console settings and run <strong>Caddy SSL</strong> deploy so subdomains get certificates. Then add DNS for <code style="font-size:11px">fedhub.&lt;FQDN&gt;</code> to this server.</p>
+    {% endif %}
+    <div class="form-group">
+      <label class="form-label">Hub web UI port (on remote host, HTTP)</label>
+      <input id="fedhub-web-ui-port" class="form-input" type="number" min="1" max="65535" value="{{ fedhub_deploy_cfg.web_ui_port }}">
+      <div class="form-hint">Must match the hub web port on the target (recommended <strong>8080</strong> for Caddy upstream). The hub must listen on an IP reachable from <strong>this console</strong> (not only <code style="font-size:11px">127.0.0.1</code>). Caddy proxies to <code style="font-size:11px">SSH host:port</code>.</div>
+    </div>
+    <p class="form-hint" style="margin-bottom:10px;line-height:1.45">Client certificate for the hub UI: use <strong>Certificates &amp; CA rotation</strong> → <strong>Download webadmin-fed.p12</strong>. TAK.gov: <a href="https://tak.gov/documentation/resources/civ-documentation/tak-server-documentation/federation-hub" target="_blank" rel="noopener noreferrer" style="color:var(--cyan)">Federation Hub docs</a>.</p>
+    <div class="form-hint" style="margin-bottom:8px">Saving the SSH target (or port) below updates settings and regenerates the Caddyfile when a base FQDN is set.</div>
+    </div>
+  </details>
+
+  {% if fh.installed and authentik_installed %}
+  <details class="fh-section">
+    <summary><span>Authentik SSO login</span><span class="chev">&#9662;</span></summary>
+    <div class="fh-section-body" style="background:rgba(59,130,246,.05)">
+    <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:14px">Enable <strong>Authentik OAuth</strong> on the Federation Hub UI so users can log in with their Authentik credentials instead of importing a client certificate. Creates an OAuth2/OIDC application in Authentik and patches <code style="font-size:11px">federation-hub-ui.yml</code> on the remote host. Users in the <strong>authentik Admins</strong> group get admin access.</p>
+    <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:14px">Users may see <strong>Login with Keycloak</strong> on the hub — that is the OIDC handoff to Authentik. After once, a browser <strong>session cookie</strong> often means the next visit skips that click (until the cookie expires or data is cleared).</p>
+    <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:14px">Client cert login (<code style="font-size:11px">webadmin-fed.p12</code>) continues to work alongside OAuth.</p>
+    <button class="btn btn-primary" type="button" onclick="fedhubEnableAuthentik()" id="fedhub-ak-btn">Enable Authentik login</button>
+    <div id="fedhub-ak-msg" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
+    </div>
+  </details>
+  {% elif fh.installed and not authentik_installed %}
+  <details class="fh-section">
+    <summary><span>Authentik SSO login</span><span class="chev">&#9662;</span></summary>
+    <div class="fh-section-body">
+    <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:14px">Deploy <strong>Authentik</strong> from the Marketplace first, then return here to enable OAuth login for the Federation Hub UI.</p>
+    </div>
+  </details>
+  {% endif %}
+
+  {% if fh.installed %}
+  <details class="fh-section"{% if fedhub_upgrading or fedhub_upgrade_done or fedhub_upgrade_error %} open{% endif %}>
+    <summary><span>Update Federation Hub</span><span class="chev">&#9662;</span></summary>
+    <div class="fh-section-body">
+      <p class="form-hint" style="margin:14px 0 12px;line-height:1.45">Upload a newer <code style="font-size:11px">takserver-fed-hub</code> .deb and push it to the same remote host (same pattern as <strong>Update TAK Server</strong>).</p>
+    <div id="fedhub-update-body">
+      <div id="fedhub-upgrade-upload-area" class="upload-area" style="margin-top:16px" onclick="var i=document.getElementById('fedhub-upgrade-file-input');if(i){i.value='';i.click();}" ondrop="fedhubDropUpgrade(event)" ondragover="event.preventDefault();this.classList.add('dragover')" ondragleave="event.preventDefault();this.classList.remove('dragover')">
+        <div style="font-size:22px;margin-bottom:6px">⬆</div>
+        <div style="font-size:13px;color:var(--text-secondary)">Drop replacement .deb here or click (same upload store as above)</div>
+      </div>
+      <input type="file" id="fedhub-upgrade-file-input" accept=".deb" style="display:none" onchange="fedhubUpgradeFilePicked(this.files)">
+      <div id="fedhub-upgrade-progress-area" style="margin-bottom:12px" aria-live="polite"></div>
+      <p id="fedhub-upgrade-hint-empty" class="form-hint" style="margin-bottom:12px{% if fedhub_pkg_filename %};display:none{% endif %}">No package in the upload store — drop a newer .deb here (same as main upload).</p>
+      <div class="controls" style="align-items:center;flex-wrap:wrap;gap:12px">
+        <button type="button" id="fedhub-update-btn" class="btn btn-primary" onclick="fedhubStartUpdate()">Update Federation Hub</button>
+        <span id="fedhub-update-msg" class="form-hint" style="margin:0"></span>
+      </div>
+      <div id="fedhub-upgrade-log-wrap" style="display:{% if fedhub_upgrading or fedhub_upgrade_done or fedhub_upgrade_error %}block{% else %}none{% endif %};margin-top:18px">
+        <div class="card-title" style="margin-bottom:8px">Update log</div>
+        <div class="log-box" id="fedhub-upgrade-log">{% if fedhub_upgrading %}Connecting…{% elif fedhub_upgrade_done %}Done.{% elif fedhub_upgrade_error %}Update failed.{% endif %}</div>
+      </div>
+    </div>
+    </div>
+  </details>
+  {% else %}
+  <div class="card">
+    <div class="card-title">Register without automated install</div>
+    <p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:14px">If you installed the .deb manually on the Ubuntu host and <code style="font-size:12px">/opt/tak/federation-hub</code> exists, you can register the module without re-running deploy.</p>
+    <button class="btn btn-primary" type="button" onclick="fedhubMarkDeployed()">Confirm install on target</button>
+    <div id="fedhub-mark-msg" style="margin-top:12px;font-size:13px;color:var(--text-dim)"></div>
+  </div>
+  {% endif %}
+
+  <details class="fh-section">
+    <summary><span>Documentation</span><span class="chev">&#9662;</span></summary>
+    <div class="fh-section-body">
+      <p style="font-size:13px;color:var(--text-secondary);line-height:1.55;margin:14px 0 12px">Follow the <strong>Federation Hub</strong> section on TAK.gov for Ubuntu (.deb), Java, optional MongoDB, certificates, and <code style="font-size:12px">systemctl</code> service <code style="font-size:12px">federation-hub</code>.</p>
+      <a href="https://tak.gov/documentation/resources/civ-documentation/tak-server-documentation/federation-hub" target="_blank" rel="noopener noreferrer" class="btn btn-primary" style="text-decoration:none">Open TAK.gov Federation Hub guide ↗</a>
+    </div>
+  </details>
+</div>
+<script>
+var fedhubLogIndex=0,fedhubLogInterval=null;
+var fedhubUpgradeLogIndex=0,fedhubUpgradeLogInterval=null;
+var fedhubRotateLogIndex=0,fedhubRotateLogInterval=null;
+var fedhubUploadXhr=null;
+function fedhubFormatSize(b){
+  if(b==null||isNaN(+b))return'';
+  b=+b;
+  if(b<1024)return b+' B';
+  if(b<1048576)return (b/1024).toFixed(1)+' KB';
+  return (b/(1024*1024)).toFixed(1)+' MB';
+}
+function fedhubToggleEmptyHints(hasFile){
+  var h1=document.getElementById('fedhub-upload-hint-empty');
+  var h2=document.getElementById('fedhub-upgrade-hint-empty');
+  if(h1)h1.style.display=hasFile?'none':'block';
+  if(h2)h2.style.display=hasFile?'none':'block';
+}
+function fedhubMaybeResetUploadZones(){
+  var p1=document.getElementById('fedhub-progress-area');
+  var p2=document.getElementById('fedhub-upgrade-progress-area');
+  var empty=(!p1||!p1.children.length)&&(!p2||!p2.children.length);
+  if(empty){
+    var ua=document.getElementById('fedhub-upload-area');
+    if(ua){ua.style.maxHeight='';ua.style.padding='';}
+    var u2=document.getElementById('fedhub-upgrade-upload-area');
+    if(u2){u2.style.maxHeight='';u2.style.padding='';}
+    fedhubToggleEmptyHints(false);
+  }
+}
+function fedhubShrinkZonesWhenHasPackage(){
+  var p1=document.getElementById('fedhub-progress-area');
+  var p2=document.getElementById('fedhub-upgrade-progress-area');
+  var has=(p1&&p1.children.length)||(p2&&p2.children.length);
+  if(!has)return;
+  var ua=document.getElementById('fedhub-upload-area');
+  if(ua){ua.style.maxHeight='72px';ua.style.padding='16px';}
+  var u2=document.getElementById('fedhub-upgrade-upload-area');
+  if(u2){u2.style.maxHeight='72px';u2.style.padding='14px';}
+  fedhubToggleEmptyHints(true);
+}
+function fedhubCancelUploadRow(row){
+  if(row&&row._xhr){try{row._xhr.abort();}catch(e){}row._xhr=null;}
+  if(fedhubUploadXhr&&row&&row._xhr===fedhubUploadXhr)fedhubUploadXhr=null;
+  fedhubUploadXhr=null;
+  if(row&&row.parentNode)row.parentNode.removeChild(row);
+  fedhubMaybeResetUploadZones();
+}
+function fedhubAppendCompleteRow(pa,filename,sizeMb){
+  if(!pa)return;
+  var row=document.createElement('div');
+  row.className='progress-item';
+  row.setAttribute('data-filename',filename);
+  var top=document.createElement('div');
+  top.style.cssText='display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px';
+  var lbl=document.createElement('span');
+  lbl.style.cssText='font-family:JetBrains Mono,monospace;font-size:13px;color:var(--text-secondary);word-break:break-all';
+  lbl.textContent=filename+(sizeMb!=null?' ('+sizeMb+' MB)':'');
+  var right=document.createElement('span');
+  right.style.cssText='display:flex;align-items:center;gap:8px';
+  var pct=document.createElement('span');
+  pct.style.cssText='font-family:JetBrains Mono,monospace;font-size:12px;color:var(--green)';
+  pct.textContent='\u2713 ';
+  var rBtn=document.createElement('span');
+  rBtn.textContent='\u2717';
+  rBtn.style.cssText='color:var(--red);cursor:pointer;margin-left:8px;font-size:14px';
+  rBtn.title='Remove';
+  rBtn.onclick=function(){fedhubRemoveUploadFile(filename);};
+  pct.appendChild(rBtn);
+  top.appendChild(lbl);
+  top.appendChild(right);
+  right.appendChild(pct);
+  var barOuter=document.createElement('div');
+  barOuter.className='progress-bar-outer';
+  var barInner=document.createElement('div');
+  barInner.className='progress-bar-inner';
+  barInner.style.width='100%';
+  barInner.style.background='var(--green)';
+  barOuter.appendChild(barInner);
+  row.appendChild(top);
+  row.appendChild(barOuter);
+  pa.appendChild(row);
+}
+function fedhubRemoveUploadFile(filename){
+  fetch('/api/upload/fedhub/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:filename}),credentials:'same-origin'})
+    .then(function(r){return r.json();})
+    .then(function(x){
+      if(x&&x.success)fedhubRefreshPackageRowsFromServer();
+      else alert((x&&x.error)||'Remove failed');
+    }).catch(function(){alert('Remove failed');});
+}
+function fedhubRefreshPackageRowsFromServer(){
+  fetch('/api/upload/fedhub/package',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    var p1=document.getElementById('fedhub-progress-area');
+    var p2=document.getElementById('fedhub-upgrade-progress-area');
+    if(p1)p1.innerHTML='';
+    if(p2)p2.innerHTML='';
+    if(d&&d.filename){
+      if(p1)fedhubAppendCompleteRow(p1,d.filename,d.size_mb);
+      if(p2)fedhubAppendCompleteRow(p2,d.filename,d.size_mb);
+      fedhubShrinkZonesWhenHasPackage();
+    }else{
+      fedhubMaybeResetUploadZones();
+    }
+  }).catch(function(){fedhubMaybeResetUploadZones();});
+}
+function fedhubDoUpload(fileList,source){
+  source=source||'main';
+  var files=[];
+  for(var i=0;i<fileList.length;i++){
+    var f=fileList[i];
+    if(f&&f.name&&f.name.toLowerCase().endsWith('.deb'))files.push(f);
+  }
+  if(!files.length){alert('Select a Federation Hub .deb file.');return;}
+  var paId=source==='upgrade'?'fedhub-upgrade-progress-area':'fedhub-progress-area';
+  var pa=document.getElementById(paId);
+  var ua=document.getElementById(source==='upgrade'?'fedhub-upgrade-upload-area':'fedhub-upload-area');
+  if(ua){ua.style.maxHeight='72px';ua.style.padding=source==='upgrade'?'14px':'16px';}
+  if(pa)pa.innerHTML='';
+  if(fedhubUploadXhr){try{fedhubUploadXhr.abort();}catch(e){}}
+  var row=document.createElement('div');
+  row.className='progress-item';
+  var top=document.createElement('div');
+  top.style.cssText='display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px';
+  var names=files.map(function(f){return f.name;}).join(', ');
+  var totalBytes=0;
+  for(var j=0;j<files.length;j++)totalBytes+=files[j].size||0;
+  var lbl=document.createElement('span');
+  lbl.style.cssText='font-family:JetBrains Mono,monospace;font-size:13px;color:var(--text-secondary);word-break:break-all';
+  lbl.textContent=names+' ('+fedhubFormatSize(totalBytes)+')';
+  var right=document.createElement('span');
+  right.style.cssText='display:flex;align-items:center;gap:8px';
+  var pct=document.createElement('span');
+  pct.style.cssText='font-family:JetBrains Mono,monospace;font-size:12px;color:var(--cyan)';
+  pct.textContent='0%';
+  var cancelBtn=document.createElement('span');
+  cancelBtn.textContent='\u2717';
+  cancelBtn.style.cssText='color:var(--red);cursor:pointer;font-size:14px';
+  cancelBtn.title='Cancel upload';
+  cancelBtn.onclick=function(){fedhubCancelUploadRow(row);};
+  right.appendChild(pct);
+  right.appendChild(cancelBtn);
+  top.appendChild(lbl);
+  top.appendChild(right);
+  var barOuter=document.createElement('div');
+  barOuter.className='progress-bar-outer';
+  var barInner=document.createElement('div');
+  barInner.className='progress-bar-inner';
+  barInner.style.width='0%';
+  barOuter.appendChild(barInner);
+  row.appendChild(top);
+  row.appendChild(barOuter);
+  if(pa)pa.appendChild(row);
+  var fd=new FormData();
+  for(var k=0;k<files.length;k++)fd.append('files',files[k]);
+  var xhr=new XMLHttpRequest();
+  fedhubUploadXhr=xhr;
+  row._xhr=xhr;
+  xhr.upload.onprogress=function(e){
+    if(e.lengthComputable){
+      var pr=Math.round((e.loaded/e.total)*100);
+      barInner.style.width=pr+'%';
+      pct.textContent=pr+'%';
+    }
+  };
+  xhr.onload=function(){
+    row._xhr=null;
+    fedhubUploadXhr=null;
+    cancelBtn.remove();
+    if(xhr.status===200){
+      try{
+        var resp=JSON.parse(xhr.responseText);
+        if(!resp||!resp.success){
+          barInner.style.background='var(--red)';
+          pct.textContent=(resp&&resp.error)||'Upload failed';
+          pct.style.color='var(--red)';
+          return;
+        }
+        barInner.style.width='100%';
+        fedhubRefreshPackageRowsFromServer();
+      }catch(ex){
+        barInner.style.background='var(--red)';
+        pct.textContent='Bad response';
+        pct.style.color='var(--red)';
+      }
+    }else{
+      barInner.style.background='var(--red)';
+      pct.textContent='HTTP '+xhr.status;
+      pct.style.color='var(--red)';
+    }
+  };
+  xhr.onerror=function(){row._xhr=null;fedhubUploadXhr=null;barInner.style.background='var(--red)';pct.textContent='Failed';pct.style.color='var(--red)';};
+  xhr.onabort=function(){row._xhr=null;fedhubUploadXhr=null;};
+  xhr.timeout=1800000;
+  xhr.ontimeout=function(){row._xhr=null;fedhubUploadXhr=null;barInner.style.background='var(--red)';pct.textContent='Timeout';pct.style.color='var(--red)';};
+  xhr.open('POST','/api/upload/fedhub');
+  xhr.send(fd);
+}
+function fedhubDrop(ev){ev.preventDefault();var z=document.getElementById('fedhub-upload-area');if(z)z.classList.remove('dragover');if(ev.dataTransfer&&ev.dataTransfer.files&&ev.dataTransfer.files.length)fedhubDoUpload(ev.dataTransfer.files,'main');}
+function fedhubDropUpgrade(ev){ev.preventDefault();var z=document.getElementById('fedhub-upgrade-upload-area');if(z)z.classList.remove('dragover');if(ev.dataTransfer&&ev.dataTransfer.files&&ev.dataTransfer.files.length)fedhubDoUpload(ev.dataTransfer.files,'upgrade');}
+function fedhubFilePicked(files){
+  if(files&&files.length)fedhubDoUpload(files,'main');
+  var inp=document.getElementById('fedhub-file-input');
+  if(inp)setTimeout(function(){inp.value='';},100);
+}
+function fedhubUpgradeFilePicked(files){
+  if(files&&files.length)fedhubDoUpload(files,'upgrade');
+  var inp=document.getElementById('fedhub-upgrade-file-input');
+  if(inp)setTimeout(function(){inp.value='';},100);
+}
+function fedhubRemoveUpload(){
+  fetch('/api/upload/fedhub/package',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    if(!d||!d.filename){fedhubRefreshPackageRowsFromServer();return;}
+    fedhubRemoveUploadFile(d.filename);
+  }).catch(function(){fedhubRefreshPackageRowsFromServer();});
+}
+function _fhCertV(id){
+  var el=document.getElementById(id);
+  return el?(el.value||'').trim():'';
+}
+function collectFedhubCertPayload(forSave){
+  var o={
+    cert_country:_fhCertV('fedhub-cert-country').toUpperCase(),
+    cert_state:_fhCertV('fedhub-cert-state').toUpperCase(),
+    cert_city:_fhCertV('fedhub-cert-city').toUpperCase(),
+    cert_org:_fhCertV('fedhub-cert-org').toUpperCase(),
+    cert_ou:_fhCertV('fedhub-cert-ou').toUpperCase(),
+    root_ca_name:_fhCertV('fedhub-root-ca'),
+    intermediate_ca_name:_fhCertV('fedhub-intermediate-ca')
+  };
+  var pw=_fhCertV('fedhub-cert-password');
+  if(forSave)o.cert_password=pw;
+  else if(pw)o.cert_password=pw;
+  return o;
+}
+function validateFedhubCertFields(){
+  var rf=[{id:'fedhub-cert-country',l:'Country'},{id:'fedhub-cert-state',l:'State'},{id:'fedhub-cert-city',l:'City'},{id:'fedhub-cert-org',l:'Organization'},{id:'fedhub-cert-ou',l:'Org Unit'},{id:'fedhub-root-ca',l:'Root CA'},{id:'fedhub-intermediate-ca',l:'Intermediate CA'}];
+  var empty=rf.filter(function(f){var el=document.getElementById(f.id);return !el||!el.value.trim();});
+  if(empty.length>0){
+    alert('Please fill in: '+empty.map(function(f){return f.l;}).join(', '));
+    empty.forEach(function(f){var el=document.getElementById(f.id);if(el){el.style.borderColor='var(--red)';el.addEventListener('input',function(){el.style.borderColor='';},{once:true});}});
+    return false;
+  }
+  var asn1ok=/^[A-Za-z0-9 '()+,./:=?-]*$/;
+  var certFields=[{id:'fedhub-cert-country',l:'Country'},{id:'fedhub-cert-state',l:'State'},{id:'fedhub-cert-city',l:'City'},{id:'fedhub-cert-org',l:'Organization'},{id:'fedhub-cert-ou',l:'Org Unit'}];
+  var bad=certFields.filter(function(f){var el=document.getElementById(f.id);var v=el?(el.value||'').trim():'';return v&&!asn1ok.test(v);});
+  if(bad.length>0){
+    alert("Invalid characters in: "+bad.map(function(f){return f.l;}).join(", ")+"\\n\\nCertificate fields only allow: A-Z, 0-9, spaces, and ' ( ) + , - . / : = ?\\n\\nNo underscores, @, #, ! or special characters.");
+    bad.forEach(function(f){var el=document.getElementById(f.id);if(el){el.style.borderColor='var(--red)';el.addEventListener('input',function(){el.style.borderColor='';},{once:true});}});
+    return false;
+  }
+  var pwt=_fhCertV('fedhub-cert-password');
+  if(pwt&&!/^[a-zA-Z0-9!@#%^+=_.,:-]+$/.test(pwt)){
+    alert('Fed Hub keystore password contains unsupported characters for the remote install scripts. Use letters, digits, and limited punctuation only.');
+    var pe=document.getElementById('fedhub-cert-password');if(pe){pe.style.borderColor='var(--red)';pe.addEventListener('input',function(){pe.style.borderColor='';},{once:true});}
+    return false;
+  }
+  return true;
+}
+function fedhubSaveCertSettings(){
+  var msg=document.getElementById('fedhub-cert-settings-msg');
+  if(msg){msg.textContent='Saving...';msg.style.color='var(--text-dim)';}
+  fetch('/api/fedhub/cert-settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fedhub_cert:collectFedhubCertPayload(true)}),credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(d){
+      if(d&&d.success){
+        if(msg){msg.textContent='Saved. Reload the page to refresh the effective password hint if you changed the password.';msg.style.color='var(--green)';}
+      }else{if(msg){msg.textContent=(d&&d.error)||'Save failed';msg.style.color='var(--red)';}}
+    }).catch(function(e){if(msg){msg.textContent='Save failed';msg.style.color='var(--red)';}});
+}
+function fedhubStartDeploy(){
+  var host=(document.getElementById('fedhub-remote-host')||{}).value||'';
+  if(!host.trim()){alert('Set remote host first');return;}
+  if(!validateFedhubCertFields())return;
+  var btn=document.getElementById('fedhub-deploy-btn');
+  fetch('/api/upload/fedhub/package',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    if(!d||!d.filename){alert('Upload the Federation Hub .deb first');return;}
+    if(btn)btn.disabled=true;
+    var lc=document.getElementById('fedhub-deploy-log-card');var lg=document.getElementById('fedhub-deploy-log');
+    if(lc)lc.style.display='block';if(lg)lg.textContent='Starting deployment...';
+    fedhubLogIndex=0;if(fedhubLogInterval){clearInterval(fedhubLogInterval);fedhubLogInterval=null;}
+    fetch('/api/fedhub/deploy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:collectFedhubDeployConfig(),fedhub_cert:collectFedhubCertPayload(false)}),credentials:'same-origin'})
+      .then(function(r){return r.json();}).then(function(res){
+        if(res&&res.error){
+          if(lg)lg.textContent='Error: '+res.error;
+          if(btn)btn.disabled=false;
+          return;
+        }
+        fedhubPollLog();
+      }).catch(function(e){if(lg)lg.textContent='Request failed';if(btn)btn.disabled=false;});
+  });
+}
+function fedhubPollLog(){
+  fedhubLogInterval=setInterval(function(){
+    fetch('/api/fedhub/deploy/log?index='+fedhubLogIndex,{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+      var box=document.getElementById('fedhub-deploy-log');
+      if(d.entries&&d.entries.length){
+        if(fedhubLogIndex===0&&box)box.textContent='';
+        if(box)box.textContent+=d.entries.join(String.fromCharCode(10))+String.fromCharCode(10);
+        if(box)box.scrollTop=box.scrollHeight;
+        fedhubLogIndex+=d.entries.length;
+      }
+      if(!d.running){
+        clearInterval(fedhubLogInterval);fedhubLogInterval=null;
+        var btn=document.getElementById('fedhub-deploy-btn');
+        if(d.complete&&!d.error){
+          if(btn){btn.textContent='Done — reloading';btn.style.background='var(--green)';}
+          location.reload();
+        }else if(d.error){
+          if(btn){btn.disabled=false;btn.textContent='Retry deploy';}
+        }else if(btn){btn.disabled=false;}
+      }
+    });
+  },800);
+}
+function fedhubResumeErrorLog(){
+  fetch('/api/fedhub/deploy/log?index=0',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    var box=document.getElementById('fedhub-deploy-log');
+    if(box&&d.entries&&d.entries.length)box.textContent=d.entries.join(String.fromCharCode(10));
+    if(box)box.scrollTop=box.scrollHeight;
+    fedhubLogIndex=d.total||0;
+  });
+}
+function fedhubToggleUpdate(){
+  var body=document.getElementById('fedhub-update-body');
+  var icon=document.getElementById('fedhub-update-toggle-icon');
+  if(!body)return;
+  var isHidden=body.style.display==='none'||body.style.display==='';
+  body.style.display=isHidden?'block':'none';
+  if(icon)icon.style.transform=isHidden?'rotate(180deg)':'';
+}
+function fedhubStartUpdate(){
+  var host=(document.getElementById('fedhub-remote-host')||{}).value||'';
+  if(!host.trim()){alert('Set remote host first');return;}
+  if(!validateFedhubCertFields())return;
+  var btn=document.getElementById('fedhub-update-btn');
+  var msg=document.getElementById('fedhub-update-msg');
+  fetch('/api/upload/fedhub/package',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    if(!d||!d.filename){alert('Upload the new Federation Hub .deb first');return;}
+    if(btn)btn.disabled=true;
+    if(msg){msg.textContent='';msg.style.color='var(--text-dim)';}
+    var wrap=document.getElementById('fedhub-upgrade-log-wrap');
+    var lg=document.getElementById('fedhub-upgrade-log');
+    if(wrap)wrap.style.display='block';
+    if(lg)lg.textContent='Starting update...';
+    fedhubUpgradeLogIndex=0;
+    if(fedhubUpgradeLogInterval){clearInterval(fedhubUpgradeLogInterval);fedhubUpgradeLogInterval=null;}
+    fetch('/api/fedhub/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:collectFedhubDeployConfig(),fedhub_cert:collectFedhubCertPayload(false)}),credentials:'same-origin'})
+      .then(function(r){return r.json();}).then(function(res){
+        if(res&&res.error){
+          if(lg)lg.textContent='Error: '+res.error;
+          if(btn)btn.disabled=false;
+          if(msg){msg.textContent=res.error;msg.style.color='var(--red)';}
+          return;
+        }
+        fedhubPollUpgradeLog();
+      }).catch(function(e){if(lg)lg.textContent='Request failed';if(btn)btn.disabled=false;});
+  });
+}
+function fedhubPollUpgradeLog(){
+  fedhubUpgradeLogInterval=setInterval(function(){
+    fetch('/api/fedhub/update/log?index='+fedhubUpgradeLogIndex,{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+      var box=document.getElementById('fedhub-upgrade-log');
+      if(d.entries&&d.entries.length){
+        if(fedhubUpgradeLogIndex===0&&box)box.textContent='';
+        if(box)box.textContent+=d.entries.join(String.fromCharCode(10))+String.fromCharCode(10);
+        if(box)box.scrollTop=box.scrollHeight;
+        fedhubUpgradeLogIndex=d.total||0;
+      }
+      if(!d.running){
+        clearInterval(fedhubUpgradeLogInterval);fedhubUpgradeLogInterval=null;
+        var btn=document.getElementById('fedhub-update-btn');
+        var msg=document.getElementById('fedhub-update-msg');
+        if(d.complete&&!d.error){
+          if(btn){btn.textContent='Update complete';btn.style.background='var(--green)';}
+          if(msg){msg.textContent='Done. Refreshing...';msg.style.color='var(--green)';}
+          setTimeout(function(){location.reload();},1200);
+        }else if(d.error){
+          if(btn){btn.disabled=false;btn.textContent='Retry update';}
+          if(msg){msg.textContent='Update failed';msg.style.color='var(--red)';}
+        }else if(btn){btn.disabled=false;}
+      }
+    });
+  },800);
+}
+function collectFedhubDeployConfig(){
+  var host=(document.getElementById('fedhub-remote-host')||{}).value||'';
+  var user=(document.getElementById('fedhub-remote-user')||{}).value||'root';
+  var key=(document.getElementById('fedhub-remote-key')||{}).value||'';
+  var portVal=(document.getElementById('fedhub-remote-port')||{}).value||'22';
+  var p=parseInt(portVal,10);
+  var wup=(document.getElementById('fedhub-web-ui-port')||{}).value;
+  var wp=parseInt(wup,10);
+  var dep=document.getElementById('fedhub-deployed-flag');
+  return{target_mode:'remote',deployed:dep&&dep.value==='1',web_ui_port:isNaN(wp)?8080:wp,remote:{host:host.trim(),ssh_user:(user||'root').trim(),ssh_port:isNaN(p)?22:p,ssh_key_path:key.trim()}};
+}
+function _fedhubSshMsg(msg,err,ok){
+  var el=document.getElementById('fedhub-ssh-status');
+  if(el){el.style.color=err?'var(--red)':ok?'var(--green)':'var(--text-dim)';el.textContent=msg||'';}
+}
+function fedhubSaveTarget(){
+  var msg=document.getElementById('fedhub-ssh-status');
+  if(msg)msg.textContent='Saving...';
+  fetch('/api/fedhub/deployment-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:collectFedhubDeployConfig()}),credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(d){
+      if(d&&(d.target_mode!==undefined||d.remote)){_fedhubSshMsg('Saved',false,true);setTimeout(function(){_fedhubSshMsg('',false,false);},1500);}
+      else _fedhubSshMsg((d&&d.error)||'Save failed',true);
+    }).catch(function(e){_fedhubSshMsg('Save failed',true);});
+}
+function fedhubEnsureKey(){
+  _fedhubSshMsg('Generating...',false,false);
+  fetch('/api/fedhub/remote/ensure-ssh-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:collectFedhubDeployConfig()}),credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(d){
+      if(!d||!d.success){_fedhubSshMsg((d&&d.error)||'Failed',true);return;}
+      var kp=document.getElementById('fedhub-remote-key');if(d.key_path&&kp)kp.value=d.key_path;
+      var pk=document.getElementById('fedhub-public-key');if(pk)pk.value=d.public_key||'';
+      _fedhubSshMsg('SSH key ready'+(d.fingerprint?' | '+d.fingerprint:''),false,true);
+    }).catch(function(e){_fedhubSshMsg('Failed',true);});
+}
+function fedhubInstallKey(){
+  var pw=(document.getElementById('fedhub-remote-password')||{}).value||'';
+  if(!pw){_fedhubSshMsg('Enter password for ssh-copy-id',true);return;}
+  _fedhubSshMsg('Installing key...',false,false);
+  fetch('/api/fedhub/remote/install-ssh-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw,config:collectFedhubDeployConfig()}),credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(d){
+      if(d&&d.success)_fedhubSshMsg('SSH key installed',false,true);
+      else _fedhubSshMsg((d&&d.error)||'Install failed',true);
+    }).catch(function(e){_fedhubSshMsg('Install failed',true);});
+}
+function fedhubTestSsh(){
+  _fedhubSshMsg('Testing...',false,false);
+  fetch('/api/fedhub/remote/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:collectFedhubDeployConfig()}),credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(d){
+      if(d&&d.success)_fedhubSshMsg('SSH OK',false,true);
+      else _fedhubSshMsg((d&&d.error)||(d&&d.output)||'Test failed',true);
+    }).catch(function(e){_fedhubSshMsg('Test failed',true);});
+}
+function fedhubMarkDeployed(){
+  var el=document.getElementById('fedhub-mark-msg');
+  if(el)el.textContent='Checking target...';
+  fetch('/api/fedhub/mark-deployed',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}',credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(d){
+      if(d&&d.success){location.reload();return;}
+      if(el)el.textContent=(d&&d.error)||'Failed';
+      if(d&&d.detail&&el)el.textContent+=' — '+(d.detail||'').substring(0,200);
+    }).catch(function(e){if(el)el.textContent='Request failed';});
+}
+function fedhubEnableAuthentik(){
+  var btn=document.getElementById('fedhub-ak-btn');
+  var el=document.getElementById('fedhub-ak-msg');
+  if(btn)btn.disabled=true;
+  if(el){el.style.color='var(--text-dim)';el.textContent='Creating OAuth app in Authentik and patching config...';}
+  fetch('/api/fedhub/enable-authentik',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}',credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(d){
+      if(btn)btn.disabled=false;
+      if(d&&d.success){
+        if(el){el.style.color='var(--green)';el.textContent=d.message||'Authentik SSO enabled';}
+      } else {
+        var msg=(d&&d.error)||'Failed';
+        if(d&&d.steps&&d.steps.length)msg+=String.fromCharCode(10)+d.steps.join(String.fromCharCode(10));
+        if(el){el.style.color='var(--red)';el.textContent=msg;el.style.whiteSpace='pre-wrap';}
+      }
+    }).catch(function(e){if(btn)btn.disabled=false;if(el){el.style.color='var(--red)';el.textContent='Request failed';}});
+}
+function fedhubClearRegistration(){
+  if(!confirm('Remove Federation Hub from this console only?'))return;
+  var el=document.getElementById('fedhub-clear-msg');
+  fetch('/api/fedhub/clear-registration',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}',credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(d){
+      if(d&&d.success){location.reload();return;}
+      if(el){el.style.color='var(--red)';el.textContent=(d&&d.error)||'Failed';}
+    }).catch(function(e){if(el){el.style.color='var(--red)';el.textContent='Failed';}});
+}
+function fedhubDownloadWebadminCert(){
+  var el=document.getElementById('fedhub-cert-download-msg')||document.getElementById('fedhub-control-msg');
+  if(el){el.style.color='var(--text-dim)';el.textContent='Preparing certificate download...';}
+  window.location='/api/fedhub/download-webadmin-cert';
+  if(el){setTimeout(function(){el.textContent='';},2500);}
+}
+function loadFedhubCertExpiry(){
+  function fmt(days){
+    var y=Math.floor(days/365),r=days%365,m=Math.floor(r/30),dd=r%30;
+    var p=[];if(y>0)p.push(y+'y');if(m>0)p.push(m+'mo');if(dd>0||p.length===0)p.push(dd+'d');
+    return p.join(' ');
+  }
+  function fill(el,d){
+    if(!el)return;
+    var parts=[];
+    var certs=[['root_ca','Root'],['intermediate_ca','Int']];
+    for(var i=0;i<certs.length;i++){
+      var key=certs[i][0],label=certs[i][1],c=d[key];
+      if(!c||c.error){parts.push(label+' <span style="color:var(--text-dim)">—</span>');continue;}
+      var days=c.days_left,color='#22c55e';
+      if(days<=90)color='#ef4444';else if(days<=365)color='#eab308';
+      parts.push(label+' <span style="color:'+color+';font-weight:600">'+fmt(days)+'</span>');
+    }
+    el.innerHTML=parts.join(' &nbsp;&middot;&nbsp; ');
+  }
+  fetch('/api/fedhub/cert-expiry',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    fill(document.getElementById('fedhub-cert-expiry-banner'),d);
+    fill(document.getElementById('fedhub-cert-expiry-section'),d);
+  }).catch(function(){
+    var b=document.getElementById('fedhub-cert-expiry-banner');
+    var s=document.getElementById('fedhub-cert-expiry-section');
+    if(b)b.innerHTML='';
+    if(s)s.innerHTML='';
+  });
+}
+function fedhubPollRotateLog(){
+  if(fedhubRotateLogInterval)clearInterval(fedhubRotateLogInterval);
+  fedhubRotateLogInterval=setInterval(function(){
+    fetch('/api/fedhub/rotate-ca/log?index='+fedhubRotateLogIndex,{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+      var box=document.getElementById('fedhub-rotate-log');
+      if(box&&d.entries&&d.entries.length){
+        var t=(box.textContent||'');
+        if(t&&t.slice(-1)!==String.fromCharCode(10))t+=String.fromCharCode(10);
+        box.textContent=t+d.entries.join(String.fromCharCode(10));
+        box.scrollTop=box.scrollHeight;
+        fedhubRotateLogIndex=d.total||fedhubRotateLogIndex;
+      }
+      if(d.complete){
+        clearInterval(fedhubRotateLogInterval);fedhubRotateLogInterval=null;
+        var btn=document.getElementById('fedhub-rotate-btn');
+        var msg=document.getElementById('fedhub-rotate-msg');
+        if(btn){btn.disabled=false;btn.textContent=d.error?'Retry CA rotation':'Rotate CA + regenerate certs';}
+        if(msg){msg.style.color=d.error?'var(--red)':'var(--green)';msg.textContent=d.error?'Rotation failed':'Rotation complete. Re-import webadmin-fed.p12 before next login.';}
+      }
+    });
+  },1200);
+}
+function fedhubStartRotateCa(){
+  if(!confirm('Rotate Federation Hub CA and regenerate certs now? This restarts federation-hub and requires importing a new webadmin-fed.p12.'))return;
+  var btn=document.getElementById('fedhub-rotate-btn');
+  var msg=document.getElementById('fedhub-rotate-msg');
+  var wrap=document.getElementById('fedhub-rotate-log-wrap');
+  var box=document.getElementById('fedhub-rotate-log');
+  if(btn){btn.disabled=true;btn.textContent='Rotating...';}
+  if(msg){msg.style.color='var(--text-dim)';msg.textContent='Starting rotation...';}
+  if(wrap)wrap.style.display='block';
+  if(box)box.textContent='';
+  fedhubRotateLogIndex=0;
+  fetch('/api/fedhub/rotate-ca',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}',credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(d){
+      if(!d||!d.success){
+        if(btn){btn.disabled=false;btn.textContent='Rotate CA + regenerate certs';}
+        if(msg){msg.style.color='var(--red)';msg.textContent=(d&&d.error)||'Failed to start rotation';}
+        return;
+      }
+      fedhubPollRotateLog();
+    }).catch(function(){
+      if(btn){btn.disabled=false;btn.textContent='Rotate CA + regenerate certs';}
+      if(msg){msg.style.color='var(--red)';msg.textContent='Request failed';}
+    });
+}
+function fedhubControl(act){
+  var el=document.getElementById('fedhub-control-msg');
+  if(el){el.style.color='var(--text-dim)';el.textContent='Running...';}
+  fetch('/api/fedhub/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:act}),credentials:'same-origin'})
+    .then(function(r){return r.json();}).then(function(d){
+      if(el){el.style.color=d&&d.success?'var(--green)':'var(--red)';el.textContent=(d&&d.success)?'OK':((d&&d.error)||'Failed');if(d&&d.output)el.textContent+=' '+(d.output||'').substring(0,200);}
+      fedhubRefreshStatus();
+    }).catch(function(e){if(el){el.style.color='var(--red)';el.textContent='Failed';}});
+}
+function fedhubRefreshStatus(){
+  fetch('/api/fedhub/status',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    var s=document.getElementById('fedhub-svc-state');
+    var di=document.getElementById('fedhub-dir-state');
+    if(!d.registered)return;
+    if(s)s.textContent=d.service_state||'—';
+    if(di)di.textContent=d.dir_ok?'/opt/tak/federation-hub present':'missing';
+  }).catch(function(){});
+}
+document.addEventListener('DOMContentLoaded',function(){
+  if(document.getElementById('fedhub-progress-area'))fedhubRefreshPackageRowsFromServer();
+  if(document.getElementById('fedhub-svc-state'))fedhubRefreshStatus();
+  {% if fedhub_deploying %}
+  fedhubLogIndex=0;
+  fedhubPollLog();
+  {% elif fedhub_deploy_done and fedhub_deploy_error %}
+  fedhubResumeErrorLog();
+  {% endif %}
+  {% if fedhub_upgrading %}
+  fedhubUpgradeLogIndex=0;
+  var uw=document.getElementById('fedhub-upgrade-log-wrap');
+  if(uw)uw.style.display='block';
+  fedhubPollUpgradeLog();
+  {% elif fedhub_upgrade_done or fedhub_upgrade_error %}
+  fetch('/api/fedhub/update/log?index=0',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    var box=document.getElementById('fedhub-upgrade-log');
+    if(box&&d.entries&&d.entries.length)box.textContent=d.entries.join(String.fromCharCode(10));
+    if(box)box.scrollTop=box.scrollHeight;
+    fedhubUpgradeLogIndex=d.total||0;
+  });
+  {% endif %}
+  {% if fedhub_rotating %}
+  fedhubRotateLogIndex=0;
+  var rw=document.getElementById('fedhub-rotate-log-wrap');
+  if(rw)rw.style.display='block';
+  fedhubPollRotateLog();
+  {% elif fedhub_rotate_done or fedhub_rotate_error %}
+  fetch('/api/fedhub/rotate-ca/log?index=0',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    var box=document.getElementById('fedhub-rotate-log');
+    if(box&&d.entries&&d.entries.length)box.textContent=d.entries.join(String.fromCharCode(10));
+    if(box)box.scrollTop=box.scrollHeight;
+    fedhubRotateLogIndex=d.total||0;
+  });
+  {% endif %}
+  if(document.getElementById('fedhub-remote-metrics-bar')){loadFedhubRemoteMetrics();setInterval(loadFedhubRemoteMetrics,5000);}
+  if(document.getElementById('fedhub-cert-expiry-banner')||document.getElementById('fedhub-cert-expiry-section')){
+    loadFedhubCertExpiry();
+    setInterval(loadFedhubCertExpiry,60000);
+  }
+});
+async function loadFedhubRemoteMetrics(){var bar=document.getElementById('fedhub-remote-metrics-bar');if(!bar)return;try{var r=await fetch('/api/fedhub/remote-metrics',{credentials:'same-origin'});if(!r.ok){document.getElementById('fedhub-remote-cpu-value').textContent='\u2014';document.getElementById('fedhub-remote-ram-value').textContent='\u2014';document.getElementById('fedhub-remote-disk-value').textContent='\u2014';document.getElementById('fedhub-remote-uptime-value').textContent='\u2014';return;}var d=await r.json();var cpu=document.getElementById('fedhub-remote-cpu-value');if(cpu)cpu.textContent=(d.cpu_percent!=null?d.cpu_percent:'\u2014')+'%';var ram=document.getElementById('fedhub-remote-ram-value');if(ram)ram.textContent=(d.ram_percent!=null?d.ram_percent:'\u2014')+'%';var ramD=document.getElementById('fedhub-remote-ram-detail');if(ramD)ramD.textContent=(d.ram_used_gb!=null&&d.ram_total_gb!=null)?(d.ram_used_gb+'GB / '+d.ram_total_gb+'GB'):'';var disk=document.getElementById('fedhub-remote-disk-value');if(disk)disk.textContent=(d.disk_percent!=null?d.disk_percent:'\u2014')+'%';var diskD=document.getElementById('fedhub-remote-disk-detail');if(diskD)diskD.textContent=(d.disk_used_gb!=null&&d.disk_total_gb!=null)?(d.disk_used_gb+'GB / '+d.disk_total_gb+'GB'):'';var up=document.getElementById('fedhub-remote-uptime-value');if(up)up.textContent=d.uptime||'\u2014';}catch(e){}}
+</script>
 </body></html>
 '''
 
@@ -16296,10 +19083,14 @@ def _run_authentik_reconfigure_remote(settings, deploy_cfg, plog):
     _ensure_proxy_providers_cookie_domain(ak_url, ak_headers, fqdn, plog)
     if _is_module_deployed(settings, 'takportal'):
         plog("  Syncing TAK Portal provider URL and outpost...")
-        _sync_authentik_takportal_provider_url(settings)
+        _sync_authentik_takportal_provider_url(settings, plog=plog)
     if _is_module_deployed(settings, 'nodered'):
         plog("  Configuring Authentik for Node-RED...")
         _ensure_authentik_nodered_app(fqdn, ak_token, plog, settings=settings)
+    fh_cfg = _get_fedhub_deployment_config(settings)
+    if fh_cfg.get('deployed') and (fh_cfg.get('remote', {}).get('host') or '').strip():
+        plog("  Configuring Authentik for Federation Hub (forward auth)...")
+        _ensure_authentik_fedhub_proxy_app(fqdn, ak_token, plog, settings=settings)
     plog("  Configuring Authentik for infra-TAK Console (infra-TAK + MediaMTX if deployed)...")
     _ensure_authentik_console_app(fqdn, ak_token, plog)
     plog("  Ensuring all app providers on embedded outpost...")
@@ -16461,10 +19252,14 @@ def run_authentik_deploy(reconfigure=False):
                         _ensure_proxy_providers_cookie_domain(ak_url, ak_headers, fqdn, plog)
                         if _is_module_deployed(settings, 'takportal'):
                             plog("  Syncing TAK Portal provider URL and outpost...")
-                            _sync_authentik_takportal_provider_url(settings)
+                            _sync_authentik_takportal_provider_url(settings, plog=plog)
                         if _is_module_deployed(settings, 'nodered'):
                             plog("  Configuring Authentik for Node-RED...")
                             _ensure_authentik_nodered_app(fqdn, ak_token, plog, settings=settings)
+                        fh_cfg = _get_fedhub_deployment_config(settings)
+                        if fh_cfg.get('deployed') and (fh_cfg.get('remote', {}).get('host') or '').strip():
+                            plog("  Configuring Authentik for Federation Hub (forward auth)...")
+                            _ensure_authentik_fedhub_proxy_app(fqdn, ak_token, plog, settings=settings)
                         plog("  Configuring Authentik for infra-TAK Console (infra-TAK + MediaMTX if deployed)...")
                         _ensure_authentik_console_app(fqdn, ak_token, plog)
                         plog("  Ensuring all app providers on embedded outpost...")
@@ -16525,6 +19320,7 @@ def run_authentik_deploy(reconfigure=False):
                                         break
                                 plog("  \u2713 Authentik domain synced (env, compose, brand, outpost)")
                                 _sync_authentik_provider_external_hosts(ak_url, ak_headers, fqdn, ak_base, plog)
+                                plog("  Recreating LDAP + restarting Authentik server/worker (no log output for up to ~2 min)...")
                                 subprocess.run(f'cd {ak_dir} && docker compose up -d --force-recreate ldap 2>&1', shell=True, capture_output=True, text=True, timeout=60)
                                 subprocess.run(f'cd {ak_dir} && docker compose restart server worker 2>&1', shell=True, capture_output=True, text=True, timeout=90)
                                 plog("  \u2713 Restarted Authentik (LDAP + server/worker to pick up new domain)")
@@ -17081,7 +19877,6 @@ entries:
             if ak_token:
                 ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
                 ak_url = f'http://127.0.0.1:9090'
-                import urllib.request
 
                 # Verify bootstrap token actually works before proceeding
                 # The worker runs apply_blueprint system/bootstrap.yaml before starting
@@ -17303,7 +20098,7 @@ entries:
                             try:
                                 req = urllib.request.Request(f'{ak_url}/api/v3/core/applications/',
                                     data=json.dumps({'name': 'LDAP', 'slug': 'ldap',
-                                        'provider': ldap_provider_pk}).encode(),
+                                        'provider': ldap_provider_pk, 'open_in_new_tab': True}).encode(),
                                     headers=ak_headers, method='POST')
                                 urllib.request.urlopen(req, timeout=10)
                                 plog(f"  ✓ Created LDAP application")
@@ -17312,6 +20107,7 @@ entries:
                                     plog(f"  ✓ LDAP application already exists")
                                 else:
                                     plog(f"  ⚠ LDAP application error: {e.code} {e.read().decode()[:100]}")
+                            _authentik_application_open_in_new_tab(ak_url, ak_headers, 'ldap', plog=plog)
 
                             # Get or create LDAP outpost (blueprint may have created it)
                             outpost_token_id = None
@@ -17507,7 +20303,6 @@ entries:
                 if ak_token:
                     ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
                     ak_url = 'http://127.0.0.1:9090'
-                    import urllib.request
 
                     # 12a: Update Brand domain
                     plog("  Updating Authentik brand domain...")
@@ -17603,6 +20398,7 @@ entries:
                                 'name': 'TAK Portal',
                                 'slug': 'tak-portal',
                                 'provider': provider_pk,
+                                'open_in_new_tab': True,
                             }
                             req = urllib.request.Request(f'{ak_url}/api/v3/core/applications/',
                                 data=json.dumps(app_data).encode(),
@@ -17617,6 +20413,7 @@ entries:
                                 app_slug = 'tak-portal'
                             else:
                                 plog(f"  ⚠ Application error: {e.code}")
+                        _authentik_application_open_in_new_tab(ak_url, ak_headers, 'tak-portal', plog=plog)
 
                     # 12e: Add to embedded outpost
                     if app_slug:
@@ -19369,6 +22166,42 @@ def takserver_cert_expiry():
     return jsonify(results)
 
 
+@app.route('/api/fedhub/cert-expiry')
+@login_required
+def fedhub_cert_expiry():
+    """Return Federation Hub Root CA and Intermediate CA expiry (remote host via SSH). Same shape as /api/takserver/cert-expiry."""
+    settings = load_settings()
+    cfg = _get_fedhub_deployment_config(settings)
+    if not cfg.get('deployed') or cfg.get('target_mode') != 'remote':
+        return jsonify({'root_ca': {'error': 'Not deployed'}, 'intermediate_ca': {'error': 'Not deployed'}})
+    remote = cfg.get('remote', {})
+    if not (remote.get('host') or '').strip():
+        return jsonify({'root_ca': {'error': 'No host'}, 'intermediate_ca': {'error': 'No host'}})
+    fh_dir = '/opt/tak/federation-hub/certs/files'
+    results = {}
+    for label, filename in [('root_ca', 'root-ca.pem'), ('intermediate_ca', 'ca.pem')]:
+        path = f'{fh_dir}/{filename}'
+        cmd = f'openssl x509 -enddate -noout -in {shlex.quote(path)} 2>/dev/null'
+        ok, out = _ssh_probe(remote, cmd, timeout=15)
+        if not ok or not (out or '').strip() or 'notAfter' not in out:
+            results[label] = {'error': 'Not found', 'file': filename}
+            continue
+        try:
+            raw = out.strip().split('=', 1)[-1].strip()
+            from datetime import datetime
+            expiry = datetime.strptime(raw, '%b %d %H:%M:%S %Y %Z')
+            now = datetime.utcnow()
+            days_left = (expiry - now).days
+            results[label] = {
+                'file': filename,
+                'expires': expiry.strftime('%Y-%m-%d'),
+                'days_left': days_left,
+            }
+        except Exception as e:
+            results[label] = {'error': str(e)[:200], 'file': filename}
+    return jsonify(results)
+
+
 @app.route('/api/takserver/groups')
 @login_required
 def takserver_groups():
@@ -20522,6 +23355,61 @@ def check_existing_uploads():
         elif fn.endswith('.pol') or 'policy' in fn.lower():
             files['policy'] = {'filename': fn, 'filepath': fp, 'size_mb': sz_mb}
     return jsonify(files)
+
+
+@app.route('/api/upload/fedhub', methods=['POST'])
+@login_required
+def upload_fedhub_package():
+    if 'files' not in request.files:
+        return jsonify({'error': 'No files uploaded'}), 400
+    files = request.files.getlist('files')
+    if not files or all((f.filename or '') == '' for f in files):
+        return jsonify({'error': 'No files selected'}), 400
+    results = []
+    for f in files:
+        raw_name = f.filename or ''
+        fn = secure_filename(raw_name)
+        if not fn:
+            return jsonify({'error': f'Invalid filename: {raw_name[:64]}'}), 400
+        if not fn.endswith('.deb'):
+            return jsonify({'error': 'Federation Hub upload must be a .deb file'}), 400
+        fp = os.path.join(UPLOAD_DIR, fn)
+        f.save(fp)
+        ok_m, err = _validate_fedhub_deb_path(fp)
+        if not ok_m:
+            try:
+                os.remove(fp)
+            except OSError:
+                pass
+            return jsonify({'error': err}), 400
+        sz = round(os.path.getsize(fp) / (1024 * 1024), 1)
+        results.append({'filename': fn, 'size_mb': sz})
+    return jsonify({'success': True, 'packages': results})
+
+
+@app.route('/api/upload/fedhub/delete', methods=['POST'])
+@login_required
+def delete_fedhub_upload():
+    fn = (request.json or {}).get('filename', '')
+    if not fn or not re.match(r'^[a-zA-Z0-9._-]+$', fn):
+        return jsonify({'error': 'Invalid filename'}), 400
+    fp = os.path.join(UPLOAD_DIR, fn)
+    if os.path.isfile(fp):
+        ok_m, _ = _validate_fedhub_deb_path(fp)
+        if not ok_m:
+            return jsonify({'error': 'File is not a recognized Federation Hub package'}), 400
+        os.remove(fp)
+        return jsonify({'success': True, 'filename': fn})
+    return jsonify({'error': 'File not found'}), 404
+
+
+@app.route('/api/upload/fedhub/package')
+@login_required
+def fedhub_uploaded_package_info():
+    fn, fp = _find_fedhub_deb_in_uploads()
+    if not fp:
+        return jsonify({'filename': None})
+    return jsonify({'filename': fn, 'size_mb': round(os.path.getsize(fp) / (1024 * 1024), 1)})
 
 # === TAK Server Deployment ===
 
@@ -21684,7 +24572,7 @@ body::after{content:'';position:fixed;top:0;left:0;right:0;height:2px;background
 @app.route('/api/host-resource-usage')
 @login_required
 def api_host_resource_usage():
-    """Top processes by CPU and RAM for this host or a remote (target=tak_db). Same hosts as UU cards."""
+    """Top processes by CPU and RAM for this host or a remote (target=tak_db|fedhub). Same hosts as UU cards."""
     target = request.args.get('target', 'this_host')
     if target == 'tak_db':
         settings = load_settings()
@@ -21695,6 +24583,15 @@ def api_host_resource_usage():
         if not (s1.get('host') or '').strip():
             return jsonify({'cpu_top': [], 'mem_top': [], 'error': 'No DB host'})
         return jsonify(_top_processes_remote(s1))
+    if target == 'fedhub':
+        settings = load_settings()
+        fh_cfg = _get_fedhub_deployment_config(settings)
+        if not fh_cfg.get('deployed') or fh_cfg.get('target_mode') != 'remote':
+            return jsonify({'cpu_top': [], 'mem_top': [], 'error': 'Fed Hub not deployed'})
+        fh_remote = fh_cfg.get('remote', {})
+        if not (fh_remote.get('host') or '').strip():
+            return jsonify({'cpu_top': [], 'mem_top': [], 'error': 'No Fed Hub host'})
+        return jsonify(_top_processes_remote(fh_remote))
     return jsonify(_top_processes_local())
 
 
@@ -21716,28 +24613,39 @@ def api_metrics():
 def _run_unattended_upgrades_remote(remote_cfg, action):
     """Run enable/disable unattended-upgrades on remote host via SSH. Returns (success, result_dict)."""
     if action == 'disable':
+        # Can't use pkill -f over SSH: the SSH session's own cmdline contains the
+        # script text, so pkill matches and kills the SSH connection (exit 255).
+        # systemctl stop handles SIGTERM→SIGKILL on its own; just let it work.
         script = (
-            'pkill -TERM -f "/usr/bin/unattended-upgrade" 2>/dev/null; true; '
-            'systemctl stop unattended-upgrades 2>/dev/null; systemctl disable unattended-upgrades 2>/dev/null; '
-            'systemctl stop apt-daily-upgrade.timer 2>/dev/null; systemctl disable apt-daily-upgrade.timer 2>/dev/null; true; '
-            'e=$(systemctl is-enabled unattended-upgrades 2>/dev/null); echo "ENABLED=$e"'
+            'sudo systemctl stop apt-daily-upgrade.timer 2>/dev/null; '
+            'sudo systemctl disable apt-daily-upgrade.timer 2>/dev/null; '
+            'sudo systemctl stop apt-daily.timer 2>/dev/null; '
+            'sudo systemctl disable apt-daily.timer 2>/dev/null; '
+            'sudo systemctl stop unattended-upgrades 2>/dev/null; '
+            'sudo systemctl disable unattended-upgrades 2>/dev/null; true; '
+            'e=$(sudo systemctl is-enabled unattended-upgrades 2>/dev/null); echo "ENABLED=$e"'
         )
+        ssh_timeout = 90
     else:
         script = (
-            'systemctl enable unattended-upgrades 2>/dev/null; systemctl start unattended-upgrades 2>/dev/null; '
-            'systemctl enable apt-daily-upgrade.timer 2>/dev/null; systemctl start apt-daily-upgrade.timer 2>/dev/null; true; '
-            'e=$(systemctl is-enabled unattended-upgrades 2>/dev/null); echo "ENABLED=$e"'
+            'sudo systemctl enable unattended-upgrades 2>/dev/null; sudo systemctl start unattended-upgrades 2>/dev/null; '
+            'sudo systemctl enable apt-daily-upgrade.timer 2>/dev/null; sudo systemctl start apt-daily-upgrade.timer 2>/dev/null; true; '
+            'e=$(sudo systemctl is-enabled unattended-upgrades 2>/dev/null); echo "ENABLED=$e"'
         )
+        ssh_timeout = 30
+    host = (remote_cfg.get('host') or '').strip()
+    user = (remote_cfg.get('ssh_user') or 'root').strip()
+    key = (remote_cfg.get('ssh_key_path') or '').strip()
     try:
-        ok, out = _ssh_probe(remote_cfg, script, timeout=30)
+        ok, out = _ssh_probe(remote_cfg, script, timeout=ssh_timeout)
         if not ok:
-            return False, {'error': (out or 'ssh failed')[:100]}
+            return False, {'error': (out or 'ssh failed')[:300]}
         uu = _get_unattended_upgrades_status_remote(remote_cfg)
         if 'error' in uu:
             return False, uu
         return True, uu
     except Exception as e:
-        return False, {'error': str(e)[:100]}
+        return False, {'error': str(e)[:300]}
 
 
 @app.route('/api/unattended-upgrades', methods=['POST'])
@@ -21760,6 +24668,18 @@ def api_toggle_unattended_upgrades():
         ok, result = _run_unattended_upgrades_remote(s1, action)
         if ok:
             return jsonify({'success': True, 'target': 'tak_db', 'enabled': result['enabled'], 'running': result['running']})
+        return jsonify({'success': False, 'error': result.get('error', 'unknown')}), 500
+    if target == 'fedhub':
+        settings = load_settings()
+        fh_cfg = _get_fedhub_deployment_config(settings)
+        if not fh_cfg.get('deployed') or fh_cfg.get('target_mode') != 'remote':
+            return jsonify({'success': False, 'error': 'Fed Hub not deployed'}), 400
+        fh_remote = fh_cfg.get('remote', {})
+        if not (fh_remote.get('host') or '').strip():
+            return jsonify({'success': False, 'error': 'No Fed Hub host'}), 400
+        ok, result = _run_unattended_upgrades_remote(fh_remote, action)
+        if ok:
+            return jsonify({'success': True, 'target': 'fedhub', 'enabled': result['enabled'], 'running': result['running']})
         return jsonify({'success': False, 'error': result.get('error', 'unknown')}), 500
     # this_host
     try:
@@ -22356,13 +25276,14 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% else %}
 {% for key, mod in modules.items() %}
 <a class="module-card" href="{{ mod.route }}" data-module="{{ key }}">
-<div class="module-header{% if mod.get('icon_url') %} module-header--logo{% endif %}">{% if mod.icon_data %}<img src="{{ mod.icon_data }}" alt="" class="module-icon" style="width:24px;height:24px;object-fit:contain">{% elif key == 'takportal' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">group</span>{% elif key == 'emailrelay' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">outgoing_mail</span>{% elif mod.get('icon_url') %}<img src="{{ mod.icon_url }}" alt="" class="module-icon" style="height:36px;width:auto;max-width:{% if key == 'takserver' %}72px{% else %}100px{% endif %};object-fit:contain">{% else %}<span class="module-icon">{{ mod.icon }}</span>{% endif %}
-{% if not mod.get('icon_url') or key == 'takportal' or key == 'emailrelay' %}<div class="module-name">{{ mod.name }}</div>{% endif %}
+<div class="module-header{% if mod.get('icon_url') %} module-header--logo{% endif %}">{% if mod.icon_data %}<img src="{{ mod.icon_data }}" alt="" class="module-icon" style="width:24px;height:24px;object-fit:contain">{% elif key == 'takportal' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">group</span>{% elif key == 'fedhub' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">hub</span>{% elif key == 'emailrelay' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">outgoing_mail</span>{% elif mod.get('icon_url') %}<img src="{{ mod.icon_url }}" alt="" class="module-icon" style="height:36px;width:auto;max-width:{% if key == 'takserver' %}72px{% else %}100px{% endif %};object-fit:contain">{% else %}<span class="module-icon">{{ mod.icon }}</span>{% endif %}
+{% if not mod.get('icon_url') or key == 'takportal' or key == 'fedhub' or key == 'emailrelay' %}<div class="module-name">{{ mod.name }}</div>{% endif %}
 </div>
 <div class="module-desc">{{ mod.description }}</div>
 {% if module_versions.get(key) %}{% set v = module_versions.get(key) %}{% if v.version or v.update_available %}<div class="meta-line module-version-line" id="module-version-{{ key }}" style="margin-bottom:4px">{% if v.version %}{% if key == 'mediamtx' %}{{ v.version }}{% else %}v{{ v.version }}{% endif %}{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% endif %}</div>{% endif %}{% endif %}
 <span class="module-status status-{% if mod.installed and mod.running %}running{% elif mod.installed %}stopped{% else %}not-installed{% endif %}" id="module-status-{{ key }}" data-module="{{ key }}" data-gd-overall="{% if key == 'guarddog' and mod.installed and mod.running %}fetch{% endif %}">{% if mod.installed and mod.running %}<span class="status-dot"></span> Running{% elif mod.installed %}<span class="status-dot"></span> Stopped{% else %}Not Installed{% endif %}</span>
 {% if key == 'takserver' and mod.installed %}<div id="takserver-card-cert-expiry" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
+{% if key == 'fedhub' and mod.installed %}<div id="fedhub-card-cert-expiry" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
 {% if key == 'caddy' and mod.installed %}<div id="caddy-card-cert-days" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
 </a>
 {% endfor %}
@@ -22393,7 +25314,7 @@ async function toggleUU(cb){
         var d=await r.json();
         if(sp)sp.style.display='none';
         if(d.success){updateUUHost(target,d);}
-        else{cb.checked=!cb.checked;if(lb){lb.textContent=(action==='disable'?'Disable failed':'Error: '+(d.error||'unknown'));lb.style.color='var(--red)';}}
+        else{cb.checked=!cb.checked;if(lb){lb.textContent=(action==='disable'?'Disable failed: ':'Enable failed: ')+(d.error||'unknown');lb.style.color='var(--red)';}}
     }catch(e){if(sp)sp.style.display='none';cb.checked=!cb.checked;if(lb){lb.textContent='Error';lb.style.color='var(--red)';}}
 }
 function formatRamGb(memPct,totalRamGb){if(totalRamGb==null)return '';var gb=(Number(memPct||0)/100)*totalRamGb;return gb.toFixed(2)+' GB';}
@@ -22529,6 +25450,31 @@ function loadCaddyCertDays(){
     }).catch(function(){el.textContent='Cert: —';el.style.color='var(--text-dim)';});
 }
 loadTakCertExpiry();
+function loadFedHubCardCertExpiry(){
+  var el=document.getElementById('fedhub-card-cert-expiry');
+  if(!el)return;
+  fetch('/api/fedhub/cert-expiry',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    function fmt(days){
+      var y=Math.floor(days/365),r=days%365,m=Math.floor(r/30),dd=r%30;
+      var p=[];if(y>0)p.push(y+'y');if(m>0)p.push(m+'mo');if(dd>0||p.length===0)p.push(dd+'d');
+      return p.join(' ');
+    }
+    var parts=[];
+    var certs=[['root_ca','Root'],['intermediate_ca','Int']];
+    for(var i=0;i<certs.length;i++){
+      var key=certs[i][0],label=certs[i][1],c=d[key];
+      if(!c||c.error)continue;
+      var days=c.days_left,color='#22c55e';
+      if(days<=90)color='#ef4444';else if(days<=365)color='#eab308';
+      parts.push(label+' <span style="color:'+color+';font-weight:600">'+fmt(days)+'</span>');
+    }
+    el.innerHTML=parts.length?parts.join(' &nbsp;&middot;&nbsp; '):'';
+  }).catch(function(){el.innerHTML='';});
+}
+if(document.getElementById('fedhub-card-cert-expiry')){
+  loadFedHubCardCertExpiry();
+  setInterval(loadFedHubCardCertExpiry,60000);
+}
 loadCaddyCertDays();
 var updateBody='';
 async function checkUpdate(forceRefresh){
@@ -22646,8 +25592,8 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% else %}
 {% for key, mod in modules.items() %}
 <a class="module-card" href="{{ mod.route }}" data-module="{{ key }}">
-<div class="module-header{% if mod.get('icon_url') %} module-header--logo{% endif %}">{% if mod.icon_data %}<img src="{{ mod.icon_data }}" alt="" class="module-icon" style="width:24px;height:24px;object-fit:contain">{% elif key == 'takportal' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">group</span>{% elif key == 'emailrelay' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">outgoing_mail</span>{% elif mod.get('icon_url') %}<img src="{{ mod.icon_url }}" alt="" class="module-icon" style="height:36px;width:auto;max-width:{% if key == 'takserver' %}72px{% else %}100px{% endif %};object-fit:contain">{% else %}<span class="module-icon">{{ mod.icon }}</span>{% endif %}
-{% if not mod.get('icon_url') or key == 'takportal' or key == 'emailrelay' %}<div class="module-name">{{ mod.name }}</div>{% endif %}
+<div class="module-header{% if mod.get('icon_url') %} module-header--logo{% endif %}">{% if mod.icon_data %}<img src="{{ mod.icon_data }}" alt="" class="module-icon" style="width:24px;height:24px;object-fit:contain">{% elif key == 'takportal' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">group</span>{% elif key == 'fedhub' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">hub</span>{% elif key == 'emailrelay' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">outgoing_mail</span>{% elif mod.get('icon_url') %}<img src="{{ mod.icon_url }}" alt="" class="module-icon" style="height:36px;width:auto;max-width:{% if key == 'takserver' %}72px{% else %}100px{% endif %};object-fit:contain">{% else %}<span class="module-icon">{{ mod.icon }}</span>{% endif %}
+{% if not mod.get('icon_url') or key == 'takportal' or key == 'fedhub' or key == 'emailrelay' %}<div class="module-name">{{ mod.name }}</div>{% endif %}
 </div>
 <div class="module-desc">{{ mod.description }}</div>
 <span class="module-status status-not-installed" id="module-status-{{ key }}" data-module="{{ key }}">Not Installed</span>
@@ -23132,6 +26078,10 @@ def _auto_update_guarddog():
                 continue
             if is_two_server and name in ('tak-db-watch.sh', 'tak-cotdb-watch.sh'):
                 continue
+            if name == 'tak-fedhub-watch.sh':
+                _au_fh_cfg = _get_fedhub_deployment_config(settings)
+                if not (_au_fh_cfg.get('deployed') and _au_fh_cfg.get('target_mode') == 'remote' and (_au_fh_cfg.get('remote', {}).get('host') or '').strip()):
+                    continue
             with open(src) as f:
                 content = f.read()
             content = (content
@@ -23144,6 +26094,12 @@ def _auto_update_guarddog():
                 content = content.replace('DB_PORT_PLACEHOLDER', db_port)
                 content = content.replace('SSH_KEY_PLACEHOLDER', ssh_key_path)
                 content = content.replace('SSH_USER_PLACEHOLDER', s1_user)
+            if name == 'tak-fedhub-watch.sh':
+                _fh_cfg = _get_fedhub_deployment_config(settings)
+                _fh_remote = _fh_cfg.get('remote', {})
+                content = content.replace('FEDHUB_HOST_PLACEHOLDER', (_fh_remote.get('host') or '').strip())
+                content = content.replace('SSH_KEY_PLACEHOLDER', (_fh_remote.get('ssh_key_path') or '').strip())
+                content = content.replace('SSH_USER_PLACEHOLDER', (_fh_remote.get('username') or 'root').strip())
             dest = os.path.join('/opt/tak-guarddog', name)
             try:
                 with open(dest) as f:
@@ -23170,6 +26126,40 @@ def _auto_update_guarddog():
         print(f"Guard Dog auto-update skipped: {e}")
 
 _auto_update_guarddog()
+
+# === Startup migrations: fix known bad settings and regenerate Caddy if needed ===
+def _startup_migrations():
+    try:
+        s = load_settings()
+        settings_dirty = False
+
+        # Fix fedhub web_ui_port default for Caddy upstream (remote hub HTTP web UI is 8080)
+        fh_raw = s.get('fedhub_deployment', {})
+        if fh_raw.get('deployed') or fh_raw.get('web_ui_port') in (8446, '8446', None):
+            wp = fh_raw.get('web_ui_port')
+            if wp in (8446, '8446', None):
+                fh_raw['web_ui_port'] = 8080
+                s['fedhub_deployment'] = fh_raw
+                settings_dirty = True
+                print("Startup migration: fixed fedhub web_ui_port → 8080")
+
+        if settings_dirty:
+            save_settings(s)
+            s = load_settings()
+
+        # Build normalized cfg after settings normalization
+        fh_cfg = _get_fedhub_deployment_config(s)
+
+        # Always regenerate Caddyfile when Fed Hub is deployed (port fixes, Fed Hub vhost, etc.)
+        if fh_cfg.get('deployed') and (s.get('fqdn') or '').strip():
+            generate_caddyfile(s)
+            subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
+            print("Startup migration: Caddyfile regenerated + Caddy reloaded")
+    except Exception as e:
+        print(f"Startup migration error: {e}")
+        import traceback; traceback.print_exc()
+
+_startup_migrations()
 
 # === Main Entry Point (fallback for direct python3 app.py) ===
 if __name__ == '__main__':

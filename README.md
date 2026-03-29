@@ -1,10 +1,10 @@
 # infra-TAK
 
-Team Awareness Kit Infrastructure Management Platform.
+Tea Awarness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Latest release: v0.3.2-alpha** — **Guard Dog:** fixes false **TAK LE certificate expiry** emails (`tak-cert-watch.sh` now uses the real keystore alias). **After upgrading the console, click ↻ Update Guard Dog** so `/opt/tak-guarddog/` scripts match the release. See [docs/RELEASE-v0.3.2-alpha.md](docs/RELEASE-v0.3.2-alpha.md). Prior: [v0.3.1-alpha](docs/RELEASE-v0.3.1-alpha.md) (two-server DB migration).
+**Latest release: v0.3.3-alpha** — **Federation Hub:** full remote deploy-and-manage lifecycle, Authentik SSO integration, certificate metadata, Guard Dog monitor. **TAK Portal:** `/locate/*` public path. **Fix:** remote unattended-upgrades toggle no longer kills its own SSH session. **After upgrading, click ↻ Update Guard Dog** so scripts on disk include the new Fed Hub monitor and fixes. See [docs/RELEASE-v0.3.3-alpha.md](docs/RELEASE-v0.3.3-alpha.md). Prior: [v0.3.2-alpha](docs/RELEASE-v0.3.2-alpha.md) (Guard Dog cert fix).
 
 **Goal: universal installer.** Currently supported platform: **Ubuntu 22.04 LTS**.
 
@@ -13,6 +13,7 @@ One clone. One password. One URL. Manage everything from your browser.
 A unified web console for deploying and managing TAK ecosystem infrastructure:
 
 - **TAK Server** — Upload your .deb, configure, deploy, manage CoreConfig — all from the browser
+- **Federation Hub** — Deploy and manage a TAK Server Federation Hub on a remote VPS, with Authentik SSO, certificate management, and Guard Dog monitoring
 - **Authentik** — Identity provider with automated LDAP configuration for TAK Server auth
 - **TAK Portal** — User and certificate management portal with auto-configured Authentik + TAK Server integration
 - **Caddy SSL** — Let's Encrypt certificates and reverse proxy management
@@ -20,7 +21,7 @@ A unified web console for deploying and managing TAK ecosystem infrastructure:
 - **MediaMTX** — Video streaming server for real-time feeds
 - **Node-RED** — Flow-based automation engine, protected behind Authentik forward auth
 - **Email Relay** — Outbound email for notifications and alerts
-- **Guard Dog** — TAK Server health monitoring and auto-recovery (port 8089, processes, OOM, PostgreSQL, CoT DB size, disk, certificates; optional monitors for Authentik, Node-RED, MediaMTX, CloudTAK)
+- **Guard Dog** — TAK Server health monitoring and auto-recovery (port 8089, processes, OOM, PostgreSQL, CoT DB size, disk, certificates; optional monitors for Authentik, Node-RED, MediaMTX, CloudTAK, Federation Hub)
 
 No more SSH. No more editing XML by hand. No more running scripts and hoping.
 
@@ -58,7 +59,7 @@ Then open your browser to the URL shown and log in.
 If you clicked **Update Now** and the console shows an error like `could not apply ... Add files via upload`, `Pulling is not possible because you have unmerged files`, or any rebase/merge conflict message, run this single command on your server:
 
 ```bash
-cd $(grep -oP 'WorkingDirectory=\K.*' /etc/systemd/system/takwerx-console.service) && git fetch --tags origin && git checkout --force v0.3.1-alpha && sudo systemctl restart takwerx-console
+cd $(grep -oP 'WorkingDirectory=\K.*' /etc/systemd/system/takwerx-console.service) && git fetch --tags origin && git checkout --force v0.3.3-alpha && sudo systemctl restart takwerx-console
 ```
 
 This clears the stuck state and puts you on a current tag with the safe updater. No data or config is lost — your `.config/` directory is untouched.
