@@ -238,15 +238,25 @@ async function createClientCert(){
   var result=document.getElementById('cc-result');
   var name=(nameEl?nameEl.value:'').trim();
   if(!name){if(msg){msg.textContent='Enter a client name.';msg.style.color='var(--red)';}return;}
-  var groupsIn=[],groupsOut=[];
-  document.querySelectorAll('.cc-grp-read:checked').forEach(function(c){var g=c.getAttribute('data-group');if(groupsOut.indexOf(g)<0)groupsOut.push(g);});
-  document.querySelectorAll('.cc-grp-write:checked').forEach(function(c){var g=c.getAttribute('data-group');if(groupsIn.indexOf(g)<0)groupsIn.push(g);});
-  if(groupsIn.length===0&&groupsOut.length===0){if(msg){msg.textContent='Select at least one group with read or write permission.';msg.style.color='var(--red)';}return;}
+  var groupsIn=[],groupsOut=[],groupsBoth=[];
+  document.querySelectorAll('.cc-grp-both:checked').forEach(function(c){
+    var g=c.getAttribute('data-group');
+    if(groupsBoth.indexOf(g)<0)groupsBoth.push(g);
+  });
+  document.querySelectorAll('.cc-grp-read:checked').forEach(function(c){
+    var g=c.getAttribute('data-group');
+    if(groupsBoth.indexOf(g)<0&&groupsOut.indexOf(g)<0)groupsOut.push(g);
+  });
+  document.querySelectorAll('.cc-grp-write:checked').forEach(function(c){
+    var g=c.getAttribute('data-group');
+    if(groupsBoth.indexOf(g)<0&&groupsIn.indexOf(g)<0)groupsIn.push(g);
+  });
+  if(groupsIn.length===0&&groupsOut.length===0&&groupsBoth.length===0){if(msg){msg.textContent='Select at least one group with read, write, or both permission.';msg.style.color='var(--red)';}return;}
   if(btn)btn.disabled=true;
   if(msg){msg.textContent='Creating certificate...';msg.style.color='var(--text-dim)';}
   if(result)result.style.display='none';
   try{
-    var r=await fetch('/api/takserver/create-client-cert',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name,groups_in:groupsIn,groups_out:groupsOut})});
+    var r=await fetch('/api/takserver/create-client-cert',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name,groups_in:groupsIn,groups_out:groupsOut,groups_both:groupsBoth})});
     var d=await r.json();
     if(d.error){if(msg){msg.textContent=d.error;msg.style.color='var(--red)';}if(btn)btn.disabled=false;return;}
     if(msg){msg.textContent='';msg.style.color='var(--text-dim)';}

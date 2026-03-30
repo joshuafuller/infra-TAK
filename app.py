@@ -58,7 +58,7 @@ from flask import (Flask, render_template_string, request, jsonify,
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 from functools import wraps
-import os, re, ssl, json, secrets, subprocess, time, psutil, threading, html, shutil, copy, tempfile, shlex
+import os, re, ssl, json, secrets, subprocess, time, psutil, threading, html, shutil, copy, tempfile, shlex, ipaddress
 import urllib.request
 import urllib.parse
 from datetime import datetime
@@ -820,6 +820,7 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
     logo = f'<div class="sidebar-logo" style="padding-bottom:4px;margin-bottom:4px"><span>infra-TAK</span><small>Infrastructure Platform</small><small style="display:block;margin-top:2px">v{VERSION}</small>{tw_logo_img}</div>'
     parts = [logo]
     parts.append(link('/console', '<span class="nav-icon material-symbols-outlined">dashboard</span>Console'))
+    parts.append(link('/firewall', '<span class="nav-icon material-symbols-outlined">shield</span>Firewall'))
     gd = modules.get('guarddog', {})
     if gd.get('installed'):
         parts.append(link('/guarddog', '<span class="nav-icon" style="font-size:22px;line-height:1">🐕</span><span>Guard Dog</span>', 'Guard Dog'))
@@ -3043,6 +3044,14 @@ def _guarddog_health_url(settings):
 def guarddog_js():
     return send_from_directory(os.path.join(BASE_DIR, 'static'), 'guarddog.js', mimetype='application/javascript')
 
+@app.route('/firewall.js')
+def firewall_js():
+    resp = send_from_directory(os.path.join(BASE_DIR, 'static'), 'firewall.js', mimetype='application/javascript')
+    resp.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    resp.headers['Pragma'] = 'no-cache'
+    resp.headers['Expires'] = '0'
+    return resp
+
 @app.route('/takserver.js')
 def takserver_js():
     resp = send_from_directory(os.path.join(BASE_DIR, 'static'), 'takserver.js', mimetype='application/javascript')
@@ -3050,6 +3059,11 @@ def takserver_js():
     resp.headers['Pragma'] = 'no-cache'
     resp.headers['Expires'] = '0'
     return resp
+
+@app.route('/firewall')
+@login_required
+def firewall_page():
+    return render_template_string(FIREWALL_TEMPLATE, version=VERSION)
 
 @app.route('/guarddog')
 @login_required
@@ -3315,7 +3329,7 @@ def _firewall_status_local():
     """Return local firewall status for UI (UFW only)."""
     has_ufw = subprocess.run('command -v ufw >/dev/null 2>&1', shell=True).returncode == 0
     if not has_ufw:
-        return {'supported': False, 'error': 'UFW not installed on this host', 'enabled': False, 'rules': []}
+        return {'supported': False, 'error': 'UFW not installed on this host', 'enabled': False, 'rules': [], 'rules_numbered': []}
     try:
         r = subprocess.run(
             'sudo ufw status 2>/dev/null || ufw status 2>/dev/null || true',
@@ -3333,9 +3347,24 @@ def _firewall_status_local():
             if set(ln.strip()) <= {'-'}:
                 continue
             rules.append(ln)
-        return {'supported': True, 'enabled': enabled, 'rules': rules, 'raw': out}
+        rn = subprocess.run(
+            'sudo ufw status numbered 2>/dev/null || ufw status numbered 2>/dev/null || true',
+            shell=True, capture_output=True, text=True, timeout=12
+        )
+        out_n = (rn.stdout or '').strip()
+        lines_n = [ln.rstrip() for ln in out_n.splitlines() if ln.strip()]
+        rules_numbered = []
+        for ln in lines_n:
+            if ln.lower().startswith('status:'):
+                continue
+            if ln.startswith('To') and 'Action' in ln and 'From' in ln:
+                continue
+            if set(ln.strip()) <= {'-'}:
+                continue
+            rules_numbered.append(ln)
+        return {'supported': True, 'enabled': enabled, 'rules': rules, 'rules_numbered': rules_numbered, 'raw': out, 'raw_numbered': out_n}
     except Exception as e:
-        return {'supported': False, 'error': str(e)[:160], 'enabled': False, 'rules': []}
+        return {'supported': False, 'error': str(e)[:160], 'enabled': False, 'rules': [], 'rules_numbered': []}
 
 
 @app.route('/api/firewall/status')
@@ -3384,6 +3413,60 @@ def firewall_close_port_api():
         subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=12)
         st2 = _firewall_status_local()
         return jsonify({'success': True, 'message': f'Closed {port}/{proto}', 'status': st2})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)[:160]}), 500
+
+
+@app.route('/api/firewall/restrict-source', methods=['POST'])
+@login_required
+def firewall_restrict_source_api():
+    data = request.json if request.is_json else {}
+    source = str(data.get('source') or '').strip()
+    port = data.get('port')
+    proto = (data.get('protocol') or 'tcp').strip().lower()
+    action = (data.get('action') or 'allow').strip().lower()
+    if not source:
+        return jsonify({'success': False, 'error': 'Source IP/CIDR is required'}), 400
+    try:
+        ipaddress.ip_network(source, strict=False)
+    except Exception:
+        return jsonify({'success': False, 'error': 'Invalid source IP/CIDR'}), 400
+    if not isinstance(port, int) or port < 1 or port > 65535:
+        return jsonify({'success': False, 'error': 'Invalid port (1-65535 required)'}), 400
+    if proto not in ('tcp', 'udp'):
+        return jsonify({'success': False, 'error': 'Protocol must be tcp or udp'}), 400
+    if action not in ('allow', 'deny'):
+        return jsonify({'success': False, 'error': 'Action must be allow or deny'}), 400
+    st = _firewall_status_local()
+    if not st.get('supported'):
+        return jsonify({'success': False, 'error': st.get('error') or 'UFW not available'}), 400
+    try:
+        cmd = (
+            f'sudo ufw {action} from {shlex.quote(source)} to any port {port} proto {proto} >/dev/null 2>&1 || '
+            f'ufw {action} from {shlex.quote(source)} to any port {port} proto {proto} >/dev/null 2>&1 || true'
+        )
+        subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=12)
+        st2 = _firewall_status_local()
+        return jsonify({'success': True, 'message': f'{action.upper()} from {source} to {port}/{proto}', 'status': st2})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)[:160]}), 500
+
+
+@app.route('/api/firewall/delete-rule', methods=['POST'])
+@login_required
+def firewall_delete_rule_api():
+    data = request.json if request.is_json else {}
+    number = data.get('number')
+    if not isinstance(number, int) or number < 1:
+        return jsonify({'success': False, 'error': 'Rule number must be a positive integer'}), 400
+    st = _firewall_status_local()
+    if not st.get('supported'):
+        return jsonify({'success': False, 'error': st.get('error') or 'UFW not available'}), 400
+    try:
+        cmd = f'sudo ufw --force delete {number} >/dev/null 2>&1 || ufw --force delete {number} >/dev/null 2>&1 || true'
+        subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=12)
+        st2 = _firewall_status_local()
+        return jsonify({'success': True, 'message': f'Deleted rule #{number}', 'status': st2})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)[:160]}), 500
 
@@ -14744,25 +14827,6 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     <span id="gd-docker-limits-msg" style="margin-left:12px;font-size:12px"></span>
   </div>
 
-  <div class="card">
-    <div class="gd-collapse-header" onclick="gdSectionToggle(this)"><span style="margin:0">Firewall (UFW)</span><span class="gd-collapse-toggle">&#9662;</span></div>
-    <div class="gd-collapse-body open">
-      <p style="font-size:12px;color:var(--text-secondary);margin-bottom:12px">View currently allowed inbound rules and open/close ports for integrations, without CLI access.</p>
-      <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:10px">
-        <button type="button" class="btn btn-ghost" onclick="gdFirewallRefresh()">Refresh rules</button>
-        <input class="form-input" type="number" id="gd-fw-port" min="1" max="65535" placeholder="Port" style="max-width:110px">
-        <select class="form-input" id="gd-fw-proto" style="max-width:100px">
-          <option value="tcp">tcp</option>
-          <option value="udp">udp</option>
-        </select>
-        <button type="button" class="btn btn-ghost" id="gd-fw-open-btn" onclick="gdFirewallOpenPort()">Open port</button>
-        <button type="button" class="btn btn-ghost" id="gd-fw-close-btn" onclick="gdFirewallClosePort()" style="border-color:var(--yellow);color:var(--yellow)">Close port</button>
-        <span id="gd-fw-msg" style="font-size:12px"></span>
-      </div>
-      <div id="gd-fw-rules" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);background:var(--bg-deep);border:1px solid var(--border);border-radius:8px;padding:10px;white-space:pre-wrap;max-height:180px;overflow:auto">Loading firewall status...</div>
-    </div>
-  </div>
-
   {% if not tak.installed %}
   <div class="card" style="border-color:var(--yellow)">
     <div class="card-title">Requirement</div>
@@ -14936,6 +15000,85 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 <script src="/guarddog.js?v={{ version }}"></script>
 </body></html>
 '''
+
+
+FIREWALL_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Firewall — infra-TAK</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet">
+<style>
+:root{--bg-deep:#080b14;--bg-surface:#0f1219;--bg-card:#161b26;--border:#1e2736;--text-primary:#f1f5f9;--text-secondary:#cbd5e1;--text-dim:#94a3b8;--accent:#3b82f6;--cyan:#06b6d4;--green:#10b981;--red:#ef4444;--yellow:#eab308}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',sans-serif;min-height:100vh;display:flex}
+.main{flex:1;padding:22px 24px;overflow-x:hidden}
+.page-header{margin-bottom:16px}
+.page-header h1{font-size:26px;font-weight:700;display:flex;align-items:center;gap:10px}
+.page-header p{font-size:13px;color:var(--text-dim);margin-top:6px}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:14px 16px;margin-bottom:12px}
+.card summary{cursor:pointer;list-style:none;font-weight:700;color:var(--cyan);display:flex;align-items:center;gap:8px}
+.card summary::-webkit-details-marker{display:none}
+.card-body{margin-top:12px}
+.form-input{background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:8px 10px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:12px}
+.btn{padding:8px 12px;border:1px solid var(--border);background:transparent;color:var(--text-secondary);border-radius:8px;cursor:pointer;font-family:'JetBrains Mono',monospace;font-size:12px}
+.btn:hover{border-color:var(--cyan);color:var(--cyan)}
+.rules-box{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-secondary);background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:10px;white-space:pre-wrap;max-height:340px;overflow:auto}
+</style></head><body>
+{{ sidebar_html }}
+<div class="main">
+  <div class="page-header">
+    <h1><span class="material-symbols-outlined">shield</span>Firewall</h1>
+    <p>Always-on UFW controls. Open/close ports, restrict by source IP/CIDR, and remove numbered rules.</p>
+  </div>
+
+  <details class="card" open>
+    <summary><span class="material-symbols-outlined">list</span>Current Rules</summary>
+    <div class="card-body">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+        <button class="btn" type="button" onclick="fwRefresh()">Refresh</button>
+        <span id="fw-msg" style="font-size:12px;color:var(--text-dim)"></span>
+      </div>
+      <div id="fw-rules" class="rules-box">Loading firewall status...</div>
+    </div>
+  </details>
+
+  <details class="card" open>
+    <summary><span class="material-symbols-outlined">add_circle</span>Open / Close Port</summary>
+    <div class="card-body">
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <input class="form-input" type="number" id="fw-port" min="1" max="65535" placeholder="Port" style="max-width:120px">
+        <select class="form-input" id="fw-proto" style="max-width:100px"><option value="tcp">tcp</option><option value="udp">udp</option></select>
+        <button class="btn" type="button" id="fw-open-btn" onclick="fwOpenPort()">Open</button>
+        <button class="btn" type="button" id="fw-close-btn" onclick="fwClosePort()" style="border-color:var(--yellow);color:var(--yellow)">Close</button>
+      </div>
+    </div>
+  </details>
+
+  <details class="card" open>
+    <summary><span class="material-symbols-outlined">filter_alt</span>Restrict Source IP to Service</summary>
+    <div class="card-body">
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <input class="form-input" type="text" id="fw-src" placeholder="Source IP/CIDR (e.g. 203.0.113.10 or 203.0.113.0/24)" style="min-width:300px">
+        <select class="form-input" id="fw-action" style="max-width:120px"><option value="allow">allow</option><option value="deny">deny</option></select>
+        <input class="form-input" type="number" id="fw-src-port" min="1" max="65535" placeholder="Port" style="max-width:120px">
+        <select class="form-input" id="fw-src-proto" style="max-width:100px"><option value="tcp">tcp</option><option value="udp">udp</option></select>
+        <button class="btn" type="button" id="fw-src-btn" onclick="fwRestrictSource()">Apply</button>
+      </div>
+    </div>
+  </details>
+
+  <details class="card" open>
+    <summary><span class="material-symbols-outlined">delete</span>Delete Rule by Number</summary>
+    <div class="card-body">
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <input class="form-input" type="number" id="fw-rule-num" min="1" placeholder="Rule #" style="max-width:120px">
+        <button class="btn" type="button" id="fw-del-btn" onclick="fwDeleteRule()" style="border-color:var(--red);color:var(--red)">Delete rule</button>
+      </div>
+      <p style="margin-top:8px;color:var(--text-dim);font-size:12px">Use numbers shown in "Current Rules" (from <code>ufw status numbered</code>).</p>
+    </div>
+  </details>
+</div>
+<script src="/firewall.js?v={{ version }}"></script>
+</body></html>'''
 
 
 FEDHUB_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
@@ -23124,8 +23267,22 @@ def takserver_create_client_cert():
     if os.path.exists(os.path.join(cert_dir, f'{cert_name}.p12')):
         return jsonify({'error': f'Certificate "{cert_name}" already exists'}), 400
 
-    groups_in = data.get('groups_in', [])
-    groups_out = data.get('groups_out', [])
+    def _normalize_groups(values):
+        out = []
+        seen = set()
+        for v in (values or []):
+            g = str(v).strip()
+            if not g or g in seen:
+                continue
+            seen.add(g)
+            out.append(g)
+        return out
+
+    groups_in = _normalize_groups(data.get('groups_in', []))
+    groups_out = _normalize_groups(data.get('groups_out', []))
+    groups_both = _normalize_groups(data.get('groups_both', []))
+    groups_in = [g for g in groups_in if g not in groups_both]
+    groups_out = [g for g in groups_out if g not in groups_both]
 
     try:
         _patch_openssl_string_mask()
@@ -23141,9 +23298,11 @@ def takserver_create_client_cert():
         if not os.path.exists(p12_path):
             return jsonify({'error': 'Certificate file was not created'}), 500
 
-        if groups_in or groups_out:
+        if groups_in or groups_out or groups_both:
             pem_path = os.path.join(cert_dir, f'{cert_name}.pem')
             cmd = f'java -jar /opt/tak/utils/UserManager.jar certmod'
+            for g in groups_both:
+                cmd += f' -g {shlex.quote(g)}'
             for g in groups_in:
                 cmd += f' -ig {shlex.quote(g)}'
             for g in groups_out:
@@ -23158,6 +23317,7 @@ def takserver_create_client_cert():
             'name': cert_name,
             'p12': f'{cert_name}.p12',
             'download_url': f'/api/certs/download/{cert_name}.p12',
+            'groups_both': groups_both,
             'groups_in': groups_in,
             'groups_out': groups_out
         })
