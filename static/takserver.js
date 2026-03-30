@@ -204,17 +204,17 @@ async function loadGroups(){
     var r=await fetch('/api/takserver/groups');var d=await r.json();
     if(d.error&&(!d.groups||!d.groups.length)){el.innerHTML='<span style="color:var(--red)">'+d.error+'</span> <button type="button" onclick="loadGroups()" style="margin-left:8px;padding:4px 12px;background:rgba(59,130,246,0.1);color:var(--accent);border:1px solid var(--border);border-radius:6px;font-size:11px;cursor:pointer">Retry</button>';return;}
     if(!d.groups||d.groups.length===0){el.innerHTML='<span style="color:var(--text-dim)">No groups found. Groups are created in the TAK Server WebGUI or via LDAP.</span>';return;}
-    var h='<div style="display:grid;grid-template-columns:1fr auto auto auto;gap:4px 16px;align-items:center">';
-    h+='<div style="color:var(--text-dim);font-size:11px;font-weight:600;padding-bottom:4px">GROUP</div>';
+    var h='<div style="display:grid;grid-template-columns:auto auto auto 1fr;gap:4px 16px;align-items:center">';
     h+='<div style="color:var(--text-dim);font-size:11px;font-weight:600;text-align:center;padding-bottom:4px">READ</div>';
     h+='<div style="color:var(--text-dim);font-size:11px;font-weight:600;text-align:center;padding-bottom:4px">WRITE</div>';
     h+='<div style="color:var(--text-dim);font-size:11px;font-weight:600;text-align:center;padding-bottom:4px">BOTH</div>';
+    h+='<div style="color:var(--text-dim);font-size:11px;font-weight:600;padding-bottom:4px">GROUP</div>';
     for(var i=0;i<d.groups.length;i++){
       var g=d.groups[i],n=g.name,safe=n.replace(/"/g,'&quot;');
-      h+='<div style="color:var(--text-secondary);padding:4px 0">'+n+'</div>';
       h+='<div style="text-align:center"><input type="checkbox" class="cc-grp-read" data-group="'+safe+'" style="width:16px;height:16px;accent-color:var(--cyan)" onchange="ccGroupChanged(this,\'read\')"></div>';
       h+='<div style="text-align:center"><input type="checkbox" class="cc-grp-write" data-group="'+safe+'" style="width:16px;height:16px;accent-color:var(--cyan)" onchange="ccGroupChanged(this,\'write\')"></div>';
       h+='<div style="text-align:center"><input type="checkbox" class="cc-grp-both" data-group="'+safe+'" style="width:16px;height:16px;accent-color:var(--accent)" onchange="ccGroupChanged(this,\'both\')"></div>';
+      h+='<div style="color:var(--text-secondary);padding:4px 0">'+n+'</div>';
     }
     h+='</div>';
     el.innerHTML=h;
@@ -238,15 +238,25 @@ async function createClientCert(){
   var result=document.getElementById('cc-result');
   var name=(nameEl?nameEl.value:'').trim();
   if(!name){if(msg){msg.textContent='Enter a client name.';msg.style.color='var(--red)';}return;}
-  var groupsIn=[],groupsOut=[];
-  document.querySelectorAll('.cc-grp-read:checked').forEach(function(c){var g=c.getAttribute('data-group');if(groupsOut.indexOf(g)<0)groupsOut.push(g);});
-  document.querySelectorAll('.cc-grp-write:checked').forEach(function(c){var g=c.getAttribute('data-group');if(groupsIn.indexOf(g)<0)groupsIn.push(g);});
-  if(groupsIn.length===0&&groupsOut.length===0){if(msg){msg.textContent='Select at least one group with read or write permission.';msg.style.color='var(--red)';}return;}
+  var groupsIn=[],groupsOut=[],groupsBoth=[];
+  document.querySelectorAll('.cc-grp-both:checked').forEach(function(c){
+    var g=c.getAttribute('data-group');
+    if(groupsBoth.indexOf(g)<0)groupsBoth.push(g);
+  });
+  document.querySelectorAll('.cc-grp-read:checked').forEach(function(c){
+    var g=c.getAttribute('data-group');
+    if(groupsBoth.indexOf(g)<0&&groupsOut.indexOf(g)<0)groupsOut.push(g);
+  });
+  document.querySelectorAll('.cc-grp-write:checked').forEach(function(c){
+    var g=c.getAttribute('data-group');
+    if(groupsBoth.indexOf(g)<0&&groupsIn.indexOf(g)<0)groupsIn.push(g);
+  });
+  if(groupsIn.length===0&&groupsOut.length===0&&groupsBoth.length===0){if(msg){msg.textContent='Select at least one group with read, write, or both permission.';msg.style.color='var(--red)';}return;}
   if(btn)btn.disabled=true;
   if(msg){msg.textContent='Creating certificate...';msg.style.color='var(--text-dim)';}
   if(result)result.style.display='none';
   try{
-    var r=await fetch('/api/takserver/create-client-cert',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name,groups_in:groupsIn,groups_out:groupsOut})});
+    var r=await fetch('/api/takserver/create-client-cert',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name,groups_in:groupsIn,groups_out:groupsOut,groups_both:groupsBoth})});
     var d=await r.json();
     if(d.error){if(msg){msg.textContent=d.error;msg.style.color='var(--red)';}if(btn)btn.disabled=false;return;}
     if(msg){msg.textContent='';msg.style.color='var(--text-dim)';}
@@ -1000,7 +1010,7 @@ function showDeployConfig(){
       '<div class="form-field"><label>Issued cert validity (days)</label><input type="number" id="issued_cert_validity_days" placeholder="Same as intermediate" min="1" max="3652" style="width:120px"> <span style="font-size:11px;color:var(--text-dim)">Blank = same. Shorten anytime in Certificate signing.</span></div>',
       '</div>',
       '<div style="font-family:\'JetBrains Mono\',monospace;font-size:13px;color:var(--text-dim);margin:24px 0 20px;text-transform:uppercase;letter-spacing:1px;font-weight:600">Certificate password</div>',
-      '<div class="form-field" style="margin-bottom:8px"><label>Keystore / truststore password</label><input type="password" id="cert_password" placeholder="atakatak (default)" autocomplete="new-password" style="width:200px;padding:8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px"> <span style="font-size:11px;color:var(--text-dim)">Leave blank to use default atakatak. Used for CA keystores and CoreConfig.</span></div>',
+      '<div class="form-field" style="margin-bottom:8px"><label>Keystore / truststore password</label><div style="position:relative;display:inline-block"><input type="password" id="cert_password" placeholder="atakatak (default)" autocomplete="new-password" style="width:240px;padding:8px 56px 8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px"><button type="button" id="cert-password-toggle" onclick="toggleSinglePassword(\'cert_password\',\'cert-password-toggle\')" style="position:absolute;right:10px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:12px;font-family:JetBrains Mono,monospace">show</button></div> <span style="font-size:11px;color:var(--text-dim)">Leave blank to use default atakatak. Used for CA keystores and CoreConfig.</span></div>',
       '<div style="font-family:\'JetBrains Mono\',monospace;font-size:13px;color:var(--text-dim);margin:24px 0 20px;text-transform:uppercase;letter-spacing:1px;font-weight:600">WebTAK Options (Port 8446)</div>',
       '<div style="display:flex;flex-direction:column;gap:14px">',
       '<label style="display:flex;align-items:center;gap:10px;color:var(--text-secondary);cursor:pointer;font-size:14px"><input type="checkbox" id="enable_admin_ui" onchange="toggleWebadminPassword()" style="width:18px;height:18px;accent-color:var(--accent)"> Enable Admin UI <span style="color:var(--text-dim);font-size:12px">- Browser admin (no cert needed)</span></label>',
@@ -1037,6 +1047,12 @@ function showDeployConfig(){
 }
 
 function toggleWebadminPassword(){const a=document.getElementById('webadmin-password-area');if(a)a.style.display=document.getElementById('enable_admin_ui').checked?'block':'none'}
+
+function toggleSinglePassword(inputId,toggleId){
+    var i=document.getElementById(inputId);var b=document.getElementById(toggleId);if(!i||!b)return;
+    if(i.type==='password'){i.type='text';b.textContent='hide';}
+    else{i.type='password';b.textContent='show';}
+}
 
 function toggleShowPassword(){const p=document.getElementById('webadmin_password');const c=document.getElementById('webadmin_password_confirm');const b=document.getElementById('pw-toggle');if(p.type==='password'){p.type='text';c.type='text';b.textContent='hide'}else{p.type='password';c.type='password';b.textContent='show'}}
 

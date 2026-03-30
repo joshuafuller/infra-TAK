@@ -4,7 +4,7 @@ Tea Awarness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Latest release: v0.3.5-alpha** — **TAK Server:** new Federation section (status, `ca.pem` download, inbound federation-port firewall toggle). **Federation mapping note:** use bare names like `CA-COR ADSB2` (not `cn=tak_*`). **Fed Hub:** deploy already opens required remote ports (`22`, `8080`, `9100-9103`). See [docs/RELEASE-v0.3.5-alpha.md](docs/RELEASE-v0.3.4-alpha.md). Prior: [v0.3.4-alpha](docs/RELEASE-v0.3.4-alpha.md) (Federation Hub module + Guard Dog monitor).
+**Latest release: v0.3.6-alpha** — **Firewall:** new always-on dedicated page (outside Guard Dog) with open/close port, source-IP/CIDR restriction, numbered-rule delete, collapsible sections, and service labels in rules. **TAK Server cert UX:** better group permission picker layout (READ/WRITE/BOTH on the left), proper BOTH (`-g`) handling in cert generation, and keystore password show/hide on deploy. **Group discovery:** cert group picker now also pulls `tak_*` groups from Authentik so groups can appear before first client login. See [docs/RELEASE-v0.3.6-alpha.md](docs/RELEASE-v0.3.6-alpha.md). Prior: [v0.3.5-alpha](docs/RELEASE-v0.3.5-alpha.md) (updater-loop hotfix).
 
 **Goal: universal installer.** Currently supported platform: **Ubuntu 22.04 LTS**.
 
