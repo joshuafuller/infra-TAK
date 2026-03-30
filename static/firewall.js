@@ -5,6 +5,60 @@ function fwSetMsg(text, color){
   msg.style.color=color||'var(--text-dim)';
 }
 
+var FW_SERVICE_LABELS={
+  '22/tcp':'SSH',
+  '25/tcp':'SMTP',
+  '80/tcp':'HTTP/Caddy',
+  '443/tcp':'HTTPS/Caddy',
+  '5000/tcp':'Web Editor',
+  '5001/tcp':'infra-TAK Console',
+  '5002/tcp':'Web Editor Alt',
+  '5080/tcp':'Node-RED Flow/API',
+  '8060/tcp':'ADSB Feed',
+  '8061/tcp':'ADSB SUB <15k',
+  '8062/tcp':'TIS-B Feed',
+  '8063/tcp':'MIL Feed',
+  '8064/tcp':'FIRIS Feed',
+  '8089/tcp':'TAK Server TLS',
+  '8322/tcp':'RTSPS',
+  '8443/tcp':'TAK Server Web',
+  '8446/tcp':'TAK Server Federation Web',
+  '8554/tcp':'RTSP',
+  '8888/tcp':'HLS',
+  '8890/udp':'SRT',
+  '9001/tcp':'Federation Inbound',
+  '9001/udp':'Federation UDP',
+  '9898/tcp':'Integration/API'
+};
+
+function fwExtractToToken(ruleLine){
+  var s=(ruleLine||'').trim();
+  if(!s) return '';
+  var m=s.match(/^\[\s*\d+\]\s+(\S+)/);
+  if(m) return m[1];
+  return s.split(/\s+/)[0]||'';
+}
+
+function fwNormalizePortToken(tok){
+  var t=(tok||'').toLowerCase();
+  if(!t) return '';
+  if(t.indexOf('/')>0) return t;
+  return t+'/tcp';
+}
+
+function fwAnnotateRule(ruleLine){
+  var tok=fwExtractToToken(ruleLine);
+  if(!tok) return ruleLine;
+  var key=fwNormalizePortToken(tok);
+  var label=FW_SERVICE_LABELS[key];
+  if(!label && tok.toLowerCase().endsWith('(v6)')){
+    var noV6=tok.toLowerCase().replace(/\(v6\)$/,'').trim();
+    label=FW_SERVICE_LABELS[fwNormalizePortToken(noV6)];
+  }
+  if(!label) return ruleLine;
+  return ruleLine+'  ['+label+']';
+}
+
 function fwApi(url, opts){
   var o=opts||{};
   o.credentials='same-origin';
@@ -34,14 +88,14 @@ function fwRefresh(){
       lines.push('');
       lines.push('Numbered rules:');
       if(d.rules_numbered&&d.rules_numbered.length){
-        lines.push(d.rules_numbered.join(String.fromCharCode(10)));
+        lines.push(d.rules_numbered.map(fwAnnotateRule).join(String.fromCharCode(10)));
       }else{
         lines.push('(none)');
       }
       lines.push('');
       lines.push('Standard rules:');
       if(d.rules&&d.rules.length){
-        lines.push(d.rules.join(String.fromCharCode(10)));
+        lines.push(d.rules.map(fwAnnotateRule).join(String.fromCharCode(10)));
       }else{
         lines.push('(none)');
       }
