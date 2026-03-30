@@ -5,10 +5,22 @@ function fwSetMsg(text, color){
   msg.style.color=color||'var(--text-dim)';
 }
 
+function fwApi(url, opts){
+  var o=opts||{};
+  o.credentials='same-origin';
+  o.redirect='manual';
+  return fetch(url,o).then(function(r){
+    if(r.type==='opaqueredirect' || (r.status>=300 && r.status<400)){
+      throw new Error('Session expired. Refresh page and sign in again.');
+    }
+    return r;
+  });
+}
+
 function fwRefresh(){
   var box=document.getElementById('fw-rules');
   if(box) box.textContent='Loading firewall status...';
-  fetch('/api/firewall/status',{credentials:'same-origin'})
+  fwApi('/api/firewall/status')
     .then(function(r){return r.json();})
     .then(function(d){
       if(!box) return;
@@ -51,7 +63,7 @@ function fwOpenPort(){
   if(!port||port<1||port>65535){fwSetMsg('Enter a valid port (1-65535).','var(--red)');return;}
   if(btn) btn.disabled=true;
   fwSetMsg('Opening '+port+'/'+protocol+'...','var(--text-dim)');
-  fetch('/api/firewall/open-port',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin',body:JSON.stringify({port:port,protocol:protocol})})
+  fwApi('/api/firewall/open-port',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({port:port,protocol:protocol})})
     .then(function(r){return r.json();})
     .then(function(d){
       if(btn) btn.disabled=false;
@@ -75,7 +87,7 @@ function fwClosePort(){
   if(!confirm('Close '+port+'/'+protocol+' inbound rule?')) return;
   if(btn) btn.disabled=true;
   fwSetMsg('Closing '+port+'/'+protocol+'...','var(--text-dim)');
-  fetch('/api/firewall/close-port',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin',body:JSON.stringify({port:port,protocol:protocol})})
+  fwApi('/api/firewall/close-port',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({port:port,protocol:protocol})})
     .then(function(r){return r.json();})
     .then(function(d){
       if(btn) btn.disabled=false;
@@ -103,7 +115,7 @@ function fwRestrictSource(){
   if(!port||port<1||port>65535){fwSetMsg('Enter a valid port (1-65535).','var(--red)');return;}
   if(btn) btn.disabled=true;
   fwSetMsg('Applying '+act+' for '+source+' on '+port+'/'+protocol+'...','var(--text-dim)');
-  fetch('/api/firewall/restrict-source',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin',body:JSON.stringify({source:source,action:act,port:port,protocol:protocol})})
+  fwApi('/api/firewall/restrict-source',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:source,action:act,port:port,protocol:protocol})})
     .then(function(r){return r.json();})
     .then(function(d){
       if(btn) btn.disabled=false;
@@ -125,7 +137,7 @@ function fwDeleteRule(){
   if(!confirm('Delete firewall rule #'+num+'?')) return;
   if(btn) btn.disabled=true;
   fwSetMsg('Deleting rule #'+num+'...','var(--text-dim)');
-  fetch('/api/firewall/delete-rule',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin',body:JSON.stringify({number:num})})
+  fwApi('/api/firewall/delete-rule',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({number:num})})
     .then(function(r){return r.json();})
     .then(function(d){
       if(btn) btn.disabled=false;
