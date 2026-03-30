@@ -15007,21 +15007,34 @@ FIREWALL_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8
 <link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet">
 <style>
-:root{--bg-deep:#080b14;--bg-surface:#0f1219;--bg-card:#161b26;--border:#1e2736;--text-primary:#f1f5f9;--text-secondary:#cbd5e1;--text-dim:#94a3b8;--accent:#3b82f6;--cyan:#06b6d4;--green:#10b981;--red:#ef4444;--yellow:#eab308}
+:root{--bg-deep:#080b14;--bg-surface:#0f1219;--bg-card:#161b26;--border:#1e2736;--border-hover:#2a3548;--text-primary:#f1f5f9;--text-secondary:#cbd5e1;--text-dim:#94a3b8;--accent:#3b82f6;--cyan:#06b6d4;--green:#10b981;--red:#ef4444;--yellow:#eab308}
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',sans-serif;min-height:100vh;display:flex}
+.material-symbols-outlined{font-family:'Material Symbols Outlined';font-weight:400;font-style:normal;font-size:20px;line-height:1;letter-spacing:normal;white-space:nowrap;direction:ltr;-webkit-font-smoothing:antialiased}
+.sidebar{width:220px;min-width:220px;background:var(--bg-surface);border-right:1px solid var(--border);padding:24px 0;display:flex;flex-direction:column;flex-shrink:0}
+.nav-icon.material-symbols-outlined{font-size:22px;width:22px;text-align:center}
+.sidebar-logo{padding:0 20px 24px;border-bottom:1px solid var(--border);margin-bottom:16px}
+.sidebar-logo span{font-size:15px;font-weight:700;letter-spacing:.05em;color:var(--text-primary)}
+.sidebar-logo small{display:block;font-size:10px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;margin-top:2px}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;color:var(--text-secondary);text-decoration:none;font-size:13px;font-weight:500;transition:all .15s;border-left:2px solid transparent}
+.nav-item:hover{color:var(--text-primary);background:rgba(255,255,255,.03);border-left-color:var(--border-hover)}
+.nav-item.active{color:var(--cyan);background:rgba(6,182,212,.06);border-left-color:var(--cyan)}
+.nav-icon{font-size:15px;width:18px;text-align:center}
 .main{flex:1;padding:22px 24px;overflow-x:hidden}
 .page-header{margin-bottom:16px}
 .page-header h1{font-size:26px;font-weight:700;display:flex;align-items:center;gap:10px}
 .page-header p{font-size:13px;color:var(--text-dim);margin-top:6px}
 .card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:14px 16px;margin-bottom:12px}
-.card summary{cursor:pointer;list-style:none;font-weight:700;color:var(--cyan);display:flex;align-items:center;gap:8px}
+.card summary{cursor:pointer;list-style:none;font-weight:700;color:var(--cyan);display:flex;align-items:center;justify-content:space-between;gap:8px}
 .card summary::-webkit-details-marker{display:none}
 .card-body{margin-top:12px}
 .form-input{background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:8px 10px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:12px}
 .btn{padding:8px 12px;border:1px solid var(--border);background:transparent;color:var(--text-secondary);border-radius:8px;cursor:pointer;font-family:'JetBrains Mono',monospace;font-size:12px}
 .btn:hover{border-color:var(--cyan);color:var(--cyan)}
 .rules-box{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-secondary);background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:10px;white-space:pre-wrap;max-height:340px;overflow:auto}
+.fw-summary-left{display:flex;align-items:center;gap:8px}
+.fw-summary-chevron{transition:transform .2s ease;color:var(--text-dim)}
+.card[open] .fw-summary-chevron{transform:rotate(180deg)}
 </style></head><body>
 {{ sidebar_html }}
 <div class="main">
@@ -15031,7 +15044,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   </div>
 
   <details class="card" open>
-    <summary><span class="material-symbols-outlined">list</span>Current Rules</summary>
+    <summary><span class="fw-summary-left"><span class="material-symbols-outlined">list</span>Current Rules</span><span class="material-symbols-outlined fw-summary-chevron">expand_more</span></summary>
     <div class="card-body">
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px">
         <button class="btn" type="button" onclick="fwRefresh()">Refresh</button>
@@ -15042,7 +15055,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   </details>
 
   <details class="card" open>
-    <summary><span class="material-symbols-outlined">add_circle</span>Open / Close Port</summary>
+    <summary><span class="fw-summary-left"><span class="material-symbols-outlined">add_circle</span>Open / Close Port</span><span class="material-symbols-outlined fw-summary-chevron">expand_more</span></summary>
     <div class="card-body">
       <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
         <input class="form-input" type="number" id="fw-port" min="1" max="65535" placeholder="Port" style="max-width:120px">
@@ -15054,7 +15067,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   </details>
 
   <details class="card" open>
-    <summary><span class="material-symbols-outlined">filter_alt</span>Restrict Source IP to Service</summary>
+    <summary><span class="fw-summary-left"><span class="material-symbols-outlined">filter_alt</span>Restrict Source IP to Service</span><span class="material-symbols-outlined fw-summary-chevron">expand_more</span></summary>
     <div class="card-body">
       <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
         <input class="form-input" type="text" id="fw-src" placeholder="Source IP/CIDR (e.g. 203.0.113.10 or 203.0.113.0/24)" style="min-width:300px">
@@ -15067,7 +15080,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   </details>
 
   <details class="card" open>
-    <summary><span class="material-symbols-outlined">delete</span>Delete Rule by Number</summary>
+    <summary><span class="fw-summary-left"><span class="material-symbols-outlined">delete</span>Delete Rule by Number</span><span class="material-symbols-outlined fw-summary-chevron">expand_more</span></summary>
     <div class="card-body">
       <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
         <input class="form-input" type="number" id="fw-rule-num" min="1" placeholder="Rule #" style="max-width:120px">
