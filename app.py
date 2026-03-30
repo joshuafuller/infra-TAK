@@ -820,7 +820,7 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
     logo = f'<div class="sidebar-logo" style="padding-bottom:4px;margin-bottom:4px"><span>infra-TAK</span><small>Infrastructure Platform</small><small style="display:block;margin-top:2px">v{VERSION}</small>{tw_logo_img}</div>'
     parts = [logo]
     parts.append(link('/console', '<span class="nav-icon material-symbols-outlined">dashboard</span>Console'))
-    parts.append(link('/firewall', '<span class="nav-icon material-symbols-outlined">shield</span>Firewall'))
+    parts.append(link('/firewall', '<span class="nav-icon material-symbols-outlined">shield_locked</span>Firewall'))
     gd = modules.get('guarddog', {})
     if gd.get('installed'):
         parts.append(link('/guarddog', '<span class="nav-icon" style="font-size:22px;line-height:1">🐕</span><span>Guard Dog</span>', 'Guard Dog'))
@@ -15039,7 +15039,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 {{ sidebar_html }}
 <div class="main">
   <div class="page-header">
-    <h1><span class="material-symbols-outlined">shield</span>Firewall</h1>
+    <h1><span class="material-symbols-outlined">shield_locked</span>Firewall</h1>
     <p>Always-on UFW controls. Open/close ports, restrict by source IP/CIDR, and remove numbered rules.</p>
   </div>
 
