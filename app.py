@@ -22485,6 +22485,8 @@ def _exclude_from_cert_group_picker(name):
         return True
     if lowered.startswith('cn=tak_'):
         return True
+    if lowered in ('vid_public', 'vid_private'):
+        return True
     return False
 
 
