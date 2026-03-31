@@ -22471,6 +22471,23 @@ def _canonical_tak_group_name(value):
     return name
 
 
+def _exclude_from_cert_group_picker(name):
+    """Return True for system/admin groups we do not want in cert picker."""
+    n = str(name or '').strip()
+    if not n:
+        return True
+    lowered = n.lower()
+    if lowered == '__anon__':
+        return True
+    if lowered == 'role_admin':
+        return True
+    if lowered.startswith('authentik'):
+        return True
+    if lowered.startswith('cn=tak_'):
+        return True
+    return False
+
+
 @app.route('/api/takserver/groups')
 @login_required
 def takserver_groups():
@@ -22524,7 +22541,7 @@ def takserver_groups():
                     if not isinstance(g, dict):
                         continue
                     name = _canonical_tak_group_name(g.get('name'))
-                    if not name or name == '__ANON__':
+                    if _exclude_from_cert_group_picker(name):
                         continue
                     merged[name] = {
                         'name': name,
@@ -22551,7 +22568,7 @@ def takserver_groups():
                         )
                     else:
                         name = ''
-                    if not name or name == '__ANON__':
+                    if _exclude_from_cert_group_picker(name):
                         continue
                     if name not in merged:
                         merged[name] = {
@@ -22583,7 +22600,7 @@ def takserver_groups():
                             continue
                         name = raw[4:] if raw.lower().startswith('tak_') else raw
                         name = _canonical_tak_group_name(name)
-                        if not name or name == '__ANON__':
+                        if _exclude_from_cert_group_picker(name):
                             continue
                         if name not in merged:
                             merged[name] = {
