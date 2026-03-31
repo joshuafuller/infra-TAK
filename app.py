@@ -22453,6 +22453,24 @@ def fedhub_cert_expiry():
     return jsonify(results)
 
 
+def _canonical_tak_group_name(value):
+    """Normalize TAK group names to a canonical channel name.
+
+    We intentionally collapse TAK Portal directional suffix groups
+    (e.g. *_READ, *_WRITE, *_BOTH) to the base name so cert assignment
+    targets the same channel identity.
+    """
+    name = str(value or '').strip()
+    if not name:
+        return ''
+    m = re.match(r'^(.*?)(?:[_-](?:read|write|both))$', name, re.IGNORECASE)
+    if m:
+        base = (m.group(1) or '').strip()
+        if base:
+            return base
+    return name
+
+
 @app.route('/api/takserver/groups')
 @login_required
 def takserver_groups():
@@ -22505,7 +22523,7 @@ def takserver_groups():
                 for g in items:
                     if not isinstance(g, dict):
                         continue
-                    name = (g.get('name') or '').strip()
+                    name = _canonical_tak_group_name(g.get('name'))
                     if not name or name == '__ANON__':
                         continue
                     merged[name] = {
@@ -22522,15 +22540,15 @@ def takserver_groups():
             if isinstance(items, list):
                 for g in items:
                     if isinstance(g, str):
-                        name = g.strip()
+                        name = _canonical_tak_group_name(g)
                     elif isinstance(g, dict):
-                        name = (
+                        name = _canonical_tak_group_name(
                             g.get('name')
                             or g.get('groupName')
                             or g.get('groupname')
                             or g.get('group')
                             or ''
-                        ).strip()
+                        )
                     else:
                         name = ''
                     if not name or name == '__ANON__':
@@ -22564,6 +22582,7 @@ def takserver_groups():
                         if not raw:
                             continue
                         name = raw[4:] if raw.lower().startswith('tak_') else raw
+                        name = _canonical_tak_group_name(name)
                         if not name or name == '__ANON__':
                             continue
                         if name not in merged:
@@ -23284,10 +23303,13 @@ def takserver_create_client_cert():
         out = []
         seen = set()
         for v in (values or []):
-            g = str(v).strip()
-            if not g or g in seen:
+            g = _canonical_tak_group_name(v)
+            if not g:
                 continue
-            seen.add(g)
+            key = g.lower()
+            if key in seen:
+                continue
+            seen.add(key)
             out.append(g)
         return out
 
