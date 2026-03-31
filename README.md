@@ -4,7 +4,7 @@ Tea Awarness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Latest release: v0.3.6-alpha** — **Firewall:** new always-on dedicated page (outside Guard Dog) with open/close port, source-IP/CIDR restriction, numbered-rule delete, collapsible sections, and service labels in rules. **TAK Server cert UX:** better group permission picker layout (READ/WRITE/BOTH on the left), proper BOTH (`-g`) handling in cert generation, and keystore password show/hide on deploy. **Group discovery:** cert group picker now also pulls `tak_*` groups from Authentik so groups can appear before first client login. See [docs/RELEASE-v0.3.6-alpha.md](docs/RELEASE-v0.3.6-alpha.md). Prior: [v0.3.5-alpha](docs/RELEASE-v0.3.5-alpha.md) (updater-loop hotfix).
+**Latest release: v0.3.7-alpha** — **TAK Server cert UI/group handling:** cert group picker now normalizes TAK Portal directional suffix groups (treats `_READ`/`_WRITE`/`_BOTH` as one canonical channel name), dedupes duplicates, and hides system/admin-style groups (`authentik*`, `cn=tak_*`, `ROLE_ADMIN`, video access groups) so cert assignment stays focused on operational channels. **Ops docs:** pull/restart and release/update command docs were updated to avoid divergent-branch update failures. See [docs/RELEASE-v0.3.7-alpha.md](docs/RELEASE-v0.3.7-alpha.md). Prior: [v0.3.6-alpha](docs/RELEASE-v0.3.6-alpha.md) (firewall page + cert UX improvements).
 
 **Goal: universal installer.** Currently supported platform: **Ubuntu 22.04 LTS**.
 
