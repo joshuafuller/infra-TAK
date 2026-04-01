@@ -157,6 +157,27 @@ async function loadFlatfileAuthStatus(){
     return null;
 }
 
+function _sleep(ms){ return new Promise(function(resolve){ setTimeout(resolve, ms); }); }
+
+async function pollFlatfileAuthStatus(expectedEnabled, timeoutMs){
+    var start=Date.now();
+    while((Date.now()-start) < timeoutMs){
+        try{
+            var r=await fetch('/api/takserver/flatfile-auth',{cache:'no-store'});
+            if(r.ok){
+                var d=await r.json();
+                if(d && d.installed && (!!d.enabled===!!expectedEnabled)){
+                    await loadFlatfileAuthStatus();
+                    return true;
+                }
+            }
+        }catch(e){}
+        await _sleep(2500);
+    }
+    await loadFlatfileAuthStatus();
+    return false;
+}
+
 async function toggleFlatfileAuth(){
     var btn=document.getElementById('flatfile-auth-btn');
     var msg=document.getElementById('flatfile-auth-msg');
@@ -176,9 +197,16 @@ async function toggleFlatfileAuth(){
         var r=await fetch('/api/takserver/flatfile-auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:nextState})});
         var d=await r.json();
         if(d && d.success){
-            msg.textContent=d.message||'Updated.';
-            msg.style.color='var(--green)';
-            await loadFlatfileAuthStatus();
+            msg.textContent=(d.message||'Updated.')+' Waiting for TAK restart and status refresh...';
+            msg.style.color='var(--text-dim)';
+            var synced=await pollFlatfileAuthStatus(nextState, 90000);
+            if(synced){
+                msg.textContent=(d.message||'Updated.')+' State confirmed.';
+                msg.style.color='var(--green)';
+            }else{
+                msg.textContent='Change request sent, but status confirmation timed out. Refresh page and re-check.';
+                msg.style.color='var(--yellow)';
+            }
         }else{
             msg.textContent=(d&& (d.error||d.message)) ? (d.error||d.message) : 'Failed to update flat-file auth';
             msg.style.color='var(--red)';
