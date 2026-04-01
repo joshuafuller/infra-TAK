@@ -21443,12 +21443,14 @@ def _takserver_flatfile_auth_status():
         if start < 0 or end < 0:
             return {'installed': True, 'enabled': False, 'error': 'No <auth> block found'}
         block = content[start:end + len('</auth>')]
-        enabled = ('userauthenticationfile.xml' in block.lower())
+        has_userauth_file = ('userauthenticationfile.xml' in block.lower())
+        has_any_file_provider = bool(re.search(r'<File(?:\s+[^>]*)?/>', block, re.IGNORECASE))
         m = re.search(r'<auth[^>]*\bdefault="([^"]+)"', block, re.IGNORECASE)
         default_auth = (m.group(1).strip().lower() if m else '')
         return {
             'installed': True,
-            'enabled': enabled,
+            'enabled': has_any_file_provider,
+            'has_userauth_file': has_userauth_file,
             'default_auth': default_auth,
         }
     except Exception as e:
@@ -21490,28 +21492,33 @@ def takserver_flatfile_auth_toggle_api():
     end = end_tag + len('</auth>')
     auth_block = content[start:end]
 
+    has_userauth_file = ('userauthenticationfile.xml' in auth_block.lower())
+    has_any_file_provider = bool(re.search(r'<File(?:\s+[^>]*)?/>', auth_block, re.IGNORECASE))
+
     if enabled:
-        if 'userauthenticationfile.xml' in auth_block.lower():
+        if has_userauth_file:
             status = _takserver_flatfile_auth_status()
             return jsonify({'success': True, 'message': 'Flat-file auth already enabled', 'status': status})
-        file_line = '        <File location="UserAuthenticationFile.xml"/>\n'
-        new_auth = auth_block.replace('</auth>', file_line + '    </auth>')
+        if has_any_file_provider:
+            # Normalize any existing file provider to explicit UserAuthenticationFile.xml.
+            new_auth = re.sub(
+                r'^[ \t]*<File(?:\s+[^>]*)?/>\s*$',
+                '        <File location="UserAuthenticationFile.xml"/>',
+                auth_block,
+                flags=re.IGNORECASE | re.MULTILINE
+            )
+        else:
+            file_line = '        <File location="UserAuthenticationFile.xml"/>\n'
+            new_auth = auth_block.replace('</auth>', file_line + '    </auth>')
     else:
-        if 'userauthenticationfile.xml' not in auth_block.lower():
+        if not has_any_file_provider:
             status = _takserver_flatfile_auth_status()
             return jsonify({'success': True, 'message': 'Flat-file auth already disabled', 'status': status})
-        new_auth = re.sub(
-            r'^[ \t]*<File\s+location="UserAuthenticationFile\.xml"\s*/>\s*\n?',
-            '',
-            auth_block,
-            flags=re.IGNORECASE | re.MULTILINE
-        )
-        # Some TAK variants/writebacks can leave a bare <File/> node;
-        # remove any File provider entry when flat-file auth is disabled.
+        # Remove any File provider entry when flat-file auth is disabled.
         new_auth = re.sub(
             r'^[ \t]*<File(?:\s+[^>]*)?/>\s*\n?',
             '',
-            new_auth,
+            auth_block,
             flags=re.IGNORECASE | re.MULTILINE
         )
 
