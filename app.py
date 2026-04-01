@@ -21502,10 +21502,10 @@ def takserver_flatfile_auth_toggle_api():
         if has_any_file_provider:
             # Normalize any existing file provider to explicit UserAuthenticationFile.xml.
             new_auth = re.sub(
-                r'^[ \t]*<File(?:\s+[^>]*)?/>\s*$',
-                '        <File location="UserAuthenticationFile.xml"/>',
+                r'<File(?:\s+[^>]*)?/>',
+                '<File location="UserAuthenticationFile.xml"/>',
                 auth_block,
-                flags=re.IGNORECASE | re.MULTILINE
+                flags=re.IGNORECASE
             )
         else:
             file_line = '        <File location="UserAuthenticationFile.xml"/>\n'
@@ -21516,10 +21516,10 @@ def takserver_flatfile_auth_toggle_api():
             return jsonify({'success': True, 'message': 'Flat-file auth already disabled', 'status': status})
         # Remove any File provider entry when flat-file auth is disabled.
         new_auth = re.sub(
-            r'^[ \t]*<File(?:\s+[^>]*)?/>\s*\n?',
+            r'<File(?:\s+[^>]*)?/>',
             '',
             auth_block,
-            flags=re.IGNORECASE | re.MULTILINE
+            flags=re.IGNORECASE
         )
 
     new_content = content[:start] + new_auth + content[end:]
