@@ -21506,6 +21506,14 @@ def takserver_flatfile_auth_toggle_api():
             auth_block,
             flags=re.IGNORECASE | re.MULTILINE
         )
+        # Some TAK variants/writebacks can leave a bare <File/> node;
+        # remove any File provider entry when flat-file auth is disabled.
+        new_auth = re.sub(
+            r'^[ \t]*<File(?:\s+[^>]*)?/>\s*\n?',
+            '',
+            new_auth,
+            flags=re.IGNORECASE | re.MULTILINE
+        )
 
     new_content = content[:start] + new_auth + content[end:]
 
