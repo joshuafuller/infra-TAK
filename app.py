@@ -21429,6 +21429,103 @@ def _coreconfig_has_ldap():
         return False
 
 
+def _takserver_flatfile_auth_status():
+    """Return flat-file auth state from CoreConfig auth block."""
+    path = '/opt/tak/CoreConfig.xml'
+    if not os.path.exists(path):
+        return {'installed': False, 'enabled': False, 'error': 'CoreConfig.xml not found'}
+    try:
+        with open(path, 'r') as f:
+            content = f.read()
+        lower = content.lower()
+        start = lower.find('<auth')
+        end = lower.find('</auth>', start) if start >= 0 else -1
+        if start < 0 or end < 0:
+            return {'installed': True, 'enabled': False, 'error': 'No <auth> block found'}
+        block = content[start:end + len('</auth>')]
+        enabled = ('userauthenticationfile.xml' in block.lower())
+        m = re.search(r'<auth[^>]*\bdefault="([^"]+)"', block, re.IGNORECASE)
+        default_auth = (m.group(1).strip().lower() if m else '')
+        return {
+            'installed': True,
+            'enabled': enabled,
+            'default_auth': default_auth,
+        }
+    except Exception as e:
+        return {'installed': True, 'enabled': False, 'error': str(e)[:180]}
+
+
+@app.route('/api/takserver/flatfile-auth')
+@login_required
+def takserver_flatfile_auth_status_api():
+    return jsonify(_takserver_flatfile_auth_status())
+
+
+@app.route('/api/takserver/flatfile-auth', methods=['POST'])
+@login_required
+def takserver_flatfile_auth_toggle_api():
+    data = request.json if request.is_json else {}
+    enabled = data.get('enabled')
+    if not isinstance(enabled, bool):
+        return jsonify({'success': False, 'error': 'enabled must be true or false'}), 400
+
+    coreconfig = '/opt/tak/CoreConfig.xml'
+    if not os.path.exists(coreconfig):
+        return jsonify({'success': False, 'error': 'TAK Server not installed (CoreConfig.xml not found)'}), 400
+
+    try:
+        with open(coreconfig, 'r') as f:
+            content = f.read()
+    except Exception:
+        r = subprocess.run(['sudo', 'cat', coreconfig], capture_output=True, text=True, timeout=8)
+        if r.returncode != 0:
+            return jsonify({'success': False, 'error': 'Could not read CoreConfig.xml'}), 500
+        content = r.stdout
+
+    lower = content.lower()
+    start = lower.find('<auth')
+    end_tag = lower.find('</auth>', start) if start >= 0 else -1
+    if start < 0 or end_tag < 0:
+        return jsonify({'success': False, 'error': 'No <auth> block found in CoreConfig.xml'}), 400
+    end = end_tag + len('</auth>')
+    auth_block = content[start:end]
+
+    if enabled:
+        if 'userauthenticationfile.xml' in auth_block.lower():
+            status = _takserver_flatfile_auth_status()
+            return jsonify({'success': True, 'message': 'Flat-file auth already enabled', 'status': status})
+        file_line = '        <File location="UserAuthenticationFile.xml"/>\n'
+        new_auth = auth_block.replace('</auth>', file_line + '    </auth>')
+    else:
+        if 'userauthenticationfile.xml' not in auth_block.lower():
+            status = _takserver_flatfile_auth_status()
+            return jsonify({'success': True, 'message': 'Flat-file auth already disabled', 'status': status})
+        new_auth = re.sub(
+            r'^[ \t]*<File\s+location="UserAuthenticationFile\.xml"\s*/>\s*\n?',
+            '',
+            auth_block,
+            flags=re.IGNORECASE | re.MULTILINE
+        )
+
+    new_content = content[:start] + new_auth + content[end:]
+
+    try:
+        with open(coreconfig, 'w') as f:
+            f.write(new_content)
+    except Exception:
+        proc = subprocess.run(['sudo', 'tee', coreconfig], input=new_content, capture_output=True, text=True, timeout=10)
+        if proc.returncode != 0:
+            return jsonify({'success': False, 'error': 'Failed to write CoreConfig.xml'}), 500
+
+    rr = subprocess.run(['sudo', 'systemctl', 'restart', 'takserver'], capture_output=True, text=True, timeout=60)
+    if rr.returncode != 0:
+        return jsonify({'success': False, 'error': f'CoreConfig updated, but TAK restart failed: {rr.stderr[:160]}'}), 500
+
+    status = _takserver_flatfile_auth_status()
+    action = 'enabled' if enabled else 'disabled'
+    return jsonify({'success': True, 'message': f'Flat-file auth {action}. TAK Server restarted.', 'status': status})
+
+
 def _resync_ldap_credential_to_coreconfig():
     """Ensure CoreConfig.xml serviceAccountCredential matches Authentik .env.
 
@@ -26170,6 +26267,15 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div id="resync-notice" style="display:none;margin-top:8px;padding:10px 14px;background:rgba(234,179,8,0.12);border:1px solid rgba(234,179,8,0.35);border-radius:8px;font-size:12px;color:var(--yellow)">TAK Portal user list may take a short moment to repopulate.</div>
 </div>
 {% endif %}
+<div class="card" style="margin-bottom:24px">
+<div class="card-title">Auth Provider: Flat File (UserAuthenticationFile.xml)</div>
+<p style="font-size:12px;color:var(--text-dim);line-height:1.5;margin-bottom:12px">Controls whether TAK Server includes <code style="font-size:11px">UserAuthenticationFile.xml</code> in the CoreConfig <code style="font-size:11px">&lt;auth&gt;</code> block. This is optional if you want LDAP-only auth behavior.</p>
+<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+  <button type="button" id="flatfile-auth-btn" onclick="toggleFlatfileAuth()" style="padding:8px 16px;background:rgba(59,130,246,.2);color:var(--cyan);border:1px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;cursor:pointer">Loading...</button>
+  <span id="flatfile-auth-status" style="font-size:12px;color:var(--text-dim)">Checking status...</span>
+</div>
+<div id="flatfile-auth-msg" style="margin-top:8px;font-size:12px;color:var(--text-dim)"></div>
+</div>
 <div class="section-title">Access</div>
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
 <div style="display:flex;gap:10px;flex-wrap:nowrap;align-items:center">
