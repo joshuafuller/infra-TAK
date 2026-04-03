@@ -9602,28 +9602,37 @@ def run_takportal_deploy():
                         else:
                             plog(f"  \u26a0 Proxy provider error: {str(e)[:100]}")
 
-                # Create application
+                # Create application (retry — Authentik API can be slow on fresh deploys)
                 if provider_pk:
-                    try:
-                        req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/',
-                            data=json_mod.dumps({'name': 'TAK Portal', 'slug': 'tak-portal',
-                                'provider': provider_pk, 'open_in_new_tab': True}).encode(),
-                            headers=_ak_headers, method='POST')
-                        _urlreq.urlopen(req, timeout=10)
-                        plog(f"  \u2713 Application 'TAK Portal' created")
-                    except Exception as e:
-                        if hasattr(e, 'code') and e.code == 400:
-                            plog(f"  \u2713 Application 'TAK Portal' already exists")
-                        else:
-                            plog(f"  \u26a0 Application error: {str(e)[:80]}")
+                    app_created = False
+                    for app_attempt in range(1, 4):
+                        try:
+                            req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/',
+                                data=json_mod.dumps({'name': 'TAK Portal', 'slug': 'tak-portal',
+                                    'provider': provider_pk, 'open_in_new_tab': True}).encode(),
+                                headers=_ak_headers, method='POST')
+                            _urlreq.urlopen(req, timeout=30)
+                            plog(f"  \u2713 Application 'TAK Portal' created")
+                            app_created = True
+                            break
+                        except Exception as e:
+                            if hasattr(e, 'code') and e.code == 400:
+                                plog(f"  \u2713 Application 'TAK Portal' already exists")
+                                app_created = True
+                                break
+                            elif app_attempt < 3:
+                                plog(f"  \u26a0 Application create: {str(e)[:60]} (retry {app_attempt}/2)")
+                                time.sleep(5)
+                            else:
+                                plog(f"  \u26a0 Application error: {str(e)[:80]}")
                     _authentik_application_open_in_new_tab(_ak_url, _ak_headers, 'tak-portal', plog=plog)
 
                     # Add to embedded outpost (retry-safe; API can still be warming up)
                     outpost_ok = False
-                    for attempt in range(1, 4):
+                    for attempt in range(1, 6):
                         try:
                             req = _urlreq.Request(f'{_ak_url}/api/v3/outposts/instances/?search=embedded', headers=_ak_headers)
-                            resp = _urlreq.urlopen(req, timeout=15)
+                            resp = _urlreq.urlopen(req, timeout=30)
                             outposts = json_mod.loads(resp.read().decode())['results']
                             embedded = next((o for o in outposts if 'embed' in o.get('name','').lower() or o.get('type') == 'proxy'), None)
                             if not embedded:
@@ -9646,14 +9655,14 @@ def run_takportal_deploy():
                                 patch_req = _urlreq.Request(f'{_ak_url}/api/v3/outposts/instances/{embedded["pk"]}/',
                                     data=json_mod.dumps({'providers': current_pks}).encode(),
                                     headers=_ak_headers, method='PATCH')
-                                _urlreq.urlopen(patch_req, timeout=15)
+                                _urlreq.urlopen(patch_req, timeout=30)
                             outpost_ok = True
                             plog(f"  \u2713 TAK Portal added to embedded outpost")
                             break
                         except Exception as e:
-                            if attempt < 3:
-                                plog(f"  \u26a0 Outpost error: {str(e)[:80]} (retry {attempt}/2)")
-                                time.sleep(3)
+                            if attempt < 5:
+                                plog(f"  \u26a0 Outpost error: {str(e)[:80]} (retry {attempt}/4)")
+                                time.sleep(5)
                             else:
                                 plog(f"  \u26a0 Outpost error: {str(e)[:80]}")
                     if not outpost_ok:
