@@ -19113,7 +19113,7 @@ entries:
   postgresql:
     image: docker.io/library/postgres:16-alpine
     restart: unless-stopped
-    command: postgres -c max_connections=300 -c idle_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6
+    command: postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
       start_period: 20s
@@ -19527,6 +19527,7 @@ def _apply_authentik_pg_tuning(ak_dir, plog):
         alter_cmds = [
             "ALTER SYSTEM SET max_connections = 300",
             "ALTER SYSTEM SET idle_session_timeout = '300s'",
+            "ALTER SYSTEM SET idle_in_transaction_session_timeout = '300s'",
             "ALTER SYSTEM SET tcp_keepalives_idle = 60",
             "ALTER SYSTEM SET tcp_keepalives_interval = 10",
             "ALTER SYSTEM SET tcp_keepalives_count = 3",
@@ -20029,7 +20030,7 @@ entries:
                 needs_write = True
                 plog("  Added blueprint mount to server & worker")
             # Add postgres command-line tuning (max_connections, idle_session_timeout, tcp_keepalives)
-            pg_cmd = 'postgres -c max_connections=300 -c idle_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
+            pg_cmd = 'postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
             if not any('max_connections=300' in l for l in lines):
                 patched = []
                 for line in lines:
