@@ -17458,8 +17458,8 @@ Configure TAK Portal and MediaMTX to use the local relay:<br><br>
 <div class="form-group"><label class="input-label">From Name</label>
 <input type="text" id="swap-from_name" class="input-field" placeholder="TAK Operations" value="{{ relay_config.get('from_name','') }}"></div>
 <div class="form-group full" id="swap-custom-fields" style="display:none;grid-template-columns:1fr 120px;gap:12px">
-<div><label class="input-label">Custom SMTP Host</label><input type="text" id="swap-custom_host" class="input-field" placeholder="smtp.yourdomain.com"></div>
-<div><label class="input-label">Port</label><input type="text" id="swap-custom_port" class="input-field" placeholder="587" value="587"></div>
+<div><label class="input-label">Custom SMTP Host</label><input type="text" id="swap-custom_host" class="input-field" placeholder="smtp.yourdomain.com" value="{{ relay_config.get('relay_host','') if relay_config.get('provider')=='custom' else '' }}"></div>
+<div><label class="input-label">Port</label><input type="text" id="swap-custom_port" class="input-field" placeholder="587" value="{{ relay_config.get('relay_port','587') if relay_config.get('provider')=='custom' else '587' }}"></div>
 </div></div>
 <div style="margin-top:20px;text-align:center">
 <button onclick="swapProvider()" style="padding:12px 32px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;cursor:pointer">↔ Switch Provider</button>
@@ -17528,6 +17528,8 @@ function updateProviderUI(prefix){
     var customFields = document.getElementById(prefix+'custom-fields');
     if(customFields) customFields.style.display = (key==='custom') ? 'grid' : 'none';
 }
+updateProviderUI('swap-');
+updateProviderUI('deploy-');
 
 async function deployRelay(){
     var btn=document.getElementById('deploy-btn');
