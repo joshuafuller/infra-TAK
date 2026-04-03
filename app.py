@@ -24707,7 +24707,6 @@ def deploy_takserver():
         'issued_cert_validity_days': issued_days,
         'enable_admin_ui': data.get('enable_admin_ui', False),
         'enable_webtak': data.get('enable_webtak', False),
-        'enable_nonadmin_ui': data.get('enable_nonadmin_ui', False),
         'webadmin_password': data.get('webadmin_password', ''),
     }
     for ext, key in [('.key', 'gpg_key_path'), ('.pol', 'policy_path')]:
@@ -24933,10 +24932,9 @@ def run_takserver_deploy(config):
         run_cmd('sed -i \'s|<auth>|<auth x509useGroupCache="true">|g\' /opt/tak/CoreConfig.xml')
         admin_ui = str(config.get('enable_admin_ui', False)).lower()
         webtak = str(config.get('enable_webtak', False)).lower()
-        nonadmin = str(config.get('enable_nonadmin_ui', False)).lower()
-        if config.get('enable_admin_ui') or config.get('enable_webtak') or config.get('enable_nonadmin_ui'):
-            log_step(f"WebTAK: AdminUI={admin_ui}, WebTAK={webtak}, NonAdminUI={nonadmin}")
-            run_cmd(f'sed -i \'s|"cert_https"/|"cert_https" enableAdminUI="{admin_ui}" enableWebtak="{webtak}" enableNonAdminUI="{nonadmin}"/|g\' /opt/tak/CoreConfig.xml')
+        if config.get('enable_admin_ui') or config.get('enable_webtak'):
+            log_step(f"WebTAK: AdminUI={admin_ui}, WebTAK={webtak}")
+            run_cmd(f'sed -i \'s|"cert_https"/|"cert_https" enableAdminUI="{admin_ui}" enableWebtak="{webtak}" enableNonAdminUI="false"/|g\' /opt/tak/CoreConfig.xml')
         # For two-server: ensure JDBC URL and password point to Server One
         import re
         if config.get('two_server') and config.get('tak_deploy_cfg'):
