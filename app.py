@@ -2850,16 +2850,16 @@ def _recommended_takserver_heap_gb(total_ram_gb):
 
 
 def _get_current_takserver_heap_gb():
-    """Return current -Xmx heap in GB from systemd drop-in if set, else None."""
+    """Return current -Xmx heap in GB from /opt/tak/setenv.sh if set, else None."""
     import re
-    dropin = '/etc/systemd/system/takserver.service.d/heap.conf'
+    setenv = '/opt/tak/setenv.sh'
     content = None
     try:
-        with open(dropin, 'r') as f:
+        with open(setenv, 'r') as f:
             content = f.read()
     except (OSError, IOError):
         try:
-            r = subprocess.run(f'sudo cat {dropin} 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
+            r = subprocess.run(f'sudo cat {setenv} 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
             if r.returncode == 0 and r.stdout:
                 content = r.stdout
         except Exception:
@@ -2884,7 +2884,7 @@ def takserver_heap_info():
 @app.route('/api/takserver/set-heap', methods=['POST'])
 @login_required
 def takserver_set_heap():
-    """Set TAK Server JVM heap via systemd drop-in and restart. Applies on this host (where core runs)."""
+    """Set TAK Server JVM heap via /opt/tak/setenv.sh and restart."""
     data = request.get_json() or {}
     heap_gb = data.get('heap_gb')
     total_ram_gb = _get_total_ram_gb_local()
@@ -2896,31 +2896,34 @@ def takserver_set_heap():
             return jsonify({'success': False, 'error': 'heap_gb must be between 2 and 32'}), 400
     except (TypeError, ValueError):
         return jsonify({'success': False, 'error': 'heap_gb must be an integer'}), 400
+
+    setenv = '/opt/tak/setenv.sh'
     xms = max(2, heap_gb // 2)
-    opts = f'-Xms{xms}g -Xmx{heap_gb}g'
-    dropin_dir = '/etc/systemd/system/takserver.service.d'
-    dropin_file = os.path.join(dropin_dir, 'heap.conf')
-    cmd_mkdir = f'sudo mkdir -p {dropin_dir}'
-    cmd_write = f'echo \'[Service]\nEnvironment="CATALINA_OPTS={opts}"\' | sudo tee {dropin_file}'
-    cmd_reload = 'sudo systemctl daemon-reload'
-    cmd_restart = 'sudo systemctl restart takserver'
+    import re as _re
     try:
-        for c in (cmd_mkdir, cmd_write, cmd_reload, cmd_restart):
-            r = subprocess.run(c, shell=True, capture_output=True, text=True, timeout=30)
-            if r.returncode != 0 and c == cmd_restart:
-                return jsonify({
-                    'success': False,
-                    'error': f'Restart failed: {(r.stderr or r.stdout or "unknown").strip()[:200]}'
-                }), 500
-            if r.returncode != 0:
-                return jsonify({'success': False, 'error': (r.stderr or r.stdout or '').strip()[:200]}), 500
+        r = subprocess.run(f'sudo cat {setenv}', shell=True, capture_output=True, text=True, timeout=10)
+        if r.returncode != 0 or not r.stdout.strip():
+            return jsonify({'success': False, 'error': f'{setenv} not found or empty'}), 500
+        content = r.stdout
+        if _re.search(r'-Xmx\d+[gGmM]', content):
+            new_content = _re.sub(r'-Xms\d+[gGmM]', f'-Xms{xms}g', content)
+            new_content = _re.sub(r'-Xmx\d+[gGmM]', f'-Xmx{heap_gb}g', new_content)
+        else:
+            new_content = content.rstrip('\n') + f'\nexport JAVA_OPTS="$JAVA_OPTS -Xms{xms}g -Xmx{heap_gb}g"\n'
+        write_cmd = f"sudo tee {setenv} > /dev/null"
+        w = subprocess.run(write_cmd, shell=True, input=new_content, capture_output=True, text=True, timeout=10)
+        if w.returncode != 0:
+            return jsonify({'success': False, 'error': f'Failed to write {setenv}: {(w.stderr or "").strip()[:200]}'}), 500
+        rr = subprocess.run('sudo systemctl restart takserver', shell=True, capture_output=True, text=True, timeout=120)
+        if rr.returncode != 0:
+            return jsonify({'success': False, 'error': f'Restart failed: {(rr.stderr or rr.stdout or "unknown").strip()[:200]}'}), 500
     except subprocess.TimeoutExpired:
         return jsonify({'success': False, 'error': 'Command timed out'}), 500
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)[:200]}), 500
     return jsonify({
         'success': True,
-        'message': f'TAK Server heap set to -Xmx{heap_gb}g and restarted.',
+        'message': f'TAK Server heap set to -Xmx{heap_gb}g in setenv.sh and restarted.',
         'heap_gb': heap_gb,
         'current_heap_gb': heap_gb,
         'total_ram_gb': total_ram_gb,
@@ -19099,6 +19102,7 @@ entries:
   postgresql:
     image: docker.io/library/postgres:16-alpine
     restart: unless-stopped
+    command: postgres -c max_connections=300 -c idle_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
       start_period: 20s
@@ -19111,7 +19115,6 @@ entries:
       POSTGRES_PASSWORD: ${PG_PASS:?database password required}
       POSTGRES_USER: ${PG_USER:-authentik}
       POSTGRES_DB: ${PG_DB:-authentik}
-      POSTGRES_MAX_CONNECTIONS: "300"
   redis:
     image: docker.io/library/redis:alpine
     command: --save 60 1 --loglevel warning
@@ -19303,7 +19306,6 @@ volumes:
                 f'        <ldap url="ldap://{host}:389" userstring="cn={{username}},ou=users,dc=takldap" updateinterval="30" groupprefix="cn=tak_" groupNameExtractorRegex="cn=tak_(.*?)(?:,|$)" serviceAccountDN="cn=adm_ldapservice,ou=users,dc=takldap" serviceAccountCredential="'
                 + ldap_svc_pass
                 + '" groupBaseRDN="ou=groups,dc=takldap" userBaseRDN="ou=users,dc=takldap" dnAttributeName="DN" nameAttr="CN" adminGroup="ROLE_ADMIN"/>\n'
-                '        <File location="UserAuthenticationFile.xml"/>\n'
                 '    </auth>'
             )
 
@@ -20015,17 +20017,18 @@ entries:
                 lines = patched
                 needs_write = True
                 plog("  Added blueprint mount to server & worker")
-            # Add POSTGRES_MAX_CONNECTIONS
-            if not any('POSTGRES_MAX_CONNECTIONS' in l for l in lines):
+            # Add postgres command-line tuning (max_connections, idle_session_timeout, tcp_keepalives)
+            pg_cmd = 'postgres -c max_connections=300 -c idle_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
+            if not any('max_connections=300' in l for l in lines):
                 patched = []
                 for line in lines:
                     patched.append(line)
-                    if 'POSTGRES_USER:' in line:
+                    if 'image: docker.io/library/postgres:' in line:
                         indent = line[:len(line) - len(line.lstrip())]
-                        patched.append(f'{indent}POSTGRES_MAX_CONNECTIONS: "300"\n')
+                        patched.append(f'{indent}command: {pg_cmd}\n')
                 lines = patched
                 needs_write = True
-                plog("  Added POSTGRES_MAX_CONNECTIONS to postgresql")
+                plog("  Added PostgreSQL command-line tuning")
 
             # Pin AUTHENTIK_TAG to latest stable release
             ak_tag = _get_authentik_latest_release_tag(use_cache=False) or '2026.2.1'
@@ -20190,7 +20193,6 @@ entries:
                     '        <ldap url="ldap://127.0.0.1:389" userstring="cn={username},ou=users,dc=takldap" updateinterval="30" groupprefix="cn=tak_" groupNameExtractorRegex="cn=tak_(.*?)(?:,|$)" serviceAccountDN="cn=adm_ldapservice,ou=users,dc=takldap" serviceAccountCredential="'
                     + ldap_pass
                     + '" groupBaseRDN="ou=groups,dc=takldap" userBaseRDN="ou=users,dc=takldap" dnAttributeName="DN" nameAttr="CN" adminGroup="ROLE_ADMIN"/>\n'
-                    '        <File location="UserAuthenticationFile.xml"/>\n'
                     '    </auth>'
                 )
 
@@ -22150,7 +22152,6 @@ def _apply_ldap_to_coreconfig():
     auth_block += ' x509useGroupCache="true" x509useGroupCacheDefaultActive="true"'
     auth_block += ' x509checkRevocation="true">\n'
     auth_block += ldap_line + '\n'
-    auth_block += '        <File location="UserAuthenticationFile.xml"/>\n'
     auth_block += '    </auth>'
     # Sanity check the block we built
     if 'adm_ldapservice' not in auth_block:
@@ -26454,8 +26455,8 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);font-size:11px;color:var(--text-dim)">Unattended-upgrades (each host) are controlled on the <a href="/" style="color:var(--cyan);text-decoration:none">main dashboard</a>.</div>
 <div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">
 <div style="font-size:12px;color:var(--text-secondary);margin-bottom:6px">JVM heap</div>
-<p style="font-size:11px;color:var(--text-dim);margin-bottom:10px;line-height:1.5">If CloudTAK or 8446 return HTTP 500 with <code style="font-size:10px">OutOfMemoryError: Java heap space</code>, TAK Server's JVM heap may be too small. <span id="heap-why" style="display:none">TAK Server uses a fixed heap limit (-Xmx), often 2–4 GB by default; it does not auto-scale. With many CloudTAK tabs or connections, the active-groups cache can exceed that and trigger OOM. This button sets a systemd drop-in so the service can use more memory (and restarts TAK Server).</span><button type="button" onclick="var e=document.getElementById('heap-why');e.style.display=e.style.display?'none':'block'" style="background:none;border:none;color:var(--cyan);cursor:pointer;font-size:11px;padding:0;margin-left:4px">Why?</button></p>
-<div style="margin-bottom:10px;font-family:'JetBrains Mono',monospace;font-size:12px">Current: <span id="heap-current-display" style="color:var(--green)">{% if current_heap_gb %}{{ current_heap_gb }} GB <span style="color:var(--text-dim);font-weight:400">(set via drop-in)</span>{% else %}<span style="color:var(--text-dim)">Not set (package default)</span>{% endif %}</span></div>
+<p style="font-size:11px;color:var(--text-dim);margin-bottom:10px;line-height:1.5">If CloudTAK or 8446 return HTTP 500 with <code style="font-size:10px">OutOfMemoryError: Java heap space</code>, TAK Server's JVM heap may be too small. <span id="heap-why" style="display:none">TAK Server uses a fixed heap limit (-Xmx), often 2–4 GB by default; it does not auto-scale. With many CloudTAK tabs or connections, the active-groups cache can exceed that and trigger OOM. This button updates setenv.sh so the service can use more memory (and restarts TAK Server).</span><button type="button" onclick="var e=document.getElementById('heap-why');e.style.display=e.style.display?'none':'block'" style="background:none;border:none;color:var(--cyan);cursor:pointer;font-size:11px;padding:0;margin-left:4px">Why?</button></p>
+<div style="margin-bottom:10px;font-family:'JetBrains Mono',monospace;font-size:12px">Current: <span id="heap-current-display" style="color:var(--green)">{% if current_heap_gb %}{{ current_heap_gb }} GB <span style="color:var(--text-dim);font-weight:400">(setenv.sh)</span>{% else %}<span style="color:var(--text-dim)">Not set (package default)</span>{% endif %}</span></div>
 <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px">
 <button type="button" id="set-heap-btn" onclick="setTakHeap()" class="control-btn">Set recommended ({{ recommended_heap_gb }} GB)</button>
 <label style="font-size:11px;color:var(--text-dim);margin-left:8px">or set to:</label>
