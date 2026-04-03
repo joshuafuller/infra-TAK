@@ -9054,6 +9054,9 @@ def _takportal_build_settings_dict(settings):
     else:
         auth_url_host = ak_upstream.split(':')[0]
     auth_url_port = '9090' if ak_upstream == '127.0.0.1:9090' else (ak_upstream.split(':')[1] if ':' in ak_upstream else '9090')
+    # Container-to-host path for TAK Server API calls used by TAK Portal dashboard stats.
+    # Use server_ip first (same-host reliable path) and fall back to configured TAK host.
+    tak_url_host = server_ip if (server_ip and server_ip not in ('localhost', '127.0.0.1')) else (_get_takserver_host(settings) or 'host.docker.internal')
     return {
         "AUTHENTIK_URL": f"http://{auth_url_host}:{auth_url_port}",
         "AUTHENTIK_TOKEN": ak_token or "",
@@ -9066,7 +9069,7 @@ def _takportal_build_settings_dict(settings):
         "PORTAL_AUTH_REQUIRED_GROUP": "authentik Admins" if settings.get('fqdn') else "",
         "AUTHENTIK_PUBLIC_URL": _get_authentik_base_url(settings),
         "TAK_PORTAL_PUBLIC_URL": f"https://takportal.{settings['fqdn']}" if settings.get('fqdn') else f"http://{server_ip}:3000",
-        "TAK_URL": f"https://{_get_takserver_host(settings)}:8443/Marti" if _get_takserver_host(settings) else f"https://{server_ip}:8443/Marti",
+        "TAK_URL": f"https://{tak_url_host}:8443/Marti",
         "TAK_API_P12_PATH": "data/certs/tak-client.p12",
         "TAK_API_P12_PASSPHRASE": cert_pass,
         "TAK_CA_PATH": "data/certs/tak-ca.pem",
