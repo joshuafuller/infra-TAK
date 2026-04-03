@@ -1,3 +1,4 @@
+if(typeof initLogToolbar==='function'){initLogToolbar('deploy-log');initLogToolbar('upgrade-log');initLogToolbar('db-migrate-log');initLogToolbar('server-log');}
 async function resyncLdap(){
     if(!confirm("Resync will restart the Authentik worker and re-apply the LDAP blueprint. The TAK Portal user list may take a short moment to repopulate.\\n\\nContinue?")){return;}
     var btn=document.getElementById('resync-ldap-btn');

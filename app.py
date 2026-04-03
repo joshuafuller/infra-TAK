@@ -3052,6 +3052,14 @@ def firewall_js():
     resp.headers['Expires'] = '0'
     return resp
 
+@app.route('/log-tools.js')
+def log_tools_js():
+    resp = send_from_directory(os.path.join(BASE_DIR, 'static'), 'log-tools.js', mimetype='application/javascript')
+    resp.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    resp.headers['Pragma'] = 'no-cache'
+    resp.headers['Expires'] = '0'
+    return resp
+
 @app.route('/takserver.js')
 def takserver_js():
     resp = send_from_directory(os.path.join(BASE_DIR, 'static'), 'takserver.js', mimetype='application/javascript')
@@ -14757,6 +14765,8 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <div class="modal-actions"><button class="btn btn-ghost" onclick="document.getElementById('uninstall-modal').classList.remove('open')">Cancel</button><button class="btn btn-danger" onclick="doUninstall()">Uninstall</button></div>
   <div id="uninstall-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
 </div></div>
+<script src="/log-tools.js?v={{ version }}"></script>
+<script>initLogToolbar('deploy-log');initLogToolbar('deploy-log-dyn');initLogToolbar('container-logs');</script>
 <script>
 var logIndex=0,logInterval=null;
 function collectNoderedDeployConfig(){var mode=document.getElementById('nodered-target-mode');var host=document.getElementById('nodered-remote-host');var port=document.getElementById('nodered-remote-port');var user=document.getElementById('nodered-remote-user');var key=document.getElementById('nodered-remote-key');return{target_mode:(mode&&mode.value)||'local',remote:{host:host?host.value.trim():'',port:port?parseInt(port.value,10)||22:22,username:user?user.value.trim()||'root':'root',ssh_key_path:key?key.value.trim():''}};}
@@ -15049,6 +15059,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 
   <div class="card" id="gd-log-card" style="display:none"><div class="card-title">Deploy log</div><div class="log-box" id="gd-deploy-log">Initializing...</div></div>
 </div>
+<script src="/log-tools.js?v={{ version }}"></script>
 <script src="/guarddog.js?v={{ version }}"></script>
 </body></html>
 '''
@@ -15489,6 +15500,8 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     </div>
   </details>
 </div>
+<script src="/log-tools.js?v={{ version }}"></script>
+<script>initLogToolbar('fedhub-deploy-log');initLogToolbar('fedhub-upgrade-log');initLogToolbar('fedhub-rotate-log');</script>
 <script>
 var fedhubLogIndex=0,fedhubLogInterval=null;
 var fedhubUpgradeLogIndex=0,fedhubUpgradeLogInterval=null;
@@ -16322,6 +16335,8 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   </div>
 </div>
 
+<script src="/log-tools.js?v={{ version }}"></script>
+<script>initLogToolbar('deploy-log');initLogToolbar('service-logs');</script>
 <script>
 let logIndex = 0;
 let logInterval = null;
@@ -17253,6 +17268,8 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   </div>
 </div>
 
+<script src="/log-tools.js?v={{ version }}"></script>
+<script>initLogToolbar('deploy-log');initLogToolbar('deploy-log-dyn');initLogToolbar('container-logs');</script>
 <script src="/cloudtak/page.js"></script>
 <script>
 (function(){
@@ -17358,6 +17375,8 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <!-- Deploy Log -->
 <div class="section-title">Deployment Log</div>
 <div class="deploy-log" id="deploy-log">Starting deployment...</div>
+<script src="/log-tools.js?v={{ version }}"></script>
+<script>initLogToolbar('deploy-log');</script>
 <script>
 (function pollLog(){
     var el=document.getElementById('deploy-log');
@@ -17736,6 +17755,8 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% endif %}
 </div>
 <footer class="footer"></footer>
+<script src="/log-tools.js?v={{ version }}"></script>
+<script>initLogToolbar('deploy-log');</script>
 <script>
 async function deployCaddy(){
     var domain=document.getElementById('domain-input').value.trim();
@@ -18104,6 +18125,8 @@ Features: User creation with auto-cert generation, group management, mutual aid 
 </div>
 </div>
 <footer class="footer"></footer>
+<script src="/log-tools.js?v={{ version }}"></script>
+<script>initLogToolbar('deploy-log');initLogToolbar('container-log');</script>
 <script>
 function portalSectionToggle(header){
     var body=header.nextElementSibling;
@@ -21223,6 +21246,8 @@ You can also open the Authentik admin UI below to make additional Admin users (A
 </div>
 </div>
 <footer class="footer"></footer>
+<script src="/log-tools.js?v={{ version }}"></script>
+<script>initLogToolbar('deploy-log');initLogToolbar('container-log');</script>
 <script>
 async function showAkPassword(){
     var btn=document.getElementById('ak-pw-btn');
@@ -25852,6 +25877,8 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <p><a href="https://github.com/takwerx/infra-TAK" target="_blank" rel="noopener" style="color:var(--cyan);text-decoration:none">github.com/takwerx/infra-TAK</a> (README, docs/COMMANDS.md, docs/HANDOFF-LDAP-AUTHENTIK.md)</p>
 </div></div>
 </main>
+<script src="/log-tools.js?v={{ version }}"></script>
+<script>initLogToolbar('full-uninstall-log');</script>
 <script>
 function helpToggle(header){var body=header.nextElementSibling;var icon=header.querySelector('.help-card-toggle');if(!body)return;if(body.style.display==='block'){body.style.display='none';icon.style.transform='rotate(0deg)';}else{body.style.display='block';icon.style.transform='rotate(180deg)';}}
 function closeFullUninstallModal(){document.getElementById('full-uninstall-modal').classList.remove('open');}
@@ -26817,6 +26844,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 </div>
 <footer class="footer"></footer>
+<script src="/log-tools.js?v={{ version }}"></script>
 <script src="/takserver.js"></script></body></html>'''
 
 # === Startup Banner (prints for both gunicorn and direct invocation) ===
