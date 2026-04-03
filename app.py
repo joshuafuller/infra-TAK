@@ -19626,8 +19626,14 @@ def run_authentik_deploy(reconfigure=False):
                                 with open(compose_path) as f:
                                     comp_lines = f.readlines()
                                 comp_new = []
+                                in_ldap_svc = False
                                 for line in comp_lines:
-                                    if 'AUTHENTIK_HOST:' in line:
+                                    stripped = line.lstrip()
+                                    if re.match(r'^  \w', line) and not line.startswith('  ldap:'):
+                                        in_ldap_svc = False
+                                    if line.startswith('  ldap:'):
+                                        in_ldap_svc = True
+                                    if 'AUTHENTIK_HOST:' in line and not in_ldap_svc:
                                         line = re.sub(r'AUTHENTIK_HOST:\s*\S+', f'AUTHENTIK_HOST: {ak_base}', line)
                                     if ':host-gateway"' in line and '"' in line:
                                         line = re.sub(r'(")([^"]+)(":host-gateway")', r'\1' + ak_host + r'\3', line)
@@ -20010,8 +20016,7 @@ entries:
             if not any('ghcr.io/goauthentik/ldap' in l for l in lines):
                 _ak_host = _get_authentik_host(settings)
                 if _ak_host:
-                    _ak_base = _get_authentik_base_url(settings)
-                    ldap_svc = f"  ldap:\n    image: {ldap_image}\n    extra_hosts:\n      - \"{_ak_host}:host-gateway\"\n    ports:\n    - 389:3389\n    - 636:6636\n    environment:\n      AUTHENTIK_HOST: {_ak_base}\n      AUTHENTIK_INSECURE: \"true\"\n      AUTHENTIK_TOKEN: placeholder\n    restart: unless-stopped\n"
+                    ldap_svc = f"  ldap:\n    image: {ldap_image}\n    extra_hosts:\n      - \"{_ak_host}:host-gateway\"\n    ports:\n    - 389:3389\n    - 636:6636\n    environment:\n      AUTHENTIK_HOST: http://authentik-server-1:9000\n      AUTHENTIK_INSECURE: \"true\"\n      AUTHENTIK_TOKEN: placeholder\n    restart: unless-stopped\n"
                 else:
                     ldap_svc = f"  ldap:\n    image: {ldap_image}\n    ports:\n    - 389:3389\n    - 636:6636\n    environment:\n      AUTHENTIK_HOST: http://authentik-server-1:9000\n      AUTHENTIK_INSECURE: \"true\"\n      AUTHENTIK_TOKEN: placeholder\n    restart: unless-stopped\n"
                 new_lines = []
@@ -20887,6 +20892,13 @@ entries:
         else:
             plog("  2. SMTP and password recovery are already configured (Email Relay was set up).")
         plog("=" * 50)
+        # Final LDAP restart: ensure container has the injected token and internal URL
+        try:
+            subprocess.run(f'cd {ak_dir} && docker compose restart ldap 2>&1',
+                shell=True, capture_output=True, text=True, timeout=60)
+            plog("  ✓ LDAP container restarted (final)")
+        except Exception:
+            pass
         plog("  ✓ Deploy complete.")
         _update_boot_stagger_service()
         authentik_deploy_status.update({'running': False, 'complete': True})
