@@ -24211,9 +24211,12 @@ def takserver_update():
             s1, tak_cfg
         ), daemon=True).start()
     else:
+        single_pkgs = [f for f in pkg_files if '-database' not in f.lower() and '-core' not in f.lower()]
+        if not single_pkgs:
+            return jsonify({'error': 'Only split packages (core/database) found. For one-server update, upload the single takserver .deb. Remove the wrong files and upload the correct package.'}), 400
         upgrade_log.clear()
         upgrade_status.update({'running': True, 'complete': False, 'error': False})
-        threading.Thread(target=run_takserver_upgrade, args=(os.path.join(UPLOAD_DIR, pkg_files[0]),), daemon=True).start()
+        threading.Thread(target=run_takserver_upgrade, args=(os.path.join(UPLOAD_DIR, single_pkgs[0]),), daemon=True).start()
     return jsonify({'success': True})
 
 @app.route('/api/takserver/update/log')
@@ -24675,12 +24678,17 @@ def deploy_takserver():
         return jsonify({'error': str(e)[:200]}), 400
     pkg_files = [f for f in os.listdir(UPLOAD_DIR) if f.endswith('.deb') or f.endswith('.rpm')]
     if not pkg_files: return jsonify({'error': 'No package file found.'}), 400
-    # For two-server, prefer the core .deb (database is on Server One)
     if is_two_server:
-        core_pkg = next((f for f in pkg_files if 'core' in f.lower()), pkg_files[0])
+        core_pkg = next((f for f in pkg_files if 'core' in f.lower()), '')
+        if not core_pkg:
+            return jsonify({'error': 'No takserver-core package found in uploads. For two-server deploy, upload both takserver-core and takserver-database .deb files.'}), 400
         selected_pkg = core_pkg
     else:
-        selected_pkg = pkg_files[0]
+        single_pkgs = [f for f in pkg_files if '-database' not in f.lower() and '-core' not in f.lower()]
+        if not single_pkgs:
+            split_names = ', '.join(pkg_files)
+            return jsonify({'error': f'Only split packages found ({split_names}). For one-server deploy, upload the single takserver .deb (not takserver-database or takserver-core). Remove the wrong files and upload the correct package.'}), 400
+        selected_pkg = single_pkgs[0]
     try:
         intermediate_days = int(data.get('intermediate_ca_validity_days') or 730)
         intermediate_days = max(1, min(3652, intermediate_days))
