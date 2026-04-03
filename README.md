@@ -4,7 +4,7 @@ Tea Awarness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Latest release: v0.3.7-alpha** — **TAK Server cert UI/group handling:** cert group picker now normalizes TAK Portal directional suffix groups (treats `_READ`/`_WRITE`/`_BOTH` as one canonical channel name), dedupes duplicates, and hides system/admin-style groups (`authentik*`, `cn=tak_*`, `ROLE_ADMIN`, video access groups) so cert assignment stays focused on operational channels. **Ops docs:** pull/restart and release/update command docs were updated to avoid divergent-branch update failures. See [docs/RELEASE-v0.3.7-alpha.md](docs/RELEASE-v0.3.7-alpha.md). Prior: [v0.3.6-alpha](docs/RELEASE-v0.3.6-alpha.md) (firewall page + cert UX improvements).
+**Latest release: v0.3.8-alpha** — **Database maintenance & resilience:** Smart auto-VACUUM (Guard Dog daily 3am, triggers on >1M dead tuples), remote CoT DB size monitoring for two-server setups, REINDEX button, enhanced database stats (size/rows/dead tuples), background VACUUM with live elapsed timer, Authentik PostgreSQL hardening (max_connections=300, idle/keepalive tuning via Update config), TAK Portal Authentik link fix. See [docs/RELEASE-v0.3.8-alpha.md](docs/RELEASE-v0.3.8-alpha.md). Prior: [v0.3.7-alpha](docs/RELEASE-v0.3.7-alpha.md) (cert group picker normalization).
 
 **Goal: universal installer.** Currently supported platform: **Ubuntu 22.04 LTS**.
 
