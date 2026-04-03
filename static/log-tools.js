@@ -175,25 +175,21 @@
     errCtl.cb.onchange = function () {
       handle._eo = errCtl.cb.checked;
 
-      var hasTN = false;
-      for (var k = 0; k < el.childNodes.length; k++) {
-        if (el.childNodes[k].nodeType === 3 && el.childNodes[k].textContent.trim()) {
-          hasTN = true; break;
-        }
-      }
+      var taggedLines = el.querySelectorAll('[data-log-line]');
 
-      if (hasTN && _tcDesc) {
+      if (taggedLines.length > 0) {
+        /* div-based log: toggle visibility on tagged divs */
+        for (var m = 0; m < taggedLines.length; m++) {
+          taggedLines[m].style.display =
+            (handle._eo && !taggedLines[m].hasAttribute('data-log-error')) ? 'none' : '';
+        }
+      } else if (_tcDesc) {
+        /* textContent-based log: rewrite from stored full text */
         if (handle._eo) {
           var f = (handle._ft || '').split('\n').filter(_isErr);
           _tcDesc.set.call(el, f.length ? f.join('\n') : '');
         } else {
           _tcDesc.set.call(el, handle._ft || '');
-        }
-      } else {
-        var lines = el.querySelectorAll('[data-log-line]');
-        for (var m = 0; m < lines.length; m++) {
-          lines[m].style.display =
-            (handle._eo && !lines[m].hasAttribute('data-log-error')) ? 'none' : '';
         }
       }
     };
