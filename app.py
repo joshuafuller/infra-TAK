@@ -22569,7 +22569,7 @@ def takserver_vacuum_status():
     """Poll VACUUM progress. Also checks PostgreSQL directly for running VACUUM."""
     running = _vacuum_status['running']
     full = _vacuum_status['full']
-    started = _vacuum_status['started']
+    elapsed_secs = 0
     if not running:
         try:
             check_sql = "SELECT query, extract(epoch from now() - query_start)::int AS secs FROM pg_stat_activity WHERE query ILIKE '%VACUUM%' AND state = 'active' AND pid != pg_backend_pid() LIMIT 1;"
@@ -22587,16 +22587,19 @@ def takserver_vacuum_status():
                 running = True
                 full = 'FULL' in raw.upper()
                 parts = raw.split('|')
-                secs = int(parts[-1]) if len(parts) > 1 and parts[-1].strip().isdigit() else 0
-                if secs > 0:
-                    from datetime import timedelta as _td
-                    started = (datetime.now() - _td(seconds=secs)).isoformat()
+                elapsed_secs = int(parts[-1]) if len(parts) > 1 and parts[-1].strip().isdigit() else 0
+        except Exception:
+            pass
+    if running and not elapsed_secs and _vacuum_status.get('started'):
+        try:
+            st = datetime.fromisoformat(_vacuum_status['started'])
+            elapsed_secs = int((datetime.now() - st).total_seconds())
         except Exception:
             pass
     return jsonify({
         'running': running,
         'full': full,
-        'started': started,
+        'elapsed_secs': elapsed_secs,
         'result': _vacuum_status['result'],
         'error': _vacuum_status['error'],
     })
