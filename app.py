@@ -22516,41 +22516,64 @@ def takserver_ldap_drift_check():
     })
 
 
+_vacuum_status = {'running': False, 'full': False, 'started': None, 'result': None, 'error': None}
+
+def _run_vacuum_background(use_full, tak_cfg):
+    vacuum_sql = "VACUUM FULL;" if use_full else "VACUUM ANALYZE;"
+    timeout_sec = 3600 if use_full else 600
+    _vacuum_status.update({'running': True, 'full': use_full, 'started': datetime.now().isoformat(), 'result': None, 'error': None})
+    try:
+        if tak_cfg.get('mode') == 'two_server':
+            s1 = tak_cfg.get('server_one', {})
+            vacuum_cmd = f"sudo -u postgres psql -d cot -c '{vacuum_sql}' 2>&1"
+            ok, out = _ssh_probe(s1, vacuum_cmd, timeout=timeout_sec)
+            if not ok:
+                _vacuum_status.update({'running': False, 'error': (out or 'SSH command failed')[:500]})
+                return
+            _vacuum_status.update({'running': False, 'result': (out or '').strip()})
+        else:
+            cmd = f"sudo -u postgres psql -d cot -c '{vacuum_sql}' 2>&1"
+            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout_sec, cwd='/')
+            out = (r.stdout or '') + (r.stderr or '')
+            if r.returncode != 0:
+                _vacuum_status.update({'running': False, 'error': out.strip() or f'Exit code {r.returncode}'})
+                return
+            _vacuum_status.update({'running': False, 'result': out.strip()})
+    except subprocess.TimeoutExpired:
+        _vacuum_status.update({'running': False, 'error': 'VACUUM timed out (database may be very large)'})
+    except Exception as e:
+        _vacuum_status.update({'running': False, 'error': str(e)[:200]})
+
 @app.route('/api/takserver/vacuum', methods=['POST'])
 @login_required
 def takserver_vacuum():
-    """Run VACUUM on the CoT database. Default: VACUUM ANALYZE (safe, reclaims space). Optional: VACUUM FULL (locks tables, reclaims more)."""
+    """Run VACUUM on the CoT database in background. Returns immediately, poll /api/takserver/vacuum/status."""
     if not os.path.exists('/opt/tak'):
         return jsonify({'success': False, 'error': 'TAK Server not installed'}), 400
+    if _vacuum_status['running']:
+        return jsonify({'success': False, 'error': 'VACUUM already running', 'status': 'running', 'full': _vacuum_status['full'], 'started': _vacuum_status['started']}), 409
     data = request.get_json() or {}
     use_full = data.get('full') is True
-    vacuum_sql = "VACUUM FULL;" if use_full else "VACUUM ANALYZE;"
-    timeout_sec = 3600 if use_full else 600
-
-    # Two-server: run VACUUM on Server One via SSH
     settings = load_settings()
     tak_cfg = _get_tak_deployment_config(settings)
     if tak_cfg.get('mode') == 'two_server':
         s1 = tak_cfg.get('server_one', {})
         if not s1.get('host'):
             return jsonify({'success': False, 'error': 'Server One host not configured'}), 400
-        vacuum_cmd = f"sudo -u postgres psql -d cot -c '{vacuum_sql}' 2>&1"
-        ok, out = _ssh_probe(s1, vacuum_cmd, timeout=timeout_sec)
-        if not ok:
-            return jsonify({'success': False, 'error': (out or 'SSH command failed')[:500]}), 400
-        return jsonify({'success': True, 'output': (out or '').strip(), 'full': use_full, 'remote': True})
+    threading.Thread(target=_run_vacuum_background, args=(use_full, tak_cfg), daemon=True).start()
+    return jsonify({'success': True, 'status': 'started', 'full': use_full})
 
-    cmd = f"sudo -u postgres psql -d cot -c '{vacuum_sql}' 2>&1"
-    try:
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout_sec, cwd='/')
-        out = (r.stdout or '') + (r.stderr or '')
-        if r.returncode != 0:
-            return jsonify({'success': False, 'error': out.strip() or f'Exit code {r.returncode}'}), 400
-        return jsonify({'success': True, 'output': out.strip(), 'full': use_full})
-    except subprocess.TimeoutExpired:
-        return jsonify({'success': False, 'error': 'VACUUM timed out (database may be very large)'}), 400
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)[:200]}), 500
+@app.route('/api/takserver/vacuum/status')
+@login_required
+def takserver_vacuum_status():
+    """Poll VACUUM progress."""
+    return jsonify({
+        'running': _vacuum_status['running'],
+        'full': _vacuum_status['full'],
+        'started': _vacuum_status['started'],
+        'result': _vacuum_status['result'],
+        'error': _vacuum_status['error'],
+    })
 
 
 @app.route('/api/takserver/reindex', methods=['POST'])
