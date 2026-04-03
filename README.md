@@ -4,7 +4,7 @@ Tea Awarness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Latest release: v0.3.8-alpha** — **Database maintenance & resilience:** Smart auto-VACUUM (Guard Dog daily 3am, triggers on >1M dead tuples), remote CoT DB size monitoring for two-server setups, REINDEX button, enhanced database stats (size/rows/dead tuples), background VACUUM with live elapsed timer, Authentik PostgreSQL hardening (max_connections=300, idle/keepalive tuning via Update config), TAK Portal Authentik link fix. See [docs/RELEASE-v0.3.8-alpha.md](docs/RELEASE-v0.3.8-alpha.md). Prior: [v0.3.7-alpha](docs/RELEASE-v0.3.7-alpha.md) (cert group picker normalization).
+**Latest release: v0.3.8-alpha** — **Database maintenance & resilience:** Smart auto-VACUUM (Guard Dog daily 3am, triggers on >1M dead tuples), remote CoT DB size monitoring for two-server setups, REINDEX button, enhanced database stats (size/rows/dead tuples), background VACUUM with live elapsed timer, flat-file auth toggle (enable/disable `UserAuthenticationFile.xml` from the UI), Authentik PostgreSQL hardening (max_connections=300, idle/keepalive tuning via Update config), TAK Portal Authentik link fix. See [docs/RELEASE-v0.3.8-alpha.md](docs/RELEASE-v0.3.8-alpha.md). Prior: [v0.3.7-alpha](docs/RELEASE-v0.3.7-alpha.md) (cert group picker normalization).
 
 **Goal: universal installer.** Currently supported platform: **Ubuntu 22.04 LTS**.
 
