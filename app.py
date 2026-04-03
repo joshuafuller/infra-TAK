@@ -21841,6 +21841,51 @@ def _test_ldap_bind(ldap_pass):
         log = (r.stdout or '').lower()
     return 'authenticated' in log and ('adm_ldapservice' in log or 'ldapservice' in log)
 
+
+def _test_ldap_bind_dn(bind_dn, bind_pass):
+    """Best-effort LDAP bind signal for a specific DN via outpost logs.
+
+    We don't trust ldapsearch exit codes against Authentik LDAP outpost, so this checks
+    whether the outpost received a bind request for the DN and that recent lines don't
+    show obvious credential errors for that DN.
+    """
+    settings = load_settings()
+    ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+    ldap_host = '127.0.0.1'
+    is_remote = ak_cfg.get('target_mode') == 'remote'
+    if is_remote:
+        remote_host = (ak_cfg.get('remote', {}).get('host') or '').strip()
+        if remote_host:
+            ldap_host = remote_host
+    try:
+        if shutil.which('ldapsearch'):
+            subprocess.run(
+                ['ldapsearch', '-x', '-H', f'ldap://{ldap_host}:389',
+                 '-D', bind_dn, '-w', bind_pass,
+                 '-b', 'dc=takldap', '-s', 'base', '(objectClass=*)'],
+                capture_output=True, text=True, timeout=15)
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        pass
+    time.sleep(2)
+    if is_remote:
+        ok, out = _ssh_probe(ak_cfg.get('remote', {}),
+            'docker logs authentik-ldap-1 --since 25s 2>&1', timeout=15)
+        log = (out or '').lower()
+    else:
+        r = subprocess.run(
+            'docker logs authentik-ldap-1 --since 25s 2>&1',
+            shell=True, capture_output=True, text=True, timeout=10)
+        log = (r.stdout or '').lower()
+    dn = (bind_dn or '').lower()
+    if not dn:
+        return False
+    lines = [ln for ln in log.splitlines() if dn in ln]
+    if not lines:
+        return False
+    if any('invalid credentials' in ln or '"error"' in ln for ln in lines):
+        return False
+    return True
+
 def _ensure_ldap_flow_authentication_none():
     """Ensure ldap-authentication-flow exists with authentication:none and 3 stage bindings, restart LDAP outpost.
     If flow missing (blueprint never ran), create it by cloning default-authentication-flow.
@@ -22562,7 +22607,36 @@ def takserver_connect_ldap():
             diag.append(f'Outpost log: {outpost_tail[:200]}')
     except Exception as e:
         diag.append(f'Diagnostic error: {str(e)[:100]}')
-    return jsonify({'success': ok, 'message': ' | '.join(diag)})
+    # Post-fix verification signals (best-effort)
+    try:
+        verify = {}
+        verify['coreconfig_has_ldap'] = bool(_coreconfig_has_ldap())
+        ws = _get_authentik_webadmin_status()
+        verify['webadmin_exists_in_authentik'] = bool(ws.get('exists'))
+        verify['webadmin_superuser'] = bool(ws.get('is_superuser'))
+        ldap_pass = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD') or ''
+        verify['service_bind_seen'] = bool(_test_ldap_bind(ldap_pass)) if ldap_pass else False
+        wap = (settings.get('webadmin_password') or '').strip()
+        verify['webadmin_bind_seen'] = bool(_test_ldap_bind_dn('cn=webadmin,ou=users,dc=takldap', wap)) if wap else False
+        verify['ready'] = all([
+            verify['coreconfig_has_ldap'],
+            verify['webadmin_exists_in_authentik'],
+            verify['webadmin_superuser'],
+            verify['webadmin_bind_seen'],
+        ])
+        diag.append(
+            "Verification: coreconfig={} webadmin={} superuser={} webadmin-bind={} ready={}".format(
+                'OK' if verify['coreconfig_has_ldap'] else 'FAIL',
+                'OK' if verify['webadmin_exists_in_authentik'] else 'FAIL',
+                'OK' if verify['webadmin_superuser'] else 'FAIL',
+                'OK' if verify['webadmin_bind_seen'] else 'FAIL',
+                'YES' if verify['ready'] else 'NO',
+            )
+        )
+    except Exception as e:
+        verify = {'ready': False, 'error': str(e)[:120]}
+        diag.append(f'Verification: ERROR ({str(e)[:80]})')
+    return jsonify({'success': ok, 'message': ' | '.join(diag), 'verification': verify})
 
 
 @app.route('/api/takserver/ldap-drift-check')
