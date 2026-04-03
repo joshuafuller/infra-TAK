@@ -24993,6 +24993,20 @@ def run_takserver_deploy(config):
                 except Exception as e:
                     log_step(f"⚠ Could not verify JDBC URL: {e}")
         log_step("✓ CoreConfig.xml configured")
+
+        # Auto-connect to LDAP if Authentik is already deployed (removes flat-file auth)
+        try:
+            ak_installed = bool(detect_modules().get('authentik', {}).get('installed'))
+            if ak_installed and not _coreconfig_has_ldap():
+                log_step("Authentik detected — connecting TAK Server to LDAP...")
+                ldap_ok, ldap_msg = _apply_ldap_to_coreconfig()
+                if ldap_ok:
+                    log_step(f"✓ {ldap_msg}")
+                else:
+                    log_step(f"⚠ LDAP auto-connect: {ldap_msg} — use 'Connect TAK Server to LDAP' after deploy")
+        except Exception as e:
+            log_step(f"⚠ LDAP auto-connect failed: {str(e)[:120]} — use 'Connect TAK Server to LDAP' after deploy")
+
         log_step("Final restart...")
         ne_changed, ne_msg = _sanitize_coreconfig_name_entries()
         if ne_changed:
