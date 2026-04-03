@@ -20031,7 +20031,9 @@ entries:
                 plog("  Added blueprint mount to server & worker")
             # Add postgres command-line tuning (max_connections, idle_session_timeout, tcp_keepalives)
             pg_cmd = 'postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
-            if not any('max_connections=300' in l for l in lines):
+            has_pg_cmd = any('max_connections=300' in l for l in lines)
+            needs_pg_update = has_pg_cmd and not any('idle_in_transaction_session_timeout' in l for l in lines)
+            if not has_pg_cmd:
                 patched = []
                 for line in lines:
                     patched.append(line)
@@ -20041,6 +20043,14 @@ entries:
                 lines = patched
                 needs_write = True
                 plog("  Added PostgreSQL command-line tuning")
+            elif needs_pg_update:
+                for i, line in enumerate(lines):
+                    if 'command: postgres' in line and 'max_connections' in line:
+                        indent = line[:len(line) - len(line.lstrip())]
+                        lines[i] = f'{indent}command: {pg_cmd}\n'
+                        needs_write = True
+                        plog("  Updated PostgreSQL command-line tuning (added idle_in_transaction_session_timeout)")
+                        break
 
             # Pin AUTHENTIK_TAG to latest stable release
             ak_tag = _get_authentik_latest_release_tag(use_cache=False) or '2026.2.1'
