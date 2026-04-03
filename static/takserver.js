@@ -129,6 +129,95 @@ async function checkLdapDrift(){
         }else{banner.style.display='none';}
     }catch(e){banner.style.display='none';}
 }
+async function loadFlatfileAuthStatus(){
+    var btn=document.getElementById('flatfile-auth-btn');
+    var statusEl=document.getElementById('flatfile-auth-status');
+    if(!btn||!statusEl)return null;
+    try{
+        var r=await fetch('/api/takserver/flatfile-auth');
+        var d=await r.json();
+        if(d && d.installed){
+            var on=!!d.enabled;
+            btn.textContent=on?'Disable flat-file auth':'Enable flat-file auth';
+            btn.setAttribute('data-enabled',on?'true':'false');
+            statusEl.textContent='Current state: '+(on?'Enabled':'Disabled')+(d.default_auth?(' · default='+d.default_auth):'');
+            statusEl.style.color=on?'var(--yellow)':'var(--green)';
+            return d;
+        }
+        btn.textContent='Unavailable';
+        btn.disabled=true;
+        statusEl.textContent=(d&&d.error)?d.error:'Unavailable';
+        statusEl.style.color='var(--red)';
+    }catch(e){
+        btn.textContent='Unavailable';
+        btn.disabled=true;
+        statusEl.textContent='Error loading status';
+        statusEl.style.color='var(--red)';
+    }
+    return null;
+}
+
+function _sleep(ms){ return new Promise(function(resolve){ setTimeout(resolve, ms); }); }
+
+async function pollFlatfileAuthStatus(expectedEnabled, timeoutMs){
+    var start=Date.now();
+    while((Date.now()-start) < timeoutMs){
+        try{
+            var r=await fetch('/api/takserver/flatfile-auth',{cache:'no-store'});
+            if(r.ok){
+                var d=await r.json();
+                if(d && d.installed && (!!d.enabled===!!expectedEnabled)){
+                    await loadFlatfileAuthStatus();
+                    return true;
+                }
+            }
+        }catch(e){}
+        await _sleep(2500);
+    }
+    await loadFlatfileAuthStatus();
+    return false;
+}
+
+async function toggleFlatfileAuth(){
+    var btn=document.getElementById('flatfile-auth-btn');
+    var msg=document.getElementById('flatfile-auth-msg');
+    var statusEl=document.getElementById('flatfile-auth-status');
+    if(!btn||!msg||!statusEl)return;
+    var enabledNow=(btn.getAttribute('data-enabled')==='true');
+    var nextState=!enabledNow;
+    if(!nextState){
+        if(!confirm('Disable flat-file auth provider in CoreConfig and restart TAK Server now?'))return;
+    }else{
+        if(!confirm('Enable flat-file auth provider in CoreConfig and restart TAK Server now?'))return;
+    }
+    btn.disabled=true;
+    msg.textContent='Applying change and restarting TAK Server...';
+    msg.style.color='var(--text-dim)';
+    try{
+        var r=await fetch('/api/takserver/flatfile-auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:nextState})});
+        var d=await r.json();
+        if(d && d.success){
+            msg.textContent=(d.message||'Updated.')+' Waiting for TAK restart and status refresh...';
+            msg.style.color='var(--text-dim)';
+            var synced=await pollFlatfileAuthStatus(nextState, 90000);
+            if(synced){
+                msg.textContent=(d.message||'Updated.')+' State confirmed.';
+                msg.style.color='var(--green)';
+            }else{
+                msg.textContent='Change request sent, but status confirmation timed out. Refresh page and re-check.';
+                msg.style.color='var(--yellow)';
+            }
+        }else{
+            msg.textContent=(d&& (d.error||d.message)) ? (d.error||d.message) : 'Failed to update flat-file auth';
+            msg.style.color='var(--red)';
+        }
+    }catch(e){
+        msg.textContent='Error: '+e.message;
+        msg.style.color='var(--red)';
+    }
+    btn.disabled=false;
+}
+
 async function loadServices(){
     var el=document.getElementById('services-list');
     if(!el)return;
@@ -184,7 +273,8 @@ if(document.getElementById('tak-remote-metrics-bar')){loadTakRemoteMetrics();set
 if(document.getElementById('webadmin-superuser-status')){loadWebadminSuperuserStatus();}
 if(document.getElementById('tak-cert-password-inline')){loadTakCertPassword();}
 if(document.getElementById('ldap-drift-banner')){checkLdapDrift();}
-if(document.getElementById('cot-db-size')){refreshCotSize();}
+if(document.getElementById('flatfile-auth-btn')){loadFlatfileAuthStatus();}
+if(document.getElementById('cot-db-size')){refreshCotSize();fetch('/api/takserver/vacuum/status').then(function(r){return r.json();}).then(function(d){if(d.running){_vacuumSetUI(true,d.full,d.elapsed_secs||0);_pollVacuumStatus();}}).catch(function(){});}
 if(document.getElementById('cert-expiry-info')){loadCertExpiry();}
 if(document.getElementById('rotate-ca-info')){loadCAInfo();}
 function refreshTakServerCAState(){
@@ -568,8 +658,11 @@ function pollRootRotateLog(){
   }).catch(function(){setTimeout(pollRootRotateLog,2000);});
 }
 
-async function refreshCotSize(){var el=document.getElementById('cot-db-size');if(!el)return;el.textContent='...';el.style.color='';try{var r=await fetch('/api/takserver/cot-db-size');var d=await r.json();if(d.error){el.textContent=d.error;}else{el.textContent=d.size_human||'-';var b=d.size_bytes;if(typeof b==='number'){var gb25=25*1024*1024*1024;var gb40=40*1024*1024*1024;if(b<gb25)el.style.color='var(--green)';else if(b<gb40)el.style.color='var(--yellow)';else el.style.color='var(--red)';}}}catch(e){el.textContent='Error';}}
-async function runVacuum(full){var msg=document.getElementById('vacuum-msg');var out=document.getElementById('vacuum-output');var btnA=document.getElementById('vacuum-analyze-btn');var btnF=document.getElementById('vacuum-full-btn');if(full&&!confirm("VACUUM FULL locks the CoT tables. Run when TAK Server is not running. Continue?"))return;if(msg){msg.textContent=full?'Running VACUUM FULL (may take a long time)...':'Running VACUUM ANALYZE...';msg.style.color='var(--text-dim)';}if(out){out.style.display='none';out.textContent='';}if(btnA){btnA.disabled=true;}if(btnF){btnF.disabled=true;}try{var r=await fetch('/api/takserver/vacuum',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({full:full})});var d=await r.json();if(d.success){if(msg){msg.textContent='Done.';msg.style.color='var(--green)';}if(out&&d.output){out.textContent=d.output;out.style.display='block';}if(document.getElementById('cot-db-size')){refreshCotSize();}}else{if(msg){msg.textContent=d.error||'Failed';msg.style.color='var(--red)';}if(out&&d.error){out.textContent=d.error;out.style.display='block';}}}catch(e){if(msg){msg.textContent='Error: '+e.message;msg.style.color='var(--red)';}}if(btnA){btnA.disabled=false;}if(btnF){btnF.disabled=false;}}
+async function refreshCotSize(){var el=document.getElementById('cot-db-size');if(!el)return;el.textContent='...';el.style.color='';var mc=document.getElementById('cot-msg-count');var dt=document.getElementById('cot-dead-tuples');try{var r=await fetch('/api/takserver/cot-db-size');var d=await r.json();if(d.error){el.textContent=d.error;}else{el.textContent=d.size_human||'-';var b=d.size_bytes;if(typeof b==='number'){var gb25=25*1024*1024*1024;var gb40=40*1024*1024*1024;if(b<gb25)el.style.color='var(--green)';else if(b<gb40)el.style.color='var(--yellow)';else el.style.color='var(--red)';}}if(mc){mc.textContent=typeof d.message_count==='number'?d.message_count.toLocaleString():'-';}if(dt){var dtv=d.dead_tuples;dt.textContent=typeof dtv==='number'?dtv.toLocaleString():'-';if(typeof dtv==='number'){dt.style.color=dtv>1000000?'var(--red)':dtv>100000?'var(--yellow)':'var(--green)';}}}catch(e){el.textContent='Error';}}
+function _vacuumSetUI(running,full,secs){var msg=document.getElementById('vacuum-msg');var btnA=document.getElementById('vacuum-analyze-btn');var btnF=document.getElementById('vacuum-full-btn');var btnR=document.getElementById('reindex-btn');[btnA,btnF,btnR].forEach(function(b){if(b){b.disabled=running;b.style.opacity=running?'0.4':'1';b.style.pointerEvents=running?'none':'auto';}});if(running&&msg){var elapsed='';if(secs>0){var m=Math.floor(secs/60);elapsed=m>0?' ('+m+'m '+secs%60+'s)':' ('+secs+'s)';}msg.textContent=(full?'Running VACUUM FULL':'Running VACUUM ANALYZE')+'...'+elapsed;msg.style.color='var(--text-dim)';}}
+async function _pollVacuumStatus(){var msg=document.getElementById('vacuum-msg');var out=document.getElementById('vacuum-output');try{var r=await fetch('/api/takserver/vacuum/status');var d=await r.json();if(d.running){_vacuumSetUI(true,d.full,d.elapsed_secs||0);setTimeout(_pollVacuumStatus,5000);}else{if(d.error){if(msg){msg.textContent=d.error;msg.style.color='var(--red)';}if(out){out.textContent=d.error;out.style.display='block';}}else if(d.result!==null){if(msg){msg.textContent='Done.';msg.style.color='var(--green)';}if(out&&d.result){out.textContent=d.result;out.style.display='block';}refreshCotSize();}_vacuumSetUI(false,false,0);}}catch(e){setTimeout(_pollVacuumStatus,10000);}}
+async function runVacuum(full){var msg=document.getElementById('vacuum-msg');var out=document.getElementById('vacuum-output');if(full&&!confirm("VACUUM FULL locks the CoT tables. Run when TAK Server is not running. Continue?"))return;if(out){out.style.display='none';out.textContent='';}_vacuumSetUI(true,full,0);try{var r=await fetch('/api/takserver/vacuum',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({full:full})});var d=await r.json();if(d.success||d.status==='running'){_pollVacuumStatus();}else{if(msg){msg.textContent=d.error||'Failed';msg.style.color='var(--red)';}_vacuumSetUI(false,false,0);}}catch(e){if(msg){msg.textContent='Error: '+e.message;msg.style.color='var(--red)';}_vacuumSetUI(false,false,0);}}
+async function runReindex(){var msg=document.getElementById('vacuum-msg');var out=document.getElementById('vacuum-output');var btn=document.getElementById('reindex-btn');if(!confirm('Rebuild all indexes on the CoT database? This is safe while running but may take a while on large databases.'))return;if(msg){msg.textContent='Running REINDEX (may take a while)...';msg.style.color='var(--text-dim)';}if(out){out.style.display='none';out.textContent='';}if(btn){btn.disabled=true;}try{var r=await fetch('/api/takserver/reindex',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});var d=await r.json();if(d.success){if(msg){msg.textContent='Done.';msg.style.color='var(--green)';}if(out&&d.output){out.textContent=d.output;out.style.display='block';}}else{if(msg){msg.textContent=d.error||'Failed';msg.style.color='var(--red)';}if(out&&d.error){out.textContent=d.error;out.style.display='block';}}}catch(e){if(msg){msg.textContent='Error: '+e.message;msg.style.color='var(--red)';}}if(btn){btn.disabled=false;}}
 
 var serverLogOffset=0;
 async function pollServerLog(){
