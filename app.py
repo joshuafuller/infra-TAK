@@ -2850,8 +2850,25 @@ def _recommended_takserver_heap_gb(total_ram_gb):
 
 
 def _get_current_takserver_heap_gb():
-    """Return current -Xmx heap in GB from /opt/tak/setenv.sh if set, else None."""
+    """Return current total JVM heap in GB from /etc/default/takserver or setenv.sh, else None."""
     import re
+    defaults_file = '/etc/default/takserver'
+    for path in [defaults_file]:
+        content = None
+        try:
+            with open(path, 'r') as f:
+                content = f.read()
+        except (OSError, IOError):
+            try:
+                r = subprocess.run(f'sudo cat {path} 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
+                if r.returncode == 0 and r.stdout:
+                    content = r.stdout
+            except Exception:
+                pass
+        if content:
+            m = re.search(r'# infra-TAK total heap: (\d+)g', content)
+            if m:
+                return int(m.group(1))
     setenv = '/opt/tak/setenv.sh'
     content = None
     try:
@@ -2884,7 +2901,7 @@ def takserver_heap_info():
 @app.route('/api/takserver/set-heap', methods=['POST'])
 @login_required
 def takserver_set_heap():
-    """Set TAK Server JVM heap via /opt/tak/setenv.sh and restart."""
+    """Set TAK Server JVM heap via /etc/default/takserver (individual MAX_HEAP vars) and restart."""
     data = request.get_json() or {}
     heap_gb = data.get('heap_gb')
     total_ram_gb = _get_total_ram_gb_local()
@@ -2892,28 +2909,47 @@ def takserver_set_heap():
         heap_gb = _recommended_takserver_heap_gb(total_ram_gb)
     try:
         heap_gb = int(heap_gb)
-        if heap_gb < 2 or heap_gb > 32:
-            return jsonify({'success': False, 'error': 'heap_gb must be between 2 and 32'}), 400
+        if heap_gb < 2 or heap_gb > 64:
+            return jsonify({'success': False, 'error': 'heap_gb must be between 2 and 64'}), 400
     except (TypeError, ValueError):
         return jsonify({'success': False, 'error': 'heap_gb must be an integer'}), 400
 
-    setenv = '/opt/tak/setenv.sh'
-    xms = max(2, heap_gb // 2)
     import re as _re
+    total_mb = heap_gb * 1024
+    w_config = 1.0 / 35000
+    w_api = 1.0 / 6300
+    w_msg = 1.0 / 6300
+    w_plugin = 1.0 / 30000
+    w_retain = 1.0 / 30000
+    w_total = w_config + w_api + w_msg + w_plugin + w_retain
+    config_mb = int(total_mb * w_config / w_total)
+    api_mb = int(total_mb * w_api / w_total)
+    msg_mb = int(total_mb * w_msg / w_total)
+    plugin_mb = int(total_mb * w_plugin / w_total)
+    retain_mb = int(total_mb * w_retain / w_total)
+
+    defaults_content = (
+        f"# infra-TAK total heap: {heap_gb}g\n"
+        f"# Proportional split across TAK Server processes (same ratios as setenv.sh defaults)\n"
+        f"export CONFIG_MAX_HEAP={config_mb}\n"
+        f"export API_MAX_HEAP={api_mb}\n"
+        f"export MESSAGING_MAX_HEAP={msg_mb}\n"
+        f"export PLUGIN_MANAGER_MAX_HEAP={plugin_mb}\n"
+        f"export RETENTION_MAX_HEAP={retain_mb}\n"
+    )
+    defaults_file = '/etc/default/takserver'
     try:
-        r = subprocess.run(f'sudo cat {setenv}', shell=True, capture_output=True, text=True, timeout=10)
-        if r.returncode != 0 or not r.stdout.strip():
-            return jsonify({'success': False, 'error': f'{setenv} not found or empty'}), 500
-        content = r.stdout
-        if _re.search(r'-Xmx\d+[gGmM]', content):
-            new_content = _re.sub(r'-Xms\d+[gGmM]', f'-Xms{xms}g', content)
-            new_content = _re.sub(r'-Xmx\d+[gGmM]', f'-Xmx{heap_gb}g', new_content)
-        else:
-            new_content = content.rstrip('\n') + f'\nexport JAVA_OPTS="$JAVA_OPTS -Xms{xms}g -Xmx{heap_gb}g"\n'
-        write_cmd = f"sudo tee {setenv} > /dev/null"
-        w = subprocess.run(write_cmd, shell=True, input=new_content, capture_output=True, text=True, timeout=10)
+        w = subprocess.run(f"sudo tee {defaults_file} > /dev/null", shell=True, input=defaults_content, capture_output=True, text=True, timeout=10)
         if w.returncode != 0:
-            return jsonify({'success': False, 'error': f'Failed to write {setenv}: {(w.stderr or "").strip()[:200]}'}), 500
+            return jsonify({'success': False, 'error': f'Failed to write {defaults_file}: {(w.stderr or "").strip()[:200]}'}), 500
+
+        setenv = '/opt/tak/setenv.sh'
+        r = subprocess.run(f'sudo cat {setenv}', shell=True, capture_output=True, text=True, timeout=10)
+        if r.returncode == 0 and r.stdout:
+            cleaned = _re.sub(r'\n*export JAVA_OPTS="\$JAVA_OPTS\s+-Xms\d+[gGmM]\s+-Xmx\d+[gGmM]"\n*', '\n', r.stdout)
+            if cleaned != r.stdout:
+                subprocess.run(f"sudo tee {setenv} > /dev/null", shell=True, input=cleaned, capture_output=True, text=True, timeout=10)
+
         rr = subprocess.run('sudo systemctl restart takserver', shell=True, capture_output=True, text=True, timeout=120)
         if rr.returncode != 0:
             return jsonify({'success': False, 'error': f'Restart failed: {(rr.stderr or rr.stdout or "unknown").strip()[:200]}'}), 500
@@ -2923,7 +2959,7 @@ def takserver_set_heap():
         return jsonify({'success': False, 'error': str(e)[:200]}), 500
     return jsonify({
         'success': True,
-        'message': f'TAK Server heap set to -Xmx{heap_gb}g in setenv.sh and restarted.',
+        'message': f'TAK Server heap set to {heap_gb} GB total across 5 processes and restarted.',
         'heap_gb': heap_gb,
         'current_heap_gb': heap_gb,
         'total_ram_gb': total_ram_gb,
@@ -19113,7 +19149,7 @@ entries:
   postgresql:
     image: docker.io/library/postgres:16-alpine
     restart: unless-stopped
-    command: postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6
+    command: postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=120s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
       start_period: 20s
@@ -19527,7 +19563,7 @@ def _apply_authentik_pg_tuning(ak_dir, plog):
         alter_cmds = [
             "ALTER SYSTEM SET max_connections = 300",
             "ALTER SYSTEM SET idle_session_timeout = '300s'",
-            "ALTER SYSTEM SET idle_in_transaction_session_timeout = '300s'",
+            "ALTER SYSTEM SET idle_in_transaction_session_timeout = '120s'",
             "ALTER SYSTEM SET tcp_keepalives_idle = 60",
             "ALTER SYSTEM SET tcp_keepalives_interval = 10",
             "ALTER SYSTEM SET tcp_keepalives_count = 3",
@@ -20030,9 +20066,9 @@ entries:
                 needs_write = True
                 plog("  Added blueprint mount to server & worker")
             # Add postgres command-line tuning (max_connections, idle_session_timeout, tcp_keepalives)
-            pg_cmd = 'postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
+            pg_cmd = 'postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=120s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
             has_pg_cmd = any('max_connections=300' in l for l in lines)
-            needs_pg_update = has_pg_cmd and not any('idle_in_transaction_session_timeout' in l for l in lines)
+            needs_pg_update = has_pg_cmd and (not any('idle_in_transaction_session_timeout' in l for l in lines) or any('idle_in_transaction_session_timeout=300s' in l for l in lines) or any('idle_in_transaction_session_timeout=30s' in l for l in lines))
             if not has_pg_cmd:
                 patched = []
                 for line in lines:
@@ -20049,7 +20085,7 @@ entries:
                         indent = line[:len(line) - len(line.lstrip())]
                         lines[i] = f'{indent}command: {pg_cmd}\n'
                         needs_write = True
-                        plog("  Updated PostgreSQL command-line tuning (added idle_in_transaction_session_timeout)")
+                        plog("  Updated PostgreSQL idle_in_transaction_session_timeout to 120s")
                         break
 
             # Pin AUTHENTIK_TAG to latest stable release
@@ -26507,8 +26543,8 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);font-size:11px;color:var(--text-dim)">Unattended-upgrades (each host) are controlled on the <a href="/" style="color:var(--cyan);text-decoration:none">main dashboard</a>.</div>
 <div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">
 <div style="font-size:12px;color:var(--text-secondary);margin-bottom:6px">JVM heap</div>
-<p style="font-size:11px;color:var(--text-dim);margin-bottom:10px;line-height:1.5">If CloudTAK or 8446 return HTTP 500 with <code style="font-size:10px">OutOfMemoryError: Java heap space</code>, TAK Server's JVM heap may be too small. <span id="heap-why" style="display:none">TAK Server uses a fixed heap limit (-Xmx), often 2–4 GB by default; it does not auto-scale. With many CloudTAK tabs or connections, the active-groups cache can exceed that and trigger OOM. This button updates setenv.sh so the service can use more memory (and restarts TAK Server).</span><button type="button" onclick="var e=document.getElementById('heap-why');e.style.display=e.style.display?'none':'block'" style="background:none;border:none;color:var(--cyan);cursor:pointer;font-size:11px;padding:0;margin-left:4px">Why?</button></p>
-<div style="margin-bottom:10px;font-family:'JetBrains Mono',monospace;font-size:12px">Current: <span id="heap-current-display" style="color:var(--green)">{% if current_heap_gb %}{{ current_heap_gb }} GB <span style="color:var(--text-dim);font-weight:400">(setenv.sh)</span>{% else %}<span style="color:var(--text-dim)">Not set (package default)</span>{% endif %}</span></div>
+<p style="font-size:11px;color:var(--text-dim);margin-bottom:10px;line-height:1.5">If CloudTAK or 8446 return HTTP 500 with <code style="font-size:10px">OutOfMemoryError: Java heap space</code>, TAK Server's JVM heap may be too small. <span id="heap-why" style="display:none">TAK Server runs 5 Java processes (API, Messaging, Config, Plugin Manager, Retention), each with its own heap limit. This button distributes your chosen total across all 5 processes proportionally (same ratios as the TAK Server defaults) via /etc/default/takserver, then restarts TAK Server.</span><button type="button" onclick="var e=document.getElementById('heap-why');e.style.display=e.style.display?'none':'block'" style="background:none;border:none;color:var(--cyan);cursor:pointer;font-size:11px;padding:0;margin-left:4px">Why?</button></p>
+<div style="margin-bottom:10px;font-family:'JetBrains Mono',monospace;font-size:12px">Current: <span id="heap-current-display" style="color:var(--green)">{% if current_heap_gb %}{{ current_heap_gb }} GB <span style="color:var(--text-dim);font-weight:400">(total across 5 processes)</span>{% else %}<span style="color:var(--text-dim)">Not set (package default)</span>{% endif %}</span></div>
 <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px">
 <button type="button" id="set-heap-btn" onclick="setTakHeap()" class="control-btn">Set recommended ({{ recommended_heap_gb }} GB)</button>
 <label style="font-size:11px;color:var(--text-dim);margin-left:8px">or set to:</label>

@@ -751,7 +751,7 @@ async function setTakHeapCustom(){
     var msgEl=document.getElementById('set-heap-msg');
     if(!input){return;}
     var gb=parseInt(input.value,10);
-    if(isNaN(gb)||gb<2||gb>32){if(msgEl){msgEl.style.color='var(--red)';msgEl.textContent='Enter a value between 2 and 32 GB';}return;}
+    if(isNaN(gb)||gb<2||gb>64){if(msgEl){msgEl.style.color='var(--red)';msgEl.textContent='Enter a value between 2 and 64 GB';}return;}
     _setHeapBtnsDisabled(true);
     if(msgEl)msgEl.textContent='Setting '+gb+' GB…';
     try{
