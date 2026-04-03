@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.3.7-alpha"
+VERSION = "0.3.8-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -3085,8 +3085,11 @@ def guarddog_page():
     if not is_two_server:
         guarddog_monitors_tak.extend([
             {'name': 'PostgreSQL', 'id': 'postgresql', 'interval': '5 min', 'desc': 'Checks that the PostgreSQL service is running. Attempts restart if down; sends alert.'},
-            {'name': 'CoT database size', 'id': 'cotdb', 'interval': '6 hours', 'desc': 'CoT DB size. Alert at 25GB (warning) or 40GB (critical). Retention deletes rows; run VACUUM to reclaim disk. Alert email includes tips.'},
         ])
+    guarddog_monitors_tak.extend([
+        {'name': 'CoT database size', 'id': 'cotdb', 'interval': '6 hours', 'desc': 'CoT DB size. Alert at 25GB (warning) or 40GB (critical). Retention deletes rows; run VACUUM to reclaim disk. Works for both local and remote databases.'},
+        {'name': 'Auto-VACUUM', 'id': 'autovacuum', 'interval': 'Daily (3am)', 'desc': 'Checks dead tuple count daily. Runs VACUUM ANALYZE automatically if dead tuples exceed 1M. Prevents database bloat from data retention.'},
+    ])
     guarddog_monitors_tak.extend([
         {'name': 'OOM', 'id': 'oom', 'interval': '1 min', 'desc': 'Scans TAK Server logs for OutOfMemoryError. Auto-restarts TAK Server and sends alert when detected.'},
         {'name': 'Disk', 'id': 'disk', 'interval': '1 hour', 'desc': 'Checks root and TAK logs filesystem usage. Alert only when usage exceeds 80% (warning) or 90% (critical).'},
@@ -3239,7 +3242,7 @@ def _sync_guarddog_remote_db_from_settings(settings=None):
     except Exception as e:
         return False, f'guarddog.conf: {e}'
     cert_pass = _get_tak_cert_password(settings)
-    for name in ('tak-remotedb-watch.sh', 'tak-remotedb-auth-watch.sh'):
+    for name in ('tak-remotedb-watch.sh', 'tak-remotedb-auth-watch.sh', 'tak-cotdb-watch.sh', 'tak-auto-vacuum.sh'):
         src = os.path.join(scripts_dir, name)
         dest = os.path.join(gd_dir, name)
         if not os.path.isfile(src):
@@ -4479,12 +4482,14 @@ def run_guarddog_deploy(alert_email):
             'tak-network-watch.sh', 'tak-process-watch.sh', 'tak-cert-watch.sh', 'tak-intca-watch.sh', 'tak-health-endpoint.py',
             'tak-updates-watch.sh'
         ]
-        # Two-server: replace local PG monitors with remote DB monitor
+        # Two-server: remote DB monitors + CoT size (SSH to Server One); single-server: local PG + CoT
         if is_two_server and s1_host:
             script_files.append('tak-remotedb-watch.sh')
             script_files.append('tak-remotedb-auth-watch.sh')
+            script_files.append('tak-cotdb-watch.sh')
         else:
             script_files.extend(['tak-db-watch.sh', 'tak-cotdb-watch.sh'])
+        script_files.append('tak-auto-vacuum.sh')
         # Optional: monitors for other services (only install if that service is present)
         ak_dir = os.path.expanduser('~/authentik')
         nr_dir = os.path.expanduser('~/node-red')
@@ -4516,7 +4521,7 @@ def run_guarddog_deploy(alert_email):
                 .replace('ALERT_SMS_PLACEHOLDER', alert_sms or '')
                 .replace('CERT_PASS_PLACEHOLDER', cert_pass)
                 .replace('CONSOLE_VERSION_PLACEHOLDER', VERSION))
-            if is_two_server and name in ('tak-remotedb-watch.sh', 'tak-remotedb-auth-watch.sh'):
+            if is_two_server and name in ('tak-remotedb-watch.sh', 'tak-remotedb-auth-watch.sh', 'tak-cotdb-watch.sh', 'tak-auto-vacuum.sh'):
                 content = content.replace('DB_HOST_PLACEHOLDER', s1_host)
                 content = content.replace('DB_PORT_PLACEHOLDER', db_port)
                 content = content.replace('SSH_KEY_PLACEHOLDER', ssh_key_path)
@@ -4569,6 +4574,10 @@ def run_guarddog_deploy(alert_email):
                 ('takremotedbguard.timer', '[Unit]\nDescription=Run remote DB monitor every 2 minutes\n\n[Timer]\nOnBootSec=5min\nOnUnitActiveSec=2min\nUnit=takremotedbguard.service\n\n[Install]\nWantedBy=timers.target\n'),
                 ('takremotedbauthguard.service', '[Unit]\nDescription=Guard Dog Remote DB Auth Monitor\nAfter=network-online.target\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-remotedb-auth-watch.sh\n'),
                 ('takremotedbauthguard.timer', '[Unit]\nDescription=Validate DB credentials every 2 minutes\n\n[Timer]\nOnBootSec=3min\nOnUnitActiveSec=2min\nUnit=takremotedbauthguard.service\n\n[Install]\nWantedBy=timers.target\n'),
+                ('takcotdbguard.service', '[Unit]\nDescription=TAK CoT Database Size Monitor\nAfter=network-online.target\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-cotdb-watch.sh\n'),
+                ('takcotdbguard.timer', '[Unit]\nDescription=Run TAK CoT DB size monitor every 6 hours\n\n[Timer]\nOnBootSec=30min\nOnUnitActiveSec=6h\nUnit=takcotdbguard.service\n\n[Install]\nWantedBy=timers.target\n'),
+                ('takautovacuum.service', '[Unit]\nDescription=Guard Dog Smart Auto-VACUUM\nAfter=network-online.target\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-auto-vacuum.sh\n'),
+                ('takautovacuum.timer', '[Unit]\nDescription=Run smart auto-VACUUM daily at 3am\n\n[Timer]\nOnCalendar=*-*-* 03:00:00\nPersistent=true\nUnit=takautovacuum.service\n\n[Install]\nWantedBy=timers.target\n'),
             ])
         else:
             units.extend([
@@ -4576,6 +4585,8 @@ def run_guarddog_deploy(alert_email):
                 ('takdbguard.timer', '[Unit]\nDescription=Run TAK DB monitor every 5 minutes\n\n[Timer]\nOnBootSec=15min\nOnUnitActiveSec=5min\nUnit=takdbguard.service\n\n[Install]\nWantedBy=timers.target\n'),
                 ('takcotdbguard.service', '[Unit]\nDescription=TAK CoT Database Size Monitor\nAfter=postgresql.service postgresql-15.service\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-cotdb-watch.sh\n'),
                 ('takcotdbguard.timer', '[Unit]\nDescription=Run TAK CoT DB size monitor every 6 hours\n\n[Timer]\nOnBootSec=30min\nOnUnitActiveSec=6h\nUnit=takcotdbguard.service\n\n[Install]\nWantedBy=timers.target\n'),
+                ('takautovacuum.service', '[Unit]\nDescription=Guard Dog Smart Auto-VACUUM\nAfter=postgresql.service postgresql-15.service\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-auto-vacuum.sh\n'),
+                ('takautovacuum.timer', '[Unit]\nDescription=Run smart auto-VACUUM daily at 3am\n\n[Timer]\nOnCalendar=*-*-* 03:00:00\nPersistent=true\nUnit=takautovacuum.service\n\n[Install]\nWantedBy=timers.target\n'),
             ])
         # Optional timers for other services (only if we installed the script)
         if 'tak-authentik-watch.sh' in script_files:
@@ -4656,8 +4667,10 @@ def run_guarddog_deploy(alert_email):
                   'taknetguard.timer', 'takprocessguard.timer', 'takcertguard.timer', 'takintcaguard.timer']
         if is_two_server and s1_host:
             timers.append('takremotedbguard.timer')
+            timers.append('takcotdbguard.timer')
         else:
             timers.extend(['takdbguard.timer', 'takcotdbguard.timer'])
+        timers.append('takautovacuum.timer')
         if 'tak-authentik-watch.sh' in script_files:
             timers.append('takauthentikguard.timer')
         if 'tak-mediamtx-watch.sh' in script_files:
@@ -8925,6 +8938,8 @@ def takportal_page():
         portal_port=portal_port, portal_version=portal_version,
         portal_update_available=portal_update_available, portal_latest=portal_latest,
         takportal_deploy_cfg=takportal_deploy_cfg,
+        authentik_base_url=_get_authentik_base_url(settings),
+        takserver_base_url=_get_takserver_base_url(settings),
         version=VERSION,
         deploying=takportal_deploy_status.get('running', False),
         deploy_done=takportal_deploy_status.get('complete', False))
@@ -14945,16 +14960,25 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <div class="card">
     <div class="gd-collapse-header" onclick="gdSectionToggle(this)"><span style="margin:0">Database maintenance (CoT)</span><span class="gd-collapse-toggle">&#9662;</span></div>
     <div class="gd-collapse-body">
-    <p style="font-size:12px;color:var(--text-secondary);line-height:1.5;margin-bottom:12px">The CoT database can grow large. Data retention deletes rows but <strong>PostgreSQL does not free disk until you run VACUUM</strong>. Run VACUUM ANALYZE to reclaim space (safe while TAK Server is running).</p>
-    <p style="font-size:12px;color:var(--text-dim);margin-bottom:14px">CoT database size: <span id="gd-cot-db-size" style="font-weight:600">—</span> <button type="button" onclick="gdRefreshCotSize()" class="btn btn-ghost" style="margin-left:8px;padding:4px 12px;font-size:12px">Refresh</button> <span style="font-size:10px;color:var(--text-dim);margin-left:6px">(green &lt; 25 GB · yellow 25–40 GB · red &gt; 40 GB)</span></p>
+    <p style="font-size:12px;color:var(--text-secondary);line-height:1.5;margin-bottom:12px">The CoT database can grow large. Data retention deletes rows but <strong>PostgreSQL does not free disk until you run VACUUM</strong>. Smart auto-VACUUM runs daily at 3am (triggers when dead tuples &gt; 1M).</p>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;margin-bottom:14px">
+    <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">Database size</div><span id="gd-cot-db-size" style="font-weight:600;font-size:14px">—</span> <button type="button" onclick="gdRefreshCotSize()" class="btn btn-ghost" style="margin-left:4px;padding:2px 8px;font-size:10px">Refresh</button></div>
+    <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">Estimated rows</div><span id="gd-cot-msg-count" style="font-weight:600;font-size:14px">—</span></div>
+    <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">Dead tuples</div><span id="gd-cot-dead-tuples" style="font-weight:600;font-size:14px">—</span></div>
+    </div>
+    <p style="font-size:10px;color:var(--text-dim);margin-bottom:14px">Size: green &lt; 25 GB · yellow 25–40 GB · red &gt; 40 GB</p>
     <div style="display:flex;flex-direction:column;gap:12px">
       <div style="display:flex;flex-wrap:wrap;align-items:center;gap:12px">
-        <button type="button" id="gd-vacuum-analyze-btn" onclick="gdRunVacuum(false)" class="btn" style="background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;flex-shrink:0">Run VACUUM ANALYZE</button>
-        <span style="font-size:12px;color:var(--text-secondary)">Reclaims space from deleted rows. Safe while TAK Server is running.</span>
+        <button type="button" id="gd-vacuum-analyze-btn" onclick="gdRunVacuum(false)" class="btn" style="background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;flex-shrink:0">Optimize Tables</button>
+        <span style="font-size:12px;color:var(--text-secondary)">VACUUM ANALYZE — marks deleted space for reuse. Safe while running.</span>
       </div>
       <div style="display:flex;flex-wrap:wrap;align-items:center;gap:12px">
-        <button type="button" id="gd-vacuum-full-btn" onclick="gdRunVacuum(true)" class="btn btn-ghost" style="color:var(--yellow);border-color:var(--yellow);flex-shrink:0" title="Caution: run when TAK Server is not running">Run VACUUM FULL</button>
-        <span style="font-size:12px;color:var(--text-secondary)">Rewrites tables to reclaim more space; locks tables. Run when <strong>TAK Server is not running</strong>. <span style="color:var(--yellow)">(yellow = caution)</span></span>
+        <button type="button" id="gd-vacuum-full-btn" onclick="gdRunVacuum(true)" class="btn btn-ghost" style="color:var(--yellow);border-color:var(--yellow);flex-shrink:0" title="Caution: run when TAK Server is not running">Compact Database</button>
+        <span style="font-size:12px;color:var(--text-secondary)">VACUUM FULL — physically shrinks files on disk. <strong>Stop TAK Server first</strong>. <span style="color:var(--yellow)">(caution)</span></span>
+      </div>
+      <div style="display:flex;flex-wrap:wrap;align-items:center;gap:12px">
+        <button type="button" id="gd-reindex-btn" onclick="gdRunReindex()" class="btn btn-ghost" style="color:var(--cyan);border-color:var(--cyan);flex-shrink:0">Rebuild Indexes</button>
+        <span style="font-size:12px;color:var(--text-secondary)">REINDEX — rebuilds indexes for faster queries. Safe while running.</span>
       </div>
     </div>
     <div id="gd-vacuum-output" style="display:none;margin-top:14px;padding:12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);white-space:pre-wrap;max-height:200px;overflow-y:auto"></div>
@@ -19036,7 +19060,7 @@ entries:
       POSTGRES_PASSWORD: ${PG_PASS:?database password required}
       POSTGRES_USER: ${PG_USER:-authentik}
       POSTGRES_DB: ${PG_DB:-authentik}
-      POSTGRES_MAX_CONNECTIONS: "200"
+      POSTGRES_MAX_CONNECTIONS: "300"
   redis:
     image: docker.io/library/redis:alpine
     command: --save 60 1 --loglevel warning
@@ -19426,6 +19450,37 @@ def _ensure_authentik_starter_branding(ak_dir, deploy_cfg, plog=None):
             plog(f"  \u26a0 Starter branding: {e}")
 
 
+def _apply_authentik_pg_tuning(ak_dir, plog):
+    """Apply PostgreSQL performance tuning inside the Authentik PostgreSQL container."""
+    try:
+        pg_container = subprocess.run(
+            f'cd {ak_dir} && docker compose ps -q postgresql 2>/dev/null',
+            shell=True, capture_output=True, text=True, timeout=15
+        ).stdout.strip()
+        if not pg_container:
+            plog("  PostgreSQL container not found, skipping PG tuning")
+            return
+        alter_cmds = [
+            "ALTER SYSTEM SET max_connections = 300",
+            "ALTER SYSTEM SET idle_session_timeout = '300s'",
+            "ALTER SYSTEM SET tcp_keepalives_idle = 60",
+            "ALTER SYSTEM SET tcp_keepalives_interval = 10",
+            "ALTER SYSTEM SET tcp_keepalives_count = 3",
+        ]
+        for cmd in alter_cmds:
+            subprocess.run(
+                f'cd {ak_dir} && docker compose exec -T postgresql psql -U authentik -d authentik -c "{cmd};" 2>&1',
+                shell=True, capture_output=True, text=True, timeout=15
+            )
+        subprocess.run(
+            f'cd {ak_dir} && docker compose exec -T postgresql psql -U authentik -d authentik -c "SELECT pg_reload_conf();" 2>&1',
+            shell=True, capture_output=True, text=True, timeout=15
+        )
+        plog("  \u2713 PostgreSQL tuning applied (max_connections=300, idle_session_timeout=5min, tcp_keepalives)")
+    except Exception as e:
+        plog(f"  \u26a0 PG tuning skipped: {e}")
+
+
 def run_authentik_deploy(reconfigure=False):
     def plog(msg):
         entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
@@ -19464,6 +19519,7 @@ def run_authentik_deploy(reconfigure=False):
             _ensure_authentik_starter_branding(ak_dir, deploy_cfg, plog)
             subprocess.run(f'cd {ak_dir} && docker compose up -d 2>&1', shell=True, capture_output=True, text=True, timeout=120)
             plog("  Ensured containers are up")
+            _apply_authentik_pg_tuning(ak_dir, plog)
             fqdn = settings.get('fqdn', '')
             # Cookie domain: so Authentik session is sent to stream.*, infratak.*, etc. (avoids redirect loop)
             if fqdn:
@@ -19909,7 +19965,7 @@ entries:
                     patched.append(line)
                     if 'POSTGRES_USER:' in line:
                         indent = line[:len(line) - len(line.lstrip())]
-                        patched.append(f'{indent}POSTGRES_MAX_CONNECTIONS: "200"\n')
+                        patched.append(f'{indent}POSTGRES_MAX_CONNECTIONS: "300"\n')
                 lines = patched
                 needs_write = True
                 plog("  Added POSTGRES_MAX_CONNECTIONS to postgresql")
@@ -22469,6 +22525,40 @@ def takserver_vacuum():
         return jsonify({'success': False, 'error': str(e)[:200]}), 500
 
 
+@app.route('/api/takserver/reindex', methods=['POST'])
+@login_required
+def takserver_reindex():
+    """Run REINDEX on the CoT database to rebuild indexes and improve query performance."""
+    if not os.path.exists('/opt/tak'):
+        return jsonify({'success': False, 'error': 'TAK Server not installed'}), 400
+    reindex_sql = "REINDEX DATABASE cot;"
+    timeout_sec = 3600
+
+    settings = load_settings()
+    tak_cfg = _get_tak_deployment_config(settings)
+    if tak_cfg.get('mode') == 'two_server':
+        s1 = tak_cfg.get('server_one', {})
+        if not s1.get('host'):
+            return jsonify({'success': False, 'error': 'Server One host not configured'}), 400
+        reindex_cmd = f"sudo -u postgres psql -d cot -c '{reindex_sql}' 2>&1"
+        ok, out = _ssh_probe(s1, reindex_cmd, timeout=timeout_sec)
+        if not ok:
+            return jsonify({'success': False, 'error': (out or 'SSH command failed')[:500]}), 400
+        return jsonify({'success': True, 'output': (out or '').strip(), 'remote': True})
+
+    cmd = f"sudo -u postgres psql -d cot -c '{reindex_sql}' 2>&1"
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout_sec, cwd='/')
+        out = (r.stdout or '') + (r.stderr or '')
+        if r.returncode != 0:
+            return jsonify({'success': False, 'error': out.strip() or f'Exit code {r.returncode}'}), 400
+        return jsonify({'success': True, 'output': out.strip()})
+    except subprocess.TimeoutExpired:
+        return jsonify({'success': False, 'error': 'REINDEX timed out (database may be very large)'}), 400
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)[:200]}), 500
+
+
 @app.route('/api/takserver/cot-db-size')
 @login_required
 def takserver_cot_db_size():
@@ -22497,7 +22587,22 @@ def takserver_cot_db_size():
             human = f'{size // 1024} KB'
         else:
             human = f'{size} B'
-        return jsonify({'size_bytes': size, 'size_human': human})
+        # Additional stats
+        msg_count = 0
+        dead_tuples = 0
+        try:
+            stats_sql = "SELECT COALESCE((SELECT SUM(n_live_tup) FROM pg_stat_user_tables), 0), COALESCE((SELECT SUM(n_dead_tup) FROM pg_stat_user_tables), 0);"
+            if tak_cfg.get('mode') == 'two_server':
+                ok2, out2 = _ssh_probe(s1, f'sudo -u postgres psql -t -A -d cot -c "{stats_sql}" 2>/dev/null', timeout=15)
+                parts = (out2 or '0|0').strip().split('|')
+            else:
+                r2 = subprocess.run(f'sudo -u postgres psql -t -A -d cot -c "{stats_sql}" 2>/dev/null', shell=True, capture_output=True, text=True, timeout=10)
+                parts = (r2.stdout or '0|0').strip().split('|')
+            msg_count = int(parts[0]) if len(parts) > 0 and parts[0].strip().isdigit() else 0
+            dead_tuples = int(parts[1]) if len(parts) > 1 and parts[1].strip().isdigit() else 0
+        except Exception:
+            pass
+        return jsonify({'size_bytes': size, 'size_human': human, 'message_count': msg_count, 'dead_tuples': dead_tuples})
     except Exception as e:
         return jsonify({'size_bytes': 0, 'size_human': 'N/A', 'error': str(e)[:200]})
 
@@ -26399,16 +26504,25 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <span id="cot-db-toggle-icon" style="font-size:18px;color:var(--text-dim);transition:transform 0.2s ease">&#9662;</span>
 </div>
 <div id="cot-db-body" style="display:none;padding:0 24px 24px 24px;border-top:1px solid var(--border)">
-<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:12px;padding-top:16px">The CoT (Cursor on Target) database can grow large. Data retention deletes old rows, but <strong>PostgreSQL does not free disk until you run VACUUM</strong>. Run VACUUM ANALYZE periodically to reclaim space (safe while TAK Server is running).</p>
-<p style="font-size:12px;color:var(--text-dim);margin-bottom:16px">CoT database size: <span id="cot-db-size" style="font-weight:600">-</span> <button type="button" onclick="refreshCotSize()" style="margin-left:8px;padding:2px 10px;background:transparent;color:var(--cyan);border:1px solid var(--border);border-radius:4px;font-size:11px;cursor:pointer">Refresh</button> <span style="font-size:10px;color:var(--text-dim);margin-left:6px">(green &lt; 25 GB · yellow 25-40 GB · red &gt; 40 GB)</span></p>
+<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:12px;padding-top:16px">The CoT database can grow large. Data retention deletes old rows, but <strong>PostgreSQL does not free disk until you run VACUUM</strong>. Guard Dog runs smart auto-VACUUM daily at 3am (when dead tuples exceed 1M).</p>
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-bottom:16px">
+<div style="padding:10px 14px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">Database size</div><span id="cot-db-size" style="font-weight:600;font-size:15px">-</span> <button type="button" onclick="refreshCotSize()" style="margin-left:6px;padding:1px 8px;background:transparent;color:var(--cyan);border:1px solid var(--border);border-radius:4px;font-size:10px;cursor:pointer">Refresh</button></div>
+<div style="padding:10px 14px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">Estimated rows</div><span id="cot-msg-count" style="font-weight:600;font-size:15px">-</span></div>
+<div style="padding:10px 14px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">Dead tuples</div><span id="cot-dead-tuples" style="font-weight:600;font-size:15px">-</span></div>
+</div>
+<p style="font-size:10px;color:var(--text-dim);margin-bottom:16px">Size: green &lt; 25 GB · yellow 25–40 GB · red &gt; 40 GB. Dead tuples &gt; 1M triggers auto-VACUUM.</p>
 <div style="display:flex;flex-direction:column;gap:12px">
 <div style="display:flex;flex-wrap:wrap;align-items:center;gap:12px">
-<button type="button" id="vacuum-analyze-btn" onclick="runVacuum(false)" style="padding:10px 20px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:8px;font-family:'DM Sans',sans-serif;font-size:13px;font-weight:600;cursor:pointer;flex-shrink:0">Run VACUUM ANALYZE</button>
-<span style="font-size:12px;color:var(--text-secondary)">Reclaims space from deleted rows and updates statistics. Safe while TAK Server is running.</span>
+<button type="button" id="vacuum-analyze-btn" onclick="runVacuum(false)" style="padding:10px 20px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:8px;font-family:'DM Sans',sans-serif;font-size:13px;font-weight:600;cursor:pointer;flex-shrink:0">Optimize Tables</button>
+<span style="font-size:12px;color:var(--text-secondary)">VACUUM ANALYZE — marks deleted space for reuse. Database stops growing but file size unchanged. Safe while running.</span>
 </div>
 <div style="display:flex;flex-wrap:wrap;align-items:center;gap:12px">
-<button type="button" id="vacuum-full-btn" onclick="runVacuum(true)" style="padding:10px 20px;background:rgba(234,179,8,0.2);color:var(--yellow);border:1px solid var(--border);border-radius:8px;font-family:'DM Sans',sans-serif;font-size:13px;font-weight:600;cursor:pointer;flex-shrink:0" title="Caution: run when TAK Server is not running">Run VACUUM FULL</button>
-<span style="font-size:12px;color:var(--text-secondary)">Rewrites tables to reclaim more space; locks tables. Run when <strong>TAK Server is not running</strong>. <span style="color:var(--yellow)">(yellow = caution)</span></span>
+<button type="button" id="vacuum-full-btn" onclick="runVacuum(true)" style="padding:10px 20px;background:rgba(234,179,8,0.2);color:var(--yellow);border:1px solid var(--border);border-radius:8px;font-family:'DM Sans',sans-serif;font-size:13px;font-weight:600;cursor:pointer;flex-shrink:0" title="Caution: run when TAK Server is not running">Compact Database</button>
+<span style="font-size:12px;color:var(--text-secondary)">VACUUM FULL — physically shrinks files on disk. Locks tables, <strong>stop TAK Server first</strong>. <span style="color:var(--yellow)">(caution)</span></span>
+</div>
+<div style="display:flex;flex-wrap:wrap;align-items:center;gap:12px">
+<button type="button" id="reindex-btn" onclick="runReindex()" style="padding:10px 20px;background:rgba(6,182,212,0.1);color:var(--cyan);border:1px solid var(--border);border-radius:8px;font-family:'DM Sans',sans-serif;font-size:13px;font-weight:600;cursor:pointer;flex-shrink:0">Rebuild Indexes</button>
+<span style="font-size:12px;color:var(--text-secondary)">REINDEX — rebuilds indexes for faster queries. Safe while running but may be slow on large databases.</span>
 </div>
 </div>
 <div id="vacuum-output" style="display:none;margin-top:14px;padding:12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);white-space:pre-wrap;max-height:200px;overflow-y:auto"></div>
@@ -26656,7 +26770,7 @@ def _auto_update_guarddog():
                 continue
             if not is_two_server and 'remotedb' in name:
                 continue
-            if is_two_server and name in ('tak-db-watch.sh', 'tak-cotdb-watch.sh'):
+            if is_two_server and name == 'tak-db-watch.sh':
                 continue
             if name == 'tak-fedhub-watch.sh':
                 _au_fh_cfg = _get_fedhub_deployment_config(settings)
@@ -26669,10 +26783,10 @@ def _auto_update_guarddog():
                 .replace('ALERT_SMS_PLACEHOLDER', '')
                 .replace('CERT_PASS_PLACEHOLDER', cert_pass)
                 .replace('CONSOLE_VERSION_PLACEHOLDER', VERSION))
-            if is_two_server and name in ('tak-remotedb-watch.sh', 'tak-remotedb-auth-watch.sh'):
+            if is_two_server and name in ('tak-remotedb-watch.sh', 'tak-remotedb-auth-watch.sh', 'tak-cotdb-watch.sh', 'tak-auto-vacuum.sh'):
                 content = content.replace('DB_HOST_PLACEHOLDER', s1_host)
                 content = content.replace('DB_PORT_PLACEHOLDER', db_port)
-                content = content.replace('SSH_KEY_PLACEHOLDER', ssh_key_path)
+                content = content.replace('SSH_KEY_PLACEHOLDER', ssh_key_path or os.path.expanduser('~/.ssh/infra-tak-server-one'))
                 content = content.replace('SSH_USER_PLACEHOLDER', s1_user)
             if name == 'tak-fedhub-watch.sh':
                 _fh_cfg = _get_fedhub_deployment_config(settings)
