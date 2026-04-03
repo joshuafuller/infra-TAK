@@ -4128,14 +4128,42 @@ def guarddog_update():
             f.write(service_content)
         with open(timer_path, 'w') as f:
             f.write(timer_content)
+        # Auto-vacuum timer (daily 3am) — install if script exists but timer doesn't
+        av_script = '/opt/tak-guarddog/tak-auto-vacuum.sh'
+        av_svc_path = '/etc/systemd/system/takautovacuum.service'
+        av_tmr_path = '/etc/systemd/system/takautovacuum.timer'
+        if os.path.isfile(av_script) and not os.path.isfile(av_tmr_path):
+            _settings = load_settings()
+            _tak_cfg = _get_tak_deployment_config(_settings)
+            _is_two = _tak_cfg.get('mode') == 'two_server'
+            _after = 'network-online.target' if _is_two else 'postgresql.service postgresql-15.service'
+            with open(av_svc_path, 'w') as f:
+                f.write(f'[Unit]\nDescription=Guard Dog Smart Auto-VACUUM\nAfter={_after}\n\n[Service]\nType=oneshot\nExecStart={av_script}\n')
+            with open(av_tmr_path, 'w') as f:
+                f.write('[Unit]\nDescription=Run smart auto-VACUUM daily at 3am\n\n[Timer]\nOnCalendar=*-*-* 03:00:00\nPersistent=true\nUnit=takautovacuum.service\n\n[Install]\nWantedBy=timers.target\n')
+        # CoT DB size timer — install for two-server if missing
+        cotdb_svc_path = '/etc/systemd/system/takcotdbguard.service'
+        cotdb_tmr_path = '/etc/systemd/system/takcotdbguard.timer'
+        if os.path.isfile('/opt/tak-guarddog/tak-cotdb-watch.sh') and not os.path.isfile(cotdb_tmr_path):
+            _settings2 = load_settings()
+            _tak_cfg2 = _get_tak_deployment_config(_settings2)
+            _is_two2 = _tak_cfg2.get('mode') == 'two_server'
+            _after2 = 'network-online.target' if _is_two2 else 'postgresql.service postgresql-15.service'
+            with open(cotdb_svc_path, 'w') as f:
+                f.write(f'[Unit]\nDescription=TAK CoT Database Size Monitor\nAfter={_after2}\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-cotdb-watch.sh\n')
+            with open(cotdb_tmr_path, 'w') as f:
+                f.write('[Unit]\nDescription=Run TAK CoT DB size monitor every 6 hours\n\n[Timer]\nOnBootSec=30min\nOnUnitActiveSec=6h\nUnit=takcotdbguard.service\n\n[Install]\nWantedBy=timers.target\n')
         subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=10)
-        re = subprocess.run(['systemctl', 'enable', '--now', 'takupdatesguard.timer'], capture_output=True, text=True, timeout=10)
-        if re.returncode != 0:
-            err = (re.stderr or re.stdout or '').strip() or 'could not enable takupdatesguard.timer'
-            return jsonify({'success': False, 'error': err}), 500
+        new_timers = ['takupdatesguard.timer']
+        if os.path.isfile(av_tmr_path):
+            new_timers.append('takautovacuum.timer')
+        if os.path.isfile(cotdb_tmr_path):
+            new_timers.append('takcotdbguard.timer')
+        for t in new_timers:
+            subprocess.run(['systemctl', 'enable', '--now', t], capture_output=True, text=True, timeout=10)
         # Refresh Guard Dog monitor cache so UI flips without waiting for background refresh.
         _guarddog_refresh_page_cache()
-        return jsonify({'success': True, 'message': 'Guard Dog scripts updated, updates timer reinstalled, and timers reloaded.'})
+        return jsonify({'success': True, 'message': 'Guard Dog scripts updated, timers installed, and reloaded.'})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)[:300]}), 500
 
