@@ -22566,11 +22566,37 @@ def takserver_vacuum():
 @app.route('/api/takserver/vacuum/status')
 @login_required
 def takserver_vacuum_status():
-    """Poll VACUUM progress."""
+    """Poll VACUUM progress. Also checks PostgreSQL directly for running VACUUM."""
+    running = _vacuum_status['running']
+    full = _vacuum_status['full']
+    started = _vacuum_status['started']
+    if not running:
+        try:
+            check_sql = "SELECT query, extract(epoch from now() - query_start)::int AS secs FROM pg_stat_activity WHERE query ILIKE '%VACUUM%' AND state = 'active' AND pid != pg_backend_pid() LIMIT 1;"
+            settings = load_settings()
+            tak_cfg = _get_tak_deployment_config(settings)
+            if tak_cfg.get('mode') == 'two_server':
+                s1 = tak_cfg.get('server_one', {})
+                if s1.get('host'):
+                    ok, out = _ssh_probe(s1, f'sudo -u postgres psql -t -A -d cot -c "{check_sql}" 2>/dev/null', timeout=10)
+                    raw = (out or '').strip()
+            else:
+                r = subprocess.run(f'sudo -u postgres psql -t -A -d cot -c "{check_sql}" 2>/dev/null', shell=True, capture_output=True, text=True, timeout=10)
+                raw = (r.stdout or '').strip()
+            if raw and 'VACUUM' in raw.upper():
+                running = True
+                full = 'FULL' in raw.upper()
+                parts = raw.split('|')
+                secs = int(parts[-1]) if len(parts) > 1 and parts[-1].strip().isdigit() else 0
+                if secs > 0:
+                    from datetime import timedelta as _td
+                    started = (datetime.now() - _td(seconds=secs)).isoformat()
+        except Exception:
+            pass
     return jsonify({
-        'running': _vacuum_status['running'],
-        'full': _vacuum_status['full'],
-        'started': _vacuum_status['started'],
+        'running': running,
+        'full': full,
+        'started': started,
         'result': _vacuum_status['result'],
         'error': _vacuum_status['error'],
     })
