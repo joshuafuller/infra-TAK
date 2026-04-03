@@ -21886,6 +21886,44 @@ def _test_ldap_bind_dn(bind_dn, bind_pass):
         return False
     return True
 
+
+def _wait_ldap_outpost_ready(timeout_secs=180):
+    """Wait until LDAP outpost container is ready enough for bind checks.
+
+    Returns (ready: bool, status_text: str). For containers with healthchecks we wait for
+    healthy. For setups without healthchecks, plain "Up" is considered ready.
+    """
+    settings = load_settings()
+    ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+    is_remote = ak_cfg.get('target_mode') == 'remote' and (ak_cfg.get('remote', {}).get('host') or '').strip()
+    started = time.time()
+    last_status = ''
+    while (time.time() - started) < timeout_secs:
+        try:
+            if is_remote:
+                ok, out = _ssh_probe(
+                    ak_cfg.get('remote', {}),
+                    'docker ps --filter name=authentik-ldap --format "{{.Status}}" 2>/dev/null',
+                    timeout=10
+                )
+                status = (out or '').strip()
+            else:
+                r = subprocess.run(
+                    'docker ps --filter name=authentik-ldap --format "{{.Status}}" 2>/dev/null',
+                    shell=True, capture_output=True, text=True, timeout=8
+                )
+                status = (r.stdout or '').strip()
+            last_status = status or last_status
+            s = (status or '').lower()
+            if 'healthy' in s:
+                return True, status
+            if 'up' in s and 'health: starting' not in s and 'unhealthy' not in s:
+                return True, status
+        except Exception:
+            pass
+        time.sleep(3)
+    return False, (last_status or 'unknown')
+
 def _ensure_ldap_flow_authentication_none():
     """Ensure ldap-authentication-flow exists with authentication:none and 3 stage bindings, restart LDAP outpost.
     If flow missing (blueprint never ran), create it by cloning default-authentication-flow.
@@ -22153,7 +22191,9 @@ def _ensure_authentik_ldap_service_account():
         # 6. Ensure ldapsearch is available (install ldap-utils / openldap-clients if missing)
         _ensure_ldapsearch()
         # 7. Wait for LDAP outpost to be ready, then VERIFY via outpost logs (ldapsearch exit code is unreliable)
-        time.sleep(10)
+        ready, ready_status = _wait_ldap_outpost_ready(timeout_secs=180)
+        if not ready:
+            return False, f'LDAP outpost not ready (status: {ready_status})'
         for attempt in range(10):
             time.sleep(6)
             if _test_ldap_bind(ldap_pass):
@@ -22378,6 +22418,33 @@ def _ensure_authentik_webadmin():
                 shell=True, capture_output=True, text=True, timeout=90)
             if r.returncode != 0:
                 return False, 'Password set but LDAP restart failed: ' + (r.stderr or r.stdout or '')[:120]
+        # Verify real LDAP bind path for 8446. If this fails, auto-rotate to a safe password
+        # (avoids edge cases where an operator-entered password works in UI but fails LDAP bind).
+        ready, ready_status = _wait_ldap_outpost_ready(timeout_secs=180)
+        if not ready:
+            return False, f'webadmin set, but LDAP outpost not ready (status: {ready_status})'
+        if not _test_ldap_bind_dn('cn=webadmin,ou=users,dc=takldap', webadmin_pass):
+            import string as _string
+            import secrets as _secrets
+            safe_chars = _string.ascii_letters + _string.digits
+            fallback_pw = ''.join(_secrets.choice(safe_chars) for _ in range(16))
+            req = _req.Request(
+                f'{url}/api/v3/core/users/{webadmin_pk}/set_password/',
+                data=json.dumps({'password': fallback_pw}).encode(),
+                headers=headers,
+                method='POST'
+            )
+            _req.urlopen(req, timeout=10)
+            settings['webadmin_password'] = fallback_pw
+            save_settings(settings)
+            if ak_cfg.get('target_mode') == 'remote' and (ak_cfg.get('remote', {}).get('host') or '').strip():
+                _module_run(ak_cfg, 'cd ~/authentik && docker compose up -d --force-recreate ldap 2>&1', timeout=90)
+            elif os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
+                subprocess.run('cd ~/authentik && docker compose up -d --force-recreate ldap 2>&1',
+                    shell=True, capture_output=True, text=True, timeout=90)
+            time.sleep(6)
+            if not _test_ldap_bind_dn('cn=webadmin,ou=users,dc=takldap', fallback_pw):
+                return False, 'webadmin exists but LDAP bind verification failed (DN/password). Check LDAP outpost health and provider flows.'
         return True, None
     except urllib.error.HTTPError as e:
         try:
@@ -22636,7 +22703,12 @@ def takserver_connect_ldap():
     except Exception as e:
         verify = {'ready': False, 'error': str(e)[:120]}
         diag.append(f'Verification: ERROR ({str(e)[:80]})')
-    return jsonify({'success': ok, 'message': ' | '.join(diag), 'verification': verify})
+    overall_ok = bool(ok and verify.get('ready', True))
+    if not overall_ok:
+        diag.append('Final: NOT READY (verification failed)')
+    else:
+        diag.append('Final: READY')
+    return jsonify({'success': overall_ok, 'message': ' | '.join(diag), 'verification': verify})
 
 
 @app.route('/api/takserver/ldap-drift-check')
