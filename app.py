@@ -21601,14 +21601,23 @@ document.addEventListener('DOMContentLoaded', function() {
 </body></html>'''
 
 def _coreconfig_has_ldap():
-    """True if CoreConfig.xml exists and already contains our LDAP auth block."""
+    """True only when CoreConfig auth block is actually LDAP-default."""
     path = '/opt/tak/CoreConfig.xml'
     if not os.path.exists(path):
         return False
     try:
         with open(path, 'r') as f:
             content = f.read()
-        return 'adm_ldapservice' in content
+        lower = content.lower()
+        start = lower.find('<auth')
+        end = lower.find('</auth>', start) if start >= 0 else -1
+        if start < 0 or end < 0:
+            return False
+        block = content[start:end + len('</auth>')]
+        has_ldap_provider = bool(re.search(r'<ldap\b', block, re.IGNORECASE)) and ('adm_ldapservice' in block.lower())
+        m = re.search(r'<auth[^>]*\bdefault="([^"]+)"', block, re.IGNORECASE)
+        default_auth = (m.group(1).strip().lower() if m else '')
+        return bool(has_ldap_provider and default_auth == 'ldap')
     except Exception:
         return False
 
@@ -21685,6 +21694,7 @@ def takserver_flatfile_auth_toggle_api():
         re.search(r'<File\b[^>]*\blocation\s*=\s*"[^"]+"[^>]*/>', auth_block, re.IGNORECASE)
     )
     has_any_file_tag = bool(re.search(r'<File(?:\s+[^>]*)?/>', auth_block, re.IGNORECASE))
+    has_ldap_provider = bool(re.search(r'<ldap\b', auth_block, re.IGNORECASE))
 
     if enabled:
         if has_userauth_file:
@@ -21712,6 +21722,19 @@ def takserver_flatfile_auth_toggle_api():
             auth_block,
             flags=re.IGNORECASE
         )
+        # If LDAP provider exists, force auth default to ldap when disabling flat-file.
+        # Prevents drift where default="file" remains after File provider removal.
+        if has_ldap_provider:
+            if re.search(r'(<auth\b[^>]*\bdefault=")([^"]*)(")', new_auth, re.IGNORECASE):
+                new_auth = re.sub(
+                    r'(<auth\b[^>]*\bdefault=")([^"]*)(")',
+                    r'\1ldap\3',
+                    new_auth,
+                    count=1,
+                    flags=re.IGNORECASE
+                )
+            else:
+                new_auth = re.sub(r'<auth\b', '<auth default="ldap"', new_auth, count=1, flags=re.IGNORECASE)
 
     new_content = content[:start] + new_auth + content[end:]
 
