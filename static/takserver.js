@@ -130,94 +130,7 @@ async function checkLdapDrift(){
         }else{banner.style.display='none';}
     }catch(e){banner.style.display='none';}
 }
-async function loadFlatfileAuthStatus(){
-    var btn=document.getElementById('flatfile-auth-btn');
-    var statusEl=document.getElementById('flatfile-auth-status');
-    if(!btn||!statusEl)return null;
-    try{
-        var r=await fetch('/api/takserver/flatfile-auth');
-        var d=await r.json();
-        if(d && d.installed){
-            var on=!!d.enabled;
-            btn.textContent=on?'Disable flat-file auth':'Enable flat-file auth';
-            btn.setAttribute('data-enabled',on?'true':'false');
-            statusEl.textContent='Current state: '+(on?'Enabled':'Disabled')+(d.default_auth?(' · default='+d.default_auth):'');
-            statusEl.style.color=on?'var(--yellow)':'var(--green)';
-            return d;
-        }
-        btn.textContent='Unavailable';
-        btn.disabled=true;
-        statusEl.textContent=(d&&d.error)?d.error:'Unavailable';
-        statusEl.style.color='var(--red)';
-    }catch(e){
-        btn.textContent='Unavailable';
-        btn.disabled=true;
-        statusEl.textContent='Error loading status';
-        statusEl.style.color='var(--red)';
-    }
-    return null;
-}
-
 function _sleep(ms){ return new Promise(function(resolve){ setTimeout(resolve, ms); }); }
-
-async function pollFlatfileAuthStatus(expectedEnabled, timeoutMs){
-    var start=Date.now();
-    while((Date.now()-start) < timeoutMs){
-        try{
-            var r=await fetch('/api/takserver/flatfile-auth',{cache:'no-store'});
-            if(r.ok){
-                var d=await r.json();
-                if(d && d.installed && (!!d.enabled===!!expectedEnabled)){
-                    await loadFlatfileAuthStatus();
-                    return true;
-                }
-            }
-        }catch(e){}
-        await _sleep(2500);
-    }
-    await loadFlatfileAuthStatus();
-    return false;
-}
-
-async function toggleFlatfileAuth(){
-    var btn=document.getElementById('flatfile-auth-btn');
-    var msg=document.getElementById('flatfile-auth-msg');
-    var statusEl=document.getElementById('flatfile-auth-status');
-    if(!btn||!msg||!statusEl)return;
-    var enabledNow=(btn.getAttribute('data-enabled')==='true');
-    var nextState=!enabledNow;
-    if(!nextState){
-        if(!confirm('Disable flat-file auth provider in CoreConfig and restart TAK Server now?'))return;
-    }else{
-        if(!confirm('Enable flat-file auth provider in CoreConfig and restart TAK Server now?'))return;
-    }
-    btn.disabled=true;
-    msg.textContent='Applying change and restarting TAK Server...';
-    msg.style.color='var(--text-dim)';
-    try{
-        var r=await fetch('/api/takserver/flatfile-auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:nextState})});
-        var d=await r.json();
-        if(d && d.success){
-            msg.textContent=(d.message||'Updated.')+' Waiting for TAK restart and status refresh...';
-            msg.style.color='var(--text-dim)';
-            var synced=await pollFlatfileAuthStatus(nextState, 90000);
-            if(synced){
-                msg.textContent=(d.message||'Updated.')+' State confirmed.';
-                msg.style.color='var(--green)';
-            }else{
-                msg.textContent='Change request sent, but status confirmation timed out. Refresh page and re-check.';
-                msg.style.color='var(--yellow)';
-            }
-        }else{
-            msg.textContent=(d&& (d.error||d.message)) ? (d.error||d.message) : 'Failed to update flat-file auth';
-            msg.style.color='var(--red)';
-        }
-    }catch(e){
-        msg.textContent='Error: '+e.message;
-        msg.style.color='var(--red)';
-    }
-    btn.disabled=false;
-}
 
 async function loadServices(){
     var el=document.getElementById('services-list');
@@ -274,7 +187,6 @@ if(document.getElementById('tak-remote-metrics-bar')){loadTakRemoteMetrics();set
 if(document.getElementById('webadmin-superuser-status')){loadWebadminSuperuserStatus();}
 if(document.getElementById('tak-cert-password-inline')){loadTakCertPassword();}
 if(document.getElementById('ldap-drift-banner')){checkLdapDrift();}
-if(document.getElementById('flatfile-auth-btn')){loadFlatfileAuthStatus();}
 if(document.getElementById('cot-db-size')){refreshCotSize();fetch('/api/takserver/vacuum/status').then(function(r){return r.json();}).then(function(d){if(d.running){_vacuumSetUI(true,d.full,d.elapsed_secs||0);_pollVacuumStatus();}}).catch(function(){});}
 if(document.getElementById('cert-expiry-info')){loadCertExpiry();}
 if(document.getElementById('rotate-ca-info')){loadCAInfo();}

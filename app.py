@@ -22253,6 +22253,29 @@ def _ensure_authentik_ldap_service_account():
     except Exception as e:
         return False, str(e)[:120]
 
+def _remove_webadmin_from_userauth():
+    """Remove webadmin entry from UserAuthenticationFile.xml so flat-file can't shadow LDAP auth.
+    TAK Server always re-adds <File/> to CoreConfig on startup. If webadmin exists in the flat-file,
+    TAK Server authenticates against the flat-file hash instead of LDAP, causing login failures."""
+    uaf = '/opt/tak/UserAuthenticationFile.xml'
+    if not os.path.exists(uaf):
+        return
+    try:
+        with open(uaf, 'r') as f:
+            content = f.read()
+        if 'identifier="webadmin"' not in content:
+            return
+        lines = content.splitlines(keepends=True)
+        cleaned = [ln for ln in lines if 'identifier="webadmin"' not in ln]
+        new_content = ''.join(cleaned)
+        patch_path = os.path.join(BASE_DIR, 'UserAuthenticationFile.patched.xml')
+        with open(patch_path, 'w') as f:
+            f.write(new_content)
+        subprocess.run(['sudo', 'cp', os.path.abspath(patch_path), uaf],
+            capture_output=True, text=True, timeout=10)
+    except Exception:
+        pass
+
 def _apply_ldap_to_coreconfig():
     """Patch CoreConfig.xml with LDAP auth and restart TAK Server. Returns (success, message)."""
     coreconfig_path = '/opt/tak/CoreConfig.xml'
@@ -22271,8 +22294,6 @@ def _apply_ldap_to_coreconfig():
             if 'adminGroup="ROLE_ADMIN"' in text:
                 return text
             return _re.sub(r'(<ldap\s[^>]*?)(\s*/>)', r'\1 adminGroup="ROLE_ADMIN"\2', text, count=1, flags=_re.DOTALL)
-        def _strip_file_tags(text):
-            return _re.sub(r'\s*<File(?:\s+[^>]*)?/>', '', text, flags=_re.IGNORECASE)
         m = _re.search(r'serviceAccountCredential="([^"]*)"', original)
         existing_pass = m.group(1) if m else ''
         needs_fix = False
@@ -22284,9 +22305,6 @@ def _apply_ldap_to_coreconfig():
             needs_fix = True
         if 'adminGroup="ROLE_ADMIN"' not in updated:
             updated = _ensure_admin_group(updated)
-            needs_fix = True
-        if _re.search(r'<File(?:\s+[^>]*)?/>', updated, _re.IGNORECASE):
-            updated = _strip_file_tags(updated)
             needs_fix = True
         if needs_fix and updated != original:
             patch_path = os.path.join(BASE_DIR, 'CoreConfig.ldap-patch.xml')
@@ -22300,7 +22318,9 @@ def _apply_ldap_to_coreconfig():
                 shell=True, capture_output=True, text=True, timeout=60)
             if r.returncode != 0:
                 return False, f'CoreConfig fixed but TAK Server restart failed: {r.stderr.strip()[:120]}'
-            return True, 'CoreConfig fixed (removed File tag / updated password / restored adminGroup) — TAK Server restarted.'
+            _remove_webadmin_from_userauth()
+            return True, 'CoreConfig fixed (updated password / restored adminGroup) — TAK Server restarted.'
+        _remove_webadmin_from_userauth()
         return True, 'CoreConfig already has LDAP (password matches .env)'
     # Backup
     backup_path = coreconfig_path + '.pre-ldap.bak'
@@ -22364,6 +22384,7 @@ def _apply_ldap_to_coreconfig():
     ag = subprocess.run(['grep', '-c', 'adminGroup="ROLE_ADMIN"', coreconfig_path], capture_output=True, text=True, timeout=5)
     if ag.returncode != 0 or (ag.stdout or '').strip() == '0':
         return False, 'CoreConfig was written but adminGroup="ROLE_ADMIN" is missing — 8446 would show WebTAK for everyone. Run Connect LDAP again.'
+    _remove_webadmin_from_userauth()
     # Restart TAK Server
     r = subprocess.run('sudo systemctl restart takserver 2>&1', shell=True, capture_output=True, text=True, timeout=60)
     if r.returncode != 0:
@@ -26797,15 +26818,6 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div id="resync-notice" style="display:none;margin-top:8px;padding:10px 14px;background:rgba(234,179,8,0.12);border:1px solid rgba(234,179,8,0.35);border-radius:8px;font-size:12px;color:var(--yellow)">TAK Portal user list may take a short moment to repopulate.</div>
 </div>
 {% endif %}
-<div class="card" style="margin-bottom:24px">
-<div class="card-title">Auth Provider: Flat File (UserAuthenticationFile.xml)</div>
-<p style="font-size:12px;color:var(--text-dim);line-height:1.5;margin-bottom:12px">Controls whether TAK Server includes <code style="font-size:11px">UserAuthenticationFile.xml</code> in the CoreConfig <code style="font-size:11px">&lt;auth&gt;</code> block. This is optional if you want LDAP-only auth behavior.</p>
-<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-  <button type="button" id="flatfile-auth-btn" onclick="toggleFlatfileAuth()" style="padding:8px 16px;background:rgba(59,130,246,.2);color:var(--cyan);border:1px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;cursor:pointer">Loading...</button>
-  <span id="flatfile-auth-status" style="font-size:12px;color:var(--text-dim)">Checking status...</span>
-</div>
-<div id="flatfile-auth-msg" style="margin-top:8px;font-size:12px;color:var(--text-dim)"></div>
-</div>
 <div class="section-title">Access</div>
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
 <div style="display:flex;gap:10px;flex-wrap:nowrap;align-items:center">
