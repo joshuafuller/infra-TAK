@@ -21614,139 +21614,6 @@ def _coreconfig_has_ldap():
         return False
 
 
-def _takserver_flatfile_auth_status():
-    """Return flat-file auth state from CoreConfig auth block."""
-    path = '/opt/tak/CoreConfig.xml'
-    if not os.path.exists(path):
-        return {'installed': False, 'enabled': False, 'error': 'CoreConfig.xml not found'}
-    try:
-        with open(path, 'r') as f:
-            content = f.read()
-        lower = content.lower()
-        start = lower.find('<auth')
-        end = lower.find('</auth>', start) if start >= 0 else -1
-        if start < 0 or end < 0:
-            return {'installed': True, 'enabled': False, 'error': 'No <auth> block found'}
-        block = content[start:end + len('</auth>')]
-        has_userauth_file = ('userauthenticationfile.xml' in block.lower())
-        has_configured_file_provider = bool(
-            re.search(r'<File\b[^>]*\blocation\s*=\s*"[^"]+"[^>]*/>', block, re.IGNORECASE)
-        )
-        has_bare_file_tag = bool(re.search(r'<File(?:\s+[^>]*)?/>', block, re.IGNORECASE))
-        m = re.search(r'<auth[^>]*\bdefault="([^"]+)"', block, re.IGNORECASE)
-        default_auth = (m.group(1).strip().lower() if m else '')
-        return {
-            'installed': True,
-            'enabled': has_userauth_file or has_configured_file_provider,
-            'has_userauth_file': has_userauth_file,
-            'has_bare_file_tag': has_bare_file_tag and not (has_userauth_file or has_configured_file_provider),
-            'default_auth': default_auth,
-        }
-    except Exception as e:
-        return {'installed': True, 'enabled': False, 'error': str(e)[:180]}
-
-
-@app.route('/api/takserver/flatfile-auth')
-@login_required
-def takserver_flatfile_auth_status_api():
-    return jsonify(_takserver_flatfile_auth_status())
-
-
-@app.route('/api/takserver/flatfile-auth', methods=['POST'])
-@login_required
-def takserver_flatfile_auth_toggle_api():
-    data = request.json if request.is_json else {}
-    enabled = data.get('enabled')
-    if not isinstance(enabled, bool):
-        return jsonify({'success': False, 'error': 'enabled must be true or false'}), 400
-
-    coreconfig = '/opt/tak/CoreConfig.xml'
-    if not os.path.exists(coreconfig):
-        return jsonify({'success': False, 'error': 'TAK Server not installed (CoreConfig.xml not found)'}), 400
-
-    try:
-        with open(coreconfig, 'r') as f:
-            content = f.read()
-    except Exception:
-        r = subprocess.run(['sudo', 'cat', coreconfig], capture_output=True, text=True, timeout=8)
-        if r.returncode != 0:
-            return jsonify({'success': False, 'error': 'Could not read CoreConfig.xml'}), 500
-        content = r.stdout
-
-    lower = content.lower()
-    start = lower.find('<auth')
-    end_tag = lower.find('</auth>', start) if start >= 0 else -1
-    if start < 0 or end_tag < 0:
-        return jsonify({'success': False, 'error': 'No <auth> block found in CoreConfig.xml'}), 400
-    end = end_tag + len('</auth>')
-    auth_block = content[start:end]
-
-    has_userauth_file = ('userauthenticationfile.xml' in auth_block.lower())
-    has_configured_file_provider = bool(
-        re.search(r'<File\b[^>]*\blocation\s*=\s*"[^"]+"[^>]*/>', auth_block, re.IGNORECASE)
-    )
-    has_any_file_tag = bool(re.search(r'<File(?:\s+[^>]*)?/>', auth_block, re.IGNORECASE))
-    has_ldap_provider = bool(re.search(r'<ldap\b', auth_block, re.IGNORECASE))
-
-    if enabled:
-        if has_userauth_file:
-            status = _takserver_flatfile_auth_status()
-            return jsonify({'success': True, 'message': 'Flat-file auth already enabled', 'status': status})
-        if has_any_file_tag:
-            # Normalize any existing file provider to explicit UserAuthenticationFile.xml.
-            new_auth = re.sub(
-                r'<File(?:\s+[^>]*)?/>',
-                '<File location="UserAuthenticationFile.xml"/>',
-                auth_block,
-                flags=re.IGNORECASE
-            )
-        else:
-            file_line = '        <File location="UserAuthenticationFile.xml"/>\n'
-            new_auth = auth_block.replace('</auth>', file_line + '    </auth>')
-    else:
-        if not has_any_file_tag:
-            status = _takserver_flatfile_auth_status()
-            return jsonify({'success': True, 'message': 'Flat-file auth already disabled', 'status': status})
-        # Remove any File provider entry when flat-file auth is disabled.
-        new_auth = re.sub(
-            r'<File(?:\s+[^>]*)?/>',
-            '',
-            auth_block,
-            flags=re.IGNORECASE
-        )
-        # If LDAP provider exists, force auth default to ldap when disabling flat-file.
-        # Prevents drift where default="file" remains after File provider removal.
-        if has_ldap_provider:
-            if re.search(r'(<auth\b[^>]*\bdefault=")([^"]*)(")', new_auth, re.IGNORECASE):
-                new_auth = re.sub(
-                    r'(<auth\b[^>]*\bdefault=")([^"]*)(")',
-                    r'\1ldap\3',
-                    new_auth,
-                    count=1,
-                    flags=re.IGNORECASE
-                )
-            else:
-                new_auth = re.sub(r'<auth\b', '<auth default="ldap"', new_auth, count=1, flags=re.IGNORECASE)
-
-    new_content = content[:start] + new_auth + content[end:]
-
-    try:
-        with open(coreconfig, 'w') as f:
-            f.write(new_content)
-    except Exception:
-        proc = subprocess.run(['sudo', 'tee', coreconfig], input=new_content, capture_output=True, text=True, timeout=10)
-        if proc.returncode != 0:
-            return jsonify({'success': False, 'error': 'Failed to write CoreConfig.xml'}), 500
-
-    rr = subprocess.run(['sudo', 'systemctl', 'restart', 'takserver'], capture_output=True, text=True, timeout=60)
-    if rr.returncode != 0:
-        return jsonify({'success': False, 'error': f'CoreConfig updated, but TAK restart failed: {rr.stderr[:160]}'}), 500
-
-    status = _takserver_flatfile_auth_status()
-    action = 'enabled' if enabled else 'disabled'
-    return jsonify({'success': True, 'message': f'Flat-file auth {action}. TAK Server restarted.', 'status': status})
-
-
 def _resync_ldap_credential_to_coreconfig():
     """Ensure CoreConfig.xml serviceAccountCredential matches Authentik .env.
 
@@ -22391,6 +22258,7 @@ def _ensure_authentik_webadmin():
     import urllib.error
     if not os.path.exists('/opt/tak'):
         return True, None
+    _remove_webadmin_from_userauth()
     settings = load_settings()
     ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
     if not ak_token:
@@ -25268,7 +25136,7 @@ def run_takserver_deploy(config):
                     log_step(f"⚠ Could not verify JDBC URL: {e}")
         log_step("✓ CoreConfig.xml configured")
 
-        # Auto-connect to LDAP if Authentik is already deployed (removes flat-file auth)
+        # Auto-connect to LDAP if Authentik is already deployed
         try:
             ak_installed = bool(detect_modules().get('authentik', {}).get('installed'))
             if ak_installed and not _coreconfig_has_ldap():
