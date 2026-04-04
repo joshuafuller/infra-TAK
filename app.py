@@ -22367,11 +22367,9 @@ def _ensure_authentik_webadmin():
     ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
     if not ak_token:
         return False, 'Authentik .env not found'
-    webadmin_pass = settings.get('webadmin_password', '')
+    webadmin_pass = (settings.get('webadmin_password') or '').strip()
     if not webadmin_pass:
-        webadmin_pass = secrets.token_urlsafe(16)
-        settings['webadmin_password'] = webadmin_pass
-        save_settings(settings)
+        return False, 'webadmin password is not set in infra-TAK settings. Re-deploy TAK Server and set a WebGUI password.'
     url = _get_authentik_api_url(settings)
     headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
     try:
@@ -22440,66 +22438,46 @@ def _ensure_authentik_webadmin():
                 shell=True, capture_output=True, text=True, timeout=90)
             if r.returncode != 0:
                 return False, 'Password set but LDAP restart failed: ' + (r.stderr or r.stdout or '')[:120]
-        # Verify real LDAP bind path for 8446. If this fails, auto-rotate to a safe password
-        # (avoids edge cases where an operator-entered password works in UI but fails LDAP bind).
+        # Verify real LDAP bind path for 8446.
+        # Keep credentials deterministic: never rotate password silently.
         ready, ready_status = _wait_ldap_outpost_ready(timeout_secs=180)
         if not ready:
             return False, f'webadmin set, but LDAP outpost not ready (status: {ready_status})'
         if not _test_ldap_bind_dn('cn=webadmin,ou=users,dc=takldap', webadmin_pass):
-            import string as _string
-            import secrets as _secrets
-            safe_chars = _string.ascii_letters + _string.digits
-            fallback_pw = ''.join(_secrets.choice(safe_chars) for _ in range(16))
+            # Last resort: rebuild the webadmin user object, but keep the configured password.
+            try:
+                req_del = _req.Request(f'{url}/api/v3/core/users/{webadmin_pk}/', headers=headers, method='DELETE')
+                _req.urlopen(req_del, timeout=10)
+            except Exception:
+                pass
+            rebuilt = _create_webadmin_user()
+            webadmin_pk = rebuilt['pk']
             req = _req.Request(
                 f'{url}/api/v3/core/users/{webadmin_pk}/set_password/',
-                data=json.dumps({'password': fallback_pw}).encode(),
+                data=json.dumps({'password': webadmin_pass}).encode(),
                 headers=headers,
                 method='POST'
             )
             _req.urlopen(req, timeout=10)
-            settings['webadmin_password'] = fallback_pw
-            save_settings(settings)
+            if admins_grp:
+                req = _req.Request(
+                    f'{url}/api/v3/core/groups/{admins_grp["pk"]}/add_user/',
+                    data=json.dumps({'pk': webadmin_pk}).encode(),
+                    headers=headers,
+                    method='POST'
+                )
+                try:
+                    _req.urlopen(req, timeout=10)
+                except Exception:
+                    pass
             if ak_cfg.get('target_mode') == 'remote' and (ak_cfg.get('remote', {}).get('host') or '').strip():
                 _module_run(ak_cfg, 'cd ~/authentik && docker compose up -d --force-recreate ldap 2>&1', timeout=90)
             elif os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
                 subprocess.run('cd ~/authentik && docker compose up -d --force-recreate ldap 2>&1',
                     shell=True, capture_output=True, text=True, timeout=90)
-            time.sleep(6)
-            if not _test_ldap_bind_dn('cn=webadmin,ou=users,dc=takldap', fallback_pw):
-                # Last resort: rebuild the webadmin user object in Authentik and verify again.
-                try:
-                    req_del = _req.Request(f'{url}/api/v3/core/users/{webadmin_pk}/', headers=headers, method='DELETE')
-                    _req.urlopen(req_del, timeout=10)
-                except Exception:
-                    pass
-                rebuilt = _create_webadmin_user()
-                webadmin_pk = rebuilt['pk']
-                req = _req.Request(
-                    f'{url}/api/v3/core/users/{webadmin_pk}/set_password/',
-                    data=json.dumps({'password': fallback_pw}).encode(),
-                    headers=headers,
-                    method='POST'
-                )
-                _req.urlopen(req, timeout=10)
-                if admins_grp:
-                    req = _req.Request(
-                        f'{url}/api/v3/core/groups/{admins_grp["pk"]}/add_user/',
-                        data=json.dumps({'pk': webadmin_pk}).encode(),
-                        headers=headers,
-                        method='POST'
-                    )
-                    try:
-                        _req.urlopen(req, timeout=10)
-                    except Exception:
-                        pass
-                if ak_cfg.get('target_mode') == 'remote' and (ak_cfg.get('remote', {}).get('host') or '').strip():
-                    _module_run(ak_cfg, 'cd ~/authentik && docker compose up -d --force-recreate ldap 2>&1', timeout=90)
-                elif os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
-                    subprocess.run('cd ~/authentik && docker compose up -d --force-recreate ldap 2>&1',
-                        shell=True, capture_output=True, text=True, timeout=90)
-                ready2, ready_status2 = _wait_ldap_outpost_ready(timeout_secs=180)
-                if (not ready2) or (not _test_ldap_bind_dn('cn=webadmin,ou=users,dc=takldap', fallback_pw)):
-                    return False, f'webadmin exists but LDAP bind verification failed (DN/password). Outpost status: {ready_status2}'
+            ready2, ready_status2 = _wait_ldap_outpost_ready(timeout_secs=180)
+            if (not ready2) or (not _test_ldap_bind_dn('cn=webadmin,ou=users,dc=takldap', webadmin_pass)):
+                return False, f'webadmin exists but LDAP bind verification failed (DN/password). Outpost status: {ready_status2}'
         return True, None
     except urllib.error.HTTPError as e:
         try:
