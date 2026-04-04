@@ -22266,50 +22266,42 @@ def _apply_ldap_to_coreconfig():
     with open(coreconfig_path, 'r') as f:
         original = f.read()
     if _coreconfig_has_ldap():
-        # LDAP already configured — ensure adminGroup="ROLE_ADMIN" (required for admin UI; without it everyone gets WebTAK)
         import re as _re
         def _ensure_admin_group(text):
             if 'adminGroup="ROLE_ADMIN"' in text:
                 return text
-            # Add adminGroup to the <ldap ... /> element so 8446 shows admin UI for ROLE_ADMIN users
             return _re.sub(r'(<ldap\s[^>]*?)(\s*/>)', r'\1 adminGroup="ROLE_ADMIN"\2', text, count=1, flags=_re.DOTALL)
-        # Check if password needs updating
+        def _strip_file_tags(text):
+            return _re.sub(r'\s*<File(?:\s+[^>]*)?/>', '', text, flags=_re.IGNORECASE)
         m = _re.search(r'serviceAccountCredential="([^"]*)"', original)
         existing_pass = m.group(1) if m else ''
-        if existing_pass == ldap_pass:
-            if 'adminGroup="ROLE_ADMIN"' not in original:
-                patched = _ensure_admin_group(original)
-                patch_path = os.path.join(BASE_DIR, 'CoreConfig.ldap-patch.xml')
-                with open(patch_path, 'w') as f:
-                    f.write(patched)
-                r = subprocess.run(['sudo', 'cp', os.path.abspath(patch_path), coreconfig_path],
-                    capture_output=True, text=True, timeout=10)
-                if r.returncode == 0:
-                    subprocess.run('sudo systemctl restart takserver 2>&1', shell=True, capture_output=True, text=True, timeout=60)
-                return True, 'CoreConfig already has LDAP (adminGroup restored — restart TAK Server if 8446 still shows WebTAK)'
-            return True, 'CoreConfig already has LDAP (password matches .env)'
-        # Password mismatch — update it in place and ensure adminGroup
-        updated = original.replace(
-            f'serviceAccountCredential="{existing_pass}"',
-            f'serviceAccountCredential="{ldap_pass}"')
-        updated = _ensure_admin_group(updated)
-        if updated != original or 'adminGroup="ROLE_ADMIN"' not in original:
+        needs_fix = False
+        updated = original
+        if existing_pass != ldap_pass:
+            updated = updated.replace(
+                f'serviceAccountCredential="{existing_pass}"',
+                f'serviceAccountCredential="{ldap_pass}"')
+            needs_fix = True
+        if 'adminGroup="ROLE_ADMIN"' not in updated:
+            updated = _ensure_admin_group(updated)
+            needs_fix = True
+        if _re.search(r'<File(?:\s+[^>]*)?/>', updated, _re.IGNORECASE):
+            updated = _strip_file_tags(updated)
+            needs_fix = True
+        if needs_fix and updated != original:
             patch_path = os.path.join(BASE_DIR, 'CoreConfig.ldap-patch.xml')
             with open(patch_path, 'w') as f:
                 f.write(updated)
             r = subprocess.run(['sudo', 'cp', os.path.abspath(patch_path), coreconfig_path],
                 capture_output=True, text=True, timeout=10)
             if r.returncode != 0:
-                return False, f'Password resync: sudo cp failed: {r.stderr.strip()[:200]}'
-            ag = subprocess.run(['grep', '-c', 'adminGroup="ROLE_ADMIN"', coreconfig_path], capture_output=True, text=True, timeout=5)
-            if ag.returncode != 0 or (ag.stdout or '').strip() == '0':
-                return False, 'CoreConfig updated but adminGroup="ROLE_ADMIN" missing — run Connect LDAP again.'
+                return False, f'CoreConfig fix: sudo cp failed: {r.stderr.strip()[:200]}'
             r = subprocess.run('sudo systemctl restart takserver 2>&1',
                 shell=True, capture_output=True, text=True, timeout=60)
             if r.returncode != 0:
-                return False, f'Password resynced but TAK Server restart failed: {r.stderr.strip()[:120]}'
-            return True, 'LDAP password resynced from .env to CoreConfig — TAK Server restarted.'
-        return True, 'CoreConfig already has LDAP'
+                return False, f'CoreConfig fixed but TAK Server restart failed: {r.stderr.strip()[:120]}'
+            return True, 'CoreConfig fixed (removed File tag / updated password / restored adminGroup) — TAK Server restarted.'
+        return True, 'CoreConfig already has LDAP (password matches .env)'
     # Backup
     backup_path = coreconfig_path + '.pre-ldap.bak'
     if not os.path.exists(backup_path):
