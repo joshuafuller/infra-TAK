@@ -8282,7 +8282,13 @@ def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
         shell=True)
     log_fn("  ✓ JKS installed to /opt/tak/certs/files/takserver-le.jks")
 
-    # Step C: Patch CoreConfig.xml 8446 connector
+    # Step C: Stop TAK Server, patch CoreConfig.xml 8446 connector, then start.
+    # TAK Server overwrites CoreConfig.xml on restart with its in-memory state,
+    # so we must stop it first to prevent our patch from being reverted.
+    subprocess.run('systemctl stop takserver 2>/dev/null; true', shell=True, capture_output=True)
+    time.sleep(10)
+    subprocess.run('pkill -9 -f takserver 2>/dev/null; true', shell=True, capture_output=True)
+    time.sleep(5)
     try:
         with open(core_config, 'r') as f:
             content = f.read()
@@ -8390,10 +8396,10 @@ WantedBy=timers.target
         shell=True, capture_output=True)
     log_fn("  ✓ Auto-renewal timer enabled (monthly)")
 
-    # Step F: Restart TAK Server to load new cert
-    log_fn("  Restarting TAK Server to load LE cert on port 8446...")
-    subprocess.run('systemctl restart takserver 2>/dev/null; true', shell=True, capture_output=True)
-    log_fn("  ✓ TAK Server restarted")
+    # Step F: Start TAK Server (was stopped in Step C before CoreConfig patch)
+    log_fn("  Starting TAK Server with LE cert on port 8446...")
+    subprocess.run('systemctl start takserver 2>/dev/null; true', shell=True, capture_output=True)
+    log_fn("  ✓ TAK Server started")
     log_fn("✓ Port 8446 now serving Let's Encrypt cert — ready for TAK clients")
     return True
 
