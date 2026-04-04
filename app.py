@@ -20214,7 +20214,7 @@ entries:
             api_ready = _wait_for_authentik_api(
                 'http://127.0.0.1:9090',
                 {'Authorization': f'Bearer {bootstrap_token}'},
-                max_attempts=90, plog=plog
+                max_attempts=150, plog=plog
             )
             if api_ready:
                 plog("✓ Authentik API is ready")
@@ -20576,7 +20576,7 @@ entries:
                                             'config': {'authentik_host': 'http://authentik-server-1:9000/',
                                                 'authentik_host_insecure': True}}).encode(),
                                             headers=ak_headers, method='POST')
-                                    resp = urllib.request.urlopen(req, timeout=10)
+                                    resp = urllib.request.urlopen(req, timeout=30)
                                     outpost_data = json.loads(resp.read().decode())
                                     outpost_token_id = outpost_data.get('token_identifier', '')
                                     plog(f"  ✓ Created LDAP outpost (token_id={outpost_token_id})")
