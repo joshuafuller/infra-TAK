@@ -19084,7 +19084,7 @@ entries:
       name: LDAP
     attrs:
       authentication_flow: !KeyOf ldap-authentication-flow
-      authorization_flow: !KeyOf ldap-authentication-flow
+      authorization_flow: !KeyOf ldap-authorization-flow
       base_dn: !Context basedn
       bind_mode: cached
       gid_start_number: 4000
@@ -19463,6 +19463,12 @@ def _run_authentik_reconfigure_remote(settings, deploy_cfg, plog):
         plog("  \u26a0 API not ready in time — run Update config & reconnect again")
         authentik_deploy_status.update({'running': False, 'error': True})
         return
+    plog("  Fixing LDAP flow & provider (authorization_flow, bind_mode)...")
+    ok_flow, err_flow = _ensure_ldap_flow_authentication_none()
+    if ok_flow:
+        plog("  \u2713 LDAP flow & provider verified")
+    else:
+        plog(f"  \u26a0 LDAP flow fix: {err_flow}")
     plog("  Setting proxy cookie domain...")
     _ensure_proxy_providers_cookie_domain(ak_url, ak_headers, fqdn, plog)
     if _is_module_deployed(settings, 'takportal'):
@@ -19657,6 +19663,12 @@ def run_authentik_deploy(reconfigure=False):
                     plog("")
                     plog("  Waiting for Authentik API...")
                     if _wait_for_authentik_api(ak_url, ak_headers, max_attempts=24, plog=plog):
+                        plog("  Fixing LDAP flow & provider (authorization_flow, bind_mode)...")
+                        ok_flow, err_flow = _ensure_ldap_flow_authentication_none()
+                        if ok_flow:
+                            plog("  ✓ LDAP flow & provider verified")
+                        else:
+                            plog(f"  ⚠ LDAP flow fix: {err_flow}")
                         plog("  Setting proxy cookie domain (shared session across subdomains)...")
                         _ensure_proxy_providers_cookie_domain(ak_url, ak_headers, fqdn, plog)
                         if _is_module_deployed(settings, 'takportal'):
@@ -19975,7 +19987,7 @@ entries:
       name: LDAP
     attrs:
       authentication_flow: !KeyOf ldap-authentication-flow
-      authorization_flow: !KeyOf ldap-authentication-flow
+      authorization_flow: !KeyOf ldap-authorization-flow
       base_dn: !Context basedn
       bind_mode: cached
       gid_start_number: 4000
@@ -20495,10 +20507,14 @@ entries:
                         ldap_provider_pk = None
                         ldap_flow_pk = next((f['pk'] for f in auth_flows if f['slug'] == 'ldap-authentication-flow'), None)
                         ldap_bind_flow = ldap_flow_pk or auth_flow_pk
+                        all_flows_resp = urllib.request.urlopen(
+                            urllib.request.Request(f'{ak_url}/api/v3/flows/instances/?page_size=200', headers=ak_headers), timeout=10)
+                        all_flows = json.loads(all_flows_resp.read().decode()).get('results', [])
+                        ldap_authz_flow = next((f['pk'] for f in all_flows if f['slug'] == 'ldap-authorization-flow'), ldap_bind_flow)
                         try:
                             req = urllib.request.Request(f'{ak_url}/api/v3/providers/ldap/',
                                 data=json.dumps({'name': 'LDAP', 'authentication_flow': ldap_bind_flow,
-                                    'authorization_flow': ldap_bind_flow, 'invalidation_flow': inv_flow_pk,
+                                    'authorization_flow': ldap_authz_flow, 'invalidation_flow': inv_flow_pk,
                                     'base_dn': 'DC=takldap', 'bind_mode': 'cached',
                                     'search_mode': 'cached', 'mfa_support': False}).encode(),
                                 headers=ak_headers, method='POST')
@@ -21874,6 +21890,8 @@ def _ensure_ldap_flow_authentication_none():
     try:
         ldap_flow_results = _get('flows/instances/?slug=ldap-authentication-flow').get('results', [])
         ldap_flow = ldap_flow_results[0] if ldap_flow_results else None
+        ldap_authz_results = _get('flows/instances/?slug=ldap-authorization-flow').get('results', [])
+        ldap_authz_flow = ldap_authz_results[0] if ldap_authz_results else None
         default_flow_results = _get('flows/instances/?slug=default-authentication-flow').get('results', [])
         default_flow = default_flow_results[0] if default_flow_results else None
 
@@ -21963,10 +21981,13 @@ def _ensure_ldap_flow_authentication_none():
             providers = _get('providers/ldap/?search=LDAP').get('results', [])
             ldap_prov = next((p for p in providers if p.get('name') == 'LDAP'), providers[0] if providers else None)
             if ldap_prov:
+                authz_pk = ldap_authz_flow['pk'] if ldap_authz_flow else ldap_flow_pk
                 try:
                     _patch(f'providers/ldap/{ldap_prov["pk"]}/', {
                         'authentication_flow': ldap_flow_pk,
-                        'authorization_flow': ldap_flow_pk})
+                        'authorization_flow': authz_pk,
+                        'bind_mode': 'cached',
+                        'search_mode': 'cached'})
                 except urllib.error.HTTPError as e:
                     body = ''
                     try: body = e.read().decode()[:200]
@@ -22006,12 +22027,25 @@ def _ensure_ldap_flow_authentication_none():
                         'invalid_response_action': b.get('invalid_response_action', 'retry')})
                 except urllib.error.HTTPError:
                     pass
+            authz_flow_pk = ldap_authz_flow['pk'] if ldap_authz_flow else None
+            if not authz_flow_pk:
+                try:
+                    authz_resp = _post('flows/instances/', {
+                        'name': 'ldap-authorization-flow', 'slug': 'ldap-authorization-flow',
+                        'title': 'ldap-authorization-flow', 'designation': 'authorization',
+                        'authentication': 'none', 'layout': 'stacked', 'denied_action': 'message_continue',
+                        'policy_engine_mode': 'any'})
+                    authz_flow_pk = authz_resp['pk']
+                except urllib.error.HTTPError:
+                    authz_flow_pk = new_flow_pk
             providers = _get('providers/ldap/?search=LDAP').get('results', [])
             ldap_provider = next((p for p in providers if p.get('name') == 'LDAP'), providers[0] if providers else None)
             if ldap_provider:
                 _patch(f'providers/ldap/{ldap_provider["pk"]}/', {
                     'authentication_flow': new_flow_pk,
-                    'authorization_flow': new_flow_pk})
+                    'authorization_flow': authz_flow_pk,
+                    'bind_mode': 'cached',
+                    'search_mode': 'cached'})
     except urllib.error.HTTPError as e:
         try:
             body = e.read().decode()[:200]
@@ -22258,9 +22292,9 @@ def _apply_ldap_to_coreconfig():
         return False, f'CoreConfig patched but TAK Server restart failed: {r.stderr.strip()[:120]}'
     return True, 'LDAP connected — CoreConfig patched and TAK Server restarted.'
 
-def _ensure_authentik_webadmin():
-    """Ensure webadmin user exists in Authentik with path=users for 8446 LDAP login.
-    Needed when Authentik was deployed before TAK Server (webadmin skipped at deploy time).
+def _ensure_authentik_webadmin(skip_bind_verify=False):
+    """Ensure webadmin user exists in Authentik (convenience sync — 8446 uses flat-file).
+    skip_bind_verify=True skips the LDAP bind test + outpost restart (used during deploy).
     Returns (True, None) on success, (False, error_msg) on failure."""
     import urllib.request as _req
     import urllib.error
@@ -22330,6 +22364,8 @@ def _ensure_authentik_webadmin():
                 req = _req.Request(f'{url}/api/v3/core/groups/{admins_grp["pk"]}/add_user/',
                     data=json.dumps({'pk': webadmin_pk}).encode(), headers=headers, method='POST')
                 _req.urlopen(req, timeout=10)
+        if skip_bind_verify:
+            return True, None
         # Restart LDAP outpost to clear bind cache (password change would otherwise be ignored until cache expires)
         ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
         if ak_cfg.get('target_mode') == 'remote' and (ak_cfg.get('remote', {}).get('host') or '').strip():
@@ -22341,13 +22377,10 @@ def _ensure_authentik_webadmin():
                 shell=True, capture_output=True, text=True, timeout=90)
             if r.returncode != 0:
                 return False, 'Password set but LDAP restart failed: ' + (r.stderr or r.stdout or '')[:120]
-        # Verify real LDAP bind path for 8446.
-        # Keep credentials deterministic: never rotate password silently.
         ready, ready_status = _wait_ldap_outpost_ready(timeout_secs=180)
         if not ready:
             return False, f'webadmin set, but LDAP outpost not ready (status: {ready_status})'
         if not _test_ldap_bind_dn('cn=webadmin,ou=users,dc=takldap', webadmin_pass):
-            # Last resort: rebuild the webadmin user object, but keep the configured password.
             try:
                 req_del = _req.Request(f'{url}/api/v3/core/users/{webadmin_pk}/', headers=headers, method='DELETE')
                 _req.urlopen(req_del, timeout=10)
@@ -25232,13 +25265,14 @@ def run_takserver_deploy(config):
             subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True)
             log_step(f"  ✓ Caddy config updated for TAK Server")
 
-        # If Authentik is installed (local or remote), ensure webadmin exists there (for 8446 LDAP login). Matches main-branch behavior so 8446 works after Connect LDAP without manual Sync webadmin.
+        # Sync webadmin to Authentik for convenience (8446 itself uses flat-file auth).
+        # skip_bind_verify=True: no outpost restart / LDAP bind test during deploy.
         if webadmin_pass and _get_authentik_env_content(settings):
-            ok, err = _ensure_authentik_webadmin()
+            ok, err = _ensure_authentik_webadmin(skip_bind_verify=True)
             if ok:
-                log_step("  ✓ webadmin synced to Authentik (8446 login ready)")
+                log_step("  ✓ webadmin synced to Authentik")
             elif err:
-                log_step(f"  ⚠ webadmin sync: {err[:80]} — use Sync webadmin or Connect LDAP if 8446 fails")
+                log_step(f"  ℹ webadmin Authentik sync skipped: {err[:80]}")
 
         # If Caddy is already running with a domain, install LE cert on 8446 now.
         # This handles the case where Caddy was deployed before TAK Server.
