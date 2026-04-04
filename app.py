@@ -19554,7 +19554,8 @@ def _ensure_authentik_starter_branding(ak_dir, deploy_cfg, plog=None):
 
 
 def _apply_authentik_pg_tuning(ak_dir, plog):
-    """Apply PostgreSQL performance tuning inside the Authentik PostgreSQL container."""
+    """Clear stale postgresql.auto.conf entries and let docker-compose command-line args handle tuning.
+    Previous versions used ALTER SYSTEM SET which left stale entries that conflict on upgrade."""
     try:
         pg_container = subprocess.run(
             f'cd {ak_dir} && docker compose ps -q postgresql 2>/dev/null',
@@ -19563,26 +19564,17 @@ def _apply_authentik_pg_tuning(ak_dir, plog):
         if not pg_container:
             plog("  PostgreSQL container not found, skipping PG tuning")
             return
-        alter_cmds = [
-            "ALTER SYSTEM SET max_connections = 300",
-            "ALTER SYSTEM SET idle_session_timeout = '300s'",
-            "ALTER SYSTEM SET idle_in_transaction_session_timeout = '120s'",
-            "ALTER SYSTEM SET tcp_keepalives_idle = 60",
-            "ALTER SYSTEM SET tcp_keepalives_interval = 10",
-            "ALTER SYSTEM SET tcp_keepalives_count = 3",
-        ]
-        for cmd in alter_cmds:
-            subprocess.run(
-                f'cd {ak_dir} && docker compose exec -T postgresql psql -U authentik -d authentik -c "{cmd};" 2>&1',
-                shell=True, capture_output=True, text=True, timeout=15
-            )
+        subprocess.run(
+            f'cd {ak_dir} && docker compose exec -T postgresql psql -U authentik -d authentik -c "ALTER SYSTEM RESET ALL;" 2>&1',
+            shell=True, capture_output=True, text=True, timeout=15
+        )
         subprocess.run(
             f'cd {ak_dir} && docker compose exec -T postgresql psql -U authentik -d authentik -c "SELECT pg_reload_conf();" 2>&1',
             shell=True, capture_output=True, text=True, timeout=15
         )
-        plog("  \u2713 PostgreSQL tuning applied (max_connections=300, idle_session_timeout=5min, tcp_keepalives)")
+        plog("  \u2713 PostgreSQL tuning cleaned up (stale ALTER SYSTEM entries cleared; command-line args in docker-compose.yml apply on restart)")
     except Exception as e:
-        plog(f"  \u26a0 PG tuning skipped: {e}")
+        plog(f"  \u26a0 PG tuning cleanup skipped: {e}")
 
 
 def run_authentik_deploy(reconfigure=False):
