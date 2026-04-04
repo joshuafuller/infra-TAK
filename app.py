@@ -22188,9 +22188,7 @@ def _apply_ldap_to_coreconfig():
                 shell=True, capture_output=True, text=True, timeout=60)
             if r.returncode != 0:
                 return False, f'CoreConfig fixed but TAK Server restart failed: {r.stderr.strip()[:120]}'
-            _remove_webadmin_from_userauth()
             return True, 'CoreConfig fixed (updated password / restored adminGroup) — TAK Server restarted.'
-        _remove_webadmin_from_userauth()
         return True, 'CoreConfig already has LDAP (password matches .env)'
     # Backup
     backup_path = coreconfig_path + '.pre-ldap.bak'
@@ -22254,7 +22252,6 @@ def _apply_ldap_to_coreconfig():
     ag = subprocess.run(['grep', '-c', 'adminGroup="ROLE_ADMIN"', coreconfig_path], capture_output=True, text=True, timeout=5)
     if ag.returncode != 0 or (ag.stdout or '').strip() == '0':
         return False, 'CoreConfig was written but adminGroup="ROLE_ADMIN" is missing — 8446 would show WebTAK for everyone. Run Connect LDAP again.'
-    _remove_webadmin_from_userauth()
     # Restart TAK Server
     r = subprocess.run('sudo systemctl restart takserver 2>&1', shell=True, capture_output=True, text=True, timeout=60)
     if r.returncode != 0:
@@ -22269,7 +22266,6 @@ def _ensure_authentik_webadmin():
     import urllib.error
     if not os.path.exists('/opt/tak'):
         return True, None
-    _remove_webadmin_from_userauth()
     settings = load_settings()
     ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
     if not ak_token:
@@ -22464,7 +22460,7 @@ def takserver_webadmin_password():
 @app.route('/api/takserver/webadmin-password', methods=['POST'])
 @login_required
 def takserver_set_webadmin_password():
-    """Set webadmin password in settings (used for 8446 and Sync webadmin to Authentik). Use when 8446 fails with remote Authentik so you can set a known password and sync."""
+    """Set webadmin password in settings and update flat-file (8446 auth source). Optionally sync to Authentik afterward."""
     data = request.get_json() or {}
     pw = (data.get('password') or '').strip()
     if not pw:
@@ -22472,7 +22468,22 @@ def takserver_set_webadmin_password():
     settings = load_settings()
     settings['webadmin_password'] = pw
     save_settings(settings)
-    return jsonify({'success': True, 'message': 'Password saved. Click Sync webadmin to Authentik, then restart LDAP on the Authentik server if needed.'})
+    flatfile_ok = False
+    if os.path.exists('/opt/tak/utils/UserManager.jar'):
+        try:
+            r = subprocess.run(
+                f"java -jar /opt/tak/utils/UserManager.jar usermod -A -p '{pw}' webadmin 2>&1",
+                shell=True, capture_output=True, text=True, timeout=30)
+            flatfile_ok = r.returncode == 0
+        except Exception:
+            pass
+    msg = 'Password saved'
+    if flatfile_ok:
+        msg += ' and updated in TAK Server (8446 login).'
+    else:
+        msg += ' but could not update TAK Server flat-file — redeploy TAK Server for 8446 to use this password.'
+    msg += ' Click Sync webadmin to also update Authentik.'
+    return jsonify({'success': True, 'message': msg})
 
 
 @app.route('/api/takserver/cert-password')
@@ -25187,13 +25198,10 @@ def run_takserver_deploy(config):
         log_step(""); log_step("━━━ Step 9/9: Promoting Admin ━━━")
         run_cmd('java -jar /opt/tak/utils/UserManager.jar certmod -A /opt/tak/certs/files/admin.pem 2>&1', "Promoting admin certificate...", check=False)
         webadmin_pass = config.get('webadmin_password', '')
-        ak_installed = bool(detect_modules().get('authentik', {}).get('installed'))
-        if webadmin_pass and not ak_installed:
-            log_step("Creating webadmin user (flat-file)...")
+        if webadmin_pass:
+            log_step("Creating webadmin user...")
             run_cmd(f"java -jar /opt/tak/utils/UserManager.jar usermod -A -p '{webadmin_pass}' webadmin 2>&1", check=False)
             log_step("✓ webadmin user created")
-        elif webadmin_pass and ak_installed:
-            log_step("Authentik detected — webadmin will be created directly in Authentik (skipping flat-file)")
         ne_changed, ne_msg = _sanitize_coreconfig_name_entries()
         if ne_changed:
             log_step(f"  NameEntry fix: {ne_msg}")
@@ -26687,7 +26695,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <button type="button" id="set-webadmin-pw-btn" onclick="setWebadminPassword()" style="padding:8px 16px;background:rgba(59,130,246,.25);color:var(--cyan);border:1px solid var(--border);border-radius:8px;font-size:12px;font-weight:600;cursor:pointer">Save password</button>
 <span id="set-webadmin-pw-msg" style="font-size:12px;color:var(--text-dim)"></span>
 </div>
-<div style="font-size:11px;color:var(--text-dim);margin-top:6px">After saving, click <strong>Sync webadmin to Authentik</strong> so 8446 login uses this password.</div>
+<div style="font-size:11px;color:var(--text-dim);margin-top:6px">Saving updates TAK Server flat-file (8446 login). Click <strong>Sync webadmin</strong> to also update Authentik.</div>
 </div>
 <div id="resync-notice" style="display:none;margin-top:8px;padding:10px 14px;background:rgba(234,179,8,0.12);border:1px solid rgba(234,179,8,0.35);border-radius:8px;font-size:12px;color:var(--yellow)">TAK Portal user list may take a short moment to repopulate.</div>
 </div>

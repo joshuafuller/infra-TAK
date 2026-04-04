@@ -59,7 +59,7 @@ async function setWebadminPassword(){
     try{
         var r=await fetch('/api/takserver/webadmin-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});
         var d=await r.json();
-        if(d.success){msgEl.textContent='Saved. Click Sync webadmin to Authentik to push to 8446.';msgEl.style.color='var(--green)';pwEl.value='';confirmEl.value='';}
+        if(d.success){msgEl.textContent=d.message||'Saved.';msgEl.style.color='var(--green)';pwEl.value='';confirmEl.value='';}
         else{msgEl.textContent=d.error||d.message||'Save failed';msgEl.style.color='var(--red)';}
     }catch(e){msgEl.textContent='Error: '+e.message;msgEl.style.color='var(--red)';}
     if(btn)btn.disabled=false;
