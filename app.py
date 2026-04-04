@@ -21857,34 +21857,53 @@ def _test_ldap_bind_dn(bind_dn, bind_pass):
         remote_host = (ak_cfg.get('remote', {}).get('host') or '').strip()
         if remote_host:
             ldap_host = remote_host
-    try:
-        if shutil.which('ldapsearch'):
-            subprocess.run(
-                ['ldapsearch', '-x', '-H', f'ldap://{ldap_host}:389',
-                 '-D', bind_dn, '-w', bind_pass,
-                 '-b', 'dc=takldap', '-s', 'base', '(objectClass=*)'],
-                capture_output=True, text=True, timeout=15)
-    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
-        pass
-    time.sleep(2)
-    if is_remote:
-        ok, out = _ssh_probe(ak_cfg.get('remote', {}),
-            'docker logs authentik-ldap-1 --since 25s 2>&1', timeout=15)
-        log = (out or '').lower()
-    else:
-        r = subprocess.run(
-            'docker logs authentik-ldap-1 --since 25s 2>&1',
-            shell=True, capture_output=True, text=True, timeout=10)
-        log = (r.stdout or '').lower()
-    dn = (bind_dn or '').lower()
+    dn = (bind_dn or '').strip().lower()
     if not dn:
         return False
-    lines = [ln for ln in log.splitlines() if dn in ln]
-    if not lines:
-        return False
-    if any('invalid credentials' in ln or '"error"' in ln for ln in lines):
-        return False
-    return True
+    user_hint = ''
+    if dn.startswith('cn=') and ',' in dn:
+        user_hint = dn.split(',', 1)[0].replace('cn=', '').strip()
+    success_markers = ('authenticated', 'bind successful', 'login successful')
+    failure_markers = ('invalid credentials', 'access denied', 'insufficient access')
+
+    for _ in range(3):
+        # Primary signal: explicit ldapsearch success for this bind DN/password.
+        try:
+            if shutil.which('ldapsearch'):
+                lr = subprocess.run(
+                    ['ldapsearch', '-x', '-H', f'ldap://{ldap_host}:389',
+                     '-D', bind_dn, '-w', bind_pass,
+                     '-b', 'dc=takldap', '-s', 'base', '(objectClass=*)'],
+                    capture_output=True, text=True, timeout=15)
+                out = ((lr.stdout or '') + '\n' + (lr.stderr or '')).lower()
+                if lr.returncode == 0 and 'invalid credentials' not in out:
+                    return True
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+            pass
+
+        time.sleep(2)
+        if is_remote:
+            ok, out = _ssh_probe(ak_cfg.get('remote', {}),
+                'docker logs authentik-ldap-1 --since 45s 2>&1', timeout=15)
+            log = (out or '').lower()
+        else:
+            r = subprocess.run(
+                'docker logs authentik-ldap-1 --since 45s 2>&1',
+                shell=True, capture_output=True, text=True, timeout=10)
+            log = (r.stdout or '').lower()
+
+        lines = []
+        for ln in log.splitlines():
+            if dn in ln or (user_hint and user_hint in ln):
+                lines.append(ln)
+        if not lines:
+            continue
+        if any(any(m in ln for m in success_markers) for ln in lines):
+            return True
+        if any(any(m in ln for m in failure_markers) for ln in lines):
+            return False
+
+    return False
 
 
 def _wait_ldap_outpost_ready(timeout_secs=180):
