@@ -22114,22 +22114,27 @@ def _ensure_authentik_ldap_service_account():
 
 def _remove_webadmin_from_userauth():
     """Remove webadmin entry from UserAuthenticationFile.xml so flat-file can't shadow LDAP auth.
-    TAK Server always re-adds <File/> to CoreConfig on startup. If webadmin exists in the flat-file,
-    TAK Server authenticates against the flat-file hash instead of LDAP, causing login failures."""
+    Uses XML parsing to avoid producing malformed XML that crashes TAK Server's FileAuthenticator."""
     uaf = '/opt/tak/UserAuthenticationFile.xml'
     if not os.path.exists(uaf):
         return
     try:
-        with open(uaf, 'r') as f:
-            content = f.read()
-        if 'identifier="webadmin"' not in content:
+        r = subprocess.run(['sudo', 'cat', uaf], capture_output=True, text=True, timeout=10)
+        content = r.stdout if r.returncode == 0 else ''
+        if not content or 'identifier="webadmin"' not in content:
             return
-        lines = content.splitlines(keepends=True)
-        cleaned = [ln for ln in lines if 'identifier="webadmin"' not in ln]
-        new_content = ''.join(cleaned)
+        import xml.etree.ElementTree as ET
+        tree = ET.ElementTree(ET.fromstring(content))
+        root = tree.getroot()
+        removed = False
+        for user in root.findall('.//user'):
+            if user.get('identifier') == 'webadmin':
+                root.remove(user)
+                removed = True
+        if not removed:
+            return
         patch_path = os.path.join(BASE_DIR, 'UserAuthenticationFile.patched.xml')
-        with open(patch_path, 'w') as f:
-            f.write(new_content)
+        tree.write(patch_path, xml_declaration=True, encoding='unicode')
         subprocess.run(['sudo', 'cp', os.path.abspath(patch_path), uaf],
             capture_output=True, text=True, timeout=10)
     except Exception:
@@ -25176,10 +25181,13 @@ def run_takserver_deploy(config):
         log_step(""); log_step("━━━ Step 9/9: Promoting Admin ━━━")
         run_cmd('java -jar /opt/tak/utils/UserManager.jar certmod -A /opt/tak/certs/files/admin.pem 2>&1', "Promoting admin certificate...", check=False)
         webadmin_pass = config.get('webadmin_password', '')
-        if webadmin_pass:
-            log_step("Creating webadmin user...")
+        ak_installed = bool(detect_modules().get('authentik', {}).get('installed'))
+        if webadmin_pass and not ak_installed:
+            log_step("Creating webadmin user (flat-file)...")
             run_cmd(f"java -jar /opt/tak/utils/UserManager.jar usermod -A -p '{webadmin_pass}' webadmin 2>&1", check=False)
             log_step("✓ webadmin user created")
+        elif webadmin_pass and ak_installed:
+            log_step("Authentik detected — webadmin will be created directly in Authentik (skipping flat-file)")
         ne_changed, ne_msg = _sanitize_coreconfig_name_entries()
         if ne_changed:
             log_step(f"  NameEntry fix: {ne_msg}")
