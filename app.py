@@ -19084,7 +19084,7 @@ entries:
       name: LDAP
     attrs:
       authentication_flow: !KeyOf ldap-authentication-flow
-      authorization_flow: !KeyOf ldap-authorization-flow
+      authorization_flow: !KeyOf ldap-authentication-flow
       base_dn: !Context basedn
       bind_mode: cached
       gid_start_number: 4000
@@ -19248,6 +19248,14 @@ volumes:
     driver: local
 """
     compose_content = compose_content.replace('2026.2.0', _ak_latest)
+    _ak_host_for_ldap = _get_authentik_host(settings)
+    if _ak_host_for_ldap:
+        compose_content = compose_content.replace(
+            'AUTHENTIK_HOST: http://authentik-server-1:9000',
+            f'AUTHENTIK_HOST: https://{_ak_host_for_ldap}')
+        compose_content = compose_content.replace(
+            f'    image: ghcr.io/goauthentik/ldap:${{AUTHENTIK_TAG:-{_ak_latest}}}\n    ports:',
+            f'    image: ghcr.io/goauthentik/ldap:${{AUTHENTIK_TAG:-{_ak_latest}}}\n    extra_hosts:\n      - "{_ak_host_for_ldap}:host-gateway"\n    ports:')
     with open('/tmp/authentik_remote_compose.yml', 'w') as f:
         f.write(compose_content)
     ok, _ = _module_copy(deploy_cfg, '/tmp/authentik_remote_compose.yml', '/tmp/docker-compose.yml', log_fn=plog)
@@ -19712,14 +19720,8 @@ def run_authentik_deploy(reconfigure=False):
                                 with open(compose_path) as f:
                                     comp_lines = f.readlines()
                                 comp_new = []
-                                in_ldap_svc = False
                                 for line in comp_lines:
-                                    stripped = line.lstrip()
-                                    if re.match(r'^  \w', line) and not line.startswith('  ldap:'):
-                                        in_ldap_svc = False
-                                    if line.startswith('  ldap:'):
-                                        in_ldap_svc = True
-                                    if 'AUTHENTIK_HOST:' in line and not in_ldap_svc:
+                                    if 'AUTHENTIK_HOST:' in line:
                                         line = re.sub(r'AUTHENTIK_HOST:\s*\S+', f'AUTHENTIK_HOST: {ak_base}', line)
                                     if ':host-gateway"' in line and '"' in line:
                                         line = re.sub(r'(")([^"]+)(":host-gateway")', r'\1' + ak_host + r'\3', line)
@@ -19987,7 +19989,7 @@ entries:
       name: LDAP
     attrs:
       authentication_flow: !KeyOf ldap-authentication-flow
-      authorization_flow: !KeyOf ldap-authorization-flow
+      authorization_flow: !KeyOf ldap-authentication-flow
       base_dn: !Context basedn
       bind_mode: cached
       gid_start_number: 4000
@@ -20113,7 +20115,8 @@ entries:
             if not any('ghcr.io/goauthentik/ldap' in l for l in lines):
                 _ak_host = _get_authentik_host(settings)
                 if _ak_host:
-                    ldap_svc = f"  ldap:\n    image: {ldap_image}\n    extra_hosts:\n      - \"{_ak_host}:host-gateway\"\n    ports:\n    - 389:3389\n    - 636:6636\n    environment:\n      AUTHENTIK_HOST: http://authentik-server-1:9000\n      AUTHENTIK_INSECURE: \"true\"\n      AUTHENTIK_TOKEN: placeholder\n    restart: unless-stopped\n"
+                    _ak_ldap_url = f"https://{_ak_host}"
+                    ldap_svc = f"  ldap:\n    image: {ldap_image}\n    extra_hosts:\n      - \"{_ak_host}:host-gateway\"\n    ports:\n    - 389:3389\n    - 636:6636\n    environment:\n      AUTHENTIK_HOST: {_ak_ldap_url}\n      AUTHENTIK_INSECURE: \"true\"\n      AUTHENTIK_TOKEN: placeholder\n    restart: unless-stopped\n"
                 else:
                     ldap_svc = f"  ldap:\n    image: {ldap_image}\n    ports:\n    - 389:3389\n    - 636:6636\n    environment:\n      AUTHENTIK_HOST: http://authentik-server-1:9000\n      AUTHENTIK_INSECURE: \"true\"\n      AUTHENTIK_TOKEN: placeholder\n    restart: unless-stopped\n"
                 new_lines = []
@@ -20507,14 +20510,10 @@ entries:
                         ldap_provider_pk = None
                         ldap_flow_pk = next((f['pk'] for f in auth_flows if f['slug'] == 'ldap-authentication-flow'), None)
                         ldap_bind_flow = ldap_flow_pk or auth_flow_pk
-                        all_flows_resp = urllib.request.urlopen(
-                            urllib.request.Request(f'{ak_url}/api/v3/flows/instances/?page_size=200', headers=ak_headers), timeout=10)
-                        all_flows = json.loads(all_flows_resp.read().decode()).get('results', [])
-                        ldap_authz_flow = next((f['pk'] for f in all_flows if f['slug'] == 'ldap-authorization-flow'), ldap_bind_flow)
                         try:
                             req = urllib.request.Request(f'{ak_url}/api/v3/providers/ldap/',
                                 data=json.dumps({'name': 'LDAP', 'authentication_flow': ldap_bind_flow,
-                                    'authorization_flow': ldap_authz_flow, 'invalidation_flow': inv_flow_pk,
+                                    'authorization_flow': ldap_bind_flow, 'invalidation_flow': inv_flow_pk,
                                     'base_dn': 'DC=takldap', 'bind_mode': 'cached',
                                     'search_mode': 'cached', 'mfa_support': False}).encode(),
                                 headers=ak_headers, method='POST')
@@ -21890,8 +21889,6 @@ def _ensure_ldap_flow_authentication_none():
     try:
         ldap_flow_results = _get('flows/instances/?slug=ldap-authentication-flow').get('results', [])
         ldap_flow = ldap_flow_results[0] if ldap_flow_results else None
-        ldap_authz_results = _get('flows/instances/?slug=ldap-authorization-flow').get('results', [])
-        ldap_authz_flow = ldap_authz_results[0] if ldap_authz_results else None
         default_flow_results = _get('flows/instances/?slug=default-authentication-flow').get('results', [])
         default_flow = default_flow_results[0] if default_flow_results else None
 
@@ -21981,11 +21978,10 @@ def _ensure_ldap_flow_authentication_none():
             providers = _get('providers/ldap/?search=LDAP').get('results', [])
             ldap_prov = next((p for p in providers if p.get('name') == 'LDAP'), providers[0] if providers else None)
             if ldap_prov:
-                authz_pk = ldap_authz_flow['pk'] if ldap_authz_flow else ldap_flow_pk
                 try:
                     _patch(f'providers/ldap/{ldap_prov["pk"]}/', {
                         'authentication_flow': ldap_flow_pk,
-                        'authorization_flow': authz_pk,
+                        'authorization_flow': ldap_flow_pk,
                         'bind_mode': 'cached',
                         'search_mode': 'cached'})
                 except urllib.error.HTTPError as e:
@@ -22027,23 +22023,12 @@ def _ensure_ldap_flow_authentication_none():
                         'invalid_response_action': b.get('invalid_response_action', 'retry')})
                 except urllib.error.HTTPError:
                     pass
-            authz_flow_pk = ldap_authz_flow['pk'] if ldap_authz_flow else None
-            if not authz_flow_pk:
-                try:
-                    authz_resp = _post('flows/instances/', {
-                        'name': 'ldap-authorization-flow', 'slug': 'ldap-authorization-flow',
-                        'title': 'ldap-authorization-flow', 'designation': 'authorization',
-                        'authentication': 'none', 'layout': 'stacked', 'denied_action': 'message_continue',
-                        'policy_engine_mode': 'any'})
-                    authz_flow_pk = authz_resp['pk']
-                except urllib.error.HTTPError:
-                    authz_flow_pk = new_flow_pk
             providers = _get('providers/ldap/?search=LDAP').get('results', [])
             ldap_provider = next((p for p in providers if p.get('name') == 'LDAP'), providers[0] if providers else None)
             if ldap_provider:
                 _patch(f'providers/ldap/{ldap_provider["pk"]}/', {
                     'authentication_flow': new_flow_pk,
-                    'authorization_flow': authz_flow_pk,
+                    'authorization_flow': new_flow_pk,
                     'bind_mode': 'cached',
                     'search_mode': 'cached'})
     except urllib.error.HTTPError as e:
