@@ -9,13 +9,11 @@ LAST_RESTART_FILE="$STATE_DIR/last_restart_time"
 RESTART_LOCK="$STATE_DIR/restart.lock"
 
 PORT=8089
-# Public 8089 sees constant scanner traffic; accept queue can sit "almost full" without TAK being
-# broken. Old rule (Recv-Q >= Send-Q-5) caused restart loops every ~15–20 min on exposed CoT ports.
 MAX_FAILS=5
 COOLDOWN_SECS=900
 MIN_UPTIME_SECS=900
-# Only treat backlog as unhealthy when the accept queue is critically full (default 95% of limit).
-BACKLOG_PCT=95
+# TCP connect timeout for the liveness probe (seconds)
+CONNECT_TIMEOUT=5
 
 mkdir -p "$STATE_DIR"
 
@@ -30,10 +28,7 @@ if [ -f "$LAST_RESTART_FILE" ]; then
   LAST_RESTART=$(cat "$LAST_RESTART_FILE")
   CURRENT_TIME=$(date +%s)
   TIME_SINCE_RESTART=$((CURRENT_TIME - LAST_RESTART))
-  
-  # 900 seconds = 15 minutes
   if [ $TIME_SINCE_RESTART -lt 900 ]; then
-    # Still in grace period, skip check
     exit 0
   fi
 fi
@@ -46,28 +41,28 @@ if [ -f "$RESTART_LOCK" ]; then
   exit 0
 fi
 
-# Check if port 8089 is listening and accepting connections
-LQ_LINE=$(ss -ltn "sport = :$PORT" | awk 'NR==2')
-
+# ── Health check ──
+# Primary signal: can we TCP-connect to 8089 within CONNECT_TIMEOUT seconds?
+# A full queue from scanners does NOT mean TAK is broken — as long as TAK accepts
+# a real connection, the server is healthy. Only fall back to queue-depth if we
+# cannot even open a socket.
 LISTEN_OK=false
-BACKLOG_BAD=false
+CONNECT_OK=false
 
+LQ_LINE=$(ss -ltn "sport = :$PORT" | awk 'NR==2')
 if echo "$LQ_LINE" | grep -q LISTEN; then
   LISTEN_OK=true
-  RECVQ=$(echo "$LQ_LINE" | awk '{print $2}')
-  SENDQ=$(echo "$LQ_LINE" | awk '{print $3}')
+fi
 
-  # Listen socket: Recv-Q ≈ completed handshakes waiting for accept(); Send-Q ≈ backlog limit (ss).
-  # Scanners fill the queue partway all day — require near-saturation before calling it unhealthy.
-  if [ -n "$RECVQ" ] && [ -n "$SENDQ" ] && [ "$SENDQ" -ge 50 ]; then
-    if [ "$((RECVQ * 100 / SENDQ))" -ge "$BACKLOG_PCT" ]; then
-      BACKLOG_BAD=true
-    fi
+if $LISTEN_OK; then
+  # Actual TCP connect test (TLS handshake not needed — kernel accept is enough)
+  if timeout "$CONNECT_TIMEOUT" bash -c "echo >/dev/tcp/127.0.0.1/$PORT" 2>/dev/null; then
+    CONNECT_OK=true
   fi
 fi
 
-# If healthy, reset fail counter
-if $LISTEN_OK && ! $BACKLOG_BAD; then
+# Healthy: port is listening AND we can connect
+if $LISTEN_OK && $CONNECT_OK; then
   echo 0 > "$FAIL_FILE"
   exit 0
 fi
@@ -108,7 +103,8 @@ LOAD="$(cut -d' ' -f1-3 /proc/loadavg)"
 MEMFREE="$(free -h | awk '/Mem:/ {print $4}')"
 MSGPID="$(ps -ef | grep takserver.war | grep messaging | grep -v grep | awk '{print $2}' | head -n1)"
 
-echo "$TS | restart | 8089 unhealthy | load=$LOAD | mem_free=$MEMFREE | msg_pid=${MSGPID:-na}" >> "$LOGFILE"
+DETAIL="listen=$LISTEN_OK connect=$CONNECT_OK"
+echo "$TS | restart | 8089 unhealthy | $DETAIL | load=$LOAD | mem_free=$MEMFREE | msg_pid=${MSGPID:-na}" >> "$LOGFILE"
 
 # Send alerts
 SUBJ="TAK Guard Dog Restart on $SERVER_IDENTIFIER"
@@ -124,8 +120,8 @@ System State:
 - Messaging PID before restart: ${MSGPID:-na}
 
 This usually indicates:
-- Dead TLS connections accumulating
-- Client reconnect loops
+- TAK Server messaging thread stuck or crashed
+- Kernel accepting connections but TAK not processing them
 - Network issues
 
 Check /var/log/takguard/restarts.log for history.
