@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.3.9-alpha"
+VERSION = "0.4.0-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -1701,17 +1701,17 @@ def update_apply():
             except Exception:
                 pass
 
-        # --force: field installs often have local release tags from old checkouts; if the tag was
-        # moved/republished on GitHub, plain fetch --tags fails with "would clobber existing tag".
-        fetch_all = _git(['fetch', 'origin', '--tags', '--force'], timeout=60)
-        if fetch_all.returncode != 0:
-            return jsonify(_error_payload(_git_err(fetch_all)))
-
-        # Checkout latest release tag so the restarted process runs that version.
-        target_ref = None
+        # Resolve latest tag from GitHub API first, then fetch ONLY that tag (+ = update local tag if
+        # it moved). Bulk `git fetch --tags` fails on many field installs: local v0.3.8-alpha etc.
+        # can differ from origin ("would clobber existing tag") even when the operator only wants
+        # the newest release.
         tag_name = _fetch_latest_tag_name()
+        target_ref = None
         if tag_name:
-            _git(['fetch', '-f', 'origin', 'tag', tag_name, '--no-tags'], timeout=30)
+            refspec = f'+refs/tags/{tag_name}:refs/tags/{tag_name}'
+            fetch_tag = _git(['fetch', 'origin', refspec], timeout=120)
+            if fetch_tag.returncode != 0:
+                return jsonify(_error_payload(_git_err(fetch_tag)))
             verify_tag = _git(['rev-parse', '-q', '--verify', f'refs/tags/{tag_name}'], timeout=15)
             if verify_tag.returncode == 0:
                 target_ref = f'refs/tags/{tag_name}'
