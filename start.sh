@@ -98,20 +98,47 @@ detect_os() {
 }
 
 # ==========================================
-# Wait for Unattended Upgrades
+# Wait for unattended-upgrades / apt-daily / dpkg lock
 # ==========================================
+# Fresh VPS images often run automatic updates at first boot. apt-get in
+# install_dependencies() fails with "Could not get lock" if we don't wait.
 wait_for_upgrades() {
-    if pgrep -f "/usr/bin/unattended-upgrade$" > /dev/null 2>&1; then
-        echo -e "${YELLOW}  System upgrades in progress, waiting...${NC}"
-        SECONDS=0
-        while pgrep -f "/usr/bin/unattended-upgrade$" > /dev/null 2>&1; do
-            printf "\r  Waiting... %02d:%02d elapsed" $((SECONDS/60)) $((SECONDS%60))
-            sleep 2
-        done
-        echo ""
-        echo -e "  ${GREEN}✓ System updates complete${NC}"
-        echo ""
-    fi
+    local waited=0
+    local max_wait=3600
+    local busy=1
+
+    while [ "$waited" -lt "$max_wait" ]; do
+        busy=0
+        if pgrep -f unattended-upgrade > /dev/null 2>&1 || pgrep -f apt.systemd.daily > /dev/null 2>&1; then
+            busy=1
+        fi
+        if command -v fuser > /dev/null 2>&1; then
+            for lock in /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock; do
+                [ -e "$lock" ] || continue
+                if fuser "$lock" > /dev/null 2>&1; then
+                    busy=1
+                    break
+                fi
+            done
+        fi
+        if [ "$busy" -eq 0 ]; then
+            if [ "$waited" -gt 0 ]; then
+                echo ""
+                echo -e "  ${GREEN}✓ Package manager is idle${NC}"
+                echo ""
+            fi
+            return 0
+        fi
+        if [ "$waited" -eq 0 ]; then
+            echo -e "${YELLOW}  Automatic updates / apt are using the package manager (common on first boot). Waiting...${NC}"
+        fi
+        printf "\r  Waiting... %02d:%02d elapsed" $((waited / 60)) $((waited % 60))
+        sleep 2
+        waited=$((waited + 2))
+    done
+    echo ""
+    echo -e "${RED}  Still waiting after 1 hour. Reboot or run: sudo systemctl status unattended-upgrades${NC}"
+    exit 1
 }
 
 # ==========================================

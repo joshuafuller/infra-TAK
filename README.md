@@ -70,11 +70,13 @@ chmod +x start.sh
 sudo ./start.sh
 ```
 
+**First boot / automatic updates:** On a new Ubuntu VPS, **`unattended-upgrades`** or **`apt`** often run right after SSH is available. If **`apt-get`** hits **“Could not get lock”**, wait a few minutes (or check `sudo systemctl status unattended-upgrades` and `ps aux | grep apt`) and run **`sudo ./start.sh`** again. Current **`start.sh`** waits for those jobs and for the **dpkg/apt lock files** to clear before installing packages.
+
 **Branches:** Default clone uses **main** (stable; tagged releases). For latest features and fixes before they're merged to main, use the **dev** branch: `git clone --depth 1 -b dev https://github.com/takwerx/infra-TAK.git`. The README and changelog here reflect main; dev may include remote deployment, UI tweaks, and fixes not yet in a release.
 
 The script will:
 1. Detect your OS (**Ubuntu 22.04 only** for now; goal is a universal installer)
-2. Install Python dependencies
+2. Wait if automatic updates hold **apt/dpkg**, then install Python dependencies
 3. Ask you to set an admin password
 4. Start the web console
 
