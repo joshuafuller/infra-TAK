@@ -6,13 +6,17 @@ One clone. One password. One URL. Manage everything from your browser.
 
 **Latest release: v0.4.1-alpha** — **Update Now** uses an isolated `git fetch` (no default `remote.origin.fetch`), so mismatched local tags no longer cause `would clobber existing tag` during upgrade. Plus **8446 / Authentik / LDAP** (v0.3.9 track) and v0.4.0 single-tag resolution. See [docs/RELEASE-v0.4.1-alpha.md](docs/RELEASE-v0.4.1-alpha.md). Prior: [v0.4.0-alpha](docs/RELEASE-v0.4.0-alpha.md), [v0.3.9-alpha](docs/RELEASE-v0.3.9-alpha.md).
 
-**Console stuck?** On the VPS, jump to **latest `origin/main`** and restart (no release number in the command — same end state as a good **Update Now**):
+**Console stuck?** On the VPS, pull **`main` straight from `takwerx/infra-TAK`** (not from **`git remote -v`** — a fork, typo, or old mirror leaves **`origin/main`** stuck for years; that is why **`git fetch origin main`** can still show **v0.2.4**). Then check **`VERSION`** and restart:
 
 ```bash
-cd $(grep -oP 'WorkingDirectory=\K.*' /etc/systemd/system/takwerx-console.service) && git fetch origin main && git checkout -B main origin/main && sudo systemctl restart takwerx-console
+cd $(grep -oP 'WorkingDirectory=\K.*' /etc/systemd/system/takwerx-console.service)
+git fetch https://github.com/takwerx/infra-TAK.git main
+git checkout --force -B main FETCH_HEAD
+grep '^VERSION' app.py
+sudo systemctl restart takwerx-console
 ```
 
-Shallow or broken clones: [docs/PULL-AND-RESTART.md](docs/PULL-AND-RESTART.md). More detail: **Update stuck?** below.
+Optional after that: **`git remote set-url origin https://github.com/takwerx/infra-TAK.git`** so later **`git fetch origin`** matches upstream. Shallow-clone errors: [docs/PULL-AND-RESTART.md](docs/PULL-AND-RESTART.md). More detail: **Update stuck?** below.
 
 **Goal: universal installer.** Currently supported platform: **Ubuntu 22.04 LTS**.
 
@@ -64,17 +68,21 @@ Then open your browser to the URL shown and log in.
 
 ## Update stuck? (merge conflict, tag clobber, or bad git state)
 
-Use this if **Update Now** errors (rebase/merge messages, **`would clobber existing tag`**, etc.). It does **not** hardcode a release number: you move to **current `origin/main`** (stable branch), then restart. No data or config is lost — **`.config/`** is untouched.
+Use this if **Update Now** errors (rebase/merge messages, **`would clobber existing tag`**, etc.). Fetch **canonical** **`main`** (same URL as **Quick Start**), not **`origin/main`**, unless you have confirmed **`git remote -v`** is **`takwerx/infra-TAK`**. No data or config is lost — **`.config/`** is untouched.
 
 ```bash
-cd $(grep -oP 'WorkingDirectory=\K.*' /etc/systemd/system/takwerx-console.service) && git fetch origin main && git checkout -B main origin/main && sudo systemctl restart takwerx-console
+cd $(grep -oP 'WorkingDirectory=\K.*' /etc/systemd/system/takwerx-console.service)
+git fetch https://github.com/takwerx/infra-TAK.git main
+git checkout --force -B main FETCH_HEAD
+grep '^VERSION' app.py
+sudo systemctl restart takwerx-console
 ```
 
-If **`grep -oP`** is not available, run `grep WorkingDirectory /etc/systemd/system/takwerx-console.service`, `cd` to that path, then run **`git fetch origin main`**, **`git checkout -B main origin/main`**, and **`sudo systemctl restart takwerx-console`** separately.
+If **`grep -oP`** is not available, run **`grep WorkingDirectory /etc/systemd/system/takwerx-console.service`**, **`cd`** to that path, then run the **`git fetch`** … **`restart`** lines above (without the **`cd`** line).
 
 **Shallow / single-branch clones** (`fetch` errors): [docs/PULL-AND-RESTART.md](docs/PULL-AND-RESTART.md) (e.g. **`git remote set-branches origin '*'`** once, then retry).
 
-**What happened:** Older consoles used **`git pull --rebase`** (v0.2.4–v0.2.5) or bulk **`git fetch --tags`** (later), which can fail on field installs. Current **Update Now** (v0.4.1+) fetches in an isolated way; **checking out `main`** gets you that code without naming a tag in docs.
+**What happened:** Older consoles used **`git pull --rebase`** (v0.2.4–v0.2.5) or bulk **`git fetch --tags`** (later), which can fail on field installs. Current **Update Now** (v0.4.1+) fetches in an isolated way. **SSH recovery** must not trust **`origin`** if that remote is wrong — use the **`https://github.com/takwerx/infra-TAK.git`** fetch above.
 
 ## Recovery / backdoor (when Authentik or Caddy is broken)
 
