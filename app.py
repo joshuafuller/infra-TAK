@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.4.0-alpha"
+VERSION = "0.4.1-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -1672,10 +1672,15 @@ def update_apply():
     console_dir = os.path.dirname(os.path.abspath(__file__))
     git_env = {'GIT_TERMINAL_PROMPT': '0'}
     git_cfg = ['git', '-c', f'safe.directory={console_dir}']
+    # Empty remote.origin.fetch: explicit refspecs are *additive* with defaults; without this,
+    # `git fetch origin +refs/tags/foo:refs/tags/foo` still updates heads/tags per origin.fetch
+    # and can hit "would clobber existing tag" on field installs.
+    git_cfg_fetch_isolated = git_cfg + ['-c', 'remote.origin.fetch=']
 
-    def _git(args, timeout=60):
+    def _git(args, timeout=60, isolated_fetch=False):
+        prefix = git_cfg_fetch_isolated if isolated_fetch else git_cfg
         return subprocess.run(
-            git_cfg + args,
+            prefix + args,
             cwd=console_dir,
             capture_output=True,
             text=True,
@@ -1709,7 +1714,7 @@ def update_apply():
         target_ref = None
         if tag_name:
             refspec = f'+refs/tags/{tag_name}:refs/tags/{tag_name}'
-            fetch_tag = _git(['fetch', 'origin', refspec], timeout=120)
+            fetch_tag = _git(['fetch', 'origin', refspec], timeout=120, isolated_fetch=True)
             if fetch_tag.returncode != 0:
                 return jsonify(_error_payload(_git_err(fetch_tag)))
             verify_tag = _git(['rev-parse', '-q', '--verify', f'refs/tags/{tag_name}'], timeout=15)
@@ -1718,7 +1723,9 @@ def update_apply():
 
         # Fallback: track origin/main if tag lookup fails.
         if not target_ref:
-            fetch_main = _git(['fetch', 'origin', 'main:refs/remotes/origin/main'], timeout=30)
+            fetch_main = _git(
+                ['fetch', 'origin', 'main:refs/remotes/origin/main'], timeout=30, isolated_fetch=True
+            )
             if fetch_main.returncode != 0:
                 return jsonify(_error_payload(_git_err(fetch_main)))
             target_ref = 'refs/remotes/origin/main'
