@@ -55,8 +55,9 @@ if echo "$LQ_LINE" | grep -q LISTEN; then
 fi
 
 if $LISTEN_OK; then
-  # Actual TCP connect test (TLS handshake not needed — kernel accept is enough)
-  if timeout "$CONNECT_TIMEOUT" bash -c "echo >/dev/tcp/127.0.0.1/$PORT" 2>/dev/null; then
+  # TCP connect: kernel-level accept is enough (TLS handshake not needed).
+  # nc -z is reliable on Ubuntu (netcat-openbsd, installed by default).
+  if nc -z -w "$CONNECT_TIMEOUT" 127.0.0.1 "$PORT" 2>/dev/null; then
     CONNECT_OK=true
   fi
 fi
