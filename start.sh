@@ -124,14 +124,24 @@ install_dependencies() {
         apt)
             export DEBIAN_FRONTEND=noninteractive
             export NEEDRESTART_MODE=a
-            apt-get update -qq > /dev/null 2>&1
+            # Do not hide apt output: with set -e, a failed apt-get would exit the script silently if stderr were discarded.
+            if ! apt-get update -qq; then
+                echo -e "${RED}  apt-get update failed. Fix network/apt sources, then re-run sudo ./start.sh${NC}"
+                exit 1
+            fi
             # Dpkg options avoid config prompts; NEEDRESTART_MODE=a avoids "Which services should be restarted?" dialog
-            NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            if ! NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get install -y \
                 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" \
-                python3 python3-pip python3-venv openssl sshpass > /dev/null 2>&1
+                python3 python3-pip python3-venv openssl sshpass; then
+                echo -e "${RED}  apt-get install failed. Try: sudo apt-get install -y python3 python3-pip python3-venv openssl sshpass${NC}"
+                exit 1
+            fi
             ;;
         dnf)
-            dnf install -y python3 python3-pip openssl sshpass > /dev/null 2>&1
+            if ! dnf install -y python3 python3-pip openssl sshpass; then
+                echo -e "${RED}  dnf install failed. Install python3, python3-pip, openssl, sshpass and re-run.${NC}"
+                exit 1
+            fi
             ;;
         *)
             echo -e "${RED}  Cannot auto-install dependencies for $PKG_MGR${NC}"
@@ -142,12 +152,25 @@ install_dependencies() {
 
     # Create virtual environment if it doesn't exist
     if [ ! -d "$INSTALL_DIR/.venv" ]; then
-        python3 -m venv "$INSTALL_DIR/.venv" 2>/dev/null || python3 -m venv "$INSTALL_DIR/.venv" --without-pip
+        if ! python3 -m venv "$INSTALL_DIR/.venv" && ! python3 -m venv "$INSTALL_DIR/.venv" --without-pip; then
+            echo -e "${RED}  python3 -m venv failed. Install package python3-venv (apt) and re-run.${NC}"
+            exit 1
+        fi
     fi
 
-    # Install Flask and dependencies in venv
-    "$INSTALL_DIR/.venv/bin/pip" install --quiet flask psutil werkzeug gunicorn 2>/dev/null || \
-        "$INSTALL_DIR/.venv/bin/pip" install flask psutil werkzeug gunicorn
+    if [ ! -x "$INSTALL_DIR/.venv/bin/pip" ]; then
+        echo -e "${RED}  No pip in .venv. Install python3-venv, remove $INSTALL_DIR/.venv, re-run.${NC}"
+        exit 1
+    fi
+
+    # Install Flask and dependencies in venv (show errors; quiet only on success path)
+    if ! "$INSTALL_DIR/.venv/bin/pip" install --quiet flask psutil werkzeug gunicorn; then
+        echo -e "${YELLOW}  Retrying pip install without --quiet...${NC}"
+        "$INSTALL_DIR/.venv/bin/pip" install flask psutil werkzeug gunicorn || {
+            echo -e "${RED}  pip install failed. Check network / PyPI and re-run.${NC}"
+            exit 1
+        }
+    fi
 
     echo -e "  ${GREEN}✓ Dependencies installed${NC}"
     echo ""
