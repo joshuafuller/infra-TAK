@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.4.1-alpha"
+VERSION = "0.4.2-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -9069,9 +9069,17 @@ def _takportal_build_settings_dict(settings):
     else:
         auth_url_host = ak_upstream.split(':')[0]
     auth_url_port = '9090' if ak_upstream == '127.0.0.1:9090' else (ak_upstream.split(':')[1] if ':' in ak_upstream else '9090')
-    # Container-to-host path for TAK Server API calls used by TAK Portal dashboard stats.
-    # Use server_ip first (same-host reliable path) and fall back to configured TAK host.
-    tak_url_host = server_ip if (server_ip and server_ip not in ('localhost', '127.0.0.1')) else (_get_takserver_host(settings) or 'host.docker.internal')
+    # TAK_URL host for HTTPS to :8443/Marti inside the portal container.
+    # Prefer takserver.<fqdn> when FQDN is set — TAK certs are issued for DNS names; using
+    # server_ip breaks TLS hostname verification ("identity could not be verified").
+    # Fall back to server_ip for IP-only / no-FQDN installs; then Docker host aliases.
+    tak_dns = (_get_takserver_host(settings) or '').strip()
+    if settings.get('fqdn') and tak_dns:
+        tak_url_host = tak_dns
+    elif server_ip and server_ip not in ('localhost', '127.0.0.1'):
+        tak_url_host = server_ip
+    else:
+        tak_url_host = tak_dns or 'host.docker.internal'
     return {
         "AUTHENTIK_URL": f"http://{auth_url_host}:{auth_url_port}",
         "AUTHENTIK_TOKEN": ak_token or "",
