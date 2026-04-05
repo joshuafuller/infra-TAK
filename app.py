@@ -20953,18 +20953,8 @@ entries:
 
         plog("")
         plog("=" * 50)
-        plog("\u2713 Authentik deployed successfully!")
-        plog(f"  Admin UI: {_get_authentik_base_url(settings)}")
-        plog(f"  Admin user: akadmin")
-        if bootstrap_pass_display:
-            plog(f"  Admin password: {'*' * max(0, len(bootstrap_pass_display) - 4) + bootstrap_pass_display[-4:]}")
-        plog("")
-        plog("  LDAP Configuration:")
-        plog(f"  - Service account: adm_ldapservice")
-        if ldap_svc_pass:
-            plog(f"  - Service password: {'*' * max(0, len(ldap_svc_pass) - 4) + ldap_svc_pass[-4:]}")
-        plog(f"  - Base DN: DC=takldap")
-        plog(f"  - LDAP port: 389")
+        plog("  Finishing: Caddy, Email Relay (if configured), final LDAP restart, then mandatory SA bind check.")
+        plog("  (Success is reported only after the bind passes — avoids deploying TAK on a broken LDAP outpost.)")
         # Regenerate Caddyfile if Caddy is configured — wait for HTTP 9090 first so Caddy doesn't get 502s
         if settings.get('fqdn'):
             plog("")
@@ -20996,25 +20986,51 @@ entries:
             except Exception as e:
                 plog(f"  ⚠ Authentik SMTP auto-config failed: {e}")
                 plog("  You can run it from Email Relay → 'Configure Authentik to use these settings'.")
-        plog("=" * 50)
-        plog("  Next steps:")
-        plog("  1. Launch Authentik Admin (link below), then come back and refresh this page to get the akadmin password.")
-        plog("     After logging in: Admin interface → Groups → authentik Admins → Users → Add new user (additional Admin users).")
-        if not relay.get('from_addr'):
-            plog("  2. Go to Email Relay and set up SMTP; then use 'Configure Authentik to use these settings'.")
-        else:
-            plog("  2. SMTP and password recovery are already configured (Email Relay was set up).")
-        plog("=" * 50)
-        # Final LDAP restart: ensure container has the injected token and internal URL
+        # Final LDAP restart: ensure container has the injected token and internal URL (after SMTP/recreate)
         try:
             subprocess.run(f'cd {ak_dir} && docker compose restart ldap 2>&1',
                 shell=True, capture_output=True, text=True, timeout=60)
             plog("  ✓ LDAP container restarted (final)")
         except Exception:
             pass
+        if not ldap_svc_pass:
+            with open(env_path) as f:
+                for line in f:
+                    if line.strip().startswith('AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD='):
+                        ldap_svc_pass = line.strip().split('=', 1)[1].strip()
+                        break
+        time.sleep(3)
+        if not _authentik_deploy_final_verify_ldap_sa(ldap_svc_pass, plog):
+            _update_boot_stagger_service()
+            authentik_deploy_status.update({'running': False, 'complete': False, 'error': True})
+            return
+        plog("")
+        plog("=" * 50)
+        plog("\u2713 Authentik deployed successfully!")
+        plog(f"  Admin UI: {_get_authentik_base_url(settings)}")
+        plog(f"  Admin user: akadmin")
+        if bootstrap_pass_display:
+            plog(f"  Admin password: {'*' * max(0, len(bootstrap_pass_display) - 4) + bootstrap_pass_display[-4:]}")
+        plog("")
+        plog("  LDAP Configuration:")
+        plog(f"  - Service account: adm_ldapservice")
+        if ldap_svc_pass:
+            plog(f"  - Service password: {'*' * max(0, len(ldap_svc_pass) - 4) + ldap_svc_pass[-4:]}")
+        plog(f"  - Base DN: DC=takldap")
+        plog(f"  - LDAP port: 389")
+        plog("=" * 50)
+        plog("  Next steps (typical order; Email Relay may already be done on your system):")
+        plog("  1. Launch Authentik Admin when needed; refresh this page to reveal akadmin password if required.")
+        plog("     Additional admins: Admin → Groups → authentik Admins → Users.")
+        if not relay.get('from_addr'):
+            plog("  2. Email Relay: set up SMTP, then 'Configure Authentik to use these settings' (before or after TAK, but before you rely on password reset email).")
+        else:
+            plog("  2. Email Relay: SMTP is already configured — this deploy applied or will apply Authentik email when that step succeeded above.")
+        plog("  3. TAK Server: deploy only after this log shows the LDAP SA bind verified (above).")
+        plog("=" * 50)
         plog("  ✓ Deploy complete.")
         _update_boot_stagger_service()
-        authentik_deploy_status.update({'running': False, 'complete': True})
+        authentik_deploy_status.update({'running': False, 'complete': True, 'error': False})
     except Exception as e:
         plog(f"\u2717 FATAL ERROR: {str(e)}")
         authentik_deploy_status.update({'running': False, 'error': True})
@@ -21307,11 +21323,12 @@ It provides centralized user authentication and management for all your services
 <div style="background:rgba(16,185,129,0.1);border:1px solid var(--border);border-radius:10px;padding:20px;margin-top:20px;text-align:center">
 <div style="font-family:'JetBrains Mono',monospace;font-size:14px;color:var(--green);margin-bottom:8px">✓ Authentik deployed!</div>
 <div style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--cyan);margin-bottom:12px;text-align:left">
-<strong>Next steps:</strong><br>
-1. <strong>Configure SMTP</strong> — go to <a href="/emailrelay" style="color:var(--cyan)">Email Relay</a>, configure SMTP, then click &quot;Configure Authentik to use these settings&quot;.<br>
-2. <strong>Deploy TAK Server</strong> — go to <a href="/takserver" style="color:var(--cyan)">TAK Server</a>, upload .deb/.rpm and deploy.<br>
-3. <strong>Deploy TAK Portal</strong> — go to <a href="/takportal" style="color:var(--cyan)">TAK Portal</a> and deploy when ready.<br>
-You can also open the Authentik admin UI below to make additional Admin users (Admin → Groups → authentik Admins → Users).
+<strong>Typical order</strong> (Email Relay may already be configured on your host):<br>
+1. <strong>Authentik</strong> — use the admin link below; deploy log must show LDAP SA bind verified before TAK.<br>
+2. <strong>SMTP</strong> — <a href="/emailrelay" style="color:var(--cyan)">Email Relay</a>: configure if needed, then &quot;Configure Authentik&quot;.<br>
+3. <strong>TAK Server</strong> — <a href="/takserver" style="color:var(--cyan)">TAK Server</a> after LDAP is healthy.<br>
+4. <strong>TAK Portal</strong> — <a href="/takportal" style="color:var(--cyan)">TAK Portal</a> when ready.<br>
+Additional admins: Authentik → Groups → authentik Admins → Users.
 </div>
 <a href="{{ authentik_base_url }}" target="_blank" rel="noopener noreferrer" style="display:inline-block;padding:12px 24px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;text-decoration:none;margin-right:10px">Authentik</a>
 <a href="/emailrelay" style="display:inline-block;padding:10px 24px;background:rgba(30,64,175,0.2);color:var(--cyan);border:1px solid var(--border);border-radius:8px;font-size:14px;font-weight:600;text-decoration:none;margin-right:10px">Email Relay</a>
@@ -21430,7 +21447,7 @@ function pollDeployLog(){
             var el=document.getElementById('deploy-log');
             var inst=document.createElement('div');
             inst.style.cssText='font-family:JetBrains Mono,monospace;font-size:12px;color:var(--cyan);margin-top:16px;margin-bottom:8px;text-align:left;line-height:1.6';
-            inst.innerHTML='<strong>Next steps:</strong><br>1. Configure <strong>SMTP</strong> (Email Relay), then &quot;Configure Authentik&quot;.<br>2. Deploy <strong>TAK Server</strong>.<br>3. Deploy <strong>TAK Portal</strong> when ready.<br>Use &quot;Launch Authentik Admin&quot; below to make additional Admin users.';
+            inst.innerHTML='<strong>Typical order</strong> (SMTP may already be set):<br>1. <strong>Authentik</strong> — deploy log showed LDAP SA bind OK.<br>2. <strong>Email Relay</strong> if you still need SMTP / &quot;Configure Authentik&quot;.<br>3. <strong>TAK Server</strong>, then <strong>TAK Portal</strong> when ready.';
             el.appendChild(inst);
             var authUrl=el.getAttribute('data-authentik-url')||'';
             var launchLink=document.createElement('a');
@@ -21829,6 +21846,30 @@ def _test_ldap_bind_dn(bind_dn, bind_pass):
     return False
 
 
+def _authentik_deploy_final_verify_ldap_sa(ldap_svc_pass, plog, attempts=12, delay_sec=5):
+    """After Caddy/SMTP/final LDAP restart, require a real SA bind before deploy success.
+
+    Stops false 'deploy complete' when the outpost or flow is broken (common after SMTP recreate).
+    """
+    sa_dn = 'cn=adm_ldapservice,ou=users,dc=takldap'
+    if not (ldap_svc_pass or '').strip():
+        plog("  \u2717 No AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD in .env — cannot verify LDAP SA bind.")
+        return False
+    if not _ensure_ldapsearch():
+        plog("  \u2717 ldapsearch not available — install ldap-utils (Debian) or openldap-clients (RHEL).")
+        return False
+    for i in range(1, attempts + 1):
+        plog(f"  Final check: LDAP SA bind ({i}/{attempts})...")
+        if _test_ldap_bind_dn(sa_dn, ldap_svc_pass):
+            plog("  \u2713 LDAP service-account bind verified (adm_ldapservice). Safe to proceed to TAK Server.")
+            return True
+        if i < attempts:
+            time.sleep(delay_sec)
+    plog("  \u2717 Final LDAP SA bind failed after Caddy/SMTP/restart.")
+    plog("     Check: docker logs authentik-ldap-1 — fix flow/outpost errors before deploying TAK Server.")
+    return False
+
+
 def _wait_ldap_outpost_ready(timeout_secs=180):
     """Wait until LDAP outpost container is ready enough for bind checks.
 
@@ -22172,10 +22213,12 @@ def _remove_webadmin_from_userauth():
         tree = ET.ElementTree(ET.fromstring(content))
         root = tree.getroot()
         removed = False
-        for user in root.findall('.//user'):
-            if user.get('identifier') == 'webadmin':
-                root.remove(user)
-                removed = True
+        # Remove from actual parent — root.remove() only works for direct children; nested <user> would raise and be swallowed.
+        for parent in root.iter():
+            for child in list(parent):
+                if child.tag == 'user' and child.get('identifier') == 'webadmin':
+                    parent.remove(child)
+                    removed = True
         if not removed:
             return
         patch_path = os.path.join(BASE_DIR, 'UserAuthenticationFile.patched.xml')
@@ -22299,7 +22342,7 @@ def _apply_ldap_to_coreconfig():
 
 def _ensure_authentik_webadmin(skip_bind_verify=False):
     """Ensure webadmin exists in Authentik with password from settings; 8446 uses LDAP when CoreConfig has <ldap/>.
-    skip_bind_verify=True skips the LDAP bind test + outpost restart (used during deploy).
+    skip_bind_verify=True skips LDAP outpost recreate and bind verification (default False — TAK deploy and Sync webadmin use full verify).
     Returns (True, None) on success, (False, error_msg) on failure."""
     import urllib.request as _req
     import urllib.error
