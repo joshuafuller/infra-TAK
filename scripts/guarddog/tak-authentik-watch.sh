@@ -17,12 +17,33 @@ UPTIME_SECS=$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0)
 AK_DIR="${HOME:-/root}/authentik"
 [ ! -f "$AK_DIR/docker-compose.yml" ] && exit 0
 
-# Health: HTTP to Authentik server (9090)
-CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 http://127.0.0.1:9090/ 2>/dev/null || echo "000")
-if [ "$CODE" = "200" ] || [ "$CODE" = "302" ] || [ "$CODE" = "301" ]; then
+# Health: liveness endpoint if present, else root (redirects OK). Double attempt with pause
+# reduces restarts on transient 500/503 during worker/DB blips (one timer tick).
+ak_http_ok() {
+  local url code
+  for url in \
+    "http://127.0.0.1:9090/-/health/live/" \
+    "http://127.0.0.1:9090/"; do
+    code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 "$url" 2>/dev/null || echo "000")
+    case "$code" in
+      200|204|301|302) return 0 ;;
+    esac
+  done
+  AK_LAST_CODE="$code"
+  return 1
+}
+
+CODE="000"
+if ak_http_ok; then
   echo 0 > "$FAIL_FILE"
   exit 0
 fi
+sleep 3
+if ak_http_ok; then
+  echo 0 > "$FAIL_FILE"
+  exit 0
+fi
+CODE="${AK_LAST_CODE:-$CODE}"
 
 # Failure
 FAILS=$(( $(cat "$FAIL_FILE" 2>/dev/null || echo 0) + 1 ))

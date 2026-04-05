@@ -4,7 +4,7 @@ Tea Awarness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Latest release: v0.4.3-alpha** — **Guard Dog** port **8089** monitor no longer restarts TAK on **scanner-noisy** public CoT ports (accept queue must be **~95%** full; **5** fails). After upgrading: **Guard Dog → ↻ Update Guard Dog** (see [docs/RELEASE-v0.4.3-alpha.md](docs/RELEASE-v0.4.3-alpha.md)). Still includes **v0.4.2** TAK Portal **`TAK_URL`** FQDN + **Update config**, **Update Now** isolation, Authentik track. Prior: [v0.4.2-alpha](docs/RELEASE-v0.4.2-alpha.md), [v0.4.1-alpha](docs/RELEASE-v0.4.1-alpha.md).
+**Latest release: v0.4.3-alpha** — **Guard Dog:** port **8089** (accept queue **~95%** + **5** fails); **Authentik** probe (**`/-/health/live/`** or **`/`**, short retry); **Auto-VACUUM** clearer skip logs. After upgrading: **Guard Dog → ↻ Update Guard Dog** (see [docs/RELEASE-v0.4.3-alpha.md](docs/RELEASE-v0.4.3-alpha.md)). Still includes **v0.4.2** TAK Portal **`TAK_URL`** FQDN + **Update config**, **Update Now** isolation, Authentik track. Prior: [v0.4.2-alpha](docs/RELEASE-v0.4.2-alpha.md), [v0.4.1-alpha](docs/RELEASE-v0.4.1-alpha.md).
 
 **Something broken?** Wrong sidebar version, **Update Now** error, merge/rebase/tag-clobber messages, or you are not sure the VPS ever pulled the real repo → go to **[Universal recovery (SSH)](#universal-recovery-ssh)** and run the one block there. **Point people at that section**; it is the single source of truth.
 

@@ -125,7 +125,11 @@ fi
 
 DEAD_RAW=$(psql_scalar "$DEAD_SQL")
 if [ -z "$DEAD_RAW" ]; then
-  log_line "Auto-VACUUM: could not read dead tuple count (psql/SSH failed), skipped"
+  if [ "$TWO_SERVER_MODE" = "1" ]; then
+    log_line "Auto-VACUUM: could not read dead tuple count (SSH/psql failed), two_server=1 target=${SSH_USER}@${SSH_TARGET}, skipped"
+  else
+    log_line "Auto-VACUUM: could not read dead tuple count (local psql failed), two_server=0, skipped"
+  fi
   exit 1
 fi
 
