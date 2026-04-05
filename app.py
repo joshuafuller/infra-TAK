@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.3.8-alpha"
+VERSION = "0.3.9-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -2850,16 +2850,33 @@ def _recommended_takserver_heap_gb(total_ram_gb):
 
 
 def _get_current_takserver_heap_gb():
-    """Return current -Xmx heap in GB from systemd drop-in if set, else None."""
+    """Return current total JVM heap in GB from /etc/default/takserver or setenv.sh, else None."""
     import re
-    dropin = '/etc/systemd/system/takserver.service.d/heap.conf'
+    defaults_file = '/etc/default/takserver'
+    for path in [defaults_file]:
+        content = None
+        try:
+            with open(path, 'r') as f:
+                content = f.read()
+        except (OSError, IOError):
+            try:
+                r = subprocess.run(f'sudo cat {path} 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
+                if r.returncode == 0 and r.stdout:
+                    content = r.stdout
+            except Exception:
+                pass
+        if content:
+            m = re.search(r'# infra-TAK total heap: (\d+)g', content)
+            if m:
+                return int(m.group(1))
+    setenv = '/opt/tak/setenv.sh'
     content = None
     try:
-        with open(dropin, 'r') as f:
+        with open(setenv, 'r') as f:
             content = f.read()
     except (OSError, IOError):
         try:
-            r = subprocess.run(f'sudo cat {dropin} 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
+            r = subprocess.run(f'sudo cat {setenv} 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
             if r.returncode == 0 and r.stdout:
                 content = r.stdout
         except Exception:
@@ -2884,7 +2901,7 @@ def takserver_heap_info():
 @app.route('/api/takserver/set-heap', methods=['POST'])
 @login_required
 def takserver_set_heap():
-    """Set TAK Server JVM heap via systemd drop-in and restart. Applies on this host (where core runs)."""
+    """Set TAK Server JVM heap via /etc/default/takserver (individual MAX_HEAP vars) and restart."""
     data = request.get_json() or {}
     heap_gb = data.get('heap_gb')
     total_ram_gb = _get_total_ram_gb_local()
@@ -2892,35 +2909,57 @@ def takserver_set_heap():
         heap_gb = _recommended_takserver_heap_gb(total_ram_gb)
     try:
         heap_gb = int(heap_gb)
-        if heap_gb < 2 or heap_gb > 32:
-            return jsonify({'success': False, 'error': 'heap_gb must be between 2 and 32'}), 400
+        if heap_gb < 2 or heap_gb > 64:
+            return jsonify({'success': False, 'error': 'heap_gb must be between 2 and 64'}), 400
     except (TypeError, ValueError):
         return jsonify({'success': False, 'error': 'heap_gb must be an integer'}), 400
-    xms = max(2, heap_gb // 2)
-    opts = f'-Xms{xms}g -Xmx{heap_gb}g'
-    dropin_dir = '/etc/systemd/system/takserver.service.d'
-    dropin_file = os.path.join(dropin_dir, 'heap.conf')
-    cmd_mkdir = f'sudo mkdir -p {dropin_dir}'
-    cmd_write = f'echo \'[Service]\nEnvironment="CATALINA_OPTS={opts}"\' | sudo tee {dropin_file}'
-    cmd_reload = 'sudo systemctl daemon-reload'
-    cmd_restart = 'sudo systemctl restart takserver'
+
+    import re as _re
+    total_mb = heap_gb * 1024
+    w_config = 1.0 / 35000
+    w_api = 1.0 / 6300
+    w_msg = 1.0 / 6300
+    w_plugin = 1.0 / 30000
+    w_retain = 1.0 / 30000
+    w_total = w_config + w_api + w_msg + w_plugin + w_retain
+    config_mb = int(total_mb * w_config / w_total)
+    api_mb = int(total_mb * w_api / w_total)
+    msg_mb = int(total_mb * w_msg / w_total)
+    plugin_mb = int(total_mb * w_plugin / w_total)
+    retain_mb = int(total_mb * w_retain / w_total)
+
+    defaults_content = (
+        f"# infra-TAK total heap: {heap_gb}g\n"
+        f"# Proportional split across TAK Server processes (same ratios as setenv.sh defaults)\n"
+        f"export CONFIG_MAX_HEAP={config_mb}\n"
+        f"export API_MAX_HEAP={api_mb}\n"
+        f"export MESSAGING_MAX_HEAP={msg_mb}\n"
+        f"export PLUGIN_MANAGER_MAX_HEAP={plugin_mb}\n"
+        f"export RETENTION_MAX_HEAP={retain_mb}\n"
+    )
+    defaults_file = '/etc/default/takserver'
     try:
-        for c in (cmd_mkdir, cmd_write, cmd_reload, cmd_restart):
-            r = subprocess.run(c, shell=True, capture_output=True, text=True, timeout=30)
-            if r.returncode != 0 and c == cmd_restart:
-                return jsonify({
-                    'success': False,
-                    'error': f'Restart failed: {(r.stderr or r.stdout or "unknown").strip()[:200]}'
-                }), 500
-            if r.returncode != 0:
-                return jsonify({'success': False, 'error': (r.stderr or r.stdout or '').strip()[:200]}), 500
+        w = subprocess.run(f"sudo tee {defaults_file} > /dev/null", shell=True, input=defaults_content, capture_output=True, text=True, timeout=10)
+        if w.returncode != 0:
+            return jsonify({'success': False, 'error': f'Failed to write {defaults_file}: {(w.stderr or "").strip()[:200]}'}), 500
+
+        setenv = '/opt/tak/setenv.sh'
+        r = subprocess.run(f'sudo cat {setenv}', shell=True, capture_output=True, text=True, timeout=10)
+        if r.returncode == 0 and r.stdout:
+            cleaned = _re.sub(r'\n*export JAVA_OPTS="\$JAVA_OPTS\s+-Xms\d+[gGmM]\s+-Xmx\d+[gGmM]"\n*', '\n', r.stdout)
+            if cleaned != r.stdout:
+                subprocess.run(f"sudo tee {setenv} > /dev/null", shell=True, input=cleaned, capture_output=True, text=True, timeout=10)
+
+        rr = subprocess.run('sudo systemctl restart takserver', shell=True, capture_output=True, text=True, timeout=120)
+        if rr.returncode != 0:
+            return jsonify({'success': False, 'error': f'Restart failed: {(rr.stderr or rr.stdout or "unknown").strip()[:200]}'}), 500
     except subprocess.TimeoutExpired:
         return jsonify({'success': False, 'error': 'Command timed out'}), 500
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)[:200]}), 500
     return jsonify({
         'success': True,
-        'message': f'TAK Server heap set to -Xmx{heap_gb}g and restarted.',
+        'message': f'TAK Server heap set to {heap_gb} GB total across 5 processes and restarted.',
         'heap_gb': heap_gb,
         'current_heap_gb': heap_gb,
         'total_ram_gb': total_ram_gb,
@@ -3047,6 +3086,14 @@ def guarddog_js():
 @app.route('/firewall.js')
 def firewall_js():
     resp = send_from_directory(os.path.join(BASE_DIR, 'static'), 'firewall.js', mimetype='application/javascript')
+    resp.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    resp.headers['Pragma'] = 'no-cache'
+    resp.headers['Expires'] = '0'
+    return resp
+
+@app.route('/log-tools.js')
+def log_tools_js():
+    resp = send_from_directory(os.path.join(BASE_DIR, 'static'), 'log-tools.js', mimetype='application/javascript')
     resp.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
     resp.headers['Pragma'] = 'no-cache'
     resp.headers['Expires'] = '0'
@@ -8235,7 +8282,13 @@ def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
         shell=True)
     log_fn("  ✓ JKS installed to /opt/tak/certs/files/takserver-le.jks")
 
-    # Step C: Patch CoreConfig.xml 8446 connector
+    # Step C: Stop TAK Server, patch CoreConfig.xml 8446 connector, then start.
+    # TAK Server overwrites CoreConfig.xml on restart with its in-memory state,
+    # so we must stop it first to prevent our patch from being reverted.
+    subprocess.run('systemctl stop takserver 2>/dev/null; true', shell=True, capture_output=True)
+    time.sleep(10)
+    subprocess.run('pkill -9 -f takserver 2>/dev/null; true', shell=True, capture_output=True)
+    time.sleep(5)
     try:
         with open(core_config, 'r') as f:
             content = f.read()
@@ -8343,10 +8396,10 @@ WantedBy=timers.target
         shell=True, capture_output=True)
     log_fn("  ✓ Auto-renewal timer enabled (monthly)")
 
-    # Step F: Restart TAK Server to load new cert
-    log_fn("  Restarting TAK Server to load LE cert on port 8446...")
-    subprocess.run('systemctl restart takserver 2>/dev/null; true', shell=True, capture_output=True)
-    log_fn("  ✓ TAK Server restarted")
+    # Step F: Start TAK Server (was stopped in Step C before CoreConfig patch)
+    log_fn("  Starting TAK Server with LE cert on port 8446...")
+    subprocess.run('systemctl start takserver 2>/dev/null; true', shell=True, capture_output=True)
+    log_fn("  ✓ TAK Server started")
     log_fn("✓ Port 8446 now serving Let's Encrypt cert — ready for TAK clients")
     return True
 
@@ -9007,6 +9060,9 @@ def _takportal_build_settings_dict(settings):
     else:
         auth_url_host = ak_upstream.split(':')[0]
     auth_url_port = '9090' if ak_upstream == '127.0.0.1:9090' else (ak_upstream.split(':')[1] if ':' in ak_upstream else '9090')
+    # Container-to-host path for TAK Server API calls used by TAK Portal dashboard stats.
+    # Use server_ip first (same-host reliable path) and fall back to configured TAK host.
+    tak_url_host = server_ip if (server_ip and server_ip not in ('localhost', '127.0.0.1')) else (_get_takserver_host(settings) or 'host.docker.internal')
     return {
         "AUTHENTIK_URL": f"http://{auth_url_host}:{auth_url_port}",
         "AUTHENTIK_TOKEN": ak_token or "",
@@ -9019,7 +9075,7 @@ def _takportal_build_settings_dict(settings):
         "PORTAL_AUTH_REQUIRED_GROUP": "authentik Admins" if settings.get('fqdn') else "",
         "AUTHENTIK_PUBLIC_URL": _get_authentik_base_url(settings),
         "TAK_PORTAL_PUBLIC_URL": f"https://takportal.{settings['fqdn']}" if settings.get('fqdn') else f"http://{server_ip}:3000",
-        "TAK_URL": f"https://{_get_takserver_host(settings)}:8443/Marti" if _get_takserver_host(settings) else f"https://{server_ip}:8443/Marti",
+        "TAK_URL": f"https://{tak_url_host}:8443/Marti",
         "TAK_API_P12_PATH": "data/certs/tak-client.p12",
         "TAK_API_P12_PASSPHRASE": cert_pass,
         "TAK_CA_PATH": "data/certs/tak-ca.pem",
@@ -9591,28 +9647,37 @@ def run_takportal_deploy():
                         else:
                             plog(f"  \u26a0 Proxy provider error: {str(e)[:100]}")
 
-                # Create application
+                # Create application (retry — Authentik API can be slow on fresh deploys)
                 if provider_pk:
-                    try:
-                        req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/',
-                            data=json_mod.dumps({'name': 'TAK Portal', 'slug': 'tak-portal',
-                                'provider': provider_pk, 'open_in_new_tab': True}).encode(),
-                            headers=_ak_headers, method='POST')
-                        _urlreq.urlopen(req, timeout=10)
-                        plog(f"  \u2713 Application 'TAK Portal' created")
-                    except Exception as e:
-                        if hasattr(e, 'code') and e.code == 400:
-                            plog(f"  \u2713 Application 'TAK Portal' already exists")
-                        else:
-                            plog(f"  \u26a0 Application error: {str(e)[:80]}")
+                    app_created = False
+                    for app_attempt in range(1, 4):
+                        try:
+                            req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/',
+                                data=json_mod.dumps({'name': 'TAK Portal', 'slug': 'tak-portal',
+                                    'provider': provider_pk, 'open_in_new_tab': True}).encode(),
+                                headers=_ak_headers, method='POST')
+                            _urlreq.urlopen(req, timeout=30)
+                            plog(f"  \u2713 Application 'TAK Portal' created")
+                            app_created = True
+                            break
+                        except Exception as e:
+                            if hasattr(e, 'code') and e.code == 400:
+                                plog(f"  \u2713 Application 'TAK Portal' already exists")
+                                app_created = True
+                                break
+                            elif app_attempt < 3:
+                                plog(f"  \u26a0 Application create: {str(e)[:60]} (retry {app_attempt}/2)")
+                                time.sleep(5)
+                            else:
+                                plog(f"  \u26a0 Application error: {str(e)[:80]}")
                     _authentik_application_open_in_new_tab(_ak_url, _ak_headers, 'tak-portal', plog=plog)
 
                     # Add to embedded outpost (retry-safe; API can still be warming up)
                     outpost_ok = False
-                    for attempt in range(1, 4):
+                    for attempt in range(1, 6):
                         try:
                             req = _urlreq.Request(f'{_ak_url}/api/v3/outposts/instances/?search=embedded', headers=_ak_headers)
-                            resp = _urlreq.urlopen(req, timeout=15)
+                            resp = _urlreq.urlopen(req, timeout=30)
                             outposts = json_mod.loads(resp.read().decode())['results']
                             embedded = next((o for o in outposts if 'embed' in o.get('name','').lower() or o.get('type') == 'proxy'), None)
                             if not embedded:
@@ -9635,14 +9700,14 @@ def run_takportal_deploy():
                                 patch_req = _urlreq.Request(f'{_ak_url}/api/v3/outposts/instances/{embedded["pk"]}/',
                                     data=json_mod.dumps({'providers': current_pks}).encode(),
                                     headers=_ak_headers, method='PATCH')
-                                _urlreq.urlopen(patch_req, timeout=15)
+                                _urlreq.urlopen(patch_req, timeout=30)
                             outpost_ok = True
                             plog(f"  \u2713 TAK Portal added to embedded outpost")
                             break
                         except Exception as e:
-                            if attempt < 3:
-                                plog(f"  \u26a0 Outpost error: {str(e)[:80]} (retry {attempt}/2)")
-                                time.sleep(3)
+                            if attempt < 5:
+                                plog(f"  \u26a0 Outpost error: {str(e)[:80]} (retry {attempt}/4)")
+                                time.sleep(5)
                             else:
                                 plog(f"  \u26a0 Outpost error: {str(e)[:80]}")
                     if not outpost_ok:
@@ -12857,6 +12922,18 @@ services:
                 message += f' Recovery flow issue: {recovery_msg}.'
         else:
             message += ' API not ready in time — recovery flow not set up.'
+    # Full-stack `docker compose up -d --force-recreate` reapplies blueprints/worker state; LDAP bind flows
+    # can break afterward (ak-stage-flow-error on simple binds). Re-apply our API flow fix + LDAP outpost recreate.
+    if ak_token:
+        try:
+            _log("  Re-healing LDAP authentication flow after Authentik SMTP/recovery restart...")
+            ok_heal, err_heal = _ensure_ldap_flow_authentication_none()
+            if ok_heal:
+                _log("  ✓ LDAP flow re-healed (ldap-authentication-flow + outpost)")
+            else:
+                _log(f"  ⚠ LDAP flow re-heal: {err_heal}")
+        except Exception as _heal_ex:
+            _log(f"  ⚠ LDAP flow re-heal skipped: {str(_heal_ex)[:100]}")
     return message
 
 
@@ -14757,6 +14834,8 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <div class="modal-actions"><button class="btn btn-ghost" onclick="document.getElementById('uninstall-modal').classList.remove('open')">Cancel</button><button class="btn btn-danger" onclick="doUninstall()">Uninstall</button></div>
   <div id="uninstall-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
 </div></div>
+<script src="/log-tools.js?v={{ version }}"></script>
+<script>initLogToolbar('deploy-log');initLogToolbar('deploy-log-dyn');initLogToolbar('container-logs');</script>
 <script>
 var logIndex=0,logInterval=null;
 function collectNoderedDeployConfig(){var mode=document.getElementById('nodered-target-mode');var host=document.getElementById('nodered-remote-host');var port=document.getElementById('nodered-remote-port');var user=document.getElementById('nodered-remote-user');var key=document.getElementById('nodered-remote-key');return{target_mode:(mode&&mode.value)||'local',remote:{host:host?host.value.trim():'',port:port?parseInt(port.value,10)||22:22,username:user?user.value.trim()||'root':'root',ssh_key_path:key?key.value.trim():''}};}
@@ -15049,6 +15128,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 
   <div class="card" id="gd-log-card" style="display:none"><div class="card-title">Deploy log</div><div class="log-box" id="gd-deploy-log">Initializing...</div></div>
 </div>
+<script src="/log-tools.js?v={{ version }}"></script>
 <script src="/guarddog.js?v={{ version }}"></script>
 </body></html>
 '''
@@ -15489,6 +15569,8 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     </div>
   </details>
 </div>
+<script src="/log-tools.js?v={{ version }}"></script>
+<script>initLogToolbar('fedhub-deploy-log');initLogToolbar('fedhub-upgrade-log');initLogToolbar('fedhub-rotate-log');</script>
 <script>
 var fedhubLogIndex=0,fedhubLogInterval=null;
 var fedhubUpgradeLogIndex=0,fedhubUpgradeLogInterval=null;
@@ -16322,6 +16404,8 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   </div>
 </div>
 
+<script src="/log-tools.js?v={{ version }}"></script>
+<script>initLogToolbar('deploy-log');initLogToolbar('service-logs');</script>
 <script>
 let logIndex = 0;
 let logInterval = null;
@@ -17253,6 +17337,8 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   </div>
 </div>
 
+<script src="/log-tools.js?v={{ version }}"></script>
+<script>initLogToolbar('deploy-log');initLogToolbar('deploy-log-dyn');initLogToolbar('container-logs');</script>
 <script src="/cloudtak/page.js"></script>
 <script>
 (function(){
@@ -17358,6 +17444,8 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <!-- Deploy Log -->
 <div class="section-title">Deployment Log</div>
 <div class="deploy-log" id="deploy-log">Starting deployment...</div>
+<script src="/log-tools.js?v={{ version }}"></script>
+<script>initLogToolbar('deploy-log');</script>
 <script>
 (function pollLog(){
     var el=document.getElementById('deploy-log');
@@ -17436,8 +17524,8 @@ Configure TAK Portal and MediaMTX to use the local relay:<br><br>
 <div class="form-group"><label class="input-label">From Name</label>
 <input type="text" id="swap-from_name" class="input-field" placeholder="TAK Operations" value="{{ relay_config.get('from_name','') }}"></div>
 <div class="form-group full" id="swap-custom-fields" style="display:none;grid-template-columns:1fr 120px;gap:12px">
-<div><label class="input-label">Custom SMTP Host</label><input type="text" id="swap-custom_host" class="input-field" placeholder="smtp.yourdomain.com"></div>
-<div><label class="input-label">Port</label><input type="text" id="swap-custom_port" class="input-field" placeholder="587" value="587"></div>
+<div><label class="input-label">Custom SMTP Host</label><input type="text" id="swap-custom_host" class="input-field" placeholder="smtp.yourdomain.com" value="{{ relay_config.get('relay_host','') if relay_config.get('provider')=='custom' else '' }}"></div>
+<div><label class="input-label">Port</label><input type="text" id="swap-custom_port" class="input-field" placeholder="587" value="{{ relay_config.get('relay_port','587') if relay_config.get('provider')=='custom' else '587' }}"></div>
 </div></div>
 <div style="margin-top:20px;text-align:center">
 <button onclick="swapProvider()" style="padding:12px 32px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;cursor:pointer">↔ Switch Provider</button>
@@ -17506,6 +17594,8 @@ function updateProviderUI(prefix){
     var customFields = document.getElementById(prefix+'custom-fields');
     if(customFields) customFields.style.display = (key==='custom') ? 'grid' : 'none';
 }
+updateProviderUI('swap-');
+updateProviderUI('deploy-');
 
 async function deployRelay(){
     var btn=document.getElementById('deploy-btn');
@@ -17736,6 +17826,8 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% endif %}
 </div>
 <footer class="footer"></footer>
+<script src="/log-tools.js?v={{ version }}"></script>
+<script>initLogToolbar('deploy-log');</script>
 <script>
 async function deployCaddy(){
     var domain=document.getElementById('domain-input').value.trim();
@@ -18104,6 +18196,8 @@ Features: User creation with auto-cert generation, group management, mutual aid 
 </div>
 </div>
 <footer class="footer"></footer>
+<script src="/log-tools.js?v={{ version }}"></script>
+<script>initLogToolbar('deploy-log');initLogToolbar('container-log');</script>
 <script>
 function portalSectionToggle(header){
     var body=header.nextElementSibling;
@@ -19076,6 +19170,7 @@ entries:
   postgresql:
     image: docker.io/library/postgres:16-alpine
     restart: unless-stopped
+    command: postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=120s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
       start_period: 20s
@@ -19088,7 +19183,6 @@ entries:
       POSTGRES_PASSWORD: ${PG_PASS:?database password required}
       POSTGRES_USER: ${PG_USER:-authentik}
       POSTGRES_DB: ${PG_DB:-authentik}
-      POSTGRES_MAX_CONNECTIONS: "300"
   redis:
     image: docker.io/library/redis:alpine
     command: --save 60 1 --loglevel warning
@@ -19166,6 +19260,14 @@ volumes:
     driver: local
 """
     compose_content = compose_content.replace('2026.2.0', _ak_latest)
+    _ak_host_for_ldap = _get_authentik_host(settings)
+    if _ak_host_for_ldap:
+        compose_content = compose_content.replace(
+            'AUTHENTIK_HOST: http://authentik-server-1:9000',
+            f'AUTHENTIK_HOST: https://{_ak_host_for_ldap}')
+        compose_content = compose_content.replace(
+            f'    image: ghcr.io/goauthentik/ldap:${{AUTHENTIK_TAG:-{_ak_latest}}}\n    ports:',
+            f'    image: ghcr.io/goauthentik/ldap:${{AUTHENTIK_TAG:-{_ak_latest}}}\n    extra_hosts:\n      - "{_ak_host_for_ldap}:host-gateway"\n    ports:')
     with open('/tmp/authentik_remote_compose.yml', 'w') as f:
         f.write(compose_content)
     ok, _ = _module_copy(deploy_cfg, '/tmp/authentik_remote_compose.yml', '/tmp/docker-compose.yml', log_fn=plog)
@@ -19280,7 +19382,6 @@ volumes:
                 f'        <ldap url="ldap://{host}:389" userstring="cn={{username}},ou=users,dc=takldap" updateinterval="30" groupprefix="cn=tak_" groupNameExtractorRegex="cn=tak_(.*?)(?:,|$)" serviceAccountDN="cn=adm_ldapservice,ou=users,dc=takldap" serviceAccountCredential="'
                 + ldap_svc_pass
                 + '" groupBaseRDN="ou=groups,dc=takldap" userBaseRDN="ou=users,dc=takldap" dnAttributeName="DN" nameAttr="CN" adminGroup="ROLE_ADMIN"/>\n'
-                '        <File location="UserAuthenticationFile.xml"/>\n'
                 '    </auth>'
             )
 
@@ -19382,6 +19483,12 @@ def _run_authentik_reconfigure_remote(settings, deploy_cfg, plog):
         plog("  \u26a0 API not ready in time — run Update config & reconnect again")
         authentik_deploy_status.update({'running': False, 'error': True})
         return
+    plog("  Fixing LDAP flow & provider (authorization_flow, bind_mode)...")
+    ok_flow, err_flow = _ensure_ldap_flow_authentication_none()
+    if ok_flow:
+        plog("  \u2713 LDAP flow & provider verified")
+    else:
+        plog(f"  \u26a0 LDAP flow fix: {err_flow}")
     plog("  Setting proxy cookie domain...")
     _ensure_proxy_providers_cookie_domain(ak_url, ak_headers, fqdn, plog)
     if _is_module_deployed(settings, 'takportal'):
@@ -19479,7 +19586,8 @@ def _ensure_authentik_starter_branding(ak_dir, deploy_cfg, plog=None):
 
 
 def _apply_authentik_pg_tuning(ak_dir, plog):
-    """Apply PostgreSQL performance tuning inside the Authentik PostgreSQL container."""
+    """Clear stale postgresql.auto.conf entries and let docker-compose command-line args handle tuning.
+    Previous versions used ALTER SYSTEM SET which left stale entries that conflict on upgrade."""
     try:
         pg_container = subprocess.run(
             f'cd {ak_dir} && docker compose ps -q postgresql 2>/dev/null',
@@ -19488,25 +19596,17 @@ def _apply_authentik_pg_tuning(ak_dir, plog):
         if not pg_container:
             plog("  PostgreSQL container not found, skipping PG tuning")
             return
-        alter_cmds = [
-            "ALTER SYSTEM SET max_connections = 300",
-            "ALTER SYSTEM SET idle_session_timeout = '300s'",
-            "ALTER SYSTEM SET tcp_keepalives_idle = 60",
-            "ALTER SYSTEM SET tcp_keepalives_interval = 10",
-            "ALTER SYSTEM SET tcp_keepalives_count = 3",
-        ]
-        for cmd in alter_cmds:
-            subprocess.run(
-                f'cd {ak_dir} && docker compose exec -T postgresql psql -U authentik -d authentik -c "{cmd};" 2>&1',
-                shell=True, capture_output=True, text=True, timeout=15
-            )
+        subprocess.run(
+            f'cd {ak_dir} && docker compose exec -T postgresql psql -U authentik -d authentik -c "ALTER SYSTEM RESET ALL;" 2>&1',
+            shell=True, capture_output=True, text=True, timeout=15
+        )
         subprocess.run(
             f'cd {ak_dir} && docker compose exec -T postgresql psql -U authentik -d authentik -c "SELECT pg_reload_conf();" 2>&1',
             shell=True, capture_output=True, text=True, timeout=15
         )
-        plog("  \u2713 PostgreSQL tuning applied (max_connections=300, idle_session_timeout=5min, tcp_keepalives)")
+        plog("  \u2713 PostgreSQL tuning cleaned up (stale ALTER SYSTEM entries cleared; command-line args in docker-compose.yml apply on restart)")
     except Exception as e:
-        plog(f"  \u26a0 PG tuning skipped: {e}")
+        plog(f"  \u26a0 PG tuning cleanup skipped: {e}")
 
 
 def run_authentik_deploy(reconfigure=False):
@@ -19583,6 +19683,12 @@ def run_authentik_deploy(reconfigure=False):
                     plog("")
                     plog("  Waiting for Authentik API...")
                     if _wait_for_authentik_api(ak_url, ak_headers, max_attempts=24, plog=plog):
+                        plog("  Fixing LDAP flow & provider (authorization_flow, bind_mode)...")
+                        ok_flow, err_flow = _ensure_ldap_flow_authentication_none()
+                        if ok_flow:
+                            plog("  ✓ LDAP flow & provider verified")
+                        else:
+                            plog(f"  ⚠ LDAP flow fix: {err_flow}")
                         plog("  Setting proxy cookie domain (shared session across subdomains)...")
                         _ensure_proxy_providers_cookie_domain(ak_url, ak_headers, fqdn, plog)
                         if _is_module_deployed(settings, 'takportal'):
@@ -19665,11 +19771,39 @@ def run_authentik_deploy(reconfigure=False):
                         plog("  \u26a0 API not ready in time — run Update config & reconnect again to apply app access policies")
                 else:
                     plog("  \u26a0 No token in .env — app access policies not applied")
-                plog("")
-                plog("\u2713 Reconfigure complete.")
-                _sync_webadmin_after_authentik_reconfigure(plog)
-                authentik_deploy_status.update({'running': False, 'complete': True, 'error': False})
-                return
+            else:
+                plog("  \u2139 No FQDN in console settings — skipped forward-auth, app policies, and domain sync (configure Caddy domain first).")
+                # Still heal LDAP provider flow if API is reachable (8446/TAK LDAP does not require public FQDN).
+                ak_token_nf = ''
+                try:
+                    with open(env_path) as f:
+                        for line in f:
+                            if line.strip().startswith('AUTHENTIK_TOKEN='):
+                                ak_token_nf = line.strip().split('=', 1)[1].strip()
+                                break
+                    if not ak_token_nf:
+                        with open(env_path) as f:
+                            for line in f:
+                                if line.strip().startswith('AUTHENTIK_BOOTSTRAP_TOKEN='):
+                                    ak_token_nf = line.strip().split('=', 1)[1].strip()
+                                    break
+                    if ak_token_nf:
+                        ak_url_nf = 'http://127.0.0.1:9090'
+                        hdr_nf = {'Authorization': f'Bearer {ak_token_nf}', 'Content-Type': 'application/json'}
+                        plog("  Waiting for Authentik API (no-FQDN reconfigure)...")
+                        if _wait_for_authentik_api(ak_url_nf, hdr_nf, max_attempts=24, plog=plog):
+                            plog("  Fixing LDAP flow & provider...")
+                            ok_nf, err_nf = _ensure_ldap_flow_authentication_none()
+                            plog("  \u2713 LDAP flow OK" if ok_nf else f"  \u26a0 LDAP flow: {err_nf}")
+                        else:
+                            plog("  \u26a0 API not ready — run Update config again after Authentik is up")
+                except Exception as e:
+                    plog(f"  \u26a0 No-FQDN LDAP heal skipped: {str(e)[:80]}")
+            plog("")
+            plog("\u2713 Reconfigure complete.")
+            _sync_webadmin_after_authentik_reconfigure(plog)
+            authentik_deploy_status.update({'running': False, 'complete': True, 'error': False})
+            return
         else:
             if settings.get('pkg_mgr', 'apt') == 'apt':
                 wait_for_apt_lock(plog, authentik_deploy_log)
@@ -19986,17 +20120,28 @@ entries:
                 lines = patched
                 needs_write = True
                 plog("  Added blueprint mount to server & worker")
-            # Add POSTGRES_MAX_CONNECTIONS
-            if not any('POSTGRES_MAX_CONNECTIONS' in l for l in lines):
+            # Add postgres command-line tuning (max_connections, idle_session_timeout, tcp_keepalives)
+            pg_cmd = 'postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=120s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
+            has_pg_cmd = any('max_connections=300' in l for l in lines)
+            needs_pg_update = has_pg_cmd and (not any('idle_in_transaction_session_timeout' in l for l in lines) or any('idle_in_transaction_session_timeout=300s' in l for l in lines) or any('idle_in_transaction_session_timeout=30s' in l for l in lines))
+            if not has_pg_cmd:
                 patched = []
                 for line in lines:
                     patched.append(line)
-                    if 'POSTGRES_USER:' in line:
+                    if 'image: docker.io/library/postgres:' in line:
                         indent = line[:len(line) - len(line.lstrip())]
-                        patched.append(f'{indent}POSTGRES_MAX_CONNECTIONS: "300"\n')
+                        patched.append(f'{indent}command: {pg_cmd}\n')
                 lines = patched
                 needs_write = True
-                plog("  Added POSTGRES_MAX_CONNECTIONS to postgresql")
+                plog("  Added PostgreSQL command-line tuning")
+            elif needs_pg_update:
+                for i, line in enumerate(lines):
+                    if 'command: postgres' in line and 'max_connections' in line:
+                        indent = line[:len(line) - len(line.lstrip())]
+                        lines[i] = f'{indent}command: {pg_cmd}\n'
+                        needs_write = True
+                        plog("  Updated PostgreSQL idle_in_transaction_session_timeout to 120s")
+                        break
 
             # Pin AUTHENTIK_TAG to latest stable release
             ak_tag = _get_authentik_latest_release_tag(use_cache=False) or '2026.2.1'
@@ -20010,8 +20155,8 @@ entries:
             if not any('ghcr.io/goauthentik/ldap' in l for l in lines):
                 _ak_host = _get_authentik_host(settings)
                 if _ak_host:
-                    _ak_base = _get_authentik_base_url(settings)
-                    ldap_svc = f"  ldap:\n    image: {ldap_image}\n    extra_hosts:\n      - \"{_ak_host}:host-gateway\"\n    ports:\n    - 389:3389\n    - 636:6636\n    environment:\n      AUTHENTIK_HOST: {_ak_base}\n      AUTHENTIK_INSECURE: \"true\"\n      AUTHENTIK_TOKEN: placeholder\n    restart: unless-stopped\n"
+                    _ak_ldap_url = f"https://{_ak_host}"
+                    ldap_svc = f"  ldap:\n    image: {ldap_image}\n    extra_hosts:\n      - \"{_ak_host}:host-gateway\"\n    ports:\n    - 389:3389\n    - 636:6636\n    environment:\n      AUTHENTIK_HOST: {_ak_ldap_url}\n      AUTHENTIK_INSECURE: \"true\"\n      AUTHENTIK_TOKEN: placeholder\n    restart: unless-stopped\n"
                 else:
                     ldap_svc = f"  ldap:\n    image: {ldap_image}\n    ports:\n    - 389:3389\n    - 636:6636\n    environment:\n      AUTHENTIK_HOST: http://authentik-server-1:9000\n      AUTHENTIK_INSECURE: \"true\"\n      AUTHENTIK_TOKEN: placeholder\n    restart: unless-stopped\n"
                 new_lines = []
@@ -20109,7 +20254,7 @@ entries:
             api_ready = _wait_for_authentik_api(
                 'http://127.0.0.1:9090',
                 {'Authorization': f'Bearer {bootstrap_token}'},
-                max_attempts=90, plog=plog
+                max_attempts=150, plog=plog
             )
             if api_ready:
                 plog("✓ Authentik API is ready")
@@ -20162,7 +20307,6 @@ entries:
                     '        <ldap url="ldap://127.0.0.1:389" userstring="cn={username},ou=users,dc=takldap" updateinterval="30" groupprefix="cn=tak_" groupNameExtractorRegex="cn=tak_(.*?)(?:,|$)" serviceAccountDN="cn=adm_ldapservice,ou=users,dc=takldap" serviceAccountCredential="'
                     + ldap_pass
                     + '" groupBaseRDN="ou=groups,dc=takldap" userBaseRDN="ou=users,dc=takldap" dnAttributeName="DN" nameAttr="CN" adminGroup="ROLE_ADMIN"/>\n'
-                    '        <File location="UserAuthenticationFile.xml"/>\n'
                     '    </auth>'
                 )
 
@@ -20219,7 +20363,9 @@ entries:
                 plog("  Waiting for worker to apply bootstrap blueprint...")
                 token_ok = False
                 attempt = 0
-                while True:
+                # Cap waits (~750s) so first-run migrations on slow VPS don't hang forever (matches Step 8 API poll budget)
+                _bootstrap_token_max_attempts = 150
+                while attempt < _bootstrap_token_max_attempts:
                     try:
                         req = urllib.request.Request(f'{ak_url}/api/v3/core/users/',
                             headers=ak_headers)
@@ -20244,93 +20390,98 @@ entries:
                     except Exception as e:
                         plog(f"  ⚠ Token check error: {str(e)[:80]} — giving up")
                         break
+                if not token_ok and attempt >= _bootstrap_token_max_attempts:
+                    plog(f"  ⚠ Bootstrap token still not active after ~{(_bootstrap_token_max_attempts * 5) // 60}m — check worker logs; skipping admin/LDAP API steps")
+                elif not token_ok:
+                    plog("  ⚠ Bootstrap token not active — skipping admin/LDAP API steps")
 
-                # Create tak_ROLE_ADMIN group (for webadmin only; all other group membership is controlled in TAK Portal)
-                group_pk = None
-                try:
-                    req = urllib.request.Request(f'{ak_url}/api/v3/core/groups/',
-                        data=json.dumps({'name': 'tak_ROLE_ADMIN', 'is_superuser': False}).encode(),
-                        headers=ak_headers, method='POST')
-                    resp = urllib.request.urlopen(req, timeout=10)
-                    group_data = json.loads(resp.read().decode())
-                    group_pk = group_data['pk']
-                    plog("  ✓ Created tak_ROLE_ADMIN group")
-                except urllib.error.HTTPError as e:
-                    if e.code == 400:
-                        plog("  ✓ tak_ROLE_ADMIN group already exists")
-                        req = urllib.request.Request(f'{ak_url}/api/v3/core/groups/?search=tak_ROLE_ADMIN',
-                            headers=ak_headers)
-                        resp = urllib.request.urlopen(req, timeout=10)
-                        results = json.loads(resp.read().decode())['results']
-                        group_pk = results[0]['pk'] if results else None
-                    elif e.code == 403:
-                        plog(f"  ⚠ 403 on group creation — bootstrap token may lack permissions, continuing anyway")
-                        group_pk = None
-                    else:
-                        plog(f"  ⚠ Group creation error: {e.code} — continuing")
-                        group_pk = None
-
-                # Create webadmin user in Authentik (only when TAK Server is deployed — used for TAK Server admin)
-                webadmin_pass = ''
-                if os.path.exists('/opt/tak'):
-                    # Read password from TAK Server settings or use default
-                    tak_settings_path = os.path.join(CONFIG_DIR, 'settings.json')
-                    if os.path.exists(tak_settings_path):
-                        with open(tak_settings_path) as f:
-                            tak_s = json.load(f)
-                            webadmin_pass = tak_s.get('webadmin_password', '')
-                    if not webadmin_pass:
-                        webadmin_pass = secrets.token_urlsafe(16)
-                        plog(f"  ⚠ webadmin_password not in settings — generated random password")
-                        settings['webadmin_password'] = webadmin_pass
-                        save_settings(settings)
-                else:
-                    plog("  ℹ TAK Server not installed — skipping webadmin user (optional; used for TAK Server admin)")
-
-                if webadmin_pass:
+                if token_ok:
+                    # Create tak_ROLE_ADMIN group (for webadmin only; all other group membership is controlled in TAK Portal)
+                    group_pk = None
                     try:
-                        user_data = {'username': 'webadmin', 'name': 'TAK Admin', 'is_active': True,
-                            'groups': [group_pk] if group_pk else []}
-                        req = urllib.request.Request(f'{ak_url}/api/v3/core/users/',
-                            data=json.dumps(user_data).encode(), headers=ak_headers, method='POST')
+                        req = urllib.request.Request(f'{ak_url}/api/v3/core/groups/',
+                            data=json.dumps({'name': 'tak_ROLE_ADMIN', 'is_superuser': False}).encode(),
+                            headers=ak_headers, method='POST')
                         resp = urllib.request.urlopen(req, timeout=10)
-                        user = json.loads(resp.read().decode())
-                        webadmin_pk = user['pk']
-                        plog(f"  ✓ Created webadmin user (pk={webadmin_pk})")
+                        group_data = json.loads(resp.read().decode())
+                        group_pk = group_data['pk']
+                        plog("  ✓ Created tak_ROLE_ADMIN group")
                     except urllib.error.HTTPError as e:
                         if e.code == 400:
-                            plog("  ✓ webadmin user already exists")
-                            # Get existing user PK and add to group
-                            req = urllib.request.Request(f'{ak_url}/api/v3/core/users/?search=webadmin',
+                            plog("  ✓ tak_ROLE_ADMIN group already exists")
+                            req = urllib.request.Request(f'{ak_url}/api/v3/core/groups/?search=tak_ROLE_ADMIN',
                                 headers=ak_headers)
                             resp = urllib.request.urlopen(req, timeout=10)
                             results = json.loads(resp.read().decode())['results']
-                            webadmin_pk = results[0]['pk'] if results else None
-                            if webadmin_pk and group_pk:
-                                req = urllib.request.Request(f'{ak_url}/api/v3/core/users/{webadmin_pk}/',
-                                    data=json.dumps({'groups': [group_pk]}).encode(),
-                                    headers=ak_headers, method='PATCH')
-                                try:
-                                    urllib.request.urlopen(req, timeout=10)
-                                    plog("  ✓ Added webadmin to tak_ROLE_ADMIN group")
-                                except Exception:
-                                    pass
+                            group_pk = results[0]['pk'] if results else None
+                        elif e.code == 403:
+                            plog(f"  ⚠ 403 on group creation — bootstrap token may lack permissions, continuing anyway")
+                            group_pk = None
                         else:
-                            plog(f"  ⚠ webadmin user error: {e.code} — continuing")
-                            webadmin_pk = None
-
-                    # Set webadmin password
-                    if webadmin_pk:
+                            plog(f"  ⚠ Group creation error: {e.code} — continuing")
+                            group_pk = None
+    
+                    # Create webadmin user in Authentik (only when TAK Server is deployed — used for TAK Server admin)
+                    webadmin_pass = ''
+                    if os.path.exists('/opt/tak'):
+                        # Read password from TAK Server settings or use default
+                        tak_settings_path = os.path.join(CONFIG_DIR, 'settings.json')
+                        if os.path.exists(tak_settings_path):
+                            with open(tak_settings_path) as f:
+                                tak_s = json.load(f)
+                                webadmin_pass = tak_s.get('webadmin_password', '')
+                        if not webadmin_pass:
+                            webadmin_pass = secrets.token_urlsafe(16)
+                            plog(f"  ⚠ webadmin_password not in settings — generated random password")
+                            settings['webadmin_password'] = webadmin_pass
+                            save_settings(settings)
+                    else:
+                        plog("  ℹ TAK Server not installed — skipping webadmin user (optional; used for TAK Server admin)")
+    
+                    if webadmin_pass:
                         try:
-                            req = urllib.request.Request(f'{ak_url}/api/v3/core/users/{webadmin_pk}/set_password/',
-                                data=json.dumps({'password': webadmin_pass}).encode(),
-                                headers=ak_headers, method='POST')
-                            urllib.request.urlopen(req, timeout=10)
-                            plog(f"  ✓ Set webadmin password")
-                        except Exception as e:
-                            plog(f"  ⚠ Could not set webadmin password: {str(e)[:100]}")
-
-                    # Create or get adm_ldapservice user
+                            user_data = {'username': 'webadmin', 'name': 'TAK Admin', 'is_active': True,
+                                'groups': [group_pk] if group_pk else []}
+                            req = urllib.request.Request(f'{ak_url}/api/v3/core/users/',
+                                data=json.dumps(user_data).encode(), headers=ak_headers, method='POST')
+                            resp = urllib.request.urlopen(req, timeout=10)
+                            user = json.loads(resp.read().decode())
+                            webadmin_pk = user['pk']
+                            plog(f"  ✓ Created webadmin user (pk={webadmin_pk})")
+                        except urllib.error.HTTPError as e:
+                            if e.code == 400:
+                                plog("  ✓ webadmin user already exists")
+                                # Get existing user PK and add to group
+                                req = urllib.request.Request(f'{ak_url}/api/v3/core/users/?search=webadmin',
+                                    headers=ak_headers)
+                                resp = urllib.request.urlopen(req, timeout=10)
+                                results = json.loads(resp.read().decode())['results']
+                                webadmin_pk = results[0]['pk'] if results else None
+                                if webadmin_pk and group_pk:
+                                    req = urllib.request.Request(f'{ak_url}/api/v3/core/users/{webadmin_pk}/',
+                                        data=json.dumps({'groups': [group_pk]}).encode(),
+                                        headers=ak_headers, method='PATCH')
+                                    try:
+                                        urllib.request.urlopen(req, timeout=10)
+                                        plog("  ✓ Added webadmin to tak_ROLE_ADMIN group")
+                                    except Exception:
+                                        pass
+                            else:
+                                plog(f"  ⚠ webadmin user error: {e.code} — continuing")
+                                webadmin_pk = None
+    
+                        # Set webadmin password
+                        if webadmin_pk:
+                            try:
+                                req = urllib.request.Request(f'{ak_url}/api/v3/core/users/{webadmin_pk}/set_password/',
+                                    data=json.dumps({'password': webadmin_pass}).encode(),
+                                    headers=ak_headers, method='POST')
+                                urllib.request.urlopen(req, timeout=10)
+                                plog(f"  ✓ Set webadmin password")
+                            except Exception as e:
+                                plog(f"  ⚠ Could not set webadmin password: {str(e)[:100]}")
+    
+                    # Set adm_ldapservice password — ALWAYS RUN regardless of TAK Server install state
                     ldap_svc_password = ''
                     with open(env_path) as f:
                         for line in f:
@@ -20338,7 +20489,7 @@ entries:
                                 ldap_svc_password = line.strip().split('=', 1)[1].strip()
                     if not ldap_svc_password:
                         ldap_svc_password = 'B9wobRV8wlFJmnlEWB71gJjD3aoKOBBW'
-
+    
                     ldap_pk = None
                     try:
                         req = urllib.request.Request(f'{ak_url}/api/v3/core/users/',
@@ -20358,7 +20509,7 @@ entries:
                             plog(f"  ✓ adm_ldapservice already exists (pk={ldap_pk})")
                         else:
                             plog(f"  ⚠ Could not create adm_ldapservice: {e.code}")
-
+    
                     if ldap_pk:
                         try:
                             req = urllib.request.Request(f'{ak_url}/api/v3/core/users/{ldap_pk}/set_password/',
@@ -20368,196 +20519,191 @@ entries:
                             plog(f"  ✓ Set adm_ldapservice password")
                         except Exception as e:
                             plog(f"  ⚠ Could not set adm_ldapservice password: {str(e)[:100]}")
-
-                # Create LDAP provider + outpost + inject token — ALWAYS RUN (required for MediaMTX, TAK Server, standalone)
-                try:
-                    # Get default invalidation flow
-                    req = urllib.request.Request(f'{ak_url}/api/v3/flows/instances/?designation=invalidation',
-                        headers=ak_headers)
-                    resp = urllib.request.urlopen(req, timeout=10)
-                    inv_flows = json.loads(resp.read().decode())['results']
-                    inv_flow_pk = next((f['pk'] for f in inv_flows if 'invalidation' in f['slug'] and 'provider' not in f['slug']), inv_flows[0]['pk'] if inv_flows else None)
-                    plog(f"  ✓ Got invalidation flow: {inv_flow_pk}")
-
-                    # Get default authentication flow - wait until ready
-                    auth_flow_pk = None
-                    attempt = 0
-                    while True:
-                        req = urllib.request.Request(f'{ak_url}/api/v3/flows/instances/?designation=authentication',
+    
+                    # Create LDAP provider + outpost + inject token — ALWAYS RUN (required for MediaMTX, TAK Server, standalone)
+                    try:
+                        # Get default invalidation flow
+                        req = urllib.request.Request(f'{ak_url}/api/v3/flows/instances/?designation=invalidation',
                             headers=ak_headers)
                         resp = urllib.request.urlopen(req, timeout=10)
-                        auth_flows = json.loads(resp.read().decode())['results']
-                        auth_flow_pk = next((f['pk'] for f in auth_flows if f['slug'] == 'default-authentication-flow'),
-                                           next((f['pk'] for f in auth_flows), None))
-                        if auth_flow_pk:
-                            plog(f"  ✓ Got authentication flow: {auth_flow_pk}")
-                            break
-                        if attempt % 6 == 0:
-                            plog(f"  ⏳ Waiting for authentication flows... ({attempt * 5}s)")
-                        else:
-                            authentik_deploy_log.append(f"  ⏳ {attempt * 5 // 60:02d}:{attempt * 5 % 60:02d}")
-                        time.sleep(5)
-                        attempt += 1
-
-                    if not auth_flow_pk or not inv_flow_pk:
-                        plog(f"  ✗ Missing flows — auth={auth_flow_pk} inv={inv_flow_pk}")
-                    else:
-                        # Create LDAP provider
-                        ldap_provider_pk = None
-                        ldap_flow_pk = next((f['pk'] for f in auth_flows if f['slug'] == 'ldap-authentication-flow'), None)
-                        ldap_bind_flow = ldap_flow_pk or auth_flow_pk
-                        try:
-                            req = urllib.request.Request(f'{ak_url}/api/v3/providers/ldap/',
-                                data=json.dumps({'name': 'LDAP', 'authentication_flow': ldap_bind_flow,
-                                    'authorization_flow': ldap_bind_flow, 'invalidation_flow': inv_flow_pk,
-                                    'base_dn': 'DC=takldap', 'bind_mode': 'cached',
-                                    'search_mode': 'cached', 'mfa_support': False}).encode(),
-                                headers=ak_headers, method='POST')
+                        inv_flows = json.loads(resp.read().decode())['results']
+                        inv_flow_pk = next((f['pk'] for f in inv_flows if 'invalidation' in f['slug'] and 'provider' not in f['slug']), inv_flows[0]['pk'] if inv_flows else None)
+                        plog(f"  ✓ Got invalidation flow: {inv_flow_pk}")
+    
+                        # Get default authentication flow - wait until ready (bounded; worker can be slow on first boot)
+                        auth_flow_pk = None
+                        for auth_flow_attempt in range(150):
+                            req = urllib.request.Request(f'{ak_url}/api/v3/flows/instances/?designation=authentication',
+                                headers=ak_headers)
                             resp = urllib.request.urlopen(req, timeout=10)
-                            ldap_provider_pk = json.loads(resp.read().decode())['pk']
-                            plog(f"  ✓ Created LDAP provider (pk={ldap_provider_pk})")
-                        except urllib.error.HTTPError as e:
-                            err = e.read().decode()[:200]
-                            if e.code == 400:
-                                req = urllib.request.Request(f'{ak_url}/api/v3/providers/ldap/?search=LDAP',
-                                    headers=ak_headers)
-                                resp = urllib.request.urlopen(req, timeout=10)
-                                results = json.loads(resp.read().decode())['results']
-                                ldap_provider_pk = results[0]['pk'] if results else None
-                                plog(f"  ✓ LDAP provider already exists (pk={ldap_provider_pk})")
+                            auth_flows = json.loads(resp.read().decode())['results']
+                            auth_flow_pk = next((f['pk'] for f in auth_flows if f['slug'] == 'default-authentication-flow'),
+                                               next((f['pk'] for f in auth_flows), None))
+                            if auth_flow_pk:
+                                plog(f"  ✓ Got authentication flow: {auth_flow_pk}")
+                                break
+                            if auth_flow_attempt % 6 == 0:
+                                plog(f"  ⏳ Waiting for authentication flows... ({auth_flow_attempt * 5}s)")
                             else:
-                                plog(f"  ✗ LDAP provider creation failed: {e.code} {err}")
-
-                        # Create LDAP application
-                        if ldap_provider_pk:
+                                authentik_deploy_log.append(f"  ⏳ {auth_flow_attempt * 5 // 60:02d}:{auth_flow_attempt * 5 % 60:02d}")
+                            time.sleep(5)
+    
+                        if not auth_flow_pk or not inv_flow_pk:
+                            plog(f"  ✗ Missing flows — auth={auth_flow_pk} inv={inv_flow_pk}")
+                        else:
+                            # Create LDAP provider
+                            ldap_provider_pk = None
+                            ldap_flow_pk = next((f['pk'] for f in auth_flows if f['slug'] == 'ldap-authentication-flow'), None)
+                            ldap_bind_flow = ldap_flow_pk or auth_flow_pk
                             try:
-                                req = urllib.request.Request(f'{ak_url}/api/v3/core/applications/',
-                                    data=json.dumps({'name': 'LDAP', 'slug': 'ldap',
-                                        'provider': ldap_provider_pk, 'open_in_new_tab': True}).encode(),
+                                req = urllib.request.Request(f'{ak_url}/api/v3/providers/ldap/',
+                                    data=json.dumps({'name': 'LDAP', 'authentication_flow': ldap_bind_flow,
+                                        'authorization_flow': ldap_bind_flow, 'invalidation_flow': inv_flow_pk,
+                                        'base_dn': 'DC=takldap', 'bind_mode': 'cached',
+                                        'search_mode': 'cached', 'mfa_support': False}).encode(),
                                     headers=ak_headers, method='POST')
-                                urllib.request.urlopen(req, timeout=10)
-                                plog(f"  ✓ Created LDAP application")
-                            except urllib.error.HTTPError as e:
-                                if e.code == 400:
-                                    plog(f"  ✓ LDAP application already exists")
-                                else:
-                                    plog(f"  ⚠ LDAP application error: {e.code} {e.read().decode()[:100]}")
-                            _authentik_application_open_in_new_tab(ak_url, ak_headers, 'ldap', plog=plog)
-
-                            # Get or create LDAP outpost (blueprint may have created it)
-                            outpost_token_id = None
-                            try:
-                                req = urllib.request.Request(f'{ak_url}/api/v3/outposts/instances/?search=LDAP',
-                                    headers=ak_headers)
                                 resp = urllib.request.urlopen(req, timeout=10)
-                                results = json.loads(resp.read().decode())['results']
-                                ldap_outpost = next((o for o in results if o.get('name') == 'LDAP' and o.get('type') == 'ldap'), None)
-                                if ldap_outpost:
-                                    outpost_token_id = ldap_outpost.get('token_identifier', '')
-                                    if not outpost_token_id:
-                                        req = urllib.request.Request(f'{ak_url}/api/v3/outposts/instances/{ldap_outpost["pk"]}/',
-                                            headers=ak_headers)
-                                        resp = urllib.request.urlopen(req, timeout=10)
-                                        detail = json.loads(resp.read().decode())
-                                        outpost_token_id = detail.get('token_identifier', '')
-                                    if outpost_token_id:
-                                        plog(f"  ✓ Using existing LDAP outpost (blueprint)")
-                            except Exception:
-                                pass
-                            if not outpost_token_id:
-                                try:
-                                    req = urllib.request.Request(f'{ak_url}/api/v3/outposts/instances/',
-                                        data=json.dumps({'name': 'LDAP', 'type': 'ldap',
-                                            'providers': [ldap_provider_pk],
-                                            'config': {'authentik_host': 'http://authentik-server-1:9000/',
-                                                'authentik_host_insecure': True}}).encode(),
-                                            headers=ak_headers, method='POST')
+                                ldap_provider_pk = json.loads(resp.read().decode())['pk']
+                                plog(f"  ✓ Created LDAP provider (pk={ldap_provider_pk})")
+                            except urllib.error.HTTPError as e:
+                                err = e.read().decode()[:200]
+                                if e.code == 400:
+                                    req = urllib.request.Request(f'{ak_url}/api/v3/providers/ldap/?search=LDAP',
+                                        headers=ak_headers)
                                     resp = urllib.request.urlopen(req, timeout=10)
-                                    outpost_data = json.loads(resp.read().decode())
-                                    outpost_token_id = outpost_data.get('token_identifier', '')
-                                    plog(f"  ✓ Created LDAP outpost (token_id={outpost_token_id})")
+                                    results = json.loads(resp.read().decode())['results']
+                                    ldap_provider_pk = results[0]['pk'] if results else None
+                                    plog(f"  ✓ LDAP provider already exists (pk={ldap_provider_pk})")
+                                else:
+                                    plog(f"  ✗ LDAP provider creation failed: {e.code} {err}")
+    
+                            # Create LDAP application
+                            if ldap_provider_pk:
+                                try:
+                                    req = urllib.request.Request(f'{ak_url}/api/v3/core/applications/',
+                                        data=json.dumps({'name': 'LDAP', 'slug': 'ldap',
+                                            'provider': ldap_provider_pk, 'open_in_new_tab': True}).encode(),
+                                        headers=ak_headers, method='POST')
+                                    urllib.request.urlopen(req, timeout=10)
+                                    plog(f"  ✓ Created LDAP application")
                                 except urllib.error.HTTPError as e:
-                                    err = e.read().decode()[:200]
                                     if e.code == 400:
-                                        req = urllib.request.Request(f'{ak_url}/api/v3/outposts/instances/?search=LDAP',
-                                            headers=ak_headers)
-                                        resp = urllib.request.urlopen(req, timeout=10)
-                                        results = json.loads(resp.read().decode())['results']
-                                        ldap_outpost = next((o for o in results if o.get('name') == 'LDAP' and o.get('type') == 'ldap'), None)
-                                        if ldap_outpost:
-                                            outpost_token_id = ldap_outpost.get('token_identifier', '')
-                                            if not outpost_token_id:
-                                                req = urllib.request.Request(f'{ak_url}/api/v3/outposts/instances/{ldap_outpost["pk"]}/',
-                                                    headers=ak_headers)
-                                                resp = urllib.request.urlopen(req, timeout=10)
-                                                detail = json.loads(resp.read().decode())
-                                                outpost_token_id = detail.get('token_identifier', '')
-                                            if outpost_token_id:
-                                                plog(f"  ✓ LDAP outpost already exists, using token")
-                                            if outpost_token_id and ldap_provider_pk:
-                                                req = urllib.request.Request(
-                                                    f'{ak_url}/api/v3/outposts/instances/{ldap_outpost["pk"]}/',
-                                                    data=json.dumps({'name': 'LDAP', 'type': 'ldap',
-                                                        'providers': [ldap_provider_pk],
-                                                        'config': {'authentik_host': 'http://authentik-server-1:9000/',
-                                                            'authentik_host_insecure': True}}).encode(),
-                                                    headers=ak_headers, method='PUT')
-                                                urllib.request.urlopen(req, timeout=10)
-                                        if not outpost_token_id:
-                                            plog(f"  ✗ LDAP outpost exists but token not available via API")
+                                        plog(f"  ✓ LDAP application already exists")
                                     else:
-                                        plog(f"  ✗ LDAP outpost creation failed: {e.code} {err}")
-                                except Exception as ex:
-                                    plog(f"  ✗ LDAP outpost error: {str(ex)[:150]}")
-
-                            # Inject token into docker-compose.yml
-                            if outpost_token_id:
+                                        plog(f"  ⚠ LDAP application error: {e.code} {e.read().decode()[:100]}")
+                                _authentik_application_open_in_new_tab(ak_url, ak_headers, 'ldap', plog=plog)
+    
+                                # Get or create LDAP outpost (blueprint may have created it)
+                                outpost_token_id = None
                                 try:
-                                    req = urllib.request.Request(
-                                        f'{ak_url}/api/v3/core/tokens/{outpost_token_id}/view_key/',
-                                        headers=ak_headers, method='GET')
+                                    req = urllib.request.Request(f'{ak_url}/api/v3/outposts/instances/?search=LDAP',
+                                        headers=ak_headers)
                                     resp = urllib.request.urlopen(req, timeout=10)
-                                    response_body = resp.read().decode()
-                                    ldap_token_key = json.loads(response_body).get('key', '')
-                                    if ldap_token_key:
-                                        with open(compose_path, 'r') as f:
-                                            compose_text = f.read()
-                                        compose_text = compose_text.replace('AUTHENTIK_TOKEN: placeholder', f'AUTHENTIK_TOKEN: {ldap_token_key}')
-                                        with open(compose_path, 'w') as f:
-                                            f.write(compose_text)
-                                        plog(f"  ✓ LDAP outpost token injected into docker-compose.yml")
-                                        plog(f"  Recreating LDAP container with new token...")
-                                        subprocess.run(f'cd {ak_dir} && docker compose stop ldap && docker compose rm -f ldap && docker compose up -d ldap 2>&1',
-                                            shell=True, capture_output=True, timeout=60)
-                                        plog(f"  ✓ LDAP container recreated with injected token")
-                                        time.sleep(10)
-                                        plog(f"  ℹ LDAP may take 30–60s to show healthy in Authentik Outposts")
-                                    else:
-                                        plog(f"  ⚠ Token key empty — response: {response_body[:200]}")
-                                except urllib.error.HTTPError as e:
-                                    plog(f"  ✗ Token injection HTTP error: {e.code} {e.read().decode()[:200]}")
-                                except Exception as e:
-                                    plog(f"  ✗ Token injection error: {str(e)[:200]}")
-                            else:
-                                plog(f"  ✗ No outpost_token_id — cannot inject token")
-
-                            # Ensure LDAP container is started (even if token inject failed)
-                            r = subprocess.run(f'cd {ak_dir} && docker compose up -d ldap 2>&1', shell=True, capture_output=True, text=True, timeout=60)
-                            if r.returncode == 0:
-                                plog(f"  ✓ LDAP container started")
-                            else:
-                                plog(f"  ⚠ LDAP start: {r.stderr.strip()[:150] if r.stderr else r.stdout.strip()[:150]}")
-
-                except Exception as e:
-                    plog(f"  ✗ LDAP setup error: {str(e)[:200]}")
-                    try:
-                        subprocess.run(f'cd {ak_dir} && docker compose up -d ldap 2>&1', shell=True, capture_output=True, timeout=60)
-                        plog(f"  ℹ LDAP container started (add token in Authentik → Outposts → LDAP, then restart LDAP)")
-                    except Exception:
-                        pass
-                else:
-                    if os.path.exists('/opt/tak'):
-                        plog("  ⚠ No webadmin password found, skipping user creation")
+                                    results = json.loads(resp.read().decode())['results']
+                                    ldap_outpost = next((o for o in results if o.get('name') == 'LDAP' and o.get('type') == 'ldap'), None)
+                                    if ldap_outpost:
+                                        outpost_token_id = ldap_outpost.get('token_identifier', '')
+                                        if not outpost_token_id:
+                                            req = urllib.request.Request(f'{ak_url}/api/v3/outposts/instances/{ldap_outpost["pk"]}/',
+                                                headers=ak_headers)
+                                            resp = urllib.request.urlopen(req, timeout=10)
+                                            detail = json.loads(resp.read().decode())
+                                            outpost_token_id = detail.get('token_identifier', '')
+                                        if outpost_token_id:
+                                            plog(f"  ✓ Using existing LDAP outpost (blueprint)")
+                                except Exception:
+                                    pass
+                                if not outpost_token_id:
+                                    try:
+                                        req = urllib.request.Request(f'{ak_url}/api/v3/outposts/instances/',
+                                            data=json.dumps({'name': 'LDAP', 'type': 'ldap',
+                                                'providers': [ldap_provider_pk],
+                                                'config': {'authentik_host': 'http://authentik-server-1:9000/',
+                                                    'authentik_host_insecure': True}}).encode(),
+                                                headers=ak_headers, method='POST')
+                                        resp = urllib.request.urlopen(req, timeout=30)
+                                        outpost_data = json.loads(resp.read().decode())
+                                        outpost_token_id = outpost_data.get('token_identifier', '')
+                                        plog(f"  ✓ Created LDAP outpost (token_id={outpost_token_id})")
+                                    except urllib.error.HTTPError as e:
+                                        err = e.read().decode()[:200]
+                                        if e.code == 400:
+                                            req = urllib.request.Request(f'{ak_url}/api/v3/outposts/instances/?search=LDAP',
+                                                headers=ak_headers)
+                                            resp = urllib.request.urlopen(req, timeout=10)
+                                            results = json.loads(resp.read().decode())['results']
+                                            ldap_outpost = next((o for o in results if o.get('name') == 'LDAP' and o.get('type') == 'ldap'), None)
+                                            if ldap_outpost:
+                                                outpost_token_id = ldap_outpost.get('token_identifier', '')
+                                                if not outpost_token_id:
+                                                    req = urllib.request.Request(f'{ak_url}/api/v3/outposts/instances/{ldap_outpost["pk"]}/',
+                                                        headers=ak_headers)
+                                                    resp = urllib.request.urlopen(req, timeout=10)
+                                                    detail = json.loads(resp.read().decode())
+                                                    outpost_token_id = detail.get('token_identifier', '')
+                                                if outpost_token_id:
+                                                    plog(f"  ✓ LDAP outpost already exists, using token")
+                                                if outpost_token_id and ldap_provider_pk:
+                                                    req = urllib.request.Request(
+                                                        f'{ak_url}/api/v3/outposts/instances/{ldap_outpost["pk"]}/',
+                                                        data=json.dumps({'name': 'LDAP', 'type': 'ldap',
+                                                            'providers': [ldap_provider_pk],
+                                                            'config': {'authentik_host': 'http://authentik-server-1:9000/',
+                                                                'authentik_host_insecure': True}}).encode(),
+                                                        headers=ak_headers, method='PUT')
+                                                    urllib.request.urlopen(req, timeout=10)
+                                            if not outpost_token_id:
+                                                plog(f"  ✗ LDAP outpost exists but token not available via API")
+                                        else:
+                                            plog(f"  ✗ LDAP outpost creation failed: {e.code} {err}")
+                                    except Exception as ex:
+                                        plog(f"  ✗ LDAP outpost error: {str(ex)[:150]}")
+    
+                                # Inject token into docker-compose.yml
+                                if outpost_token_id:
+                                    try:
+                                        req = urllib.request.Request(
+                                            f'{ak_url}/api/v3/core/tokens/{outpost_token_id}/view_key/',
+                                            headers=ak_headers, method='GET')
+                                        resp = urllib.request.urlopen(req, timeout=10)
+                                        response_body = resp.read().decode()
+                                        ldap_token_key = json.loads(response_body).get('key', '')
+                                        if ldap_token_key:
+                                            with open(compose_path, 'r') as f:
+                                                compose_text = f.read()
+                                            compose_text = compose_text.replace('AUTHENTIK_TOKEN: placeholder', f'AUTHENTIK_TOKEN: {ldap_token_key}')
+                                            with open(compose_path, 'w') as f:
+                                                f.write(compose_text)
+                                            plog(f"  ✓ LDAP outpost token injected into docker-compose.yml")
+                                            plog(f"  Recreating LDAP container with new token...")
+                                            subprocess.run(f'cd {ak_dir} && docker compose stop ldap && docker compose rm -f ldap && docker compose up -d ldap 2>&1',
+                                                shell=True, capture_output=True, timeout=60)
+                                            plog(f"  ✓ LDAP container recreated with injected token")
+                                            time.sleep(10)
+                                            plog(f"  ℹ LDAP may take 30–60s to show healthy in Authentik Outposts")
+                                        else:
+                                            plog(f"  ⚠ Token key empty — response: {response_body[:200]}")
+                                    except urllib.error.HTTPError as e:
+                                        plog(f"  ✗ Token injection HTTP error: {e.code} {e.read().decode()[:200]}")
+                                    except Exception as e:
+                                        plog(f"  ✗ Token injection error: {str(e)[:200]}")
+                                else:
+                                    plog(f"  ✗ No outpost_token_id — cannot inject token")
+    
+                                # Ensure LDAP container is started (even if token inject failed)
+                                r = subprocess.run(f'cd {ak_dir} && docker compose up -d ldap 2>&1', shell=True, capture_output=True, text=True, timeout=60)
+                                if r.returncode == 0:
+                                    plog(f"  ✓ LDAP container started")
+                                else:
+                                    plog(f"  ⚠ LDAP start: {r.stderr.strip()[:150] if r.stderr else r.stdout.strip()[:150]}")
+    
+                    except Exception as e:
+                        plog(f"  ✗ LDAP setup error: {str(e)[:200]}")
+                        try:
+                            subprocess.run(f'cd {ak_dir} && docker compose up -d ldap 2>&1', shell=True, capture_output=True, timeout=60)
+                            plog(f"  ℹ LDAP container started (add token in Authentik → Outposts → LDAP, then restart LDAP)")
+                        except Exception:
+                            pass
             else:
                 plog("  ⚠ No bootstrap token found, skipping admin setup")
         except Exception as e:
@@ -20835,18 +20981,8 @@ entries:
 
         plog("")
         plog("=" * 50)
-        plog("\u2713 Authentik deployed successfully!")
-        plog(f"  Admin UI: {_get_authentik_base_url(settings)}")
-        plog(f"  Admin user: akadmin")
-        if bootstrap_pass_display:
-            plog(f"  Admin password: {'*' * max(0, len(bootstrap_pass_display) - 4) + bootstrap_pass_display[-4:]}")
-        plog("")
-        plog("  LDAP Configuration:")
-        plog(f"  - Service account: adm_ldapservice")
-        if ldap_svc_pass:
-            plog(f"  - Service password: {'*' * max(0, len(ldap_svc_pass) - 4) + ldap_svc_pass[-4:]}")
-        plog(f"  - Base DN: DC=takldap")
-        plog(f"  - LDAP port: 389")
+        plog("  Finishing: Caddy, Email Relay (if configured), final LDAP restart, then mandatory SA bind check.")
+        plog("  (Success is reported only after the bind passes — avoids deploying TAK on a broken LDAP outpost.)")
         # Regenerate Caddyfile if Caddy is configured — wait for HTTP 9090 first so Caddy doesn't get 502s
         if settings.get('fqdn'):
             plog("")
@@ -20878,18 +21014,51 @@ entries:
             except Exception as e:
                 plog(f"  ⚠ Authentik SMTP auto-config failed: {e}")
                 plog("  You can run it from Email Relay → 'Configure Authentik to use these settings'.")
+        # Final LDAP restart: ensure container has the injected token and internal URL (after SMTP/recreate)
+        try:
+            subprocess.run(f'cd {ak_dir} && docker compose restart ldap 2>&1',
+                shell=True, capture_output=True, text=True, timeout=60)
+            plog("  ✓ LDAP container restarted (final)")
+        except Exception:
+            pass
+        if not ldap_svc_pass:
+            with open(env_path) as f:
+                for line in f:
+                    if line.strip().startswith('AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD='):
+                        ldap_svc_pass = line.strip().split('=', 1)[1].strip()
+                        break
+        time.sleep(3)
+        if not _authentik_deploy_final_verify_ldap_sa(ldap_svc_pass, plog):
+            _update_boot_stagger_service()
+            authentik_deploy_status.update({'running': False, 'complete': False, 'error': True})
+            return
+        plog("")
         plog("=" * 50)
-        plog("  Next steps:")
-        plog("  1. Launch Authentik Admin (link below), then come back and refresh this page to get the akadmin password.")
-        plog("     After logging in: Admin interface → Groups → authentik Admins → Users → Add new user (additional Admin users).")
+        plog("\u2713 Authentik deployed successfully!")
+        plog(f"  Admin UI: {_get_authentik_base_url(settings)}")
+        plog(f"  Admin user: akadmin")
+        if bootstrap_pass_display:
+            plog(f"  Admin password: {'*' * max(0, len(bootstrap_pass_display) - 4) + bootstrap_pass_display[-4:]}")
+        plog("")
+        plog("  LDAP Configuration:")
+        plog(f"  - Service account: adm_ldapservice")
+        if ldap_svc_pass:
+            plog(f"  - Service password: {'*' * max(0, len(ldap_svc_pass) - 4) + ldap_svc_pass[-4:]}")
+        plog(f"  - Base DN: DC=takldap")
+        plog(f"  - LDAP port: 389")
+        plog("=" * 50)
+        plog("  Next steps (typical order; Email Relay may already be done on your system):")
+        plog("  1. Launch Authentik Admin when needed; refresh this page to reveal akadmin password if required.")
+        plog("     Additional admins: Admin → Groups → authentik Admins → Users.")
         if not relay.get('from_addr'):
-            plog("  2. Go to Email Relay and set up SMTP; then use 'Configure Authentik to use these settings'.")
+            plog("  2. Email Relay: set up SMTP, then 'Configure Authentik to use these settings' (before or after TAK, but before you rely on password reset email).")
         else:
-            plog("  2. SMTP and password recovery are already configured (Email Relay was set up).")
+            plog("  2. Email Relay: SMTP is already configured — this deploy applied or will apply Authentik email when that step succeeded above.")
+        plog("  3. TAK Server: deploy only after this log shows the LDAP SA bind verified (above).")
         plog("=" * 50)
         plog("  ✓ Deploy complete.")
         _update_boot_stagger_service()
-        authentik_deploy_status.update({'running': False, 'complete': True})
+        authentik_deploy_status.update({'running': False, 'complete': True, 'error': False})
     except Exception as e:
         plog(f"\u2717 FATAL ERROR: {str(e)}")
         authentik_deploy_status.update({'running': False, 'error': True})
@@ -21182,11 +21351,12 @@ It provides centralized user authentication and management for all your services
 <div style="background:rgba(16,185,129,0.1);border:1px solid var(--border);border-radius:10px;padding:20px;margin-top:20px;text-align:center">
 <div style="font-family:'JetBrains Mono',monospace;font-size:14px;color:var(--green);margin-bottom:8px">✓ Authentik deployed!</div>
 <div style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--cyan);margin-bottom:12px;text-align:left">
-<strong>Next steps:</strong><br>
-1. <strong>Configure SMTP</strong> — go to <a href="/emailrelay" style="color:var(--cyan)">Email Relay</a>, configure SMTP, then click &quot;Configure Authentik to use these settings&quot;.<br>
-2. <strong>Deploy TAK Server</strong> — go to <a href="/takserver" style="color:var(--cyan)">TAK Server</a>, upload .deb/.rpm and deploy.<br>
-3. <strong>Deploy TAK Portal</strong> — go to <a href="/takportal" style="color:var(--cyan)">TAK Portal</a> and deploy when ready.<br>
-You can also open the Authentik admin UI below to make additional Admin users (Admin → Groups → authentik Admins → Users).
+<strong>Typical order</strong> (Email Relay may already be configured on your host):<br>
+1. <strong>Authentik</strong> — use the admin link below; deploy log must show LDAP SA bind verified before TAK.<br>
+2. <strong>SMTP</strong> — <a href="/emailrelay" style="color:var(--cyan)">Email Relay</a>: configure if needed, then &quot;Configure Authentik&quot;.<br>
+3. <strong>TAK Server</strong> — <a href="/takserver" style="color:var(--cyan)">TAK Server</a> after LDAP is healthy.<br>
+4. <strong>TAK Portal</strong> — <a href="/takportal" style="color:var(--cyan)">TAK Portal</a> when ready.<br>
+Additional admins: Authentik → Groups → authentik Admins → Users.
 </div>
 <a href="{{ authentik_base_url }}" target="_blank" rel="noopener noreferrer" style="display:inline-block;padding:12px 24px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;text-decoration:none;margin-right:10px">Authentik</a>
 <a href="/emailrelay" style="display:inline-block;padding:10px 24px;background:rgba(30,64,175,0.2);color:var(--cyan);border:1px solid var(--border);border-radius:8px;font-size:14px;font-weight:600;text-decoration:none;margin-right:10px">Email Relay</a>
@@ -21211,6 +21381,8 @@ You can also open the Authentik admin UI below to make additional Admin users (A
 </div>
 </div>
 <footer class="footer"></footer>
+<script src="/log-tools.js?v={{ version }}"></script>
+<script>initLogToolbar('deploy-log');initLogToolbar('container-log');</script>
 <script>
 async function showAkPassword(){
     var btn=document.getElementById('ak-pw-btn');
@@ -21303,7 +21475,7 @@ function pollDeployLog(){
             var el=document.getElementById('deploy-log');
             var inst=document.createElement('div');
             inst.style.cssText='font-family:JetBrains Mono,monospace;font-size:12px;color:var(--cyan);margin-top:16px;margin-bottom:8px;text-align:left;line-height:1.6';
-            inst.innerHTML='<strong>Next steps:</strong><br>1. Configure <strong>SMTP</strong> (Email Relay), then &quot;Configure Authentik&quot;.<br>2. Deploy <strong>TAK Server</strong>.<br>3. Deploy <strong>TAK Portal</strong> when ready.<br>Use &quot;Launch Authentik Admin&quot; below to make additional Admin users.';
+            inst.innerHTML='<strong>Typical order</strong> (SMTP may already be set):<br>1. <strong>Authentik</strong> — deploy log showed LDAP SA bind OK.<br>2. <strong>Email Relay</strong> if you still need SMTP / &quot;Configure Authentik&quot;.<br>3. <strong>TAK Server</strong>, then <strong>TAK Portal</strong> when ready.';
             el.appendChild(inst);
             var authUrl=el.getAttribute('data-authentik-url')||'';
             var launchLink=document.createElement('a');
@@ -21501,23 +21673,10 @@ document.addEventListener('DOMContentLoaded', function() {
 </body></html>'''
 
 def _coreconfig_has_ldap():
-    """True if CoreConfig.xml exists and already contains our LDAP auth block."""
+    """True only when CoreConfig auth block is actually LDAP-default."""
     path = '/opt/tak/CoreConfig.xml'
     if not os.path.exists(path):
         return False
-    try:
-        with open(path, 'r') as f:
-            content = f.read()
-        return 'adm_ldapservice' in content
-    except Exception:
-        return False
-
-
-def _takserver_flatfile_auth_status():
-    """Return flat-file auth state from CoreConfig auth block."""
-    path = '/opt/tak/CoreConfig.xml'
-    if not os.path.exists(path):
-        return {'installed': False, 'enabled': False, 'error': 'CoreConfig.xml not found'}
     try:
         with open(path, 'r') as f:
             content = f.read()
@@ -21525,111 +21684,14 @@ def _takserver_flatfile_auth_status():
         start = lower.find('<auth')
         end = lower.find('</auth>', start) if start >= 0 else -1
         if start < 0 or end < 0:
-            return {'installed': True, 'enabled': False, 'error': 'No <auth> block found'}
+            return False
         block = content[start:end + len('</auth>')]
-        has_userauth_file = ('userauthenticationfile.xml' in block.lower())
-        has_configured_file_provider = bool(
-            re.search(r'<File\b[^>]*\blocation\s*=\s*"[^"]+"[^>]*/>', block, re.IGNORECASE)
-        )
-        has_bare_file_tag = bool(re.search(r'<File(?:\s+[^>]*)?/>', block, re.IGNORECASE))
+        has_ldap_provider = bool(re.search(r'<ldap\b', block, re.IGNORECASE)) and ('adm_ldapservice' in block.lower())
         m = re.search(r'<auth[^>]*\bdefault="([^"]+)"', block, re.IGNORECASE)
         default_auth = (m.group(1).strip().lower() if m else '')
-        return {
-            'installed': True,
-            'enabled': has_userauth_file or has_configured_file_provider,
-            'has_userauth_file': has_userauth_file,
-            'has_bare_file_tag': has_bare_file_tag and not (has_userauth_file or has_configured_file_provider),
-            'default_auth': default_auth,
-        }
-    except Exception as e:
-        return {'installed': True, 'enabled': False, 'error': str(e)[:180]}
-
-
-@app.route('/api/takserver/flatfile-auth')
-@login_required
-def takserver_flatfile_auth_status_api():
-    return jsonify(_takserver_flatfile_auth_status())
-
-
-@app.route('/api/takserver/flatfile-auth', methods=['POST'])
-@login_required
-def takserver_flatfile_auth_toggle_api():
-    data = request.json if request.is_json else {}
-    enabled = data.get('enabled')
-    if not isinstance(enabled, bool):
-        return jsonify({'success': False, 'error': 'enabled must be true or false'}), 400
-
-    coreconfig = '/opt/tak/CoreConfig.xml'
-    if not os.path.exists(coreconfig):
-        return jsonify({'success': False, 'error': 'TAK Server not installed (CoreConfig.xml not found)'}), 400
-
-    try:
-        with open(coreconfig, 'r') as f:
-            content = f.read()
+        return bool(has_ldap_provider and default_auth == 'ldap')
     except Exception:
-        r = subprocess.run(['sudo', 'cat', coreconfig], capture_output=True, text=True, timeout=8)
-        if r.returncode != 0:
-            return jsonify({'success': False, 'error': 'Could not read CoreConfig.xml'}), 500
-        content = r.stdout
-
-    lower = content.lower()
-    start = lower.find('<auth')
-    end_tag = lower.find('</auth>', start) if start >= 0 else -1
-    if start < 0 or end_tag < 0:
-        return jsonify({'success': False, 'error': 'No <auth> block found in CoreConfig.xml'}), 400
-    end = end_tag + len('</auth>')
-    auth_block = content[start:end]
-
-    has_userauth_file = ('userauthenticationfile.xml' in auth_block.lower())
-    has_configured_file_provider = bool(
-        re.search(r'<File\b[^>]*\blocation\s*=\s*"[^"]+"[^>]*/>', auth_block, re.IGNORECASE)
-    )
-    has_any_file_tag = bool(re.search(r'<File(?:\s+[^>]*)?/>', auth_block, re.IGNORECASE))
-
-    if enabled:
-        if has_userauth_file:
-            status = _takserver_flatfile_auth_status()
-            return jsonify({'success': True, 'message': 'Flat-file auth already enabled', 'status': status})
-        if has_any_file_tag:
-            # Normalize any existing file provider to explicit UserAuthenticationFile.xml.
-            new_auth = re.sub(
-                r'<File(?:\s+[^>]*)?/>',
-                '<File location="UserAuthenticationFile.xml"/>',
-                auth_block,
-                flags=re.IGNORECASE
-            )
-        else:
-            file_line = '        <File location="UserAuthenticationFile.xml"/>\n'
-            new_auth = auth_block.replace('</auth>', file_line + '    </auth>')
-    else:
-        if not has_any_file_tag:
-            status = _takserver_flatfile_auth_status()
-            return jsonify({'success': True, 'message': 'Flat-file auth already disabled', 'status': status})
-        # Remove any File provider entry when flat-file auth is disabled.
-        new_auth = re.sub(
-            r'<File(?:\s+[^>]*)?/>',
-            '',
-            auth_block,
-            flags=re.IGNORECASE
-        )
-
-    new_content = content[:start] + new_auth + content[end:]
-
-    try:
-        with open(coreconfig, 'w') as f:
-            f.write(new_content)
-    except Exception:
-        proc = subprocess.run(['sudo', 'tee', coreconfig], input=new_content, capture_output=True, text=True, timeout=10)
-        if proc.returncode != 0:
-            return jsonify({'success': False, 'error': 'Failed to write CoreConfig.xml'}), 500
-
-    rr = subprocess.run(['sudo', 'systemctl', 'restart', 'takserver'], capture_output=True, text=True, timeout=60)
-    if rr.returncode != 0:
-        return jsonify({'success': False, 'error': f'CoreConfig updated, but TAK restart failed: {rr.stderr[:160]}'}), 500
-
-    status = _takserver_flatfile_auth_status()
-    action = 'enabled' if enabled else 'disabled'
-    return jsonify({'success': True, 'message': f'Flat-file auth {action}. TAK Server restarted.', 'status': status})
+        return False
 
 
 def _resync_ldap_credential_to_coreconfig():
@@ -21740,6 +21802,138 @@ def _test_ldap_bind(ldap_pass):
             shell=True, capture_output=True, text=True, timeout=10)
         log = (r.stdout or '').lower()
     return 'authenticated' in log and ('adm_ldapservice' in log or 'ldapservice' in log)
+
+
+def _test_ldap_bind_dn(bind_dn, bind_pass):
+    """Best-effort LDAP bind signal for a specific DN via outpost logs.
+
+    We don't trust ldapsearch exit codes against Authentik LDAP outpost, so this checks
+    whether the outpost received a bind request for the DN and that recent lines don't
+    show obvious credential errors for that DN.
+    """
+    settings = load_settings()
+    ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+    ldap_host = '127.0.0.1'
+    is_remote = ak_cfg.get('target_mode') == 'remote'
+    if is_remote:
+        remote_host = (ak_cfg.get('remote', {}).get('host') or '').strip()
+        if remote_host:
+            ldap_host = remote_host
+    dn = (bind_dn or '').strip().lower()
+    if not dn:
+        return False
+    user_hint = ''
+    if dn.startswith('cn=') and ',' in dn:
+        user_hint = dn.split(',', 1)[0].replace('cn=', '').strip()
+    success_markers = ('authenticated', 'bind successful', 'login successful')
+    failure_markers = ('invalid credentials', 'access denied', 'insufficient access')
+
+    for _ in range(3):
+        # Primary signal: explicit ldapsearch success for this bind DN/password.
+        try:
+            if shutil.which('ldapsearch'):
+                lr = subprocess.run(
+                    ['ldapsearch', '-x', '-H', f'ldap://{ldap_host}:389',
+                     '-D', bind_dn, '-w', bind_pass,
+                     '-b', 'dc=takldap', '-s', 'base', '(objectClass=*)'],
+                    capture_output=True, text=True, timeout=15)
+                out = ((lr.stdout or '') + '\n' + (lr.stderr or '')).lower()
+                if lr.returncode == 0 and 'invalid credentials' not in out:
+                    return True
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+            pass
+
+        time.sleep(2)
+        if is_remote:
+            ok, out = _ssh_probe(ak_cfg.get('remote', {}),
+                'docker logs authentik-ldap-1 --since 45s 2>&1', timeout=15)
+            log = (out or '').lower()
+        else:
+            r = subprocess.run(
+                'docker logs authentik-ldap-1 --since 45s 2>&1',
+                shell=True, capture_output=True, text=True, timeout=10)
+            log = (r.stdout or '').lower()
+
+        lines = []
+        for ln in log.splitlines():
+            if dn in ln or (user_hint and user_hint in ln):
+                lines.append(ln)
+        if not lines:
+            continue
+        for ln in lines:
+            ln_low = ln.lower()
+            if 'failed to execute flow' in ln_low or 'ak-stage-flow-error' in ln_low:
+                return False
+            if 'flow error' in ln_low and ('password' in ln_low or 'invalid' in ln_low):
+                return False
+        if any(any(m in ln for m in success_markers) for ln in lines):
+            return True
+        if any(any(m in ln for m in failure_markers) for ln in lines):
+            return False
+
+    return False
+
+
+def _authentik_deploy_final_verify_ldap_sa(ldap_svc_pass, plog, attempts=12, delay_sec=5):
+    """After Caddy/SMTP/final LDAP restart, require a real SA bind before deploy success.
+
+    Stops false 'deploy complete' when the outpost or flow is broken (common after SMTP recreate).
+    """
+    sa_dn = 'cn=adm_ldapservice,ou=users,dc=takldap'
+    if not (ldap_svc_pass or '').strip():
+        plog("  \u2717 No AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD in .env — cannot verify LDAP SA bind.")
+        return False
+    if not _ensure_ldapsearch():
+        plog("  \u2717 ldapsearch not available — install ldap-utils (Debian) or openldap-clients (RHEL).")
+        return False
+    for i in range(1, attempts + 1):
+        plog(f"  Final check: LDAP SA bind ({i}/{attempts})...")
+        if _test_ldap_bind_dn(sa_dn, ldap_svc_pass):
+            plog("  \u2713 LDAP service-account bind verified (adm_ldapservice). Safe to proceed to TAK Server.")
+            return True
+        if i < attempts:
+            time.sleep(delay_sec)
+    plog("  \u2717 Final LDAP SA bind failed after Caddy/SMTP/restart.")
+    plog("     Check: docker logs authentik-ldap-1 — fix flow/outpost errors before deploying TAK Server.")
+    return False
+
+
+def _wait_ldap_outpost_ready(timeout_secs=180):
+    """Wait until LDAP outpost container is ready enough for bind checks.
+
+    Returns (ready: bool, status_text: str). For containers with healthchecks we wait for
+    healthy. For setups without healthchecks, plain "Up" is considered ready.
+    """
+    settings = load_settings()
+    ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+    is_remote = ak_cfg.get('target_mode') == 'remote' and (ak_cfg.get('remote', {}).get('host') or '').strip()
+    started = time.time()
+    last_status = ''
+    while (time.time() - started) < timeout_secs:
+        try:
+            if is_remote:
+                ok, out = _ssh_probe(
+                    ak_cfg.get('remote', {}),
+                    'docker ps --filter name=authentik-ldap --format "{{.Status}}" 2>/dev/null',
+                    timeout=10
+                )
+                status = (out or '').strip()
+            else:
+                r = subprocess.run(
+                    'docker ps --filter name=authentik-ldap --format "{{.Status}}" 2>/dev/null',
+                    shell=True, capture_output=True, text=True, timeout=8
+                )
+                status = (r.stdout or '').strip()
+            last_status = status or last_status
+            s = (status or '').lower()
+            if 'healthy' in s:
+                return True, status
+            if 'up' in s and 'health: starting' not in s and 'unhealthy' not in s:
+                return True, status
+        except Exception:
+            pass
+        time.sleep(3)
+    return False, (last_status or 'unknown')
 
 def _ensure_ldap_flow_authentication_none():
     """Ensure ldap-authentication-flow exists with authentication:none and 3 stage bindings, restart LDAP outpost.
@@ -21876,7 +22070,9 @@ def _ensure_ldap_flow_authentication_none():
                 try:
                     _patch(f'providers/ldap/{ldap_prov["pk"]}/', {
                         'authentication_flow': ldap_flow_pk,
-                        'authorization_flow': ldap_flow_pk})
+                        'authorization_flow': ldap_flow_pk,
+                        'bind_mode': 'cached',
+                        'search_mode': 'cached'})
                 except urllib.error.HTTPError as e:
                     body = ''
                     try: body = e.read().decode()[:200]
@@ -21921,7 +22117,9 @@ def _ensure_ldap_flow_authentication_none():
             if ldap_provider:
                 _patch(f'providers/ldap/{ldap_provider["pk"]}/', {
                     'authentication_flow': new_flow_pk,
-                    'authorization_flow': new_flow_pk})
+                    'authorization_flow': new_flow_pk,
+                    'bind_mode': 'cached',
+                    'search_mode': 'cached'})
     except urllib.error.HTTPError as e:
         try:
             body = e.read().decode()[:200]
@@ -22008,7 +22206,9 @@ def _ensure_authentik_ldap_service_account():
         # 6. Ensure ldapsearch is available (install ldap-utils / openldap-clients if missing)
         _ensure_ldapsearch()
         # 7. Wait for LDAP outpost to be ready, then VERIFY via outpost logs (ldapsearch exit code is unreliable)
-        time.sleep(10)
+        ready, ready_status = _wait_ldap_outpost_ready(timeout_secs=180)
+        if not ready:
+            return False, f'LDAP outpost not ready (status: {ready_status})'
         for attempt in range(10):
             time.sleep(6)
             if _test_ldap_bind(ldap_pass):
@@ -22026,6 +22226,36 @@ def _ensure_authentik_ldap_service_account():
     except Exception as e:
         return False, str(e)[:120]
 
+def _remove_webadmin_from_userauth():
+    """Remove webadmin entry from UserAuthenticationFile.xml so flat-file can't shadow LDAP auth.
+    Uses XML parsing to avoid producing malformed XML that crashes TAK Server's FileAuthenticator."""
+    uaf = '/opt/tak/UserAuthenticationFile.xml'
+    if not os.path.exists(uaf):
+        return
+    try:
+        r = subprocess.run(['sudo', 'cat', uaf], capture_output=True, text=True, timeout=10)
+        content = r.stdout if r.returncode == 0 else ''
+        if not content or 'identifier="webadmin"' not in content:
+            return
+        import xml.etree.ElementTree as ET
+        tree = ET.ElementTree(ET.fromstring(content))
+        root = tree.getroot()
+        removed = False
+        # Remove from actual parent — root.remove() only works for direct children; nested <user> would raise and be swallowed.
+        for parent in root.iter():
+            for child in list(parent):
+                if child.tag == 'user' and child.get('identifier') == 'webadmin':
+                    parent.remove(child)
+                    removed = True
+        if not removed:
+            return
+        patch_path = os.path.join(BASE_DIR, 'UserAuthenticationFile.patched.xml')
+        tree.write(patch_path, xml_declaration=True, encoding='unicode')
+        subprocess.run(['sudo', 'cp', os.path.abspath(patch_path), uaf],
+            capture_output=True, text=True, timeout=10)
+    except Exception:
+        pass
+
 def _apply_ldap_to_coreconfig():
     """Patch CoreConfig.xml with LDAP auth and restart TAK Server. Returns (success, message)."""
     coreconfig_path = '/opt/tak/CoreConfig.xml'
@@ -22039,50 +22269,37 @@ def _apply_ldap_to_coreconfig():
     with open(coreconfig_path, 'r') as f:
         original = f.read()
     if _coreconfig_has_ldap():
-        # LDAP already configured — ensure adminGroup="ROLE_ADMIN" (required for admin UI; without it everyone gets WebTAK)
         import re as _re
         def _ensure_admin_group(text):
             if 'adminGroup="ROLE_ADMIN"' in text:
                 return text
-            # Add adminGroup to the <ldap ... /> element so 8446 shows admin UI for ROLE_ADMIN users
             return _re.sub(r'(<ldap\s[^>]*?)(\s*/>)', r'\1 adminGroup="ROLE_ADMIN"\2', text, count=1, flags=_re.DOTALL)
-        # Check if password needs updating
         m = _re.search(r'serviceAccountCredential="([^"]*)"', original)
         existing_pass = m.group(1) if m else ''
-        if existing_pass == ldap_pass:
-            if 'adminGroup="ROLE_ADMIN"' not in original:
-                patched = _ensure_admin_group(original)
-                patch_path = os.path.join(BASE_DIR, 'CoreConfig.ldap-patch.xml')
-                with open(patch_path, 'w') as f:
-                    f.write(patched)
-                r = subprocess.run(['sudo', 'cp', os.path.abspath(patch_path), coreconfig_path],
-                    capture_output=True, text=True, timeout=10)
-                if r.returncode == 0:
-                    subprocess.run('sudo systemctl restart takserver 2>&1', shell=True, capture_output=True, text=True, timeout=60)
-                return True, 'CoreConfig already has LDAP (adminGroup restored — restart TAK Server if 8446 still shows WebTAK)'
-            return True, 'CoreConfig already has LDAP (password matches .env)'
-        # Password mismatch — update it in place and ensure adminGroup
-        updated = original.replace(
-            f'serviceAccountCredential="{existing_pass}"',
-            f'serviceAccountCredential="{ldap_pass}"')
-        updated = _ensure_admin_group(updated)
-        if updated != original or 'adminGroup="ROLE_ADMIN"' not in original:
+        needs_fix = False
+        updated = original
+        if existing_pass != ldap_pass:
+            updated = updated.replace(
+                f'serviceAccountCredential="{existing_pass}"',
+                f'serviceAccountCredential="{ldap_pass}"')
+            needs_fix = True
+        if 'adminGroup="ROLE_ADMIN"' not in updated:
+            updated = _ensure_admin_group(updated)
+            needs_fix = True
+        if needs_fix and updated != original:
             patch_path = os.path.join(BASE_DIR, 'CoreConfig.ldap-patch.xml')
             with open(patch_path, 'w') as f:
                 f.write(updated)
             r = subprocess.run(['sudo', 'cp', os.path.abspath(patch_path), coreconfig_path],
                 capture_output=True, text=True, timeout=10)
             if r.returncode != 0:
-                return False, f'Password resync: sudo cp failed: {r.stderr.strip()[:200]}'
-            ag = subprocess.run(['grep', '-c', 'adminGroup="ROLE_ADMIN"', coreconfig_path], capture_output=True, text=True, timeout=5)
-            if ag.returncode != 0 or (ag.stdout or '').strip() == '0':
-                return False, 'CoreConfig updated but adminGroup="ROLE_ADMIN" missing — run Connect LDAP again.'
+                return False, f'CoreConfig fix: sudo cp failed: {r.stderr.strip()[:200]}'
             r = subprocess.run('sudo systemctl restart takserver 2>&1',
                 shell=True, capture_output=True, text=True, timeout=60)
             if r.returncode != 0:
-                return False, f'Password resynced but TAK Server restart failed: {r.stderr.strip()[:120]}'
-            return True, 'LDAP password resynced from .env to CoreConfig — TAK Server restarted.'
-        return True, 'CoreConfig already has LDAP'
+                return False, f'CoreConfig fixed but TAK Server restart failed: {r.stderr.strip()[:120]}'
+            return True, 'CoreConfig fixed (updated password / restored adminGroup) — TAK Server restarted.'
+        return True, 'CoreConfig already has LDAP (password matches .env)'
     # Backup
     backup_path = coreconfig_path + '.pre-ldap.bak'
     if not os.path.exists(backup_path):
@@ -22113,7 +22330,6 @@ def _apply_ldap_to_coreconfig():
     auth_block += ' x509useGroupCache="true" x509useGroupCacheDefaultActive="true"'
     auth_block += ' x509checkRevocation="true">\n'
     auth_block += ldap_line + '\n'
-    auth_block += '        <File location="UserAuthenticationFile.xml"/>\n'
     auth_block += '    </auth>'
     # Sanity check the block we built
     if 'adm_ldapservice' not in auth_block:
@@ -22152,9 +22368,9 @@ def _apply_ldap_to_coreconfig():
         return False, f'CoreConfig patched but TAK Server restart failed: {r.stderr.strip()[:120]}'
     return True, 'LDAP connected — CoreConfig patched and TAK Server restarted.'
 
-def _ensure_authentik_webadmin():
-    """Ensure webadmin user exists in Authentik with path=users for 8446 LDAP login.
-    Needed when Authentik was deployed before TAK Server (webadmin skipped at deploy time).
+def _ensure_authentik_webadmin(skip_bind_verify=False):
+    """Ensure webadmin exists in Authentik with password from settings; 8446 uses LDAP when CoreConfig has <ldap/>.
+    skip_bind_verify=True skips LDAP outpost recreate and bind verification (default False — TAK deploy and Sync webadmin use full verify).
     Returns (True, None) on success, (False, error_msg) on failure."""
     import urllib.request as _req
     import urllib.error
@@ -22164,11 +22380,9 @@ def _ensure_authentik_webadmin():
     ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
     if not ak_token:
         return False, 'Authentik .env not found'
-    webadmin_pass = settings.get('webadmin_password', '')
+    webadmin_pass = (settings.get('webadmin_password') or '').strip()
     if not webadmin_pass:
-        webadmin_pass = secrets.token_urlsafe(16)
-        settings['webadmin_password'] = webadmin_pass
-        save_settings(settings)
+        return False, 'webadmin password is not set in infra-TAK settings. Re-deploy TAK Server and set a WebGUI password.'
     url = _get_authentik_api_url(settings)
     headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
     try:
@@ -22180,11 +22394,7 @@ def _ensure_authentik_webadmin():
         if not group_pk:
             gr = _req.Request(f'{url}/api/v3/core/groups/', data=json.dumps({'name': 'tak_ROLE_ADMIN', 'is_superuser': False}).encode(), headers=headers, method='POST')
             group_pk = json.loads(_req.urlopen(gr, timeout=10).read().decode())['pk']
-        req = _req.Request(f'{url}/api/v3/core/users/?search=webadmin', headers=headers)
-        resp = _req.urlopen(req, timeout=10)
-        results = json.loads(resp.read().decode())['results']
-        user_obj = next((u for u in results if u.get('username') == 'webadmin'), None)
-        if not user_obj:
+        def _create_webadmin_user():
             ud = {
                 'username': 'webadmin',
                 'name': 'TAK Admin',
@@ -22194,8 +22404,15 @@ def _ensure_authentik_webadmin():
                 'path': 'users',
                 'groups': [group_pk] if group_pk else []
             }
-            req = _req.Request(f'{url}/api/v3/core/users/', data=json.dumps(ud).encode(), headers=headers, method='POST')
-            user_obj = json.loads(_req.urlopen(req, timeout=10).read().decode())
+            req_local = _req.Request(f'{url}/api/v3/core/users/', data=json.dumps(ud).encode(), headers=headers, method='POST')
+            return json.loads(_req.urlopen(req_local, timeout=10).read().decode())
+
+        req = _req.Request(f'{url}/api/v3/core/users/?search=webadmin', headers=headers)
+        resp = _req.urlopen(req, timeout=10)
+        results = json.loads(resp.read().decode())['results']
+        user_obj = next((u for u in results if u.get('username') == 'webadmin'), None)
+        if not user_obj:
+            user_obj = _create_webadmin_user()
         webadmin_pk = user_obj['pk']
         patch_fields = {}
         if user_obj.get('is_superuser') is not True:
@@ -22223,6 +22440,8 @@ def _ensure_authentik_webadmin():
                 req = _req.Request(f'{url}/api/v3/core/groups/{admins_grp["pk"]}/add_user/',
                     data=json.dumps({'pk': webadmin_pk}).encode(), headers=headers, method='POST')
                 _req.urlopen(req, timeout=10)
+        if skip_bind_verify:
+            return True, None
         # Restart LDAP outpost to clear bind cache (password change would otherwise be ignored until cache expires)
         ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
         if ak_cfg.get('target_mode') == 'remote' and (ak_cfg.get('remote', {}).get('host') or '').strip():
@@ -22234,6 +22453,43 @@ def _ensure_authentik_webadmin():
                 shell=True, capture_output=True, text=True, timeout=90)
             if r.returncode != 0:
                 return False, 'Password set but LDAP restart failed: ' + (r.stderr or r.stdout or '')[:120]
+        ready, ready_status = _wait_ldap_outpost_ready(timeout_secs=180)
+        if not ready:
+            return False, f'webadmin set, but LDAP outpost not ready (status: {ready_status})'
+        if not _test_ldap_bind_dn('cn=webadmin,ou=users,dc=takldap', webadmin_pass):
+            try:
+                req_del = _req.Request(f'{url}/api/v3/core/users/{webadmin_pk}/', headers=headers, method='DELETE')
+                _req.urlopen(req_del, timeout=10)
+            except Exception:
+                pass
+            rebuilt = _create_webadmin_user()
+            webadmin_pk = rebuilt['pk']
+            req = _req.Request(
+                f'{url}/api/v3/core/users/{webadmin_pk}/set_password/',
+                data=json.dumps({'password': webadmin_pass}).encode(),
+                headers=headers,
+                method='POST'
+            )
+            _req.urlopen(req, timeout=10)
+            if admins_grp:
+                req = _req.Request(
+                    f'{url}/api/v3/core/groups/{admins_grp["pk"]}/add_user/',
+                    data=json.dumps({'pk': webadmin_pk}).encode(),
+                    headers=headers,
+                    method='POST'
+                )
+                try:
+                    _req.urlopen(req, timeout=10)
+                except Exception:
+                    pass
+            if ak_cfg.get('target_mode') == 'remote' and (ak_cfg.get('remote', {}).get('host') or '').strip():
+                _module_run(ak_cfg, 'cd ~/authentik && docker compose up -d --force-recreate ldap 2>&1', timeout=90)
+            elif os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
+                subprocess.run('cd ~/authentik && docker compose up -d --force-recreate ldap 2>&1',
+                    shell=True, capture_output=True, text=True, timeout=90)
+            ready2, ready_status2 = _wait_ldap_outpost_ready(timeout_secs=180)
+            if (not ready2) or (not _test_ldap_bind_dn('cn=webadmin,ou=users,dc=takldap', webadmin_pass)):
+                return False, f'webadmin exists but LDAP bind verification failed (DN/password). Outpost status: {ready_status2}'
         return True, None
     except urllib.error.HTTPError as e:
         try:
@@ -22313,7 +22569,7 @@ def takserver_webadmin_password():
 @app.route('/api/takserver/webadmin-password', methods=['POST'])
 @login_required
 def takserver_set_webadmin_password():
-    """Set webadmin password in settings (used for 8446 and Sync webadmin to Authentik). Use when 8446 fails with remote Authentik so you can set a known password and sync."""
+    """Set webadmin password in settings and update flat-file (8446 auth source). Optionally sync to Authentik afterward."""
     data = request.get_json() or {}
     pw = (data.get('password') or '').strip()
     if not pw:
@@ -22321,7 +22577,28 @@ def takserver_set_webadmin_password():
     settings = load_settings()
     settings['webadmin_password'] = pw
     save_settings(settings)
-    return jsonify({'success': True, 'message': 'Password saved. Click Sync webadmin to Authentik, then restart LDAP on the Authentik server if needed.'})
+    if _get_authentik_env_content(settings):
+        _remove_webadmin_from_userauth()
+        return jsonify({
+            'success': True,
+            'message': 'Password saved. Stale flat-file webadmin removed if present. Click Sync webadmin to push this password to Authentik LDAP (8446 uses LDAP when Authentik is deployed).'
+        })
+    flatfile_ok = False
+    if os.path.exists('/opt/tak/utils/UserManager.jar'):
+        try:
+            r = subprocess.run(
+                f"java -jar /opt/tak/utils/UserManager.jar usermod -A -p '{pw}' webadmin 2>&1",
+                shell=True, capture_output=True, text=True, timeout=30)
+            flatfile_ok = r.returncode == 0
+        except Exception:
+            pass
+    msg = 'Password saved'
+    if flatfile_ok:
+        msg += ' and updated in TAK Server (8446 login).'
+    else:
+        msg += ' but could not update TAK Server flat-file — redeploy TAK Server for 8446 to use this password.'
+    msg += ' Click Sync webadmin to also update Authentik.'
+    return jsonify({'success': True, 'message': msg})
 
 
 @app.route('/api/takserver/cert-password')
@@ -22428,6 +22705,8 @@ def takserver_connect_ldap():
         diag.append(f'WebAdmin: {err_wa}')
     else:
         diag.append('WebAdmin: OK')
+    _remove_webadmin_from_userauth()
+    diag.append('Removed flat-file webadmin shadow if present (8446 → LDAP)')
     ok, msg = _apply_ldap_to_coreconfig()
     diag.append(f'CoreConfig: {msg}')
     # Diagnostic: compare passwords and check outpost health
@@ -22463,7 +22742,41 @@ def takserver_connect_ldap():
             diag.append(f'Outpost log: {outpost_tail[:200]}')
     except Exception as e:
         diag.append(f'Diagnostic error: {str(e)[:100]}')
-    return jsonify({'success': ok, 'message': ' | '.join(diag)})
+    # Post-fix verification signals (best-effort)
+    try:
+        verify = {}
+        verify['coreconfig_has_ldap'] = bool(_coreconfig_has_ldap())
+        ws = _get_authentik_webadmin_status()
+        verify['webadmin_exists_in_authentik'] = bool(ws.get('exists'))
+        verify['webadmin_superuser'] = bool(ws.get('is_superuser'))
+        ldap_pass = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD') or ''
+        verify['service_bind_seen'] = bool(_test_ldap_bind(ldap_pass)) if ldap_pass else False
+        wap = (settings.get('webadmin_password') or '').strip()
+        verify['webadmin_bind_seen'] = bool(_test_ldap_bind_dn('cn=webadmin,ou=users,dc=takldap', wap)) if wap else False
+        verify['ready'] = all([
+            verify['coreconfig_has_ldap'],
+            verify['webadmin_exists_in_authentik'],
+            verify['webadmin_superuser'],
+            verify['webadmin_bind_seen'],
+        ])
+        diag.append(
+            "Verification: coreconfig={} webadmin={} superuser={} webadmin-bind={} ready={}".format(
+                'OK' if verify['coreconfig_has_ldap'] else 'FAIL',
+                'OK' if verify['webadmin_exists_in_authentik'] else 'FAIL',
+                'OK' if verify['webadmin_superuser'] else 'FAIL',
+                'OK' if verify['webadmin_bind_seen'] else 'FAIL',
+                'YES' if verify['ready'] else 'NO',
+            )
+        )
+    except Exception as e:
+        verify = {'ready': False, 'error': str(e)[:120]}
+        diag.append(f'Verification: ERROR ({str(e)[:80]})')
+    overall_ok = bool(ok and verify.get('ready', True))
+    if not overall_ok:
+        diag.append('Final: NOT READY (verification failed)')
+    else:
+        diag.append('Final: READY')
+    return jsonify({'success': overall_ok, 'message': ' | '.join(diag), 'verification': verify})
 
 
 @app.route('/api/takserver/ldap-drift-check')
@@ -23684,14 +23997,22 @@ def takserver_create_client_cert():
 
 
 def _sync_webadmin_after_authentik_reconfigure(plog):
-    """After Authentik reconfigure, run TAK Server update config (Caddy + 8446 cert + restart) so WebAdmin is in sync. No-op if TAK Server not installed. plog is a logging fn (e.g. from run_authentik_deploy)."""
+    """After Authentik reconfigure, update Caddy + 8446 cert (NO TAK Server restart). No-op if TAK Server not installed."""
     modules = detect_modules()
     if not modules.get('takserver', {}).get('installed'):
         return
     try:
-        plog("  Syncing WebAdmin (Caddy + TAK Server restart)...")
-        _run_takserver_update_config()
-        plog("  ✓ WebAdmin synced.")
+        plog("  Syncing WebAdmin (Caddy + 8446 cert, no restart)...")
+        settings = load_settings()
+        fqdn = settings.get('fqdn', '').strip()
+        generate_caddyfile(settings)
+        subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
+        takserver_host = _get_service_domain(settings, 'takserver')
+        if fqdn and takserver_host:
+            caddy_active = subprocess.run('systemctl is-active caddy', shell=True, capture_output=True, text=True)
+            if caddy_active.stdout.strip() == 'active':
+                install_le_cert_on_8446(takserver_host, lambda msg: None, wait_for_cert=False)
+        plog("  ✓ WebAdmin synced (Caddy reloaded, no TAK Server restart).")
     except Exception as e:
         plog(f"  ⚠ WebAdmin sync failed: {str(e)[:80]} — run Update config on TAK Server page if needed.")
 
@@ -24173,9 +24494,12 @@ def takserver_update():
             s1, tak_cfg
         ), daemon=True).start()
     else:
+        single_pkgs = [f for f in pkg_files if '-database' not in f.lower() and '-core' not in f.lower()]
+        if not single_pkgs:
+            return jsonify({'error': 'Only split packages (core/database) found. For one-server update, upload the single takserver .deb. Remove the wrong files and upload the correct package.'}), 400
         upgrade_log.clear()
         upgrade_status.update({'running': True, 'complete': False, 'error': False})
-        threading.Thread(target=run_takserver_upgrade, args=(os.path.join(UPLOAD_DIR, pkg_files[0]),), daemon=True).start()
+        threading.Thread(target=run_takserver_upgrade, args=(os.path.join(UPLOAD_DIR, single_pkgs[0]),), daemon=True).start()
     return jsonify({'success': True})
 
 @app.route('/api/takserver/update/log')
@@ -24637,12 +24961,17 @@ def deploy_takserver():
         return jsonify({'error': str(e)[:200]}), 400
     pkg_files = [f for f in os.listdir(UPLOAD_DIR) if f.endswith('.deb') or f.endswith('.rpm')]
     if not pkg_files: return jsonify({'error': 'No package file found.'}), 400
-    # For two-server, prefer the core .deb (database is on Server One)
     if is_two_server:
-        core_pkg = next((f for f in pkg_files if 'core' in f.lower()), pkg_files[0])
+        core_pkg = next((f for f in pkg_files if 'core' in f.lower()), '')
+        if not core_pkg:
+            return jsonify({'error': 'No takserver-core package found in uploads. For two-server deploy, upload both takserver-core and takserver-database .deb files.'}), 400
         selected_pkg = core_pkg
     else:
-        selected_pkg = pkg_files[0]
+        single_pkgs = [f for f in pkg_files if '-database' not in f.lower() and '-core' not in f.lower()]
+        if not single_pkgs:
+            split_names = ', '.join(pkg_files)
+            return jsonify({'error': f'Only split packages found ({split_names}). For one-server deploy, upload the single takserver .deb (not takserver-database or takserver-core). Remove the wrong files and upload the correct package.'}), 400
+        selected_pkg = single_pkgs[0]
     try:
         intermediate_days = int(data.get('intermediate_ca_validity_days') or 730)
         intermediate_days = max(1, min(3652, intermediate_days))
@@ -24670,7 +24999,6 @@ def deploy_takserver():
         'issued_cert_validity_days': issued_days,
         'enable_admin_ui': data.get('enable_admin_ui', False),
         'enable_webtak': data.get('enable_webtak', False),
-        'enable_nonadmin_ui': data.get('enable_nonadmin_ui', False),
         'webadmin_password': data.get('webadmin_password', ''),
     }
     for ext, key in [('.key', 'gpg_key_path'), ('.pol', 'policy_path')]:
@@ -24896,10 +25224,9 @@ def run_takserver_deploy(config):
         run_cmd('sed -i \'s|<auth>|<auth x509useGroupCache="true">|g\' /opt/tak/CoreConfig.xml')
         admin_ui = str(config.get('enable_admin_ui', False)).lower()
         webtak = str(config.get('enable_webtak', False)).lower()
-        nonadmin = str(config.get('enable_nonadmin_ui', False)).lower()
-        if config.get('enable_admin_ui') or config.get('enable_webtak') or config.get('enable_nonadmin_ui'):
-            log_step(f"WebTAK: AdminUI={admin_ui}, WebTAK={webtak}, NonAdminUI={nonadmin}")
-            run_cmd(f'sed -i \'s|"cert_https"/|"cert_https" enableAdminUI="{admin_ui}" enableWebtak="{webtak}" enableNonAdminUI="{nonadmin}"/|g\' /opt/tak/CoreConfig.xml')
+        if config.get('enable_admin_ui') or config.get('enable_webtak'):
+            log_step(f"WebTAK: AdminUI={admin_ui}, WebTAK={webtak}")
+            run_cmd(f'sed -i \'s|"cert_https"/|"cert_https" enableAdminUI="{admin_ui}" enableWebtak="{webtak}" enableNonAdminUI="false"/|g\' /opt/tak/CoreConfig.xml')
         # For two-server: ensure JDBC URL and password point to Server One
         import re
         if config.get('two_server') and config.get('tak_deploy_cfg'):
@@ -24947,6 +25274,20 @@ def run_takserver_deploy(config):
                 except Exception as e:
                     log_step(f"⚠ Could not verify JDBC URL: {e}")
         log_step("✓ CoreConfig.xml configured")
+
+        # Auto-connect to LDAP if Authentik is already deployed
+        try:
+            ak_installed = bool(detect_modules().get('authentik', {}).get('installed'))
+            if ak_installed and not _coreconfig_has_ldap():
+                log_step("Authentik detected — connecting TAK Server to LDAP...")
+                ldap_ok, ldap_msg = _apply_ldap_to_coreconfig()
+                if ldap_ok:
+                    log_step(f"✓ {ldap_msg}")
+                else:
+                    log_step(f"⚠ LDAP auto-connect: {ldap_msg} — use 'Connect TAK Server to LDAP' after deploy")
+        except Exception as e:
+            log_step(f"⚠ LDAP auto-connect failed: {str(e)[:120]} — use 'Connect TAK Server to LDAP' after deploy")
+
         log_step("Final restart...")
         ne_changed, ne_msg = _sanitize_coreconfig_name_entries()
         if ne_changed:
@@ -24974,10 +25315,16 @@ def run_takserver_deploy(config):
         log_step(""); log_step("━━━ Step 9/9: Promoting Admin ━━━")
         run_cmd('java -jar /opt/tak/utils/UserManager.jar certmod -A /opt/tak/certs/files/admin.pem 2>&1', "Promoting admin certificate...", check=False)
         webadmin_pass = config.get('webadmin_password', '')
+        settings_for_ak = load_settings()
+        authentik_for_webadmin = bool(webadmin_pass and _get_authentik_env_content(settings_for_ak))
         if webadmin_pass:
-            log_step("Creating webadmin user...")
-            run_cmd(f"java -jar /opt/tak/utils/UserManager.jar usermod -A -p '{webadmin_pass}' webadmin 2>&1", check=False)
-            log_step("✓ webadmin user created")
+            if authentik_for_webadmin:
+                log_step("Authentik detected — webadmin will live in Authentik/LDAP only (skipping flat-file UserManager; avoids 8446 shadowing).")
+                _remove_webadmin_from_userauth()
+            else:
+                log_step("Creating webadmin user (flat-file)...")
+                run_cmd(f"java -jar /opt/tak/utils/UserManager.jar usermod -A -p '{webadmin_pass}' webadmin 2>&1", check=False)
+                log_step("✓ webadmin user created")
         ne_changed, ne_msg = _sanitize_coreconfig_name_entries()
         if ne_changed:
             log_step(f"  NameEntry fix: {ne_msg}")
@@ -24995,26 +25342,32 @@ def run_takserver_deploy(config):
         if webadmin_pass:
             settings['webadmin_password'] = webadmin_pass
             save_settings(settings)
-        log_step(""); log_step("=" * 50); log_step("✓ DEPLOYMENT COMPLETE!"); log_step("=" * 50); log_step("")
-        log_step(f"  WebGUI (cert):     https://{ip}:8443")
-        if webadmin_pass:
-            log_step(f"  WebGUI (password): https://{ip}:8446")
-            log_step(f"  Username: webadmin")
-        log_step(f"  Certificate Password: {cert_pass}")
-        log_step(f"  Admin cert: /opt/tak/certs/files/admin.p12")
         # Regenerate Caddyfile if Caddy is configured
         if settings.get('fqdn'):
             generate_caddyfile(settings)
             subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True)
             log_step(f"  ✓ Caddy config updated for TAK Server")
 
-        # If Authentik is installed (local or remote), ensure webadmin exists there (for 8446 LDAP login). Matches main-branch behavior so 8446 works after Connect LDAP without manual Sync webadmin.
+        # Sync webadmin to Authentik with verification so first 8446 login works without manual fixes.
         if webadmin_pass and _get_authentik_env_content(settings):
-            ok, err = _ensure_authentik_webadmin()
-            if ok:
-                log_step("  ✓ webadmin synced to Authentik (8446 login ready)")
-            elif err:
-                log_step(f"  ⚠ webadmin sync: {err[:80]} — use Sync webadmin or Connect LDAP if 8446 fails")
+            sync_ok = False
+            sync_err = None
+            for attempt in range(2):
+                ok, err = _ensure_authentik_webadmin(skip_bind_verify=False)
+                if ok:
+                    sync_ok = True
+                    log_step("  ✓ webadmin synced to Authentik")
+                    break
+                sync_err = (err or 'Unknown sync error')[:120]
+                if attempt == 0:
+                    log_step(f"  ℹ webadmin sync attempt 1 failed: {sync_err} — retrying once...")
+                    time.sleep(15)
+            if not sync_ok:
+                log_step(f"  ✗ webadmin Authentik sync failed: {sync_err}")
+                deploy_status.update({'error': True, 'running': False})
+                return
+            _remove_webadmin_from_userauth()
+            log_step("  ✓ Removed any flat-file webadmin shadow (8446 → LDAP only)")
 
         # If Caddy is already running with a domain, install LE cert on 8446 now.
         # This handles the case where Caddy was deployed before TAK Server.
@@ -25026,6 +25379,13 @@ def run_takserver_deploy(config):
                 log_step("━━━ Installing LE Cert on Port 8446 ━━━")
                 install_le_cert_on_8446(_get_service_domain(settings, 'takserver'), log_step, wait_for_cert=True)
 
+        log_step(""); log_step("=" * 50); log_step("✓ DEPLOYMENT COMPLETE!"); log_step("=" * 50); log_step("")
+        log_step(f"  WebGUI (cert):     https://{ip}:8443")
+        if webadmin_pass:
+            log_step(f"  WebGUI (password): https://{ip}:8446")
+            log_step(f"  Username: webadmin")
+        log_step(f"  Certificate Password: {cert_pass}")
+        log_step(f"  Admin cert: /opt/tak/certs/files/admin.p12")
         deploy_status.update({'complete': True, 'running': False})
 
         # Auto-deploy Guard Dog so it runs from the start (user can disable or configure notifications later)
@@ -25840,6 +26200,8 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <p><a href="https://github.com/takwerx/infra-TAK" target="_blank" rel="noopener" style="color:var(--cyan);text-decoration:none">github.com/takwerx/infra-TAK</a> (README, docs/COMMANDS.md, docs/HANDOFF-LDAP-AUTHENTIK.md)</p>
 </div></div>
 </main>
+<script src="/log-tools.js?v={{ version }}"></script>
+<script>initLogToolbar('full-uninstall-log');</script>
 <script>
 function helpToggle(header){var body=header.nextElementSibling;var icon=header.querySelector('.help-card-toggle');if(!body)return;if(body.style.display==='block'){body.style.display='none';icon.style.transform='rotate(0deg)';}else{body.style.display='block';icon.style.transform='rotate(180deg)';}}
 function closeFullUninstallModal(){document.getElementById('full-uninstall-modal').classList.remove('open');}
@@ -26417,8 +26779,8 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);font-size:11px;color:var(--text-dim)">Unattended-upgrades (each host) are controlled on the <a href="/" style="color:var(--cyan);text-decoration:none">main dashboard</a>.</div>
 <div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">
 <div style="font-size:12px;color:var(--text-secondary);margin-bottom:6px">JVM heap</div>
-<p style="font-size:11px;color:var(--text-dim);margin-bottom:10px;line-height:1.5">If CloudTAK or 8446 return HTTP 500 with <code style="font-size:10px">OutOfMemoryError: Java heap space</code>, TAK Server's JVM heap may be too small. <span id="heap-why" style="display:none">TAK Server uses a fixed heap limit (-Xmx), often 2–4 GB by default; it does not auto-scale. With many CloudTAK tabs or connections, the active-groups cache can exceed that and trigger OOM. This button sets a systemd drop-in so the service can use more memory (and restarts TAK Server).</span><button type="button" onclick="var e=document.getElementById('heap-why');e.style.display=e.style.display?'none':'block'" style="background:none;border:none;color:var(--cyan);cursor:pointer;font-size:11px;padding:0;margin-left:4px">Why?</button></p>
-<div style="margin-bottom:10px;font-family:'JetBrains Mono',monospace;font-size:12px">Current: <span id="heap-current-display" style="color:var(--green)">{% if current_heap_gb %}{{ current_heap_gb }} GB <span style="color:var(--text-dim);font-weight:400">(set via drop-in)</span>{% else %}<span style="color:var(--text-dim)">Not set (package default)</span>{% endif %}</span></div>
+<p style="font-size:11px;color:var(--text-dim);margin-bottom:10px;line-height:1.5">If CloudTAK or 8446 return HTTP 500 with <code style="font-size:10px">OutOfMemoryError: Java heap space</code>, TAK Server's JVM heap may be too small. <span id="heap-why" style="display:none">TAK Server runs 5 Java processes (API, Messaging, Config, Plugin Manager, Retention), each with its own heap limit. This button distributes your chosen total across all 5 processes proportionally (same ratios as the TAK Server defaults) via /etc/default/takserver, then restarts TAK Server.</span><button type="button" onclick="var e=document.getElementById('heap-why');e.style.display=e.style.display?'none':'block'" style="background:none;border:none;color:var(--cyan);cursor:pointer;font-size:11px;padding:0;margin-left:4px">Why?</button></p>
+<div style="margin-bottom:10px;font-family:'JetBrains Mono',monospace;font-size:12px">Current: <span id="heap-current-display" style="color:var(--green)">{% if current_heap_gb %}{{ current_heap_gb }} GB <span style="color:var(--text-dim);font-weight:400">(total across 5 processes)</span>{% else %}<span style="color:var(--text-dim)">Not set (package default)</span>{% endif %}</span></div>
 <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px">
 <button type="button" id="set-heap-btn" onclick="setTakHeap()" class="control-btn">Set recommended ({{ recommended_heap_gb }} GB)</button>
 <label style="font-size:11px;color:var(--text-dim);margin-left:8px">or set to:</label>
@@ -26469,20 +26831,11 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <button type="button" id="set-webadmin-pw-btn" onclick="setWebadminPassword()" style="padding:8px 16px;background:rgba(59,130,246,.25);color:var(--cyan);border:1px solid var(--border);border-radius:8px;font-size:12px;font-weight:600;cursor:pointer">Save password</button>
 <span id="set-webadmin-pw-msg" style="font-size:12px;color:var(--text-dim)"></span>
 </div>
-<div style="font-size:11px;color:var(--text-dim);margin-top:6px">After saving, click <strong>Sync webadmin to Authentik</strong> so 8446 login uses this password.</div>
+<div style="font-size:11px;color:var(--text-dim);margin-top:6px">Saving updates TAK Server flat-file (8446 login). Click <strong>Sync webadmin</strong> to also update Authentik.</div>
 </div>
 <div id="resync-notice" style="display:none;margin-top:8px;padding:10px 14px;background:rgba(234,179,8,0.12);border:1px solid rgba(234,179,8,0.35);border-radius:8px;font-size:12px;color:var(--yellow)">TAK Portal user list may take a short moment to repopulate.</div>
 </div>
 {% endif %}
-<div class="card" style="margin-bottom:24px">
-<div class="card-title">Auth Provider: Flat File (UserAuthenticationFile.xml)</div>
-<p style="font-size:12px;color:var(--text-dim);line-height:1.5;margin-bottom:12px">Controls whether TAK Server includes <code style="font-size:11px">UserAuthenticationFile.xml</code> in the CoreConfig <code style="font-size:11px">&lt;auth&gt;</code> block. This is optional if you want LDAP-only auth behavior.</p>
-<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-  <button type="button" id="flatfile-auth-btn" onclick="toggleFlatfileAuth()" style="padding:8px 16px;background:rgba(59,130,246,.2);color:var(--cyan);border:1px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;cursor:pointer">Loading...</button>
-  <span id="flatfile-auth-status" style="font-size:12px;color:var(--text-dim)">Checking status...</span>
-</div>
-<div id="flatfile-auth-msg" style="margin-top:8px;font-size:12px;color:var(--text-dim)"></div>
-</div>
 <div class="section-title">Access</div>
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
 <div style="display:flex;gap:10px;flex-wrap:nowrap;align-items:center">
@@ -26805,6 +27158,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 </div>
 <footer class="footer"></footer>
+<script src="/log-tools.js?v={{ version }}"></script>
 <script src="/takserver.js"></script></body></html>'''
 
 # === Startup Banner (prints for both gunicorn and direct invocation) ===

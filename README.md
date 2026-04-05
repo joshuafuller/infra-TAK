@@ -4,7 +4,7 @@ Tea Awarness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Latest release: v0.3.8-alpha** — **Database maintenance & resilience:** Smart auto-VACUUM (Guard Dog daily 3am, triggers on >1M dead tuples), remote CoT DB size monitoring for two-server setups, REINDEX button, enhanced database stats (size/rows/dead tuples), background VACUUM with live elapsed timer, flat-file auth toggle (enable/disable `UserAuthenticationFile.xml` from the UI), Authentik PostgreSQL hardening (max_connections=300, idle/keepalive tuning via Update config), TAK Portal Authentik link fix. See [docs/RELEASE-v0.3.8-alpha.md](docs/RELEASE-v0.3.8-alpha.md). Prior: [v0.3.7-alpha](docs/RELEASE-v0.3.7-alpha.md) (cert group picker normalization).
+**Latest release: v0.3.9-alpha** — **8446 / Authentik / LDAP:** `webadmin` lives in Authentik only when Authentik is present (no flat-file shadowing), verified LDAP bind after deploy, LE 8446 connector patched with TAK stopped, Authentik deploy final `adm_ldapservice` gate after Caddy/SMTP/restart, PostgreSQL tuning cleanup on Authentik Update config, local Authentik Update config no longer falls through to full deploy without FQDN. See [docs/RELEASE-v0.3.9-alpha.md](docs/RELEASE-v0.3.9-alpha.md). Prior: [v0.3.8-alpha](docs/RELEASE-v0.3.8-alpha.md).
 
 **Goal: universal installer.** Currently supported platform: **Ubuntu 22.04 LTS**.
 
@@ -148,15 +148,73 @@ start.sh                    ← One CLI command to launch everything
 
 ## Ports
 
-| Service | Port | Description |
-|---------|------|-------------|
-| TAK-infra Console | 5001 | Management web UI |
-| TAK Server | 8089 | TAK client connections (TLS) |
-| TAK Server | 8443 | WebGUI (cert auth) |
-| TAK Server | 8446 | WebGUI (Let's Encrypt, password auth) |
-| Authentik | 9090 | Identity provider |
-| LDAP | 389 | LDAP auth for TAK Server |
-| TAK Portal | 3000 | User management portal |
+| Service | Port | Protocol | Description |
+|---------|------|----------|-------------|
+| infra-TAK Console | 5001 | HTTPS | Management web UI (backdoor: direct IP access) |
+| Caddy | 80 | HTTP | Redirect to HTTPS |
+| Caddy | 443 | HTTPS | Reverse proxy for all services (Let's Encrypt) |
+| TAK Server | 8089 | TLS | TAK client connections (ATAK, iTAK, WinTAK) |
+| TAK Server | 8443 | HTTPS | Admin WebGUI (client certificate auth) |
+| TAK Server | 8446 | HTTPS | Admin WebGUI (Let's Encrypt, password/LDAP auth) |
+| TAK Server | 8087 | TCP | Disabled by default (plaintext, replaced by 8089) |
+| PostgreSQL | 5432 | TCP | TAK Server database (localhost or remote for two-server) |
+| Authentik | 9090 | HTTP | Identity provider API + admin UI (proxied via Caddy) |
+| Authentik | 9443 | HTTPS | Authentik HTTPS (direct, rarely needed) |
+| LDAP Outpost | 389 | TCP | LDAP auth for TAK Server (Authentik outpost) |
+| LDAP Outpost | 636 | TCP | LDAPS (TLS-wrapped LDAP) |
+| TAK Portal | 3000 | HTTP | User/cert management portal (proxied via Caddy) |
+| Email Relay | 25 | SMTP | Local Postfix relay (localhost only, apps send here) |
+| Node-RED | 1880 | HTTP | Flow editor (proxied via Caddy) |
+| MediaMTX | 8554 | RTSP | Video streaming (RTSP) |
+| MediaMTX | 8889 | HTTP | WebRTC / HLS playback |
+| MediaMTX | 5080 | HTTP | MediaMTX web editor |
+| CloudTAK | 5000 | HTTP | Browser-based TAK client (proxied via Caddy) |
+
+## Actions Reference (Sync, Update Config, Resync)
+
+Each page has buttons that do specific things. Here's what they do and when to use them.
+
+### TAK Server Page
+
+| Button | What it does | When to use it |
+|--------|-------------|----------------|
+| **Update Config** | Regenerates Caddyfile, reloads Caddy, installs Let's Encrypt cert on 8446, restarts TAK Server | After changing the TAK Server domain/FQDN in Caddy settings |
+| **Connect TAK Server to LDAP** | Full LDAP setup: repairs Authentik blueprint, ensures service account + webadmin, writes LDAP auth block into CoreConfig.xml (without flat-file), restarts TAK Server | After deploying Authentik (if TAK Server was deployed first), or if LDAP auth stops working |
+| **Resync LDAP to TAK Server** | Same as Connect LDAP — full re-run of the LDAP fix flow | If QR registration fails, if 8446 login stops working, after pulling console updates |
+| **Sync webadmin to Authentik** | Pushes the 8446 webadmin password from settings into Authentik (no TAK Server restart) | After changing the webadmin password |
+| **Disable/Enable flat-file auth** | Adds or removes `UserAuthenticationFile.xml` from the CoreConfig auth block, restarts TAK Server | When you want LDAP-only auth (disable) or need local password fallback (enable) |
+| **Set JVM Heap** | Writes `-Xms`/`-Xmx` to `/opt/tak/setenv.sh`, restarts TAK Server | TAK Server running out of memory (OutOfMemoryError in logs) |
+
+### TAK Portal Page
+
+| Button | What it does | When to use it |
+|--------|-------------|----------------|
+| **Sync TAK Server to TAK Portal** | Forces TAK Portal to re-read the TAK Server connection (IP, certs, API URL) | If TAK Portal dashboard doesn't show TAK Server uptime/disk usage |
+| **Update Config** | Rewrites TAK Portal's `settings.json` with current Authentik + TAK Server URLs, restarts the container | After changing FQDN, after Authentik redeploy, if TAK Portal can't reach TAK Server or Authentik |
+| **Sync TAK Server CA** | Copies the current `tak-ca.pem` into the TAK Portal container | After CA rotation — TAK Portal needs the new CA to generate valid client certs |
+
+### Authentik Page
+
+| Button | What it does | When to use it |
+|--------|-------------|----------------|
+| **Update Config & Reconnect** | Patches docker-compose.yml (PostgreSQL tuning, blueprint mounts), ensures all forward auth apps exist (infra-TAK, TAK Portal, Node-RED, etc.), repairs embedded outpost, updates LDAP CoreConfig, reloads Caddy | After pulling console updates, if forward auth breaks, if apps disappear from Authentik, if LDAP stops working |
+| **Fix LDAP Token** | Re-fetches the LDAP outpost token from Authentik API and injects it into docker-compose.yml, restarts the LDAP container | If LDAP container shows "unhealthy" or "403 Forbidden" in logs |
+
+### Email Relay Page
+
+| Button | What it does | When to use it |
+|--------|-------------|----------------|
+| **Switch Provider** | Reconfigures Postfix with new SMTP credentials/host, restarts Postfix | Changing email provider or From address |
+| **Configure Authentik** | Pushes relay settings (localhost:25, From address) into Authentik so password recovery emails work | After deploying or switching Email Relay provider |
+
+### General Rules
+
+- **Deploy order matters:** Caddy → Authentik → Email Relay → TAK Server → TAK Portal → everything else
+- **After pulling console updates:** Hit "Update Config" on Authentik, then optionally on TAK Server if you changed FQDN
+- **If TAK Portal can't reach TAK Server:** Hit "Sync TAK Server to TAK Portal" on the TAK Portal page
+- **If LDAP auth breaks:** Hit "Connect TAK Server to LDAP" on the TAK Server page
+- **If forward auth breaks (502/blank on FQDN URLs):** Hit "Update Config" on the Authentik page
+- **After CA rotation:** Hit "Sync TAK Server CA" on the TAK Portal page, then have users re-enroll
 
 ## Access Modes
 
