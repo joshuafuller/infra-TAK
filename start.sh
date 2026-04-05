@@ -158,28 +158,36 @@ wait_for_upgrades() {
 install_dependencies() {
     echo -e "  Installing dependencies..."
 
+    local apt_log="/tmp/infratak-apt-$$.log"
+
     case "$PKG_MGR" in
         apt)
             export DEBIAN_FRONTEND=noninteractive
             export NEEDRESTART_MODE=a
-            # Do not hide apt output: with set -e, a failed apt-get would exit the script silently if stderr were discarded.
-            if ! apt-get update -qq; then
-                echo -e "${RED}  apt-get update failed. Fix network/apt sources, then re-run sudo ./start.sh${NC}"
+            if ! apt-get update -qq > "$apt_log" 2>&1; then
+                echo -e "${RED}  apt-get update failed:${NC}"
+                tail -20 "$apt_log"
+                rm -f "$apt_log"
                 exit 1
             fi
-            # Dpkg options avoid config prompts; NEEDRESTART_MODE=a avoids "Which services should be restarted?" dialog
             if ! NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get install -y \
                 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" \
-                python3 python3-pip python3-venv openssl sshpass; then
-                echo -e "${RED}  apt-get install failed. Try: sudo apt-get install -y python3 python3-pip python3-venv openssl sshpass${NC}"
+                python3 python3-pip python3-venv openssl sshpass > "$apt_log" 2>&1; then
+                echo -e "${RED}  apt-get install failed:${NC}"
+                tail -30 "$apt_log"
+                rm -f "$apt_log"
                 exit 1
             fi
+            rm -f "$apt_log"
             ;;
         dnf)
-            if ! dnf install -y python3 python3-pip openssl sshpass; then
-                echo -e "${RED}  dnf install failed. Install python3, python3-pip, openssl, sshpass and re-run.${NC}"
+            if ! dnf install -y python3 python3-pip openssl sshpass > "$apt_log" 2>&1; then
+                echo -e "${RED}  dnf install failed:${NC}"
+                tail -30 "$apt_log"
+                rm -f "$apt_log"
                 exit 1
             fi
+            rm -f "$apt_log"
             ;;
         *)
             echo -e "${RED}  Cannot auto-install dependencies for $PKG_MGR${NC}"
@@ -201,14 +209,13 @@ install_dependencies() {
         exit 1
     fi
 
-    # Install Flask and dependencies in venv (show errors; quiet only on success path)
-    if ! "$INSTALL_DIR/.venv/bin/pip" install --quiet flask psutil werkzeug gunicorn; then
-        echo -e "${YELLOW}  Retrying pip install without --quiet...${NC}"
-        "$INSTALL_DIR/.venv/bin/pip" install flask psutil werkzeug gunicorn || {
-            echo -e "${RED}  pip install failed. Check network / PyPI and re-run.${NC}"
-            exit 1
-        }
+    if ! "$INSTALL_DIR/.venv/bin/pip" install --quiet flask psutil werkzeug gunicorn 2>"$apt_log"; then
+        echo -e "${RED}  pip install failed:${NC}"
+        tail -20 "$apt_log"
+        rm -f "$apt_log"
+        exit 1
     fi
+    rm -f "$apt_log"
 
     echo -e "  ${GREEN}✓ Dependencies installed${NC}"
     echo ""
