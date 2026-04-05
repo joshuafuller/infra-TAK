@@ -4,7 +4,7 @@ Tea Awarness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Latest release: v0.3.9-alpha** — **8446 / Authentik / LDAP:** `webadmin` lives in Authentik only when Authentik is present (no flat-file shadowing), verified LDAP bind after deploy, LE 8446 connector patched with TAK stopped, Authentik deploy final `adm_ldapservice` gate after Caddy/SMTP/restart, PostgreSQL tuning cleanup on Authentik Update config, local Authentik Update config no longer falls through to full deploy without FQDN. See [docs/RELEASE-v0.3.9-alpha.md](docs/RELEASE-v0.3.9-alpha.md). Prior: [v0.3.8-alpha](docs/RELEASE-v0.3.8-alpha.md).
+**Latest release: v0.4.0-alpha** — **Update Now** fetches only the latest Git tag (fixes `would clobber existing tag`). Plus **8446 / Authentik / LDAP** (v0.3.9 track): `webadmin` in Authentik only, final LDAP SA gate on Authentik deploy, PG tuning on Update config, reconfigure without FQDN fixed, LE 8446 stop-then-patch. See [docs/RELEASE-v0.4.0-alpha.md](docs/RELEASE-v0.4.0-alpha.md). Prior: [v0.3.9-alpha](docs/RELEASE-v0.3.9-alpha.md), [v0.3.8-alpha](docs/RELEASE-v0.3.8-alpha.md).
 
 **Goal: universal installer.** Currently supported platform: **Ubuntu 22.04 LTS**.
 

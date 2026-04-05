@@ -1,3 +1,4 @@
+if(typeof initLogToolbar==='function'){initLogToolbar('gd-deploy-log');initLogToolbar('gd-activity-log');}
 var gdLogIndex=0,gdLogInterval=null;
 function startGuarddogDeploy(){var btn=document.getElementById('gd-deploy-btn');var emailEl=document.getElementById('gd-notify-email');var errEl=document.getElementById('gd-deploy-email-err');var email=(emailEl&&emailEl.value)?emailEl.value.trim():'';if(errEl)errEl.style.display='none';if(btn)btn.disabled=true;document.getElementById('gd-log-card').style.display='block';document.getElementById('gd-deploy-log').textContent='Starting...';gdLogIndex=0;
 var nickEl=document.getElementById('gd-server-nickname');var nick=(nickEl&&nickEl.value)?nickEl.value.trim():'';fetch('/api/guarddog/deploy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({alert_email:email,server_nickname:nick}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
