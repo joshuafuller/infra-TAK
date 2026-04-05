@@ -1494,7 +1494,10 @@ def console_page():
     settings = load_settings()
     all_modules = detect_modules()
     modules = {k: m for k, m in all_modules.items() if m.get('installed')}
-    module_versions = get_all_module_versions()
+    try:
+        module_versions = get_all_module_versions()
+    except Exception:
+        module_versions = {}
     metrics = get_system_metrics()
     uu_hosts = _build_uu_hosts(metrics, settings)
     resp = render_template_string(CONSOLE_TEMPLATE,
@@ -8638,17 +8641,19 @@ def _get_fedhub_version_info():
 def _get_caddy_version_info():
     """Return {version: str, update_available: bool} for Caddy."""
     out = {'version': '', 'update_available': False}
-    r = subprocess.run('caddy version 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
-    if r.returncode == 0 and r.stdout:
-        # e.g. "v2.8.4" or "Caddy v2.8.4"
-        import re
-        m = re.search(r'v(\d+\.\d+\.\d+[^\s]*)', r.stdout)
-        if m:
-            out['version'] = 'v' + m.group(1).strip()
-    if out['version']:
-        apt = subprocess.run('apt list --upgradable 2>/dev/null | grep -i caddy', shell=True, capture_output=True, text=True, timeout=10)
-        if apt.returncode == 0 and (apt.stdout or '').strip():
-            out['update_available'] = True
+    try:
+        r = subprocess.run('caddy version 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout:
+            import re
+            m = re.search(r'v(\d+\.\d+\.\d+[^\s]*)', r.stdout)
+            if m:
+                out['version'] = 'v' + m.group(1).strip()
+        if out['version']:
+            apt = subprocess.run('apt list --upgradable 2>/dev/null | grep -i caddy', shell=True, capture_output=True, text=True, timeout=10)
+            if apt.returncode == 0 and (apt.stdout or '').strip():
+                out['update_available'] = True
+    except (subprocess.TimeoutExpired, OSError):
+        pass
     return out
 
 
