@@ -6,6 +6,8 @@ One clone. One password. One URL. Manage everything from your browser.
 
 **Latest release: v0.4.1-alpha** — **Update Now** uses an isolated `git fetch` (no default `remote.origin.fetch`), so mismatched local tags no longer cause `would clobber existing tag` during upgrade. Plus **8446 / Authentik / LDAP** (v0.3.9 track) and v0.4.0 single-tag resolution. See [docs/RELEASE-v0.4.1-alpha.md](docs/RELEASE-v0.4.1-alpha.md). Prior: [v0.4.0-alpha](docs/RELEASE-v0.4.0-alpha.md), [v0.3.9-alpha](docs/RELEASE-v0.3.9-alpha.md).
 
+**Console stuck (no version in the command):** On the VPS, sync to **latest `main`** and restart — same idea as **Update Now**, without editing the README every release: `git fetch origin main` → `git checkout -B main origin/main` → `sudo systemctl restart takwerx-console` (run from the service’s install directory; one-liner under **Update stuck?** below). Shallow or broken clones: [docs/PULL-AND-RESTART.md](docs/PULL-AND-RESTART.md).
+
 **Goal: universal installer.** Currently supported platform: **Ubuntu 22.04 LTS**.
 
 ## What Is This?
@@ -54,17 +56,19 @@ Then open your browser to the URL shown and log in.
 
 **Password not working after update?** Use the **backdoor**: **https://&lt;VPS_IP&gt;:5001**. If login spins or fails, on the server run (from the directory where you do `git pull`, e.g. `/root/infra-TAK`): **`sudo ./fix-console-after-pull.sh`** — it pins the config path in the systemd unit and prompts you to set a new password so you can log in again. Alternatively run `sudo ./reset-console-password.sh` from that same directory. After pulling, open the Caddy module and re-save your domain once so the Caddyfile (login bypass) is applied.
 
-## Update stuck? (rebase / merge conflict)
+## Update stuck? (merge conflict, tag clobber, or bad git state)
 
-If you clicked **Update Now** and the console shows an error like `could not apply ... Add files via upload`, `Pulling is not possible because you have unmerged files`, or any rebase/merge conflict message, run this single command on your server:
+Use this if **Update Now** errors (rebase/merge messages, **`would clobber existing tag`**, etc.). It does **not** hardcode a release number: you move to **current `origin/main`** (stable branch), then restart. No data or config is lost — **`.config/`** is untouched.
 
 ```bash
-cd $(grep -oP 'WorkingDirectory=\K.*' /etc/systemd/system/takwerx-console.service) && git fetch --tags origin && git checkout --force v0.3.3-alpha && sudo systemctl restart takwerx-console
+cd $(grep -oP 'WorkingDirectory=\K.*' /etc/systemd/system/takwerx-console.service) && git fetch origin main && git checkout -B main origin/main && sudo systemctl restart takwerx-console
 ```
 
-This clears the stuck state and puts you on a current tag with the safe updater. No data or config is lost — your `.config/` directory is untouched.
+If **`grep -oP`** is not available, run `grep WorkingDirectory /etc/systemd/system/takwerx-console.service`, `cd` to that path, then run **`git fetch origin main`**, **`git checkout -B main origin/main`**, and **`sudo systemctl restart takwerx-console`** separately.
 
-**What happened:** Versions v0.2.4 and v0.2.5 used `git pull --rebase` internally, which can fail on installs with non-standard git state. v0.2.6+ uses a safe `fetch + force checkout` that works regardless of local git state.
+**Shallow / single-branch clones** (`fetch` errors): [docs/PULL-AND-RESTART.md](docs/PULL-AND-RESTART.md) (e.g. **`git remote set-branches origin '*'`** once, then retry).
+
+**What happened:** Older consoles used **`git pull --rebase`** (v0.2.4–v0.2.5) or bulk **`git fetch --tags`** (later), which can fail on field installs. Current **Update Now** (v0.4.1+) fetches in an isolated way; **checking out `main`** gets you that code without naming a tag in docs.
 
 ## Recovery / backdoor (when Authentik or Caddy is broken)
 
