@@ -19771,11 +19771,39 @@ def run_authentik_deploy(reconfigure=False):
                         plog("  \u26a0 API not ready in time — run Update config & reconnect again to apply app access policies")
                 else:
                     plog("  \u26a0 No token in .env — app access policies not applied")
-                plog("")
-                plog("\u2713 Reconfigure complete.")
-                _sync_webadmin_after_authentik_reconfigure(plog)
-                authentik_deploy_status.update({'running': False, 'complete': True, 'error': False})
-                return
+            else:
+                plog("  \u2139 No FQDN in console settings — skipped forward-auth, app policies, and domain sync (configure Caddy domain first).")
+                # Still heal LDAP provider flow if API is reachable (8446/TAK LDAP does not require public FQDN).
+                ak_token_nf = ''
+                try:
+                    with open(env_path) as f:
+                        for line in f:
+                            if line.strip().startswith('AUTHENTIK_TOKEN='):
+                                ak_token_nf = line.strip().split('=', 1)[1].strip()
+                                break
+                    if not ak_token_nf:
+                        with open(env_path) as f:
+                            for line in f:
+                                if line.strip().startswith('AUTHENTIK_BOOTSTRAP_TOKEN='):
+                                    ak_token_nf = line.strip().split('=', 1)[1].strip()
+                                    break
+                    if ak_token_nf:
+                        ak_url_nf = 'http://127.0.0.1:9090'
+                        hdr_nf = {'Authorization': f'Bearer {ak_token_nf}', 'Content-Type': 'application/json'}
+                        plog("  Waiting for Authentik API (no-FQDN reconfigure)...")
+                        if _wait_for_authentik_api(ak_url_nf, hdr_nf, max_attempts=24, plog=plog):
+                            plog("  Fixing LDAP flow & provider...")
+                            ok_nf, err_nf = _ensure_ldap_flow_authentication_none()
+                            plog("  \u2713 LDAP flow OK" if ok_nf else f"  \u26a0 LDAP flow: {err_nf}")
+                        else:
+                            plog("  \u26a0 API not ready — run Update config again after Authentik is up")
+                except Exception as e:
+                    plog(f"  \u26a0 No-FQDN LDAP heal skipped: {str(e)[:80]}")
+            plog("")
+            plog("\u2713 Reconfigure complete.")
+            _sync_webadmin_after_authentik_reconfigure(plog)
+            authentik_deploy_status.update({'running': False, 'complete': True, 'error': False})
+            return
         else:
             if settings.get('pkg_mgr', 'apt') == 'apt':
                 wait_for_apt_lock(plog, authentik_deploy_log)
