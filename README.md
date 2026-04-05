@@ -4,7 +4,7 @@ Tea Awarness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Latest release: v0.4.2-alpha** — **TAK Portal** `TAK_URL` now uses **`takserver.<fqdn>`** (not the VPS IP) when a domain is set, fixing TLS / **QR enrollment** (“identity could not be verified”). After upgrading: **TAK Portal → Update config** (see [docs/RELEASE-v0.4.2-alpha.md](docs/RELEASE-v0.4.2-alpha.md)). Still includes **Update Now** isolated fetch (v0.4.1), **8446 / Authentik / LDAP** track. Prior: [v0.4.1-alpha](docs/RELEASE-v0.4.1-alpha.md), [v0.4.0-alpha](docs/RELEASE-v0.4.0-alpha.md).
+**Latest release: v0.4.3-alpha** — **Guard Dog** port **8089** monitor no longer restarts TAK on **scanner-noisy** public CoT ports (accept queue must be **~95%** full; **5** fails). After upgrading: **Guard Dog → ↻ Update Guard Dog** (see [docs/RELEASE-v0.4.3-alpha.md](docs/RELEASE-v0.4.3-alpha.md)). Still includes **v0.4.2** TAK Portal **`TAK_URL`** FQDN + **Update config**, **Update Now** isolation, Authentik track. Prior: [v0.4.2-alpha](docs/RELEASE-v0.4.2-alpha.md), [v0.4.1-alpha](docs/RELEASE-v0.4.1-alpha.md).
 
 **Something broken?** Wrong sidebar version, **Update Now** error, merge/rebase/tag-clobber messages, or you are not sure the VPS ever pulled the real repo → go to **[Universal recovery (SSH)](#universal-recovery-ssh)** and run the one block there. **Point people at that section**; it is the single source of truth.
 
@@ -15,7 +15,7 @@ One clone. One password. One URL. Manage everything from your browser.
 Use this on the **VPS** when anything below is true:
 
 - **Update Now** failed (including **`would clobber existing tag`**, merge/rebase errors, or a vague git error).
-- The sidebar **VERSION** does not match the **Latest release** line at the top of this README (e.g. stuck on **v0.2.4** while the README says **v0.4.2-alpha**).
+- The sidebar **VERSION** does not match the **Latest release** line at the top of this README (e.g. stuck on **v0.2.4** while the README says **v0.4.3-alpha**).
 - You are unsure whether **`git remote -v`** points at **`github.com/takwerx/infra-TAK`** (forks, typos, and old mirrors leave **`origin/main`** years behind — **`git fetch origin`** is not safe until **`origin` is fixed**).
 
 This pulls **`main` from the official repo URL** (same as **Quick Start**), checks **`VERSION`**, restarts the service. Your **`.config/`** is not touched.
@@ -28,7 +28,7 @@ grep '^VERSION' app.py
 sudo systemctl restart takwerx-console
 ```
 
-**Check:** The **`grep`** line should show **`VERSION = "…"`** matching the current **Latest release** at the top (without the **`v`**, e.g. **`0.4.2-alpha`**). If it still shows an old number, you are in the wrong directory (compare with **`grep WorkingDirectory /etc/systemd/system/takwerx-console.service`**) or the fetch failed (network).
+**Check:** The **`grep`** line should show **`VERSION = "…"`** matching the current **Latest release** at the top (without the **`v`**, e.g. **`0.4.3-alpha`**). If it still shows an old number, you are in the wrong directory (compare with **`grep WorkingDirectory /etc/systemd/system/takwerx-console.service`**) or the fetch failed (network).
 
 **Fix `origin` once (recommended):** so future **`git fetch origin`** hits upstream:
 

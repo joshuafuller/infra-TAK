@@ -9,9 +9,13 @@ LAST_RESTART_FILE="$STATE_DIR/last_restart_time"
 RESTART_LOCK="$STATE_DIR/restart.lock"
 
 PORT=8089
-MAX_FAILS=3
+# Public 8089 sees constant scanner traffic; accept queue can sit "almost full" without TAK being
+# broken. Old rule (Recv-Q >= Send-Q-5) caused restart loops every ~15–20 min on exposed CoT ports.
+MAX_FAILS=5
 COOLDOWN_SECS=900
 MIN_UPTIME_SECS=900
+# Only treat backlog as unhealthy when the accept queue is critically full (default 95% of limit).
+BACKLOG_PCT=95
 
 mkdir -p "$STATE_DIR"
 
@@ -53,9 +57,12 @@ if echo "$LQ_LINE" | grep -q LISTEN; then
   RECVQ=$(echo "$LQ_LINE" | awk '{print $2}')
   SENDQ=$(echo "$LQ_LINE" | awk '{print $3}')
 
-  # Check if listen backlog is saturated
-  if [ -n "$RECVQ" ] && [ -n "$SENDQ" ] && [ "$SENDQ" -gt 0 ] && [ "$RECVQ" -ge $((SENDQ-5)) ]; then
-    BACKLOG_BAD=true
+  # Listen socket: Recv-Q ≈ completed handshakes waiting for accept(); Send-Q ≈ backlog limit (ss).
+  # Scanners fill the queue partway all day — require near-saturation before calling it unhealthy.
+  if [ -n "$RECVQ" ] && [ -n "$SENDQ" ] && [ "$SENDQ" -ge 50 ]; then
+    if [ "$((RECVQ * 100 / SENDQ))" -ge "$BACKLOG_PCT" ]; then
+      BACKLOG_BAD=true
+    fi
   fi
 fi
 
