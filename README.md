@@ -4,7 +4,7 @@ Tea Awarness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Latest release: v0.4.4-alpha** — **Guard Dog 8089:** TCP connect probe replaces queue-depth (stops restart loops on scanner-heavy public ports). After upgrading: **Guard Dog → ↻ Update Guard Dog** (see [docs/RELEASE-v0.4.4-alpha.md](docs/RELEASE-v0.4.4-alpha.md)). Also includes v0.4.3 Authentik health + Auto-VACUUM logging, v0.4.2 TAK Portal FQDN + Update Now isolation. Prior: [v0.4.3-alpha](docs/RELEASE-v0.4.3-alpha.md), [v0.4.2-alpha](docs/RELEASE-v0.4.2-alpha.md).
+**Latest release: v0.4.5-alpha** — Console crash fix (`apt` timeout on page load); Guard Dog **8089** TCP connect probe (stops restart loops). After upgrading: **Guard Dog → ↻ Update Guard Dog** (see [docs/RELEASE-v0.4.5-alpha.md](docs/RELEASE-v0.4.5-alpha.md)). Prior: [v0.4.4-alpha](docs/RELEASE-v0.4.4-alpha.md), [v0.4.3-alpha](docs/RELEASE-v0.4.3-alpha.md), [v0.4.2-alpha](docs/RELEASE-v0.4.2-alpha.md).
 
 **Something broken?** Wrong sidebar version, **Update Now** error, merge/rebase/tag-clobber messages, or you are not sure the VPS ever pulled the real repo → go to **[Universal recovery (SSH)](#universal-recovery-ssh)** and run the one block there. **Point people at that section**; it is the single source of truth.
 
@@ -15,7 +15,7 @@ One clone. One password. One URL. Manage everything from your browser.
 Use this on the **VPS** when anything below is true:
 
 - **Update Now** failed (including **`would clobber existing tag`**, merge/rebase errors, or a vague git error).
-- The sidebar **VERSION** does not match the **Latest release** line at the top of this README (e.g. stuck on **v0.2.4** while the README says **v0.4.4-alpha**).
+- The sidebar **VERSION** does not match the **Latest release** line at the top of this README (e.g. stuck on **v0.2.4** while the README says **v0.4.5-alpha**).
 - You are unsure whether **`git remote -v`** points at **`github.com/takwerx/infra-TAK`** (forks, typos, and old mirrors leave **`origin/main`** years behind — **`git fetch origin`** is not safe until **`origin` is fixed**).
 
 This pulls **`main` from the official repo URL** (same as **Quick Start**), checks **`VERSION`**, restarts the service. Your **`.config/`** is not touched.
