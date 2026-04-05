@@ -1701,7 +1701,9 @@ def update_apply():
             except Exception:
                 pass
 
-        fetch_all = _git(['fetch', '--tags', 'origin'], timeout=60)
+        # --force: field installs often have local release tags from old checkouts; if the tag was
+        # moved/republished on GitHub, plain fetch --tags fails with "would clobber existing tag".
+        fetch_all = _git(['fetch', 'origin', '--tags', '--force'], timeout=60)
         if fetch_all.returncode != 0:
             return jsonify(_error_payload(_git_err(fetch_all)))
 
@@ -1709,7 +1711,7 @@ def update_apply():
         target_ref = None
         tag_name = _fetch_latest_tag_name()
         if tag_name:
-            _git(['fetch', 'origin', 'tag', tag_name, '--no-tags'], timeout=30)
+            _git(['fetch', '-f', 'origin', 'tag', tag_name, '--no-tags'], timeout=30)
             verify_tag = _git(['rev-parse', '-q', '--verify', f'refs/tags/{tag_name}'], timeout=15)
             if verify_tag.returncode == 0:
                 target_ref = f'refs/tags/{tag_name}'
