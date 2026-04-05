@@ -20434,44 +20434,44 @@ entries:
                         except Exception as e:
                             plog(f"  ⚠ Could not set webadmin password: {str(e)[:100]}")
 
-                    # Create or get adm_ldapservice user
-                    ldap_svc_password = ''
-                    with open(env_path) as f:
-                        for line in f:
-                            if line.strip().startswith('AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD='):
-                                ldap_svc_password = line.strip().split('=', 1)[1].strip()
-                    if not ldap_svc_password:
-                        ldap_svc_password = 'B9wobRV8wlFJmnlEWB71gJjD3aoKOBBW'
+                # Set adm_ldapservice password — ALWAYS RUN regardless of TAK Server install state
+                ldap_svc_password = ''
+                with open(env_path) as f:
+                    for line in f:
+                        if line.strip().startswith('AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD='):
+                            ldap_svc_password = line.strip().split('=', 1)[1].strip()
+                if not ldap_svc_password:
+                    ldap_svc_password = 'B9wobRV8wlFJmnlEWB71gJjD3aoKOBBW'
 
-                    ldap_pk = None
-                    try:
-                        req = urllib.request.Request(f'{ak_url}/api/v3/core/users/',
-                            data=json.dumps({'username': 'adm_ldapservice', 'name': 'LDAP Service Account',
-                                'is_active': True, 'type': 'service_account', 'path': 'users'}).encode(),
-                            headers=ak_headers, method='POST')
+                ldap_pk = None
+                try:
+                    req = urllib.request.Request(f'{ak_url}/api/v3/core/users/',
+                        data=json.dumps({'username': 'adm_ldapservice', 'name': 'LDAP Service Account',
+                            'is_active': True, 'type': 'service_account', 'path': 'users'}).encode(),
+                        headers=ak_headers, method='POST')
+                    resp = urllib.request.urlopen(req, timeout=10)
+                    ldap_pk = json.loads(resp.read().decode())['pk']
+                    plog(f"  ✓ Created adm_ldapservice (pk={ldap_pk})")
+                except urllib.error.HTTPError as e:
+                    if e.code == 400:
+                        req = urllib.request.Request(f'{ak_url}/api/v3/core/users/?search=adm_ldapservice',
+                            headers=ak_headers)
                         resp = urllib.request.urlopen(req, timeout=10)
-                        ldap_pk = json.loads(resp.read().decode())['pk']
-                        plog(f"  ✓ Created adm_ldapservice (pk={ldap_pk})")
-                    except urllib.error.HTTPError as e:
-                        if e.code == 400:
-                            req = urllib.request.Request(f'{ak_url}/api/v3/core/users/?search=adm_ldapservice',
-                                headers=ak_headers)
-                            resp = urllib.request.urlopen(req, timeout=10)
-                            results = json.loads(resp.read().decode())['results']
-                            ldap_pk = next((u['pk'] for u in results if u['username'] == 'adm_ldapservice'), None)
-                            plog(f"  ✓ adm_ldapservice already exists (pk={ldap_pk})")
-                        else:
-                            plog(f"  ⚠ Could not create adm_ldapservice: {e.code}")
+                        results = json.loads(resp.read().decode())['results']
+                        ldap_pk = next((u['pk'] for u in results if u['username'] == 'adm_ldapservice'), None)
+                        plog(f"  ✓ adm_ldapservice already exists (pk={ldap_pk})")
+                    else:
+                        plog(f"  ⚠ Could not create adm_ldapservice: {e.code}")
 
-                    if ldap_pk:
-                        try:
-                            req = urllib.request.Request(f'{ak_url}/api/v3/core/users/{ldap_pk}/set_password/',
-                                data=json.dumps({'password': ldap_svc_password}).encode(),
-                                headers=ak_headers, method='POST')
-                            urllib.request.urlopen(req, timeout=10)
-                            plog(f"  ✓ Set adm_ldapservice password")
-                        except Exception as e:
-                            plog(f"  ⚠ Could not set adm_ldapservice password: {str(e)[:100]}")
+                if ldap_pk:
+                    try:
+                        req = urllib.request.Request(f'{ak_url}/api/v3/core/users/{ldap_pk}/set_password/',
+                            data=json.dumps({'password': ldap_svc_password}).encode(),
+                            headers=ak_headers, method='POST')
+                        urllib.request.urlopen(req, timeout=10)
+                        plog(f"  ✓ Set adm_ldapservice password")
+                    except Exception as e:
+                        plog(f"  ⚠ Could not set adm_ldapservice password: {str(e)[:100]}")
 
                 # Create LDAP provider + outpost + inject token — ALWAYS RUN (required for MediaMTX, TAK Server, standalone)
                 try:
