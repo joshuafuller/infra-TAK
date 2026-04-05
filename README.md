@@ -70,7 +70,7 @@ chmod +x start.sh
 sudo ./start.sh
 ```
 
-**First boot / automatic updates:** On a new Ubuntu VPS, **`unattended-upgrades`** or **`apt`** often run right after SSH is available. If **`apt-get`** hits **“Could not get lock”**, wait a few minutes (or check `sudo systemctl status unattended-upgrades` and `ps aux | grep apt`) and run **`sudo ./start.sh`** again. Current **`start.sh`** waits for those jobs and for the **dpkg/apt lock files** to clear before installing packages.
+**First boot / automatic updates:** On a new Ubuntu VPS, **`apt`** may run right after SSH is available. **`systemctl status unattended-upgrades`** often shows **active (running)** for **`unattended-upgrade-shutdown`** — that idle process is **normal** and is **not** blocking installs. If **`apt-get`** still reports **“Could not get lock”**, wait until **`sudo fuser /var/lib/dpkg/lock-frontend`** shows nothing, then run **`sudo ./start.sh`** again. **`start.sh`** waits for **real** apt/dpkg activity and for **dpkg/apt lock files** before installing packages.
 
 **Branches:** Default clone uses **main** (stable; tagged releases). For latest features and fixes before they're merged to main, use the **dev** branch: `git clone --depth 1 -b dev https://github.com/takwerx/infra-TAK.git`. The README and changelog here reflect main; dev may include remote deployment, UI tweaks, and fixes not yet in a release.
 

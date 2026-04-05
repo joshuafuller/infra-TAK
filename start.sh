@@ -109,9 +109,20 @@ wait_for_upgrades() {
 
     while [ "$waited" -lt "$max_wait" ]; do
         busy=0
-        if pgrep -f unattended-upgrade > /dev/null 2>&1 || pgrep -f apt.systemd.daily > /dev/null 2>&1; then
+        # apt-daily / explicit apt & dpkg (real work)
+        if pgrep -f apt.systemd.daily > /dev/null 2>&1 \
+            || pgrep -x apt-get > /dev/null 2>&1 \
+            || pgrep -x apt > /dev/null 2>&1 \
+            || pgrep -x dpkg > /dev/null 2>&1; then
             busy=1
         fi
+        # Do NOT treat unattended-upgrade-shutdown as busy — it stays running forever on Ubuntu.
+        while read -r _u_line; do
+            case "$_u_line" in
+                *unattended-upgrade-shutdown*) ;;
+                *) busy=1; break ;;
+            esac
+        done < <(pgrep -af unattended-upgrade 2>/dev/null)
         if command -v fuser > /dev/null 2>&1; then
             for lock in /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock; do
                 [ -e "$lock" ] || continue
