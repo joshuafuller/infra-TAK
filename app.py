@@ -12922,6 +12922,18 @@ services:
                 message += f' Recovery flow issue: {recovery_msg}.'
         else:
             message += ' API not ready in time — recovery flow not set up.'
+    # Full-stack `docker compose up -d --force-recreate` reapplies blueprints/worker state; LDAP bind flows
+    # can break afterward (ak-stage-flow-error on simple binds). Re-apply our API flow fix + LDAP outpost recreate.
+    if ak_token:
+        try:
+            _log("  Re-healing LDAP authentication flow after Authentik SMTP/recovery restart...")
+            ok_heal, err_heal = _ensure_ldap_flow_authentication_none()
+            if ok_heal:
+                _log("  ✓ LDAP flow re-healed (ldap-authentication-flow + outpost)")
+            else:
+                _log(f"  ⚠ LDAP flow re-heal: {err_heal}")
+        except Exception as _heal_ex:
+            _log(f"  ⚠ LDAP flow re-heal skipped: {str(_heal_ex)[:100]}")
     return message
 
 
@@ -21803,6 +21815,12 @@ def _test_ldap_bind_dn(bind_dn, bind_pass):
                 lines.append(ln)
         if not lines:
             continue
+        for ln in lines:
+            ln_low = ln.lower()
+            if 'failed to execute flow' in ln_low or 'ak-stage-flow-error' in ln_low:
+                return False
+            if 'flow error' in ln_low and ('password' in ln_low or 'invalid' in ln_low):
+                return False
         if any(any(m in ln for m in success_markers) for ln in lines):
             return True
         if any(any(m in ln for m in failure_markers) for ln in lines):
@@ -22280,7 +22298,7 @@ def _apply_ldap_to_coreconfig():
     return True, 'LDAP connected — CoreConfig patched and TAK Server restarted.'
 
 def _ensure_authentik_webadmin(skip_bind_verify=False):
-    """Ensure webadmin user exists in Authentik (convenience sync — 8446 uses flat-file).
+    """Ensure webadmin exists in Authentik with password from settings; 8446 uses LDAP when CoreConfig has <ldap/>.
     skip_bind_verify=True skips the LDAP bind test + outpost restart (used during deploy).
     Returns (True, None) on success, (False, error_msg) on failure."""
     import urllib.request as _req
@@ -22488,6 +22506,12 @@ def takserver_set_webadmin_password():
     settings = load_settings()
     settings['webadmin_password'] = pw
     save_settings(settings)
+    if _get_authentik_env_content(settings):
+        _remove_webadmin_from_userauth()
+        return jsonify({
+            'success': True,
+            'message': 'Password saved. Stale flat-file webadmin removed if present. Click Sync webadmin to push this password to Authentik LDAP (8446 uses LDAP when Authentik is deployed).'
+        })
     flatfile_ok = False
     if os.path.exists('/opt/tak/utils/UserManager.jar'):
         try:
@@ -22610,6 +22634,8 @@ def takserver_connect_ldap():
         diag.append(f'WebAdmin: {err_wa}')
     else:
         diag.append('WebAdmin: OK')
+    _remove_webadmin_from_userauth()
+    diag.append('Removed flat-file webadmin shadow if present (8446 → LDAP)')
     ok, msg = _apply_ldap_to_coreconfig()
     diag.append(f'CoreConfig: {msg}')
     # Diagnostic: compare passwords and check outpost health
@@ -25218,10 +25244,16 @@ def run_takserver_deploy(config):
         log_step(""); log_step("━━━ Step 9/9: Promoting Admin ━━━")
         run_cmd('java -jar /opt/tak/utils/UserManager.jar certmod -A /opt/tak/certs/files/admin.pem 2>&1', "Promoting admin certificate...", check=False)
         webadmin_pass = config.get('webadmin_password', '')
+        settings_for_ak = load_settings()
+        authentik_for_webadmin = bool(webadmin_pass and _get_authentik_env_content(settings_for_ak))
         if webadmin_pass:
-            log_step("Creating webadmin user...")
-            run_cmd(f"java -jar /opt/tak/utils/UserManager.jar usermod -A -p '{webadmin_pass}' webadmin 2>&1", check=False)
-            log_step("✓ webadmin user created")
+            if authentik_for_webadmin:
+                log_step("Authentik detected — webadmin will live in Authentik/LDAP only (skipping flat-file UserManager; avoids 8446 shadowing).")
+                _remove_webadmin_from_userauth()
+            else:
+                log_step("Creating webadmin user (flat-file)...")
+                run_cmd(f"java -jar /opt/tak/utils/UserManager.jar usermod -A -p '{webadmin_pass}' webadmin 2>&1", check=False)
+                log_step("✓ webadmin user created")
         ne_changed, ne_msg = _sanitize_coreconfig_name_entries()
         if ne_changed:
             log_step(f"  NameEntry fix: {ne_msg}")
@@ -25263,6 +25295,8 @@ def run_takserver_deploy(config):
                 log_step(f"  ✗ webadmin Authentik sync failed: {sync_err}")
                 deploy_status.update({'error': True, 'running': False})
                 return
+            _remove_webadmin_from_userauth()
+            log_step("  ✓ Removed any flat-file webadmin shadow (8446 → LDAP only)")
 
         # If Caddy is already running with a domain, install LE cert on 8446 now.
         # This handles the case where Caddy was deployed before TAK Server.
