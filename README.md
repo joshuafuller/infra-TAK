@@ -6,7 +6,13 @@ One clone. One password. One URL. Manage everything from your browser.
 
 **Latest release: v0.4.1-alpha** — **Update Now** uses an isolated `git fetch` (no default `remote.origin.fetch`), so mismatched local tags no longer cause `would clobber existing tag` during upgrade. Plus **8446 / Authentik / LDAP** (v0.3.9 track) and v0.4.0 single-tag resolution. See [docs/RELEASE-v0.4.1-alpha.md](docs/RELEASE-v0.4.1-alpha.md). Prior: [v0.4.0-alpha](docs/RELEASE-v0.4.0-alpha.md), [v0.3.9-alpha](docs/RELEASE-v0.3.9-alpha.md).
 
-**Console stuck (no version in the command):** On the VPS, sync to **latest `main`** and restart — same idea as **Update Now**, without editing the README every release: `git fetch origin main` → `git checkout -B main origin/main` → `sudo systemctl restart takwerx-console` (run from the service’s install directory; one-liner under **Update stuck?** below). Shallow or broken clones: [docs/PULL-AND-RESTART.md](docs/PULL-AND-RESTART.md).
+**Console stuck?** On the VPS, jump to **latest `origin/main`** and restart (no release number in the command — same end state as a good **Update Now**):
+
+```bash
+cd $(grep -oP 'WorkingDirectory=\K.*' /etc/systemd/system/takwerx-console.service) && git fetch origin main && git checkout -B main origin/main && sudo systemctl restart takwerx-console
+```
+
+Shallow or broken clones: [docs/PULL-AND-RESTART.md](docs/PULL-AND-RESTART.md). More detail: **Update stuck?** below.
 
 **Goal: universal installer.** Currently supported platform: **Ubuntu 22.04 LTS**.
 
