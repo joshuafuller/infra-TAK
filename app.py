@@ -4746,7 +4746,7 @@ def run_guarddog_deploy(alert_email):
                     plog("✓ 4GB swap configured (memory stability)")
         except Exception as e:
             plog(f"⚠ Swap setup skipped: {e}")
-        r = subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, text=True, timeout=10)
+        r = subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, text=True, timeout=60)
         if r.returncode != 0:
             plog(f"✗ daemon-reload failed: {r.stderr}")
             guarddog_deploy_status.update({'running': False, 'error': True})
