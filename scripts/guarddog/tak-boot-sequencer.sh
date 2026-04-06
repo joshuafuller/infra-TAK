@@ -1,20 +1,43 @@
 #!/bin/bash
-# Guard Dog Boot Sequencer
-# ExecStartPre for takserver.service — waits for dependent services before TAK starts.
-# Prevents CPU stampede from all services initializing simultaneously on boot.
+# Guard Dog Boot Sequencer (Pre-Start)
+# ExecStartPre for takserver.service.
 #
-# Order: PostgreSQL → Docker/Authentik → then TAK Server may start.
-# Each wait has a timeout so TAK always starts eventually.
+# 1. Stops Docker containers (Authentik, TAK Portal, CloudTAK) so TAK Server
+#    gets all CPU during its heavy 5-7 minute initialization.
+# 2. Waits for PostgreSQL to accept connections.
+# 3. Exits → TAK Server starts with full CPU.
+#
+# The companion tak-post-start.sh brings Docker services back up in order
+# once TAK is listening on 8089.
 
-MAX_WAIT=180
-INTERVAL=10
+MAX_WAIT=120
+INTERVAL=5
 
 _log() {
   echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') boot-sequencer: $1"
   logger -t takguard-boot "$1" 2>/dev/null
 }
 
-# 1. Wait for PostgreSQL to accept connections
+# ── 1. Stop Docker containers so TAK gets full CPU ──
+_log "Stopping Docker containers to give TAK Server full CPU..."
+
+for _d in /root/authentik "${HOME:-/root}/authentik"; do
+  if [ -f "$_d/docker-compose.yml" ]; then
+    cd "$_d" && docker compose stop -t 10 2>/dev/null && _log "Authentik containers stopped"
+    break
+  fi
+done
+
+docker stop tak-portal 2>/dev/null && _log "TAK Portal stopped"
+
+for _d in /root/CloudTAK "${HOME:-/root}/CloudTAK"; do
+  if [ -f "$_d/docker-compose.yml" ]; then
+    cd "$_d" && docker compose stop -t 10 2>/dev/null && _log "CloudTAK stopped"
+    break
+  fi
+done
+
+# ── 2. Wait for PostgreSQL ──
 _log "Waiting for PostgreSQL..."
 _t=0
 while [ $_t -lt $MAX_WAIT ]; do
@@ -27,28 +50,5 @@ while [ $_t -lt $MAX_WAIT ]; do
 done
 [ $_t -ge $MAX_WAIT ] && _log "PostgreSQL not ready after ${MAX_WAIT}s, proceeding anyway"
 
-# 2. Wait for Authentik containers to be healthy (if installed)
-AK_COMPOSE=""
-for _d in /root/authentik "${HOME:-/root}/authentik"; do
-  [ -f "$_d/docker-compose.yml" ] && AK_COMPOSE="$_d/docker-compose.yml" && break
-done
-
-if [ -n "$AK_COMPOSE" ]; then
-  _log "Waiting for Authentik to be healthy..."
-  _t=0
-  while [ $_t -lt $MAX_WAIT ]; do
-    _status=$(docker ps --filter name=authentik-server --format '{{.Status}}' 2>/dev/null || echo "")
-    if echo "$_status" | grep -q "healthy"; then
-      _log "Authentik healthy (${_t}s)"
-      break
-    fi
-    sleep $INTERVAL
-    _t=$((_t + INTERVAL))
-  done
-  [ $_t -ge $MAX_WAIT ] && _log "Authentik not healthy after ${MAX_WAIT}s, proceeding anyway"
-else
-  _log "Authentik not installed, skipping"
-fi
-
-_log "Boot sequencer complete — TAK Server may start"
+_log "Pre-start complete — TAK Server may start with full CPU"
 exit 0
