@@ -52,7 +52,15 @@ if systemctl list-unit-files mediamtx.service &>/dev/null && systemctl is-active
   systemctl stop mediamtx 2>/dev/null && _log "MediaMTX stopped"
 fi
 
-# ── 2. Wait for PostgreSQL ──
+# ── 2. Kill orphan TAK processes and clear Ignite cache ──
+# Stale Ignite work dir from previous crashes causes messaging to fail with
+# "Failed to find deployed service: distributed-configuration".
+pkill -9 -u tak 2>/dev/null && _log "Killed orphan TAK processes"
+if [ -d /opt/tak/work ]; then
+  rm -rf /opt/tak/work && _log "Cleared Ignite work directory"
+fi
+
+# ── 3. Wait for PostgreSQL ──
 _log "Waiting for PostgreSQL..."
 _t=0
 while [ $_t -lt $MAX_WAIT ]; do
