@@ -2,12 +2,15 @@
 # Guard Dog Boot Sequencer (Pre-Start)
 # ExecStartPre for takserver.service.
 #
-# 1. Stops Docker containers (Authentik, TAK Portal, CloudTAK) so TAK Server
-#    gets all CPU during its heavy 5-7 minute initialization.
+# 1. Stops all non-essential services (Docker containers + MediaMTX) so TAK
+#    Server gets full CPU during its heavy 5-7 minute initialization.
 # 2. Waits for PostgreSQL to accept connections.
 # 3. Exits → TAK Server starts with full CPU.
 #
-# The companion tak-post-start.sh brings Docker services back up in order
+# Services stopped: Authentik, TAK Portal, CloudTAK, Node-RED, MediaMTX.
+# Caddy (reverse proxy) is left running — it's lightweight and harmless.
+#
+# The companion tak-post-start.sh brings services back up in order
 # once TAK is listening on 8089.
 
 MAX_WAIT=120
@@ -19,7 +22,7 @@ _log() {
 }
 
 # ── 1. Stop Docker containers so TAK gets full CPU ──
-_log "Stopping Docker containers to give TAK Server full CPU..."
+_log "Stopping Docker containers and MediaMTX to give TAK Server full CPU..."
 
 for _d in /root/authentik "${HOME:-/root}/authentik"; do
   if [ -f "$_d/docker-compose.yml" ]; then
@@ -36,6 +39,18 @@ for _d in /root/CloudTAK "${HOME:-/root}/CloudTAK"; do
     break
   fi
 done
+
+for _d in /root/node-red "${HOME:-/root}/node-red"; do
+  if [ -f "$_d/docker-compose.yml" ]; then
+    cd "$_d" && docker compose stop -t 10 2>/dev/null && _log "Node-RED stopped"
+    break
+  fi
+done
+
+# MediaMTX is a systemd service, not Docker
+if systemctl list-unit-files mediamtx.service &>/dev/null && systemctl is-active --quiet mediamtx 2>/dev/null; then
+  systemctl stop mediamtx 2>/dev/null && _log "MediaMTX stopped"
+fi
 
 # ── 2. Wait for PostgreSQL ──
 _log "Waiting for PostgreSQL..."

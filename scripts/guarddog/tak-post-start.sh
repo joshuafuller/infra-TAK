@@ -3,12 +3,15 @@
 # Runs as a separate systemd oneshot after takserver.service.
 #
 # Waits for TAK Server to be fully listening on 8089, then starts
-# Docker services one at a time in order:
-#   1. Authentik (LDAP + SSO)
+# every service in order:
+#   1. Authentik (LDAP + SSO) — waits for healthy
 #   2. TAK Portal
 #   3. CloudTAK
+#   4. Node-RED
+#   5. MediaMTX
 #
 # Each service is given time to stabilize before the next one starts.
+# Only starts services that are actually installed; skips the rest.
 # Companion to tak-boot-sequencer.sh which stops these before TAK starts.
 
 MAX_WAIT_TAK=900
@@ -82,6 +85,35 @@ if [ -n "$CT_DIR" ]; then
   _log "CloudTAK started"
 else
   _log "CloudTAK not installed, skipping"
+fi
+
+# ── 5. Start Node-RED ──
+NR_DIR=""
+for _d in /root/node-red "${HOME:-/root}/node-red"; do
+  [ -f "$_d/docker-compose.yml" ] && NR_DIR="$_d" && break
+done
+
+if [ -n "$NR_DIR" ]; then
+  _log "Starting Node-RED..."
+  cd "$NR_DIR" && docker compose up -d 2>/dev/null
+  sleep 10
+  _log "Node-RED started"
+else
+  _log "Node-RED not installed, skipping"
+fi
+
+# ── 6. Start MediaMTX ──
+if systemctl list-unit-files mediamtx.service &>/dev/null; then
+  _log "Starting MediaMTX..."
+  systemctl start mediamtx 2>/dev/null
+  sleep 5
+  if systemctl is-active --quiet mediamtx 2>/dev/null; then
+    _log "MediaMTX running"
+  else
+    _log "MediaMTX failed to start (Guard Dog will retry later)"
+  fi
+else
+  _log "MediaMTX not installed, skipping"
 fi
 
 _log "Boot sequence complete — all services started"
