@@ -4564,7 +4564,7 @@ def run_guarddog_deploy(alert_email):
         if is_two_server and s1_host:
             plog(f"Two-server mode detected — DB on {s1_host}:{db_port}")
         script_files = [
-            'send-alert-email.sh',
+            'send-alert-email.sh', 'tak-boot-sequencer.sh',
             'tak-8089-watch.sh', 'tak-oom-watch.sh', 'tak-disk-watch.sh',
             'tak-network-watch.sh', 'tak-process-watch.sh', 'tak-cert-watch.sh', 'tak-intca-watch.sh', 'tak-health-endpoint.py',
             'tak-updates-watch.sh'
@@ -4639,15 +4639,15 @@ def run_guarddog_deploy(alert_email):
         plog("✓ Server identifier written (for alert subject/body)")
         units = [
             ('tak8089guard.service', '[Unit]\nDescription=TAK 8089 Health Guard Dog\nAfter=network-online.target\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-8089-watch.sh\n'),
-            ('tak8089guard.timer', '[Unit]\nDescription=Run TAK 8089 guard dog every 1 minute\n\n[Timer]\nOnBootSec=10min\nOnUnitActiveSec=1min\nUnit=tak8089guard.service\n\n[Install]\nWantedBy=timers.target\n'),
+            ('tak8089guard.timer', '[Unit]\nDescription=Run TAK 8089 guard dog every 1 minute\n\n[Timer]\nOnBootSec=20min\nOnUnitActiveSec=1min\nUnit=tak8089guard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ('takoomguard.service', '[Unit]\nDescription=TAK OOM Guard Dog\nAfter=takserver.service\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-oom-watch.sh\n'),
-            ('takoomguard.timer', '[Unit]\nDescription=Run TAK OOM guard dog every 1 minute\n\n[Timer]\nOnBootSec=5min\nOnUnitActiveSec=1min\nUnit=takoomguard.service\n\n[Install]\nWantedBy=timers.target\n'),
+            ('takoomguard.timer', '[Unit]\nDescription=Run TAK OOM guard dog every 1 minute\n\n[Timer]\nOnBootSec=20min\nOnUnitActiveSec=1min\nUnit=takoomguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ('takdiskguard.service', '[Unit]\nDescription=TAK Disk Space Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-disk-watch.sh\n'),
             ('takdiskguard.timer', '[Unit]\nDescription=Run TAK disk monitor every hour\n\n[Timer]\nOnBootSec=30min\nOnUnitActiveSec=1h\nUnit=takdiskguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ('taknetguard.service', '[Unit]\nDescription=TAK Network Monitor\nAfter=network.target\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-network-watch.sh\n'),
             ('taknetguard.timer', '[Unit]\nDescription=TAK Network Monitor Timer\nRequires=taknetguard.service\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=1min\nAccuracySec=30s\n\n[Install]\nWantedBy=timers.target\n'),
             ('takprocessguard.service', '[Unit]\nDescription=TAK Server Process Monitor\nAfter=network.target takserver.service\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-process-watch.sh\n'),
-            ('takprocessguard.timer', '[Unit]\nDescription=TAK Server Process Monitor Timer\nRequires=takprocessguard.service\n\n[Timer]\nOnBootSec=3min\nOnUnitActiveSec=1min\nAccuracySec=30s\n\n[Install]\nWantedBy=timers.target\n'),
+            ('takprocessguard.timer', '[Unit]\nDescription=TAK Server Process Monitor Timer\nRequires=takprocessguard.service\n\n[Timer]\nOnBootSec=20min\nOnUnitActiveSec=1min\nAccuracySec=30s\n\n[Install]\nWantedBy=timers.target\n'),
             ('takcertguard.service', '[Unit]\nDescription=TAK Certificate Expiry Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-cert-watch.sh\n'),
             ('takcertguard.timer', '[Unit]\nDescription=Run TAK cert monitor daily\n\n[Timer]\nOnBootSec=1h\nOnUnitActiveSec=1d\nUnit=takcertguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ('takintcaguard.service', '[Unit]\nDescription=TAK Intermediate CA Expiry Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-intca-watch.sh\n'),
@@ -4716,8 +4716,8 @@ def run_guarddog_deploy(alert_email):
         os.makedirs(tak_dropin_dir, exist_ok=True)
         tak_dropin = os.path.join(tak_dropin_dir, 'soft-start.conf')
         with open(tak_dropin, 'w') as f:
-            f.write('[Unit]\nAfter=network-online.target postgresql.service postgresql-15.service\nWants=network-online.target\n')
-        plog("✓ TAK Server soft-start drop-in installed (starts after network + PostgreSQL)")
+            f.write('[Unit]\nAfter=network-online.target postgresql.service postgresql-15.service\nWants=network-online.target\n\n[Service]\nExecStartPre=-/opt/tak-guarddog/tak-boot-sequencer.sh\n')
+        plog("✓ TAK Server soft-start drop-in installed (boot sequencer waits for PostgreSQL + Authentik before TAK starts)")
         # 4GB swap for memory stability (from reference TAK Server Hardening script)
         try:
             r = subprocess.run(['swapon', '--show'], capture_output=True, text=True, timeout=5)
