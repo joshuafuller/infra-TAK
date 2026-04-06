@@ -4,7 +4,7 @@ Tea Awarness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Latest release: v0.4.5-alpha** — Console crash fix (`apt` timeout on page load); Guard Dog **8089** TCP connect probe (stops restart loops). After upgrading: **Guard Dog → ↻ Update Guard Dog** (see [docs/RELEASE-v0.4.5-alpha.md](docs/RELEASE-v0.4.5-alpha.md)). Prior: [v0.4.4-alpha](docs/RELEASE-v0.4.4-alpha.md), [v0.4.3-alpha](docs/RELEASE-v0.4.3-alpha.md), [v0.4.2-alpha](docs/RELEASE-v0.4.2-alpha.md).
+**Latest release: v0.4.6-alpha** — Guard Dog **boot-loop prevention**: service-age grace (10 min), daily restart cap (3/day), clean restart (kills orphan Java, clears Ignite). After upgrading: **Guard Dog → ↻ Update Guard Dog** (see [docs/RELEASE-v0.4.6-alpha.md](docs/RELEASE-v0.4.6-alpha.md)). Prior: [v0.4.5-alpha](docs/RELEASE-v0.4.5-alpha.md), [v0.4.4-alpha](docs/RELEASE-v0.4.4-alpha.md), [v0.4.3-alpha](docs/RELEASE-v0.4.3-alpha.md), [v0.4.2-alpha](docs/RELEASE-v0.4.2-alpha.md).
 
 **Something broken?** Wrong sidebar version, **Update Now** error, merge/rebase/tag-clobber messages, or you are not sure the VPS ever pulled the real repo → go to **[Universal recovery (SSH)](#universal-recovery-ssh)** and run the one block there. **Point people at that section**; it is the single source of truth.
 
@@ -28,7 +28,7 @@ grep '^VERSION' app.py
 sudo systemctl restart takwerx-console
 ```
 
-**Check:** The **`grep`** line should show **`VERSION = "…"`** matching the current **Latest release** at the top (without the **`v`**, e.g. **`0.4.4-alpha`**). If it still shows an old number, you are in the wrong directory (compare with **`grep WorkingDirectory /etc/systemd/system/takwerx-console.service`**) or the fetch failed (network).
+**Check:** The **`grep`** line should show **`VERSION = "…"`** matching the current **Latest release** at the top (without the **`v`**, e.g. **`0.4.6-alpha`**). If it still shows an old number, you are in the wrong directory (compare with **`grep WorkingDirectory /etc/systemd/system/takwerx-console.service`**) or the fetch failed (network).
 
 **Fix `origin` once (recommended):** so future **`git fetch origin`** hits upstream:
 
