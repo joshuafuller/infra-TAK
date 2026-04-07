@@ -4,7 +4,7 @@ Tea Awarness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Latest release: v0.4.6-alpha** — Guard Dog **boot-loop prevention**: service-age grace (10 min), daily restart cap (3/day), clean restart (kills orphan Java, clears Ignite). After upgrading: **Guard Dog → ↻ Update Guard Dog** (see [docs/RELEASE-v0.4.6-alpha.md](docs/RELEASE-v0.4.6-alpha.md)). Prior: [v0.4.5-alpha](docs/RELEASE-v0.4.5-alpha.md), [v0.4.4-alpha](docs/RELEASE-v0.4.4-alpha.md), [v0.4.3-alpha](docs/RELEASE-v0.4.3-alpha.md), [v0.4.2-alpha](docs/RELEASE-v0.4.2-alpha.md).
+**Latest release: v0.4.6-alpha** — **Staggered boot sequencer** (cold reboot → all services up in ~2 min), **Authentik deployment resilience** (TLS cert gate, LDAP port gate, improved bind verification), Guard Dog **boot-loop prevention** (service-age grace, daily restart cap, clean restart). After upgrading: **Guard Dog → ↻ Update Guard Dog**, then **Authentik → Update Config & Reconnect** (see [docs/RELEASE-v0.4.6-alpha.md](docs/RELEASE-v0.4.6-alpha.md)). Prior: [v0.4.5-alpha](docs/RELEASE-v0.4.5-alpha.md), [v0.4.4-alpha](docs/RELEASE-v0.4.4-alpha.md), [v0.4.3-alpha](docs/RELEASE-v0.4.3-alpha.md), [v0.4.2-alpha](docs/RELEASE-v0.4.2-alpha.md).
 
 **Something broken?** Wrong sidebar version, **Update Now** error, merge/rebase/tag-clobber messages, or you are not sure the VPS ever pulled the real repo → go to **[Universal recovery (SSH)](#universal-recovery-ssh)** and run the one block there. **Point people at that section**; it is the single source of truth.
 
@@ -160,9 +160,34 @@ After deployment, create users in TAK Portal — they flow through Authentik →
 - **Root access**
 - **RAM:** 8 GB+ recommended for TAK Server; more if you run the full stack (Authentik, TAK Portal, Node-RED, MediaMTX, CloudTAK, Guard Dog).
 - **Disk:** At max deployment (all modules) you can sit around **26 GB** used. Plan for growth: CoT data, logs, and retention. **50 GB+** disk is recommended so you have headroom; TAK Server's own minimum is 40 GB per the official configuration guide. Apply Docker log limits (Guard Dog → Apply Docker log limits) to avoid containers filling the disk.
+- **Disk I/O:** SSD-backed storage strongly recommended. **Test your VPS before deploying** — slow disk I/O causes Docker build timeouts, service startup failures, and unreliable boots. See [VPS disk I/O check](#vps-disk-io-check) below.
 - **CPU:** Enough cores for all processes (TAK Server, PostgreSQL, Authentik, Caddy, Node-RED, etc.). TAK Server's minimum is 4 cores; more is better for the full stack.
 - **Internet** connection for initial setup.
 - **TAK Server .deb** package from [tak.gov](https://tak.gov).
+
+### VPS disk I/O check
+
+Run this on your VPS **before deploying**. Poor disk I/O is the #1 cause of slow deploys and unreliable service startups.
+
+```bash
+# Write speed (sequential, sync)
+dd if=/dev/zero of=/tmp/testfile bs=1M count=1024 oflag=dsync 2>&1 | tail -1
+
+# Read speed
+dd if=/tmp/testfile of=/dev/null bs=1M 2>&1 | tail -1
+
+# Clean up
+rm -f /tmp/testfile
+```
+
+| Write speed | Assessment |
+|-------------|------------|
+| **400+ MB/s** | Good — SSD-backed, full stack will deploy and boot quickly |
+| **200–400 MB/s** | Acceptable — deploys work, boot may be slightly slower |
+| **< 200 MB/s** | Poor — expect slow Docker builds, service timeouts, longer boot sequences |
+| **< 100 MB/s** | Bad — likely throttled or HDD-backed; migrate to a different node or provider |
+
+Some VPS providers place instances on overloaded or HDD-backed storage nodes. If your write speed is consistently under 200 MB/s, contact your provider about migrating to a different node before troubleshooting service issues. The difference between a bad node and a good one can be 50 MB/s vs 500 MB/s on the same provider.
 
 ## Architecture
 
@@ -274,6 +299,31 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v0.4.6-alpha — 2026-04-07
+
+**Staggered boot sequencer — cold reboot to all services in ~2 minutes**
+- Full boot orchestration: pre-start stops all Docker services and waits for PostgreSQL, then TAK Server starts with exclusive CPU. Post-start waits for port 8089, then brings up Authentik (waits for healthy + LDAP 389), TAK Portal, CloudTAK, Node-RED, and MediaMTX in order. Only installed services are touched.
+- Auto-restarts TAK messaging if it crashes during cold boot (config ready but messaging process died).
+
+**Authentik deployment resilience**
+- TLS cert readiness gate: waits up to 300s for Caddy to provision a valid cert on the Authentik FQDN before restarting the LDAP outpost.
+- LDAP port 389 readiness gate: waits up to 180s for the LDAP container to be listening before running bind verification.
+- Improved LDAP bind verification: 24 attempts / 10s delay (was 12/5s). Log parsing prioritizes success markers over stale errors.
+- Docker healthcheck `start_period` extended to 600s for Authentik server and worker (accommodates slow first-run migrations).
+
+**Guard Dog — boot-loop prevention**
+- Service-age grace (10 min), daily restart cap (3/day shared counter), clean restart (stop → kill orphans → clear Ignite → start).
+- Timer delays increased to 20 min after boot.
+
+**Certificate password fix**
+- Custom cert passwords now correctly applied to all JKS files during TAK Server deploy and CA rotation. Previously, `cert-metadata.sh` was not patched before cert generation, and the helper patched wrong variable names. Default password (`atakatak`) deployments were never affected.
+
+**After upgrading:** Guard Dog → ↻ Update Guard Dog, then Authentik → Update Config & Reconnect.
+
+Full notes: [docs/RELEASE-v0.4.6-alpha.md](docs/RELEASE-v0.4.6-alpha.md).
+
+---
 
 ### v0.2.9-alpha — 2026-03-15
 

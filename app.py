@@ -7211,15 +7211,20 @@ def _validate_cert_password(pw):
 
 
 def _patch_cert_metadata_password(cert_pass):
-    """Patch cert-metadata.sh with the given password so makeCert.sh creates JKS with it. Tries common variable names."""
+    """Patch cert-metadata.sh with the given password so makeRootCa/makeCert create JKS files with it.
+
+    TAK Server's cert-metadata.sh uses CAPASS and PASS; older or custom scripts may use other names.
+    """
     path = '/opt/tak/certs/cert-metadata.sh'
     if not os.path.exists(path):
+        return
+    if not cert_pass or cert_pass == 'atakatak':
         return
     try:
         with open(path, 'r') as f:
             lines = f.readlines()
         changed = False
-        for var in ('CERT_PASS', 'PASSWORD', 'KEYSTORE_PASS', 'CA_PASS', 'JKS_PASS'):
+        for var in ('CAPASS', 'PASS', 'CERT_PASS', 'PASSWORD', 'KEYSTORE_PASS', 'CA_PASS', 'JKS_PASS'):
             for i, line in enumerate(lines):
                 if line.strip().startswith(var + '='):
                     lines[i] = f'{var}="{cert_pass.replace(chr(34), chr(92)+chr(34))}"\n'
@@ -25320,6 +25325,7 @@ def run_takserver_deploy(config):
         log_step(f"  Intermediate CA validity: {int_validity_days} days (issued cert will default to same; change anytime in Certificate signing)")
 
         _patch_openssl_string_mask(log_step)
+        _patch_cert_metadata_password(cert_pass)
 
         run_cmd('chown -R tak:tak /opt/tak/certs/')
         log_step(f"Creating Root CA: {root_ca}...")
