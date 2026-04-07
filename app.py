@@ -19266,7 +19266,7 @@ entries:
       - "${COMPOSE_PORT_HTTPS:-9443}:9443"
     healthcheck:
       test: ["CMD", "ak", "healthcheck"]
-      start_period: 90s
+      start_period: 600s
       interval: 30s
       timeout: 10s
       retries: 5
@@ -19296,7 +19296,7 @@ entries:
       - .env
     healthcheck:
       test: ["CMD", "ak", "healthcheck"]
-      start_period: 90s
+      start_period: 600s
       interval: 30s
       timeout: 10s
       retries: 5
@@ -20224,7 +20224,7 @@ entries:
                     needs_write = True
             # Inject healthchecks for server and worker if missing (upstream compose may not have them)
             if not any('ak healthcheck' in l or 'ak", "healthcheck' in l for l in lines):
-                _hc_block = '    healthcheck:\n      test: ["CMD", "ak", "healthcheck"]\n      start_period: 90s\n      interval: 30s\n      timeout: 10s\n      retries: 5\n'
+                _hc_block = '    healthcheck:\n      test: ["CMD", "ak", "healthcheck"]\n      start_period: 600s\n      interval: 30s\n      timeout: 10s\n      retries: 5\n'
                 patched = []
                 for i, line in enumerate(lines):
                     patched.append(line)
@@ -20233,6 +20233,23 @@ entries:
                 lines = patched
                 needs_write = True
                 plog("  Added healthchecks for server and worker")
+            else:
+                # Upstream compose has healthchecks — ensure start_period is long enough for first-run migrations
+                for i, line in enumerate(lines):
+                    if 'start_period' in line and 'start_period: 600s' not in line:
+                        # Only patch start_period inside server/worker healthcheck blocks (not pg/redis)
+                        # Check if this is under a server or worker service by looking backwards
+                        for j in range(i - 1, max(i - 15, 0), -1):
+                            if lines[j].strip().startswith('command: server') or lines[j].strip().startswith('command: worker'):
+                                lines[i] = re.sub(r'start_period:\s*\S+', 'start_period: 600s', line)
+                                needs_write = True
+                                break
+                            if lines[j].strip().startswith('image:') and 'postgres' in lines[j]:
+                                break
+                            if lines[j].strip().startswith('image:') and 'redis' in lines[j]:
+                                break
+                if needs_write:
+                    plog("  Updated healthcheck start_period to 600s for first-run migrations")
 
             ldap_image = f"ghcr.io/goauthentik/ldap:${{AUTHENTIK_TAG:-{ak_tag}}}"
             if not any('ghcr.io/goauthentik/ldap' in l for l in lines):
@@ -20337,7 +20354,7 @@ entries:
             api_ready = _wait_for_authentik_api(
                 'http://127.0.0.1:9090',
                 {'Authorization': f'Bearer {bootstrap_token}'},
-                max_attempts=150, plog=plog
+                max_attempts=300, plog=plog
             )
             if api_ready:
                 plog("✓ Authentik API is ready")
@@ -20446,8 +20463,8 @@ entries:
                 plog("  Waiting for worker to apply bootstrap blueprint...")
                 token_ok = False
                 attempt = 0
-                # Cap waits (~750s) so first-run migrations on slow VPS don't hang forever (matches Step 8 API poll budget)
-                _bootstrap_token_max_attempts = 150
+                # Cap waits (~1500s / 25min) so first-run migrations on slow VPS don't hang forever (matches Step 8 API poll budget)
+                _bootstrap_token_max_attempts = 300
                 while attempt < _bootstrap_token_max_attempts:
                     try:
                         req = urllib.request.Request(f'{ak_url}/api/v3/core/users/',
