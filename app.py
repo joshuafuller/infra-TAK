@@ -7237,6 +7237,30 @@ def _patch_cert_metadata_password(cert_pass):
         pass
 
 
+def _patch_coreconfig_passwords(cert_pass, log_fn=None):
+    """Ensure every keystorePass / truststorePass in CoreConfig.xml matches cert_pass."""
+    cc_path = '/opt/tak/CoreConfig.xml'
+    if not cert_pass or not os.path.exists(cc_path):
+        return
+    try:
+        import re
+        with open(cc_path, 'r') as f:
+            content = f.read()
+        updated = content
+        for attr in ('keystorePass', 'truststorePass'):
+            for m in re.finditer(rf'{attr}="([^"]*)"', content):
+                old_val = m.group(1)
+                if old_val != cert_pass:
+                    updated = updated.replace(f'{attr}="{old_val}"', f'{attr}="{cert_pass}"')
+        if updated != content:
+            with open(cc_path, 'w') as f:
+                f.write(updated)
+            if log_fn:
+                log_fn("✓ CoreConfig.xml keystore/truststore passwords updated")
+    except Exception:
+        pass
+
+
 import re as _re_module
 _ASN1_PRINTABLE_RE = _re_module.compile(r"^[A-Za-z0-9 '()+,\-./:=?]*$")
 
@@ -23649,6 +23673,7 @@ def takserver_rotate_intca():
             log("Step 6/7: Updating CoreConfig.xml...")
             run(f'sed -i "s/{old_ca_name}/{new_ca_name}/g" /opt/tak/CoreConfig.xml')
             run(f'sed -i "s/{old_ca_name}/{new_ca_name}/g" /opt/tak/CoreConfig.example.xml 2>/dev/null', check=False)
+            _patch_coreconfig_passwords(cert_pass, log_fn=log)
             log("✓ CoreConfig.xml updated")
 
             log("")
@@ -23984,6 +24009,7 @@ def takserver_rotate_rootca():
             if old_root_name and old_root_name != new_root_name:
                 run(f'sed -i "s/{old_root_name}/{new_root_name}/g" /opt/tak/CoreConfig.xml', check=False)
                 run(f'sed -i "s/{old_root_name}/{new_root_name}/g" /opt/tak/CoreConfig.example.xml 2>/dev/null', check=False)
+            _patch_coreconfig_passwords(cert_pass, log_fn=log)
             log("✓ CoreConfig.xml updated")
 
             log("")
@@ -25360,6 +25386,7 @@ def run_takserver_deploy(config):
         log_step(""); log_step("━━━ Step 8/9: Configuring CoreConfig.xml ━━━")
         run_cmd('sed -i \'s|<input auth="anonymous" _name="stdtcp" protocol="tcp" port="8087"/>|<input auth="x509" _name="stdssl" protocol="tls" port="8089"/>|g\' /opt/tak/CoreConfig.xml', "Enabling X.509 auth on 8089...")
         run_cmd(f'sed -i "s|truststoreFile=\\"certs/files/truststore-root.jks|truststoreFile=\\"certs/files/truststore-{int_ca}.jks|g" /opt/tak/CoreConfig.xml', "Setting intermediate CA truststore...")
+        _patch_coreconfig_passwords(cert_pass, log_fn=log_step)
         issued_days = config.get('issued_cert_validity_days') or config.get('intermediate_ca_validity_days', 730)
         cert_block = (f'<certificateSigning CA="TAKServer"><certificateConfig>\\n'
             f'<nameEntries>\\n<nameEntry name="O" value="{config["cert_org"]}"/>\\n'
