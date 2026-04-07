@@ -21107,6 +21107,26 @@ entries:
             generate_caddyfile(settings)
             subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=90)
             plog(f"  ✓ Caddy config updated for Authentik")
+            # Wait for Caddy to provision the TLS cert before restarting LDAP
+            # (LDAP outpost uses AUTHENTIK_HOST with HTTPS FQDN — needs valid cert)
+            fqdn = settings.get('fqdn', '')
+            if fqdn:
+                plog(f"  Waiting for TLS cert on {fqdn}...")
+                _tls_ready = False
+                for _tls_attempt in range(30):
+                    try:
+                        import ssl, socket
+                        ctx = ssl.create_default_context()
+                        with ctx.wrap_socket(socket.socket(), server_hostname=fqdn.split(':')[0]) as s:
+                            s.settimeout(5)
+                            s.connect((fqdn.split(':')[0], 443))
+                        _tls_ready = True
+                        plog(f"  ✓ TLS cert ready for {fqdn}")
+                        break
+                    except Exception:
+                        time.sleep(5)
+                if not _tls_ready:
+                    plog(f"  ⚠ TLS cert not ready after 150s — LDAP outpost may take longer to connect")
         # If Email Relay is already configured, push SMTP + recovery flow into Authentik now (persistent)
         relay = settings.get('email_relay') or {}
         if relay.get('from_addr'):
@@ -21131,8 +21151,22 @@ entries:
                     if line.strip().startswith('AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD='):
                         ldap_svc_pass = line.strip().split('=', 1)[1].strip()
                         break
-        time.sleep(3)
-        if not _authentik_deploy_final_verify_ldap_sa(ldap_svc_pass, plog):
+        # Wait for LDAP port 389 to be open before burning bind-check attempts
+        import socket as _sock
+        plog("  Waiting for LDAP port 389...")
+        _ldap_port_ready = False
+        for _lp in range(36):  # 36 × 5s = 180s max
+            try:
+                with _sock.create_connection(('127.0.0.1', 389), timeout=3):
+                    _ldap_port_ready = True
+                    plog(f"  ✓ LDAP port 389 open ({_lp * 5}s)")
+                    break
+            except (OSError, ConnectionRefusedError):
+                time.sleep(5)
+        if not _ldap_port_ready:
+            plog("  ⚠ LDAP port 389 not open after 180s — bind check may fail")
+        time.sleep(5)
+        if not _authentik_deploy_final_verify_ldap_sa(ldap_svc_pass, plog, attempts=24, delay_sec=10):
             _update_boot_stagger_service()
             authentik_deploy_status.update({'running': False, 'complete': False, 'error': True})
             return
@@ -21964,15 +21998,18 @@ def _test_ldap_bind_dn(bind_dn, bind_pass):
                 lines.append(ln)
         if not lines:
             continue
-        for ln in lines:
-            ln_low = ln.lower()
-            if 'failed to execute flow' in ln_low or 'ak-stage-flow-error' in ln_low:
-                return False
-            if 'flow error' in ln_low and ('password' in ln_low or 'invalid' in ln_low):
-                return False
+        # Check success FIRST — a recent success trumps a stale flow-error from outpost startup
         if any(any(m in ln for m in success_markers) for ln in lines):
             return True
         if any(any(m in ln for m in failure_markers) for ln in lines):
+            return False
+        has_flow_error = any(
+            'failed to execute flow' in ln.lower() or 'ak-stage-flow-error' in ln.lower()
+            for ln in lines)
+        has_cred_error = any(
+            'flow error' in ln.lower() and ('password' in ln.lower() or 'invalid' in ln.lower())
+            for ln in lines)
+        if has_flow_error or has_cred_error:
             return False
 
     return False
