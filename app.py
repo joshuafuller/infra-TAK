@@ -9076,7 +9076,7 @@ takportal_deploy_log = []
 takportal_deploy_status = {'running': False, 'complete': False, 'error': False}
 
 # Keys in TAK Portal settings.json that are configurable in TAK Portal UI (e.g. custom logo/photo). We never overwrite these when pushing settings on update/reconfigure/deploy.
-PRESERVE_TAKPORTAL_KEYS = frozenset(['BRAND_LOGO_URL'])
+PRESERVE_TAKPORTAL_KEYS = frozenset(['BRAND_LOGO_URL', 'TAK_SSH_ONBOARDED', 'TAK_SSH_LAST_HANDSHAKE_AT'])
 
 
 def _takportal_get_existing_settings():
@@ -9117,6 +9117,8 @@ def _takportal_build_settings_dict(settings):
         tak_url_host = server_ip
     else:
         tak_url_host = tak_dns or 'host.docker.internal'
+    # SSH: container→host uses host.docker.internal (extra_hosts in compose)
+    ssh_host = server_ip if (server_ip and server_ip not in ('localhost', '127.0.0.1')) else 'host.docker.internal'
     return {
         "AUTHENTIK_URL": f"http://{auth_url_host}:{auth_url_port}",
         "AUTHENTIK_TOKEN": ak_token or "",
@@ -9139,7 +9141,13 @@ def _takportal_build_settings_dict(settings):
         "CLOUDTAK_URL": f"https://{cloudtak_host}" if cloudtak_host else "",
         **_portal_email_settings(settings),
         "BRAND_THEME": "dark",
-        "BRAND_LOGO_URL": ""
+        "BRAND_LOGO_URL": "",
+        "TAK_SSH_HOST": ssh_host,
+        "TAK_SSH_PORT": "22",
+        "TAK_SSH_USER": "root",
+        "TAK_SSH_PRIVATE_KEY_PATH": "data/ssh/tak_ssh_ed25519",
+        "TAK_SSH_PUBLIC_KEY_PATH": "data/ssh/tak_ssh_ed25519.pub",
+        "TAK_SSH_PASSPHRASE": "",
     }
 
 
@@ -9153,6 +9161,103 @@ def _takportal_merged_settings_json(settings):
             continue
         merged[k] = v
     return json.dumps(merged, indent=2)
+
+
+def _takportal_setup_ssh(log_fn=None):
+    """Generate an ed25519 keypair, install it on the host, and copy it into the TAK Portal container.
+
+    After this, TAK Portal can SSH to the host via host.docker.internal without a password handshake.
+    Returns True if the key was installed (or already existed) and is ready to use.
+    """
+    key_dir = os.path.expanduser('~/TAK-Portal/data/ssh')
+    priv_key = os.path.join(key_dir, 'tak_ssh_ed25519')
+    pub_key = priv_key + '.pub'
+    auth_keys = os.path.expanduser('~/.ssh/authorized_keys')
+
+    try:
+        os.makedirs(key_dir, mode=0o700, exist_ok=True)
+
+        # Generate keypair if missing
+        if not os.path.exists(priv_key):
+            r = subprocess.run(
+                ['ssh-keygen', '-t', 'ed25519', '-f', priv_key, '-N', '', '-C', 'tak-portal-auto'],
+                capture_output=True, text=True, timeout=15)
+            if r.returncode != 0 or not os.path.exists(pub_key):
+                if log_fn:
+                    log_fn(f"  ✗ SSH keygen failed: {(r.stderr or '').strip()[:200]}")
+                return False
+            if log_fn:
+                log_fn("  ✓ SSH ed25519 keypair generated")
+        else:
+            if log_fn:
+                log_fn("  ✓ SSH keypair already exists")
+
+        # Install public key in host authorized_keys
+        with open(pub_key, 'r') as f:
+            pub_content = f.read().strip()
+        os.makedirs(os.path.dirname(auth_keys), mode=0o700, exist_ok=True)
+        existing_keys = ''
+        if os.path.exists(auth_keys):
+            with open(auth_keys, 'r') as f:
+                existing_keys = f.read()
+        if pub_content not in existing_keys:
+            with open(auth_keys, 'a') as f:
+                f.write(f'\n{pub_content}\n')
+            os.chmod(auth_keys, 0o600)
+            if log_fn:
+                log_fn("  ✓ Public key added to ~/.ssh/authorized_keys")
+        else:
+            if log_fn:
+                log_fn("  ✓ Public key already in authorized_keys")
+
+        # Copy keypair into running container
+        subprocess.run(
+            'docker exec tak-portal mkdir -p /usr/src/app/data/ssh',
+            shell=True, capture_output=True, text=True, timeout=10)
+        subprocess.run(
+            f'docker cp {shlex.quote(priv_key)} tak-portal:/usr/src/app/data/ssh/tak_ssh_ed25519',
+            shell=True, capture_output=True, text=True, timeout=10)
+        subprocess.run(
+            f'docker cp {shlex.quote(pub_key)} tak-portal:/usr/src/app/data/ssh/tak_ssh_ed25519.pub',
+            shell=True, capture_output=True, text=True, timeout=10)
+        # Ensure correct permissions inside container
+        subprocess.run(
+            'docker exec tak-portal chmod 600 /usr/src/app/data/ssh/tak_ssh_ed25519',
+            shell=True, capture_output=True, text=True, timeout=10)
+        if log_fn:
+            log_fn("  ✓ SSH keys copied into TAK Portal container")
+
+        # Mark onboarded in container settings
+        try:
+            from datetime import datetime as _dt
+            r = subprocess.run(
+                'docker exec tak-portal cat /usr/src/app/data/settings.json',
+                shell=True, capture_output=True, text=True, timeout=10)
+            if r.returncode == 0 and r.stdout.strip():
+                import json as _json
+                portal_cfg = _json.loads(r.stdout)
+                portal_cfg['TAK_SSH_ONBOARDED'] = 'true'
+                portal_cfg['TAK_SSH_LAST_HANDSHAKE_AT'] = _dt.now().isoformat()
+                fd, tmp = tempfile.mkstemp(suffix='.json', prefix='tak-portal-ssh-')
+                try:
+                    with os.fdopen(fd, 'w') as f:
+                        _json.dump(portal_cfg, f, indent=2)
+                    subprocess.run(
+                        f'docker cp {shlex.quote(tmp)} tak-portal:/usr/src/app/data/settings.json',
+                        shell=True, capture_output=True, text=True, timeout=10)
+                finally:
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+        except Exception:
+            pass
+
+        return True
+    except Exception as e:
+        if log_fn:
+            log_fn(f"  ✗ SSH setup error: {e}")
+        return False
 
 
 def _takportal_build_settings_json(settings):
@@ -9189,6 +9294,7 @@ def takportal_control():
                     pass
             if cp.returncode != 0:
                 return jsonify({'success': False, 'error': (cp.stderr or cp.stdout or 'docker cp failed').strip()[:300]}), 500
+            _takportal_setup_ssh()
             subprocess.run('docker restart tak-portal', shell=True, capture_output=True, text=True, timeout=30)
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)[:300]}), 500
@@ -9197,7 +9303,7 @@ def takportal_control():
         time.sleep(2)
         r = subprocess.run('docker ps --filter name=tak-portal --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
         running = 'Up' in (r.stdout or '')
-        return jsonify({'success': True, 'running': running, 'action': action, 'message': 'Config updated and portal restarted.'})
+        return jsonify({'success': True, 'running': running, 'action': action, 'message': 'Config updated and portal restarted (SSH configured).'})
     elif action == 'update':
         pull = subprocess.run(
             f'cd {portal_dir} && git -c safe.directory={portal_dir} pull --rebase --autostash',
@@ -9231,6 +9337,7 @@ def takportal_control():
                 except OSError:
                     pass
             if cp.returncode == 0:
+                _takportal_setup_ssh()
                 subprocess.run('docker restart tak-portal', shell=True, capture_output=True, text=True, timeout=30)
                 settings_synced = True
             else:
@@ -9589,6 +9696,15 @@ def run_takportal_deploy():
         else:
             plog("\u26a0 Authentik not deployed yet - configure token in Server Settings")
         plog("\u2713 Settings auto-configured")
+
+        # SSH: generate keypair and install so TAK Portal can reach host TAK Server
+        plog("")
+        plog("\u2501\u2501\u2501 Setting up SSH (container \u2192 host) \u2501\u2501\u2501")
+        if _takportal_setup_ssh(log_fn=plog):
+            plog(f"  SSH target: {portal_settings.get('TAK_SSH_HOST', 'host.docker.internal')}:22 as root")
+            plog("\u2713 SSH ready (no handshake needed)")
+        else:
+            plog("\u26a0 SSH auto-setup failed — configure manually in TAK Portal settings")
 
         # Restart container to pick up settings
         subprocess.run('docker restart tak-portal', shell=True, capture_output=True, text=True, timeout=30)
