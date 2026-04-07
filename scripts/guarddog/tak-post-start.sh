@@ -63,13 +63,36 @@ if [ -n "$AK_DIR" ]; then
   while [ $_t -lt $MAX_WAIT_AK ]; do
     _status=$(docker ps --filter name=authentik-server --format '{{.Status}}' 2>/dev/null || echo "")
     if echo "$_status" | grep -q "healthy"; then
-      _log "Authentik healthy (${_t}s)"
+      _log "Authentik server healthy (${_t}s)"
       break
     fi
     sleep $INTERVAL
     _t=$((_t + INTERVAL))
   done
-  [ $_t -ge $MAX_WAIT_AK ] && _log "Authentik not healthy after ${MAX_WAIT_AK}s, continuing"
+  [ $_t -ge $MAX_WAIT_AK ] && _log "Authentik server not healthy after ${MAX_WAIT_AK}s, continuing"
+
+  # Verify LDAP outpost is also responding (port 389)
+  _log "Checking LDAP outpost (port 389)..."
+  _t=0
+  _MAX_LDAP=120
+  while [ $_t -lt $_MAX_LDAP ]; do
+    if nc -z 127.0.0.1 389 2>/dev/null; then
+      _log "LDAP outpost ready (${_t}s)"
+      break
+    fi
+    sleep $INTERVAL
+    _t=$((_t + INTERVAL))
+  done
+  if [ $_t -ge $_MAX_LDAP ]; then
+    _log "LDAP not responding after ${_MAX_LDAP}s — force-recreating LDAP container"
+    cd "$AK_DIR" && docker compose up -d --force-recreate ldap 2>/dev/null
+    sleep 30
+    if nc -z 127.0.0.1 389 2>/dev/null; then
+      _log "LDAP outpost recovered after recreate"
+    else
+      _log "LDAP still not responding — Guard Dog will monitor"
+    fi
+  fi
 else
   _log "Authentik not installed, skipping"
 fi
