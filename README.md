@@ -4,7 +4,7 @@ Tea Awarness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Latest release: v0.4.6-alpha** — **Staggered boot sequencer** (cold reboot → all services up in ~2 min), **Authentik deployment resilience** (TLS cert gate, LDAP port gate, improved bind verification), Guard Dog **boot-loop prevention** (service-age grace, daily restart cap, clean restart). After upgrading: **Guard Dog → ↻ Update Guard Dog**, then **Authentik → Update Config & Reconnect** (see [docs/RELEASE-v0.4.6-alpha.md](docs/RELEASE-v0.4.6-alpha.md)). Prior: [v0.4.5-alpha](docs/RELEASE-v0.4.5-alpha.md), [v0.4.4-alpha](docs/RELEASE-v0.4.4-alpha.md), [v0.4.3-alpha](docs/RELEASE-v0.4.3-alpha.md), [v0.4.2-alpha](docs/RELEASE-v0.4.2-alpha.md).
+**Latest release: v0.4.6-alpha** — **Staggered boot sequencer** (cold reboot → full stack healthy in ~2 min), **Authentik deployment resilience** (TLS cert gate, LDAP port gate, improved bind verification), Guard Dog **boot-loop prevention**, **certificate password fix** (custom passwords now applied everywhere — JKS files and all CoreConfig.xml entries), **TAK Portal SSH auto-config** (zero-touch SSH from container to host on deploy), **VPS disk I/O check** in installer. After upgrading: **Guard Dog → ↻ Update Guard Dog**, then **Authentik → Update Config & Reconnect**, then **TAK Portal → Update Config** (enables SSH). See [docs/RELEASE-v0.4.6-alpha.md](docs/RELEASE-v0.4.6-alpha.md). Prior: [v0.4.5-alpha](docs/RELEASE-v0.4.5-alpha.md), [v0.4.4-alpha](docs/RELEASE-v0.4.4-alpha.md), [v0.4.3-alpha](docs/RELEASE-v0.4.3-alpha.md), [v0.4.2-alpha](docs/RELEASE-v0.4.2-alpha.md).
 
 **Something broken?** Wrong sidebar version, **Update Now** error, merge/rebase/tag-clobber messages, or you are not sure the VPS ever pulled the real repo → go to **[Universal recovery (SSH)](#universal-recovery-ssh)** and run the one block there. **Point people at that section**; it is the single source of truth.
 
@@ -302,9 +302,10 @@ Each page has buttons that do specific things. Here's what they do and when to u
 
 ### v0.4.6-alpha — 2026-04-07
 
-**Staggered boot sequencer — cold reboot to all services in ~2 minutes**
+**Staggered boot sequencer — cold reboot to full stack healthy in ~2 minutes**
 - Full boot orchestration: pre-start stops all Docker services and waits for PostgreSQL, then TAK Server starts with exclusive CPU. Post-start waits for port 8089, then brings up Authentik (waits for healthy + LDAP 389), TAK Portal, CloudTAK, Node-RED, and MediaMTX in order. Only installed services are touched.
 - Auto-restarts TAK messaging if it crashes during cold boot (config ready but messaging process died).
+- Tested on fresh 12-core / 48 GB VPS (316 MB/s disk): pre-start 15s, TAK Server 9s, full stack healthy in ~2 min 15s.
 
 **Authentik deployment resilience**
 - TLS cert readiness gate: waits up to 300s for Caddy to provision a valid cert on the Authentik FQDN before restarting the LDAP outpost.
@@ -317,9 +318,19 @@ Each page has buttons that do specific things. Here's what they do and when to u
 - Timer delays increased to 20 min after boot.
 
 **Certificate password fix**
-- Custom cert passwords now correctly applied to all JKS files during TAK Server deploy and CA rotation. Previously, `cert-metadata.sh` was not patched before cert generation, and the helper patched wrong variable names. Default password (`atakatak`) deployments were never affected.
+- Custom cert passwords now correctly applied to all JKS files during TAK Server deploy and CA rotation. `cert-metadata.sh` is patched before cert generation with the correct variable names (`CAPASS`, `PASS`).
+- All `keystorePass` and `truststorePass` attributes in CoreConfig.xml are updated to match the custom password — including `<tls>` elements that previously retained the default `atakatak`, causing TAK Server to crash with a JWT RSA key NPE on startup.
+- Default password (`atakatak`) deployments were never affected.
 
-**After upgrading:** Guard Dog → ↻ Update Guard Dog, then Authentik → Update Config & Reconnect.
+**TAK Portal — SSH auto-configuration**
+- On deploy, reconfigure, or update: generates an ed25519 keypair, installs the public key in the host's `authorized_keys`, copies the keypair into the TAK Portal container, and populates all `TAK_SSH_*` settings. No manual handshake needed.
+- Only runs when TAK Server is on the same box (`/opt/tak` exists). Remote TAK Server deployments are left for manual SSH config in TAK Portal's UI.
+- Existing users: click **Update Config** on the TAK Portal page to enable.
+
+**VPS disk I/O check in installer**
+- `start.sh` now runs a 256 MB write test on first boot and prints a colored speed assessment (excellent / acceptable / slow) with guidance if performance is poor.
+
+**After upgrading:** Guard Dog → ↻ Update Guard Dog, then Authentik → Update Config & Reconnect, then TAK Portal → Update Config (enables SSH).
 
 Full notes: [docs/RELEASE-v0.4.6-alpha.md](docs/RELEASE-v0.4.6-alpha.md).
 
