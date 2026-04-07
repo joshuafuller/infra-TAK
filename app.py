@@ -21108,25 +21108,26 @@ entries:
             subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=90)
             plog(f"  ✓ Caddy config updated for Authentik")
             # Wait for Caddy to provision the TLS cert before restarting LDAP
-            # (LDAP outpost uses AUTHENTIK_HOST with HTTPS FQDN — needs valid cert)
-            fqdn = settings.get('fqdn', '')
-            if fqdn:
-                plog(f"  Waiting for TLS cert on {fqdn}...")
+            # (LDAP outpost uses AUTHENTIK_HOST = https://<ak_host> — needs valid cert on that exact domain)
+            _ak_tls_host = _get_authentik_host(settings) or settings.get('fqdn', '')
+            if _ak_tls_host:
+                _ak_tls_hostname = _ak_tls_host.split(':')[0]
+                plog(f"  Waiting for TLS cert on {_ak_tls_hostname}...")
                 _tls_ready = False
-                for _tls_attempt in range(30):
+                for _tls_attempt in range(60):  # 60 × 5s = 300s max
                     try:
                         import ssl, socket
                         ctx = ssl.create_default_context()
-                        with ctx.wrap_socket(socket.socket(), server_hostname=fqdn.split(':')[0]) as s:
+                        with ctx.wrap_socket(socket.socket(), server_hostname=_ak_tls_hostname) as s:
                             s.settimeout(5)
-                            s.connect((fqdn.split(':')[0], 443))
+                            s.connect((_ak_tls_hostname, 443))
                         _tls_ready = True
-                        plog(f"  ✓ TLS cert ready for {fqdn}")
+                        plog(f"  ✓ TLS cert ready for {_ak_tls_hostname} ({_tls_attempt * 5}s)")
                         break
                     except Exception:
                         time.sleep(5)
                 if not _tls_ready:
-                    plog(f"  ⚠ TLS cert not ready after 150s — LDAP outpost may take longer to connect")
+                    plog(f"  ⚠ TLS cert not ready after 300s — LDAP outpost may take longer to connect")
         # If Email Relay is already configured, push SMTP + recovery flow into Authentik now (persistent)
         relay = settings.get('email_relay') or {}
         if relay.get('from_addr'):
