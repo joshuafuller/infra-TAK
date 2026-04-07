@@ -26,11 +26,23 @@ _log() {
 # ── 1. Wait for TAK Server to be listening on 8089 ──
 _log "Waiting for TAK Server port 8089..."
 _t=0
+_msg_restarted=0
 while [ $_t -lt $MAX_WAIT_TAK ]; do
   if nc -z 127.0.0.1 8089 2>/dev/null; then
     _log "TAK Server 8089 ready (${_t}s)"
     break
   fi
+
+  if [ $_t -ge 120 ] && [ $_msg_restarted -eq 0 ] && [ $((_t % 60)) -eq 0 ]; then
+    if grep -q "Started TAK Server config Microservice" /opt/tak/logs/takserver-config.log 2>/dev/null; then
+      if ! pgrep -f "spring.profiles.active=messaging" >/dev/null 2>&1; then
+        _log "Config ready but messaging crashed — restarting messaging"
+        service takserver-messaging start 2>/dev/null
+        _msg_restarted=1
+      fi
+    fi
+  fi
+
   sleep $INTERVAL
   _t=$((_t + INTERVAL))
 done
