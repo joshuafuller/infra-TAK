@@ -23,6 +23,15 @@ if [ "$UPTIME_SECS" -lt "$MIN_UPTIME_SECS" ]; then
   exit 0
 fi
 
+# TAK takes ~5 min to fully start; restarting during startup orphans Java processes.
+# Check actual service activation time (covers operator restart, systemd restart, Guard Dog restart).
+STARTUP_GRACE=600
+_tak_mono=$(systemctl show takserver --property=ActiveEnterTimestampMonotonic --value 2>/dev/null || echo "")
+if [ -n "$_tak_mono" ] && [ "$_tak_mono" != "0" ]; then
+  _tak_age=$(( UPTIME_SECS - _tak_mono / 1000000 ))
+  [ "$_tak_age" -ge 0 ] && [ "$_tak_age" -lt "$STARTUP_GRACE" ] && exit 0
+fi
+
 # Check if we're in grace period (15 minutes after any restart)
 if [ -f "$LAST_RESTART_FILE" ]; then
   LAST_RESTART=$(cat "$LAST_RESTART_FILE")
@@ -87,6 +96,23 @@ if [ $((NOW - LAST)) -lt "$COOLDOWN_SECS" ]; then
   exit 0
 fi
 
+# Daily restart cap — shared across all Guard Dog TAK scripts to prevent infinite loops
+DAILY_COUNT_FILE="$STATE_DIR/tak_restart_count_24h"
+DAILY_WINDOW_FILE="$STATE_DIR/tak_restart_window"
+MAX_DAILY_RESTARTS=3
+_window_start=$(cat "$DAILY_WINDOW_FILE" 2>/dev/null || echo 0)
+if [ $((NOW - _window_start)) -ge 86400 ]; then
+  echo "$NOW" > "$DAILY_WINDOW_FILE"
+  echo 0 > "$DAILY_COUNT_FILE"
+fi
+_daily=$(cat "$DAILY_COUNT_FILE" 2>/dev/null || echo 0)
+if [ "$_daily" -ge "$MAX_DAILY_RESTARTS" ]; then
+  TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  mkdir -p /var/log/takguard
+  echo "$TS | SKIP | 8089 unhealthy but daily restart cap ($MAX_DAILY_RESTARTS) reached — manual intervention required" >> /var/log/takguard/restarts.log
+  exit 0
+fi
+
 # Log and alert
 logger -t takguard "8089 unhealthy for $FAILS checks; restarting takserver"
 
@@ -143,8 +169,16 @@ touch "$RESTART_LOCK"
 # Record restart time for grace period
 date +%s > "$LAST_RESTART_FILE"
 
-# Restart TAK Server
-systemctl restart takserver
+# Increment daily restart counter
+echo $((_daily + 1)) > "$DAILY_COUNT_FILE"
+
+# Clean restart: stop → kill orphan Java processes → clear Ignite cache → start
+systemctl stop takserver
+sleep 2
+pkill -9 -u tak 2>/dev/null || true
+sleep 1
+rm -rf /opt/tak/work
+systemctl start takserver
 
 # Wait 30 seconds then remove lock
 sleep 30

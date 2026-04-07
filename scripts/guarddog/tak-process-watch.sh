@@ -13,6 +13,14 @@ if [ "$UPTIME_SECS" -lt "$MIN_UPTIME_SECS" ]; then
   exit 0
 fi
 
+# TAK takes ~5 min to fully start; checking for missing processes during startup is invalid.
+STARTUP_GRACE=600
+_tak_mono=$(systemctl show takserver --property=ActiveEnterTimestampMonotonic --value 2>/dev/null || echo "")
+if [ -n "$_tak_mono" ] && [ "$_tak_mono" != "0" ]; then
+  _tak_age=$(( UPTIME_SECS - _tak_mono / 1000000 ))
+  [ "$_tak_age" -ge 0 ] && [ "$_tak_age" -lt "$STARTUP_GRACE" ] && exit 0
+fi
+
 if ! systemctl is-active --quiet takserver; then
   rm -f "$FAIL_COUNT_FILE"
   exit 0
@@ -101,11 +109,37 @@ Check logs after restart:
         rm -f "$TMPF"
       fi
       mkdir -p /var/log/takguard
+
+      # Daily restart cap — shared across all Guard Dog TAK scripts
+      DAILY_COUNT_FILE="/var/lib/takguard/tak_restart_count_24h"
+      DAILY_WINDOW_FILE="/var/lib/takguard/tak_restart_window"
+      MAX_DAILY_RESTARTS=3
+      _now=$(date +%s)
+      _window_start=$(cat "$DAILY_WINDOW_FILE" 2>/dev/null || echo 0)
+      if [ $((_now - _window_start)) -ge 86400 ]; then
+        echo "$_now" > "$DAILY_WINDOW_FILE"
+        echo 0 > "$DAILY_COUNT_FILE"
+      fi
+      _daily=$(cat "$DAILY_COUNT_FILE" 2>/dev/null || echo 0)
+      if [ "$_daily" -ge "$MAX_DAILY_RESTARTS" ]; then
+        echo "$(date): TAK Server missing processes: $MISSING_LIST — daily restart cap ($MAX_DAILY_RESTARTS) reached, skipping" >> /var/log/takguard/restarts.log
+        exit 0
+      fi
+
       echo "$(date): TAK Server missing processes: $MISSING_LIST ($FAIL_COUNT failures) - restarting" >> /var/log/takguard/restarts.log
       
       touch "$RESTART_LOCK"
       date +%s > "$LAST_RESTART_FILE"
-      systemctl restart takserver
+      echo $((_daily + 1)) > "$DAILY_COUNT_FILE"
+
+      # Clean restart: stop → kill orphan Java processes → clear Ignite cache → start
+      systemctl stop takserver
+      sleep 2
+      pkill -9 -u tak 2>/dev/null || true
+      sleep 1
+      rm -rf /opt/tak/work
+      systemctl start takserver
+
       sleep 30
       rm -f "$RESTART_LOCK"
       rm -f "$FAIL_COUNT_FILE"

@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.4.5-alpha"
+VERSION = "0.4.6-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -2551,9 +2551,9 @@ def takserver_two_server_deploy_server_two():
             if proc.returncode != 0:
                 return jsonify({'success': False, 'error': 'Failed to write CoreConfig.xml', 'log': log}), 400
 
-            subprocess.run(['sudo', 'systemctl', 'daemon-reload'], capture_output=True, timeout=10)
-            subprocess.run(['sudo', 'systemctl', 'enable', 'takserver'], capture_output=True, timeout=10)
-            subprocess.run(['sudo', 'systemctl', 'restart', 'takserver'], capture_output=True, timeout=30)
+            subprocess.run(['sudo', 'systemctl', 'daemon-reload'], capture_output=True, timeout=90)
+            subprocess.run(['sudo', 'systemctl', 'enable', 'takserver'], capture_output=True, timeout=90)
+            subprocess.run(['sudo', 'systemctl', 'restart', 'takserver'], capture_output=True, timeout=90)
             log.append(f'CoreConfig updated: DB→{db_host}:{db_port}, takserver restarted.')
         except Exception as e:
             return jsonify({'success': False, 'error': f'CoreConfig update failed: {e}', 'log': log}), 400
@@ -4564,7 +4564,7 @@ def run_guarddog_deploy(alert_email):
         if is_two_server and s1_host:
             plog(f"Two-server mode detected — DB on {s1_host}:{db_port}")
         script_files = [
-            'send-alert-email.sh',
+            'send-alert-email.sh', 'tak-boot-sequencer.sh', 'tak-post-start.sh',
             'tak-8089-watch.sh', 'tak-oom-watch.sh', 'tak-disk-watch.sh',
             'tak-network-watch.sh', 'tak-process-watch.sh', 'tak-cert-watch.sh', 'tak-intca-watch.sh', 'tak-health-endpoint.py',
             'tak-updates-watch.sh'
@@ -4639,20 +4639,21 @@ def run_guarddog_deploy(alert_email):
         plog("✓ Server identifier written (for alert subject/body)")
         units = [
             ('tak8089guard.service', '[Unit]\nDescription=TAK 8089 Health Guard Dog\nAfter=network-online.target\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-8089-watch.sh\n'),
-            ('tak8089guard.timer', '[Unit]\nDescription=Run TAK 8089 guard dog every 1 minute\n\n[Timer]\nOnBootSec=10min\nOnUnitActiveSec=1min\nUnit=tak8089guard.service\n\n[Install]\nWantedBy=timers.target\n'),
+            ('tak8089guard.timer', '[Unit]\nDescription=Run TAK 8089 guard dog every 1 minute\n\n[Timer]\nOnBootSec=20min\nOnUnitActiveSec=1min\nUnit=tak8089guard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ('takoomguard.service', '[Unit]\nDescription=TAK OOM Guard Dog\nAfter=takserver.service\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-oom-watch.sh\n'),
-            ('takoomguard.timer', '[Unit]\nDescription=Run TAK OOM guard dog every 1 minute\n\n[Timer]\nOnBootSec=5min\nOnUnitActiveSec=1min\nUnit=takoomguard.service\n\n[Install]\nWantedBy=timers.target\n'),
+            ('takoomguard.timer', '[Unit]\nDescription=Run TAK OOM guard dog every 1 minute\n\n[Timer]\nOnBootSec=20min\nOnUnitActiveSec=1min\nUnit=takoomguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ('takdiskguard.service', '[Unit]\nDescription=TAK Disk Space Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-disk-watch.sh\n'),
             ('takdiskguard.timer', '[Unit]\nDescription=Run TAK disk monitor every hour\n\n[Timer]\nOnBootSec=30min\nOnUnitActiveSec=1h\nUnit=takdiskguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ('taknetguard.service', '[Unit]\nDescription=TAK Network Monitor\nAfter=network.target\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-network-watch.sh\n'),
             ('taknetguard.timer', '[Unit]\nDescription=TAK Network Monitor Timer\nRequires=taknetguard.service\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=1min\nAccuracySec=30s\n\n[Install]\nWantedBy=timers.target\n'),
             ('takprocessguard.service', '[Unit]\nDescription=TAK Server Process Monitor\nAfter=network.target takserver.service\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-process-watch.sh\n'),
-            ('takprocessguard.timer', '[Unit]\nDescription=TAK Server Process Monitor Timer\nRequires=takprocessguard.service\n\n[Timer]\nOnBootSec=3min\nOnUnitActiveSec=1min\nAccuracySec=30s\n\n[Install]\nWantedBy=timers.target\n'),
+            ('takprocessguard.timer', '[Unit]\nDescription=TAK Server Process Monitor Timer\nRequires=takprocessguard.service\n\n[Timer]\nOnBootSec=20min\nOnUnitActiveSec=1min\nAccuracySec=30s\n\n[Install]\nWantedBy=timers.target\n'),
             ('takcertguard.service', '[Unit]\nDescription=TAK Certificate Expiry Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-cert-watch.sh\n'),
             ('takcertguard.timer', '[Unit]\nDescription=Run TAK cert monitor daily\n\n[Timer]\nOnBootSec=1h\nOnUnitActiveSec=1d\nUnit=takcertguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ('takintcaguard.service', '[Unit]\nDescription=TAK Intermediate CA Expiry Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-intca-watch.sh\n'),
             ('takintcaguard.timer', '[Unit]\nDescription=Run TAK Intermediate CA expiry monitor daily\n\n[Timer]\nOnBootSec=2h\nOnUnitActiveSec=1d\nUnit=takintcaguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ('tak-health.service', '[Unit]\nDescription=TAK Server Health Check Endpoint\nAfter=network.target takserver.service\n\n[Service]\nType=simple\nExecStart=/usr/bin/python3 /opt/tak-guarddog/tak-health-endpoint.py\nRestart=always\nRestartSec=10\n\n[Install]\nWantedBy=multi-user.target\n'),
+            ('tak-post-start.service', '[Unit]\nDescription=Guard Dog Post-Start Orchestrator (starts Authentik, TAK Portal, CloudTAK after TAK)\nAfter=takserver.service docker.service\nWants=takserver.service\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nTimeoutStartSec=1200\nExecStart=/opt/tak-guarddog/tak-post-start.sh\n\n[Install]\nWantedBy=multi-user.target\n'),
         ]
         # Two-server: remote DB monitor instead of local PG monitors
         if is_two_server and s1_host:
@@ -4716,8 +4717,8 @@ def run_guarddog_deploy(alert_email):
         os.makedirs(tak_dropin_dir, exist_ok=True)
         tak_dropin = os.path.join(tak_dropin_dir, 'soft-start.conf')
         with open(tak_dropin, 'w') as f:
-            f.write('[Unit]\nAfter=network-online.target postgresql.service postgresql-15.service\nWants=network-online.target\n')
-        plog("✓ TAK Server soft-start drop-in installed (starts after network + PostgreSQL)")
+            f.write('[Unit]\nAfter=network-online.target postgresql.service postgresql-15.service\nWants=network-online.target\n\n[Service]\nExecStartPre=-/opt/tak-guarddog/tak-boot-sequencer.sh\n')
+        plog("✓ TAK Server soft-start drop-in installed (boot sequencer waits for PostgreSQL + Authentik before TAK starts)")
         # 4GB swap for memory stability (from reference TAK Server Hardening script)
         try:
             r = subprocess.run(['swapon', '--show'], capture_output=True, text=True, timeout=5)
@@ -4745,7 +4746,7 @@ def run_guarddog_deploy(alert_email):
                     plog("✓ 4GB swap configured (memory stability)")
         except Exception as e:
             plog(f"⚠ Swap setup skipped: {e}")
-        r = subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, text=True, timeout=10)
+        r = subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, text=True, timeout=60)
         if r.returncode != 0:
             plog(f"✗ daemon-reload failed: {r.stderr}")
             guarddog_deploy_status.update({'running': False, 'error': True})
@@ -4784,6 +4785,8 @@ def run_guarddog_deploy(alert_email):
             guarddog_deploy_status.update({'running': False, 'error': True})
             return
         subprocess.run(['systemctl', 'start', 'tak-health.service'], capture_output=True, timeout=5)
+        subprocess.run(['systemctl', 'enable', 'tak-post-start.service'], capture_output=True, text=True, timeout=5)
+        plog("✓ Boot orchestrator enabled (staggered start: TAK → Authentik → TAK Portal → CloudTAK)")
         for f in ['process_alert_sent', 'disk_alert_sent', 'db_alert_sent', 'cotdb_alert_sent', 'network_alert_sent', 'cert_alert_sent']:
             p = os.path.join('/var/lib/takguard', f)
             if not os.path.exists(p):
@@ -5477,8 +5480,8 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
         # --- chown + systemd ---
         plog('━━━ Start Federation Hub services ━━━')
         _ssh_probe(remote, f'sudo chown -R tak:tak {fh_dir}', timeout=30)
-        _ssh_probe(remote, 'sudo systemctl daemon-reload', timeout=30)
-        _ssh_probe(remote, 'sudo systemctl enable federation-hub 2>/dev/null; true', timeout=30)
+        _ssh_probe(remote, 'sudo systemctl daemon-reload', timeout=90)
+        _ssh_probe(remote, 'sudo systemctl enable federation-hub 2>/dev/null; true', timeout=90)
         _ssh_probe(remote, f'sudo touch {fh_dir}/logs/federation-hub-ui.log && sudo chown tak:tak {fh_dir}/logs/federation-hub-ui.log', timeout=15)
         _ssh_probe(remote, 'sudo systemctl restart federation-hub 2>&1', timeout=90)
 
@@ -6192,7 +6195,7 @@ def caddy_update_domain():
     def _restart():
         time.sleep(2)
         try:
-            subprocess.run('systemctl restart caddy 2>&1', shell=True, capture_output=True, text=True, timeout=30)
+            subprocess.run('systemctl restart caddy 2>&1', shell=True, capture_output=True, text=True, timeout=90)
         except Exception:
             pass
     threading.Thread(target=_restart, daemon=True).start()
@@ -6211,7 +6214,7 @@ def _caddy_restart_after_response():
     time.sleep(2)
     try:
         generate_caddyfile(load_settings())
-        subprocess.run('systemctl restart caddy 2>&1', shell=True, capture_output=True, text=True, timeout=30)
+        subprocess.run('systemctl restart caddy 2>&1', shell=True, capture_output=True, text=True, timeout=90)
     except Exception:
         pass
 
@@ -6225,7 +6228,7 @@ def caddy_control():
         threading.Thread(target=_caddy_restart_after_response, daemon=True).start()
         return jsonify({'success': True, 'output': 'Caddy restart scheduled; connection may drop briefly.'})
     elif action == 'stop':
-        r = subprocess.run('systemctl stop caddy 2>&1', shell=True, capture_output=True, text=True, timeout=30)
+        r = subprocess.run('systemctl stop caddy 2>&1', shell=True, capture_output=True, text=True, timeout=90)
         return jsonify({'success': r.returncode == 0, 'output': (r.stdout or r.stderr or '').strip()})
     elif action == 'start':
         generate_caddyfile(load_settings())
@@ -6243,8 +6246,8 @@ def caddy_control():
 @login_required
 def caddy_uninstall():
     steps = []
-    subprocess.run('systemctl stop caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=30)
-    subprocess.run('systemctl disable caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=30)
+    subprocess.run('systemctl stop caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=90)
+    subprocess.run('systemctl disable caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=90)
     steps.append('Stopped and disabled Caddy')
     settings = load_settings()
     pkg_mgr = settings.get('pkg_mgr', 'apt')
@@ -7208,15 +7211,20 @@ def _validate_cert_password(pw):
 
 
 def _patch_cert_metadata_password(cert_pass):
-    """Patch cert-metadata.sh with the given password so makeCert.sh creates JKS with it. Tries common variable names."""
+    """Patch cert-metadata.sh with the given password so makeRootCa/makeCert create JKS files with it.
+
+    TAK Server's cert-metadata.sh uses CAPASS and PASS; older or custom scripts may use other names.
+    """
     path = '/opt/tak/certs/cert-metadata.sh'
     if not os.path.exists(path):
+        return
+    if not cert_pass or cert_pass == 'atakatak':
         return
     try:
         with open(path, 'r') as f:
             lines = f.readlines()
         changed = False
-        for var in ('CERT_PASS', 'PASSWORD', 'KEYSTORE_PASS', 'CA_PASS', 'JKS_PASS'):
+        for var in ('CAPASS', 'PASS', 'CERT_PASS', 'PASSWORD', 'KEYSTORE_PASS', 'CA_PASS', 'JKS_PASS'):
             for i, line in enumerate(lines):
                 if line.strip().startswith(var + '='):
                     lines[i] = f'{var}="{cert_pass.replace(chr(34), chr(92)+chr(34))}"\n'
@@ -7225,6 +7233,30 @@ def _patch_cert_metadata_password(cert_pass):
         if changed:
             with open(path, 'w') as f:
                 f.writelines(lines)
+    except Exception:
+        pass
+
+
+def _patch_coreconfig_passwords(cert_pass, log_fn=None):
+    """Ensure every keystorePass / truststorePass in CoreConfig.xml matches cert_pass."""
+    cc_path = '/opt/tak/CoreConfig.xml'
+    if not cert_pass or not os.path.exists(cc_path):
+        return
+    try:
+        import re
+        with open(cc_path, 'r') as f:
+            content = f.read()
+        updated = content
+        for attr in ('keystorePass', 'truststorePass'):
+            for m in re.finditer(rf'{attr}="([^"]*)"', content):
+                old_val = m.group(1)
+                if old_val != cert_pass:
+                    updated = updated.replace(f'{attr}="{old_val}"', f'{attr}="{cert_pass}"')
+        if updated != content:
+            with open(cc_path, 'w') as f:
+                f.write(updated)
+            if log_fn:
+                log_fn("✓ CoreConfig.xml keystore/truststore passwords updated")
     except Exception:
         pass
 
@@ -8517,7 +8549,7 @@ def run_caddy_deploy(domain):
         plog("")
         plog("━━━ Step 4/4: Starting Caddy ━━━")
         subprocess.run('systemctl enable caddy 2>/dev/null; true', shell=True, capture_output=True)
-        r = subprocess.run('systemctl restart caddy 2>&1', shell=True, capture_output=True, text=True, timeout=30)
+        r = subprocess.run('systemctl restart caddy 2>&1', shell=True, capture_output=True, text=True, timeout=90)
         if r.returncode != 0:
             plog(f"⚠ systemctl restart: {(r.stderr or r.stdout or '').strip()[:300]}")
         time.sleep(3)
@@ -9044,7 +9076,7 @@ takportal_deploy_log = []
 takportal_deploy_status = {'running': False, 'complete': False, 'error': False}
 
 # Keys in TAK Portal settings.json that are configurable in TAK Portal UI (e.g. custom logo/photo). We never overwrite these when pushing settings on update/reconfigure/deploy.
-PRESERVE_TAKPORTAL_KEYS = frozenset(['BRAND_LOGO_URL'])
+PRESERVE_TAKPORTAL_KEYS = frozenset(['BRAND_LOGO_URL', 'TAK_SSH_ONBOARDED', 'TAK_SSH_LAST_HANDSHAKE_AT'])
 
 
 def _takportal_get_existing_settings():
@@ -9085,6 +9117,9 @@ def _takportal_build_settings_dict(settings):
         tak_url_host = server_ip
     else:
         tak_url_host = tak_dns or 'host.docker.internal'
+    # SSH: only pre-populate when TAK Server is on the same box
+    tak_local = os.path.isdir('/opt/tak')
+    ssh_host = ('host.docker.internal' if server_ip in ('localhost', '127.0.0.1', '') else server_ip) if tak_local else ''
     return {
         "AUTHENTIK_URL": f"http://{auth_url_host}:{auth_url_port}",
         "AUTHENTIK_TOKEN": ak_token or "",
@@ -9107,7 +9142,13 @@ def _takportal_build_settings_dict(settings):
         "CLOUDTAK_URL": f"https://{cloudtak_host}" if cloudtak_host else "",
         **_portal_email_settings(settings),
         "BRAND_THEME": "dark",
-        "BRAND_LOGO_URL": ""
+        "BRAND_LOGO_URL": "",
+        "TAK_SSH_HOST": ssh_host,
+        "TAK_SSH_PORT": "22",
+        "TAK_SSH_USER": "root",
+        "TAK_SSH_PRIVATE_KEY_PATH": "data/ssh/tak_ssh_ed25519",
+        "TAK_SSH_PUBLIC_KEY_PATH": "data/ssh/tak_ssh_ed25519.pub",
+        "TAK_SSH_PASSPHRASE": "",
     }
 
 
@@ -9121,6 +9162,109 @@ def _takportal_merged_settings_json(settings):
             continue
         merged[k] = v
     return json.dumps(merged, indent=2)
+
+
+def _takportal_setup_ssh(log_fn=None):
+    """Generate an ed25519 keypair, install it on the host, and copy it into the TAK Portal container.
+
+    After this, TAK Portal can SSH to the host via host.docker.internal without a password handshake.
+    Only runs when TAK Server is on the same box (i.e. /opt/tak exists). For remote TAK Server
+    deployments, SSH must be configured manually in TAK Portal's UI.
+    Returns True if the key was installed (or already existed) and is ready to use.
+    """
+    if not os.path.isdir('/opt/tak'):
+        if log_fn:
+            log_fn("  ⏭ TAK Server not on this host — skipping SSH auto-config (configure manually in TAK Portal)")
+        return False
+    key_dir = os.path.expanduser('~/TAK-Portal/data/ssh')
+    priv_key = os.path.join(key_dir, 'tak_ssh_ed25519')
+    pub_key = priv_key + '.pub'
+    auth_keys = os.path.expanduser('~/.ssh/authorized_keys')
+
+    try:
+        os.makedirs(key_dir, mode=0o700, exist_ok=True)
+
+        # Generate keypair if missing
+        if not os.path.exists(priv_key):
+            r = subprocess.run(
+                ['ssh-keygen', '-t', 'ed25519', '-f', priv_key, '-N', '', '-C', 'tak-portal-auto'],
+                capture_output=True, text=True, timeout=15)
+            if r.returncode != 0 or not os.path.exists(pub_key):
+                if log_fn:
+                    log_fn(f"  ✗ SSH keygen failed: {(r.stderr or '').strip()[:200]}")
+                return False
+            if log_fn:
+                log_fn("  ✓ SSH ed25519 keypair generated")
+        else:
+            if log_fn:
+                log_fn("  ✓ SSH keypair already exists")
+
+        # Install public key in host authorized_keys
+        with open(pub_key, 'r') as f:
+            pub_content = f.read().strip()
+        os.makedirs(os.path.dirname(auth_keys), mode=0o700, exist_ok=True)
+        existing_keys = ''
+        if os.path.exists(auth_keys):
+            with open(auth_keys, 'r') as f:
+                existing_keys = f.read()
+        if pub_content not in existing_keys:
+            with open(auth_keys, 'a') as f:
+                f.write(f'\n{pub_content}\n')
+            os.chmod(auth_keys, 0o600)
+            if log_fn:
+                log_fn("  ✓ Public key added to ~/.ssh/authorized_keys")
+        else:
+            if log_fn:
+                log_fn("  ✓ Public key already in authorized_keys")
+
+        # Copy keypair into running container
+        subprocess.run(
+            'docker exec tak-portal mkdir -p /usr/src/app/data/ssh',
+            shell=True, capture_output=True, text=True, timeout=10)
+        subprocess.run(
+            f'docker cp {shlex.quote(priv_key)} tak-portal:/usr/src/app/data/ssh/tak_ssh_ed25519',
+            shell=True, capture_output=True, text=True, timeout=10)
+        subprocess.run(
+            f'docker cp {shlex.quote(pub_key)} tak-portal:/usr/src/app/data/ssh/tak_ssh_ed25519.pub',
+            shell=True, capture_output=True, text=True, timeout=10)
+        # Ensure correct permissions inside container
+        subprocess.run(
+            'docker exec tak-portal chmod 600 /usr/src/app/data/ssh/tak_ssh_ed25519',
+            shell=True, capture_output=True, text=True, timeout=10)
+        if log_fn:
+            log_fn("  ✓ SSH keys copied into TAK Portal container")
+
+        # Mark onboarded in container settings
+        try:
+            from datetime import datetime as _dt
+            r = subprocess.run(
+                'docker exec tak-portal cat /usr/src/app/data/settings.json',
+                shell=True, capture_output=True, text=True, timeout=10)
+            if r.returncode == 0 and r.stdout.strip():
+                import json as _json
+                portal_cfg = _json.loads(r.stdout)
+                portal_cfg['TAK_SSH_ONBOARDED'] = 'true'
+                portal_cfg['TAK_SSH_LAST_HANDSHAKE_AT'] = _dt.now().isoformat()
+                fd, tmp = tempfile.mkstemp(suffix='.json', prefix='tak-portal-ssh-')
+                try:
+                    with os.fdopen(fd, 'w') as f:
+                        _json.dump(portal_cfg, f, indent=2)
+                    subprocess.run(
+                        f'docker cp {shlex.quote(tmp)} tak-portal:/usr/src/app/data/settings.json',
+                        shell=True, capture_output=True, text=True, timeout=10)
+                finally:
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+        except Exception:
+            pass
+
+        return True
+    except Exception as e:
+        if log_fn:
+            log_fn(f"  ✗ SSH setup error: {e}")
+        return False
 
 
 def _takportal_build_settings_json(settings):
@@ -9157,6 +9301,7 @@ def takportal_control():
                     pass
             if cp.returncode != 0:
                 return jsonify({'success': False, 'error': (cp.stderr or cp.stdout or 'docker cp failed').strip()[:300]}), 500
+            _takportal_setup_ssh()
             subprocess.run('docker restart tak-portal', shell=True, capture_output=True, text=True, timeout=30)
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)[:300]}), 500
@@ -9165,7 +9310,7 @@ def takportal_control():
         time.sleep(2)
         r = subprocess.run('docker ps --filter name=tak-portal --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
         running = 'Up' in (r.stdout or '')
-        return jsonify({'success': True, 'running': running, 'action': action, 'message': 'Config updated and portal restarted.'})
+        return jsonify({'success': True, 'running': running, 'action': action, 'message': 'Config updated and portal restarted (SSH configured).'})
     elif action == 'update':
         pull = subprocess.run(
             f'cd {portal_dir} && git -c safe.directory={portal_dir} pull --rebase --autostash',
@@ -9199,6 +9344,7 @@ def takportal_control():
                 except OSError:
                     pass
             if cp.returncode == 0:
+                _takportal_setup_ssh()
                 subprocess.run('docker restart tak-portal', shell=True, capture_output=True, text=True, timeout=30)
                 settings_synced = True
             else:
@@ -9557,6 +9703,15 @@ def run_takportal_deploy():
         else:
             plog("\u26a0 Authentik not deployed yet - configure token in Server Settings")
         plog("\u2713 Settings auto-configured")
+
+        # SSH: generate keypair and install so TAK Portal can reach host TAK Server
+        plog("")
+        plog("\u2501\u2501\u2501 Setting up SSH (container \u2192 host) \u2501\u2501\u2501")
+        if _takportal_setup_ssh(log_fn=plog):
+            plog(f"  SSH target: {portal_settings.get('TAK_SSH_HOST', 'host.docker.internal')}:22 as root")
+            plog("\u2713 SSH ready (no handshake needed)")
+        else:
+            plog("\u26a0 SSH auto-setup failed — configure manually in TAK Portal settings")
 
         # Restart container to pick up settings
         subprocess.run('docker restart tak-portal', shell=True, capture_output=True, text=True, timeout=30)
@@ -10303,7 +10458,7 @@ paths:
     except Exception:
         pass
     plog("✓ Services created")
-    _module_run(deploy_cfg, 'systemctl daemon-reload && systemctl enable mediamtx && systemctl enable mediamtx-webeditor 2>/dev/null; systemctl start mediamtx && systemctl start mediamtx-webeditor 2>/dev/null', timeout=30)
+    _module_run(deploy_cfg, 'systemctl daemon-reload && systemctl enable mediamtx && systemctl enable mediamtx-webeditor 2>/dev/null; systemctl start mediamtx && systemctl start mediamtx-webeditor 2>/dev/null', timeout=90)
     plog("✓ Services started")
 
     # Step 5b: Test video
@@ -12622,7 +12777,7 @@ smtp_generic_maps = hash:/etc/postfix/generic
 
         plog(f"📧 Step 4/5 — Enabling and starting Postfix...")
         subprocess.run('systemctl enable postfix 2>&1', shell=True, capture_output=True, text=True)
-        r = subprocess.run('systemctl restart postfix 2>&1', shell=True, capture_output=True, text=True, timeout=30)
+        r = subprocess.run('systemctl restart postfix 2>&1', shell=True, capture_output=True, text=True, timeout=90)
         if r.returncode != 0:
             plog(f"✗ Postfix restart failed: {r.stdout}")
             status.update({'running': False, 'error': True})
@@ -12793,11 +12948,11 @@ def emailrelay_control():
     data = request.get_json()
     action = data.get('action', '')
     if action == 'restart':
-        r = subprocess.run('systemctl restart postfix 2>&1', shell=True, capture_output=True, text=True, timeout=30)
+        r = subprocess.run('systemctl restart postfix 2>&1', shell=True, capture_output=True, text=True, timeout=90)
     elif action == 'stop':
-        r = subprocess.run('systemctl stop postfix 2>&1', shell=True, capture_output=True, text=True, timeout=30)
+        r = subprocess.run('systemctl stop postfix 2>&1', shell=True, capture_output=True, text=True, timeout=90)
     elif action == 'start':
-        r = subprocess.run('systemctl start postfix 2>&1', shell=True, capture_output=True, text=True, timeout=30)
+        r = subprocess.run('systemctl start postfix 2>&1', shell=True, capture_output=True, text=True, timeout=90)
     else:
         return jsonify({'success': False, 'error': 'Unknown action'})
     return jsonify({'success': r.returncode == 0, 'output': r.stdout.strip()})
@@ -12805,8 +12960,8 @@ def emailrelay_control():
 @app.route('/api/emailrelay/uninstall', methods=['POST'])
 @login_required
 def emailrelay_uninstall():
-    subprocess.run('systemctl stop postfix 2>/dev/null; true', shell=True, capture_output=True, timeout=30)
-    subprocess.run('systemctl disable postfix 2>/dev/null; true', shell=True, capture_output=True, timeout=30)
+    subprocess.run('systemctl stop postfix 2>/dev/null; true', shell=True, capture_output=True, timeout=90)
+    subprocess.run('systemctl disable postfix 2>/dev/null; true', shell=True, capture_output=True, timeout=90)
     settings = load_settings()
     pkg_mgr = settings.get('pkg_mgr', 'apt')
     if pkg_mgr == 'apt':
@@ -12893,7 +13048,7 @@ services:
         if changed:
             with open(main_cf_path, 'w') as f:
                 f.write(mc)
-            subprocess.run('systemctl restart postfix 2>&1', shell=True, capture_output=True, text=True, timeout=30)
+            subprocess.run('systemctl restart postfix 2>&1', shell=True, capture_output=True, text=True, timeout=90)
 
     # Allow Docker networks to reach host port 25 (Authentik worker → Postfix)
     r = subprocess.run('which ufw', shell=True, capture_output=True)
@@ -12980,6 +13135,31 @@ def _wait_for_authentik_api(ak_url, ak_headers, max_attempts=90, plog=None, requ
             _log(f"  ⏳ Still waiting for API... ({attempt * 5}s)")
         time.sleep(5)
     return False
+
+
+def _ak_api_call(url, data=None, method='GET', headers=None, max_retries=3, timeout=15):
+    """Authentik API call with automatic retry on 502/503/timeout."""
+    import urllib.request as _req
+    import urllib.error
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            req = _req.Request(url, data=data, method=method, headers=headers or {})
+            return _req.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            if e.code in (502, 503) and attempt < max_retries - 1:
+                time.sleep(5 * (attempt + 1))
+                last_exc = e
+                continue
+            raise
+        except (urllib.error.URLError, OSError) as e:
+            if attempt < max_retries - 1:
+                time.sleep(5 * (attempt + 1))
+                last_exc = e
+                continue
+            raise
+    if last_exc:
+        raise last_exc
 
 
 def _ensure_authentik_recovery_flow(ak_url, ak_headers):
@@ -13254,7 +13434,7 @@ os.makedirs("/etc/docker", exist_ok=True)
 with open(p, "w") as f:
     json.dump(data, f, indent=2)
     f.write("\\n")
-subprocess.run(["systemctl", "restart", "docker"], timeout=30, capture_output=True)
+subprocess.run(["systemctl", "restart", "docker"], timeout=90, capture_output=True)
 print("OK_RESTARTED")
 '''
     tmp_path = '/tmp/infra_tak_docker_log_limits.py'
@@ -13368,7 +13548,7 @@ def _ensure_docker_log_limits(log_fn=None):
         with open(daemon_json, 'w') as f:
             json.dump(data, f, indent=2)
             f.write('\n')
-        subprocess.run(['systemctl', 'restart', 'docker'], capture_output=True, timeout=30)
+        subprocess.run(['systemctl', 'restart', 'docker'], capture_output=True, timeout=90)
         time.sleep(5)
         if log_fn:
             log_fn("✓ Docker log limits set (50 MB × 3 per container). Docker was restarted; other containers may need starting from their pages.")
@@ -18540,7 +18720,7 @@ def authentik_control():
         elif action == 'stop':
             _ssh_probe(remote, f'cd {ak_dir} && docker compose stop 2>&1', timeout=60)
         elif action == 'restart':
-            _ssh_probe(remote, f'cd {ak_dir} && docker compose restart 2>&1', timeout=120)
+            _ssh_probe(remote, f'cd {ak_dir} && docker compose down --timeout 30 2>&1 && docker compose up -d 2>&1', timeout=180)
         elif action == 'update':
             latest = _get_authentik_latest_release_tag(use_cache=False)
             if latest:
@@ -19236,6 +19416,12 @@ entries:
     ports:
       - "${COMPOSE_PORT_HTTP:-9000}:9000"
       - "${COMPOSE_PORT_HTTPS:-9443}:9443"
+    healthcheck:
+      test: ["CMD", "ak", "healthcheck"]
+      start_period: 600s
+      interval: 30s
+      timeout: 10s
+      retries: 5
     depends_on:
       postgresql:
         condition: service_healthy
@@ -19260,6 +19446,12 @@ entries:
       - ./blueprints:/blueprints/custom
     env_file:
       - .env
+    healthcheck:
+      test: ["CMD", "ak", "healthcheck"]
+      start_period: 600s
+      interval: 30s
+      timeout: 10s
+      retries: 5
     depends_on:
       postgresql:
         condition: service_healthy
@@ -19275,6 +19467,15 @@ entries:
       AUTHENTIK_INSECURE: "true"
       AUTHENTIK_TOKEN: placeholder
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9300/outpost.goauthentik.io/ping"]
+      start_period: 30s
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    depends_on:
+      server:
+        condition: service_healthy
 volumes:
   database:
     driver: local
@@ -19501,7 +19702,7 @@ def _run_authentik_reconfigure_remote(settings, deploy_cfg, plog):
     ak_url = _get_authentik_api_url(settings)
     ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
     plog("  Waiting for Authentik API (remote)...")
-    if not _wait_for_authentik_api(ak_url, ak_headers, max_attempts=24, plog=plog):
+    if not _wait_for_authentik_api(ak_url, ak_headers, max_attempts=60, plog=plog):
         plog("  \u26a0 API not ready in time — run Update config & reconnect again")
         authentik_deploy_status.update({'running': False, 'error': True})
         return
@@ -19704,7 +19905,7 @@ def run_authentik_deploy(reconfigure=False):
                     ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
                     plog("")
                     plog("  Waiting for Authentik API...")
-                    if _wait_for_authentik_api(ak_url, ak_headers, max_attempts=24, plog=plog):
+                    if _wait_for_authentik_api(ak_url, ak_headers, max_attempts=60, plog=plog):
                         plog("  Fixing LDAP flow & provider (authorization_flow, bind_mode)...")
                         ok_flow, err_flow = _ensure_ldap_flow_authentication_none()
                         if ok_flow:
@@ -19813,7 +20014,7 @@ def run_authentik_deploy(reconfigure=False):
                         ak_url_nf = 'http://127.0.0.1:9090'
                         hdr_nf = {'Authorization': f'Bearer {ak_token_nf}', 'Content-Type': 'application/json'}
                         plog("  Waiting for Authentik API (no-FQDN reconfigure)...")
-                        if _wait_for_authentik_api(ak_url_nf, hdr_nf, max_attempts=24, plog=plog):
+                        if _wait_for_authentik_api(ak_url_nf, hdr_nf, max_attempts=60, plog=plog):
                             plog("  Fixing LDAP flow & provider...")
                             ok_nf, err_nf = _ensure_ldap_flow_authentication_none()
                             plog("  \u2713 LDAP flow OK" if ok_nf else f"  \u26a0 LDAP flow: {err_nf}")
@@ -20173,14 +20374,43 @@ entries:
                 if m and m.group(1).strip() != ak_tag:
                     lines[i] = l.replace(f'AUTHENTIK_TAG:-{m.group(1)}', f'AUTHENTIK_TAG:-{ak_tag}')
                     needs_write = True
+            # Inject healthchecks for server and worker if missing (upstream compose may not have them)
+            if not any('ak healthcheck' in l or 'ak", "healthcheck' in l for l in lines):
+                _hc_block = '    healthcheck:\n      test: ["CMD", "ak", "healthcheck"]\n      start_period: 600s\n      interval: 30s\n      timeout: 10s\n      retries: 5\n'
+                patched = []
+                for i, line in enumerate(lines):
+                    patched.append(line)
+                    if line.strip() == 'command: server' or line.strip() == 'command: worker':
+                        patched.append(_hc_block)
+                lines = patched
+                needs_write = True
+                plog("  Added healthchecks for server and worker")
+            else:
+                # Upstream compose has healthchecks — ensure start_period is long enough for first-run migrations
+                for i, line in enumerate(lines):
+                    if 'start_period' in line and 'start_period: 600s' not in line:
+                        # Only patch start_period inside server/worker healthcheck blocks (not pg/redis)
+                        # Check if this is under a server or worker service by looking backwards
+                        for j in range(i - 1, max(i - 15, 0), -1):
+                            if lines[j].strip().startswith('command: server') or lines[j].strip().startswith('command: worker'):
+                                lines[i] = re.sub(r'start_period:\s*\S+', 'start_period: 600s', line)
+                                needs_write = True
+                                break
+                            if lines[j].strip().startswith('image:') and 'postgres' in lines[j]:
+                                break
+                            if lines[j].strip().startswith('image:') and 'redis' in lines[j]:
+                                break
+                if needs_write:
+                    plog("  Updated healthcheck start_period to 600s for first-run migrations")
+
             ldap_image = f"ghcr.io/goauthentik/ldap:${{AUTHENTIK_TAG:-{ak_tag}}}"
             if not any('ghcr.io/goauthentik/ldap' in l for l in lines):
                 _ak_host = _get_authentik_host(settings)
                 if _ak_host:
                     _ak_ldap_url = f"https://{_ak_host}"
-                    ldap_svc = f"  ldap:\n    image: {ldap_image}\n    extra_hosts:\n      - \"{_ak_host}:host-gateway\"\n    ports:\n    - 389:3389\n    - 636:6636\n    environment:\n      AUTHENTIK_HOST: {_ak_ldap_url}\n      AUTHENTIK_INSECURE: \"true\"\n      AUTHENTIK_TOKEN: placeholder\n    restart: unless-stopped\n"
+                    ldap_svc = f"  ldap:\n    image: {ldap_image}\n    extra_hosts:\n      - \"{_ak_host}:host-gateway\"\n    ports:\n    - 389:3389\n    - 636:6636\n    environment:\n      AUTHENTIK_HOST: {_ak_ldap_url}\n      AUTHENTIK_INSECURE: \"true\"\n      AUTHENTIK_TOKEN: placeholder\n    restart: unless-stopped\n    healthcheck:\n      test: [\"CMD\", \"wget\", \"--spider\", \"-q\", \"http://localhost:9300/outpost.goauthentik.io/ping\"]\n      start_period: 30s\n      interval: 30s\n      timeout: 5s\n      retries: 3\n    depends_on:\n      server:\n        condition: service_healthy\n"
                 else:
-                    ldap_svc = f"  ldap:\n    image: {ldap_image}\n    ports:\n    - 389:3389\n    - 636:6636\n    environment:\n      AUTHENTIK_HOST: http://authentik-server-1:9000\n      AUTHENTIK_INSECURE: \"true\"\n      AUTHENTIK_TOKEN: placeholder\n    restart: unless-stopped\n"
+                    ldap_svc = f"  ldap:\n    image: {ldap_image}\n    ports:\n    - 389:3389\n    - 636:6636\n    environment:\n      AUTHENTIK_HOST: http://authentik-server-1:9000\n      AUTHENTIK_INSECURE: \"true\"\n      AUTHENTIK_TOKEN: placeholder\n    restart: unless-stopped\n    healthcheck:\n      test: [\"CMD\", \"wget\", \"--spider\", \"-q\", \"http://localhost:9300/outpost.goauthentik.io/ping\"]\n      start_period: 30s\n      interval: 30s\n      timeout: 5s\n      retries: 3\n    depends_on:\n      server:\n        condition: service_healthy\n"
                 new_lines = []
                 for line in lines:
                     if line.startswith('volumes:'):
@@ -20276,7 +20506,7 @@ entries:
             api_ready = _wait_for_authentik_api(
                 'http://127.0.0.1:9090',
                 {'Authorization': f'Bearer {bootstrap_token}'},
-                max_attempts=150, plog=plog
+                max_attempts=300, plog=plog
             )
             if api_ready:
                 plog("✓ Authentik API is ready")
@@ -20385,8 +20615,8 @@ entries:
                 plog("  Waiting for worker to apply bootstrap blueprint...")
                 token_ok = False
                 attempt = 0
-                # Cap waits (~750s) so first-run migrations on slow VPS don't hang forever (matches Step 8 API poll budget)
-                _bootstrap_token_max_attempts = 150
+                # Cap waits (~1500s / 25min) so first-run migrations on slow VPS don't hang forever (matches Step 8 API poll budget)
+                _bootstrap_token_max_attempts = 300
                 while attempt < _bootstrap_token_max_attempts:
                     try:
                         req = urllib.request.Request(f'{ak_url}/api/v3/core/users/',
@@ -20398,7 +20628,7 @@ entries:
                         plog(f"  ✓ Bootstrap token active (waited {m}m {s}s)")
                         break
                     except urllib.error.HTTPError as e:
-                        if e.code == 403:
+                        if e.code in (403, 502, 503):
                             if attempt % 6 == 0:
                                 m, s = divmod(attempt * 5, 60)
                                 plog(f"  ⏳ Worker still applying bootstrap... ({m}m {s}s)")
@@ -20410,6 +20640,10 @@ entries:
                             plog(f"  ⚠ Token check unexpected error: {e.code} — giving up")
                             break
                     except Exception as e:
+                        if attempt < 5:
+                            time.sleep(5)
+                            attempt += 1
+                            continue
                         plog(f"  ⚠ Token check error: {str(e)[:80]} — giving up")
                         break
                 if not token_ok and attempt >= _bootstrap_token_max_attempts:
@@ -21023,8 +21257,29 @@ entries:
                 plog("  ⚠ Authentik HTTP not ready in time — Caddy may 502 briefly; retry in a minute.")
             plog("  Updating Caddy config...")
             generate_caddyfile(settings)
-            subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=30)
+            subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=90)
             plog(f"  ✓ Caddy config updated for Authentik")
+            # Wait for Caddy to provision the TLS cert before restarting LDAP
+            # (LDAP outpost uses AUTHENTIK_HOST = https://<ak_host> — needs valid cert on that exact domain)
+            _ak_tls_host = _get_authentik_host(settings) or settings.get('fqdn', '')
+            if _ak_tls_host:
+                _ak_tls_hostname = _ak_tls_host.split(':')[0]
+                plog(f"  Waiting for TLS cert on {_ak_tls_hostname}...")
+                _tls_ready = False
+                for _tls_attempt in range(60):  # 60 × 5s = 300s max
+                    try:
+                        import ssl, socket
+                        ctx = ssl.create_default_context()
+                        with ctx.wrap_socket(socket.socket(), server_hostname=_ak_tls_hostname) as s:
+                            s.settimeout(5)
+                            s.connect((_ak_tls_hostname, 443))
+                        _tls_ready = True
+                        plog(f"  ✓ TLS cert ready for {_ak_tls_hostname} ({_tls_attempt * 5}s)")
+                        break
+                    except Exception:
+                        time.sleep(5)
+                if not _tls_ready:
+                    plog(f"  ⚠ TLS cert not ready after 300s — LDAP outpost may take longer to connect")
         # If Email Relay is already configured, push SMTP + recovery flow into Authentik now (persistent)
         relay = settings.get('email_relay') or {}
         if relay.get('from_addr'):
@@ -21049,8 +21304,22 @@ entries:
                     if line.strip().startswith('AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD='):
                         ldap_svc_pass = line.strip().split('=', 1)[1].strip()
                         break
-        time.sleep(3)
-        if not _authentik_deploy_final_verify_ldap_sa(ldap_svc_pass, plog):
+        # Wait for LDAP port 389 to be open before burning bind-check attempts
+        import socket as _sock
+        plog("  Waiting for LDAP port 389...")
+        _ldap_port_ready = False
+        for _lp in range(36):  # 36 × 5s = 180s max
+            try:
+                with _sock.create_connection(('127.0.0.1', 389), timeout=3):
+                    _ldap_port_ready = True
+                    plog(f"  ✓ LDAP port 389 open ({_lp * 5}s)")
+                    break
+            except (OSError, ConnectionRefusedError):
+                time.sleep(5)
+        if not _ldap_port_ready:
+            plog("  ⚠ LDAP port 389 not open after 180s — bind check may fail")
+        time.sleep(5)
+        if not _authentik_deploy_final_verify_ldap_sa(ldap_svc_pass, plog, attempts=24, delay_sec=10):
             _update_boot_stagger_service()
             authentik_deploy_status.update({'running': False, 'complete': False, 'error': True})
             return
@@ -21882,15 +22151,18 @@ def _test_ldap_bind_dn(bind_dn, bind_pass):
                 lines.append(ln)
         if not lines:
             continue
-        for ln in lines:
-            ln_low = ln.lower()
-            if 'failed to execute flow' in ln_low or 'ak-stage-flow-error' in ln_low:
-                return False
-            if 'flow error' in ln_low and ('password' in ln_low or 'invalid' in ln_low):
-                return False
+        # Check success FIRST — a recent success trumps a stale flow-error from outpost startup
         if any(any(m in ln for m in success_markers) for ln in lines):
             return True
         if any(any(m in ln for m in failure_markers) for ln in lines):
+            return False
+        has_flow_error = any(
+            'failed to execute flow' in ln.lower() or 'ak-stage-flow-error' in ln.lower()
+            for ln in lines)
+        has_cred_error = any(
+            'flow error' in ln.lower() and ('password' in ln.lower() or 'invalid' in ln.lower())
+            for ln in lines)
+        if has_flow_error or has_cred_error:
             return False
 
     return False
@@ -23524,6 +23796,7 @@ def takserver_rotate_intca():
             log("Step 6/7: Updating CoreConfig.xml...")
             run(f'sed -i "s/{old_ca_name}/{new_ca_name}/g" /opt/tak/CoreConfig.xml')
             run(f'sed -i "s/{old_ca_name}/{new_ca_name}/g" /opt/tak/CoreConfig.example.xml 2>/dev/null', check=False)
+            _patch_coreconfig_passwords(cert_pass, log_fn=log)
             log("✓ CoreConfig.xml updated")
 
             log("")
@@ -23669,7 +23942,7 @@ def takserver_revoke_old_ca():
             f'-srcstoretype JKS -deststoretype PKCS12 -srcstorepass {shlex.quote(cert_pass)} -deststorepass {shlex.quote(cert_pass)} -noprompt 2>&1',
             shell=True, capture_output=True, text=True, timeout=15)
 
-        subprocess.run('systemctl restart takserver 2>&1', shell=True, capture_output=True, text=True, timeout=30)
+        subprocess.run('systemctl restart takserver 2>&1', shell=True, capture_output=True, text=True, timeout=90)
 
         # 4) Update TAK Portal certs so it can talk to TAK Server (new server cert / chain)
         portal_running = subprocess.run('docker ps --format "{{.Names}}" 2>/dev/null | grep -q tak-portal', shell=True, capture_output=True).returncode == 0
@@ -23859,6 +24132,7 @@ def takserver_rotate_rootca():
             if old_root_name and old_root_name != new_root_name:
                 run(f'sed -i "s/{old_root_name}/{new_root_name}/g" /opt/tak/CoreConfig.xml', check=False)
                 run(f'sed -i "s/{old_root_name}/{new_root_name}/g" /opt/tak/CoreConfig.example.xml 2>/dev/null', check=False)
+            _patch_coreconfig_passwords(cert_pass, log_fn=log)
             log("✓ CoreConfig.xml updated")
 
             log("")
@@ -24254,8 +24528,8 @@ def takserver_uninstall():
         return jsonify({'error': 'Invalid admin password'}), 403
     steps = []
     # Stop service
-    subprocess.run(['systemctl', 'stop', 'takserver'], capture_output=True, timeout=60)
-    subprocess.run(['systemctl', 'disable', 'takserver'], capture_output=True, timeout=30)
+    subprocess.run(['systemctl', 'stop', 'takserver'], capture_output=True, timeout=90)
+    subprocess.run(['systemctl', 'disable', 'takserver'], capture_output=True, timeout=90)
     steps.append('Stopped TAK Server')
     # Kill any remaining processes
     subprocess.run('pkill -9 -f takserver 2>/dev/null; true', shell=True, capture_output=True)
@@ -24479,7 +24753,7 @@ def takserver_security_config_post():
             return jsonify({'error': 'Failed to write CoreConfig.xml'}), 500
     except Exception as e:
         return jsonify({'error': str(e)[:200]}), 500
-    subprocess.run(['sudo', 'systemctl', 'restart', 'takserver'], capture_output=True, timeout=30)
+    subprocess.run(['sudo', 'systemctl', 'restart', 'takserver'], capture_output=True, timeout=90)
     return jsonify({'success': True, 'validity_days': validity_days, 'message': f'Issued cert validity set to {validity_days} days. TAK Server restarted.'})
 
 
@@ -24562,7 +24836,7 @@ def run_takserver_upgrade(pkg_path):
         if changed:
             ulog(f"LDAP resync: {resync_msg}")
         ulog("Restarting TAK Server...")
-        subprocess.run('systemctl restart takserver', shell=True, capture_output=True, text=True, timeout=30)
+        subprocess.run('systemctl restart takserver', shell=True, capture_output=True, text=True, timeout=90)
         ulog("TAK Server update complete.")
         upgrade_status.update({'running': False, 'complete': True, 'error': False})
     except Exception as e:
@@ -24589,7 +24863,7 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
         # Step 1: Update Core (local) — per TAK guide, core first
         ulog("")
         ulog("━━━ Step 1/4: Stopping TAK Server ━━━")
-        subprocess.run('systemctl stop takserver', shell=True, capture_output=True, text=True, timeout=30)
+        subprocess.run('systemctl stop takserver', shell=True, capture_output=True, text=True, timeout=90)
         ulog("✓ TAK Server stopped")
 
         ulog("")
@@ -24704,7 +24978,7 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
         changed, resync_msg = _resync_ldap_credential_to_coreconfig()
         if changed:
             ulog(f"LDAP resync: {resync_msg}")
-        subprocess.run('systemctl start takserver', shell=True, capture_output=True, text=True, timeout=30)
+        subprocess.run('systemctl start takserver', shell=True, capture_output=True, text=True, timeout=90)
         ulog("Waiting 30 seconds for startup...")
         for remaining in range(20, -1, -10):
             time.sleep(10)
@@ -25200,6 +25474,7 @@ def run_takserver_deploy(config):
         log_step(f"  Intermediate CA validity: {int_validity_days} days (issued cert will default to same; change anytime in Certificate signing)")
 
         _patch_openssl_string_mask(log_step)
+        _patch_cert_metadata_password(cert_pass)
 
         run_cmd('chown -R tak:tak /opt/tak/certs/')
         log_step(f"Creating Root CA: {root_ca}...")
@@ -25234,6 +25509,7 @@ def run_takserver_deploy(config):
         log_step(""); log_step("━━━ Step 8/9: Configuring CoreConfig.xml ━━━")
         run_cmd('sed -i \'s|<input auth="anonymous" _name="stdtcp" protocol="tcp" port="8087"/>|<input auth="x509" _name="stdssl" protocol="tls" port="8089"/>|g\' /opt/tak/CoreConfig.xml', "Enabling X.509 auth on 8089...")
         run_cmd(f'sed -i "s|truststoreFile=\\"certs/files/truststore-root.jks|truststoreFile=\\"certs/files/truststore-{int_ca}.jks|g" /opt/tak/CoreConfig.xml', "Setting intermediate CA truststore...")
+        _patch_coreconfig_passwords(cert_pass, log_fn=log_step)
         issued_days = config.get('issued_cert_validity_days') or config.get('intermediate_ca_validity_days', 730)
         cert_block = (f'<certificateSigning CA="TAKServer"><certificateConfig>\\n'
             f'<nameEntries>\\n<nameEntry name="O" value="{config["cert_org"]}"/>\\n'
@@ -25834,7 +26110,7 @@ def run_full_uninstall():
 
         # 1. MediaMTX
         plog("━━━ MediaMTX ━━━")
-        subprocess.run('systemctl stop mediamtx mediamtx-webeditor 2>/dev/null; true', shell=True, capture_output=True, timeout=30)
+        subprocess.run('systemctl stop mediamtx mediamtx-webeditor 2>/dev/null; true', shell=True, capture_output=True, timeout=90)
         subprocess.run('systemctl disable mediamtx mediamtx-webeditor 2>/dev/null; true', shell=True, capture_output=True)
         for f in ['/etc/systemd/system/mediamtx.service', '/etc/systemd/system/mediamtx-webeditor.service',
                   '/usr/local/bin/mediamtx', '/usr/local/etc/mediamtx.yml']:
@@ -25887,8 +26163,8 @@ def run_full_uninstall():
 
         # 5. TAK Server
         plog("━━━ TAK Server ━━━")
-        subprocess.run(['systemctl', 'stop', 'takserver'], capture_output=True, timeout=60)
-        subprocess.run(['systemctl', 'disable', 'takserver'], capture_output=True, timeout=30)
+        subprocess.run(['systemctl', 'stop', 'takserver'], capture_output=True, timeout=90)
+        subprocess.run(['systemctl', 'disable', 'takserver'], capture_output=True, timeout=90)
         subprocess.run('pkill -9 -f takserver 2>/dev/null; true', shell=True, capture_output=True)
         pkg_result = subprocess.run('dpkg -l | grep takserver', shell=True, capture_output=True, text=True)
         if 'takserver' in (pkg_result.stdout or ''):
@@ -25909,8 +26185,8 @@ def run_full_uninstall():
 
         # 6. Email Relay
         plog("━━━ Email Relay ━━━")
-        subprocess.run('systemctl stop postfix 2>/dev/null; true', shell=True, capture_output=True, timeout=30)
-        subprocess.run('systemctl disable postfix 2>/dev/null; true', shell=True, capture_output=True)
+        subprocess.run('systemctl stop postfix 2>/dev/null; true', shell=True, capture_output=True, timeout=90)
+        subprocess.run('systemctl disable postfix 2>/dev/null; true', shell=True, capture_output=True, timeout=90)
         if pkg_mgr == 'apt':
             subprocess.run('apt-get remove -y postfix 2>/dev/null; true', shell=True, capture_output=True, timeout=120)
         else:
@@ -25934,8 +26210,8 @@ def run_full_uninstall():
 
         # 8. Caddy
         plog("━━━ Caddy ━━━")
-        subprocess.run('systemctl stop caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=30)
-        subprocess.run('systemctl disable caddy 2>/dev/null; true', shell=True, capture_output=True)
+        subprocess.run('systemctl stop caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=90)
+        subprocess.run('systemctl disable caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=90)
         if pkg_mgr == 'apt':
             subprocess.run('DEBIAN_FRONTEND=noninteractive apt-get remove --purge -y caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=120)
         else:
