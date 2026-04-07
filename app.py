@@ -9117,8 +9117,9 @@ def _takportal_build_settings_dict(settings):
         tak_url_host = server_ip
     else:
         tak_url_host = tak_dns or 'host.docker.internal'
-    # SSH: container→host uses host.docker.internal (extra_hosts in compose)
-    ssh_host = server_ip if (server_ip and server_ip not in ('localhost', '127.0.0.1')) else 'host.docker.internal'
+    # SSH: only pre-populate when TAK Server is on the same box
+    tak_local = os.path.isdir('/opt/tak')
+    ssh_host = ('host.docker.internal' if server_ip in ('localhost', '127.0.0.1', '') else server_ip) if tak_local else ''
     return {
         "AUTHENTIK_URL": f"http://{auth_url_host}:{auth_url_port}",
         "AUTHENTIK_TOKEN": ak_token or "",
@@ -9167,8 +9168,14 @@ def _takportal_setup_ssh(log_fn=None):
     """Generate an ed25519 keypair, install it on the host, and copy it into the TAK Portal container.
 
     After this, TAK Portal can SSH to the host via host.docker.internal without a password handshake.
+    Only runs when TAK Server is on the same box (i.e. /opt/tak exists). For remote TAK Server
+    deployments, SSH must be configured manually in TAK Portal's UI.
     Returns True if the key was installed (or already existed) and is ready to use.
     """
+    if not os.path.isdir('/opt/tak'):
+        if log_fn:
+            log_fn("  ⏭ TAK Server not on this host — skipping SSH auto-config (configure manually in TAK Portal)")
+        return False
     key_dir = os.path.expanduser('~/TAK-Portal/data/ssh')
     priv_key = os.path.join(key_dir, 'tak_ssh_ed25519')
     pub_key = priv_key + '.pub'
