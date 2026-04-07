@@ -37,6 +37,39 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 # ==========================================
+# VPS Disk I/O Check
+# ==========================================
+check_disk_io() {
+    echo -e "  ${BOLD}Checking disk I/O performance...${NC}"
+    local write_output
+    write_output=$(dd if=/dev/zero of=/tmp/.infratak-disktest bs=1M count=256 oflag=dsync 2>&1)
+    rm -f /tmp/.infratak-disktest
+    local speed_str
+    speed_str=$(echo "$write_output" | tail -1 | grep -oP '[\d.]+ [MGk]?B/s' | tail -1)
+    local speed_mb=0
+    if echo "$speed_str" | grep -q "GB/s"; then
+        speed_mb=$(echo "$speed_str" | grep -oP '[\d.]+' | head -1 | awk '{printf "%d", $1 * 1024}')
+    elif echo "$speed_str" | grep -q "MB/s"; then
+        speed_mb=$(echo "$speed_str" | grep -oP '[\d.]+' | head -1 | awk '{printf "%d", $1}')
+    elif echo "$speed_str" | grep -q "kB/s"; then
+        speed_mb=0
+    fi
+
+    if [ "$speed_mb" -ge 400 ] 2>/dev/null; then
+        echo -e "  ${GREEN}✓ Disk write: ${speed_str} — excellent${NC}"
+    elif [ "$speed_mb" -ge 200 ] 2>/dev/null; then
+        echo -e "  ${GREEN}✓ Disk write: ${speed_str} — acceptable${NC}"
+    elif [ "$speed_mb" -gt 0 ] 2>/dev/null; then
+        echo -e "  ${YELLOW}⚠ Disk write: ${speed_str} — slow (< 200 MB/s)${NC}"
+        echo -e "  ${YELLOW}  Deploys may be slow. Consider migrating to a faster VPS node.${NC}"
+        echo -e "  ${YELLOW}  Contact your provider about SSD-backed storage.${NC}"
+    else
+        echo -e "  ${YELLOW}⚠ Could not measure disk speed (${speed_str:-unknown})${NC}"
+    fi
+    echo ""
+}
+
+# ==========================================
 # Detect Operating System
 # ==========================================
 detect_os() {
@@ -379,6 +412,7 @@ EOF
 # Main
 # ==========================================
 detect_os
+check_disk_io
 wait_for_upgrades
 install_dependencies
 
