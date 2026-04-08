@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Latest release: v0.4.9-alpha** — **Security hardening:** all Docker port bindings (Node-RED, Authentik, LDAP) locked to `127.0.0.1` so services are only reachable through Caddy — closes a vulnerability where Docker bypassed UFW and exposed unauthenticated services directly to the internet. Auto-deployed on update. See [docs/RELEASE-v0.4.9-alpha.md](docs/RELEASE-v0.4.9-alpha.md). Prior: [v0.4.8-alpha](docs/RELEASE-v0.4.8-alpha.md), [v0.4.7-alpha](docs/RELEASE-v0.4.7-alpha.md), [v0.4.6-alpha](docs/RELEASE-v0.4.6-alpha.md), [v0.4.5-alpha](docs/RELEASE-v0.4.5-alpha.md), [v0.4.4-alpha](docs/RELEASE-v0.4.4-alpha.md), [v0.4.3-alpha](docs/RELEASE-v0.4.3-alpha.md), [v0.4.2-alpha](docs/RELEASE-v0.4.2-alpha.md).
+**Latest release: v0.5.0-alpha** — **Security hardening:** all Docker port bindings (Node-RED, Authentik, LDAP) locked to `127.0.0.1` so services are only reachable through Caddy — closes a vulnerability where Docker bypassed UFW and exposed unauthenticated services directly to the internet. Auto-deployed on update. See [docs/RELEASE-v0.5.0-alpha.md](docs/RELEASE-v0.5.0-alpha.md). Prior: [v0.4.9-alpha](docs/RELEASE-v0.4.9-alpha.md), [v0.4.8-alpha](docs/RELEASE-v0.4.8-alpha.md), [v0.4.7-alpha](docs/RELEASE-v0.4.7-alpha.md), [v0.4.6-alpha](docs/RELEASE-v0.4.6-alpha.md), [v0.4.5-alpha](docs/RELEASE-v0.4.5-alpha.md), [v0.4.4-alpha](docs/RELEASE-v0.4.4-alpha.md), [v0.4.3-alpha](docs/RELEASE-v0.4.3-alpha.md), [v0.4.2-alpha](docs/RELEASE-v0.4.2-alpha.md).
 
 **Something broken?** Wrong sidebar version, **Update Now** error, merge/rebase/tag-clobber messages, or you are not sure the VPS ever pulled the real repo → go to **[Universal recovery (SSH)](#universal-recovery-ssh)** and run the one block there. **Point people at that section**; it is the single source of truth.
 
@@ -28,7 +28,7 @@ grep '^VERSION' app.py
 sudo systemctl restart takwerx-console
 ```
 
-**Check:** The **`grep`** line should show **`VERSION = "…"`** matching the current **Latest release** at the top (without the **`v`**, e.g. **`0.4.9-alpha`**). If it still shows an old number, you are in the wrong directory (compare with **`grep WorkingDirectory /etc/systemd/system/takwerx-console.service`**) or the fetch failed (network).
+**Check:** The **`grep`** line should show **`VERSION = "…"`** matching the current **Latest release** at the top (without the **`v`**, e.g. **`0.5.0-alpha`**). If it still shows an old number, you are in the wrong directory (compare with **`grep WorkingDirectory /etc/systemd/system/takwerx-console.service`**) or the fetch failed (network).
 
 **Fix `origin` once (recommended):** so future **`git fetch origin`** hits upstream:
 
