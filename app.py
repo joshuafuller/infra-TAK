@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.4.8-alpha"
+VERSION = "0.4.9-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -14799,7 +14799,7 @@ def _run_nodered_deploy_remote(settings, deploy_cfg, plog):
     image: nodered/node-red:latest
     container_name: nodered
     ports:
-      - "1880:1880"
+      - "127.0.0.1:1880:1880"
     volumes:
       - node_red_data:/data
       - ./settings.js:/data/settings.js
@@ -14907,7 +14907,7 @@ def run_nodered_deploy():
     image: nodered/node-red:latest
     container_name: nodered
     ports:
-      - "1880:1880"
+      - "127.0.0.1:1880:1880"
     volumes:
       - node_red_data:/data
       - ./settings.js:/data/settings.js
@@ -19490,8 +19490,8 @@ entries:
     env_file:
       - .env
     ports:
-      - "${COMPOSE_PORT_HTTP:-9000}:9000"
-      - "${COMPOSE_PORT_HTTPS:-9443}:9443"
+      - "127.0.0.1:${COMPOSE_PORT_HTTP:-9000}:9000"
+      - "127.0.0.1:${COMPOSE_PORT_HTTPS:-9443}:9443"
     healthcheck:
       test: ["CMD", "ak", "healthcheck"]
       start_period: 600s
@@ -20484,9 +20484,9 @@ entries:
                 _ak_host = _get_authentik_host(settings)
                 if _ak_host:
                     _ak_ldap_url = f"https://{_ak_host}"
-                    ldap_svc = f"  ldap:\n    image: {ldap_image}\n    extra_hosts:\n      - \"{_ak_host}:host-gateway\"\n    ports:\n    - 389:3389\n    - 636:6636\n    environment:\n      AUTHENTIK_HOST: {_ak_ldap_url}\n      AUTHENTIK_INSECURE: \"true\"\n      AUTHENTIK_TOKEN: placeholder\n    restart: unless-stopped\n    healthcheck:\n      test: [\"CMD\", \"wget\", \"--spider\", \"-q\", \"http://localhost:9300/outpost.goauthentik.io/ping\"]\n      start_period: 30s\n      interval: 30s\n      timeout: 5s\n      retries: 3\n    depends_on:\n      server:\n        condition: service_healthy\n"
+                    ldap_svc = f"  ldap:\n    image: {ldap_image}\n    extra_hosts:\n      - \"{_ak_host}:host-gateway\"\n    ports:\n    - 127.0.0.1:389:3389\n    - 127.0.0.1:636:6636\n    environment:\n      AUTHENTIK_HOST: {_ak_ldap_url}\n      AUTHENTIK_INSECURE: \"true\"\n      AUTHENTIK_TOKEN: placeholder\n    restart: unless-stopped\n    healthcheck:\n      test: [\"CMD\", \"wget\", \"--spider\", \"-q\", \"http://localhost:9300/outpost.goauthentik.io/ping\"]\n      start_period: 30s\n      interval: 30s\n      timeout: 5s\n      retries: 3\n    depends_on:\n      server:\n        condition: service_healthy\n"
                 else:
-                    ldap_svc = f"  ldap:\n    image: {ldap_image}\n    ports:\n    - 389:3389\n    - 636:6636\n    environment:\n      AUTHENTIK_HOST: http://authentik-server-1:9000\n      AUTHENTIK_INSECURE: \"true\"\n      AUTHENTIK_TOKEN: placeholder\n    restart: unless-stopped\n    healthcheck:\n      test: [\"CMD\", \"wget\", \"--spider\", \"-q\", \"http://localhost:9300/outpost.goauthentik.io/ping\"]\n      start_period: 30s\n      interval: 30s\n      timeout: 5s\n      retries: 3\n    depends_on:\n      server:\n        condition: service_healthy\n"
+                    ldap_svc = f"  ldap:\n    image: {ldap_image}\n    ports:\n    - 127.0.0.1:389:3389\n    - 127.0.0.1:636:6636\n    environment:\n      AUTHENTIK_HOST: http://authentik-server-1:9000\n      AUTHENTIK_INSECURE: \"true\"\n      AUTHENTIK_TOKEN: placeholder\n    restart: unless-stopped\n    healthcheck:\n      test: [\"CMD\", \"wget\", \"--spider\", \"-q\", \"http://localhost:9300/outpost.goauthentik.io/ping\"]\n      start_period: 30s\n      interval: 30s\n      timeout: 5s\n      retries: 3\n    depends_on:\n      server:\n        condition: service_healthy\n"
                 new_lines = []
                 for line in lines:
                     if line.startswith('volumes:'):
@@ -27814,8 +27814,63 @@ def _post_update_auto_deploy():
                 finally:
                     _auto_deploy_active.pop('cloudtak', None)
 
+            def _auto_nodered():
+                nr_dir = os.path.expanduser('~/node-red')
+                compose_path = os.path.join(nr_dir, 'docker-compose.yml')
+                if os.path.exists(compose_path):
+                    try:
+                        with open(compose_path) as f:
+                            content = f.read()
+                        if '"1880:1880"' in content and '127.0.0.1:1880:1880' not in content:
+                            print("Post-update: hardening Node-RED port binding to 127.0.0.1")
+                            _auto_deploy_active['nodered'] = True
+                            new_content = content.replace('"1880:1880"', '"127.0.0.1:1880:1880"')
+                            with open(compose_path, 'w') as f:
+                                f.write(new_content)
+                            subprocess.run(f'cd {shlex.quote(nr_dir)} && docker compose up -d 2>/dev/null',
+                                shell=True, capture_output=True, text=True, timeout=120)
+                            print("Post-update: Node-RED port hardened and restarted")
+                        else:
+                            print("Post-update: Node-RED port binding already secure")
+                    except Exception as e:
+                        print(f"Post-update: Node-RED port hardening error: {e}")
+                    finally:
+                        _auto_deploy_active.pop('nodered', None)
+
+            def _auto_authentik_ports():
+                ak_dir = os.path.expanduser('~/authentik')
+                compose_path = os.path.join(ak_dir, 'docker-compose.yml')
+                if os.path.exists(compose_path):
+                    try:
+                        with open(compose_path) as f:
+                            content = f.read()
+                        patched = False
+                        for old, new in [
+                            ('- 389:3389', '- 127.0.0.1:389:3389'),
+                            ('- 636:6636', '- 127.0.0.1:636:6636'),
+                        ]:
+                            if old in content and new not in content:
+                                content = content.replace(old, new)
+                                patched = True
+                        for old_pat in ['"${COMPOSE_PORT_HTTP:-9000}:9000"', '"9000:9000"']:
+                            if old_pat in content and '127.0.0.1' not in content.split(old_pat)[0].split('\n')[-1]:
+                                content = content.replace(old_pat, f'"127.0.0.1:${{COMPOSE_PORT_HTTP:-9000}}:9000"')
+                                patched = True
+                        for old_pat in ['"${COMPOSE_PORT_HTTPS:-9443}:9443"', '"9443:9443"']:
+                            if old_pat in content and '127.0.0.1' not in content.split(old_pat)[0].split('\n')[-1]:
+                                content = content.replace(old_pat, f'"127.0.0.1:${{COMPOSE_PORT_HTTPS:-9443}}:9443"')
+                                patched = True
+                        if patched:
+                            print("Post-update: hardening Authentik port bindings to 127.0.0.1")
+                            with open(compose_path, 'w') as f:
+                                f.write(content)
+                        else:
+                            print("Post-update: Authentik port bindings already secure")
+                    except Exception as e:
+                        print(f"Post-update: Authentik port hardening error: {e}")
+
             parallel_tasks = []
-            for fn in (_auto_authentik, _auto_takportal, _auto_cloudtak):
+            for fn in (_auto_authentik, _auto_takportal, _auto_cloudtak, _auto_nodered, _auto_authentik_ports):
                 t = threading.Thread(target=fn, daemon=True)
                 t.start()
                 parallel_tasks.append(t)
