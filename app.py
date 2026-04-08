@@ -3065,6 +3065,7 @@ def mediamtx_page():
 # ── Guard Dog (TAK Server hardening / 7 monitors) ─────────────────────────────
 guarddog_deploy_log = []
 guarddog_deploy_status = {'running': False, 'complete': False, 'error': False}
+_auto_deploy_active = {}
 
 def _guarddog_server_identifier(settings):
     """Build the server identifier string for Guard Dog alerts (nickname and/or IP/FQDN)."""
@@ -26167,7 +26168,13 @@ def api_toggle_unattended_upgrades():
 def api_modules():
     """Live module states for dashboard cards (so CLI uninstall/start/stop is reflected)."""
     modules = detect_modules()
-    return jsonify({k: {'installed': m.get('installed', False), 'running': m.get('running', False)} for k, m in modules.items()})
+    result = {}
+    for k, m in modules.items():
+        d = {'installed': m.get('installed', False), 'running': m.get('running', False)}
+        if k in _auto_deploy_active:
+            d['updating_config'] = True
+        result[k] = d
+    return jsonify(result)
 
 # Full uninstall (all deployed services) — for testing: reset VPS without destroying it
 full_uninstall_log = []
@@ -26650,8 +26657,10 @@ body{display:flex;flex-direction:row;min-height:100vh}
 .status-critical{background:rgba(239,68,68,0.1);color:var(--red)}
 .status-stopped{background:rgba(239,68,68,0.1);color:var(--red)}
 .status-not-installed{background:rgba(71,85,105,0.2);color:var(--text-dim)}
+.status-updating{background:rgba(6,182,212,0.1);color:var(--cyan)}
 .status-dot{width:5px;height:5px;border-radius:50%;background:currentColor}
 .status-running .status-dot,.status-caution .status-dot{animation:pulse 2s infinite}
+.status-updating .status-dot{animation:uu-spin .7s linear infinite;width:8px;height:8px;border:2px solid var(--cyan);border-top-color:transparent;background:none}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
 .uu-spinner{display:inline-block;width:14px;height:14px;border:2px solid var(--border);border-top-color:var(--cyan);border-radius:50%;animation:uu-spin .7s linear infinite;vertical-align:middle;margin-right:6px}
 @keyframes uu-spin{to{transform:rotate(360deg)}}
@@ -26826,6 +26835,11 @@ function refreshModuleCards(){
             var el=document.getElementById('module-status-'+k);
             if(!el)continue;
             var m=mods[k];
+            if(m.updating_config){
+                el.className='module-status status-updating';
+                el.innerHTML='<span class="status-dot"></span> Updating config\u2026';
+                continue;
+            }
             if(k==='guarddog'&&m.installed&&m.running){ continue; }
             var cls='module-status status-'+(m.installed&&m.running?'running':m.installed?'stopped':'not-installed');
             var label=m.installed&&m.running?'<span class="status-dot"></span> Running':m.installed?'<span class="status-dot"></span> Stopped':'Not Installed';
@@ -27705,11 +27719,14 @@ def _post_update_auto_deploy():
                 if not guarddog_deploy_status.get('running'):
                     alert_email = (load_settings().get('guarddog_alert_email') or '').strip()
                     print("Post-update: auto-deploying Guard Dog")
+                    _auto_deploy_active['guarddog'] = True
                     guarddog_deploy_status.update({'running': True, 'complete': False, 'error': False})
                     try:
                         run_guarddog_deploy(alert_email)
                     except Exception as e:
                         print(f"Post-update: Guard Dog deploy error: {e}")
+                    finally:
+                        _auto_deploy_active.pop('guarddog', None)
                 else:
                     print("Post-update: Guard Dog deploy already running, skipped")
 
@@ -27719,11 +27736,14 @@ def _post_update_auto_deploy():
                 if os.path.exists(os.path.join(ak_dir, 'docker-compose.yml')) and _authentik_installed_for_reconfigure():
                     if not authentik_deploy_status.get('running'):
                         print("Post-update: auto-reconfiguring Authentik")
+                        _auto_deploy_active['authentik'] = True
                         authentik_deploy_status.update({'running': True, 'complete': False, 'error': False})
                         try:
                             run_authentik_deploy(reconfigure=True)
                         except Exception as e:
                             print(f"Post-update: Authentik reconfigure error: {e}")
+                        finally:
+                            _auto_deploy_active.pop('authentik', None)
                     else:
                         print("Post-update: Authentik deploy already running, skipped")
 
@@ -27735,29 +27755,35 @@ def _post_update_auto_deploy():
                             shell=True, capture_output=True, text=True, timeout=5)
                         if 'Up' in (r.stdout or ''):
                             print("Post-update: auto-reconfiguring TAK Portal")
-                            settings = load_settings()
-                            settings_json = _takportal_merged_settings_json(settings)
-                            fd, tmp = tempfile.mkstemp(suffix='.json', prefix='tak-portal-')
+                            _auto_deploy_active['takportal'] = True
                             try:
-                                with os.fdopen(fd, 'w') as f:
-                                    f.write(settings_json)
-                                subprocess.run(f'docker cp {shlex.quote(tmp)} tak-portal:/usr/src/app/data/settings.json',
-                                    shell=True, capture_output=True, text=True, timeout=20)
-                            finally:
+                                settings = load_settings()
+                                settings_json = _takportal_merged_settings_json(settings)
+                                fd, tmp = tempfile.mkstemp(suffix='.json', prefix='tak-portal-')
                                 try:
-                                    os.remove(tmp)
-                                except OSError:
-                                    pass
-                            _takportal_setup_ssh()
-                            subprocess.run('docker restart tak-portal', shell=True, capture_output=True, text=True, timeout=30)
-                            _sync_authentik_takportal_provider_url(settings)
-                            print("Post-update: TAK Portal config updated and restarted")
+                                    with os.fdopen(fd, 'w') as f:
+                                        f.write(settings_json)
+                                    subprocess.run(f'docker cp {shlex.quote(tmp)} tak-portal:/usr/src/app/data/settings.json',
+                                        shell=True, capture_output=True, text=True, timeout=20)
+                                finally:
+                                    try:
+                                        os.remove(tmp)
+                                    except OSError:
+                                        pass
+                                _takportal_setup_ssh()
+                                subprocess.run('docker restart tak-portal', shell=True, capture_output=True, text=True, timeout=30)
+                                _sync_authentik_takportal_provider_url(settings)
+                                print("Post-update: TAK Portal config updated and restarted")
+                            finally:
+                                _auto_deploy_active.pop('takportal', None)
                         else:
                             print("Post-update: TAK Portal not running, skipped config update")
                     except Exception as e:
+                        _auto_deploy_active.pop('takportal', None)
                         print(f"Post-update: TAK Portal reconfigure error: {e}")
 
             def _auto_cloudtak():
+                _auto_deploy_active['cloudtak'] = True
                 try:
                     settings = load_settings()
                     ct_cfg = _get_cloudtak_deployment_config(settings)
@@ -27792,6 +27818,8 @@ def _post_update_auto_deploy():
                         print("Post-update: CloudTAK override refreshed (local)")
                 except Exception as e:
                     print(f"Post-update: CloudTAK override refresh error: {e}")
+                finally:
+                    _auto_deploy_active.pop('cloudtak', None)
 
             parallel_tasks = []
             for fn in (_auto_authentik, _auto_takportal, _auto_cloudtak):
