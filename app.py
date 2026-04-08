@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.4.6-alpha"
+VERSION = "0.4.7-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -3301,7 +3301,7 @@ def _sync_guarddog_remote_db_from_settings(settings=None):
     except Exception as e:
         return False, f'guarddog.conf: {e}'
     cert_pass = _get_tak_cert_password(settings)
-    for name in ('tak-remotedb-watch.sh', 'tak-remotedb-auth-watch.sh', 'tak-cotdb-watch.sh', 'tak-auto-vacuum.sh'):
+    for name in ('tak-remotedb-watch.sh', 'tak-remotedb-auth-watch.sh', 'tak-cotdb-watch.sh', 'tak-auto-vacuum.sh', 'tak-db-repack.sh'):
         src = os.path.join(scripts_dir, name)
         dest = os.path.join(gd_dir, name)
         if not os.path.isfile(src):
@@ -3904,9 +3904,12 @@ def _monitor_health_check(monitor_id):
                 db_port = int(conf.get('db_port', 0))
             if not db_host or not db_port:
                 return None
-            s = socket.create_connection((db_host, db_port), timeout=5)
-            s.close()
-            return True
+            try:
+                s = socket.create_connection((db_host, db_port), timeout=5)
+                s.close()
+                return True
+            except (OSError, socket.timeout):
+                return False
         if monitor_id == 'remotedb_agent':
             db_host, _dbp = _remotedb_host_port_from_tak_settings()
             if not db_host:
@@ -4212,12 +4215,27 @@ def guarddog_update():
                 f.write(f'[Unit]\nDescription=TAK CoT Database Size Monitor\nAfter={_after2}\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-cotdb-watch.sh\n')
             with open(cotdb_tmr_path, 'w') as f:
                 f.write('[Unit]\nDescription=Run TAK CoT DB size monitor every 6 hours\n\n[Timer]\nOnBootSec=30min\nOnUnitActiveSec=6h\nUnit=takcotdbguard.service\n\n[Install]\nWantedBy=timers.target\n')
+        # DB repack timer (weekly Sunday 4am) — install if script exists but timer doesn't
+        rp_script = '/opt/tak-guarddog/tak-db-repack.sh'
+        rp_svc_path = '/etc/systemd/system/takdbrepack.service'
+        rp_tmr_path = '/etc/systemd/system/takdbrepack.timer'
+        if os.path.isfile(rp_script) and not os.path.isfile(rp_tmr_path):
+            _settings3 = load_settings()
+            _tak_cfg3 = _get_tak_deployment_config(_settings3)
+            _is_two3 = _tak_cfg3.get('mode') == 'two_server'
+            _after3 = 'network-online.target' if _is_two3 else 'postgresql.service postgresql-15.service'
+            with open(rp_svc_path, 'w') as f:
+                f.write(f'[Unit]\nDescription=Guard Dog Online DB Repack (pg_repack)\nAfter={_after3}\n\n[Service]\nType=oneshot\nTimeoutStartSec=3600\nExecStart={rp_script}\n')
+            with open(rp_tmr_path, 'w') as f:
+                f.write('[Unit]\nDescription=Run online DB repack weekly (Sunday 4am)\n\n[Timer]\nOnCalendar=Sun *-*-* 04:00:00\nPersistent=true\nUnit=takdbrepack.service\n\n[Install]\nWantedBy=timers.target\n')
         subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=10)
         new_timers = ['takupdatesguard.timer']
         if os.path.isfile(av_tmr_path):
             new_timers.append('takautovacuum.timer')
         if os.path.isfile(cotdb_tmr_path):
             new_timers.append('takcotdbguard.timer')
+        if os.path.isfile(rp_tmr_path):
+            new_timers.append('takdbrepack.timer')
         for t in new_timers:
             subprocess.run(['systemctl', 'enable', '--now', t], capture_output=True, text=True, timeout=10)
         # Refresh Guard Dog monitor cache so UI flips without waiting for background refresh.
@@ -4577,6 +4595,7 @@ def run_guarddog_deploy(alert_email):
         else:
             script_files.extend(['tak-db-watch.sh', 'tak-cotdb-watch.sh'])
         script_files.append('tak-auto-vacuum.sh')
+        script_files.append('tak-db-repack.sh')
         # Optional: monitors for other services (only install if that service is present)
         ak_dir = os.path.expanduser('~/authentik')
         nr_dir = os.path.expanduser('~/node-red')
@@ -4608,7 +4627,7 @@ def run_guarddog_deploy(alert_email):
                 .replace('ALERT_SMS_PLACEHOLDER', alert_sms or '')
                 .replace('CERT_PASS_PLACEHOLDER', cert_pass)
                 .replace('CONSOLE_VERSION_PLACEHOLDER', VERSION))
-            if is_two_server and name in ('tak-remotedb-watch.sh', 'tak-remotedb-auth-watch.sh', 'tak-cotdb-watch.sh', 'tak-auto-vacuum.sh'):
+            if is_two_server and name in ('tak-remotedb-watch.sh', 'tak-remotedb-auth-watch.sh', 'tak-cotdb-watch.sh', 'tak-auto-vacuum.sh', 'tak-db-repack.sh'):
                 content = content.replace('DB_HOST_PLACEHOLDER', s1_host)
                 content = content.replace('DB_PORT_PLACEHOLDER', db_port)
                 content = content.replace('SSH_KEY_PLACEHOLDER', ssh_key_path)
@@ -4666,6 +4685,8 @@ def run_guarddog_deploy(alert_email):
                 ('takcotdbguard.timer', '[Unit]\nDescription=Run TAK CoT DB size monitor every 6 hours\n\n[Timer]\nOnBootSec=30min\nOnUnitActiveSec=6h\nUnit=takcotdbguard.service\n\n[Install]\nWantedBy=timers.target\n'),
                 ('takautovacuum.service', '[Unit]\nDescription=Guard Dog Smart Auto-VACUUM\nAfter=network-online.target\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-auto-vacuum.sh\n'),
                 ('takautovacuum.timer', '[Unit]\nDescription=Run smart auto-VACUUM daily at 3am\n\n[Timer]\nOnCalendar=*-*-* 03:00:00\nPersistent=true\nUnit=takautovacuum.service\n\n[Install]\nWantedBy=timers.target\n'),
+                ('takdbrepack.service', '[Unit]\nDescription=Guard Dog Online DB Repack (pg_repack)\nAfter=network-online.target\n\n[Service]\nType=oneshot\nTimeoutStartSec=3600\nExecStart=/opt/tak-guarddog/tak-db-repack.sh\n'),
+                ('takdbrepack.timer', '[Unit]\nDescription=Run online DB repack weekly (Sunday 4am)\n\n[Timer]\nOnCalendar=Sun *-*-* 04:00:00\nPersistent=true\nUnit=takdbrepack.service\n\n[Install]\nWantedBy=timers.target\n'),
             ])
         else:
             units.extend([
@@ -4675,6 +4696,8 @@ def run_guarddog_deploy(alert_email):
                 ('takcotdbguard.timer', '[Unit]\nDescription=Run TAK CoT DB size monitor every 6 hours\n\n[Timer]\nOnBootSec=30min\nOnUnitActiveSec=6h\nUnit=takcotdbguard.service\n\n[Install]\nWantedBy=timers.target\n'),
                 ('takautovacuum.service', '[Unit]\nDescription=Guard Dog Smart Auto-VACUUM\nAfter=postgresql.service postgresql-15.service\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-auto-vacuum.sh\n'),
                 ('takautovacuum.timer', '[Unit]\nDescription=Run smart auto-VACUUM daily at 3am\n\n[Timer]\nOnCalendar=*-*-* 03:00:00\nPersistent=true\nUnit=takautovacuum.service\n\n[Install]\nWantedBy=timers.target\n'),
+                ('takdbrepack.service', '[Unit]\nDescription=Guard Dog Online DB Repack (pg_repack)\nAfter=postgresql.service postgresql-15.service\n\n[Service]\nType=oneshot\nTimeoutStartSec=3600\nExecStart=/opt/tak-guarddog/tak-db-repack.sh\n'),
+                ('takdbrepack.timer', '[Unit]\nDescription=Run online DB repack weekly (Sunday 4am)\n\n[Timer]\nOnCalendar=Sun *-*-* 04:00:00\nPersistent=true\nUnit=takdbrepack.service\n\n[Install]\nWantedBy=timers.target\n'),
             ])
         # Optional timers for other services (only if we installed the script)
         if 'tak-authentik-watch.sh' in script_files:
@@ -27515,7 +27538,7 @@ def _auto_update_guarddog():
                 .replace('ALERT_SMS_PLACEHOLDER', '')
                 .replace('CERT_PASS_PLACEHOLDER', cert_pass)
                 .replace('CONSOLE_VERSION_PLACEHOLDER', VERSION))
-            if is_two_server and name in ('tak-remotedb-watch.sh', 'tak-remotedb-auth-watch.sh', 'tak-cotdb-watch.sh', 'tak-auto-vacuum.sh'):
+            if is_two_server and name in ('tak-remotedb-watch.sh', 'tak-remotedb-auth-watch.sh', 'tak-cotdb-watch.sh', 'tak-auto-vacuum.sh', 'tak-db-repack.sh'):
                 content = content.replace('DB_HOST_PLACEHOLDER', s1_host)
                 content = content.replace('DB_PORT_PLACEHOLDER', db_port)
                 content = content.replace('SSH_KEY_PLACEHOLDER', ssh_key_path or os.path.expanduser('~/.ssh/infra-tak-server-one'))
@@ -27581,11 +27604,101 @@ def _startup_migrations():
             generate_caddyfile(s)
             subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
             print("Startup migration: Caddyfile regenerated + Caddy reloaded")
+
+        # Keep guarddog.conf in sync with settings.json DB host (prevents stale IP after migration)
+        tak_cfg = _get_tak_deployment_config(s)
+        if tak_cfg.get('mode') == 'two_server' and os.path.exists('/opt/tak-guarddog'):
+            sg_ok, sg_msg = _sync_guarddog_remote_db_from_settings(s)
+            if sg_ok and 'synced' in (sg_msg or ''):
+                print(f"Startup migration: guarddog.conf synced — {sg_msg}")
     except Exception as e:
         print(f"Startup migration error: {e}")
         import traceback; traceback.print_exc()
 
+def _post_update_auto_deploy():
+    """After a console update, automatically re-deploy Guard Dog and reconfigure Authentik."""
+    try:
+        s = load_settings()
+        last_ver = s.get('last_console_version', '')
+        if last_ver == VERSION:
+            return
+        s['last_console_version'] = VERSION
+        save_settings(s)
+
+        if last_ver == '':
+            print(f"Post-update: first run at {VERSION}, skipping auto-deploy")
+            return
+
+        print(f"Post-update: version changed {last_ver} → {VERSION}, scheduling auto-deploy")
+
+        def _run_post_update():
+            import time
+            time.sleep(10)
+
+            # Re-deploy Guard Dog (updated scripts + timers)
+            if os.path.exists('/opt/tak-guarddog') and os.path.exists('/opt/tak'):
+                if not guarddog_deploy_status.get('running'):
+                    alert_email = (load_settings().get('guarddog_alert_email') or '').strip()
+                    print("Post-update: auto-deploying Guard Dog")
+                    guarddog_deploy_status.update({'running': True, 'complete': False, 'error': False})
+                    try:
+                        run_guarddog_deploy(alert_email)
+                    except Exception as e:
+                        print(f"Post-update: Guard Dog deploy error: {e}")
+                else:
+                    print("Post-update: Guard Dog deploy already running, skipped")
+
+            # Reconfigure Authentik (LDAP/forward-auth sync)
+            ak_dir = os.path.expanduser('~/authentik')
+            if os.path.exists(os.path.join(ak_dir, 'docker-compose.yml')) and _authentik_installed_for_reconfigure():
+                if not authentik_deploy_status.get('running'):
+                    print("Post-update: auto-reconfiguring Authentik")
+                    authentik_deploy_status.update({'running': True, 'complete': False, 'error': False})
+                    try:
+                        run_authentik_deploy(reconfigure=True)
+                    except Exception as e:
+                        print(f"Post-update: Authentik reconfigure error: {e}")
+                else:
+                    print("Post-update: Authentik deploy already running, skipped")
+
+            # Reconfigure TAK Portal (push settings, SSH only if local)
+            portal_dir = os.path.expanduser('~/TAK-Portal')
+            if os.path.exists(portal_dir):
+                try:
+                    r = subprocess.run('docker ps --filter name=tak-portal --format "{{.Status}}"',
+                        shell=True, capture_output=True, text=True, timeout=5)
+                    if 'Up' in (r.stdout or ''):
+                        print("Post-update: auto-reconfiguring TAK Portal")
+                        settings = load_settings()
+                        settings_json = _takportal_merged_settings_json(settings)
+                        fd, tmp = tempfile.mkstemp(suffix='.json', prefix='tak-portal-')
+                        try:
+                            with os.fdopen(fd, 'w') as f:
+                                f.write(settings_json)
+                            subprocess.run(f'docker cp {shlex.quote(tmp)} tak-portal:/usr/src/app/data/settings.json',
+                                shell=True, capture_output=True, text=True, timeout=20)
+                        finally:
+                            try:
+                                os.remove(tmp)
+                            except OSError:
+                                pass
+                        _takportal_setup_ssh()
+                        subprocess.run('docker restart tak-portal', shell=True, capture_output=True, text=True, timeout=30)
+                        _sync_authentik_takportal_provider_url(settings)
+                        print("Post-update: TAK Portal config updated and restarted")
+                    else:
+                        print("Post-update: TAK Portal not running, skipped config update")
+                except Exception as e:
+                    print(f"Post-update: TAK Portal reconfigure error: {e}")
+
+            print("Post-update: auto-deploy complete")
+
+        threading.Thread(target=_run_post_update, daemon=True).start()
+    except Exception as e:
+        print(f"Post-update auto-deploy error: {e}")
+
 _startup_migrations()
+_post_update_auto_deploy()
 
 # === Main Entry Point (fallback for direct python3 app.py) ===
 if __name__ == '__main__':

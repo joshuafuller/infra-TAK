@@ -300,6 +300,16 @@ Each page has buttons that do specific things. Here's what they do and when to u
 
 ## Changelog
 
+### v0.4.7-alpha — 2026-04-08
+
+**Auto-deploy Guard Dog + Authentik + TAK Portal on update** — no more manual button presses after console updates. Guard Dog scripts, Authentik config, and TAK Portal settings are automatically re-deployed when a version change is detected on startup.
+
+**Online database repack (pg_repack)** — new weekly Guard Dog script reclaims actual disk space from the CoT database without downtime. Runs Sunday 4 AM, auto-installs pg_repack, works in both local and two-server mode.
+
+**Remote DB monitor fix** — TCP+SSH monitor now correctly shows red when Server One is unreachable (was falsely showing green due to exception handling bug).
+
+**Guard Dog config drift prevention** — `guarddog.conf` auto-syncs with settings.json on every console startup, preventing stale remote DB IPs after migration.
+
 ### v0.4.6-alpha — 2026-04-07
 
 **Staggered boot sequencer — cold reboot to full stack healthy in ~2 minutes**
