@@ -27864,6 +27864,17 @@ def _post_update_auto_deploy():
                             print("Post-update: hardening Authentik port bindings to 127.0.0.1")
                             with open(compose_path, 'w') as f:
                                 f.write(content)
+                        needs_recreate = patched
+                        if not needs_recreate:
+                            r = subprocess.run('ss -tlnp | grep -c "0.0.0.0:9000\\|0.0.0.0:9443"',
+                                shell=True, capture_output=True, text=True, timeout=5)
+                            if r.stdout.strip() not in ('', '0'):
+                                needs_recreate = True
+                                print("Post-update: Authentik compose secure but containers still on 0.0.0.0, recreating")
+                        if needs_recreate:
+                            subprocess.run(f'cd {shlex.quote(ak_dir)} && docker compose up -d 2>/dev/null',
+                                shell=True, capture_output=True, text=True, timeout=300)
+                            print("Post-update: Authentik containers recreated with 127.0.0.1 bindings")
                         else:
                             print("Post-update: Authentik port bindings already secure")
                     except Exception as e:
