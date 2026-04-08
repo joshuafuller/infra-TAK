@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.4.9-alpha"
+VERSION = "0.5.0-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -14799,7 +14799,7 @@ def _run_nodered_deploy_remote(settings, deploy_cfg, plog):
     image: nodered/node-red:latest
     container_name: nodered
     ports:
-      - "127.0.0.1:1880:1880"
+      - "1880:1880"
     volumes:
       - node_red_data:/data
       - ./settings.js:/data/settings.js
@@ -19490,8 +19490,8 @@ entries:
     env_file:
       - .env
     ports:
-      - "127.0.0.1:${COMPOSE_PORT_HTTP:-9000}:9000"
-      - "127.0.0.1:${COMPOSE_PORT_HTTPS:-9443}:9443"
+      - "${COMPOSE_PORT_HTTP:-9000}:9000"
+      - "${COMPOSE_PORT_HTTPS:-9443}:9443"
     healthcheck:
       test: ["CMD", "ak", "healthcheck"]
       start_period: 600s
@@ -27832,10 +27832,48 @@ def _post_update_auto_deploy():
                             print("Post-update: Node-RED port hardened and restarted")
                         else:
                             print("Post-update: Node-RED port binding already secure")
+                        _nodered_malware_scan()
                     except Exception as e:
                         print(f"Post-update: Node-RED port hardening error: {e}")
                     finally:
                         _auto_deploy_active.pop('nodered', None)
+
+            def _nodered_malware_scan():
+                try:
+                    r = subprocess.run('docker ps -q --filter name=nodered', shell=True,
+                        capture_output=True, text=True, timeout=5)
+                    if not (r.stdout or '').strip():
+                        return
+                    malware_paths = [
+                        '/usr/src/node-red/.local/share/javac',
+                        '/usr/src/node-red/.local/share/java',
+                        '/usr/src/node-red/.local/share/.cache',
+                    ]
+                    found = []
+                    for path in malware_paths:
+                        chk = subprocess.run(f'docker exec nodered test -f {shlex.quote(path)}',
+                            shell=True, capture_output=True, timeout=5)
+                        if chk.returncode == 0:
+                            found.append(path)
+                    susp = subprocess.run(
+                        'docker exec nodered find /usr/src/node-red/.local/share -type f -executable 2>/dev/null',
+                        shell=True, capture_output=True, text=True, timeout=10)
+                    for line in (susp.stdout or '').strip().splitlines():
+                        p = line.strip()
+                        if p and p not in found:
+                            found.append(p)
+                    if found:
+                        print(f"Post-update: ⚠ Node-RED malware detected — removing {len(found)} suspicious file(s)")
+                        for f in found:
+                            subprocess.run(f'docker exec nodered rm -f {shlex.quote(f)}',
+                                shell=True, capture_output=True, timeout=5)
+                            print(f"Post-update:   removed {f}")
+                        subprocess.run('docker restart nodered', shell=True, capture_output=True, timeout=60)
+                        print("Post-update: Node-RED restarted after malware cleanup")
+                    else:
+                        print("Post-update: Node-RED malware scan clean")
+                except Exception as e:
+                    print(f"Post-update: Node-RED malware scan error: {e}")
 
             def _auto_authentik_ports():
                 ak_dir = os.path.expanduser('~/authentik')
@@ -27852,25 +27890,49 @@ def _post_update_auto_deploy():
                             if old in content and new not in content:
                                 content = content.replace(old, new)
                                 patched = True
-                        for old_pat in ['"${COMPOSE_PORT_HTTP:-9000}:9000"', '"9000:9000"']:
+                        for old_pat, new_pat in [
+                            ('${COMPOSE_PORT_HTTP:-9000}:9000', '127.0.0.1:${COMPOSE_PORT_HTTP:-9000}:9000'),
+                            ('"${COMPOSE_PORT_HTTP:-9000}:9000"', '"127.0.0.1:${COMPOSE_PORT_HTTP:-9000}:9000"'),
+                            ('"9000:9000"', '"127.0.0.1:9000:9000"'),
+                            ('- 9000:9000', '- 127.0.0.1:9000:9000'),
+                        ]:
                             if old_pat in content and '127.0.0.1' not in content.split(old_pat)[0].split('\n')[-1]:
-                                content = content.replace(old_pat, f'"127.0.0.1:${{COMPOSE_PORT_HTTP:-9000}}:9000"')
+                                content = content.replace(old_pat, new_pat)
                                 patched = True
-                        for old_pat in ['"${COMPOSE_PORT_HTTPS:-9443}:9443"', '"9443:9443"']:
+                        for old_pat, new_pat in [
+                            ('${COMPOSE_PORT_HTTPS:-9443}:9443', '127.0.0.1:${COMPOSE_PORT_HTTPS:-9443}:9443'),
+                            ('"${COMPOSE_PORT_HTTPS:-9443}:9443"', '"127.0.0.1:${COMPOSE_PORT_HTTPS:-9443}:9443"'),
+                            ('"9443:9443"', '"127.0.0.1:9443:9443"'),
+                            ('- 9443:9443', '- 127.0.0.1:9443:9443'),
+                        ]:
                             if old_pat in content and '127.0.0.1' not in content.split(old_pat)[0].split('\n')[-1]:
-                                content = content.replace(old_pat, f'"127.0.0.1:${{COMPOSE_PORT_HTTPS:-9443}}:9443"')
+                                content = content.replace(old_pat, new_pat)
                                 patched = True
                         if patched:
                             print("Post-update: hardening Authentik port bindings to 127.0.0.1")
                             with open(compose_path, 'w') as f:
                                 f.write(content)
+                        needs_recreate = patched
+                        if not needs_recreate:
+                            r = subprocess.run('ss -tlnp | grep -c "0.0.0.0:9000\\|0.0.0.0:9443"',
+                                shell=True, capture_output=True, text=True, timeout=5)
+                            if r.stdout.strip() not in ('', '0'):
+                                needs_recreate = True
+                                print("Post-update: Authentik compose secure but containers still on 0.0.0.0, recreating")
+                        if needs_recreate:
+                            subprocess.run(f'cd {shlex.quote(ak_dir)} && docker compose up -d 2>/dev/null',
+                                shell=True, capture_output=True, text=True, timeout=300)
+                            print("Post-update: Authentik containers recreated with 127.0.0.1 bindings")
                         else:
                             print("Post-update: Authentik port bindings already secure")
                     except Exception as e:
                         print(f"Post-update: Authentik port hardening error: {e}")
 
+            _auto_authentik_ports()
+            _auto_nodered()
+
             parallel_tasks = []
-            for fn in (_auto_authentik, _auto_takportal, _auto_cloudtak, _auto_nodered, _auto_authentik_ports):
+            for fn in (_auto_authentik, _auto_takportal, _auto_cloudtak):
                 t = threading.Thread(target=fn, daemon=True)
                 t.start()
                 parallel_tasks.append(t)
