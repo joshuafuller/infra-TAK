@@ -27663,6 +27663,19 @@ def _startup_migrations():
             sg_ok, sg_msg = _sync_guarddog_remote_db_from_settings(s)
             if sg_ok and 'synced' in (sg_msg or ''):
                 print(f"Startup migration: guarddog.conf synced — {sg_msg}")
+
+        # Ensure Guard Dog has a deployed-version stamp (one-time migration for existing installs)
+        if os.path.exists('/opt/tak-guarddog') and not s.get('guarddog_deployed_version'):
+            try:
+                _auto_update_guarddog()
+                s = load_settings()
+                s['guarddog_deployed_version'] = VERSION
+                s['guarddog_deployed_email'] = (s.get('guarddog_alert_email') or '').strip()
+                s['guarddog_deployed_nickname'] = (s.get('guarddog_server_nickname') or '').strip()
+                save_settings(s)
+                print(f"Startup migration: Guard Dog stamped at {VERSION}")
+            except Exception as gu_err:
+                print(f"Startup migration: Guard Dog stamp error: {gu_err}")
     except Exception as e:
         print(f"Startup migration error: {e}")
         import traceback; traceback.print_exc()
