@@ -27713,84 +27713,93 @@ def _post_update_auto_deploy():
                 else:
                     print("Post-update: Guard Dog deploy already running, skipped")
 
-            # Reconfigure Authentik (LDAP/forward-auth sync)
-            ak_dir = os.path.expanduser('~/authentik')
-            if os.path.exists(os.path.join(ak_dir, 'docker-compose.yml')) and _authentik_installed_for_reconfigure():
-                if not authentik_deploy_status.get('running'):
-                    print("Post-update: auto-reconfiguring Authentik")
-                    authentik_deploy_status.update({'running': True, 'complete': False, 'error': False})
-                    try:
-                        run_authentik_deploy(reconfigure=True)
-                    except Exception as e:
-                        print(f"Post-update: Authentik reconfigure error: {e}")
-                else:
-                    print("Post-update: Authentik deploy already running, skipped")
-
-            # Reconfigure TAK Portal (push settings, SSH only if local)
-            portal_dir = os.path.expanduser('~/TAK-Portal')
-            if os.path.exists(portal_dir):
-                try:
-                    r = subprocess.run('docker ps --filter name=tak-portal --format "{{.Status}}"',
-                        shell=True, capture_output=True, text=True, timeout=5)
-                    if 'Up' in (r.stdout or ''):
-                        print("Post-update: auto-reconfiguring TAK Portal")
-                        settings = load_settings()
-                        settings_json = _takportal_merged_settings_json(settings)
-                        fd, tmp = tempfile.mkstemp(suffix='.json', prefix='tak-portal-')
+            # Run Authentik, TAK Portal, CloudTAK in parallel (they're independent)
+            def _auto_authentik():
+                ak_dir = os.path.expanduser('~/authentik')
+                if os.path.exists(os.path.join(ak_dir, 'docker-compose.yml')) and _authentik_installed_for_reconfigure():
+                    if not authentik_deploy_status.get('running'):
+                        print("Post-update: auto-reconfiguring Authentik")
+                        authentik_deploy_status.update({'running': True, 'complete': False, 'error': False})
                         try:
-                            with os.fdopen(fd, 'w') as f:
-                                f.write(settings_json)
-                            subprocess.run(f'docker cp {shlex.quote(tmp)} tak-portal:/usr/src/app/data/settings.json',
-                                shell=True, capture_output=True, text=True, timeout=20)
-                        finally:
-                            try:
-                                os.remove(tmp)
-                            except OSError:
-                                pass
-                        _takportal_setup_ssh()
-                        subprocess.run('docker restart tak-portal', shell=True, capture_output=True, text=True, timeout=30)
-                        _sync_authentik_takportal_provider_url(settings)
-                        print("Post-update: TAK Portal config updated and restarted")
+                            run_authentik_deploy(reconfigure=True)
+                        except Exception as e:
+                            print(f"Post-update: Authentik reconfigure error: {e}")
                     else:
-                        print("Post-update: TAK Portal not running, skipped config update")
-                except Exception as e:
-                    print(f"Post-update: TAK Portal reconfigure error: {e}")
+                        print("Post-update: Authentik deploy already running, skipped")
 
-            # Refresh CloudTAK override (removes stale env vars, updates extra_hosts)
-            try:
-                settings = load_settings()
-                ct_cfg = _get_cloudtak_deployment_config(settings)
-                ct_dir = os.path.expanduser('~/CloudTAK')
-                if ct_cfg.get('target_mode') == 'remote' and ct_cfg.get('deployed'):
-                    remote_cfg = ct_cfg.get('remote', {})
-                    remote_host = (remote_cfg.get('host') or '').strip()
-                    if remote_host:
-                        override_yml = _cloudtak_build_override_yml(settings)
-                        fd, tmp = tempfile.mkstemp(suffix='.yml', prefix='cloudtak-override-')
-                        try:
-                            with os.fdopen(fd, 'w') as f:
-                                f.write(override_yml)
-                            ok, _ = _scp_to_host(remote_cfg, tmp, '~/CloudTAK/docker-compose.override.yml')
-                            if ok:
-                                _ssh_probe(remote_cfg, 'cd ~/CloudTAK && docker compose up -d 2>/dev/null', timeout=120)
-                                print(f"Post-update: CloudTAK override refreshed on remote ({remote_host})")
-                            else:
-                                print("Post-update: could not SCP CloudTAK override to remote")
-                        finally:
+            def _auto_takportal():
+                portal_dir = os.path.expanduser('~/TAK-Portal')
+                if os.path.exists(portal_dir):
+                    try:
+                        r = subprocess.run('docker ps --filter name=tak-portal --format "{{.Status}}"',
+                            shell=True, capture_output=True, text=True, timeout=5)
+                        if 'Up' in (r.stdout or ''):
+                            print("Post-update: auto-reconfiguring TAK Portal")
+                            settings = load_settings()
+                            settings_json = _takportal_merged_settings_json(settings)
+                            fd, tmp = tempfile.mkstemp(suffix='.json', prefix='tak-portal-')
                             try:
-                                os.remove(tmp)
-                            except OSError:
-                                pass
-                elif os.path.exists(os.path.join(ct_dir, 'docker-compose.yml')) or os.path.exists(os.path.join(ct_dir, 'compose.yaml')):
-                    override_path = os.path.join(ct_dir, 'docker-compose.override.yml')
-                    override_yml = _cloudtak_build_override_yml(settings)
-                    with open(override_path, 'w') as f:
-                        f.write(override_yml)
-                    subprocess.run(f'cd {shlex.quote(ct_dir)} && docker compose up -d 2>/dev/null',
-                        shell=True, capture_output=True, text=True, timeout=120)
-                    print("Post-update: CloudTAK override refreshed (local)")
-            except Exception as e:
-                print(f"Post-update: CloudTAK override refresh error: {e}")
+                                with os.fdopen(fd, 'w') as f:
+                                    f.write(settings_json)
+                                subprocess.run(f'docker cp {shlex.quote(tmp)} tak-portal:/usr/src/app/data/settings.json',
+                                    shell=True, capture_output=True, text=True, timeout=20)
+                            finally:
+                                try:
+                                    os.remove(tmp)
+                                except OSError:
+                                    pass
+                            _takportal_setup_ssh()
+                            subprocess.run('docker restart tak-portal', shell=True, capture_output=True, text=True, timeout=30)
+                            _sync_authentik_takportal_provider_url(settings)
+                            print("Post-update: TAK Portal config updated and restarted")
+                        else:
+                            print("Post-update: TAK Portal not running, skipped config update")
+                    except Exception as e:
+                        print(f"Post-update: TAK Portal reconfigure error: {e}")
+
+            def _auto_cloudtak():
+                try:
+                    settings = load_settings()
+                    ct_cfg = _get_cloudtak_deployment_config(settings)
+                    ct_dir = os.path.expanduser('~/CloudTAK')
+                    if ct_cfg.get('target_mode') == 'remote' and ct_cfg.get('deployed'):
+                        remote_cfg = ct_cfg.get('remote', {})
+                        remote_host = (remote_cfg.get('host') or '').strip()
+                        if remote_host:
+                            override_yml = _cloudtak_build_override_yml(settings)
+                            fd, tmp = tempfile.mkstemp(suffix='.yml', prefix='cloudtak-override-')
+                            try:
+                                with os.fdopen(fd, 'w') as f:
+                                    f.write(override_yml)
+                                ok, _ = _scp_to_host(remote_cfg, tmp, '~/CloudTAK/docker-compose.override.yml')
+                                if ok:
+                                    _ssh_probe(remote_cfg, 'cd ~/CloudTAK && docker compose up -d 2>/dev/null', timeout=120)
+                                    print(f"Post-update: CloudTAK override refreshed on remote ({remote_host})")
+                                else:
+                                    print("Post-update: could not SCP CloudTAK override to remote")
+                            finally:
+                                try:
+                                    os.remove(tmp)
+                                except OSError:
+                                    pass
+                    elif os.path.exists(os.path.join(ct_dir, 'docker-compose.yml')) or os.path.exists(os.path.join(ct_dir, 'compose.yaml')):
+                        override_path = os.path.join(ct_dir, 'docker-compose.override.yml')
+                        override_yml = _cloudtak_build_override_yml(settings)
+                        with open(override_path, 'w') as f:
+                            f.write(override_yml)
+                        subprocess.run(f'cd {shlex.quote(ct_dir)} && docker compose up -d 2>/dev/null',
+                            shell=True, capture_output=True, text=True, timeout=120)
+                        print("Post-update: CloudTAK override refreshed (local)")
+                except Exception as e:
+                    print(f"Post-update: CloudTAK override refresh error: {e}")
+
+            parallel_tasks = []
+            for fn in (_auto_authentik, _auto_takportal, _auto_cloudtak):
+                t = threading.Thread(target=fn, daemon=True)
+                t.start()
+                parallel_tasks.append(t)
+            for t in parallel_tasks:
+                t.join(timeout=600)
 
             print("Post-update: auto-deploy complete")
 
