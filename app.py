@@ -27869,8 +27869,11 @@ def _post_update_auto_deploy():
                     except Exception as e:
                         print(f"Post-update: Authentik port hardening error: {e}")
 
+            _auto_authentik_ports()
+            _auto_nodered()
+
             parallel_tasks = []
-            for fn in (_auto_authentik, _auto_takportal, _auto_cloudtak, _auto_nodered, _auto_authentik_ports):
+            for fn in (_auto_authentik, _auto_takportal, _auto_cloudtak):
                 t = threading.Thread(target=fn, daemon=True)
                 t.start()
                 parallel_tasks.append(t)
