@@ -14799,7 +14799,7 @@ def _run_nodered_deploy_remote(settings, deploy_cfg, plog):
     image: nodered/node-red:latest
     container_name: nodered
     ports:
-      - "127.0.0.1:1880:1880"
+      - "1880:1880"
     volumes:
       - node_red_data:/data
       - ./settings.js:/data/settings.js
@@ -19490,8 +19490,8 @@ entries:
     env_file:
       - .env
     ports:
-      - "127.0.0.1:${COMPOSE_PORT_HTTP:-9000}:9000"
-      - "127.0.0.1:${COMPOSE_PORT_HTTPS:-9443}:9443"
+      - "${COMPOSE_PORT_HTTP:-9000}:9000"
+      - "${COMPOSE_PORT_HTTPS:-9443}:9443"
     healthcheck:
       test: ["CMD", "ak", "healthcheck"]
       start_period: 600s
