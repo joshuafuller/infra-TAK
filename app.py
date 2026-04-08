@@ -3178,6 +3178,7 @@ def guarddog_page():
         ]})
     guarddog_services.extend([
         {'id': 'authentik', 'name': 'Authentik', 'monitored': modules.get('authentik', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'id': 'authentik_http', 'interval': '1 min', 'desc': 'Checks Authentik HTTP (9090). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
+        {'id': 'takportal', 'name': 'TAK Portal', 'monitored': modules.get('takportal', {}).get('installed'), 'monitors': [{'name': 'Container', 'id': 'takportal_ctr', 'interval': '1 min', 'desc': 'Checks TAK Portal container is running. Alert and auto-restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'mediamtx', 'name': 'MediaMTX', 'monitored': modules.get('mediamtx', {}).get('installed'), 'monitors': [{'name': 'Service', 'id': 'mediamtx_svc', 'interval': '1 min', 'desc': 'Checks systemd mediamtx. Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'nodered', 'name': 'Node-RED', 'monitored': modules.get('nodered', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'id': 'nodered_http', 'interval': '1 min', 'desc': 'Checks Node-RED HTTP (1880). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'cloudtak', 'name': 'CloudTAK', 'monitored': modules.get('cloudtak', {}).get('installed'), 'monitors': [{'name': 'Container', 'id': 'cloudtak_ctr', 'interval': '1 min', 'desc': 'Checks CloudTAK container. Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
@@ -3185,8 +3186,22 @@ def guarddog_page():
     ])
     guarddog_docs_url = f'https://github.com/{GITHUB_REPO}/blob/main/docs/GUARDDOG.md'
     notifications_configured = bool((settings.get('guarddog_alert_email') or '').strip())
+    # Detect if Guard Dog config is current or needs re-deploy
+    _gd_dep_ver = settings.get('guarddog_deployed_version', '')
+    _gd_dep_email = settings.get('guarddog_deployed_email', '')
+    _gd_dep_nick = settings.get('guarddog_deployed_nickname', '')
+    _gd_cur_email = (settings.get('guarddog_alert_email') or '').strip()
+    _gd_cur_nick = (settings.get('guarddog_server_nickname') or '').strip()
+    gd_needs_update = (
+        gd.get('installed') and (
+            _gd_dep_ver != VERSION or
+            _gd_dep_email != _gd_cur_email or
+            _gd_dep_nick != _gd_cur_nick
+        )
+    )
     return render_template_string(GUARDDOG_TEMPLATE,
         settings=settings, gd=gd, tak=tak, version=VERSION,
+        gd_needs_update=gd_needs_update, gd_deployed_version=_gd_dep_ver,
         guarddog_alert_email=settings.get('guarddog_alert_email', ''),
         guarddog_server_nickname=settings.get('guarddog_server_nickname', ''),
         guarddog_sms=settings.get('guarddog_sms', {}),
@@ -3571,6 +3586,9 @@ def _guarddog_health_check(service_id):
             req = urllib.request.Request(ak_url + '/', method='GET')
             resp = urllib.request.urlopen(req, timeout=8)
             return resp.status in (200, 302, 301)
+        if service_id == 'takportal':
+            r = subprocess.run('docker ps --filter name=tak-portal --format "{{.Status}}"', shell=True, capture_output=True, text=True, timeout=5)
+            return bool(r.stdout and 'Up' in r.stdout)
         if service_id == 'mediamtx':
             settings = load_settings()
             mtx_cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
@@ -3643,6 +3661,7 @@ def _guarddog_service_monitor_ids(settings):
         'remotedb': ['remotedb_tcp', 'remotedb_agent', 'remotedb_auth'],
         'federation_hub': ['fedhub_svc', 'fedhub_port', 'fedhub_mongo', 'fedhub_disk', 'fedhub_cert', 'fedhub_intca'],
         'authentik': ['authentik_http'],
+        'takportal': ['takportal_ctr'],
         'mediamtx': ['mediamtx_svc'],
         'nodered': ['nodered_http'],
         'cloudtak': ['cloudtak_ctr'],
@@ -3666,6 +3685,8 @@ def _guarddog_monitored_service_ids(settings):
         ids.append('federation_hub')
     if modules.get('authentik', {}).get('installed'):
         ids.append('authentik')
+    if modules.get('takportal', {}).get('installed'):
+        ids.append('takportal')
     if modules.get('mediamtx', {}).get('installed'):
         ids.append('mediamtx')
     if modules.get('nodered', {}).get('installed'):
@@ -3977,6 +3998,9 @@ def _monitor_health_check(monitor_id):
             req = urllib.request.Request('http://127.0.0.1:1880/', method='GET')
             resp = urllib.request.urlopen(req, timeout=5)
             return resp.status in (200, 302, 301)
+        if monitor_id == 'takportal_ctr':
+            r = subprocess.run('docker ps --filter name=tak-portal --format "{{.Status}}"', shell=True, capture_output=True, text=True, timeout=5)
+            return bool(r.stdout and 'Up' in r.stdout)
         if monitor_id == 'cloudtak_ctr':
             settings = load_settings()
             cfg = _get_cloudtak_deployment_config(settings)
@@ -4108,7 +4132,7 @@ def _guarddog_timer_list():
             'takcotdbguard.timer', 'taknetguard.timer', 'takprocessguard.timer', 'takcertguard.timer',
             'takintcaguard.timer',
             'takauthentikguard.timer', 'takmediamtxguard.timer', 'taknoderedguard.timer', 'takcloudtakguard.timer',
-            'takfedhubguard.timer']
+            'taktakportalguard.timer', 'takfedhubguard.timer']
 
 def _guarddog_is_enabled():
     """True if Guard Dog timers are enabled (at least the core 8089 timer)."""
@@ -4228,6 +4252,15 @@ def guarddog_update():
                 f.write(f'[Unit]\nDescription=Guard Dog Online DB Repack (pg_repack)\nAfter={_after3}\n\n[Service]\nType=oneshot\nTimeoutStartSec=3600\nExecStart={rp_script}\n')
             with open(rp_tmr_path, 'w') as f:
                 f.write('[Unit]\nDescription=Run online DB repack weekly (Sunday 4am)\n\n[Timer]\nOnCalendar=Sun *-*-* 04:00:00\nPersistent=true\nUnit=takdbrepack.service\n\n[Install]\nWantedBy=timers.target\n')
+        # TAK Portal timer — install if script exists but timer doesn't
+        tp_script = '/opt/tak-guarddog/tak-takportal-watch.sh'
+        tp_svc_path = '/etc/systemd/system/taktakportalguard.service'
+        tp_tmr_path = '/etc/systemd/system/taktakportalguard.timer'
+        if os.path.isfile(tp_script) and not os.path.isfile(tp_tmr_path):
+            with open(tp_svc_path, 'w') as f:
+                f.write(f'[Unit]\nDescription=Guard Dog TAK Portal Monitor\n\n[Service]\nType=oneshot\nExecStart={tp_script}\n')
+            with open(tp_tmr_path, 'w') as f:
+                f.write('[Unit]\nDescription=Run TAK Portal guard every 1 minute\n\n[Timer]\nOnBootSec=15min\nOnUnitActiveSec=1min\nUnit=taktakportalguard.service\n\n[Install]\nWantedBy=timers.target\n')
         subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=10)
         new_timers = ['takupdatesguard.timer']
         if os.path.isfile(av_tmr_path):
@@ -4236,8 +4269,19 @@ def guarddog_update():
             new_timers.append('takcotdbguard.timer')
         if os.path.isfile(rp_tmr_path):
             new_timers.append('takdbrepack.timer')
+        if os.path.isfile(tp_tmr_path):
+            new_timers.append('taktakportalguard.timer')
         for t in new_timers:
             subprocess.run(['systemctl', 'enable', '--now', t], capture_output=True, text=True, timeout=10)
+        # Stamp deployed version + settings so UI knows when re-deploy is needed
+        try:
+            _s = load_settings()
+            _s['guarddog_deployed_version'] = VERSION
+            _s['guarddog_deployed_email'] = (_s.get('guarddog_alert_email') or '').strip()
+            _s['guarddog_deployed_nickname'] = (_s.get('guarddog_server_nickname') or '').strip()
+            save_settings(_s)
+        except Exception:
+            pass
         # Refresh Guard Dog monitor cache so UI flips without waiting for background refresh.
         _guarddog_refresh_page_cache()
         return jsonify({'success': True, 'message': 'Guard Dog scripts updated, timers installed, and reloaded.'})
@@ -4262,7 +4306,7 @@ def guarddog_uninstall():
     services_extra = ['tak8089guard.service', 'takoomguard.service', 'takdiskguard.service', 'takdbguard.service',
                       'takcotdbguard.service', 'taknetguard.service', 'takprocessguard.service', 'takcertguard.service',
                       'takintcaguard.service',
-                      'takauthentikguard.service', 'takmediamtxguard.service', 'taknoderedguard.service', 'takcloudtakguard.service', 'tak-health.service']
+                      'takauthentikguard.service', 'takmediamtxguard.service', 'taknoderedguard.service', 'takcloudtakguard.service', 'taktakportalguard.service', 'tak-health.service']
     for name in timers + services_extra:
         path = os.path.join('/etc/systemd/system', name)
         if os.path.exists(path):
@@ -4608,6 +4652,9 @@ def run_guarddog_deploy(alert_email):
             script_files.append('tak-nodered-watch.sh')
         if os.path.exists(cloudtak_dir) and os.path.exists(os.path.join(cloudtak_dir, 'docker-compose.yml')):
             script_files.append('tak-cloudtak-watch.sh')
+        portal_dir = os.path.expanduser('~/TAK-Portal')
+        if os.path.exists(os.path.join(portal_dir, 'docker-compose.yml')):
+            script_files.append('tak-takportal-watch.sh')
         fh_cfg = _get_fedhub_deployment_config(settings)
         fh_deployed = fh_cfg.get('deployed') and fh_cfg.get('target_mode') == 'remote'
         fh_host = (fh_cfg.get('remote', {}).get('host') or '').strip() if fh_deployed else ''
@@ -4720,6 +4767,11 @@ def run_guarddog_deploy(alert_email):
                 ('takcloudtakguard.service', '[Unit]\nDescription=Guard Dog CloudTAK Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-cloudtak-watch.sh\n'),
                 ('takcloudtakguard.timer', '[Unit]\nDescription=Run CloudTAK guard every 1 minute\n\n[Timer]\nOnBootSec=15min\nOnUnitActiveSec=1min\nUnit=takcloudtakguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ])
+        if 'tak-takportal-watch.sh' in script_files:
+            units.extend([
+                ('taktakportalguard.service', '[Unit]\nDescription=Guard Dog TAK Portal Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-takportal-watch.sh\n'),
+                ('taktakportalguard.timer', '[Unit]\nDescription=Run TAK Portal guard every 1 minute\n\n[Timer]\nOnBootSec=15min\nOnUnitActiveSec=1min\nUnit=taktakportalguard.service\n\n[Install]\nWantedBy=timers.target\n'),
+            ])
         if 'tak-fedhub-watch.sh' in script_files:
             units.extend([
                 ('takfedhubguard.service', '[Unit]\nDescription=Guard Dog Federation Hub Monitor\nAfter=network-online.target\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-fedhub-watch.sh\n'),
@@ -4790,6 +4842,8 @@ def run_guarddog_deploy(alert_email):
             timers.append('taknoderedguard.timer')
         if 'tak-cloudtak-watch.sh' in script_files:
             timers.append('takcloudtakguard.timer')
+        if 'tak-takportal-watch.sh' in script_files:
+            timers.append('taktakportalguard.timer')
         if 'tak-fedhub-watch.sh' in script_files:
             timers.append('takfedhubguard.timer')
         timers.append('takupdatesguard.timer')
@@ -4865,6 +4919,15 @@ def run_guarddog_deploy(alert_email):
             plog("⚠ SSH key not found — skipping Server One health agent deploy")
 
         plog("✓ Deployment complete")
+        # Stamp the deployed version + settings so the UI can detect when re-deploy is needed
+        try:
+            _s = load_settings()
+            _s['guarddog_deployed_version'] = VERSION
+            _s['guarddog_deployed_email'] = (_s.get('guarddog_alert_email') or '').strip()
+            _s['guarddog_deployed_nickname'] = (_s.get('guarddog_server_nickname') or '').strip()
+            save_settings(_s)
+        except Exception:
+            pass
         guarddog_deploy_status.update({'running': False, 'complete': True, 'error': False})
     except Exception as e:
         plog(f"✗ Error: {str(e)}")
@@ -11933,12 +11996,6 @@ MEDIA_PORT_RTSP=18554
 MEDIA_PORT_RTMP=11935
 MEDIA_PORT_HLS=18888
 MEDIA_PORT_SRT=18890
-
-# TAK Server uses self-signed certs; Node.js 22+ / OpenSSL 3.x rejects them
-# during mTLS polling unless we disable strict verification.
-# NOTE: This must also be injected via docker-compose.override.yml environment
-# because docker-compose.yml only passes explicitly listed env vars.
-NODE_TLS_REJECT_UNAUTHORIZED=0
 """
 
 
@@ -11946,8 +12003,7 @@ def _cloudtak_build_override_yml(settings):
     """Build docker-compose.override.yml for CloudTAK deployment.
 
     Adds extra_hosts so the api container can resolve TAK Server FQDN and
-    host.docker.internal, injects NODE_TLS_REJECT_UNAUTHORIZED for mTLS compat,
-    and gives the events container an internal API_URL.
+    host.docker.internal, and gives the events container an internal API_URL.
     """
     import socket as _sock
     extra_hosts = ['host.docker.internal:host-gateway']
@@ -11966,19 +12022,15 @@ services:
   api:
     extra_hosts:
 {hosts_block}
-    environment:
-      NODE_TLS_REJECT_UNAUTHORIZED: "0"
   events:
     extra_hosts:
 {hosts_block}
     environment:
-      NODE_TLS_REJECT_UNAUTHORIZED: "0"
       API_URL: "http://api:5000"
   media:
     extra_hosts:
 {hosts_block}
     environment:
-      NODE_TLS_REJECT_UNAUTHORIZED: "0"
       API_URL: "http://api:5000"
 """
 
@@ -15163,8 +15215,8 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 {{ sidebar_html }}
 <div class="main">
   <div class="page-header"><h1 style="display:flex;align-items:center;gap:10px"><span class="nav-icon" style="font-size:22px;line-height:1">🐕</span><span>Guard Dog</span></h1><p>TAK Server health monitoring and auto-recovery. Runs automatically after TAK Server deploy; configure notifications below.</p></div>
-  {% if gd.running %}<div class="status-banner running" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px"><div style="display:flex;align-items:center;gap:12px"><div class="dot"></div>Guard Dog is running</div><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><button type="button" class="btn btn-ghost" id="gd-update-btn" onclick="gdUpdate()" title="Re-deploy scripts and timers from latest console version">↻ Update Guard Dog</button><button type="button" class="btn btn-ghost" style="border-color:var(--yellow);color:var(--yellow)" onclick="gdSetEnabled(false, this)">Disable</button><button class="btn btn-ghost" style="color:var(--red);border-color:var(--red)" onclick="document.getElementById('gd-uninstall-modal').classList.add('open')">Uninstall</button><span id="gd-update-msg" style="font-size:12px"></span></div></div>
-  {% elif gd.installed %}<div class="status-banner stopped" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px"><div style="display:flex;align-items:center;gap:12px"><div class="dot"></div>Guard Dog is disabled</div><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><button type="button" class="btn btn-ghost" id="gd-update-btn" onclick="gdUpdate()">↻ Update Guard Dog</button><button type="button" class="btn btn-primary" onclick="gdSetEnabled(true, this)">Enable</button><button class="btn btn-ghost" style="color:var(--red);border-color:var(--red)" onclick="document.getElementById('gd-uninstall-modal').classList.add('open')">Uninstall</button><span id="gd-update-msg" style="font-size:12px"></span></div></div>
+  {% if gd.running %}<div class="status-banner running" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px"><div style="display:flex;align-items:center;gap:12px"><div class="dot"></div>Guard Dog is running{% if not gd_needs_update and gd_deployed_version %}<span style="margin-left:8px;font-size:12px;color:var(--green);opacity:0.8">✓ up to date (v{{ gd_deployed_version }})</span>{% elif gd_needs_update %}<span style="margin-left:8px;font-size:12px;color:var(--yellow);opacity:0.9">⚠ settings changed — update needed</span>{% endif %}</div><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">{% if gd_needs_update %}<button type="button" class="btn btn-ghost" id="gd-update-btn" onclick="gdUpdate()" title="Re-deploy scripts and timers with your updated settings" style="border-color:var(--yellow);color:var(--yellow)">↻ Update Guard Dog</button>{% endif %}<button type="button" class="btn btn-ghost" style="border-color:var(--yellow);color:var(--yellow)" onclick="gdSetEnabled(false, this)">Disable</button><button class="btn btn-ghost" style="color:var(--red);border-color:var(--red)" onclick="document.getElementById('gd-uninstall-modal').classList.add('open')">Uninstall</button><span id="gd-update-msg" style="font-size:12px"></span></div></div>
+  {% elif gd.installed %}<div class="status-banner stopped" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px"><div style="display:flex;align-items:center;gap:12px"><div class="dot"></div>Guard Dog is disabled{% if gd_needs_update %}<span style="margin-left:8px;font-size:12px;color:var(--yellow);opacity:0.9">⚠ settings changed</span>{% endif %}</div><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">{% if gd_needs_update %}<button type="button" class="btn btn-ghost" id="gd-update-btn" onclick="gdUpdate()" style="border-color:var(--yellow);color:var(--yellow)">↻ Update Guard Dog</button>{% endif %}<button type="button" class="btn btn-primary" onclick="gdSetEnabled(true, this)">Enable</button><button class="btn btn-ghost" style="color:var(--red);border-color:var(--red)" onclick="document.getElementById('gd-uninstall-modal').classList.add('open')">Uninstall</button><span id="gd-update-msg" style="font-size:12px"></span></div></div>
   {% else %}<div class="status-banner not-installed"><div class="dot"></div>Guard Dog is not installed (it will install automatically when you deploy TAK Server)</div>{% endif %}
 
   <div class="card">
@@ -27690,6 +27742,42 @@ def _post_update_auto_deploy():
                         print("Post-update: TAK Portal not running, skipped config update")
                 except Exception as e:
                     print(f"Post-update: TAK Portal reconfigure error: {e}")
+
+            # Refresh CloudTAK override (removes stale env vars, updates extra_hosts)
+            try:
+                settings = load_settings()
+                ct_cfg = _get_cloudtak_deployment_config(settings)
+                ct_dir = os.path.expanduser('~/CloudTAK')
+                if ct_cfg.get('target_mode') == 'remote' and ct_cfg.get('deployed'):
+                    remote_cfg = ct_cfg.get('remote', {})
+                    remote_host = (remote_cfg.get('host') or '').strip()
+                    if remote_host:
+                        override_yml = _cloudtak_build_override_yml(settings)
+                        fd, tmp = tempfile.mkstemp(suffix='.yml', prefix='cloudtak-override-')
+                        try:
+                            with os.fdopen(fd, 'w') as f:
+                                f.write(override_yml)
+                            ok, _ = _scp_to_host(remote_cfg, tmp, '~/CloudTAK/docker-compose.override.yml')
+                            if ok:
+                                _ssh_probe(remote_cfg, 'cd ~/CloudTAK && docker compose up -d 2>/dev/null', timeout=120)
+                                print(f"Post-update: CloudTAK override refreshed on remote ({remote_host})")
+                            else:
+                                print("Post-update: could not SCP CloudTAK override to remote")
+                        finally:
+                            try:
+                                os.remove(tmp)
+                            except OSError:
+                                pass
+                elif os.path.exists(os.path.join(ct_dir, 'docker-compose.yml')) or os.path.exists(os.path.join(ct_dir, 'compose.yaml')):
+                    override_path = os.path.join(ct_dir, 'docker-compose.override.yml')
+                    override_yml = _cloudtak_build_override_yml(settings)
+                    with open(override_path, 'w') as f:
+                        f.write(override_yml)
+                    subprocess.run(f'cd {shlex.quote(ct_dir)} && docker compose up -d 2>/dev/null',
+                        shell=True, capture_output=True, text=True, timeout=120)
+                    print("Post-update: CloudTAK override refreshed (local)")
+            except Exception as e:
+                print(f"Post-update: CloudTAK override refresh error: {e}")
 
             print("Post-update: auto-deploy complete")
 
