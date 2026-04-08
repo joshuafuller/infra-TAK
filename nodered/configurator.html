@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ArcGIS → TAK Configurator</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: #1a1a2e; color: #e0e0e0; padding: 2rem;
+  }
+  .container { max-width: 860px; margin: 0 auto; }
+  h1 { color: #fff; margin-bottom: 0.3rem; font-size: 1.5rem; }
+  .subtitle { color: #888; margin-bottom: 1.5rem; font-size: 0.85rem; }
+
+  .step {
+    background: #16213e; border-radius: 8px; padding: 1.5rem;
+    margin-bottom: 1rem; border-left: 3px solid #0f3460;
+    transition: opacity 0.3s;
+  }
+  .step h2 {
+    color: #e94560; font-size: 0.85rem; margin-bottom: 1rem;
+    text-transform: uppercase; letter-spacing: 0.05em;
+  }
+  .step.disabled { opacity: 0.35; pointer-events: none; }
+
+  label { display: block; font-size: 0.85rem; color: #a0a0b0; margin-bottom: 0.3rem; }
+  input[type="text"], input[type="number"], select {
+    width: 100%; padding: 0.6rem; background: #0f3460;
+    border: 1px solid #1a1a4e; border-radius: 4px;
+    color: #fff; font-size: 0.95rem;
+  }
+  input:focus, select:focus { outline: none; border-color: #e94560; }
+
+  button {
+    padding: 0.6rem 1.5rem; background: #e94560; color: #fff;
+    border: none; border-radius: 4px; cursor: pointer; font-size: 0.95rem;
+    transition: background 0.2s;
+  }
+  button:hover { background: #c73650; }
+  button:disabled { background: #555; cursor: not-allowed; }
+  .btn-secondary { background: #0f3460; }
+  .btn-secondary:hover { background: #1a4a7a; }
+
+  .row { display: flex; gap: 1rem; align-items: end; }
+  .grow { flex: 1; }
+  .field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+
+  .sample-wrap { overflow-x: auto; margin-top: 1rem; }
+  .sample-table {
+    border-collapse: collapse; font-size: 0.78rem; white-space: nowrap;
+  }
+  .sample-table th, .sample-table td {
+    padding: 0.35rem 0.6rem; border: 1px solid #1a1a4e; text-align: left;
+  }
+  .sample-table th { background: #0f3460; position: sticky; top: 0; }
+  .sample-table tr:hover td { background: #1a2a4e; }
+  .sample-table .hi { background: #e9456022; }
+
+  .config-output {
+    background: #0a0a1a; padding: 1rem; border-radius: 4px;
+    font-family: 'SF Mono', Menlo, monospace; font-size: 0.85rem;
+    white-space: pre-wrap; max-height: 400px; overflow-y: auto;
+    margin-top: 1rem; border: 1px solid #1a1a4e;
+  }
+
+  .badge {
+    display: inline-block; padding: 0.1rem 0.45rem; border-radius: 3px;
+    font-size: 0.7rem; margin-left: 0.4rem; vertical-align: middle;
+  }
+  .badge-oid  { background: #e94560; color: #fff; }
+  .badge-date { background: #0f9b58; color: #fff; }
+  .badge-geom { background: #4285f4; color: #fff; }
+
+  .status {
+    padding: 0.5rem; border-radius: 4px; margin-top: 0.5rem; font-size: 0.85rem;
+  }
+  .status.ok    { background: #0f9b5822; border: 1px solid #0f9b58; color: #7fdb9a; }
+  .status.error { background: #e9456022; border: 1px solid #e94560; color: #f4a0b0; }
+
+  .color-row { display: flex; gap: 0.5rem; align-items: center; }
+  .color-swatch {
+    width: 28px; height: 28px; border-radius: 4px;
+    border: 1px solid #333; flex-shrink: 0;
+  }
+
+  .spinner {
+    display: inline-block; width: 14px; height: 14px;
+    border: 2px solid #fff3; border-top-color: #fff;
+    border-radius: 50%; animation: spin 0.6s linear infinite;
+    margin-left: 0.5rem; vertical-align: middle;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>ArcGIS &rarr; TAK Configurator</h1>
+  <p class="subtitle">Paste a Feature Service URL, pick your layer &amp; fields, generate config for the sync engine.</p>
+
+  <!-- Step 1 -->
+  <div class="step" id="step1">
+    <h2>1. Feature Service URL</h2>
+    <div class="row">
+      <div class="grow">
+        <label for="serviceUrl">ArcGIS Feature Service or Layer URL</label>
+        <input type="text" id="serviceUrl"
+               placeholder="https://services.arcgis.com/…/FeatureServer">
+      </div>
+      <button id="btnFetch" onclick="fetchService()">Fetch</button>
+    </div>
+    <div id="svcStatus"></div>
+  </div>
+
+  <!-- Step 2 -->
+  <div class="step disabled" id="step2">
+    <h2>2. Select Layer</h2>
+    <label for="layerSelect">Layer</label>
+    <select id="layerSelect" onchange="fetchLayer()">
+      <option value="">-- fetch service first --</option>
+    </select>
+    <div id="layerStatus"></div>
+  </div>
+
+  <!-- Step 3 -->
+  <div class="step disabled" id="step3">
+    <h2>3. Field Mapping</h2>
+    <div class="field-grid">
+      <div>
+        <label for="idField">Stable ID field <span class="badge badge-oid">suggested: OID / GlobalID</span></label>
+        <select id="idField"></select>
+      </div>
+      <div>
+        <label for="timeField">Time field <span class="badge badge-date">suggested: Date type</span></label>
+        <select id="timeField"><option value="">(none)</option></select>
+      </div>
+    </div>
+    <div style="margin-top:1rem">
+      <label>Detected geometry <span class="badge badge-geom" id="geomBadge"></span></label>
+    </div>
+    <div id="sampleData"></div>
+  </div>
+
+  <!-- Step 4 -->
+  <div class="step disabled" id="step4">
+    <h2>4. CoT Style &amp; TTL</h2>
+    <div class="field-grid">
+      <div>
+        <label for="strokeColor">Stroke color (hex)</label>
+        <div class="color-row">
+          <input type="text" id="strokeColor" value="#FF0000" style="width:130px"
+                 oninput="updSwatch('swStroke',this.value)">
+          <div class="color-swatch" id="swStroke" style="background:#FF0000"></div>
+        </div>
+      </div>
+      <div>
+        <label for="fillColor">Fill color (hex + alpha ok)</label>
+        <div class="color-row">
+          <input type="text" id="fillColor" value="#FF000044" style="width:130px"
+                 oninput="updSwatch('swFill',this.value)">
+          <div class="color-swatch" id="swFill" style="background:#FF000044"></div>
+        </div>
+      </div>
+      <div>
+        <label for="ttlHours">TTL hours (0 = no expiry)</label>
+        <input type="number" id="ttlHours" value="72" min="0">
+      </div>
+      <div>
+        <label for="uidPrefix">UID prefix</label>
+        <input type="text" id="uidPrefix" value="arcgis-" placeholder="arcgis-">
+      </div>
+    </div>
+  </div>
+
+  <!-- Step 5 -->
+  <div class="step disabled" id="step5">
+    <h2>5. Generate Config</h2>
+    <div class="row">
+      <button onclick="generateConfig()">Generate Config JSON</button>
+      <button class="btn-secondary" onclick="copyConfig()">Copy to Clipboard</button>
+      <button class="btn-secondary" onclick="downloadConfig()">Download</button>
+    </div>
+    <div id="saveStatus"></div>
+    <div class="config-output" id="configOutput"></div>
+  </div>
+</div>
+
+<script>
+const state = {
+  serviceUrl: '',
+  layers: [],
+  selectedLayer: null,
+  layerName: '',
+  fields: [],
+  geometryType: '',
+  sampleFeatures: []
+};
+
+function updSwatch(id, v) {
+  document.getElementById(id).style.background = v;
+}
+
+function enable(n) {
+  document.getElementById('step' + n).classList.remove('disabled');
+}
+
+function status(id, msg, ok) {
+  document.getElementById(id).innerHTML =
+    '<div class="status ' + (ok ? 'ok' : 'error') + '">' + msg + '</div>';
+}
+
+function setLoading(btnId, loading) {
+  const btn = document.getElementById(btnId);
+  if (loading) {
+    btn.disabled = true;
+    btn._orig = btn.innerHTML;
+    btn.innerHTML += '<span class="spinner"></span>';
+  } else {
+    btn.disabled = false;
+    btn.innerHTML = btn._orig || btn.innerHTML.replace(/<span.*<\/span>/, '');
+  }
+}
+
+/* ── Step 1: Fetch service ── */
+async function fetchService() {
+  const raw = document.getElementById('serviceUrl').value.trim();
+  if (!raw) return;
+  state.serviceUrl = raw.replace(/\/+$/, '');
+  setLoading('btnFetch', true);
+
+  try {
+    const res = await fetch('/api/arcgis/service', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: state.serviceUrl })
+    });
+    const data = await res.json();
+    if (data.error) { status('svcStatus', 'Error: ' + data.error, false); return; }
+
+    state.layers = data.layers || [];
+    const sel = document.getElementById('layerSelect');
+    sel.innerHTML = '<option value="">-- select a layer --</option>';
+    state.layers.forEach(function(l) {
+      var gt = l.geometryType ? l.geometryType.replace('esriGeometry', '') : 'Table';
+      sel.innerHTML += '<option value="' + l.id + '">' + l.id + ': ' + l.name + ' (' + gt + ')</option>';
+    });
+
+    status('svcStatus', 'Found ' + state.layers.length + ' layer(s)', true);
+    enable(2);
+  } catch (e) {
+    status('svcStatus', 'Fetch failed: ' + e.message, false);
+  } finally {
+    setLoading('btnFetch', false);
+  }
+}
+
+/* ── Step 2: Fetch layer detail + sample ── */
+async function fetchLayer() {
+  var layerId = document.getElementById('layerSelect').value;
+  if (layerId === '') return;
+  state.selectedLayer = layerId;
+
+  try {
+    var results = await Promise.all([
+      fetch('/api/arcgis/layer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: state.serviceUrl, layerId: layerId })
+      }),
+      fetch('/api/arcgis/sample', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: state.serviceUrl, layerId: layerId })
+      })
+    ]);
+
+    var layerData  = await results[0].json();
+    var sampleData = await results[1].json();
+    if (layerData.error) { status('layerStatus', 'Error: ' + layerData.error, false); return; }
+
+    state.fields         = layerData.fields || [];
+    state.geometryType   = layerData.geometryType || 'unknown';
+    state.layerName      = layerData.name || '';
+    state.sampleFeatures = (sampleData.features || []).slice(0, 5);
+
+    /* populate field dropdowns */
+    var idSel   = document.getElementById('idField');
+    var timeSel = document.getElementById('timeField');
+    idSel.innerHTML   = '';
+    timeSel.innerHTML  = '<option value="">(none &mdash; no time filter)</option>';
+
+    state.fields.forEach(function(f) {
+      var short = f.type.replace('esriFieldType', '');
+      var isId   = (f.type === 'esriFieldTypeOID' || f.type === 'esriFieldTypeGlobalID');
+      var isDate = (f.type === 'esriFieldTypeDate');
+      var tag    = isId ? ' << ID' : isDate ? ' << Date' : '';
+
+      idSel.innerHTML += '<option value="' + f.name + '"' + (isId ? ' selected' : '') + '>'
+                         + f.name + ' (' + short + ')' + tag + '</option>';
+      timeSel.innerHTML += '<option value="' + f.name + '"' + (isDate ? ' selected' : '') + '>'
+                           + f.name + ' (' + short + ')' + (isDate ? ' << Date' : '') + '</option>';
+    });
+
+    document.getElementById('geomBadge').textContent =
+      state.geometryType.replace('esriGeometry', '');
+
+    /* sample data table */
+    if (state.sampleFeatures.length) {
+      var keys = Object.keys(state.sampleFeatures[0].attributes);
+      var html = '<div class="sample-wrap"><table class="sample-table"><tr>';
+      keys.forEach(function(k) { html += '<th>' + k + '</th>'; });
+      html += '</tr>';
+      state.sampleFeatures.forEach(function(f) {
+        html += '<tr>';
+        keys.forEach(function(k) {
+          var v = f.attributes[k];
+          if (v != null && String(v).length > 50) v = String(v).substring(0, 50) + '\u2026';
+          html += '<td>' + (v != null ? v : '') + '</td>';
+        });
+        html += '</tr>';
+      });
+      html += '</table></div>';
+      document.getElementById('sampleData').innerHTML =
+        '<label style="margin-top:1rem;display:block">Sample features (first 5)</label>' + html;
+    }
+
+    /* auto-set UID prefix from layer name */
+    var match = state.layers.find(function(l) { return String(l.id) === String(layerId); });
+    if (match) {
+      document.getElementById('uidPrefix').value =
+        match.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') + '-';
+    }
+
+    status('layerStatus',
+      state.fields.length + ' fields, geometry: ' + state.geometryType.replace('esriGeometry', ''), true);
+    enable(3); enable(4); enable(5);
+  } catch (e) {
+    status('layerStatus', 'Fetch failed: ' + e.message, false);
+  }
+}
+
+/* ── Step 5: Generate config ── */
+function generateConfig() {
+  var config = {
+    source: {
+      serviceUrl: state.serviceUrl,
+      layerId: parseInt(state.selectedLayer, 10),
+      layerName: state.layerName,
+      geometryType: state.geometryType
+    },
+    mapping: {
+      idField: document.getElementById('idField').value,
+      timeField: document.getElementById('timeField').value || null
+    },
+    style: {
+      strokeColor: document.getElementById('strokeColor').value,
+      fillColor: document.getElementById('fillColor').value
+    },
+    ttlHours: parseInt(document.getElementById('ttlHours').value, 10) || 0,
+    uidPrefix: document.getElementById('uidPrefix').value,
+    generated: new Date().toISOString()
+  };
+
+  document.getElementById('configOutput').textContent = JSON.stringify(config, null, 2);
+
+  fetch('/api/config/save', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(config)
+  }).then(function(r) { return r.json(); })
+    .then(function(d) {
+      status('saveStatus', 'Saved to Node-RED flow context (' + d.configCount + ' config(s) stored)', true);
+    })
+    .catch(function() {});
+}
+
+function copyConfig() {
+  var t = document.getElementById('configOutput').textContent;
+  if (t) navigator.clipboard.writeText(t).then(function() {
+    status('saveStatus', 'Copied to clipboard', true);
+  });
+}
+
+function downloadConfig() {
+  var t = document.getElementById('configOutput').textContent;
+  if (!t) return;
+  var blob = new Blob([t], { type: 'application/json' });
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'arcgis-tak-config.json';
+  a.click();
+}
+</script>
+</body>
+</html>
