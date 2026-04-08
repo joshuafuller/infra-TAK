@@ -302,11 +302,17 @@ Each page has buttons that do specific things. Here's what they do and when to u
 
 ### v0.4.7-alpha — 2026-04-08
 
-**Auto-deploy Guard Dog + Authentik + TAK Portal on update** — no more manual button presses after console updates. Guard Dog scripts, Authentik config, and TAK Portal settings are automatically re-deployed when a version change is detected on startup.
+**Auto-deploy on update** — Guard Dog, Authentik, TAK Portal, and CloudTAK configs are all automatically re-deployed when a version change is detected. No manual button presses after console updates.
 
 **Online database repack (pg_repack)** — new weekly Guard Dog script reclaims actual disk space from the CoT database without downtime. Runs Sunday 4 AM, auto-installs pg_repack, works in both local and two-server mode.
 
-**Remote DB monitor fix** — TCP+SSH monitor now correctly shows red when Server One is unreachable (was falsely showing green due to exception handling bug).
+**TAK Portal Guard Dog monitor** — new container health monitor with alert + auto-restart after 3 failures. Previously TAK Portal had no monitoring — if it crashed, nobody knew.
+
+**Smart Guard Dog UI** — shows "✓ up to date" when config is current; "Update Guard Dog" button only appears when settings have changed.
+
+**CloudTAK security fix** — removed `NODE_TLS_REJECT_UNAUTHORIZED=0` from CloudTAK config (flagged by CloudTAK dev as security flaw). Applied automatically on upgrade.
+
+**Remote DB monitor fix** — TCP+SSH monitor now correctly shows red when Server One is unreachable (was falsely showing green).
 
 **Guard Dog config drift prevention** — `guarddog.conf` auto-syncs with settings.json on every console startup, preventing stale remote DB IPs after migration.
 
