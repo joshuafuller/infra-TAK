@@ -27832,10 +27832,48 @@ def _post_update_auto_deploy():
                             print("Post-update: Node-RED port hardened and restarted")
                         else:
                             print("Post-update: Node-RED port binding already secure")
+                        _nodered_malware_scan()
                     except Exception as e:
                         print(f"Post-update: Node-RED port hardening error: {e}")
                     finally:
                         _auto_deploy_active.pop('nodered', None)
+
+            def _nodered_malware_scan():
+                try:
+                    r = subprocess.run('docker ps -q --filter name=nodered', shell=True,
+                        capture_output=True, text=True, timeout=5)
+                    if not (r.stdout or '').strip():
+                        return
+                    malware_paths = [
+                        '/usr/src/node-red/.local/share/javac',
+                        '/usr/src/node-red/.local/share/java',
+                        '/usr/src/node-red/.local/share/.cache',
+                    ]
+                    found = []
+                    for path in malware_paths:
+                        chk = subprocess.run(f'docker exec nodered test -f {shlex.quote(path)}',
+                            shell=True, capture_output=True, timeout=5)
+                        if chk.returncode == 0:
+                            found.append(path)
+                    susp = subprocess.run(
+                        'docker exec nodered find /usr/src/node-red/.local/share -type f -executable 2>/dev/null',
+                        shell=True, capture_output=True, text=True, timeout=10)
+                    for line in (susp.stdout or '').strip().splitlines():
+                        p = line.strip()
+                        if p and p not in found:
+                            found.append(p)
+                    if found:
+                        print(f"Post-update: ⚠ Node-RED malware detected — removing {len(found)} suspicious file(s)")
+                        for f in found:
+                            subprocess.run(f'docker exec nodered rm -f {shlex.quote(f)}',
+                                shell=True, capture_output=True, timeout=5)
+                            print(f"Post-update:   removed {f}")
+                        subprocess.run('docker restart nodered', shell=True, capture_output=True, timeout=60)
+                        print("Post-update: Node-RED restarted after malware cleanup")
+                    else:
+                        print("Post-update: Node-RED malware scan clean")
+                except Exception as e:
+                    print(f"Post-update: Node-RED malware scan error: {e}")
 
             def _auto_authentik_ports():
                 ak_dir = os.path.expanduser('~/authentik')
