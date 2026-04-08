@@ -1,10 +1,10 @@
 # infra-TAK
 
-Tea Awarness Kit Infrastructure Management Platform.
+Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Latest release: v0.4.6-alpha** — **Staggered boot sequencer** (cold reboot → full stack healthy in ~2 min), **Authentik deployment resilience** (TLS cert gate, LDAP port gate, improved bind verification), Guard Dog **boot-loop prevention**, **certificate password fix** (custom passwords now applied everywhere — JKS files and all CoreConfig.xml entries), **TAK Portal SSH auto-config** (zero-touch SSH from container to host on deploy), **VPS disk I/O check** in installer. After upgrading: **Guard Dog → ↻ Update Guard Dog**, then **Authentik → Update Config & Reconnect**, then **TAK Portal → Update Config** (enables SSH). See [docs/RELEASE-v0.4.6-alpha.md](docs/RELEASE-v0.4.6-alpha.md). Prior: [v0.4.5-alpha](docs/RELEASE-v0.4.5-alpha.md), [v0.4.4-alpha](docs/RELEASE-v0.4.4-alpha.md), [v0.4.3-alpha](docs/RELEASE-v0.4.3-alpha.md), [v0.4.2-alpha](docs/RELEASE-v0.4.2-alpha.md).
+**Latest release: v0.4.7-alpha** — **Auto-deploy on update** (Guard Dog, Authentik, TAK Portal, CloudTAK configs all re-deployed automatically — no manual button presses), **online database repack** (pg_repack, weekly, no downtime), **TAK Portal Guard Dog monitor**, **smart Guard Dog UI** (shows up-to-date status), **CloudTAK security fix** (removed `NODE_TLS_REJECT_UNAUTHORIZED=0`), **boot sequencer fix** for two-server setups (instant remote DB check instead of 2-min hang), zero-disruption auto-deploy (other services stay up while configs update). After upgrading: everything is automatic. See [docs/RELEASE-v0.4.7-alpha.md](docs/RELEASE-v0.4.7-alpha.md). Prior: [v0.4.6-alpha](docs/RELEASE-v0.4.6-alpha.md), [v0.4.5-alpha](docs/RELEASE-v0.4.5-alpha.md), [v0.4.4-alpha](docs/RELEASE-v0.4.4-alpha.md), [v0.4.3-alpha](docs/RELEASE-v0.4.3-alpha.md), [v0.4.2-alpha](docs/RELEASE-v0.4.2-alpha.md).
 
 **Something broken?** Wrong sidebar version, **Update Now** error, merge/rebase/tag-clobber messages, or you are not sure the VPS ever pulled the real repo → go to **[Universal recovery (SSH)](#universal-recovery-ssh)** and run the one block there. **Point people at that section**; it is the single source of truth.
 
@@ -28,7 +28,7 @@ grep '^VERSION' app.py
 sudo systemctl restart takwerx-console
 ```
 
-**Check:** The **`grep`** line should show **`VERSION = "…"`** matching the current **Latest release** at the top (without the **`v`**, e.g. **`0.4.6-alpha`**). If it still shows an old number, you are in the wrong directory (compare with **`grep WorkingDirectory /etc/systemd/system/takwerx-console.service`**) or the fetch failed (network).
+**Check:** The **`grep`** line should show **`VERSION = "…"`** matching the current **Latest release** at the top (without the **`v`**, e.g. **`0.4.7-alpha`**). If it still shows an old number, you are in the wrong directory (compare with **`grep WorkingDirectory /etc/systemd/system/takwerx-console.service`**) or the fetch failed (network).
 
 **Fix `origin` once (recommended):** so future **`git fetch origin`** hits upstream:
 
@@ -83,7 +83,7 @@ Then open your browser to the URL shown and log in.
 
 **Updating:** After `git pull` or **Update Now**, restart the console with `sudo systemctl restart takwerx-console`. Your password and config live in the install directory's `.config/`. If you run `start.sh` from a different clone or path, the service keeps using the original install directory so your password continues to work.
 
-**Guard Dog — always after a console upgrade:** If **Guard Dog** is installed, open **Guard Dog** and click **↻ Update Guard Dog** every time you upgrade infra-TAK. That **rewrites the watch scripts** under `/opt/tak-guarddog/` from the current repo (certificate monitor, 8089/process/DB/disk/network, optional service monitors, updates check, etc.). Without this, the console is new but **on-disk scripts can stay old**, so fixes and behavior won’t match the release. Also ensures alert and “updates available” emails use your **Email Relay** (v0.2.7-alpha+). Set **Notifications** → alert email and use **Send test email** to verify. Details: [docs/GUARDDOG.md](docs/GUARDDOG.md).
+**Guard Dog — automatic since v0.4.7-alpha:** Guard Dog scripts are automatically re-deployed when the console detects a version change. No manual button press needed after upgrading. The button still exists as a fallback if you change alert email or server nickname. Set **Notifications** → alert email and use **Send test email** to verify. Details: [docs/GUARDDOG.md](docs/GUARDDOG.md).
 
 **Testing Update Now before you ship a release:** Maintainers should follow [docs/TESTING-UPDATES.md](docs/TESTING-UPDATES.md) on a test VPS (fake low `VERSION`, click **Update Now**, then restore). Pushing a Git **tag** is what shows customers “Update Available”; test the button before pushing the tag.
 
@@ -300,6 +300,24 @@ Each page has buttons that do specific things. Here's what they do and when to u
 
 ## Changelog
 
+### v0.4.7-alpha — 2026-04-08
+
+**Auto-deploy on update** — Guard Dog, Authentik, TAK Portal, and CloudTAK configs are all automatically re-deployed when a version change is detected. No manual button presses after console updates. Authentik, TAK Portal, and CloudTAK run in parallel. Console cards show "Updating config..." while each service reconfigures. TAK Server and other services stay running throughout.
+
+**Online database repack (pg_repack)** — new weekly Guard Dog script reclaims actual disk space from the CoT database without downtime. Runs Sunday 4 AM, auto-installs pg_repack, works in both local and two-server mode.
+
+**Boot sequencer — two-server fix** — `tak-boot-sequencer.sh` no longer hangs for 2 minutes on two-server setups trying to reach a local PostgreSQL that doesn't exist. Detects remote DB from `guarddog.conf` or `CoreConfig.xml` and checks via TCP, completing instantly.
+
+**TAK Portal Guard Dog monitor** — new container health monitor with alert + auto-restart after 3 failures. Previously TAK Portal had no monitoring — if it crashed, nobody knew.
+
+**Smart Guard Dog UI** — shows "up to date" when config is current; "Update Guard Dog" button only appears when settings have changed.
+
+**CloudTAK security fix** — removed `NODE_TLS_REJECT_UNAUTHORIZED=0` from CloudTAK `.env` and `docker-compose.override.yml` (flagged by CloudTAK developer as security flaw). Applied automatically on upgrade.
+
+**Remote DB monitor fix** — TCP+SSH monitor now correctly shows red when Server One is unreachable (was falsely showing green).
+
+**Guard Dog config drift prevention** — `guarddog.conf` auto-syncs with settings.json on every console startup, preventing stale remote DB IPs after migration.
+
 ### v0.4.6-alpha — 2026-04-07
 
 **Staggered boot sequencer — cold reboot to full stack healthy in ~2 minutes**
@@ -330,7 +348,7 @@ Each page has buttons that do specific things. Here's what they do and when to u
 **VPS disk I/O check in installer**
 - `start.sh` now runs a 256 MB write test on first boot and prints a colored speed assessment (excellent / acceptable / slow) with guidance if performance is poor.
 
-**After upgrading:** Guard Dog → ↻ Update Guard Dog, then Authentik → Update Config & Reconnect, then TAK Portal → Update Config (enables SSH).
+**After upgrading to v0.4.6:** Guard Dog → ↻ Update Guard Dog, then Authentik → Update Config & Reconnect, then TAK Portal → Update Config (enables SSH). Note: v0.4.7-alpha makes all of this automatic.
 
 Full notes: [docs/RELEASE-v0.4.6-alpha.md](docs/RELEASE-v0.4.6-alpha.md).
 

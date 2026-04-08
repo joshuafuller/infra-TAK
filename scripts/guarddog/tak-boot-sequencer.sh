@@ -53,17 +53,45 @@ if systemctl list-unit-files mediamtx.service &>/dev/null && systemctl is-active
 fi
 
 # ── 2. Wait for PostgreSQL ──
-_log "Waiting for PostgreSQL..."
-_t=0
-while [ $_t -lt $MAX_WAIT ]; do
-  if sudo -u postgres psql -c "SELECT 1" &>/dev/null; then
-    _log "PostgreSQL ready (${_t}s)"
-    break
+_REMOTE_DB=""
+if id -u postgres &>/dev/null; then
+  # Local PostgreSQL — use psql directly
+  _log "Waiting for local PostgreSQL..."
+  _t=0
+  while [ $_t -lt $MAX_WAIT ]; do
+    if sudo -u postgres psql -c "SELECT 1" &>/dev/null; then
+      _log "PostgreSQL ready (${_t}s)"
+      break
+    fi
+    sleep $INTERVAL
+    _t=$((_t + INTERVAL))
+  done
+  [ $_t -ge $MAX_WAIT ] && _log "PostgreSQL not ready after ${MAX_WAIT}s, proceeding anyway"
+else
+  # No local postgres user — two-server setup, check remote DB via TCP
+  if [ -f /opt/tak-guarddog/guarddog.conf ]; then
+    _REMOTE_DB=$(grep '^REMOTE_DB_HOST=' /opt/tak-guarddog/guarddog.conf 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'")
   fi
-  sleep $INTERVAL
-  _t=$((_t + INTERVAL))
-done
-[ $_t -ge $MAX_WAIT ] && _log "PostgreSQL not ready after ${MAX_WAIT}s, proceeding anyway"
+  if [ -z "$_REMOTE_DB" ] && [ -f /opt/tak/CoreConfig.xml ]; then
+    _REMOTE_DB=$(grep -oP 'jdbc:postgresql://\K[^:/"]+' /opt/tak/CoreConfig.xml 2>/dev/null | head -1)
+    [ "$_REMOTE_DB" = "127.0.0.1" ] || [ "$_REMOTE_DB" = "localhost" ] && _REMOTE_DB=""
+  fi
+  if [ -n "$_REMOTE_DB" ]; then
+    _log "Waiting for remote PostgreSQL ($_REMOTE_DB:5432)..."
+    _t=0
+    while [ $_t -lt $MAX_WAIT ]; do
+      if nc -z "$_REMOTE_DB" 5432 2>/dev/null; then
+        _log "Remote PostgreSQL ($_REMOTE_DB) ready (${_t}s)"
+        break
+      fi
+      sleep $INTERVAL
+      _t=$((_t + INTERVAL))
+    done
+    [ $_t -ge $MAX_WAIT ] && _log "Remote PostgreSQL not ready after ${MAX_WAIT}s, proceeding anyway"
+  else
+    _log "No local PostgreSQL and no remote DB configured — skipping wait"
+  fi
+fi
 
 _log "Pre-start complete — TAK Server may start with full CPU"
 exit 0
