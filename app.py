@@ -27852,13 +27852,23 @@ def _post_update_auto_deploy():
                             if old in content and new not in content:
                                 content = content.replace(old, new)
                                 patched = True
-                        for old_pat in ['"${COMPOSE_PORT_HTTP:-9000}:9000"', '"9000:9000"']:
+                        for old_pat, new_pat in [
+                            ('${COMPOSE_PORT_HTTP:-9000}:9000', '127.0.0.1:${COMPOSE_PORT_HTTP:-9000}:9000'),
+                            ('"${COMPOSE_PORT_HTTP:-9000}:9000"', '"127.0.0.1:${COMPOSE_PORT_HTTP:-9000}:9000"'),
+                            ('"9000:9000"', '"127.0.0.1:9000:9000"'),
+                            ('- 9000:9000', '- 127.0.0.1:9000:9000'),
+                        ]:
                             if old_pat in content and '127.0.0.1' not in content.split(old_pat)[0].split('\n')[-1]:
-                                content = content.replace(old_pat, f'"127.0.0.1:${{COMPOSE_PORT_HTTP:-9000}}:9000"')
+                                content = content.replace(old_pat, new_pat)
                                 patched = True
-                        for old_pat in ['"${COMPOSE_PORT_HTTPS:-9443}:9443"', '"9443:9443"']:
+                        for old_pat, new_pat in [
+                            ('${COMPOSE_PORT_HTTPS:-9443}:9443', '127.0.0.1:${COMPOSE_PORT_HTTPS:-9443}:9443'),
+                            ('"${COMPOSE_PORT_HTTPS:-9443}:9443"', '"127.0.0.1:${COMPOSE_PORT_HTTPS:-9443}:9443"'),
+                            ('"9443:9443"', '"127.0.0.1:9443:9443"'),
+                            ('- 9443:9443', '- 127.0.0.1:9443:9443'),
+                        ]:
                             if old_pat in content and '127.0.0.1' not in content.split(old_pat)[0].split('\n')[-1]:
-                                content = content.replace(old_pat, f'"127.0.0.1:${{COMPOSE_PORT_HTTPS:-9443}}:9443"')
+                                content = content.replace(old_pat, new_pat)
                                 patched = True
                         if patched:
                             print("Post-update: hardening Authentik port bindings to 127.0.0.1")
