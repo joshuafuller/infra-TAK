@@ -24369,22 +24369,16 @@ def takserver_create_client_cert():
 
 
 def _sync_webadmin_after_authentik_reconfigure(plog):
-    """After Authentik reconfigure, update Caddy + 8446 cert (NO TAK Server restart). No-op if TAK Server not installed."""
+    """After Authentik reconfigure, regenerate Caddyfile and reload Caddy. Does NOT touch TAK Server or 8446 cert."""
     modules = detect_modules()
     if not modules.get('takserver', {}).get('installed'):
         return
     try:
-        plog("  Syncing WebAdmin (Caddy + 8446 cert, no restart)...")
+        plog("  Syncing WebAdmin (Caddy reload only, no TAK restart)...")
         settings = load_settings()
-        fqdn = settings.get('fqdn', '').strip()
         generate_caddyfile(settings)
         subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
-        takserver_host = _get_service_domain(settings, 'takserver')
-        if fqdn and takserver_host:
-            caddy_active = subprocess.run('systemctl is-active caddy', shell=True, capture_output=True, text=True)
-            if caddy_active.stdout.strip() == 'active':
-                install_le_cert_on_8446(takserver_host, lambda msg: None, wait_for_cert=False)
-        plog("  ✓ WebAdmin synced (Caddy reloaded, no TAK Server restart).")
+        plog("  ✓ Caddy reloaded.")
     except Exception as e:
         plog(f"  ⚠ WebAdmin sync failed: {str(e)[:80]} — run Update config on TAK Server page if needed.")
 
