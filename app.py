@@ -27699,10 +27699,9 @@ def _post_update_auto_deploy():
         save_settings(s)
 
         if last_ver == '':
-            print(f"Post-update: first run at {VERSION}, skipping auto-deploy")
-            return
-
-        print(f"Post-update: version changed {last_ver} → {VERSION}, scheduling auto-deploy")
+            print(f"Post-update: first run of auto-deploy at {VERSION}, running full deploy")
+        else:
+            print(f"Post-update: version changed {last_ver} → {VERSION}, scheduling auto-deploy")
 
         def _run_post_update():
             import time
