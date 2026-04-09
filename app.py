@@ -25115,29 +25115,45 @@ def _tak_upgrade_apt_install(cwd, pkg_name, upgrade_log, timeout_sec=600):
     return proc.returncode if proc.returncode is not None else 1
 
 
-def _tak_upgrade_mitigate_takserver_postinst_config_sh(ulog):
-    """Repair missing /opt/tak/config scripts so takserver postinst chmod succeeds after partial upgrades.
+# takserver .postinst chmods *.sh under these trees; partial upgrades can omit dirs/files and break dpkg --configure -a.
+_TAK_POSTINST_SH_GLOB_DIRS = (
+    '/opt/tak/config',
+    '/opt/tak/messaging',
+    '/opt/tak/utils',
+    '/opt/tak/api',
+    '/opt/tak/cluster',
+    '/opt/tak/retention',
+)
 
-    Postinst chmods /opt/tak/config/*.sh and /opt/tak/config/takserver-config.sh; missing files break
-    dpkg --configure -a (seen when 5.6→5.7 was interrupted).
+
+def _tak_upgrade_mitigate_takserver_postinst_config_sh(ulog):
+    """Ensure dirs and *.sh globs exist so takserver postinst chmod succeeds after partial upgrades.
+
+    Postinst runs chmod on multiple paths (e.g. config/takserver-config.sh, config/*.sh, messaging/*.sh).
+    Extend _TAK_POSTINST_SH_GLOB_DIRS if a new Debian package adds another tree.
     """
-    mit = r'''
+    dirs_q = ' '.join(shlex.quote(d) for d in _TAK_POSTINST_SH_GLOB_DIRS)
+    mit = rf'''
 set -e
-mkdir -p /opt/tak/config
 MIT=""
+DIRS=({dirs_q})
+for d in "${{DIRS[@]}}"; do
+  mkdir -p "$d"
+  shopt -s nullglob
+  a=("$d"/*.sh)
+  if [[ ${{#a[@]}} -eq 0 ]]; then
+    printf '%s\n' '#!/bin/sh' '# infra-TAK: placeholder so postinst chmod on *.sh in this dir succeeds' 'exit 0' \
+      > "$d/_infra_tak_placeholder_for_postinst.sh"
+    chmod +x "$d/_infra_tak_placeholder_for_postinst.sh"
+    MIT="${{MIT:+$MIT, }}$d/*.sh"
+  fi
+done
 if [[ ! -f /opt/tak/config/takserver-config.sh ]]; then
-  printf '%s\n' '#!/bin/sh' '# infra-TAK: placeholder — real file comes from takserver .deb; reinstall if needed' 'exit 0' \
+  mkdir -p /opt/tak/config
+  printf '%s\n' '#!/bin/sh' '# infra-TAK: placeholder — real file from takserver .deb' 'exit 0' \
     > /opt/tak/config/takserver-config.sh
   chmod +x /opt/tak/config/takserver-config.sh
-  MIT="takserver-config.sh"
-fi
-shopt -s nullglob
-a=(/opt/tak/config/*.sh)
-if [[ ${#a[@]} -eq 0 ]]; then
-  printf '%s\n' '#!/bin/sh' '# infra-TAK: placeholder so postinst chmod on *.sh succeeds' 'exit 0' \
-    > /opt/tak/config/_infra_tak_placeholder_for_postinst.sh
-  chmod +x /opt/tak/config/_infra_tak_placeholder_for_postinst.sh
-  MIT="${MIT:+$MIT, }*.sh glob"
+  MIT="${{MIT:+$MIT, }}takserver-config.sh"
 fi
 if [[ -n "$MIT" ]]; then
   echo "MITIGATED:$MIT"
@@ -25146,15 +25162,15 @@ else
 fi
 '''
     try:
-        r = subprocess.run(['sudo', 'bash', '-c', mit], capture_output=True, text=True, timeout=30)
+        r = subprocess.run(['sudo', 'bash', '-c', mit], capture_output=True, text=True, timeout=60)
         out = ((r.stdout or '') + (r.stderr or '')).strip()
         if r.returncode != 0:
-            ulog(f"⚠ Could not prepare /opt/tak/config ({out[:200]})")
+            ulog(f"⚠ Could not prepare /opt/tak script dirs ({out[:200]})")
             return
         if out.startswith('MITIGATED:'):
-            ulog("Prepared /opt/tak/config (" + out.replace('MITIGATED:', '').strip() + ")")
+            ulog("Prepared TAK script dirs: " + out.replace('MITIGATED:', '').strip())
     except Exception as e:
-        ulog(f"⚠ Tak config path workaround skipped: {e}")
+        ulog(f"⚠ Tak script path workaround skipped: {e}")
 
 
 def _tak_upgrade_dpkg_configure_a(ulog, upgrade_log, timeout_sec=3600):
