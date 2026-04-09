@@ -25161,60 +25161,60 @@ def _tak_postinst_resolved_mitigation_paths():
     return sorted(sh_paths), sorted(dir_paths)
 
 
+def _sudo_test(path, flag):
+    """True if `sudo test <flag> path` succeeds (e.g. flag '-d', '-f', '-e')."""
+    r = subprocess.run(['sudo', 'test', flag, path], capture_output=True, text=True, timeout=15)
+    return r.returncode == 0
+
+
 def _tak_upgrade_mitigate_takserver_postinst_config_sh(ulog):
     """Ensure dirs, named scripts, and *.sh globs exist so takserver postinst chmod/chown succeeds.
 
-    Parses takserver.postinst for /opt/tak paths on chmod/chown/install/cp/mv lines.
+    Implemented in Python (not a single bash -c blob) so every step is logged and failures are visible.
+    After a killed upgrade, dpkg --configure needs paths the .deb would normally unpack.
     """
+    ulog("Preparing /opt/tak paths expected by takserver postinst (partial-upgrade workaround)...")
     sh_paths, dir_paths = _tak_postinst_resolved_mitigation_paths()
-    explicit_q = ' '.join(shlex.quote(p) for p in sh_paths)
-    dir_mk_q = ' '.join(shlex.quote(p) for p in dir_paths)
-    dirs_q = ' '.join(shlex.quote(d) for d in _TAK_POSTINST_SH_GLOB_DIRS)
-    mit = rf'''
-set -e
-MIT=""
-DIRPATHS=({dir_mk_q})
-for p in "${{DIRPATHS[@]}}"; do
-  mkdir -p "$p"
-  MIT="${{MIT:+$MIT, }}d:$(basename "$p")"
-done
-EXPLICIT=({explicit_q})
-for f in "${{EXPLICIT[@]}}"; do
-  mkdir -p "$(dirname "$f")"
-  if [[ ! -f "$f" ]]; then
-    printf '%s\n' '#!/bin/sh' '# infra-TAK: placeholder until package files are on disk — reinstall .deb if issues persist' 'exit 0' > "$f"
-    chmod +x "$f"
-    MIT="${{MIT:+$MIT, }}$(basename "$f")"
-  fi
-done
-DIRS=({dirs_q})
-for d in "${{DIRS[@]}}"; do
-  mkdir -p "$d"
-  shopt -s nullglob
-  a=("$d"/*.sh)
-  if [[ ${{#a[@]}} -eq 0 ]]; then
-    printf '%s\n' '#!/bin/sh' '# infra-TAK: placeholder so postinst chmod on *.sh in this dir succeeds' 'exit 0' \
-      > "$d/_infra_tak_placeholder_for_postinst.sh"
-    chmod +x "$d/_infra_tak_placeholder_for_postinst.sh"
-    MIT="${{MIT:+$MIT, }}$d/*.sh"
-  fi
-done
-if [[ -n "$MIT" ]]; then
-  echo "MITIGATED:$MIT"
-else
-  echo OK
-fi
-'''
+    placeholder = (
+        '#!/bin/sh\n'
+        '# infra-TAK: placeholder until package files are restored — run: apt reinstall takserver .deb\n'
+        'exit 0\n'
+    )
     try:
-        r = subprocess.run(['sudo', 'bash', '-c', mit], capture_output=True, text=True, timeout=60)
-        out = ((r.stdout or '') + (r.stderr or '')).strip()
-        if r.returncode != 0:
-            ulog(f"⚠ Could not prepare /opt/tak script dirs ({out[:200]})")
-            return
-        if out.startswith('MITIGATED:'):
-            ulog("Prepared TAK script dirs: " + out.replace('MITIGATED:', '').strip())
+        for d in sorted(dir_paths):
+            r = subprocess.run(['sudo', 'mkdir', '-p', d], capture_output=True, text=True, timeout=30)
+            if r.returncode != 0:
+                ulog(f"✗ mkdir -p {d} failed: {(r.stderr or r.stdout or '').strip()[:400]}")
+            else:
+                ulog(f"  ✓ mkdir -p {d}")
+        for fpath in sorted(sh_paths):
+            parent = os.path.dirname(fpath)
+            subprocess.run(['sudo', 'mkdir', '-p', parent], capture_output=True, text=True, timeout=30)
+            if _sudo_test(fpath, '-f'):
+                continue
+            w = subprocess.run(
+                ['sudo', 'tee', fpath], input=placeholder, capture_output=True, text=True, timeout=30)
+            if w.returncode != 0:
+                ulog(f"✗ could not write {fpath}: {(w.stderr or '')[:200]}")
+                continue
+            subprocess.run(['sudo', 'chmod', '+x', fpath], capture_output=True, text=True, timeout=15)
+            ulog(f"  ✓ placeholder {os.path.basename(fpath)}")
+        for d in _TAK_POSTINST_SH_GLOB_DIRS:
+            subprocess.run(['sudo', 'mkdir', '-p', d], capture_output=True, text=True, timeout=30)
+            d_q = shlex.quote(d)
+            bash_glob = 'shopt -s nullglob; a=(' + d_q + '/*.sh); [[ ${#a[@]} -eq 0 ]]'
+            chk = subprocess.run(
+                ['sudo', 'bash', '-c', bash_glob], capture_output=True, text=True, timeout=15)
+            if chk.returncode != 0:
+                continue
+            stub = os.path.join(d, '_infra_tak_placeholder_for_postinst.sh')
+            w = subprocess.run(
+                ['sudo', 'tee', stub], input=placeholder, capture_output=True, text=True, timeout=30)
+            if w.returncode == 0:
+                subprocess.run(['sudo', 'chmod', '+x', stub], capture_output=True, text=True, timeout=15)
+                ulog(f"  ✓ {d}/*.sh glob placeholder")
     except Exception as e:
-        ulog(f"⚠ Tak script path workaround skipped: {e}")
+        ulog(f"✗ Tak path preparation error: {e}")
 
 
 def _tak_upgrade_dpkg_configure_a(ulog, upgrade_log, timeout_sec=3600):
