@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.5.3-alpha"
+VERSION = "0.5.4-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -7682,6 +7682,41 @@ def _patch_takportal_compose_network():
         return False
 
 
+def _patch_authentik_compose_network():
+    """Add the infratak external network to Authentik's docker-compose.yml.
+
+    Ensures the server container stays on the infratak network even after
+    'docker compose down && up' or Docker-initiated restarts — not just
+    console-driven restarts that call _ensure_infratak_network_for_authentik().
+    """
+    compose_path = os.path.expanduser('~/authentik/docker-compose.yml')
+    if not os.path.exists(compose_path):
+        return False
+    try:
+        _ensure_infratak_docker_network()
+        with open(compose_path) as f:
+            content = f.read()
+        if INFRATAK_DOCKER_NETWORK in content:
+            return False
+        service_network = "    networks:\n      - default\n      - infratak\n"
+        if '    command: server\n' in content:
+            content = content.replace(
+                '    command: server\n',
+                '    command: server\n' + service_network, 1)
+        networks_block = (
+            f"\nnetworks:\n"
+            f"  default:\n"
+            f"  {INFRATAK_DOCKER_NETWORK}:\n"
+            f"    external: true\n"
+        )
+        content = content.rstrip() + '\n' + networks_block
+        with open(compose_path, 'w') as f:
+            f.write(content)
+        return True
+    except Exception:
+        return False
+
+
 def _check_authentik_api_reachable(settings):
     """Verify we can reach the Authentik API (for remote: ensures firewall allows console -> Authentik:9090).
     Returns (True, None) if reachable, (False, error_msg) otherwise."""
@@ -8491,6 +8526,42 @@ def wait_for_apt_lock(log_fn, log_list):
         if not is_locked():
             m, s = divmod(waited, 60)
             log_fn(f"✓ System upgrades complete (waited {m}m {s}s)")
+            time.sleep(5)
+            return True
+        m, s = divmod(waited, 60)
+        log_list.append(f"  ⏳ {m:02d}:{s:02d}")
+
+
+def wait_for_unattended_upgrade_worker(log_fn, log_list, cancelled_check=None):
+    """Wait until no /usr/bin/unattended-upgrade worker is running.
+
+    Same check as the start of TAK Server deploy (wait_for_package_lock). Complements
+    wait_for_apt_lock (dpkg lock + broader process grep): the worker can be mid-run
+    before a lock appears, so both are used before apt installs in deploy and upgrade.
+    No timeout — ticks every 10s. cancelled_check, if set, returns True to abort wait.
+    """
+    log_fn("Checking for system upgrades in progress...")
+    r = subprocess.run(
+        'ps aux | grep "/usr/bin/unattended-upgrade" | grep -v shutdown | grep -v grep',
+        shell=True, capture_output=True, text=True)
+    if r.stdout.strip() == '':
+        log_fn("✓ No system upgrades in progress, continuing...")
+        return True
+    log_fn("⏳ System is running unattended-upgrades, waiting for completion...")
+    log_fn("  This can take 20-45 minutes on a fresh VPS. Do not cancel.")
+    waited = 0
+    while True:
+        time.sleep(10)
+        waited += 10
+        if cancelled_check and cancelled_check():
+            log_fn("⚠ Cancelled during upgrade wait")
+            return False
+        r = subprocess.run(
+            'ps aux | grep "/usr/bin/unattended-upgrade" | grep -v shutdown | grep -v grep',
+            shell=True, capture_output=True, text=True)
+        if r.stdout.strip() == '':
+            m, s = divmod(waited, 60)
+            log_fn(f"✓ System upgrades complete! (waited {m}m {s}s)")
             time.sleep(5)
             return True
         m, s = divmod(waited, 60)
@@ -18956,6 +19027,7 @@ def authentik_control():
         if not (remote.get('host') or '').strip():
             return jsonify({'error': 'Remote host not configured'}), 400
         ak_dir = '~/authentik'
+        _ssh_probe(remote, f'docker network inspect {INFRATAK_DOCKER_NETWORK} >/dev/null 2>&1 || docker network create {INFRATAK_DOCKER_NETWORK}', timeout=10)
         if action == 'start':
             _ssh_probe(remote, f'cd {ak_dir} && docker compose up -d 2>&1', timeout=120)
         elif action == 'stop':
@@ -18974,6 +19046,7 @@ def authentik_control():
         running = bool(ok and out and 'Up' in out)
         return jsonify({'success': True, 'running': running, 'action': action})
     ak_dir = os.path.expanduser('~/authentik')
+    _patch_authentik_compose_network()
     if action == 'start':
         subprocess.run(f'cd {ak_dir} && docker compose up -d', shell=True, capture_output=True, text=True, timeout=120)
     elif action == 'stop':
@@ -19642,6 +19715,9 @@ entries:
     image: ${AUTHENTIK_IMAGE:-ghcr.io/goauthentik/server}:${AUTHENTIK_TAG:-2026.2.0}
     restart: unless-stopped
     command: server
+    networks:
+      - default
+      - infratak
     environment:
       AUTHENTIK_REDIS__HOST: redis
       AUTHENTIK_POSTGRESQL__HOST: postgresql
@@ -19722,6 +19798,10 @@ volumes:
     driver: local
   redis:
     driver: local
+networks:
+  default:
+  infratak:
+    external: true
 """
     compose_content = compose_content.replace('2026.2.0', _ak_latest)
     _ak_host_for_ldap = _get_authentik_host(settings)
@@ -19745,6 +19825,7 @@ volumes:
     # Step 6: Docker Compose up
     plog("")
     plog("━━━ Step 6/8: Starting Authentik (remote) ━━━")
+    _module_run(deploy_cfg, f'docker network inspect {INFRATAK_DOCKER_NETWORK} >/dev/null 2>&1 || docker network create {INFRATAK_DOCKER_NETWORK}', timeout=10)
     plog("  Running docker compose up (this may take 2-5 minutes)...")
     ok, out = _module_run(deploy_cfg, 'cd ~/authentik && docker compose pull 2>&1', timeout=600, log_fn=plog)
     if not ok:
@@ -20109,6 +20190,7 @@ def run_authentik_deploy(reconfigure=False):
                         break
             plog("\u2501\u2501\u2501 Reconfigure: Updating LDAP, CoreConfig, Forward Auth (no removal) \u2501\u2501\u2501")
             _ensure_authentik_starter_branding(ak_dir, deploy_cfg, plog)
+            _patch_authentik_compose_network()
             subprocess.run(f'cd {ak_dir} && docker compose up -d 2>&1', shell=True, capture_output=True, text=True, timeout=120)
             _ensure_infratak_network_for_authentik()
             _ensure_infratak_network_for_portal()
@@ -20679,6 +20761,8 @@ entries:
                 plog("\u2713 Docker Compose patched")
             else:
                 plog("\u2713 Docker Compose already patched")
+            if _patch_authentik_compose_network():
+                plog("  \u2713 infratak network added to docker-compose.yml")
 
             # Step 7: Pull and start core services (no verbose docker output in log)
             plog("")
@@ -22268,15 +22352,24 @@ def _resync_ldap_credential_to_coreconfig():
 
     if env_pass is None:
         return False, 'no_env_password_found'
-    if cc_pass == env_pass:
+
+    needs_write = False
+    new_cc = cc
+
+    if cc_pass != env_pass:
+        new_cc = _re.sub(
+            r'serviceAccountCredential="[^"]*"',
+            f'serviceAccountCredential="{env_pass}"',
+            new_cc, count=1)
+        needs_write = True
+
+    if '<ldap' in new_cc and 'adminGroup="ROLE_ADMIN"' not in new_cc:
+        new_cc = _re.sub(r'(<ldap\s[^>]*?)(\s*/>)', r'\1 adminGroup="ROLE_ADMIN"\2', new_cc, count=1, flags=_re.DOTALL)
+        needs_write = True
+
+    if not needs_write:
         return False, 'credentials_match'
 
-    new_cc = _re.sub(
-        r'serviceAccountCredential="[^"]*"',
-        f'serviceAccountCredential="{env_pass}"',
-        cc,
-        count=1
-    )
     try:
         with open(coreconfig, 'w') as f:
             f.write(new_cc)
@@ -22286,7 +22379,12 @@ def _resync_ldap_credential_to_coreconfig():
             f.write(new_cc)
         subprocess.run(['sudo', 'cp', patch_path, coreconfig],
                        capture_output=True, text=True, timeout=10)
-    return True, 'LDAP credential resynced from Authentik .env to CoreConfig.xml'
+    fixes = []
+    if cc_pass != env_pass:
+        fixes.append('credential')
+    if '<ldap' in cc and 'adminGroup="ROLE_ADMIN"' not in cc:
+        fixes.append('adminGroup')
+    return True, f'LDAP resync: fixed {" + ".join(fixes)} in CoreConfig.xml'
 
 def _ensure_ldapsearch():
     """Ensure ldapsearch CLI is available (install ldap-utils / openldap-clients if missing).
@@ -25043,6 +25141,291 @@ def takserver_update_log():
     return jsonify({'entries': upgrade_log[idx:], 'total': len(upgrade_log),
         'running': upgrade_status['running'], 'complete': upgrade_status['complete'], 'error': upgrade_status['error']})
 
+def _tak_upgrade_apt_install(cwd, pkg_name, upgrade_log, timeout_sec=600):
+    """Run apt-get install for a local .deb with streamed output.
+
+    subprocess.run(capture_output=True) buffers all stdout/stderr until exit, so a slow
+    configure/postinst looks like a silent hang. stdbuf -oL line-buffers; a reader thread
+    appends lines to upgrade_log so operators see where apt stalled if a timeout fires.
+    """
+    qn = shlex.quote(pkg_name)
+    cmd = f'stdbuf -oL -eL env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y ./{qn} 2>&1'
+    proc = subprocess.Popen(
+        cmd, shell=True, cwd=cwd,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    if proc.stdout is None:
+        return 1
+
+    def _drain():
+        for line in iter(proc.stdout.readline, ''):
+            if line and 'NEEDRESTART' not in line:
+                upgrade_log.append('  ' + line.rstrip('\n'))
+
+    t = threading.Thread(target=_drain, daemon=True)
+    t.start()
+    try:
+        proc.wait(timeout=timeout_sec)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.wait(timeout=15)
+        except Exception:
+            pass
+        t.join(timeout=5)
+        raise
+    t.join(timeout=5)
+    return proc.returncode if proc.returncode is not None else 1
+
+
+# takserver .postinst chmod/chown targets; fallbacks if postinst is unreadable.
+_TAK_POSTINST_EXPLICIT_SH_FALLBACK = (
+    '/opt/tak/config/takserver-config.sh',
+    '/opt/tak/messaging/takserver-messaging.sh',
+)
+# Paths that look like files (do not mkdir — postinst cp/install references these).
+_TAK_POSTINST_SKIP_DIR_MK_SUFFIX = (
+    '.xml', '.sql', '.conf', '.jks', '.pem', '.properties', '.jar', '.war', '.deb', '.rpm',
+    '.pol', '.p12', '.crt', '.key', '.idx', '.policy',
+)
+_TAK_POSTINST_SH_GLOB_DIRS = (
+    '/opt/tak/config',
+    '/opt/tak/messaging',
+    '/opt/tak/utils',
+    '/opt/tak/api',
+    '/opt/tak/cluster',
+    '/opt/tak/retention',
+)
+
+
+def _tak_postinst_path_should_skip_mkdir(p):
+    """True if p is almost certainly a file (postinst cp/install lines mention these — do not mkdir)."""
+    pl = p.lower()
+    if pl.endswith(_TAK_POSTINST_SKIP_DIR_MK_SUFFIX):
+        return True
+    if pl.endswith('.dist') or '.dist.' in os.path.basename(p):
+        return True
+    return False
+
+
+def _tak_postinst_resolved_mitigation_paths():
+    """Return (sh_paths, dir_paths) from takserver.postinst chmod/chown lines only (+ .sh fallbacks).
+
+    Do not parse cp/install/mv — those reference many files; mkdir on them breaks dpkg.
+    Do not mkdir /opt/tak/config/takserver-config here — an empty dir breaks postinst cp; see rmdir helper.
+    """
+    sh_paths = set(_TAK_POSTINST_EXPLICIT_SH_FALLBACK)
+    dir_paths = set()
+    pi = '/var/lib/dpkg/info/takserver.postinst'
+    try:
+        if os.path.isfile(pi):
+            with open(pi, 'r', encoding='utf-8', errors='ignore') as f:
+                lines = f.read().splitlines()
+            for line in lines:
+                if '#' in line:
+                    line = line.split('#', 1)[0]
+                if not any(k in line for k in ('chmod', 'chown')):
+                    continue
+                for m in re.finditer(r'/opt/tak/[A-Za-z0-9_./-]+', line):
+                    p = m.group(0)
+                    if p.endswith('.sh'):
+                        sh_paths.add(p)
+                    elif p.endswith(('.deb', '.rpm', '.jar', '.war')):
+                        continue
+                    elif _tak_postinst_path_should_skip_mkdir(p):
+                        continue
+                    elif p == '/opt/tak/config/takserver-config':
+                        # Postinst populates via cp; empty pre-created dir breaks cp (see _tak_upgrade_remove_blocking_empty_takserver_config).
+                        continue
+                    else:
+                        dir_paths.add(p)
+    except OSError:
+        pass
+    return sorted(sh_paths), sorted(dir_paths)
+
+
+def _sudo_test(path, flag):
+    """True if `sudo test <flag> path` succeeds (e.g. flag '-d', '-f', '-e')."""
+    r = subprocess.run(['sudo', 'test', flag, path], capture_output=True, text=True, timeout=15)
+    return r.returncode == 0
+
+
+def _tak_upgrade_remove_blocking_empty_takserver_config(ulog):
+    """Remove empty /opt/tak/config/takserver-config if present.
+
+    A prior workaround mkdir created an empty directory; postinst then fails with:
+    cp: -r not specified; omitting directory '.../takserver-config'
+    Real install unpacks/copies into that path — it must not exist as an empty infra-TAK placeholder.
+    """
+    p = '/opt/tak/config/takserver-config'
+    script = (
+        'if [ -d ' + shlex.quote(p) + ' ] && [ -z "$(ls -A ' + shlex.quote(p) + ' 2>/dev/null)" ]; then '
+        'rmdir ' + shlex.quote(p) + ' && echo REMOVED; fi'
+    )
+    try:
+        r = subprocess.run(['sudo', 'bash', '-c', script], capture_output=True, text=True, timeout=15)
+        out = (r.stdout or '').strip()
+        if 'REMOVED' in out:
+            ulog(f"  ✓ removed empty {p} (so postinst can populate — not a mkdir placeholder)")
+    except Exception as e:
+        ulog(f"  ⚠ could not clear empty {p}: {e}")
+
+
+def _tak_upgrade_mitigate_takserver_postinst_config_sh(ulog):
+    """Ensure dirs, named scripts, and *.sh globs exist so takserver postinst chmod/chown succeeds.
+
+    Implemented in Python (not a single bash -c blob) so every step is logged and failures are visible.
+    After a killed upgrade, dpkg --configure needs paths the .deb would normally unpack.
+
+    Also invoked from _tak_upgrade_dpkg_configure_a so this always runs immediately before dpkg --configure -a.
+    """
+    ulog("Preparing /opt/tak paths expected by takserver postinst (partial-upgrade workaround)...")
+    _tak_upgrade_remove_blocking_empty_takserver_config(ulog)
+    sh_paths, dir_paths = _tak_postinst_resolved_mitigation_paths()
+    placeholder = (
+        '#!/bin/sh\n'
+        '# infra-TAK: placeholder until package files are restored — run: apt reinstall takserver .deb\n'
+        'exit 0\n'
+    )
+    try:
+        for d in sorted(dir_paths):
+            r = subprocess.run(['sudo', 'mkdir', '-p', d], capture_output=True, text=True, timeout=30)
+            if r.returncode != 0:
+                ulog(f"✗ mkdir -p {d} failed: {(r.stderr or r.stdout or '').strip()[:400]}")
+            else:
+                ulog(f"  ✓ mkdir -p {d}")
+        for fpath in sorted(sh_paths):
+            parent = os.path.dirname(fpath)
+            subprocess.run(['sudo', 'mkdir', '-p', parent], capture_output=True, text=True, timeout=30)
+            if _sudo_test(fpath, '-f'):
+                continue
+            w = subprocess.run(
+                ['sudo', 'tee', fpath], input=placeholder, capture_output=True, text=True, timeout=30)
+            if w.returncode != 0:
+                ulog(f"✗ could not write {fpath}: {(w.stderr or '')[:200]}")
+                continue
+            subprocess.run(['sudo', 'chmod', '+x', fpath], capture_output=True, text=True, timeout=15)
+            ulog(f"  ✓ placeholder {os.path.basename(fpath)}")
+        for d in _TAK_POSTINST_SH_GLOB_DIRS:
+            subprocess.run(['sudo', 'mkdir', '-p', d], capture_output=True, text=True, timeout=30)
+            d_q = shlex.quote(d)
+            bash_glob = 'shopt -s nullglob; a=(' + d_q + '/*.sh); [[ ${#a[@]} -eq 0 ]]'
+            chk = subprocess.run(
+                ['sudo', 'bash', '-c', bash_glob], capture_output=True, text=True, timeout=15)
+            if chk.returncode != 0:
+                continue
+            stub = os.path.join(d, '_infra_tak_placeholder_for_postinst.sh')
+            w = subprocess.run(
+                ['sudo', 'tee', stub], input=placeholder, capture_output=True, text=True, timeout=30)
+            if w.returncode == 0:
+                subprocess.run(['sudo', 'chmod', '+x', stub], capture_output=True, text=True, timeout=15)
+                ulog(f"  ✓ {d}/*.sh glob placeholder")
+    except Exception as e:
+        ulog(f"✗ Tak path preparation error: {e}")
+
+
+def _run_dpkg_configure_a(ulog, upgrade_log, timeout_sec=3600):
+    """Run dpkg --configure -a, streaming output. Returns exit code (0 = success)."""
+    ulog("Running dpkg --configure -a...")
+    cmd = 'sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l dpkg --configure -a 2>&1'
+    proc = subprocess.Popen(
+        cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    if proc.stdout is None:
+        ulog("✗ Could not start dpkg --configure -a")
+        return 1
+
+    def _drain():
+        for line in iter(proc.stdout.readline, ''):
+            if line and 'NEEDRESTART' not in line:
+                upgrade_log.append('  ' + line.rstrip('\n'))
+
+    t = threading.Thread(target=_drain, daemon=True)
+    t.start()
+    try:
+        proc.wait(timeout=timeout_sec)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.wait(timeout=15)
+        except Exception:
+            pass
+        t.join(timeout=5)
+        ulog("✗ dpkg --configure -a timed out.")
+        return 1
+    t.join(timeout=5)
+    return proc.returncode if proc.returncode is not None else 1
+
+
+def _tak_upgrade_dpkg_configure_a(ulog, upgrade_log, pkg_path=None):
+    """Ensure dpkg is in a clean state before apt-get install.
+
+    First attempt: dpkg --configure -a.
+    If that fails and pkg_path is set (the .deb we're about to install), re-unpack it
+    with dpkg --unpack (restores all missing files without running postinst), then retry
+    dpkg --configure -a. This handles the common case where a timed-out upgrade left
+    files missing while dpkg still needs to configure the half-installed package.
+    """
+    ulog("Ensuring dpkg state is consistent...")
+    rc = _run_dpkg_configure_a(ulog, upgrade_log)
+    if rc == 0:
+        ulog("✓ dpkg state OK")
+        return True
+
+    if not pkg_path or not os.path.isfile(pkg_path):
+        ulog("✗ dpkg --configure -a failed and no .deb available for re-unpack.")
+        return False
+
+    ulog("dpkg --configure -a failed — re-unpacking .deb to restore missing files...")
+    ulog(f"  dpkg --unpack {os.path.basename(pkg_path)}")
+    try:
+        rc2 = _tak_upgrade_apt_install_streamed(
+            'sudo dpkg --unpack ' + shlex.quote(pkg_path) + ' 2>&1',
+            os.path.dirname(pkg_path), upgrade_log, timeout_sec=300)
+    except subprocess.TimeoutExpired:
+        ulog("✗ dpkg --unpack timed out.")
+        return False
+    if rc2 != 0:
+        ulog(f"✗ dpkg --unpack failed (exit {rc2}).")
+        return False
+    ulog("✓ Files restored from .deb")
+
+    ulog("Retrying dpkg --configure -a after re-unpack...")
+    rc3 = _run_dpkg_configure_a(ulog, upgrade_log)
+    if rc3 != 0:
+        ulog("✗ dpkg --configure -a still failed after re-unpack. Manual intervention needed.")
+        return False
+    ulog("✓ dpkg state OK (after re-unpack)")
+    return 'ALREADY_INSTALLED'
+
+
+def _tak_upgrade_apt_install_streamed(cmd, cwd, upgrade_log, timeout_sec=600):
+    """Run a shell command with line-buffered output streamed to upgrade_log. Returns exit code."""
+    proc = subprocess.Popen(
+        cmd, shell=True, cwd=cwd,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    if proc.stdout is None:
+        return 1
+
+    def _drain():
+        for line in iter(proc.stdout.readline, ''):
+            if line and 'NEEDRESTART' not in line:
+                upgrade_log.append('  ' + line.rstrip('\n'))
+
+    t = threading.Thread(target=_drain, daemon=True)
+    t.start()
+    try:
+        proc.wait(timeout=timeout_sec)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.wait(timeout=15)
+        except Exception:
+            pass
+        t.join(timeout=5)
+        raise
+    t.join(timeout=5)
+    return proc.returncode if proc.returncode is not None else 1
+
+
 def run_takserver_upgrade(pkg_path):
     def ulog(msg):
         entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
@@ -25053,28 +25436,53 @@ def run_takserver_upgrade(pkg_path):
         ulog("=" * 50)
         ulog("TAK Server update (upgrade)")
         ulog("=" * 50)
+        wait_for_unattended_upgrade_worker(ulog, upgrade_log)
         wait_for_apt_lock(ulog, upgrade_log)
-        ulog("")
-        ulog("Installing upgrade package: " + pkg_name)
-        r = subprocess.run(
-            f'DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y ./{pkg_name} 2>&1',
-            shell=True, cwd=os.path.dirname(pkg_path), capture_output=True, text=True, timeout=600)
-        out = (r.stdout or '') + (r.stderr or '')
-        for line in out.strip().split('\n'):
-            if line.strip() and 'NEEDRESTART' not in line:
-                upgrade_log.append("  " + line)
-        if r.returncode != 0:
-            ulog("Update failed (exit " + str(r.returncode) + ")")
+        dpkg_result = _tak_upgrade_dpkg_configure_a(ulog, upgrade_log, pkg_path=pkg_path)
+        if not dpkg_result:
             upgrade_status.update({'running': False, 'complete': False, 'error': True})
             return
+        if dpkg_result == 'ALREADY_INSTALLED':
+            ulog("Package already installed via re-unpack + configure — skipping redundant apt-get install.")
+        else:
+            wait_for_apt_lock(ulog, upgrade_log)
+            ulog("")
+            ulog("Installing upgrade package: " + pkg_name)
+            try:
+                rc = _tak_upgrade_apt_install(os.path.dirname(pkg_path), pkg_name, upgrade_log, timeout_sec=3600)
+            except subprocess.TimeoutExpired as te:
+                ulog("Error: " + str(te))
+                upgrade_status.update({'running': False, 'complete': False, 'error': True})
+                return
+            if rc != 0:
+                ulog("Update failed (exit " + str(rc) + ")")
+                upgrade_status.update({'running': False, 'complete': False, 'error': True})
+                return
         ne_changed, ne_msg = _sanitize_coreconfig_name_entries()
         if ne_changed:
             ulog(f"NameEntry fix: {ne_msg}")
         changed, resync_msg = _resync_ldap_credential_to_coreconfig()
         if changed:
             ulog(f"LDAP resync: {resync_msg}")
+        settings = load_settings()
+        takserver_host = _get_service_domain(settings, 'takserver')
+        if takserver_host:
+            ulog("Re-installing LE cert on 8446 (postinst may have reset connector)...")
+            if install_le_cert_on_8446(takserver_host, ulog, wait_for_cert=False):
+                ulog("\u2713 8446 LE cert restored")
+            else:
+                ulog("\u26a0 8446 LE cert not available \u2014 self-signed cert will be used until next Update config")
         ulog("Restarting TAK Server...")
         subprocess.run('systemctl restart takserver', shell=True, capture_output=True, text=True, timeout=90)
+        if _get_authentik_env_content(settings):
+            ulog("Syncing webadmin to Authentik (LDAP cache refresh)...")
+            ok_wa, err_wa = _ensure_authentik_webadmin(skip_bind_verify=False)
+            if ok_wa:
+                ulog("\u2713 webadmin synced to Authentik")
+            else:
+                ulog(f"\u26a0 webadmin sync: {err_wa or 'failed'} \u2014 use Sync webadmin button if 8446 login fails")
+        generate_caddyfile(settings)
+        subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
         ulog("TAK Server update complete.")
         upgrade_status.update({'running': False, 'complete': True, 'error': False})
     except Exception as e:
@@ -25098,6 +25506,8 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
         ulog(f"  Server One (DB): {s1_host}")
         ulog("=" * 50)
 
+        wait_for_unattended_upgrade_worker(ulog, upgrade_log)
+
         # Step 1: Update Core (local) — per TAK guide, core first
         ulog("")
         ulog("━━━ Step 1/4: Stopping TAK Server ━━━")
@@ -25107,18 +25517,25 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
         ulog("")
         ulog("━━━ Step 2/4: Upgrading Core (this host) ━━━")
         wait_for_apt_lock(ulog, upgrade_log)
-        ulog(f"Installing {core_name}...")
-        r = subprocess.run(
-            f'DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y ./{core_name} 2>&1',
-            shell=True, cwd=os.path.dirname(core_pkg_path), capture_output=True, text=True, timeout=600)
-        out = (r.stdout or '') + (r.stderr or '')
-        for line in out.strip().split('\n'):
-            if line.strip() and 'NEEDRESTART' not in line:
-                upgrade_log.append("  " + line)
-        if r.returncode != 0:
-            ulog(f"✗ Core upgrade failed (exit {r.returncode})")
+        dpkg_result = _tak_upgrade_dpkg_configure_a(ulog, upgrade_log, pkg_path=core_pkg_path)
+        if not dpkg_result:
             upgrade_status.update({'running': False, 'complete': False, 'error': True})
             return
+        if dpkg_result == 'ALREADY_INSTALLED':
+            ulog("Core already installed via re-unpack + configure — skipping redundant apt-get install.")
+        else:
+            wait_for_apt_lock(ulog, upgrade_log)
+            ulog(f"Installing {core_name}...")
+            try:
+                rc = _tak_upgrade_apt_install(os.path.dirname(core_pkg_path), core_name, upgrade_log, timeout_sec=3600)
+            except subprocess.TimeoutExpired as te:
+                ulog(f"✗ Error: {te}")
+                upgrade_status.update({'running': False, 'complete': False, 'error': True})
+                return
+            if rc != 0:
+                ulog(f"✗ Core upgrade failed (exit {rc})")
+                upgrade_status.update({'running': False, 'complete': False, 'error': True})
+                return
         ulog("✓ Core package upgraded")
 
         # Restore JDBC URL to Server One (the upgrade may have reset CoreConfig)
@@ -25216,16 +25633,33 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
         changed, resync_msg = _resync_ldap_credential_to_coreconfig()
         if changed:
             ulog(f"LDAP resync: {resync_msg}")
+        settings = load_settings()
+        takserver_host = _get_service_domain(settings, 'takserver')
+        if takserver_host:
+            ulog("Re-installing LE cert on 8446 (postinst may have reset connector)...")
+            if install_le_cert_on_8446(takserver_host, ulog, wait_for_cert=False):
+                ulog("\u2713 8446 LE cert restored")
+            else:
+                ulog("\u26a0 8446 LE cert not available \u2014 self-signed cert will be used until next Update config")
         subprocess.run('systemctl start takserver', shell=True, capture_output=True, text=True, timeout=90)
         ulog("Waiting 30 seconds for startup...")
         for remaining in range(20, -1, -10):
             time.sleep(10)
-            upgrade_log.append(f"  ⏳ {remaining//60:02d}:{remaining%60:02d} remaining")
-        ulog("✓ TAK Server started")
+            upgrade_log.append(f"  \u23f3 {remaining//60:02d}:{remaining%60:02d} remaining")
+        ulog("\u2713 TAK Server started")
+        if _get_authentik_env_content(settings):
+            ulog("Syncing webadmin to Authentik (LDAP cache refresh)...")
+            ok_wa, err_wa = _ensure_authentik_webadmin(skip_bind_verify=False)
+            if ok_wa:
+                ulog("\u2713 webadmin synced to Authentik")
+            else:
+                ulog(f"\u26a0 webadmin sync: {err_wa or 'failed'} \u2014 use Sync webadmin button if 8446 login fails")
+        generate_caddyfile(settings)
+        subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
 
         ulog("")
         ulog("=" * 50)
-        ulog("✓ Two-server update complete")
+        ulog("\u2713 Two-server update complete")
         ulog(f"  Core: upgraded on this host")
         ulog(f"  Database: upgraded on {s1_host}")
         ulog("=" * 50)
@@ -25577,28 +26011,8 @@ def run_cmd(cmd, desc=None, check=True, quiet=False):
 def wait_for_package_lock():
     """Wait for unattended-upgrades to finish (common on fresh VPS).
     NO TIMEOUT - waits as long as needed. Ticks every 10 seconds."""
-    log_step("Checking for system upgrades in progress...")
-    r = subprocess.run('ps aux | grep "/usr/bin/unattended-upgrade" | grep -v shutdown | grep -v grep', shell=True, capture_output=True, text=True)
-    if r.stdout.strip() == '':
-        log_step("\u2713 No system upgrades in progress, continuing...")
-        return True
-    log_step("\u23f3 System is running unattended-upgrades, waiting for completion...")
-    log_step("  This can take 20-45 minutes on a fresh VPS. Do not cancel.")
-    waited = 0
-    while True:
-        time.sleep(10)
-        waited += 10
-        if deploy_status.get('cancelled'):
-            log_step("⚠ Cancelled during upgrade wait")
-            return False
-        r = subprocess.run('ps aux | grep "/usr/bin/unattended-upgrade" | grep -v shutdown | grep -v grep', shell=True, capture_output=True, text=True)
-        if r.stdout.strip() == '':
-            m, s = divmod(waited, 60)
-            log_step(f"\u2713 System upgrades complete! (waited {m}m {s}s)")
-            time.sleep(5)
-            return True
-        m, s = divmod(waited, 60)
-        deploy_log.append(f"  \u23f3 {m:02d}:{s:02d}")
+    return wait_for_unattended_upgrade_worker(
+        log_step, deploy_log, lambda: deploy_status.get('cancelled'))
 
 def run_takserver_deploy(config):
     try:
@@ -27847,6 +28261,7 @@ def _startup_migrations():
             ak_up = subprocess.run('docker ps -q --filter name=authentik-server-1', shell=True, capture_output=True, text=True, timeout=5)
             if (portal_up.stdout or '').strip() and (ak_up.stdout or '').strip():
                 _patch_takportal_compose_network()
+                _patch_authentik_compose_network()
                 _ensure_infratak_network_for_authentik()
                 _ensure_infratak_network_for_portal()
                 print("Startup migration: infratak Docker network ensured (Portal ↔ Authentik)")
@@ -28095,6 +28510,7 @@ def _post_update_auto_deploy():
                             print("Post-update: hardening Authentik port bindings to 127.0.0.1")
                             with open(compose_path, 'w') as f:
                                 f.write(content)
+                        _patch_authentik_compose_network()
                         needs_recreate = patched
                         if not needs_recreate:
                             r = subprocess.run('ss -tlnp | grep -c "0.0.0.0:9000\\|0.0.0.0:9443"',

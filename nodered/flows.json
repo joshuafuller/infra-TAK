@@ -1,0 +1,412 @@
+[
+  {
+    "id": "flow_arcgis_cfg",
+    "type": "tab",
+    "label": "ArcGIS Configurator",
+    "disabled": false,
+    "info": "Guided ArcGIS Feature Service → TAK CoT configuration tool.\nOpen /configurator in your browser after deploying."
+  },
+  {
+    "id": "c_ui",
+    "type": "comment",
+    "z": "flow_arcgis_cfg",
+    "name": "── Configurator UI (/configurator) ──",
+    "info": "",
+    "x": 240,
+    "y": 40,
+    "wires": []
+  },
+  {
+    "id": "hi_ui",
+    "type": "http in",
+    "z": "flow_arcgis_cfg",
+    "name": "GET /configurator",
+    "url": "/configurator",
+    "method": "get",
+    "upload": false,
+    "swaggerDoc": "",
+    "x": 170,
+    "y": 80,
+    "wires": [
+      [
+        "t_ui"
+      ]
+    ]
+  },
+  {
+    "id": "t_ui",
+    "type": "template",
+    "z": "flow_arcgis_cfg",
+    "name": "Configurator HTML",
+    "field": "payload",
+    "fieldType": "msg",
+    "format": "html",
+    "syntax": "plain",
+    "template": "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"UTF-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n<title>ArcGIS → TAK Configurator</title>\n<style>\n  * { box-sizing: border-box; margin: 0; padding: 0; }\n  body {\n    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;\n    background: #1a1a2e; color: #e0e0e0; padding: 2rem;\n  }\n  .container { max-width: 860px; margin: 0 auto; }\n  h1 { color: #fff; margin-bottom: 0.3rem; font-size: 1.5rem; }\n  .subtitle { color: #888; margin-bottom: 1.5rem; font-size: 0.85rem; }\n\n  .step {\n    background: #16213e; border-radius: 8px; padding: 1.5rem;\n    margin-bottom: 1rem; border-left: 3px solid #0f3460;\n    transition: opacity 0.3s;\n  }\n  .step h2 {\n    color: #e94560; font-size: 0.85rem; margin-bottom: 1rem;\n    text-transform: uppercase; letter-spacing: 0.05em;\n  }\n  .step.disabled { opacity: 0.35; pointer-events: none; }\n\n  label { display: block; font-size: 0.85rem; color: #a0a0b0; margin-bottom: 0.3rem; }\n  input[type=\"text\"], input[type=\"number\"], select {\n    width: 100%; padding: 0.6rem; background: #0f3460;\n    border: 1px solid #1a1a4e; border-radius: 4px;\n    color: #fff; font-size: 0.95rem;\n  }\n  input:focus, select:focus { outline: none; border-color: #e94560; }\n\n  button {\n    padding: 0.6rem 1.5rem; background: #e94560; color: #fff;\n    border: none; border-radius: 4px; cursor: pointer; font-size: 0.95rem;\n    transition: background 0.2s;\n  }\n  button:hover { background: #c73650; }\n  button:disabled { background: #555; cursor: not-allowed; }\n  .btn-secondary { background: #0f3460; }\n  .btn-secondary:hover { background: #1a4a7a; }\n\n  .row { display: flex; gap: 1rem; align-items: end; }\n  .grow { flex: 1; }\n  .field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }\n\n  .sample-wrap { overflow-x: auto; margin-top: 1rem; }\n  .sample-table {\n    border-collapse: collapse; font-size: 0.78rem; white-space: nowrap;\n  }\n  .sample-table th, .sample-table td {\n    padding: 0.35rem 0.6rem; border: 1px solid #1a1a4e; text-align: left;\n  }\n  .sample-table th { background: #0f3460; position: sticky; top: 0; }\n  .sample-table tr:hover td { background: #1a2a4e; }\n  .sample-table .hi { background: #e9456022; }\n\n  .config-output {\n    background: #0a0a1a; padding: 1rem; border-radius: 4px;\n    font-family: 'SF Mono', Menlo, monospace; font-size: 0.85rem;\n    white-space: pre-wrap; max-height: 400px; overflow-y: auto;\n    margin-top: 1rem; border: 1px solid #1a1a4e;\n  }\n\n  .badge {\n    display: inline-block; padding: 0.1rem 0.45rem; border-radius: 3px;\n    font-size: 0.7rem; margin-left: 0.4rem; vertical-align: middle;\n  }\n  .badge-oid  { background: #e94560; color: #fff; }\n  .badge-date { background: #0f9b58; color: #fff; }\n  .badge-geom { background: #4285f4; color: #fff; }\n\n  .status {\n    padding: 0.5rem; border-radius: 4px; margin-top: 0.5rem; font-size: 0.85rem;\n  }\n  .status.ok    { background: #0f9b5822; border: 1px solid #0f9b58; color: #7fdb9a; }\n  .status.error { background: #e9456022; border: 1px solid #e94560; color: #f4a0b0; }\n\n  .color-row { display: flex; gap: 0.5rem; align-items: center; }\n  .color-swatch {\n    width: 28px; height: 28px; border-radius: 4px;\n    border: 1px solid #333; flex-shrink: 0;\n  }\n\n  .spinner {\n    display: inline-block; width: 14px; height: 14px;\n    border: 2px solid #fff3; border-top-color: #fff;\n    border-radius: 50%; animation: spin 0.6s linear infinite;\n    margin-left: 0.5rem; vertical-align: middle;\n  }\n  @keyframes spin { to { transform: rotate(360deg); } }\n</style>\n</head>\n<body>\n<div class=\"container\">\n  <h1>ArcGIS &rarr; TAK Configurator</h1>\n  <p class=\"subtitle\">Paste a Feature Service URL, pick your layer &amp; fields, generate config for the sync engine.</p>\n\n  <!-- Step 1 -->\n  <div class=\"step\" id=\"step1\">\n    <h2>1. Feature Service URL</h2>\n    <div class=\"row\">\n      <div class=\"grow\">\n        <label for=\"serviceUrl\">ArcGIS Feature Service or Layer URL</label>\n        <input type=\"text\" id=\"serviceUrl\"\n               placeholder=\"https://services.arcgis.com/…/FeatureServer\">\n      </div>\n      <button id=\"btnFetch\" onclick=\"fetchService()\">Fetch</button>\n    </div>\n    <div id=\"svcStatus\"></div>\n  </div>\n\n  <!-- Step 2 -->\n  <div class=\"step disabled\" id=\"step2\">\n    <h2>2. Select Layer</h2>\n    <label for=\"layerSelect\">Layer</label>\n    <select id=\"layerSelect\" onchange=\"fetchLayer()\">\n      <option value=\"\">-- fetch service first --</option>\n    </select>\n    <div id=\"layerStatus\"></div>\n  </div>\n\n  <!-- Step 3 -->\n  <div class=\"step disabled\" id=\"step3\">\n    <h2>3. Field Mapping</h2>\n    <div class=\"field-grid\">\n      <div>\n        <label for=\"idField\">Stable ID field <span class=\"badge badge-oid\">suggested: OID / GlobalID</span></label>\n        <select id=\"idField\"></select>\n      </div>\n      <div>\n        <label for=\"timeField\">Time field <span class=\"badge badge-date\">suggested: Date type</span></label>\n        <select id=\"timeField\"><option value=\"\">(none)</option></select>\n      </div>\n    </div>\n    <div style=\"margin-top:1rem\">\n      <label>Detected geometry <span class=\"badge badge-geom\" id=\"geomBadge\"></span></label>\n    </div>\n    <div id=\"sampleData\"></div>\n  </div>\n\n  <!-- Step 4 -->\n  <div class=\"step disabled\" id=\"step4\">\n    <h2>4. CoT Style &amp; TTL</h2>\n    <div class=\"field-grid\">\n      <div>\n        <label for=\"strokeColor\">Stroke color (hex)</label>\n        <div class=\"color-row\">\n          <input type=\"text\" id=\"strokeColor\" value=\"#FF0000\" style=\"width:130px\"\n                 oninput=\"updSwatch('swStroke',this.value)\">\n          <div class=\"color-swatch\" id=\"swStroke\" style=\"background:#FF0000\"></div>\n        </div>\n      </div>\n      <div>\n        <label for=\"fillColor\">Fill color (hex + alpha ok)</label>\n        <div class=\"color-row\">\n          <input type=\"text\" id=\"fillColor\" value=\"#FF000044\" style=\"width:130px\"\n                 oninput=\"updSwatch('swFill',this.value)\">\n          <div class=\"color-swatch\" id=\"swFill\" style=\"background:#FF000044\"></div>\n        </div>\n      </div>\n      <div>\n        <label for=\"ttlHours\">TTL hours (0 = no expiry)</label>\n        <input type=\"number\" id=\"ttlHours\" value=\"72\" min=\"0\">\n      </div>\n      <div>\n        <label for=\"uidPrefix\">UID prefix</label>\n        <input type=\"text\" id=\"uidPrefix\" value=\"arcgis-\" placeholder=\"arcgis-\">\n      </div>\n    </div>\n  </div>\n\n  <!-- Step 5 -->\n  <div class=\"step disabled\" id=\"step5\">\n    <h2>5. Generate Config</h2>\n    <div class=\"row\">\n      <button onclick=\"generateConfig()\">Generate Config JSON</button>\n      <button class=\"btn-secondary\" onclick=\"copyConfig()\">Copy to Clipboard</button>\n      <button class=\"btn-secondary\" onclick=\"downloadConfig()\">Download</button>\n    </div>\n    <div id=\"saveStatus\"></div>\n    <div class=\"config-output\" id=\"configOutput\"></div>\n  </div>\n</div>\n\n<script>\nconst state = {\n  serviceUrl: '',\n  layers: [],\n  selectedLayer: null,\n  layerName: '',\n  fields: [],\n  geometryType: '',\n  sampleFeatures: []\n};\n\nfunction updSwatch(id, v) {\n  document.getElementById(id).style.background = v;\n}\n\nfunction enable(n) {\n  document.getElementById('step' + n).classList.remove('disabled');\n}\n\nfunction status(id, msg, ok) {\n  document.getElementById(id).innerHTML =\n    '<div class=\"status ' + (ok ? 'ok' : 'error') + '\">' + msg + '</div>';\n}\n\nfunction setLoading(btnId, loading) {\n  const btn = document.getElementById(btnId);\n  if (loading) {\n    btn.disabled = true;\n    btn._orig = btn.innerHTML;\n    btn.innerHTML += '<span class=\"spinner\"></span>';\n  } else {\n    btn.disabled = false;\n    btn.innerHTML = btn._orig || btn.innerHTML.replace(/<span.*<\\/span>/, '');\n  }\n}\n\n/* ── Step 1: Fetch service ── */\nasync function fetchService() {\n  const raw = document.getElementById('serviceUrl').value.trim();\n  if (!raw) return;\n  state.serviceUrl = raw.replace(/\\/+$/, '');\n  setLoading('btnFetch', true);\n\n  try {\n    const res = await fetch('/api/arcgis/service', {\n      method: 'POST',\n      headers: { 'Content-Type': 'application/json' },\n      body: JSON.stringify({ url: state.serviceUrl })\n    });\n    const data = await res.json();\n    if (data.error) { status('svcStatus', 'Error: ' + data.error, false); return; }\n\n    state.layers = data.layers || [];\n    const sel = document.getElementById('layerSelect');\n    sel.innerHTML = '<option value=\"\">-- select a layer --</option>';\n    state.layers.forEach(function(l) {\n      var gt = l.geometryType ? l.geometryType.replace('esriGeometry', '') : 'Table';\n      sel.innerHTML += '<option value=\"' + l.id + '\">' + l.id + ': ' + l.name + ' (' + gt + ')</option>';\n    });\n\n    status('svcStatus', 'Found ' + state.layers.length + ' layer(s)', true);\n    enable(2);\n  } catch (e) {\n    status('svcStatus', 'Fetch failed: ' + e.message, false);\n  } finally {\n    setLoading('btnFetch', false);\n  }\n}\n\n/* ── Step 2: Fetch layer detail + sample ── */\nasync function fetchLayer() {\n  var layerId = document.getElementById('layerSelect').value;\n  if (layerId === '') return;\n  state.selectedLayer = layerId;\n\n  try {\n    var results = await Promise.all([\n      fetch('/api/arcgis/layer', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ url: state.serviceUrl, layerId: layerId })\n      }),\n      fetch('/api/arcgis/sample', {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ url: state.serviceUrl, layerId: layerId })\n      })\n    ]);\n\n    var layerData  = await results[0].json();\n    var sampleData = await results[1].json();\n    if (layerData.error) { status('layerStatus', 'Error: ' + layerData.error, false); return; }\n\n    state.fields         = layerData.fields || [];\n    state.geometryType   = layerData.geometryType || 'unknown';\n    state.layerName      = layerData.name || '';\n    state.sampleFeatures = (sampleData.features || []).slice(0, 5);\n\n    /* populate field dropdowns */\n    var idSel   = document.getElementById('idField');\n    var timeSel = document.getElementById('timeField');\n    idSel.innerHTML   = '';\n    timeSel.innerHTML  = '<option value=\"\">(none &mdash; no time filter)</option>';\n\n    state.fields.forEach(function(f) {\n      var short = f.type.replace('esriFieldType', '');\n      var isId   = (f.type === 'esriFieldTypeOID' || f.type === 'esriFieldTypeGlobalID');\n      var isDate = (f.type === 'esriFieldTypeDate');\n      var tag    = isId ? ' << ID' : isDate ? ' << Date' : '';\n\n      idSel.innerHTML += '<option value=\"' + f.name + '\"' + (isId ? ' selected' : '') + '>'\n                         + f.name + ' (' + short + ')' + tag + '</option>';\n      timeSel.innerHTML += '<option value=\"' + f.name + '\"' + (isDate ? ' selected' : '') + '>'\n                           + f.name + ' (' + short + ')' + (isDate ? ' << Date' : '') + '</option>';\n    });\n\n    document.getElementById('geomBadge').textContent =\n      state.geometryType.replace('esriGeometry', '');\n\n    /* sample data table */\n    if (state.sampleFeatures.length) {\n      var keys = Object.keys(state.sampleFeatures[0].attributes);\n      var html = '<div class=\"sample-wrap\"><table class=\"sample-table\"><tr>';\n      keys.forEach(function(k) { html += '<th>' + k + '</th>'; });\n      html += '</tr>';\n      state.sampleFeatures.forEach(function(f) {\n        html += '<tr>';\n        keys.forEach(function(k) {\n          var v = f.attributes[k];\n          if (v != null && String(v).length > 50) v = String(v).substring(0, 50) + '\\u2026';\n          html += '<td>' + (v != null ? v : '') + '</td>';\n        });\n        html += '</tr>';\n      });\n      html += '</table></div>';\n      document.getElementById('sampleData').innerHTML =\n        '<label style=\"margin-top:1rem;display:block\">Sample features (first 5)</label>' + html;\n    }\n\n    /* auto-set UID prefix from layer name */\n    var match = state.layers.find(function(l) { return String(l.id) === String(layerId); });\n    if (match) {\n      document.getElementById('uidPrefix').value =\n        match.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') + '-';\n    }\n\n    status('layerStatus',\n      state.fields.length + ' fields, geometry: ' + state.geometryType.replace('esriGeometry', ''), true);\n    enable(3); enable(4); enable(5);\n  } catch (e) {\n    status('layerStatus', 'Fetch failed: ' + e.message, false);\n  }\n}\n\n/* ── Step 5: Generate config ── */\nfunction generateConfig() {\n  var config = {\n    source: {\n      serviceUrl: state.serviceUrl,\n      layerId: parseInt(state.selectedLayer, 10),\n      layerName: state.layerName,\n      geometryType: state.geometryType\n    },\n    mapping: {\n      idField: document.getElementById('idField').value,\n      timeField: document.getElementById('timeField').value || null\n    },\n    style: {\n      strokeColor: document.getElementById('strokeColor').value,\n      fillColor: document.getElementById('fillColor').value\n    },\n    ttlHours: parseInt(document.getElementById('ttlHours').value, 10) || 0,\n    uidPrefix: document.getElementById('uidPrefix').value,\n    generated: new Date().toISOString()\n  };\n\n  document.getElementById('configOutput').textContent = JSON.stringify(config, null, 2);\n\n  fetch('/api/config/save', {\n    method: 'POST',\n    headers: { 'Content-Type': 'application/json' },\n    body: JSON.stringify(config)\n  }).then(function(r) { return r.json(); })\n    .then(function(d) {\n      status('saveStatus', 'Saved to Node-RED flow context (' + d.configCount + ' config(s) stored)', true);\n    })\n    .catch(function() {});\n}\n\nfunction copyConfig() {\n  var t = document.getElementById('configOutput').textContent;\n  if (t) navigator.clipboard.writeText(t).then(function() {\n    status('saveStatus', 'Copied to clipboard', true);\n  });\n}\n\nfunction downloadConfig() {\n  var t = document.getElementById('configOutput').textContent;\n  if (!t) return;\n  var blob = new Blob([t], { type: 'application/json' });\n  var a = document.createElement('a');\n  a.href = URL.createObjectURL(blob);\n  a.download = 'arcgis-tak-config.json';\n  a.click();\n}\n</script>\n</body>\n</html>\n",
+    "output": "str",
+    "x": 390,
+    "y": 80,
+    "wires": [
+      [
+        "ho_ui"
+      ]
+    ]
+  },
+  {
+    "id": "ho_ui",
+    "type": "http response",
+    "z": "flow_arcgis_cfg",
+    "name": "",
+    "statusCode": "200",
+    "headers": {
+      "content-type": "text/html"
+    },
+    "x": 590,
+    "y": 80,
+    "wires": []
+  },
+  {
+    "id": "c_api",
+    "type": "comment",
+    "z": "flow_arcgis_cfg",
+    "name": "── ArcGIS Proxy APIs ──",
+    "info": "",
+    "x": 240,
+    "y": 160,
+    "wires": []
+  },
+  {
+    "id": "hi_svc",
+    "type": "http in",
+    "z": "flow_arcgis_cfg",
+    "name": "POST /api/arcgis/service",
+    "url": "/api/arcgis/service",
+    "method": "post",
+    "upload": false,
+    "swaggerDoc": "",
+    "x": 200,
+    "y": 200,
+    "wires": [
+      [
+        "fn_svc"
+      ]
+    ]
+  },
+  {
+    "id": "fn_svc",
+    "type": "function",
+    "z": "flow_arcgis_cfg",
+    "name": "Build service URL",
+    "func": "const base = msg.payload.url.replace(/\\/+$/, '');\nmsg.url = base + '?f=json';\nreturn msg;",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 430,
+    "y": 200,
+    "wires": [
+      [
+        "hr_svc"
+      ]
+    ]
+  },
+  {
+    "id": "hr_svc",
+    "type": "http request",
+    "z": "flow_arcgis_cfg",
+    "name": "GET service info",
+    "method": "GET",
+    "ret": "obj",
+    "paytoqs": "ignore",
+    "url": "",
+    "tls": "",
+    "persist": false,
+    "proxy": "",
+    "insecureHTTPParser": false,
+    "authType": "",
+    "senderr": false,
+    "headers": [],
+    "x": 620,
+    "y": 200,
+    "wires": [
+      [
+        "fn_svc_parse"
+      ]
+    ]
+  },
+  {
+    "id": "fn_svc_parse",
+    "type": "function",
+    "z": "flow_arcgis_cfg",
+    "name": "Parse service",
+    "func": "if (msg.payload.error) {\n  msg.payload = { error: msg.payload.error.message || 'ArcGIS error' };\n} else {\n  msg.payload = {\n    layers: (msg.payload.layers || []).map(function(l) {\n      return { id: l.id, name: l.name, geometryType: l.geometryType || null };\n    })\n  };\n}\nreturn msg;",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 810,
+    "y": 200,
+    "wires": [
+      [
+        "ho_svc"
+      ]
+    ]
+  },
+  {
+    "id": "ho_svc",
+    "type": "http response",
+    "z": "flow_arcgis_cfg",
+    "name": "",
+    "statusCode": "",
+    "headers": {},
+    "x": 1000,
+    "y": 200,
+    "wires": []
+  },
+  {
+    "id": "hi_lyr",
+    "type": "http in",
+    "z": "flow_arcgis_cfg",
+    "name": "POST /api/arcgis/layer",
+    "url": "/api/arcgis/layer",
+    "method": "post",
+    "upload": false,
+    "swaggerDoc": "",
+    "x": 200,
+    "y": 300,
+    "wires": [
+      [
+        "fn_lyr"
+      ]
+    ]
+  },
+  {
+    "id": "fn_lyr",
+    "type": "function",
+    "z": "flow_arcgis_cfg",
+    "name": "Build layer URL",
+    "func": "const base = msg.payload.url.replace(/\\/+$/, '');\nmsg.url = base + '/' + msg.payload.layerId + '?f=json';\nreturn msg;",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 430,
+    "y": 300,
+    "wires": [
+      [
+        "hr_lyr"
+      ]
+    ]
+  },
+  {
+    "id": "hr_lyr",
+    "type": "http request",
+    "z": "flow_arcgis_cfg",
+    "name": "GET layer info",
+    "method": "GET",
+    "ret": "obj",
+    "paytoqs": "ignore",
+    "url": "",
+    "tls": "",
+    "persist": false,
+    "proxy": "",
+    "insecureHTTPParser": false,
+    "authType": "",
+    "senderr": false,
+    "headers": [],
+    "x": 620,
+    "y": 300,
+    "wires": [
+      [
+        "fn_lyr_parse"
+      ]
+    ]
+  },
+  {
+    "id": "fn_lyr_parse",
+    "type": "function",
+    "z": "flow_arcgis_cfg",
+    "name": "Parse layer",
+    "func": "if (msg.payload.error) {\n  msg.payload = { error: msg.payload.error.message || 'ArcGIS error' };\n} else {\n  msg.payload = {\n    name: msg.payload.name,\n    geometryType: msg.payload.geometryType,\n    fields: (msg.payload.fields || []).map(function(f) {\n      return { name: f.name, type: f.type, alias: f.alias || f.name };\n    })\n  };\n}\nreturn msg;",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 810,
+    "y": 300,
+    "wires": [
+      [
+        "ho_lyr"
+      ]
+    ]
+  },
+  {
+    "id": "ho_lyr",
+    "type": "http response",
+    "z": "flow_arcgis_cfg",
+    "name": "",
+    "statusCode": "",
+    "headers": {},
+    "x": 1000,
+    "y": 300,
+    "wires": []
+  },
+  {
+    "id": "hi_smp",
+    "type": "http in",
+    "z": "flow_arcgis_cfg",
+    "name": "POST /api/arcgis/sample",
+    "url": "/api/arcgis/sample",
+    "method": "post",
+    "upload": false,
+    "swaggerDoc": "",
+    "x": 200,
+    "y": 400,
+    "wires": [
+      [
+        "fn_smp"
+      ]
+    ]
+  },
+  {
+    "id": "fn_smp",
+    "type": "function",
+    "z": "flow_arcgis_cfg",
+    "name": "Build sample query URL",
+    "func": "const base = msg.payload.url.replace(/\\/+$/, '');\nconst lid  = msg.payload.layerId;\nmsg.url = base + '/' + lid + '/query?where=1%3D1&outFields=*&resultRecordCount=5&f=json';\nreturn msg;",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 430,
+    "y": 400,
+    "wires": [
+      [
+        "hr_smp"
+      ]
+    ]
+  },
+  {
+    "id": "hr_smp",
+    "type": "http request",
+    "z": "flow_arcgis_cfg",
+    "name": "GET sample features",
+    "method": "GET",
+    "ret": "obj",
+    "paytoqs": "ignore",
+    "url": "",
+    "tls": "",
+    "persist": false,
+    "proxy": "",
+    "insecureHTTPParser": false,
+    "authType": "",
+    "senderr": false,
+    "headers": [],
+    "x": 620,
+    "y": 400,
+    "wires": [
+      [
+        "fn_smp_parse"
+      ]
+    ]
+  },
+  {
+    "id": "fn_smp_parse",
+    "type": "function",
+    "z": "flow_arcgis_cfg",
+    "name": "Parse sample",
+    "func": "if (msg.payload.error) {\n  msg.payload = { error: msg.payload.error.message || 'ArcGIS error' };\n} else {\n  msg.payload = { features: (msg.payload.features || []).slice(0, 5) };\n}\nreturn msg;",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 810,
+    "y": 400,
+    "wires": [
+      [
+        "ho_smp"
+      ]
+    ]
+  },
+  {
+    "id": "ho_smp",
+    "type": "http response",
+    "z": "flow_arcgis_cfg",
+    "name": "",
+    "statusCode": "",
+    "headers": {},
+    "x": 1000,
+    "y": 400,
+    "wires": []
+  },
+  {
+    "id": "c_save",
+    "type": "comment",
+    "z": "flow_arcgis_cfg",
+    "name": "── Config Save ──",
+    "info": "",
+    "x": 240,
+    "y": 480,
+    "wires": []
+  },
+  {
+    "id": "hi_save",
+    "type": "http in",
+    "z": "flow_arcgis_cfg",
+    "name": "POST /api/config/save",
+    "url": "/api/config/save",
+    "method": "post",
+    "upload": false,
+    "swaggerDoc": "",
+    "x": 200,
+    "y": 520,
+    "wires": [
+      [
+        "fn_save"
+      ]
+    ]
+  },
+  {
+    "id": "fn_save",
+    "type": "function",
+    "z": "flow_arcgis_cfg",
+    "name": "Save to flow context",
+    "func": "var config  = msg.payload;\nvar configs = flow.get('arcgis_configs') || [];\nvar idx = configs.findIndex(function(c) {\n  return c.source.serviceUrl === config.source.serviceUrl\n      && c.source.layerId    === config.source.layerId;\n});\nif (idx >= 0) { configs[idx] = config; }\nelse           { configs.push(config); }\nflow.set('arcgis_configs', configs);\nmsg.payload = { ok: true, configCount: configs.length };\nreturn msg;",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 430,
+    "y": 520,
+    "wires": [
+      [
+        "ho_save"
+      ]
+    ]
+  },
+  {
+    "id": "ho_save",
+    "type": "http response",
+    "z": "flow_arcgis_cfg",
+    "name": "",
+    "statusCode": "",
+    "headers": {},
+    "x": 640,
+    "y": 520,
+    "wires": []
+  }
+]
