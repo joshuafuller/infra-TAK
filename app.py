@@ -25043,6 +25043,42 @@ def takserver_update_log():
     return jsonify({'entries': upgrade_log[idx:], 'total': len(upgrade_log),
         'running': upgrade_status['running'], 'complete': upgrade_status['complete'], 'error': upgrade_status['error']})
 
+def _tak_upgrade_apt_install(cwd, pkg_name, upgrade_log, timeout_sec=600):
+    """Run apt-get install for a local .deb with streamed output.
+
+    subprocess.run(capture_output=True) buffers all stdout/stderr until exit, so a slow
+    configure/postinst looks like a silent hang. stdbuf -oL line-buffers; a reader thread
+    appends lines to upgrade_log so operators see where apt stalled if a timeout fires.
+    """
+    qn = shlex.quote(pkg_name)
+    cmd = f'stdbuf -oL -eL env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y ./{qn} 2>&1'
+    proc = subprocess.Popen(
+        cmd, shell=True, cwd=cwd,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    if proc.stdout is None:
+        return 1
+
+    def _drain():
+        for line in iter(proc.stdout.readline, ''):
+            if line and 'NEEDRESTART' not in line:
+                upgrade_log.append('  ' + line.rstrip('\n'))
+
+    t = threading.Thread(target=_drain, daemon=True)
+    t.start()
+    try:
+        proc.wait(timeout=timeout_sec)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.wait(timeout=15)
+        except Exception:
+            pass
+        t.join(timeout=5)
+        raise
+    t.join(timeout=5)
+    return proc.returncode if proc.returncode is not None else 1
+
+
 def run_takserver_upgrade(pkg_path):
     def ulog(msg):
         entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
@@ -25056,15 +25092,14 @@ def run_takserver_upgrade(pkg_path):
         wait_for_apt_lock(ulog, upgrade_log)
         ulog("")
         ulog("Installing upgrade package: " + pkg_name)
-        r = subprocess.run(
-            f'DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y ./{pkg_name} 2>&1',
-            shell=True, cwd=os.path.dirname(pkg_path), capture_output=True, text=True, timeout=600)
-        out = (r.stdout or '') + (r.stderr or '')
-        for line in out.strip().split('\n'):
-            if line.strip() and 'NEEDRESTART' not in line:
-                upgrade_log.append("  " + line)
-        if r.returncode != 0:
-            ulog("Update failed (exit " + str(r.returncode) + ")")
+        try:
+            rc = _tak_upgrade_apt_install(os.path.dirname(pkg_path), pkg_name, upgrade_log, timeout_sec=600)
+        except subprocess.TimeoutExpired as te:
+            ulog("Error: " + str(te))
+            upgrade_status.update({'running': False, 'complete': False, 'error': True})
+            return
+        if rc != 0:
+            ulog("Update failed (exit " + str(rc) + ")")
             upgrade_status.update({'running': False, 'complete': False, 'error': True})
             return
         ne_changed, ne_msg = _sanitize_coreconfig_name_entries()
@@ -25108,15 +25143,14 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
         ulog("━━━ Step 2/4: Upgrading Core (this host) ━━━")
         wait_for_apt_lock(ulog, upgrade_log)
         ulog(f"Installing {core_name}...")
-        r = subprocess.run(
-            f'DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y ./{core_name} 2>&1',
-            shell=True, cwd=os.path.dirname(core_pkg_path), capture_output=True, text=True, timeout=600)
-        out = (r.stdout or '') + (r.stderr or '')
-        for line in out.strip().split('\n'):
-            if line.strip() and 'NEEDRESTART' not in line:
-                upgrade_log.append("  " + line)
-        if r.returncode != 0:
-            ulog(f"✗ Core upgrade failed (exit {r.returncode})")
+        try:
+            rc = _tak_upgrade_apt_install(os.path.dirname(core_pkg_path), core_name, upgrade_log, timeout_sec=600)
+        except subprocess.TimeoutExpired as te:
+            ulog(f"✗ Error: {te}")
+            upgrade_status.update({'running': False, 'complete': False, 'error': True})
+            return
+        if rc != 0:
+            ulog(f"✗ Core upgrade failed (exit {rc})")
             upgrade_status.update({'running': False, 'complete': False, 'error': True})
             return
         ulog("✓ Core package upgraded")
