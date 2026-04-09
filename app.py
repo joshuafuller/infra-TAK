@@ -25116,21 +25116,31 @@ def _tak_upgrade_apt_install(cwd, pkg_name, upgrade_log, timeout_sec=600):
 
 
 def _tak_upgrade_mitigate_takserver_postinst_config_sh(ulog):
-    """takserver maintainer script chmods /opt/tak/config/*.sh; if the dir is missing or the glob is empty, chmod fails.
+    """Repair missing /opt/tak/config scripts so takserver postinst chmod succeeds after partial upgrades.
 
-    Seen after interrupted upgrades (5.6→5.7 partial). Ensure the directory exists and at least one
-    executable *.sh when none are present so dpkg --configure -a can complete.
+    Postinst chmods /opt/tak/config/*.sh and /opt/tak/config/takserver-config.sh; missing files break
+    dpkg --configure -a (seen when 5.6→5.7 was interrupted).
     """
     mit = r'''
 set -e
 mkdir -p /opt/tak/config
+MIT=""
+if [[ ! -f /opt/tak/config/takserver-config.sh ]]; then
+  printf '%s\n' '#!/bin/sh' '# infra-TAK: placeholder — real file comes from takserver .deb; reinstall if needed' 'exit 0' \
+    > /opt/tak/config/takserver-config.sh
+  chmod +x /opt/tak/config/takserver-config.sh
+  MIT="takserver-config.sh"
+fi
 shopt -s nullglob
 a=(/opt/tak/config/*.sh)
 if [[ ${#a[@]} -eq 0 ]]; then
-  printf '%s\n' '#!/bin/sh' '# infra-TAK: placeholder so takserver postinst chmod on *.sh succeeds' 'exit 0' \
+  printf '%s\n' '#!/bin/sh' '# infra-TAK: placeholder so postinst chmod on *.sh succeeds' 'exit 0' \
     > /opt/tak/config/_infra_tak_placeholder_for_postinst.sh
   chmod +x /opt/tak/config/_infra_tak_placeholder_for_postinst.sh
-  echo MITIGATED
+  MIT="${MIT:+$MIT, }*.sh glob"
+fi
+if [[ -n "$MIT" ]]; then
+  echo "MITIGATED:$MIT"
 else
   echo OK
 fi
@@ -25141,8 +25151,8 @@ fi
         if r.returncode != 0:
             ulog(f"⚠ Could not prepare /opt/tak/config ({out[:200]})")
             return
-        if 'MITIGATED' in out:
-            ulog("Prepared /opt/tak/config (placeholder .sh — takserver postinst requires a matching glob)")
+        if out.startswith('MITIGATED:'):
+            ulog("Prepared /opt/tak/config (" + out.replace('MITIGATED:', '').strip() + ")")
     except Exception as e:
         ulog(f"⚠ Tak config path workaround skipped: {e}")
 
