@@ -15142,6 +15142,7 @@ def run_nodered_deploy():
   node-red:
     image: nodered/node-red:latest
     container_name: nodered
+    restart: unless-stopped
     ports:
       - "127.0.0.1:1880:1880"
     volumes:

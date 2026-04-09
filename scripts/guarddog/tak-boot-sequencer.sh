@@ -21,35 +21,43 @@ _log() {
   logger -t takguard-boot "$1" 2>/dev/null
 }
 
-# ── 1. Stop Docker containers so TAK gets full CPU ──
-_log "Stopping Docker containers and MediaMTX to give TAK Server full CPU..."
+# ── 1. Stop Docker containers so TAK gets full CPU (boot only) ──
+# On a real boot, uptime is under a few minutes — stop everything so TAK
+# gets full CPU during its heavy 5-7 minute initialization.
+# On a manual restart (uptime > 10 min), the containers are already running
+# fine and should not be disturbed.
+_uptime_sec=$(awk '{printf "%d", $1}' /proc/uptime 2>/dev/null || echo 9999)
+if [ "$_uptime_sec" -lt 600 ]; then
+  _log "Boot detected (uptime ${_uptime_sec}s) — stopping Docker containers and MediaMTX to give TAK Server full CPU..."
 
-for _d in /root/authentik "${HOME:-/root}/authentik"; do
-  if [ -f "$_d/docker-compose.yml" ]; then
-    cd "$_d" && docker compose stop -t 10 2>/dev/null && _log "Authentik containers stopped"
-    break
+  for _d in /root/authentik "${HOME:-/root}/authentik"; do
+    if [ -f "$_d/docker-compose.yml" ]; then
+      cd "$_d" && docker compose stop -t 10 2>/dev/null && _log "Authentik containers stopped"
+      break
+    fi
+  done
+
+  docker stop tak-portal 2>/dev/null && _log "TAK Portal stopped"
+
+  for _d in /root/CloudTAK "${HOME:-/root}/CloudTAK"; do
+    if [ -f "$_d/docker-compose.yml" ]; then
+      cd "$_d" && docker compose stop -t 10 2>/dev/null && _log "CloudTAK stopped"
+      break
+    fi
+  done
+
+  for _d in /root/node-red "${HOME:-/root}/node-red"; do
+    if [ -f "$_d/docker-compose.yml" ]; then
+      cd "$_d" && docker compose stop -t 10 2>/dev/null && _log "Node-RED stopped"
+      break
+    fi
+  done
+
+  if systemctl list-unit-files mediamtx.service &>/dev/null && systemctl is-active --quiet mediamtx 2>/dev/null; then
+    systemctl stop mediamtx 2>/dev/null && _log "MediaMTX stopped"
   fi
-done
-
-docker stop tak-portal 2>/dev/null && _log "TAK Portal stopped"
-
-for _d in /root/CloudTAK "${HOME:-/root}/CloudTAK"; do
-  if [ -f "$_d/docker-compose.yml" ]; then
-    cd "$_d" && docker compose stop -t 10 2>/dev/null && _log "CloudTAK stopped"
-    break
-  fi
-done
-
-for _d in /root/node-red "${HOME:-/root}/node-red"; do
-  if [ -f "$_d/docker-compose.yml" ]; then
-    cd "$_d" && docker compose stop -t 10 2>/dev/null && _log "Node-RED stopped"
-    break
-  fi
-done
-
-# MediaMTX is a systemd service, not Docker
-if systemctl list-unit-files mediamtx.service &>/dev/null && systemctl is-active --quiet mediamtx 2>/dev/null; then
-  systemctl stop mediamtx 2>/dev/null && _log "MediaMTX stopped"
+else
+  _log "Runtime restart (uptime ${_uptime_sec}s) — skipping container shutdown"
 fi
 
 # ── 2. Wait for PostgreSQL ──
