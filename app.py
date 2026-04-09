@@ -25120,9 +25120,10 @@ _TAK_POSTINST_EXPLICIT_SH_FALLBACK = (
     '/opt/tak/config/takserver-config.sh',
     '/opt/tak/messaging/takserver-messaging.sh',
 )
-# Non-.sh paths postinst may chown (usually directories); mkdir -p until .deb restores layout.
-_TAK_POSTINST_DIR_FALLBACK = (
-    '/opt/tak/config/takserver-config',
+# Paths that look like files (do not mkdir — postinst cp/install references these).
+_TAK_POSTINST_SKIP_DIR_MK_SUFFIX = (
+    '.xml', '.sql', '.conf', '.jks', '.pem', '.properties', '.jar', '.war', '.deb', '.rpm',
+    '.pol', '.p12', '.crt', '.key', '.idx', '.policy',
 )
 _TAK_POSTINST_SH_GLOB_DIRS = (
     '/opt/tak/config',
@@ -25134,10 +25135,24 @@ _TAK_POSTINST_SH_GLOB_DIRS = (
 )
 
 
+def _tak_postinst_path_should_skip_mkdir(p):
+    """True if p is almost certainly a file (postinst cp/install lines mention these — do not mkdir)."""
+    pl = p.lower()
+    if pl.endswith(_TAK_POSTINST_SKIP_DIR_MK_SUFFIX):
+        return True
+    if pl.endswith('.dist') or '.dist.' in os.path.basename(p):
+        return True
+    return False
+
+
 def _tak_postinst_resolved_mitigation_paths():
-    """Return (sh_paths, dir_paths) for chmod/chown targets under /opt/tak from takserver.postinst + fallbacks."""
+    """Return (sh_paths, dir_paths) from takserver.postinst chmod/chown lines only (+ .sh fallbacks).
+
+    Do not parse cp/install/mv — those reference many files; mkdir on them breaks dpkg.
+    Do not mkdir /opt/tak/config/takserver-config here — an empty dir breaks postinst cp; see rmdir helper.
+    """
     sh_paths = set(_TAK_POSTINST_EXPLICIT_SH_FALLBACK)
-    dir_paths = set(_TAK_POSTINST_DIR_FALLBACK)
+    dir_paths = set()
     pi = '/var/lib/dpkg/info/takserver.postinst'
     try:
         if os.path.isfile(pi):
@@ -25146,13 +25161,18 @@ def _tak_postinst_resolved_mitigation_paths():
             for line in lines:
                 if '#' in line:
                     line = line.split('#', 1)[0]
-                if not any(k in line for k in ('chmod', 'chown', 'install', 'cp ', 'mv ', 'mkdir')):
+                if not any(k in line for k in ('chmod', 'chown')):
                     continue
                 for m in re.finditer(r'/opt/tak/[A-Za-z0-9_./-]+', line):
                     p = m.group(0)
                     if p.endswith('.sh'):
                         sh_paths.add(p)
                     elif p.endswith(('.deb', '.rpm', '.jar', '.war')):
+                        continue
+                    elif _tak_postinst_path_should_skip_mkdir(p):
+                        continue
+                    elif p == '/opt/tak/config/takserver-config':
+                        # Postinst populates via cp; empty pre-created dir breaks cp (see _tak_upgrade_remove_blocking_empty_takserver_config).
                         continue
                     else:
                         dir_paths.add(p)
@@ -25167,6 +25187,27 @@ def _sudo_test(path, flag):
     return r.returncode == 0
 
 
+def _tak_upgrade_remove_blocking_empty_takserver_config(ulog):
+    """Remove empty /opt/tak/config/takserver-config if present.
+
+    A prior workaround mkdir created an empty directory; postinst then fails with:
+    cp: -r not specified; omitting directory '.../takserver-config'
+    Real install unpacks/copies into that path — it must not exist as an empty infra-TAK placeholder.
+    """
+    p = '/opt/tak/config/takserver-config'
+    script = (
+        'if [ -d ' + shlex.quote(p) + ' ] && [ -z "$(ls -A ' + shlex.quote(p) + ' 2>/dev/null)" ]; then '
+        'rmdir ' + shlex.quote(p) + ' && echo REMOVED; fi'
+    )
+    try:
+        r = subprocess.run(['sudo', 'bash', '-c', script], capture_output=True, text=True, timeout=15)
+        out = (r.stdout or '').strip()
+        if 'REMOVED' in out:
+            ulog(f"  ✓ removed empty {p} (so postinst can populate — not a mkdir placeholder)")
+    except Exception as e:
+        ulog(f"  ⚠ could not clear empty {p}: {e}")
+
+
 def _tak_upgrade_mitigate_takserver_postinst_config_sh(ulog):
     """Ensure dirs, named scripts, and *.sh globs exist so takserver postinst chmod/chown succeeds.
 
@@ -25176,13 +25217,7 @@ def _tak_upgrade_mitigate_takserver_postinst_config_sh(ulog):
     Also invoked from _tak_upgrade_dpkg_configure_a so this always runs immediately before dpkg --configure -a.
     """
     ulog("Preparing /opt/tak paths expected by takserver postinst (partial-upgrade workaround)...")
-    # Hard prerequisites — do not rely only on postinst parsing (broken upgrades omit these).
-    for critical in ('/opt/tak/config/takserver-config',):
-        r = subprocess.run(['sudo', 'mkdir', '-p', critical], capture_output=True, text=True, timeout=30)
-        if r.returncode != 0:
-            ulog(f"✗ mkdir -p {critical} failed: {(r.stderr or r.stdout or '').strip()[:400]}")
-        else:
-            ulog(f"  ✓ mkdir -p {critical} (required for takserver postinst chown)")
+    _tak_upgrade_remove_blocking_empty_takserver_config(ulog)
     sh_paths, dir_paths = _tak_postinst_resolved_mitigation_paths()
     placeholder = (
         '#!/bin/sh\n'
