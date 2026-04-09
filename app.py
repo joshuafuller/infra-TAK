@@ -5727,12 +5727,34 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
             _ssh_probe(remote, f'sudo cp {fh_dir}/certs/files/webadmin-fed.p12 /root/ 2>/dev/null; true', timeout=15)
 
         # --- Firewall ---
+        # Web UI (8080 HTTP / 9100 HTTPS): must NOT be world-accessible — edge is Caddy on this console
+        # (https://fedhub.<fqdn> + Authentik). Scope to console public IP when Settings → Server IP is set.
+        # Federation protocol (9101-9103): remain open for peer TAK servers on the internet.
         plog('━━━ Firewall (UFW) ━━━')
         _ssh_probe(remote, 'sudo ufw allow 22/tcp > /dev/null 2>&1; true', timeout=15)
-        for p in ['8080/tcp', '9100/tcp', '9101/tcp', '9102/tcp', '9103/tcp']:
+        caddy_src = _fedhub_caddy_source_ip(settings)
+        if caddy_src:
+            plog(f'Fed Hub web UI: allowing 8080, 9100 only from Caddy host {caddy_src} (Settings → Server IP)')
+            for port in (8080, 9100):
+                _ssh_probe(
+                    remote,
+                    f'sudo ufw allow from {caddy_src} to any port {port} proto tcp > /dev/null 2>&1; true',
+                    timeout=15,
+                )
+        else:
+            plog(
+                '⚠ Server IP unset or not IPv4 — opening 8080/9100 to everyone (insecure). '
+                'Set Settings → Server IP to this console\'s public IP and re-run Update Federation Hub to restrict.'
+            )
+            for p in ('8080/tcp', '9100/tcp'):
+                _ssh_probe(remote, f'sudo ufw allow {p} > /dev/null 2>&1; true', timeout=15)
+        for p in ('9101/tcp', '9102/tcp', '9103/tcp'):
             _ssh_probe(remote, f'sudo ufw allow {p} > /dev/null 2>&1; true', timeout=15)
         _ssh_probe(remote, 'sudo ufw --force enable > /dev/null 2>&1; true', timeout=15)
-        plog('✓ Firewall configured (22, 8080, 9100-9103)')
+        if caddy_src:
+            plog('✓ Firewall: SSH; 8080/9100 from Caddy host only; 9101-9103 public (federation peers)')
+        else:
+            plog('✓ Firewall configured (22, 8080, 9100-9103) — set Server IP + re-run deploy to harden UI ports')
 
         plog('━━━ Verify ━━━')
         ok_9100, out_9100 = _ssh_probe(remote, 'ss -tlnp | grep :9100 || true', timeout=15)
@@ -6579,6 +6601,23 @@ def _get_fedhub_deployment_config(settings):
         p = 8080
     c['web_ui_port'] = max(1, min(65535, p))
     return c
+
+
+def _fedhub_caddy_source_ip(settings):
+    """Public IPv4 of the infra-TAK console (Settings → Server IP). Used to UFW-scope Fed Hub web UI ports so only Caddy reaches 8080/9100; peers still use 9101-9103."""
+    ip = (settings.get('server_ip') or '').strip()
+    if not ip or ip in ('localhost', '127.0.0.1'):
+        return None
+    parts = ip.split('.')
+    if len(parts) != 4:
+        return None
+    try:
+        nums = [int(x) for x in parts]
+        if all(0 <= n <= 255 for n in nums):
+            return ip
+    except ValueError:
+        pass
+    return None
 
 
 def _module_deployment_settings_key(module_name):
