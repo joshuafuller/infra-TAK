@@ -7682,6 +7682,41 @@ def _patch_takportal_compose_network():
         return False
 
 
+def _patch_authentik_compose_network():
+    """Add the infratak external network to Authentik's docker-compose.yml.
+
+    Ensures the server container stays on the infratak network even after
+    'docker compose down && up' or Docker-initiated restarts — not just
+    console-driven restarts that call _ensure_infratak_network_for_authentik().
+    """
+    compose_path = os.path.expanduser('~/authentik/docker-compose.yml')
+    if not os.path.exists(compose_path):
+        return False
+    try:
+        _ensure_infratak_docker_network()
+        with open(compose_path) as f:
+            content = f.read()
+        if INFRATAK_DOCKER_NETWORK in content:
+            return False
+        service_network = "    networks:\n      - default\n      - infratak\n"
+        if '    command: server\n' in content:
+            content = content.replace(
+                '    command: server\n',
+                '    command: server\n' + service_network, 1)
+        networks_block = (
+            f"\nnetworks:\n"
+            f"  default:\n"
+            f"  {INFRATAK_DOCKER_NETWORK}:\n"
+            f"    external: true\n"
+        )
+        content = content.rstrip() + '\n' + networks_block
+        with open(compose_path, 'w') as f:
+            f.write(content)
+        return True
+    except Exception:
+        return False
+
+
 def _check_authentik_api_reachable(settings):
     """Verify we can reach the Authentik API (for remote: ensures firewall allows console -> Authentik:9090).
     Returns (True, None) if reachable, (False, error_msg) otherwise."""
@@ -18992,6 +19027,7 @@ def authentik_control():
         if not (remote.get('host') or '').strip():
             return jsonify({'error': 'Remote host not configured'}), 400
         ak_dir = '~/authentik'
+        _ssh_probe(remote, f'docker network inspect {INFRATAK_DOCKER_NETWORK} >/dev/null 2>&1 || docker network create {INFRATAK_DOCKER_NETWORK}', timeout=10)
         if action == 'start':
             _ssh_probe(remote, f'cd {ak_dir} && docker compose up -d 2>&1', timeout=120)
         elif action == 'stop':
@@ -19010,6 +19046,7 @@ def authentik_control():
         running = bool(ok and out and 'Up' in out)
         return jsonify({'success': True, 'running': running, 'action': action})
     ak_dir = os.path.expanduser('~/authentik')
+    _patch_authentik_compose_network()
     if action == 'start':
         subprocess.run(f'cd {ak_dir} && docker compose up -d', shell=True, capture_output=True, text=True, timeout=120)
     elif action == 'stop':
@@ -19678,6 +19715,9 @@ entries:
     image: ${AUTHENTIK_IMAGE:-ghcr.io/goauthentik/server}:${AUTHENTIK_TAG:-2026.2.0}
     restart: unless-stopped
     command: server
+    networks:
+      - default
+      - infratak
     environment:
       AUTHENTIK_REDIS__HOST: redis
       AUTHENTIK_POSTGRESQL__HOST: postgresql
@@ -19758,6 +19798,10 @@ volumes:
     driver: local
   redis:
     driver: local
+networks:
+  default:
+  infratak:
+    external: true
 """
     compose_content = compose_content.replace('2026.2.0', _ak_latest)
     _ak_host_for_ldap = _get_authentik_host(settings)
@@ -19781,6 +19825,7 @@ volumes:
     # Step 6: Docker Compose up
     plog("")
     plog("━━━ Step 6/8: Starting Authentik (remote) ━━━")
+    _module_run(deploy_cfg, f'docker network inspect {INFRATAK_DOCKER_NETWORK} >/dev/null 2>&1 || docker network create {INFRATAK_DOCKER_NETWORK}', timeout=10)
     plog("  Running docker compose up (this may take 2-5 minutes)...")
     ok, out = _module_run(deploy_cfg, 'cd ~/authentik && docker compose pull 2>&1', timeout=600, log_fn=plog)
     if not ok:
@@ -20145,6 +20190,7 @@ def run_authentik_deploy(reconfigure=False):
                         break
             plog("\u2501\u2501\u2501 Reconfigure: Updating LDAP, CoreConfig, Forward Auth (no removal) \u2501\u2501\u2501")
             _ensure_authentik_starter_branding(ak_dir, deploy_cfg, plog)
+            _patch_authentik_compose_network()
             subprocess.run(f'cd {ak_dir} && docker compose up -d 2>&1', shell=True, capture_output=True, text=True, timeout=120)
             _ensure_infratak_network_for_authentik()
             _ensure_infratak_network_for_portal()
@@ -20715,6 +20761,8 @@ entries:
                 plog("\u2713 Docker Compose patched")
             else:
                 plog("\u2713 Docker Compose already patched")
+            if _patch_authentik_compose_network():
+                plog("  \u2713 infratak network added to docker-compose.yml")
 
             # Step 7: Pull and start core services (no verbose docker output in log)
             plog("")
@@ -22304,15 +22352,24 @@ def _resync_ldap_credential_to_coreconfig():
 
     if env_pass is None:
         return False, 'no_env_password_found'
-    if cc_pass == env_pass:
+
+    needs_write = False
+    new_cc = cc
+
+    if cc_pass != env_pass:
+        new_cc = _re.sub(
+            r'serviceAccountCredential="[^"]*"',
+            f'serviceAccountCredential="{env_pass}"',
+            new_cc, count=1)
+        needs_write = True
+
+    if '<ldap' in new_cc and 'adminGroup="ROLE_ADMIN"' not in new_cc:
+        new_cc = _re.sub(r'(<ldap\s[^>]*?)(\s*/>)', r'\1 adminGroup="ROLE_ADMIN"\2', new_cc, count=1, flags=_re.DOTALL)
+        needs_write = True
+
+    if not needs_write:
         return False, 'credentials_match'
 
-    new_cc = _re.sub(
-        r'serviceAccountCredential="[^"]*"',
-        f'serviceAccountCredential="{env_pass}"',
-        cc,
-        count=1
-    )
     try:
         with open(coreconfig, 'w') as f:
             f.write(new_cc)
@@ -22322,7 +22379,12 @@ def _resync_ldap_credential_to_coreconfig():
             f.write(new_cc)
         subprocess.run(['sudo', 'cp', patch_path, coreconfig],
                        capture_output=True, text=True, timeout=10)
-    return True, 'LDAP credential resynced from Authentik .env to CoreConfig.xml'
+    fixes = []
+    if cc_pass != env_pass:
+        fixes.append('credential')
+    if '<ldap' in cc and 'adminGroup="ROLE_ADMIN"' not in cc:
+        fixes.append('adminGroup')
+    return True, f'LDAP resync: fixed {" + ".join(fixes)} in CoreConfig.xml'
 
 def _ensure_ldapsearch():
     """Ensure ldapsearch CLI is available (install ldap-utils / openldap-clients if missing).
@@ -25402,8 +25464,25 @@ def run_takserver_upgrade(pkg_path):
         changed, resync_msg = _resync_ldap_credential_to_coreconfig()
         if changed:
             ulog(f"LDAP resync: {resync_msg}")
+        settings = load_settings()
+        takserver_host = _get_service_domain(settings, 'takserver')
+        if takserver_host:
+            ulog("Re-installing LE cert on 8446 (postinst may have reset connector)...")
+            if install_le_cert_on_8446(takserver_host, ulog, wait_for_cert=False):
+                ulog("\u2713 8446 LE cert restored")
+            else:
+                ulog("\u26a0 8446 LE cert not available \u2014 self-signed cert will be used until next Update config")
         ulog("Restarting TAK Server...")
         subprocess.run('systemctl restart takserver', shell=True, capture_output=True, text=True, timeout=90)
+        if _get_authentik_env_content(settings):
+            ulog("Syncing webadmin to Authentik (LDAP cache refresh)...")
+            ok_wa, err_wa = _ensure_authentik_webadmin(skip_bind_verify=False)
+            if ok_wa:
+                ulog("\u2713 webadmin synced to Authentik")
+            else:
+                ulog(f"\u26a0 webadmin sync: {err_wa or 'failed'} \u2014 use Sync webadmin button if 8446 login fails")
+        generate_caddyfile(settings)
+        subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
         ulog("TAK Server update complete.")
         upgrade_status.update({'running': False, 'complete': True, 'error': False})
     except Exception as e:
@@ -25554,16 +25633,33 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
         changed, resync_msg = _resync_ldap_credential_to_coreconfig()
         if changed:
             ulog(f"LDAP resync: {resync_msg}")
+        settings = load_settings()
+        takserver_host = _get_service_domain(settings, 'takserver')
+        if takserver_host:
+            ulog("Re-installing LE cert on 8446 (postinst may have reset connector)...")
+            if install_le_cert_on_8446(takserver_host, ulog, wait_for_cert=False):
+                ulog("\u2713 8446 LE cert restored")
+            else:
+                ulog("\u26a0 8446 LE cert not available \u2014 self-signed cert will be used until next Update config")
         subprocess.run('systemctl start takserver', shell=True, capture_output=True, text=True, timeout=90)
         ulog("Waiting 30 seconds for startup...")
         for remaining in range(20, -1, -10):
             time.sleep(10)
-            upgrade_log.append(f"  ⏳ {remaining//60:02d}:{remaining%60:02d} remaining")
-        ulog("✓ TAK Server started")
+            upgrade_log.append(f"  \u23f3 {remaining//60:02d}:{remaining%60:02d} remaining")
+        ulog("\u2713 TAK Server started")
+        if _get_authentik_env_content(settings):
+            ulog("Syncing webadmin to Authentik (LDAP cache refresh)...")
+            ok_wa, err_wa = _ensure_authentik_webadmin(skip_bind_verify=False)
+            if ok_wa:
+                ulog("\u2713 webadmin synced to Authentik")
+            else:
+                ulog(f"\u26a0 webadmin sync: {err_wa or 'failed'} \u2014 use Sync webadmin button if 8446 login fails")
+        generate_caddyfile(settings)
+        subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
 
         ulog("")
         ulog("=" * 50)
-        ulog("✓ Two-server update complete")
+        ulog("\u2713 Two-server update complete")
         ulog(f"  Core: upgraded on this host")
         ulog(f"  Database: upgraded on {s1_host}")
         ulog("=" * 50)
@@ -28165,6 +28261,7 @@ def _startup_migrations():
             ak_up = subprocess.run('docker ps -q --filter name=authentik-server-1', shell=True, capture_output=True, text=True, timeout=5)
             if (portal_up.stdout or '').strip() and (ak_up.stdout or '').strip():
                 _patch_takportal_compose_network()
+                _patch_authentik_compose_network()
                 _ensure_infratak_network_for_authentik()
                 _ensure_infratak_network_for_portal()
                 print("Startup migration: infratak Docker network ensured (Portal ↔ Authentik)")
@@ -28413,6 +28510,7 @@ def _post_update_auto_deploy():
                             print("Post-update: hardening Authentik port bindings to 127.0.0.1")
                             with open(compose_path, 'w') as f:
                                 f.write(content)
+                        _patch_authentik_compose_network()
                         needs_recreate = patched
                         if not needs_recreate:
                             r = subprocess.run('ss -tlnp | grep -c "0.0.0.0:9000\\|0.0.0.0:9443"',
