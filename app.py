@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.5.6-alpha"
+VERSION = "0.5.7-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -25437,6 +25437,16 @@ def run_takserver_upgrade(pkg_path):
         ulog("=" * 50)
         ulog("TAK Server update (upgrade)")
         ulog("=" * 50)
+        heap_backup = None
+        heap_file = '/etc/default/takserver'
+        if os.path.isfile(heap_file):
+            try:
+                with open(heap_file, 'r') as f:
+                    heap_backup = f.read()
+                if heap_backup.strip():
+                    ulog("✓ JVM heap settings backed up")
+            except Exception:
+                heap_backup = None
         wait_for_unattended_upgrade_worker(ulog, upgrade_log)
         wait_for_apt_lock(ulog, upgrade_log)
         dpkg_result = _tak_upgrade_dpkg_configure_a(ulog, upgrade_log, pkg_path=pkg_path)
@@ -25473,6 +25483,13 @@ def run_takserver_upgrade(pkg_path):
                 ulog("\u2713 8446 LE cert restored")
             else:
                 ulog("\u26a0 8446 LE cert not available \u2014 self-signed cert will be used until next Update config")
+        if heap_backup and heap_backup.strip():
+            try:
+                with open(heap_file, 'w') as f:
+                    f.write(heap_backup)
+                ulog("✓ JVM heap settings restored")
+            except Exception as e:
+                ulog(f"⚠ Could not restore heap settings: {e}")
         ulog("Restarting TAK Server...")
         subprocess.run('systemctl restart takserver', shell=True, capture_output=True, text=True, timeout=90)
         if _get_authentik_env_content(settings):
@@ -25507,6 +25524,16 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
         ulog(f"  Server One (DB): {s1_host}")
         ulog("=" * 50)
 
+        heap_backup = None
+        heap_file = '/etc/default/takserver'
+        if os.path.isfile(heap_file):
+            try:
+                with open(heap_file, 'r') as f:
+                    heap_backup = f.read()
+                if heap_backup.strip():
+                    ulog("✓ JVM heap settings backed up")
+            except Exception:
+                heap_backup = None
         wait_for_unattended_upgrade_worker(ulog, upgrade_log)
 
         # Step 1: Update Core (local) — per TAK guide, core first
@@ -25628,6 +25655,13 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
         # Step 4: Start TAK Server
         ulog("")
         ulog("━━━ Step 4/4: Starting TAK Server ━━━")
+        if heap_backup and heap_backup.strip():
+            try:
+                with open(heap_file, 'w') as f:
+                    f.write(heap_backup)
+                ulog("✓ JVM heap settings restored")
+            except Exception as e:
+                ulog(f"⚠ Could not restore heap settings: {e}")
         ne_changed, ne_msg = _sanitize_coreconfig_name_entries()
         if ne_changed:
             ulog(f"NameEntry fix: {ne_msg}")
