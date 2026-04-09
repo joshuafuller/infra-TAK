@@ -3317,7 +3317,7 @@ def _sync_guarddog_remote_db_from_settings(settings=None):
     except Exception as e:
         return False, f'guarddog.conf: {e}'
     cert_pass = _get_tak_cert_password(settings)
-    for name in ('tak-remotedb-watch.sh', 'tak-remotedb-auth-watch.sh', 'tak-cotdb-watch.sh', 'tak-auto-vacuum.sh', 'tak-db-repack.sh'):
+    for name in ('tak-remotedb-watch.sh', 'tak-remotedb-auth-watch.sh', 'tak-cotdb-watch.sh', 'tak-auto-vacuum.sh', 'tak-db-repack.sh', 'tak-retention-guard.sh'):
         src = os.path.join(scripts_dir, name)
         dest = os.path.join(gd_dir, name)
         if not os.path.isfile(src):
@@ -4253,6 +4253,19 @@ def guarddog_update():
                 f.write(f'[Unit]\nDescription=Guard Dog Online DB Repack (pg_repack)\nAfter={_after3}\n\n[Service]\nType=oneshot\nTimeoutStartSec=3600\nExecStart={rp_script}\n')
             with open(rp_tmr_path, 'w') as f:
                 f.write('[Unit]\nDescription=Run online DB repack weekly (Sunday 4am)\n\n[Timer]\nOnCalendar=Sun *-*-* 04:00:00\nPersistent=true\nUnit=takdbrepack.service\n\n[Install]\nWantedBy=timers.target\n')
+        # Retention guard timer (every 15min) — install if script exists but timer doesn't
+        rg_script = '/opt/tak-guarddog/tak-retention-guard.sh'
+        rg_svc_path = '/etc/systemd/system/takretentionguard.service'
+        rg_tmr_path = '/etc/systemd/system/takretentionguard.timer'
+        if os.path.isfile(rg_script) and not os.path.isfile(rg_tmr_path):
+            _settings4 = load_settings()
+            _tak_cfg4 = _get_tak_deployment_config(_settings4)
+            _is_two4 = _tak_cfg4.get('mode') == 'two_server'
+            _after4 = 'network-online.target' if _is_two4 else 'postgresql.service postgresql-15.service'
+            with open(rg_svc_path, 'w') as f:
+                f.write(f'[Unit]\nDescription=Guard Dog CoT Retention Safety Net\nAfter={_after4}\n\n[Service]\nType=oneshot\nTimeoutStartSec=1800\nExecStart={rg_script}\n')
+            with open(rg_tmr_path, 'w') as f:
+                f.write('[Unit]\nDescription=Run CoT retention guard every 15 minutes\n\n[Timer]\nOnBootSec=10min\nOnUnitActiveSec=15min\nUnit=takretentionguard.service\n\n[Install]\nWantedBy=timers.target\n')
         # TAK Portal timer — install if script exists but timer doesn't
         tp_script = '/opt/tak-guarddog/tak-takportal-watch.sh'
         tp_svc_path = '/etc/systemd/system/taktakportalguard.service'
@@ -4641,6 +4654,7 @@ def run_guarddog_deploy(alert_email):
             script_files.extend(['tak-db-watch.sh', 'tak-cotdb-watch.sh'])
         script_files.append('tak-auto-vacuum.sh')
         script_files.append('tak-db-repack.sh')
+        script_files.append('tak-retention-guard.sh')
         # Optional: monitors for other services (only install if that service is present)
         ak_dir = os.path.expanduser('~/authentik')
         nr_dir = os.path.expanduser('~/node-red')
@@ -4675,7 +4689,7 @@ def run_guarddog_deploy(alert_email):
                 .replace('ALERT_SMS_PLACEHOLDER', alert_sms or '')
                 .replace('CERT_PASS_PLACEHOLDER', cert_pass)
                 .replace('CONSOLE_VERSION_PLACEHOLDER', VERSION))
-            if is_two_server and name in ('tak-remotedb-watch.sh', 'tak-remotedb-auth-watch.sh', 'tak-cotdb-watch.sh', 'tak-auto-vacuum.sh', 'tak-db-repack.sh'):
+            if is_two_server and name in ('tak-remotedb-watch.sh', 'tak-remotedb-auth-watch.sh', 'tak-cotdb-watch.sh', 'tak-auto-vacuum.sh', 'tak-db-repack.sh', 'tak-retention-guard.sh'):
                 content = content.replace('DB_HOST_PLACEHOLDER', s1_host)
                 content = content.replace('DB_PORT_PLACEHOLDER', db_port)
                 content = content.replace('SSH_KEY_PLACEHOLDER', ssh_key_path)
@@ -4735,6 +4749,8 @@ def run_guarddog_deploy(alert_email):
                 ('takautovacuum.timer', '[Unit]\nDescription=Run smart auto-VACUUM daily at 3am\n\n[Timer]\nOnCalendar=*-*-* 03:00:00\nPersistent=true\nUnit=takautovacuum.service\n\n[Install]\nWantedBy=timers.target\n'),
                 ('takdbrepack.service', '[Unit]\nDescription=Guard Dog Online DB Repack (pg_repack)\nAfter=network-online.target\n\n[Service]\nType=oneshot\nTimeoutStartSec=3600\nExecStart=/opt/tak-guarddog/tak-db-repack.sh\n'),
                 ('takdbrepack.timer', '[Unit]\nDescription=Run online DB repack weekly (Sunday 4am)\n\n[Timer]\nOnCalendar=Sun *-*-* 04:00:00\nPersistent=true\nUnit=takdbrepack.service\n\n[Install]\nWantedBy=timers.target\n'),
+                ('takretentionguard.service', '[Unit]\nDescription=Guard Dog CoT Retention Safety Net\nAfter=network-online.target\n\n[Service]\nType=oneshot\nTimeoutStartSec=1800\nExecStart=/opt/tak-guarddog/tak-retention-guard.sh\n'),
+                ('takretentionguard.timer', '[Unit]\nDescription=Run CoT retention guard every 15 minutes\n\n[Timer]\nOnBootSec=10min\nOnUnitActiveSec=15min\nUnit=takretentionguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ])
         else:
             units.extend([
@@ -4746,6 +4762,8 @@ def run_guarddog_deploy(alert_email):
                 ('takautovacuum.timer', '[Unit]\nDescription=Run smart auto-VACUUM daily at 3am\n\n[Timer]\nOnCalendar=*-*-* 03:00:00\nPersistent=true\nUnit=takautovacuum.service\n\n[Install]\nWantedBy=timers.target\n'),
                 ('takdbrepack.service', '[Unit]\nDescription=Guard Dog Online DB Repack (pg_repack)\nAfter=postgresql.service postgresql-15.service\n\n[Service]\nType=oneshot\nTimeoutStartSec=3600\nExecStart=/opt/tak-guarddog/tak-db-repack.sh\n'),
                 ('takdbrepack.timer', '[Unit]\nDescription=Run online DB repack weekly (Sunday 4am)\n\n[Timer]\nOnCalendar=Sun *-*-* 04:00:00\nPersistent=true\nUnit=takdbrepack.service\n\n[Install]\nWantedBy=timers.target\n'),
+                ('takretentionguard.service', '[Unit]\nDescription=Guard Dog CoT Retention Safety Net\nAfter=postgresql.service postgresql-15.service\n\n[Service]\nType=oneshot\nTimeoutStartSec=1800\nExecStart=/opt/tak-guarddog/tak-retention-guard.sh\n'),
+                ('takretentionguard.timer', '[Unit]\nDescription=Run CoT retention guard every 15 minutes\n\n[Timer]\nOnBootSec=10min\nOnUnitActiveSec=15min\nUnit=takretentionguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ])
         # Optional timers for other services (only if we installed the script)
         if 'tak-authentik-watch.sh' in script_files:
@@ -5442,6 +5460,7 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
         plog('━━━ Install & start MongoDB ━━━')
         mongo_cmds = (
             'if ! command -v mongod >/dev/null 2>&1; then '
+            '  apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl gnupg >/dev/null 2>&1; '
             '  distro_codename=$(awk -F= "/^VERSION_CODENAME=/{ print tolower(\\$2) }" /etc/*-release | tr -d \'\\"\'); '
             '  if grep -q avx /proc/cpuinfo; then '
             '    MONGO_VER=8.0; '
@@ -27605,7 +27624,7 @@ def _auto_update_guarddog():
                 .replace('ALERT_SMS_PLACEHOLDER', '')
                 .replace('CERT_PASS_PLACEHOLDER', cert_pass)
                 .replace('CONSOLE_VERSION_PLACEHOLDER', VERSION))
-            if is_two_server and name in ('tak-remotedb-watch.sh', 'tak-remotedb-auth-watch.sh', 'tak-cotdb-watch.sh', 'tak-auto-vacuum.sh', 'tak-db-repack.sh'):
+            if is_two_server and name in ('tak-remotedb-watch.sh', 'tak-remotedb-auth-watch.sh', 'tak-cotdb-watch.sh', 'tak-auto-vacuum.sh', 'tak-db-repack.sh', 'tak-retention-guard.sh'):
                 content = content.replace('DB_HOST_PLACEHOLDER', s1_host)
                 content = content.replace('DB_PORT_PLACEHOLDER', db_port)
                 content = content.replace('SSH_KEY_PLACEHOLDER', ssh_key_path or os.path.expanduser('~/.ssh/infra-tak-server-one'))
