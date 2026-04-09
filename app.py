@@ -25261,22 +25261,15 @@ def _tak_upgrade_mitigate_takserver_postinst_config_sh(ulog):
         ulog(f"✗ Tak path preparation error: {e}")
 
 
-def _tak_upgrade_dpkg_configure_a(ulog, upgrade_log, timeout_sec=3600):
-    """Finish interrupted dpkg configuration before apt-get install (e.g. after a killed/timed-out upgrade).
-
-    Same idea as run_takserver_deploy's post-install dpkg --configure -a. Required when apt reports
-    'dpkg was interrupted, you must manually run dpkg --configure -a'.
-
-    Path mitigation runs here (not only from the caller) so it cannot be skipped by stale workers or old call sites.
-    """
-    _tak_upgrade_mitigate_takserver_postinst_config_sh(ulog)
-    ulog("Ensuring dpkg state is consistent (dpkg --configure -a)...")
+def _run_dpkg_configure_a(ulog, upgrade_log, timeout_sec=3600):
+    """Run dpkg --configure -a, streaming output. Returns exit code (0 = success)."""
+    ulog("Running dpkg --configure -a...")
     cmd = 'sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l dpkg --configure -a 2>&1'
     proc = subprocess.Popen(
         cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     if proc.stdout is None:
         ulog("✗ Could not start dpkg --configure -a")
-        return False
+        return 1
 
     def _drain():
         for line in iter(proc.stdout.readline, ''):
@@ -25294,18 +25287,81 @@ def _tak_upgrade_dpkg_configure_a(ulog, upgrade_log, timeout_sec=3600):
         except Exception:
             pass
         t.join(timeout=5)
-        ulog("✗ dpkg --configure -a timed out — fix packages over SSH, then retry.")
-        return False
+        ulog("✗ dpkg --configure -a timed out.")
+        return 1
     t.join(timeout=5)
-    rc = proc.returncode if proc.returncode is not None else 1
-    if rc != 0:
-        ulog(
-            f"✗ dpkg --configure -a failed (exit {rc}). "
-            "On the server run: sudo DEBIAN_FRONTEND=noninteractive dpkg --configure -a && sudo apt-get -f install -y"
-        )
+    return proc.returncode if proc.returncode is not None else 1
+
+
+def _tak_upgrade_dpkg_configure_a(ulog, upgrade_log, pkg_path=None):
+    """Ensure dpkg is in a clean state before apt-get install.
+
+    First attempt: dpkg --configure -a.
+    If that fails and pkg_path is set (the .deb we're about to install), re-unpack it
+    with dpkg --unpack (restores all missing files without running postinst), then retry
+    dpkg --configure -a. This handles the common case where a timed-out upgrade left
+    files missing while dpkg still needs to configure the half-installed package.
+    """
+    ulog("Ensuring dpkg state is consistent...")
+    rc = _run_dpkg_configure_a(ulog, upgrade_log)
+    if rc == 0:
+        ulog("✓ dpkg state OK")
+        return True
+
+    if not pkg_path or not os.path.isfile(pkg_path):
+        ulog("✗ dpkg --configure -a failed and no .deb available for re-unpack.")
         return False
-    ulog("✓ dpkg state OK")
+
+    ulog("dpkg --configure -a failed — re-unpacking .deb to restore missing files...")
+    ulog(f"  dpkg --unpack {os.path.basename(pkg_path)}")
+    try:
+        rc2 = _tak_upgrade_apt_install_streamed(
+            'sudo dpkg --unpack ' + shlex.quote(pkg_path) + ' 2>&1',
+            os.path.dirname(pkg_path), upgrade_log, timeout_sec=300)
+    except subprocess.TimeoutExpired:
+        ulog("✗ dpkg --unpack timed out.")
+        return False
+    if rc2 != 0:
+        ulog(f"✗ dpkg --unpack failed (exit {rc2}).")
+        return False
+    ulog("✓ Files restored from .deb")
+
+    ulog("Retrying dpkg --configure -a after re-unpack...")
+    rc3 = _run_dpkg_configure_a(ulog, upgrade_log)
+    if rc3 != 0:
+        ulog("✗ dpkg --configure -a still failed after re-unpack. Manual intervention needed.")
+        return False
+    ulog("✓ dpkg state OK (after re-unpack)")
     return True
+
+
+def _tak_upgrade_apt_install_streamed(cmd, cwd, upgrade_log, timeout_sec=600):
+    """Run a shell command with line-buffered output streamed to upgrade_log. Returns exit code."""
+    proc = subprocess.Popen(
+        cmd, shell=True, cwd=cwd,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    if proc.stdout is None:
+        return 1
+
+    def _drain():
+        for line in iter(proc.stdout.readline, ''):
+            if line and 'NEEDRESTART' not in line:
+                upgrade_log.append('  ' + line.rstrip('\n'))
+
+    t = threading.Thread(target=_drain, daemon=True)
+    t.start()
+    try:
+        proc.wait(timeout=timeout_sec)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.wait(timeout=15)
+        except Exception:
+            pass
+        t.join(timeout=5)
+        raise
+    t.join(timeout=5)
+    return proc.returncode if proc.returncode is not None else 1
 
 
 def run_takserver_upgrade(pkg_path):
@@ -25320,7 +25376,7 @@ def run_takserver_upgrade(pkg_path):
         ulog("=" * 50)
         wait_for_unattended_upgrade_worker(ulog, upgrade_log)
         wait_for_apt_lock(ulog, upgrade_log)
-        if not _tak_upgrade_dpkg_configure_a(ulog, upgrade_log):
+        if not _tak_upgrade_dpkg_configure_a(ulog, upgrade_log, pkg_path=pkg_path):
             upgrade_status.update({'running': False, 'complete': False, 'error': True})
             return
         wait_for_apt_lock(ulog, upgrade_log)
@@ -25378,7 +25434,7 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
         ulog("")
         ulog("━━━ Step 2/4: Upgrading Core (this host) ━━━")
         wait_for_apt_lock(ulog, upgrade_log)
-        if not _tak_upgrade_dpkg_configure_a(ulog, upgrade_log):
+        if not _tak_upgrade_dpkg_configure_a(ulog, upgrade_log, pkg_path=core_pkg_path):
             upgrade_status.update({'running': False, 'complete': False, 'error': True})
             return
         wait_for_apt_lock(ulog, upgrade_log)
