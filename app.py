@@ -25115,6 +25115,38 @@ def _tak_upgrade_apt_install(cwd, pkg_name, upgrade_log, timeout_sec=600):
     return proc.returncode if proc.returncode is not None else 1
 
 
+def _tak_upgrade_mitigate_takserver_postinst_config_sh(ulog):
+    """takserver maintainer script chmods /opt/tak/config/*.sh; if the dir is missing or the glob is empty, chmod fails.
+
+    Seen after interrupted upgrades (5.6→5.7 partial). Ensure the directory exists and at least one
+    executable *.sh when none are present so dpkg --configure -a can complete.
+    """
+    mit = r'''
+set -e
+mkdir -p /opt/tak/config
+shopt -s nullglob
+a=(/opt/tak/config/*.sh)
+if [[ ${#a[@]} -eq 0 ]]; then
+  printf '%s\n' '#!/bin/sh' '# infra-TAK: placeholder so takserver postinst chmod on *.sh succeeds' 'exit 0' \
+    > /opt/tak/config/_infra_tak_placeholder_for_postinst.sh
+  chmod +x /opt/tak/config/_infra_tak_placeholder_for_postinst.sh
+  echo MITIGATED
+else
+  echo OK
+fi
+'''
+    try:
+        r = subprocess.run(['sudo', 'bash', '-c', mit], capture_output=True, text=True, timeout=30)
+        out = ((r.stdout or '') + (r.stderr or '')).strip()
+        if r.returncode != 0:
+            ulog(f"⚠ Could not prepare /opt/tak/config ({out[:200]})")
+            return
+        if 'MITIGATED' in out:
+            ulog("Prepared /opt/tak/config (placeholder .sh — takserver postinst requires a matching glob)")
+    except Exception as e:
+        ulog(f"⚠ Tak config path workaround skipped: {e}")
+
+
 def _tak_upgrade_dpkg_configure_a(ulog, upgrade_log, timeout_sec=3600):
     """Finish interrupted dpkg configuration before apt-get install (e.g. after a killed/timed-out upgrade).
 
@@ -25171,6 +25203,7 @@ def run_takserver_upgrade(pkg_path):
         ulog("=" * 50)
         wait_for_unattended_upgrade_worker(ulog, upgrade_log)
         wait_for_apt_lock(ulog, upgrade_log)
+        _tak_upgrade_mitigate_takserver_postinst_config_sh(ulog)
         if not _tak_upgrade_dpkg_configure_a(ulog, upgrade_log):
             upgrade_status.update({'running': False, 'complete': False, 'error': True})
             return
@@ -25229,6 +25262,7 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
         ulog("")
         ulog("━━━ Step 2/4: Upgrading Core (this host) ━━━")
         wait_for_apt_lock(ulog, upgrade_log)
+        _tak_upgrade_mitigate_takserver_postinst_config_sh(ulog)
         if not _tak_upgrade_dpkg_configure_a(ulog, upgrade_log):
             upgrade_status.update({'running': False, 'complete': False, 'error': True})
             return
