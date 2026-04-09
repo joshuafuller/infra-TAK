@@ -7641,6 +7641,47 @@ def _ensure_infratak_network_for_portal():
     _connect_container_to_infratak_network('tak-portal')
 
 
+def _patch_takportal_compose_network():
+    """Add the infratak external network to TAK Portal's docker-compose.yml.
+
+    This makes the network survive 'docker compose down && up' from the CLI,
+    not just console-driven restarts.
+    """
+    compose_path = os.path.expanduser('~/TAK-Portal/docker-compose.yml')
+    if not os.path.exists(compose_path):
+        return False
+    try:
+        _ensure_infratak_docker_network()
+        with open(compose_path) as f:
+            content = f.read()
+        if INFRATAK_DOCKER_NETWORK in content:
+            return False
+        networks_block = (
+            f"\nnetworks:\n"
+            f"  default:\n"
+            f"  {INFRATAK_DOCKER_NETWORK}:\n"
+            f"    external: true\n"
+        )
+        service_network_line = f"    networks:\n      - default\n      - {INFRATAK_DOCKER_NETWORK}\n"
+        if 'restart: unless-stopped' in content:
+            content = content.replace(
+                'restart: unless-stopped',
+                'restart: unless-stopped\n' + service_network_line.rstrip('\n'),
+                1)
+        elif 'restart: always' in content:
+            content = content.replace(
+                'restart: always',
+                'restart: always\n' + service_network_line.rstrip('\n'),
+                1)
+        if not content.rstrip().endswith('external: true'):
+            content = content.rstrip() + '\n' + networks_block
+        with open(compose_path, 'w') as f:
+            f.write(content)
+        return True
+    except Exception:
+        return False
+
+
 def _check_authentik_api_reachable(settings):
     """Verify we can reach the Authentik API (for remote: ensures firewall allows console -> Authentik:9090).
     Returns (True, None) if reachable, (False, error_msg) otherwise."""
@@ -9476,12 +9517,14 @@ def takportal_control():
     action = request.json.get('action')
     portal_dir = os.path.expanduser('~/TAK-Portal')
     if action == 'start':
+        _patch_takportal_compose_network()
         subprocess.run(f'cd {portal_dir} && docker compose up -d --build', shell=True, capture_output=True, text=True, timeout=120)
         _ensure_infratak_network_for_portal()
         _ensure_infratak_network_for_authentik()
     elif action == 'stop':
         subprocess.run(f'cd {portal_dir} && docker compose down', shell=True, capture_output=True, text=True, timeout=60)
     elif action == 'restart':
+        _patch_takportal_compose_network()
         subprocess.run(f'cd {portal_dir} && docker compose down && docker compose up -d', shell=True, capture_output=True, text=True, timeout=120)
         _ensure_infratak_network_for_portal()
         _ensure_infratak_network_for_authentik()
@@ -9760,6 +9803,9 @@ def run_takportal_deploy():
                     plog("  ✓ extra_hosts (host.docker.internal) added for container→host")
                 else:
                     plog("  ⚠ Could not auto-add extra_hosts (missing 'restart: unless-stopped').")
+
+        if _patch_takportal_compose_network():
+            plog("  ✓ infratak Docker network added to docker-compose.yml (Portal ↔ Authentik)")
 
         plog("  Building image (this may take a minute)...")
         r = subprocess.run(f'cd {portal_dir} && docker compose up -d --build 2>&1', shell=True, capture_output=True, text=True, timeout=900)
@@ -27800,6 +27846,7 @@ def _startup_migrations():
             portal_up = subprocess.run('docker ps -q --filter name=tak-portal', shell=True, capture_output=True, text=True, timeout=5)
             ak_up = subprocess.run('docker ps -q --filter name=authentik-server-1', shell=True, capture_output=True, text=True, timeout=5)
             if (portal_up.stdout or '').strip() and (ak_up.stdout or '').strip():
+                _patch_takportal_compose_network()
                 _ensure_infratak_network_for_authentik()
                 _ensure_infratak_network_for_portal()
                 print("Startup migration: infratak Docker network ensured (Portal ↔ Authentik)")
