@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.5.2-alpha"
+VERSION = "0.5.3-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -5727,12 +5727,34 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
             _ssh_probe(remote, f'sudo cp {fh_dir}/certs/files/webadmin-fed.p12 /root/ 2>/dev/null; true', timeout=15)
 
         # --- Firewall ---
+        # Web UI (8080 HTTP / 9100 HTTPS): must NOT be world-accessible — edge is Caddy on this console
+        # (https://fedhub.<fqdn> + Authentik). Scope to console public IP when Settings → Server IP is set.
+        # Federation protocol (9101-9103): remain open for peer TAK servers on the internet.
         plog('━━━ Firewall (UFW) ━━━')
         _ssh_probe(remote, 'sudo ufw allow 22/tcp > /dev/null 2>&1; true', timeout=15)
-        for p in ['8080/tcp', '9100/tcp', '9101/tcp', '9102/tcp', '9103/tcp']:
+        caddy_src = _fedhub_caddy_source_ip(settings)
+        if caddy_src:
+            plog(f'Fed Hub web UI: allowing 8080, 9100 only from Caddy host {caddy_src} (Settings → Server IP)')
+            for port in (8080, 9100):
+                _ssh_probe(
+                    remote,
+                    f'sudo ufw allow from {caddy_src} to any port {port} proto tcp > /dev/null 2>&1; true',
+                    timeout=15,
+                )
+        else:
+            plog(
+                '⚠ Server IP unset or not IPv4 — opening 8080/9100 to everyone (insecure). '
+                'Set Settings → Server IP to this console\'s public IP and re-run Update Federation Hub to restrict.'
+            )
+            for p in ('8080/tcp', '9100/tcp'):
+                _ssh_probe(remote, f'sudo ufw allow {p} > /dev/null 2>&1; true', timeout=15)
+        for p in ('9101/tcp', '9102/tcp', '9103/tcp'):
             _ssh_probe(remote, f'sudo ufw allow {p} > /dev/null 2>&1; true', timeout=15)
         _ssh_probe(remote, 'sudo ufw --force enable > /dev/null 2>&1; true', timeout=15)
-        plog('✓ Firewall configured (22, 8080, 9100-9103)')
+        if caddy_src:
+            plog('✓ Firewall: SSH; 8080/9100 from Caddy host only; 9101-9103 public (federation peers)')
+        else:
+            plog('✓ Firewall configured (22, 8080, 9100-9103) — set Server IP + re-run deploy to harden UI ports')
 
         plog('━━━ Verify ━━━')
         ok_9100, out_9100 = _ssh_probe(remote, 'ss -tlnp | grep :9100 || true', timeout=15)
@@ -6579,6 +6601,23 @@ def _get_fedhub_deployment_config(settings):
         p = 8080
     c['web_ui_port'] = max(1, min(65535, p))
     return c
+
+
+def _fedhub_caddy_source_ip(settings):
+    """Public IPv4 of the infra-TAK console (Settings → Server IP). Used to UFW-scope Fed Hub web UI ports so only Caddy reaches 8080/9100; peers still use 9101-9103."""
+    ip = (settings.get('server_ip') or '').strip()
+    if not ip or ip in ('localhost', '127.0.0.1'):
+        return None
+    parts = ip.split('.')
+    if len(parts) != 4:
+        return None
+    try:
+        nums = [int(x) for x in parts]
+        if all(0 <= n <= 255 for n in nums):
+            return ip
+    except ValueError:
+        pass
+    return None
 
 
 def _module_deployment_settings_key(module_name):
@@ -7557,6 +7596,90 @@ def _get_authentik_api_url(settings):
     """Return Authentik API base URL for server-side HTTP calls (e.g. LDAP flow, WebAdmin)."""
     upstream = _get_authentik_upstream(settings)
     return f'http://{upstream}'
+
+
+INFRATAK_DOCKER_NETWORK = 'infratak'
+
+
+def _ensure_infratak_docker_network():
+    """Create the shared 'infratak' Docker bridge network if it doesn't exist.
+
+    This network allows containers from different compose stacks (e.g. TAK Portal,
+    Authentik) to communicate directly using container hostnames, which is required
+    because published ports are hardened to 127.0.0.1 and unreachable between containers.
+    """
+    try:
+        r = subprocess.run(
+            f'docker network inspect {INFRATAK_DOCKER_NETWORK}',
+            shell=True, capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            subprocess.run(
+                f'docker network create {INFRATAK_DOCKER_NETWORK}',
+                shell=True, capture_output=True, text=True, timeout=10)
+    except Exception:
+        pass
+
+
+def _connect_container_to_infratak_network(container_name):
+    """Connect a running container to the shared infratak Docker network (idempotent)."""
+    try:
+        _ensure_infratak_docker_network()
+        subprocess.run(
+            f'docker network connect {INFRATAK_DOCKER_NETWORK} {shlex.quote(container_name)} 2>/dev/null',
+            shell=True, capture_output=True, text=True, timeout=10)
+    except Exception:
+        pass
+
+
+def _ensure_infratak_network_for_authentik():
+    """Connect Authentik server container to the infratak network."""
+    _connect_container_to_infratak_network('authentik-server-1')
+
+
+def _ensure_infratak_network_for_portal():
+    """Connect TAK Portal container to the infratak network."""
+    _connect_container_to_infratak_network('tak-portal')
+
+
+def _patch_takportal_compose_network():
+    """Add the infratak external network to TAK Portal's docker-compose.yml.
+
+    This makes the network survive 'docker compose down && up' from the CLI,
+    not just console-driven restarts.
+    """
+    compose_path = os.path.expanduser('~/TAK-Portal/docker-compose.yml')
+    if not os.path.exists(compose_path):
+        return False
+    try:
+        _ensure_infratak_docker_network()
+        with open(compose_path) as f:
+            content = f.read()
+        if INFRATAK_DOCKER_NETWORK in content:
+            return False
+        networks_block = (
+            f"\nnetworks:\n"
+            f"  default:\n"
+            f"  {INFRATAK_DOCKER_NETWORK}:\n"
+            f"    external: true\n"
+        )
+        service_network_line = f"    networks:\n      - default\n      - {INFRATAK_DOCKER_NETWORK}\n"
+        if 'restart: unless-stopped' in content:
+            content = content.replace(
+                'restart: unless-stopped',
+                'restart: unless-stopped\n' + service_network_line.rstrip('\n'),
+                1)
+        elif 'restart: always' in content:
+            content = content.replace(
+                'restart: always',
+                'restart: always\n' + service_network_line.rstrip('\n'),
+                1)
+        if not content.rstrip().endswith('external: true'):
+            content = content.rstrip() + '\n' + networks_block
+        with open(compose_path, 'w') as f:
+            f.write(content)
+        return True
+    except Exception:
+        return False
 
 
 def _check_authentik_api_reachable(settings):
@@ -9212,13 +9335,15 @@ def _takportal_build_settings_dict(settings):
     cloudtak_host = _get_service_domain(settings, 'cloudtak_map')
     cert_pass = _get_tak_cert_password(settings)
     ak_upstream = _get_authentik_upstream(settings)
-    # Same-host: use server_ip so container (bridge) can reach host's Authentik.
-    # Loopback addresses (localhost, 127.0.0.1) don't work inside a container — use host.docker.internal (requires extra_hosts in compose).
+    # Local Authentik: use the Docker-internal hostname on the shared infratak network.
+    # Published ports are hardened to 127.0.0.1, so containers can't reach them via
+    # the host's public IP. The infratak network lets Portal talk to Authentik directly.
     if ak_upstream == '127.0.0.1:9090':
-        auth_url_host = server_ip if (server_ip and server_ip not in ('localhost', '127.0.0.1')) else 'host.docker.internal'
+        auth_url_host = 'authentik-server-1'
+        auth_url_port = '9000'
     else:
         auth_url_host = ak_upstream.split(':')[0]
-    auth_url_port = '9090' if ak_upstream == '127.0.0.1:9090' else (ak_upstream.split(':')[1] if ':' in ak_upstream else '9090')
+        auth_url_port = ak_upstream.split(':')[1] if ':' in ak_upstream else '9090'
     # TAK_URL host for HTTPS to :8443/Marti inside the portal container.
     # Prefer takserver.<fqdn> when FQDN is set — TAK certs are issued for DNS names; using
     # server_ip breaks TLS hostname verification ("identity could not be verified").
@@ -9392,11 +9517,17 @@ def takportal_control():
     action = request.json.get('action')
     portal_dir = os.path.expanduser('~/TAK-Portal')
     if action == 'start':
+        _patch_takportal_compose_network()
         subprocess.run(f'cd {portal_dir} && docker compose up -d --build', shell=True, capture_output=True, text=True, timeout=120)
+        _ensure_infratak_network_for_portal()
+        _ensure_infratak_network_for_authentik()
     elif action == 'stop':
         subprocess.run(f'cd {portal_dir} && docker compose down', shell=True, capture_output=True, text=True, timeout=60)
     elif action == 'restart':
+        _patch_takportal_compose_network()
         subprocess.run(f'cd {portal_dir} && docker compose down && docker compose up -d', shell=True, capture_output=True, text=True, timeout=120)
+        _ensure_infratak_network_for_portal()
+        _ensure_infratak_network_for_authentik()
     elif action == 'reconfigure':
         # Update config only: push settings into container and restart (no git pull / image build). Preserves user-configured keys (e.g. BRAND_LOGO_URL).
         settings = load_settings()
@@ -9430,6 +9561,8 @@ def takportal_control():
             shell=True, capture_output=True, text=True, timeout=60)
         pull_msg = pull.stdout.strip().split('\n')[-1] if pull.stdout.strip() else ''
         build = subprocess.run(f'cd {portal_dir} && docker compose up -d --build', shell=True, capture_output=True, text=True, timeout=180)
+        _ensure_infratak_network_for_portal()
+        _ensure_infratak_network_for_authentik()
         if build.returncode != 0:
             err = (build.stderr or build.stdout or 'Build failed').strip()[:400]
             return jsonify({'success': False, 'error': 'Build failed. Container may have stopped — try Start below or check container logs.'}), 500
@@ -9671,6 +9804,9 @@ def run_takportal_deploy():
                 else:
                     plog("  ⚠ Could not auto-add extra_hosts (missing 'restart: unless-stopped').")
 
+        if _patch_takportal_compose_network():
+            plog("  ✓ infratak Docker network added to docker-compose.yml (Portal ↔ Authentik)")
+
         plog("  Building image (this may take a minute)...")
         r = subprocess.run(f'cd {portal_dir} && docker compose up -d --build 2>&1', shell=True, capture_output=True, text=True, timeout=900)
         for line in r.stdout.strip().split('\n'):
@@ -9683,6 +9819,9 @@ def run_takportal_deploy():
                     takportal_deploy_log.append(f"  \u2717 {line.strip()}")
             takportal_deploy_status.update({'running': False, 'error': True})
             return
+
+        _ensure_infratak_network_for_portal()
+        _ensure_infratak_network_for_authentik()
 
         # Wait for container to be healthy
         plog("  Waiting for container...")
@@ -19971,6 +20110,8 @@ def run_authentik_deploy(reconfigure=False):
             plog("\u2501\u2501\u2501 Reconfigure: Updating LDAP, CoreConfig, Forward Auth (no removal) \u2501\u2501\u2501")
             _ensure_authentik_starter_branding(ak_dir, deploy_cfg, plog)
             subprocess.run(f'cd {ak_dir} && docker compose up -d 2>&1', shell=True, capture_output=True, text=True, timeout=120)
+            _ensure_infratak_network_for_authentik()
+            _ensure_infratak_network_for_portal()
             plog("  Ensured containers are up")
             _apply_authentik_pg_tuning(ak_dir, plog)
             fqdn = settings.get('fqdn', '')
@@ -20589,6 +20730,7 @@ entries:
                 plog("  \u26a0 PostgreSQL not ready in time, starting server anyway")
             plog("  Starting server and worker...")
             r = subprocess.run(f'cd {ak_dir} && docker compose up -d server worker 2>&1', shell=True, capture_output=True, text=True, timeout=120)
+            _ensure_infratak_network_for_authentik()
             if r.returncode != 0:
                 plog(f"  \u26a0 Start had issues: {r.stderr.strip()[:200] if r.stderr else r.stdout.strip()[:200]}")
             else:
@@ -27698,6 +27840,19 @@ def _startup_migrations():
             if sg_ok and 'synced' in (sg_msg or ''):
                 print(f"Startup migration: guarddog.conf synced — {sg_msg}")
 
+        # Ensure the shared infratak Docker network exists and containers are connected
+        # (cheap idempotent check — runs every startup so restarts/recreates don't break Portal→Authentik)
+        try:
+            portal_up = subprocess.run('docker ps -q --filter name=tak-portal', shell=True, capture_output=True, text=True, timeout=5)
+            ak_up = subprocess.run('docker ps -q --filter name=authentik-server-1', shell=True, capture_output=True, text=True, timeout=5)
+            if (portal_up.stdout or '').strip() and (ak_up.stdout or '').strip():
+                _patch_takportal_compose_network()
+                _ensure_infratak_network_for_authentik()
+                _ensure_infratak_network_for_portal()
+                print("Startup migration: infratak Docker network ensured (Portal ↔ Authentik)")
+        except Exception as net_err:
+            print(f"Startup migration: infratak network error: {net_err}")
+
         # Ensure Guard Dog has a deployed-version stamp (one-time migration for existing installs)
         if os.path.exists('/opt/tak-guarddog') and not s.get('guarddog_deployed_version'):
             try:
@@ -27790,9 +27945,11 @@ def _post_update_auto_deploy():
                                     except OSError:
                                         pass
                                 _takportal_setup_ssh()
+                                _ensure_infratak_network_for_authentik()
+                                _ensure_infratak_network_for_portal()
                                 subprocess.run('docker restart tak-portal', shell=True, capture_output=True, text=True, timeout=30)
                                 _sync_authentik_takportal_provider_url(settings)
-                                print("Post-update: TAK Portal config updated and restarted")
+                                print("Post-update: TAK Portal config updated and restarted (infratak network connected)")
                             finally:
                                 _auto_deploy_active.pop('takportal', None)
                         else:
@@ -27948,6 +28105,8 @@ def _post_update_auto_deploy():
                         if needs_recreate:
                             subprocess.run(f'cd {shlex.quote(ak_dir)} && docker compose up -d 2>/dev/null',
                                 shell=True, capture_output=True, text=True, timeout=300)
+                            _ensure_infratak_network_for_authentik()
+                            _ensure_infratak_network_for_portal()
                             print("Post-update: Authentik containers recreated with 127.0.0.1 bindings")
                         else:
                             print("Post-update: Authentik port bindings already secure")
