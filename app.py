@@ -25115,7 +25115,11 @@ def _tak_upgrade_apt_install(cwd, pkg_name, upgrade_log, timeout_sec=600):
     return proc.returncode if proc.returncode is not None else 1
 
 
-# takserver .postinst chmods *.sh under these trees; partial upgrades can omit dirs/files and break dpkg --configure -a.
+# takserver .postinst chmods named *.sh paths and directory globs. Fallback paths if postinst is unreadable.
+_TAK_POSTINST_EXPLICIT_SH_FALLBACK = (
+    '/opt/tak/config/takserver-config.sh',
+    '/opt/tak/messaging/takserver-messaging.sh',
+)
 _TAK_POSTINST_SH_GLOB_DIRS = (
     '/opt/tak/config',
     '/opt/tak/messaging',
@@ -25126,16 +25130,40 @@ _TAK_POSTINST_SH_GLOB_DIRS = (
 )
 
 
-def _tak_upgrade_mitigate_takserver_postinst_config_sh(ulog):
-    """Ensure dirs and *.sh globs exist so takserver postinst chmod succeeds after partial upgrades.
+def _tak_postinst_resolved_explicit_sh_paths():
+    """Paths to literal .sh files chmod'd in takserver postinst (discovered + small fallback list)."""
+    paths = set(_TAK_POSTINST_EXPLICIT_SH_FALLBACK)
+    pi = '/var/lib/dpkg/info/takserver.postinst'
+    try:
+        if os.path.isfile(pi):
+            with open(pi, 'r', encoding='utf-8', errors='ignore') as f:
+                txt = f.read()
+            for m in re.finditer(r'/opt/tak/[A-Za-z0-9_./-]+\.sh', txt):
+                paths.add(m.group(0))
+    except OSError:
+        pass
+    return sorted(paths)
 
-    Postinst runs chmod on multiple paths (e.g. config/takserver-config.sh, config/*.sh, messaging/*.sh).
-    Extend _TAK_POSTINST_SH_GLOB_DIRS if a new Debian package adds another tree.
+
+def _tak_upgrade_mitigate_takserver_postinst_config_sh(ulog):
+    """Ensure named scripts and *.sh globs exist so takserver postinst chmod succeeds after partial upgrades.
+
+    Named paths are parsed from /var/lib/dpkg/info/takserver.postinst when present, plus a fallback tuple.
     """
+    explicit_q = ' '.join(shlex.quote(p) for p in _tak_postinst_resolved_explicit_sh_paths())
     dirs_q = ' '.join(shlex.quote(d) for d in _TAK_POSTINST_SH_GLOB_DIRS)
     mit = rf'''
 set -e
 MIT=""
+EXPLICIT=({explicit_q})
+for f in "${{EXPLICIT[@]}}"; do
+  mkdir -p "$(dirname "$f")"
+  if [[ ! -f "$f" ]]; then
+    printf '%s\n' '#!/bin/sh' '# infra-TAK: placeholder until package files are on disk — reinstall .deb if issues persist' 'exit 0' > "$f"
+    chmod +x "$f"
+    MIT="${{MIT:+$MIT, }}$(basename "$f")"
+  fi
+done
 DIRS=({dirs_q})
 for d in "${{DIRS[@]}}"; do
   mkdir -p "$d"
@@ -25148,13 +25176,6 @@ for d in "${{DIRS[@]}}"; do
     MIT="${{MIT:+$MIT, }}$d/*.sh"
   fi
 done
-if [[ ! -f /opt/tak/config/takserver-config.sh ]]; then
-  mkdir -p /opt/tak/config
-  printf '%s\n' '#!/bin/sh' '# infra-TAK: placeholder — real file from takserver .deb' 'exit 0' \
-    > /opt/tak/config/takserver-config.sh
-  chmod +x /opt/tak/config/takserver-config.sh
-  MIT="${{MIT:+$MIT, }}takserver-config.sh"
-fi
 if [[ -n "$MIT" ]]; then
   echo "MITIGATED:$MIT"
 else
