@@ -28532,8 +28532,22 @@ def _post_update_auto_deploy():
             _auto_authentik_ports()
             _auto_nodered()
 
+            _auto_authentik()
+            # Wait for Authentik healthy before reconfiguring Portal/CloudTAK (they depend on it)
+            ak_dir = os.path.expanduser('~/authentik')
+            if os.path.exists(os.path.join(ak_dir, 'docker-compose.yml')):
+                for _i in range(60):
+                    r = subprocess.run('docker ps --filter name=authentik-server --format "{{.Status}}" 2>/dev/null',
+                        shell=True, capture_output=True, text=True, timeout=5)
+                    if 'healthy' in (r.stdout or '').lower():
+                        print("Post-update: Authentik healthy, proceeding with Portal/CloudTAK")
+                        break
+                    time.sleep(5)
+                else:
+                    print("Post-update: Authentik not healthy after 5 min, proceeding anyway")
+
             parallel_tasks = []
-            for fn in (_auto_authentik, _auto_takportal, _auto_cloudtak):
+            for fn in (_auto_takportal, _auto_cloudtak):
                 t = threading.Thread(target=fn, daemon=True)
                 t.start()
                 parallel_tasks.append(t)
