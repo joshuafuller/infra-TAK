@@ -25115,10 +25115,14 @@ def _tak_upgrade_apt_install(cwd, pkg_name, upgrade_log, timeout_sec=600):
     return proc.returncode if proc.returncode is not None else 1
 
 
-# takserver .postinst chmods named *.sh paths and directory globs. Fallback paths if postinst is unreadable.
+# takserver .postinst chmod/chown targets; fallbacks if postinst is unreadable.
 _TAK_POSTINST_EXPLICIT_SH_FALLBACK = (
     '/opt/tak/config/takserver-config.sh',
     '/opt/tak/messaging/takserver-messaging.sh',
+)
+# Non-.sh paths postinst may chown (usually directories); mkdir -p until .deb restores layout.
+_TAK_POSTINST_DIR_FALLBACK = (
+    '/opt/tak/config/takserver-config',
 )
 _TAK_POSTINST_SH_GLOB_DIRS = (
     '/opt/tak/config',
@@ -25130,31 +25134,50 @@ _TAK_POSTINST_SH_GLOB_DIRS = (
 )
 
 
-def _tak_postinst_resolved_explicit_sh_paths():
-    """Paths to literal .sh files chmod'd in takserver postinst (discovered + small fallback list)."""
-    paths = set(_TAK_POSTINST_EXPLICIT_SH_FALLBACK)
+def _tak_postinst_resolved_mitigation_paths():
+    """Return (sh_paths, dir_paths) for chmod/chown targets under /opt/tak from takserver.postinst + fallbacks."""
+    sh_paths = set(_TAK_POSTINST_EXPLICIT_SH_FALLBACK)
+    dir_paths = set(_TAK_POSTINST_DIR_FALLBACK)
     pi = '/var/lib/dpkg/info/takserver.postinst'
     try:
         if os.path.isfile(pi):
             with open(pi, 'r', encoding='utf-8', errors='ignore') as f:
-                txt = f.read()
-            for m in re.finditer(r'/opt/tak/[A-Za-z0-9_./-]+\.sh', txt):
-                paths.add(m.group(0))
+                lines = f.read().splitlines()
+            for line in lines:
+                if '#' in line:
+                    line = line.split('#', 1)[0]
+                if not any(k in line for k in ('chmod', 'chown', 'install', 'cp ', 'mv ', 'mkdir')):
+                    continue
+                for m in re.finditer(r'/opt/tak/[A-Za-z0-9_./-]+', line):
+                    p = m.group(0)
+                    if p.endswith('.sh'):
+                        sh_paths.add(p)
+                    elif p.endswith(('.deb', '.rpm', '.jar', '.war')):
+                        continue
+                    else:
+                        dir_paths.add(p)
     except OSError:
         pass
-    return sorted(paths)
+    return sorted(sh_paths), sorted(dir_paths)
 
 
 def _tak_upgrade_mitigate_takserver_postinst_config_sh(ulog):
-    """Ensure named scripts and *.sh globs exist so takserver postinst chmod succeeds after partial upgrades.
+    """Ensure dirs, named scripts, and *.sh globs exist so takserver postinst chmod/chown succeeds.
 
-    Named paths are parsed from /var/lib/dpkg/info/takserver.postinst when present, plus a fallback tuple.
+    Parses takserver.postinst for /opt/tak paths on chmod/chown/install/cp/mv lines.
     """
-    explicit_q = ' '.join(shlex.quote(p) for p in _tak_postinst_resolved_explicit_sh_paths())
+    sh_paths, dir_paths = _tak_postinst_resolved_mitigation_paths()
+    explicit_q = ' '.join(shlex.quote(p) for p in sh_paths)
+    dir_mk_q = ' '.join(shlex.quote(p) for p in dir_paths)
     dirs_q = ' '.join(shlex.quote(d) for d in _TAK_POSTINST_SH_GLOB_DIRS)
     mit = rf'''
 set -e
 MIT=""
+DIRPATHS=({dir_mk_q})
+for p in "${{DIRPATHS[@]}}"; do
+  mkdir -p "$p"
+  MIT="${{MIT:+$MIT, }}d:$(basename "$p")"
+done
 EXPLICIT=({explicit_q})
 for f in "${{EXPLICIT[@]}}"; do
   mkdir -p "$(dirname "$f")"
