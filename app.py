@@ -8497,6 +8497,42 @@ def wait_for_apt_lock(log_fn, log_list):
         log_list.append(f"  ⏳ {m:02d}:{s:02d}")
 
 
+def wait_for_unattended_upgrade_worker(log_fn, log_list, cancelled_check=None):
+    """Wait until no /usr/bin/unattended-upgrade worker is running.
+
+    Same check as the start of TAK Server deploy (wait_for_package_lock). Complements
+    wait_for_apt_lock (dpkg lock + broader process grep): the worker can be mid-run
+    before a lock appears, so both are used before apt installs in deploy and upgrade.
+    No timeout — ticks every 10s. cancelled_check, if set, returns True to abort wait.
+    """
+    log_fn("Checking for system upgrades in progress...")
+    r = subprocess.run(
+        'ps aux | grep "/usr/bin/unattended-upgrade" | grep -v shutdown | grep -v grep',
+        shell=True, capture_output=True, text=True)
+    if r.stdout.strip() == '':
+        log_fn("✓ No system upgrades in progress, continuing...")
+        return True
+    log_fn("⏳ System is running unattended-upgrades, waiting for completion...")
+    log_fn("  This can take 20-45 minutes on a fresh VPS. Do not cancel.")
+    waited = 0
+    while True:
+        time.sleep(10)
+        waited += 10
+        if cancelled_check and cancelled_check():
+            log_fn("⚠ Cancelled during upgrade wait")
+            return False
+        r = subprocess.run(
+            'ps aux | grep "/usr/bin/unattended-upgrade" | grep -v shutdown | grep -v grep',
+            shell=True, capture_output=True, text=True)
+        if r.stdout.strip() == '':
+            m, s = divmod(waited, 60)
+            log_fn(f"✓ System upgrades complete! (waited {m}m {s}s)")
+            time.sleep(5)
+            return True
+        m, s = divmod(waited, 60)
+        log_list.append(f"  ⏳ {m:02d}:{s:02d}")
+
+
 def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
     """
     Install the Caddy-managed Let's Encrypt cert on TAK Server's port 8446
@@ -25079,6 +25115,50 @@ def _tak_upgrade_apt_install(cwd, pkg_name, upgrade_log, timeout_sec=600):
     return proc.returncode if proc.returncode is not None else 1
 
 
+def _tak_upgrade_dpkg_configure_a(ulog, upgrade_log, timeout_sec=3600):
+    """Finish interrupted dpkg configuration before apt-get install (e.g. after a killed/timed-out upgrade).
+
+    Same idea as run_takserver_deploy's post-install dpkg --configure -a. Required when apt reports
+    'dpkg was interrupted, you must manually run dpkg --configure -a'.
+    """
+    ulog("Ensuring dpkg state is consistent (dpkg --configure -a)...")
+    cmd = 'sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l dpkg --configure -a 2>&1'
+    proc = subprocess.Popen(
+        cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    if proc.stdout is None:
+        ulog("✗ Could not start dpkg --configure -a")
+        return False
+
+    def _drain():
+        for line in iter(proc.stdout.readline, ''):
+            if line and 'NEEDRESTART' not in line:
+                upgrade_log.append('  ' + line.rstrip('\n'))
+
+    t = threading.Thread(target=_drain, daemon=True)
+    t.start()
+    try:
+        proc.wait(timeout=timeout_sec)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.wait(timeout=15)
+        except Exception:
+            pass
+        t.join(timeout=5)
+        ulog("✗ dpkg --configure -a timed out — fix packages over SSH, then retry.")
+        return False
+    t.join(timeout=5)
+    rc = proc.returncode if proc.returncode is not None else 1
+    if rc != 0:
+        ulog(
+            f"✗ dpkg --configure -a failed (exit {rc}). "
+            "On the server run: sudo DEBIAN_FRONTEND=noninteractive dpkg --configure -a && sudo apt-get -f install -y"
+        )
+        return False
+    ulog("✓ dpkg state OK")
+    return True
+
+
 def run_takserver_upgrade(pkg_path):
     def ulog(msg):
         entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
@@ -25089,6 +25169,11 @@ def run_takserver_upgrade(pkg_path):
         ulog("=" * 50)
         ulog("TAK Server update (upgrade)")
         ulog("=" * 50)
+        wait_for_unattended_upgrade_worker(ulog, upgrade_log)
+        wait_for_apt_lock(ulog, upgrade_log)
+        if not _tak_upgrade_dpkg_configure_a(ulog, upgrade_log):
+            upgrade_status.update({'running': False, 'complete': False, 'error': True})
+            return
         wait_for_apt_lock(ulog, upgrade_log)
         ulog("")
         ulog("Installing upgrade package: " + pkg_name)
@@ -25133,6 +25218,8 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
         ulog(f"  Server One (DB): {s1_host}")
         ulog("=" * 50)
 
+        wait_for_unattended_upgrade_worker(ulog, upgrade_log)
+
         # Step 1: Update Core (local) — per TAK guide, core first
         ulog("")
         ulog("━━━ Step 1/4: Stopping TAK Server ━━━")
@@ -25141,6 +25228,10 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
 
         ulog("")
         ulog("━━━ Step 2/4: Upgrading Core (this host) ━━━")
+        wait_for_apt_lock(ulog, upgrade_log)
+        if not _tak_upgrade_dpkg_configure_a(ulog, upgrade_log):
+            upgrade_status.update({'running': False, 'complete': False, 'error': True})
+            return
         wait_for_apt_lock(ulog, upgrade_log)
         ulog(f"Installing {core_name}...")
         try:
@@ -25611,28 +25702,8 @@ def run_cmd(cmd, desc=None, check=True, quiet=False):
 def wait_for_package_lock():
     """Wait for unattended-upgrades to finish (common on fresh VPS).
     NO TIMEOUT - waits as long as needed. Ticks every 10 seconds."""
-    log_step("Checking for system upgrades in progress...")
-    r = subprocess.run('ps aux | grep "/usr/bin/unattended-upgrade" | grep -v shutdown | grep -v grep', shell=True, capture_output=True, text=True)
-    if r.stdout.strip() == '':
-        log_step("\u2713 No system upgrades in progress, continuing...")
-        return True
-    log_step("\u23f3 System is running unattended-upgrades, waiting for completion...")
-    log_step("  This can take 20-45 minutes on a fresh VPS. Do not cancel.")
-    waited = 0
-    while True:
-        time.sleep(10)
-        waited += 10
-        if deploy_status.get('cancelled'):
-            log_step("⚠ Cancelled during upgrade wait")
-            return False
-        r = subprocess.run('ps aux | grep "/usr/bin/unattended-upgrade" | grep -v shutdown | grep -v grep', shell=True, capture_output=True, text=True)
-        if r.stdout.strip() == '':
-            m, s = divmod(waited, 60)
-            log_step(f"\u2713 System upgrades complete! (waited {m}m {s}s)")
-            time.sleep(5)
-            return True
-        m, s = divmod(waited, 60)
-        deploy_log.append(f"  \u23f3 {m:02d}:{s:02d}")
+    return wait_for_unattended_upgrade_worker(
+        log_step, deploy_log, lambda: deploy_status.get('cancelled'))
 
 def run_takserver_deploy(config):
     try:
