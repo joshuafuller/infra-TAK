@@ -7598,6 +7598,49 @@ def _get_authentik_api_url(settings):
     return f'http://{upstream}'
 
 
+INFRATAK_DOCKER_NETWORK = 'infratak'
+
+
+def _ensure_infratak_docker_network():
+    """Create the shared 'infratak' Docker bridge network if it doesn't exist.
+
+    This network allows containers from different compose stacks (e.g. TAK Portal,
+    Authentik) to communicate directly using container hostnames, which is required
+    because published ports are hardened to 127.0.0.1 and unreachable between containers.
+    """
+    try:
+        r = subprocess.run(
+            f'docker network inspect {INFRATAK_DOCKER_NETWORK}',
+            shell=True, capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            subprocess.run(
+                f'docker network create {INFRATAK_DOCKER_NETWORK}',
+                shell=True, capture_output=True, text=True, timeout=10)
+    except Exception:
+        pass
+
+
+def _connect_container_to_infratak_network(container_name):
+    """Connect a running container to the shared infratak Docker network (idempotent)."""
+    try:
+        _ensure_infratak_docker_network()
+        subprocess.run(
+            f'docker network connect {INFRATAK_DOCKER_NETWORK} {shlex.quote(container_name)} 2>/dev/null',
+            shell=True, capture_output=True, text=True, timeout=10)
+    except Exception:
+        pass
+
+
+def _ensure_infratak_network_for_authentik():
+    """Connect Authentik server container to the infratak network."""
+    _connect_container_to_infratak_network('authentik-server-1')
+
+
+def _ensure_infratak_network_for_portal():
+    """Connect TAK Portal container to the infratak network."""
+    _connect_container_to_infratak_network('tak-portal')
+
+
 def _check_authentik_api_reachable(settings):
     """Verify we can reach the Authentik API (for remote: ensures firewall allows console -> Authentik:9090).
     Returns (True, None) if reachable, (False, error_msg) otherwise."""
@@ -9251,13 +9294,15 @@ def _takportal_build_settings_dict(settings):
     cloudtak_host = _get_service_domain(settings, 'cloudtak_map')
     cert_pass = _get_tak_cert_password(settings)
     ak_upstream = _get_authentik_upstream(settings)
-    # Same-host: use server_ip so container (bridge) can reach host's Authentik.
-    # Loopback addresses (localhost, 127.0.0.1) don't work inside a container — use host.docker.internal (requires extra_hosts in compose).
+    # Local Authentik: use the Docker-internal hostname on the shared infratak network.
+    # Published ports are hardened to 127.0.0.1, so containers can't reach them via
+    # the host's public IP. The infratak network lets Portal talk to Authentik directly.
     if ak_upstream == '127.0.0.1:9090':
-        auth_url_host = server_ip if (server_ip and server_ip not in ('localhost', '127.0.0.1')) else 'host.docker.internal'
+        auth_url_host = 'authentik-server-1'
+        auth_url_port = '9000'
     else:
         auth_url_host = ak_upstream.split(':')[0]
-    auth_url_port = '9090' if ak_upstream == '127.0.0.1:9090' else (ak_upstream.split(':')[1] if ':' in ak_upstream else '9090')
+        auth_url_port = ak_upstream.split(':')[1] if ':' in ak_upstream else '9090'
     # TAK_URL host for HTTPS to :8443/Marti inside the portal container.
     # Prefer takserver.<fqdn> when FQDN is set — TAK certs are issued for DNS names; using
     # server_ip breaks TLS hostname verification ("identity could not be verified").
@@ -9432,10 +9477,14 @@ def takportal_control():
     portal_dir = os.path.expanduser('~/TAK-Portal')
     if action == 'start':
         subprocess.run(f'cd {portal_dir} && docker compose up -d --build', shell=True, capture_output=True, text=True, timeout=120)
+        _ensure_infratak_network_for_portal()
+        _ensure_infratak_network_for_authentik()
     elif action == 'stop':
         subprocess.run(f'cd {portal_dir} && docker compose down', shell=True, capture_output=True, text=True, timeout=60)
     elif action == 'restart':
         subprocess.run(f'cd {portal_dir} && docker compose down && docker compose up -d', shell=True, capture_output=True, text=True, timeout=120)
+        _ensure_infratak_network_for_portal()
+        _ensure_infratak_network_for_authentik()
     elif action == 'reconfigure':
         # Update config only: push settings into container and restart (no git pull / image build). Preserves user-configured keys (e.g. BRAND_LOGO_URL).
         settings = load_settings()
@@ -9469,6 +9518,8 @@ def takportal_control():
             shell=True, capture_output=True, text=True, timeout=60)
         pull_msg = pull.stdout.strip().split('\n')[-1] if pull.stdout.strip() else ''
         build = subprocess.run(f'cd {portal_dir} && docker compose up -d --build', shell=True, capture_output=True, text=True, timeout=180)
+        _ensure_infratak_network_for_portal()
+        _ensure_infratak_network_for_authentik()
         if build.returncode != 0:
             err = (build.stderr or build.stdout or 'Build failed').strip()[:400]
             return jsonify({'success': False, 'error': 'Build failed. Container may have stopped — try Start below or check container logs.'}), 500
@@ -9722,6 +9773,9 @@ def run_takportal_deploy():
                     takportal_deploy_log.append(f"  \u2717 {line.strip()}")
             takportal_deploy_status.update({'running': False, 'error': True})
             return
+
+        _ensure_infratak_network_for_portal()
+        _ensure_infratak_network_for_authentik()
 
         # Wait for container to be healthy
         plog("  Waiting for container...")
@@ -20010,6 +20064,8 @@ def run_authentik_deploy(reconfigure=False):
             plog("\u2501\u2501\u2501 Reconfigure: Updating LDAP, CoreConfig, Forward Auth (no removal) \u2501\u2501\u2501")
             _ensure_authentik_starter_branding(ak_dir, deploy_cfg, plog)
             subprocess.run(f'cd {ak_dir} && docker compose up -d 2>&1', shell=True, capture_output=True, text=True, timeout=120)
+            _ensure_infratak_network_for_authentik()
+            _ensure_infratak_network_for_portal()
             plog("  Ensured containers are up")
             _apply_authentik_pg_tuning(ak_dir, plog)
             fqdn = settings.get('fqdn', '')
@@ -20628,6 +20684,7 @@ entries:
                 plog("  \u26a0 PostgreSQL not ready in time, starting server anyway")
             plog("  Starting server and worker...")
             r = subprocess.run(f'cd {ak_dir} && docker compose up -d server worker 2>&1', shell=True, capture_output=True, text=True, timeout=120)
+            _ensure_infratak_network_for_authentik()
             if r.returncode != 0:
                 plog(f"  \u26a0 Start had issues: {r.stderr.strip()[:200] if r.stderr else r.stdout.strip()[:200]}")
             else:
@@ -27829,9 +27886,11 @@ def _post_update_auto_deploy():
                                     except OSError:
                                         pass
                                 _takportal_setup_ssh()
+                                _ensure_infratak_network_for_authentik()
+                                _ensure_infratak_network_for_portal()
                                 subprocess.run('docker restart tak-portal', shell=True, capture_output=True, text=True, timeout=30)
                                 _sync_authentik_takportal_provider_url(settings)
-                                print("Post-update: TAK Portal config updated and restarted")
+                                print("Post-update: TAK Portal config updated and restarted (infratak network connected)")
                             finally:
                                 _auto_deploy_active.pop('takportal', None)
                         else:
@@ -27987,6 +28046,8 @@ def _post_update_auto_deploy():
                         if needs_recreate:
                             subprocess.run(f'cd {shlex.quote(ak_dir)} && docker compose up -d 2>/dev/null',
                                 shell=True, capture_output=True, text=True, timeout=300)
+                            _ensure_infratak_network_for_authentik()
+                            _ensure_infratak_network_for_portal()
                             print("Post-update: Authentik containers recreated with 127.0.0.1 bindings")
                         else:
                             print("Post-update: Authentik port bindings already secure")
