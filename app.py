@@ -27794,6 +27794,18 @@ def _startup_migrations():
             if sg_ok and 'synced' in (sg_msg or ''):
                 print(f"Startup migration: guarddog.conf synced — {sg_msg}")
 
+        # Ensure the shared infratak Docker network exists and containers are connected
+        # (cheap idempotent check — runs every startup so restarts/recreates don't break Portal→Authentik)
+        try:
+            portal_up = subprocess.run('docker ps -q --filter name=tak-portal', shell=True, capture_output=True, text=True, timeout=5)
+            ak_up = subprocess.run('docker ps -q --filter name=authentik-server-1', shell=True, capture_output=True, text=True, timeout=5)
+            if (portal_up.stdout or '').strip() and (ak_up.stdout or '').strip():
+                _ensure_infratak_network_for_authentik()
+                _ensure_infratak_network_for_portal()
+                print("Startup migration: infratak Docker network ensured (Portal ↔ Authentik)")
+        except Exception as net_err:
+            print(f"Startup migration: infratak network error: {net_err}")
+
         # Ensure Guard Dog has a deployed-version stamp (one-time migration for existing installs)
         if os.path.exists('/opt/tak-guarddog') and not s.get('guarddog_deployed_version'):
             try:
