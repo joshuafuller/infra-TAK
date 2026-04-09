@@ -25332,7 +25332,7 @@ def _tak_upgrade_dpkg_configure_a(ulog, upgrade_log, pkg_path=None):
         ulog("✗ dpkg --configure -a still failed after re-unpack. Manual intervention needed.")
         return False
     ulog("✓ dpkg state OK (after re-unpack)")
-    return True
+    return 'ALREADY_INSTALLED'
 
 
 def _tak_upgrade_apt_install_streamed(cmd, cwd, upgrade_log, timeout_sec=600):
@@ -25376,22 +25376,26 @@ def run_takserver_upgrade(pkg_path):
         ulog("=" * 50)
         wait_for_unattended_upgrade_worker(ulog, upgrade_log)
         wait_for_apt_lock(ulog, upgrade_log)
-        if not _tak_upgrade_dpkg_configure_a(ulog, upgrade_log, pkg_path=pkg_path):
+        dpkg_result = _tak_upgrade_dpkg_configure_a(ulog, upgrade_log, pkg_path=pkg_path)
+        if not dpkg_result:
             upgrade_status.update({'running': False, 'complete': False, 'error': True})
             return
-        wait_for_apt_lock(ulog, upgrade_log)
-        ulog("")
-        ulog("Installing upgrade package: " + pkg_name)
-        try:
-            rc = _tak_upgrade_apt_install(os.path.dirname(pkg_path), pkg_name, upgrade_log, timeout_sec=600)
-        except subprocess.TimeoutExpired as te:
-            ulog("Error: " + str(te))
-            upgrade_status.update({'running': False, 'complete': False, 'error': True})
-            return
-        if rc != 0:
-            ulog("Update failed (exit " + str(rc) + ")")
-            upgrade_status.update({'running': False, 'complete': False, 'error': True})
-            return
+        if dpkg_result == 'ALREADY_INSTALLED':
+            ulog("Package already installed via re-unpack + configure — skipping redundant apt-get install.")
+        else:
+            wait_for_apt_lock(ulog, upgrade_log)
+            ulog("")
+            ulog("Installing upgrade package: " + pkg_name)
+            try:
+                rc = _tak_upgrade_apt_install(os.path.dirname(pkg_path), pkg_name, upgrade_log, timeout_sec=3600)
+            except subprocess.TimeoutExpired as te:
+                ulog("Error: " + str(te))
+                upgrade_status.update({'running': False, 'complete': False, 'error': True})
+                return
+            if rc != 0:
+                ulog("Update failed (exit " + str(rc) + ")")
+                upgrade_status.update({'running': False, 'complete': False, 'error': True})
+                return
         ne_changed, ne_msg = _sanitize_coreconfig_name_entries()
         if ne_changed:
             ulog(f"NameEntry fix: {ne_msg}")
@@ -25434,21 +25438,25 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
         ulog("")
         ulog("━━━ Step 2/4: Upgrading Core (this host) ━━━")
         wait_for_apt_lock(ulog, upgrade_log)
-        if not _tak_upgrade_dpkg_configure_a(ulog, upgrade_log, pkg_path=core_pkg_path):
+        dpkg_result = _tak_upgrade_dpkg_configure_a(ulog, upgrade_log, pkg_path=core_pkg_path)
+        if not dpkg_result:
             upgrade_status.update({'running': False, 'complete': False, 'error': True})
             return
-        wait_for_apt_lock(ulog, upgrade_log)
-        ulog(f"Installing {core_name}...")
-        try:
-            rc = _tak_upgrade_apt_install(os.path.dirname(core_pkg_path), core_name, upgrade_log, timeout_sec=600)
-        except subprocess.TimeoutExpired as te:
-            ulog(f"✗ Error: {te}")
-            upgrade_status.update({'running': False, 'complete': False, 'error': True})
-            return
-        if rc != 0:
-            ulog(f"✗ Core upgrade failed (exit {rc})")
-            upgrade_status.update({'running': False, 'complete': False, 'error': True})
-            return
+        if dpkg_result == 'ALREADY_INSTALLED':
+            ulog("Core already installed via re-unpack + configure — skipping redundant apt-get install.")
+        else:
+            wait_for_apt_lock(ulog, upgrade_log)
+            ulog(f"Installing {core_name}...")
+            try:
+                rc = _tak_upgrade_apt_install(os.path.dirname(core_pkg_path), core_name, upgrade_log, timeout_sec=3600)
+            except subprocess.TimeoutExpired as te:
+                ulog(f"✗ Error: {te}")
+                upgrade_status.update({'running': False, 'complete': False, 'error': True})
+                return
+            if rc != 0:
+                ulog(f"✗ Core upgrade failed (exit {rc})")
+                upgrade_status.update({'running': False, 'complete': False, 'error': True})
+                return
         ulog("✓ Core package upgraded")
 
         # Restore JDBC URL to Server One (the upgrade may have reset CoreConfig)
