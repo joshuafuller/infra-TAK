@@ -25172,8 +25172,17 @@ def _tak_upgrade_mitigate_takserver_postinst_config_sh(ulog):
 
     Implemented in Python (not a single bash -c blob) so every step is logged and failures are visible.
     After a killed upgrade, dpkg --configure needs paths the .deb would normally unpack.
+
+    Also invoked from _tak_upgrade_dpkg_configure_a so this always runs immediately before dpkg --configure -a.
     """
     ulog("Preparing /opt/tak paths expected by takserver postinst (partial-upgrade workaround)...")
+    # Hard prerequisites — do not rely only on postinst parsing (broken upgrades omit these).
+    for critical in ('/opt/tak/config/takserver-config',):
+        r = subprocess.run(['sudo', 'mkdir', '-p', critical], capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            ulog(f"✗ mkdir -p {critical} failed: {(r.stderr or r.stdout or '').strip()[:400]}")
+        else:
+            ulog(f"  ✓ mkdir -p {critical} (required for takserver postinst chown)")
     sh_paths, dir_paths = _tak_postinst_resolved_mitigation_paths()
     placeholder = (
         '#!/bin/sh\n'
@@ -25222,7 +25231,10 @@ def _tak_upgrade_dpkg_configure_a(ulog, upgrade_log, timeout_sec=3600):
 
     Same idea as run_takserver_deploy's post-install dpkg --configure -a. Required when apt reports
     'dpkg was interrupted, you must manually run dpkg --configure -a'.
+
+    Path mitigation runs here (not only from the caller) so it cannot be skipped by stale workers or old call sites.
     """
+    _tak_upgrade_mitigate_takserver_postinst_config_sh(ulog)
     ulog("Ensuring dpkg state is consistent (dpkg --configure -a)...")
     cmd = 'sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l dpkg --configure -a 2>&1'
     proc = subprocess.Popen(
@@ -25273,7 +25285,6 @@ def run_takserver_upgrade(pkg_path):
         ulog("=" * 50)
         wait_for_unattended_upgrade_worker(ulog, upgrade_log)
         wait_for_apt_lock(ulog, upgrade_log)
-        _tak_upgrade_mitigate_takserver_postinst_config_sh(ulog)
         if not _tak_upgrade_dpkg_configure_a(ulog, upgrade_log):
             upgrade_status.update({'running': False, 'complete': False, 'error': True})
             return
@@ -25332,7 +25343,6 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
         ulog("")
         ulog("━━━ Step 2/4: Upgrading Core (this host) ━━━")
         wait_for_apt_lock(ulog, upgrade_log)
-        _tak_upgrade_mitigate_takserver_postinst_config_sh(ulog)
         if not _tak_upgrade_dpkg_configure_a(ulog, upgrade_log):
             upgrade_status.update({'running': False, 'complete': False, 'error': True})
             return
