@@ -57,8 +57,26 @@ for _d in /root/authentik "${HOME:-/root}/authentik"; do
 done
 
 if [ -n "$AK_DIR" ]; then
-  _log "Starting Authentik..."
-  cd "$AK_DIR" && docker compose up -d 2>/dev/null
+  cd "$AK_DIR"
+
+  # Stagger: start PostgreSQL first and wait for it to accept connections
+  _log "Starting Authentik PostgreSQL..."
+  docker compose up -d postgresql 2>/dev/null
+  _pg_t=0
+  while [ $_pg_t -lt 60 ]; do
+    if docker compose exec -T postgresql pg_isready -U authentik 2>/dev/null; then
+      _log "PostgreSQL ready (${_pg_t}s)"
+      break
+    fi
+    sleep 2
+    _pg_t=$((_pg_t + 2))
+  done
+  [ $_pg_t -ge 60 ] && _log "PostgreSQL not ready after 60s, starting server anyway"
+
+  # Now start redis, server, and worker (depends_on in compose handles redis ordering)
+  _log "Starting Authentik server and worker..."
+  docker compose up -d redis server worker 2>/dev/null
+
   _t=0
   while [ $_t -lt $MAX_WAIT_AK ]; do
     _status=$(docker ps --filter name=authentik-server --format '{{.Status}}' 2>/dev/null || echo "")
@@ -71,7 +89,10 @@ if [ -n "$AK_DIR" ]; then
   done
   [ $_t -ge $MAX_WAIT_AK ] && _log "Authentik server not healthy after ${MAX_WAIT_AK}s, continuing"
 
-  # Verify LDAP outpost is also responding (port 389)
+  # Start LDAP outpost now that server is healthy (or timed out)
+  _log "Starting LDAP outpost..."
+  cd "$AK_DIR" && docker compose up -d ldap 2>/dev/null
+
   _log "Checking LDAP outpost (port 389)..."
   _t=0
   _MAX_LDAP=120

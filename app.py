@@ -19069,8 +19069,8 @@ def authentik_control():
     elif action == 'update':
         import re as _re
         latest = _get_authentik_latest_release_tag(use_cache=False)
+        cp = os.path.join(ak_dir, 'docker-compose.yml')
         if latest:
-            cp = os.path.join(ak_dir, 'docker-compose.yml')
             if os.path.isfile(cp):
                 with open(cp) as _f:
                     _cc = _f.read()
@@ -19078,6 +19078,7 @@ def authentik_control():
                 if _new != _cc:
                     with open(cp, 'w') as _f:
                         _f.write(_new)
+        _ensure_authentik_compose_patches(cp)
         subprocess.run(f'cd {ak_dir} && docker compose pull && docker compose up -d && docker image prune -f', shell=True, capture_output=True, text=True, timeout=300)
     else:
         return jsonify({'error': 'Invalid action'}), 400
@@ -20143,16 +20144,91 @@ def _ensure_authentik_starter_branding(ak_dir, deploy_cfg, plog=None):
             plog(f"  \u26a0 Starter branding: {e}")
 
 
+def _ensure_authentik_compose_patches(compose_path, plog=None):
+    """Ensure docker-compose.yml has PostgreSQL tuning and proper healthchecks.
+    Safe to call multiple times (idempotent). Returns True if file was modified."""
+    if not compose_path or not os.path.exists(compose_path):
+        return False
+    try:
+        with open(compose_path, 'r') as f:
+            lines = f.readlines()
+        changed = False
+
+        pg_cmd = 'postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=120s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
+        has_pg_cmd = any('max_connections=300' in l for l in lines)
+        needs_pg_update = has_pg_cmd and (not any('idle_in_transaction_session_timeout' in l for l in lines) or any('idle_in_transaction_session_timeout=300s' in l for l in lines) or any('idle_in_transaction_session_timeout=30s' in l for l in lines))
+        if not has_pg_cmd:
+            patched = []
+            for line in lines:
+                patched.append(line)
+                if 'image: docker.io/library/postgres:' in line or (line.strip().startswith('image:') and 'postgres:' in line and 'ghcr' not in line and 'redis' not in line):
+                    indent = line[:len(line) - len(line.lstrip())]
+                    patched.append(f'{indent}command: {pg_cmd}\n')
+            if len(patched) > len(lines):
+                lines = patched
+                changed = True
+                if plog:
+                    plog("  ✓ Added PostgreSQL command-line tuning (max_connections=300, idle timeouts, tcp keepalives)")
+        elif needs_pg_update:
+            for i, line in enumerate(lines):
+                if 'command: postgres' in line and 'max_connections' in line:
+                    indent = line[:len(line) - len(line.lstrip())]
+                    lines[i] = f'{indent}command: {pg_cmd}\n'
+                    changed = True
+                    if plog:
+                        plog("  ✓ Updated PostgreSQL tuning parameters")
+                    break
+
+        if not any('ak healthcheck' in l or 'ak", "healthcheck' in l for l in lines):
+            _hc_block = '    healthcheck:\n      test: ["CMD", "ak", "healthcheck"]\n      start_period: 600s\n      interval: 30s\n      timeout: 10s\n      retries: 5\n'
+            patched = []
+            for line in lines:
+                patched.append(line)
+                if line.strip() == 'command: server' or line.strip() == 'command: worker':
+                    patched.append(_hc_block)
+            if len(patched) > len(lines):
+                lines = patched
+                changed = True
+                if plog:
+                    plog("  ✓ Added healthchecks for server and worker")
+        else:
+            _hc_changed = False
+            for i, line in enumerate(lines):
+                if 'start_period' in line and 'start_period: 600s' not in line:
+                    for j in range(i - 1, max(i - 15, 0), -1):
+                        if lines[j].strip().startswith('command: server') or lines[j].strip().startswith('command: worker'):
+                            lines[i] = re.sub(r'start_period:\s*\S+', 'start_period: 600s', line)
+                            _hc_changed = True
+                            changed = True
+                            break
+                        if lines[j].strip().startswith('image:') and 'postgres' in lines[j]:
+                            break
+                        if lines[j].strip().startswith('image:') and 'redis' in lines[j]:
+                            break
+            if _hc_changed and plog:
+                plog("  ✓ Updated healthcheck start_period to 600s")
+
+        if changed:
+            with open(compose_path, 'w') as f:
+                f.writelines(lines)
+        return changed
+    except Exception as e:
+        if plog:
+            plog(f"  ⚠ Compose patching error: {e}")
+        return False
+
+
 def _apply_authentik_pg_tuning(ak_dir, plog):
-    """Clear stale postgresql.auto.conf entries and let docker-compose command-line args handle tuning.
-    Previous versions used ALTER SYSTEM SET which left stale entries that conflict on upgrade."""
+    """Ensure compose has PG tuning args, clear stale ALTER SYSTEM entries, and reload config."""
+    compose_path = os.path.join(ak_dir, 'docker-compose.yml')
+    _ensure_authentik_compose_patches(compose_path, plog)
     try:
         pg_container = subprocess.run(
             f'cd {ak_dir} && docker compose ps -q postgresql 2>/dev/null',
             shell=True, capture_output=True, text=True, timeout=15
         ).stdout.strip()
         if not pg_container:
-            plog("  PostgreSQL container not found, skipping PG tuning")
+            plog("  PostgreSQL container not found, skipping PG tuning runtime check")
             return
         subprocess.run(
             f'cd {ak_dir} && docker compose exec -T postgresql psql -U authentik -d authentik -c "ALTER SYSTEM RESET ALL;" 2>&1',
@@ -20162,9 +20238,9 @@ def _apply_authentik_pg_tuning(ak_dir, plog):
             f'cd {ak_dir} && docker compose exec -T postgresql psql -U authentik -d authentik -c "SELECT pg_reload_conf();" 2>&1',
             shell=True, capture_output=True, text=True, timeout=15
         )
-        plog("  \u2713 PostgreSQL tuning cleaned up (stale ALTER SYSTEM entries cleared; command-line args in docker-compose.yml apply on restart)")
+        plog("  ✓ PostgreSQL: ALTER SYSTEM entries cleared, compose command-line args apply on next restart")
     except Exception as e:
-        plog(f"  \u26a0 PG tuning cleanup skipped: {e}")
+        plog(f"  ⚠ PG tuning cleanup skipped: {e}")
 
 
 def run_authentik_deploy(reconfigure=False):
@@ -20204,6 +20280,7 @@ def run_authentik_deploy(reconfigure=False):
             plog("\u2501\u2501\u2501 Reconfigure: Updating LDAP, CoreConfig, Forward Auth (no removal) \u2501\u2501\u2501")
             _ensure_authentik_starter_branding(ak_dir, deploy_cfg, plog)
             _patch_authentik_compose_network()
+            _ensure_authentik_compose_patches(compose_path, plog)
             subprocess.run(f'cd {ak_dir} && docker compose up -d 2>&1', shell=True, capture_output=True, text=True, timeout=120)
             _ensure_infratak_network_for_authentik()
             _ensure_infratak_network_for_portal()
