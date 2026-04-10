@@ -296,17 +296,17 @@ const flows = [
   },
   {
     id: 'fn_save', type: 'function', z: FLOW_ID,
-    name: 'Save to flow context',
+    name: 'Save to global context',
     func: [
       "var config  = msg.payload;",
-      "var configs = flow.get('arcgis_configs') || [];",
+      "var configs = global.get('arcgis_configs') || [];",
       "var idx = configs.findIndex(function(c) {",
       "  return c.source.serviceUrl === config.source.serviceUrl",
       "      && c.source.layerId    === config.source.layerId;",
       "});",
       "if (idx >= 0) { configs[idx] = config; }",
       "else           { configs.push(config); }",
-      "flow.set('arcgis_configs', configs);",
+      "global.set('arcgis_configs', configs);",
       "msg.payload = { ok: true, configCount: configs.length };",
       "return msg;"
     ].join('\n'),
@@ -332,7 +332,7 @@ const flows = [
     id: 'fn_saveall', type: 'function', z: FLOW_ID,
     name: 'Replace all configs',
     func: [
-      "flow.set('arcgis_configs', msg.payload.configs || []);",
+      "global.set('arcgis_configs', msg.payload.configs || []);",
       "msg.payload = { ok: true };",
       "return msg;"
     ].join('\n'),
@@ -356,9 +356,9 @@ const flows = [
   },
   {
     id: 'fn_load', type: 'function', z: FLOW_ID,
-    name: 'Load from flow context',
+    name: 'Load from global context',
     func: [
-      "var configs = flow.get('arcgis_configs') || [];",
+      "var configs = global.get('arcgis_configs') || [];",
       "msg.payload = { configs: configs };",
       "return msg;"
     ].join('\n'),
@@ -391,7 +391,7 @@ const flows = [
     id: 'fn_tak_save', type: 'function', z: FLOW_ID,
     name: 'Save TAK settings',
     func: [
-      "flow.set('tak_settings', msg.payload);",
+      "global.set('tak_settings', msg.payload);",
       "msg.payload = { ok: true };",
       "return msg;"
     ].join('\n'),
@@ -415,7 +415,7 @@ const flows = [
     id: 'fn_tak_load', type: 'function', z: FLOW_ID,
     name: 'Load TAK settings',
     func: [
-      "msg.payload = { settings: flow.get('tak_settings') || {} };",
+      "msg.payload = { settings: global.get('tak_settings') || {} };",
       "return msg;"
     ].join('\n'),
     outputs: 1, timeout: '', noerr: 0,
@@ -475,8 +475,8 @@ const engineFlows = [
     id: 'eng_load', type: 'function', z: ENGINE_ID,
     name: 'Load configs',
     func: [
-      "var configs = flow.get('arcgis_configs') || [];",
-      "var tak = flow.get('tak_settings') || {};",
+      "var configs = global.get('arcgis_configs') || [];",
+      "var tak = global.get('tak_settings') || {};",
       "if (configs.length === 0) { node.warn('No ArcGIS configs — open /configurator'); return null; }",
       "if (!tak.serverUrl) { node.warn('No TAK Server URL — open /configurator → TAK Settings'); return null; }",
       "var out = [];",
