@@ -218,24 +218,25 @@
 
     <div class="field-grid">
       <div>
-        <label for="strokeColor">Stroke color</label>
+        <label for="shapeColor">Shape color</label>
         <div class="color-row">
-          <input type="color" id="strokeColorPick" value="#FF0000"
-                 oninput="document.getElementById('strokeColor').value=this.value;updSwatch('swStroke',this.value)">
-          <input type="text" id="strokeColor" value="#FF0000" style="width:110px"
-                 oninput="updSwatch('swStroke',this.value);document.getElementById('strokeColorPick').value=this.value">
-          <div class="color-swatch" id="swStroke" style="background:#FF0000"></div>
+          <input type="color" id="shapeColorPick" value="#FF0000"
+                 oninput="document.getElementById('shapeColor').value=this.value;updSwatch('swColor',this.value)">
+          <input type="text" id="shapeColor" value="#FF0000" style="width:110px"
+                 oninput="updSwatch('swColor',this.value);document.getElementById('shapeColorPick').value=this.value">
+          <div class="color-swatch" id="swColor" style="background:#FF0000"></div>
         </div>
       </div>
       <div>
-        <label for="fillColor">Fill color (with alpha)</label>
-        <div class="color-row">
-          <input type="color" id="fillColorPick" value="#FF0000"
-                 oninput="document.getElementById('fillColor').value=this.value+'44';updSwatch('swFill',this.value+'44')">
-          <input type="text" id="fillColor" value="#FF000044" style="width:110px"
-                 oninput="updSwatch('swFill',this.value)">
-          <div class="color-swatch" id="swFill" style="background:#FF000044"></div>
-        </div>
+        <label for="fillAlpha">Fill opacity</label>
+        <select id="fillAlpha">
+          <option value="00">0% — No fill</option>
+          <option value="33">20%</option>
+          <option value="55" selected>33%</option>
+          <option value="80">50%</option>
+          <option value="AA">67%</option>
+          <option value="FF">100% — Solid fill</option>
+        </select>
       </div>
       <div>
         <label for="strokeWeight">Line thickness (px)</label>
@@ -698,8 +699,8 @@ function generateConfig() {
       values: allValues.length > 0 ? allValues : null
     },
     style: {
-      strokeColor: document.getElementById('strokeColor').value,
-      fillColor: document.getElementById('fillColor').value,
+      color: document.getElementById('shapeColor').value,
+      fillAlpha: document.getElementById('fillAlpha').value,
       strokeWeight: parseInt(document.getElementById('strokeWeight').value, 10),
       strokeStyle: document.getElementById('strokeStyle').value,
       closed: document.getElementById('closedShape').value === 'true',
