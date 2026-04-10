@@ -216,20 +216,83 @@ const flows = [
     x: 1000, y: 400, wires: []
   },
 
+  // POST /api/arcgis/distinct  →  fetch distinct values for a field
+  {
+    id: 'hi_dist', type: 'http in', z: FLOW_ID,
+    name: 'POST /api/arcgis/distinct',
+    url: '/api/arcgis/distinct', method: 'post',
+    upload: false, swaggerDoc: '',
+    x: 200, y: 500, wires: [['fn_dist']]
+  },
+  {
+    id: 'fn_dist', type: 'function', z: FLOW_ID,
+    name: 'Build distinct query URL',
+    func: [
+      "const base  = msg.payload.url.replace(/\\/+$/, '');",
+      "const lid   = msg.payload.layerId;",
+      "const field = encodeURIComponent(msg.payload.field);",
+      "msg.url = base + '/' + lid + '/query'",
+      "  + '?where=1%3D1'",
+      "  + '&outFields=' + field",
+      "  + '&returnDistinctValues=true'",
+      "  + '&orderByFields=' + field",
+      "  + '&resultRecordCount=500'",
+      "  + '&f=json';",
+      "msg._field = msg.payload.field;",
+      "return msg;"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 430, y: 500, wires: [['hr_dist']]
+  },
+  {
+    id: 'hr_dist', type: 'http request', z: FLOW_ID,
+    name: 'GET distinct values',
+    method: 'GET', ret: 'obj', paytoqs: 'ignore',
+    url: '', tls: '', persist: false, proxy: '',
+    insecureHTTPParser: false, authType: '',
+    senderr: false, headers: [],
+    x: 620, y: 500, wires: [['fn_dist_parse']]
+  },
+  {
+    id: 'fn_dist_parse', type: 'function', z: FLOW_ID,
+    name: 'Parse distinct',
+    func: [
+      "if (msg.payload.error) {",
+      "  msg.payload = { error: msg.payload.error.message || 'ArcGIS error' };",
+      "} else {",
+      "  var field = msg._field;",
+      "  var vals = (msg.payload.features || []).map(function(f) {",
+      "    return f.attributes[field];",
+      "  });",
+      "  msg.payload = { values: vals };",
+      "}",
+      "return msg;"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 810, y: 500, wires: [['ho_dist']]
+  },
+  {
+    id: 'ho_dist', type: 'http response', z: FLOW_ID,
+    name: '', statusCode: '', headers: {},
+    x: 1000, y: 500, wires: []
+  },
+
   // ════════════════════════════════════════════════
   //  Config persistence
   // ════════════════════════════════════════════════
   {
     id: 'c_save', type: 'comment', z: FLOW_ID,
     name: '── Config Save ──',
-    info: '', x: 240, y: 480, wires: []
+    info: '', x: 240, y: 580, wires: []
   },
   {
     id: 'hi_save', type: 'http in', z: FLOW_ID,
     name: 'POST /api/config/save',
     url: '/api/config/save', method: 'post',
     upload: false, swaggerDoc: '',
-    x: 200, y: 520, wires: [['fn_save']]
+    x: 200, y: 620, wires: [['fn_save']]
   },
   {
     id: 'fn_save', type: 'function', z: FLOW_ID,
@@ -249,12 +312,12 @@ const flows = [
     ].join('\n'),
     outputs: 1, timeout: '', noerr: 0,
     initialize: '', finalize: '', libs: [],
-    x: 430, y: 520, wires: [['ho_save']]
+    x: 430, y: 620, wires: [['ho_save']]
   },
   {
     id: 'ho_save', type: 'http response', z: FLOW_ID,
     name: '', statusCode: '', headers: {},
-    x: 640, y: 520, wires: []
+    x: 640, y: 620, wires: []
   }
 ];
 

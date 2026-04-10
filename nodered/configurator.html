@@ -92,6 +92,18 @@
     margin-left: 0.5rem; vertical-align: middle;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
+
+  .cb-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.3rem; }
+  .cb-item {
+    display: flex; align-items: center; gap: 0.5rem;
+    padding: 0.4rem 0.6rem; border-radius: 4px; cursor: pointer;
+    font-size: 0.85rem; transition: background 0.15s;
+  }
+  .cb-item:hover { background: #1a2a4e; }
+  .cb-item input[type="checkbox"] { accent-color: #e94560; width: 16px; height: 16px; }
+  .cb-item.checked { background: #e9456018; }
+  .cb-actions { margin-top: 0.5rem; display: flex; gap: 0.5rem; }
+  .cb-actions button { padding: 0.3rem 0.8rem; font-size: 0.78rem; }
 </style>
 </head>
 <body>
@@ -140,6 +152,25 @@
       <label>Detected geometry <span class="badge badge-geom" id="geomBadge"></span></label>
     </div>
     <div id="sampleData"></div>
+  </div>
+
+  <!-- Step 3b: Filter -->
+  <div class="step disabled" id="step3b">
+    <h2>3b. Filter</h2>
+    <div class="field-grid">
+      <div>
+        <label for="filterField">Filter by field</label>
+        <select id="filterField" onchange="fetchDistinct()">
+          <option value="">(none — no filter)</option>
+        </select>
+      </div>
+      <div>
+        <button id="btnDistinct" onclick="fetchDistinct()" style="margin-top:1.4rem" disabled>Load Values</button>
+      </div>
+    </div>
+    <div id="filterStatus"></div>
+    <div id="distinctValues" style="margin-top:0.8rem;max-height:260px;overflow-y:auto"></div>
+    <div style="margin-top:0.8rem;font-size:0.8rem;color:#888" id="filterPreview"></div>
   </div>
 
   <!-- Step 4 -->
@@ -325,6 +356,19 @@ async function fetchLayer() {
         '<label style="margin-top:1rem;display:block">Sample features (first 5)</label>' + html;
     }
 
+    /* populate filter field dropdown */
+    var filterSel = document.getElementById('filterField');
+    filterSel.innerHTML = '<option value="">(none &mdash; no filter)</option>';
+    state.fields.forEach(function(f) {
+      var short = f.type.replace('esriFieldType', '');
+      filterSel.innerHTML += '<option value="' + f.name + '">' + f.name + ' (' + short + ')' + '</option>';
+    });
+    document.getElementById('distinctValues').innerHTML = '';
+    document.getElementById('filterPreview').textContent = '';
+    state.filterField = '';
+    state.distinctValues = [];
+    state.selectedValues = [];
+
     /* auto-set UID prefix from layer name */
     var match = state.layers.find(function(l) { return String(l.id) === String(layerId); });
     if (match) {
@@ -334,24 +378,137 @@ async function fetchLayer() {
 
     status('layerStatus',
       state.fields.length + ' fields, geometry: ' + state.geometryType.replace('esriGeometry', ''), true);
-    enable(3); enable(4); enable(5);
+    enable(3); enable('3b'); enable(4); enable(5);
   } catch (e) {
     status('layerStatus', 'Fetch failed: ' + e.message, false);
   }
 }
 
+/* ── Step 3b: Distinct values + filter ── */
+state.distinctValues = [];
+state.selectedValues = [];
+state.filterField = '';
+
+async function fetchDistinct() {
+  var field = document.getElementById('filterField').value;
+  if (!field) {
+    document.getElementById('distinctValues').innerHTML = '';
+    document.getElementById('filterPreview').textContent = '';
+    state.filterField = '';
+    state.distinctValues = [];
+    state.selectedValues = [];
+    return;
+  }
+  state.filterField = field;
+  document.getElementById('btnDistinct').disabled = true;
+
+  try {
+    var res = await fetch('/api/arcgis/distinct', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        url: state.serviceUrl,
+        layerId: state.selectedLayer,
+        field: field
+      })
+    });
+    var data = await res.json();
+    if (data.error) { status('filterStatus', 'Error: ' + data.error, false); return; }
+
+    state.distinctValues = data.values || [];
+    state.selectedValues = state.distinctValues.slice();
+
+    var html = '<div class="cb-actions">' +
+      '<button class="btn-secondary" onclick="filterSelectAll()">Select All</button>' +
+      '<button class="btn-secondary" onclick="filterSelectNone()">Select None</button>' +
+      '</div><div class="cb-grid">';
+    state.distinctValues.forEach(function(v, i) {
+      var display = (v == null || v === '') ? '(empty)' : v;
+      html += '<label class="cb-item checked">' +
+        '<input type="checkbox" checked onchange="filterToggle(this,' + i + ')">' +
+        '<span>' + display + '</span></label>';
+    });
+    html += '</div>';
+    document.getElementById('distinctValues').innerHTML = html;
+    status('filterStatus', state.distinctValues.length + ' distinct values found', true);
+    updateFilterPreview();
+  } catch (e) {
+    status('filterStatus', 'Fetch failed: ' + e.message, false);
+  } finally {
+    document.getElementById('btnDistinct').disabled = false;
+  }
+}
+
+function filterToggle(cb, idx) {
+  var val = state.distinctValues[idx];
+  var item = cb.closest('.cb-item');
+  if (cb.checked) {
+    if (state.selectedValues.indexOf(val) < 0) state.selectedValues.push(val);
+    item.classList.add('checked');
+  } else {
+    state.selectedValues = state.selectedValues.filter(function(v) { return v !== val; });
+    item.classList.remove('checked');
+  }
+  updateFilterPreview();
+}
+
+function filterSelectAll() {
+  state.selectedValues = state.distinctValues.slice();
+  document.querySelectorAll('#distinctValues input[type=checkbox]').forEach(function(cb) {
+    cb.checked = true;
+    cb.closest('.cb-item').classList.add('checked');
+  });
+  updateFilterPreview();
+}
+
+function filterSelectNone() {
+  state.selectedValues = [];
+  document.querySelectorAll('#distinctValues input[type=checkbox]').forEach(function(cb) {
+    cb.checked = false;
+    cb.closest('.cb-item').classList.remove('checked');
+  });
+  updateFilterPreview();
+}
+
+function updateFilterPreview() {
+  var el = document.getElementById('filterPreview');
+  if (!state.filterField || state.selectedValues.length === 0) {
+    el.textContent = state.selectedValues.length === 0 ? '⚠ No values selected — nothing will sync' : '';
+    return;
+  }
+  if (state.selectedValues.length === state.distinctValues.length) {
+    el.textContent = 'Filter: all values selected (no filter applied)';
+    return;
+  }
+  var vals = state.selectedValues.map(function(v) { return "'" + String(v).replace(/'/g, "''") + "'"; });
+  el.textContent = 'WHERE ' + state.filterField + ' IN (' + vals.join(', ') + ')';
+}
+
 /* ── Step 5: Generate config ── */
 function generateConfig() {
+  var whereClause = null;
+  if (state.filterField && state.selectedValues.length > 0 &&
+      state.selectedValues.length < state.distinctValues.length) {
+    var vals = state.selectedValues.map(function(v) { return "'" + String(v).replace(/'/g, "''") + "'"; });
+    whereClause = state.filterField + ' IN (' + vals.join(', ') + ')';
+  }
+
   var config = {
     source: {
       serviceUrl: state.serviceUrl,
       layerId: parseInt(state.selectedLayer, 10),
       layerName: state.layerName,
-      geometryType: state.geometryType
+      geometryType: state.geometryType,
+      where: whereClause
     },
     mapping: {
       idField: document.getElementById('idField').value,
       timeField: document.getElementById('timeField').value || null
+    },
+    filter: {
+      field: state.filterField || null,
+      values: (state.filterField && state.selectedValues.length < state.distinctValues.length)
+        ? state.selectedValues : null
     },
     style: {
       strokeColor: document.getElementById('strokeColor').value,
