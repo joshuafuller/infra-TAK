@@ -128,6 +128,20 @@
   .config-card .cc-detail { font-size: 0.75rem; color: #888; margin-top: 0.2rem; }
   .config-card .cc-actions { display: flex; gap: 0.4rem; }
   .config-card .cc-actions button { padding: 0.3rem 0.6rem; font-size: 0.75rem; }
+
+  .remark-pill {
+    display: inline-block; padding: 0.3rem 0.7rem; border-radius: 4px;
+    font-size: 0.8rem; cursor: pointer; transition: all 0.15s; user-select: none;
+  }
+  .remark-pill.available {
+    background: #0f3460; border: 1px solid #1a1a4e; color: #a0a0b0;
+  }
+  .remark-pill.available:hover { border-color: #2ec4b6; color: #fff; }
+  .remark-pill.available.used { opacity: 0.3; pointer-events: none; }
+  .remark-pill.selected {
+    background: #2ec4b620; border: 1px solid #2ec4b6; color: #2ec4b6;
+  }
+  .remark-pill.selected:hover { background: #2ec4b640; }
 </style>
 </head>
 <body>
@@ -302,18 +316,27 @@
         </select>
       </div>
       <div>
+        <label for="centerLabel">Center label in shape</label>
+        <select id="centerLabel">
+          <option value="true" selected>Yes</option>
+          <option value="false">No</option>
+        </select>
+      </div>
+      <div>
         <label for="uidPrefix">UID prefix</label>
         <input type="text" id="uidPrefix" value="arcgis-" placeholder="arcgis-">
       </div>
     </div>
 
     <div style="margin-top:1rem">
-      <label for="remarksTemplate">Remarks template (use {FieldName} to insert ArcGIS values)</label>
-      <input type="text" id="remarksTemplate" style="font-family:monospace"
-             value="Source: {source} | Mission: {mission} | Incident: {IncidentName} | {irwin_POOProtectingUnit}"
-             placeholder="Source: {source} | Mission: {mission}">
-      <div style="margin-top:0.3rem;font-size:0.75rem;color:#666">
-        Available fields from your layer will populate {FieldName} at runtime
+      <label>Remarks — click fields to add them in order. Click a selected field to remove it.</label>
+      <div id="remarksAvailable" style="display:flex;flex-wrap:wrap;gap:0.3rem;margin-top:0.5rem"></div>
+      <div style="margin-top:0.6rem">
+        <label>Selected (in order)</label>
+        <div id="remarksSelected" style="display:flex;flex-wrap:wrap;gap:0.3rem;margin-top:0.3rem;min-height:2rem;padding:0.5rem;background:#0a0a1a;border-radius:4px;border:1px solid #1a1a4e"></div>
+      </div>
+      <div style="margin-top:0.4rem;font-size:0.75rem;color:#666">
+        Remarks will show as: <span id="remarksPreview" style="color:#2ec4b6">FieldA: value | FieldB: value</span>
       </div>
     </div>
 
@@ -504,6 +527,9 @@ async function fetchLayer() {
       labelSel.innerHTML += '<option value="' + f.name + '"' + (isMission ? ' selected' : '') + '>'
         + f.name + '</option>';
     });
+
+    /* populate remarks picker */
+    populateRemarksPicker();
 
     /* auto-set UID prefix from layer name */
     var match = state.layers.find(function(l) { return String(l.id) === String(layerId); });
@@ -699,6 +725,66 @@ function renderAllSelectedTags() {
   if (el) el.innerHTML = html || '<span style="color:#555">No sources selected</span>';
 }
 
+/* ── Remarks field picker ── */
+state.remarksFields = [];
+
+function populateRemarksPicker() {
+  state.remarksFields = [];
+  var html = '';
+  state.fields.forEach(function(f) {
+    html += '<span class="remark-pill available" id="rpill-' + f.name + '" onclick="addRemarkField(\'' + f.name.replace(/'/g, "\\'") + '\')">'
+      + f.name + '</span>';
+  });
+  document.getElementById('remarksAvailable').innerHTML = html;
+  document.getElementById('remarksSelected').innerHTML = '<span style="color:#555">Click fields above to add</span>';
+  updateRemarksPreview();
+}
+
+function addRemarkField(name) {
+  if (state.remarksFields.indexOf(name) >= 0) return;
+  state.remarksFields.push(name);
+  renderRemarksSelected();
+  updateRemarksPreview();
+  var pill = document.getElementById('rpill-' + name);
+  if (pill) pill.classList.add('used');
+}
+
+function removeRemarkField(idx) {
+  var name = state.remarksFields[idx];
+  state.remarksFields.splice(idx, 1);
+  renderRemarksSelected();
+  updateRemarksPreview();
+  var pill = document.getElementById('rpill-' + name);
+  if (pill) pill.classList.remove('used');
+}
+
+function renderRemarksSelected() {
+  if (state.remarksFields.length === 0) {
+    document.getElementById('remarksSelected').innerHTML = '<span style="color:#555">Click fields above to add</span>';
+    return;
+  }
+  var html = '';
+  state.remarksFields.forEach(function(name, i) {
+    html += '<span class="remark-pill selected" onclick="removeRemarkField(' + i + ')">'
+      + name + ' &times;</span>';
+  });
+  document.getElementById('remarksSelected').innerHTML = html;
+}
+
+function updateRemarksPreview() {
+  var el = document.getElementById('remarksPreview');
+  if (state.remarksFields.length === 0) {
+    el.textContent = '(none selected)';
+    return;
+  }
+  el.textContent = state.remarksFields.map(function(f) { return f + ': {value}'; }).join(' | ');
+}
+
+function getRemarksTemplate() {
+  if (state.remarksFields.length === 0) return null;
+  return state.remarksFields.map(function(f) { return f + ': {' + f + '}'; }).join(' | ');
+}
+
 /* ── Step 5: Generate config ── */
 function generateConfig() {
   var allValues = getAllFilterValues();
@@ -733,9 +819,11 @@ function generateConfig() {
       strokeStyle: document.getElementById('strokeStyle').value,
       closed: document.getElementById('closedShape').value === 'true',
       labelsOn: document.getElementById('labelsOn').value === 'true',
-      labelField: document.getElementById('labelField').value || null
+      labelField: document.getElementById('labelField').value || null,
+      centerLabel: document.getElementById('centerLabel').value === 'true'
     },
-    remarksTemplate: document.getElementById('remarksTemplate').value || null,
+    remarksTemplate: getRemarksTemplate(),
+    remarksFields: state.remarksFields.length > 0 ? state.remarksFields.slice() : null,
     ttlHours: parseInt(document.getElementById('ttlHours').value, 10) || 0,
     uidPrefix: document.getElementById('uidPrefix').value,
     generated: new Date().toISOString()
@@ -881,9 +969,13 @@ async function selectConfig(idx) {
     if (c.style.closed != null) document.getElementById('closedShape').value = String(c.style.closed);
     if (c.style.labelsOn != null) document.getElementById('labelsOn').value = String(c.style.labelsOn);
     if (c.style.labelField) document.getElementById('labelField').value = c.style.labelField;
+    if (c.style.centerLabel != null) document.getElementById('centerLabel').value = String(c.style.centerLabel);
   }
 
-  if (c.remarksTemplate) document.getElementById('remarksTemplate').value = c.remarksTemplate;
+  if (c.remarksFields && c.remarksFields.length) {
+    state.remarksFields = [];
+    c.remarksFields.forEach(function(f) { addRemarkField(f); });
+  }
   if (c.ttlHours != null) document.getElementById('ttlHours').value = c.ttlHours;
   if (c.uidPrefix) document.getElementById('uidPrefix').value = c.uidPrefix;
 
