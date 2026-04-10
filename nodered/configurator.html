@@ -104,6 +104,17 @@
   .cb-item.checked { background: #2ec4b618; }
   .cb-actions { margin-top: 0.5rem; display: flex; gap: 0.5rem; }
   .cb-actions button { padding: 0.3rem 0.8rem; font-size: 0.78rem; }
+
+  .filter-tag {
+    display: inline-flex; align-items: center; gap: 0.4rem;
+    background: #2ec4b620; border: 1px solid #2ec4b6; color: #2ec4b6;
+    padding: 0.35rem 0.7rem; border-radius: 16px; font-size: 0.85rem;
+  }
+  .filter-tag .x {
+    cursor: pointer; font-weight: bold; font-size: 1rem; line-height: 1;
+    opacity: 0.7; transition: opacity 0.15s;
+  }
+  .filter-tag .x:hover { opacity: 1; }
 </style>
 </head>
 <body>
@@ -165,12 +176,14 @@
 
   <!-- Step 3b: Filter -->
   <div class="step disabled" id="step3b">
-    <h2>3b. Filter</h2>
-    <div class="field-grid">
+    <h2>3b. Source Filter</h2>
+    <label>Select from current sources and/or type additional source names below. Only checked/added sources will sync.</label>
+
+    <div class="field-grid" style="margin-top:0.8rem">
       <div>
-        <label for="filterField">Filter by field</label>
+        <label for="filterField">Load values from field</label>
         <select id="filterField" onchange="fetchDistinct()">
-          <option value="">(none — no filter)</option>
+          <option value="">(none)</option>
         </select>
       </div>
       <div>
@@ -179,6 +192,19 @@
     </div>
     <div id="filterStatus"></div>
     <div id="distinctValues" style="margin-top:0.8rem;max-height:260px;overflow-y:auto"></div>
+
+    <div style="margin-top:1rem;border-top:1px solid #1a1a4e;padding-top:1rem">
+      <label>Add source manually (for sources not currently in the data)</label>
+      <div class="row" style="margin-top:0.4rem">
+        <div class="grow">
+          <input type="text" id="filterInput" placeholder="e.g. FIRIS, CAL FIRE INTEL FLIGHT DATA"
+                 onkeydown="if(event.key==='Enter'){event.preventDefault();addManualFilter();}">
+        </div>
+        <button onclick="addManualFilter()">Add</button>
+      </div>
+      <div id="manualTags" style="display:flex;flex-wrap:wrap;gap:0.4rem;margin-top:0.6rem"></div>
+    </div>
+
     <div style="margin-top:0.8rem;font-size:0.8rem;color:#888" id="filterPreview"></div>
   </div>
 
@@ -397,6 +423,7 @@ async function fetchLayer() {
 state.distinctValues = [];
 state.selectedValues = [];
 state.filterField = '';
+state.manualSources = [];
 
 async function fetchDistinct() {
   var field = document.getElementById('filterField').value;
@@ -479,27 +506,67 @@ function filterSelectNone() {
   updateFilterPreview();
 }
 
+function getAllFilterValues() {
+  var all = state.selectedValues.slice();
+  state.manualSources.forEach(function(m) {
+    if (all.indexOf(m) < 0) all.push(m);
+  });
+  return all;
+}
+
 function updateFilterPreview() {
   var el = document.getElementById('filterPreview');
-  if (!state.filterField || state.selectedValues.length === 0) {
-    el.textContent = state.selectedValues.length === 0 ? '⚠ No values selected — nothing will sync' : '';
+  var all = getAllFilterValues();
+  var field = state.filterField || 'source';
+  if (all.length === 0 && state.manualSources.length === 0 && state.selectedValues.length === 0) {
+    el.textContent = '';
     return;
   }
-  if (state.selectedValues.length === state.distinctValues.length) {
+  if (all.length === 0) {
+    el.textContent = '⚠ No values selected — nothing will sync';
+    return;
+  }
+  if (state.filterField && all.length === state.distinctValues.length && state.manualSources.length === 0) {
     el.textContent = 'Filter: all values selected (no filter applied)';
     return;
   }
-  var vals = state.selectedValues.map(function(v) { return "'" + String(v).replace(/'/g, "''") + "'"; });
-  el.textContent = 'WHERE ' + state.filterField + ' IN (' + vals.join(', ') + ')';
+  var vals = all.map(function(v) { return "'" + String(v).replace(/'/g, "''") + "'"; });
+  el.textContent = 'WHERE ' + field + ' IN (' + vals.join(', ') + ')';
+}
+
+function addManualFilter() {
+  var input = document.getElementById('filterInput');
+  var val = input.value.trim();
+  if (!val || state.manualSources.indexOf(val) >= 0) { input.value = ''; return; }
+  state.manualSources.push(val);
+  input.value = '';
+  renderManualTags();
+  updateFilterPreview();
+}
+
+function removeManualFilter(idx) {
+  state.manualSources.splice(idx, 1);
+  renderManualTags();
+  updateFilterPreview();
+}
+
+function renderManualTags() {
+  var html = '';
+  state.manualSources.forEach(function(v, i) {
+    html += '<span class="filter-tag">' + v +
+      ' <span class="x" onclick="removeManualFilter(' + i + ')">&times;</span></span>';
+  });
+  document.getElementById('manualTags').innerHTML = html;
 }
 
 /* ── Step 5: Generate config ── */
 function generateConfig() {
+  var allValues = getAllFilterValues();
+  var filterField = state.filterField || (allValues.length > 0 ? 'source' : null);
   var whereClause = null;
-  if (state.filterField && state.selectedValues.length > 0 &&
-      state.selectedValues.length < state.distinctValues.length) {
-    var vals = state.selectedValues.map(function(v) { return "'" + String(v).replace(/'/g, "''") + "'"; });
-    whereClause = state.filterField + ' IN (' + vals.join(', ') + ')';
+  if (filterField && allValues.length > 0) {
+    var vals = allValues.map(function(v) { return "'" + String(v).replace(/'/g, "''") + "'"; });
+    whereClause = filterField + ' IN (' + vals.join(', ') + ')';
   }
 
   var config = {
@@ -515,9 +582,8 @@ function generateConfig() {
       timeField: document.getElementById('timeField').value || null
     },
     filter: {
-      field: state.filterField || null,
-      values: (state.filterField && state.selectedValues.length < state.distinctValues.length)
-        ? state.selectedValues : null
+      field: filterField,
+      values: allValues.length > 0 ? allValues : null
     },
     style: {
       strokeColor: document.getElementById('strokeColor').value,
