@@ -115,6 +115,19 @@
     opacity: 0.7; transition: opacity 0.15s;
   }
   .filter-tag .x:hover { opacity: 1; }
+
+  .config-card {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0.7rem 1rem; margin-bottom: 0.4rem;
+    background: #0f3460; border-radius: 6px; border: 1px solid #1a1a4e;
+    cursor: pointer; transition: border-color 0.2s;
+  }
+  .config-card:hover { border-color: #2ec4b6; }
+  .config-card.active { border-color: #2ec4b6; background: #2ec4b612; }
+  .config-card .cc-name { font-weight: 600; font-size: 0.95rem; }
+  .config-card .cc-detail { font-size: 0.75rem; color: #888; margin-top: 0.2rem; }
+  .config-card .cc-actions { display: flex; gap: 0.4rem; }
+  .config-card .cc-actions button { padding: 0.3rem 0.6rem; font-size: 0.75rem; }
 </style>
 </head>
 <body>
@@ -131,15 +144,11 @@
   </h1>
   <p class="subtitle">Paste a Feature Service URL, pick your layer &amp; fields, generate config for the sync engine.</p>
 
-  <div id="savedConfigBar" style="display:none;margin-bottom:1rem;padding:0.8rem;background:#0f3460;border-radius:6px">
-    <div class="row">
-      <div class="grow">
-        <label for="savedConfigSelect" style="margin-bottom:0.3rem">Saved configurations</label>
-        <select id="savedConfigSelect" onchange="loadSavedConfig()">
-          <option value="">— New config —</option>
-        </select>
-      </div>
-      <button class="btn-secondary" onclick="deleteSavedConfig()" style="margin-top:1.2rem">Delete</button>
+  <div id="savedConfigBar" style="display:none;margin-bottom:1rem">
+    <div class="step" style="border-left-color:#2ec4b6">
+      <h2>Saved Configurations</h2>
+      <div id="configList"></div>
+      <button class="btn-secondary" onclick="newConfig()" style="margin-top:0.8rem">+ New Config</button>
     </div>
   </div>
 
@@ -318,9 +327,15 @@
 
   <!-- Step 5 -->
   <div class="step disabled" id="step5">
-    <h2>5. Generate Config</h2>
+    <h2>5. Save &amp; Generate</h2>
+    <div class="field-grid" style="margin-bottom:1rem">
+      <div>
+        <label for="configName">Config name</label>
+        <input type="text" id="configName" placeholder="e.g. CA Fires - FIRIS Only">
+      </div>
+    </div>
     <div class="row">
-      <button onclick="generateConfig()">Generate Config JSON</button>
+      <button onclick="generateConfig()">Save &amp; Generate Config JSON</button>
       <button class="btn-secondary" onclick="copyConfig()">Copy to Clipboard</button>
       <button class="btn-secondary" onclick="downloadConfig()">Download</button>
     </div>
@@ -695,6 +710,7 @@ function generateConfig() {
   }
 
   var config = {
+    configName: document.getElementById('configName').value || state.layerName || 'Unnamed',
     source: {
       serviceUrl: state.serviceUrl,
       layerId: parseInt(state.selectedLayer, 10),
@@ -733,7 +749,8 @@ function generateConfig() {
     body: JSON.stringify(config)
   }).then(function(r) { return r.json(); })
     .then(function(d) {
-      status('saveStatus', 'Saved to Node-RED flow context (' + d.configCount + ' config(s) stored)', true);
+      status('saveStatus', '✓ Saved "' + config.configName + '" (' + d.configCount + ' config(s) total)', true);
+      loadSavedConfigs();
     })
     .catch(function() {});
 }
@@ -757,36 +774,61 @@ function downloadConfig() {
 
 /* ── Load saved configs on page open ── */
 var _savedConfigs = [];
+var _activeConfigIdx = -1;
 
 async function loadSavedConfigs() {
   try {
     var res = await fetch('/api/config/load');
     var data = await res.json();
     _savedConfigs = data.configs || [];
-    if (_savedConfigs.length === 0) return;
+    if (_savedConfigs.length === 0) {
+      document.getElementById('savedConfigBar').style.display = 'none';
+      return;
+    }
 
-    var bar = document.getElementById('savedConfigBar');
-    bar.style.display = 'block';
-    var sel = document.getElementById('savedConfigSelect');
-    sel.innerHTML = '<option value="">— New config —</option>';
-    _savedConfigs.forEach(function(c, i) {
-      var label = (c.source.layerName || 'Config') + ' (' + (c.source.serviceUrl || '').split('/').pop() + ')';
-      sel.innerHTML += '<option value="' + i + '">' + label + '</option>';
-    });
+    document.getElementById('savedConfigBar').style.display = 'block';
+    renderConfigList();
 
     if (_savedConfigs.length === 1) {
-      sel.value = '0';
-      loadSavedConfig();
+      selectConfig(0);
     }
   } catch (e) {}
 }
 
-async function loadSavedConfig() {
-  var idx = document.getElementById('savedConfigSelect').value;
-  if (idx === '') return;
-  var c = _savedConfigs[parseInt(idx, 10)];
+function renderConfigList() {
+  var html = '';
+  _savedConfigs.forEach(function(c, i) {
+    var name = c.configName || c.source.layerName || 'Unnamed Config';
+    var detail = (c.source.serviceUrl || '').split('/services/')[1] || c.source.serviceUrl || '';
+    if (detail.length > 60) detail = detail.substring(0, 60) + '…';
+    var filters = (c.filter && c.filter.values) ? c.filter.values.join(', ') : 'No filter';
+    var active = (i === _activeConfigIdx) ? ' active' : '';
+    html += '<div class="config-card' + active + '" onclick="selectConfig(' + i + ')">' +
+      '<div><div class="cc-name">' + name + '</div>' +
+      '<div class="cc-detail">' + detail + ' | ' + filters + '</div></div>' +
+      '<div class="cc-actions">' +
+      '<button class="btn-secondary" onclick="event.stopPropagation();deleteConfig(' + i + ')">Delete</button>' +
+      '</div></div>';
+  });
+  document.getElementById('configList').innerHTML = html;
+}
+
+function newConfig() {
+  _activeConfigIdx = -1;
+  renderConfigList();
+  document.getElementById('serviceUrl').value = '';
+  document.getElementById('configName').value = '';
+  document.getElementById('configOutput').textContent = '';
+  status('saveStatus', '', true);
+}
+
+async function selectConfig(idx) {
+  _activeConfigIdx = idx;
+  renderConfigList();
+  var c = _savedConfigs[idx];
   if (!c) return;
 
+  document.getElementById('configName').value = c.configName || '';
   document.getElementById('serviceUrl').value = c.source.serviceUrl || '';
   state.serviceUrl = c.source.serviceUrl || '';
 
@@ -845,19 +887,23 @@ async function loadSavedConfig() {
   if (c.ttlHours != null) document.getElementById('ttlHours').value = c.ttlHours;
   if (c.uidPrefix) document.getElementById('uidPrefix').value = c.uidPrefix;
 
-  status('saveStatus', 'Loaded saved config — edit and Generate to publish changes', true);
+  document.getElementById('configOutput').textContent = JSON.stringify(c, null, 2);
+  status('saveStatus', 'Loaded "' + (c.configName || 'config') + '" — edit and hit Save to publish changes', true);
 }
 
-async function deleteSavedConfig() {
-  var idx = document.getElementById('savedConfigSelect').value;
-  if (idx === '') return;
-  _savedConfigs.splice(parseInt(idx, 10), 1);
+async function deleteConfig(idx) {
+  var name = _savedConfigs[idx].configName || 'this config';
+  if (!confirm('Delete "' + name + '"?')) return;
+  _savedConfigs.splice(idx, 1);
+  if (_activeConfigIdx === idx) _activeConfigIdx = -1;
+  else if (_activeConfigIdx > idx) _activeConfigIdx--;
   await fetch('/api/config/save-all', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ configs: _savedConfigs })
   });
-  loadSavedConfigs();
+  renderConfigList();
+  if (_savedConfigs.length === 0) document.getElementById('savedConfigBar').style.display = 'none';
 }
 
 loadSavedConfigs();
