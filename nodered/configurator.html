@@ -202,9 +202,13 @@
         </div>
         <button onclick="addManualFilter()">Add</button>
       </div>
-      <div id="manualTags" style="display:flex;flex-wrap:wrap;gap:0.4rem;margin-top:0.6rem"></div>
+      <div id="manualTags"></div>
     </div>
 
+    <div style="margin-top:1rem;border-top:1px solid #1a1a4e;padding-top:1rem">
+      <label>Selected sources</label>
+      <div id="allSelectedTags" style="display:flex;flex-wrap:wrap;gap:0.4rem;margin-top:0.4rem"></div>
+    </div>
     <div style="margin-top:0.8rem;font-size:0.8rem;color:#888" id="filterPreview"></div>
   </div>
 
@@ -451,8 +455,14 @@ async function fetchDistinct() {
     var data = await res.json();
     if (data.error) { status('filterStatus', 'Error: ' + data.error, false); return; }
 
-    state.distinctValues = data.values || [];
-    state.selectedValues = state.distinctValues.slice();
+    var raw = (data.values || []).map(function(v) { return v != null ? String(v).trim() : ''; });
+    var seen = {};
+    state.distinctValues = raw.filter(function(v) {
+      if (!v || seen[v]) return false;
+      seen[v] = true;
+      return true;
+    });
+    state.selectedValues = [];
 
     var html = '<div class="cb-actions">' +
       '<button class="btn-secondary" onclick="filterSelectAll()">Select All</button>' +
@@ -467,6 +477,7 @@ async function fetchDistinct() {
     html += '</div>';
     document.getElementById('distinctValues').innerHTML = html;
     status('filterStatus', state.distinctValues.length + ' distinct values found', true);
+    renderAllSelectedTags();
     updateFilterPreview();
   } catch (e) {
     status('filterStatus', 'Fetch failed: ' + e.message, false);
@@ -485,6 +496,7 @@ function filterToggle(cb, idx) {
     state.selectedValues = state.selectedValues.filter(function(v) { return v !== val; });
     item.classList.remove('checked');
   }
+  renderAllSelectedTags();
   updateFilterPreview();
 }
 
@@ -494,6 +506,7 @@ function filterSelectAll() {
     cb.checked = true;
     cb.closest('.cb-item').classList.add('checked');
   });
+  renderAllSelectedTags();
   updateFilterPreview();
 }
 
@@ -503,6 +516,7 @@ function filterSelectNone() {
     cb.checked = false;
     cb.closest('.cb-item').classList.remove('checked');
   });
+  renderAllSelectedTags();
   updateFilterPreview();
 }
 
@@ -536,27 +550,53 @@ function updateFilterPreview() {
 
 function addManualFilter() {
   var input = document.getElementById('filterInput');
-  var val = input.value.trim();
-  if (!val || state.manualSources.indexOf(val) >= 0) { input.value = ''; return; }
-  state.manualSources.push(val);
-  input.value = '';
-  renderManualTags();
-  updateFilterPreview();
-}
-
-function removeManualFilter(idx) {
-  state.manualSources.splice(idx, 1);
-  renderManualTags();
-  updateFilterPreview();
-}
-
-function renderManualTags() {
-  var html = '';
-  state.manualSources.forEach(function(v, i) {
-    html += '<span class="filter-tag">' + v +
-      ' <span class="x" onclick="removeManualFilter(' + i + ')">&times;</span></span>';
+  var raw = input.value.trim();
+  if (!raw) { return; }
+  var parts = raw.split(',');
+  parts.forEach(function(p) {
+    var val = p.trim();
+    if (!val) return;
+    if (state.manualSources.indexOf(val) >= 0) return;
+    if (state.selectedValues.indexOf(val) >= 0) return;
+    state.manualSources.push(val);
   });
-  document.getElementById('manualTags').innerHTML = html;
+  input.value = '';
+  renderAllSelectedTags();
+  updateFilterPreview();
+}
+
+function removeManualFilter(val) {
+  state.manualSources = state.manualSources.filter(function(v) { return v !== val; });
+  renderAllSelectedTags();
+  updateFilterPreview();
+}
+
+function removeCheckboxFilter(val) {
+  state.selectedValues = state.selectedValues.filter(function(v) { return v !== val; });
+  var idx = state.distinctValues.indexOf(val);
+  if (idx >= 0) {
+    var cbs = document.querySelectorAll('#distinctValues input[type=checkbox]');
+    if (cbs[idx]) {
+      cbs[idx].checked = false;
+      cbs[idx].closest('.cb-item').classList.remove('checked');
+    }
+  }
+  renderAllSelectedTags();
+  updateFilterPreview();
+}
+
+function renderAllSelectedTags() {
+  var html = '';
+  state.selectedValues.forEach(function(v) {
+    html += '<span class="filter-tag">' + v +
+      ' <span class="x" onclick="removeCheckboxFilter(\'' + v.replace(/'/g, "\\'") + '\')">&times;</span></span>';
+  });
+  state.manualSources.forEach(function(v) {
+    html += '<span class="filter-tag">' + v +
+      ' <span class="x" onclick="removeManualFilter(\'' + v.replace(/'/g, "\\'") + '\')">&times;</span></span>';
+  });
+  var el = document.getElementById('allSelectedTags');
+  if (el) el.innerHTML = html || '<span style="color:#555">No sources selected</span>';
 }
 
 /* ── Step 5: Generate config ── */
