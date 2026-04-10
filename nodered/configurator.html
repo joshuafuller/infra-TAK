@@ -470,8 +470,8 @@ async function fetchDistinct() {
       '</div><div class="cb-grid">';
     state.distinctValues.forEach(function(v, i) {
       var display = (v == null || v === '') ? '(empty)' : v;
-      html += '<label class="cb-item checked">' +
-        '<input type="checkbox" checked onchange="filterToggle(this,' + i + ')">' +
+      html += '<label class="cb-item">' +
+        '<input type="checkbox" onchange="filterToggle(this,' + i + ')">' +
         '<span>' + display + '</span></label>';
     });
     html += '</div>';
