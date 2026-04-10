@@ -471,11 +471,14 @@ async function fetchDistinct() {
     state.distinctValues.forEach(function(v, i) {
       var display = (v == null || v === '') ? '(empty)' : v;
       html += '<label class="cb-item">' +
-        '<input type="checkbox" onchange="filterToggle(this,' + i + ')">' +
+        '<input type="checkbox" autocomplete="off" onchange="filterToggle(this,' + i + ')">' +
         '<span>' + display + '</span></label>';
     });
     html += '</div>';
     document.getElementById('distinctValues').innerHTML = html;
+    document.querySelectorAll('#distinctValues input[type=checkbox]').forEach(function(cb) {
+      cb.checked = false;
+    });
     status('filterStatus', state.distinctValues.length + ' distinct values found', true);
     renderAllSelectedTags();
     updateFilterPreview();
