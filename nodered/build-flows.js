@@ -42,7 +42,7 @@ const flows = [
   {
     id: 'ho_ui', type: 'http response', z: FLOW_ID,
     name: '', statusCode: '200',
-    headers: { 'content-type': 'text/html' },
+    headers: { 'content-type': 'text/html', 'cache-control': 'no-cache, no-store, must-revalidate' },
     x: 590, y: 80, wires: []
   },
 

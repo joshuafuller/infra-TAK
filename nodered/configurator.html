@@ -837,9 +837,9 @@ function generateConfig() {
     body: JSON.stringify(config)
   }).then(function(r) { return r.json(); })
     .then(function(d) {
-      loadSavedConfigs().then(function() {
-        newConfig();
-      });
+      _savedConfigs = [];
+      loadSavedConfigs();
+      setTimeout(function() { newConfig(); }, 500);
     })
     .catch(function() {});
 }
@@ -864,6 +864,7 @@ function downloadConfig() {
 /* ── Load saved configs on page open ── */
 var _savedConfigs = [];
 var _activeConfigIdx = -1;
+var _initialLoad = true;
 
 async function loadSavedConfigs() {
   try {
@@ -878,9 +879,11 @@ async function loadSavedConfigs() {
     document.getElementById('savedConfigBar').style.display = 'block';
     renderConfigList();
 
-    if (_savedConfigs.length === 1) {
+    if (_initialLoad && _savedConfigs.length === 1) {
+      _initialLoad = false;
       selectConfig(0);
     }
+    _initialLoad = false;
   } catch (e) {}
 }
 
