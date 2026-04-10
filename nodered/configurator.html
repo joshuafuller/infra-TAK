@@ -837,8 +837,9 @@ function generateConfig() {
     body: JSON.stringify(config)
   }).then(function(r) { return r.json(); })
     .then(function(d) {
-      status('saveStatus', '✓ Saved "' + config.configName + '" (' + d.configCount + ' config(s) total)', true);
-      loadSavedConfigs();
+      loadSavedConfigs().then(function() {
+        newConfig();
+      });
     })
     .catch(function() {});
 }
