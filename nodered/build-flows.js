@@ -179,7 +179,7 @@ const flows = [
     func: [
       "const base = msg.payload.url.replace(/\\/+$/, '');",
       "const lid  = msg.payload.layerId;",
-      "msg.url = base + '/' + lid + '/query?where=1%3D1&outFields=*&resultRecordCount=5&f=json';",
+      "msg.url = base + '/' + lid + '/query?where=1%3D1&outFields=*&resultRecordCount=50&f=json';",
       "return msg;"
     ].join('\n'),
     outputs: 1, timeout: '', noerr: 0,
@@ -202,7 +202,7 @@ const flows = [
       "if (msg.payload.error) {",
       "  msg.payload = { error: msg.payload.error.message || 'ArcGIS error' };",
       "} else {",
-      "  msg.payload = { features: (msg.payload.features || []).slice(0, 5) };",
+      "  msg.payload = { features: (msg.payload.features || []).slice(0, 50) };",
       "}",
       "return msg;"
     ].join('\n'),

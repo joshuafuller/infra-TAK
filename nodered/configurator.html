@@ -47,7 +47,7 @@
   .grow { flex: 1; }
   .field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
 
-  .sample-wrap { overflow-x: auto; margin-top: 1rem; }
+  .sample-wrap { overflow: auto; margin-top: 1rem; max-height: 400px; }
   .sample-table {
     border-collapse: collapse; font-size: 0.78rem; white-space: nowrap;
   }
@@ -440,7 +440,7 @@ async function fetchLayer() {
     state.fields         = layerData.fields || [];
     state.geometryType   = layerData.geometryType || 'unknown';
     state.layerName      = layerData.name || '';
-    state.sampleFeatures = (sampleData.features || []).slice(0, 5);
+    state.sampleFeatures = (sampleData.features || []).slice(0, 50);
 
     /* populate field dropdowns */
     var idSel   = document.getElementById('idField');
@@ -480,7 +480,7 @@ async function fetchLayer() {
       });
       html += '</table></div>';
       document.getElementById('sampleData').innerHTML =
-        '<label style="margin-top:1rem;display:block">Sample features (first 5)</label>' + html;
+        '<label style="margin-top:1rem;display:block">Sample features (' + state.sampleFeatures.length + ' rows)</label>' + html;
     }
 
     /* populate filter field dropdown */
