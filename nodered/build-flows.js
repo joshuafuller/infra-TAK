@@ -42,7 +42,7 @@ const flows = [
   {
     id: 'ho_ui', type: 'http response', z: FLOW_ID,
     name: '', statusCode: '200',
-    headers: { 'content-type': 'text/html' },
+    headers: { 'content-type': 'text/html', 'cache-control': 'no-cache, no-store, must-revalidate' },
     x: 590, y: 80, wires: []
   },
 
@@ -179,7 +179,7 @@ const flows = [
     func: [
       "const base = msg.payload.url.replace(/\\/+$/, '');",
       "const lid  = msg.payload.layerId;",
-      "msg.url = base + '/' + lid + '/query?where=1%3D1&outFields=*&resultRecordCount=5&f=json';",
+      "msg.url = base + '/' + lid + '/query?where=1%3D1&outFields=*&resultRecordCount=50&f=json';",
       "return msg;"
     ].join('\n'),
     outputs: 1, timeout: '', noerr: 0,
@@ -202,7 +202,7 @@ const flows = [
       "if (msg.payload.error) {",
       "  msg.payload = { error: msg.payload.error.message || 'ArcGIS error' };",
       "} else {",
-      "  msg.payload = { features: (msg.payload.features || []).slice(0, 5) };",
+      "  msg.payload = { features: (msg.payload.features || []).slice(0, 50) };",
       "}",
       "return msg;"
     ].join('\n'),
@@ -216,20 +216,83 @@ const flows = [
     x: 1000, y: 400, wires: []
   },
 
+  // POST /api/arcgis/distinct  →  fetch distinct values for a field
+  {
+    id: 'hi_dist', type: 'http in', z: FLOW_ID,
+    name: 'POST /api/arcgis/distinct',
+    url: '/api/arcgis/distinct', method: 'post',
+    upload: false, swaggerDoc: '',
+    x: 200, y: 500, wires: [['fn_dist']]
+  },
+  {
+    id: 'fn_dist', type: 'function', z: FLOW_ID,
+    name: 'Build distinct query URL',
+    func: [
+      "const base  = msg.payload.url.replace(/\\/+$/, '');",
+      "const lid   = msg.payload.layerId;",
+      "const field = encodeURIComponent(msg.payload.field);",
+      "msg.url = base + '/' + lid + '/query'",
+      "  + '?where=1%3D1'",
+      "  + '&outFields=' + field",
+      "  + '&returnDistinctValues=true'",
+      "  + '&orderByFields=' + field",
+      "  + '&resultRecordCount=500'",
+      "  + '&f=json';",
+      "msg._field = msg.payload.field;",
+      "return msg;"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 430, y: 500, wires: [['hr_dist']]
+  },
+  {
+    id: 'hr_dist', type: 'http request', z: FLOW_ID,
+    name: 'GET distinct values',
+    method: 'GET', ret: 'obj', paytoqs: 'ignore',
+    url: '', tls: '', persist: false, proxy: '',
+    insecureHTTPParser: false, authType: '',
+    senderr: false, headers: [],
+    x: 620, y: 500, wires: [['fn_dist_parse']]
+  },
+  {
+    id: 'fn_dist_parse', type: 'function', z: FLOW_ID,
+    name: 'Parse distinct',
+    func: [
+      "if (msg.payload.error) {",
+      "  msg.payload = { error: msg.payload.error.message || 'ArcGIS error' };",
+      "} else {",
+      "  var field = msg._field;",
+      "  var vals = (msg.payload.features || []).map(function(f) {",
+      "    return f.attributes[field];",
+      "  });",
+      "  msg.payload = { values: vals };",
+      "}",
+      "return msg;"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 810, y: 500, wires: [['ho_dist']]
+  },
+  {
+    id: 'ho_dist', type: 'http response', z: FLOW_ID,
+    name: '', statusCode: '', headers: {},
+    x: 1000, y: 500, wires: []
+  },
+
   // ════════════════════════════════════════════════
   //  Config persistence
   // ════════════════════════════════════════════════
   {
     id: 'c_save', type: 'comment', z: FLOW_ID,
     name: '── Config Save ──',
-    info: '', x: 240, y: 480, wires: []
+    info: '', x: 240, y: 580, wires: []
   },
   {
     id: 'hi_save', type: 'http in', z: FLOW_ID,
     name: 'POST /api/config/save',
     url: '/api/config/save', method: 'post',
     upload: false, swaggerDoc: '',
-    x: 200, y: 520, wires: [['fn_save']]
+    x: 200, y: 620, wires: [['fn_save']]
   },
   {
     id: 'fn_save', type: 'function', z: FLOW_ID,
@@ -249,15 +312,485 @@ const flows = [
     ].join('\n'),
     outputs: 1, timeout: '', noerr: 0,
     initialize: '', finalize: '', libs: [],
-    x: 430, y: 520, wires: [['ho_save']]
+    x: 430, y: 620, wires: [['ho_save']]
   },
   {
     id: 'ho_save', type: 'http response', z: FLOW_ID,
     name: '', statusCode: '', headers: {},
-    x: 640, y: 520, wires: []
+    x: 640, y: 620, wires: []
+  },
+
+  // POST /api/config/save-all  →  replace all configs (used by delete)
+  {
+    id: 'hi_saveall', type: 'http in', z: FLOW_ID,
+    name: 'POST /api/config/save-all',
+    url: '/api/config/save-all', method: 'post',
+    upload: false, swaggerDoc: '',
+    x: 200, y: 660, wires: [['fn_saveall']]
+  },
+  {
+    id: 'fn_saveall', type: 'function', z: FLOW_ID,
+    name: 'Replace all configs',
+    func: [
+      "flow.set('arcgis_configs', msg.payload.configs || []);",
+      "msg.payload = { ok: true };",
+      "return msg;"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 430, y: 660, wires: [['ho_saveall']]
+  },
+  {
+    id: 'ho_saveall', type: 'http response', z: FLOW_ID,
+    name: '', statusCode: '', headers: {},
+    x: 640, y: 660, wires: []
+  },
+
+  // GET /api/config/load  →  return saved configs
+  {
+    id: 'hi_load', type: 'http in', z: FLOW_ID,
+    name: 'GET /api/config/load',
+    url: '/api/config/load', method: 'get',
+    upload: false, swaggerDoc: '',
+    x: 200, y: 700, wires: [['fn_load']]
+  },
+  {
+    id: 'fn_load', type: 'function', z: FLOW_ID,
+    name: 'Load from flow context',
+    func: [
+      "var configs = flow.get('arcgis_configs') || [];",
+      "msg.payload = { configs: configs };",
+      "return msg;"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 430, y: 700, wires: [['ho_load']]
+  },
+  {
+    id: 'ho_load', type: 'http response', z: FLOW_ID,
+    name: '', statusCode: '', headers: {},
+    x: 640, y: 700, wires: []
+  },
+
+  // ════════════════════════════════════════════════
+  //  TAK Server settings persistence
+  // ════════════════════════════════════════════════
+  {
+    id: 'c_tak', type: 'comment', z: FLOW_ID,
+    name: '── TAK Settings ──',
+    info: '', x: 240, y: 780, wires: []
+  },
+  {
+    id: 'hi_tak_save', type: 'http in', z: FLOW_ID,
+    name: 'POST /api/tak-settings/save',
+    url: '/api/tak-settings/save', method: 'post',
+    upload: false, swaggerDoc: '',
+    x: 220, y: 820, wires: [['fn_tak_save']]
+  },
+  {
+    id: 'fn_tak_save', type: 'function', z: FLOW_ID,
+    name: 'Save TAK settings',
+    func: [
+      "flow.set('tak_settings', msg.payload);",
+      "msg.payload = { ok: true };",
+      "return msg;"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 450, y: 820, wires: [['ho_tak_save']]
+  },
+  {
+    id: 'ho_tak_save', type: 'http response', z: FLOW_ID,
+    name: '', statusCode: '', headers: {},
+    x: 640, y: 820, wires: []
+  },
+  {
+    id: 'hi_tak_load', type: 'http in', z: FLOW_ID,
+    name: 'GET /api/tak-settings/load',
+    url: '/api/tak-settings/load', method: 'get',
+    upload: false, swaggerDoc: '',
+    x: 220, y: 860, wires: [['fn_tak_load']]
+  },
+  {
+    id: 'fn_tak_load', type: 'function', z: FLOW_ID,
+    name: 'Load TAK settings',
+    func: [
+      "msg.payload = { settings: flow.get('tak_settings') || {} };",
+      "return msg;"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 450, y: 860, wires: [['ho_tak_load']]
+  },
+  {
+    id: 'ho_tak_load', type: 'http response', z: FLOW_ID,
+    name: '', statusCode: '', headers: {},
+    x: 640, y: 860, wires: []
   }
 ];
 
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  ENGINE FLOW TAB — ArcGIS → TAK Reconciliation Engine      ║
+// ╚══════════════════════════════════════════════════════════════╝
+
+const ENGINE_ID = 'flow_arcgis_engine';
+
+const engineFlows = [
+
+  // ── Flow tab (disabled by default — enable after configuring TLS) ──
+  {
+    id: ENGINE_ID, type: 'tab',
+    label: 'ArcGIS → TAK Engine',
+    disabled: true,
+    info: 'Single reconciliation engine: polls ArcGIS, builds CoT, diffs against TAK mission, PUTs new / DELETEs stale.\\nEnable this tab after configuring TLS certs and wiring the TAK node.'
+  },
+
+  // ── TLS config placeholder (user uploads certs in editor) ──
+  {
+    id: 'tls_tak', type: 'tls-config',
+    name: 'TAK Server TLS',
+    cert: '', key: '', ca: '',
+    certname: '', keyname: '', caname: '',
+    servername: '', verifyservercert: false
+  },
+
+  // ════════════════════════════════════════════════
+  //  Row 1 — Timer & config loader
+  // ════════════════════════════════════════════════
+  {
+    id: 'eng_c1', type: 'comment', z: ENGINE_ID,
+    name: '── ArcGIS → TAK Sync Engine ──',
+    info: '', x: 260, y: 40, wires: []
+  },
+  {
+    id: 'eng_inject', type: 'inject', z: ENGINE_ID,
+    name: 'Poll timer (5 min)',
+    props: [{ p: 'payload' }, { p: 'topic', vt: 'str' }],
+    repeat: '300', crontab: '',
+    once: true, onceDelay: '30',
+    topic: 'poll', payload: '', payloadType: 'date',
+    x: 180, y: 80, wires: [['eng_load']]
+  },
+  {
+    id: 'eng_load', type: 'function', z: ENGINE_ID,
+    name: 'Load configs',
+    func: [
+      "var configs = flow.get('arcgis_configs') || [];",
+      "var tak = flow.get('tak_settings') || {};",
+      "if (configs.length === 0) { node.warn('No ArcGIS configs — open /configurator'); return null; }",
+      "if (!tak.serverUrl) { node.warn('No TAK Server URL — open /configurator → TAK Settings'); return null; }",
+      "var out = [];",
+      "for (var i = 0; i < configs.length; i++) {",
+      "  if (!configs[i].missionName) { node.warn('Config \"' + configs[i].configName + '\" has no mission name — skipping'); continue; }",
+      "  out.push({ payload: configs[i], takSettings: tak });",
+      "}",
+      "if (out.length === 0) return null;",
+      "return [out];"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 400, y: 80, wires: [['eng_split']]
+  },
+  {
+    id: 'eng_split', type: 'split', z: ENGINE_ID,
+    name: '', splt: '\\n', spltType: 'str',
+    arraySplt: 1, arraySpltType: 'len',
+    stream: false, addname: '',
+    x: 560, y: 80, wires: [['eng_build_q']]
+  },
+
+  // ════════════════════════════════════════════════
+  //  Row 2 — Query ArcGIS
+  // ════════════════════════════════════════════════
+  {
+    id: 'eng_c2', type: 'comment', z: ENGINE_ID,
+    name: '── Query ArcGIS features ──',
+    info: '', x: 260, y: 140, wires: []
+  },
+  {
+    id: 'eng_build_q', type: 'function', z: ENGINE_ID,
+    name: 'Build ArcGIS query',
+    func: [
+      "var cfg = msg.payload;",
+      "var base = cfg.source.serviceUrl.replace(/\\/+$/, '');",
+      "var lid = cfg.source.layerId;",
+      "var parts = [];",
+      "if (cfg.source.where) parts.push(cfg.source.where);",
+      "if (cfg.mapping.timeField && cfg.ttlHours > 0) {",
+      "  var cutoff = Date.now() - cfg.ttlHours * 3600000;",
+      "  parts.push(cfg.mapping.timeField + ' > ' + cutoff);",
+      "}",
+      "var where = parts.length > 0 ? parts.join(' AND ') : '1=1';",
+      "msg.url = base + '/' + lid + '/query'",
+      "  + '?where=' + encodeURIComponent(where)",
+      "  + '&outFields=*&returnGeometry=true&f=json';",
+      "msg._config = cfg;",
+      "return msg;"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 180, y: 180, wires: [['eng_http_ag']]
+  },
+  {
+    id: 'eng_http_ag', type: 'http request', z: ENGINE_ID,
+    name: 'GET ArcGIS features',
+    method: 'GET', ret: 'obj', paytoqs: 'ignore',
+    url: '', tls: '', persist: false, proxy: '',
+    insecureHTTPParser: false, authType: '',
+    senderr: false, headers: [],
+    x: 400, y: 180, wires: [['eng_parse']]
+  },
+
+  // ════════════════════════════════════════════════
+  //  Row 3 — Parse features & build CoT JSON
+  // ════════════════════════════════════════════════
+  {
+    id: 'eng_parse', type: 'function', z: ENGINE_ID,
+    name: 'Parse & build CoT',
+    func: [
+      "var features = (msg.payload && msg.payload.features) || [];",
+      "var cfg = msg._config;",
+      "if (features.length === 0) { node.warn(cfg.configName + ': 0 features from ArcGIS'); return null; }",
+      "",
+      "function hexArgb(hex, a) {",
+      "  var r = parseInt(hex.substr(1,2),16);",
+      "  var g = parseInt(hex.substr(3,2),16);",
+      "  var b = parseInt(hex.substr(5,2),16);",
+      "  var ai = Math.round((a !== undefined ? a : 1) * 255);",
+      "  return ((ai << 24) | (r << 16) | (g << 8) | b);",
+      "}",
+      "",
+      "var strokeArgb = hexArgb(cfg.style.color || '#FF0000', 1);",
+      "var fillArgb   = hexArgb(cfg.style.color || '#FF0000', parseFloat(cfg.style.fillAlpha || '0.3'));",
+      "var now = new Date();",
+      "var staleMs = cfg.ttlHours > 0 ? cfg.ttlHours * 3600000 : 3600000;",
+      "var stale = new Date(now.getTime() + staleMs);",
+      "var isPoly = cfg.source.geometryType !== 'esriGeometryPoint';",
+      "var cotType = isPoly ? 'u-d-f' : 'a-u-G';",
+      "",
+      "var results = [];",
+      "for (var i = 0; i < features.length; i++) {",
+      "  var f = features[i];",
+      "  var a = f.attributes || {};",
+      "  var g = f.geometry;",
+      "  if (!g) continue;",
+      "",
+      "  var idVal = a[cfg.mapping.idField] || ('f' + i);",
+      "  var uid = (cfg.uidPrefix || 'arcgis') + '-' + String(idVal).replace(/[^a-zA-Z0-9_.-]/g, '_');",
+      "",
+      "  var lat, lon;",
+      "  if (isPoly && g.rings && g.rings[0]) {",
+      "    var ring = g.rings[0]; var sx=0,sy=0;",
+      "    for (var j=0;j<ring.length;j++) { sx+=ring[j][0]; sy+=ring[j][1]; }",
+      "    lon = sx/ring.length; lat = sy/ring.length;",
+      "  } else { lat = g.y || 0; lon = g.x || 0; }",
+      "",
+      "  var callsign = uid;",
+      "  if (cfg.style.labelField && a[cfg.style.labelField] != null) callsign = String(a[cfg.style.labelField]);",
+      "",
+      "  var remarks = '';",
+      "  if (cfg.remarksFields && cfg.remarksFields.length) {",
+      "    var rp = [];",
+      "    for (var k=0;k<cfg.remarksFields.length;k++) {",
+      "      var fn = cfg.remarksFields[k];",
+      "      rp.push(fn + ': ' + (a[fn] != null ? String(a[fn]) : ''));",
+      "    }",
+      "    remarks = rp.join(' | ');",
+      "  }",
+      "",
+      "  var detail = {",
+      "    contact: [{ _attributes: { callsign: callsign } }],",
+      "    remarks: remarks,",
+      "    strokeColor: [{ _attributes: { value: String(strokeArgb) } }],",
+      "    strokeWeight: [{ _attributes: { value: String(cfg.style.strokeWeight || 3) + '.0' } }],",
+      "    fillColor: [{ _attributes: { value: String(fillArgb) } }],",
+      "    labels_on: [{ _attributes: { value: cfg.style.labelsOn ? 'true' : 'false' } }]",
+      "  };",
+      "",
+      "  if (isPoly && g.rings && g.rings[0]) {",
+      "    var links = [];",
+      "    var ring = g.rings[0];",
+      "    for (var j=0;j<ring.length;j++) links.push({ _attributes: { point: ring[j][1]+','+ring[j][0] } });",
+      "    detail.link = links;",
+      "  }",
+      "",
+      "  results.push({",
+      "    uid: uid,",
+      "    cot: {",
+      "      event: {",
+      "        _attributes: {",
+      "          version: '2.0', uid: uid, type: cotType,",
+      "          how: 'h-e',",
+      "          time: now.toISOString(),",
+      "          start: now.toISOString(),",
+      "          stale: stale.toISOString()",
+      "        },",
+      "        point: { _attributes: { lat: String(lat), lon: String(lon), hae: '9999999.0', ce: '9999999.0', le: '9999999.0' } },",
+      "        detail: detail",
+      "      }",
+      "    }",
+      "  });",
+      "}",
+      "",
+      "node.warn(cfg.configName + ': ' + results.length + ' CoT events built from ' + features.length + ' features');",
+      "msg._features = results;",
+      "msg._config = cfg;",
+      "return msg;"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 600, y: 180, wires: [['eng_build_m']]
+  },
+
+  // ════════════════════════════════════════════════
+  //  Row 4 — Get mission contents & reconcile
+  // ════════════════════════════════════════════════
+  {
+    id: 'eng_c3', type: 'comment', z: ENGINE_ID,
+    name: '── Reconcile with TAK Mission ──',
+    info: '', x: 260, y: 260, wires: []
+  },
+  {
+    id: 'eng_build_m', type: 'function', z: ENGINE_ID,
+    name: 'Build mission GET URL',
+    func: [
+      "var tak = msg.takSettings;",
+      "var cfg = msg._config;",
+      "msg.url = 'https://' + tak.serverUrl + ':' + (tak.missionApiPort || 8443)",
+      "  + '/Marti/api/missions/' + encodeURIComponent(cfg.missionName);",
+      "return msg;"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 180, y: 300, wires: [['eng_http_m']]
+  },
+  {
+    id: 'eng_http_m', type: 'http request', z: ENGINE_ID,
+    name: 'GET mission',
+    method: 'GET', ret: 'obj', paytoqs: 'ignore',
+    url: '', tls: 'tls_tak', persist: false, proxy: '',
+    insecureHTTPParser: false, authType: '',
+    senderr: false, headers: [],
+    x: 400, y: 300, wires: [['eng_reconcile']]
+  },
+  {
+    id: 'eng_reconcile', type: 'function', z: ENGINE_ID,
+    name: 'Reconcile (diff)',
+    func: [
+      "var features = msg._features || [];",
+      "var mData = msg.payload;",
+      "var cfg = msg._config;",
+      "var tak = msg.takSettings;",
+      "var prefix = cfg.uidPrefix || 'arcgis';",
+      "",
+      "// Extract existing UIDs from mission response",
+      "var existing = {};",
+      "try {",
+      "  var mission = null;",
+      "  if (mData && mData.data) {",
+      "    mission = Array.isArray(mData.data) ? mData.data[0] : mData.data;",
+      "  }",
+      "  if (mission) {",
+      "    if (mission.uids) {",
+      "      for (var i=0;i<mission.uids.length;i++) {",
+      "        var u = mission.uids[i];",
+      "        var uid = (typeof u === 'string') ? u : (u.data || u.uid || u);",
+      "        if (typeof uid === 'string') existing[uid] = true;",
+      "      }",
+      "    }",
+      "    if (mission.contents) {",
+      "      for (var i=0;i<mission.contents.length;i++) {",
+      "        var c = mission.contents[i];",
+      "        if (c.data && c.data.uid) existing[c.data.uid] = true;",
+      "      }",
+      "    }",
+      "  }",
+      "} catch(e) { node.warn('Could not parse mission contents (new mission?): ' + e.message); }",
+      "",
+      "var arcgis = {};",
+      "for (var i=0;i<features.length;i++) arcgis[features[i].uid] = features[i];",
+      "",
+      "var baseUrl = 'https://' + tak.serverUrl + ':' + (tak.missionApiPort || 8443)",
+      "  + '/Marti/api/missions/' + encodeURIComponent(cfg.missionName);",
+      "var creator = encodeURIComponent(tak.creatorUid || 'nodered');",
+      "",
+      "var nPut = 0, nDel = 0;",
+      "",
+      "// New features → CoT out (port 0) + PUT (port 1)",
+      "for (var uid in arcgis) {",
+      "  if (!existing[uid]) {",
+      "    nPut++;",
+      "    node.send([",
+      "      { payload: arcgis[uid].cot },",
+      "      {",
+      "        method: 'PUT',",
+      "        url: baseUrl + '/contents?creatorUid=' + creator,",
+      "        headers: { 'accept': '*/*', 'Content-Type': 'application/json' },",
+      "        payload: { uids: [uid] }",
+      "      }",
+      "    ]);",
+      "  }",
+      "}",
+      "",
+      "// Stale UIDs → DELETE (port 1)",
+      "for (var uid in existing) {",
+      "  if (uid.indexOf(prefix) === 0 && !arcgis[uid]) {",
+      "    nDel++;",
+      "    node.send([null, {",
+      "      method: 'DELETE',",
+      "      url: baseUrl + '/contents?uid=' + encodeURIComponent(uid) + '&creatorUid=' + creator,",
+      "      headers: { 'accept': '*/*' },",
+      "      payload: ''",
+      "    }]);",
+      "  }",
+      "}",
+      "",
+      "node.warn(cfg.configName + ' reconcile: ' + nPut + ' PUT, ' + nDel + ' DELETE, '",
+      "  + Object.keys(arcgis).length + ' ArcGIS, ' + Object.keys(existing).length + ' in mission');",
+      "return null;"
+    ].join('\n'),
+    outputs: 2, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 600, y: 300, wires: [['eng_debug_cot'], ['eng_http_action']]
+  },
+
+  // ════════════════════════════════════════════════
+  //  Row 5 — Outputs
+  // ════════════════════════════════════════════════
+  {
+    id: 'eng_c4', type: 'comment', z: ENGINE_ID,
+    name: '── CoT output → wire TAK node + tcp out here ──',
+    info: '', x: 280, y: 380, wires: []
+  },
+  {
+    id: 'eng_debug_cot', type: 'debug', z: ENGINE_ID,
+    name: 'CoT JSON → TAK node',
+    active: true, tosidebar: true, console: false, tostatus: true,
+    complete: 'payload',
+    targetType: 'msg', statusVal: 'payload.event._attributes.uid', statusType: 'auto',
+    x: 200, y: 420, wires: []
+  },
+  {
+    id: 'eng_http_action', type: 'http request', z: ENGINE_ID,
+    name: 'Mission API (PUT/DELETE)',
+    method: 'use', ret: 'obj', paytoqs: 'ignore',
+    url: '', tls: 'tls_tak', persist: false, proxy: '',
+    insecureHTTPParser: false, authType: '',
+    senderr: false, headers: [],
+    x: 460, y: 420, wires: [['eng_debug_action']]
+  },
+  {
+    id: 'eng_debug_action', type: 'debug', z: ENGINE_ID,
+    name: 'Mission API result',
+    active: true, tosidebar: true, console: false, tostatus: true,
+    complete: 'true', targetType: 'full',
+    statusVal: '', statusType: 'auto',
+    x: 680, y: 420, wires: []
+  }
+];
+
+// Merge all flows
+const allFlows = flows.concat(engineFlows);
 const out = path.join(__dirname, 'flows.json');
-fs.writeFileSync(out, JSON.stringify(flows, null, 2));
-console.log('flows.json generated  (' + flows.length + ' nodes)  →  ' + out);
+fs.writeFileSync(out, JSON.stringify(allFlows, null, 2));
+console.log('flows.json generated  (' + allFlows.length + ' nodes)  →  ' + out);
