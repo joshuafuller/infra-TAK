@@ -73,9 +73,9 @@ if [ -n "$AK_DIR" ]; then
   done
   [ $_pg_t -ge 60 ] && _log "PostgreSQL not ready after 60s, starting server anyway"
 
-  # Now start redis, server, and worker (depends_on in compose handles redis ordering)
+  # Start remaining services (compose depends_on handles ordering)
   _log "Starting Authentik server and worker..."
-  docker compose up -d redis server worker 2>/dev/null
+  docker compose up -d 2>/dev/null
 
   _t=0
   while [ $_t -lt $MAX_WAIT_AK ]; do
@@ -89,10 +89,7 @@ if [ -n "$AK_DIR" ]; then
   done
   [ $_t -ge $MAX_WAIT_AK ] && _log "Authentik server not healthy after ${MAX_WAIT_AK}s, continuing"
 
-  # Start LDAP outpost now that server is healthy (or timed out)
-  _log "Starting LDAP outpost..."
-  cd "$AK_DIR" && docker compose up -d ldap 2>/dev/null
-
+  # Verify LDAP outpost is responding (already started by compose up -d above)
   _log "Checking LDAP outpost (port 389)..."
   _t=0
   _MAX_LDAP=120
