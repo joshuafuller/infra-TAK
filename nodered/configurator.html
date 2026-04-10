@@ -214,31 +214,91 @@
 
   <!-- Step 4 -->
   <div class="step disabled" id="step4">
-    <h2>4. CoT Style &amp; TTL</h2>
+    <h2>4. Shape Style, Remarks &amp; TTL</h2>
+
     <div class="field-grid">
       <div>
-        <label for="strokeColor">Stroke color (hex)</label>
+        <label for="strokeColor">Stroke color</label>
         <div class="color-row">
-          <input type="text" id="strokeColor" value="#FF0000" style="width:130px"
-                 oninput="updSwatch('swStroke',this.value)">
+          <input type="color" id="strokeColorPick" value="#FF0000"
+                 oninput="document.getElementById('strokeColor').value=this.value;updSwatch('swStroke',this.value)">
+          <input type="text" id="strokeColor" value="#FF0000" style="width:110px"
+                 oninput="updSwatch('swStroke',this.value);document.getElementById('strokeColorPick').value=this.value">
           <div class="color-swatch" id="swStroke" style="background:#FF0000"></div>
         </div>
       </div>
       <div>
-        <label for="fillColor">Fill color (hex + alpha ok)</label>
+        <label for="fillColor">Fill color (with alpha)</label>
         <div class="color-row">
-          <input type="text" id="fillColor" value="#FF000044" style="width:130px"
+          <input type="color" id="fillColorPick" value="#FF0000"
+                 oninput="document.getElementById('fillColor').value=this.value+'44';updSwatch('swFill',this.value+'44')">
+          <input type="text" id="fillColor" value="#FF000044" style="width:110px"
                  oninput="updSwatch('swFill',this.value)">
           <div class="color-swatch" id="swFill" style="background:#FF000044"></div>
         </div>
       </div>
       <div>
-        <label for="ttlHours">TTL hours (0 = no expiry)</label>
-        <input type="number" id="ttlHours" value="72" min="0">
+        <label for="strokeWeight">Line thickness (px)</label>
+        <select id="strokeWeight">
+          <option value="1">1 — Thin</option>
+          <option value="2">2 — Light</option>
+          <option value="3" selected>3 — Normal</option>
+          <option value="5">5 — Medium</option>
+          <option value="8">8 — Heavy</option>
+        </select>
+      </div>
+      <div>
+        <label for="strokeStyle">Line style</label>
+        <select id="strokeStyle">
+          <option value="solid">Solid</option>
+          <option value="dashed">Dashed</option>
+          <option value="dotted">Dotted</option>
+          <option value="outlined">Outlined</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="field-grid" style="margin-top:1rem">
+      <div>
+        <label for="closedShape">Shape closed</label>
+        <select id="closedShape">
+          <option value="true" selected>Yes — Closed polygon</option>
+          <option value="false">No — Open polyline</option>
+        </select>
+      </div>
+      <div>
+        <label for="labelsOn">Show label on map</label>
+        <select id="labelsOn">
+          <option value="true">Yes</option>
+          <option value="false" selected>No</option>
+        </select>
+      </div>
+      <div>
+        <label for="labelField">Label field (callsign)</label>
+        <select id="labelField">
+          <option value="">(none)</option>
+        </select>
       </div>
       <div>
         <label for="uidPrefix">UID prefix</label>
         <input type="text" id="uidPrefix" value="arcgis-" placeholder="arcgis-">
+      </div>
+    </div>
+
+    <div style="margin-top:1rem">
+      <label for="remarksTemplate">Remarks template (use {FieldName} to insert ArcGIS values)</label>
+      <input type="text" id="remarksTemplate" style="font-family:monospace"
+             value="Source: {source} | Mission: {mission} | Incident: {IncidentName} | {irwin_POOProtectingUnit}"
+             placeholder="Source: {source} | Mission: {mission}">
+      <div style="margin-top:0.3rem;font-size:0.75rem;color:#666">
+        Available fields from your layer will populate {FieldName} at runtime
+      </div>
+    </div>
+
+    <div class="field-grid" style="margin-top:1rem">
+      <div>
+        <label for="ttlHours">TTL hours (0 = no expiry)</label>
+        <input type="number" id="ttlHours" value="72" min="0">
       </div>
     </div>
   </div>
@@ -407,6 +467,15 @@ async function fetchLayer() {
     state.filterField = '';
     state.distinctValues = [];
     state.selectedValues = [];
+
+    /* populate label field dropdown */
+    var labelSel = document.getElementById('labelField');
+    labelSel.innerHTML = '<option value="">(none)</option>';
+    state.fields.forEach(function(f) {
+      var isMission = (f.name.toLowerCase() === 'mission' || f.name.toLowerCase() === 'incidentname');
+      labelSel.innerHTML += '<option value="' + f.name + '"' + (isMission ? ' selected' : '') + '>'
+        + f.name + '</option>';
+    });
 
     /* auto-set UID prefix from layer name */
     var match = state.layers.find(function(l) { return String(l.id) === String(layerId); });
@@ -630,8 +699,14 @@ function generateConfig() {
     },
     style: {
       strokeColor: document.getElementById('strokeColor').value,
-      fillColor: document.getElementById('fillColor').value
+      fillColor: document.getElementById('fillColor').value,
+      strokeWeight: parseInt(document.getElementById('strokeWeight').value, 10),
+      strokeStyle: document.getElementById('strokeStyle').value,
+      closed: document.getElementById('closedShape').value === 'true',
+      labelsOn: document.getElementById('labelsOn').value === 'true',
+      labelField: document.getElementById('labelField').value || null
     },
+    remarksTemplate: document.getElementById('remarksTemplate').value || null,
     ttlHours: parseInt(document.getElementById('ttlHours').value, 10) || 0,
     uidPrefix: document.getElementById('uidPrefix').value,
     generated: new Date().toISOString()
