@@ -380,8 +380,16 @@
 
     <div class="field-grid" style="margin-top:1rem">
       <div>
-        <label for="ttlHours">TTL hours (0 = no expiry)</label>
-        <input type="number" id="ttlHours" value="72" min="0">
+        <label for="ttlValue">Time window (filters by time field when set; also sets CoT stale)</label>
+        <div class="row" style="margin-top:0.35rem;align-items:center">
+          <input type="number" id="ttlValue" value="72" min="0" step="any" class="grow" style="max-width:160px">
+          <select id="ttlUnit" style="max-width:160px">
+            <option value="minutes">Minutes</option>
+            <option value="hours" selected>Hours</option>
+            <option value="days">Days</option>
+          </select>
+        </div>
+        <div style="font-size:0.75rem;color:#888;margin-top:0.4rem">Use <strong>0</strong> for no time filter and default CoT stale (1h).</div>
       </div>
     </div>
   </div>
@@ -868,7 +876,8 @@ function generateConfig() {
     },
     remarksTemplate: getRemarksTemplate(),
     remarksFields: state.remarksFields.length > 0 ? state.remarksFields.slice() : null,
-    ttlHours: parseInt(document.getElementById('ttlHours').value, 10) || 0,
+    ttlValue: parseFloat(document.getElementById('ttlValue').value) || 0,
+    ttlUnit: document.getElementById('ttlUnit').value,
     uidPrefix: document.getElementById('uidPrefix').value,
     missionName: document.getElementById('missionName').value || '',
     generated: new Date().toISOString()
@@ -998,6 +1007,9 @@ function resetForm() {
   document.getElementById('filterStatus').innerHTML = '';
   document.getElementById('saveStatus').innerHTML = '';
 
+  document.getElementById('ttlValue').value = '72';
+  document.getElementById('ttlUnit').value = 'hours';
+
   window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
@@ -1073,7 +1085,13 @@ async function selectConfig(idx) {
     state.remarksFields = [];
     c.remarksFields.forEach(function(f) { addRemarkField(f); });
   }
-  if (c.ttlHours != null) document.getElementById('ttlHours').value = c.ttlHours;
+  if (c.ttlValue != null && c.ttlUnit) {
+    document.getElementById('ttlValue').value = c.ttlValue;
+    document.getElementById('ttlUnit').value = c.ttlUnit;
+  } else if (c.ttlHours != null) {
+    document.getElementById('ttlValue').value = c.ttlHours;
+    document.getElementById('ttlUnit').value = 'hours';
+  }
   if (c.uidPrefix) document.getElementById('uidPrefix').value = c.uidPrefix;
   if (c.missionName) document.getElementById('missionName').value = c.missionName;
 
