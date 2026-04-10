@@ -2,9 +2,9 @@
   {
     "id": "flow_arcgis_cfg",
     "type": "tab",
-    "label": "ArcGIS Configurator",
+    "label": "ArcGIS → TAK",
     "disabled": false,
-    "info": "Guided ArcGIS Feature Service → TAK CoT configuration tool.\nOpen /configurator in your browser after deploying."
+    "info": "Top: Configurator (/configurator). Bottom: sync engine (TLS + poll). Same tab so saved configs & TAK settings share one flow context."
   },
   {
     "id": "c_ui",
@@ -475,8 +475,8 @@
     "id": "fn_save",
     "type": "function",
     "z": "flow_arcgis_cfg",
-    "name": "Save to global context",
-    "func": "var config  = msg.payload;\nvar configs = global.get('arcgis_configs') || [];\nvar idx = configs.findIndex(function(c) {\n  return c.source.serviceUrl === config.source.serviceUrl\n      && c.source.layerId    === config.source.layerId;\n});\nif (idx >= 0) { configs[idx] = config; }\nelse           { configs.push(config); }\nglobal.set('arcgis_configs', configs);\nmsg.payload = { ok: true, configCount: configs.length };\nreturn msg;",
+    "name": "Save to flow context",
+    "func": "var config  = msg.payload;\nvar configs = flow.get('arcgis_configs') || [];\nvar idx = configs.findIndex(function(c) {\n  return c.source.serviceUrl === config.source.serviceUrl\n      && c.source.layerId    === config.source.layerId;\n});\nif (idx >= 0) { configs[idx] = config; }\nelse           { configs.push(config); }\nflow.set('arcgis_configs', configs);\nmsg.payload = { ok: true, configCount: configs.length };\nreturn msg;",
     "outputs": 1,
     "timeout": "",
     "noerr": 0,
@@ -524,7 +524,7 @@
     "type": "function",
     "z": "flow_arcgis_cfg",
     "name": "Replace all configs",
-    "func": "global.set('arcgis_configs', msg.payload.configs || []);\nmsg.payload = { ok: true };\nreturn msg;",
+    "func": "flow.set('arcgis_configs', msg.payload.configs || []);\nmsg.payload = { ok: true };\nreturn msg;",
     "outputs": 1,
     "timeout": "",
     "noerr": 0,
@@ -571,8 +571,8 @@
     "id": "fn_load",
     "type": "function",
     "z": "flow_arcgis_cfg",
-    "name": "Load from global context",
-    "func": "var configs = global.get('arcgis_configs') || [];\nmsg.payload = { configs: configs };\nreturn msg;",
+    "name": "Load from flow context",
+    "func": "var configs = flow.get('arcgis_configs') || [];\nmsg.payload = { configs: configs };\nreturn msg;",
     "outputs": 1,
     "timeout": "",
     "noerr": 0,
@@ -630,7 +630,7 @@
     "type": "function",
     "z": "flow_arcgis_cfg",
     "name": "Save TAK settings",
-    "func": "global.set('tak_settings', msg.payload);\nmsg.payload = { ok: true };\nreturn msg;",
+    "func": "flow.set('tak_settings', msg.payload);\nmsg.payload = { ok: true };\nreturn msg;",
     "outputs": 1,
     "timeout": "",
     "noerr": 0,
@@ -678,7 +678,7 @@
     "type": "function",
     "z": "flow_arcgis_cfg",
     "name": "Load TAK settings",
-    "func": "msg.payload = { settings: global.get('tak_settings') || {} };\nreturn msg;",
+    "func": "msg.payload = { settings: flow.get('tak_settings') || {} };\nreturn msg;",
     "outputs": 1,
     "timeout": "",
     "noerr": 0,
@@ -705,13 +705,6 @@
     "wires": []
   },
   {
-    "id": "flow_arcgis_engine",
-    "type": "tab",
-    "label": "ArcGIS → TAK Engine",
-    "disabled": true,
-    "info": "Single reconciliation engine: polls ArcGIS, builds CoT, diffs against TAK mission, PUTs new / DELETEs stale.\\nEnable this tab after configuring TLS certs and wiring the TAK node."
-  },
-  {
     "id": "tls_tak",
     "type": "tls-config",
     "name": "TAK Server TLS",
@@ -727,17 +720,17 @@
   {
     "id": "eng_c1",
     "type": "comment",
-    "z": "flow_arcgis_engine",
+    "z": "flow_arcgis_cfg",
     "name": "── ArcGIS → TAK Sync Engine ──",
     "info": "",
     "x": 260,
-    "y": 40,
+    "y": 960,
     "wires": []
   },
   {
     "id": "eng_inject",
     "type": "inject",
-    "z": "flow_arcgis_engine",
+    "z": "flow_arcgis_cfg",
     "name": "Poll timer (5 min)",
     "props": [
       {
@@ -756,7 +749,7 @@
     "payload": "",
     "payloadType": "date",
     "x": 180,
-    "y": 80,
+    "y": 1000,
     "wires": [
       [
         "eng_load"
@@ -766,9 +759,9 @@
   {
     "id": "eng_load",
     "type": "function",
-    "z": "flow_arcgis_engine",
+    "z": "flow_arcgis_cfg",
     "name": "Load configs",
-    "func": "var configs = global.get('arcgis_configs') || [];\nvar tak = global.get('tak_settings') || {};\nif (configs.length === 0) { node.warn('No ArcGIS configs — open /configurator'); return null; }\nif (!tak.serverUrl) { node.warn('No TAK Server URL — open /configurator → TAK Settings'); return null; }\nvar out = [];\nfor (var i = 0; i < configs.length; i++) {\n  if (!configs[i].missionName) { node.warn('Config \"' + configs[i].configName + '\" has no mission name — skipping'); continue; }\n  out.push({ payload: configs[i], takSettings: tak });\n}\nif (out.length === 0) return null;\nreturn [out];",
+    "func": "var configs = flow.get('arcgis_configs') || [];\nvar tak = flow.get('tak_settings') || {};\nif (configs.length === 0) { node.warn('No ArcGIS configs — open /configurator'); return null; }\nif (!tak.serverUrl) { node.warn('No TAK Server URL — open /configurator → TAK Settings'); return null; }\nvar out = [];\nfor (var i = 0; i < configs.length; i++) {\n  if (!configs[i].missionName) { node.warn('Config \"' + configs[i].configName + '\" has no mission name — skipping'); continue; }\n  out.push({ payload: configs[i], takSettings: tak });\n}\nif (out.length === 0) return null;\nreturn [out];",
     "outputs": 1,
     "timeout": "",
     "noerr": 0,
@@ -776,7 +769,7 @@
     "finalize": "",
     "libs": [],
     "x": 400,
-    "y": 80,
+    "y": 1000,
     "wires": [
       [
         "eng_split"
@@ -786,7 +779,7 @@
   {
     "id": "eng_split",
     "type": "split",
-    "z": "flow_arcgis_engine",
+    "z": "flow_arcgis_cfg",
     "name": "",
     "splt": "\\n",
     "spltType": "str",
@@ -795,7 +788,7 @@
     "stream": false,
     "addname": "",
     "x": 560,
-    "y": 80,
+    "y": 1000,
     "wires": [
       [
         "eng_build_q"
@@ -805,17 +798,17 @@
   {
     "id": "eng_c2",
     "type": "comment",
-    "z": "flow_arcgis_engine",
+    "z": "flow_arcgis_cfg",
     "name": "── Query ArcGIS features ──",
     "info": "",
     "x": 260,
-    "y": 140,
+    "y": 1060,
     "wires": []
   },
   {
     "id": "eng_build_q",
     "type": "function",
-    "z": "flow_arcgis_engine",
+    "z": "flow_arcgis_cfg",
     "name": "Build ArcGIS query",
     "func": "var cfg = msg.payload;\nvar base = cfg.source.serviceUrl.replace(/\\/+$/, '');\nvar lid = cfg.source.layerId;\nvar parts = [];\nif (cfg.source.where) parts.push(cfg.source.where);\nif (cfg.mapping.timeField && cfg.ttlHours > 0) {\n  var cutoff = Date.now() - cfg.ttlHours * 3600000;\n  parts.push(cfg.mapping.timeField + ' > ' + cutoff);\n}\nvar where = parts.length > 0 ? parts.join(' AND ') : '1=1';\nmsg.url = base + '/' + lid + '/query'\n  + '?where=' + encodeURIComponent(where)\n  + '&outFields=*&returnGeometry=true&f=json';\nmsg._config = cfg;\nreturn msg;",
     "outputs": 1,
@@ -825,7 +818,7 @@
     "finalize": "",
     "libs": [],
     "x": 180,
-    "y": 180,
+    "y": 1100,
     "wires": [
       [
         "eng_http_ag"
@@ -835,7 +828,7 @@
   {
     "id": "eng_http_ag",
     "type": "http request",
-    "z": "flow_arcgis_engine",
+    "z": "flow_arcgis_cfg",
     "name": "GET ArcGIS features",
     "method": "GET",
     "ret": "obj",
@@ -849,7 +842,7 @@
     "senderr": false,
     "headers": [],
     "x": 400,
-    "y": 180,
+    "y": 1100,
     "wires": [
       [
         "eng_parse"
@@ -859,7 +852,7 @@
   {
     "id": "eng_parse",
     "type": "function",
-    "z": "flow_arcgis_engine",
+    "z": "flow_arcgis_cfg",
     "name": "Parse & build CoT",
     "func": "var features = (msg.payload && msg.payload.features) || [];\nvar cfg = msg._config;\nif (features.length === 0) { node.warn(cfg.configName + ': 0 features from ArcGIS'); return null; }\n\nfunction hexArgb(hex, a) {\n  var r = parseInt(hex.substr(1,2),16);\n  var g = parseInt(hex.substr(3,2),16);\n  var b = parseInt(hex.substr(5,2),16);\n  var ai = Math.round((a !== undefined ? a : 1) * 255);\n  return ((ai << 24) | (r << 16) | (g << 8) | b);\n}\n\nvar strokeArgb = hexArgb(cfg.style.color || '#FF0000', 1);\nvar fillArgb   = hexArgb(cfg.style.color || '#FF0000', parseFloat(cfg.style.fillAlpha || '0.3'));\nvar now = new Date();\nvar staleMs = cfg.ttlHours > 0 ? cfg.ttlHours * 3600000 : 3600000;\nvar stale = new Date(now.getTime() + staleMs);\nvar isPoly = cfg.source.geometryType !== 'esriGeometryPoint';\nvar cotType = isPoly ? 'u-d-f' : 'a-u-G';\n\nvar results = [];\nfor (var i = 0; i < features.length; i++) {\n  var f = features[i];\n  var a = f.attributes || {};\n  var g = f.geometry;\n  if (!g) continue;\n\n  var idVal = a[cfg.mapping.idField] || ('f' + i);\n  var uid = (cfg.uidPrefix || 'arcgis') + '-' + String(idVal).replace(/[^a-zA-Z0-9_.-]/g, '_');\n\n  var lat, lon;\n  if (isPoly && g.rings && g.rings[0]) {\n    var ring = g.rings[0]; var sx=0,sy=0;\n    for (var j=0;j<ring.length;j++) { sx+=ring[j][0]; sy+=ring[j][1]; }\n    lon = sx/ring.length; lat = sy/ring.length;\n  } else { lat = g.y || 0; lon = g.x || 0; }\n\n  var callsign = uid;\n  if (cfg.style.labelField && a[cfg.style.labelField] != null) callsign = String(a[cfg.style.labelField]);\n\n  var remarks = '';\n  if (cfg.remarksFields && cfg.remarksFields.length) {\n    var rp = [];\n    for (var k=0;k<cfg.remarksFields.length;k++) {\n      var fn = cfg.remarksFields[k];\n      rp.push(fn + ': ' + (a[fn] != null ? String(a[fn]) : ''));\n    }\n    remarks = rp.join(' | ');\n  }\n\n  var detail = {\n    contact: [{ _attributes: { callsign: callsign } }],\n    remarks: remarks,\n    strokeColor: [{ _attributes: { value: String(strokeArgb) } }],\n    strokeWeight: [{ _attributes: { value: String(cfg.style.strokeWeight || 3) + '.0' } }],\n    fillColor: [{ _attributes: { value: String(fillArgb) } }],\n    labels_on: [{ _attributes: { value: cfg.style.labelsOn ? 'true' : 'false' } }]\n  };\n\n  if (isPoly && g.rings && g.rings[0]) {\n    var links = [];\n    var ring = g.rings[0];\n    for (var j=0;j<ring.length;j++) links.push({ _attributes: { point: ring[j][1]+','+ring[j][0] } });\n    detail.link = links;\n  }\n\n  results.push({\n    uid: uid,\n    cot: {\n      event: {\n        _attributes: {\n          version: '2.0', uid: uid, type: cotType,\n          how: 'h-e',\n          time: now.toISOString(),\n          start: now.toISOString(),\n          stale: stale.toISOString()\n        },\n        point: { _attributes: { lat: String(lat), lon: String(lon), hae: '9999999.0', ce: '9999999.0', le: '9999999.0' } },\n        detail: detail\n      }\n    }\n  });\n}\n\nnode.warn(cfg.configName + ': ' + results.length + ' CoT events built from ' + features.length + ' features');\nmsg._features = results;\nmsg._config = cfg;\nreturn msg;",
     "outputs": 1,
@@ -869,7 +862,7 @@
     "finalize": "",
     "libs": [],
     "x": 600,
-    "y": 180,
+    "y": 1100,
     "wires": [
       [
         "eng_build_m"
@@ -879,19 +872,19 @@
   {
     "id": "eng_c3",
     "type": "comment",
-    "z": "flow_arcgis_engine",
+    "z": "flow_arcgis_cfg",
     "name": "── Reconcile with TAK Mission ──",
     "info": "",
     "x": 260,
-    "y": 260,
+    "y": 1180,
     "wires": []
   },
   {
     "id": "eng_build_m",
     "type": "function",
-    "z": "flow_arcgis_engine",
+    "z": "flow_arcgis_cfg",
     "name": "Build mission GET URL",
-    "func": "var tak = msg.takSettings;\nvar cfg = msg._config;\nmsg.url = 'https://' + tak.serverUrl + ':' + (tak.missionApiPort || 8443)\n  + '/Marti/api/missions/' + encodeURIComponent(cfg.missionName);\nreturn msg;",
+    "func": "var tak = msg.takSettings;\nvar cfg = msg._config;\nvar host = String(tak.serverUrl || '').replace(/^https?:\\/\\//i, '').replace(/\\/$/, '');\nmsg.url = 'https://' + host + ':' + (tak.missionApiPort || 8443)\n  + '/Marti/api/missions/' + encodeURIComponent(cfg.missionName);\nreturn msg;",
     "outputs": 1,
     "timeout": "",
     "noerr": 0,
@@ -899,7 +892,7 @@
     "finalize": "",
     "libs": [],
     "x": 180,
-    "y": 300,
+    "y": 1220,
     "wires": [
       [
         "eng_http_m"
@@ -909,7 +902,7 @@
   {
     "id": "eng_http_m",
     "type": "http request",
-    "z": "flow_arcgis_engine",
+    "z": "flow_arcgis_cfg",
     "name": "GET mission",
     "method": "GET",
     "ret": "obj",
@@ -923,7 +916,7 @@
     "senderr": false,
     "headers": [],
     "x": 400,
-    "y": 300,
+    "y": 1220,
     "wires": [
       [
         "eng_reconcile"
@@ -933,9 +926,9 @@
   {
     "id": "eng_reconcile",
     "type": "function",
-    "z": "flow_arcgis_engine",
+    "z": "flow_arcgis_cfg",
     "name": "Reconcile (diff)",
-    "func": "var features = msg._features || [];\nvar mData = msg.payload;\nvar cfg = msg._config;\nvar tak = msg.takSettings;\nvar prefix = cfg.uidPrefix || 'arcgis';\n\n// Extract existing UIDs from mission response\nvar existing = {};\ntry {\n  var mission = null;\n  if (mData && mData.data) {\n    mission = Array.isArray(mData.data) ? mData.data[0] : mData.data;\n  }\n  if (mission) {\n    if (mission.uids) {\n      for (var i=0;i<mission.uids.length;i++) {\n        var u = mission.uids[i];\n        var uid = (typeof u === 'string') ? u : (u.data || u.uid || u);\n        if (typeof uid === 'string') existing[uid] = true;\n      }\n    }\n    if (mission.contents) {\n      for (var i=0;i<mission.contents.length;i++) {\n        var c = mission.contents[i];\n        if (c.data && c.data.uid) existing[c.data.uid] = true;\n      }\n    }\n  }\n} catch(e) { node.warn('Could not parse mission contents (new mission?): ' + e.message); }\n\nvar arcgis = {};\nfor (var i=0;i<features.length;i++) arcgis[features[i].uid] = features[i];\n\nvar baseUrl = 'https://' + tak.serverUrl + ':' + (tak.missionApiPort || 8443)\n  + '/Marti/api/missions/' + encodeURIComponent(cfg.missionName);\nvar creator = encodeURIComponent(tak.creatorUid || 'nodered');\n\nvar nPut = 0, nDel = 0;\n\n// New features → CoT out (port 0) + PUT (port 1)\nfor (var uid in arcgis) {\n  if (!existing[uid]) {\n    nPut++;\n    node.send([\n      { payload: arcgis[uid].cot },\n      {\n        method: 'PUT',\n        url: baseUrl + '/contents?creatorUid=' + creator,\n        headers: { 'accept': '*/*', 'Content-Type': 'application/json' },\n        payload: { uids: [uid] }\n      }\n    ]);\n  }\n}\n\n// Stale UIDs → DELETE (port 1)\nfor (var uid in existing) {\n  if (uid.indexOf(prefix) === 0 && !arcgis[uid]) {\n    nDel++;\n    node.send([null, {\n      method: 'DELETE',\n      url: baseUrl + '/contents?uid=' + encodeURIComponent(uid) + '&creatorUid=' + creator,\n      headers: { 'accept': '*/*' },\n      payload: ''\n    }]);\n  }\n}\n\nnode.warn(cfg.configName + ' reconcile: ' + nPut + ' PUT, ' + nDel + ' DELETE, '\n  + Object.keys(arcgis).length + ' ArcGIS, ' + Object.keys(existing).length + ' in mission');\nreturn null;",
+    "func": "var features = msg._features || [];\nvar mData = msg.payload;\nvar cfg = msg._config;\nvar tak = msg.takSettings;\nvar prefix = cfg.uidPrefix || 'arcgis';\n\n// Extract existing UIDs from mission response\nvar existing = {};\ntry {\n  var mission = null;\n  if (mData && mData.data) {\n    mission = Array.isArray(mData.data) ? mData.data[0] : mData.data;\n  }\n  if (mission) {\n    if (mission.uids) {\n      for (var i=0;i<mission.uids.length;i++) {\n        var u = mission.uids[i];\n        var uid = (typeof u === 'string') ? u : (u.data || u.uid || u);\n        if (typeof uid === 'string') existing[uid] = true;\n      }\n    }\n    if (mission.contents) {\n      for (var i=0;i<mission.contents.length;i++) {\n        var c = mission.contents[i];\n        if (c.data && c.data.uid) existing[c.data.uid] = true;\n      }\n    }\n  }\n} catch(e) { node.warn('Could not parse mission contents (new mission?): ' + e.message); }\n\nvar arcgis = {};\nfor (var i=0;i<features.length;i++) arcgis[features[i].uid] = features[i];\n\nvar host = String(tak.serverUrl || '').replace(/^https?:\\/\\//i, '').replace(/\\/$/, '');\nvar baseUrl = 'https://' + host + ':' + (tak.missionApiPort || 8443)\n  + '/Marti/api/missions/' + encodeURIComponent(cfg.missionName);\nvar creator = encodeURIComponent(tak.creatorUid || 'nodered');\n\nvar nPut = 0, nDel = 0;\n\n// New features → CoT out (port 0) + PUT (port 1)\nfor (var uid in arcgis) {\n  if (!existing[uid]) {\n    nPut++;\n    node.send([\n      { payload: arcgis[uid].cot },\n      {\n        method: 'PUT',\n        url: baseUrl + '/contents?creatorUid=' + creator,\n        headers: { 'accept': '*/*', 'Content-Type': 'application/json' },\n        payload: { uids: [uid] }\n      }\n    ]);\n  }\n}\n\n// Stale UIDs → DELETE (port 1)\nfor (var uid in existing) {\n  if (uid.indexOf(prefix) === 0 && !arcgis[uid]) {\n    nDel++;\n    node.send([null, {\n      method: 'DELETE',\n      url: baseUrl + '/contents?uid=' + encodeURIComponent(uid) + '&creatorUid=' + creator,\n      headers: { 'accept': '*/*' },\n      payload: ''\n    }]);\n  }\n}\n\nnode.warn(cfg.configName + ' reconcile: ' + nPut + ' PUT, ' + nDel + ' DELETE, '\n  + Object.keys(arcgis).length + ' ArcGIS, ' + Object.keys(existing).length + ' in mission');\nreturn null;",
     "outputs": 2,
     "timeout": "",
     "noerr": 0,
@@ -943,7 +936,7 @@
     "finalize": "",
     "libs": [],
     "x": 600,
-    "y": 300,
+    "y": 1220,
     "wires": [
       [
         "eng_debug_cot"
@@ -956,17 +949,17 @@
   {
     "id": "eng_c4",
     "type": "comment",
-    "z": "flow_arcgis_engine",
+    "z": "flow_arcgis_cfg",
     "name": "── CoT output → wire TAK node + tcp out here ──",
     "info": "",
     "x": 280,
-    "y": 380,
+    "y": 1300,
     "wires": []
   },
   {
     "id": "eng_debug_cot",
     "type": "debug",
-    "z": "flow_arcgis_engine",
+    "z": "flow_arcgis_cfg",
     "name": "CoT JSON → TAK node",
     "active": true,
     "tosidebar": true,
@@ -977,13 +970,13 @@
     "statusVal": "payload.event._attributes.uid",
     "statusType": "auto",
     "x": 200,
-    "y": 420,
+    "y": 1340,
     "wires": []
   },
   {
     "id": "eng_http_action",
     "type": "http request",
-    "z": "flow_arcgis_engine",
+    "z": "flow_arcgis_cfg",
     "name": "Mission API (PUT/DELETE)",
     "method": "use",
     "ret": "obj",
@@ -997,7 +990,7 @@
     "senderr": false,
     "headers": [],
     "x": 460,
-    "y": 420,
+    "y": 1340,
     "wires": [
       [
         "eng_debug_action"
@@ -1007,7 +1000,7 @@
   {
     "id": "eng_debug_action",
     "type": "debug",
-    "z": "flow_arcgis_engine",
+    "z": "flow_arcgis_cfg",
     "name": "Mission API result",
     "active": true,
     "tosidebar": true,
@@ -1018,7 +1011,7 @@
     "statusVal": "",
     "statusType": "auto",
     "x": 680,
-    "y": 420,
+    "y": 1340,
     "wires": []
   }
 ]
