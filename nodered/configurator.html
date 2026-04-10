@@ -168,6 +168,32 @@
   </h1>
   <p class="subtitle">Paste a Feature Service URL, pick your layer &amp; fields, generate config for the sync engine.</p>
 
+  <details id="takSettingsPanel" style="margin-bottom:1rem">
+    <summary style="cursor:pointer;color:#2ec4b6;font-weight:600;font-size:0.95rem">TAK Server Settings</summary>
+    <div class="step" style="border-left-color:#2ec4b6;margin-top:0.5rem">
+      <div class="field-grid">
+        <div>
+          <label for="takServerUrl">TAK Server URL / IP</label>
+          <input type="text" id="takServerUrl" placeholder="e.g. 203.0.113.10">
+        </div>
+        <div>
+          <label for="takApiPort">Mission API port</label>
+          <input type="number" id="takApiPort" value="8443">
+        </div>
+        <div>
+          <label for="takStreamPort">Streaming port</label>
+          <input type="number" id="takStreamPort" value="8089">
+        </div>
+        <div>
+          <label for="takCreatorUid">Creator UID</label>
+          <input type="text" id="takCreatorUid" placeholder="e.g. nodered-arcgis" value="nodered-arcgis-engine">
+        </div>
+      </div>
+      <button onclick="saveTakSettings()" style="margin-top:0.5rem">Save TAK Settings</button>
+      <span id="takSettingsStatus" style="margin-left:0.5rem;font-size:0.85rem"></span>
+    </div>
+  </details>
+
   <div id="savedConfigBar" style="display:none;margin-bottom:1rem">
     <div class="step" style="border-left-color:#2ec4b6">
       <h2>Saved Configurations</h2>
@@ -367,6 +393,10 @@
       <div>
         <label for="configName">Config name</label>
         <input type="text" id="configName" placeholder="e.g. CA Fires - FIRIS Only">
+      </div>
+      <div>
+        <label for="missionName">TAK Mission name</label>
+        <input type="text" id="missionName" placeholder="e.g. ArcGIS-Fires">
       </div>
     </div>
     <div class="row">
@@ -840,6 +870,7 @@ function generateConfig() {
     remarksFields: state.remarksFields.length > 0 ? state.remarksFields.slice() : null,
     ttlHours: parseInt(document.getElementById('ttlHours').value, 10) || 0,
     uidPrefix: document.getElementById('uidPrefix').value,
+    missionName: document.getElementById('missionName').value || '',
     generated: new Date().toISOString()
   };
 
@@ -932,6 +963,7 @@ function resetForm() {
 
   document.getElementById('serviceUrl').value = '';
   document.getElementById('configName').value = '';
+  document.getElementById('missionName').value = '';
   document.getElementById('configOutput').textContent = '';
 
   document.getElementById('layerSelect').innerHTML = '<option value="">-- fetch service first --</option>';
@@ -1047,6 +1079,7 @@ async function selectConfig(idx) {
   }
   if (c.ttlHours != null) document.getElementById('ttlHours').value = c.ttlHours;
   if (c.uidPrefix) document.getElementById('uidPrefix').value = c.uidPrefix;
+  if (c.missionName) document.getElementById('missionName').value = c.missionName;
 
   document.getElementById('configOutput').textContent = JSON.stringify(c, null, 2);
   status('saveStatus', 'Loaded "' + (c.configName || 'config') + '" — edit and hit Save to publish changes', true);
@@ -1068,6 +1101,43 @@ async function deleteConfig(idx) {
 }
 
 loadSavedConfigs();
+
+async function loadTakSettings() {
+  try {
+    var res = await fetch('/api/tak-settings/load');
+    var data = await res.json();
+    var s = data.settings || {};
+    if (s.serverUrl) document.getElementById('takServerUrl').value = s.serverUrl;
+    if (s.missionApiPort) document.getElementById('takApiPort').value = s.missionApiPort;
+    if (s.streamingPort) document.getElementById('takStreamPort').value = s.streamingPort;
+    if (s.creatorUid) document.getElementById('takCreatorUid').value = s.creatorUid;
+  } catch(e) {}
+}
+
+async function saveTakSettings() {
+  var settings = {
+    serverUrl: document.getElementById('takServerUrl').value,
+    missionApiPort: parseInt(document.getElementById('takApiPort').value) || 8443,
+    streamingPort: parseInt(document.getElementById('takStreamPort').value) || 8089,
+    creatorUid: document.getElementById('takCreatorUid').value
+  };
+  try {
+    var res = await fetch('/api/tak-settings/save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(settings)
+    });
+    var data = await res.json();
+    var el = document.getElementById('takSettingsStatus');
+    el.textContent = data.ok ? '✓ Saved' : 'Error';
+    el.style.color = data.ok ? '#2ec4b6' : '#e94560';
+  } catch(e) {
+    var el = document.getElementById('takSettingsStatus');
+    el.textContent = 'Error saving';
+    el.style.color = '#e94560';
+  }
+}
+loadTakSettings();
 </script>
 </body>
 </html>
