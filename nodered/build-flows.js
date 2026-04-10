@@ -482,14 +482,7 @@ const engineFlows = [
     ].join('\n'),
     outputs: 1, timeout: '', noerr: 0,
     initialize: '', finalize: '', libs: [],
-    x: 400, y: 80 + EY, wires: [['eng_split']]
-  },
-  {
-    id: 'eng_split', type: 'split', z: FLOW_ID,
-    name: '', splt: '\\n', spltType: 'str',
-    arraySplt: 1, arraySpltType: 'len',
-    stream: false, addname: '',
-    x: 560, y: 80 + EY, wires: [['eng_build_q']]
+    x: 400, y: 80 + EY, wires: [['eng_build_q']]
   },
 
   // ════════════════════════════════════════════════

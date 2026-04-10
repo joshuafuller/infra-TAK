@@ -772,25 +772,6 @@
     "y": 1000,
     "wires": [
       [
-        "eng_split"
-      ]
-    ]
-  },
-  {
-    "id": "eng_split",
-    "type": "split",
-    "z": "flow_arcgis_cfg",
-    "name": "",
-    "splt": "\\n",
-    "spltType": "str",
-    "arraySplt": 1,
-    "arraySpltType": "len",
-    "stream": false,
-    "addname": "",
-    "x": 560,
-    "y": 1000,
-    "wires": [
-      [
         "eng_build_q"
       ]
     ]
