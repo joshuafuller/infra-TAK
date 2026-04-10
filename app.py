@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.5.7-alpha"
+VERSION = "0.5.8-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -7385,6 +7385,8 @@ def _patch_cert_metadata_password(cert_pass):
         if changed:
             with open(path, 'w') as f:
                 f.writelines(lines)
+            import shutil
+            shutil.chown(path, user='tak', group='tak')
     except Exception:
         pass
 
@@ -24098,7 +24100,7 @@ def takserver_rotate_intca():
 
             log("")
             log(f"Step 2/7: Creating new Intermediate CA: {new_ca_name}...")
-            run('chmod +r /opt/tak/certs/cert-metadata.sh 2>/dev/null')
+            run('chown tak:tak /opt/tak/certs/cert-metadata.sh && chmod 500 /opt/tak/certs/cert-metadata.sh')
             run(f'grep -qE "^CA_VALIDITY=" /opt/tak/certs/cert-metadata.sh 2>/dev/null && sed -i "s/^CA_VALIDITY=.*/CA_VALIDITY={int_validity_days}/" /opt/tak/certs/cert-metadata.sh || true', check=False)
             run(f'grep -qE "^INTERMEDIATE_VALIDITY" /opt/tak/certs/cert-metadata.sh 2>/dev/null && sed -i "s/^INTERMEDIATE_VALIDITY.*/INTERMEDIATE_VALIDITY={int_validity_days}/" /opt/tak/certs/cert-metadata.sh || true', check=False)
             log(f"  New intermediate validity: {int_validity_days} days (capped by root if needed)")
@@ -24115,7 +24117,7 @@ def takserver_rotate_intca():
 
             log("")
             log("Step 4/7: Regenerating all client certificates...")
-            run('chmod +r /opt/tak/certs/cert-metadata.sh 2>/dev/null')
+            run('chown tak:tak /opt/tak/certs/cert-metadata.sh && chmod 500 /opt/tak/certs/cert-metadata.sh')
             skip = {'takserver', 'root-ca', 'ca', old_ca_name.lower(), new_ca_name.lower()}
             regen_count = 0
             for f in sorted(os.listdir(cert_dir)):
@@ -24437,7 +24439,7 @@ def takserver_rotate_rootca():
 
             log("")
             log(f"Step 2/8: Creating new Root CA: {new_root_name}...")
-            run('chmod +r /opt/tak/certs/cert-metadata.sh 2>/dev/null')
+            run('chown tak:tak /opt/tak/certs/cert-metadata.sh && chmod 500 /opt/tak/certs/cert-metadata.sh')
             _patch_cert_metadata_password(cert_pass)
             if not run(f'cd /opt/tak/certs && echo "{new_root_name}" | sudo -u tak ./makeRootCa.sh 2>&1'):
                 raise Exception('Failed to create new Root CA')
@@ -24606,7 +24608,7 @@ def takserver_create_client_cert():
 
     try:
         _patch_openssl_string_mask()
-        subprocess.run('chmod +r /opt/tak/certs/cert-metadata.sh 2>/dev/null', shell=True, capture_output=True)
+        subprocess.run('chown tak:tak /opt/tak/certs/cert-metadata.sh && chmod 500 /opt/tak/certs/cert-metadata.sh', shell=True, capture_output=True)
         r = subprocess.run(
             f'sudo -u tak bash -c "cd /opt/tak/certs && ./makeCert.sh client {cert_name}" 2>&1',
             shell=True, capture_output=True, text=True, timeout=30
