@@ -28350,6 +28350,21 @@ def _post_update_auto_deploy():
             import time
             time.sleep(10)
 
+            # Fix cert-metadata.sh ownership (v0.5.8 — servers upgraded from 5.6→5.7 left it as root:root)
+            _cm = '/opt/tak/certs/cert-metadata.sh'
+            if os.path.exists(_cm):
+                try:
+                    import stat, pwd, grp
+                    st = os.stat(_cm)
+                    tak_uid = pwd.getpwnam('tak').pw_uid
+                    tak_gid = grp.getgrnam('tak').gr_gid
+                    if st.st_uid != tak_uid or st.st_gid != tak_gid:
+                        os.chown(_cm, tak_uid, tak_gid)
+                        os.chmod(_cm, stat.S_IRUSR | stat.S_IXUSR)
+                        print(f"Post-update: fixed cert-metadata.sh ownership to tak:tak")
+                except Exception as e:
+                    print(f"Post-update: cert-metadata.sh fixup skipped: {e}")
+
             # Re-deploy Guard Dog (updated scripts + timers)
             if os.path.exists('/opt/tak-guarddog') and os.path.exists('/opt/tak'):
                 if not guarddog_deploy_status.get('running'):
