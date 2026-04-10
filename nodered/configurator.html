@@ -131,6 +131,18 @@
   </h1>
   <p class="subtitle">Paste a Feature Service URL, pick your layer &amp; fields, generate config for the sync engine.</p>
 
+  <div id="savedConfigBar" style="display:none;margin-bottom:1rem;padding:0.8rem;background:#0f3460;border-radius:6px">
+    <div class="row">
+      <div class="grow">
+        <label for="savedConfigSelect" style="margin-bottom:0.3rem">Saved configurations</label>
+        <select id="savedConfigSelect" onchange="loadSavedConfig()">
+          <option value="">— New config —</option>
+        </select>
+      </div>
+      <button class="btn-secondary" onclick="deleteSavedConfig()" style="margin-top:1.2rem">Delete</button>
+    </div>
+  </div>
+
   <!-- Step 1 -->
   <div class="step" id="step1">
     <h2>1. Feature Service URL</h2>
@@ -742,6 +754,113 @@ function downloadConfig() {
   a.download = 'arcgis-tak-config.json';
   a.click();
 }
+
+/* ── Load saved configs on page open ── */
+var _savedConfigs = [];
+
+async function loadSavedConfigs() {
+  try {
+    var res = await fetch('/api/config/load');
+    var data = await res.json();
+    _savedConfigs = data.configs || [];
+    if (_savedConfigs.length === 0) return;
+
+    var bar = document.getElementById('savedConfigBar');
+    bar.style.display = 'block';
+    var sel = document.getElementById('savedConfigSelect');
+    sel.innerHTML = '<option value="">— New config —</option>';
+    _savedConfigs.forEach(function(c, i) {
+      var label = (c.source.layerName || 'Config') + ' (' + (c.source.serviceUrl || '').split('/').pop() + ')';
+      sel.innerHTML += '<option value="' + i + '">' + label + '</option>';
+    });
+
+    if (_savedConfigs.length === 1) {
+      sel.value = '0';
+      loadSavedConfig();
+    }
+  } catch (e) {}
+}
+
+async function loadSavedConfig() {
+  var idx = document.getElementById('savedConfigSelect').value;
+  if (idx === '') return;
+  var c = _savedConfigs[parseInt(idx, 10)];
+  if (!c) return;
+
+  document.getElementById('serviceUrl').value = c.source.serviceUrl || '';
+  state.serviceUrl = c.source.serviceUrl || '';
+
+  await fetchService();
+
+  var layerSel = document.getElementById('layerSelect');
+  if (c.source.layerId != null) {
+    layerSel.value = String(c.source.layerId);
+    await fetchLayer();
+  }
+
+  if (c.mapping) {
+    if (c.mapping.idField) document.getElementById('idField').value = c.mapping.idField;
+    if (c.mapping.timeField) document.getElementById('timeField').value = c.mapping.timeField;
+  }
+
+  if (c.filter && c.filter.field) {
+    document.getElementById('filterField').value = c.filter.field;
+    await fetchDistinct();
+    if (c.filter.values && c.filter.values.length) {
+      state.selectedValues = [];
+      state.manualSources = [];
+      c.filter.values.forEach(function(v) {
+        var distIdx = state.distinctValues.indexOf(v);
+        if (distIdx >= 0) {
+          state.selectedValues.push(v);
+          var cbs = document.querySelectorAll('#distinctValues input[type=checkbox]');
+          if (cbs[distIdx]) {
+            cbs[distIdx].checked = true;
+            cbs[distIdx].closest('.cb-item').classList.add('checked');
+          }
+        } else {
+          state.manualSources.push(v);
+        }
+      });
+      renderAllSelectedTags();
+      updateFilterPreview();
+    }
+  }
+
+  if (c.style) {
+    if (c.style.color) {
+      document.getElementById('shapeColor').value = c.style.color;
+      document.getElementById('shapeColorPick').value = c.style.color;
+      updSwatch('swColor', c.style.color);
+    }
+    if (c.style.fillAlpha) document.getElementById('fillAlpha').value = c.style.fillAlpha;
+    if (c.style.strokeWeight) document.getElementById('strokeWeight').value = String(c.style.strokeWeight);
+    if (c.style.strokeStyle) document.getElementById('strokeStyle').value = c.style.strokeStyle;
+    if (c.style.closed != null) document.getElementById('closedShape').value = String(c.style.closed);
+    if (c.style.labelsOn != null) document.getElementById('labelsOn').value = String(c.style.labelsOn);
+    if (c.style.labelField) document.getElementById('labelField').value = c.style.labelField;
+  }
+
+  if (c.remarksTemplate) document.getElementById('remarksTemplate').value = c.remarksTemplate;
+  if (c.ttlHours != null) document.getElementById('ttlHours').value = c.ttlHours;
+  if (c.uidPrefix) document.getElementById('uidPrefix').value = c.uidPrefix;
+
+  status('saveStatus', 'Loaded saved config — edit and Generate to publish changes', true);
+}
+
+async function deleteSavedConfig() {
+  var idx = document.getElementById('savedConfigSelect').value;
+  if (idx === '') return;
+  _savedConfigs.splice(parseInt(idx, 10), 1);
+  await fetch('/api/config/save-all', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ configs: _savedConfigs })
+  });
+  loadSavedConfigs();
+}
+
+loadSavedConfigs();
 </script>
 </body>
 </html>

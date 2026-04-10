@@ -318,6 +318,58 @@ const flows = [
     id: 'ho_save', type: 'http response', z: FLOW_ID,
     name: '', statusCode: '', headers: {},
     x: 640, y: 620, wires: []
+  },
+
+  // POST /api/config/save-all  →  replace all configs (used by delete)
+  {
+    id: 'hi_saveall', type: 'http in', z: FLOW_ID,
+    name: 'POST /api/config/save-all',
+    url: '/api/config/save-all', method: 'post',
+    upload: false, swaggerDoc: '',
+    x: 200, y: 660, wires: [['fn_saveall']]
+  },
+  {
+    id: 'fn_saveall', type: 'function', z: FLOW_ID,
+    name: 'Replace all configs',
+    func: [
+      "flow.set('arcgis_configs', msg.payload.configs || []);",
+      "msg.payload = { ok: true };",
+      "return msg;"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 430, y: 660, wires: [['ho_saveall']]
+  },
+  {
+    id: 'ho_saveall', type: 'http response', z: FLOW_ID,
+    name: '', statusCode: '', headers: {},
+    x: 640, y: 660, wires: []
+  },
+
+  // GET /api/config/load  →  return saved configs
+  {
+    id: 'hi_load', type: 'http in', z: FLOW_ID,
+    name: 'GET /api/config/load',
+    url: '/api/config/load', method: 'get',
+    upload: false, swaggerDoc: '',
+    x: 200, y: 700, wires: [['fn_load']]
+  },
+  {
+    id: 'fn_load', type: 'function', z: FLOW_ID,
+    name: 'Load from flow context',
+    func: [
+      "var configs = flow.get('arcgis_configs') || [];",
+      "msg.payload = { configs: configs };",
+      "return msg;"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 430, y: 700, wires: [['ho_load']]
+  },
+  {
+    id: 'ho_load', type: 'http response', z: FLOW_ID,
+    name: '', statusCode: '', headers: {},
+    x: 640, y: 700, wires: []
   }
 ];
 
