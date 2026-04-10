@@ -909,7 +909,6 @@ function downloadConfig() {
 /* ── Load saved configs on page open ── */
 var _savedConfigs = [];
 var _activeConfigIdx = -1;
-var _initialLoad = true;
 
 async function loadSavedConfigs() {
   try {
@@ -918,16 +917,13 @@ async function loadSavedConfigs() {
     _savedConfigs = data.configs || [];
     if (_savedConfigs.length === 0) {
       document.getElementById('savedConfigBar').style.display = 'none';
+      showSteps();
       return;
     }
 
     document.getElementById('savedConfigBar').style.display = 'block';
     renderConfigList();
-
-    if (_initialLoad && _savedConfigs.length === 1) {
-      selectConfig(0);
-    }
-    _initialLoad = false;
+    hideSteps();
   } catch (e) {}
 }
 
@@ -1097,7 +1093,11 @@ async function deleteConfig(idx) {
     body: JSON.stringify({ configs: _savedConfigs })
   });
   renderConfigList();
-  if (_savedConfigs.length === 0) document.getElementById('savedConfigBar').style.display = 'none';
+  if (_savedConfigs.length === 0) {
+    document.getElementById('savedConfigBar').style.display = 'none';
+    resetForm();
+    showSteps();
+  }
 }
 
 loadSavedConfigs();
