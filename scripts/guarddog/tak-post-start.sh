@@ -126,15 +126,17 @@ else
 fi
 
 # ── 4. Start CloudTAK ──
+# Stagger Docker starts to avoid iptables churn that disrupts TAK Server connections
 CT_DIR=""
 for _d in /root/CloudTAK "${HOME:-/root}/CloudTAK"; do
   [ -f "$_d/docker-compose.yml" ] && CT_DIR="$_d" && break
 done
 
 if [ -n "$CT_DIR" ]; then
-  _log "Starting CloudTAK..."
+  _log "Starting CloudTAK (30s stagger to protect TAK connections)..."
+  sleep 30
   cd "$CT_DIR" && docker compose up -d 2>/dev/null
-  sleep 10
+  sleep 15
   _log "CloudTAK started"
 else
   _log "CloudTAK not installed, skipping"
@@ -147,17 +149,20 @@ for _d in /root/node-red "${HOME:-/root}/node-red"; do
 done
 
 if [ -n "$NR_DIR" ]; then
-  _log "Starting Node-RED..."
+  _log "Starting Node-RED (30s stagger to protect TAK connections)..."
+  sleep 30
   cd "$NR_DIR" && docker compose up -d 2>/dev/null
-  sleep 10
+  sleep 15
   _log "Node-RED started"
 else
   _log "Node-RED not installed, skipping"
 fi
 
 # ── 6. Start MediaMTX ──
+# MediaMTX is systemd-native (no Docker iptables impact), shorter stagger is fine
 if systemctl list-unit-files mediamtx.service &>/dev/null; then
   _log "Starting MediaMTX..."
+  sleep 10
   systemctl start mediamtx 2>/dev/null
   sleep 5
   if systemctl is-active --quiet mediamtx 2>/dev/null; then
