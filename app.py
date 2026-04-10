@@ -15027,7 +15027,12 @@ def _run_nodered_deploy_remote(settings, deploy_cfg, plog):
   flowFilePretty: true,
   userDir: '/data',
   httpAdminRoot: '/',
-  httpNodeRoot: '/'
+  httpNodeRoot: '/',
+  contextStorage: {
+    default: {
+      module: 'localfilesystem'
+    }
+  }
 };
 """
     compose_yml = """services:
@@ -15134,7 +15139,12 @@ def run_nodered_deploy():
   flowFilePretty: true,
   userDir: '/data',
   httpAdminRoot: '/',
-  httpNodeRoot: '/'
+  httpNodeRoot: '/',
+  contextStorage: {
+    default: {
+      module: 'localfilesystem'
+    }
+  }
 };
 """)
         with open(compose_yml, 'w') as f:
