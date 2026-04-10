@@ -904,10 +904,48 @@ function renderConfigList() {
 function newConfig() {
   _activeConfigIdx = -1;
   renderConfigList();
+
   document.getElementById('serviceUrl').value = '';
   document.getElementById('configName').value = '';
   document.getElementById('configOutput').textContent = '';
-  status('saveStatus', '', true);
+
+  document.getElementById('layerSelect').innerHTML = '<option value="">-- fetch service first --</option>';
+  document.getElementById('idField').innerHTML = '';
+  document.getElementById('timeField').innerHTML = '<option value="">(none)</option>';
+  document.getElementById('labelField').innerHTML = '<option value="">(none)</option>';
+  document.getElementById('filterField').innerHTML = '<option value="">(none)</option>';
+  document.getElementById('distinctValues').innerHTML = '';
+  document.getElementById('filterPreview').textContent = '';
+  document.getElementById('remarksAvailable').innerHTML = '';
+  document.getElementById('remarksSelected').innerHTML = '';
+  document.getElementById('remarksPreview').textContent = '';
+  document.getElementById('sampleData').innerHTML = '';
+  document.getElementById('geomBadge').textContent = '';
+  if (document.getElementById('allSelectedTags')) document.getElementById('allSelectedTags').innerHTML = '';
+  if (document.getElementById('manualTags')) document.getElementById('manualTags').innerHTML = '';
+
+  state.serviceUrl = '';
+  state.layers = [];
+  state.selectedLayer = null;
+  state.fields = [];
+  state.geometryType = '';
+  state.sampleFeatures = [];
+  state.filterField = '';
+  state.distinctValues = [];
+  state.selectedValues = [];
+  state.manualSources = [];
+  state.remarksFields = [];
+
+  ['step2','step3','step3b','step4','step5'].forEach(function(id) {
+    document.getElementById(id).classList.add('disabled');
+  });
+
+  document.getElementById('svcStatus').innerHTML = '';
+  document.getElementById('layerStatus').innerHTML = '';
+  document.getElementById('filterStatus').innerHTML = '';
+  document.getElementById('saveStatus').innerHTML = '';
+
+  window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
 async function selectConfig(idx) {
