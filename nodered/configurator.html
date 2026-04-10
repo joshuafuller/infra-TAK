@@ -166,6 +166,8 @@
     </div>
   </div>
 
+  <div id="stepsContainer" style="display:none">
+
   <!-- Step 1 -->
   <div class="step" id="step1">
     <h2>1. Feature Service URL</h2>
@@ -365,6 +367,8 @@
     <div id="saveStatus"></div>
     <div class="config-output" id="configOutput"></div>
   </div>
+
+  </div><!-- end stepsContainer -->
 </div>
 
 <script>
@@ -839,7 +843,7 @@ function generateConfig() {
     .then(function(d) {
       _savedConfigs = [];
       loadSavedConfigs();
-      setTimeout(function() { newConfig(); }, 500);
+      setTimeout(function() { resetForm(); hideSteps(); }, 500);
     })
     .catch(function() {});
 }
@@ -880,7 +884,6 @@ async function loadSavedConfigs() {
     renderConfigList();
 
     if (_initialLoad && _savedConfigs.length === 1) {
-      _initialLoad = false;
       selectConfig(0);
     }
     _initialLoad = false;
@@ -905,7 +908,15 @@ function renderConfigList() {
   document.getElementById('configList').innerHTML = html;
 }
 
-function newConfig() {
+function hideSteps() {
+  document.getElementById('stepsContainer').style.display = 'none';
+}
+
+function showSteps() {
+  document.getElementById('stepsContainer').style.display = 'block';
+}
+
+function resetForm() {
   _activeConfigIdx = -1;
   renderConfigList();
 
@@ -952,9 +963,15 @@ function newConfig() {
   window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
+function newConfig() {
+  resetForm();
+  showSteps();
+}
+
 async function selectConfig(idx) {
   _activeConfigIdx = idx;
   renderConfigList();
+  showSteps();
   var c = _savedConfigs[idx];
   if (!c) return;
 
