@@ -781,7 +781,7 @@ const engineFlows = [
       "      {",
       "        method: 'PUT',",
       "        url: baseUrl + '/contents?creatorUid=' + creator,",
-      "        header: { 'accept': '*/*', 'Content-Type': 'application/json' },",
+      "        headers: { 'accept': '*/*', 'Content-Type': 'application/json' },",
       "        payload: JSON.stringify({ uids: [uid] }),",
       "        topic: topicCfg",
       "      }",
