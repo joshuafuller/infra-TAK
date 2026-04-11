@@ -830,14 +830,8 @@ const engineFlows = [
   },
   {
     id: 'eng_tak', type: 'tak', z: FLOW_ID,
-    name: 'CoT JSON → XML',
-    x: 200, y: 460 + EY, wires: [['eng_tak_out']]
-  },
-  {
-    id: 'eng_tak_out', type: 'tak server', z: FLOW_ID,
-    name: 'TAK Server (8089)',
-    server: '', port: '8089', tls: 'tls_tak',
-    x: 420, y: 460 + EY, wires: [[]]
+    name: 'CoT → TAK Server',
+    x: 200, y: 460 + EY, wires: [[]]
   },
   {
     id: 'eng_http_action', type: 'http request', z: FLOW_ID,
