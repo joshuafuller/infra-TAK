@@ -965,7 +965,8 @@
     "wires": [
       [
         "eng_debug_cot",
-        "eng_tak"
+        "eng_tak",
+        "eng_delay_put"
       ],
       [
         "eng_delay_del"
@@ -1007,6 +1008,29 @@
     "x": 200,
     "y": 1380,
     "wires": [
+      []
+    ]
+  },
+  {
+    "id": "eng_delay_put",
+    "type": "delay",
+    "z": "flow_arcgis_cfg",
+    "name": "Wait 5s for CoT",
+    "pauseType": "delay",
+    "timeout": "5",
+    "timeoutUnits": "seconds",
+    "rate": "1",
+    "nbRateUnits": "1",
+    "rateUnits": "second",
+    "randomFirst": "1",
+    "randomLast": "5",
+    "randomUnits": "seconds",
+    "drop": false,
+    "allowrate": false,
+    "outputs": 1,
+    "x": 200,
+    "y": 1420,
+    "wires": [
       [
         "eng_build_put"
       ]
@@ -1016,7 +1040,7 @@
     "id": "eng_build_put",
     "type": "function",
     "z": "flow_arcgis_cfg",
-    "name": "Build PUT (after CoT sent)",
+    "name": "Build PUT (after delay)",
     "func": "if (!msg._putUrl || !msg._putUid) return null;\nmsg.method = 'PUT';\nmsg.url = msg._putUrl;\nmsg.headers = { 'accept': '*/*', 'Content-Type': 'application/json' };\nmsg.payload = JSON.stringify({ uids: [msg._putUid] });\nreturn msg;",
     "outputs": 1,
     "timeout": "",
@@ -1024,8 +1048,8 @@
     "initialize": "",
     "finalize": "",
     "libs": [],
-    "x": 380,
-    "y": 1380,
+    "x": 400,
+    "y": 1420,
     "wires": [
       [
         "eng_http_action"
@@ -1050,7 +1074,7 @@
     "allowrate": false,
     "outputs": 1,
     "x": 280,
-    "y": 1440,
+    "y": 1460,
     "wires": [
       [
         "eng_http_action"

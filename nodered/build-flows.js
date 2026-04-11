@@ -805,7 +805,7 @@ const engineFlows = [
     ].join('\n'),
     outputs: 2, timeout: '', noerr: 0,
     initialize: '', finalize: '', libs: [],
-    x: 600, y: 300 + EY, wires: [['eng_debug_cot', 'eng_tak'], ['eng_delay_del']]
+    x: 600, y: 300 + EY, wires: [['eng_debug_cot', 'eng_tak', 'eng_delay_put'], ['eng_delay_del']]
   },
 
   // ════════════════════════════════════════════════
@@ -827,11 +827,19 @@ const engineFlows = [
   {
     id: 'eng_tak', type: 'tak', z: FLOW_ID,
     name: 'CoT → TAK Server',
-    x: 200, y: 460 + EY, wires: [['eng_build_put']]
+    x: 200, y: 460 + EY, wires: [[]]
+  },
+  {
+    id: 'eng_delay_put', type: 'delay', z: FLOW_ID,
+    name: 'Wait 5s for CoT', pauseType: 'delay', timeout: '5', timeoutUnits: 'seconds',
+    rate: '1', nbRateUnits: '1', rateUnits: 'second',
+    randomFirst: '1', randomLast: '5', randomUnits: 'seconds',
+    drop: false, allowrate: false, outputs: 1,
+    x: 200, y: 500 + EY, wires: [['eng_build_put']]
   },
   {
     id: 'eng_build_put', type: 'function', z: FLOW_ID,
-    name: 'Build PUT (after CoT sent)',
+    name: 'Build PUT (after delay)',
     func: [
       "if (!msg._putUrl || !msg._putUid) return null;",
       "msg.method = 'PUT';",
@@ -842,7 +850,7 @@ const engineFlows = [
     ].join('\n'),
     outputs: 1, timeout: '', noerr: 0,
     initialize: '', finalize: '', libs: [],
-    x: 380, y: 460 + EY, wires: [['eng_http_action']]
+    x: 400, y: 500 + EY, wires: [['eng_http_action']]
   },
   {
     id: 'eng_delay_del', type: 'delay', z: FLOW_ID,
@@ -850,7 +858,7 @@ const engineFlows = [
     rate: '1', nbRateUnits: '1', rateUnits: 'second',
     randomFirst: '1', randomLast: '5', randomUnits: 'seconds',
     drop: false, allowrate: false, outputs: 1,
-    x: 280, y: 520 + EY, wires: [['eng_http_action']]
+    x: 280, y: 540 + EY, wires: [['eng_http_action']]
   },
   {
     id: 'eng_http_action', type: 'http request', z: FLOW_ID,
