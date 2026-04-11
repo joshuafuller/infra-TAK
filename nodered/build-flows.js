@@ -698,7 +698,7 @@ const engineFlows = [
     url: '', tls: 'tls_tak', persist: false, proxy: '',
     insecureHTTPParser: false, authType: '',
     senderr: false, headers: [],
-    x: 380, y: 300 + EY, wires: [['eng_build_m']]
+    x: 380, y: 300 + EY, wires: [['eng_debug_sub', 'eng_build_m']]
   },
   {
     id: 'eng_build_m', type: 'function', z: FLOW_ID,
@@ -872,6 +872,35 @@ const engineFlows = [
     host: '', port: '', beserver: 'client',
     base64: false, end: false, tls: 'tls_tak',
     x: 410, y: 460 + EY, wires: []
+  },
+  {
+    id: 'eng_status_stream', type: 'status', z: FLOW_ID,
+    name: 'Stream status',
+    scope: ['eng_tcp_out'],
+    x: 410, y: 500 + EY, wires: [['eng_debug_stream']]
+  },
+  {
+    id: 'eng_catch_stream', type: 'catch', z: FLOW_ID,
+    name: 'Stream errors',
+    scope: ['eng_tcp_out', 'eng_tak'],
+    uncaught: false,
+    x: 180, y: 540 + EY, wires: [['eng_debug_stream']]
+  },
+  {
+    id: 'eng_debug_stream', type: 'debug', z: FLOW_ID,
+    name: 'TAK stream status/error',
+    active: true, tosidebar: true, console: false, tostatus: true,
+    complete: 'true', targetType: 'full',
+    statusVal: '', statusType: 'auto',
+    x: 640, y: 500 + EY, wires: []
+  },
+  {
+    id: 'eng_debug_sub', type: 'debug', z: FLOW_ID,
+    name: 'Mission subscribe result',
+    active: true, tosidebar: true, console: false, tostatus: false,
+    complete: 'true', targetType: 'full',
+    statusVal: '', statusType: 'auto',
+    x: 620, y: 260 + EY, wires: []
   },
   {
     id: 'eng_delay_put', type: 'delay', z: FLOW_ID,

@@ -900,6 +900,7 @@
     "y": 1220,
     "wires": [
       [
+        "eng_debug_sub",
         "eng_build_m"
       ]
     ]
@@ -1026,6 +1027,74 @@
     "tls": "tls_tak",
     "x": 410,
     "y": 1380,
+    "wires": []
+  },
+  {
+    "id": "eng_status_stream",
+    "type": "status",
+    "z": "flow_arcgis_cfg",
+    "name": "Stream status",
+    "scope": [
+      "eng_tcp_out"
+    ],
+    "x": 410,
+    "y": 1420,
+    "wires": [
+      [
+        "eng_debug_stream"
+      ]
+    ]
+  },
+  {
+    "id": "eng_catch_stream",
+    "type": "catch",
+    "z": "flow_arcgis_cfg",
+    "name": "Stream errors",
+    "scope": [
+      "eng_tcp_out",
+      "eng_tak"
+    ],
+    "uncaught": false,
+    "x": 180,
+    "y": 1460,
+    "wires": [
+      [
+        "eng_debug_stream"
+      ]
+    ]
+  },
+  {
+    "id": "eng_debug_stream",
+    "type": "debug",
+    "z": "flow_arcgis_cfg",
+    "name": "TAK stream status/error",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": true,
+    "complete": "true",
+    "targetType": "full",
+    "statusVal": "",
+    "statusType": "auto",
+    "x": 640,
+    "y": 1420,
+    "wires": []
+  },
+  {
+    "id": "eng_debug_sub",
+    "type": "debug",
+    "z": "flow_arcgis_cfg",
+    "name": "Mission subscribe result",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "true",
+    "targetType": "full",
+    "statusVal": "",
+    "statusType": "auto",
+    "x": 620,
+    "y": 1180,
     "wires": []
   },
   {
