@@ -846,7 +846,7 @@
     "y": 1100,
     "wires": [
       [
-        "eng_build_m"
+        "eng_build_sub"
       ]
     ]
   },
@@ -901,7 +901,31 @@
     "wires": [
       [
         "eng_debug_sub",
-        "eng_build_m"
+        "eng_add_mission_simple"
+      ]
+    ]
+  },
+  {
+    "id": "eng_add_mission_simple",
+    "type": "function",
+    "z": "flow_arcgis_cfg",
+    "name": "Emit CoT + DataSync add (no dedupe)",
+    "func": "var features = msg._features || [];\\nvar cfg = msg._config || {};\\nvar tak = msg.takSettings || {};\\nvar topicCfg = (cfg && cfg.configName && String(cfg.configName).trim()) ? String(cfg.configName).trim() : 'unnamed';\\nvar host = String(tak.serverUrl || '').replace(/^https?:\\/\\//i, '').replace(/\\/$/, '');\\nvar streamPort = Number(tak.streamingPort || tak.streamPort || tak.takPort || 8089);\\nvar baseUrl = 'https://' + host + ':' + (tak.missionApiPort || 8443)\\n  + '/Marti/api/missions/' + encodeURIComponent(cfg.missionName);\\nvar creatorUidRaw = String((cfg && cfg.creatorUid) || (tak && tak.creatorUid) || 'nodered').trim();\\nvar creator = encodeURIComponent(creatorUidRaw);\\nvar cookie = '';\\nif (msg.responseCookies && msg.responseCookies.JSESSIONID && msg.responseCookies.JSESSIONID.value) {\\n  cookie = 'JSESSIONID=' + String(msg.responseCookies.JSESSIONID.value);\\n}\\nif (!cookie && msg.headers && msg.headers['set-cookie']) {\\n  var sc = msg.headers['set-cookie'];\\n  if (Array.isArray(sc) && sc.length) {\\n    var m = String(sc[0]).match(/JSESSIONID=([^;]+)/);\\n    if (m && m[1]) cookie = 'JSESSIONID=' + m[1];\\n  } else if (typeof sc === 'string') {\\n    var n = sc.match(/JSESSIONID=([^;]+)/);\\n    if (n && n[1]) cookie = 'JSESSIONID=' + n[1];\\n  }\\n}\\nvar nPut = 0;\\nfor (var i = 0; i < features.length; i++) {\\n  var f = features[i];\\n  nPut++;\\n  var putMsg = {\\n    method: 'PUT',\\n    url: baseUrl + '/contents?creatorUid=' + creator,\\n    headers: { 'accept': '*/*', 'Content-Type': 'application/json' },\\n    payload: JSON.stringify({ uids: [f.uid] }),\\n    topic: topicCfg\\n  };\\n  if (cookie) putMsg.headers.Cookie = cookie;\\n  node.send([\\n    { payload: f.cot, topic: topicCfg, host: host, port: streamPort },\\n    putMsg\\n  ]);\\n}\\nnode.warn(topicCfg + ' add-only: streamed ' + features.length + ', PUT ' + nPut);\\nreturn null;",
+    "outputs": 2,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 650,
+    "y": 1220,
+    "wires": [
+      [
+        "eng_debug_cot",
+        "eng_tak"
+      ],
+      [
+        "eng_http_action"
       ]
     ]
   },
