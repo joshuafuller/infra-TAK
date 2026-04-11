@@ -772,19 +772,15 @@ const engineFlows = [
       "",
       "var nPut = 0, nDel = 0;",
       "",
-      "// New features → CoT out (port 0) + PUT (port 1)",
+      "// New features → CoT out (port 0) with metadata for PUT after send",
       "for (var uid in arcgis) {",
       "  if (!existing[uid]) {",
       "    nPut++;",
       "    node.send([",
-      "      { payload: arcgis[uid].cot, topic: topicCfg },",
-      "      {",
-      "        method: 'PUT',",
-      "        url: baseUrl + '/contents?creatorUid=' + creator,",
-      "        headers: { 'accept': '*/*', 'Content-Type': 'application/json' },",
-      "        payload: JSON.stringify({ uids: [uid] }),",
-      "        topic: topicCfg",
-      "      }",
+      "      { payload: arcgis[uid].cot, topic: topicCfg,",
+      "        _putUrl: baseUrl + '/contents?creatorUid=' + creator,",
+      "        _putUid: uid },",
+      "      null",
       "    ]);",
       "  }",
       "}",
@@ -809,7 +805,7 @@ const engineFlows = [
     ].join('\n'),
     outputs: 2, timeout: '', noerr: 0,
     initialize: '', finalize: '', libs: [],
-    x: 600, y: 300 + EY, wires: [['eng_debug_cot', 'eng_tak'], ['eng_http_action']]
+    x: 600, y: 300 + EY, wires: [['eng_debug_cot', 'eng_tak'], ['eng_delay_del']]
   },
 
   // ════════════════════════════════════════════════
@@ -831,12 +827,34 @@ const engineFlows = [
   {
     id: 'eng_tak', type: 'tak', z: FLOW_ID,
     name: 'CoT → TAK Server',
-    x: 200, y: 460 + EY, wires: [[]]
+    x: 200, y: 460 + EY, wires: [['eng_build_put']]
+  },
+  {
+    id: 'eng_build_put', type: 'function', z: FLOW_ID,
+    name: 'Build PUT (after CoT sent)',
+    func: [
+      "if (!msg._putUrl || !msg._putUid) return null;",
+      "msg.method = 'PUT';",
+      "msg.url = msg._putUrl;",
+      "msg.headers = { 'accept': '*/*', 'Content-Type': 'application/json' };",
+      "msg.payload = JSON.stringify({ uids: [msg._putUid] });",
+      "return msg;"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 380, y: 460 + EY, wires: [['eng_http_action']]
+  },
+  {
+    id: 'eng_delay_del', type: 'delay', z: FLOW_ID,
+    name: '', pauseType: 'delay', timeout: '1', timeoutUnits: 'seconds',
+    rate: '1', nbRateUnits: '1', rateUnits: 'second',
+    randomFirst: '1', randomLast: '5', randomUnits: 'seconds',
+    drop: false, allowrate: false, outputs: 1,
+    x: 280, y: 520 + EY, wires: [['eng_http_action']]
   },
   {
     id: 'eng_http_action', type: 'http request', z: FLOW_ID,
     name: 'Mission API (PUT/DELETE)',
-    // ret: txt — TAK often returns empty body or non-JSON on PUT/DELETE; obj causes "JSON parse error"
     method: 'use', ret: 'txt', paytoqs: 'ignore',
     url: '', tls: 'tls_tak', persist: false, proxy: '',
     insecureHTTPParser: false, authType: '',
