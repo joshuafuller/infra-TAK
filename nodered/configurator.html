@@ -184,10 +184,6 @@
           <label for="takStreamPort">Streaming port</label>
           <input type="number" id="takStreamPort" value="8089">
         </div>
-        <div>
-          <label for="takCreatorUid">Creator UID</label>
-          <input type="text" id="takCreatorUid" placeholder="e.g. nodered-arcgis" value="nodered-arcgis-engine">
-        </div>
       </div>
       <button onclick="saveTakSettings()" style="margin-top:0.5rem">Save TAK Settings</button>
       <span id="takSettingsStatus" style="margin-left:0.5rem;font-size:0.85rem"></span>
@@ -400,11 +396,17 @@
     <div class="field-grid" style="margin-bottom:1rem">
       <div>
         <label for="configName">Config name</label>
-        <input type="text" id="configName" placeholder="e.g. CA Fires - FIRIS Only">
+        <input type="text" id="configName" placeholder="Shown in Saved list &amp; Node-RED debug (e.g. CA AIR INTEL)">
       </div>
       <div>
         <label for="missionName">TAK Mission name</label>
         <input type="text" id="missionName" placeholder="e.g. ArcGIS-Fires">
+      </div>
+    </div>
+    <div class="field-grid" style="margin-bottom:1rem">
+      <div>
+        <label for="configCreatorUid">Creator UID</label>
+        <input type="text" id="configCreatorUid" placeholder="e.g. nodered-global-airdata (match Portal integration user &amp; TLS cert)">
       </div>
     </div>
     <div class="row">
@@ -880,6 +882,7 @@ function generateConfig() {
     ttlUnit: document.getElementById('ttlUnit').value,
     uidPrefix: document.getElementById('uidPrefix').value,
     missionName: document.getElementById('missionName').value || '',
+    creatorUid: (document.getElementById('configCreatorUid').value || '').trim(),
     generated: new Date().toISOString()
   };
 
@@ -936,17 +939,23 @@ async function loadSavedConfigs() {
   } catch (e) {}
 }
 
+function _esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
 function renderConfigList() {
   var html = '';
   _savedConfigs.forEach(function(c, i) {
-    var name = c.configName || c.source.layerName || 'Unnamed Config';
+    var rawName = (c.configName && String(c.configName).trim()) ? c.configName.trim() : '';
+    var name = rawName ? _esc(rawName) : '<span style="color:#e94560">Unnamed</span> <span style="color:#888;font-weight:400;font-size:0.8rem">(set Config name in Step 5)</span>';
     var detail = (c.source.serviceUrl || '').split('/services/')[1] || c.source.serviceUrl || '';
     if (detail.length > 60) detail = detail.substring(0, 60) + '…';
     var filters = (c.filter && c.filter.values) ? c.filter.values.join(', ') : 'No filter';
     var active = (i === _activeConfigIdx) ? ' active' : '';
     html += '<div class="config-card' + active + '" onclick="selectConfig(' + i + ')">' +
       '<div><div class="cc-name">' + name + '</div>' +
-      '<div class="cc-detail">' + detail + ' | ' + filters + '</div></div>' +
+      '<div class="cc-detail">' + _esc(detail) + ' | ' + _esc(filters) + '</div></div>' +
       '<div class="cc-actions">' +
       '<button class="btn-secondary" onclick="event.stopPropagation();deleteConfig(' + i + ')">Delete</button>' +
       '</div></div>';
@@ -969,6 +978,7 @@ function resetForm() {
   document.getElementById('serviceUrl').value = '';
   document.getElementById('configName').value = '';
   document.getElementById('missionName').value = '';
+  document.getElementById('configCreatorUid').value = '';
   document.getElementById('configOutput').textContent = '';
 
   document.getElementById('layerSelect').innerHTML = '<option value="">-- fetch service first --</option>';
@@ -1094,6 +1104,7 @@ async function selectConfig(idx) {
   }
   if (c.uidPrefix) document.getElementById('uidPrefix').value = c.uidPrefix;
   if (c.missionName) document.getElementById('missionName').value = c.missionName;
+  document.getElementById('configCreatorUid').value = (c.creatorUid != null && c.creatorUid !== '') ? c.creatorUid : '';
 
   document.getElementById('configOutput').textContent = JSON.stringify(c, null, 2);
   status('saveStatus', 'Loaded "' + (c.configName || 'config') + '" — edit and hit Save to publish changes', true);
@@ -1128,7 +1139,6 @@ async function loadTakSettings() {
     if (s.serverUrl) document.getElementById('takServerUrl').value = s.serverUrl;
     if (s.missionApiPort) document.getElementById('takApiPort').value = s.missionApiPort;
     if (s.streamingPort) document.getElementById('takStreamPort').value = s.streamingPort;
-    if (s.creatorUid) document.getElementById('takCreatorUid').value = s.creatorUid;
   } catch(e) {}
 }
 
@@ -1136,8 +1146,7 @@ async function saveTakSettings() {
   var settings = {
     serverUrl: document.getElementById('takServerUrl').value,
     missionApiPort: parseInt(document.getElementById('takApiPort').value) || 8443,
-    streamingPort: parseInt(document.getElementById('takStreamPort').value) || 8089,
-    creatorUid: document.getElementById('takCreatorUid').value
+    streamingPort: parseInt(document.getElementById('takStreamPort').value) || 8089
   };
   try {
     var res = await fetch('/api/tak-settings/save', {
