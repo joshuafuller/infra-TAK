@@ -624,6 +624,10 @@ const engineFlows = [
       "    labels_on: [{ _attributes: { value: cfg.style.labelsOn ? 'true' : 'false' } }]",
       "  };",
       "",
+      "  if (cfg.missionName) {",
+      "    detail.Marti = { dest: { _attributes: { mission: cfg.missionName } } };",
+      "  }",
+      "",
       "  if (isPoly && g.rings && g.rings[0]) {",
       "    var links = [];",
       "    var ring = g.rings[0];",
@@ -805,7 +809,7 @@ const engineFlows = [
     ].join('\n'),
     outputs: 2, timeout: '', noerr: 0,
     initialize: '', finalize: '', libs: [],
-    x: 600, y: 300 + EY, wires: [['eng_debug_cot'], ['eng_http_action']]
+    x: 600, y: 300 + EY, wires: [['eng_debug_cot', 'eng_tak'], ['eng_http_action']]
   },
 
   // ════════════════════════════════════════════════
@@ -818,11 +822,22 @@ const engineFlows = [
   },
   {
     id: 'eng_debug_cot', type: 'debug', z: FLOW_ID,
-    name: 'CoT JSON → TAK node',
+    name: 'CoT JSON',
     active: true, tosidebar: true, console: false, tostatus: true,
     complete: 'payload',
     targetType: 'msg',     statusVal: 'payload.event._attributes.uid', statusType: 'auto',
     x: 200, y: 420 + EY, wires: []
+  },
+  {
+    id: 'eng_tak', type: 'tak', z: FLOW_ID,
+    name: 'CoT JSON → XML',
+    x: 200, y: 460 + EY, wires: [['eng_tak_out']]
+  },
+  {
+    id: 'eng_tak_out', type: 'tak server', z: FLOW_ID,
+    name: 'TAK Server (8089)',
+    server: '', port: '8089', tls: 'tls_tak',
+    x: 420, y: 460 + EY, wires: [[]]
   },
   {
     id: 'eng_http_action', type: 'http request', z: FLOW_ID,

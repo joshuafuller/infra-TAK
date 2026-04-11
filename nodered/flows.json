@@ -835,7 +835,7 @@
     "type": "function",
     "z": "flow_arcgis_cfg",
     "name": "Parse & build CoT",
-    "func": "var features = (msg.payload && msg.payload.features) || [];\nvar cfg = msg._config;\nif (features.length === 0) { node.warn(cfg.configName + ': 0 features from ArcGIS'); return null; }\n\nfunction ttlMs(c) {\n  var u = c.ttlUnit || 'hours';\n  var v;\n  if (c.ttlValue != null && c.ttlValue !== '') v = Number(c.ttlValue);\n  else if (c.ttlHours != null && c.ttlHours !== '') { v = Number(c.ttlHours); u = 'hours'; }\n  else return 0;\n  if (!(v > 0) || v !== v) return 0;\n  if (u === 'minutes') return v * 60 * 1000;\n  if (u === 'days') return v * 24 * 3600000;\n  return v * 3600000;\n}\n\nfunction hexArgb(hex, a) {\n  var r = parseInt(hex.substr(1,2),16);\n  var g = parseInt(hex.substr(3,2),16);\n  var b = parseInt(hex.substr(5,2),16);\n  var ai = Math.round((a !== undefined ? a : 1) * 255);\n  return ((ai << 24) | (r << 16) | (g << 8) | b);\n}\n\nvar strokeArgb = hexArgb(cfg.style.color || '#FF0000', 1);\nvar fillArgb   = hexArgb(cfg.style.color || '#FF0000', parseFloat(cfg.style.fillAlpha || '0.3'));\nvar now = new Date();\nvar tm = ttlMs(cfg);\nvar staleMs = tm > 0 ? tm : 3600000;\nvar stale = new Date(now.getTime() + staleMs);\nvar isPoly = cfg.source.geometryType !== 'esriGeometryPoint';\nvar cotType = isPoly ? 'u-d-f' : 'a-u-G';\n\nvar results = [];\nfor (var i = 0; i < features.length; i++) {\n  var f = features[i];\n  var a = f.attributes || {};\n  var g = f.geometry;\n  if (!g) continue;\n\n  var idVal = a[cfg.mapping.idField] || ('f' + i);\n  var uid = (cfg.uidPrefix || 'arcgis') + '-' + String(idVal).replace(/[^a-zA-Z0-9_.-]/g, '_');\n\n  var lat, lon;\n  if (isPoly && g.rings && g.rings[0]) {\n    var ring = g.rings[0]; var sx=0,sy=0;\n    for (var j=0;j<ring.length;j++) { sx+=ring[j][0]; sy+=ring[j][1]; }\n    lon = sx/ring.length; lat = sy/ring.length;\n  } else { lat = g.y || 0; lon = g.x || 0; }\n\n  var callsign = uid;\n  if (cfg.style.labelField && a[cfg.style.labelField] != null) callsign = String(a[cfg.style.labelField]);\n\n  var remarks = '';\n  if (cfg.remarksFields && cfg.remarksFields.length) {\n    var rp = [];\n    for (var k=0;k<cfg.remarksFields.length;k++) {\n      var fn = cfg.remarksFields[k];\n      rp.push(fn + ': ' + (a[fn] != null ? String(a[fn]) : ''));\n    }\n    remarks = rp.join(' | ');\n  }\n\n  var detail = {\n    contact: [{ _attributes: { callsign: callsign } }],\n    remarks: remarks,\n    strokeColor: [{ _attributes: { value: String(strokeArgb) } }],\n    strokeWeight: [{ _attributes: { value: String(cfg.style.strokeWeight || 3) + '.0' } }],\n    fillColor: [{ _attributes: { value: String(fillArgb) } }],\n    labels_on: [{ _attributes: { value: cfg.style.labelsOn ? 'true' : 'false' } }]\n  };\n\n  if (isPoly && g.rings && g.rings[0]) {\n    var links = [];\n    var ring = g.rings[0];\n    for (var j=0;j<ring.length;j++) links.push({ _attributes: { point: ring[j][1]+','+ring[j][0] } });\n    detail.link = links;\n  }\n\n  results.push({\n    uid: uid,\n    cot: {\n      event: {\n        _attributes: {\n          version: '2.0', uid: uid, type: cotType,\n          how: 'h-e',\n          time: now.toISOString(),\n          start: now.toISOString(),\n          stale: stale.toISOString()\n        },\n        point: { _attributes: { lat: String(lat), lon: String(lon), hae: '9999999.0', ce: '9999999.0', le: '9999999.0' } },\n        detail: detail\n      }\n    }\n  });\n}\n\nnode.warn(cfg.configName + ': ' + results.length + ' CoT events built from ' + features.length + ' features');\nmsg._features = results;\nmsg._config = cfg;\nreturn msg;",
+    "func": "var features = (msg.payload && msg.payload.features) || [];\nvar cfg = msg._config;\nif (features.length === 0) { node.warn(cfg.configName + ': 0 features from ArcGIS'); return null; }\n\nfunction ttlMs(c) {\n  var u = c.ttlUnit || 'hours';\n  var v;\n  if (c.ttlValue != null && c.ttlValue !== '') v = Number(c.ttlValue);\n  else if (c.ttlHours != null && c.ttlHours !== '') { v = Number(c.ttlHours); u = 'hours'; }\n  else return 0;\n  if (!(v > 0) || v !== v) return 0;\n  if (u === 'minutes') return v * 60 * 1000;\n  if (u === 'days') return v * 24 * 3600000;\n  return v * 3600000;\n}\n\nfunction hexArgb(hex, a) {\n  var r = parseInt(hex.substr(1,2),16);\n  var g = parseInt(hex.substr(3,2),16);\n  var b = parseInt(hex.substr(5,2),16);\n  var ai = Math.round((a !== undefined ? a : 1) * 255);\n  return ((ai << 24) | (r << 16) | (g << 8) | b);\n}\n\nvar strokeArgb = hexArgb(cfg.style.color || '#FF0000', 1);\nvar fillArgb   = hexArgb(cfg.style.color || '#FF0000', parseFloat(cfg.style.fillAlpha || '0.3'));\nvar now = new Date();\nvar tm = ttlMs(cfg);\nvar staleMs = tm > 0 ? tm : 3600000;\nvar stale = new Date(now.getTime() + staleMs);\nvar isPoly = cfg.source.geometryType !== 'esriGeometryPoint';\nvar cotType = isPoly ? 'u-d-f' : 'a-u-G';\n\nvar results = [];\nfor (var i = 0; i < features.length; i++) {\n  var f = features[i];\n  var a = f.attributes || {};\n  var g = f.geometry;\n  if (!g) continue;\n\n  var idVal = a[cfg.mapping.idField] || ('f' + i);\n  var uid = (cfg.uidPrefix || 'arcgis') + '-' + String(idVal).replace(/[^a-zA-Z0-9_.-]/g, '_');\n\n  var lat, lon;\n  if (isPoly && g.rings && g.rings[0]) {\n    var ring = g.rings[0]; var sx=0,sy=0;\n    for (var j=0;j<ring.length;j++) { sx+=ring[j][0]; sy+=ring[j][1]; }\n    lon = sx/ring.length; lat = sy/ring.length;\n  } else { lat = g.y || 0; lon = g.x || 0; }\n\n  var callsign = uid;\n  if (cfg.style.labelField && a[cfg.style.labelField] != null) callsign = String(a[cfg.style.labelField]);\n\n  var remarks = '';\n  if (cfg.remarksFields && cfg.remarksFields.length) {\n    var rp = [];\n    for (var k=0;k<cfg.remarksFields.length;k++) {\n      var fn = cfg.remarksFields[k];\n      rp.push(fn + ': ' + (a[fn] != null ? String(a[fn]) : ''));\n    }\n    remarks = rp.join(' | ');\n  }\n\n  var detail = {\n    contact: [{ _attributes: { callsign: callsign } }],\n    remarks: remarks,\n    strokeColor: [{ _attributes: { value: String(strokeArgb) } }],\n    strokeWeight: [{ _attributes: { value: String(cfg.style.strokeWeight || 3) + '.0' } }],\n    fillColor: [{ _attributes: { value: String(fillArgb) } }],\n    labels_on: [{ _attributes: { value: cfg.style.labelsOn ? 'true' : 'false' } }]\n  };\n\n  if (cfg.missionName) {\n    detail.Marti = { dest: { _attributes: { mission: cfg.missionName } } };\n  }\n\n  if (isPoly && g.rings && g.rings[0]) {\n    var links = [];\n    var ring = g.rings[0];\n    for (var j=0;j<ring.length;j++) links.push({ _attributes: { point: ring[j][1]+','+ring[j][0] } });\n    detail.link = links;\n  }\n\n  results.push({\n    uid: uid,\n    cot: {\n      event: {\n        _attributes: {\n          version: '2.0', uid: uid, type: cotType,\n          how: 'h-e',\n          time: now.toISOString(),\n          start: now.toISOString(),\n          stale: stale.toISOString()\n        },\n        point: { _attributes: { lat: String(lat), lon: String(lon), hae: '9999999.0', ce: '9999999.0', le: '9999999.0' } },\n        detail: detail\n      }\n    }\n  });\n}\n\nnode.warn(cfg.configName + ': ' + results.length + ' CoT events built from ' + features.length + ' features');\nmsg._features = results;\nmsg._config = cfg;\nreturn msg;",
     "outputs": 1,
     "timeout": "",
     "noerr": 0,
@@ -964,7 +964,8 @@
     "y": 1220,
     "wires": [
       [
-        "eng_debug_cot"
+        "eng_debug_cot",
+        "eng_tak"
       ],
       [
         "eng_http_action"
@@ -985,7 +986,7 @@
     "id": "eng_debug_cot",
     "type": "debug",
     "z": "flow_arcgis_cfg",
-    "name": "CoT JSON → TAK node",
+    "name": "CoT JSON",
     "active": true,
     "tosidebar": true,
     "console": false,
@@ -997,6 +998,33 @@
     "x": 200,
     "y": 1340,
     "wires": []
+  },
+  {
+    "id": "eng_tak",
+    "type": "tak",
+    "z": "flow_arcgis_cfg",
+    "name": "CoT JSON → XML",
+    "x": 200,
+    "y": 1380,
+    "wires": [
+      [
+        "eng_tak_out"
+      ]
+    ]
+  },
+  {
+    "id": "eng_tak_out",
+    "type": "tak server",
+    "z": "flow_arcgis_cfg",
+    "name": "TAK Server (8089)",
+    "server": "",
+    "port": "8089",
+    "tls": "tls_tak",
+    "x": 420,
+    "y": 1380,
+    "wires": [
+      []
+    ]
   },
   {
     "id": "eng_http_action",
