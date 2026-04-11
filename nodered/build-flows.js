@@ -502,7 +502,7 @@ const engineFlows = [
     ].join('\n'),
     outputs: 1, timeout: '', noerr: 0,
     initialize: '', finalize: '', libs: [],
-    x: 400, y: 50 + EY, wires: [['eng_tak']]
+    x: 400, y: 50 + EY, wires: [['eng_cot_to_xml']]
   },
 
   // ════════════════════════════════════════════════
@@ -961,7 +961,7 @@ const engineFlows = [
     ].join('\n'),
     outputs: 2, timeout: '', noerr: 0,
     initialize: '', finalize: '', libs: [],
-    x: 600, y: 360 + EY, wires: [['eng_debug_cot', 'eng_tak', 'eng_cot_to_xml', 'eng_delay_put'], ['eng_delay_del']]
+    x: 600, y: 360 + EY, wires: [['eng_debug_cot', 'eng_cot_to_xml', 'eng_delay_put'], ['eng_delay_del']]
   },
 
   // ════════════════════════════════════════════════
@@ -1021,10 +1021,10 @@ const engineFlows = [
     statusVal: '', statusType: 'auto',
     x: 620, y: 320 + EY, wires: []
   },
-  // CoT JSON → XML string → POST to /Marti/api/cot (HTTPS, reliable)
+  // CoT JSON → XML string → direct TCP out (bypasses node-red-contrib-tak)
   {
     id: 'eng_cot_to_xml', type: 'function', z: FLOW_ID,
-    name: 'CoT JSON → XML POST',
+    name: 'CoT JSON → XML',
     func: [
       "var e = msg.payload && msg.payload.event;",
       "if (!e || !e._attributes) return null;",
@@ -1053,35 +1053,20 @@ const engineFlows = [
       "",
       "xml += '</detail></event>';",
       "",
-      "var host = msg.host;",
-      "msg.url = 'https://' + host + ':' + (msg.port === 8089 ? 8443 : msg.port) + '/Marti/api/cot';",
-      "msg.method = 'POST';",
-      "msg.headers = { 'Content-Type': 'application/xml', 'accept': '*/*' };",
-      "if (msg._missionCookie) msg.headers.Cookie = msg._missionCookie;",
-      "if (msg._missionBearer) msg.headers.Authorization = 'Bearer ' + msg._missionBearer;",
-      "msg.payload = xml;",
+      "msg.payload = Buffer.from(xml, 'utf8');",
       "return msg;"
     ].join('\n'),
     outputs: 1, timeout: '', noerr: 0,
     initialize: '', finalize: '', libs: [],
-    x: 200, y: 640 + EY, wires: [['eng_http_cot_post']]
+    x: 200, y: 640 + EY, wires: [['eng_tcp_out', 'eng_debug_xml']]
   },
   {
-    id: 'eng_http_cot_post', type: 'http request', z: FLOW_ID,
-    name: 'POST CoT to TAK (HTTPS)',
-    method: 'use', ret: 'txt', paytoqs: 'ignore',
-    url: '', tls: 'tls_tak', persist: false, proxy: '',
-    insecureHTTPParser: false, authType: '',
-    senderr: false, headers: [],
-    x: 440, y: 640 + EY, wires: [['eng_debug_cot_post']]
-  },
-  {
-    id: 'eng_debug_cot_post', type: 'debug', z: FLOW_ID,
-    name: 'CoT POST result',
+    id: 'eng_debug_xml', type: 'debug', z: FLOW_ID,
+    name: 'XML sent to TAK',
     active: true, tosidebar: true, console: false, tostatus: true,
-    complete: 'true', targetType: 'full',
-    statusVal: 'statusCode', statusType: 'msg',
-    x: 660, y: 640 + EY, wires: []
+    complete: 'payload',
+    targetType: 'msg', statusVal: '', statusType: 'auto',
+    x: 440, y: 640 + EY, wires: []
   },
   {
     id: 'eng_delay_put', type: 'delay', z: FLOW_ID,
