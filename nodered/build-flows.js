@@ -961,7 +961,7 @@ const engineFlows = [
     ].join('\n'),
     outputs: 2, timeout: '', noerr: 0,
     initialize: '', finalize: '', libs: [],
-    x: 600, y: 360 + EY, wires: [['eng_debug_cot', 'eng_tak', 'eng_delay_put'], ['eng_delay_del']]
+    x: 600, y: 360 + EY, wires: [['eng_debug_cot', 'eng_tak', 'eng_cot_to_xml', 'eng_delay_put'], ['eng_delay_del']]
   },
 
   // ════════════════════════════════════════════════
@@ -1020,6 +1020,68 @@ const engineFlows = [
     complete: 'true', targetType: 'full',
     statusVal: '', statusType: 'auto',
     x: 620, y: 320 + EY, wires: []
+  },
+  // CoT JSON → XML string → POST to /Marti/api/cot (HTTPS, reliable)
+  {
+    id: 'eng_cot_to_xml', type: 'function', z: FLOW_ID,
+    name: 'CoT JSON → XML POST',
+    func: [
+      "var e = msg.payload && msg.payload.event;",
+      "if (!e || !e._attributes) return null;",
+      "var a = e._attributes;",
+      "var p = e.point._attributes;",
+      "var d = e.detail || {};",
+      "",
+      "var xml = '<?xml version=\"1.0\" encoding=\"UTF-8\"?>'",
+      "  + '<event version=\"' + a.version + '\" uid=\"' + a.uid + '\" type=\"' + a.type + '\"'",
+      "  + ' how=\"' + a.how + '\" time=\"' + a.time + '\" start=\"' + a.start + '\" stale=\"' + a.stale + '\">'",
+      "  + '<point lat=\"' + p.lat + '\" lon=\"' + p.lon + '\" hae=\"' + p.hae + '\" ce=\"' + p.ce + '\" le=\"' + p.le + '\"/>'",
+      "  + '<detail>';",
+      "",
+      "if (d.contact && d.contact[0]) xml += '<contact callsign=\"' + d.contact[0]._attributes.callsign + '\"/>';",
+      "if (d.remarks != null) xml += '<remarks>' + String(d.remarks).replace(/&/g,'&amp;').replace(/</g,'&lt;') + '</remarks>';",
+      "if (d.strokeColor && d.strokeColor[0]) xml += '<strokeColor value=\"' + d.strokeColor[0]._attributes.value + '\"/>';",
+      "if (d.strokeWeight && d.strokeWeight[0]) xml += '<strokeWeight value=\"' + d.strokeWeight[0]._attributes.value + '\"/>';",
+      "if (d.fillColor && d.fillColor[0]) xml += '<fillColor value=\"' + d.fillColor[0]._attributes.value + '\"/>';",
+      "if (d.labels_on && d.labels_on[0]) xml += '<labels_on value=\"' + d.labels_on[0]._attributes.value + '\"/>';",
+      "",
+      "if (d.link && d.link.length) {",
+      "  for (var i = 0; i < d.link.length; i++) {",
+      "    xml += '<link point=\"' + d.link[i]._attributes.point + '\"/>';",
+      "  }",
+      "}",
+      "",
+      "xml += '</detail></event>';",
+      "",
+      "var host = msg.host;",
+      "msg.url = 'https://' + host + ':' + (msg.port === 8089 ? 8443 : msg.port) + '/Marti/api/cot';",
+      "msg.method = 'POST';",
+      "msg.headers = { 'Content-Type': 'application/xml', 'accept': '*/*' };",
+      "if (msg._missionCookie) msg.headers.Cookie = msg._missionCookie;",
+      "if (msg._missionBearer) msg.headers.Authorization = 'Bearer ' + msg._missionBearer;",
+      "msg.payload = xml;",
+      "return msg;"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 200, y: 640 + EY, wires: [['eng_http_cot_post']]
+  },
+  {
+    id: 'eng_http_cot_post', type: 'http request', z: FLOW_ID,
+    name: 'POST CoT to TAK (HTTPS)',
+    method: 'use', ret: 'txt', paytoqs: 'ignore',
+    url: '', tls: 'tls_tak', persist: false, proxy: '',
+    insecureHTTPParser: false, authType: '',
+    senderr: false, headers: [],
+    x: 440, y: 640 + EY, wires: [['eng_debug_cot_post']]
+  },
+  {
+    id: 'eng_debug_cot_post', type: 'debug', z: FLOW_ID,
+    name: 'CoT POST result',
+    active: true, tosidebar: true, console: false, tostatus: true,
+    complete: 'true', targetType: 'full',
+    statusVal: 'statusCode', statusType: 'msg',
+    x: 660, y: 640 + EY, wires: []
   },
   {
     id: 'eng_delay_put', type: 'delay', z: FLOW_ID,

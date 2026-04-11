@@ -1026,6 +1026,7 @@
       [
         "eng_debug_cot",
         "eng_tak",
+        "eng_cot_to_xml",
         "eng_delay_put"
       ],
       [
@@ -1154,6 +1155,67 @@
     "statusType": "auto",
     "x": 620,
     "y": 1240,
+    "wires": []
+  },
+  {
+    "id": "eng_cot_to_xml",
+    "type": "function",
+    "z": "flow_arcgis_cfg",
+    "name": "CoT JSON → XML POST",
+    "func": "var e = msg.payload && msg.payload.event;\nif (!e || !e._attributes) return null;\nvar a = e._attributes;\nvar p = e.point._attributes;\nvar d = e.detail || {};\n\nvar xml = '<?xml version=\"1.0\" encoding=\"UTF-8\"?>'\n  + '<event version=\"' + a.version + '\" uid=\"' + a.uid + '\" type=\"' + a.type + '\"'\n  + ' how=\"' + a.how + '\" time=\"' + a.time + '\" start=\"' + a.start + '\" stale=\"' + a.stale + '\">'\n  + '<point lat=\"' + p.lat + '\" lon=\"' + p.lon + '\" hae=\"' + p.hae + '\" ce=\"' + p.ce + '\" le=\"' + p.le + '\"/>'\n  + '<detail>';\n\nif (d.contact && d.contact[0]) xml += '<contact callsign=\"' + d.contact[0]._attributes.callsign + '\"/>';\nif (d.remarks != null) xml += '<remarks>' + String(d.remarks).replace(/&/g,'&amp;').replace(/</g,'&lt;') + '</remarks>';\nif (d.strokeColor && d.strokeColor[0]) xml += '<strokeColor value=\"' + d.strokeColor[0]._attributes.value + '\"/>';\nif (d.strokeWeight && d.strokeWeight[0]) xml += '<strokeWeight value=\"' + d.strokeWeight[0]._attributes.value + '\"/>';\nif (d.fillColor && d.fillColor[0]) xml += '<fillColor value=\"' + d.fillColor[0]._attributes.value + '\"/>';\nif (d.labels_on && d.labels_on[0]) xml += '<labels_on value=\"' + d.labels_on[0]._attributes.value + '\"/>';\n\nif (d.link && d.link.length) {\n  for (var i = 0; i < d.link.length; i++) {\n    xml += '<link point=\"' + d.link[i]._attributes.point + '\"/>';\n  }\n}\n\nxml += '</detail></event>';\n\nvar host = msg.host;\nmsg.url = 'https://' + host + ':' + (msg.port === 8089 ? 8443 : msg.port) + '/Marti/api/cot';\nmsg.method = 'POST';\nmsg.headers = { 'Content-Type': 'application/xml', 'accept': '*/*' };\nif (msg._missionCookie) msg.headers.Cookie = msg._missionCookie;\nif (msg._missionBearer) msg.headers.Authorization = 'Bearer ' + msg._missionBearer;\nmsg.payload = xml;\nreturn msg;",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 200,
+    "y": 1560,
+    "wires": [
+      [
+        "eng_http_cot_post"
+      ]
+    ]
+  },
+  {
+    "id": "eng_http_cot_post",
+    "type": "http request",
+    "z": "flow_arcgis_cfg",
+    "name": "POST CoT to TAK (HTTPS)",
+    "method": "use",
+    "ret": "txt",
+    "paytoqs": "ignore",
+    "url": "",
+    "tls": "tls_tak",
+    "persist": false,
+    "proxy": "",
+    "insecureHTTPParser": false,
+    "authType": "",
+    "senderr": false,
+    "headers": [],
+    "x": 440,
+    "y": 1560,
+    "wires": [
+      [
+        "eng_debug_cot_post"
+      ]
+    ]
+  },
+  {
+    "id": "eng_debug_cot_post",
+    "type": "debug",
+    "z": "flow_arcgis_cfg",
+    "name": "CoT POST result",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": true,
+    "complete": "true",
+    "targetType": "full",
+    "statusVal": "statusCode",
+    "statusType": "msg",
+    "x": 660,
+    "y": 1560,
     "wires": []
   },
   {
