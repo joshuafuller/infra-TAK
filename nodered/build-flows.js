@@ -778,6 +778,8 @@ const engineFlows = [
       "    nPut++;",
       "    node.send([",
       "      { payload: arcgis[uid].cot, topic: topicCfg,",
+      "        host: host,",
+      "        port: Number(tak.streamPort || tak.takPort || 8089),",
       "        _putUrl: baseUrl + '/contents?creatorUid=' + creator,",
       "        _putUid: uid },",
       "      null",
@@ -826,8 +828,15 @@ const engineFlows = [
   },
   {
     id: 'eng_tak', type: 'tak', z: FLOW_ID,
-    name: 'CoT → TAK Server',
-    x: 200, y: 460 + EY, wires: [[]]
+    name: 'CoT encode',
+    x: 200, y: 460 + EY, wires: [['eng_tcp_out']]
+  },
+  {
+    id: 'eng_tcp_out', type: 'tcp out', z: FLOW_ID,
+    name: 'CoT stream to TAK',
+    host: '', port: '', beserver: 'client',
+    base64: false, end: false, tls: 'tls_tak',
+    x: 410, y: 460 + EY, wires: []
   },
   {
     id: 'eng_delay_put', type: 'delay', z: FLOW_ID,
