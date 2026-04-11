@@ -707,7 +707,7 @@ const engineFlows = [
       "  };",
       "",
       "  if (cfg.missionName) {",
-      "    detail.Marti = { dest: { _attributes: { mission: cfg.missionName } } };",
+      "    msg._missionName = cfg.missionName;",
       "  }",
       "",
       "  if (isPoly && g.rings && g.rings[0]) {",
