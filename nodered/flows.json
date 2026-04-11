@@ -718,13 +718,72 @@
     "verifyservercert": false
   },
   {
+    "id": "eng_c0",
+    "type": "comment",
+    "z": "flow_arcgis_cfg",
+    "name": "── SA Ident (must fire before any CoT) ──",
+    "info": "",
+    "x": 280,
+    "y": 940,
+    "wires": []
+  },
+  {
+    "id": "eng_sa_inject",
+    "type": "inject",
+    "z": "flow_arcgis_cfg",
+    "name": "SA ident (startup)",
+    "props": [
+      {
+        "p": "payload"
+      },
+      {
+        "p": "topic",
+        "vt": "str"
+      }
+    ],
+    "repeat": "600",
+    "crontab": "",
+    "once": true,
+    "onceDelay": "10",
+    "topic": "sa-ident",
+    "payload": "",
+    "payloadType": "date",
+    "x": 180,
+    "y": 970,
+    "wires": [
+      [
+        "eng_sa_build"
+      ]
+    ]
+  },
+  {
+    "id": "eng_sa_build",
+    "type": "function",
+    "z": "flow_arcgis_cfg",
+    "name": "Build SA ident CoT",
+    "func": "var tak = flow.get('tak_settings') || {};\nvar configs = flow.get('arcgis_configs') || [];\nvar creatorUid = '';\nfor (var i = 0; i < configs.length; i++) {\n  if (configs[i].creatorUid) { creatorUid = String(configs[i].creatorUid).trim(); break; }\n}\nif (!creatorUid && tak.creatorUid) creatorUid = String(tak.creatorUid).trim();\nif (!creatorUid) { node.warn('No creatorUid found — SA ident skipped'); return null; }\n\nvar now = new Date();\nvar stale = new Date(now.getTime() + 120000);\nmsg.payload = {\n  event: {\n    _attributes: {\n      version: '2.0',\n      uid: creatorUid,\n      type: 'a-f-G-E-S',\n      how: 'h-g-i-g-o',\n      time: now.toISOString(),\n      start: now.toISOString(),\n      stale: stale.toISOString()\n    },\n    point: { _attributes: { lat: '0', lon: '0', hae: '0', ce: '9999999', le: '9999999' } },\n    detail: {\n      contact: [{ _attributes: { callsign: creatorUid } }],\n      __group: [{ _attributes: { name: 'Purple', role: 'Team Member' } }]\n    }\n  }\n};\nnode.warn('SA ident sent for uid: ' + creatorUid);\nreturn msg;",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 400,
+    "y": 970,
+    "wires": [
+      [
+        "eng_tak"
+      ]
+    ]
+  },
+  {
     "id": "eng_c1",
     "type": "comment",
     "z": "flow_arcgis_cfg",
     "name": "── ArcGIS → TAK Sync Engine ──",
     "info": "",
     "x": 260,
-    "y": 960,
+    "y": 1020,
     "wires": []
   },
   {
@@ -749,7 +808,7 @@
     "payload": "",
     "payloadType": "date",
     "x": 180,
-    "y": 1000,
+    "y": 1060,
     "wires": [
       [
         "eng_load"
@@ -769,7 +828,7 @@
     "finalize": "",
     "libs": [],
     "x": 400,
-    "y": 1000,
+    "y": 1060,
     "wires": [
       [
         "eng_build_q"
@@ -783,7 +842,7 @@
     "name": "── Query ArcGIS features ──",
     "info": "",
     "x": 260,
-    "y": 1060,
+    "y": 1120,
     "wires": []
   },
   {
@@ -799,7 +858,7 @@
     "finalize": "",
     "libs": [],
     "x": 180,
-    "y": 1100,
+    "y": 1160,
     "wires": [
       [
         "eng_http_ag"
@@ -823,7 +882,7 @@
     "senderr": false,
     "headers": [],
     "x": 400,
-    "y": 1100,
+    "y": 1160,
     "wires": [
       [
         "eng_parse"
@@ -843,7 +902,7 @@
     "finalize": "",
     "libs": [],
     "x": 600,
-    "y": 1100,
+    "y": 1160,
     "wires": [
       [
         "eng_build_sub",
@@ -858,7 +917,7 @@
     "name": "── Reconcile with TAK Mission ──",
     "info": "",
     "x": 260,
-    "y": 1180,
+    "y": 1240,
     "wires": []
   },
   {
@@ -874,7 +933,7 @@
     "finalize": "",
     "libs": [],
     "x": 180,
-    "y": 1220,
+    "y": 1280,
     "wires": [
       [
         "eng_http_sub"
@@ -898,7 +957,7 @@
     "senderr": false,
     "headers": [],
     "x": 380,
-    "y": 1220,
+    "y": 1280,
     "wires": [
       [
         "eng_debug_sub"
@@ -918,7 +977,7 @@
     "finalize": "",
     "libs": [],
     "x": 560,
-    "y": 1220,
+    "y": 1280,
     "wires": [
       [
         "eng_http_m"
@@ -942,7 +1001,7 @@
     "senderr": false,
     "headers": [],
     "x": 740,
-    "y": 1220,
+    "y": 1280,
     "wires": [
       [
         "eng_reconcile"
@@ -962,7 +1021,7 @@
     "finalize": "",
     "libs": [],
     "x": 600,
-    "y": 1220,
+    "y": 1280,
     "wires": [
       [
         "eng_debug_cot",
@@ -981,7 +1040,7 @@
     "name": "── CoT output → wire TAK node + tcp out here ──",
     "info": "",
     "x": 280,
-    "y": 1300,
+    "y": 1360,
     "wires": []
   },
   {
@@ -998,7 +1057,7 @@
     "statusVal": "payload.event._attributes.uid",
     "statusType": "auto",
     "x": 200,
-    "y": 1340,
+    "y": 1400,
     "wires": []
   },
   {
@@ -1007,7 +1066,7 @@
     "z": "flow_arcgis_cfg",
     "name": "CoT encode",
     "x": 200,
-    "y": 1380,
+    "y": 1440,
     "wires": [
       [
         "eng_tcp_out"
@@ -1026,7 +1085,7 @@
     "end": false,
     "tls": "tls_tak",
     "x": 410,
-    "y": 1380,
+    "y": 1440,
     "wires": []
   },
   {
@@ -1038,7 +1097,7 @@
       "eng_tcp_out"
     ],
     "x": 410,
-    "y": 1420,
+    "y": 1480,
     "wires": [
       [
         "eng_debug_stream"
@@ -1056,7 +1115,7 @@
     ],
     "uncaught": false,
     "x": 180,
-    "y": 1460,
+    "y": 1520,
     "wires": [
       [
         "eng_debug_stream"
@@ -1077,7 +1136,7 @@
     "statusVal": "",
     "statusType": "auto",
     "x": 640,
-    "y": 1420,
+    "y": 1480,
     "wires": []
   },
   {
@@ -1094,7 +1153,7 @@
     "statusVal": "",
     "statusType": "auto",
     "x": 620,
-    "y": 1180,
+    "y": 1240,
     "wires": []
   },
   {
@@ -1115,7 +1174,7 @@
     "allowrate": false,
     "outputs": 1,
     "x": 200,
-    "y": 1420,
+    "y": 1480,
     "wires": [
       [
         "eng_build_put"
@@ -1135,7 +1194,7 @@
     "finalize": "",
     "libs": [],
     "x": 400,
-    "y": 1420,
+    "y": 1480,
     "wires": [
       [
         "eng_http_action"
@@ -1160,7 +1219,7 @@
     "allowrate": false,
     "outputs": 1,
     "x": 280,
-    "y": 1460,
+    "y": 1520,
     "wires": [
       [
         "eng_http_action"
@@ -1184,7 +1243,7 @@
     "senderr": false,
     "headers": [],
     "x": 460,
-    "y": 1340,
+    "y": 1400,
     "wires": [
       [
         "eng_debug_action"
@@ -1205,7 +1264,7 @@
     "statusVal": "",
     "statusType": "auto",
     "x": 680,
-    "y": 1340,
+    "y": 1400,
     "wires": []
   }
 ]

@@ -448,12 +448,70 @@ const engineFlows = [
   },
 
   // ════════════════════════════════════════════════
+  //  Row 0 — SA identification (tells TAK Server who this connection is)
+  // ════════════════════════════════════════════════
+  {
+    id: 'eng_c0', type: 'comment', z: FLOW_ID,
+    name: '── SA Ident (must fire before any CoT) ──',
+    info: '', x: 280, y: 20 + EY, wires: []
+  },
+  {
+    id: 'eng_sa_inject', type: 'inject', z: FLOW_ID,
+    name: 'SA ident (startup)',
+    props: [{ p: 'payload' }, { p: 'topic', vt: 'str' }],
+    repeat: '600', crontab: '',
+    once: true, onceDelay: '10',
+    topic: 'sa-ident', payload: '', payloadType: 'date',
+    x: 180, y: 50 + EY, wires: [['eng_sa_build']]
+  },
+  {
+    id: 'eng_sa_build', type: 'function', z: FLOW_ID,
+    name: 'Build SA ident CoT',
+    func: [
+      "var tak = flow.get('tak_settings') || {};",
+      "var configs = flow.get('arcgis_configs') || [];",
+      "var creatorUid = '';",
+      "for (var i = 0; i < configs.length; i++) {",
+      "  if (configs[i].creatorUid) { creatorUid = String(configs[i].creatorUid).trim(); break; }",
+      "}",
+      "if (!creatorUid && tak.creatorUid) creatorUid = String(tak.creatorUid).trim();",
+      "if (!creatorUid) { node.warn('No creatorUid found — SA ident skipped'); return null; }",
+      "",
+      "var now = new Date();",
+      "var stale = new Date(now.getTime() + 120000);",
+      "msg.payload = {",
+      "  event: {",
+      "    _attributes: {",
+      "      version: '2.0',",
+      "      uid: creatorUid,",
+      "      type: 'a-f-G-E-S',",
+      "      how: 'h-g-i-g-o',",
+      "      time: now.toISOString(),",
+      "      start: now.toISOString(),",
+      "      stale: stale.toISOString()",
+      "    },",
+      "    point: { _attributes: { lat: '0', lon: '0', hae: '0', ce: '9999999', le: '9999999' } },",
+      "    detail: {",
+      "      contact: [{ _attributes: { callsign: creatorUid } }],",
+      "      __group: [{ _attributes: { name: 'Purple', role: 'Team Member' } }]",
+      "    }",
+      "  }",
+      "};",
+      "node.warn('SA ident sent for uid: ' + creatorUid);",
+      "return msg;"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 400, y: 50 + EY, wires: [['eng_tak']]
+  },
+
+  // ════════════════════════════════════════════════
   //  Row 1 — Timer & config loader
   // ════════════════════════════════════════════════
   {
     id: 'eng_c1', type: 'comment', z: FLOW_ID,
     name: '── ArcGIS → TAK Sync Engine ──',
-    info: '', x: 260, y: 40 + EY, wires: []
+    info: '', x: 260, y: 100 + EY, wires: []
   },
   {
     id: 'eng_inject', type: 'inject', z: FLOW_ID,
@@ -462,7 +520,7 @@ const engineFlows = [
     repeat: '300', crontab: '',
     once: true, onceDelay: '30',
     topic: 'poll', payload: '', payloadType: 'date',
-    x: 180, y: 80 + EY, wires: [['eng_load']]
+    x: 180, y: 140 + EY, wires: [['eng_load']]
   },
   {
     id: 'eng_load', type: 'function', z: FLOW_ID,
@@ -483,7 +541,7 @@ const engineFlows = [
     ].join('\n'),
     outputs: 1, timeout: '', noerr: 0,
     initialize: '', finalize: '', libs: [],
-    x: 400, y: 80 + EY, wires: [['eng_build_q']]
+    x: 400, y: 140 + EY, wires: [['eng_build_q']]
   },
 
   // ════════════════════════════════════════════════
@@ -492,7 +550,7 @@ const engineFlows = [
   {
     id: 'eng_c2', type: 'comment', z: FLOW_ID,
     name: '── Query ArcGIS features ──',
-    info: '', x: 260, y: 140 + EY, wires: []
+    info: '', x: 260, y: 200 + EY, wires: []
   },
   {
     id: 'eng_build_q', type: 'function', z: FLOW_ID,
@@ -533,7 +591,7 @@ const engineFlows = [
     ].join('\n'),
     outputs: 1, timeout: '', noerr: 0,
     initialize: '', finalize: '', libs: [],
-    x: 180, y: 180 + EY, wires: [['eng_http_ag']]
+    x: 180, y: 240 + EY, wires: [['eng_http_ag']]
   },
   {
     id: 'eng_http_ag', type: 'http request', z: FLOW_ID,
@@ -542,7 +600,7 @@ const engineFlows = [
     url: '', tls: '', persist: false, proxy: '',
     insecureHTTPParser: false, authType: '',
     senderr: false, headers: [],
-    x: 400, y: 180 + EY, wires: [['eng_parse']]
+    x: 400, y: 240 + EY, wires: [['eng_parse']]
   },
 
   // ════════════════════════════════════════════════
@@ -684,7 +742,7 @@ const engineFlows = [
     ].join('\n'),
     outputs: 1, timeout: '', noerr: 0,
     initialize: '', finalize: '', libs: [],
-    x: 600, y: 180 + EY, wires: [['eng_build_sub', 'eng_build_m']]
+    x: 600, y: 240 + EY, wires: [['eng_build_sub', 'eng_build_m']]
   },
 
   // ════════════════════════════════════════════════
@@ -693,7 +751,7 @@ const engineFlows = [
   {
     id: 'eng_c3', type: 'comment', z: FLOW_ID,
     name: '── Reconcile with TAK Mission ──',
-    info: '', x: 260, y: 260 + EY, wires: []
+    info: '', x: 260, y: 320 + EY, wires: []
   },
   {
     id: 'eng_build_sub', type: 'function', z: FLOW_ID,
@@ -716,7 +774,7 @@ const engineFlows = [
     ].join('\n'),
     outputs: 1, timeout: '', noerr: 0,
     initialize: '', finalize: '', libs: [],
-    x: 180, y: 300 + EY, wires: [['eng_http_sub']]
+    x: 180, y: 360 + EY, wires: [['eng_http_sub']]
   },
   {
     id: 'eng_http_sub', type: 'http request', z: FLOW_ID,
@@ -725,7 +783,7 @@ const engineFlows = [
     url: '', tls: 'tls_tak', persist: false, proxy: '',
     insecureHTTPParser: false, authType: '',
     senderr: false, headers: [],
-    x: 380, y: 300 + EY, wires: [['eng_debug_sub']]
+    x: 380, y: 360 + EY, wires: [['eng_debug_sub']]
   },
   {
     id: 'eng_build_m', type: 'function', z: FLOW_ID,
@@ -783,7 +841,7 @@ const engineFlows = [
     ].join('\n'),
     outputs: 1, timeout: '', noerr: 0,
     initialize: '', finalize: '', libs: [],
-    x: 560, y: 300 + EY, wires: [['eng_http_m']]
+    x: 560, y: 360 + EY, wires: [['eng_http_m']]
   },
   {
     id: 'eng_http_m', type: 'http request', z: FLOW_ID,
@@ -792,7 +850,7 @@ const engineFlows = [
     url: '', tls: 'tls_tak', persist: false, proxy: '',
     insecureHTTPParser: false, authType: '',
     senderr: false, headers: [],
-    x: 740, y: 300 + EY, wires: [['eng_reconcile']]
+    x: 740, y: 360 + EY, wires: [['eng_reconcile']]
   },
   {
     id: 'eng_reconcile', type: 'function', z: FLOW_ID,
@@ -901,7 +959,7 @@ const engineFlows = [
     ].join('\n'),
     outputs: 2, timeout: '', noerr: 0,
     initialize: '', finalize: '', libs: [],
-    x: 600, y: 300 + EY, wires: [['eng_debug_cot', 'eng_tak', 'eng_delay_put'], ['eng_delay_del']]
+    x: 600, y: 360 + EY, wires: [['eng_debug_cot', 'eng_tak', 'eng_delay_put'], ['eng_delay_del']]
   },
 
   // ════════════════════════════════════════════════
@@ -910,7 +968,7 @@ const engineFlows = [
   {
     id: 'eng_c4', type: 'comment', z: FLOW_ID,
     name: '── CoT output → wire TAK node + tcp out here ──',
-    info: '', x: 280, y: 380 + EY, wires: []
+    info: '', x: 280, y: 440 + EY, wires: []
   },
   {
     id: 'eng_debug_cot', type: 'debug', z: FLOW_ID,
@@ -918,32 +976,32 @@ const engineFlows = [
     active: true, tosidebar: true, console: false, tostatus: true,
     complete: 'payload',
     targetType: 'msg',     statusVal: 'payload.event._attributes.uid', statusType: 'auto',
-    x: 200, y: 420 + EY, wires: []
+    x: 200, y: 480 + EY, wires: []
   },
   {
     id: 'eng_tak', type: 'tak', z: FLOW_ID,
     name: 'CoT encode',
-    x: 200, y: 460 + EY, wires: [['eng_tcp_out']]
+    x: 200, y: 520 + EY, wires: [['eng_tcp_out']]
   },
   {
     id: 'eng_tcp_out', type: 'tcp out', z: FLOW_ID,
     name: 'CoT stream to TAK',
     host: '', port: '', beserver: 'client',
     base64: false, end: false, tls: 'tls_tak',
-    x: 410, y: 460 + EY, wires: []
+    x: 410, y: 520 + EY, wires: []
   },
   {
     id: 'eng_status_stream', type: 'status', z: FLOW_ID,
     name: 'Stream status',
     scope: ['eng_tcp_out'],
-    x: 410, y: 500 + EY, wires: [['eng_debug_stream']]
+    x: 410, y: 560 + EY, wires: [['eng_debug_stream']]
   },
   {
     id: 'eng_catch_stream', type: 'catch', z: FLOW_ID,
     name: 'Stream errors',
     scope: ['eng_tcp_out', 'eng_tak'],
     uncaught: false,
-    x: 180, y: 540 + EY, wires: [['eng_debug_stream']]
+    x: 180, y: 600 + EY, wires: [['eng_debug_stream']]
   },
   {
     id: 'eng_debug_stream', type: 'debug', z: FLOW_ID,
@@ -951,7 +1009,7 @@ const engineFlows = [
     active: true, tosidebar: true, console: false, tostatus: true,
     complete: 'true', targetType: 'full',
     statusVal: '', statusType: 'auto',
-    x: 640, y: 500 + EY, wires: []
+    x: 640, y: 560 + EY, wires: []
   },
   {
     id: 'eng_debug_sub', type: 'debug', z: FLOW_ID,
@@ -959,7 +1017,7 @@ const engineFlows = [
     active: true, tosidebar: true, console: false, tostatus: false,
     complete: 'true', targetType: 'full',
     statusVal: '', statusType: 'auto',
-    x: 620, y: 260 + EY, wires: []
+    x: 620, y: 320 + EY, wires: []
   },
   {
     id: 'eng_delay_put', type: 'delay', z: FLOW_ID,
@@ -967,7 +1025,7 @@ const engineFlows = [
     rate: '1', nbRateUnits: '1', rateUnits: 'second',
     randomFirst: '1', randomLast: '5', randomUnits: 'seconds',
     drop: false, allowrate: false, outputs: 1,
-    x: 200, y: 500 + EY, wires: [['eng_build_put']]
+    x: 200, y: 560 + EY, wires: [['eng_build_put']]
   },
   {
     id: 'eng_build_put', type: 'function', z: FLOW_ID,
@@ -984,7 +1042,7 @@ const engineFlows = [
     ].join('\n'),
     outputs: 1, timeout: '', noerr: 0,
     initialize: '', finalize: '', libs: [],
-    x: 400, y: 500 + EY, wires: [['eng_http_action']]
+    x: 400, y: 560 + EY, wires: [['eng_http_action']]
   },
   {
     id: 'eng_delay_del', type: 'delay', z: FLOW_ID,
@@ -992,7 +1050,7 @@ const engineFlows = [
     rate: '1', nbRateUnits: '1', rateUnits: 'second',
     randomFirst: '1', randomLast: '5', randomUnits: 'seconds',
     drop: false, allowrate: false, outputs: 1,
-    x: 280, y: 540 + EY, wires: [['eng_http_action']]
+    x: 280, y: 600 + EY, wires: [['eng_http_action']]
   },
   {
     id: 'eng_http_action', type: 'http request', z: FLOW_ID,
@@ -1001,7 +1059,7 @@ const engineFlows = [
     url: '', tls: 'tls_tak', persist: false, proxy: '',
     insecureHTTPParser: false, authType: '',
     senderr: false, headers: [],
-    x: 460, y: 420 + EY, wires: [['eng_debug_action']]
+    x: 460, y: 480 + EY, wires: [['eng_debug_action']]
   },
   {
     id: 'eng_debug_action', type: 'debug', z: FLOW_ID,
@@ -1009,7 +1067,7 @@ const engineFlows = [
     active: true, tosidebar: true, console: false, tostatus: true,
     complete: 'true', targetType: 'full',
     statusVal: '', statusType: 'auto',
-    x: 680, y: 420 + EY, wires: []
+    x: 680, y: 480 + EY, wires: []
   }
 ];
 
