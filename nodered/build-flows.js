@@ -668,6 +668,35 @@ const engineFlows = [
     info: '', x: 260, y: 260 + EY, wires: []
   },
   {
+    id: 'eng_build_sub', type: 'function', z: FLOW_ID,
+    name: 'Build subscribe URL',
+    func: [
+      "var tak = msg.takSettings;",
+      "var cfg = msg._config;",
+      "var host = String(tak.serverUrl || '').replace(/^https?:\\/\\//i, '').replace(/\\/$/, '');",
+      "var creatorUid = String((cfg && cfg.creatorUid) || (tak && tak.creatorUid) || 'nodered').trim();",
+      "msg.url = 'https://' + host + ':' + (tak.missionApiPort || 8443)",
+      "  + '/Marti/api/missions/' + encodeURIComponent(cfg.missionName)",
+      "  + '/subscription?uid=' + encodeURIComponent(creatorUid);",
+      "msg.method = 'PUT';",
+      "msg.headers = { 'accept': '*/*', 'Content-Type': 'application/json' };",
+      "msg.payload = '';",
+      "return msg;"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 180, y: 300 + EY, wires: [['eng_http_sub']]
+  },
+  {
+    id: 'eng_http_sub', type: 'http request', z: FLOW_ID,
+    name: 'Subscribe to mission',
+    method: 'use', ret: 'txt', paytoqs: 'ignore',
+    url: '', tls: 'tls_tak', persist: false, proxy: '',
+    insecureHTTPParser: false, authType: '',
+    senderr: false, headers: [],
+    x: 380, y: 300 + EY, wires: [['eng_build_m']]
+  },
+  {
     id: 'eng_build_m', type: 'function', z: FLOW_ID,
     name: 'Build mission GET URL',
     func: [
@@ -680,7 +709,7 @@ const engineFlows = [
     ].join('\n'),
     outputs: 1, timeout: '', noerr: 0,
     initialize: '', finalize: '', libs: [],
-    x: 180, y: 300 + EY, wires: [['eng_http_m']]
+    x: 560, y: 300 + EY, wires: [['eng_http_m']]
   },
   {
     id: 'eng_http_m', type: 'http request', z: FLOW_ID,
@@ -689,7 +718,7 @@ const engineFlows = [
     url: '', tls: 'tls_tak', persist: false, proxy: '',
     insecureHTTPParser: false, authType: '',
     senderr: false, headers: [],
-    x: 400, y: 300 + EY, wires: [['eng_reconcile']]
+    x: 740, y: 300 + EY, wires: [['eng_reconcile']]
   },
   {
     id: 'eng_reconcile', type: 'function', z: FLOW_ID,
@@ -747,9 +776,9 @@ const engineFlows = [
       "      { payload: arcgis[uid].cot, topic: topicCfg },",
       "      {",
       "        method: 'PUT',",
-      "        url: baseUrl + '/contents?uid=' + encodeURIComponent(uid) + '&creatorUid=' + creator,",
-      "        headers: { 'accept': '*/*' },",
-      "        payload: '',",
+      "        url: baseUrl + '/contents?creatorUid=' + creator,",
+      "        headers: { 'accept': '*/*', 'Content-Type': 'application/json' },",
+      "        payload: { uids: [uid] },",
       "        topic: topicCfg",
       "      }",
       "    ]);",
