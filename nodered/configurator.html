@@ -287,25 +287,29 @@
 
     <div class="field-grid">
       <div>
-        <label for="shapeColor">Shape color</label>
+        <label for="strokeColor">Stroke (outline) color</label>
         <div class="color-row">
-          <input type="color" id="shapeColorPick" value="#FF0000"
-                 oninput="document.getElementById('shapeColor').value=this.value;updSwatch('swColor',this.value)">
-          <input type="text" id="shapeColor" value="#FF0000" style="width:110px"
-                 oninput="updSwatch('swColor',this.value);document.getElementById('shapeColorPick').value=this.value">
-          <div class="color-swatch" id="swColor" style="background:#FF0000"></div>
+          <input type="color" id="strokeColorPick" value="#FF0000"
+                 oninput="document.getElementById('strokeColor').value=this.value;updSwatch('swStroke',this.value)">
+          <input type="text" id="strokeColor" value="#FF0000" style="width:110px"
+                 oninput="updSwatch('swStroke',this.value);document.getElementById('strokeColorPick').value=this.value">
+          <div class="color-swatch" id="swStroke" style="background:#FF0000"></div>
         </div>
       </div>
       <div>
-        <label for="fillAlpha">Fill opacity</label>
-        <select id="fillAlpha">
-          <option value="00">0% — No fill</option>
-          <option value="33">20%</option>
-          <option value="55" selected>33%</option>
-          <option value="80">50%</option>
-          <option value="AA">67%</option>
-          <option value="FF">100% — Solid fill</option>
-        </select>
+        <label for="fillColor">Fill color</label>
+        <div class="color-row">
+          <input type="color" id="fillColorPick" value="#FF0000"
+                 oninput="document.getElementById('fillColor').value=this.value;updSwatch('swFill',this.value)">
+          <input type="text" id="fillColor" value="#FF0000" style="width:110px"
+                 oninput="updSwatch('swFill',this.value);document.getElementById('fillColorPick').value=this.value">
+          <div class="color-swatch" id="swFill" style="background:#FF0000"></div>
+        </div>
+      </div>
+      <div>
+        <label for="fillAlpha">Fill opacity <span id="fillAlphaVal" style="color:#2ec4b6">33%</span></label>
+        <input type="range" id="fillAlpha" min="0" max="100" value="33" style="width:100%"
+               oninput="document.getElementById('fillAlphaVal').textContent=this.value+'%'">
       </div>
       <div>
         <label for="strokeWeight">Line thickness (px)</label>
@@ -407,6 +411,10 @@
       <div>
         <label for="configCreatorUid">Creator UID</label>
         <input type="text" id="configCreatorUid" placeholder="e.g. nodered-global-airdata (match Portal integration user &amp; TLS cert)">
+      </div>
+      <div>
+        <label for="pollInterval">Poll interval (minutes)</label>
+        <input type="number" id="pollInterval" min="1" max="1440" value="5" placeholder="5">
       </div>
     </div>
     <div class="row">
@@ -867,8 +875,9 @@ function generateConfig() {
       values: allValues.length > 0 ? allValues : null
     },
     style: {
-      color: document.getElementById('shapeColor').value,
-      fillAlpha: document.getElementById('fillAlpha').value,
+      strokeColor: document.getElementById('strokeColor').value,
+      fillColor: document.getElementById('fillColor').value,
+      fillAlpha: parseInt(document.getElementById('fillAlpha').value, 10) || 33,
       strokeWeight: parseInt(document.getElementById('strokeWeight').value, 10),
       strokeStyle: document.getElementById('strokeStyle').value,
       closed: document.getElementById('closedShape').value === 'true',
@@ -883,6 +892,7 @@ function generateConfig() {
     uidPrefix: document.getElementById('uidPrefix').value,
     missionName: document.getElementById('missionName').value || '',
     creatorUid: (document.getElementById('configCreatorUid').value || '').trim(),
+    pollInterval: parseInt(document.getElementById('pollInterval').value, 10) || 5,
     generated: new Date().toISOString()
   };
 
@@ -979,6 +989,15 @@ function resetForm() {
   document.getElementById('configName').value = '';
   document.getElementById('missionName').value = '';
   document.getElementById('configCreatorUid').value = '';
+  document.getElementById('pollInterval').value = '5';
+  document.getElementById('strokeColor').value = '#FF0000';
+  document.getElementById('strokeColorPick').value = '#FF0000';
+  updSwatch('swStroke', '#FF0000');
+  document.getElementById('fillColor').value = '#FF0000';
+  document.getElementById('fillColorPick').value = '#FF0000';
+  updSwatch('swFill', '#FF0000');
+  document.getElementById('fillAlpha').value = '33';
+  document.getElementById('fillAlphaVal').textContent = '33%';
   document.getElementById('configOutput').textContent = '';
 
   document.getElementById('layerSelect').innerHTML = '<option value="">-- fetch service first --</option>';
@@ -1077,12 +1096,19 @@ async function selectConfig(idx) {
   }
 
   if (c.style) {
-    if (c.style.color) {
-      document.getElementById('shapeColor').value = c.style.color;
-      document.getElementById('shapeColorPick').value = c.style.color;
-      updSwatch('swColor', c.style.color);
+    var sc = c.style.strokeColor || c.style.color || '#FF0000';
+    var fc = c.style.fillColor || c.style.color || '#FF0000';
+    document.getElementById('strokeColor').value = sc;
+    document.getElementById('strokeColorPick').value = sc;
+    updSwatch('swStroke', sc);
+    document.getElementById('fillColor').value = fc;
+    document.getElementById('fillColorPick').value = fc;
+    updSwatch('swFill', fc);
+    if (c.style.fillAlpha != null) {
+      var fa = (typeof c.style.fillAlpha === 'string') ? Math.round(parseInt(c.style.fillAlpha, 16) / 2.55) : c.style.fillAlpha;
+      document.getElementById('fillAlpha').value = fa;
+      document.getElementById('fillAlphaVal').textContent = fa + '%';
     }
-    if (c.style.fillAlpha) document.getElementById('fillAlpha').value = c.style.fillAlpha;
     if (c.style.strokeWeight) document.getElementById('strokeWeight').value = String(c.style.strokeWeight);
     if (c.style.strokeStyle) document.getElementById('strokeStyle').value = c.style.strokeStyle;
     if (c.style.closed != null) document.getElementById('closedShape').value = String(c.style.closed);
@@ -1105,6 +1131,7 @@ async function selectConfig(idx) {
   if (c.uidPrefix) document.getElementById('uidPrefix').value = c.uidPrefix;
   if (c.missionName) document.getElementById('missionName').value = c.missionName;
   document.getElementById('configCreatorUid').value = (c.creatorUid != null && c.creatorUid !== '') ? c.creatorUid : '';
+  document.getElementById('pollInterval').value = (c.pollInterval != null && c.pollInterval > 0) ? c.pollInterval : 5;
 
   document.getElementById('configOutput').textContent = JSON.stringify(c, null, 2);
   status('saveStatus', 'Loaded "' + (c.configName || 'config') + '" — edit and hit Save to publish changes', true);
