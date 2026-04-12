@@ -95,13 +95,11 @@ docker exec "$CONTAINER" node -e "
   fs.writeFileSync('/tmp/flows_merged.json', JSON.stringify(upd, null, 2));
 "
 
-# Copy merged flows into place and restart
-docker cp "$CONTAINER:/tmp/flows_merged.json" "$CONTAINER:/data/flows.json"
-docker restart "$CONTAINER"
-
-# Clean up
+# Move merged flows into place inside the container and restart
+docker exec "$CONTAINER" cp /tmp/flows_merged.json /data/flows.json
 docker exec "$CONTAINER" sh -c "rm -f /tmp/flows_*.json /tmp/build-flows.js /tmp/configurator.html" 2>/dev/null || true
 rm -f /tmp/flows_current.json /tmp/flows_context.json
+docker restart "$CONTAINER"
 
 echo ""
 echo "==> Deploy complete."
