@@ -1006,7 +1006,7 @@ const engineFlows = [
   {
     id: 'eng_tcp_out', type: 'tcp out', z: FLOW_ID,
     name: 'CoT stream to TAK',
-    host: '', port: '', beserver: 'client',
+    host: 'host.docker.internal', port: '8089', beserver: 'client',
     base64: false, end: false, tls: 'tls_tak',
     x: 410, y: 520 + EY, wires: []
   },
