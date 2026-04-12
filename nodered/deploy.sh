@@ -19,10 +19,12 @@ docker cp "$SCRIPT_DIR/configurator.html" "$CONTAINER:/tmp/configurator.html"
 docker exec "$CONTAINER" node /tmp/build-flows.js
 docker cp "$CONTAINER:/tmp/flows.json" "$NEW_FLOWS"
 
-# Back up current flows from running container (has TLS certs + TCP config)
+# Back up current flows + credentials from running container
 echo "==> Backing up current config from container"
 HAS_EXISTING=true
 docker cp "$CONTAINER:/data/flows.json" "/tmp/flows_current.json" 2>/dev/null || HAS_EXISTING=false
+# Preserve encrypted credentials file (TLS cert data lives here, not in flows.json)
+docker cp "$CONTAINER:/data/flows_cred.json" "/tmp/flows_cred_backup.json" 2>/dev/null || true
 
 # Read flow context to get creatorUid for TLS cert convention
 echo "==> Reading flow context for TLS auto-config"
@@ -95,10 +97,15 @@ docker exec "$CONTAINER" node -e "
   fs.writeFileSync('/tmp/flows_merged.json', JSON.stringify(upd, null, 2));
 "
 
-# Move merged flows into place inside the container and restart
+# Move merged flows into place inside the container
 docker exec "$CONTAINER" cp /tmp/flows_merged.json /data/flows.json
+# Restore credentials file so TLS cert data survives the deploy
+if [ -f "/tmp/flows_cred_backup.json" ]; then
+  docker cp "/tmp/flows_cred_backup.json" "$CONTAINER:/data/flows_cred.json"
+  echo "    Credentials: restored"
+fi
 docker exec "$CONTAINER" sh -c "rm -f /tmp/flows_*.json /tmp/build-flows.js /tmp/configurator.html" 2>/dev/null || true
-rm -f /tmp/flows_current.json /tmp/flows_context.json
+rm -f /tmp/flows_current.json /tmp/flows_context.json /tmp/flows_cred_backup.json
 docker restart "$CONTAINER"
 
 echo ""
