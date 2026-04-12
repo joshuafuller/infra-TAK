@@ -1048,13 +1048,13 @@
     "type": "debug",
     "z": "flow_arcgis_cfg",
     "name": "CoT JSON",
-    "active": true,
+    "active": false,
     "tosidebar": true,
     "console": false,
     "tostatus": true,
     "complete": "payload",
     "targetType": "msg",
-    "statusVal": "payload.event._attributes.uid",
+    "statusVal": "topic",
     "statusType": "auto",
     "x": 200,
     "y": 1400,
@@ -1147,10 +1147,10 @@
     "active": true,
     "tosidebar": true,
     "console": false,
-    "tostatus": false,
+    "tostatus": true,
     "complete": "true",
     "targetType": "full",
-    "statusVal": "",
+    "statusVal": "topic",
     "statusType": "auto",
     "x": 620,
     "y": 1240,
@@ -1182,13 +1182,13 @@
     "type": "debug",
     "z": "flow_arcgis_cfg",
     "name": "XML sent to TAK",
-    "active": true,
+    "active": false,
     "tosidebar": true,
     "console": false,
     "tostatus": true,
     "complete": "payload",
     "targetType": "msg",
-    "statusVal": "",
+    "statusVal": "topic",
     "statusType": "auto",
     "x": 440,
     "y": 1560,
@@ -1284,6 +1284,26 @@
     "y": 1400,
     "wires": [
       [
+        "eng_log_action"
+      ]
+    ]
+  },
+  {
+    "id": "eng_log_action",
+    "type": "function",
+    "z": "flow_arcgis_cfg",
+    "name": "Log API result",
+    "func": "var code = msg.statusCode || '?';\nvar method = msg.method || '?';\nvar feed = msg.topic || 'unknown';\nvar ok = (code >= 200 && code < 300);\nvar label = feed + ' ' + method + ' → ' + code + (ok ? ' ✓' : ' ✗');\nif (!ok) {\n  var body = (typeof msg.payload === 'string') ? msg.payload.substring(0, 200) : '';\n  node.warn(label + (body ? ' — ' + body : ''));\n} else {\n  node.warn(label);\n}\nmsg._apiResult = label;\nreturn msg;",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 660,
+    "y": 1400,
+    "wires": [
+      [
         "eng_debug_action"
       ]
     ]
@@ -1297,11 +1317,11 @@
     "tosidebar": true,
     "console": false,
     "tostatus": true,
-    "complete": "true",
-    "targetType": "full",
-    "statusVal": "",
+    "complete": "_apiResult",
+    "targetType": "msg",
+    "statusVal": "_apiResult",
     "statusType": "auto",
-    "x": 680,
+    "x": 860,
     "y": 1400,
     "wires": []
   }

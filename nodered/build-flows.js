@@ -993,9 +993,9 @@ const engineFlows = [
   {
     id: 'eng_debug_cot', type: 'debug', z: FLOW_ID,
     name: 'CoT JSON',
-    active: true, tosidebar: true, console: false, tostatus: true,
+    active: false, tosidebar: true, console: false, tostatus: true,
     complete: 'payload',
-    targetType: 'msg',     statusVal: 'payload.event._attributes.uid', statusType: 'auto',
+    targetType: 'msg', statusVal: 'topic', statusType: 'auto',
     x: 200, y: 480 + EY, wires: []
   },
   {
@@ -1034,9 +1034,9 @@ const engineFlows = [
   {
     id: 'eng_debug_sub', type: 'debug', z: FLOW_ID,
     name: 'Mission subscribe result',
-    active: true, tosidebar: true, console: false, tostatus: false,
+    active: true, tosidebar: true, console: false, tostatus: true,
     complete: 'true', targetType: 'full',
-    statusVal: '', statusType: 'auto',
+    statusVal: 'topic', statusType: 'auto',
     x: 620, y: 320 + EY, wires: []
   },
   // CoT JSON → XML string → direct TCP out (bypasses node-red-contrib-tak)
@@ -1081,9 +1081,9 @@ const engineFlows = [
   {
     id: 'eng_debug_xml', type: 'debug', z: FLOW_ID,
     name: 'XML sent to TAK',
-    active: true, tosidebar: true, console: false, tostatus: true,
+    active: false, tosidebar: true, console: false, tostatus: true,
     complete: 'payload',
-    targetType: 'msg', statusVal: '', statusType: 'auto',
+    targetType: 'msg', statusVal: 'topic', statusType: 'auto',
     x: 440, y: 640 + EY, wires: []
   },
   {
@@ -1126,15 +1126,37 @@ const engineFlows = [
     url: '', tls: 'tls_tak', persist: false, proxy: '',
     insecureHTTPParser: false, authType: '',
     senderr: false, headers: [],
-    x: 460, y: 480 + EY, wires: [['eng_debug_action']]
+    x: 460, y: 480 + EY, wires: [['eng_log_action']]
+  },
+  {
+    id: 'eng_log_action', type: 'function', z: FLOW_ID,
+    name: 'Log API result',
+    func: [
+      "var code = msg.statusCode || '?';",
+      "var method = msg.method || '?';",
+      "var feed = msg.topic || 'unknown';",
+      "var ok = (code >= 200 && code < 300);",
+      "var label = feed + ' ' + method + ' → ' + code + (ok ? ' ✓' : ' ✗');",
+      "if (!ok) {",
+      "  var body = (typeof msg.payload === 'string') ? msg.payload.substring(0, 200) : '';",
+      "  node.warn(label + (body ? ' — ' + body : ''));",
+      "} else {",
+      "  node.warn(label);",
+      "}",
+      "msg._apiResult = label;",
+      "return msg;"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 660, y: 480 + EY, wires: [['eng_debug_action']]
   },
   {
     id: 'eng_debug_action', type: 'debug', z: FLOW_ID,
     name: 'Mission API result',
     active: true, tosidebar: true, console: false, tostatus: true,
-    complete: 'true', targetType: 'full',
-    statusVal: '', statusType: 'auto',
-    x: 680, y: 480 + EY, wires: []
+    complete: '_apiResult',
+    targetType: 'msg', statusVal: '_apiResult', statusType: 'auto',
+    x: 860, y: 480 + EY, wires: []
   }
 ];
 
