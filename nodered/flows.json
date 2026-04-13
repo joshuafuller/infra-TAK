@@ -519,7 +519,7 @@
     "type": "function",
     "z": "flow_arcgis_cfg",
     "name": "Save to global context",
-    "func": "var config  = msg.payload;\nvar configs = global.get('arcgis_configs') || [];\nvar idx = configs.findIndex(function(c) {\n  return c.source.serviceUrl === config.source.serviceUrl\n      && c.source.layerId    === config.source.layerId;\n});\nif (idx >= 0) { configs[idx] = config; }\nelse           { configs.push(config); }\nglobal.set('arcgis_configs', configs);\nmsg.payload = { ok: true, configCount: configs.length };\nreturn msg;",
+    "func": "var config  = msg.payload;\nvar configs = global.get('arcgis_configs') || [];\nvar idx = configs.findIndex(function(c) {\n  return c.source.serviceUrl === config.source.serviceUrl\n      && c.source.layerId    === config.source.layerId;\n});\nif (idx >= 0) { configs[idx] = config; }\nelse           { configs.push(config); }\nglobal.set('arcgis_configs', configs);\nvar certUser = (config.streamCertUser || '').trim();\nif (certUser) {\n  try {\n    var fs = require('fs');\n    var pem = '/certs/' + certUser + '.pem';\n    var key = '/certs/' + certUser + '.key';\n    if (fs.existsSync(pem)) fs.chmodSync(pem, 0o644);\n    if (fs.existsSync(key)) fs.chmodSync(key, 0o644);\n    node.warn('Cert permissions fixed for ' + certUser);\n  } catch(e) { node.warn('chmod failed: ' + e.message); }\n}\nmsg.payload = { ok: true, configCount: configs.length };\nreturn msg;",
     "outputs": 1,
     "timeout": "",
     "noerr": 0,
