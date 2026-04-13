@@ -1147,16 +1147,16 @@ const engineFlows = [
   },
   {
     id: 'eng_rate_stream', type: 'delay', z: FLOW_ID,
-    name: 'Throttle CoT (20/sec)', pauseType: 'rate',
+    name: 'Throttle CoT (10/sec)', pauseType: 'rate',
     timeout: '1', timeoutUnits: 'seconds',
-    rate: '20', nbRateUnits: '1', rateUnits: 'second',
+    rate: '10', nbRateUnits: '1', rateUnits: 'second',
     randomFirst: '1', randomLast: '5', randomUnits: 'seconds',
     drop: false, allowrate: false, outputs: 1,
     x: 440, y: 680 + EY, wires: [['eng_tcp_out']]
   },
   {
     id: 'eng_delay_put', type: 'delay', z: FLOW_ID,
-    name: 'Wait 15s for CoT ingest', pauseType: 'delay', timeout: '15', timeoutUnits: 'seconds',
+    name: 'Wait 45s for CoT ingest', pauseType: 'delay', timeout: '45', timeoutUnits: 'seconds',
     rate: '1', nbRateUnits: '1', rateUnits: 'second',
     randomFirst: '1', randomLast: '5', randomUnits: 'seconds',
     drop: false, allowrate: false, outputs: 1,
