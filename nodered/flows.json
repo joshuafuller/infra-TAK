@@ -816,8 +816,8 @@
     "cert": "",
     "key": "",
     "ca": "",
-    "certname": "",
-    "keyname": "",
+    "certname": "/certs/nodered-global-caairintel.pem",
+    "keyname": "/certs/nodered-global-caairintel.key",
     "caname": "",
     "servername": "",
     "verifyservercert": false

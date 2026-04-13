@@ -10,7 +10,7 @@ const CFG_TAB = 'flow_arcgis_cfg';
 // ║  integration: add a row here and redeploy.                  ║
 // ╚══════════════════════════════════════════════════════════════╝
 const FEEDS = [
-  { id: 'air_intel',    configName: 'CA AIR INTEL',  streamPort: 7001, certUser: '', ratePerSec: 10, putDelaySec: 15 },
+  { id: 'air_intel',    configName: 'CA AIR INTEL',  streamPort: 7001, certUser: 'nodered-global-caairintel', ratePerSec: 10, putDelaySec: 15 },
   { id: 'pwr_outages',  configName: 'POWER-OUTAGES', streamPort: 7002, certUser: '', ratePerSec: 10, putDelaySec: 90 }
 ];
 
