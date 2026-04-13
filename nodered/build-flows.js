@@ -775,7 +775,7 @@ const engineFlows = [
       "  if (isPoly && g.rings && g.rings[0]) {",
       "    var links = [];",
       "    var ring = g.rings[0];",
-      "    var MAX_VERTS = 400;",
+      "    var MAX_VERTS = 200;",
       "    if (ring.length > MAX_VERTS) {",
       "      var step = ring.length / MAX_VERTS;",
       "      var simplified = [];",
@@ -1108,7 +1108,7 @@ const engineFlows = [
       "var p = e.point._attributes;",
       "var d = e.detail || {};",
       "",
-      "var xml = '<?xml version=\"1.0\" encoding=\"UTF-8\"?>'",
+      "var xml = '<?xml version=\"1.0\" encoding=\"UTF-8\"?>\\n'",
       "  + '<event version=\"' + a.version + '\" uid=\"' + a.uid + '\" type=\"' + a.type + '\"'",
       "  + ' how=\"' + a.how + '\" time=\"' + a.time + '\" start=\"' + a.start + '\" stale=\"' + a.stale + '\">'",
       "  + '<point lat=\"' + p.lat + '\" lon=\"' + p.lon + '\" hae=\"' + p.hae + '\" ce=\"' + p.ce + '\" le=\"' + p.le + '\"/>'",
@@ -1129,12 +1129,13 @@ const engineFlows = [
       "",
       "xml += '</detail></event>';",
       "",
-      "msg.payload = Buffer.from(xml + '\\n', 'utf8');",
+      "msg.payload = Buffer.from(xml, 'utf8');",
+      "if (msg.payload.length > 5000) node.warn('CoT ' + a.uid + ': ' + msg.payload.length + ' bytes');",
       "return msg;"
     ].join('\n'),
     outputs: 1, timeout: '', noerr: 0,
     initialize: '', finalize: '', libs: [],
-    x: 200, y: 640 + EY, wires: [['eng_tcp_out', 'eng_debug_xml']]
+    x: 200, y: 640 + EY, wires: [['eng_rate_stream', 'eng_debug_xml']]
   },
   {
     id: 'eng_debug_xml', type: 'debug', z: FLOW_ID,
@@ -1145,8 +1146,17 @@ const engineFlows = [
     x: 440, y: 640 + EY, wires: []
   },
   {
+    id: 'eng_rate_stream', type: 'delay', z: FLOW_ID,
+    name: 'Throttle CoT (20/sec)', pauseType: 'rate',
+    timeout: '1', timeoutUnits: 'seconds',
+    rate: '20', nbRateUnits: '1', rateUnits: 'second',
+    randomFirst: '1', randomLast: '5', randomUnits: 'seconds',
+    drop: false, allowrate: false, outputs: 1,
+    x: 440, y: 680 + EY, wires: [['eng_tcp_out']]
+  },
+  {
     id: 'eng_delay_put', type: 'delay', z: FLOW_ID,
-    name: 'Wait 5s for CoT', pauseType: 'delay', timeout: '5', timeoutUnits: 'seconds',
+    name: 'Wait 15s for CoT ingest', pauseType: 'delay', timeout: '15', timeoutUnits: 'seconds',
     rate: '1', nbRateUnits: '1', rateUnits: 'second',
     randomFirst: '1', randomLast: '5', randomUnits: 'seconds',
     drop: false, allowrate: false, outputs: 1,
