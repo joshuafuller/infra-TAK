@@ -88,40 +88,7 @@ docker exec "$CONTAINER" node -e "
 
   upd.forEach(function(n) {
     if (n.type === 'tls-config' && n.id.indexOf('tls_stream_') === 0) {
-      var curTls = cur.find(function(c) { return c.id === n.id; });
-      if (curTls && (curTls.cert || curTls.certname)) {
-        var name = n.name;
-        var cfgName = n._configName;
-        var buildCert = n.cert;
-        var buildKey  = n.key;
-        Object.keys(curTls).forEach(function(k) { n[k] = curTls[k]; });
-        n.name = name;
-        n._configName = cfgName;
-        if (!n.cert && n.certname && n.certname.indexOf('/certs/') === 0) {
-          n.cert = n.certname; n.certname = '';
-          n.key  = n.keyname;  n.keyname  = '';
-          console.log('    TLS (' + n.name + '): migrated certname→cert (' + n.cert + ')');
-        } else if (!n.cert && buildCert) {
-          n.cert = buildCert; n.key = buildKey;
-          n.certname = ''; n.keyname = '';
-          console.log('    TLS (' + n.name + '): used build values (' + n.cert + ')');
-        } else {
-          console.log('    TLS (' + n.name + '): preserved (' + n.cert + ')');
-        }
-      } else {
-        var matchCfg = cfgs.find(function(c) { return c.configName === n._configName; });
-        var certUser = matchCfg ? (matchCfg.streamCertUser || '').trim() : '';
-        if (certUser) {
-          n.cert = '/certs/' + certUser + '.pem';
-          n.key  = '/certs/' + certUser + '.key';
-          n.certname = '';
-          n.keyname  = '';
-          n.verifyservercert = false;
-          console.log('    TLS (' + n.name + '): auto-configured from configurator (' + certUser + ')');
-        } else {
-          console.log('    TLS (' + n.name + '): no streamCertUser in configurator — set in editor');
-        }
-      }
+      console.log('    TLS (' + n.name + '): cert=' + (n.cert || '(empty)') + ' key=' + (n.key || '(empty)'));
     }
   });
 
