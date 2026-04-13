@@ -89,26 +89,27 @@ docker exec "$CONTAINER" node -e "
   upd.forEach(function(n) {
     if (n.type === 'tls-config' && n.id.indexOf('tls_stream_') === 0) {
       var curTls = cur.find(function(c) { return c.id === n.id; });
-      if (curTls && (curTls.certname || curTls.cert)) {
+      if (curTls && (curTls.cert || curTls.certname)) {
         var name = n.name;
         var cfgName = n._configName;
         Object.keys(curTls).forEach(function(k) { n[k] = curTls[k]; });
         n.name = name;
         n._configName = cfgName;
-        console.log('    TLS (' + n.name + '): preserved (' + n.certname + ')');
+        console.log('    TLS (' + n.name + '): preserved (cert=' + (n.cert || n.certname) + ')');
       } else {
         var matchCfg = cfgs.find(function(c) { return c.configName === n._configName; });
         var certUser = matchCfg ? (matchCfg.streamCertUser || '').trim() : '';
         if (certUser) {
-          n.certname = '/certs/' + certUser + '.pem';
-          n.keyname  = '/certs/' + certUser + '.key';
+          n.cert = '/certs/' + certUser + '.pem';
+          n.key  = '/certs/' + certUser + '.key';
+          n.certname = '';
+          n.keyname  = '';
           n.verifyservercert = false;
           console.log('    TLS (' + n.name + '): auto-configured from configurator (' + certUser + ')');
         } else {
           console.log('    TLS (' + n.name + '): no streamCertUser in configurator — set in editor');
         }
       }
-      if (n.certname) n.uselocalfiles = true;
     }
   });
 

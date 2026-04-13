@@ -498,11 +498,10 @@ const tlsNodes = [
     id: 'tls_stream_' + f.id, type: 'tls-config',
     name: f.configName + ' Stream TLS',
     _configName: f.configName,
-    cert: '', key: '', ca: '',
-    certname: f.certUser ? '/certs/' + f.certUser + '.pem' : '',
-    keyname:  f.certUser ? '/certs/' + f.certUser + '.key' : '',
-    caname: '',
-    uselocalfiles: !!f.certUser,
+    cert: f.certUser ? '/certs/' + f.certUser + '.pem' : '',
+    key:  f.certUser ? '/certs/' + f.certUser + '.key' : '',
+    ca: '',
+    certname: '', keyname: '', caname: '',
     servername: '', verifyservercert: false
   }))
 ];
