@@ -1121,7 +1121,7 @@ const engineFlows = [
       "",
       "xml += '</detail></event>';",
       "",
-      "msg.payload = Buffer.from(xml, 'utf8');",
+      "msg.payload = Buffer.from(xml + '\\n', 'utf8');",
       "return msg;"
     ].join('\n'),
     outputs: 1, timeout: '', noerr: 0,
