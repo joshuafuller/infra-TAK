@@ -10,8 +10,8 @@ const CFG_TAB = 'flow_arcgis_cfg';
 // ║  integration: add a row here and redeploy.                  ║
 // ╚══════════════════════════════════════════════════════════════╝
 const FEEDS = [
-  { id: 'air_intel',    configName: 'CA AIR INTEL',  ratePerSec: 10, putDelaySec: 15 },
-  { id: 'pwr_outages',  configName: 'POWER-OUTAGES', ratePerSec: 10, putDelaySec: 90 }
+  { id: 'air_intel',    configName: 'CA AIR INTEL',  streamPort: 7001, certUser: 'nodered-global-arcgis', ratePerSec: 10, putDelaySec: 15 },
+  { id: 'pwr_outages',  configName: 'POWER-OUTAGES', streamPort: 7002, certUser: '',                     ratePerSec: 10, putDelaySec: 90 }
 ];
 
 // ════════════════════════════════════════════════════════════════
@@ -493,13 +493,16 @@ const tlsNodes = [
     certname: '', keyname: '', caname: '',
     servername: '', verifyservercert: false
   },
-  {
-    id: 'tls_tak_stream', type: 'tls-config',
-    name: 'TAK Stream TLS',
+  // Per-feed stream TLS configs (each integration has its own cert)
+  ...FEEDS.map(f => ({
+    id: 'tls_stream_' + f.id, type: 'tls-config',
+    name: f.configName + ' Stream TLS',
     cert: '', key: '', ca: '',
-    certname: '', keyname: '', caname: '',
+    certname: f.certUser ? '/certs/' + f.certUser + '.pem' : '',
+    keyname:  f.certUser ? '/certs/' + f.certUser + '.key' : '',
+    caname: '',
     servername: '', verifyservercert: false
-  }
+  }))
 ];
 
 // ════════════════════════════════════════════════════════════════
@@ -1075,9 +1078,9 @@ function makeEngineTab(feed) {
     },
     {
       id: P + 'tcp_out', type: 'tcp out', z: FID,
-      name: 'CoT → TAK',
-      host: 'host.docker.internal', port: '7001', beserver: 'client',
-      base64: false, end: false, tls: 'tls_tak_stream',
+      name: 'CoT → TAK :' + feed.streamPort,
+      host: 'host.docker.internal', port: String(feed.streamPort), beserver: 'client',
+      base64: false, end: false, tls: 'tls_stream_' + feed.id,
       x: 600, y: 520, wires: []
     },
     {

@@ -82,43 +82,52 @@ docker exec "$CONTAINER" node -e "
     console.log('    TLS (API): empty (first deploy — configure in Node-RED editor)');
   }
 
-  // --- TLS config: TCP streaming (restricted cert for 7001) ---
-  var tlsStreamIdx = upd.findIndex(function(n) { return n.id === 'tls_tak_stream'; });
-  var tlsStreamCur = cur.find(function(n) { return n.id === 'tls_tak_stream'; });
-
-  if (tlsStreamCur && (tlsStreamCur.certname || tlsStreamCur.cert)) {
-    if (tlsStreamIdx >= 0) upd[tlsStreamIdx] = tlsStreamCur;
-    console.log('    TLS (Stream): preserved from running container');
-  } else if (creatorUid) {
-    if (tlsStreamIdx >= 0) {
-      upd[tlsStreamIdx].certname = '/certs/' + creatorUid + '.pem';
-      upd[tlsStreamIdx].keyname  = '/certs/' + creatorUid + '.key';
-      upd[tlsStreamIdx].caname   = '';
-      upd[tlsStreamIdx].verifyservercert = false;
+  // --- TLS config: per-feed stream certs ---
+  upd.forEach(function(n) {
+    if (n.type === 'tls-config' && n.id.indexOf('tls_stream_') === 0) {
+      var curTls = cur.find(function(c) { return c.id === n.id; });
+      if (curTls && (curTls.certname || curTls.cert)) {
+        var name = n.name;
+        Object.keys(curTls).forEach(function(k) { n[k] = curTls[k]; });
+        n.name = name;
+        console.log('    TLS (' + n.name + '): preserved');
+      } else if (n.certname) {
+        console.log('    TLS (' + n.name + '): auto-configured (' + n.certname + ')');
+      } else {
+        console.log('    TLS (' + n.name + '): empty (configure in Node-RED editor)');
+      }
     }
-    console.log('    TLS (Stream): auto-configured from creatorUid (' + creatorUid + ')');
-  } else {
-    console.log('    TLS (Stream): empty (first deploy — configure in Node-RED editor)');
+  });
+
+  // Legacy fallback: if old tls_tak_stream exists, copy its certs to first empty stream TLS
+  var oldStream = cur.find(function(n) { return n.id === 'tls_tak_stream' && (n.certname || n.cert); });
+  if (oldStream) {
+    var firstEmpty = upd.find(function(n) { return n.type === 'tls-config' && n.id.indexOf('tls_stream_') === 0 && !n.certname && !n.cert; });
+    if (firstEmpty) {
+      firstEmpty.certname = oldStream.certname;
+      firstEmpty.keyname = oldStream.keyname;
+      firstEmpty.caname = oldStream.caname;
+      firstEmpty.cert = oldStream.cert;
+      firstEmpty.key = oldStream.key;
+      firstEmpty.ca = oldStream.ca;
+      firstEmpty.verifyservercert = oldStream.verifyservercert;
+      console.log('    TLS: migrated old tls_tak_stream to ' + firstEmpty.name);
+    }
   }
 
-  // --- TCP out (patch ALL tcp out nodes with same host/port/tls) ---
+  // --- TCP out (preserve host + tls from existing; keep per-feed ports from build) ---
   var tcpCur = cur.find(function(n) { return n.type === 'tcp out' && n.host; });
   var tcpCount = 0;
   upd.forEach(function(n) {
     if (n.type === 'tcp out') {
       if (tcpCur) {
         n.host = tcpCur.host;
-        n.port = tcpCur.port;
         n.tls  = tcpCur.tls;
       }
       tcpCount++;
+      console.log('    TCP: ' + n.name + ' → ' + n.host + ':' + n.port);
     }
   });
-  if (tcpCur) {
-    console.log('    TCP: preserved (' + tcpCur.host + ':' + tcpCur.port + ') on ' + tcpCount + ' nodes');
-  } else {
-    console.log('    TCP: using defaults (host.docker.internal:7001) on ' + tcpCount + ' nodes');
-  }
 
   fs.writeFileSync('/tmp/flows_merged.json', JSON.stringify(upd, null, 2));
 "
