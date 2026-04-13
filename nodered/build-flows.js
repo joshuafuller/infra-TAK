@@ -502,6 +502,7 @@ const tlsNodes = [
     certname: f.certUser ? '/certs/' + f.certUser + '.pem' : '',
     keyname:  f.certUser ? '/certs/' + f.certUser + '.key' : '',
     caname: '',
+    uselocalfiles: !!f.certUser,
     servername: '', verifyservercert: false
   }))
 ];

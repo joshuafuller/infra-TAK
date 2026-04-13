@@ -819,6 +819,7 @@
     "certname": "/certs/nodered-global-caairintel.pem",
     "keyname": "/certs/nodered-global-caairintel.key",
     "caname": "",
+    "uselocalfiles": true,
     "servername": "",
     "verifyservercert": false
   },
@@ -833,6 +834,7 @@
     "certname": "",
     "keyname": "",
     "caname": "",
+    "uselocalfiles": false,
     "servername": "",
     "verifyservercert": false
   },
