@@ -82,50 +82,29 @@ docker exec "$CONTAINER" node -e "
     console.log('    TLS (API): empty (first deploy — configure in Node-RED editor)');
   }
 
-  // --- TLS config: per-feed stream certs ---
+  // --- TLS config: per-feed stream certs (preserved from running container) ---
   upd.forEach(function(n) {
     if (n.type === 'tls-config' && n.id.indexOf('tls_stream_') === 0) {
       var curTls = cur.find(function(c) { return c.id === n.id; });
       if (curTls && (curTls.certname || curTls.cert)) {
         var name = n.name;
+        var cfgName = n._configName;
         Object.keys(curTls).forEach(function(k) { n[k] = curTls[k]; });
         n.name = name;
-        console.log('    TLS (' + n.name + '): preserved');
-      } else if (n.certname) {
-        console.log('    TLS (' + n.name + '): auto-configured (' + n.certname + ')');
+        n._configName = cfgName;
+        console.log('    TLS (' + n.name + '): preserved (' + n.certname + ')');
       } else {
-        console.log('    TLS (' + n.name + '): empty (configure in Node-RED editor)');
+        console.log('    TLS (' + n.name + '): empty — configure in Node-RED editor');
       }
     }
   });
 
-  // Legacy fallback: if old tls_tak_stream exists, copy its certs to first empty stream TLS
-  var oldStream = cur.find(function(n) { return n.id === 'tls_tak_stream' && (n.certname || n.cert); });
-  if (oldStream) {
-    var firstEmpty = upd.find(function(n) { return n.type === 'tls-config' && n.id.indexOf('tls_stream_') === 0 && !n.certname && !n.cert; });
-    if (firstEmpty) {
-      firstEmpty.certname = oldStream.certname;
-      firstEmpty.keyname = oldStream.keyname;
-      firstEmpty.caname = oldStream.caname;
-      firstEmpty.cert = oldStream.cert;
-      firstEmpty.key = oldStream.key;
-      firstEmpty.ca = oldStream.ca;
-      firstEmpty.verifyservercert = oldStream.verifyservercert;
-      console.log('    TLS: migrated old tls_tak_stream to ' + firstEmpty.name);
-    }
-  }
-
-  // --- TCP out (preserve host + tls from existing; keep per-feed ports from build) ---
+  // --- TCP out (preserve host from existing; keep per-feed ports + tls from build) ---
   var tcpCur = cur.find(function(n) { return n.type === 'tcp out' && n.host; });
-  var tcpCount = 0;
   upd.forEach(function(n) {
     if (n.type === 'tcp out') {
-      if (tcpCur) {
-        n.host = tcpCur.host;
-        n.tls  = tcpCur.tls;
-      }
-      tcpCount++;
-      console.log('    TCP: ' + n.name + ' → ' + n.host + ':' + n.port);
+      if (tcpCur) n.host = tcpCur.host;
+      console.log('    TCP: ' + n.name + ' → ' + n.host + ':' + n.port + ' tls=' + n.tls);
     }
   });
 
