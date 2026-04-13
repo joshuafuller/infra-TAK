@@ -1068,7 +1068,7 @@ async function selectConfig(idx) {
 
   if (c.mapping) {
     if (c.mapping.idField) document.getElementById('idField').value = c.mapping.idField;
-    if (c.mapping.timeField) document.getElementById('timeField').value = c.mapping.timeField;
+    document.getElementById('timeField').value = c.mapping.timeField || '';
   }
 
   if (c.filter && c.filter.field) {

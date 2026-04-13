@@ -426,6 +426,41 @@ const flows = [
     id: 'ho_tak_load', type: 'http response', z: FLOW_ID,
     name: '', statusCode: '', headers: {},
     x: 640, y: 860, wires: []
+  },
+
+  // POST /api/tak/force-subscribe  →  clear _subscribed so eng_build_sub runs again on next poll
+  {
+    id: 'hi_force_sub', type: 'http in', z: FLOW_ID,
+    name: 'POST /api/tak/force-subscribe',
+    url: '/api/tak/force-subscribe', method: 'post',
+    upload: false, swaggerDoc: '',
+    x: 220, y: 900, wires: [['fn_force_sub']]
+  },
+  {
+    id: 'fn_force_sub', type: 'function', z: FLOW_ID,
+    name: 'Clear mission subscribe cache',
+    func: [
+      "var sub = flow.get('_subscribed') || {};",
+      "var mn = (msg.payload && msg.payload.missionName) ? String(msg.payload.missionName).trim() : '';",
+      "if (mn) {",
+      "  delete sub[mn];",
+      "  flow.set('_subscribed', sub);",
+      "  msg.payload = { ok: true, cleared: mn };",
+      "} else {",
+      "  flow.set('_subscribed', {});",
+      "  msg.payload = { ok: true, cleared: 'all' };",
+      "}",
+      "node.warn('force-subscribe: next engine poll will PUT /subscription for ' + (mn || 'all missions'));",
+      "return msg;"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 480, y: 900, wires: [['ho_force_sub']]
+  },
+  {
+    id: 'ho_force_sub', type: 'http response', z: FLOW_ID,
+    name: '', statusCode: '', headers: {},
+    x: 720, y: 900, wires: []
   }
 ];
 
