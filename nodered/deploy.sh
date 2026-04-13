@@ -26,11 +26,11 @@ docker cp "$CONTAINER:/data/flows.json" "/tmp/flows_current.json" 2>/dev/null ||
 # Preserve encrypted credentials file (TLS cert data lives here, not in flows.json)
 docker cp "$CONTAINER:/data/flows_cred.json" "/tmp/flows_cred_backup.json" 2>/dev/null || true
 
-# Read flow context to get creatorUid for TLS cert convention
+# Read context to get creatorUid for TLS cert convention (global first, flow fallback)
 echo "==> Reading flow context for TLS auto-config"
-FLOW_ID="flow_arcgis_cfg"
 HAS_CONTEXT=false
-docker cp "$CONTAINER:/data/context/flow/${FLOW_ID}.json" "/tmp/flows_context.json" 2>/dev/null && HAS_CONTEXT=true || true
+docker cp "$CONTAINER:/data/context/global/global.json" "/tmp/flows_context.json" 2>/dev/null && HAS_CONTEXT=true || \
+  docker cp "$CONTAINER:/data/context/flow/flow_arcgis_cfg.json" "/tmp/flows_context.json" 2>/dev/null && HAS_CONTEXT=true || true
 
 # Run merge inside the container (node is available there)
 docker cp "$NEW_FLOWS" "$CONTAINER:/tmp/flows_new.json"
@@ -101,16 +101,23 @@ docker exec "$CONTAINER" node -e "
     console.log('    TLS (Stream): empty (first deploy — configure in Node-RED editor)');
   }
 
-  // --- TCP out ---
-  var tcpIdx = upd.findIndex(function(n) { return n.id === 'eng_tcp_out'; });
-  var tcpCur = cur.find(function(n) { return n.id === 'eng_tcp_out'; });
-  if (tcpCur && tcpCur.host) {
-    upd[tcpIdx].host = tcpCur.host;
-    upd[tcpIdx].port = tcpCur.port;
-    upd[tcpIdx].tls  = tcpCur.tls;
-    console.log('    TCP: preserved (' + tcpCur.host + ':' + tcpCur.port + ')');
+  // --- TCP out (patch ALL tcp out nodes with same host/port/tls) ---
+  var tcpCur = cur.find(function(n) { return n.type === 'tcp out' && n.host; });
+  var tcpCount = 0;
+  upd.forEach(function(n) {
+    if (n.type === 'tcp out') {
+      if (tcpCur) {
+        n.host = tcpCur.host;
+        n.port = tcpCur.port;
+        n.tls  = tcpCur.tls;
+      }
+      tcpCount++;
+    }
+  });
+  if (tcpCur) {
+    console.log('    TCP: preserved (' + tcpCur.host + ':' + tcpCur.port + ') on ' + tcpCount + ' nodes');
   } else {
-    console.log('    TCP: using defaults (host.docker.internal:7001)');
+    console.log('    TCP: using defaults (host.docker.internal:7001) on ' + tcpCount + ' nodes');
   }
 
   fs.writeFileSync('/tmp/flows_merged.json', JSON.stringify(upd, null, 2));
