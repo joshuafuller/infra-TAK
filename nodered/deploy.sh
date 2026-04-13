@@ -104,6 +104,22 @@ docker exec "$CONTAINER" node -e "
   fs.writeFileSync('/tmp/flows_merged.json', JSON.stringify(upd, null, 2));
 "
 
+# Fix permissions on any certs referenced by stream TLS configs
+CERT_HOST_DIR="/opt/tak/certs/files"
+docker exec "$CONTAINER" node -e "
+  var f = JSON.parse(require('fs').readFileSync('/tmp/flows_merged.json','utf8'));
+  f.forEach(function(n) {
+    if (n.type === 'tls-config' && n.cert) console.log(n.cert);
+    if (n.type === 'tls-config' && n.key)  console.log(n.key);
+  });
+" | while read -r CPATH; do
+  HOST_FILE="$CERT_HOST_DIR/$(basename "$CPATH")"
+  if [ -f "$HOST_FILE" ]; then
+    chmod 644 "$HOST_FILE"
+    echo "    Certs: chmod 644 $HOST_FILE"
+  fi
+done
+
 # Move merged flows into place inside the container
 docker exec "$CONTAINER" cp /tmp/flows_merged.json /data/flows.json
 # Restore credentials file so TLS cert data survives the deploy
