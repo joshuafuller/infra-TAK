@@ -108,6 +108,7 @@ docker exec "$CONTAINER" node -e "
           console.log('    TLS (' + n.name + '): no streamCertUser in configurator — set in editor');
         }
       }
+      if (n.certname) n.uselocalfiles = true;
     }
   });
 
