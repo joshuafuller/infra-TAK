@@ -473,10 +473,19 @@ const EY = 920;
 
 const engineFlows = [
 
-  // ── TLS config placeholder (user uploads certs in editor) ──
+  // ── TLS config: Mission API (admin cert — 8443 PUT/DELETE/GET) ──
   {
     id: 'tls_tak', type: 'tls-config',
-    name: 'TAK Server TLS',
+    name: 'TAK Mission API TLS',
+    cert: '', key: '', ca: '',
+    certname: '', keyname: '', caname: '',
+    servername: '', verifyservercert: false
+  },
+
+  // ── TLS config: TCP streaming (restricted cert — 7001 CoT ingest) ──
+  {
+    id: 'tls_tak_stream', type: 'tls-config',
+    name: 'TAK Stream TLS',
     cert: '', key: '', ca: '',
     certname: '', keyname: '', caname: '',
     servername: '', verifyservercert: false
@@ -1047,8 +1056,8 @@ const engineFlows = [
   {
     id: 'eng_tcp_out', type: 'tcp out', z: FLOW_ID,
     name: 'CoT stream to TAK',
-    host: 'host.docker.internal', port: '8089', beserver: 'client',
-    base64: false, end: false, tls: 'tls_tak',
+    host: 'host.docker.internal', port: '7001', beserver: 'client',
+    base64: false, end: false, tls: 'tls_tak_stream',
     x: 410, y: 520 + EY, wires: []
   },
   {

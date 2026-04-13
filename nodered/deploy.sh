@@ -63,23 +63,42 @@ docker exec "$CONTAINER" node -e "
   var cur = [];
   try { cur = JSON.parse(fs.readFileSync('/tmp/flows_current.json', 'utf8')); } catch(e) {}
 
-  // --- TLS config ---
+  // --- TLS config: Mission API (admin cert for 8443) ---
   var tlsIdx = upd.findIndex(function(n) { return n.id === 'tls_tak'; });
   var tlsCur = cur.find(function(n) { return n.id === 'tls_tak'; });
 
   if (tlsCur && (tlsCur.certname || tlsCur.cert)) {
     if (tlsIdx >= 0) upd[tlsIdx] = tlsCur;
-    console.log('    TLS: preserved from running container');
+    console.log('    TLS (API): preserved from running container');
   } else if (creatorUid) {
     if (tlsIdx >= 0) {
-      upd[tlsIdx].certname = '/certs/' + creatorUid + '.pem';
-      upd[tlsIdx].keyname  = '/certs/' + creatorUid + '.key';
+      upd[tlsIdx].certname = '/certs/admin.pem';
+      upd[tlsIdx].keyname  = '/certs/admin.key';
       upd[tlsIdx].caname   = '';
       upd[tlsIdx].verifyservercert = false;
     }
-    console.log('    TLS: auto-configured from creatorUid (' + creatorUid + ')');
+    console.log('    TLS (API): auto-configured with admin cert');
   } else {
-    console.log('    TLS: empty (first deploy — configure in Node-RED editor)');
+    console.log('    TLS (API): empty (first deploy — configure in Node-RED editor)');
+  }
+
+  // --- TLS config: TCP streaming (restricted cert for 7001) ---
+  var tlsStreamIdx = upd.findIndex(function(n) { return n.id === 'tls_tak_stream'; });
+  var tlsStreamCur = cur.find(function(n) { return n.id === 'tls_tak_stream'; });
+
+  if (tlsStreamCur && (tlsStreamCur.certname || tlsStreamCur.cert)) {
+    if (tlsStreamIdx >= 0) upd[tlsStreamIdx] = tlsStreamCur;
+    console.log('    TLS (Stream): preserved from running container');
+  } else if (creatorUid) {
+    if (tlsStreamIdx >= 0) {
+      upd[tlsStreamIdx].certname = '/certs/' + creatorUid + '.pem';
+      upd[tlsStreamIdx].keyname  = '/certs/' + creatorUid + '.key';
+      upd[tlsStreamIdx].caname   = '';
+      upd[tlsStreamIdx].verifyservercert = false;
+    }
+    console.log('    TLS (Stream): auto-configured from creatorUid (' + creatorUid + ')');
+  } else {
+    console.log('    TLS (Stream): empty (first deploy — configure in Node-RED editor)');
   }
 
   // --- TCP out ---
@@ -91,7 +110,7 @@ docker exec "$CONTAINER" node -e "
     upd[tcpIdx].tls  = tcpCur.tls;
     console.log('    TCP: preserved (' + tcpCur.host + ':' + tcpCur.port + ')');
   } else {
-    console.log('    TCP: using defaults (host.docker.internal:8089)');
+    console.log('    TCP: using defaults (host.docker.internal:7001)');
   }
 
   fs.writeFileSync('/tmp/flows_merged.json', JSON.stringify(upd, null, 2));
