@@ -82,7 +82,10 @@ docker exec "$CONTAINER" node -e "
     console.log('    TLS (API): empty (first deploy — configure in Node-RED editor)');
   }
 
-  // --- TLS config: per-feed stream certs (preserved from running container) ---
+  // --- TLS config: per-feed stream certs (from configurator streamCertUser or preserved) ---
+  var cfgs = [];
+  try { cfgs = ctx.arcgis_configs || []; } catch(e) {}
+
   upd.forEach(function(n) {
     if (n.type === 'tls-config' && n.id.indexOf('tls_stream_') === 0) {
       var curTls = cur.find(function(c) { return c.id === n.id; });
@@ -94,7 +97,16 @@ docker exec "$CONTAINER" node -e "
         n._configName = cfgName;
         console.log('    TLS (' + n.name + '): preserved (' + n.certname + ')');
       } else {
-        console.log('    TLS (' + n.name + '): empty — configure in Node-RED editor');
+        var matchCfg = cfgs.find(function(c) { return c.configName === n._configName; });
+        var certUser = matchCfg ? (matchCfg.streamCertUser || '').trim() : '';
+        if (certUser) {
+          n.certname = '/certs/' + certUser + '.pem';
+          n.keyname  = '/certs/' + certUser + '.key';
+          n.verifyservercert = false;
+          console.log('    TLS (' + n.name + '): auto-configured from configurator (' + certUser + ')');
+        } else {
+          console.log('    TLS (' + n.name + '): no streamCertUser in configurator — set in editor');
+        }
       }
     }
   });
