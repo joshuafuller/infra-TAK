@@ -417,6 +417,12 @@
         <div id="certPreview" style="font-size:0.75rem;color:#666;margin-top:0.2rem"></div>
       </div>
     </div>
+    <div class="field-grid" style="margin-bottom:1rem">
+      <div>
+        <label for="streamPort">Stream port (from TAK Portal data feed)</label>
+        <input type="number" id="streamPort" min="1" max="65535" value="8089" placeholder="e.g. 7001">
+      </div>
+    </div>
     <div class="field-grid" style="margin-bottom:1rem" id="dataSyncFields">
       <div>
         <label for="missionName">TAK Mission name</label>
@@ -925,6 +931,7 @@ function generateConfig() {
     uidPrefix: document.getElementById('uidPrefix').value,
     dataSyncEnabled: document.getElementById('dataSyncEnabled').checked,
     streamCertUser: (document.getElementById('streamCertUser').value || '').trim(),
+    streamPort: parseInt(document.getElementById('streamPort').value, 10) || 8089,
     missionName: document.getElementById('missionName').value || '',
     creatorUid: (document.getElementById('configCreatorUid').value || '').trim(),
     pollInterval: parseInt(document.getElementById('pollInterval').value, 10) || 5,
@@ -1024,6 +1031,7 @@ function resetForm() {
   document.getElementById('configName').value = '';
   document.getElementById('dataSyncEnabled').checked = true;
   document.getElementById('streamCertUser').value = '';
+  document.getElementById('streamPort').value = '8089';
   document.getElementById('missionName').value = '';
   document.getElementById('configCreatorUid').value = 'admin';
   document.getElementById('pollInterval').value = '5';
@@ -1170,6 +1178,7 @@ async function selectConfig(idx) {
   if (c.uidPrefix) document.getElementById('uidPrefix').value = c.uidPrefix;
   document.getElementById('dataSyncEnabled').checked = c.dataSyncEnabled !== false;
   document.getElementById('streamCertUser').value = c.streamCertUser || '';
+  document.getElementById('streamPort').value = (c.streamPort > 0) ? c.streamPort : 8089;
   if (c.missionName) document.getElementById('missionName').value = c.missionName;
   document.getElementById('configCreatorUid').value = (c.creatorUid != null && c.creatorUid !== '') ? c.creatorUid : 'admin';
   document.getElementById('pollInterval').value = (c.pollInterval != null && c.pollInterval > 0) ? c.pollInterval : 5;
