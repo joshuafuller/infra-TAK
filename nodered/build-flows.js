@@ -1154,7 +1154,8 @@ const engineFlows = [
       "msg.headers = { 'accept': '*/*', 'Content-Type': 'application/json' };",
       "if (msg._missionCookie) msg.headers.Cookie = msg._missionCookie;",
       "if (msg._missionBearer) msg.headers.Authorization = 'Bearer ' + msg._missionBearer;",
-      "msg.payload = JSON.stringify({ uids: [msg._putUid] });",
+      "msg.payload = { uids: [msg._putUid] };",
+      "node.warn('PUT → ' + msg.url + '  body: ' + JSON.stringify(msg.payload));",
       "return msg;"
     ].join('\n'),
     outputs: 1, timeout: '', noerr: 0,

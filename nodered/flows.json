@@ -1285,7 +1285,7 @@
     "type": "function",
     "z": "flow_arcgis_cfg",
     "name": "Build PUT (after delay)",
-    "func": "if (!msg._putUrl || !msg._putUid) return null;\nmsg.method = 'PUT';\nmsg.url = msg._putUrl;\nmsg.headers = { 'accept': '*/*', 'Content-Type': 'application/json' };\nif (msg._missionCookie) msg.headers.Cookie = msg._missionCookie;\nif (msg._missionBearer) msg.headers.Authorization = 'Bearer ' + msg._missionBearer;\nmsg.payload = JSON.stringify({ uids: [msg._putUid] });\nreturn msg;",
+    "func": "if (!msg._putUrl || !msg._putUid) return null;\nmsg.method = 'PUT';\nmsg.url = msg._putUrl;\nmsg.headers = { 'accept': '*/*', 'Content-Type': 'application/json' };\nif (msg._missionCookie) msg.headers.Cookie = msg._missionCookie;\nif (msg._missionBearer) msg.headers.Authorization = 'Bearer ' + msg._missionBearer;\nmsg.payload = { uids: [msg._putUid] };\nnode.warn('PUT → ' + msg.url + '  body: ' + JSON.stringify(msg.payload));\nreturn msg;",
     "outputs": 1,
     "timeout": "",
     "noerr": 0,
