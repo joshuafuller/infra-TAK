@@ -4840,6 +4840,29 @@ def run_guarddog_deploy(alert_email):
                     plog("✓ 4GB swap configured (memory stability)")
         except Exception as e:
             plog(f"⚠ Swap setup skipped: {e}")
+        # Low swappiness: only use swap when RAM is actually exhausted.
+        # Default 60 aggressively swaps out processes even with tons of free RAM,
+        # causing severe performance issues on VPS with mediocre disk I/O.
+        try:
+            cur = subprocess.run(['sysctl', '-n', 'vm.swappiness'], capture_output=True, text=True, timeout=5)
+            if cur.returncode == 0 and cur.stdout.strip() != '10':
+                subprocess.run(['sysctl', '-w', 'vm.swappiness=10'], capture_output=True, timeout=5)
+                sysctl_conf = '/etc/sysctl.conf'
+                with open(sysctl_conf, 'r') as f:
+                    content = f.read()
+                if 'vm.swappiness' in content:
+                    lines = content.split('\n')
+                    lines = [('vm.swappiness=10' if l.strip().startswith('vm.swappiness') else l) for l in lines]
+                    with open(sysctl_conf, 'w') as f:
+                        f.write('\n'.join(lines))
+                else:
+                    with open(sysctl_conf, 'a') as f:
+                        f.write('\nvm.swappiness=10\n')
+                plog("✓ vm.swappiness set to 10 (swap only when RAM exhausted)")
+            else:
+                plog("✓ vm.swappiness already 10")
+        except Exception as e:
+            plog(f"⚠ Swappiness tuning skipped: {e}")
         r = subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, text=True, timeout=60)
         if r.returncode != 0:
             plog(f"✗ daemon-reload failed: {r.stderr}")

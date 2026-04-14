@@ -10,8 +10,8 @@ const CFG_TAB = 'flow_arcgis_cfg';
 // ║  integration: add a row here and redeploy.                  ║
 // ╚══════════════════════════════════════════════════════════════╝
 const FEEDS = [
-  { id: 'air_intel',    configName: 'CA AIR INTEL',  streamPort: 7001, certUser: 'nodered-global-caairintel', ratePerSec: 10, putDelaySec: 15 },
-  { id: 'pwr_outages',  configName: 'POWER-OUTAGES', streamPort: 7002, certUser: '', ratePerSec: 10, putDelaySec: 90 }
+  { id: 'air_intel',    configName: 'CA AIR INTEL' },
+  { id: 'pwr_outages',  configName: 'POWER-OUTAGES' }
 ];
 
 // ════════════════════════════════════════════════════════════════
@@ -503,18 +503,7 @@ const tlsNodes = [
     cert: '', key: '', ca: '',
     certname: '', keyname: '', caname: '',
     servername: '', verifyservercert: false
-  },
-  // Per-feed stream TLS configs (each integration has its own cert)
-  ...FEEDS.map(f => ({
-    id: 'tls_stream_' + f.id, type: 'tls-config',
-    name: f.configName + ' Stream TLS',
-    _configName: f.configName,
-    cert: f.certUser ? '/certs/' + f.certUser + '.pem' : '',
-    key:  f.certUser ? '/certs/' + f.certUser + '.key' : '',
-    ca: '',
-    certname: '', keyname: '', caname: '',
-    servername: '', verifyservercert: false
-  }))
+  }
 ];
 
 // ════════════════════════════════════════════════════════════════
@@ -732,7 +721,7 @@ function makeEngineTab(feed) {
   const FID = 'flow_eng_' + feed.id;
   const P   = feed.id + '_';
 
-  // Reconcile function — uses global context for _subscribed tracking
+  // Reconcile — pure Mission API: upload new CoTs to Enterprise Sync, delete stale by hash
   const FN_RECONCILE = [
     "var features = msg._features || [];",
     "var mData = msg.payload;",
@@ -750,17 +739,22 @@ function makeEngineTab(feed) {
     "    mission = Array.isArray(mData.data) ? mData.data[0] : mData.data;",
     "  }",
     "  if (mission) {",
+    "    if (mission.contents) {",
+    "      for (var i=0;i<mission.contents.length;i++) {",
+    "        var c = mission.contents[i];",
+    "        var d = c.data || c;",
+    "        var name = d.name || '';",
+    "        var hash = d.hash || d.sha256hash || '';",
+    "        if (name.indexOf(prefix) === 0 && name.slice(-4) === '.cot') {",
+    "          existing[name.slice(0, -4)] = { hash: hash, type: 'hash' };",
+    "        }",
+    "      }",
+    "    }",
     "    if (mission.uids) {",
     "      for (var i=0;i<mission.uids.length;i++) {",
     "        var u = mission.uids[i];",
     "        var uid = (typeof u === 'string') ? u : (u.data || u.uid || u);",
-    "        if (typeof uid === 'string') existing[uid] = true;",
-    "      }",
-    "    }",
-    "    if (mission.contents) {",
-    "      for (var i=0;i<mission.contents.length;i++) {",
-    "        var c = mission.contents[i];",
-    "        if (c.data && c.data.uid) existing[c.data.uid] = true;",
+    "        if (typeof uid === 'string') existing[uid] = { hash: uid, type: 'uid' };",
     "      }",
     "    }",
     "  }",
@@ -770,12 +764,12 @@ function makeEngineTab(feed) {
     "for (var i=0;i<features.length;i++) arcgis[features[i].uid] = features[i];",
     "",
     "var host = String(tak.serverUrl || '').replace(/^https?:\\/\\//i, '').replace(/\\/$/, '');",
-    "var baseUrl = 'https://' + host + ':' + (tak.missionApiPort || 8443)",
+    "var port = tak.missionApiPort || 8443;",
+    "var baseUrl = 'https://' + host + ':' + port",
     "  + '/Marti/api/missions/' + encodeURIComponent(cfg.missionName);",
     "var creatorUidRaw = String((cfg && cfg.creatorUid) || (tak && tak.creatorUid) || 'nodered').trim();",
     "var creator = encodeURIComponent(creatorUidRaw);",
     "",
-    "var nPut = 0, nDel = 0;",
     "var cookie = msg._missionCookie || '';",
     "var bearer = msg._missionBearer || '';",
     "if (!cookie && msg.responseCookies && msg.responseCookies.JSESSIONID && msg.responseCookies.JSESSIONID.value) {",
@@ -792,28 +786,22 @@ function makeEngineTab(feed) {
     "  }",
     "}",
     "",
-    "var nStream = 0;",
-    "var newUids = [];",
+    "var nUpload = 0, nDel = 0;",
     "for (var uid in arcgis) {",
-    "  nStream++;",
-    "  if (!existing[uid]) { nPut++; newUids.push(uid); }",
-    "  node.send([",
-    "    { payload: arcgis[uid].cot, topic: topicCfg,",
-    "      host: host,",
-    "      port: Number(tak.streamingPort || tak.streamPort || tak.takPort || 8089) },",
-    "    null",
-    "  ]);",
-    "}",
-    "",
-    "if (newUids.length > 0) {",
-    "  node.send([",
-    "    { topic: topicCfg, payload: {},",
+    "  if (!existing[uid]) {",
+    "    nUpload++;",
+    "    node.send([{",
+    "      payload: arcgis[uid].cot,",
+    "      _uploadUid: uid,",
+    "      _host: host,",
+    "      _port: port,",
+    "      _missionName: encodeURIComponent(cfg.missionName),",
+    "      _creator: creator,",
     "      _missionCookie: cookie,",
     "      _missionBearer: bearer,",
-    "      _putUrl: baseUrl + '/contents?creatorUid=' + creator,",
-    "      _putUids: newUids },",
-    "    null",
-    "  ]);",
+    "      topic: topicCfg",
+    "    }, null]);",
+    "  }",
     "}",
     "",
     "if (!arcgisOk) {",
@@ -822,9 +810,13 @@ function makeEngineTab(feed) {
     "  for (var uid in existing) {",
     "    if (uid.indexOf(prefix) === 0 && !arcgis[uid]) {",
     "      nDel++;",
+    "      var entry = existing[uid];",
+    "      var delParam = (entry.type === 'uid')",
+    "        ? 'uid=' + encodeURIComponent(uid)",
+    "        : 'hash=' + encodeURIComponent(entry.hash);",
     "      node.send([null, {",
     "        method: 'DELETE',",
-    "        url: baseUrl + '/contents?uid=' + encodeURIComponent(uid) + '&creatorUid=' + creator,",
+    "        url: baseUrl + '/contents?' + delParam + '&creatorUid=' + creator,",
     "        headers: { 'accept': '*/*' },",
     "        _missionCookie: cookie,",
     "        _missionBearer: bearer,",
@@ -835,9 +827,60 @@ function makeEngineTab(feed) {
     "  }",
     "}",
     "",
-    "node.warn(topicCfg + ' reconcile: ' + nStream + ' streamed, ' + nPut + ' PUT, ' + nDel + ' DELETE, '",
+    "node.warn(topicCfg + ' reconcile: ' + nUpload + ' upload, ' + nDel + ' DELETE, '",
     "  + Object.keys(arcgis).length + ' ArcGIS, ' + Object.keys(existing).length + ' in mission');",
     "return null;"
+  ].join('\n');
+
+  // Build multipart upload: CoT JSON → XML → POST /Marti/sync/missionupload
+  const FN_BUILD_UPLOAD = [
+    "var e = msg.payload && msg.payload.event;",
+    "if (!e || !e._attributes) return null;",
+    "var a = e._attributes;",
+    "var p = e.point._attributes;",
+    "var d = e.detail || {};",
+    "",
+    "var xml = '<event version=\"' + a.version + '\" uid=\"' + a.uid + '\" type=\"' + a.type + '\"'",
+    "  + ' how=\"' + a.how + '\" time=\"' + a.time + '\" start=\"' + a.start + '\" stale=\"' + a.stale + '\">'",
+    "  + '<point lat=\"' + p.lat + '\" lon=\"' + p.lon + '\" hae=\"' + p.hae + '\" ce=\"' + p.ce + '\" le=\"' + p.le + '\"/>'",
+    "  + '<detail>';",
+    "",
+    "if (d.contact && d.contact[0]) xml += '<contact callsign=\"' + d.contact[0]._attributes.callsign + '\"/>';",
+    "if (d.remarks != null) xml += '<remarks>' + String(d.remarks).replace(/&/g,'&amp;').replace(/</g,'&lt;') + '</remarks>';",
+    "if (d.strokeColor && d.strokeColor[0]) xml += '<strokeColor value=\"' + d.strokeColor[0]._attributes.value + '\"/>';",
+    "if (d.strokeWeight && d.strokeWeight[0]) xml += '<strokeWeight value=\"' + d.strokeWeight[0]._attributes.value + '\"/>';",
+    "if (d.fillColor && d.fillColor[0]) xml += '<fillColor value=\"' + d.fillColor[0]._attributes.value + '\"/>';",
+    "if (d.labels_on && d.labels_on[0]) xml += '<labels_on value=\"' + d.labels_on[0]._attributes.value + '\"/>';",
+    "if (d.link && d.link.length) {",
+    "  for (var i = 0; i < d.link.length; i++) {",
+    "    xml += '<link point=\"' + d.link[i]._attributes.point + '\"/>';",
+    "  }",
+    "}",
+    "xml += '</detail></event>';",
+    "",
+    "var uid = msg._uploadUid;",
+    "var filename = uid + '.cot';",
+    "var boundary = 'NodeRED' + Date.now() + Math.random().toString(36).substr(2,9);",
+    "var CRLF = '\\r\\n';",
+    "var body = '--' + boundary + CRLF",
+    "  + 'Content-Disposition: form-data; name=\"assetfile\"; filename=\"' + filename + '\"' + CRLF",
+    "  + 'Content-Type: application/xml' + CRLF + CRLF",
+    "  + xml + CRLF",
+    "  + '--' + boundary + '--' + CRLF;",
+    "",
+    "msg.url = 'https://' + msg._host + ':' + msg._port",
+    "  + '/Marti/sync/missionupload'",
+    "  + '?filename=' + encodeURIComponent(filename)",
+    "  + '&creatorUid=' + msg._creator",
+    "  + '&name=' + msg._missionName;",
+    "msg.method = 'POST';",
+    "msg.headers = {",
+    "  'Content-Type': 'multipart/form-data; boundary=' + boundary",
+    "};",
+    "if (msg._missionCookie) msg.headers.Cookie = msg._missionCookie;",
+    "if (msg._missionBearer) msg.headers.Authorization = 'Bearer ' + msg._missionBearer;",
+    "msg.payload = Buffer.from(body, 'utf8');",
+    "return msg;"
   ].join('\n');
 
   return [
@@ -846,55 +889,7 @@ function makeEngineTab(feed) {
       id: FID, type: 'tab',
       label: feed.configName,
       disabled: false,
-      info: 'Isolated engine for ' + feed.configName + '. Own rate limiter, TCP stream, delay, reconcile.'
-    },
-
-    // ── SA ident ──
-    {
-      id: P + 'sa_inject', type: 'inject', z: FID,
-      name: 'SA ident (startup)',
-      props: [{ p: 'payload' }, { p: 'topic', vt: 'str' }],
-      repeat: '600', crontab: '',
-      once: true, onceDelay: '10',
-      topic: 'sa-ident', payload: '', payloadType: 'date',
-      x: 180, y: 40, wires: [[P + 'sa_build']]
-    },
-    {
-      id: P + 'sa_build', type: 'function', z: FID,
-      name: 'Build SA ident CoT',
-      func: [
-        "var tak = global.get('tak_settings') || {};",
-        "var configs = global.get('arcgis_configs') || [];",
-        "var cfg = null;",
-        "for (var i = 0; i < configs.length; i++) {",
-        "  if (configs[i].configName === '" + feed.configName + "') { cfg = configs[i]; break; }",
-        "}",
-        "var creatorUid = '';",
-        "if (cfg && cfg.creatorUid) creatorUid = String(cfg.creatorUid).trim();",
-        "if (!creatorUid && tak.creatorUid) creatorUid = String(tak.creatorUid).trim();",
-        "if (!creatorUid) { return null; }",
-        "",
-        "var now = new Date();",
-        "var stale = new Date(now.getTime() + 120000);",
-        "msg.payload = {",
-        "  event: {",
-        "    _attributes: {",
-        "      version: '2.0', uid: creatorUid,",
-        "      type: 'a-f-G-E-S', how: 'h-g-i-g-o',",
-        "      time: now.toISOString(), start: now.toISOString(), stale: stale.toISOString()",
-        "    },",
-        "    point: { _attributes: { lat: '0', lon: '0', hae: '0', ce: '9999999', le: '9999999' } },",
-        "    detail: {",
-        "      contact: [{ _attributes: { callsign: creatorUid } }],",
-        "      __group: [{ _attributes: { name: 'Purple', role: 'Team Member' } }]",
-        "    }",
-        "  }",
-        "};",
-        "return msg;"
-      ].join('\n'),
-      outputs: 1, timeout: '', noerr: 0,
-      initialize: '', finalize: '', libs: [],
-      x: 400, y: 40, wires: [[P + 'cot_to_xml']]
+      info: 'DataSync engine for ' + feed.configName + '. Pure Mission API — no TCP streaming, no broadcast.'
     },
 
     // ── Poll timer + config loader ──
@@ -905,7 +900,7 @@ function makeEngineTab(feed) {
       repeat: '60', crontab: '',
       once: true, onceDelay: '30',
       topic: 'poll', payload: '', payloadType: 'date',
-      x: 180, y: 120, wires: [[P + 'load']]
+      x: 180, y: 80, wires: [[P + 'load']]
     },
     {
       id: P + 'load', type: 'function', z: FID,
@@ -929,7 +924,7 @@ function makeEngineTab(feed) {
       ].join('\n'),
       outputs: 1, timeout: '', noerr: 0,
       initialize: '', finalize: '', libs: [],
-      x: 400, y: 120, wires: [[P + 'build_q']]
+      x: 400, y: 80, wires: [[P + 'build_q']]
     },
 
     // ── ArcGIS query ──
@@ -939,7 +934,7 @@ function makeEngineTab(feed) {
       func: FN_BUILD_QUERY,
       outputs: 1, timeout: '', noerr: 0,
       initialize: '', finalize: '', libs: [],
-      x: 180, y: 200, wires: [[P + 'http_ag']]
+      x: 180, y: 160, wires: [[P + 'http_ag']]
     },
     {
       id: P + 'http_ag', type: 'http request', z: FID,
@@ -948,7 +943,7 @@ function makeEngineTab(feed) {
       url: '', tls: '', persist: false, proxy: '',
       insecureHTTPParser: false, authType: '',
       senderr: false, headers: [],
-      x: 400, y: 200, wires: [[P + 'parse']]
+      x: 400, y: 160, wires: [[P + 'parse']]
     },
 
     // ── Parse & build CoT ──
@@ -958,10 +953,10 @@ function makeEngineTab(feed) {
       func: FN_PARSE_COT,
       outputs: 1, timeout: '', noerr: 0,
       initialize: '', finalize: '', libs: [],
-      x: 600, y: 200, wires: [[P + 'build_sub', P + 'build_m']]
+      x: 600, y: 160, wires: [[P + 'build_sub', P + 'build_m']]
     },
 
-    // ── Subscribe + GET mission + Reconcile ──
+    // ── Subscribe ──
     {
       id: P + 'build_sub', type: 'function', z: FID,
       name: 'Build subscribe URL',
@@ -989,7 +984,7 @@ function makeEngineTab(feed) {
       ].join('\n'),
       outputs: 1, timeout: '', noerr: 0,
       initialize: '', finalize: '', libs: [],
-      x: 180, y: 300, wires: [[P + 'http_sub']]
+      x: 180, y: 240, wires: [[P + 'http_sub']]
     },
     {
       id: P + 'http_sub', type: 'http request', z: FID,
@@ -998,7 +993,7 @@ function makeEngineTab(feed) {
       url: '', tls: 'tls_tak', persist: false, proxy: '',
       insecureHTTPParser: false, authType: '',
       senderr: false, headers: [],
-      x: 380, y: 300, wires: [[P + 'debug_sub']]
+      x: 380, y: 240, wires: [[P + 'debug_sub']]
     },
     {
       id: P + 'debug_sub', type: 'debug', z: FID,
@@ -1006,8 +1001,10 @@ function makeEngineTab(feed) {
       active: true, tosidebar: true, console: false, tostatus: true,
       complete: 'true', targetType: 'full',
       statusVal: 'topic', statusType: 'auto',
-      x: 580, y: 300, wires: []
+      x: 580, y: 240, wires: []
     },
+
+    // ── GET mission + Reconcile ──
     {
       id: P + 'build_m', type: 'function', z: FID,
       name: 'Build mission GET URL',
@@ -1048,7 +1045,7 @@ function makeEngineTab(feed) {
       ].join('\n'),
       outputs: 1, timeout: '', noerr: 0,
       initialize: '', finalize: '', libs: [],
-      x: 560, y: 360, wires: [[P + 'http_m']]
+      x: 560, y: 320, wires: [[P + 'http_m']]
     },
     {
       id: P + 'http_m', type: 'http request', z: FID,
@@ -1057,7 +1054,7 @@ function makeEngineTab(feed) {
       url: '', tls: 'tls_tak', persist: false, proxy: '',
       insecureHTTPParser: false, authType: '',
       senderr: false, headers: [],
-      x: 740, y: 360, wires: [[P + 'reconcile']]
+      x: 740, y: 320, wires: [[P + 'reconcile']]
     },
     {
       id: P + 'reconcile', type: 'function', z: FID,
@@ -1065,106 +1062,84 @@ function makeEngineTab(feed) {
       func: FN_RECONCILE,
       outputs: 2, timeout: '', noerr: 0,
       initialize: '', finalize: '', libs: [],
-      x: 180, y: 440,
-      wires: [[P + 'cot_to_xml', P + 'delay_put'], [P + 'delay_del']]
+      x: 180, y: 400,
+      wires: [[P + 'build_upload'], [P + 'delay_del']]
     },
 
-    // ── CoT → XML → Rate limiter → TCP out ──
+    // ── Upload CoT to Enterprise Sync (no streaming, no broadcast) ──
     {
-      id: P + 'cot_to_xml', type: 'function', z: FID,
-      name: 'CoT JSON → XML',
-      func: FN_COT_TO_XML,
+      id: P + 'build_upload', type: 'function', z: FID,
+      name: 'Build upload (CoT → XML → multipart)',
+      func: FN_BUILD_UPLOAD,
       outputs: 1, timeout: '', noerr: 0,
       initialize: '', finalize: '', libs: [],
-      x: 180, y: 520, wires: [[P + 'rate_stream']]
+      x: 400, y: 400, wires: [[P + 'rate_upload']]
     },
     {
-      id: P + 'rate_stream', type: 'delay', z: FID,
-      name: 'Throttle (' + feed.ratePerSec + '/sec)', pauseType: 'rate',
+      id: P + 'rate_upload', type: 'delay', z: FID,
+      name: 'Throttle (5/sec)', pauseType: 'rate',
       timeout: '1', timeoutUnits: 'seconds',
-      rate: String(feed.ratePerSec), nbRateUnits: '1', rateUnits: 'second',
+      rate: '5', nbRateUnits: '1', rateUnits: 'second',
       randomFirst: '1', randomLast: '5', randomUnits: 'seconds',
       drop: false, allowrate: false, outputs: 1,
-      x: 400, y: 520, wires: [[P + 'tcp_out']]
+      x: 600, y: 400, wires: [[P + 'http_upload']]
     },
     {
-      id: P + 'tcp_out', type: 'tcp out', z: FID,
-      name: 'CoT → TAK :' + feed.streamPort,
-      host: 'host.docker.internal', port: String(feed.streamPort), beserver: 'client',
-      base64: false, end: false, tls: 'tls_stream_' + feed.id,
-      x: 600, y: 520, wires: []
+      id: P + 'http_upload', type: 'http request', z: FID,
+      name: 'POST missionupload',
+      method: 'use', ret: 'txt', paytoqs: 'ignore',
+      url: '', tls: 'tls_tak', persist: false, proxy: '',
+      insecureHTTPParser: false, authType: '',
+      senderr: false, headers: [],
+      x: 790, y: 400, wires: [[P + 'log_upload']]
     },
     {
-      id: P + 'catch_stream', type: 'catch', z: FID,
-      name: 'Stream errors',
-      scope: [P + 'tcp_out'],
-      uncaught: false,
-      x: 180, y: 580, wires: [[P + 'debug_stream']]
-    },
-    {
-      id: P + 'debug_stream', type: 'debug', z: FID,
-      name: 'Stream status/error',
-      active: true, tosidebar: true, console: false, tostatus: true,
-      complete: 'true', targetType: 'full',
-      statusVal: '', statusType: 'auto',
-      x: 400, y: 580, wires: []
-    },
-
-    // ── Delay → PUT → Mission API ──
-    {
-      id: P + 'delay_put', type: 'delay', z: FID,
-      name: 'Wait ' + feed.putDelaySec + 's for cache',
-      pauseType: 'delay', timeout: String(feed.putDelaySec), timeoutUnits: 'seconds',
-      rate: '1', nbRateUnits: '1', rateUnits: 'second',
-      randomFirst: '1', randomLast: '5', randomUnits: 'seconds',
-      drop: false, allowrate: false, outputs: 1,
-      x: 400, y: 440, wires: [[P + 'build_put']]
-    },
-    {
-      id: P + 'build_put', type: 'function', z: FID,
-      name: 'Build PUT (after delay)',
+      id: P + 'log_upload', type: 'function', z: FID,
+      name: 'Log upload result',
       func: [
-        "var uids = msg._putUids || (msg._putUid ? [msg._putUid] : []);",
-        "if (!msg._putUrl || uids.length === 0) return null;",
-        "msg.method = 'PUT';",
-        "msg.url = msg._putUrl;",
-        "msg.headers = { 'accept': '*/*', 'Content-Type': 'application/json' };",
-        "if (msg._missionCookie) msg.headers.Cookie = msg._missionCookie;",
-        "if (msg._missionBearer) msg.headers.Authorization = 'Bearer ' + msg._missionBearer;",
-        "msg.payload = { uids: uids };",
-        "node.warn('PUT → ' + msg.url + '  (' + uids.length + ' UIDs)');",
+        "var code = msg.statusCode || '?';",
+        "var feed = msg.topic || 'unknown';",
+        "var ok = (code >= 200 && code < 300);",
+        "var label = feed + ' UPLOAD → ' + code + (ok ? ' ✓' : ' ✗');",
+        "if (!ok) {",
+        "  var body = (typeof msg.payload === 'string') ? msg.payload.substring(0, 300) : '';",
+        "  node.warn(label + (body ? ' — ' + body : ''));",
+        "} else {",
+        "  node.warn(label);",
+        "}",
         "return msg;"
       ].join('\n'),
       outputs: 1, timeout: '', noerr: 0,
       initialize: '', finalize: '', libs: [],
-      x: 600, y: 440, wires: [[P + 'http_action']]
+      x: 960, y: 400, wires: [[]]
     },
+
+    // ── DELETE stale from mission ──
     {
       id: P + 'delay_del', type: 'delay', z: FID,
       name: '', pauseType: 'delay', timeout: '1', timeoutUnits: 'seconds',
       rate: '1', nbRateUnits: '1', rateUnits: 'second',
       randomFirst: '1', randomLast: '5', randomUnits: 'seconds',
       drop: false, allowrate: false, outputs: 1,
-      x: 400, y: 480, wires: [[P + 'http_action']]
+      x: 400, y: 460, wires: [[P + 'http_action']]
     },
     {
       id: P + 'http_action', type: 'http request', z: FID,
-      name: 'Mission API (PUT/DELETE)',
+      name: 'Mission API (DELETE)',
       method: 'use', ret: 'txt', paytoqs: 'ignore',
       url: '', tls: 'tls_tak', persist: false, proxy: '',
       insecureHTTPParser: false, authType: '',
       senderr: false, headers: [],
-      x: 600, y: 480, wires: [[P + 'log_action']]
+      x: 600, y: 460, wires: [[P + 'log_action']]
     },
     {
       id: P + 'log_action', type: 'function', z: FID,
-      name: 'Log API result',
+      name: 'Log DELETE result',
       func: [
         "var code = msg.statusCode || '?';",
-        "var method = msg.method || '?';",
         "var feed = msg.topic || 'unknown';",
         "var ok = (code >= 200 && code < 300);",
-        "var label = feed + ' ' + method + ' → ' + code + (ok ? ' ✓' : ' ✗');",
+        "var label = feed + ' DELETE → ' + code + (ok ? ' ✓' : ' ✗');",
         "if (!ok) {",
         "  var body = (typeof msg.payload === 'string') ? msg.payload.substring(0, 200) : '';",
         "  node.warn(label + (body ? ' — ' + body : ''));",
@@ -1175,7 +1150,7 @@ function makeEngineTab(feed) {
       ].join('\n'),
       outputs: 1, timeout: '', noerr: 0,
       initialize: '', finalize: '', libs: [],
-      x: 800, y: 480, wires: [[]]
+      x: 800, y: 460, wires: [[]]
     }
   ];
 }
