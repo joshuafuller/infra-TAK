@@ -718,7 +718,7 @@ const FN_COT_TO_XML = [
   "  }",
   "}",
   "",
-  "xml += '</detail></event>';",
+  "xml += '</detail></event>\\n';",
   "",
   "msg.payload = Buffer.from(xml, 'utf8');",
   "if (msg.payload.length > 5000) node.warn('CoT ' + a.uid + ': ' + msg.payload.length + ' bytes');",
