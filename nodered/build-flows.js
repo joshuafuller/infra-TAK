@@ -501,7 +501,7 @@ const tlsNodes = [
     id: 'tls_tak', type: 'tls-config',
     name: 'TAK Mission API TLS',
     cert: '', key: '', ca: '',
-    certname: '', keyname: '', caname: '',
+    certname: '/certs/admin.pem', keyname: '/certs/admin.key', caname: '',
     servername: '', verifyservercert: false
   }
 ];
@@ -657,6 +657,10 @@ const FN_PARSE_COT = [
   "    detail.link = links;",
   "  }",
   "",
+  "  if (cfg.missionName) {",
+  "    detail.Marti = { dest: { _attributes: { mission: cfg.missionName } } };",
+  "  }",
+  "",
   "  results.push({",
   "    uid: uid,",
   "    cot: {",
@@ -706,6 +710,9 @@ const FN_COT_TO_XML = [
   "  }",
   "}",
   "",
+  "if (d.Marti && d.Marti.dest && d.Marti.dest._attributes && d.Marti.dest._attributes.mission) {",
+  "  xml += '<Marti><dest mission=\"' + d.Marti.dest._attributes.mission + '\"/></Marti>';",
+  "}",
   "xml += '</detail></event>\\n';",
   "",
   "msg.payload = Buffer.from(xml, 'utf8');",
