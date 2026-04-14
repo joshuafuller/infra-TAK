@@ -813,7 +813,56 @@
     "type": "tab",
     "label": "CA AIR INTEL",
     "disabled": false,
-    "info": "DataSync engine for CA AIR INTEL. Pure Mission API — no TCP streaming, no broadcast."
+    "info": "DataSync engine for CA AIR INTEL. Stream CoT via TCP, PUT UIDs to mission."
+  },
+  {
+    "id": "air_intel_sa_inject",
+    "type": "inject",
+    "z": "flow_eng_air_intel",
+    "name": "SA ident (startup)",
+    "props": [
+      {
+        "p": "payload"
+      },
+      {
+        "p": "topic",
+        "vt": "str"
+      }
+    ],
+    "repeat": "600",
+    "crontab": "",
+    "once": true,
+    "onceDelay": "10",
+    "topic": "sa-ident",
+    "payload": "",
+    "payloadType": "date",
+    "x": 180,
+    "y": 40,
+    "wires": [
+      [
+        "air_intel_sa_build"
+      ]
+    ]
+  },
+  {
+    "id": "air_intel_sa_build",
+    "type": "function",
+    "z": "flow_eng_air_intel",
+    "name": "Build SA ident CoT",
+    "func": "var tak = global.get('tak_settings') || {};\nvar configs = global.get('arcgis_configs') || [];\nvar cfg = null;\nfor (var i = 0; i < configs.length; i++) {\n  if (configs[i].configName === 'CA AIR INTEL') { cfg = configs[i]; break; }\n}\nvar creatorUid = '';\nif (cfg && cfg.creatorUid) creatorUid = String(cfg.creatorUid).trim();\nif (!creatorUid && tak.creatorUid) creatorUid = String(tak.creatorUid).trim();\nif (!creatorUid) { return null; }\n\nvar now = new Date();\nvar stale = new Date(now.getTime() + 120000);\nmsg.payload = {\n  event: {\n    _attributes: {\n      version: '2.0', uid: creatorUid,\n      type: 'a-f-G-E-S', how: 'h-g-i-g-o',\n      time: now.toISOString(), start: now.toISOString(), stale: stale.toISOString()\n    },\n    point: { _attributes: { lat: '0', lon: '0', hae: '0', ce: '9999999', le: '9999999' } },\n    detail: {\n      contact: [{ _attributes: { callsign: creatorUid } }],\n      __group: [{ _attributes: { name: 'Purple', role: 'Team Member' } }]\n    }\n  }\n};\nreturn msg;",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 400,
+    "y": 40,
+    "wires": [
+      [
+        "air_intel_cot_to_xml"
+      ]
+    ]
   },
   {
     "id": "air_intel_inject",
@@ -837,7 +886,7 @@
     "payload": "",
     "payloadType": "date",
     "x": 180,
-    "y": 80,
+    "y": 120,
     "wires": [
       [
         "air_intel_load"
@@ -857,7 +906,7 @@
     "finalize": "",
     "libs": [],
     "x": 400,
-    "y": 80,
+    "y": 120,
     "wires": [
       [
         "air_intel_build_q"
@@ -877,7 +926,7 @@
     "finalize": "",
     "libs": [],
     "x": 180,
-    "y": 160,
+    "y": 200,
     "wires": [
       [
         "air_intel_http_ag"
@@ -901,7 +950,7 @@
     "senderr": false,
     "headers": [],
     "x": 400,
-    "y": 160,
+    "y": 200,
     "wires": [
       [
         "air_intel_parse"
@@ -921,7 +970,7 @@
     "finalize": "",
     "libs": [],
     "x": 600,
-    "y": 160,
+    "y": 200,
     "wires": [
       [
         "air_intel_build_sub",
@@ -942,7 +991,7 @@
     "finalize": "",
     "libs": [],
     "x": 180,
-    "y": 240,
+    "y": 300,
     "wires": [
       [
         "air_intel_http_sub"
@@ -966,7 +1015,7 @@
     "senderr": false,
     "headers": [],
     "x": 380,
-    "y": 240,
+    "y": 300,
     "wires": [
       [
         "air_intel_debug_sub"
@@ -987,7 +1036,7 @@
     "statusVal": "topic",
     "statusType": "auto",
     "x": 580,
-    "y": 240,
+    "y": 300,
     "wires": []
   },
   {
@@ -1027,7 +1076,7 @@
     "senderr": false,
     "headers": [],
     "x": 740,
-    "y": 320,
+    "y": 360,
     "wires": [
       [
         "air_intel_reconcile"
@@ -1039,7 +1088,7 @@
     "type": "function",
     "z": "flow_eng_air_intel",
     "name": "Reconcile (diff)",
-    "func": "var features = msg._features || [];\nvar mData = msg.payload;\nvar cfg = msg._config;\nvar tak = msg.takSettings;\nvar topicCfg = cfg.configName || 'unnamed';\nmsg.topic = topicCfg;\nvar prefix = cfg.uidPrefix || 'arcgis';\nvar arcgisOk = !msg._arcgisStatus || msg._arcgisStatus === 200;\n\nvar existing = {};\ntry {\n  var mission = null;\n  if (mData && mData.data) {\n    mission = Array.isArray(mData.data) ? mData.data[0] : mData.data;\n  }\n  if (mission) {\n    if (mission.contents) {\n      for (var i=0;i<mission.contents.length;i++) {\n        var c = mission.contents[i];\n        var d = c.data || c;\n        var name = d.name || '';\n        var hash = d.hash || d.sha256hash || '';\n        if (name.indexOf(prefix) === 0 && name.slice(-4) === '.cot') {\n          existing[name.slice(0, -4)] = { hash: hash, type: 'hash' };\n        }\n      }\n    }\n    if (mission.uids) {\n      for (var i=0;i<mission.uids.length;i++) {\n        var u = mission.uids[i];\n        var uid = (typeof u === 'string') ? u : (u.data || u.uid || u);\n        if (typeof uid === 'string') existing[uid] = { hash: uid, type: 'uid' };\n      }\n    }\n  }\n} catch(e) { node.warn('Could not parse mission contents: ' + e.message); }\n\nvar arcgis = {};\nfor (var i=0;i<features.length;i++) arcgis[features[i].uid] = features[i];\n\nvar host = String(tak.serverUrl || '').replace(/^https?:\\/\\//i, '').replace(/\\/$/, '');\nvar port = tak.missionApiPort || 8443;\nvar baseUrl = 'https://' + host + ':' + port\n  + '/Marti/api/missions/' + encodeURIComponent(cfg.missionName);\nvar creatorUidRaw = String((cfg && cfg.creatorUid) || (tak && tak.creatorUid) || 'nodered').trim();\nvar creator = encodeURIComponent(creatorUidRaw);\n\nvar cookie = msg._missionCookie || '';\nvar bearer = msg._missionBearer || '';\nif (!cookie && msg.responseCookies && msg.responseCookies.JSESSIONID && msg.responseCookies.JSESSIONID.value) {\n  cookie = 'JSESSIONID=' + String(msg.responseCookies.JSESSIONID.value);\n}\nif (!cookie && msg.headers && msg.headers['set-cookie']) {\n  var sc = msg.headers['set-cookie'];\n  if (Array.isArray(sc) && sc.length) {\n    var a2 = String(sc[0]).match(/JSESSIONID=([^;]+)/);\n    if (a2 && a2[1]) cookie = 'JSESSIONID=' + a2[1];\n  } else if (typeof sc === 'string') {\n    var b = sc.match(/JSESSIONID=([^;]+)/);\n    if (b && b[1]) cookie = 'JSESSIONID=' + b[1];\n  }\n}\n\nvar nUpload = 0, nDel = 0;\nfor (var uid in arcgis) {\n  if (!existing[uid]) {\n    nUpload++;\n    node.send([{\n      payload: arcgis[uid].cot,\n      _uploadUid: uid,\n      _host: host,\n      _port: port,\n      _missionName: encodeURIComponent(cfg.missionName),\n      _creator: creator,\n      _missionCookie: cookie,\n      _missionBearer: bearer,\n      topic: topicCfg\n    }, null]);\n  }\n}\n\nif (!arcgisOk) {\n  node.warn(topicCfg + ': ArcGIS fetch failed (status ' + msg._arcgisStatus + ') — skipping deletes');\n} else {\n  for (var uid in existing) {\n    if (uid.indexOf(prefix) === 0 && !arcgis[uid]) {\n      nDel++;\n      var entry = existing[uid];\n      var delParam = (entry.type === 'uid')\n        ? 'uid=' + encodeURIComponent(uid)\n        : 'hash=' + encodeURIComponent(entry.hash);\n      node.send([null, {\n        method: 'DELETE',\n        url: baseUrl + '/contents?' + delParam + '&creatorUid=' + creator,\n        headers: { 'accept': '*/*' },\n        _missionCookie: cookie,\n        _missionBearer: bearer,\n        payload: '',\n        topic: topicCfg\n      }]);\n    }\n  }\n}\n\nnode.warn(topicCfg + ' reconcile: ' + nUpload + ' upload, ' + nDel + ' DELETE, '\n  + Object.keys(arcgis).length + ' ArcGIS, ' + Object.keys(existing).length + ' in mission');\nreturn null;",
+    "func": "var features = msg._features || [];\nvar mData = msg.payload;\nvar cfg = msg._config;\nvar tak = msg.takSettings;\nvar topicCfg = cfg.configName || 'unnamed';\nmsg.topic = topicCfg;\nvar prefix = cfg.uidPrefix || 'arcgis';\nvar arcgisOk = !msg._arcgisStatus || msg._arcgisStatus === 200;\n\nvar existing = {};\ntry {\n  var mission = null;\n  if (mData && mData.data) {\n    mission = Array.isArray(mData.data) ? mData.data[0] : mData.data;\n  }\n  if (mission && mission.uids) {\n    for (var i=0;i<mission.uids.length;i++) {\n      var u = mission.uids[i];\n      var uid = (typeof u === 'string') ? u : (u.data || u.uid || u);\n      if (typeof uid === 'string') existing[uid] = true;\n    }\n  }\n  if (mission && mission.contents) {\n    for (var i=0;i<mission.contents.length;i++) {\n      var c = mission.contents[i];\n      if (c.data && c.data.uid) existing[c.data.uid] = true;\n    }\n  }\n} catch(e) { node.warn('Could not parse mission contents: ' + e.message); }\n\nvar arcgis = {};\nfor (var i=0;i<features.length;i++) arcgis[features[i].uid] = features[i];\n\nvar host = String(tak.serverUrl || '').replace(/^https?:\\/\\//i, '').replace(/\\/$/, '');\nvar baseUrl = 'https://' + host + ':' + (tak.missionApiPort || 8443)\n  + '/Marti/api/missions/' + encodeURIComponent(cfg.missionName);\nvar creatorUidRaw = String((cfg && cfg.creatorUid) || (tak && tak.creatorUid) || 'nodered').trim();\nvar creator = encodeURIComponent(creatorUidRaw);\n\nvar cookie = msg._missionCookie || '';\nvar bearer = msg._missionBearer || '';\nif (!cookie && msg.responseCookies && msg.responseCookies.JSESSIONID && msg.responseCookies.JSESSIONID.value) {\n  cookie = 'JSESSIONID=' + String(msg.responseCookies.JSESSIONID.value);\n}\nif (!cookie && msg.headers && msg.headers['set-cookie']) {\n  var sc = msg.headers['set-cookie'];\n  if (Array.isArray(sc) && sc.length) {\n    var a2 = String(sc[0]).match(/JSESSIONID=([^;]+)/);\n    if (a2 && a2[1]) cookie = 'JSESSIONID=' + a2[1];\n  } else if (typeof sc === 'string') {\n    var b = sc.match(/JSESSIONID=([^;]+)/);\n    if (b && b[1]) cookie = 'JSESSIONID=' + b[1];\n  }\n}\n\nvar nStream = 0, nPut = 0, nDel = 0;\nvar newUids = [];\nfor (var uid in arcgis) {\n  nStream++;\n  if (!existing[uid]) { nPut++; newUids.push(uid); }\n  node.send([\n    { payload: arcgis[uid].cot, topic: topicCfg,\n      host: host,\n      port: Number(tak.streamingPort || tak.streamPort || 8089) },\n    null\n  ]);\n}\n\nif (newUids.length > 0) {\n  node.send([\n    { topic: topicCfg, payload: {},\n      _missionCookie: cookie,\n      _missionBearer: bearer,\n      _putUrl: baseUrl + '/contents?creatorUid=' + creator,\n      _putUids: newUids },\n    null\n  ]);\n}\n\nif (!arcgisOk) {\n  node.warn(topicCfg + ': ArcGIS fetch failed (status ' + msg._arcgisStatus + ') — skipping deletes');\n} else {\n  for (var uid in existing) {\n    if (uid.indexOf(prefix) === 0 && !arcgis[uid]) {\n      nDel++;\n      node.send([null, {\n        method: 'DELETE',\n        url: baseUrl + '/contents?uid=' + encodeURIComponent(uid) + '&creatorUid=' + creator,\n        headers: { 'accept': '*/*' },\n        _missionCookie: cookie,\n        _missionBearer: bearer,\n        payload: '',\n        topic: topicCfg\n      }]);\n    }\n  }\n}\n\nnode.warn(topicCfg + ' reconcile: ' + nStream + ' streamed, ' + nPut + ' PUT, ' + nDel + ' DELETE, '\n  + Object.keys(arcgis).length + ' ArcGIS, ' + Object.keys(existing).length + ' in mission');\nreturn null;",
     "outputs": 2,
     "timeout": "",
     "noerr": 0,
@@ -1047,10 +1096,11 @@
     "finalize": "",
     "libs": [],
     "x": 180,
-    "y": 400,
+    "y": 440,
     "wires": [
       [
-        "air_intel_build_upload"
+        "air_intel_cot_to_xml",
+        "air_intel_delay_put"
       ],
       [
         "air_intel_delay_del"
@@ -1058,34 +1108,34 @@
     ]
   },
   {
-    "id": "air_intel_build_upload",
+    "id": "air_intel_cot_to_xml",
     "type": "function",
     "z": "flow_eng_air_intel",
-    "name": "Build upload (CoT → XML)",
-    "func": "var e = msg.payload && msg.payload.event;\nif (!e || !e._attributes) return null;\nvar a = e._attributes;\nvar p = e.point._attributes;\nvar d = e.detail || {};\n\nvar xml = '<event version=\"' + a.version + '\" uid=\"' + a.uid + '\" type=\"' + a.type + '\"'\n  + ' how=\"' + a.how + '\" time=\"' + a.time + '\" start=\"' + a.start + '\" stale=\"' + a.stale + '\">'\n  + '<point lat=\"' + p.lat + '\" lon=\"' + p.lon + '\" hae=\"' + p.hae + '\" ce=\"' + p.ce + '\" le=\"' + p.le + '\"/>'\n  + '<detail>';\n\nif (d.contact && d.contact[0]) xml += '<contact callsign=\"' + d.contact[0]._attributes.callsign + '\"/>';\nif (d.remarks != null) xml += '<remarks>' + String(d.remarks).replace(/&/g,'&amp;').replace(/</g,'&lt;') + '</remarks>';\nif (d.strokeColor && d.strokeColor[0]) xml += '<strokeColor value=\"' + d.strokeColor[0]._attributes.value + '\"/>';\nif (d.strokeWeight && d.strokeWeight[0]) xml += '<strokeWeight value=\"' + d.strokeWeight[0]._attributes.value + '\"/>';\nif (d.fillColor && d.fillColor[0]) xml += '<fillColor value=\"' + d.fillColor[0]._attributes.value + '\"/>';\nif (d.labels_on && d.labels_on[0]) xml += '<labels_on value=\"' + d.labels_on[0]._attributes.value + '\"/>';\nif (d.link && d.link.length) {\n  for (var i = 0; i < d.link.length; i++) {\n    xml += '<link point=\"' + d.link[i]._attributes.point + '\"/>';\n  }\n}\nxml += '</detail></event>';\n\nmsg.url = 'https://' + msg._host + ':' + msg._port\n  + '/Marti/api/missions/' + msg._missionName\n  + '/contents/missionpackage?creatorUid=' + msg._creator;\nmsg.method = 'PUT';\nmsg.headers = {\n  'Content-Type': 'application/xml'\n};\nif (msg._missionCookie) msg.headers.Cookie = msg._missionCookie;\nif (msg._missionBearer) msg.headers.Authorization = 'Bearer ' + msg._missionBearer;\nmsg.payload = xml;\nreturn msg;",
+    "name": "CoT JSON → XML",
+    "func": "var e = msg.payload && msg.payload.event;\nif (!e || !e._attributes) return null;\nvar a = e._attributes;\nvar p = e.point._attributes;\nvar d = e.detail || {};\n\nvar xml = '<event version=\"' + a.version + '\" uid=\"' + a.uid + '\" type=\"' + a.type + '\"'\n  + ' how=\"' + a.how + '\" time=\"' + a.time + '\" start=\"' + a.start + '\" stale=\"' + a.stale + '\">'\n  + '<point lat=\"' + p.lat + '\" lon=\"' + p.lon + '\" hae=\"' + p.hae + '\" ce=\"' + p.ce + '\" le=\"' + p.le + '\"/>'\n  + '<detail>';\n\nif (d.contact && d.contact[0]) xml += '<contact callsign=\"' + d.contact[0]._attributes.callsign + '\"/>';\nif (d.remarks != null) xml += '<remarks>' + String(d.remarks).replace(/&/g,'&amp;').replace(/</g,'&lt;') + '</remarks>';\nif (d.strokeColor && d.strokeColor[0]) xml += '<strokeColor value=\"' + d.strokeColor[0]._attributes.value + '\"/>';\nif (d.strokeWeight && d.strokeWeight[0]) xml += '<strokeWeight value=\"' + d.strokeWeight[0]._attributes.value + '\"/>';\nif (d.fillColor && d.fillColor[0]) xml += '<fillColor value=\"' + d.fillColor[0]._attributes.value + '\"/>';\nif (d.labels_on && d.labels_on[0]) xml += '<labels_on value=\"' + d.labels_on[0]._attributes.value + '\"/>';\n\nif (d.link && d.link.length) {\n  for (var i = 0; i < d.link.length; i++) {\n    xml += '<link point=\"' + d.link[i]._attributes.point + '\"/>';\n  }\n}\n\nxml += '</detail></event>\\n';\n\nmsg.payload = Buffer.from(xml, 'utf8');\nif (msg.payload.length > 5000) node.warn('CoT ' + a.uid + ': ' + msg.payload.length + ' bytes');\nreturn msg;",
     "outputs": 1,
     "timeout": "",
     "noerr": 0,
     "initialize": "",
     "finalize": "",
     "libs": [],
-    "x": 400,
-    "y": 400,
+    "x": 180,
+    "y": 520,
     "wires": [
       [
-        "air_intel_rate_upload"
+        "air_intel_rate_stream"
       ]
     ]
   },
   {
-    "id": "air_intel_rate_upload",
+    "id": "air_intel_rate_stream",
     "type": "delay",
     "z": "flow_eng_air_intel",
-    "name": "Throttle (5/sec)",
+    "name": "Throttle (10/sec)",
     "pauseType": "rate",
     "timeout": "1",
     "timeoutUnits": "seconds",
-    "rate": "5",
+    "rate": "10",
     "nbRateUnits": "1",
     "rateUnits": "second",
     "randomFirst": "1",
@@ -1094,19 +1144,113 @@
     "drop": false,
     "allowrate": false,
     "outputs": 1,
-    "x": 600,
-    "y": 400,
+    "x": 400,
+    "y": 520,
     "wires": [
       [
-        "air_intel_http_upload"
+        "air_intel_tcp_out"
       ]
     ]
   },
   {
-    "id": "air_intel_http_upload",
+    "id": "air_intel_tcp_out",
+    "type": "tcp out",
+    "z": "flow_eng_air_intel",
+    "name": "CoT → TAK :8089",
+    "host": "host.docker.internal",
+    "port": "8089",
+    "beserver": "client",
+    "base64": false,
+    "end": false,
+    "tls": "tls_tak",
+    "x": 600,
+    "y": 520,
+    "wires": []
+  },
+  {
+    "id": "air_intel_catch_stream",
+    "type": "catch",
+    "z": "flow_eng_air_intel",
+    "name": "Stream errors",
+    "scope": [
+      "air_intel_tcp_out"
+    ],
+    "uncaught": false,
+    "x": 180,
+    "y": 580,
+    "wires": [
+      [
+        "air_intel_debug_stream"
+      ]
+    ]
+  },
+  {
+    "id": "air_intel_debug_stream",
+    "type": "debug",
+    "z": "flow_eng_air_intel",
+    "name": "Stream error",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": true,
+    "complete": "true",
+    "targetType": "full",
+    "statusVal": "",
+    "statusType": "auto",
+    "x": 400,
+    "y": 580,
+    "wires": []
+  },
+  {
+    "id": "air_intel_delay_put",
+    "type": "delay",
+    "z": "flow_eng_air_intel",
+    "name": "Wait 5s for cache",
+    "pauseType": "delay",
+    "timeout": "5",
+    "timeoutUnits": "seconds",
+    "rate": "1",
+    "nbRateUnits": "1",
+    "rateUnits": "second",
+    "randomFirst": "1",
+    "randomLast": "5",
+    "randomUnits": "seconds",
+    "drop": false,
+    "allowrate": false,
+    "outputs": 1,
+    "x": 400,
+    "y": 440,
+    "wires": [
+      [
+        "air_intel_build_put"
+      ]
+    ]
+  },
+  {
+    "id": "air_intel_build_put",
+    "type": "function",
+    "z": "flow_eng_air_intel",
+    "name": "Build PUT UIDs",
+    "func": "var uids = msg._putUids || [];\nif (!msg._putUrl || uids.length === 0) return null;\nmsg.method = 'PUT';\nmsg.url = msg._putUrl;\nmsg.headers = { 'accept': '*/*', 'Content-Type': 'application/json' };\nif (msg._missionCookie) msg.headers.Cookie = msg._missionCookie;\nif (msg._missionBearer) msg.headers.Authorization = 'Bearer ' + msg._missionBearer;\nmsg.payload = { uids: uids };\nnode.warn(msg.topic + ' PUT → ' + uids.length + ' UIDs');\nreturn msg;",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 600,
+    "y": 440,
+    "wires": [
+      [
+        "air_intel_http_action"
+      ]
+    ]
+  },
+  {
+    "id": "air_intel_http_action",
     "type": "http request",
     "z": "flow_eng_air_intel",
-    "name": "PUT missionpackage",
+    "name": "Mission API (PUT/DELETE)",
     "method": "use",
     "ret": "txt",
     "paytoqs": "ignore",
@@ -1118,30 +1262,12 @@
     "authType": "",
     "senderr": false,
     "headers": [],
-    "x": 790,
-    "y": 400,
+    "x": 800,
+    "y": 440,
     "wires": [
       [
-        "air_intel_log_upload"
+        "air_intel_log_action"
       ]
-    ]
-  },
-  {
-    "id": "air_intel_log_upload",
-    "type": "function",
-    "z": "flow_eng_air_intel",
-    "name": "Log upload result",
-    "func": "var code = msg.statusCode || '?';\nvar feed = msg.topic || 'unknown';\nvar ok = (code >= 200 && code < 300);\nvar label = feed + ' UPLOAD → ' + code + (ok ? ' ✓' : ' ✗');\nif (!ok) {\n  var body = (typeof msg.payload === 'string') ? msg.payload.substring(0, 300) : '';\n  node.warn(label + (body ? ' — ' + body : ''));\n} else {\n  node.warn(label);\n}\nreturn msg;",
-    "outputs": 1,
-    "timeout": "",
-    "noerr": 0,
-    "initialize": "",
-    "finalize": "",
-    "libs": [],
-    "x": 960,
-    "y": 400,
-    "wires": [
-      []
     ]
   },
   {
@@ -1161,8 +1287,8 @@
     "drop": false,
     "allowrate": false,
     "outputs": 1,
-    "x": 400,
-    "y": 460,
+    "x": 600,
+    "y": 490,
     "wires": [
       [
         "air_intel_http_action"
@@ -1170,43 +1296,19 @@
     ]
   },
   {
-    "id": "air_intel_http_action",
-    "type": "http request",
-    "z": "flow_eng_air_intel",
-    "name": "Mission API (DELETE)",
-    "method": "use",
-    "ret": "txt",
-    "paytoqs": "ignore",
-    "url": "",
-    "tls": "tls_tak",
-    "persist": false,
-    "proxy": "",
-    "insecureHTTPParser": false,
-    "authType": "",
-    "senderr": false,
-    "headers": [],
-    "x": 600,
-    "y": 460,
-    "wires": [
-      [
-        "air_intel_log_action"
-      ]
-    ]
-  },
-  {
     "id": "air_intel_log_action",
     "type": "function",
     "z": "flow_eng_air_intel",
-    "name": "Log DELETE result",
-    "func": "var code = msg.statusCode || '?';\nvar feed = msg.topic || 'unknown';\nvar ok = (code >= 200 && code < 300);\nvar label = feed + ' DELETE → ' + code + (ok ? ' ✓' : ' ✗');\nif (!ok) {\n  var body = (typeof msg.payload === 'string') ? msg.payload.substring(0, 200) : '';\n  node.warn(label + (body ? ' — ' + body : ''));\n} else {\n  node.warn(label);\n}\nreturn msg;",
+    "name": "Log API result",
+    "func": "var code = msg.statusCode || '?';\nvar method = msg.method || '?';\nvar feed = msg.topic || 'unknown';\nvar ok = (code >= 200 && code < 300);\nvar label = feed + ' ' + method + ' → ' + code + (ok ? ' ✓' : ' ✗');\nif (!ok) {\n  var body = (typeof msg.payload === 'string') ? msg.payload.substring(0, 200) : '';\n  node.warn(label + (body ? ' — ' + body : ''));\n} else {\n  node.warn(label);\n}\nreturn msg;",
     "outputs": 1,
     "timeout": "",
     "noerr": 0,
     "initialize": "",
     "finalize": "",
     "libs": [],
-    "x": 800,
-    "y": 460,
+    "x": 960,
+    "y": 440,
     "wires": [
       []
     ]
@@ -1216,7 +1318,56 @@
     "type": "tab",
     "label": "POWER-OUTAGES",
     "disabled": false,
-    "info": "DataSync engine for POWER-OUTAGES. Pure Mission API — no TCP streaming, no broadcast."
+    "info": "DataSync engine for POWER-OUTAGES. Stream CoT via TCP, PUT UIDs to mission."
+  },
+  {
+    "id": "pwr_outages_sa_inject",
+    "type": "inject",
+    "z": "flow_eng_pwr_outages",
+    "name": "SA ident (startup)",
+    "props": [
+      {
+        "p": "payload"
+      },
+      {
+        "p": "topic",
+        "vt": "str"
+      }
+    ],
+    "repeat": "600",
+    "crontab": "",
+    "once": true,
+    "onceDelay": "10",
+    "topic": "sa-ident",
+    "payload": "",
+    "payloadType": "date",
+    "x": 180,
+    "y": 40,
+    "wires": [
+      [
+        "pwr_outages_sa_build"
+      ]
+    ]
+  },
+  {
+    "id": "pwr_outages_sa_build",
+    "type": "function",
+    "z": "flow_eng_pwr_outages",
+    "name": "Build SA ident CoT",
+    "func": "var tak = global.get('tak_settings') || {};\nvar configs = global.get('arcgis_configs') || [];\nvar cfg = null;\nfor (var i = 0; i < configs.length; i++) {\n  if (configs[i].configName === 'POWER-OUTAGES') { cfg = configs[i]; break; }\n}\nvar creatorUid = '';\nif (cfg && cfg.creatorUid) creatorUid = String(cfg.creatorUid).trim();\nif (!creatorUid && tak.creatorUid) creatorUid = String(tak.creatorUid).trim();\nif (!creatorUid) { return null; }\n\nvar now = new Date();\nvar stale = new Date(now.getTime() + 120000);\nmsg.payload = {\n  event: {\n    _attributes: {\n      version: '2.0', uid: creatorUid,\n      type: 'a-f-G-E-S', how: 'h-g-i-g-o',\n      time: now.toISOString(), start: now.toISOString(), stale: stale.toISOString()\n    },\n    point: { _attributes: { lat: '0', lon: '0', hae: '0', ce: '9999999', le: '9999999' } },\n    detail: {\n      contact: [{ _attributes: { callsign: creatorUid } }],\n      __group: [{ _attributes: { name: 'Purple', role: 'Team Member' } }]\n    }\n  }\n};\nreturn msg;",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 400,
+    "y": 40,
+    "wires": [
+      [
+        "pwr_outages_cot_to_xml"
+      ]
+    ]
   },
   {
     "id": "pwr_outages_inject",
@@ -1240,7 +1391,7 @@
     "payload": "",
     "payloadType": "date",
     "x": 180,
-    "y": 80,
+    "y": 120,
     "wires": [
       [
         "pwr_outages_load"
@@ -1260,7 +1411,7 @@
     "finalize": "",
     "libs": [],
     "x": 400,
-    "y": 80,
+    "y": 120,
     "wires": [
       [
         "pwr_outages_build_q"
@@ -1280,7 +1431,7 @@
     "finalize": "",
     "libs": [],
     "x": 180,
-    "y": 160,
+    "y": 200,
     "wires": [
       [
         "pwr_outages_http_ag"
@@ -1304,7 +1455,7 @@
     "senderr": false,
     "headers": [],
     "x": 400,
-    "y": 160,
+    "y": 200,
     "wires": [
       [
         "pwr_outages_parse"
@@ -1324,7 +1475,7 @@
     "finalize": "",
     "libs": [],
     "x": 600,
-    "y": 160,
+    "y": 200,
     "wires": [
       [
         "pwr_outages_build_sub",
@@ -1345,7 +1496,7 @@
     "finalize": "",
     "libs": [],
     "x": 180,
-    "y": 240,
+    "y": 300,
     "wires": [
       [
         "pwr_outages_http_sub"
@@ -1369,7 +1520,7 @@
     "senderr": false,
     "headers": [],
     "x": 380,
-    "y": 240,
+    "y": 300,
     "wires": [
       [
         "pwr_outages_debug_sub"
@@ -1390,7 +1541,7 @@
     "statusVal": "topic",
     "statusType": "auto",
     "x": 580,
-    "y": 240,
+    "y": 300,
     "wires": []
   },
   {
@@ -1430,7 +1581,7 @@
     "senderr": false,
     "headers": [],
     "x": 740,
-    "y": 320,
+    "y": 360,
     "wires": [
       [
         "pwr_outages_reconcile"
@@ -1442,7 +1593,7 @@
     "type": "function",
     "z": "flow_eng_pwr_outages",
     "name": "Reconcile (diff)",
-    "func": "var features = msg._features || [];\nvar mData = msg.payload;\nvar cfg = msg._config;\nvar tak = msg.takSettings;\nvar topicCfg = cfg.configName || 'unnamed';\nmsg.topic = topicCfg;\nvar prefix = cfg.uidPrefix || 'arcgis';\nvar arcgisOk = !msg._arcgisStatus || msg._arcgisStatus === 200;\n\nvar existing = {};\ntry {\n  var mission = null;\n  if (mData && mData.data) {\n    mission = Array.isArray(mData.data) ? mData.data[0] : mData.data;\n  }\n  if (mission) {\n    if (mission.contents) {\n      for (var i=0;i<mission.contents.length;i++) {\n        var c = mission.contents[i];\n        var d = c.data || c;\n        var name = d.name || '';\n        var hash = d.hash || d.sha256hash || '';\n        if (name.indexOf(prefix) === 0 && name.slice(-4) === '.cot') {\n          existing[name.slice(0, -4)] = { hash: hash, type: 'hash' };\n        }\n      }\n    }\n    if (mission.uids) {\n      for (var i=0;i<mission.uids.length;i++) {\n        var u = mission.uids[i];\n        var uid = (typeof u === 'string') ? u : (u.data || u.uid || u);\n        if (typeof uid === 'string') existing[uid] = { hash: uid, type: 'uid' };\n      }\n    }\n  }\n} catch(e) { node.warn('Could not parse mission contents: ' + e.message); }\n\nvar arcgis = {};\nfor (var i=0;i<features.length;i++) arcgis[features[i].uid] = features[i];\n\nvar host = String(tak.serverUrl || '').replace(/^https?:\\/\\//i, '').replace(/\\/$/, '');\nvar port = tak.missionApiPort || 8443;\nvar baseUrl = 'https://' + host + ':' + port\n  + '/Marti/api/missions/' + encodeURIComponent(cfg.missionName);\nvar creatorUidRaw = String((cfg && cfg.creatorUid) || (tak && tak.creatorUid) || 'nodered').trim();\nvar creator = encodeURIComponent(creatorUidRaw);\n\nvar cookie = msg._missionCookie || '';\nvar bearer = msg._missionBearer || '';\nif (!cookie && msg.responseCookies && msg.responseCookies.JSESSIONID && msg.responseCookies.JSESSIONID.value) {\n  cookie = 'JSESSIONID=' + String(msg.responseCookies.JSESSIONID.value);\n}\nif (!cookie && msg.headers && msg.headers['set-cookie']) {\n  var sc = msg.headers['set-cookie'];\n  if (Array.isArray(sc) && sc.length) {\n    var a2 = String(sc[0]).match(/JSESSIONID=([^;]+)/);\n    if (a2 && a2[1]) cookie = 'JSESSIONID=' + a2[1];\n  } else if (typeof sc === 'string') {\n    var b = sc.match(/JSESSIONID=([^;]+)/);\n    if (b && b[1]) cookie = 'JSESSIONID=' + b[1];\n  }\n}\n\nvar nUpload = 0, nDel = 0;\nfor (var uid in arcgis) {\n  if (!existing[uid]) {\n    nUpload++;\n    node.send([{\n      payload: arcgis[uid].cot,\n      _uploadUid: uid,\n      _host: host,\n      _port: port,\n      _missionName: encodeURIComponent(cfg.missionName),\n      _creator: creator,\n      _missionCookie: cookie,\n      _missionBearer: bearer,\n      topic: topicCfg\n    }, null]);\n  }\n}\n\nif (!arcgisOk) {\n  node.warn(topicCfg + ': ArcGIS fetch failed (status ' + msg._arcgisStatus + ') — skipping deletes');\n} else {\n  for (var uid in existing) {\n    if (uid.indexOf(prefix) === 0 && !arcgis[uid]) {\n      nDel++;\n      var entry = existing[uid];\n      var delParam = (entry.type === 'uid')\n        ? 'uid=' + encodeURIComponent(uid)\n        : 'hash=' + encodeURIComponent(entry.hash);\n      node.send([null, {\n        method: 'DELETE',\n        url: baseUrl + '/contents?' + delParam + '&creatorUid=' + creator,\n        headers: { 'accept': '*/*' },\n        _missionCookie: cookie,\n        _missionBearer: bearer,\n        payload: '',\n        topic: topicCfg\n      }]);\n    }\n  }\n}\n\nnode.warn(topicCfg + ' reconcile: ' + nUpload + ' upload, ' + nDel + ' DELETE, '\n  + Object.keys(arcgis).length + ' ArcGIS, ' + Object.keys(existing).length + ' in mission');\nreturn null;",
+    "func": "var features = msg._features || [];\nvar mData = msg.payload;\nvar cfg = msg._config;\nvar tak = msg.takSettings;\nvar topicCfg = cfg.configName || 'unnamed';\nmsg.topic = topicCfg;\nvar prefix = cfg.uidPrefix || 'arcgis';\nvar arcgisOk = !msg._arcgisStatus || msg._arcgisStatus === 200;\n\nvar existing = {};\ntry {\n  var mission = null;\n  if (mData && mData.data) {\n    mission = Array.isArray(mData.data) ? mData.data[0] : mData.data;\n  }\n  if (mission && mission.uids) {\n    for (var i=0;i<mission.uids.length;i++) {\n      var u = mission.uids[i];\n      var uid = (typeof u === 'string') ? u : (u.data || u.uid || u);\n      if (typeof uid === 'string') existing[uid] = true;\n    }\n  }\n  if (mission && mission.contents) {\n    for (var i=0;i<mission.contents.length;i++) {\n      var c = mission.contents[i];\n      if (c.data && c.data.uid) existing[c.data.uid] = true;\n    }\n  }\n} catch(e) { node.warn('Could not parse mission contents: ' + e.message); }\n\nvar arcgis = {};\nfor (var i=0;i<features.length;i++) arcgis[features[i].uid] = features[i];\n\nvar host = String(tak.serverUrl || '').replace(/^https?:\\/\\//i, '').replace(/\\/$/, '');\nvar baseUrl = 'https://' + host + ':' + (tak.missionApiPort || 8443)\n  + '/Marti/api/missions/' + encodeURIComponent(cfg.missionName);\nvar creatorUidRaw = String((cfg && cfg.creatorUid) || (tak && tak.creatorUid) || 'nodered').trim();\nvar creator = encodeURIComponent(creatorUidRaw);\n\nvar cookie = msg._missionCookie || '';\nvar bearer = msg._missionBearer || '';\nif (!cookie && msg.responseCookies && msg.responseCookies.JSESSIONID && msg.responseCookies.JSESSIONID.value) {\n  cookie = 'JSESSIONID=' + String(msg.responseCookies.JSESSIONID.value);\n}\nif (!cookie && msg.headers && msg.headers['set-cookie']) {\n  var sc = msg.headers['set-cookie'];\n  if (Array.isArray(sc) && sc.length) {\n    var a2 = String(sc[0]).match(/JSESSIONID=([^;]+)/);\n    if (a2 && a2[1]) cookie = 'JSESSIONID=' + a2[1];\n  } else if (typeof sc === 'string') {\n    var b = sc.match(/JSESSIONID=([^;]+)/);\n    if (b && b[1]) cookie = 'JSESSIONID=' + b[1];\n  }\n}\n\nvar nStream = 0, nPut = 0, nDel = 0;\nvar newUids = [];\nfor (var uid in arcgis) {\n  nStream++;\n  if (!existing[uid]) { nPut++; newUids.push(uid); }\n  node.send([\n    { payload: arcgis[uid].cot, topic: topicCfg,\n      host: host,\n      port: Number(tak.streamingPort || tak.streamPort || 8089) },\n    null\n  ]);\n}\n\nif (newUids.length > 0) {\n  node.send([\n    { topic: topicCfg, payload: {},\n      _missionCookie: cookie,\n      _missionBearer: bearer,\n      _putUrl: baseUrl + '/contents?creatorUid=' + creator,\n      _putUids: newUids },\n    null\n  ]);\n}\n\nif (!arcgisOk) {\n  node.warn(topicCfg + ': ArcGIS fetch failed (status ' + msg._arcgisStatus + ') — skipping deletes');\n} else {\n  for (var uid in existing) {\n    if (uid.indexOf(prefix) === 0 && !arcgis[uid]) {\n      nDel++;\n      node.send([null, {\n        method: 'DELETE',\n        url: baseUrl + '/contents?uid=' + encodeURIComponent(uid) + '&creatorUid=' + creator,\n        headers: { 'accept': '*/*' },\n        _missionCookie: cookie,\n        _missionBearer: bearer,\n        payload: '',\n        topic: topicCfg\n      }]);\n    }\n  }\n}\n\nnode.warn(topicCfg + ' reconcile: ' + nStream + ' streamed, ' + nPut + ' PUT, ' + nDel + ' DELETE, '\n  + Object.keys(arcgis).length + ' ArcGIS, ' + Object.keys(existing).length + ' in mission');\nreturn null;",
     "outputs": 2,
     "timeout": "",
     "noerr": 0,
@@ -1450,10 +1601,11 @@
     "finalize": "",
     "libs": [],
     "x": 180,
-    "y": 400,
+    "y": 440,
     "wires": [
       [
-        "pwr_outages_build_upload"
+        "pwr_outages_cot_to_xml",
+        "pwr_outages_delay_put"
       ],
       [
         "pwr_outages_delay_del"
@@ -1461,34 +1613,34 @@
     ]
   },
   {
-    "id": "pwr_outages_build_upload",
+    "id": "pwr_outages_cot_to_xml",
     "type": "function",
     "z": "flow_eng_pwr_outages",
-    "name": "Build upload (CoT → XML)",
-    "func": "var e = msg.payload && msg.payload.event;\nif (!e || !e._attributes) return null;\nvar a = e._attributes;\nvar p = e.point._attributes;\nvar d = e.detail || {};\n\nvar xml = '<event version=\"' + a.version + '\" uid=\"' + a.uid + '\" type=\"' + a.type + '\"'\n  + ' how=\"' + a.how + '\" time=\"' + a.time + '\" start=\"' + a.start + '\" stale=\"' + a.stale + '\">'\n  + '<point lat=\"' + p.lat + '\" lon=\"' + p.lon + '\" hae=\"' + p.hae + '\" ce=\"' + p.ce + '\" le=\"' + p.le + '\"/>'\n  + '<detail>';\n\nif (d.contact && d.contact[0]) xml += '<contact callsign=\"' + d.contact[0]._attributes.callsign + '\"/>';\nif (d.remarks != null) xml += '<remarks>' + String(d.remarks).replace(/&/g,'&amp;').replace(/</g,'&lt;') + '</remarks>';\nif (d.strokeColor && d.strokeColor[0]) xml += '<strokeColor value=\"' + d.strokeColor[0]._attributes.value + '\"/>';\nif (d.strokeWeight && d.strokeWeight[0]) xml += '<strokeWeight value=\"' + d.strokeWeight[0]._attributes.value + '\"/>';\nif (d.fillColor && d.fillColor[0]) xml += '<fillColor value=\"' + d.fillColor[0]._attributes.value + '\"/>';\nif (d.labels_on && d.labels_on[0]) xml += '<labels_on value=\"' + d.labels_on[0]._attributes.value + '\"/>';\nif (d.link && d.link.length) {\n  for (var i = 0; i < d.link.length; i++) {\n    xml += '<link point=\"' + d.link[i]._attributes.point + '\"/>';\n  }\n}\nxml += '</detail></event>';\n\nmsg.url = 'https://' + msg._host + ':' + msg._port\n  + '/Marti/api/missions/' + msg._missionName\n  + '/contents/missionpackage?creatorUid=' + msg._creator;\nmsg.method = 'PUT';\nmsg.headers = {\n  'Content-Type': 'application/xml'\n};\nif (msg._missionCookie) msg.headers.Cookie = msg._missionCookie;\nif (msg._missionBearer) msg.headers.Authorization = 'Bearer ' + msg._missionBearer;\nmsg.payload = xml;\nreturn msg;",
+    "name": "CoT JSON → XML",
+    "func": "var e = msg.payload && msg.payload.event;\nif (!e || !e._attributes) return null;\nvar a = e._attributes;\nvar p = e.point._attributes;\nvar d = e.detail || {};\n\nvar xml = '<event version=\"' + a.version + '\" uid=\"' + a.uid + '\" type=\"' + a.type + '\"'\n  + ' how=\"' + a.how + '\" time=\"' + a.time + '\" start=\"' + a.start + '\" stale=\"' + a.stale + '\">'\n  + '<point lat=\"' + p.lat + '\" lon=\"' + p.lon + '\" hae=\"' + p.hae + '\" ce=\"' + p.ce + '\" le=\"' + p.le + '\"/>'\n  + '<detail>';\n\nif (d.contact && d.contact[0]) xml += '<contact callsign=\"' + d.contact[0]._attributes.callsign + '\"/>';\nif (d.remarks != null) xml += '<remarks>' + String(d.remarks).replace(/&/g,'&amp;').replace(/</g,'&lt;') + '</remarks>';\nif (d.strokeColor && d.strokeColor[0]) xml += '<strokeColor value=\"' + d.strokeColor[0]._attributes.value + '\"/>';\nif (d.strokeWeight && d.strokeWeight[0]) xml += '<strokeWeight value=\"' + d.strokeWeight[0]._attributes.value + '\"/>';\nif (d.fillColor && d.fillColor[0]) xml += '<fillColor value=\"' + d.fillColor[0]._attributes.value + '\"/>';\nif (d.labels_on && d.labels_on[0]) xml += '<labels_on value=\"' + d.labels_on[0]._attributes.value + '\"/>';\n\nif (d.link && d.link.length) {\n  for (var i = 0; i < d.link.length; i++) {\n    xml += '<link point=\"' + d.link[i]._attributes.point + '\"/>';\n  }\n}\n\nxml += '</detail></event>\\n';\n\nmsg.payload = Buffer.from(xml, 'utf8');\nif (msg.payload.length > 5000) node.warn('CoT ' + a.uid + ': ' + msg.payload.length + ' bytes');\nreturn msg;",
     "outputs": 1,
     "timeout": "",
     "noerr": 0,
     "initialize": "",
     "finalize": "",
     "libs": [],
-    "x": 400,
-    "y": 400,
+    "x": 180,
+    "y": 520,
     "wires": [
       [
-        "pwr_outages_rate_upload"
+        "pwr_outages_rate_stream"
       ]
     ]
   },
   {
-    "id": "pwr_outages_rate_upload",
+    "id": "pwr_outages_rate_stream",
     "type": "delay",
     "z": "flow_eng_pwr_outages",
-    "name": "Throttle (5/sec)",
+    "name": "Throttle (10/sec)",
     "pauseType": "rate",
     "timeout": "1",
     "timeoutUnits": "seconds",
-    "rate": "5",
+    "rate": "10",
     "nbRateUnits": "1",
     "rateUnits": "second",
     "randomFirst": "1",
@@ -1497,19 +1649,113 @@
     "drop": false,
     "allowrate": false,
     "outputs": 1,
-    "x": 600,
-    "y": 400,
+    "x": 400,
+    "y": 520,
     "wires": [
       [
-        "pwr_outages_http_upload"
+        "pwr_outages_tcp_out"
       ]
     ]
   },
   {
-    "id": "pwr_outages_http_upload",
+    "id": "pwr_outages_tcp_out",
+    "type": "tcp out",
+    "z": "flow_eng_pwr_outages",
+    "name": "CoT → TAK :8089",
+    "host": "host.docker.internal",
+    "port": "8089",
+    "beserver": "client",
+    "base64": false,
+    "end": false,
+    "tls": "tls_tak",
+    "x": 600,
+    "y": 520,
+    "wires": []
+  },
+  {
+    "id": "pwr_outages_catch_stream",
+    "type": "catch",
+    "z": "flow_eng_pwr_outages",
+    "name": "Stream errors",
+    "scope": [
+      "pwr_outages_tcp_out"
+    ],
+    "uncaught": false,
+    "x": 180,
+    "y": 580,
+    "wires": [
+      [
+        "pwr_outages_debug_stream"
+      ]
+    ]
+  },
+  {
+    "id": "pwr_outages_debug_stream",
+    "type": "debug",
+    "z": "flow_eng_pwr_outages",
+    "name": "Stream error",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": true,
+    "complete": "true",
+    "targetType": "full",
+    "statusVal": "",
+    "statusType": "auto",
+    "x": 400,
+    "y": 580,
+    "wires": []
+  },
+  {
+    "id": "pwr_outages_delay_put",
+    "type": "delay",
+    "z": "flow_eng_pwr_outages",
+    "name": "Wait 5s for cache",
+    "pauseType": "delay",
+    "timeout": "5",
+    "timeoutUnits": "seconds",
+    "rate": "1",
+    "nbRateUnits": "1",
+    "rateUnits": "second",
+    "randomFirst": "1",
+    "randomLast": "5",
+    "randomUnits": "seconds",
+    "drop": false,
+    "allowrate": false,
+    "outputs": 1,
+    "x": 400,
+    "y": 440,
+    "wires": [
+      [
+        "pwr_outages_build_put"
+      ]
+    ]
+  },
+  {
+    "id": "pwr_outages_build_put",
+    "type": "function",
+    "z": "flow_eng_pwr_outages",
+    "name": "Build PUT UIDs",
+    "func": "var uids = msg._putUids || [];\nif (!msg._putUrl || uids.length === 0) return null;\nmsg.method = 'PUT';\nmsg.url = msg._putUrl;\nmsg.headers = { 'accept': '*/*', 'Content-Type': 'application/json' };\nif (msg._missionCookie) msg.headers.Cookie = msg._missionCookie;\nif (msg._missionBearer) msg.headers.Authorization = 'Bearer ' + msg._missionBearer;\nmsg.payload = { uids: uids };\nnode.warn(msg.topic + ' PUT → ' + uids.length + ' UIDs');\nreturn msg;",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 600,
+    "y": 440,
+    "wires": [
+      [
+        "pwr_outages_http_action"
+      ]
+    ]
+  },
+  {
+    "id": "pwr_outages_http_action",
     "type": "http request",
     "z": "flow_eng_pwr_outages",
-    "name": "PUT missionpackage",
+    "name": "Mission API (PUT/DELETE)",
     "method": "use",
     "ret": "txt",
     "paytoqs": "ignore",
@@ -1521,30 +1767,12 @@
     "authType": "",
     "senderr": false,
     "headers": [],
-    "x": 790,
-    "y": 400,
+    "x": 800,
+    "y": 440,
     "wires": [
       [
-        "pwr_outages_log_upload"
+        "pwr_outages_log_action"
       ]
-    ]
-  },
-  {
-    "id": "pwr_outages_log_upload",
-    "type": "function",
-    "z": "flow_eng_pwr_outages",
-    "name": "Log upload result",
-    "func": "var code = msg.statusCode || '?';\nvar feed = msg.topic || 'unknown';\nvar ok = (code >= 200 && code < 300);\nvar label = feed + ' UPLOAD → ' + code + (ok ? ' ✓' : ' ✗');\nif (!ok) {\n  var body = (typeof msg.payload === 'string') ? msg.payload.substring(0, 300) : '';\n  node.warn(label + (body ? ' — ' + body : ''));\n} else {\n  node.warn(label);\n}\nreturn msg;",
-    "outputs": 1,
-    "timeout": "",
-    "noerr": 0,
-    "initialize": "",
-    "finalize": "",
-    "libs": [],
-    "x": 960,
-    "y": 400,
-    "wires": [
-      []
     ]
   },
   {
@@ -1564,8 +1792,8 @@
     "drop": false,
     "allowrate": false,
     "outputs": 1,
-    "x": 400,
-    "y": 460,
+    "x": 600,
+    "y": 490,
     "wires": [
       [
         "pwr_outages_http_action"
@@ -1573,43 +1801,19 @@
     ]
   },
   {
-    "id": "pwr_outages_http_action",
-    "type": "http request",
-    "z": "flow_eng_pwr_outages",
-    "name": "Mission API (DELETE)",
-    "method": "use",
-    "ret": "txt",
-    "paytoqs": "ignore",
-    "url": "",
-    "tls": "tls_tak",
-    "persist": false,
-    "proxy": "",
-    "insecureHTTPParser": false,
-    "authType": "",
-    "senderr": false,
-    "headers": [],
-    "x": 600,
-    "y": 460,
-    "wires": [
-      [
-        "pwr_outages_log_action"
-      ]
-    ]
-  },
-  {
     "id": "pwr_outages_log_action",
     "type": "function",
     "z": "flow_eng_pwr_outages",
-    "name": "Log DELETE result",
-    "func": "var code = msg.statusCode || '?';\nvar feed = msg.topic || 'unknown';\nvar ok = (code >= 200 && code < 300);\nvar label = feed + ' DELETE → ' + code + (ok ? ' ✓' : ' ✗');\nif (!ok) {\n  var body = (typeof msg.payload === 'string') ? msg.payload.substring(0, 200) : '';\n  node.warn(label + (body ? ' — ' + body : ''));\n} else {\n  node.warn(label);\n}\nreturn msg;",
+    "name": "Log API result",
+    "func": "var code = msg.statusCode || '?';\nvar method = msg.method || '?';\nvar feed = msg.topic || 'unknown';\nvar ok = (code >= 200 && code < 300);\nvar label = feed + ' ' + method + ' → ' + code + (ok ? ' ✓' : ' ✗');\nif (!ok) {\n  var body = (typeof msg.payload === 'string') ? msg.payload.substring(0, 200) : '';\n  node.warn(label + (body ? ' — ' + body : ''));\n} else {\n  node.warn(label);\n}\nreturn msg;",
     "outputs": 1,
     "timeout": "",
     "noerr": 0,
     "initialize": "",
     "finalize": "",
     "libs": [],
-    "x": 800,
-    "y": 460,
+    "x": 960,
+    "y": 440,
     "wires": [
       []
     ]
