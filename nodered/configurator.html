@@ -411,28 +411,29 @@
         <label for="configName">Config name</label>
         <input type="text" id="configName" placeholder="Shown in Saved list &amp; Node-RED debug (e.g. CA AIR INTEL)">
       </div>
-      <div>
-        <label for="streamCertUser">Stream integration user (from TAK Portal)</label>
-        <input type="text" id="streamCertUser" placeholder="e.g. nodered_global_caairintel" oninput="updateCertPreview()">
-        <div id="certPreview" style="font-size:0.75rem;color:#666;margin-top:0.2rem"></div>
-      </div>
-    </div>
-    <div class="field-grid" style="margin-bottom:1rem">
-      <div>
-        <label for="streamPort">Stream port (from TAK Portal data feed)</label>
-        <input type="number" id="streamPort" min="1" max="65535" value="8089" placeholder="e.g. 7001">
-      </div>
+      <div></div>
     </div>
     <div class="field-grid" style="margin-bottom:1rem" id="dataSyncFields">
       <div>
         <label for="missionName">TAK Mission name</label>
         <input type="text" id="missionName" placeholder="e.g. CA AIR INTEL">
       </div>
-      <div>
-        <label for="configCreatorUid">Mission API Creator UID</label>
-        <input type="text" id="configCreatorUid" value="admin" placeholder="admin (uses admin cert for mission API)">
+      <div style="font-size:0.78rem;color:#888;align-self:end;padding-bottom:0.5rem">
+        Uses admin cert for streaming &amp; Mission API (port 8089)
       </div>
     </div>
+    <div class="field-grid" id="streamFields" style="display:none;margin-bottom:1rem">
+      <div>
+        <label for="streamCertUser">Stream integration user (from TAK Portal)</label>
+        <input type="text" id="streamCertUser" placeholder="e.g. nodered_global_caairintel" oninput="updateCertPreview()">
+        <div id="certPreview" style="font-size:0.75rem;color:#666;margin-top:0.2rem"></div>
+      </div>
+      <div>
+        <label for="streamPort">Stream port (from TAK Portal data feed)</label>
+        <input type="number" id="streamPort" min="1" max="65535" value="8089" placeholder="e.g. 7001">
+      </div>
+    </div>
+    <input type="hidden" id="configCreatorUid" value="admin">
     <div class="field-grid" style="margin-bottom:1rem">
       <div>
         <label for="pollInterval">Poll interval (minutes)</label>
@@ -470,6 +471,7 @@ function updSwatch(id, v) {
 function toggleDataSync() {
   var on = document.getElementById('dataSyncEnabled').checked;
   document.getElementById('dataSyncFields').style.display = on ? '' : 'none';
+  document.getElementById('streamFields').style.display = on ? 'none' : '';
 }
 
 function updateCertPreview() {
