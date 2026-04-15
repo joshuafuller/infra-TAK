@@ -802,8 +802,8 @@
     "cert": "",
     "key": "",
     "ca": "",
-    "certname": "",
-    "keyname": "",
+    "certname": "/certs/admin.pem",
+    "keyname": "/certs/admin.key",
     "caname": "",
     "servername": "",
     "verifyservercert": false
