@@ -324,8 +324,9 @@ const configFlows = [
       "var config  = msg.payload;",
       "var configs = global.get('arcgis_configs') || [];",
       "var idx = configs.findIndex(function(c) {",
-      "  return c.source.serviceUrl === config.source.serviceUrl",
-      "      && c.source.layerId    === config.source.layerId;",
+      "  if (config.sourceType === 'faa_tfr') return c.configName === config.configName && c.sourceType === 'faa_tfr';",
+      "  return c.source && config.source && c.source.serviceUrl === config.source.serviceUrl",
+      "      && c.source.layerId === config.source.layerId;",
       "});",
       "if (idx >= 0) { configs[idx] = config; }",
       "else           { configs.push(config); }",
@@ -722,6 +723,20 @@ const FN_COT_TO_XML = [
   "  for (var i = 0; i < d.link.length; i++) {",
   "    xml += '<link point=\"' + d.link[i]._attributes.point + '\"/>';",
   "  }",
+  "}",
+  "",
+  "if (d.height && d.height[0]) xml += '<height value=\"' + d.height[0]._attributes.value + '\"/>';",
+  "if (d.status && d.status[0]) xml += '<status readiness=\"' + d.status[0]._attributes.readiness + '\"/>';",
+  "if (d.precisionlocation && d.precisionlocation[0]) xml += '<precisionlocation altsrc=\"' + d.precisionlocation[0]._attributes.altsrc + '\"/>';",
+  "if (d._geofence && d._geofence[0]) {",
+  "  var gf = d._geofence[0]._attributes;",
+  "  xml += '<_geofence elevationMonitored=\"' + gf.elevationMonitored + '\"'",
+  "    + ' minElevation=\"' + gf.minElevation + '\"'",
+  "    + ' monitor=\"' + gf.monitor + '\"'",
+  "    + ' trigger=\"' + gf.trigger + '\"'",
+  "    + ' tracking=\"' + gf.tracking + '\"'",
+  "    + ' maxElevation=\"' + gf.maxElevation + '\"'",
+  "    + ' boundingSphere=\"' + gf.boundingSphere + '\"/>';",
   "}",
   "",
   "if (msg._missionName) {",
@@ -1193,12 +1208,622 @@ function makeEngineTab(feed) {
 }
 
 // ════════════════════════════════════════════════════════════════
-//  Engine tab template (embedded in configurator.html for dynamic creation)
+//  Per-feed TFR engine tab generator
+// ════════════════════════════════════════════════════════════════
+
+const FN_TFR_FILTER_SPLIT = [
+  "var tfrs = msg.payload || [];",
+  "var cfg = msg._config;",
+  "var states = cfg.tfrStates || [];",
+  "var filtered = [];",
+  "for (var i = 0; i < tfrs.length; i++) {",
+  "  if (states.length === 0 || states.indexOf(tfrs[i].state) >= 0) {",
+  "    var nid = tfrs[i].notam_id.replace(/\\//g, '_');",
+  "    filtered.push({",
+  "      url: 'https://tfr.faa.gov/download/detail_' + nid + '.xml',",
+  "      notamId: nid, state: tfrs[i].state",
+  "    });",
+  "  }",
+  "}",
+  "node.warn(cfg.configName + ': ' + filtered.length + ' TFRs after state filter (from ' + tfrs.length + ')');",
+  "flow.set('_tfrUids', []);",
+  "flow.set('_tfrCount', filtered.length);",
+  "flow.set('_tfrDone', 0);",
+  "for (var i = 0; i < filtered.length; i++) {",
+  "  node.send([{ url: filtered[i].url, method: 'GET',",
+  "    _tfrMeta: filtered[i], _config: cfg, takSettings: msg.takSettings,",
+  "    topic: cfg.configName }, null]);",
+  "}",
+  "if (filtered.length > 0) {",
+  "  node.send([null, {",
+  "    _config: cfg, takSettings: msg.takSettings, topic: cfg.configName",
+  "  }]);",
+  "}",
+  "return null;"
+].join('\n');
+
+const FN_TFR_PARSE_BUILD_COT = [
+  "var xml = msg.payload;",
+  "var cfg = msg._config;",
+  "",
+  "function hexArgb(hex, a) {",
+  "  var r = parseInt(hex.substr(1,2),16);",
+  "  var g = parseInt(hex.substr(3,2),16);",
+  "  var b = parseInt(hex.substr(5,2),16);",
+  "  var ai = Math.round((a !== undefined ? a : 1) * 255);",
+  "  return ((ai << 24) | (r << 16) | (g << 8) | b);",
+  "}",
+  "",
+  "var sColor = (cfg.style && cfg.style.strokeColor) || '#FF6600';",
+  "var fColor = (cfg.style && cfg.style.fillColor) || '#FF6600';",
+  "var rawAlpha = cfg.style && cfg.style.fillAlpha;",
+  "var fa = (typeof rawAlpha === 'number') ? rawAlpha / 100 : 0.25;",
+  "var strokeArgb = hexArgb(sColor, 1);",
+  "var fillArgb = hexArgb(fColor, fa);",
+  "",
+  "try {",
+  "  var xnotam = xml['XNOTAM-Update'];",
+  "  if (!xnotam || !xnotam.Group) throw new Error('Invalid XNOTAM');",
+  "  var tfr_dict = xnotam.Group[0].Add[0].Not[0];",
+  "  var tfr_info = tfr_dict.TfrNot[0].TFRAreaGroup;",
+  "  var tfrId = tfr_dict.NotUid[0].txtLocalName[0].replace(/\\//g, '_');",
+  "  var tfrSeqNo = tfr_dict.NotUid[0].noSeqNo[0];",
+  "  var remarks = (tfr_dict.txtDescrTraditional && tfr_dict.txtDescrTraditional[0]) || '';",
+  "  var detailUrl = 'https://tfr.faa.gov/tfr3/?page=detail_' + tfrId;",
+  "",
+  "  var now = new Date();",
+  "  var staleMs = ((cfg.tfrPollInterval || 15) * 60000) + 120000;",
+  "  var stale = new Date(now.getTime() + staleMs);",
+  "",
+  "  for (var i = 0; i < tfr_info.length; i++) {",
+  "    if (!tfr_info[i].aseShapes) continue;",
+  "    var labelArea = '';",
+  "    if (i >= 1 && tfr_info[i].aseTFRArea && tfr_info[i].aseTFRArea[0].txtName) {",
+  "      labelArea = tfr_info[i].aseTFRArea[0].txtName[0];",
+  "    }",
+  "    var callsign = ('tfr-3-' + tfrSeqNo + ' ' + labelArea).trim();",
+  "    var uid = (cfg.uidPrefix || 'tfr-') + tfrId + (labelArea ? '_' + labelArea.replace(/[^a-zA-Z0-9]/g,'_') : '');",
+  "",
+  "    var firstAvx = tfr_info[i].aseShapes[0].Abd[0].Avx[0];",
+  "    var lat = parseFloat(String(firstAvx.geoLat[0]).replace('N',''));",
+  "    var lon = parseFloat('-' + String(firstAvx.geoLong[0]).replace('W',''));",
+  "",
+  "    var heightFt = 0;",
+  "    if (tfr_info[i].aseTFRArea && tfr_info[i].aseTFRArea[0].valDistVerUpper) {",
+  "      heightFt = parseFloat(tfr_info[i].aseTFRArea[0].valDistVerUpper[0]) || 0;",
+  "    }",
+  "    var heightM = heightFt * 0.3048;",
+  "",
+  "    var linkPoints = tfr_info[i].abdMergedArea[0].Avx;",
+  "    var links = [];",
+  "    for (var j = 0; j < linkPoints.length; j++) {",
+  "      var ptLat = String(linkPoints[j].geoLat[0]).replace('N','');",
+  "      var ptLon = '-' + String(linkPoints[j].geoLong[0]).replace('W','');",
+  "      links.push({ _attributes: { point: ptLat + ',' + ptLon } });",
+  "    }",
+  "",
+  "    var detail = {",
+  "      contact: [{ _attributes: { callsign: callsign } }],",
+  "      remarks: remarks,",
+  "      strokeColor: [{ _attributes: { value: String(strokeArgb) } }],",
+  "      strokeWeight: [{ _attributes: { value: '2.0' } }],",
+  "      fillColor: [{ _attributes: { value: String(fillArgb) } }],",
+  "      labels_on: [{ _attributes: { value: 'true' } }],",
+  "      status: [{ _attributes: { readiness: 'true' } }],",
+  "      link: links",
+  "    };",
+  "",
+  "    if (cfg.tfr3D && heightM > 0) {",
+  "      detail.height = [{ _attributes: { value: String(heightM) } }];",
+  "      detail._geofence = [{ _attributes: {",
+  "        elevationMonitored: 'true', minElevation: '0.0',",
+  "        monitor: 'All', trigger: 'Both', tracking: 'false',",
+  "        maxElevation: String(heightM), boundingSphere: '96000.0'",
+  "      } }];",
+  "    }",
+  "",
+  "    var uids = flow.get('_tfrUids') || [];",
+  "    uids.push(uid);",
+  "    flow.set('_tfrUids', uids);",
+  "",
+  "    node.send({",
+  "      payload: { event: {",
+  "        _attributes: { version: '2.0', uid: uid, type: 'u-d-f', how: 'h-e',",
+  "          time: now.toISOString(), start: now.toISOString(), stale: stale.toISOString() },",
+  "        point: { _attributes: { lat: String(lat), lon: String(lon), hae: '9999999.0', ce: '9999999.0', le: '9999999.0' } },",
+  "        detail: detail",
+  "      } },",
+  "      topic: cfg.configName, _missionName: cfg.missionName",
+  "    });",
+  "  }",
+  "} catch(e) { node.warn(cfg.configName + ' TFR parse error: ' + e.message); }",
+  "",
+  "var done = (flow.get('_tfrDone') || 0) + 1;",
+  "flow.set('_tfrDone', done);",
+  "node.warn(cfg.configName + ': TFR ' + done + '/' + flow.get('_tfrCount') + ' parsed');",
+  "return null;"
+].join('\n');
+
+const FN_TFR_RECONCILE = [
+  "var mData = msg.payload;",
+  "var cfg = msg._config;",
+  "var tak = msg.takSettings;",
+  "var topicCfg = cfg.configName || 'unnamed';",
+  "msg.topic = topicCfg;",
+  "var prefix = cfg.uidPrefix || 'tfr-';",
+  "",
+  "var tfrUids = flow.get('_tfrUids') || [];",
+  "var tfrMap = {};",
+  "for (var i = 0; i < tfrUids.length; i++) tfrMap[tfrUids[i]] = true;",
+  "",
+  "var existing = {};",
+  "try {",
+  "  var mission = null;",
+  "  if (mData && mData.data) {",
+  "    mission = Array.isArray(mData.data) ? mData.data[0] : mData.data;",
+  "  }",
+  "  if (mission && mission.uids) {",
+  "    for (var i=0;i<mission.uids.length;i++) {",
+  "      var u = mission.uids[i];",
+  "      var uid = (typeof u === 'string') ? u : (u.data || u.uid || u);",
+  "      if (typeof uid === 'string') existing[uid] = true;",
+  "    }",
+  "  }",
+  "  if (mission && mission.contents) {",
+  "    for (var i=0;i<mission.contents.length;i++) {",
+  "      var c = mission.contents[i];",
+  "      if (c.data && c.data.uid) existing[c.data.uid] = true;",
+  "    }",
+  "  }",
+  "} catch(e) { node.warn('Could not parse mission: ' + e.message); }",
+  "",
+  "var host = String(tak.serverUrl || '').replace(/^https?:\\/\\//i, '').replace(/\\/$/, '');",
+  "var baseUrl = 'https://' + host + ':' + (tak.missionApiPort || 8443)",
+  "  + '/Marti/api/missions/' + encodeURIComponent(cfg.missionName);",
+  "var creator = encodeURIComponent(String((cfg && cfg.creatorUid) || (tak && tak.creatorUid) || 'nodered').trim());",
+  "",
+  "var cookie = msg._missionCookie || '';",
+  "var bearer = msg._missionBearer || '';",
+  "if (!cookie && msg.responseCookies && msg.responseCookies.JSESSIONID && msg.responseCookies.JSESSIONID.value) {",
+  "  cookie = 'JSESSIONID=' + String(msg.responseCookies.JSESSIONID.value);",
+  "}",
+  "if (!cookie && msg.headers && msg.headers['set-cookie']) {",
+  "  var sc = msg.headers['set-cookie'];",
+  "  if (Array.isArray(sc) && sc.length) {",
+  "    var a2 = String(sc[0]).match(/JSESSIONID=([^;]+)/);",
+  "    if (a2 && a2[1]) cookie = 'JSESSIONID=' + a2[1];",
+  "  } else if (typeof sc === 'string') {",
+  "    var b = sc.match(/JSESSIONID=([^;]+)/);",
+  "    if (b && b[1]) cookie = 'JSESSIONID=' + b[1];",
+  "  }",
+  "}",
+  "",
+  "var nPut = 0, nDel = 0;",
+  "var newUids = [];",
+  "for (var uid in tfrMap) {",
+  "  if (!existing[uid]) { nPut++; newUids.push(uid); }",
+  "}",
+  "if (newUids.length > 0) {",
+  "  node.send([{",
+  "    topic: topicCfg, payload: {},",
+  "    _missionCookie: cookie, _missionBearer: bearer,",
+  "    _putUrl: baseUrl + '/contents?creatorUid=' + creator,",
+  "    _putUids: newUids",
+  "  }, null]);",
+  "}",
+  "for (var uid in existing) {",
+  "  if (uid.indexOf(prefix) === 0 && !tfrMap[uid]) {",
+  "    nDel++;",
+  "    node.send([null, {",
+  "      method: 'DELETE',",
+  "      url: baseUrl + '/contents?uid=' + encodeURIComponent(uid) + '&creatorUid=' + creator,",
+  "      headers: { 'accept': '*/*' },",
+  "      _missionCookie: cookie, _missionBearer: bearer,",
+  "      payload: '', topic: topicCfg",
+  "    }]);",
+  "  }",
+  "}",
+  "node.warn(topicCfg + ' reconcile: ' + nPut + ' PUT, ' + nDel + ' DELETE, '",
+  "  + tfrUids.length + ' TFR, ' + Object.keys(existing).length + ' in mission');",
+  "flow.set('_tfrUids', []);",
+  "return null;"
+].join('\n');
+
+function makeTfrEngineTab(feed) {
+  const FID = 'flow_eng_' + feed.id;
+  const P   = feed.id + '_';
+
+  // Subscribe URL build (shared with ArcGIS)
+  const FN_SUB = [
+    "var tak = msg.takSettings;",
+    "var cfg = msg._config;",
+    "var missionName = cfg.missionName;",
+    "var subscribed = global.get('_subscribed') || {};",
+    "if (subscribed[missionName]) return null;",
+    "subscribed[missionName] = Date.now();",
+    "global.set('_subscribed', subscribed);",
+    "var host = String(tak.serverUrl || '').replace(/^https?:\\/\\//i, '').replace(/\\/$/, '');",
+    "var creatorUid = String((cfg && cfg.creatorUid) || (tak && tak.creatorUid) || 'nodered').trim();",
+    "msg.url = 'https://' + host + ':' + (tak.missionApiPort || 8443)",
+    "  + '/Marti/api/missions/' + encodeURIComponent(missionName)",
+    "  + '/subscription?uid=' + encodeURIComponent(creatorUid);",
+    "msg.method = 'PUT';",
+    "msg.headers = { 'accept': '*/*', 'Content-Type': 'application/json' };",
+    "if (tak && tak.missionBearerToken) {",
+    "  msg.headers.Authorization = 'Bearer ' + String(tak.missionBearerToken).trim();",
+    "}",
+    "msg.payload = '';",
+    "node.warn('Subscribing to ' + missionName + ' as ' + creatorUid);",
+    "return msg;"
+  ].join('\n');
+
+  // Mission GET URL build (shared with ArcGIS)
+  const FN_GET_MISSION = [
+    "var tak = msg.takSettings;",
+    "var cfg = msg._config;",
+    "var host = String(tak.serverUrl || '').replace(/^https?:\\/\\//i, '').replace(/\\/$/, '');",
+    "function getJsid(m) {",
+    "  if (m && m.responseCookies && m.responseCookies.JSESSIONID && m.responseCookies.JSESSIONID.value) {",
+    "    return String(m.responseCookies.JSESSIONID.value);",
+    "  }",
+    "  var sc = m && m.headers && m.headers['set-cookie'];",
+    "  if (Array.isArray(sc) && sc.length) {",
+    "    var x = String(sc[0]).match(/JSESSIONID=([^;]+)/);",
+    "    if (x && x[1]) return x[1];",
+    "  }",
+    "  if (typeof sc === 'string') {",
+    "    var y = sc.match(/JSESSIONID=([^;]+)/);",
+    "    if (y && y[1]) return y[1];",
+    "  }",
+    "  return '';",
+    "}",
+    "function getBearer(m, tk) {",
+    "  if (tk && tk.missionBearerToken) return String(tk.missionBearerToken).trim();",
+    "  if (m && m._missionBearer) return String(m._missionBearer).trim();",
+    "  return '';",
+    "}",
+    "msg.url = 'https://' + host + ':' + (tak.missionApiPort || 8443)",
+    "  + '/Marti/api/missions/' + encodeURIComponent(cfg.missionName);",
+    "var jsid = getJsid(msg);",
+    "if (jsid) msg._missionCookie = 'JSESSIONID=' + jsid;",
+    "var bearer = getBearer(msg, tak);",
+    "if (bearer) msg._missionBearer = bearer;",
+    "msg.headers = { 'accept': '*/*' };",
+    "if (msg._missionCookie) msg.headers.Cookie = msg._missionCookie;",
+    "if (msg._missionBearer) msg.headers.Authorization = 'Bearer ' + msg._missionBearer;",
+    "return msg;"
+  ].join('\n');
+
+  return [
+    // Tab
+    {
+      id: FID, type: 'tab',
+      label: feed.configName,
+      disabled: false,
+      info: 'FAA TFR engine for ' + feed.configName + '. Fetch TFRs, build 3D CoT, stream via TCP, sync to mission.'
+    },
+
+    // SA ident
+    {
+      id: P + 'sa_inject', type: 'inject', z: FID,
+      name: 'SA ident (startup)',
+      props: [{ p: 'payload' }, { p: 'topic', vt: 'str' }],
+      repeat: '600', crontab: '',
+      once: true, onceDelay: '10',
+      topic: 'sa-ident', payload: '', payloadType: 'date',
+      x: 180, y: 40, wires: [[P + 'sa_build']]
+    },
+    {
+      id: P + 'sa_build', type: 'function', z: FID,
+      name: 'Build SA ident CoT',
+      func: [
+        "var tak = global.get('tak_settings') || {};",
+        "var configs = global.get('arcgis_configs') || [];",
+        "var cfg = null;",
+        "for (var i = 0; i < configs.length; i++) {",
+        "  if (configs[i].configName === '" + feed.configName + "') { cfg = configs[i]; break; }",
+        "}",
+        "var creatorUid = '';",
+        "if (cfg && cfg.creatorUid) creatorUid = String(cfg.creatorUid).trim();",
+        "if (!creatorUid && tak.creatorUid) creatorUid = String(tak.creatorUid).trim();",
+        "if (!creatorUid) { return null; }",
+        "var now = new Date();",
+        "var stale = new Date(now.getTime() + 120000);",
+        "msg.payload = {",
+        "  event: {",
+        "    _attributes: {",
+        "      version: '2.0', uid: creatorUid,",
+        "      type: 'a-f-G-E-S', how: 'h-g-i-g-o',",
+        "      time: now.toISOString(), start: now.toISOString(), stale: stale.toISOString()",
+        "    },",
+        "    point: { _attributes: { lat: '0', lon: '0', hae: '0', ce: '9999999', le: '9999999' } },",
+        "    detail: {",
+        "      contact: [{ _attributes: { callsign: creatorUid } }],",
+        "      __group: [{ _attributes: { name: 'Purple', role: 'Team Member' } }]",
+        "    }",
+        "  }",
+        "};",
+        "return msg;"
+      ].join('\n'),
+      outputs: 1, timeout: '', noerr: 0,
+      initialize: '', finalize: '', libs: [],
+      x: 400, y: 40, wires: [[P + 'cot_to_xml']]
+    },
+
+    // Poll timer + config loader
+    {
+      id: P + 'inject', type: 'inject', z: FID,
+      name: 'Poll timer (60s base)',
+      props: [{ p: 'payload' }, { p: 'topic', vt: 'str' }],
+      repeat: '60', crontab: '',
+      once: true, onceDelay: '30',
+      topic: 'poll', payload: '', payloadType: 'date',
+      x: 180, y: 120, wires: [[P + 'load']]
+    },
+    {
+      id: P + 'load', type: 'function', z: FID,
+      name: 'Load TFR ' + feed.configName,
+      func: [
+        "var configs = global.get('arcgis_configs') || [];",
+        "var tak = global.get('tak_settings') || {};",
+        "var cfg = null;",
+        "for (var i = 0; i < configs.length; i++) {",
+        "  if (configs[i].configName === '" + feed.configName + "') { cfg = configs[i]; break; }",
+        "}",
+        "if (!cfg) { return null; }",
+        "if (!tak.serverUrl) { node.warn('" + feed.configName + ": No TAK Server URL'); return null; }",
+        "var lastPoll = flow.get('_lastPoll') || 0;",
+        "var now = Date.now();",
+        "var intervalMs = ((cfg.tfrPollInterval || 15) * 60000);",
+        "if (now - lastPoll < intervalMs) return null;",
+        "flow.set('_lastPoll', now);",
+        "node.warn('Polling: " + feed.configName + "');",
+        "msg.url = 'https://tfr.faa.gov/tfrapi/exportTfrList';",
+        "msg._config = cfg;",
+        "msg.takSettings = tak;",
+        "msg.topic = '" + feed.configName + "';",
+        "return msg;"
+      ].join('\n'),
+      outputs: 1, timeout: '', noerr: 0,
+      initialize: '', finalize: '', libs: [],
+      x: 400, y: 120, wires: [[P + 'http_list']]
+    },
+
+    // Fetch TFR list
+    {
+      id: P + 'http_list', type: 'http request', z: FID,
+      name: 'GET TFR list',
+      method: 'GET', ret: 'obj', paytoqs: 'ignore',
+      url: '', tls: '', persist: false, proxy: '',
+      insecureHTTPParser: false, authType: '',
+      senderr: false, headers: [],
+      x: 600, y: 120, wires: [[P + 'filter']]
+    },
+
+    // Filter by state & split
+    {
+      id: P + 'filter', type: 'function', z: FID,
+      name: 'Filter & split TFRs',
+      func: FN_TFR_FILTER_SPLIT,
+      outputs: 2, timeout: '', noerr: 0,
+      initialize: '', finalize: '', libs: [],
+      x: 180, y: 220,
+      wires: [[P + 'http_xml'], [P + 'delay_recon']]
+    },
+
+    // Per-TFR XML fetch
+    {
+      id: P + 'http_xml', type: 'http request', z: FID,
+      name: 'GET TFR XML',
+      method: 'use', ret: 'txt', paytoqs: 'ignore',
+      url: '', tls: '', persist: false, proxy: '',
+      insecureHTTPParser: false, authType: '',
+      senderr: false, headers: [],
+      x: 400, y: 220, wires: [[P + 'xml_parse']]
+    },
+
+    // XML -> JSON
+    {
+      id: P + 'xml_parse', type: 'xml', z: FID,
+      name: 'Parse XNOTAM',
+      property: 'payload', attr: '', chr: '',
+      x: 580, y: 220, wires: [[P + 'build_cot']]
+    },
+
+    // Parse XNOTAM & build CoT
+    {
+      id: P + 'build_cot', type: 'function', z: FID,
+      name: 'Build TFR CoT',
+      func: FN_TFR_PARSE_BUILD_COT,
+      outputs: 1, timeout: '', noerr: 0,
+      initialize: '', finalize: '', libs: [],
+      x: 740, y: 220, wires: [[P + 'cot_to_xml']]
+    },
+
+    // CoT -> XML -> Throttle -> TCP out (same as ArcGIS)
+    {
+      id: P + 'cot_to_xml', type: 'function', z: FID,
+      name: 'CoT JSON -> XML',
+      func: FN_COT_TO_XML,
+      outputs: 1, timeout: '', noerr: 0,
+      initialize: '', finalize: '', libs: [],
+      x: 180, y: 320, wires: [[P + 'rate_stream']]
+    },
+    {
+      id: P + 'rate_stream', type: 'delay', z: FID,
+      name: 'Throttle (10/sec)', pauseType: 'rate',
+      timeout: '1', timeoutUnits: 'seconds',
+      rate: '10', nbRateUnits: '1', rateUnits: 'second',
+      randomFirst: '1', randomLast: '5', randomUnits: 'seconds',
+      drop: false, allowrate: false, outputs: 1,
+      x: 400, y: 320, wires: [[P + 'tcp_out']]
+    },
+    {
+      id: P + 'tcp_out', type: 'tcp out', z: FID,
+      name: 'CoT -> TAK :8089',
+      host: 'host.docker.internal', port: '8089', beserver: 'client',
+      base64: false, end: false, tls: 'tls_tak',
+      x: 600, y: 320, wires: []
+    },
+    {
+      id: P + 'catch_stream', type: 'catch', z: FID,
+      name: 'Stream errors',
+      scope: [P + 'tcp_out'],
+      uncaught: false,
+      x: 180, y: 380, wires: [[P + 'debug_stream']]
+    },
+    {
+      id: P + 'debug_stream', type: 'debug', z: FID,
+      name: 'Stream error',
+      active: true, tosidebar: true, console: false, tostatus: true,
+      complete: 'true', targetType: 'full',
+      statusVal: '', statusType: 'auto',
+      x: 400, y: 380, wires: []
+    },
+
+    // Reconcile path: delay -> subscribe -> GET mission -> reconcile -> PUT/DELETE
+    {
+      id: P + 'delay_recon', type: 'delay', z: FID,
+      name: 'Wait 60s for fetches',
+      pauseType: 'delay', timeout: '60', timeoutUnits: 'seconds',
+      rate: '1', nbRateUnits: '1', rateUnits: 'second',
+      randomFirst: '1', randomLast: '5', randomUnits: 'seconds',
+      drop: false, allowrate: false, outputs: 1,
+      x: 180, y: 460, wires: [[P + 'build_sub']]
+    },
+    {
+      id: P + 'build_sub', type: 'function', z: FID,
+      name: 'Build subscribe URL',
+      func: FN_SUB,
+      outputs: 1, timeout: '', noerr: 0,
+      initialize: '', finalize: '', libs: [],
+      x: 400, y: 460, wires: [[P + 'http_sub']]
+    },
+    {
+      id: P + 'http_sub', type: 'http request', z: FID,
+      name: 'Subscribe to mission',
+      method: 'use', ret: 'txt', paytoqs: 'ignore',
+      url: '', tls: 'tls_tak', persist: false, proxy: '',
+      insecureHTTPParser: false, authType: '',
+      senderr: false, headers: [],
+      x: 600, y: 460, wires: [[P + 'debug_sub']]
+    },
+    {
+      id: P + 'debug_sub', type: 'debug', z: FID,
+      name: 'Subscribe result ' + feed.configName,
+      active: true, tosidebar: true, console: false, tostatus: true,
+      complete: 'true', targetType: 'full',
+      statusVal: 'topic', statusType: 'auto',
+      x: 800, y: 460, wires: [[P + 'build_m']]
+    },
+
+    {
+      id: P + 'build_m', type: 'function', z: FID,
+      name: 'Build mission GET URL',
+      func: FN_GET_MISSION,
+      outputs: 1, timeout: '', noerr: 0,
+      initialize: '', finalize: '', libs: [],
+      x: 180, y: 540, wires: [[P + 'http_m']]
+    },
+    {
+      id: P + 'http_m', type: 'http request', z: FID,
+      name: 'GET mission',
+      method: 'GET', ret: 'obj', paytoqs: 'ignore',
+      url: '', tls: 'tls_tak', persist: false, proxy: '',
+      insecureHTTPParser: false, authType: '',
+      senderr: false, headers: [],
+      x: 400, y: 540, wires: [[P + 'reconcile']]
+    },
+    {
+      id: P + 'reconcile', type: 'function', z: FID,
+      name: 'TFR Reconcile (diff)',
+      func: FN_TFR_RECONCILE,
+      outputs: 2, timeout: '', noerr: 0,
+      initialize: '', finalize: '', libs: [],
+      x: 580, y: 540,
+      wires: [[P + 'delay_put'], [P + 'delay_del']]
+    },
+
+    // PUT new UIDs
+    {
+      id: P + 'delay_put', type: 'delay', z: FID,
+      name: 'Wait 30s for cache',
+      pauseType: 'delay', timeout: '30', timeoutUnits: 'seconds',
+      rate: '1', nbRateUnits: '1', rateUnits: 'second',
+      randomFirst: '1', randomLast: '5', randomUnits: 'seconds',
+      drop: false, allowrate: false, outputs: 1,
+      x: 780, y: 540, wires: [[P + 'build_put']]
+    },
+    {
+      id: P + 'build_put', type: 'function', z: FID,
+      name: 'Build PUT UIDs',
+      func: [
+        "var uids = msg._putUids || [];",
+        "if (!msg._putUrl || uids.length === 0) return null;",
+        "msg.method = 'PUT';",
+        "msg.url = msg._putUrl;",
+        "msg.headers = { 'accept': '*/*', 'Content-Type': 'application/json' };",
+        "if (msg._missionCookie) msg.headers.Cookie = msg._missionCookie;",
+        "if (msg._missionBearer) msg.headers.Authorization = 'Bearer ' + msg._missionBearer;",
+        "msg.payload = { uids: uids };",
+        "node.warn(msg.topic + ' PUT -> ' + uids.length + ' UIDs -> ' + msg.url);",
+        "return msg;"
+      ].join('\n'),
+      outputs: 1, timeout: '', noerr: 0,
+      initialize: '', finalize: '', libs: [],
+      x: 180, y: 620, wires: [[P + 'http_action']]
+    },
+    {
+      id: P + 'http_action', type: 'http request', z: FID,
+      name: 'Mission API (PUT/DELETE)',
+      method: 'use', ret: 'txt', paytoqs: 'body',
+      url: '', tls: 'tls_tak', persist: false, proxy: '',
+      insecureHTTPParser: false, authType: '',
+      senderr: false, headers: [],
+      x: 420, y: 620, wires: [[P + 'log_action']]
+    },
+    {
+      id: P + 'delay_del', type: 'delay', z: FID,
+      name: '', pauseType: 'delay', timeout: '1', timeoutUnits: 'seconds',
+      rate: '1', nbRateUnits: '1', rateUnits: 'second',
+      randomFirst: '1', randomLast: '5', randomUnits: 'seconds',
+      drop: false, allowrate: false, outputs: 1,
+      x: 420, y: 670, wires: [[P + 'http_action']]
+    },
+    {
+      id: P + 'log_action', type: 'function', z: FID,
+      name: 'Log API result',
+      func: [
+        "var code = msg.statusCode || '?';",
+        "var method = msg.method || '?';",
+        "var feed = msg.topic || 'unknown';",
+        "var ok = (code >= 200 && code < 300);",
+        "var label = feed + ' ' + method + ' -> ' + code + (ok ? ' OK' : ' FAIL');",
+        "if (!ok) {",
+        "  var body = (typeof msg.payload === 'string') ? msg.payload.substring(0, 200) : '';",
+        "  node.warn(label + (body ? ' - ' + body : ''));",
+        "} else {",
+        "  node.warn(label);",
+        "}",
+        "return msg;"
+      ].join('\n'),
+      outputs: 1, timeout: '', noerr: 0,
+      initialize: '', finalize: '', libs: [],
+      x: 640, y: 620, wires: [[]]
+    }
+  ];
+}
+
+// ════════════════════════════════════════════════════════════════
+//  Engine tab templates (embedded in configurator.html for dynamic creation)
 // ════════════════════════════════════════════════════════════════
 
 const templateFeed = { id: '__FEED_ID__', configName: '__CONFIG_NAME__' };
 const templateNodes = makeEngineTab(templateFeed);
 const engineTabTemplate = JSON.stringify(templateNodes);
+
+const tfrTemplateNodes = makeTfrEngineTab(templateFeed);
+const tfrEngineTabTemplate = JSON.stringify(tfrTemplateNodes);
 
 // ════════════════════════════════════════════════════════════════
 //  Assembly
@@ -1214,10 +1839,12 @@ const out = path.join(__dirname, 'flows.json');
 fs.writeFileSync(out, JSON.stringify(allFlows, null, 2));
 console.log('flows.json generated  (' + allFlows.length + ' nodes, ' + FEEDS.length + ' engine tabs)  →  ' + out);
 
-// Inject engine tab template into configurator.html (skip if read-only, e.g. inside Docker)
+// Inject engine tab templates into configurator.html (skip if read-only, e.g. inside Docker)
 try {
   const htmlPath = path.join(__dirname, 'configurator.html');
   let htmlContent = fs.readFileSync(htmlPath, 'utf8');
+
+  // ArcGIS template
   const startMarker = '/* __ENGINE_TAB_TEMPLATE_START__ */';
   const endMarker   = '/* __ENGINE_TAB_TEMPLATE_END__ */';
   const b64 = Buffer.from(engineTabTemplate, 'utf8').toString('base64');
@@ -1237,8 +1864,30 @@ try {
       '\n' + templateBlock + '\n</script>\n</body>'
     );
   }
+
+  // TFR template
+  const tfrStart = '/* __TFR_ENGINE_TAB_TEMPLATE_START__ */';
+  const tfrEnd   = '/* __TFR_ENGINE_TAB_TEMPLATE_END__ */';
+  const tfrB64 = Buffer.from(tfrEngineTabTemplate, 'utf8').toString('base64');
+  const tfrBlock = tfrStart + '\n'
+    + 'var TFR_ENGINE_TAB_TEMPLATE = decodeURIComponent(escape(atob("' + tfrB64 + '")));\n'
+    + tfrEnd;
+  if (htmlContent.includes(tfrStart)) {
+    const re2 = new RegExp(
+      tfrStart.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      + '[\\s\\S]*?'
+      + tfrEnd.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    );
+    htmlContent = htmlContent.replace(re2, tfrBlock);
+  } else {
+    htmlContent = htmlContent.replace(
+      endMarker,
+      endMarker + '\n' + tfrBlock
+    );
+  }
+
   fs.writeFileSync(htmlPath, htmlContent);
-  console.log('Engine tab template injected into configurator.html');
+  console.log('Engine tab templates injected into configurator.html (ArcGIS + TFR)');
 } catch(e) {
   console.log('Skipped configurator.html template injection (' + e.code + ')');
 }
