@@ -1105,8 +1105,8 @@ function makeEngineTab(feed) {
     // ── Delay → PUT new UIDs to mission ──
     {
       id: P + 'delay_put', type: 'delay', z: FID,
-      name: 'Wait 5s for cache',
-      pauseType: 'delay', timeout: '5', timeoutUnits: 'seconds',
+      name: 'Wait 30s for cache',
+      pauseType: 'delay', timeout: '30', timeoutUnits: 'seconds',
       rate: '1', nbRateUnits: '1', rateUnits: 'second',
       randomFirst: '1', randomLast: '5', randomUnits: 'seconds',
       drop: false, allowrate: false, outputs: 1,
