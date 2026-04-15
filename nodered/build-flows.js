@@ -1222,7 +1222,7 @@ try {
   const endMarker   = '/* __ENGINE_TAB_TEMPLATE_END__ */';
   const b64 = Buffer.from(engineTabTemplate, 'utf8').toString('base64');
   const templateBlock = startMarker + '\n'
-    + 'var ENGINE_TAB_TEMPLATE = atob("' + b64 + '");\n'
+    + 'var ENGINE_TAB_TEMPLATE = decodeURIComponent(escape(atob("' + b64 + '")));\n'
     + endMarker;
   if (htmlContent.includes(startMarker)) {
     const re = new RegExp(
