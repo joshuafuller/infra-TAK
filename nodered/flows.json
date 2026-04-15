@@ -813,56 +813,7 @@
     "type": "tab",
     "label": "CA AIR INTEL",
     "disabled": false,
-    "info": "DataSync engine for CA AIR INTEL. Stream CoT via TCP, PUT UIDs to mission."
-  },
-  {
-    "id": "air_intel_sa_inject",
-    "type": "inject",
-    "z": "flow_eng_air_intel",
-    "name": "SA ident (startup)",
-    "props": [
-      {
-        "p": "payload"
-      },
-      {
-        "p": "topic",
-        "vt": "str"
-      }
-    ],
-    "repeat": "600",
-    "crontab": "",
-    "once": true,
-    "onceDelay": "10",
-    "topic": "sa-ident",
-    "payload": "",
-    "payloadType": "date",
-    "x": 180,
-    "y": 40,
-    "wires": [
-      [
-        "air_intel_sa_build"
-      ]
-    ]
-  },
-  {
-    "id": "air_intel_sa_build",
-    "type": "function",
-    "z": "flow_eng_air_intel",
-    "name": "Build SA ident CoT",
-    "func": "var tak = global.get('tak_settings') || {};\nvar configs = global.get('arcgis_configs') || [];\nvar cfg = null;\nfor (var i = 0; i < configs.length; i++) {\n  if (configs[i].configName === 'CA AIR INTEL') { cfg = configs[i]; break; }\n}\nvar creatorUid = '';\nif (cfg && cfg.creatorUid) creatorUid = String(cfg.creatorUid).trim();\nif (!creatorUid && tak.creatorUid) creatorUid = String(tak.creatorUid).trim();\nif (!creatorUid) { return null; }\n\nvar now = new Date();\nvar stale = new Date(now.getTime() + 120000);\nmsg.payload = {\n  event: {\n    _attributes: {\n      version: '2.0', uid: creatorUid,\n      type: 'a-f-G-E-S', how: 'h-g-i-g-o',\n      time: now.toISOString(), start: now.toISOString(), stale: stale.toISOString()\n    },\n    point: { _attributes: { lat: '0', lon: '0', hae: '0', ce: '9999999', le: '9999999' } },\n    detail: {\n      contact: [{ _attributes: { callsign: creatorUid } }],\n      __group: [{ _attributes: { name: 'Purple', role: 'Team Member' } }]\n    }\n  }\n};\nreturn msg;",
-    "outputs": 1,
-    "timeout": "",
-    "noerr": 0,
-    "initialize": "",
-    "finalize": "",
-    "libs": [],
-    "x": 400,
-    "y": 40,
-    "wires": [
-      [
-        "air_intel_cot_to_xml"
-      ]
-    ]
+    "info": "DataSync engine for CA AIR INTEL. Pure Mission API — no TCP broadcast."
   },
   {
     "id": "air_intel_inject",
@@ -886,7 +837,7 @@
     "payload": "",
     "payloadType": "date",
     "x": 180,
-    "y": 120,
+    "y": 80,
     "wires": [
       [
         "air_intel_load"
@@ -906,7 +857,7 @@
     "finalize": "",
     "libs": [],
     "x": 400,
-    "y": 120,
+    "y": 80,
     "wires": [
       [
         "air_intel_build_q"
@@ -926,7 +877,7 @@
     "finalize": "",
     "libs": [],
     "x": 180,
-    "y": 200,
+    "y": 160,
     "wires": [
       [
         "air_intel_http_ag"
@@ -950,7 +901,7 @@
     "senderr": false,
     "headers": [],
     "x": 400,
-    "y": 200,
+    "y": 160,
     "wires": [
       [
         "air_intel_parse"
@@ -970,7 +921,7 @@
     "finalize": "",
     "libs": [],
     "x": 600,
-    "y": 200,
+    "y": 160,
     "wires": [
       [
         "air_intel_build_sub",
@@ -991,7 +942,7 @@
     "finalize": "",
     "libs": [],
     "x": 180,
-    "y": 300,
+    "y": 240,
     "wires": [
       [
         "air_intel_http_sub"
@@ -1015,36 +966,17 @@
     "senderr": false,
     "headers": [],
     "x": 380,
-    "y": 300,
+    "y": 240,
     "wires": [
-      [
-        "air_intel_debug_sub"
-      ]
+      []
     ]
-  },
-  {
-    "id": "air_intel_debug_sub",
-    "type": "debug",
-    "z": "flow_eng_air_intel",
-    "name": "Subscribe result",
-    "active": true,
-    "tosidebar": true,
-    "console": false,
-    "tostatus": true,
-    "complete": "true",
-    "targetType": "full",
-    "statusVal": "topic",
-    "statusType": "auto",
-    "x": 580,
-    "y": 300,
-    "wires": []
   },
   {
     "id": "air_intel_build_m",
     "type": "function",
     "z": "flow_eng_air_intel",
     "name": "Build mission GET URL",
-    "func": "var tak = msg.takSettings;\nvar cfg = msg._config;\nvar host = String(tak.serverUrl || '').replace(/^https?:\\/\\//i, '').replace(/\\/$/, '');\nfunction getJsid(m) {\n  if (m && m.responseCookies && m.responseCookies.JSESSIONID && m.responseCookies.JSESSIONID.value) {\n    return String(m.responseCookies.JSESSIONID.value);\n  }\n  var sc = m && m.headers && m.headers['set-cookie'];\n  if (Array.isArray(sc) && sc.length) {\n    var x = String(sc[0]).match(/JSESSIONID=([^;]+)/);\n    if (x && x[1]) return x[1];\n  }\n  if (typeof sc === 'string') {\n    var y = sc.match(/JSESSIONID=([^;]+)/);\n    if (y && y[1]) return y[1];\n  }\n  return '';\n}\nfunction getBearer(m, tk) {\n  if (tk && tk.missionBearerToken) return String(tk.missionBearerToken).trim();\n  if (m && m._missionBearer) return String(m._missionBearer).trim();\n  return '';\n}\nmsg.url = 'https://' + host + ':' + (tak.missionApiPort || 8443)\n  + '/Marti/api/missions/' + encodeURIComponent(cfg.missionName);\nvar jsid = getJsid(msg);\nif (jsid) msg._missionCookie = 'JSESSIONID=' + jsid;\nvar bearer = getBearer(msg, tak);\nif (bearer) msg._missionBearer = bearer;\nmsg.headers = { 'accept': '*/*' };\nif (msg._missionCookie) msg.headers.Cookie = msg._missionCookie;\nif (msg._missionBearer) msg.headers.Authorization = 'Bearer ' + msg._missionBearer;\nreturn msg;",
+    "func": "var tak = msg.takSettings;\nvar cfg = msg._config;\nvar host = String(tak.serverUrl || '').replace(/^https?:\\/\\//i, '').replace(/\\/$/, '');\nmsg.url = 'https://' + host + ':' + (tak.missionApiPort || 8443)\n  + '/Marti/api/missions/' + encodeURIComponent(cfg.missionName);\nmsg.headers = { 'accept': '*/*' };\nreturn msg;",
     "outputs": 1,
     "timeout": "",
     "noerr": 0,
@@ -1052,7 +984,7 @@
     "finalize": "",
     "libs": [],
     "x": 560,
-    "y": 320,
+    "y": 280,
     "wires": [
       [
         "air_intel_http_m"
@@ -1076,7 +1008,7 @@
     "senderr": false,
     "headers": [],
     "x": 740,
-    "y": 360,
+    "y": 320,
     "wires": [
       [
         "air_intel_reconcile"
@@ -1088,7 +1020,7 @@
     "type": "function",
     "z": "flow_eng_air_intel",
     "name": "Reconcile (diff)",
-    "func": "var features = msg._features || [];\nvar mData = msg.payload;\nvar cfg = msg._config;\nvar tak = msg.takSettings;\nvar topicCfg = cfg.configName || 'unnamed';\nmsg.topic = topicCfg;\nvar prefix = cfg.uidPrefix || 'arcgis';\nvar arcgisOk = !msg._arcgisStatus || msg._arcgisStatus === 200;\n\nvar existing = {};\ntry {\n  var mission = null;\n  if (mData && mData.data) {\n    mission = Array.isArray(mData.data) ? mData.data[0] : mData.data;\n  }\n  if (mission && mission.uids) {\n    for (var i=0;i<mission.uids.length;i++) {\n      var u = mission.uids[i];\n      var uid = (typeof u === 'string') ? u : (u.data || u.uid || u);\n      if (typeof uid === 'string') existing[uid] = true;\n    }\n  }\n  if (mission && mission.contents) {\n    for (var i=0;i<mission.contents.length;i++) {\n      var c = mission.contents[i];\n      if (c.data && c.data.uid) existing[c.data.uid] = true;\n    }\n  }\n} catch(e) { node.warn('Could not parse mission contents: ' + e.message); }\n\nvar arcgis = {};\nfor (var i=0;i<features.length;i++) arcgis[features[i].uid] = features[i];\n\nvar host = String(tak.serverUrl || '').replace(/^https?:\\/\\//i, '').replace(/\\/$/, '');\nvar baseUrl = 'https://' + host + ':' + (tak.missionApiPort || 8443)\n  + '/Marti/api/missions/' + encodeURIComponent(cfg.missionName);\nvar creatorUidRaw = String((cfg && cfg.creatorUid) || (tak && tak.creatorUid) || 'nodered').trim();\nvar creator = encodeURIComponent(creatorUidRaw);\n\nvar cookie = msg._missionCookie || '';\nvar bearer = msg._missionBearer || '';\nif (!cookie && msg.responseCookies && msg.responseCookies.JSESSIONID && msg.responseCookies.JSESSIONID.value) {\n  cookie = 'JSESSIONID=' + String(msg.responseCookies.JSESSIONID.value);\n}\nif (!cookie && msg.headers && msg.headers['set-cookie']) {\n  var sc = msg.headers['set-cookie'];\n  if (Array.isArray(sc) && sc.length) {\n    var a2 = String(sc[0]).match(/JSESSIONID=([^;]+)/);\n    if (a2 && a2[1]) cookie = 'JSESSIONID=' + a2[1];\n  } else if (typeof sc === 'string') {\n    var b = sc.match(/JSESSIONID=([^;]+)/);\n    if (b && b[1]) cookie = 'JSESSIONID=' + b[1];\n  }\n}\n\nvar nStream = 0, nPut = 0, nDel = 0;\nvar newUids = [];\nfor (var uid in arcgis) {\n  nStream++;\n  if (!existing[uid]) { nPut++; newUids.push(uid); }\n  node.send([\n    { payload: arcgis[uid].cot, topic: topicCfg,\n      _missionName: cfg.missionName,\n      host: host,\n      port: Number(tak.streamingPort || tak.streamPort || 8089) },\n    null\n  ]);\n}\n\nvar streamTimeSec = Math.ceil(nStream / 10) + 3;\nif (newUids.length > 0) {\n  node.send([\n    { topic: topicCfg, payload: {},\n      _missionCookie: cookie,\n      _missionBearer: bearer,\n      _putUrl: baseUrl + '/contents?creatorUid=' + creator,\n      _putUids: newUids,\n      _delaySec: streamTimeSec },\n    null\n  ]);\n}\n\nif (!arcgisOk) {\n  node.send([null, null, {payload: topicCfg + ': ArcGIS fetch failed (status ' + msg._arcgisStatus + ') — skipping deletes', topic: topicCfg}]);\n} else {\n  for (var uid in existing) {\n    if (uid.indexOf(prefix) === 0 && !arcgis[uid]) {\n      nDel++;\n      node.send([null, {\n        method: 'DELETE',\n        url: baseUrl + '/contents?uid=' + encodeURIComponent(uid) + '&creatorUid=' + creator,\n        headers: { 'accept': '*/*' },\n        _missionCookie: cookie,\n        _missionBearer: bearer,\n        payload: '',\n        topic: topicCfg\n      }]);\n    }\n  }\n}\n\nvar summary = topicCfg + ' reconcile: ' + nStream + ' streamed, ' + nPut + ' PUT, ' + nDel + ' DELETE, '\n  + Object.keys(arcgis).length + ' ArcGIS, ' + Object.keys(existing).length + ' in mission';\nnode.status({text: nStream + ' stream, ' + nPut + ' PUT, ' + nDel + ' DEL'});\nnode.send([null, null, {payload: summary, topic: topicCfg}]);\nreturn null;",
+    "func": "var features = msg._features || [];\nvar mData = msg.payload;\nvar cfg = msg._config;\nvar tak = msg.takSettings;\nvar topicCfg = cfg.configName || 'unnamed';\nmsg.topic = topicCfg;\nvar prefix = cfg.uidPrefix || 'arcgis';\nvar arcgisOk = !msg._arcgisStatus || msg._arcgisStatus === 200;\n\nvar existingByName = {};\ntry {\n  var mission = null;\n  if (mData && mData.data) {\n    mission = Array.isArray(mData.data) ? mData.data[0] : mData.data;\n  }\n  if (mission && mission.contents) {\n    for (var i = 0; i < mission.contents.length; i++) {\n      var c = mission.contents[i];\n      if (c.data && c.data.name) {\n        existingByName[c.data.name] = c.data.hash;\n      }\n    }\n  }\n  if (mission && mission.uids) {\n    for (var i = 0; i < mission.uids.length; i++) {\n      var u = mission.uids[i];\n      var uid = (typeof u === 'string') ? u : (u.data || u.uid || u);\n      if (typeof uid === 'string') existingByName[uid] = '_uid_' + uid;\n    }\n  }\n} catch(e) { node.warn('Could not parse mission contents: ' + e.message); }\n\nvar arcgisFiles = {};\nfor (var i = 0; i < features.length; i++) {\n  arcgisFiles[features[i].uid + '.cot'] = features[i];\n}\n\nvar host = String(tak.serverUrl || '').replace(/^https?:\\/\\//i, '').replace(/\\/$/, '');\nvar baseUrl = 'https://' + host + ':' + (tak.missionApiPort || 8443);\nvar missionUrl = baseUrl + '/Marti/api/missions/' + encodeURIComponent(cfg.missionName);\nvar uploadUrl = baseUrl + '/Marti/sync/missionupload';\nvar creatorUidRaw = String((cfg && cfg.creatorUid) || (tak && tak.creatorUid) || 'nodered').trim();\nvar creator = encodeURIComponent(creatorUidRaw);\n\nvar nUpload = 0, nSkip = 0, nDel = 0;\nfor (var fname in arcgisFiles) {\n  if (!existingByName[fname] && !existingByName[arcgisFiles[fname].uid]) {\n    nUpload++;\n    node.send([\n      { payload: arcgisFiles[fname].cot,\n        _filename: fname,\n        _uploadUrl: uploadUrl,\n        _missionUrl: missionUrl + '/contents?creatorUid=' + creator,\n        _creatorUid: creatorUidRaw,\n        topic: topicCfg },\n      null, null\n    ]);\n  } else { nSkip++; }\n}\n\nif (!arcgisOk) {\n  node.send([null, null, {payload: topicCfg + ': ArcGIS failed — skipping deletes', topic: topicCfg}]);\n} else {\n  for (var name in existingByName) {\n    var matchesPrefix = name.indexOf(prefix) === 0;\n    if (!matchesPrefix) continue;\n    if (arcgisFiles[name]) continue;\n    if (arcgisFiles[name.replace(/\\.cot$/, '')]) continue;\n    var val = existingByName[name];\n    nDel++;\n    if (val.indexOf('_uid_') === 0) {\n      var uidVal = val.substring(5);\n      node.send([null, {\n        method: 'DELETE',\n        url: missionUrl + '/contents?uid=' + encodeURIComponent(uidVal) + '&creatorUid=' + creator,\n        headers: { 'accept': '*/*' },\n        payload: '', topic: topicCfg\n      }, null]);\n    } else {\n      node.send([null, {\n        method: 'DELETE',\n        url: missionUrl + '/contents?hash=' + encodeURIComponent(val) + '&creatorUid=' + creator,\n        headers: { 'accept': '*/*' },\n        payload: '', topic: topicCfg\n      }, null]);\n    }\n  }\n}\n\nvar summary = topicCfg + ': ' + nUpload + ' upload, ' + nSkip + ' exist, ' + nDel + ' delete';\nnode.status({text: nUpload + ' up, ' + nSkip + ' ok, ' + nDel + ' del'});\nnode.send([null, null, {payload: summary, topic: topicCfg}]);\nreturn null;",
     "outputs": 3,
     "timeout": "",
     "noerr": 0,
@@ -1096,11 +1028,10 @@
     "finalize": "",
     "libs": [],
     "x": 180,
-    "y": 440,
+    "y": 400,
     "wires": [
       [
-        "air_intel_cot_to_xml",
-        "air_intel_delay_put"
+        "air_intel_cot_to_xml"
       ],
       [
         "air_intel_delay_del"
@@ -1122,122 +1053,77 @@
     "initialize": "",
     "finalize": "",
     "libs": [],
-    "x": 180,
-    "y": 520,
-    "wires": [
-      [
-        "air_intel_rate_stream"
-      ]
-    ]
-  },
-  {
-    "id": "air_intel_rate_stream",
-    "type": "delay",
-    "z": "flow_eng_air_intel",
-    "name": "Throttle (10/sec)",
-    "pauseType": "rate",
-    "timeout": "1",
-    "timeoutUnits": "seconds",
-    "rate": "10",
-    "nbRateUnits": "1",
-    "rateUnits": "second",
-    "randomFirst": "1",
-    "randomLast": "5",
-    "randomUnits": "seconds",
-    "drop": false,
-    "allowrate": false,
-    "outputs": 1,
     "x": 400,
-    "y": 520,
+    "y": 400,
     "wires": [
       [
-        "air_intel_tcp_out"
+        "air_intel_build_upload"
       ]
     ]
   },
   {
-    "id": "air_intel_tcp_out",
-    "type": "tcp out",
+    "id": "air_intel_build_upload",
+    "type": "function",
     "z": "flow_eng_air_intel",
-    "name": "CoT → TAK :8089",
-    "host": "host.docker.internal",
-    "port": "8089",
-    "beserver": "client",
-    "base64": false,
-    "end": false,
-    "tls": "tls_tak",
-    "x": 600,
-    "y": 520,
-    "wires": []
-  },
-  {
-    "id": "air_intel_catch_stream",
-    "type": "catch",
-    "z": "flow_eng_air_intel",
-    "name": "Stream errors",
-    "scope": [
-      "air_intel_tcp_out"
+    "name": "Build multipart upload",
+    "func": "var xml = (Buffer.isBuffer(msg.payload)) ? msg.payload.toString('utf8') : String(msg.payload);\nvar hash = crypto.createHash('sha256').update(xml).digest('hex');\nvar fname = msg._filename || 'upload.cot';\nvar creator = msg._creatorUid || 'admin';\nvar boundary = '----NRBoundary' + Date.now();\nvar body = '--' + boundary + '\\r\\n'\n  + 'Content-Disposition: form-data; name=\"assetfile\"; filename=\"' + fname + '\"\\r\\n'\n  + 'Content-Type: application/xml\\r\\n\\r\\n'\n  + xml + '\\r\\n--' + boundary + '--\\r\\n';\nmsg.payload = Buffer.from(body);\nmsg.headers = { 'Content-Type': 'multipart/form-data; boundary=' + boundary };\nmsg.url = msg._uploadUrl + '?hash=' + hash\n  + '&filename=' + encodeURIComponent(fname)\n  + '&creatorUid=' + encodeURIComponent(creator);\nmsg.method = 'POST';\nmsg._hash = hash;\nnode.status({text: 'Uploading ' + fname.substring(0, 30)});\nreturn msg;",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [
+      {
+        "var": "crypto",
+        "module": "crypto"
+      }
     ],
-    "uncaught": false,
-    "x": 180,
-    "y": 580,
-    "wires": [
-      [
-        "air_intel_debug_stream"
-      ]
-    ]
-  },
-  {
-    "id": "air_intel_debug_stream",
-    "type": "debug",
-    "z": "flow_eng_air_intel",
-    "name": "Stream error",
-    "active": true,
-    "tosidebar": true,
-    "console": false,
-    "tostatus": true,
-    "complete": "true",
-    "targetType": "full",
-    "statusVal": "",
-    "statusType": "auto",
-    "x": 400,
-    "y": 580,
-    "wires": []
-  },
-  {
-    "id": "air_intel_delay_put",
-    "type": "function",
-    "z": "flow_eng_air_intel",
-    "name": "Wait for stream cache",
-    "func": "var delaySec = msg._delaySec || 5;\nnode.status({text: 'Waiting ' + delaySec + 's for cache'});\nvar n = node;\nvar m = msg;\nsetTimeout(function() { n.send(m); }, delaySec * 1000);\nreturn null;",
-    "outputs": 1,
-    "timeout": "",
-    "noerr": 0,
-    "initialize": "",
-    "finalize": "",
-    "libs": [],
-    "x": 400,
-    "y": 440,
-    "wires": [
-      [
-        "air_intel_build_put"
-      ]
-    ]
-  },
-  {
-    "id": "air_intel_build_put",
-    "type": "function",
-    "z": "flow_eng_air_intel",
-    "name": "Build PUT UIDs",
-    "func": "var uids = msg._putUids || [];\nif (!msg._putUrl || uids.length === 0) return null;\nmsg.method = 'PUT';\nmsg.url = msg._putUrl;\nmsg.headers = { 'accept': '*/*', 'Content-Type': 'application/json' };\nif (msg._missionCookie) msg.headers.Cookie = msg._missionCookie;\nif (msg._missionBearer) msg.headers.Authorization = 'Bearer ' + msg._missionBearer;\nmsg.payload = { uids: uids };\nnode.status({text: 'PUT ' + uids.length + ' UIDs'});\nreturn msg;",
-    "outputs": 1,
-    "timeout": "",
-    "noerr": 0,
-    "initialize": "",
-    "finalize": "",
-    "libs": [],
     "x": 600,
-    "y": 440,
+    "y": 400,
+    "wires": [
+      [
+        "air_intel_http_upload"
+      ]
+    ]
+  },
+  {
+    "id": "air_intel_http_upload",
+    "type": "http request",
+    "z": "flow_eng_air_intel",
+    "name": "POST Enterprise Sync",
+    "method": "use",
+    "ret": "txt",
+    "paytoqs": "body",
+    "url": "",
+    "tls": "tls_tak",
+    "persist": false,
+    "proxy": "",
+    "insecureHTTPParser": false,
+    "authType": "",
+    "senderr": false,
+    "headers": [],
+    "x": 800,
+    "y": 400,
+    "wires": [
+      [
+        "air_intel_build_put_hash"
+      ]
+    ]
+  },
+  {
+    "id": "air_intel_build_put_hash",
+    "type": "function",
+    "z": "flow_eng_air_intel",
+    "name": "Build PUT hash",
+    "func": "var hash = msg._hash;\nif (!hash || !msg._missionUrl) return null;\nvar ok = msg.statusCode >= 200 && msg.statusCode < 300;\nif (!ok) {\n  node.status({text: 'Upload failed: ' + msg.statusCode});\n  return null;\n}\nmsg.method = 'PUT';\nmsg.url = msg._missionUrl;\nmsg.headers = { 'accept': '*/*', 'Content-Type': 'application/json' };\nmsg.payload = { hashes: [hash] };\nnode.status({text: 'PUT hash ' + hash.substring(0, 12)});\nreturn msg;",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 960,
+    "y": 400,
     "wires": [
       [
         "air_intel_http_action"
@@ -1260,8 +1146,8 @@
     "authType": "",
     "senderr": false,
     "headers": [],
-    "x": 800,
-    "y": 440,
+    "x": 400,
+    "y": 480,
     "wires": [
       [
         "air_intel_log_action"
@@ -1273,10 +1159,10 @@
     "type": "delay",
     "z": "flow_eng_air_intel",
     "name": "",
-    "pauseType": "delay",
+    "pauseType": "rate",
     "timeout": "1",
     "timeoutUnits": "seconds",
-    "rate": "1",
+    "rate": "5",
     "nbRateUnits": "1",
     "rateUnits": "second",
     "randomFirst": "1",
@@ -1285,8 +1171,8 @@
     "drop": false,
     "allowrate": false,
     "outputs": 1,
-    "x": 600,
-    "y": 490,
+    "x": 180,
+    "y": 480,
     "wires": [
       [
         "air_intel_http_action"
@@ -1305,8 +1191,8 @@
     "initialize": "",
     "finalize": "",
     "libs": [],
-    "x": 960,
-    "y": 440,
+    "x": 600,
+    "y": 480,
     "wires": [
       [],
       [
@@ -1327,8 +1213,8 @@
     "targetType": "msg",
     "statusVal": "payload",
     "statusType": "auto",
-    "x": 960,
-    "y": 520,
+    "x": 800,
+    "y": 480,
     "wires": []
   },
   {
@@ -1336,56 +1222,7 @@
     "type": "tab",
     "label": "POWER-OUTAGES",
     "disabled": false,
-    "info": "DataSync engine for POWER-OUTAGES. Stream CoT via TCP, PUT UIDs to mission."
-  },
-  {
-    "id": "pwr_outages_sa_inject",
-    "type": "inject",
-    "z": "flow_eng_pwr_outages",
-    "name": "SA ident (startup)",
-    "props": [
-      {
-        "p": "payload"
-      },
-      {
-        "p": "topic",
-        "vt": "str"
-      }
-    ],
-    "repeat": "600",
-    "crontab": "",
-    "once": true,
-    "onceDelay": "10",
-    "topic": "sa-ident",
-    "payload": "",
-    "payloadType": "date",
-    "x": 180,
-    "y": 40,
-    "wires": [
-      [
-        "pwr_outages_sa_build"
-      ]
-    ]
-  },
-  {
-    "id": "pwr_outages_sa_build",
-    "type": "function",
-    "z": "flow_eng_pwr_outages",
-    "name": "Build SA ident CoT",
-    "func": "var tak = global.get('tak_settings') || {};\nvar configs = global.get('arcgis_configs') || [];\nvar cfg = null;\nfor (var i = 0; i < configs.length; i++) {\n  if (configs[i].configName === 'POWER-OUTAGES') { cfg = configs[i]; break; }\n}\nvar creatorUid = '';\nif (cfg && cfg.creatorUid) creatorUid = String(cfg.creatorUid).trim();\nif (!creatorUid && tak.creatorUid) creatorUid = String(tak.creatorUid).trim();\nif (!creatorUid) { return null; }\n\nvar now = new Date();\nvar stale = new Date(now.getTime() + 120000);\nmsg.payload = {\n  event: {\n    _attributes: {\n      version: '2.0', uid: creatorUid,\n      type: 'a-f-G-E-S', how: 'h-g-i-g-o',\n      time: now.toISOString(), start: now.toISOString(), stale: stale.toISOString()\n    },\n    point: { _attributes: { lat: '0', lon: '0', hae: '0', ce: '9999999', le: '9999999' } },\n    detail: {\n      contact: [{ _attributes: { callsign: creatorUid } }],\n      __group: [{ _attributes: { name: 'Purple', role: 'Team Member' } }]\n    }\n  }\n};\nreturn msg;",
-    "outputs": 1,
-    "timeout": "",
-    "noerr": 0,
-    "initialize": "",
-    "finalize": "",
-    "libs": [],
-    "x": 400,
-    "y": 40,
-    "wires": [
-      [
-        "pwr_outages_cot_to_xml"
-      ]
-    ]
+    "info": "DataSync engine for POWER-OUTAGES. Pure Mission API — no TCP broadcast."
   },
   {
     "id": "pwr_outages_inject",
@@ -1409,7 +1246,7 @@
     "payload": "",
     "payloadType": "date",
     "x": 180,
-    "y": 120,
+    "y": 80,
     "wires": [
       [
         "pwr_outages_load"
@@ -1429,7 +1266,7 @@
     "finalize": "",
     "libs": [],
     "x": 400,
-    "y": 120,
+    "y": 80,
     "wires": [
       [
         "pwr_outages_build_q"
@@ -1449,7 +1286,7 @@
     "finalize": "",
     "libs": [],
     "x": 180,
-    "y": 200,
+    "y": 160,
     "wires": [
       [
         "pwr_outages_http_ag"
@@ -1473,7 +1310,7 @@
     "senderr": false,
     "headers": [],
     "x": 400,
-    "y": 200,
+    "y": 160,
     "wires": [
       [
         "pwr_outages_parse"
@@ -1493,7 +1330,7 @@
     "finalize": "",
     "libs": [],
     "x": 600,
-    "y": 200,
+    "y": 160,
     "wires": [
       [
         "pwr_outages_build_sub",
@@ -1514,7 +1351,7 @@
     "finalize": "",
     "libs": [],
     "x": 180,
-    "y": 300,
+    "y": 240,
     "wires": [
       [
         "pwr_outages_http_sub"
@@ -1538,36 +1375,17 @@
     "senderr": false,
     "headers": [],
     "x": 380,
-    "y": 300,
+    "y": 240,
     "wires": [
-      [
-        "pwr_outages_debug_sub"
-      ]
+      []
     ]
-  },
-  {
-    "id": "pwr_outages_debug_sub",
-    "type": "debug",
-    "z": "flow_eng_pwr_outages",
-    "name": "Subscribe result",
-    "active": true,
-    "tosidebar": true,
-    "console": false,
-    "tostatus": true,
-    "complete": "true",
-    "targetType": "full",
-    "statusVal": "topic",
-    "statusType": "auto",
-    "x": 580,
-    "y": 300,
-    "wires": []
   },
   {
     "id": "pwr_outages_build_m",
     "type": "function",
     "z": "flow_eng_pwr_outages",
     "name": "Build mission GET URL",
-    "func": "var tak = msg.takSettings;\nvar cfg = msg._config;\nvar host = String(tak.serverUrl || '').replace(/^https?:\\/\\//i, '').replace(/\\/$/, '');\nfunction getJsid(m) {\n  if (m && m.responseCookies && m.responseCookies.JSESSIONID && m.responseCookies.JSESSIONID.value) {\n    return String(m.responseCookies.JSESSIONID.value);\n  }\n  var sc = m && m.headers && m.headers['set-cookie'];\n  if (Array.isArray(sc) && sc.length) {\n    var x = String(sc[0]).match(/JSESSIONID=([^;]+)/);\n    if (x && x[1]) return x[1];\n  }\n  if (typeof sc === 'string') {\n    var y = sc.match(/JSESSIONID=([^;]+)/);\n    if (y && y[1]) return y[1];\n  }\n  return '';\n}\nfunction getBearer(m, tk) {\n  if (tk && tk.missionBearerToken) return String(tk.missionBearerToken).trim();\n  if (m && m._missionBearer) return String(m._missionBearer).trim();\n  return '';\n}\nmsg.url = 'https://' + host + ':' + (tak.missionApiPort || 8443)\n  + '/Marti/api/missions/' + encodeURIComponent(cfg.missionName);\nvar jsid = getJsid(msg);\nif (jsid) msg._missionCookie = 'JSESSIONID=' + jsid;\nvar bearer = getBearer(msg, tak);\nif (bearer) msg._missionBearer = bearer;\nmsg.headers = { 'accept': '*/*' };\nif (msg._missionCookie) msg.headers.Cookie = msg._missionCookie;\nif (msg._missionBearer) msg.headers.Authorization = 'Bearer ' + msg._missionBearer;\nreturn msg;",
+    "func": "var tak = msg.takSettings;\nvar cfg = msg._config;\nvar host = String(tak.serverUrl || '').replace(/^https?:\\/\\//i, '').replace(/\\/$/, '');\nmsg.url = 'https://' + host + ':' + (tak.missionApiPort || 8443)\n  + '/Marti/api/missions/' + encodeURIComponent(cfg.missionName);\nmsg.headers = { 'accept': '*/*' };\nreturn msg;",
     "outputs": 1,
     "timeout": "",
     "noerr": 0,
@@ -1575,7 +1393,7 @@
     "finalize": "",
     "libs": [],
     "x": 560,
-    "y": 320,
+    "y": 280,
     "wires": [
       [
         "pwr_outages_http_m"
@@ -1599,7 +1417,7 @@
     "senderr": false,
     "headers": [],
     "x": 740,
-    "y": 360,
+    "y": 320,
     "wires": [
       [
         "pwr_outages_reconcile"
@@ -1611,7 +1429,7 @@
     "type": "function",
     "z": "flow_eng_pwr_outages",
     "name": "Reconcile (diff)",
-    "func": "var features = msg._features || [];\nvar mData = msg.payload;\nvar cfg = msg._config;\nvar tak = msg.takSettings;\nvar topicCfg = cfg.configName || 'unnamed';\nmsg.topic = topicCfg;\nvar prefix = cfg.uidPrefix || 'arcgis';\nvar arcgisOk = !msg._arcgisStatus || msg._arcgisStatus === 200;\n\nvar existing = {};\ntry {\n  var mission = null;\n  if (mData && mData.data) {\n    mission = Array.isArray(mData.data) ? mData.data[0] : mData.data;\n  }\n  if (mission && mission.uids) {\n    for (var i=0;i<mission.uids.length;i++) {\n      var u = mission.uids[i];\n      var uid = (typeof u === 'string') ? u : (u.data || u.uid || u);\n      if (typeof uid === 'string') existing[uid] = true;\n    }\n  }\n  if (mission && mission.contents) {\n    for (var i=0;i<mission.contents.length;i++) {\n      var c = mission.contents[i];\n      if (c.data && c.data.uid) existing[c.data.uid] = true;\n    }\n  }\n} catch(e) { node.warn('Could not parse mission contents: ' + e.message); }\n\nvar arcgis = {};\nfor (var i=0;i<features.length;i++) arcgis[features[i].uid] = features[i];\n\nvar host = String(tak.serverUrl || '').replace(/^https?:\\/\\//i, '').replace(/\\/$/, '');\nvar baseUrl = 'https://' + host + ':' + (tak.missionApiPort || 8443)\n  + '/Marti/api/missions/' + encodeURIComponent(cfg.missionName);\nvar creatorUidRaw = String((cfg && cfg.creatorUid) || (tak && tak.creatorUid) || 'nodered').trim();\nvar creator = encodeURIComponent(creatorUidRaw);\n\nvar cookie = msg._missionCookie || '';\nvar bearer = msg._missionBearer || '';\nif (!cookie && msg.responseCookies && msg.responseCookies.JSESSIONID && msg.responseCookies.JSESSIONID.value) {\n  cookie = 'JSESSIONID=' + String(msg.responseCookies.JSESSIONID.value);\n}\nif (!cookie && msg.headers && msg.headers['set-cookie']) {\n  var sc = msg.headers['set-cookie'];\n  if (Array.isArray(sc) && sc.length) {\n    var a2 = String(sc[0]).match(/JSESSIONID=([^;]+)/);\n    if (a2 && a2[1]) cookie = 'JSESSIONID=' + a2[1];\n  } else if (typeof sc === 'string') {\n    var b = sc.match(/JSESSIONID=([^;]+)/);\n    if (b && b[1]) cookie = 'JSESSIONID=' + b[1];\n  }\n}\n\nvar nStream = 0, nPut = 0, nDel = 0;\nvar newUids = [];\nfor (var uid in arcgis) {\n  nStream++;\n  if (!existing[uid]) { nPut++; newUids.push(uid); }\n  node.send([\n    { payload: arcgis[uid].cot, topic: topicCfg,\n      _missionName: cfg.missionName,\n      host: host,\n      port: Number(tak.streamingPort || tak.streamPort || 8089) },\n    null\n  ]);\n}\n\nvar streamTimeSec = Math.ceil(nStream / 10) + 3;\nif (newUids.length > 0) {\n  node.send([\n    { topic: topicCfg, payload: {},\n      _missionCookie: cookie,\n      _missionBearer: bearer,\n      _putUrl: baseUrl + '/contents?creatorUid=' + creator,\n      _putUids: newUids,\n      _delaySec: streamTimeSec },\n    null\n  ]);\n}\n\nif (!arcgisOk) {\n  node.send([null, null, {payload: topicCfg + ': ArcGIS fetch failed (status ' + msg._arcgisStatus + ') — skipping deletes', topic: topicCfg}]);\n} else {\n  for (var uid in existing) {\n    if (uid.indexOf(prefix) === 0 && !arcgis[uid]) {\n      nDel++;\n      node.send([null, {\n        method: 'DELETE',\n        url: baseUrl + '/contents?uid=' + encodeURIComponent(uid) + '&creatorUid=' + creator,\n        headers: { 'accept': '*/*' },\n        _missionCookie: cookie,\n        _missionBearer: bearer,\n        payload: '',\n        topic: topicCfg\n      }]);\n    }\n  }\n}\n\nvar summary = topicCfg + ' reconcile: ' + nStream + ' streamed, ' + nPut + ' PUT, ' + nDel + ' DELETE, '\n  + Object.keys(arcgis).length + ' ArcGIS, ' + Object.keys(existing).length + ' in mission';\nnode.status({text: nStream + ' stream, ' + nPut + ' PUT, ' + nDel + ' DEL'});\nnode.send([null, null, {payload: summary, topic: topicCfg}]);\nreturn null;",
+    "func": "var features = msg._features || [];\nvar mData = msg.payload;\nvar cfg = msg._config;\nvar tak = msg.takSettings;\nvar topicCfg = cfg.configName || 'unnamed';\nmsg.topic = topicCfg;\nvar prefix = cfg.uidPrefix || 'arcgis';\nvar arcgisOk = !msg._arcgisStatus || msg._arcgisStatus === 200;\n\nvar existingByName = {};\ntry {\n  var mission = null;\n  if (mData && mData.data) {\n    mission = Array.isArray(mData.data) ? mData.data[0] : mData.data;\n  }\n  if (mission && mission.contents) {\n    for (var i = 0; i < mission.contents.length; i++) {\n      var c = mission.contents[i];\n      if (c.data && c.data.name) {\n        existingByName[c.data.name] = c.data.hash;\n      }\n    }\n  }\n  if (mission && mission.uids) {\n    for (var i = 0; i < mission.uids.length; i++) {\n      var u = mission.uids[i];\n      var uid = (typeof u === 'string') ? u : (u.data || u.uid || u);\n      if (typeof uid === 'string') existingByName[uid] = '_uid_' + uid;\n    }\n  }\n} catch(e) { node.warn('Could not parse mission contents: ' + e.message); }\n\nvar arcgisFiles = {};\nfor (var i = 0; i < features.length; i++) {\n  arcgisFiles[features[i].uid + '.cot'] = features[i];\n}\n\nvar host = String(tak.serverUrl || '').replace(/^https?:\\/\\//i, '').replace(/\\/$/, '');\nvar baseUrl = 'https://' + host + ':' + (tak.missionApiPort || 8443);\nvar missionUrl = baseUrl + '/Marti/api/missions/' + encodeURIComponent(cfg.missionName);\nvar uploadUrl = baseUrl + '/Marti/sync/missionupload';\nvar creatorUidRaw = String((cfg && cfg.creatorUid) || (tak && tak.creatorUid) || 'nodered').trim();\nvar creator = encodeURIComponent(creatorUidRaw);\n\nvar nUpload = 0, nSkip = 0, nDel = 0;\nfor (var fname in arcgisFiles) {\n  if (!existingByName[fname] && !existingByName[arcgisFiles[fname].uid]) {\n    nUpload++;\n    node.send([\n      { payload: arcgisFiles[fname].cot,\n        _filename: fname,\n        _uploadUrl: uploadUrl,\n        _missionUrl: missionUrl + '/contents?creatorUid=' + creator,\n        _creatorUid: creatorUidRaw,\n        topic: topicCfg },\n      null, null\n    ]);\n  } else { nSkip++; }\n}\n\nif (!arcgisOk) {\n  node.send([null, null, {payload: topicCfg + ': ArcGIS failed — skipping deletes', topic: topicCfg}]);\n} else {\n  for (var name in existingByName) {\n    var matchesPrefix = name.indexOf(prefix) === 0;\n    if (!matchesPrefix) continue;\n    if (arcgisFiles[name]) continue;\n    if (arcgisFiles[name.replace(/\\.cot$/, '')]) continue;\n    var val = existingByName[name];\n    nDel++;\n    if (val.indexOf('_uid_') === 0) {\n      var uidVal = val.substring(5);\n      node.send([null, {\n        method: 'DELETE',\n        url: missionUrl + '/contents?uid=' + encodeURIComponent(uidVal) + '&creatorUid=' + creator,\n        headers: { 'accept': '*/*' },\n        payload: '', topic: topicCfg\n      }, null]);\n    } else {\n      node.send([null, {\n        method: 'DELETE',\n        url: missionUrl + '/contents?hash=' + encodeURIComponent(val) + '&creatorUid=' + creator,\n        headers: { 'accept': '*/*' },\n        payload: '', topic: topicCfg\n      }, null]);\n    }\n  }\n}\n\nvar summary = topicCfg + ': ' + nUpload + ' upload, ' + nSkip + ' exist, ' + nDel + ' delete';\nnode.status({text: nUpload + ' up, ' + nSkip + ' ok, ' + nDel + ' del'});\nnode.send([null, null, {payload: summary, topic: topicCfg}]);\nreturn null;",
     "outputs": 3,
     "timeout": "",
     "noerr": 0,
@@ -1619,11 +1437,10 @@
     "finalize": "",
     "libs": [],
     "x": 180,
-    "y": 440,
+    "y": 400,
     "wires": [
       [
-        "pwr_outages_cot_to_xml",
-        "pwr_outages_delay_put"
+        "pwr_outages_cot_to_xml"
       ],
       [
         "pwr_outages_delay_del"
@@ -1645,122 +1462,77 @@
     "initialize": "",
     "finalize": "",
     "libs": [],
-    "x": 180,
-    "y": 520,
-    "wires": [
-      [
-        "pwr_outages_rate_stream"
-      ]
-    ]
-  },
-  {
-    "id": "pwr_outages_rate_stream",
-    "type": "delay",
-    "z": "flow_eng_pwr_outages",
-    "name": "Throttle (10/sec)",
-    "pauseType": "rate",
-    "timeout": "1",
-    "timeoutUnits": "seconds",
-    "rate": "10",
-    "nbRateUnits": "1",
-    "rateUnits": "second",
-    "randomFirst": "1",
-    "randomLast": "5",
-    "randomUnits": "seconds",
-    "drop": false,
-    "allowrate": false,
-    "outputs": 1,
     "x": 400,
-    "y": 520,
+    "y": 400,
     "wires": [
       [
-        "pwr_outages_tcp_out"
+        "pwr_outages_build_upload"
       ]
     ]
   },
   {
-    "id": "pwr_outages_tcp_out",
-    "type": "tcp out",
+    "id": "pwr_outages_build_upload",
+    "type": "function",
     "z": "flow_eng_pwr_outages",
-    "name": "CoT → TAK :8089",
-    "host": "host.docker.internal",
-    "port": "8089",
-    "beserver": "client",
-    "base64": false,
-    "end": false,
-    "tls": "tls_tak",
-    "x": 600,
-    "y": 520,
-    "wires": []
-  },
-  {
-    "id": "pwr_outages_catch_stream",
-    "type": "catch",
-    "z": "flow_eng_pwr_outages",
-    "name": "Stream errors",
-    "scope": [
-      "pwr_outages_tcp_out"
+    "name": "Build multipart upload",
+    "func": "var xml = (Buffer.isBuffer(msg.payload)) ? msg.payload.toString('utf8') : String(msg.payload);\nvar hash = crypto.createHash('sha256').update(xml).digest('hex');\nvar fname = msg._filename || 'upload.cot';\nvar creator = msg._creatorUid || 'admin';\nvar boundary = '----NRBoundary' + Date.now();\nvar body = '--' + boundary + '\\r\\n'\n  + 'Content-Disposition: form-data; name=\"assetfile\"; filename=\"' + fname + '\"\\r\\n'\n  + 'Content-Type: application/xml\\r\\n\\r\\n'\n  + xml + '\\r\\n--' + boundary + '--\\r\\n';\nmsg.payload = Buffer.from(body);\nmsg.headers = { 'Content-Type': 'multipart/form-data; boundary=' + boundary };\nmsg.url = msg._uploadUrl + '?hash=' + hash\n  + '&filename=' + encodeURIComponent(fname)\n  + '&creatorUid=' + encodeURIComponent(creator);\nmsg.method = 'POST';\nmsg._hash = hash;\nnode.status({text: 'Uploading ' + fname.substring(0, 30)});\nreturn msg;",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [
+      {
+        "var": "crypto",
+        "module": "crypto"
+      }
     ],
-    "uncaught": false,
-    "x": 180,
-    "y": 580,
-    "wires": [
-      [
-        "pwr_outages_debug_stream"
-      ]
-    ]
-  },
-  {
-    "id": "pwr_outages_debug_stream",
-    "type": "debug",
-    "z": "flow_eng_pwr_outages",
-    "name": "Stream error",
-    "active": true,
-    "tosidebar": true,
-    "console": false,
-    "tostatus": true,
-    "complete": "true",
-    "targetType": "full",
-    "statusVal": "",
-    "statusType": "auto",
-    "x": 400,
-    "y": 580,
-    "wires": []
-  },
-  {
-    "id": "pwr_outages_delay_put",
-    "type": "function",
-    "z": "flow_eng_pwr_outages",
-    "name": "Wait for stream cache",
-    "func": "var delaySec = msg._delaySec || 5;\nnode.status({text: 'Waiting ' + delaySec + 's for cache'});\nvar n = node;\nvar m = msg;\nsetTimeout(function() { n.send(m); }, delaySec * 1000);\nreturn null;",
-    "outputs": 1,
-    "timeout": "",
-    "noerr": 0,
-    "initialize": "",
-    "finalize": "",
-    "libs": [],
-    "x": 400,
-    "y": 440,
-    "wires": [
-      [
-        "pwr_outages_build_put"
-      ]
-    ]
-  },
-  {
-    "id": "pwr_outages_build_put",
-    "type": "function",
-    "z": "flow_eng_pwr_outages",
-    "name": "Build PUT UIDs",
-    "func": "var uids = msg._putUids || [];\nif (!msg._putUrl || uids.length === 0) return null;\nmsg.method = 'PUT';\nmsg.url = msg._putUrl;\nmsg.headers = { 'accept': '*/*', 'Content-Type': 'application/json' };\nif (msg._missionCookie) msg.headers.Cookie = msg._missionCookie;\nif (msg._missionBearer) msg.headers.Authorization = 'Bearer ' + msg._missionBearer;\nmsg.payload = { uids: uids };\nnode.status({text: 'PUT ' + uids.length + ' UIDs'});\nreturn msg;",
-    "outputs": 1,
-    "timeout": "",
-    "noerr": 0,
-    "initialize": "",
-    "finalize": "",
-    "libs": [],
     "x": 600,
-    "y": 440,
+    "y": 400,
+    "wires": [
+      [
+        "pwr_outages_http_upload"
+      ]
+    ]
+  },
+  {
+    "id": "pwr_outages_http_upload",
+    "type": "http request",
+    "z": "flow_eng_pwr_outages",
+    "name": "POST Enterprise Sync",
+    "method": "use",
+    "ret": "txt",
+    "paytoqs": "body",
+    "url": "",
+    "tls": "tls_tak",
+    "persist": false,
+    "proxy": "",
+    "insecureHTTPParser": false,
+    "authType": "",
+    "senderr": false,
+    "headers": [],
+    "x": 800,
+    "y": 400,
+    "wires": [
+      [
+        "pwr_outages_build_put_hash"
+      ]
+    ]
+  },
+  {
+    "id": "pwr_outages_build_put_hash",
+    "type": "function",
+    "z": "flow_eng_pwr_outages",
+    "name": "Build PUT hash",
+    "func": "var hash = msg._hash;\nif (!hash || !msg._missionUrl) return null;\nvar ok = msg.statusCode >= 200 && msg.statusCode < 300;\nif (!ok) {\n  node.status({text: 'Upload failed: ' + msg.statusCode});\n  return null;\n}\nmsg.method = 'PUT';\nmsg.url = msg._missionUrl;\nmsg.headers = { 'accept': '*/*', 'Content-Type': 'application/json' };\nmsg.payload = { hashes: [hash] };\nnode.status({text: 'PUT hash ' + hash.substring(0, 12)});\nreturn msg;",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 960,
+    "y": 400,
     "wires": [
       [
         "pwr_outages_http_action"
@@ -1783,8 +1555,8 @@
     "authType": "",
     "senderr": false,
     "headers": [],
-    "x": 800,
-    "y": 440,
+    "x": 400,
+    "y": 480,
     "wires": [
       [
         "pwr_outages_log_action"
@@ -1796,10 +1568,10 @@
     "type": "delay",
     "z": "flow_eng_pwr_outages",
     "name": "",
-    "pauseType": "delay",
+    "pauseType": "rate",
     "timeout": "1",
     "timeoutUnits": "seconds",
-    "rate": "1",
+    "rate": "5",
     "nbRateUnits": "1",
     "rateUnits": "second",
     "randomFirst": "1",
@@ -1808,8 +1580,8 @@
     "drop": false,
     "allowrate": false,
     "outputs": 1,
-    "x": 600,
-    "y": 490,
+    "x": 180,
+    "y": 480,
     "wires": [
       [
         "pwr_outages_http_action"
@@ -1828,8 +1600,8 @@
     "initialize": "",
     "finalize": "",
     "libs": [],
-    "x": 960,
-    "y": 440,
+    "x": 600,
+    "y": 480,
     "wires": [
       [],
       [
@@ -1850,8 +1622,8 @@
     "targetType": "msg",
     "statusVal": "payload",
     "statusType": "auto",
-    "x": 960,
-    "y": 520,
+    "x": 800,
+    "y": 480,
     "wires": []
   }
 ]
