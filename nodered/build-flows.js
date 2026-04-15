@@ -38,7 +38,7 @@ const configFlows = [
   },
   {
     id: 'migrate_fn', type: 'function', z: CFG_TAB,
-    name: 'Migrate flow→global',
+    name: 'Migrate flow->global',
     func: [
       "var cfgs = flow.get('arcgis_configs');",
       "var tak  = flow.get('tak_settings');",
@@ -574,7 +574,7 @@ const FN_PARSE_COT = [
   "  var before = features.length;",
   "  features = Object.keys(groups).map(function(k) { return groups[k]; });",
   "  if (features.length < before) {",
-  "    node.warn(cfg.configName + ': dedup by ' + dedupField + ': ' + before + ' → ' + features.length + ' features');",
+  "    node.warn(cfg.configName + ': dedup by ' + dedupField + ': ' + before + ' -> ' + features.length + ' features');",
   "  }",
   "}",
   "",
@@ -825,7 +825,7 @@ function makeEngineTab(feed) {
     "}",
     "",
     "if (!arcgisOk) {",
-    "  node.warn(topicCfg + ': ArcGIS fetch failed (status ' + msg._arcgisStatus + ') — skipping deletes');",
+    "  node.warn(topicCfg + ': ArcGIS fetch failed (status ' + msg._arcgisStatus + ') - skipping deletes');",
     "} else {",
     "  for (var uid in existing) {",
     "    if (uid.indexOf(prefix) === 0 && !arcgis[uid]) {",
@@ -1079,10 +1079,10 @@ function makeEngineTab(feed) {
       wires: [[P + 'cot_to_xml', P + 'delay_put'], [P + 'delay_del']]
     },
 
-    // ── CoT → XML → Rate limiter → TCP out (stream to TAK Server) ──
+    // ── CoT -> XML -> Rate limiter -> TCP out (stream to TAK Server) ──
     {
       id: P + 'cot_to_xml', type: 'function', z: FID,
-      name: 'CoT JSON → XML',
+      name: 'CoT JSON -> XML',
       func: FN_COT_TO_XML,
       outputs: 1, timeout: '', noerr: 0,
       initialize: '', finalize: '', libs: [],
@@ -1099,7 +1099,7 @@ function makeEngineTab(feed) {
     },
     {
       id: P + 'tcp_out', type: 'tcp out', z: FID,
-      name: 'CoT → TAK :8089',
+      name: 'CoT -> TAK :8089',
       host: 'host.docker.internal', port: '8089', beserver: 'client',
       base64: false, end: false, tls: 'tls_tak',
       x: 600, y: 520, wires: []
@@ -1120,7 +1120,7 @@ function makeEngineTab(feed) {
       x: 400, y: 580, wires: []
     },
 
-    // ── Delay → PUT new UIDs to mission ──
+    // ── Delay -> PUT new UIDs to mission ──
     {
       id: P + 'delay_put', type: 'delay', z: FID,
       name: 'Wait 30s for cache',
@@ -1142,7 +1142,7 @@ function makeEngineTab(feed) {
         "if (msg._missionCookie) msg.headers.Cookie = msg._missionCookie;",
         "if (msg._missionBearer) msg.headers.Authorization = 'Bearer ' + msg._missionBearer;",
         "msg.payload = { uids: uids };",
-        "node.warn(msg.topic + ' PUT → ' + uids.length + ' UIDs → ' + msg.url);",
+        "node.warn(msg.topic + ' PUT -> ' + uids.length + ' UIDs -> ' + msg.url);",
         "return msg;"
       ].join('\n'),
       outputs: 1, timeout: '', noerr: 0,
@@ -1176,10 +1176,10 @@ function makeEngineTab(feed) {
         "var method = msg.method || '?';",
         "var feed = msg.topic || 'unknown';",
         "var ok = (code >= 200 && code < 300);",
-        "var label = feed + ' ' + method + ' → ' + code + (ok ? ' ✓' : ' ✗');",
+        "var label = feed + ' ' + method + ' -> ' + code + (ok ? ' OK' : ' FAIL');",
         "if (!ok) {",
         "  var body = (typeof msg.payload === 'string') ? msg.payload.substring(0, 200) : '';",
-        "  node.warn(label + (body ? ' — ' + body : ''));",
+        "  node.warn(label + (body ? ' - ' + body : ''));",
         "} else {",
         "  node.warn(label);",
         "}",
