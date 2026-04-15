@@ -237,8 +237,14 @@
         <select id="timeField"><option value="">(none)</option></select>
       </div>
     </div>
-    <div style="margin-top:1rem">
-      <label>Detected geometry <span class="badge badge-geom" id="geomBadge"></span></label>
+    <div class="field-grid" style="margin-top:1rem">
+      <div>
+        <label for="dedupField">Deduplicate by <span class="badge badge-oid">keep latest per value</span></label>
+        <select id="dedupField"><option value="">(none — keep all features)</option></select>
+      </div>
+      <div>
+        <label>Detected geometry <span class="badge badge-geom" id="geomBadge"></span></label>
+      </div>
     </div>
     <div id="sampleData"></div>
   </div>
@@ -622,6 +628,15 @@ async function fetchLayer() {
     state.distinctValues = [];
     state.selectedValues = [];
 
+    /* populate dedup field dropdown */
+    var dedupSel = document.getElementById('dedupField');
+    dedupSel.innerHTML = '<option value="">(none &mdash; keep all features)</option>';
+    state.fields.forEach(function(f) {
+      var short = f.type.replace('esriFieldType', '');
+      dedupSel.innerHTML += '<option value="' + f.name + '">'
+        + f.name + ' (' + short + ')' + '</option>';
+    });
+
     /* populate label field dropdown */
     var labelSel = document.getElementById('labelField');
     labelSel.innerHTML = '<option value="">(none)</option>';
@@ -909,7 +924,8 @@ function generateConfig() {
     },
     mapping: {
       idField: document.getElementById('idField').value,
-      timeField: document.getElementById('timeField').value || null
+      timeField: document.getElementById('timeField').value || null,
+      dedupField: document.getElementById('dedupField').value || null
     },
     filter: {
       field: filterField,
@@ -1052,6 +1068,7 @@ function resetForm() {
   document.getElementById('layerSelect').innerHTML = '<option value="">-- fetch service first --</option>';
   document.getElementById('idField').innerHTML = '';
   document.getElementById('timeField').innerHTML = '<option value="">(none)</option>';
+  document.getElementById('dedupField').innerHTML = '<option value="">(none — keep all features)</option>';
   document.getElementById('labelField').innerHTML = '<option value="">(none)</option>';
   document.getElementById('filterField').innerHTML = '<option value="">(none)</option>';
   document.getElementById('distinctValues').innerHTML = '';
@@ -1118,6 +1135,7 @@ async function selectConfig(idx) {
   if (c.mapping) {
     if (c.mapping.idField) document.getElementById('idField').value = c.mapping.idField;
     document.getElementById('timeField').value = c.mapping.timeField || '';
+    document.getElementById('dedupField').value = c.mapping.dedupField || '';
   }
 
   if (c.filter && c.filter.field) {
