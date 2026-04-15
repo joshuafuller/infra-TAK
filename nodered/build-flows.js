@@ -1218,17 +1218,23 @@ console.log('flows.json generated  (' + allFlows.length + ' nodes, ' + FEEDS.len
 try {
   const htmlPath = path.join(__dirname, 'configurator.html');
   let htmlContent = fs.readFileSync(htmlPath, 'utf8');
-  const marker = '/* __ENGINE_TAB_TEMPLATE__ */';
-  const templateLine = 'var ENGINE_TAB_TEMPLATE = ' + JSON.stringify(engineTabTemplate) + ';';
-  if (htmlContent.includes(marker)) {
-    htmlContent = htmlContent.replace(
-      new RegExp('var ENGINE_TAB_TEMPLATE = .*?;'),
-      templateLine
+  const startMarker = '/* __ENGINE_TAB_TEMPLATE_START__ */';
+  const endMarker   = '/* __ENGINE_TAB_TEMPLATE_END__ */';
+  const b64 = Buffer.from(engineTabTemplate, 'utf8').toString('base64');
+  const templateBlock = startMarker + '\n'
+    + 'var ENGINE_TAB_TEMPLATE = atob("' + b64 + '");\n'
+    + endMarker;
+  if (htmlContent.includes(startMarker)) {
+    const re = new RegExp(
+      startMarker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      + '[\\s\\S]*?'
+      + endMarker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
     );
+    htmlContent = htmlContent.replace(re, templateBlock);
   } else {
     htmlContent = htmlContent.replace(
       '</script>\n</body>',
-      '\n' + marker + '\n' + templateLine + '\n</script>\n</body>'
+      '\n' + templateBlock + '\n</script>\n</body>'
     );
   }
   fs.writeFileSync(htmlPath, htmlContent);
