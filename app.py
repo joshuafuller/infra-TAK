@@ -15057,6 +15057,11 @@ def _run_nodered_deploy_remote(settings, deploy_cfg, plog):
     default: {
       module: 'localfilesystem'
     }
+  },
+  editorTheme: {
+    header: {
+      title: 'infra-TAK Node-RED  —  <a href="/configurator" target="_blank" style="color:#2ec4b6;text-decoration:underline">Open Configurator</a>'
+    }
   }
 };
 """
@@ -15168,6 +15173,11 @@ def run_nodered_deploy():
   contextStorage: {
     default: {
       module: 'localfilesystem'
+    }
+  },
+  editorTheme: {
+    header: {
+      title: 'infra-TAK Node-RED  —  <a href="/configurator" target="_blank" style="color:#2ec4b6;text-decoration:underline">Open Configurator</a>'
     }
   }
 };
@@ -28593,10 +28603,66 @@ def _post_update_auto_deploy():
                         else:
                             print("Post-update: Node-RED port binding already secure")
                         _nodered_malware_scan()
+                        _auto_nodered_settings(nr_dir)
+                        _auto_nodered_flows()
                     except Exception as e:
                         print(f"Post-update: Node-RED port hardening error: {e}")
                     finally:
                         _auto_deploy_active.pop('nodered', None)
+
+            def _auto_nodered_settings(nr_dir):
+                """Ensure Node-RED settings.js has editorTheme with Configurator link."""
+                settings_path = os.path.join(nr_dir, 'settings.js')
+                if not os.path.exists(settings_path):
+                    return
+                try:
+                    with open(settings_path) as f:
+                        content = f.read()
+                    if 'editorTheme' not in content:
+                        print("Post-update: adding editorTheme to Node-RED settings.js")
+                        new_content = content.replace(
+                            '};',
+                            """,
+  editorTheme: {
+    header: {
+      title: 'infra-TAK Node-RED  —  <a href="/configurator" target="_blank" style="color:#2ec4b6;text-decoration:underline">Open Configurator</a>'
+    }
+  }
+};""",
+                            1
+                        )
+                        with open(settings_path, 'w') as f:
+                            f.write(new_content)
+                        subprocess.run('docker restart nodered', shell=True, capture_output=True, timeout=60)
+                        print("Post-update: Node-RED settings.js updated and restarted")
+                except Exception as e:
+                    print(f"Post-update: Node-RED settings.js update error: {e}")
+
+            def _auto_nodered_flows():
+                """Sync infra-TAK flows into Node-RED container (merge, preserve user flows + dynamic engine tabs + credentials)."""
+                deploy_sh = os.path.join(BASE_DIR, 'nodered', 'deploy.sh')
+                if not os.path.exists(deploy_sh):
+                    return
+                r = subprocess.run('docker ps -q --filter name=nodered', shell=True,
+                    capture_output=True, text=True, timeout=5)
+                if not (r.stdout or '').strip():
+                    print("Post-update: Node-RED container not running — skipping flow sync")
+                    return
+                try:
+                    print("Post-update: syncing infra-TAK flows into Node-RED (merge)")
+                    result = subprocess.run(f'bash {shlex.quote(deploy_sh)} --no-pull',
+                        shell=True, capture_output=True, text=True, timeout=180,
+                        cwd=BASE_DIR)
+                    for line in (result.stdout or '').strip().splitlines():
+                        print(f"  nodered-deploy: {line}")
+                    if result.returncode == 0:
+                        print("Post-update: Node-RED flows synced successfully")
+                    else:
+                        print(f"Post-update: Node-RED flow sync returned {result.returncode}")
+                        for line in (result.stderr or '').strip().splitlines():
+                            print(f"  nodered-deploy-err: {line}")
+                except Exception as e:
+                    print(f"Post-update: Node-RED flow sync error: {e}")
 
             def _nodered_malware_scan():
                 try:

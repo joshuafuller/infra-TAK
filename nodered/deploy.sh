@@ -8,9 +8,13 @@ NEW_FLOWS="$SCRIPT_DIR/flows.json"
 
 cd "$REPO_DIR"
 
-# Pull latest code
-echo "==> git pull"
-git pull
+# Pull latest code (skip if called with --no-pull, e.g. from post-update auto-deploy)
+if [ "${1:-}" != "--no-pull" ]; then
+  echo "==> git pull"
+  git pull
+else
+  echo "==> Skipping git pull (--no-pull)"
+fi
 
 # Rebuild flows.json using node inside the container
 echo "==> Rebuilding flows.json"
@@ -45,54 +49,43 @@ docker exec "$CONTAINER" node -e "
   var fs = require('fs');
   var upd = JSON.parse(fs.readFileSync('/tmp/flows_new.json', 'utf8'));
 
-  // Read creatorUid from flow context
-  var creatorUid = '';
-  try {
-    var ctx = JSON.parse(fs.readFileSync('/tmp/flows_context.json', 'utf8'));
-    var ts = ctx.tak_settings || {};
-    creatorUid = (ts.creatorUid || '').trim();
-    if (!creatorUid) {
-      var cfgs = ctx.arcgis_configs || [];
-      for (var i = 0; i < cfgs.length; i++) {
-        if (cfgs[i].creatorUid) { creatorUid = cfgs[i].creatorUid.trim(); break; }
-      }
-    }
-  } catch(e) {}
-
   // Read existing flows
   var cur = [];
   try { cur = JSON.parse(fs.readFileSync('/tmp/flows_current.json', 'utf8')); } catch(e) {}
 
-  // --- TLS config: Mission API (admin cert for 8443) ---
+  // Build lookup of new node IDs (infra-TAK managed nodes)
+  var updIds = {};
+  upd.forEach(function(n) { updIds[n.id] = true; });
+
+  // Identify infra-TAK managed flow tabs (configurator + static engine tabs)
+  var managedTabs = {};
+  upd.forEach(function(n) { if (n.type === 'tab') managedTabs[n.id] = true; });
+
+  // Preserve existing nodes NOT managed by infra-TAK:
+  // - Dynamic engine tabs (flow_eng_* created by Configurator)
+  // - User's own custom flows and nodes
+  var preserved = [];
+  cur.forEach(function(n) {
+    if (updIds[n.id]) return; // will be replaced by new version
+    var isInManagedTab = n.z && managedTabs[n.z];
+    if (isInManagedTab) return; // old node in a tab we're replacing
+    preserved.push(n);
+  });
+
+  console.log('    Preserved ' + preserved.length + ' existing nodes (dynamic tabs + user flows)');
+
+  // --- TLS config: preserve cert/key from running container if populated ---
   var tlsIdx = upd.findIndex(function(n) { return n.id === 'tls_tak'; });
   var tlsCur = cur.find(function(n) { return n.id === 'tls_tak'; });
 
-  if (tlsCur && (tlsCur.certname || tlsCur.cert)) {
+  if (tlsCur && (tlsCur.cert || tlsCur.certname)) {
     if (tlsIdx >= 0) upd[tlsIdx] = tlsCur;
     console.log('    TLS (API): preserved from running container');
-  } else if (creatorUid) {
-    if (tlsIdx >= 0) {
-      upd[tlsIdx].certname = '/certs/admin.pem';
-      upd[tlsIdx].keyname  = '/certs/admin.key';
-      upd[tlsIdx].caname   = '';
-      upd[tlsIdx].verifyservercert = false;
-    }
-    console.log('    TLS (API): auto-configured with admin cert');
   } else {
-    console.log('    TLS (API): empty (first deploy — configure in Node-RED editor)');
+    console.log('    TLS (API): using build-flows.js defaults');
   }
 
-  // --- TLS config: per-feed stream certs (from configurator streamCertUser or preserved) ---
-  var cfgs = [];
-  try { cfgs = ctx.arcgis_configs || []; } catch(e) {}
-
-  upd.forEach(function(n) {
-    if (n.type === 'tls-config' && n.id.indexOf('tls_stream_') === 0) {
-      console.log('    TLS (' + n.name + '): cert=' + (n.cert || '(empty)') + ' key=' + (n.key || '(empty)'));
-    }
-  });
-
-  // --- TCP out (preserve host from existing; keep per-feed ports + tls from build) ---
+  // --- TCP out (preserve host from existing) ---
   var tcpCur = cur.find(function(n) { return n.type === 'tcp out' && n.host; });
   upd.forEach(function(n) {
     if (n.type === 'tcp out') {
@@ -101,7 +94,10 @@ docker exec "$CONTAINER" node -e "
     }
   });
 
-  fs.writeFileSync('/tmp/flows_merged.json', JSON.stringify(upd, null, 2));
+  // Merge: new infra-TAK nodes + preserved existing nodes
+  var merged = upd.concat(preserved);
+  fs.writeFileSync('/tmp/flows_merged.json', JSON.stringify(merged, null, 2));
+  console.log('    Final: ' + merged.length + ' total nodes (' + upd.length + ' infra-TAK + ' + preserved.length + ' preserved)');
 "
 
 # Fix permissions on any certs referenced by stream TLS configs
