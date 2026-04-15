@@ -94,8 +94,8 @@ const configFlows = [
   },
   {
     id: 'hi_svc', type: 'http in', z: CFG_TAB,
-    name: 'POST /api/arcgis/service',
-    url: '/api/arcgis/service', method: 'post',
+    name: 'POST /arcgis-tak/arcgis/service',
+    url: '/arcgis-tak/arcgis/service', method: 'post',
     upload: false, swaggerDoc: '',
     x: 200, y: 240, wires: [['fn_svc']]
   },
@@ -143,8 +143,8 @@ const configFlows = [
 
   {
     id: 'hi_lyr', type: 'http in', z: CFG_TAB,
-    name: 'POST /api/arcgis/layer',
-    url: '/api/arcgis/layer', method: 'post',
+    name: 'POST /arcgis-tak/arcgis/layer',
+    url: '/arcgis-tak/arcgis/layer', method: 'post',
     upload: false, swaggerDoc: '',
     x: 200, y: 340, wires: [['fn_lyr']]
   },
@@ -194,8 +194,8 @@ const configFlows = [
 
   {
     id: 'hi_smp', type: 'http in', z: CFG_TAB,
-    name: 'POST /api/arcgis/sample',
-    url: '/api/arcgis/sample', method: 'post',
+    name: 'POST /arcgis-tak/arcgis/sample',
+    url: '/arcgis-tak/arcgis/sample', method: 'post',
     upload: false, swaggerDoc: '',
     x: 200, y: 440, wires: [['fn_smp']]
   },
@@ -244,8 +244,8 @@ const configFlows = [
 
   {
     id: 'hi_dist', type: 'http in', z: CFG_TAB,
-    name: 'POST /api/arcgis/distinct',
-    url: '/api/arcgis/distinct', method: 'post',
+    name: 'POST /arcgis-tak/arcgis/distinct',
+    url: '/arcgis-tak/arcgis/distinct', method: 'post',
     upload: false, swaggerDoc: '',
     x: 200, y: 540, wires: [['fn_dist']]
   },
@@ -312,8 +312,8 @@ const configFlows = [
   },
   {
     id: 'hi_save', type: 'http in', z: CFG_TAB,
-    name: 'POST /api/config/save',
-    url: '/api/config/save', method: 'post',
+    name: 'POST /arcgis-tak/config/save',
+    url: '/arcgis-tak/config/save', method: 'post',
     upload: false, swaggerDoc: '',
     x: 200, y: 660, wires: [['fn_save']]
   },
@@ -355,8 +355,8 @@ const configFlows = [
   },
   {
     id: 'hi_saveall', type: 'http in', z: CFG_TAB,
-    name: 'POST /api/config/save-all',
-    url: '/api/config/save-all', method: 'post',
+    name: 'POST /arcgis-tak/config/save-all',
+    url: '/arcgis-tak/config/save-all', method: 'post',
     upload: false, swaggerDoc: '',
     x: 200, y: 700, wires: [['fn_saveall']]
   },
@@ -379,8 +379,8 @@ const configFlows = [
   },
   {
     id: 'hi_load', type: 'http in', z: CFG_TAB,
-    name: 'GET /api/config/load',
-    url: '/api/config/load', method: 'get',
+    name: 'GET /arcgis-tak/config/load',
+    url: '/arcgis-tak/config/load', method: 'get',
     upload: false, swaggerDoc: '',
     x: 200, y: 740, wires: [['fn_load']]
   },
@@ -410,8 +410,8 @@ const configFlows = [
   },
   {
     id: 'hi_tak_save', type: 'http in', z: CFG_TAB,
-    name: 'POST /api/tak-settings/save',
-    url: '/api/tak-settings/save', method: 'post',
+    name: 'POST /arcgis-tak/tak-settings/save',
+    url: '/arcgis-tak/tak-settings/save', method: 'post',
     upload: false, swaggerDoc: '',
     x: 220, y: 860, wires: [['fn_tak_save']]
   },
@@ -459,8 +459,8 @@ const configFlows = [
   // ── Force re-subscribe ──
   {
     id: 'hi_force_sub', type: 'http in', z: CFG_TAB,
-    name: 'POST /api/tak/force-subscribe',
-    url: '/api/tak/force-subscribe', method: 'post',
+    name: 'POST /arcgis-tak/tak/force-subscribe',
+    url: '/arcgis-tak/tak/force-subscribe', method: 'post',
     upload: false, swaggerDoc: '',
     x: 220, y: 960, wires: [['fn_force_sub']]
   },
