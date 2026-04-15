@@ -544,7 +544,7 @@ const FN_BUILD_QUERY = [
   "msg.url = base + '/' + lid + '/query'",
   "  + '?where=' + encodeURIComponent(where)",
   "  + '&outFields=*&returnGeometry=true&outSR=4326&f=json';",
-  "node.warn(msg.topic + ' ArcGIS query where: ' + where);",
+  "node.status({text: 'Query: ' + where.substring(0, 50)});",
   "msg._config = cfg;",
   "return msg;"
 ].join('\n');
@@ -554,7 +554,7 @@ const FN_PARSE_COT = [
   "var cfg = msg._config;",
   "msg._arcgisStatus = msg.statusCode || 200;",
   "if (features.length === 0) {",
-  "  node.warn(cfg.configName + ': 0 features from ArcGIS (status ' + msg._arcgisStatus + ')');",
+  "  node.status({fill: 'yellow', shape: 'ring', text: '0 features (status ' + msg._arcgisStatus + ')'});",
   "  msg._features = [];",
   "  msg._config = cfg;",
   "  return msg;",
@@ -675,7 +675,7 @@ const FN_PARSE_COT = [
   "  });",
   "}",
   "",
-  "node.warn(cfg.configName + ': ' + results.length + ' CoT events built from ' + features.length + ' features');",
+  "node.status({text: results.length + ' CoT from ' + features.length + ' features'});",
   "msg._features = results;",
   "msg._config = cfg;",
   "return msg;"
@@ -712,7 +712,7 @@ const FN_COT_TO_XML = [
   "xml += '</detail></event>\\n';",
   "",
   "msg.payload = Buffer.from(xml, 'utf8');",
-  "if (msg.payload.length > 5000) node.warn('CoT ' + a.uid + ': ' + msg.payload.length + ' bytes');",
+  "node.status({text: a.uid.substring(0, 30) + ' ' + msg.payload.length + 'B'});",
   "return msg;"
 ].join('\n');
 
@@ -795,19 +795,21 @@ function makeEngineTab(feed) {
     "  ]);",
     "}",
     "",
+    "var streamTimeSec = Math.ceil(nStream / 10) + 3;",
     "if (newUids.length > 0) {",
     "  node.send([",
     "    { topic: topicCfg, payload: {},",
     "      _missionCookie: cookie,",
     "      _missionBearer: bearer,",
     "      _putUrl: baseUrl + '/contents?creatorUid=' + creator,",
-    "      _putUids: newUids },",
+    "      _putUids: newUids,",
+    "      _delaySec: streamTimeSec },",
     "    null",
     "  ]);",
     "}",
     "",
     "if (!arcgisOk) {",
-    "  node.warn(topicCfg + ': ArcGIS fetch failed (status ' + msg._arcgisStatus + ') — skipping deletes');",
+    "  node.send([null, null, {payload: topicCfg + ': ArcGIS fetch failed (status ' + msg._arcgisStatus + ') — skipping deletes', topic: topicCfg}]);",
     "} else {",
     "  for (var uid in existing) {",
     "    if (uid.indexOf(prefix) === 0 && !arcgis[uid]) {",
@@ -825,8 +827,10 @@ function makeEngineTab(feed) {
     "  }",
     "}",
     "",
-    "node.warn(topicCfg + ' reconcile: ' + nStream + ' streamed, ' + nPut + ' PUT, ' + nDel + ' DELETE, '",
-    "  + Object.keys(arcgis).length + ' ArcGIS, ' + Object.keys(existing).length + ' in mission');",
+    "var summary = topicCfg + ' reconcile: ' + nStream + ' streamed, ' + nPut + ' PUT, ' + nDel + ' DELETE, '",
+    "  + Object.keys(arcgis).length + ' ArcGIS, ' + Object.keys(existing).length + ' in mission';",
+    "node.status({text: nStream + ' stream, ' + nPut + ' PUT, ' + nDel + ' DEL'});",
+    "node.send([null, null, {payload: summary, topic: topicCfg}]);",
     "return null;"
   ].join('\n');
 
@@ -914,7 +918,7 @@ function makeEngineTab(feed) {
         "var intervalMs = ((cfg.pollInterval || 5) * 60000);",
         "if (now - lastPoll < intervalMs) return null;",
         "flow.set('_lastPoll', now);",
-        "node.warn('Polling: " + feed.configName + "');",
+        "node.status({text: 'Polling @ ' + new Date().toLocaleTimeString()});",
         "return { payload: cfg, takSettings: tak, topic: '" + feed.configName + "' };"
       ].join('\n'),
       outputs: 1, timeout: '', noerr: 0,
@@ -974,7 +978,7 @@ function makeEngineTab(feed) {
         "  msg.headers.Authorization = 'Bearer ' + String(tak.missionBearerToken).trim();",
         "}",
         "msg.payload = '';",
-        "node.warn('Subscribing to ' + missionName + ' as ' + creatorUid);",
+        "node.status({text: 'Subscribing as ' + creatorUid});",
         "return msg;"
       ].join('\n'),
       outputs: 1, timeout: '', noerr: 0,
@@ -1055,10 +1059,10 @@ function makeEngineTab(feed) {
       id: P + 'reconcile', type: 'function', z: FID,
       name: 'Reconcile (diff)',
       func: FN_RECONCILE,
-      outputs: 2, timeout: '', noerr: 0,
+      outputs: 3, timeout: '', noerr: 0,
       initialize: '', finalize: '', libs: [],
       x: 180, y: 440,
-      wires: [[P + 'cot_to_xml', P + 'delay_put'], [P + 'delay_del']]
+      wires: [[P + 'cot_to_xml', P + 'delay_put'], [P + 'delay_del'], [P + 'debug_status']]
     },
 
     // ── CoT → XML → Rate limiter → TCP out (stream to TAK Server) ──
@@ -1104,12 +1108,18 @@ function makeEngineTab(feed) {
 
     // ── Delay → PUT new UIDs to mission ──
     {
-      id: P + 'delay_put', type: 'delay', z: FID,
-      name: 'Wait 5s for cache',
-      pauseType: 'delay', timeout: '5', timeoutUnits: 'seconds',
-      rate: '1', nbRateUnits: '1', rateUnits: 'second',
-      randomFirst: '1', randomLast: '5', randomUnits: 'seconds',
-      drop: false, allowrate: false, outputs: 1,
+      id: P + 'delay_put', type: 'function', z: FID,
+      name: 'Wait for stream cache',
+      func: [
+        "var delaySec = msg._delaySec || 5;",
+        "node.status({text: 'Waiting ' + delaySec + 's for cache'});",
+        "var n = node;",
+        "var m = msg;",
+        "setTimeout(function() { n.send(m); }, delaySec * 1000);",
+        "return null;"
+      ].join('\n'),
+      outputs: 1, timeout: '', noerr: 0,
+      initialize: '', finalize: '', libs: [],
       x: 400, y: 440, wires: [[P + 'build_put']]
     },
     {
@@ -1124,7 +1134,7 @@ function makeEngineTab(feed) {
         "if (msg._missionCookie) msg.headers.Cookie = msg._missionCookie;",
         "if (msg._missionBearer) msg.headers.Authorization = 'Bearer ' + msg._missionBearer;",
         "msg.payload = { uids: uids };",
-        "node.warn(msg.topic + ' PUT → ' + uids.length + ' UIDs');",
+        "node.status({text: 'PUT ' + uids.length + ' UIDs'});",
         "return msg;"
       ].join('\n'),
       outputs: 1, timeout: '', noerr: 0,
@@ -1161,15 +1171,24 @@ function makeEngineTab(feed) {
         "var label = feed + ' ' + method + ' → ' + code + (ok ? ' ✓' : ' ✗');",
         "if (!ok) {",
         "  var body = (typeof msg.payload === 'string') ? msg.payload.substring(0, 200) : '';",
-        "  node.warn(label + (body ? ' — ' + body : ''));",
-        "} else {",
-        "  node.warn(label);",
+        "  label += (body ? ' — ' + body : '');",
         "}",
-        "return msg;"
+        "node.status({text: method + ' → ' + code + (ok ? ' ✓' : ' ✗')});",
+        "return [null, {payload: label, topic: feed}];"
       ].join('\n'),
-      outputs: 1, timeout: '', noerr: 0,
+      outputs: 2, timeout: '', noerr: 0,
       initialize: '', finalize: '', libs: [],
-      x: 960, y: 440, wires: [[]]
+      x: 960, y: 440, wires: [[], [P + 'debug_status']]
+    },
+
+    // ── Per-tab filterable debug node ──
+    {
+      id: P + 'debug_status', type: 'debug', z: FID,
+      name: feed.configName + ' Status',
+      active: true, tosidebar: true, console: false, tostatus: true,
+      complete: 'payload', targetType: 'msg',
+      statusVal: 'payload', statusType: 'auto',
+      x: 960, y: 520, wires: []
     }
   ];
 }
