@@ -1136,7 +1136,7 @@ function makeEngineTab(feed) {
     {
       id: P + 'http_action', type: 'http request', z: FID,
       name: 'Mission API (PUT/DELETE)',
-      method: 'use', ret: 'txt', paytoqs: 'ignore',
+      method: 'use', ret: 'txt', paytoqs: 'body',
       url: '', tls: 'tls_tak', persist: false, proxy: '',
       insecureHTTPParser: false, authType: '',
       senderr: false, headers: [],
