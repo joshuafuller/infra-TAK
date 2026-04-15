@@ -1124,7 +1124,7 @@ function makeEngineTab(feed) {
         "if (msg._missionCookie) msg.headers.Cookie = msg._missionCookie;",
         "if (msg._missionBearer) msg.headers.Authorization = 'Bearer ' + msg._missionBearer;",
         "msg.payload = { uids: uids };",
-        "node.warn(msg.topic + ' PUT → ' + uids.length + ' UIDs');",
+        "node.warn(msg.topic + ' PUT → ' + uids.length + ' UIDs → ' + msg.url);",
         "return msg;"
       ].join('\n'),
       outputs: 1, timeout: '', noerr: 0,
