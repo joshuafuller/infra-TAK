@@ -434,8 +434,8 @@ const configFlows = [
   },
   {
     id: 'hi_tak_load', type: 'http in', z: CFG_TAB,
-    name: 'GET /api/tak-settings/load',
-    url: '/api/tak-settings/load', method: 'get',
+    name: 'GET /arcgis-tak/tak-settings/load',
+    url: '/arcgis-tak/tak-settings/load', method: 'get',
     upload: false, swaggerDoc: '',
     x: 220, y: 900, wires: [['fn_tak_load']]
   },
