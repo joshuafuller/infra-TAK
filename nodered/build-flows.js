@@ -500,8 +500,8 @@ const tlsNodes = [
   {
     id: 'tls_tak', type: 'tls-config',
     name: 'TAK Mission API TLS',
-    cert: '', key: '', ca: '',
-    certname: '/certs/admin.pem', keyname: '/certs/admin.key', caname: '',
+    cert: '/certs/admin.pem', key: '/certs/admin.key', ca: '',
+    certname: '', keyname: '', caname: '',
     servername: '', verifyservercert: false
   }
 ];
