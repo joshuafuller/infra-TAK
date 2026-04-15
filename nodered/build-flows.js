@@ -1214,21 +1214,25 @@ const out = path.join(__dirname, 'flows.json');
 fs.writeFileSync(out, JSON.stringify(allFlows, null, 2));
 console.log('flows.json generated  (' + allFlows.length + ' nodes, ' + FEEDS.length + ' engine tabs)  →  ' + out);
 
-// Inject engine tab template into configurator.html
-const htmlPath = path.join(__dirname, 'configurator.html');
-let htmlContent = fs.readFileSync(htmlPath, 'utf8');
-const marker = '/* __ENGINE_TAB_TEMPLATE__ */';
-const templateLine = 'var ENGINE_TAB_TEMPLATE = ' + JSON.stringify(engineTabTemplate) + ';';
-if (htmlContent.includes(marker)) {
-  htmlContent = htmlContent.replace(
-    new RegExp('var ENGINE_TAB_TEMPLATE = .*?;'),
-    templateLine
-  );
-} else {
-  htmlContent = htmlContent.replace(
-    '</script>\n</body>',
-    '\n' + marker + '\n' + templateLine + '\n</script>\n</body>'
-  );
+// Inject engine tab template into configurator.html (skip if read-only, e.g. inside Docker)
+try {
+  const htmlPath = path.join(__dirname, 'configurator.html');
+  let htmlContent = fs.readFileSync(htmlPath, 'utf8');
+  const marker = '/* __ENGINE_TAB_TEMPLATE__ */';
+  const templateLine = 'var ENGINE_TAB_TEMPLATE = ' + JSON.stringify(engineTabTemplate) + ';';
+  if (htmlContent.includes(marker)) {
+    htmlContent = htmlContent.replace(
+      new RegExp('var ENGINE_TAB_TEMPLATE = .*?;'),
+      templateLine
+    );
+  } else {
+    htmlContent = htmlContent.replace(
+      '</script>\n</body>',
+      '\n' + marker + '\n' + templateLine + '\n</script>\n</body>'
+    );
+  }
+  fs.writeFileSync(htmlPath, htmlContent);
+  console.log('Engine tab template injected into configurator.html');
+} catch(e) {
+  console.log('Skipped configurator.html template injection (' + e.code + ')');
 }
-fs.writeFileSync(htmlPath, htmlContent);
-console.log('Engine tab template injected into configurator.html');
