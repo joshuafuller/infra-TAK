@@ -20,6 +20,10 @@ fi
 echo "==> Rebuilding flows.json"
 docker cp "$SCRIPT_DIR/build-flows.js" "$CONTAINER:/tmp/build-flows.js"
 docker cp "$SCRIPT_DIR/configurator.html" "$CONTAINER:/tmp/configurator.html"
+if [ -f "$SCRIPT_DIR/icon-catalog.json" ]; then
+  docker cp "$SCRIPT_DIR/icon-catalog.json" "$CONTAINER:/data/icon-catalog.json"
+  echo "    Icon catalog: copied to /data/icon-catalog.json"
+fi
 docker exec "$CONTAINER" node /tmp/build-flows.js
 docker cp "$CONTAINER:/tmp/flows.json" "$NEW_FLOWS"
 docker cp "$CONTAINER:/tmp/template-functions.json" "/tmp/template-functions.json" 2>/dev/null || true
