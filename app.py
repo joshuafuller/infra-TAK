@@ -61,7 +61,7 @@ from functools import wraps
 import os, re, ssl, json, secrets, subprocess, time, psutil, threading, html, shutil, copy, tempfile, shlex, ipaddress
 import urllib.request
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import defaultdict, deque
 
 app = Flask(__name__)
@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.5.9-alpha"
+VERSION = "0.6.0-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -3094,7 +3094,11 @@ def _guarddog_health_url(settings):
 
 @app.route('/guarddog.js')
 def guarddog_js():
-    return send_from_directory(os.path.join(BASE_DIR, 'static'), 'guarddog.js', mimetype='application/javascript')
+    resp = send_from_directory(os.path.join(BASE_DIR, 'static'), 'guarddog.js', mimetype='application/javascript')
+    resp.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    resp.headers['Pragma'] = 'no-cache'
+    resp.headers['Expires'] = '0'
+    return resp
 
 @app.route('/firewall.js')
 def firewall_js():
@@ -4127,11 +4131,109 @@ def guarddog_activity_log():
         entries.append({'raw': raw, 'date': parsed_date.isoformat() if parsed_date else None, 'time_display': display_ts})
     return jsonify({'entries': entries, 'log_path': log_path})
 
+@app.route('/api/guarddog/diskio-history')
+@login_required
+def guarddog_diskio_history():
+    """Return disk I/O benchmark history from CSV. Optional ?hours=N (default 24)."""
+    try:
+        hours = int(request.args.get('hours', 24))
+        csv_path = '/var/lib/takguard/diskio_history.csv'
+        if not os.path.exists(csv_path):
+            return jsonify({'entries': [], 'avg_1h': None, 'avg_24h': None})
+        import csv as csv_mod
+        cutoff = datetime.utcnow() - timedelta(hours=hours)
+        entries = []
+        with open(csv_path, 'r') as f:
+            reader = csv_mod.DictReader(f)
+            for row in reader:
+                try:
+                    ts = datetime.strptime(row['timestamp'], '%Y-%m-%dT%H:%M:%SZ')
+                    if ts >= cutoff:
+                        entries.append({'t': row['timestamp'], 'v': float(row['mb_per_sec'])})
+                except (ValueError, KeyError):
+                    continue
+        now = datetime.utcnow()
+        vals_1h = [e['v'] for e in entries if (now - datetime.strptime(e['t'], '%Y-%m-%dT%H:%M:%SZ')).total_seconds() <= 3600]
+        vals_all = [e['v'] for e in entries]
+        avg_1h = round(sum(vals_1h) / len(vals_1h), 1) if vals_1h else None
+        avg_all = round(sum(vals_all) / len(vals_all), 1) if vals_all else None
+        min_val = round(min(vals_all), 1) if vals_all else None
+        max_val = round(max(vals_all), 1) if vals_all else None
+        return jsonify({'entries': entries, 'avg_1h': avg_1h, 'avg_24h': avg_all,
+                        'min': min_val, 'max': max_val, 'samples': len(entries)})
+    except Exception as e:
+        import traceback
+        return jsonify({'entries': [], 'error': f'{type(e).__name__}: {e}', 'traceback': traceback.format_exc()}), 500
+
+@app.route('/api/guarddog/diskio-report')
+@login_required
+def guarddog_diskio_report():
+    """Download disk I/O history as a CSV report with summary header."""
+    try:
+        return _guarddog_diskio_report_inner()
+    except Exception as e:
+        import traceback
+        return f'Error: {type(e).__name__}: {e}\n\n{traceback.format_exc()}', 500, {'Content-Type': 'text/plain'}
+
+def _guarddog_diskio_report_inner():
+    hours = int(request.args.get('hours', 72))
+    csv_path = '/var/lib/takguard/diskio_history.csv'
+    if not os.path.exists(csv_path):
+        return 'No disk I/O data available yet.\n', 404, {'Content-Type': 'text/plain'}
+    import csv as csv_mod
+    cutoff = datetime.utcnow() - timedelta(hours=hours)
+    entries = []
+    try:
+        with open(csv_path, 'r') as f:
+            reader = csv_mod.DictReader(f)
+            for row in reader:
+                try:
+                    ts = datetime.strptime(row['timestamp'], '%Y-%m-%dT%H:%M:%SZ')
+                    if ts >= cutoff:
+                        entries.append((row['timestamp'], float(row['mb_per_sec'])))
+                except (ValueError, KeyError):
+                    continue
+    except (OSError, PermissionError):
+        return 'Could not read history file.\n', 500, {'Content-Type': 'text/plain'}
+    if not entries:
+        return 'No data in the requested time range.\n', 404, {'Content-Type': 'text/plain'}
+    vals = [e[1] for e in entries]
+    now = datetime.utcnow()
+    vals_1h = [e[1] for e in entries if (now - datetime.strptime(e[0], '%Y-%m-%dT%H:%M:%SZ')).total_seconds() <= 3600]
+    avg_1h = round(sum(vals_1h) / len(vals_1h), 1) if vals_1h else 'N/A'
+    avg_all = round(sum(vals) / len(vals), 1)
+    hostname = subprocess.run(['hostname'], capture_output=True, text=True, timeout=5).stdout.strip()
+    server_id = 'unknown'
+    try:
+        with open('/opt/tak-guarddog/server_identifier', 'r') as f:
+            server_id = f.read().strip()
+    except Exception:
+        server_id = hostname
+    import io
+    output = io.StringIO()
+    output.write(f'# Disk I/O Performance Report\n')
+    output.write(f'# Server: {server_id}\n')
+    output.write(f'# Generated: {now.strftime("%Y-%m-%dT%H:%M:%SZ")}\n')
+    output.write(f'# Period: last {hours} hours ({len(entries)} readings)\n')
+    output.write(f'# 1h average: {avg_1h} MB/s\n')
+    output.write(f'# {hours}h average: {avg_all} MB/s\n')
+    output.write(f'# Min: {round(min(vals), 1)} MB/s | Max: {round(max(vals), 1)} MB/s\n')
+    output.write(f'#\n')
+    output.write('timestamp,mb_per_sec\n')
+    for ts, v in entries:
+        output.write(f'{ts},{v}\n')
+    csv_data = output.getvalue()
+    fn = f'diskio-report-{server_id}-{now.strftime("%Y%m%d-%H%M")}.csv'
+    return csv_data, 200, {
+        'Content-Type': 'text/csv',
+        'Content-Disposition': f'attachment; filename="{fn}"'
+    }
+
 def _guarddog_timer_list():
     """All Guard Dog timer unit names (core + optional service monitors)."""
-    return ['tak8089guard.timer', 'takoomguard.timer', 'takdiskguard.timer', 'takdbguard.timer',
-            'takcotdbguard.timer', 'taknetguard.timer', 'takprocessguard.timer', 'takcertguard.timer',
-            'takintcaguard.timer',
+    return ['tak8089guard.timer', 'takoomguard.timer', 'takdiskguard.timer', 'takdiskioguard.timer',
+            'takdbguard.timer', 'takcotdbguard.timer', 'taknetguard.timer', 'takprocessguard.timer',
+            'takcertguard.timer', 'takintcaguard.timer',
             'takauthentikguard.timer', 'takmediamtxguard.timer', 'taknoderedguard.timer', 'takcloudtakguard.timer',
             'taktakportalguard.timer', 'takfedhubguard.timer']
 
@@ -4641,7 +4743,7 @@ def run_guarddog_deploy(alert_email):
             plog(f"Two-server mode detected — DB on {s1_host}:{db_port}")
         script_files = [
             'send-alert-email.sh', 'tak-boot-sequencer.sh', 'tak-post-start.sh',
-            'tak-8089-watch.sh', 'tak-oom-watch.sh', 'tak-disk-watch.sh',
+            'tak-8089-watch.sh', 'tak-oom-watch.sh', 'tak-disk-watch.sh', 'tak-diskio-watch.sh',
             'tak-network-watch.sh', 'tak-process-watch.sh', 'tak-cert-watch.sh', 'tak-intca-watch.sh', 'tak-health-endpoint.py',
             'tak-updates-watch.sh'
         ]
@@ -4725,6 +4827,8 @@ def run_guarddog_deploy(alert_email):
             ('takoomguard.timer', '[Unit]\nDescription=Run TAK OOM guard dog every 1 minute\n\n[Timer]\nOnBootSec=20min\nOnUnitActiveSec=1min\nUnit=takoomguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ('takdiskguard.service', '[Unit]\nDescription=TAK Disk Space Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-disk-watch.sh\n'),
             ('takdiskguard.timer', '[Unit]\nDescription=Run TAK disk monitor every hour\n\n[Timer]\nOnBootSec=30min\nOnUnitActiveSec=1h\nUnit=takdiskguard.service\n\n[Install]\nWantedBy=timers.target\n'),
+            ('takdiskioguard.service', '[Unit]\nDescription=Guard Dog Disk I/O Performance Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-diskio-watch.sh\n'),
+            ('takdiskioguard.timer', '[Unit]\nDescription=Run disk I/O benchmark every 15 minutes\n\n[Timer]\nOnBootSec=10min\nOnUnitActiveSec=15min\nUnit=takdiskioguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ('taknetguard.service', '[Unit]\nDescription=TAK Network Monitor\nAfter=network.target\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-network-watch.sh\n'),
             ('taknetguard.timer', '[Unit]\nDescription=TAK Network Monitor Timer\nRequires=taknetguard.service\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=1min\nAccuracySec=30s\n\n[Install]\nWantedBy=timers.target\n'),
             ('takprocessguard.service', '[Unit]\nDescription=TAK Server Process Monitor\nAfter=network.target takserver.service\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-process-watch.sh\n'),
@@ -4840,12 +4944,35 @@ def run_guarddog_deploy(alert_email):
                     plog("✓ 4GB swap configured (memory stability)")
         except Exception as e:
             plog(f"⚠ Swap setup skipped: {e}")
+        # Low swappiness: only use swap when RAM is actually exhausted.
+        # Default 60 aggressively swaps out processes even with tons of free RAM,
+        # causing severe performance issues on VPS with mediocre disk I/O.
+        try:
+            cur = subprocess.run(['sysctl', '-n', 'vm.swappiness'], capture_output=True, text=True, timeout=5)
+            if cur.returncode == 0 and cur.stdout.strip() != '10':
+                subprocess.run(['sysctl', '-w', 'vm.swappiness=10'], capture_output=True, timeout=5)
+                sysctl_conf = '/etc/sysctl.conf'
+                with open(sysctl_conf, 'r') as f:
+                    content = f.read()
+                if 'vm.swappiness' in content:
+                    lines = content.split('\n')
+                    lines = [('vm.swappiness=10' if l.strip().startswith('vm.swappiness') else l) for l in lines]
+                    with open(sysctl_conf, 'w') as f:
+                        f.write('\n'.join(lines))
+                else:
+                    with open(sysctl_conf, 'a') as f:
+                        f.write('\nvm.swappiness=10\n')
+                plog("✓ vm.swappiness set to 10 (swap only when RAM exhausted)")
+            else:
+                plog("✓ vm.swappiness already 10")
+        except Exception as e:
+            plog(f"⚠ Swappiness tuning skipped: {e}")
         r = subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, text=True, timeout=60)
         if r.returncode != 0:
             plog(f"✗ daemon-reload failed: {r.stderr}")
             guarddog_deploy_status.update({'running': False, 'error': True})
             return
-        timers = ['tak8089guard.timer', 'takoomguard.timer', 'takdiskguard.timer',
+        timers = ['tak8089guard.timer', 'takoomguard.timer', 'takdiskguard.timer', 'takdiskioguard.timer',
                   'taknetguard.timer', 'takprocessguard.timer', 'takcertguard.timer', 'takintcaguard.timer']
         if is_two_server and s1_host:
             timers.append('takremotedbguard.timer')
@@ -13027,6 +13154,10 @@ def run_email_deploy(provider_key, smtp_user, smtp_pass, from_addr, from_name):
         plog(f"📧 Step 1/5 — Installing Postfix...")
         if pkg_mgr == 'apt':
             wait_for_apt_lock(plog, log)
+            subprocess.run(
+                'echo "postfix postfix/mailname string $(hostname -f)" | debconf-set-selections && '
+                'echo "postfix postfix/main_mailer_type string Internet Site" | debconf-set-selections',
+                shell=True, capture_output=True, timeout=30)
             r = subprocess.run(
                 'DEBIAN_FRONTEND=noninteractive apt-get install -y postfix libsasl2-modules 2>&1',
                 shell=True, capture_output=True, text=True, timeout=300)
@@ -15034,6 +15165,11 @@ def _run_nodered_deploy_remote(settings, deploy_cfg, plog):
     default: {
       module: 'localfilesystem'
     }
+  },
+  editorTheme: {
+    header: {
+      title: 'infra-TAK Node-RED  —  <a href="/configurator" target="_blank" style="color:#2ec4b6;text-decoration:underline">Open Configurator</a>'
+    }
   }
 };
 """
@@ -15145,6 +15281,11 @@ def run_nodered_deploy():
   contextStorage: {
     default: {
       module: 'localfilesystem'
+    }
+  },
+  editorTheme: {
+    header: {
+      title: 'infra-TAK Node-RED  —  <a href="/configurator" target="_blank" style="color:#2ec4b6;text-decoration:underline">Open Configurator</a>'
     }
   }
 };
@@ -15523,6 +15664,37 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     <p style="margin-top:14px;font-size:12px;color:var(--text-dim)">Health endpoint (for Uptime Robot): <code style="color:var(--cyan);word-break:break-all">{{ health_url }}</code></p>
     <p style="margin-top:10px;font-size:12px;color:var(--text-dim)"><a href="{{ guarddog_docs_url }}" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);text-decoration:none;font-weight:500">How Guard Dog works</a> (delays, soft start, restart-loop protection) → docs</p>
     
+  </div>
+
+  <div class="card" id="gd-diskio-card">
+    <div class="card-title" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+      <span>Disk I/O Performance</span>
+      <div style="display:flex;align-items:center;gap:8px">
+        <select id="gd-dio-range-sel" class="form-input" style="width:auto;min-width:100px;padding:4px 8px;font-size:11px" onchange="gdRefreshDiskIO()">
+          <option value="24">Last 24 hours</option>
+          <option value="72" selected>Last 3 days</option>
+          <option value="120">Last 5 days</option>
+          <option value="168">Last 7 days</option>
+          <option value="720">Last 30 days</option>
+        </select>
+        <button id="gd-dio-refresh-btn" class="btn btn-ghost" style="padding:4px 12px;font-size:11px" onclick="gdRefreshDiskIO()">Refresh</button>
+      </div>
+    </div>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:14px">Benchmarked every 15 minutes. Alerts if the last-hour average drops below 50 MB/s or falls 70%+ from the 24h average (noisy neighbor detection).</p>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px;margin-bottom:16px">
+      <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">Current</div><span id="gd-dio-current" style="font-weight:600;font-size:14px">—</span></div>
+      <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">1h avg</div><span id="gd-dio-1h" style="font-weight:600;font-size:14px">—</span></div>
+      <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">24h avg</div><span id="gd-dio-24h" style="font-weight:600;font-size:14px">—</span></div>
+      <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">Min / Max</div><span id="gd-dio-range" style="font-weight:600;font-size:14px">—</span></div>
+    </div>
+    <div style="display:flex;gap:8px;margin-bottom:16px;align-items:center">
+      <button class="btn btn-ghost" style="padding:6px 14px;font-size:11px" onclick="gdDownloadDiskIOReport()">Download CSV report</button>
+      <span id="gd-dio-dl-msg" style="font-size:11px;color:var(--text-dim)"></span>
+    </div>
+    <div style="position:relative;height:120px;background:var(--bg-deep);border:1px solid var(--border);border-radius:8px;overflow:hidden">
+      <canvas id="gd-dio-chart" style="width:100%;height:100%"></canvas>
+      <div id="gd-dio-empty" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:12px;color:var(--text-dim)">No data yet — first sample in ~15 min after Guard Dog deploy</div>
+    </div>
   </div>
   {% endif %}
 
@@ -28570,10 +28742,66 @@ def _post_update_auto_deploy():
                         else:
                             print("Post-update: Node-RED port binding already secure")
                         _nodered_malware_scan()
+                        _auto_nodered_settings(nr_dir)
+                        _auto_nodered_flows()
                     except Exception as e:
                         print(f"Post-update: Node-RED port hardening error: {e}")
                     finally:
                         _auto_deploy_active.pop('nodered', None)
+
+            def _auto_nodered_settings(nr_dir):
+                """Ensure Node-RED settings.js has editorTheme with Configurator link."""
+                settings_path = os.path.join(nr_dir, 'settings.js')
+                if not os.path.exists(settings_path):
+                    return
+                try:
+                    with open(settings_path) as f:
+                        content = f.read()
+                    if 'editorTheme' not in content:
+                        print("Post-update: adding editorTheme to Node-RED settings.js")
+                        new_content = content.replace(
+                            '};',
+                            """,
+  editorTheme: {
+    header: {
+      title: 'infra-TAK Node-RED  —  <a href="/configurator" target="_blank" style="color:#2ec4b6;text-decoration:underline">Open Configurator</a>'
+    }
+  }
+};""",
+                            1
+                        )
+                        with open(settings_path, 'w') as f:
+                            f.write(new_content)
+                        subprocess.run('docker restart nodered', shell=True, capture_output=True, timeout=60)
+                        print("Post-update: Node-RED settings.js updated and restarted")
+                except Exception as e:
+                    print(f"Post-update: Node-RED settings.js update error: {e}")
+
+            def _auto_nodered_flows():
+                """Sync infra-TAK flows into Node-RED container (merge, preserve user flows + dynamic engine tabs + credentials)."""
+                deploy_sh = os.path.join(BASE_DIR, 'nodered', 'deploy.sh')
+                if not os.path.exists(deploy_sh):
+                    return
+                r = subprocess.run('docker ps -q --filter name=nodered', shell=True,
+                    capture_output=True, text=True, timeout=5)
+                if not (r.stdout or '').strip():
+                    print("Post-update: Node-RED container not running — skipping flow sync")
+                    return
+                try:
+                    print("Post-update: syncing infra-TAK flows into Node-RED (merge)")
+                    result = subprocess.run(f'bash {shlex.quote(deploy_sh)} --no-pull',
+                        shell=True, capture_output=True, text=True, timeout=180,
+                        cwd=BASE_DIR)
+                    for line in (result.stdout or '').strip().splitlines():
+                        print(f"  nodered-deploy: {line}")
+                    if result.returncode == 0:
+                        print("Post-update: Node-RED flows synced successfully")
+                    else:
+                        print(f"Post-update: Node-RED flow sync returned {result.returncode}")
+                        for line in (result.stderr or '').strip().splitlines():
+                            print(f"  nodered-deploy-err: {line}")
+                except Exception as e:
+                    print(f"Post-update: Node-RED flow sync error: {e}")
 
             def _nodered_malware_scan():
                 try:
