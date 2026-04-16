@@ -4127,11 +4127,44 @@ def guarddog_activity_log():
         entries.append({'raw': raw, 'date': parsed_date.isoformat() if parsed_date else None, 'time_display': display_ts})
     return jsonify({'entries': entries, 'log_path': log_path})
 
+@app.route('/api/guarddog/diskio-history')
+@login_required
+def guarddog_diskio_history():
+    """Return disk I/O benchmark history from CSV. Optional ?hours=N (default 24)."""
+    hours = int(request.args.get('hours', 24))
+    csv_path = '/var/lib/takguard/diskio_history.csv'
+    if not os.path.exists(csv_path):
+        return jsonify({'entries': [], 'avg_1h': None, 'avg_24h': None})
+    import csv as csv_mod
+    cutoff = datetime.utcnow() - timedelta(hours=hours)
+    entries = []
+    try:
+        with open(csv_path, 'r') as f:
+            reader = csv_mod.DictReader(f)
+            for row in reader:
+                try:
+                    ts = datetime.strptime(row['timestamp'], '%Y-%m-%dT%H:%M:%SZ')
+                    if ts >= cutoff:
+                        entries.append({'t': row['timestamp'], 'v': float(row['mb_per_sec'])})
+                except (ValueError, KeyError):
+                    continue
+    except (OSError, PermissionError):
+        return jsonify({'entries': [], 'error': 'Could not read history file'})
+    now = datetime.utcnow()
+    vals_1h = [e['v'] for e in entries if (now - datetime.strptime(e['t'], '%Y-%m-%dT%H:%M:%SZ')).total_seconds() <= 3600]
+    vals_all = [e['v'] for e in entries]
+    avg_1h = round(sum(vals_1h) / len(vals_1h), 1) if vals_1h else None
+    avg_all = round(sum(vals_all) / len(vals_all), 1) if vals_all else None
+    min_val = round(min(vals_all), 1) if vals_all else None
+    max_val = round(max(vals_all), 1) if vals_all else None
+    return jsonify({'entries': entries, 'avg_1h': avg_1h, 'avg_24h': avg_all,
+                    'min': min_val, 'max': max_val, 'samples': len(entries)})
+
 def _guarddog_timer_list():
     """All Guard Dog timer unit names (core + optional service monitors)."""
-    return ['tak8089guard.timer', 'takoomguard.timer', 'takdiskguard.timer', 'takdbguard.timer',
-            'takcotdbguard.timer', 'taknetguard.timer', 'takprocessguard.timer', 'takcertguard.timer',
-            'takintcaguard.timer',
+    return ['tak8089guard.timer', 'takoomguard.timer', 'takdiskguard.timer', 'takdiskioguard.timer',
+            'takdbguard.timer', 'takcotdbguard.timer', 'taknetguard.timer', 'takprocessguard.timer',
+            'takcertguard.timer', 'takintcaguard.timer',
             'takauthentikguard.timer', 'takmediamtxguard.timer', 'taknoderedguard.timer', 'takcloudtakguard.timer',
             'taktakportalguard.timer', 'takfedhubguard.timer']
 
@@ -4641,7 +4674,7 @@ def run_guarddog_deploy(alert_email):
             plog(f"Two-server mode detected — DB on {s1_host}:{db_port}")
         script_files = [
             'send-alert-email.sh', 'tak-boot-sequencer.sh', 'tak-post-start.sh',
-            'tak-8089-watch.sh', 'tak-oom-watch.sh', 'tak-disk-watch.sh',
+            'tak-8089-watch.sh', 'tak-oom-watch.sh', 'tak-disk-watch.sh', 'tak-diskio-watch.sh',
             'tak-network-watch.sh', 'tak-process-watch.sh', 'tak-cert-watch.sh', 'tak-intca-watch.sh', 'tak-health-endpoint.py',
             'tak-updates-watch.sh'
         ]
@@ -4725,6 +4758,8 @@ def run_guarddog_deploy(alert_email):
             ('takoomguard.timer', '[Unit]\nDescription=Run TAK OOM guard dog every 1 minute\n\n[Timer]\nOnBootSec=20min\nOnUnitActiveSec=1min\nUnit=takoomguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ('takdiskguard.service', '[Unit]\nDescription=TAK Disk Space Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-disk-watch.sh\n'),
             ('takdiskguard.timer', '[Unit]\nDescription=Run TAK disk monitor every hour\n\n[Timer]\nOnBootSec=30min\nOnUnitActiveSec=1h\nUnit=takdiskguard.service\n\n[Install]\nWantedBy=timers.target\n'),
+            ('takdiskioguard.service', '[Unit]\nDescription=Guard Dog Disk I/O Performance Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-diskio-watch.sh\n'),
+            ('takdiskioguard.timer', '[Unit]\nDescription=Run disk I/O benchmark every 15 minutes\n\n[Timer]\nOnBootSec=10min\nOnUnitActiveSec=15min\nUnit=takdiskioguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ('taknetguard.service', '[Unit]\nDescription=TAK Network Monitor\nAfter=network.target\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-network-watch.sh\n'),
             ('taknetguard.timer', '[Unit]\nDescription=TAK Network Monitor Timer\nRequires=taknetguard.service\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=1min\nAccuracySec=30s\n\n[Install]\nWantedBy=timers.target\n'),
             ('takprocessguard.service', '[Unit]\nDescription=TAK Server Process Monitor\nAfter=network.target takserver.service\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-process-watch.sh\n'),
@@ -15560,6 +15595,25 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     <p style="margin-top:14px;font-size:12px;color:var(--text-dim)">Health endpoint (for Uptime Robot): <code style="color:var(--cyan);word-break:break-all">{{ health_url }}</code></p>
     <p style="margin-top:10px;font-size:12px;color:var(--text-dim)"><a href="{{ guarddog_docs_url }}" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);text-decoration:none;font-weight:500">How Guard Dog works</a> (delays, soft start, restart-loop protection) → docs</p>
     
+  </div>
+
+  <div class="card" id="gd-diskio-card">
+    <div class="card-title" style="display:flex;align-items:center;justify-content:space-between">
+      <span>Disk I/O Performance</span>
+      <button class="btn btn-ghost" style="padding:4px 12px;font-size:11px" onclick="gdRefreshDiskIO()">Refresh</button>
+    </div>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:14px">Benchmarked every 15 minutes. Alerts if the last-hour average drops below 50 MB/s or falls 70%+ from the 24h average (noisy neighbor detection).</p>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px;margin-bottom:16px">
+      <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">Current</div><span id="gd-dio-current" style="font-weight:600;font-size:14px">—</span></div>
+      <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">1h avg</div><span id="gd-dio-1h" style="font-weight:600;font-size:14px">—</span></div>
+      <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">24h avg</div><span id="gd-dio-24h" style="font-weight:600;font-size:14px">—</span></div>
+      <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">Min / Max</div><span id="gd-dio-range" style="font-weight:600;font-size:14px">—</span></div>
+      <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">Samples</div><span id="gd-dio-samples" style="font-weight:600;font-size:14px">—</span></div>
+    </div>
+    <div style="position:relative;height:120px;background:var(--bg-deep);border:1px solid var(--border);border-radius:8px;overflow:hidden">
+      <canvas id="gd-dio-chart" style="width:100%;height:100%"></canvas>
+      <div id="gd-dio-empty" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:12px;color:var(--text-dim)">No data yet — first sample in ~15 min after Guard Dog deploy</div>
+    </div>
   </div>
   {% endif %}
 

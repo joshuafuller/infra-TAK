@@ -988,6 +988,7 @@ function makeEngineTab(feed) {
     {
       id: P + 'build_q', type: 'function', z: FID,
       name: 'Build ArcGIS query',
+      _templateKey: 'arcgis.build_query',
       func: FN_BUILD_QUERY,
       outputs: 1, timeout: '', noerr: 0,
       initialize: '', finalize: '', libs: [],
@@ -1007,6 +1008,7 @@ function makeEngineTab(feed) {
     {
       id: P + 'parse', type: 'function', z: FID,
       name: 'Parse & build CoT',
+      _templateKey: 'arcgis.parse_cot',
       func: FN_PARSE_COT,
       outputs: 1, timeout: '', noerr: 0,
       initialize: '', finalize: '', libs: [],
@@ -1017,6 +1019,7 @@ function makeEngineTab(feed) {
     {
       id: P + 'build_sub', type: 'function', z: FID,
       name: 'Build subscribe URL',
+      _templateKey: 'shared.build_sub',
       func: [
         "var tak = msg.takSettings;",
         "var cfg = msg._config;",
@@ -1065,6 +1068,7 @@ function makeEngineTab(feed) {
     {
       id: P + 'build_m', type: 'function', z: FID,
       name: 'Build mission GET URL',
+      _templateKey: 'shared.build_m',
       func: [
         "var tak = msg.takSettings;",
         "var cfg = msg._config;",
@@ -1116,6 +1120,7 @@ function makeEngineTab(feed) {
     {
       id: P + 'reconcile', type: 'function', z: FID,
       name: 'Reconcile (diff)',
+      _templateKey: 'arcgis.reconcile',
       func: FN_RECONCILE,
       outputs: 2, timeout: '', noerr: 0,
       initialize: '', finalize: '', libs: [],
@@ -1127,6 +1132,7 @@ function makeEngineTab(feed) {
     {
       id: P + 'cot_to_xml', type: 'function', z: FID,
       name: 'CoT JSON -> XML',
+      _templateKey: 'shared.cot_to_xml',
       func: FN_COT_TO_XML,
       outputs: 1, timeout: '', noerr: 0,
       initialize: '', finalize: '', libs: [],
@@ -1177,6 +1183,7 @@ function makeEngineTab(feed) {
     {
       id: P + 'build_put', type: 'function', z: FID,
       name: 'Build PUT UIDs',
+      _templateKey: 'shared.build_put',
       func: [
         "var uids = msg._putUids || [];",
         "if (!msg._putUrl || uids.length === 0) return null;",
@@ -1215,6 +1222,7 @@ function makeEngineTab(feed) {
     {
       id: P + 'log_action', type: 'function', z: FID,
       name: 'Log API result',
+      _templateKey: 'shared.log_action',
       func: [
         "var code = msg.statusCode || '?';",
         "var method = msg.method || '?';",
@@ -1768,6 +1776,7 @@ function makeTfrEngineTab(feed) {
     {
       id: P + 'filter', type: 'function', z: FID,
       name: 'Filter & split TFRs',
+      _templateKey: 'tfr.filter_split',
       func: FN_TFR_FILTER_SPLIT,
       outputs: 1, timeout: '', noerr: 0,
       initialize: '', finalize: '', libs: [],
@@ -1798,6 +1807,7 @@ function makeTfrEngineTab(feed) {
     {
       id: P + 'build_cot', type: 'function', z: FID,
       name: 'Build TFR CoT',
+      _templateKey: 'tfr.build_cot',
       func: FN_TFR_PARSE_BUILD_COT,
       outputs: 1, timeout: '', noerr: 0,
       initialize: '', finalize: '', libs: [],
@@ -1808,6 +1818,7 @@ function makeTfrEngineTab(feed) {
     {
       id: P + 'cot_to_xml', type: 'function', z: FID,
       name: 'CoT JSON -> XML',
+      _templateKey: 'shared.cot_to_xml',
       func: FN_COT_TO_XML,
       outputs: 1, timeout: '', noerr: 0,
       initialize: '', finalize: '', libs: [],
@@ -1881,6 +1892,7 @@ function makeTfrEngineTab(feed) {
     {
       id: P + 'build_sub', type: 'function', z: FID,
       name: 'Build subscribe URL',
+      _templateKey: 'shared.build_sub',
       func: FN_SUB,
       outputs: 1, timeout: '', noerr: 0,
       initialize: '', finalize: '', libs: [],
@@ -1907,6 +1919,7 @@ function makeTfrEngineTab(feed) {
     {
       id: P + 'build_m', type: 'function', z: FID,
       name: 'Build mission GET URL',
+      _templateKey: 'shared.build_m',
       func: FN_GET_MISSION,
       outputs: 1, timeout: '', noerr: 0,
       initialize: '', finalize: '', libs: [],
@@ -1924,6 +1937,7 @@ function makeTfrEngineTab(feed) {
     {
       id: P + 'reconcile', type: 'function', z: FID,
       name: 'TFR Reconcile (diff)',
+      _templateKey: 'tfr.reconcile',
       func: FN_TFR_RECONCILE,
       outputs: 2, timeout: '', noerr: 0,
       initialize: '', finalize: '', libs: [],
@@ -1944,6 +1958,7 @@ function makeTfrEngineTab(feed) {
     {
       id: P + 'build_put', type: 'function', z: FID,
       name: 'Build PUT UIDs',
+      _templateKey: 'shared.build_put',
       func: [
         "var uids = msg._putUids || [];",
         "if (!msg._putUrl || uids.length === 0) return null;",
@@ -1980,6 +1995,7 @@ function makeTfrEngineTab(feed) {
     {
       id: P + 'log_action', type: 'function', z: FID,
       name: 'Log API result',
+      _templateKey: 'shared.log_action',
       func: [
         "var code = msg.statusCode || '?';",
         "var method = msg.method || '?';",

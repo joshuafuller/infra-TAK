@@ -94,6 +94,54 @@ docker exec "$CONTAINER" node -e "
     }
   });
 
+  // --- Template function sync: update func code in dynamic engine tabs ---
+  var funcTemplates = {};
+  upd.forEach(function(n) {
+    if (n.type === 'function' && n._templateKey) {
+      funcTemplates[n._templateKey] = n.func;
+    }
+  });
+
+  // Migration: detect engine tab types for old nodes without _templateKey
+  var tabTypes = {};
+  preserved.forEach(function(n) {
+    if (!n.z) return;
+    if (n.name === 'Filter & split TFRs' || n.name === 'TFR Reconcile (diff)' || n.name === 'Build TFR CoT') tabTypes[n.z] = 'tfr';
+    if (n.name === 'Build ArcGIS query' || n.name === 'Parse & build CoT') tabTypes[n.z] = 'arcgis';
+  });
+
+  var nameToKey = {
+    'Build ArcGIS query': { arcgis: 'arcgis.build_query' },
+    'Parse & build CoT': { arcgis: 'arcgis.parse_cot' },
+    'Reconcile (diff)': { arcgis: 'arcgis.reconcile' },
+    'Filter & split TFRs': { tfr: 'tfr.filter_split' },
+    'Build TFR CoT': { tfr: 'tfr.build_cot' },
+    'TFR Reconcile (diff)': { tfr: 'tfr.reconcile' },
+    'Build subscribe URL': { arcgis: 'shared.build_sub', tfr: 'shared.build_sub' },
+    'Build mission GET URL': { arcgis: 'shared.build_m', tfr: 'shared.build_m' },
+    'CoT JSON -> XML': { arcgis: 'shared.cot_to_xml', tfr: 'shared.cot_to_xml' },
+    'Build PUT UIDs': { arcgis: 'shared.build_put', tfr: 'shared.build_put' },
+    'Log API result': { arcgis: 'shared.log_action', tfr: 'shared.log_action' }
+  };
+
+  var nSync = 0;
+  preserved.forEach(function(n) {
+    if (n.type !== 'function') return;
+    var key = n._templateKey;
+    if (!key && n.name && nameToKey[n.name] && n.z) {
+      var tt = tabTypes[n.z];
+      if (tt && nameToKey[n.name][tt]) {
+        key = nameToKey[n.name][tt];
+        n._templateKey = key;
+      }
+    }
+    if (key && funcTemplates[key] && n.func !== funcTemplates[key]) {
+      n.func = funcTemplates[key];
+      nSync++;
+    }
+  });
+  console.log('    Synced ' + nSync + ' function nodes in dynamic engine tabs');
+
   // Merge: new infra-TAK nodes + preserved existing nodes
   var merged = upd.concat(preserved);
   fs.writeFileSync('/tmp/flows_merged.json', JSON.stringify(merged, null, 2));

@@ -40,3 +40,84 @@ if (document.getElementById('gd-fw-rules')) gdFirewallRefresh();
 if (document.querySelector('.guard-service-row')){gdRefreshHealth();gdRefreshMonitorHealth();setInterval(gdRefreshHealth,30000);setInterval(gdRefreshMonitorHealth,30000);}
 if (document.getElementById('gd-sms-provider')) gdSmsProviderChange();
 if (document.getElementById('gd-sms-br-sender')) gdSenderCheck();
+
+function gdRefreshDiskIO(){
+  var card=document.getElementById('gd-diskio-card');if(!card)return;
+  fetch('/api/guarddog/diskio-history?hours=24',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    var cur=document.getElementById('gd-dio-current');
+    var h1=document.getElementById('gd-dio-1h');
+    var h24=document.getElementById('gd-dio-24h');
+    var rng=document.getElementById('gd-dio-range');
+    var samp=document.getElementById('gd-dio-samples');
+    var empty=document.getElementById('gd-dio-empty');
+    if(!d.entries||d.entries.length===0){if(empty)empty.style.display='flex';return;}
+    if(empty)empty.style.display='none';
+    var last=d.entries[d.entries.length-1].v;
+    if(cur){cur.textContent=last+' MB/s';cur.style.color=last<50?'var(--red)':last<100?'var(--yellow)':'var(--green)';}
+    if(h1){h1.textContent=d.avg_1h!==null?d.avg_1h+' MB/s':'—';if(d.avg_1h!==null)h1.style.color=d.avg_1h<50?'var(--red)':d.avg_1h<100?'var(--yellow)':'var(--green)';}
+    if(h24){h24.textContent=d.avg_24h!==null?d.avg_24h+' MB/s':'—';if(d.avg_24h!==null)h24.style.color=d.avg_24h<50?'var(--red)':d.avg_24h<100?'var(--yellow)':'var(--green)';}
+    if(rng)rng.textContent=(d.min!==null?d.min:'—')+' / '+(d.max!==null?d.max:'—')+' MB/s';
+    if(samp)samp.textContent=d.samples;
+    gdDrawDiskIOChart(d.entries);
+  }).catch(function(){});
+}
+function gdDrawDiskIOChart(entries){
+  var canvas=document.getElementById('gd-dio-chart');if(!canvas||!canvas.getContext)return;
+  var ctx=canvas.getContext('2d');
+  var dpr=window.devicePixelRatio||1;
+  canvas.width=canvas.offsetWidth*dpr;canvas.height=canvas.offsetHeight*dpr;
+  ctx.scale(dpr,dpr);
+  var w=canvas.offsetWidth,h=canvas.offsetHeight;
+  ctx.clearRect(0,0,w,h);
+  if(entries.length<2)return;
+  var vals=entries.map(function(e){return e.v;});
+  var maxV=Math.max.apply(null,vals);var minV=Math.min.apply(null,vals);
+  var range=maxV-minV||1;
+  var pad={t:8,b:18,l:4,r:4};
+  var cw=w-pad.l-pad.r,ch=h-pad.t-pad.b;
+  // Warning threshold line at 50 MB/s
+  if(maxV>50){
+    var yWarn=pad.t+ch-(50-minV)/range*ch;
+    ctx.strokeStyle='rgba(239,68,68,0.3)';ctx.lineWidth=1;ctx.setLineDash([4,4]);
+    ctx.beginPath();ctx.moveTo(pad.l,yWarn);ctx.lineTo(w-pad.r,yWarn);ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle='rgba(239,68,68,0.5)';ctx.font='9px JetBrains Mono,monospace';
+    ctx.fillText('50 MB/s',pad.l+2,yWarn-3);
+  }
+  // Gradient fill
+  var grad=ctx.createLinearGradient(0,pad.t,0,h-pad.b);
+  grad.addColorStop(0,'rgba(6,182,212,0.25)');grad.addColorStop(1,'rgba(6,182,212,0.02)');
+  ctx.beginPath();
+  for(var i=0;i<vals.length;i++){
+    var x=pad.l+(i/(vals.length-1))*cw;
+    var y=pad.t+ch-(vals[i]-minV)/range*ch;
+    if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);
+  }
+  ctx.lineTo(pad.l+cw,h-pad.b);ctx.lineTo(pad.l,h-pad.b);ctx.closePath();
+  ctx.fillStyle=grad;ctx.fill();
+  // Line
+  ctx.beginPath();
+  for(var i=0;i<vals.length;i++){
+    var x=pad.l+(i/(vals.length-1))*cw;
+    var y=pad.t+ch-(vals[i]-minV)/range*ch;
+    if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);
+  }
+  ctx.strokeStyle='#06b6d4';ctx.lineWidth=1.5;ctx.stroke();
+  // Dots for low values
+  for(var i=0;i<vals.length;i++){
+    if(vals[i]<50){
+      var x=pad.l+(i/(vals.length-1))*cw;
+      var y=pad.t+ch-(vals[i]-minV)/range*ch;
+      ctx.beginPath();ctx.arc(x,y,3,0,Math.PI*2);ctx.fillStyle='var(--red)';ctx.fill();
+    }
+  }
+  // Time labels
+  ctx.fillStyle='rgba(148,163,184,0.6)';ctx.font='9px JetBrains Mono,monospace';
+  if(entries.length>0){
+    var first=entries[0].t.replace('T',' ').replace('Z','').slice(11,16);
+    var last=entries[entries.length-1].t.replace('T',' ').replace('Z','').slice(11,16);
+    ctx.textAlign='left';ctx.fillText(first,pad.l,h-3);
+    ctx.textAlign='right';ctx.fillText(last,w-pad.r,h-3);
+  }
+}
+if(document.getElementById('gd-diskio-card')){gdRefreshDiskIO();setInterval(gdRefreshDiskIO,300000);}
