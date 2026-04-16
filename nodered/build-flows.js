@@ -1272,17 +1272,19 @@ const FN_TFR_FILTER_SPLIT = [
   "flow.set('_tfrUids', []);",
   "flow.set('_tfrCount', filtered.length);",
   "flow.set('_tfrDone', 0);",
+  "",
+  "// Build output arrays: output1 = per-TFR XML fetches, output2 = reconcile trigger",
+  "var out1 = [];",
   "for (var i = 0; i < filtered.length; i++) {",
-  "  node.send([{ url: filtered[i].url, method: 'GET',",
+  "  out1.push({ url: filtered[i].url, method: 'GET',",
   "    _tfrMeta: filtered[i], _config: cfg, takSettings: msg.takSettings,",
-  "    topic: cfg.configName }, null]);",
+  "    topic: cfg.configName });",
   "}",
-  "if (filtered.length > 0) {",
-  "  node.send([null, {",
-  "    _config: cfg, takSettings: msg.takSettings, topic: cfg.configName",
-  "  }]);",
-  "}",
-  "return null;"
+  "var out2 = filtered.length > 0 ? {",
+  "  _config: cfg, takSettings: msg.takSettings, topic: cfg.configName",
+  "} : null;",
+  "node.warn(cfg.configName + ': sending ' + out1.length + ' to output1, reconcile trigger: ' + (out2 ? 'yes' : 'no'));",
+  "return [out1, out2];"
 ].join('\n');
 
 const FN_TFR_PARSE_BUILD_COT = [
