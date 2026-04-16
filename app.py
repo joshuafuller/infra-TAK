@@ -15677,7 +15677,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
           <option value="168">Last 7 days</option>
           <option value="720">Last 30 days</option>
         </select>
-        <button class="btn btn-ghost" style="padding:4px 12px;font-size:11px" onclick="gdRefreshDiskIO()">Refresh</button>
+        <button id="gd-dio-refresh-btn" class="btn btn-ghost" style="padding:4px 12px;font-size:11px" onclick="gdRefreshDiskIO()">Refresh</button>
       </div>
     </div>
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:14px">Benchmarked every 15 minutes. Alerts if the last-hour average drops below 50 MB/s or falls 70%+ from the 24h average (noisy neighbor detection).</p>

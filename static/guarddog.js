@@ -46,6 +46,8 @@ function gdRefreshDiskIO(){
   var sel=document.getElementById('gd-dio-range-sel');
   var hours=sel?sel.value:'72';
   var empty=document.getElementById('gd-dio-empty');
+  var rbtn=document.getElementById('gd-dio-refresh-btn');
+  if(rbtn){rbtn.textContent='Refreshing…';rbtn.disabled=true;}
   fetch('/api/guarddog/diskio-history?hours='+hours,{credentials:'same-origin'}).then(function(r){
     if(!r.ok){return r.json().then(function(err){var msg=err.error||('HTTP '+r.status);if(empty){empty.style.display='flex';empty.textContent=msg;}console.error('diskio API',msg,err.traceback||'');return Promise.reject(msg);}).catch(function(){if(empty){empty.style.display='flex';empty.textContent='API error ('+r.status+')';}return Promise.reject('status '+r.status);});}
     var ct=r.headers.get('content-type')||'';
@@ -65,7 +67,8 @@ function gdRefreshDiskIO(){
     if(h24){h24.textContent=d.avg_24h!==null?d.avg_24h+' MB/s':'—';if(d.avg_24h!==null)h24.style.color=d.avg_24h<50?'var(--red)':d.avg_24h<100?'var(--yellow)':'var(--green)';}
     if(rng)rng.textContent=(d.min!==null?d.min:'—')+' / '+(d.max!==null?d.max:'—')+' MB/s';
     gdDrawDiskIOChart(d.entries);
-  }).catch(function(e){console.error('diskio fetch error',e);});
+    if(rbtn){rbtn.textContent='✓ Updated';setTimeout(function(){rbtn.textContent='Refresh';rbtn.disabled=false;},1200);}
+  }).catch(function(e){console.error('diskio fetch error',e);if(rbtn){rbtn.textContent='Refresh';rbtn.disabled=false;}});
 }
 function gdDrawDiskIOChart(entries){
   var canvas=document.getElementById('gd-dio-chart');if(!canvas||!canvas.getContext)return;
