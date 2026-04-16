@@ -47,7 +47,7 @@ function gdRefreshDiskIO(){
   var hours=sel?sel.value:'72';
   var empty=document.getElementById('gd-dio-empty');
   fetch('/api/guarddog/diskio-history?hours='+hours,{credentials:'same-origin'}).then(function(r){
-    if(!r.ok){if(empty)empty.textContent='API error ('+r.status+')';return Promise.reject('status '+r.status);}
+    if(!r.ok){return r.json().then(function(err){var msg=err.error||('HTTP '+r.status);if(empty){empty.style.display='flex';empty.textContent=msg;}console.error('diskio API',msg,err.traceback||'');return Promise.reject(msg);}).catch(function(){if(empty){empty.style.display='flex';empty.textContent='API error ('+r.status+')';}return Promise.reject('status '+r.status);});}
     var ct=r.headers.get('content-type')||'';
     if(ct.indexOf('json')<0){if(empty)empty.textContent='Auth redirect — reload page';return Promise.reject('not json');}
     return r.json();

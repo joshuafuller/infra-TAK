@@ -4135,14 +4135,14 @@ def guarddog_activity_log():
 @login_required
 def guarddog_diskio_history():
     """Return disk I/O benchmark history from CSV. Optional ?hours=N (default 24)."""
-    hours = int(request.args.get('hours', 24))
-    csv_path = '/var/lib/takguard/diskio_history.csv'
-    if not os.path.exists(csv_path):
-        return jsonify({'entries': [], 'avg_1h': None, 'avg_24h': None})
-    import csv as csv_mod
-    cutoff = datetime.utcnow() - timedelta(hours=hours)
-    entries = []
     try:
+        hours = int(request.args.get('hours', 24))
+        csv_path = '/var/lib/takguard/diskio_history.csv'
+        if not os.path.exists(csv_path):
+            return jsonify({'entries': [], 'avg_1h': None, 'avg_24h': None})
+        import csv as csv_mod
+        cutoff = datetime.utcnow() - timedelta(hours=hours)
+        entries = []
         with open(csv_path, 'r') as f:
             reader = csv_mod.DictReader(f)
             for row in reader:
@@ -4152,22 +4152,30 @@ def guarddog_diskio_history():
                         entries.append({'t': row['timestamp'], 'v': float(row['mb_per_sec'])})
                 except (ValueError, KeyError):
                     continue
-    except (OSError, PermissionError):
-        return jsonify({'entries': [], 'error': 'Could not read history file'})
-    now = datetime.utcnow()
-    vals_1h = [e['v'] for e in entries if (now - datetime.strptime(e['t'], '%Y-%m-%dT%H:%M:%SZ')).total_seconds() <= 3600]
-    vals_all = [e['v'] for e in entries]
-    avg_1h = round(sum(vals_1h) / len(vals_1h), 1) if vals_1h else None
-    avg_all = round(sum(vals_all) / len(vals_all), 1) if vals_all else None
-    min_val = round(min(vals_all), 1) if vals_all else None
-    max_val = round(max(vals_all), 1) if vals_all else None
-    return jsonify({'entries': entries, 'avg_1h': avg_1h, 'avg_24h': avg_all,
-                    'min': min_val, 'max': max_val, 'samples': len(entries)})
+        now = datetime.utcnow()
+        vals_1h = [e['v'] for e in entries if (now - datetime.strptime(e['t'], '%Y-%m-%dT%H:%M:%SZ')).total_seconds() <= 3600]
+        vals_all = [e['v'] for e in entries]
+        avg_1h = round(sum(vals_1h) / len(vals_1h), 1) if vals_1h else None
+        avg_all = round(sum(vals_all) / len(vals_all), 1) if vals_all else None
+        min_val = round(min(vals_all), 1) if vals_all else None
+        max_val = round(max(vals_all), 1) if vals_all else None
+        return jsonify({'entries': entries, 'avg_1h': avg_1h, 'avg_24h': avg_all,
+                        'min': min_val, 'max': max_val, 'samples': len(entries)})
+    except Exception as e:
+        import traceback
+        return jsonify({'entries': [], 'error': f'{type(e).__name__}: {e}', 'traceback': traceback.format_exc()}), 500
 
 @app.route('/api/guarddog/diskio-report')
 @login_required
 def guarddog_diskio_report():
     """Download disk I/O history as a CSV report with summary header."""
+    try:
+        return _guarddog_diskio_report_inner()
+    except Exception as e:
+        import traceback
+        return f'Error: {type(e).__name__}: {e}\n\n{traceback.format_exc()}', 500, {'Content-Type': 'text/plain'}
+
+def _guarddog_diskio_report_inner():
     hours = int(request.args.get('hours', 72))
     csv_path = '/var/lib/takguard/diskio_history.csv'
     if not os.path.exists(csv_path):
