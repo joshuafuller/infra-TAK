@@ -13050,6 +13050,10 @@ def run_email_deploy(provider_key, smtp_user, smtp_pass, from_addr, from_name):
         plog(f"📧 Step 1/5 — Installing Postfix...")
         if pkg_mgr == 'apt':
             wait_for_apt_lock(plog, log)
+            subprocess.run(
+                'echo "postfix postfix/mailname string $(hostname -f)" | debconf-set-selections && '
+                'echo "postfix postfix/main_mailer_type string Internet Site" | debconf-set-selections',
+                shell=True, capture_output=True, timeout=30)
             r = subprocess.run(
                 'DEBIAN_FRONTEND=noninteractive apt-get install -y postfix libsasl2-modules 2>&1',
                 shell=True, capture_output=True, text=True, timeout=300)
