@@ -490,7 +490,7 @@
           <option value="AL">AL - Alabama</option><option value="AK">AK - Alaska</option>
           <option value="AS">AS - American Samoa</option>
           <option value="AZ">AZ - Arizona</option><option value="AR">AR - Arkansas</option>
-          <option value="CA" selected>CA - California</option><option value="CO">CO - Colorado</option>
+          <option value="CA">CA - California</option><option value="CO">CO - Colorado</option>
           <option value="MP">MP - CNMI (Northern Mariana Is.)</option>
           <option value="CT">CT - Connecticut</option><option value="DE">DE - Delaware</option>
           <option value="DC">DC - District of Columbia</option><option value="FL">FL - Florida</option>
@@ -1325,7 +1325,8 @@ function resetForm() {
   document.getElementById('tfrConfigName').value = '';
   document.getElementById('tfrMissionName').value = '';
   var tfrSel = document.getElementById('tfrStates');
-  for (var si = 0; si < tfrSel.options.length; si++) tfrSel.options[si].selected = tfrSel.options[si].value === 'CA';
+  for (var si = 0; si < tfrSel.options.length; si++) tfrSel.options[si].selected = false;
+  if (typeof updateStateTags === 'function') updateStateTags();
   document.getElementById('tfrPollInterval').value = '15';
   document.getElementById('tfr3D').value = 'true';
   ['tfrTypeHazards','tfrTypeSecurity','tfrTypeVIP','tfrTypeSpaceOps','tfrTypeAirShows','tfrTypeUAS','tfrTypeSpecial'].forEach(function(id) {
@@ -1386,6 +1387,7 @@ async function selectConfig(idx) {
     for (var si = 0; si < statesSel.options.length; si++) {
       statesSel.options[si].selected = saved.indexOf(statesSel.options[si].value) >= 0;
     }
+    if (typeof updateStateTags === 'function') updateStateTags();
     if (c.tfrPollInterval) document.getElementById('tfrPollInterval').value = c.tfrPollInterval;
     if (c.tfr3D != null) document.getElementById('tfr3D').value = String(c.tfr3D);
     // Restore TFR types
