@@ -4903,7 +4903,7 @@ def run_guarddog_deploy(alert_email):
             plog(f"✗ daemon-reload failed: {r.stderr}")
             guarddog_deploy_status.update({'running': False, 'error': True})
             return
-        timers = ['tak8089guard.timer', 'takoomguard.timer', 'takdiskguard.timer',
+        timers = ['tak8089guard.timer', 'takoomguard.timer', 'takdiskguard.timer', 'takdiskioguard.timer',
                   'taknetguard.timer', 'takprocessguard.timer', 'takcertguard.timer', 'takintcaguard.timer']
         if is_two_server and s1_host:
             timers.append('takremotedbguard.timer')
