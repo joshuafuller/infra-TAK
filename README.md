@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Latest release: v0.6.0-alpha** — **Guard Dog Disk I/O Monitor:** automated 15-minute benchmarks with trend detection, email/SMS alerts on degradation, dashboard card with color-coded stats and sparkline chart, time range selector (24h–30d), CSV report download. **VPS stability:** `vm.swappiness=10` tuning baked into Guard Dog deploy. **Postfix fix:** `debconf` preseed for universal non-interactive install. **Node-RED ArcGIS DataSync & FAA TFR Configurator:** stream ArcGIS vector data and FAA TFRs into TAK — web-based configurator UI, no flow editing required. See [docs/RELEASE-v0.6.0-alpha.md](docs/RELEASE-v0.6.0-alpha.md). Prior: [v0.5.9-alpha](docs/RELEASE-v0.5.9-alpha.md), [v0.5.8-alpha](docs/RELEASE-v0.5.8-alpha.md), [v0.5.7-alpha](docs/RELEASE-v0.5.7-alpha.md), [v0.5.6-alpha](docs/RELEASE-v0.5.6-alpha.md), [v0.5.5-alpha](docs/RELEASE-v0.5.5-alpha.md), [v0.5.4-alpha](docs/RELEASE-v0.5.4-alpha.md), [v0.5.3-alpha](docs/RELEASE-v0.5.3-alpha.md), [v0.5.2-alpha](docs/RELEASE-v0.5.2-alpha.md), [v0.5.1-alpha](docs/RELEASE-v0.5.1-alpha.md), [v0.5.0-alpha](docs/RELEASE-v0.5.0-alpha.md), [v0.4.9-alpha](docs/RELEASE-v0.4.9-alpha.md), [v0.4.8-alpha](docs/RELEASE-v0.4.8-alpha.md), [v0.4.7-alpha](docs/RELEASE-v0.4.7-alpha.md), [v0.4.6-alpha](docs/RELEASE-v0.4.6-alpha.md), [v0.4.5-alpha](docs/RELEASE-v0.4.5-alpha.md), [v0.4.4-alpha](docs/RELEASE-v0.4.4-alpha.md), [v0.4.3-alpha](docs/RELEASE-v0.4.3-alpha.md), [v0.4.2-alpha](docs/RELEASE-v0.4.2-alpha.md).
+**Latest release: v0.6.1-alpha** — **Guard Dog Disk I/O Monitor:** automated 15-minute benchmarks with trend detection, email/SMS alerts on degradation, dashboard card with color-coded stats and sparkline chart, time range selector (24h–30d), CSV report download. **VPS stability:** `vm.swappiness=10` tuning baked into Guard Dog deploy. **Postfix fix:** `debconf` preseed for universal non-interactive install. **Node-RED ArcGIS DataSync & FAA TFR Configurator:** stream ArcGIS vector data and FAA TFRs into TAK — web-based configurator UI, no flow editing required. See [docs/RELEASE-v0.6.0-alpha.md](docs/RELEASE-v0.6.0-alpha.md). Prior: [v0.5.9-alpha](docs/RELEASE-v0.5.9-alpha.md), [v0.5.8-alpha](docs/RELEASE-v0.5.8-alpha.md), [v0.5.7-alpha](docs/RELEASE-v0.5.7-alpha.md), [v0.5.6-alpha](docs/RELEASE-v0.5.6-alpha.md), [v0.5.5-alpha](docs/RELEASE-v0.5.5-alpha.md), [v0.5.4-alpha](docs/RELEASE-v0.5.4-alpha.md), [v0.5.3-alpha](docs/RELEASE-v0.5.3-alpha.md), [v0.5.2-alpha](docs/RELEASE-v0.5.2-alpha.md), [v0.5.1-alpha](docs/RELEASE-v0.5.1-alpha.md), [v0.5.0-alpha](docs/RELEASE-v0.5.0-alpha.md), [v0.4.9-alpha](docs/RELEASE-v0.4.9-alpha.md), [v0.4.8-alpha](docs/RELEASE-v0.4.8-alpha.md), [v0.4.7-alpha](docs/RELEASE-v0.4.7-alpha.md), [v0.4.6-alpha](docs/RELEASE-v0.4.6-alpha.md), [v0.4.5-alpha](docs/RELEASE-v0.4.5-alpha.md), [v0.4.4-alpha](docs/RELEASE-v0.4.4-alpha.md), [v0.4.3-alpha](docs/RELEASE-v0.4.3-alpha.md), [v0.4.2-alpha](docs/RELEASE-v0.4.2-alpha.md).
 
 **Something broken?** Wrong sidebar version, **Update Now** error, merge/rebase/tag-clobber messages, or you are not sure the VPS ever pulled the real repo → go to **[Universal recovery (SSH)](#universal-recovery-ssh)** and run the one block there. **Point people at that section**; it is the single source of truth.
 
@@ -28,7 +28,7 @@ grep '^VERSION' app.py
 sudo systemctl restart takwerx-console
 ```
 
-**Check:** The **`grep`** line should show **`VERSION = "…"`** matching the current **Latest release** at the top (without the **`v`**, e.g. **`0.6.0-alpha`**). If it still shows an old number, you are in the wrong directory (compare with **`grep WorkingDirectory /etc/systemd/system/takwerx-console.service`**) or the fetch failed (network).
+**Check:** The **`grep`** line should show **`VERSION = "…"`** matching the current **Latest release** at the top (without the **`v`**, e.g. **`0.6.1-alpha`**). If it still shows an old number, you are in the wrong directory (compare with **`grep WorkingDirectory /etc/systemd/system/takwerx-console.service`**) or the fetch failed (network).
 
 **Fix `origin` once (recommended):** so future **`git fetch origin`** hits upstream:
 
@@ -299,6 +299,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v0.6.1-alpha — 2026-04-16
+
+**Patch release** — version bump to ensure all boxes (including those that fetched the original v0.6.0-alpha tag) receive the disk I/O monitor fix via Update Now. No functional changes beyond the version string.
+
+---
 
 ### v0.6.0-alpha — 2026-04-16
 
