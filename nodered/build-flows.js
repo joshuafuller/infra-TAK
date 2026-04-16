@@ -854,7 +854,11 @@ function makeEngineTab(feed) {
     "    ]);",
     "  } else { nSkip++; }",
     "}",
-    "flow.set('_featureHashes', newHashes);",
+    "if (Object.keys(newHashes).length > 0) {",
+    "  flow.set('_featureHashes', newHashes);",
+    "} else if (Object.keys(prevHashes).length > 0) {",
+    "  node.warn(topicCfg + ': 0 features from ArcGIS — keeping previous hashes to avoid false churn');",
+    "}",
     "if (coldStart) node.warn(topicCfg + ' cold start: seeded ' + nSeed + ' hashes without re-streaming');",
     "",
     "if (newUids.length > 0) {",
@@ -1454,7 +1458,7 @@ const FN_TFR_PARSE_BUILD_COT = [
   "",
   "    // Add FAA detail page as Associated Link (like tfr2cot)",
   "    links.push({ _attributes: {",
-  "      url: detailUrl, relation: 'r-u', mime: 'text/html',",
+  "      url: detailViewerUrl, relation: 'r-u', mime: 'text/html',",
   "      remarks: 'FAA TFR Detail: ' + callsign",
   "    } });",
   "",
@@ -2041,6 +2045,14 @@ const allFlows = [
 const out = path.join(__dirname, 'flows.json');
 fs.writeFileSync(out, JSON.stringify(allFlows, null, 2));
 console.log('flows.json generated  (' + allFlows.length + ' nodes, ' + FEEDS.length + ' engine tabs)  →  ' + out);
+
+// Write template function map (ArcGIS + TFR) for deploy.sh dynamic-tab sync
+const templateFuncMap = {};
+[...templateNodes, ...tfrTemplateNodes].forEach(n => {
+  if (n._templateKey) templateFuncMap[n._templateKey] = n.func;
+});
+fs.writeFileSync(path.join(__dirname, 'template-functions.json'), JSON.stringify(templateFuncMap));
+console.log('template-functions.json: ' + Object.keys(templateFuncMap).length + ' keys');
 
 // Inject engine tab templates into configurator.html (skip if read-only, e.g. inside Docker)
 try {

@@ -22,6 +22,7 @@ docker cp "$SCRIPT_DIR/build-flows.js" "$CONTAINER:/tmp/build-flows.js"
 docker cp "$SCRIPT_DIR/configurator.html" "$CONTAINER:/tmp/configurator.html"
 docker exec "$CONTAINER" node /tmp/build-flows.js
 docker cp "$CONTAINER:/tmp/flows.json" "$NEW_FLOWS"
+docker cp "$CONTAINER:/tmp/template-functions.json" "/tmp/template-functions.json" 2>/dev/null || true
 
 # Back up current flows + credentials from running container
 echo "==> Backing up current config from container"
@@ -96,11 +97,15 @@ docker exec "$CONTAINER" node -e "
 
   // --- Template function sync: update func code in dynamic engine tabs ---
   var funcTemplates = {};
-  upd.forEach(function(n) {
-    if (n.type === 'function' && n._templateKey) {
-      funcTemplates[n._templateKey] = n.func;
-    }
-  });
+  try {
+    funcTemplates = JSON.parse(fs.readFileSync('/tmp/template-functions.json', 'utf8'));
+  } catch(e) {
+    upd.forEach(function(n) {
+      if (n.type === 'function' && n._templateKey) {
+        funcTemplates[n._templateKey] = n.func;
+      }
+    });
+  }
 
   // Migration: detect engine tab types for old nodes without _templateKey
   var tabTypes = {};
