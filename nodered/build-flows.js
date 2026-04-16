@@ -1273,18 +1273,13 @@ const FN_TFR_FILTER_SPLIT = [
   "flow.set('_tfrCount', filtered.length);",
   "flow.set('_tfrDone', 0);",
   "",
-  "// Build output arrays: output1 = per-TFR XML fetches, output2 = reconcile trigger",
-  "var out1 = [];",
+  "var msgs = [];",
   "for (var i = 0; i < filtered.length; i++) {",
-  "  out1.push({ url: filtered[i].url, method: 'GET',",
+  "  msgs.push({ url: filtered[i].url, method: 'GET',",
   "    _tfrMeta: filtered[i], _config: cfg, takSettings: msg.takSettings,",
   "    topic: cfg.configName });",
   "}",
-  "var out2 = filtered.length > 0 ? {",
-  "  _config: cfg, takSettings: msg.takSettings, topic: cfg.configName",
-  "} : null;",
-  "node.warn(cfg.configName + ': sending ' + out1.length + ' to output1, reconcile trigger: ' + (out2 ? 'yes' : 'no'));",
-  "return [out1, out2];"
+  "return [msgs];"
 ].join('\n');
 
 const FN_TFR_PARSE_BUILD_COT = [
@@ -1684,10 +1679,10 @@ function makeTfrEngineTab(feed) {
       id: P + 'filter', type: 'function', z: FID,
       name: 'Filter & split TFRs',
       func: FN_TFR_FILTER_SPLIT,
-      outputs: 2, timeout: '', noerr: 0,
+      outputs: 1, timeout: '', noerr: 0,
       initialize: '', finalize: '', libs: [],
       x: 180, y: 220,
-      wires: [[P + 'http_xml'], [P + 'delay_recon']]
+      wires: [[P + 'http_xml']]
     },
 
     // Per-TFR XML fetch
@@ -1760,15 +1755,36 @@ function makeTfrEngineTab(feed) {
       x: 400, y: 380, wires: []
     },
 
-    // Reconcile path: delay -> subscribe -> GET mission -> reconcile -> PUT/DELETE
+    // Reconcile path: independent timer -> load config -> subscribe -> GET mission -> reconcile -> PUT/DELETE
     {
-      id: P + 'delay_recon', type: 'delay', z: FID,
-      name: 'Wait 60s for fetches',
-      pauseType: 'delay', timeout: '60', timeoutUnits: 'seconds',
-      rate: '1', nbRateUnits: '1', rateUnits: 'second',
-      randomFirst: '1', randomLast: '5', randomUnits: 'seconds',
-      drop: false, allowrate: false, outputs: 1,
-      x: 180, y: 460, wires: [[P + 'build_sub']]
+      id: P + 'recon_inject', type: 'inject', z: FID,
+      name: 'Reconcile timer (90s)',
+      props: [{ p: 'payload' }, { p: 'topic', vt: 'str' }],
+      repeat: '60', crontab: '',
+      once: true, onceDelay: '90',
+      topic: 'reconcile', payload: '', payloadType: 'date',
+      x: 180, y: 460, wires: [[P + 'recon_load']]
+    },
+    {
+      id: P + 'recon_load', type: 'function', z: FID,
+      name: 'Load config for reconcile',
+      func: [
+        "var configs = global.get('arcgis_configs') || [];",
+        "var tak = global.get('tak_settings') || {};",
+        "var cfg = null;",
+        "for (var i = 0; i < configs.length; i++) {",
+        "  if (configs[i].configName === '" + feed.configName + "') { cfg = configs[i]; break; }",
+        "}",
+        "if (!cfg) return null;",
+        "if (!tak.serverUrl) return null;",
+        "msg._config = cfg;",
+        "msg.takSettings = tak;",
+        "msg.topic = '" + feed.configName + "';",
+        "return msg;"
+      ].join('\n'),
+      outputs: 1, timeout: '', noerr: 0,
+      initialize: '', finalize: '', libs: [],
+      x: 400, y: 460, wires: [[P + 'build_sub']]
     },
     {
       id: P + 'build_sub', type: 'function', z: FID,
