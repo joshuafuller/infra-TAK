@@ -45,23 +45,27 @@ function gdRefreshDiskIO(){
   var card=document.getElementById('gd-diskio-card');if(!card)return;
   var sel=document.getElementById('gd-dio-range-sel');
   var hours=sel?sel.value:'72';
-  fetch('/api/guarddog/diskio-history?hours='+hours,{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+  var empty=document.getElementById('gd-dio-empty');
+  fetch('/api/guarddog/diskio-history?hours='+hours,{credentials:'same-origin'}).then(function(r){
+    if(!r.ok){if(empty)empty.textContent='API error ('+r.status+')';return Promise.reject('status '+r.status);}
+    var ct=r.headers.get('content-type')||'';
+    if(ct.indexOf('json')<0){if(empty)empty.textContent='Auth redirect — reload page';return Promise.reject('not json');}
+    return r.json();
+  }).then(function(d){
+    if(!d)return;
     var cur=document.getElementById('gd-dio-current');
     var h1=document.getElementById('gd-dio-1h');
     var h24=document.getElementById('gd-dio-24h');
     var rng=document.getElementById('gd-dio-range');
-    var samp=document.getElementById('gd-dio-samples');
-    var empty=document.getElementById('gd-dio-empty');
-    if(!d.entries||d.entries.length===0){if(empty)empty.style.display='flex';return;}
+    if(!d.entries||d.entries.length===0){if(empty){empty.style.display='flex';empty.textContent='No data yet — first sample in ~15 min after Guard Dog deploy';}return;}
     if(empty)empty.style.display='none';
     var last=d.entries[d.entries.length-1].v;
     if(cur){cur.textContent=last+' MB/s';cur.style.color=last<50?'var(--red)':last<100?'var(--yellow)':'var(--green)';}
     if(h1){h1.textContent=d.avg_1h!==null?d.avg_1h+' MB/s':'—';if(d.avg_1h!==null)h1.style.color=d.avg_1h<50?'var(--red)':d.avg_1h<100?'var(--yellow)':'var(--green)';}
     if(h24){h24.textContent=d.avg_24h!==null?d.avg_24h+' MB/s':'—';if(d.avg_24h!==null)h24.style.color=d.avg_24h<50?'var(--red)':d.avg_24h<100?'var(--yellow)':'var(--green)';}
     if(rng)rng.textContent=(d.min!==null?d.min:'—')+' / '+(d.max!==null?d.max:'—')+' MB/s';
-    if(samp)samp.textContent=d.samples;
     gdDrawDiskIOChart(d.entries);
-  }).catch(function(){});
+  }).catch(function(e){console.error('diskio fetch error',e);});
 }
 function gdDrawDiskIOChart(entries){
   var canvas=document.getElementById('gd-dio-chart');if(!canvas||!canvas.getContext)return;
