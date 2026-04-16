@@ -4160,6 +4160,63 @@ def guarddog_diskio_history():
     return jsonify({'entries': entries, 'avg_1h': avg_1h, 'avg_24h': avg_all,
                     'min': min_val, 'max': max_val, 'samples': len(entries)})
 
+@app.route('/api/guarddog/diskio-report')
+@login_required
+def guarddog_diskio_report():
+    """Download disk I/O history as a CSV report with summary header."""
+    hours = int(request.args.get('hours', 72))
+    csv_path = '/var/lib/takguard/diskio_history.csv'
+    if not os.path.exists(csv_path):
+        return 'No disk I/O data available yet.\n', 404, {'Content-Type': 'text/plain'}
+    import csv as csv_mod
+    cutoff = datetime.utcnow() - timedelta(hours=hours)
+    entries = []
+    try:
+        with open(csv_path, 'r') as f:
+            reader = csv_mod.DictReader(f)
+            for row in reader:
+                try:
+                    ts = datetime.strptime(row['timestamp'], '%Y-%m-%dT%H:%M:%SZ')
+                    if ts >= cutoff:
+                        entries.append((row['timestamp'], float(row['mb_per_sec'])))
+                except (ValueError, KeyError):
+                    continue
+    except (OSError, PermissionError):
+        return 'Could not read history file.\n', 500, {'Content-Type': 'text/plain'}
+    if not entries:
+        return 'No data in the requested time range.\n', 404, {'Content-Type': 'text/plain'}
+    vals = [e[1] for e in entries]
+    now = datetime.utcnow()
+    vals_1h = [e[1] for e in entries if (now - datetime.strptime(e[0], '%Y-%m-%dT%H:%M:%SZ')).total_seconds() <= 3600]
+    avg_1h = round(sum(vals_1h) / len(vals_1h), 1) if vals_1h else 'N/A'
+    avg_all = round(sum(vals) / len(vals), 1)
+    hostname = subprocess.run(['hostname'], capture_output=True, text=True, timeout=5).stdout.strip()
+    server_id = 'unknown'
+    try:
+        with open('/opt/tak-guarddog/server_identifier', 'r') as f:
+            server_id = f.read().strip()
+    except Exception:
+        server_id = hostname
+    import io
+    output = io.StringIO()
+    output.write(f'# Disk I/O Performance Report\n')
+    output.write(f'# Server: {server_id}\n')
+    output.write(f'# Generated: {now.strftime("%Y-%m-%dT%H:%M:%SZ")}\n')
+    output.write(f'# Period: last {hours} hours ({len(entries)} readings)\n')
+    output.write(f'# 1h average: {avg_1h} MB/s\n')
+    output.write(f'# {hours}h average: {avg_all} MB/s\n')
+    output.write(f'# Min: {round(min(vals), 1)} MB/s | Max: {round(max(vals), 1)} MB/s\n')
+    output.write(f'#\n')
+    output.write('timestamp,mb_per_sec\n')
+    for ts, v in entries:
+        output.write(f'{ts},{v}\n')
+    csv_data = output.getvalue()
+    fn = f'diskio-report-{server_id}-{now.strftime("%Y%m%d-%H%M")}.csv'
+    return csv_data, 200, {
+        'Content-Type': 'text/csv',
+        'Content-Disposition': f'attachment; filename="{fn}"'
+    }
+
 def _guarddog_timer_list():
     """All Guard Dog timer unit names (core + optional service monitors)."""
     return ['tak8089guard.timer', 'takoomguard.timer', 'takdiskguard.timer', 'takdiskioguard.timer',
@@ -15608,7 +15665,11 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
       <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">1h avg</div><span id="gd-dio-1h" style="font-weight:600;font-size:14px">—</span></div>
       <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">24h avg</div><span id="gd-dio-24h" style="font-weight:600;font-size:14px">—</span></div>
       <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">Min / Max</div><span id="gd-dio-range" style="font-weight:600;font-size:14px">—</span></div>
-      <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">Samples</div><span id="gd-dio-samples" style="font-weight:600;font-size:14px">—</span></div>
+      <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">Readings (24h)</div><span id="gd-dio-samples" style="font-weight:600;font-size:14px">—</span></div>
+    </div>
+    <div style="display:flex;gap:8px;margin-bottom:16px;align-items:center">
+      <button class="btn btn-ghost" style="padding:6px 14px;font-size:11px" onclick="gdDownloadDiskIOReport()">Download CSV report</button>
+      <span id="gd-dio-dl-msg" style="font-size:11px;color:var(--text-dim)"></span>
     </div>
     <div style="position:relative;height:120px;background:var(--bg-deep);border:1px solid var(--border);border-radius:8px;overflow:hidden">
       <canvas id="gd-dio-chart" style="width:100%;height:100%"></canvas>

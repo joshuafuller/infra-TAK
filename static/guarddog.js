@@ -120,4 +120,10 @@ function gdDrawDiskIOChart(entries){
     ctx.textAlign='right';ctx.fillText(last,w-pad.r,h-3);
   }
 }
+function gdDownloadDiskIOReport(){
+  var msg=document.getElementById('gd-dio-dl-msg');
+  if(msg){msg.textContent='Generating...';msg.style.color='var(--text-dim)';}
+  window.location.href='/api/guarddog/diskio-report?hours=72';
+  setTimeout(function(){if(msg)msg.textContent='';},3000);
+}
 if(document.getElementById('gd-diskio-card')){gdRefreshDiskIO();setInterval(gdRefreshDiskIO,300000);}
