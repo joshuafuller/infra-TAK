@@ -519,6 +519,7 @@
           <option value="WI">WI - Wisconsin</option><option value="WY">WY - Wyoming</option>
           <option value="USA">USA - National</option>
         </select>
+        <div id="tfrStatesTags" style="margin-top:0.4rem;display:flex;flex-wrap:wrap;gap:0.3rem"></div>
         <div style="color:#888;font-size:0.8rem;margin-top:0.2rem">Ctrl/Cmd+click to select multiple. Includes AS, GU, MP, PR, VI, and USA (national).</div>
       </div>
       <div>
@@ -587,6 +588,20 @@
       document.getElementById('tfrRadiusEnable').addEventListener('change', function() {
         document.getElementById('tfrRadiusFields').style.display = this.checked ? 'block' : 'none';
       });
+      function updateStateTags() {
+        var sel = document.getElementById('tfrStates');
+        var tags = document.getElementById('tfrStatesTags');
+        var picked = Array.from(sel.selectedOptions);
+        if (picked.length === 0) {
+          tags.innerHTML = '<span style="color:#2ec4b6;font-size:0.85rem">All states (no filter)</span>';
+        } else {
+          tags.innerHTML = picked.map(function(o) {
+            return '<span style="background:#2ec4b6;color:#0f0f1a;padding:0.15rem 0.5rem;border-radius:4px;font-size:0.8rem;font-weight:600">' + o.value + '</span>';
+          }).join('');
+        }
+      }
+      document.getElementById('tfrStates').addEventListener('change', updateStateTags);
+      updateStateTags();
     </script>
   </div>
 
