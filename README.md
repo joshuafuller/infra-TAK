@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Latest release: v0.6.0-alpha** — **Guard Dog Disk I/O Monitor:** automated 15-minute benchmarks with trend detection, email/SMS alerts on degradation, dashboard card with color-coded stats and sparkline chart, time range selector (24h–30d), CSV report download. **VPS stability:** `vm.swappiness=10` tuning baked into Guard Dog deploy. **Postfix fix:** `debconf` preseed for universal non-interactive install. **Node-RED (ArcGIS DataSync):** FAA TFR ID fix, cold-start guards (no more post-restart churn), template sync for dynamic tabs, stable ArcGIS hashing. See [docs/RELEASE-v0.6.0-alpha.md](docs/RELEASE-v0.6.0-alpha.md). Prior: [v0.5.9-alpha](docs/RELEASE-v0.5.9-alpha.md), [v0.5.8-alpha](docs/RELEASE-v0.5.8-alpha.md), [v0.5.7-alpha](docs/RELEASE-v0.5.7-alpha.md), [v0.5.6-alpha](docs/RELEASE-v0.5.6-alpha.md), [v0.5.5-alpha](docs/RELEASE-v0.5.5-alpha.md), [v0.5.4-alpha](docs/RELEASE-v0.5.4-alpha.md), [v0.5.3-alpha](docs/RELEASE-v0.5.3-alpha.md), [v0.5.2-alpha](docs/RELEASE-v0.5.2-alpha.md), [v0.5.1-alpha](docs/RELEASE-v0.5.1-alpha.md), [v0.5.0-alpha](docs/RELEASE-v0.5.0-alpha.md), [v0.4.9-alpha](docs/RELEASE-v0.4.9-alpha.md), [v0.4.8-alpha](docs/RELEASE-v0.4.8-alpha.md), [v0.4.7-alpha](docs/RELEASE-v0.4.7-alpha.md), [v0.4.6-alpha](docs/RELEASE-v0.4.6-alpha.md), [v0.4.5-alpha](docs/RELEASE-v0.4.5-alpha.md), [v0.4.4-alpha](docs/RELEASE-v0.4.4-alpha.md), [v0.4.3-alpha](docs/RELEASE-v0.4.3-alpha.md), [v0.4.2-alpha](docs/RELEASE-v0.4.2-alpha.md).
+**Latest release: v0.6.0-alpha** — **Guard Dog Disk I/O Monitor:** automated 15-minute benchmarks with trend detection, email/SMS alerts on degradation, dashboard card with color-coded stats and sparkline chart, time range selector (24h–30d), CSV report download. **VPS stability:** `vm.swappiness=10` tuning baked into Guard Dog deploy. **Postfix fix:** `debconf` preseed for universal non-interactive install. **Node-RED ArcGIS DataSync & FAA TFR Configurator:** stream ArcGIS vector data and FAA TFRs into TAK — web-based configurator UI, no flow editing required. See [docs/RELEASE-v0.6.0-alpha.md](docs/RELEASE-v0.6.0-alpha.md). Prior: [v0.5.9-alpha](docs/RELEASE-v0.5.9-alpha.md), [v0.5.8-alpha](docs/RELEASE-v0.5.8-alpha.md), [v0.5.7-alpha](docs/RELEASE-v0.5.7-alpha.md), [v0.5.6-alpha](docs/RELEASE-v0.5.6-alpha.md), [v0.5.5-alpha](docs/RELEASE-v0.5.5-alpha.md), [v0.5.4-alpha](docs/RELEASE-v0.5.4-alpha.md), [v0.5.3-alpha](docs/RELEASE-v0.5.3-alpha.md), [v0.5.2-alpha](docs/RELEASE-v0.5.2-alpha.md), [v0.5.1-alpha](docs/RELEASE-v0.5.1-alpha.md), [v0.5.0-alpha](docs/RELEASE-v0.5.0-alpha.md), [v0.4.9-alpha](docs/RELEASE-v0.4.9-alpha.md), [v0.4.8-alpha](docs/RELEASE-v0.4.8-alpha.md), [v0.4.7-alpha](docs/RELEASE-v0.4.7-alpha.md), [v0.4.6-alpha](docs/RELEASE-v0.4.6-alpha.md), [v0.4.5-alpha](docs/RELEASE-v0.4.5-alpha.md), [v0.4.4-alpha](docs/RELEASE-v0.4.4-alpha.md), [v0.4.3-alpha](docs/RELEASE-v0.4.3-alpha.md), [v0.4.2-alpha](docs/RELEASE-v0.4.2-alpha.md).
 
 **Something broken?** Wrong sidebar version, **Update Now** error, merge/rebase/tag-clobber messages, or you are not sure the VPS ever pulled the real repo → go to **[Universal recovery (SSH)](#universal-recovery-ssh)** and run the one block there. **Point people at that section**; it is the single source of truth.
 
@@ -313,13 +313,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 **Postfix installation fix**
 - `debconf-set-selections` preseeds `postfix/mailname` and `postfix/main_mailer_type` before install. Fixes `meter mydomain: bad parameter value: 0` failure on some systems.
 
-**Node-RED (ArcGIS DataSync)**
-- FAA TFR ID fix — correct `notam_id` for display labels and direct detail page links.
-- Cold-start guards — ArcGIS and TFR feeds no longer churn (delete + re-add all items) after Node-RED restart.
-- Template sync — code fixes propagate to dynamic engine tabs automatically via `_templateKey`.
-- TFR configurator — labels on/off toggle, capitalize names checkbox.
-- Stable ArcGIS hashing — only CoT-affecting fields are hashed; metadata changes no longer trigger false updates.
-- Deploy preserves all user flows, configs, TLS, TCP settings, and credentials.
+**Node-RED — ArcGIS DataSync & FAA TFR Configurator (new)**
+- Stream ArcGIS Feature Service data (wildfire perimeters, weather alerts, infrastructure, custom layers) and FAA Temporary Flight Restrictions into TAK Server missions as live CoT objects.
+- Web-based configurator UI inside Node-RED — no flow editing required. Add feeds, pick fields, set poll intervals, click Deploy.
+- Access at `https://nodered.<your-fqdn>` → Configurator tab.
+- Non-destructive updates: user flows, feed configs, TLS, TCP settings, and credentials all survive `deploy.sh` runs. Template sync auto-updates function code in existing tabs.
+- Ships with cold-start guards (no post-restart churn), stable ArcGIS hashing, FAA TFR ID fix, and per-feed label/capitalize options.
 
 Full notes: [docs/RELEASE-v0.6.0-alpha.md](docs/RELEASE-v0.6.0-alpha.md).
 
