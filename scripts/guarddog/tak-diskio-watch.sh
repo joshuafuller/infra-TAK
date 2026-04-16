@@ -12,7 +12,7 @@ HISTORY="/var/lib/takguard/diskio_history.csv"
 ALERT_SENT_FILE="/var/lib/takguard/diskio_alert_sent"
 WARN_MBPS=50
 TEST_SIZE_MB=10
-RETENTION_HOURS=72
+RETENTION_HOURS=744
 
 mkdir -p /var/lib/takguard
 

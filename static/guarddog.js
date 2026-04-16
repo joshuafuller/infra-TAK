@@ -43,7 +43,9 @@ if (document.getElementById('gd-sms-br-sender')) gdSenderCheck();
 
 function gdRefreshDiskIO(){
   var card=document.getElementById('gd-diskio-card');if(!card)return;
-  fetch('/api/guarddog/diskio-history?hours=24',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+  var sel=document.getElementById('gd-dio-range-sel');
+  var hours=sel?sel.value:'72';
+  fetch('/api/guarddog/diskio-history?hours='+hours,{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
     var cur=document.getElementById('gd-dio-current');
     var h1=document.getElementById('gd-dio-1h');
     var h24=document.getElementById('gd-dio-24h');
@@ -123,7 +125,9 @@ function gdDrawDiskIOChart(entries){
 function gdDownloadDiskIOReport(){
   var msg=document.getElementById('gd-dio-dl-msg');
   if(msg){msg.textContent='Generating...';msg.style.color='var(--text-dim)';}
-  window.location.href='/api/guarddog/diskio-report?hours=72';
+  var sel=document.getElementById('gd-dio-range-sel');
+  var hours=sel?sel.value:'72';
+  window.location.href='/api/guarddog/diskio-report?hours='+hours;
   setTimeout(function(){if(msg)msg.textContent='';},3000);
 }
 if(document.getElementById('gd-diskio-card')){gdRefreshDiskIO();setInterval(gdRefreshDiskIO,300000);}

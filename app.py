@@ -15655,9 +15655,18 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   </div>
 
   <div class="card" id="gd-diskio-card">
-    <div class="card-title" style="display:flex;align-items:center;justify-content:space-between">
+    <div class="card-title" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
       <span>Disk I/O Performance</span>
-      <button class="btn btn-ghost" style="padding:4px 12px;font-size:11px" onclick="gdRefreshDiskIO()">Refresh</button>
+      <div style="display:flex;align-items:center;gap:8px">
+        <select id="gd-dio-range-sel" class="form-input" style="width:auto;min-width:100px;padding:4px 8px;font-size:11px" onchange="gdRefreshDiskIO()">
+          <option value="24">Last 24 hours</option>
+          <option value="72" selected>Last 3 days</option>
+          <option value="120">Last 5 days</option>
+          <option value="168">Last 7 days</option>
+          <option value="720">Last 30 days</option>
+        </select>
+        <button class="btn btn-ghost" style="padding:4px 12px;font-size:11px" onclick="gdRefreshDiskIO()">Refresh</button>
+      </div>
     </div>
     <p style="font-size:12px;color:var(--text-dim);margin-bottom:14px">Benchmarked every 15 minutes. Alerts if the last-hour average drops below 50 MB/s or falls 70%+ from the 24h average (noisy neighbor detection).</p>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px;margin-bottom:16px">
@@ -15665,7 +15674,6 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
       <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">1h avg</div><span id="gd-dio-1h" style="font-weight:600;font-size:14px">—</span></div>
       <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">24h avg</div><span id="gd-dio-24h" style="font-weight:600;font-size:14px">—</span></div>
       <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">Min / Max</div><span id="gd-dio-range" style="font-weight:600;font-size:14px">—</span></div>
-      <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">Readings (24h)</div><span id="gd-dio-samples" style="font-weight:600;font-size:14px">—</span></div>
     </div>
     <div style="display:flex;gap:8px;margin-bottom:16px;align-items:center">
       <button class="btn btn-ghost" style="padding:6px 14px;font-size:11px" onclick="gdDownloadDiskIOReport()">Download CSV report</button>
