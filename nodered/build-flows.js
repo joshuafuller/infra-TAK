@@ -6,13 +6,12 @@ const html    = fs.readFileSync(path.join(__dirname, 'configurator.html'), 'utf8
 const CFG_TAB = 'flow_arcgis_cfg';
 
 // ╔══════════════════════════════════════════════════════════════╗
-// ║  FEEDS — one engine tab per entry.  To add a new ArcGIS    ║
-// ║  integration: add a row here and redeploy.                  ║
+// ║  FEEDS — STATIC ArcGIS engine tabs in the shipped flows.   ║
+// ║  Leave EMPTY. Do not ship named feeds (e.g. CA AIR INTEL) in ║
+// ║  the repo — every box would get those tabs. Add feeds via   ║
+// ║  the ArcGIS Configurator (dynamic tabs merged on deploy).   ║
 // ╚══════════════════════════════════════════════════════════════╝
-const FEEDS = [
-  { id: 'air_intel',    configName: 'CA AIR INTEL' },
-  { id: 'pwr_outages',  configName: 'POWER-OUTAGES' }
-];
+const FEEDS = [];
 
 // ════════════════════════════════════════════════════════════════
 //  Configurator tab — shared UI + persistence (global context)
@@ -497,11 +496,14 @@ const configFlows = [
 //  TLS configs — global nodes, shared by all engine tabs
 // ════════════════════════════════════════════════════════════════
 
+// Do not ship paths to real cert files — fresh clones have no /certs mount until configured.
+// deploy.sh auto-fills /certs/admin.pem when /opt/tak/certs/files/admin.pem exists on the host.
+// Otherwise: mount host certs to /certs in the nodered container and set paths in the editor, or upload certs in the TLS node UI.
 const tlsNodes = [
   {
     id: 'tls_tak', type: 'tls-config',
     name: 'TAK Mission API TLS',
-    cert: '/certs/admin.pem', key: '/certs/admin.key', ca: '',
+    cert: '', key: '', ca: '',
     certname: '', keyname: '', caname: '',
     servername: '', verifyservercert: false
   }
