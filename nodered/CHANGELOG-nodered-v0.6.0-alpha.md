@@ -64,7 +64,19 @@ Reference chat: [TFR fix & cold-start guards](69bff012-da63-4038-a09c-558e829d64
 
 ---
 
-## 5. Deploy process — flow preservation
+## 5. Stable ArcGIS feature hashing
+
+**Problem:** ArcGIS reconcile hashed the entire feature object (`JSON.stringify(f)`), including metadata fields that change between polls (timestamps, refresh counters, etc.). This caused features to look "changed" every other poll cycle, triggering mass re-streams even when the visible data was identical. Combined with unstable `OBJECTID` fields (which ArcGIS can reassign between queries), this produced alternating full-sync churn cycles.
+
+**Fix:** The hash now only includes fields that affect the CoT output: geometry, ID field, label field, and remarks fields. Metadata changes in the ArcGIS response no longer trigger false hash mismatches.
+
+**Recommendation:** For any ArcGIS layer where `OBJECTID` is unstable, use a business-specific ID field instead (e.g. `IncidentId`, `GlobalID`). This is a per-feed config change in the configurator, no code change needed.
+
+**Files:** `build-flows.js` — `FN_ARCGIS_PARSE_BUILD_COT`
+
+---
+
+## 6. Deploy process — flow preservation
 
 `deploy.sh` is designed so that deploying code updates **never destroys user-created flows or configurator configs.**
 
