@@ -1834,8 +1834,8 @@ function makeTfrEngineTab(feed) {
         "for (var i = 0; i < configs.length; i++) {",
         "  if (configs[i].configName === '" + feed.configName + "') { cfg = configs[i]; break; }",
         "}",
-        "if (!cfg) return null;",
-        "if (!tak.serverUrl) return null;",
+        "if (!cfg) { node.warn('" + feed.configName + " reconcile: no config in global arcgis_configs'); return null; }",
+        "if (!tak.serverUrl) { node.warn('" + feed.configName + " reconcile: no TAK serverUrl'); return null; }",
         "msg._config = cfg;",
         "msg.takSettings = tak;",
         "msg.topic = '" + feed.configName + "';",
@@ -1843,7 +1843,9 @@ function makeTfrEngineTab(feed) {
       ].join('\n'),
       outputs: 1, timeout: '', noerr: 0,
       initialize: '', finalize: '', libs: [],
-      x: 400, y: 460, wires: [[P + 'build_sub']]
+      // Fan-out like ArcGIS parse: subscribe AND mission GET in parallel. If FN_SUB skips
+      // (mission already in _subscribed), GET mission still runs — otherwise reconcile never fires.
+      x: 400, y: 460, wires: [[P + 'build_sub', P + 'build_m']]
     },
     {
       id: P + 'build_sub', type: 'function', z: FID,
@@ -1868,7 +1870,7 @@ function makeTfrEngineTab(feed) {
       active: true, tosidebar: true, console: false, tostatus: true,
       complete: 'true', targetType: 'full',
       statusVal: 'topic', statusType: 'auto',
-      x: 800, y: 460, wires: [[P + 'build_m']]
+      x: 800, y: 460, wires: [[]]
     },
 
     {
