@@ -102,3 +102,27 @@ Reference chat: [TFR fix & cold-start guards](69bff012-da63-4038-a09c-558e829d64
 
 - Static template tabs (Configurator tab, static engine tab templates)
 - Function node code inside dynamic tabs (via template sync — only the code, not the config/wiring)
+
+---
+
+## 7. No static named feed tabs in shipped `flows.json`
+
+**Problem:** `build-flows.js` previously listed `CA AIR INTEL` and `POWER-OUTAGES` in `FEEDS`, which generated **static** engine tabs in the committed `flows.json`. Every deploy shipped those tabs to all customers.
+
+**Fix:** `FEEDS` is now **empty**. ArcGIS feeds are created only via the configurator (dynamic tabs). See `.cursorrules` for the same rule.
+
+---
+
+## 8. TLS defaults — no hardcoded `/certs/admin.pem` in git
+
+**Problem:** The shipped `tls_tak` node referenced `/certs/admin.pem` and `/certs/admin.key`. Those paths only exist when the Node-RED container mounts the host TAK cert directory (e.g. `/opt/tak/certs/files` → `/certs`). Fresh tests without that mount failed with `ENOENT` on connect.
+
+**Fix:** `build-flows.js` now ships **empty** `cert` / `key` fields. `deploy.sh` auto-fills `/certs/admin.pem` when `admin.pem` and `admin.key` exist under `/opt/tak/certs/files` on the host (same layout as production). Otherwise operators set paths or upload certs in the Node-RED TLS config UI. Existing deployments still have TLS preserved from the running container on deploy.
+
+---
+
+## 9. v0.6.2 operator end-state
+
+**Intent:** No pre-loaded feed tabs; operators configure **ArcGIS or TFR in the Configurator**, then open the **Node-RED editor** → **TAK Mission API TLS** → **`/certs/admin.pem`** / **`.key`** (mounted by the console) → **private key passphrase** → **Deploy**.
+
+**Docs:** `docs/RELEASE-v0.6.2-alpha.md`. **Configurator** includes a short note under TAK Server Settings. **Console** (`app.py`) mounts `/opt/tak/certs/files` and runs `deploy.sh` on deploy/post-update.

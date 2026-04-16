@@ -153,8 +153,24 @@ docker exec "$CONTAINER" node -e "
   console.log('    Final: ' + merged.length + ' total nodes (' + upd.length + ' infra-TAK + ' + preserved.length + ' preserved)');
 "
 
-# Fix permissions on any certs referenced by stream TLS configs
 CERT_HOST_DIR="/opt/tak/certs/files"
+# If tls_tak still has no cert paths but host has standard TAK admin files, wire /certs/... (expects volume mount host:files -> container:/certs)
+if [ -f "$CERT_HOST_DIR/admin.pem" ] && [ -f "$CERT_HOST_DIR/admin.key" ]; then
+  docker exec "$CONTAINER" node -e "
+    var fs = require('fs');
+    var p = '/tmp/flows_merged.json';
+    var f = JSON.parse(fs.readFileSync(p, 'utf8'));
+    var tls = f.find(function(n) { return n.id === 'tls_tak'; });
+    if (tls && (!tls.cert || tls.cert === '')) {
+      tls.cert = '/certs/admin.pem';
+      tls.key = '/certs/admin.key';
+      fs.writeFileSync(p, JSON.stringify(f, null, 2));
+      console.log('    TLS: auto-filled /certs/admin.pem (host has admin certs)');
+    }
+  "
+fi
+
+# Fix permissions on any certs referenced by stream TLS configs
 docker exec "$CONTAINER" node -e "
   var f = JSON.parse(require('fs').readFileSync('/tmp/flows_merged.json','utf8'));
   f.forEach(function(n) {

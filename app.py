@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.6.1-alpha"
+VERSION = "0.6.2-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -15177,11 +15177,14 @@ def _run_nodered_deploy_remote(settings, deploy_cfg, plog):
   node-red:
     image: nodered/node-red:latest
     container_name: nodered
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "1880:1880"
     volumes:
       - node_red_data:/data
       - ./settings.js:/data/settings.js
+      - /opt/tak/certs/files:/certs:ro
 volumes:
   node_red_data:
 """
@@ -15228,6 +15231,8 @@ volumes:
         nodered_deploy_status.update({'running': False, 'error': True})
         return
     plog("✓ Node-RED container started on remote")
+    plog("━━━ Infra-TAK flows + TLS (remote, if repo present) ━━━")
+    _module_run(deploy_cfg, 'test -f "$HOME/infra-TAK/nodered/deploy.sh" && bash "$HOME/infra-TAK/nodered/deploy.sh" --no-pull 2>&1 || echo "(no ~/infra-TAK deploy.sh — skip)"', timeout=240, log_fn=plog)
     deploy_cfg['deployed'] = True
     settings['nodered_deployment'] = _normalize_module_deployment_config(deploy_cfg)
     save_settings(settings)
@@ -15296,15 +15301,18 @@ def run_nodered_deploy():
     image: nodered/node-red:latest
     container_name: nodered
     restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "127.0.0.1:1880:1880"
     volumes:
       - node_red_data:/data
       - ./settings.js:/data/settings.js
+      - /opt/tak/certs/files:/certs:ro
 volumes:
   node_red_data:
 """)
-        plog("✓ docker-compose.yml written")
+        plog("✓ docker-compose.yml written (TAK certs → /certs, host.docker.internal for CoT)")
         plog("")
         plog("━━━ Step 2/3: Starting Node-RED ━━━")
         r = subprocess.run(f'docker compose -f "{compose_yml}" up -d 2>&1', shell=True, capture_output=True, text=True, timeout=120, cwd=nr_dir)
@@ -15313,6 +15321,30 @@ volumes:
             nodered_deploy_status.update({'running': False, 'error': True})
             return
         plog("✓ Node-RED container started")
+        plog("")
+        plog("━━━ Step 2b: Merge infra-TAK flows + TLS (same as post-update) ━━━")
+        _deploy_sh = os.path.join(BASE_DIR, 'nodered', 'deploy.sh')
+        if os.path.isfile(_deploy_sh):
+            try:
+                r_nr = subprocess.run(
+                    ['bash', _deploy_sh, '--no-pull'],
+                    cwd=BASE_DIR,
+                    capture_output=True,
+                    text=True,
+                    timeout=240,
+                )
+                for line in (r_nr.stdout or '').splitlines():
+                    plog(f"  {line}")
+                if r_nr.returncode != 0:
+                    plog(f"  ⚠ deploy.sh exited {r_nr.returncode}")
+                    for line in (r_nr.stderr or '').splitlines()[-20:]:
+                        plog(f"  {line}")
+                else:
+                    plog("✓ Flows synced — /certs admin.pem wired if present on host")
+            except Exception as e2:
+                plog(f"  ⚠ deploy.sh failed: {e2}")
+        else:
+            plog("  (no nodered/deploy.sh in repo — skip)")
         plog("")
         plog("━━━ Step 3/3: Updating Caddy ━━━")
         if domain:
@@ -28730,17 +28762,34 @@ def _post_update_auto_deploy():
                     try:
                         with open(compose_path) as f:
                             content = f.read()
+                        orig = content
                         if '"1880:1880"' in content and '127.0.0.1:1880:1880' not in content:
                             print("Post-update: hardening Node-RED port binding to 127.0.0.1")
                             _auto_deploy_active['nodered'] = True
-                            new_content = content.replace('"1880:1880"', '"127.0.0.1:1880:1880"')
-                            with open(compose_path, 'w') as f:
-                                f.write(new_content)
-                            subprocess.run(f'cd {shlex.quote(nr_dir)} && docker compose up -d 2>/dev/null',
-                                shell=True, capture_output=True, text=True, timeout=120)
-                            print("Post-update: Node-RED port hardened and restarted")
+                            content = content.replace('"1880:1880"', '"127.0.0.1:1880:1880"')
                         else:
                             print("Post-update: Node-RED port binding already secure")
+                        # Enterprise DataSync: mount TAK cert dir + host.docker.internal (matches fresh deploy)
+                        if '/opt/tak/certs/files:/certs' not in content and './settings.js:/data/settings.js' in content:
+                            content = content.replace(
+                                '- ./settings.js:/data/settings.js',
+                                '- ./settings.js:/data/settings.js\n      - /opt/tak/certs/files:/certs:ro'
+                            )
+                            print("Post-update: Node-RED compose — adding /opt/tak/certs/files → /certs")
+                        if 'host.docker.internal:host-gateway' not in content and 'container_name: nodered' in content:
+                            content = content.replace(
+                                'container_name: nodered\n',
+                                'container_name: nodered\n    extra_hosts:\n      - "host.docker.internal:host-gateway"\n',
+                                1
+                            )
+                            print("Post-update: Node-RED compose — adding host.docker.internal")
+                        if content != orig:
+                            _auto_deploy_active['nodered'] = True
+                            with open(compose_path, 'w') as f:
+                                f.write(content)
+                            subprocess.run(f'cd {shlex.quote(nr_dir)} && docker compose up -d 2>/dev/null',
+                                shell=True, capture_output=True, text=True, timeout=120)
+                            print("Post-update: Node-RED recreated (compose patch)")
                         _nodered_malware_scan()
                         _auto_nodered_settings(nr_dir)
                         _auto_nodered_flows()
