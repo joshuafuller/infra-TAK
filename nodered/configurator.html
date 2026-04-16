@@ -648,7 +648,8 @@
         </div>
       </div>
       <div>
-        <label><input type="checkbox" id="tfrLabelsOn"> Show labels on map</label>
+        <label><input type="checkbox" id="tfrLabelsOn" checked> Show labels on map</label>
+        <label><input type="checkbox" id="tfrUpperCase"> Capitalize names</label>
       </div>
     </div>
     <div class="field-grid" style="margin-top:1rem">
@@ -1363,7 +1364,8 @@ function resetForm() {
   document.getElementById('tfrFillAlpha').value = '25';
   document.getElementById('tfrFillAlphaVal').textContent = '25%';
   document.getElementById('tfrLabelMode').value = 'faa_sequence';
-  document.getElementById('tfrLabelsOn').checked = false;
+  document.getElementById('tfrLabelsOn').checked = true;
+  document.getElementById('tfrUpperCase').checked = false;
   document.getElementById('tfrSaveStatus').textContent = '';
 
   ['step2','step3','step3b','step4','step5'].forEach(function(id) {
@@ -1437,7 +1439,8 @@ async function selectConfig(idx) {
     }
     if (c.tfrLabelMode) document.getElementById('tfrLabelMode').value = c.tfrLabelMode;
     else document.getElementById('tfrLabelMode').value = 'faa_sequence';
-    document.getElementById('tfrLabelsOn').checked = !!c.tfrLabelsOn;
+    document.getElementById('tfrLabelsOn').checked = c.tfrLabelsOn !== false;
+    document.getElementById('tfrUpperCase').checked = !!c.tfrUpperCase;
     return;
   }
 
@@ -1631,6 +1634,7 @@ async function saveTfrConfig() {
     },
     tfrLabelMode: document.getElementById('tfrLabelMode').value || 'faa_sequence',
     tfrLabelsOn: document.getElementById('tfrLabelsOn').checked,
+    tfrUpperCase: document.getElementById('tfrUpperCase').checked,
     creatorUid: 'admin',
     uidPrefix: 'tfr-'
   };
