@@ -365,6 +365,10 @@
   <div class="step disabled" id="step4">
     <h2>4. Shape Style, Remarks &amp; TTL</h2>
 
+    <div id="pointStyleNote" style="display:none;padding:0.8rem;background:#0d0d2b;border:1px solid #333;border-radius:8px;margin-bottom:1rem">
+      <p style="font-size:0.85rem;color:#2ec4b6;margin:0">Point geometry — icons and colors are set per class in <strong>Step 3c</strong> above. If no class field is set, a default marker (<code>a-u-G</code>) is used. Shape styling below does not apply to points.</p>
+    </div>
+    <div id="polyStyleFields">
     <div class="field-grid">
       <div>
         <label for="strokeColor">Stroke (outline) color</label>
@@ -420,6 +424,10 @@
           <option value="false">No — Open polyline</option>
         </select>
       </div>
+    </div>
+    </div><!-- end polyStyleFields -->
+
+    <div class="field-grid" style="margin-top:1rem">
       <div>
         <label for="labelsOn">Show label on map</label>
         <select id="labelsOn">
@@ -1212,6 +1220,9 @@ async function fetchLayer() {
       }
     });
     document.getElementById('btnClassLoad').disabled = false;
+    var isPoint = state.geometryType === 'esriGeometryPoint';
+    document.getElementById('polyStyleFields').style.display = isPoint ? 'none' : '';
+    document.getElementById('pointStyleNote').style.display = isPoint ? '' : 'none';
     enable(3); enable('3b'); enable('3c'); enable(4); enable(5);
   } catch (e) {
     status('layerStatus', 'Fetch failed: ' + e.message, false);
