@@ -1027,11 +1027,7 @@ function renderClassMappings() {
       + '<td style="text-align:center;padding:4px"><input type="checkbox" ' + (m.enabled !== false ? 'checked' : '') + ' onchange="toggleClassEnabled(\'' + ve + '\', this.checked)"></td>'
       + '<td style="padding:4px">' + iconHtml + '</td>'
       + '<td style="padding:4px"><input type="text" value="' + (m.cotType || '') + '" style="width:80px;font-size:0.78rem;padding:2px 4px" onchange="setClassCotType(\'' + ve + '\', this.value)"></td>'
-      + '<td style="padding:4px;white-space:nowrap">'
-      + (m.color ? '<input type="color" value="' + m.color + '" style="width:28px;height:24px;padding:0;border:none;vertical-align:middle;cursor:pointer" onchange="setClassColor(\'' + ve + '\', this.value)">'
-        + '<button onclick="clearClassColor(\'' + ve + '\')" style="font-size:0.65rem;padding:1px 4px;cursor:pointer;margin-left:2px;vertical-align:middle" title="Remove color overlay">&times;</button>'
-        : '<button onclick="setClassColor(\'' + ve + '\', \'#FF0000\')" style="font-size:0.7rem;padding:2px 6px;cursor:pointer">+ color</button><span style="color:#666;font-size:0.7rem;margin-left:3px">none</span>')
-      + '</td>'
+      + '<td style="padding:4px">' + buildColorPicker(ve, m.color) + '</td>'
       + '<td style="padding:4px"><input type="text" value="' + (m.customLabel || '') + '" placeholder="auto" style="width:80px;font-size:0.78rem;padding:2px 4px" onchange="setClassLabel(\'' + ve + '\', this.value)"></td>'
       + '<td style="padding:4px">' + remarksHtml + '</td>'
       + '</tr>';
@@ -1067,6 +1063,40 @@ function buildRemarksPickerForClass(classVal, m) {
 
 function toggleClassEnabled(v, on) { if (!state.classMappings[v]) state.classMappings[v] = {}; state.classMappings[v].enabled = on; }
 function setClassCotType(v, t) { if (!state.classMappings[v]) state.classMappings[v] = {}; state.classMappings[v].cotType = t; }
+var ATAK_COLORS = [
+  { name: 'White',      hex: '#FFFFFF' },
+  { name: 'Yellow',     hex: '#FFFF00' },
+  { name: 'Orange',     hex: '#FF7F00' },
+  { name: 'Red',        hex: '#FF0000' },
+  { name: 'Magenta',    hex: '#FF00FF' },
+  { name: 'Maroon',     hex: '#800000' },
+  { name: 'Purple',     hex: '#800080' },
+  { name: 'Dark Blue',  hex: '#0000FF' },
+  { name: 'Cyan',       hex: '#00FFFF' },
+  { name: 'Teal',       hex: '#008080' },
+  { name: 'Green',      hex: '#00FF00' },
+  { name: 'Dark Green', hex: '#006400' },
+  { name: 'Brown',      hex: '#964B00' },
+  { name: 'Black',      hex: '#000000' }
+];
+
+function buildColorPicker(ve, curColor) {
+  var swatches = ATAK_COLORS.map(function(c) {
+    var sel = curColor && curColor.toUpperCase() === c.hex.toUpperCase();
+    var border = sel ? '2px solid #2ec4b6' : '2px solid ' + (c.hex === '#000000' ? '#555' : 'transparent');
+    return '<div onclick="setClassColor(\'' + ve + '\', \'' + c.hex + '\')" title="' + c.name + '" style="width:16px;height:16px;background:' + c.hex + ';border:' + border + ';border-radius:3px;cursor:pointer;flex-shrink:0"></div>';
+  }).join('');
+
+  var customMatch = curColor && !ATAK_COLORS.some(function(c) { return c.hex.toUpperCase() === curColor.toUpperCase(); });
+
+  var html = '<div style="display:flex;flex-wrap:wrap;gap:2px;align-items:center;max-width:160px">'
+    + swatches
+    + '<input type="color" value="' + (curColor || '#FF0000') + '" style="width:16px;height:16px;padding:0;border:' + (customMatch ? '2px solid #2ec4b6' : '1px solid #555') + ';border-radius:3px;cursor:pointer;flex-shrink:0" title="Custom color" onchange="setClassColor(\'' + ve + '\', this.value)">'
+    + '<div onclick="clearClassColor(\'' + ve + '\')" title="No color" style="width:16px;height:16px;border:' + (!curColor ? '2px solid #2ec4b6' : '2px solid #555') + ';border-radius:3px;cursor:pointer;flex-shrink:0;background:repeating-conic-gradient(#555 0% 25%, transparent 0% 50%) 50%/8px 8px"></div>'
+    + '</div>';
+  return html;
+}
+
 function setClassColor(v, c) { if (!state.classMappings[v]) state.classMappings[v] = {}; state.classMappings[v].color = c; renderClassMappings(); }
 function clearClassColor(v) { if (!state.classMappings[v]) state.classMappings[v] = {}; state.classMappings[v].color = ''; renderClassMappings(); }
 function setClassLabel(v, l) { if (!state.classMappings[v]) state.classMappings[v] = {}; state.classMappings[v].customLabel = l.trim() || ''; }
