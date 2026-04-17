@@ -366,7 +366,25 @@
     <h2>4. Shape Style, Remarks &amp; TTL</h2>
 
     <div id="pointStyleNote" style="display:none;padding:0.8rem;background:#0d0d2b;border:1px solid #333;border-radius:8px;margin-bottom:1rem">
-      <p style="font-size:0.85rem;color:#2ec4b6;margin:0">Point geometry — icons and colors are set per class in <strong>Step 3c</strong> above. If no class field is set, a default marker (<code>a-u-G</code>) is used. Shape styling below does not apply to points.</p>
+      <p style="font-size:0.85rem;color:#94a3b8;margin:0 0 0.8rem 0">Point geometry — pick an icon for all markers, or use <strong>Step 3c</strong> class mapping for per-class icons.</p>
+      <div style="display:flex;align-items:center;gap:1rem">
+        <div>
+          <label style="font-size:0.82rem">Icon</label>
+          <div style="display:flex;align-items:center;gap:0.5rem;margin-top:0.3rem">
+            <img id="pointIconPreview" src="" style="width:32px;height:32px;display:none;background:#16213e;border-radius:4px;padding:2px">
+            <button onclick="openIconPicker('_uniform')" style="font-size:0.82rem;padding:4px 10px;cursor:pointer" id="btnPointIcon">Pick Icon</button>
+            <span id="pointIconLabel" style="font-size:0.78rem;color:#888"></span>
+          </div>
+        </div>
+        <div>
+          <label style="font-size:0.82rem">CoT Type</label>
+          <input type="text" id="pointCotType" value="a-u-G" style="width:120px;font-size:0.82rem;margin-top:0.3rem" placeholder="a-u-G">
+        </div>
+        <div>
+          <label style="font-size:0.82rem">Marker color</label>
+          <div style="margin-top:0.3rem"><input type="color" id="pointColor" value="#FF0000"></div>
+        </div>
+      </div>
     </div>
     <div id="polyStyleFields">
     <div class="field-grid">
@@ -752,6 +770,7 @@ const state = {
   classField: '',
   classValues: [],
   classMappings: {},
+  uniformIcon: null,
   iconCatalog: null
 };
 
@@ -878,6 +897,16 @@ function searchIcons() {
 function pickIcon(iconsetpath, type2525b, label, b64) {
   var classVal = _iconPickerCallback;
   if (classVal == null) { closeIconPicker(); return; }
+  if (classVal === '_uniform') {
+    state.uniformIcon = { iconsetpath: iconsetpath, cotType: type2525b || 'a-u-G', label: label, b64: b64 || '' };
+    document.getElementById('pointCotType').value = state.uniformIcon.cotType;
+    document.getElementById('pointIconLabel').textContent = label;
+    var prev = document.getElementById('pointIconPreview');
+    if (b64) { prev.src = 'data:image/png;base64,' + b64; prev.style.display = ''; }
+    document.getElementById('btnPointIcon').textContent = 'Change';
+    closeIconPicker();
+    return;
+  }
   if (!state.classMappings[classVal]) state.classMappings[classVal] = { enabled: true };
   state.classMappings[classVal].iconsetpath = iconsetpath;
   state.classMappings[classVal].cotType = type2525b || 'a-u-G';
@@ -1516,7 +1545,15 @@ function generateConfig() {
       centerLabel: document.getElementById('centerLabel').value === 'true'
     },
     classField: state.classField || null,
-    classes: (state.classField && Object.keys(state.classMappings).length) ? state.classMappings : null,
+    classes: (state.classField && Object.keys(state.classMappings).length) ? state.classMappings : (function() {
+      var ct = (document.getElementById('pointCotType') || {}).value || '';
+      var ui = (state.uniformIcon || {});
+      var pc = (document.getElementById('pointColor') || {}).value || '';
+      if (ui.iconsetpath || ct !== 'a-u-G') {
+        return { _default: { enabled: true, cotType: ct || ui.cotType || 'a-u-G', iconsetpath: ui.iconsetpath || '', color: pc || '#FF0000' } };
+      }
+      return null;
+    })(),
     remarksTemplate: getRemarksTemplate(),
     remarksFields: state.remarksFields.length > 0 ? state.remarksFields.slice() : null,
     ttlValue: parseFloat(document.getElementById('ttlValue').value) || 0,
@@ -1702,8 +1739,14 @@ function resetForm() {
   state.classField = '';
   state.classValues = [];
   state.classMappings = {};
+  state.uniformIcon = null;
   document.getElementById('classField').innerHTML = '<option value="">(none — uniform style)</option>';
   document.getElementById('classMappings').innerHTML = '';
+  document.getElementById('pointCotType').value = 'a-u-G';
+  document.getElementById('pointIconLabel').textContent = '';
+  document.getElementById('pointIconPreview').style.display = 'none';
+  document.getElementById('btnPointIcon').textContent = 'Pick Icon';
+  document.getElementById('pointColor').value = '#FF0000';
 
   // Reset TFR fields
   document.getElementById('tfrConfigName').value = '';
