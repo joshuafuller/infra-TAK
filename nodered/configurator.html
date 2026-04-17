@@ -357,7 +357,12 @@
           <input type="text" id="iconPickerSearch" placeholder="e.g. fire, school, hydrant" oninput="searchIcons()">
         </div>
       </div>
-      <div id="iconGrid" style="margin-top:1rem;display:flex;flex-wrap:wrap;gap:6px;max-height:400px;overflow-y:auto"></div>
+      <div style="margin-top:0.8rem;display:flex;align-items:center;gap:0.6rem">
+        <button id="btnViewGrid" onclick="setIconView('grid')" style="padding:3px 10px;font-size:0.78rem;cursor:pointer;background:#2ec4b6;color:#0d0d2b;border:none;border-radius:4px">Grid</button>
+        <button id="btnViewList" onclick="setIconView('list')" style="padding:3px 10px;font-size:0.78rem;cursor:pointer;background:#1a1a4e;color:#ccc;border:1px solid #333;border-radius:4px">List</button>
+        <span style="color:#666;font-size:0.72rem" id="iconCountLabel"></span>
+      </div>
+      <div id="iconGrid" style="margin-top:0.5rem;display:flex;flex-wrap:wrap;gap:6px;max-height:400px;overflow-y:auto"></div>
     </div>
   </div>
 
@@ -776,6 +781,51 @@ const state = {
 };
 
 var _iconPickerCallback = null;
+var _iconViewMode = 'grid';
+
+function setIconView(mode) {
+  _iconViewMode = mode;
+  document.getElementById('btnViewGrid').style.cssText = mode === 'grid'
+    ? 'padding:3px 10px;font-size:0.78rem;cursor:pointer;background:#2ec4b6;color:#0d0d2b;border:none;border-radius:4px'
+    : 'padding:3px 10px;font-size:0.78rem;cursor:pointer;background:#1a1a4e;color:#ccc;border:1px solid #333;border-radius:4px';
+  document.getElementById('btnViewList').style.cssText = mode === 'list'
+    ? 'padding:3px 10px;font-size:0.78rem;cursor:pointer;background:#2ec4b6;color:#0d0d2b;border:none;border-radius:4px'
+    : 'padding:3px 10px;font-size:0.78rem;cursor:pointer;background:#1a1a4e;color:#ccc;border:1px solid #333;border-radius:4px';
+  var g = document.getElementById('iconGrid');
+  g.style.flexWrap = mode === 'grid' ? 'wrap' : 'nowrap';
+  g.style.flexDirection = mode === 'list' ? 'column' : 'row';
+  if (document.getElementById('iconPickerSearch').value.trim().length >= 2) searchIcons();
+  else renderIconGrid();
+}
+
+function buildIconItem(icon, iPath, label, setLabel) {
+  var btn = document.createElement('div');
+  if (_iconViewMode === 'list') {
+    btn.style.cssText = 'display:flex;align-items:center;gap:10px;cursor:pointer;border:2px solid transparent;border-radius:6px;padding:5px 8px;background:#0d0d2b;transition:border-color 0.15s;min-height:36px';
+  } else {
+    btn.style.cssText = 'width:52px;height:62px;display:flex;flex-direction:column;align-items:center;justify-content:center;cursor:pointer;border:2px solid transparent;border-radius:6px;padding:2px;background:#0d0d2b;transition:border-color 0.15s';
+  }
+  btn.title = (setLabel ? setLabel + ' > ' : '') + label + (icon.t ? ' (' + icon.t + ')' : '');
+  btn.onmouseenter = function() { this.style.borderColor = '#2ec4b6'; };
+  btn.onmouseleave = function() { this.style.borderColor = 'transparent'; };
+  btn.onclick = function() { pickIcon(iPath, icon.t, label, icon.b); };
+  if (icon.b) {
+    var img = document.createElement('img');
+    img.src = 'data:image/png;base64,' + icon.b;
+    img.style.cssText = _iconViewMode === 'list' ? 'width:28px;height:28px;object-fit:contain;flex-shrink:0' : 'width:32px;height:32px;object-fit:contain';
+    btn.appendChild(img);
+  }
+  var lbl = document.createElement('div');
+  if (_iconViewMode === 'list') {
+    lbl.style.cssText = 'font-size:0.78rem;color:#ccc;white-space:nowrap';
+    lbl.textContent = label + (icon.t ? '  [' + icon.t + ']' : '');
+  } else {
+    lbl.style.cssText = 'font-size:0.55rem;color:#888;text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;width:100%;margin-top:2px';
+    lbl.textContent = label.length > 10 ? label.substr(0, 10) + '\u2026' : label;
+  }
+  btn.appendChild(lbl);
+  return btn;
+}
 
 async function loadIconCatalog() {
   if (state.iconCatalog) return state.iconCatalog;
@@ -841,26 +891,11 @@ function renderIconGrid() {
       if (count > 500) return;
       var iPath = cat.uid + '/' + icon.f;
       var label = icon.f.replace(/\.png$/i, '').replace(/[-_]/g, ' ');
-      var btn = document.createElement('div');
-      btn.style.cssText = 'width:52px;height:62px;display:flex;flex-direction:column;align-items:center;justify-content:center;cursor:pointer;border:2px solid transparent;border-radius:6px;padding:2px;background:#0d0d2b;transition:border-color 0.15s';
-      btn.title = label + (icon.t ? ' (' + icon.t + ')' : '');
-      btn.onmouseenter = function() { this.style.borderColor = '#2ec4b6'; };
-      btn.onmouseleave = function() { this.style.borderColor = 'transparent'; };
-      btn.onclick = function() { pickIcon(iPath, icon.t, label, icon.b); };
-      if (icon.b) {
-        var img = document.createElement('img');
-        img.src = 'data:image/png;base64,' + icon.b;
-        img.style.cssText = 'width:32px;height:32px;object-fit:contain';
-        btn.appendChild(img);
-      }
-      var lbl = document.createElement('div');
-      lbl.style.cssText = 'font-size:0.55rem;color:#888;text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;width:100%;margin-top:2px';
-      lbl.textContent = label.length > 10 ? label.substr(0, 10) + '…' : label;
-      btn.appendChild(lbl);
-      grid.appendChild(btn);
+      grid.appendChild(buildIconItem(icon, iPath, label, ''));
       count++;
     });
   });
+  document.getElementById('iconCountLabel').textContent = count + ' icons';
   if (count === 0) grid.innerHTML = '<div style="color:#888;font-size:0.85rem">No icons in this selection</div>';
 }
 
@@ -878,27 +913,12 @@ function searchIcons() {
         var label = icon.f.replace(/\.png$/i, '').replace(/[-_]/g, ' ');
         if (label.toLowerCase().indexOf(q) === -1 && g.toLowerCase().indexOf(q) === -1) return;
         var iPath = cat.uid + '/' + icon.f;
-        var btn = document.createElement('div');
-        btn.style.cssText = 'width:52px;height:62px;display:flex;flex-direction:column;align-items:center;justify-content:center;cursor:pointer;border:2px solid transparent;border-radius:6px;padding:2px;background:#0d0d2b;transition:border-color 0.15s';
-        btn.title = setName + ' > ' + g + ' > ' + label + (icon.t ? ' (' + icon.t + ')' : '');
-        btn.onmouseenter = function() { this.style.borderColor = '#2ec4b6'; };
-        btn.onmouseleave = function() { this.style.borderColor = 'transparent'; };
-        btn.onclick = function() { pickIcon(iPath, icon.t, label, icon.b); };
-        if (icon.b) {
-          var img = document.createElement('img');
-          img.src = 'data:image/png;base64,' + icon.b;
-          img.style.cssText = 'width:32px;height:32px;object-fit:contain';
-          btn.appendChild(img);
-        }
-        var lbl = document.createElement('div');
-        lbl.style.cssText = 'font-size:0.55rem;color:#888;text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;width:100%;margin-top:2px';
-        lbl.textContent = label.length > 10 ? label.substr(0, 10) + '…' : label;
-        btn.appendChild(lbl);
-        grid.appendChild(btn);
+        grid.appendChild(buildIconItem(icon, iPath, label, setName + ' > ' + g));
         count++;
       });
     });
   });
+  document.getElementById('iconCountLabel').textContent = count + ' results';
   if (count === 0) grid.innerHTML = '<div style="color:#888;font-size:0.85rem">No icons matching "' + q + '"</div>';
 }
 
