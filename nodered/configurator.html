@@ -1078,25 +1078,31 @@ function buildClassEditPanel(v, m, ve) {
 
   html += '</div>';
 
-  var inputIdLabel = 'clsLabel_' + v.replace(/[^a-zA-Z0-9]/g, '_');
-  var inputIdRemarks = 'clsRemarks_' + v.replace(/[^a-zA-Z0-9]/g, '_');
+  var labelFields = m.labelFields || [];
+  var remarkFields = m.remarksFields || curRemarks;
 
   html += '<div style="margin-top:0.8rem">';
-  html += '<div class="field-grid" style="gap:1rem">';
-  html += '<div style="grid-column:1/-1">';
-  html += '<label style="font-size:0.82rem">Label (callsign) — type text and click fields to insert <code style="color:#2ec4b6">{Field}</code> placeholders</label>';
-  html += '<input type="text" id="' + inputIdLabel + '" value="' + (m.labelTemplate || m.customLabel || '').replace(/"/g, '&quot;') + '" placeholder="e.g. HAIL - {MAGNITUDE} or just HAIL" style="font-size:0.82rem;margin-top:0.3rem;width:100%" onchange="setClassLabelTemplate(\'' + ve + '\', this.value)">';
+  html += '<label style="font-size:0.82rem">Label (callsign) — click fields to add, click again to remove. Add custom text below.</label>';
   if (fields.length > 0) {
-    html += '<div style="display:flex;flex-wrap:wrap;gap:3px;margin-top:0.3rem">';
+    html += '<div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:0.4rem">';
     fields.forEach(function(f) {
-      var fe = f.name.replace(/'/g, "\\'");
-      html += '<span onclick="insertAtCursor(\'' + inputIdLabel + '\', \'{' + fe + '}\'); setClassLabelTemplate(\'' + ve + '\', document.getElementById(\'' + inputIdLabel + '\').value)" '
-        + 'style="display:inline-block;padding:1px 6px;background:#1a1a4e;color:#94a3b8;border-radius:10px;font-size:0.7rem;cursor:pointer" title="Insert {' + f.name + '}">' + f.name + '</span>';
+      var isOn = labelFields.indexOf(f.name) >= 0;
+      html += '<span onclick="toggleClassLabelField(\'' + ve + '\',\'' + f.name.replace(/'/g, "\\'") + '\')" '
+        + 'class="remark-pill ' + (isOn ? 'selected' : 'available') + '" '
+        + 'style="display:inline-block;padding:3px 10px;background:' + (isOn ? '#2ec4b6' : '#1a1a4e') + ';color:' + (isOn ? '#0d0d2b' : '#ccc') + ';border-radius:14px;font-size:0.78rem;cursor:pointer;font-weight:' + (isOn ? '600' : '400') + '">'
+        + f.name + '</span>';
     });
     html += '</div>';
   }
+  html += '<input type="text" value="' + (m.labelCustomText || '').replace(/"/g, '&quot;') + '" placeholder="Custom text to prepend (optional)" style="font-size:0.82rem;margin-top:0.4rem;width:100%" '
+    + 'onchange="setClassLabelCustomText(\'' + ve + '\', this.value)">';
+  if (labelFields.length > 0 || m.labelCustomText) {
+    var preview = (m.labelCustomText || '') + (m.labelCustomText && labelFields.length ? ' ' : '') + labelFields.map(function(f) { return '{' + f + '}'; }).join(' | ');
+    html += '<div style="margin-top:0.3rem;font-size:0.72rem;color:#666">Preview: <span style="color:#2ec4b6">' + preview + '</span></div>';
+  }
   html += '</div>';
 
+  html += '<div class="field-grid" style="margin-top:0.6rem;gap:1rem">';
   html += '<div>';
   html += '<label style="font-size:0.82rem">ALL CAPS</label>';
   html += '<select style="font-size:0.82rem;margin-top:0.3rem" onchange="setClassUpperCase(\'' + ve + '\', this.value === \'true\')">';
@@ -1111,21 +1117,26 @@ function buildClassEditPanel(v, m, ve) {
   html += '<option value="false"' + (m.labelsOn === false || m.labelsOn == null ? ' selected' : '') + '>No</option>';
   html += '</select></div>';
   html += '</div>';
-  html += '</div>';
 
   html += '<div style="margin-top:0.8rem">';
-  html += '<label style="font-size:0.82rem">Remarks — type text and click fields to insert <code style="color:#2ec4b6">{Field}</code> placeholders</label>';
-  html += '<textarea id="' + inputIdRemarks + '" rows="2" style="font-size:0.82rem;margin-top:0.3rem;width:100%;background:#1a1a2e;color:#eee;border:1px solid #333;border-radius:6px;padding:0.4rem;resize:vertical" onchange="setClassRemarksTemplate(\'' + ve + '\', this.value)">'
-    + (m.remarksTemplate || (curRemarks.length ? curRemarks.map(function(f) { return f + ': {' + f + '}'; }).join(' | ') : ''))
-    + '</textarea>';
+  html += '<label style="font-size:0.82rem">Remarks — click fields to add, click again to remove. Add custom text below.</label>';
   if (fields.length > 0) {
-    html += '<div style="display:flex;flex-wrap:wrap;gap:3px;margin-top:0.3rem">';
+    html += '<div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:0.4rem">';
     fields.forEach(function(f) {
-      var fe = f.name.replace(/'/g, "\\'");
-      html += '<span onclick="insertAtCursor(\'' + inputIdRemarks + '\', \'{' + fe + '}\'); setClassRemarksTemplate(\'' + ve + '\', document.getElementById(\'' + inputIdRemarks + '\').value)" '
-        + 'style="display:inline-block;padding:1px 6px;background:#1a1a4e;color:#94a3b8;border-radius:10px;font-size:0.7rem;cursor:pointer" title="Insert {' + f.name + '}">' + f.name + '</span>';
+      var isOn = remarkFields.indexOf(f.name) >= 0;
+      html += '<span onclick="toggleClassRemarkField(\'' + ve + '\',\'' + f.name.replace(/'/g, "\\'") + '\')" '
+        + 'class="remark-pill ' + (isOn ? 'selected' : 'available') + '" '
+        + 'style="display:inline-block;padding:3px 10px;background:' + (isOn ? '#2ec4b6' : '#1a1a4e') + ';color:' + (isOn ? '#0d0d2b' : '#ccc') + ';border-radius:14px;font-size:0.78rem;cursor:pointer;font-weight:' + (isOn ? '600' : '400') + '">'
+        + f.name + '</span>';
     });
     html += '</div>';
+  }
+  html += '<input type="text" value="' + (m.remarksCustomText || '').replace(/"/g, '&quot;') + '" placeholder="Custom text to append (optional)" style="font-size:0.82rem;margin-top:0.4rem;width:100%" '
+    + 'onchange="setClassRemarksCustomText(\'' + ve + '\', this.value)">';
+  if (remarkFields.length > 0 || m.remarksCustomText) {
+    var rmkPreview = remarkFields.map(function(f) { return f + ': {' + f + '}'; }).join(' | ')
+      + (m.remarksCustomText ? (remarkFields.length ? ' | ' : '') + m.remarksCustomText : '');
+    html += '<div style="margin-top:0.3rem;font-size:0.72rem;color:#666">Preview: <span style="color:#2ec4b6">' + rmkPreview + '</span></div>';
   }
   html += '</div>';
 
@@ -1196,19 +1207,49 @@ function buildColorPicker(ve, curColor) {
 function setClassColor(v, c) { if (!state.classMappings[v]) state.classMappings[v] = {}; state.classMappings[v].color = c; renderClassMappings(); }
 function clearClassColor(v) { if (!state.classMappings[v]) state.classMappings[v] = {}; state.classMappings[v].color = ''; renderClassMappings(); }
 function setClassLabel(v, l) { if (!state.classMappings[v]) state.classMappings[v] = {}; state.classMappings[v].customLabel = l.trim() || ''; }
-function setClassLabelTemplate(v, t) { if (!state.classMappings[v]) state.classMappings[v] = {}; state.classMappings[v].labelTemplate = t; }
-function setClassRemarksTemplate(v, t) { if (!state.classMappings[v]) state.classMappings[v] = {}; state.classMappings[v].remarksTemplate = t; }
 function setClassUpperCase(v, on) { if (!state.classMappings[v]) state.classMappings[v] = {}; state.classMappings[v].labelUpperCase = on; }
 function setClassLabelsOn(v, on) { if (!state.classMappings[v]) state.classMappings[v] = {}; state.classMappings[v].labelsOn = on; }
-
-function insertAtCursor(inputId, text) {
-  var el = document.getElementById(inputId);
-  if (!el) return;
-  el.focus();
-  var start = el.selectionStart || el.value.length;
-  var end = el.selectionEnd || el.value.length;
-  el.value = el.value.substring(0, start) + text + el.value.substring(end);
-  el.selectionStart = el.selectionEnd = start + text.length;
+function setClassLabelCustomText(v, t) {
+  if (!state.classMappings[v]) state.classMappings[v] = {};
+  state.classMappings[v].labelCustomText = t;
+  rebuildClassLabelTemplate(v);
+}
+function setClassRemarksCustomText(v, t) {
+  if (!state.classMappings[v]) state.classMappings[v] = {};
+  state.classMappings[v].remarksCustomText = t;
+  rebuildClassRemarksTemplate(v);
+}
+function toggleClassLabelField(v, f) {
+  if (!state.classMappings[v]) state.classMappings[v] = {};
+  if (!state.classMappings[v].labelFields) state.classMappings[v].labelFields = [];
+  var arr = state.classMappings[v].labelFields;
+  var idx = arr.indexOf(f);
+  if (idx >= 0) arr.splice(idx, 1); else arr.push(f);
+  rebuildClassLabelTemplate(v);
+  renderClassMappings();
+}
+function toggleClassRemarkField(v, f) {
+  if (!state.classMappings[v]) state.classMappings[v] = {};
+  if (!state.classMappings[v].remarksFields) state.classMappings[v].remarksFields = [];
+  var arr = state.classMappings[v].remarksFields;
+  var idx = arr.indexOf(f);
+  if (idx >= 0) arr.splice(idx, 1); else arr.push(f);
+  rebuildClassRemarksTemplate(v);
+  renderClassMappings();
+}
+function rebuildClassLabelTemplate(v) {
+  var m = state.classMappings[v] || {};
+  var parts = [];
+  if (m.labelCustomText) parts.push(m.labelCustomText);
+  if (m.labelFields && m.labelFields.length) parts.push(m.labelFields.map(function(f) { return '{' + f + '}'; }).join(' | '));
+  m.labelTemplate = parts.join(' ') || '';
+}
+function rebuildClassRemarksTemplate(v) {
+  var m = state.classMappings[v] || {};
+  var parts = [];
+  if (m.remarksFields && m.remarksFields.length) parts.push(m.remarksFields.map(function(f) { return f + ': {' + f + '}'; }).join(' | '));
+  if (m.remarksCustomText) parts.push(m.remarksCustomText);
+  m.remarksTemplate = parts.join(' | ') || '';
 }
 function addClassRemark(v, f) {
   if (!f) return;
