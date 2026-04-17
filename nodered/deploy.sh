@@ -77,6 +77,27 @@ docker exec "$CONTAINER" node -e "
     preserved.push(n);
   });
 
+  // De-duplicate tabs with the same label (keep first occurrence, drop extras + their children)
+  var seenLabels = {};
+  upd.forEach(function(n) { if (n.type === 'tab' && n.label) seenLabels[n.label] = true; });
+  var dupTabIds = {};
+  preserved.forEach(function(n) {
+    if (n.type === 'tab' && n.label) {
+      if (seenLabels[n.label]) { dupTabIds[n.id] = n.label; }
+      else { seenLabels[n.label] = true; }
+    }
+  });
+  if (Object.keys(dupTabIds).length > 0) {
+    preserved = preserved.filter(function(n) {
+      if (dupTabIds[n.id]) return false;
+      if (n.z && dupTabIds[n.z]) return false;
+      return true;
+    });
+    Object.keys(dupTabIds).forEach(function(id) {
+      console.log('    Dedup: removed extra tab \"' + dupTabIds[id] + '\" (' + id + ')');
+    });
+  }
+
   console.log('    Preserved ' + preserved.length + ' existing nodes (dynamic tabs + user flows)');
 
   // --- TLS config: preserve cert/key from running container if populated ---
