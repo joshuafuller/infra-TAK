@@ -781,8 +781,15 @@ async function loadIconCatalog() {
   if (state.iconCatalog) return state.iconCatalog;
   try {
     var res = await fetch('/arcgis-tak/icons');
-    state.iconCatalog = await res.json();
-  } catch(e) { state.iconCatalog = {}; }
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    var data = await res.json();
+    if (data.error) throw new Error(data.error);
+    state.iconCatalog = data;
+  } catch(e) {
+    console.error('Icon catalog load failed:', e);
+    state.iconCatalog = {};
+    alert('Failed to load icon catalog: ' + e.message);
+  }
   return state.iconCatalog;
 }
 

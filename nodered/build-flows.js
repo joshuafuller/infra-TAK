@@ -508,14 +508,14 @@ const configFlows = [
     id: 'fn_icons', type: 'function', z: CFG_TAB,
     name: 'Serve icon catalog',
     func: [
-      "var fs = require('fs');",
       "try {",
       "  msg.payload = JSON.parse(fs.readFileSync('/data/icon-catalog.json', 'utf8'));",
-      "} catch(e) { msg.payload = {}; }",
+      "} catch(e) { msg.payload = { error: e.message }; }",
       "return msg;"
     ].join('\n'),
     outputs: 1, timeout: '', noerr: 0,
-    initialize: '', finalize: '', libs: [],
+    initialize: '', finalize: '',
+    libs: [{ var: 'fs', module: 'fs' }],
     x: 430, y: 1060, wires: [['ho_icons']]
   },
   {
