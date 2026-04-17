@@ -1154,7 +1154,7 @@ function makeEngineTab(feed) {
         "return msg;"
       ].join('\n'),
       outputs: 1, timeout: '', noerr: 0,
-      initialize: '', finalize: '', libs: [],
+      initialize: "global.set('_subscribed', {});", finalize: '', libs: [],
       x: 180, y: 300, wires: [[P + 'http_sub']]
     },
     {
