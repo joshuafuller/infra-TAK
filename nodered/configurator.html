@@ -979,9 +979,11 @@ async function fetchClassValues() {
     });
     var data = await res.json();
     var vals = [];
+    var seen = {};
     if (data.values) {
       data.values.forEach(function(v) {
-        if (v != null && String(v).trim()) vals.push(String(v).trim());
+        var s = (v != null) ? String(v).trim() : '';
+        if (s && !seen[s]) { seen[s] = true; vals.push(s); }
       });
     }
     vals.sort();
