@@ -1885,13 +1885,45 @@ function populateIdFieldsPicker() {
   state.idFields = [];
   var html = '';
   var autoPick = null;
-  state.fields.forEach(function(f) {
+
+  var layerNames = Object.keys(state.layerFields || {});
+  var multi = layerNames.length > 1;
+  var presenceByName = {};
+  var typeByName = {};
+  if (multi) {
+    layerNames.forEach(function(lname) {
+      (state.layerFields[lname] || []).forEach(function(f) {
+        if (!presenceByName[f.name]) presenceByName[f.name] = {};
+        presenceByName[f.name][lname] = true;
+        typeByName[f.name] = f.type;
+      });
+    });
+  } else {
+    state.fields.forEach(function(f) { typeByName[f.name] = f.type; });
+  }
+
+  var fieldList;
+  if (multi) {
+    fieldList = Object.keys(presenceByName).sort().map(function(n) {
+      return { name: n, type: typeByName[n], presentIn: Object.keys(presenceByName[n]).length };
+    });
+  } else {
+    fieldList = state.fields.map(function(f) { return { name: f.name, type: f.type, presentIn: 1 }; });
+  }
+  var totalLayers = multi ? layerNames.length : 1;
+
+  fieldList.forEach(function(f) {
     var isId = (f.type === 'esriFieldTypeOID' || f.type === 'esriFieldTypeGlobalID');
-    var short = f.type.replace('esriFieldType', '');
+    var short = (f.type || '').replace('esriFieldType', '');
+    var inAll = f.presentIn === totalLayers;
     var tag = isId ? ' << ID' : '';
-    html += '<span class="remark-pill available" id="idpill-' + f.name + '" onclick="addIdField(\'' + f.name.replace(/'/g, "\\'") + '\')">'
-      + f.name + ' <span style="opacity:.6;font-size:.7rem">(' + short + ')</span>' + tag + '</span>';
-    if (isId && !autoPick) autoPick = f.name;
+    var partial = multi && !inAll ? ' <span style="color:#c77;font-size:.7rem">(in ' + f.presentIn + '/' + totalLayers + ')</span>' : '';
+    var style = multi && !inAll ? ' style="opacity:.55"' : '';
+    var title = multi && !inAll ? ' title="Only in ' + f.presentIn + ' of ' + totalLayers + ' selected layers — other layers will hash as empty string for this field"' : '';
+    html += '<span class="remark-pill available" id="idpill-' + f.name + '"' + style + title
+      + ' onclick="addIdField(\'' + f.name.replace(/'/g, "\\'") + '\')">'
+      + f.name + ' <span style="opacity:.6;font-size:.7rem">(' + short + ')</span>' + tag + partial + '</span>';
+    if (isId && !autoPick && inAll) autoPick = f.name;
   });
   document.getElementById('idFieldsAvailable').innerHTML = html;
   document.getElementById('idFieldsSelected').innerHTML = '<span style="color:#555">Click field(s) above to add</span>';
