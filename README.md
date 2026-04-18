@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Latest release: v0.6.2-alpha** — **Node-RED DataSync operator end-state:** no static example feeds in shipped flows (`FEEDS` empty); feeds only via **Configurator** (ArcGIS / FAA TFR). **Console Node-RED deploy** mounts `/opt/tak/certs/files` → `/certs`, adds `host.docker.internal`, runs **`nodered/deploy.sh`** on first deploy; **post-update** patches existing compose + flow sync. Operators: **TAK Mission API TLS** in the Node-RED editor → admin cert paths + **key passphrase** → **Deploy**. Stable ArcGIS hashing; TLS defaults not hardcoded in git. See **[docs/RELEASE-v0.6.2-alpha.md](docs/RELEASE-v0.6.2-alpha.md)**. Prior: [v0.6.1-alpha](docs/RELEASE-v0.6.1-alpha.md), [v0.6.0-alpha](docs/RELEASE-v0.6.0-alpha.md), [v0.5.9-alpha](docs/RELEASE-v0.5.9-alpha.md), [v0.5.8-alpha](docs/RELEASE-v0.5.8-alpha.md), [v0.5.7-alpha](docs/RELEASE-v0.5.7-alpha.md), [v0.5.6-alpha](docs/RELEASE-v0.5.6-alpha.md), [v0.5.5-alpha](docs/RELEASE-v0.5.5-alpha.md), [v0.5.4-alpha](docs/RELEASE-v0.5.4-alpha.md), [v0.5.3-alpha](docs/RELEASE-v0.5.3-alpha.md), [v0.5.2-alpha](docs/RELEASE-v0.5.2-alpha.md), [v0.5.1-alpha](docs/RELEASE-v0.5.1-alpha.md), [v0.5.0-alpha](docs/RELEASE-v0.5.0-alpha.md), [v0.4.9-alpha](docs/RELEASE-v0.4.9-alpha.md), [v0.4.8-alpha](docs/RELEASE-v0.4.8-alpha.md), [v0.4.7-alpha](docs/RELEASE-v0.4.7-alpha.md), [v0.4.6-alpha](docs/RELEASE-v0.4.6-alpha.md), [v0.4.5-alpha](docs/RELEASE-v0.4.5-alpha.md), [v0.4.4-alpha](docs/RELEASE-v0.4.4-alpha.md), [v0.4.3-alpha](docs/RELEASE-v0.4.3-alpha.md), [v0.4.2-alpha](docs/RELEASE-v0.4.2-alpha.md).
+**Latest release: v0.6.4-alpha** — **Patch:** `app.py` **`VERSION`** now matches the release tag so **Update Now** clears the banner and **post-update** (Guard Dog + Node-RED) runs. Same Node-RED / Configurator content as v0.6.3. See **[docs/RELEASE-v0.6.4-alpha.md](docs/RELEASE-v0.6.4-alpha.md)**. Feature notes: [v0.6.3-alpha](docs/RELEASE-v0.6.3-alpha.md). Prior: [v0.6.1-alpha](docs/RELEASE-v0.6.1-alpha.md), [v0.6.0-alpha](docs/RELEASE-v0.6.0-alpha.md), [v0.5.9-alpha](docs/RELEASE-v0.5.9-alpha.md), [v0.5.8-alpha](docs/RELEASE-v0.5.8-alpha.md), [v0.5.7-alpha](docs/RELEASE-v0.5.7-alpha.md), [v0.5.6-alpha](docs/RELEASE-v0.5.6-alpha.md), [v0.5.5-alpha](docs/RELEASE-v0.5.5-alpha.md), [v0.5.4-alpha](docs/RELEASE-v0.5.4-alpha.md), [v0.5.3-alpha](docs/RELEASE-v0.5.3-alpha.md), [v0.5.2-alpha](docs/RELEASE-v0.5.2-alpha.md), [v0.5.1-alpha](docs/RELEASE-v0.5.1-alpha.md), [v0.5.0-alpha](docs/RELEASE-v0.5.0-alpha.md), [v0.4.9-alpha](docs/RELEASE-v0.4.9-alpha.md), [v0.4.8-alpha](docs/RELEASE-v0.4.8-alpha.md), [v0.4.7-alpha](docs/RELEASE-v0.4.7-alpha.md), [v0.4.6-alpha](docs/RELEASE-v0.4.6-alpha.md), [v0.4.5-alpha](docs/RELEASE-v0.4.5-alpha.md), [v0.4.4-alpha](docs/RELEASE-v0.4.4-alpha.md), [v0.4.3-alpha](docs/RELEASE-v0.4.3-alpha.md), [v0.4.2-alpha](docs/RELEASE-v0.4.2-alpha.md).
 
 **Something broken?** Wrong sidebar version, **Update Now** error, merge/rebase/tag-clobber messages, or you are not sure the VPS ever pulled the real repo → go to **[Universal recovery (SSH)](#universal-recovery-ssh)** and run the one block there. **Point people at that section**; it is the single source of truth.
 
@@ -299,6 +299,29 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v0.6.4-alpha — 2026-04-16
+
+**Patch — VERSION / tag alignment for Update Now**
+- Bumps **`VERSION`** to **`0.6.4-alpha`** so the checked-out tag and sidebar match, the update banner clears, and **post-update auto-deploy** (Guard Dog, Node-RED `deploy.sh` flow sync) runs after upgrade. No change to shipped Node-RED flows vs v0.6.3 content.
+
+Full notes: [docs/RELEASE-v0.6.4-alpha.md](docs/RELEASE-v0.6.4-alpha.md). Node-RED pointer: [nodered/CHANGELOG-nodered-v0.6.4-alpha.md](nodered/CHANGELOG-nodered-v0.6.4-alpha.md).
+
+---
+
+### v0.6.3-alpha — 2026-04-17
+
+**Node-RED Configurator — multi-layer, per-class styling, epoch-ms time**
+- **Multi-layer** ArcGIS configs (one wizard, multiple layers); **multi-geometry** (point + polygon) with geometry-aware Step 4.
+- **Step 3c class mapping:** per-class icons, ATAK color swatches, **no-color** option, template **label** and **remarks** with pill field toggles; **ALL CAPS** callsign option.
+- **Epoch-millisecond time field** for rolling windows on numeric epoch columns (e.g. NOAA storm reports).
+- **Template export/import** for reusable feed JSON.
+- **Reconciliation:** global `_lastPoll`, duplicate tab dedup on deploy, stable polygon hash, `_subscribed` reset — fewer spurious ATAK notifications after deploy.
+- **UI fixes:** Step 4 visible for point + class mapping; `resetForm()` on config switch so fields don’t leak between saved feeds.
+
+Full notes: [docs/RELEASE-v0.6.3-alpha.md](docs/RELEASE-v0.6.3-alpha.md). Node-RED file list: [nodered/CHANGELOG-nodered-v0.6.3-alpha.md](nodered/CHANGELOG-nodered-v0.6.3-alpha.md).
+
+---
 
 ### v0.6.2-alpha — 2026-04-16
 
