@@ -491,6 +491,43 @@ const configFlows = [
     x: 720, y: 960, wires: []
   },
 
+  // ── Purge orphan UIDs (one-shot) ──
+  {
+    id: 'hi_purge', type: 'http in', z: CFG_TAB,
+    name: 'POST /arcgis-tak/tak/purge-orphans',
+    url: '/arcgis-tak/tak/purge-orphans', method: 'post',
+    upload: false, swaggerDoc: '',
+    x: 220, y: 990, wires: [['fn_purge']]
+  },
+  {
+    id: 'fn_purge', type: 'function', z: CFG_TAB,
+    name: 'Queue one-shot orphan purge',
+    func: [
+      "var name = (msg.payload && msg.payload.configName) ? String(msg.payload.configName).trim() : '';",
+      "if (!name) {",
+      "  msg.statusCode = 400;",
+      "  msg.payload = { ok: false, error: 'configName required' };",
+      "  return msg;",
+      "}",
+      "var fp = global.get('_forcePurge') || {};",
+      "fp[name] = true;",
+      "global.set('_forcePurge', fp);",
+      "var pollKey = '_lastPoll_' + name.replace(/[^A-Za-z0-9]/g, '_');",
+      "global.set(pollKey, 0);",
+      "node.warn('purge-orphans queued for ' + name + ' — next poll will DELETE any UIDs in mission not in current ArcGIS set');",
+      "msg.payload = { ok: true, queued: name, note: 'Next poll cycle will remove orphans. Click Update Now or wait for poll interval.' };",
+      "return msg;"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 500, y: 990, wires: [['ho_purge']]
+  },
+  {
+    id: 'ho_purge', type: 'http response', z: CFG_TAB,
+    name: '', statusCode: '', headers: {},
+    x: 720, y: 990, wires: []
+  },
+
   // ── Icon catalog endpoint ──
   {
     id: 'c_icons', type: 'comment', z: CFG_TAB,
@@ -991,8 +1028,13 @@ function makeEngineTab(feed) {
     "if (!arcgisOk) {",
     "  node.warn(topicCfg + ': ArcGIS fetch failed (status ' + msg._arcgisStatus + ') - skipping deletes');",
     "} else {",
+    "  var forcePurge = global.get('_forcePurge') || {};",
+    "  var strictMode = (cfg.strictMode !== false);",
+    "  var oneShotPurge = forcePurge[topicCfg] === true;",
+    "  var cleanOrphans = strictMode || oneShotPurge;",
     "  for (var uid in existing) {",
-    "    if (uid.indexOf(prefix) === 0 && !arcgis[uid]) {",
+    "    var matchesPrefix = (uid.indexOf(prefix) === 0);",
+    "    if (!arcgis[uid] && (cleanOrphans || matchesPrefix)) {",
     "      nDel++;",
     "      node.send([null, {",
     "        method: 'DELETE',",
@@ -1005,10 +1047,15 @@ function makeEngineTab(feed) {
     "      }]);",
     "    }",
     "  }",
+    "  if (oneShotPurge) {",
+    "    delete forcePurge[topicCfg];",
+    "    global.set('_forcePurge', forcePurge);",
+    "    node.warn(topicCfg + ': one-shot purge complete, DELETED ' + nDel + ' orphan UIDs');",
+    "  }",
     "}",
     "",
     "node.warn(topicCfg + ' reconcile: ' + nStream + ' streamed, ' + nSkip + ' unchanged, ' + nPut + ' PUT, ' + nDel + ' DELETE, '",
-    "  + Object.keys(arcgis).length + ' ArcGIS, ' + Object.keys(existing).length + ' in mission');",
+    "  + Object.keys(arcgis).length + ' ArcGIS, ' + Object.keys(existing).length + ' in mission' + (strictMode ? ' [strict]' : ''));",
     "return null;"
   ].join('\n');
 
@@ -1711,8 +1758,13 @@ const FN_TFR_RECONCILE = [
   "  node.warn(topicCfg + ' reconcile: sending PUT msg, url=' + putMsg._putUrl + ' uids=' + newUids.length);",
   "  node.send([putMsg, null]);",
   "}",
+  "var forcePurge = global.get('_forcePurge') || {};",
+  "var strictMode = (cfg.strictMode !== false);",
+  "var oneShotPurge = forcePurge[topicCfg] === true;",
+  "var cleanOrphans = strictMode || oneShotPurge;",
   "for (var uid in existing) {",
-  "  if (uid.indexOf(prefix) === 0 && !tfrMap[uid]) {",
+  "  var matchesPrefix = (uid.indexOf(prefix) === 0);",
+  "  if (!tfrMap[uid] && (cleanOrphans || matchesPrefix)) {",
   "    nDel++;",
   "    node.send([null, {",
   "      method: 'DELETE',",
@@ -1723,8 +1775,13 @@ const FN_TFR_RECONCILE = [
   "    }]);",
   "  }",
   "}",
+  "if (oneShotPurge) {",
+  "  delete forcePurge[topicCfg];",
+  "  global.set('_forcePurge', forcePurge);",
+  "  node.warn(topicCfg + ': one-shot purge complete, DELETED ' + nDel + ' orphan UIDs');",
+  "}",
   "node.warn(topicCfg + ' reconcile: ' + nPut + ' PUT, ' + nDel + ' DELETE, '",
-  "  + tfrUids.length + ' TFR, ' + Object.keys(existing).length + ' in mission');",
+  "  + tfrUids.length + ' TFR, ' + Object.keys(existing).length + ' in mission' + (strictMode ? ' [strict]' : ''));",
   "// _tfrUids is reset only at the start of each poll (Filter & split), not here —",
   "// clearing here caused the next timer reconcile to DELETE everything.",
   "return null;"
