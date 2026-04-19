@@ -102,8 +102,12 @@ if [ "$(echo "$AVG_24H > 0" | bc -l 2>/dev/null)" = "1" ]; then
 fi
 
 # ── 6. Send alert (max once per 6 hours) ──
+# Skip email/SMS only when /opt/tak-guarddog/diskio_email_off exists (set from Guard Dog UI).
+# Benchmark + CSV + syslog above still run.
 if $NEED_ALERT; then
-  if [ ! -f "$ALERT_SENT_FILE" ] || [ "$(find "$ALERT_SENT_FILE" -mmin +360 2>/dev/null)" ]; then
+  if [ -f /opt/tak-guarddog/diskio_email_off ]; then
+    logger -t takguard-diskio "Alert condition met — email/SMS disabled for disk I/O (UI); not sending."
+  elif [ ! -f "$ALERT_SENT_FILE" ] || [ "$(find "$ALERT_SENT_FILE" -mmin +360 2>/dev/null)" ]; then
     touch "$ALERT_SENT_FILE"
 
     RECENT=$(tail -n 8 "$HISTORY" | tail -n +1)

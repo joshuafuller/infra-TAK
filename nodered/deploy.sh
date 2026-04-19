@@ -141,20 +141,23 @@ docker exec "$CONTAINER" node -e "
     if (!n.z) return;
     if (n.name === 'Filter & split TFRs' || n.name === 'TFR Reconcile (diff)' || n.name === 'Build TFR CoT') tabTypes[n.z] = 'tfr';
     if (n.name === 'Build ArcGIS query' || n.name === 'Parse & build CoT') tabTypes[n.z] = 'arcgis';
+    if (n.name === 'Build KML URL' || n.name === 'KML to Feature JSON') tabTypes[n.z] = 'kml';
   });
 
   var nameToKey = {
     'Build ArcGIS query': { arcgis: 'arcgis.build_query' },
     'Parse & build CoT': { arcgis: 'arcgis.parse_cot' },
-    'Reconcile (diff)': { arcgis: 'arcgis.reconcile' },
+    'Reconcile (diff)': { arcgis: 'arcgis.reconcile', kml: 'arcgis.reconcile' },
     'Filter & split TFRs': { tfr: 'tfr.filter_split' },
     'Build TFR CoT': { tfr: 'tfr.build_cot' },
     'TFR Reconcile (diff)': { tfr: 'tfr.reconcile' },
-    'Build subscribe URL': { arcgis: 'shared.build_sub', tfr: 'shared.build_sub' },
-    'Build mission GET URL': { arcgis: 'shared.build_m', tfr: 'shared.build_m' },
-    'CoT JSON -> XML': { arcgis: 'shared.cot_to_xml', tfr: 'shared.cot_to_xml' },
-    'Build PUT UIDs': { arcgis: 'shared.build_put', tfr: 'shared.build_put' },
-    'Log API result': { arcgis: 'shared.log_action', tfr: 'shared.log_action' }
+    'Build KML URL': { kml: 'kml.build_url' },
+    'KML to Feature JSON': { kml: 'kml.xml_to_features' },
+    'Build subscribe URL': { arcgis: 'shared.build_sub', tfr: 'shared.build_sub', kml: 'shared.build_sub' },
+    'Build mission GET URL': { arcgis: 'shared.build_m', tfr: 'shared.build_m', kml: 'shared.build_m' },
+    'CoT JSON -> XML': { arcgis: 'shared.cot_to_xml', tfr: 'shared.cot_to_xml', kml: 'shared.cot_to_xml' },
+    'Build PUT UIDs': { arcgis: 'shared.build_put', tfr: 'shared.build_put', kml: 'shared.build_put' },
+    'Log API result': { arcgis: 'shared.log_action', tfr: 'shared.log_action', kml: 'shared.log_action' }
   };
 
   var nSync = 0;

@@ -727,7 +727,11 @@ const FN_PARSE_COT = [
   "  var idFields = (cfg.mapping.idFields && cfg.mapping.idFields.length) ? cfg.mapping.idFields : (cfg.mapping.idField ? [cfg.mapping.idField] : []);",
 "  var hp = [gKey];",
 "  for (var hfi = 0; hfi < idFields.length; hfi++) hp.push(String(a[idFields[hfi]] != null ? a[idFields[hfi]] : ''));",
-"  if (cfg.style.labelField) hp.push(String(a[cfg.style.labelField] || ''));",
+"  if (cfg.style.labelFields && cfg.style.labelFields.length) {",
+"    for (var __hli = 0; __hli < cfg.style.labelFields.length; __hli++) {",
+"      hp.push(String(a[cfg.style.labelFields[__hli]] || ''));",
+"    }",
+"  } else if (cfg.style.labelField) hp.push(String(a[cfg.style.labelField] || ''));",
 "  if (cfg.remarksFields) { for (var ri=0;ri<cfg.remarksFields.length;ri++) hp.push(String(a[cfg.remarksFields[ri]] || '')); }",
 "  var _hash = djb2(hp.join('|'));",
   "",
@@ -795,6 +799,7 @@ const FN_PARSE_COT = [
   "  var callsign = uid;",
   "  if (cls.labelTemplate) callsign = tmpl(cls.labelTemplate, a);",
   "  else if (cls.customLabel) callsign = String(cls.customLabel);",
+  "  else if (cfg.style.labelTemplate && String(cfg.style.labelTemplate).trim()) callsign = tmpl(cfg.style.labelTemplate, a);",
   "  else if (cfg.style.customLabel) callsign = String(cfg.style.customLabel);",
   "  else if (cfg.style.labelField && a[cfg.style.labelField] != null) callsign = String(a[cfg.style.labelField]);",
   "  if (cls.labelUpperCase || cfg.style.labelUpperCase) callsign = callsign.toUpperCase();",
@@ -1429,6 +1434,221 @@ function makeEngineTab(feed) {
       x: 960, y: 440, wires: [[]]
     }
   ];
+}
+
+// KML Network Link → same downstream as ArcGIS (parse_cot, reconcile, TCP)
+const FN_KML_BUILD_URL = [
+  "var cfg = msg.payload;",
+  "if (!cfg || cfg.sourceType !== 'kml') { return null; }",
+  "msg._config = cfg;",
+  "msg.takSettings = msg.takSettings || {};",
+  "var u = (cfg.source && cfg.source.networkLinkUrl) ? String(cfg.source.networkLinkUrl).trim() : '';",
+  "if (!u) { node.warn((cfg.configName || 'KML') + ': No network link URL'); return null; }",
+  "msg.url = u;",
+  "msg.method = 'GET';",
+  "msg.headers = { Accept: 'application/vnd.google-earth.kml+xml, application/xml, text/xml, */*' };",
+  "return msg;"
+].join('\n');
+
+const FN_KML_TO_FEATURES = [
+  "var cfg = msg._config;",
+  "var tak = msg.takSettings;",
+  "var topic = msg.topic;",
+  "var startUrl = (cfg.source && cfg.source.networkLinkUrl) ? String(cfg.source.networkLinkUrl).trim() : '';",
+  "",
+  "function xmlFromPayload(p) {",
+  "  if (typeof p === 'string') return p;",
+  "  if (Buffer.isBuffer(p)) return p.toString('utf8');",
+  "  if (p && typeof p === 'object' && p.data) return Buffer.from(p.data).toString('utf8');",
+  "  return String(p || '');",
+  "}",
+  "",
+  "function parsePlacemarks(xml) {",
+  "  var features = [];",
+  "  var re = /<Placemark([^>]*)>([\\s\\S]*?)<\\/Placemark>/gi;",
+  "  var m;",
+  "  var oid = 0;",
+  "  while ((m = re.exec(xml)) !== null) {",
+  "    var block = m[2];",
+  "    var name = 'Placemark';",
+  "    var nm = block.match(/<name[^>]*>([\\s\\S]*?)<\\/name>/i);",
+  "    if (nm) name = nm[1].replace(/<[^>]+>/g,'').trim() || name;",
+  "    var desc = '';",
+  "    var dm = block.match(/<description[^>]*>([\\s\\S]*?)<\\/description>/i);",
+  "    if (dm) desc = dm[1].replace(/<[^>]+>/g,' ').replace(/\\s+/g,' ').trim();",
+  "    var pt = block.match(/<Point[^>]*>[\\s\\S]*?<coordinates[^>]*>\\s*([^<]+)\\s*<\\/coordinates>/i);",
+  "    if (pt) {",
+  "      var parts = pt[1].trim().split(/[\\s,]+/);",
+  "      var lon = parseFloat(parts[0]), lat = parseFloat(parts[1]);",
+  "      if (!isNaN(lat) && !isNaN(lon))",
+  "        features.push({ attributes: { name: name, description: desc, OBJECTID: oid }, geometry: { x: lon, y: lat } });",
+  "      oid++;",
+  "      continue;",
+  "    }",
+  "    var poly = block.match(/<Polygon[^>]*>[\\s\\S]*?<\\/Polygon>/i);",
+  "    if (poly) {",
+  "      var ob = poly[0].match(/<outerBoundaryIs>[\\s\\S]*?<coordinates[^>]*>\\s*([^<]+)\\s*<\\/coordinates>/i);",
+  "      if (ob) {",
+  "        var ring = [];",
+  "        ob[1].trim().split(/\\s+/).forEach(function(pair) {",
+  "          var p = pair.split(',');",
+  "          if (p.length >= 2) ring.push([parseFloat(p[0]), parseFloat(p[1])]);",
+  "        });",
+  "        if (ring.length)",
+  "          features.push({ attributes: { name: name, description: desc, OBJECTID: oid }, geometry: { rings: [ring] } });",
+  "      }",
+  "      oid++;",
+  "      continue;",
+  "    }",
+  "    var ls = block.match(/<LineString[^>]*>[\\s\\S]*?<coordinates[^>]*>\\s*([^<]+)\\s*<\\/coordinates>/i);",
+  "    if (ls) {",
+  "      var path = [];",
+  "      ls[1].trim().split(/\\s+/).forEach(function(pair) {",
+  "        var p = pair.split(',');",
+  "        if (p.length >= 2) path.push([parseFloat(p[0]), parseFloat(p[1])]);",
+  "      });",
+  "      if (path.length)",
+  "        features.push({ attributes: { name: name, description: desc, OBJECTID: oid }, geometry: { paths: [path] } });",
+  "      oid++;",
+  "    }",
+  "  }",
+  "  return features;",
+  "}",
+  "",
+  "function networkHref(xml) {",
+  "  var m = xml.match(/<NetworkLink[^>]*>[\\s\\S]*?<\\/NetworkLink>/i);",
+  "  if (!m) return '';",
+  "  var h = m[0].match(/<href[^>]*>([\\s\\S]*?)<\\/href>/i);",
+  "  if (!h) return '';",
+  "  return h[1].replace(/<[^>]+>/g,'').trim();",
+  "}",
+  "",
+  "var xml0 = xmlFromPayload(msg.payload);",
+  "var st0 = msg.statusCode || 200;",
+  "var urlMod = require('url');",
+  "var https = require('https');",
+  "var http = require('http');",
+  "",
+  "function fetchInner(u, cb) {",
+  "  var lib = u.indexOf('https') === 0 ? https : http;",
+  "  lib.get(u, function(res) {",
+  "    var chunks = [];",
+  "    res.on('data', function(c) { chunks.push(c); });",
+  "    res.on('end', function() {",
+  "      var body = Buffer.concat(chunks).toString('utf8');",
+  "      cb(null, body, res.statusCode);",
+  "    });",
+  "  }).on('error', function(e) { cb(e); });",
+  "}",
+  "",
+  "function finish(xmlBody, status) {",
+  "  var feats = parsePlacemarks(xmlBody);",
+  "  msg.payload = { features: feats };",
+  "  msg._arcgisStatus = status || 200;",
+  "  msg._config = cfg;",
+  "  msg.takSettings = tak;",
+  "  msg.topic = topic;",
+  "  msg._layerName = '';",
+  "}",
+  "",
+  "var innerHref = networkHref(xml0);",
+  "if (innerHref) {",
+  "  var target = '';",
+  "  if (/^https?:\\/\\//i.test(innerHref)) target = innerHref;",
+  "  else if (innerHref.indexOf('//') === 0 && startUrl) {",
+  "    var pr = urlMod.parse(startUrl);",
+  "    target = (pr.protocol || 'http:') + innerHref;",
+  "  } else if (startUrl) target = urlMod.resolve(startUrl, innerHref);",
+  "  if (target) {",
+  "    fetchInner(target, function(err, xml1, st1) {",
+  "      if (err) {",
+  "        node.warn((cfg.configName || 'KML') + ' KML NetworkLink fetch: ' + err.message);",
+  "        msg.payload = { features: [] };",
+  "        msg._arcgisStatus = 500;",
+  "        msg._config = cfg;",
+  "        msg.takSettings = tak;",
+  "        msg.topic = topic;",
+  "        msg._layerName = '';",
+  "        return node.send(msg);",
+  "      }",
+  "      finish(xml1, st1);",
+  "      node.send(msg);",
+  "    });",
+  "    return;",
+  "  }",
+  "}",
+  "",
+  "finish(xml0, st0);",
+  "return msg;"
+].join('\n');
+
+/** ArcGIS engine tab, then swap query chain for KML GET + parse (shared parse_cot / reconcile). */
+function makeKmlEngineTab(feed) {
+  const nodes = makeEngineTab(feed);
+  const P = feed.id + '_';
+  const FID = 'flow_eng_' + feed.id;
+  const tab = nodes.find(function(n) { return n.type === 'tab'; });
+  if (tab) {
+    tab.info = 'KML Network Link engine for ' + feed.configName + '. Fetch KML, stream CoT via TCP, sync to mission.';
+  }
+  nodes.forEach(function(n) {
+    if (n.id !== P + 'load') return;
+    n.func = [
+      "var configs = global.get('arcgis_configs') || [];",
+      "var tak = global.get('tak_settings') || {};",
+      "var cfg = null;",
+      "for (var i = 0; i < configs.length; i++) {",
+      "  if (configs[i].configName === '" + feed.configName + "') { cfg = configs[i]; break; }",
+      "}",
+      "if (!cfg) { return null; }",
+      "if (cfg.sourceType !== 'kml') { return null; }",
+      "if (!tak.serverUrl) { node.warn('" + feed.configName + ": No TAK Server URL'); return null; }",
+      "var nl = (cfg.source && cfg.source.networkLinkUrl) ? String(cfg.source.networkLinkUrl).trim() : '';",
+      "if (!nl) { node.warn('" + feed.configName + ": No KML network link URL'); return null; }",
+      "var pollKey = '_lastPoll_' + String(cfg.configName || '').replace(/[^A-Za-z0-9]/g, '_');",
+      "var lastPoll = global.get(pollKey) || 0;",
+      "var now = Date.now();",
+      "var intervalMs = ((cfg.pollInterval || 5) * 60000);",
+      "if (now - lastPoll < intervalMs) return null;",
+      "global.set(pollKey, now);",
+      "node.warn('Polling KML: " + feed.configName + "');",
+      "return { payload: cfg, takSettings: tak, topic: '" + feed.configName + "' };"
+    ].join('\n');
+    n.wires = [[P + 'build_kml']];
+  });
+  const iq = nodes.findIndex(function(n) { return n.id === P + 'build_q'; });
+  if (iq < 0) return nodes;
+  const kmlChain = [
+    {
+      id: P + 'build_kml', type: 'function', z: FID,
+      name: 'Build KML URL',
+      _templateKey: 'kml.build_url',
+      func: FN_KML_BUILD_URL,
+      outputs: 1, timeout: '', noerr: 0,
+      initialize: '', finalize: '', libs: [],
+      x: 180, y: 200, wires: [[P + 'http_kml']]
+    },
+    {
+      id: P + 'http_kml', type: 'http request', z: FID,
+      name: 'GET KML',
+      method: 'use', ret: 'txt', paytoqs: 'ignore',
+      url: '', tls: '', persist: false, proxy: '',
+      insecureHTTPParser: false, authType: '',
+      senderr: false, headers: [],
+      x: 400, y: 200, wires: [[P + 'parse_kml']]
+    },
+    {
+      id: P + 'parse_kml', type: 'function', z: FID,
+      name: 'KML to Feature JSON',
+      _templateKey: 'kml.xml_to_features',
+      func: FN_KML_TO_FEATURES,
+      outputs: 1, timeout: '', noerr: 0,
+      initialize: '', finalize: '', libs: [],
+      x: 500, y: 200, wires: [[P + 'parse']]
+    }
+  ];
+  nodes.splice(iq, 2, kmlChain[0], kmlChain[1], kmlChain[2]);
+  return nodes;
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -2234,6 +2454,9 @@ const engineTabTemplate = JSON.stringify(templateNodes);
 const tfrTemplateNodes = makeTfrEngineTab(templateFeed);
 const tfrEngineTabTemplate = JSON.stringify(tfrTemplateNodes);
 
+const kmlTemplateNodes = makeKmlEngineTab(templateFeed);
+const kmlEngineTabTemplate = JSON.stringify(kmlTemplateNodes);
+
 // ════════════════════════════════════════════════════════════════
 //  Assembly
 // ════════════════════════════════════════════════════════════════
@@ -2248,9 +2471,9 @@ const out = path.join(__dirname, 'flows.json');
 fs.writeFileSync(out, JSON.stringify(allFlows, null, 2));
 console.log('flows.json generated  (' + allFlows.length + ' nodes, ' + FEEDS.length + ' engine tabs)  →  ' + out);
 
-// Write template function map (ArcGIS + TFR) for deploy.sh dynamic-tab sync
+// Write template function map (ArcGIS + TFR + KML) for deploy.sh dynamic-tab sync
 const templateFuncMap = {};
-[...templateNodes, ...tfrTemplateNodes].forEach(n => {
+[...templateNodes, ...tfrTemplateNodes, ...kmlTemplateNodes].forEach(n => {
   if (n._templateKey) templateFuncMap[n._templateKey] = n.func;
 });
 fs.writeFileSync(path.join(__dirname, 'template-functions.json'), JSON.stringify(templateFuncMap));
@@ -2303,8 +2526,29 @@ try {
     );
   }
 
+  // KML template
+  const kmlStart = '/* __KML_ENGINE_TAB_TEMPLATE_START__ */';
+  const kmlEnd   = '/* __KML_ENGINE_TAB_TEMPLATE_END__ */';
+  const kmlB64 = Buffer.from(kmlEngineTabTemplate, 'utf8').toString('base64');
+  const kmlBlock = kmlStart + '\n'
+    + 'var KML_ENGINE_TAB_TEMPLATE = decodeURIComponent(escape(atob("' + kmlB64 + '")));\n'
+    + kmlEnd;
+  if (htmlContent.includes(kmlStart)) {
+    const re3 = new RegExp(
+      kmlStart.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      + '[\\s\\S]*?'
+      + kmlEnd.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    );
+    htmlContent = htmlContent.replace(re3, kmlBlock);
+  } else {
+    htmlContent = htmlContent.replace(
+      tfrEnd,
+      tfrEnd + '\n' + kmlBlock
+    );
+  }
+
   fs.writeFileSync(htmlPath, htmlContent);
-  console.log('Engine tab templates injected into configurator.html (ArcGIS + TFR)');
+  console.log('Engine tab templates injected into configurator.html (ArcGIS + TFR + KML)');
 } catch(e) {
   console.log('Skipped configurator.html template injection (' + e.code + ')');
 }

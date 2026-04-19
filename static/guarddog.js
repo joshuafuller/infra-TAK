@@ -141,19 +141,38 @@ function gdDownloadDiskIOReport(){
   window.location.href='/api/guarddog/diskio-report?hours='+hours;
   setTimeout(function(){if(msg)msg.textContent='';},3000);
 }
-function gdDiskioMonitorToggle(cb){
-  if(!cb)return;
-  var enabled=!!cb.checked;
-  var revert=!enabled;
-  cb.disabled=true;
+function gdDiskioUiRefresh(){
+  var mon=document.getElementById('gd-dio-enabled');
+  var em=document.getElementById('gd-dio-email');
+  if(em&&mon){em.disabled=!mon.checked;}
+}
+function gdSaveDiskioSettings(){
+  var mon=document.getElementById('gd-dio-enabled');
+  var em=document.getElementById('gd-dio-email');
   var msg=document.getElementById('gd-dio-enabled-msg');
+  var prevMon=mon?mon.checked:false;
+  var prevEm=em?em.checked:false;
+  if(mon)mon.disabled=true;
+  if(em)em.disabled=true;
   if(msg){msg.textContent='Saving...';msg.style.color='var(--text-dim)';}
-  fetch('/api/guarddog/diskio-monitor',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:enabled}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
-    cb.disabled=false;
-    if(!d.success){cb.checked=revert;if(msg){msg.textContent=d.error||'Failed';msg.style.color='var(--red)';}return;}
-    if(msg){msg.textContent=enabled?'Benchmark timer on.':'Benchmark timer off.';msg.style.color='var(--green)';setTimeout(function(){if(msg)msg.textContent='';},4500);}
+  var body={enabled:!!(mon&&mon.checked),email_enabled:!!(em&&em.checked)};
+  fetch('/api/guarddog/diskio-monitor',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    if(mon)mon.disabled=false;
+    if(em){em.disabled=!mon.checked;}
+    if(!d.success){
+      if(mon)mon.checked=prevMon;
+      if(em)em.checked=prevEm;
+      gdDiskioUiRefresh();
+      if(msg){msg.textContent=d.error||'Failed';msg.style.color='var(--red)';}
+      return;
+    }
+    gdDiskioUiRefresh();
+    if(msg){msg.textContent='Saved.';msg.style.color='var(--green)';setTimeout(function(){if(msg)msg.textContent='';},4500);}
   }).catch(function(e){
-    cb.disabled=false;cb.checked=revert;if(msg){msg.textContent=e.message||'Request failed';msg.style.color='var(--red)';}
+    if(mon){mon.disabled=false;mon.checked=prevMon;}
+    if(em){em.checked=prevEm;}
+    gdDiskioUiRefresh();
+    if(msg){msg.textContent=e.message||'Request failed';msg.style.color='var(--red)';}
   });
 }
-if(document.getElementById('gd-diskio-card')){gdRefreshDiskIO();setInterval(gdRefreshDiskIO,300000);}
+if(document.getElementById('gd-diskio-card')){gdDiskioUiRefresh();gdRefreshDiskIO();setInterval(gdRefreshDiskIO,300000);}
