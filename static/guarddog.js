@@ -141,4 +141,19 @@ function gdDownloadDiskIOReport(){
   window.location.href='/api/guarddog/diskio-report?hours='+hours;
   setTimeout(function(){if(msg)msg.textContent='';},3000);
 }
+function gdDiskioMonitorToggle(cb){
+  if(!cb)return;
+  var enabled=!!cb.checked;
+  var revert=!enabled;
+  cb.disabled=true;
+  var msg=document.getElementById('gd-dio-enabled-msg');
+  if(msg){msg.textContent='Saving...';msg.style.color='var(--text-dim)';}
+  fetch('/api/guarddog/diskio-monitor',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:enabled}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    cb.disabled=false;
+    if(!d.success){cb.checked=revert;if(msg){msg.textContent=d.error||'Failed';msg.style.color='var(--red)';}return;}
+    if(msg){msg.textContent=enabled?'Benchmark timer on.':'Benchmark timer off.';msg.style.color='var(--green)';setTimeout(function(){if(msg)msg.textContent='';},4500);}
+  }).catch(function(e){
+    cb.disabled=false;cb.checked=revert;if(msg){msg.textContent=e.message||'Request failed';msg.style.color='var(--red)';}
+  });
+}
 if(document.getElementById('gd-diskio-card')){gdRefreshDiskIO();setInterval(gdRefreshDiskIO,300000);}
