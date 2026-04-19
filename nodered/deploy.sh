@@ -35,19 +35,22 @@ docker cp "$CONTAINER:/data/flows.json" "/tmp/flows_current.json" 2>/dev/null ||
 # Preserve encrypted credentials file (TLS cert data lives here, not in flows.json)
 docker cp "$CONTAINER:/data/flows_cred.json" "/tmp/flows_cred_backup.json" 2>/dev/null || true
 
-# Read context to get creatorUid for TLS cert convention (global first, flow fallback)
-echo "==> Reading flow context for TLS auto-config"
-HAS_CONTEXT=false
-docker cp "$CONTAINER:/data/context/global/global.json" "/tmp/flows_context.json" 2>/dev/null && HAS_CONTEXT=true || \
-  docker cp "$CONTAINER:/data/context/flow/flow_arcgis_cfg.json" "/tmp/flows_context.json" 2>/dev/null && HAS_CONTEXT=true || true
+# Configurator configs + TAK settings live in Node-RED context files (global + legacy flow tab).
+# We re-apply these after replacing flows.json so a hot reload cannot persist an empty global state.
+echo "==> Backing up Node-RED context (Configurator / TAK settings)"
+NR_CTX_GLOBAL="/tmp/nr_ctx_global.json"
+NR_CTX_FLOW_CFG="/tmp/nr_ctx_flow_arcgis_cfg.json"
+rm -f "$NR_CTX_GLOBAL" "$NR_CTX_FLOW_CFG"
+docker cp "$CONTAINER:/data/context/global/global.json" "$NR_CTX_GLOBAL" 2>/dev/null || true
+docker cp "$CONTAINER:/data/context/flow/flow_arcgis_cfg.json" "$NR_CTX_FLOW_CFG" 2>/dev/null || true
+if [ -f "$NR_CTX_GLOBAL" ] || [ -f "$NR_CTX_FLOW_CFG" ]; then
+  echo "    Context backup: global=$([ -f "$NR_CTX_GLOBAL" ] && echo yes || echo no) flow_arcgis_cfg=$([ -f "$NR_CTX_FLOW_CFG" ] && echo yes || echo no)"
+fi
 
 # Run merge inside the container (node is available there)
 docker cp "$NEW_FLOWS" "$CONTAINER:/tmp/flows_new.json"
 if [ "$HAS_EXISTING" = true ]; then
   docker cp "/tmp/flows_current.json" "$CONTAINER:/tmp/flows_current.json"
-fi
-if [ "$HAS_CONTEXT" = true ]; then
-  docker cp "/tmp/flows_context.json" "$CONTAINER:/tmp/flows_context.json"
 fi
 
 docker exec "$CONTAINER" node -e "
@@ -210,18 +213,31 @@ docker exec "$CONTAINER" node -e "
   fi
 done
 
-# Move merged flows into place inside the container
-docker exec "$CONTAINER" cp /tmp/flows_merged.json /data/flows.json
+# Copy merged flows to host, then stop Node-RED before writing /data/flows.json.
+# Writing flows.json while NR is running can hot-reload; the migration inject may run before
+# global context is loaded from disk and empty state can be persisted — wiping Configurator saves.
+echo "==> Installing merged flows (stop → write → restore context → start)"
+docker cp "$CONTAINER:/tmp/flows_merged.json" "/tmp/flows_merged.json"
+docker stop -t 30 "$CONTAINER"
+docker cp "/tmp/flows_merged.json" "$CONTAINER:/data/flows.json"
 # Restore credentials file so TLS cert data survives the deploy
 if [ -f "/tmp/flows_cred_backup.json" ]; then
   docker cp "/tmp/flows_cred_backup.json" "$CONTAINER:/data/flows_cred.json"
   echo "    Credentials: restored"
 fi
+if [ -f "$NR_CTX_GLOBAL" ]; then
+  docker cp "$NR_CTX_GLOBAL" "$CONTAINER:/data/context/global/global.json"
+  echo "    Context: restored global (arcgis_configs / tak_settings)"
+fi
+if [ -f "$NR_CTX_FLOW_CFG" ]; then
+  docker cp "$NR_CTX_FLOW_CFG" "$CONTAINER:/data/context/flow/flow_arcgis_cfg.json"
+  echo "    Context: restored flow tab (legacy migration source)"
+fi
+rm -f /tmp/flows_current.json /tmp/flows_cred_backup.json /tmp/flows_merged.json "$NR_CTX_GLOBAL" "$NR_CTX_FLOW_CFG"
+docker start "$CONTAINER"
 docker exec "$CONTAINER" sh -c "rm -f /tmp/flows_*.json /tmp/build-flows.js /tmp/configurator.html" 2>/dev/null || true
-rm -f /tmp/flows_current.json /tmp/flows_context.json /tmp/flows_cred_backup.json
-docker restart "$CONTAINER"
 
 echo ""
 echo "==> Deploy complete."
-echo "    Configurator configs survive restarts (flow context on Docker volume)."
+echo "    Configurator configs persist in Node-RED global context on the Docker volume (restored on each deploy)."
 echo "    Open Node-RED editor, verify, hit Deploy."
