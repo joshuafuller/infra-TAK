@@ -798,26 +798,26 @@
   <div id="kmlSteps" style="display:none">
 
   <div class="step" id="kmlStep1">
-    <h2>1. KML source</h2>
+    <h2>1. KML / Network Link URL</h2>
     <p style="font-size:0.82rem;color:#94a3b8;margin-bottom:1rem;line-height:1.45">
-      Paste the <strong>network link URL</strong> (the same URL you would use in Google Earth). The engine performs an HTTP GET on each poll, follows a single-level <code>&lt;NetworkLink&gt;</code> <code>&lt;href&gt;</code> when present, then extracts <code>Placemark</code> points, polygons, and line strings for CoT (same styling path as ArcGIS polygons/points). The response must be <strong>KML or XML text</strong> (not a binary KMZ).
+      Same idea as ArcGIS step 1: paste the URL, click <strong>Fetch</strong>, then map fields and style below. The engine GETs this URL on each poll, follows one <code>&lt;NetworkLink&gt;</code> <code>&lt;href&gt;</code> when present, and parses <code>Placemark</code> geometry and attributes (HTML tables in <code>&lt;description&gt;</code>, ExtendedData, etc.). Response must be <strong>KML or XML text</strong> (not a binary KMZ).
     </p>
-    <div class="field-grid">
-      <div style="grid-column:1/-1">
-        <label for="kmlNetworkLinkUrl">KML / Network Link URL</label>
-        <div class="row" style="margin-top:0.35rem">
-          <input type="text" id="kmlNetworkLinkUrl" class="grow" placeholder="https://…/overlay.kml" style="width:100%;box-sizing:border-box">
-          <button type="button" id="btnKmlFetch" onclick="fetchKmlFields()">Fetch fields</button>
-        </div>
-        <p style="font-size:0.78rem;color:#94a3b8;margin:0.45rem 0 0;line-height:1.45">Same workflow as ArcGIS: paste the URL, click <strong>Fetch fields</strong>, then pick stable ID, label tokens, and remarks from the discovered columns (FIRIS-style HTML tables and ExtendedData are supported).</p>
+    <div class="row">
+      <div class="grow">
+        <label for="kmlNetworkLinkUrl">KML or network link URL</label>
+        <input type="text" id="kmlNetworkLinkUrl"
+               placeholder="https://…/overlay.kml">
       </div>
+      <button type="button" id="btnKmlFetch" onclick="fetchKmlFields()">Fetch</button>
+    </div>
+    <div id="kmlFetchStatus"></div>
+    <div id="kmlSampleData"></div>
+    <div class="field-grid" style="margin-top:1rem">
       <div>
         <label for="kmlPollInterval">Poll interval (minutes)</label>
         <input type="number" id="kmlPollInterval" min="1" max="1440" value="5" placeholder="5">
       </div>
     </div>
-    <div id="kmlFetchStatus"></div>
-    <div id="kmlSampleData"></div>
   </div>
 
   <div class="step" id="kmlStep2">
@@ -881,7 +881,7 @@
       </div>
     </div>
 
-    <h3 style="font-size:0.95rem;color:#e2e8f0;margin:1.25rem 0 0.5rem">Field mapping <span class="badge badge-oid" style="font-size:0.65rem">after Fetch fields</span></h3>
+    <h3 style="font-size:0.95rem;color:#e2e8f0;margin:1.25rem 0 0.5rem">Field mapping <span class="badge badge-oid" style="font-size:0.65rem">after Fetch</span></h3>
     <div class="field-grid">
       <div style="grid-column:1/-1">
         <label>Stable ID field(s) <span class="badge badge-oid">pick 1 preferred — or combine for synthetic UID</span></label>
@@ -889,7 +889,7 @@
           <div id="kml_idFieldsAvailable" style="display:flex;flex-wrap:wrap;gap:0.3rem;margin-bottom:0.35rem"></div>
           <div id="kml_idFieldsSelected" style="display:flex;flex-wrap:wrap;gap:0.3rem;min-height:1.6rem;padding:0.3rem;background:#050514;border-radius:3px"></div>
         </div>
-        <div id="kml_idFieldsPreview" style="font-size:0.75rem;color:#888;margin-top:0.3rem">(fetch fields in step 1 first)</div>
+        <div id="kml_idFieldsPreview" style="font-size:0.75rem;color:#888;margin-top:0.3rem">(click Fetch in step 1 first)</div>
       </div>
     </div>
 
@@ -1509,7 +1509,7 @@ function renderUniformLabelUI() {
   var selected = state.uniformLabelFields || [];
   if (fields.length === 0) {
     container.innerHTML = '<span style="color:#64748b;font-size:0.8rem">'
-      + (_sourceType === 'kml' ? 'Fetch fields in step 1 first.' : 'Load layer fields in Step 2 first.') + '</span>';
+      + (_sourceType === 'kml' ? 'Click Fetch in step 1 first.' : 'Load layer fields in Step 2 first.') + '</span>';
     refreshUniformLabelPreview();
     return;
   }
@@ -2709,7 +2709,7 @@ function resetForm() {
   document.getElementById('kml_idFieldsAvailable').innerHTML = '';
   document.getElementById('kml_idFieldsSelected').innerHTML = '<span style="color:#555">Click field(s) above to add</span>';
   var kmlIdPrev = document.getElementById('kml_idFieldsPreview');
-  if (kmlIdPrev) { kmlIdPrev.textContent = '(fetch fields in step 1 first)'; kmlIdPrev.style.color = '#888'; }
+  if (kmlIdPrev) { kmlIdPrev.textContent = '(click Fetch in step 1 first)'; kmlIdPrev.style.color = '#888'; }
   document.getElementById('kml_uniformLabelPills').innerHTML = '';
   document.getElementById('kml_uniformLabelPreview').textContent = '';
   document.getElementById('kml_remarksAvailable').innerHTML = '';
@@ -2863,7 +2863,7 @@ async function selectConfig(idx) {
     document.getElementById('kmlDataSyncEnabled').checked = c.dataSyncEnabled !== false;
     document.getElementById('kmlStrictMode').checked = (c.strictMode !== false);
     document.getElementById('kmlConfigOutput').textContent = JSON.stringify(c, null, 2);
-    status('kmlSaveStatus', 'Loaded "' + (c.configName || 'config') + '" — Fetch fields to refresh column list from live KML, or edit and Save', true);
+    status('kmlSaveStatus', 'Loaded "' + (c.configName || 'config') + '" — click Fetch in step 1 to refresh columns from live KML, or edit and Save', true);
     return;
   }
 
