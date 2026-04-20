@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Latest release: v0.6.5-alpha** — **Node-RED ArcGIS Configurator:** **stable-ID multi-field pill picker** (compound UIDs for rotating-OBJECTID NOAA-style feeds), **multi-layer field union** with **`(in X/N)`** presence badges, **strict mission ownership** reconcile + one-shot **Purge Orphans** (fixes yellow missions / silent map deletes). See **[docs/RELEASE-v0.6.5-alpha.md](docs/RELEASE-v0.6.5-alpha.md)**. Patch / VERSION alignment: [v0.6.4-alpha](docs/RELEASE-v0.6.4-alpha.md). Prior: [v0.6.1-alpha](docs/RELEASE-v0.6.1-alpha.md), [v0.6.0-alpha](docs/RELEASE-v0.6.0-alpha.md), [v0.5.9-alpha](docs/RELEASE-v0.5.9-alpha.md), [v0.5.8-alpha](docs/RELEASE-v0.5.8-alpha.md), [v0.5.7-alpha](docs/RELEASE-v0.5.7-alpha.md), [v0.5.6-alpha](docs/RELEASE-v0.5.6-alpha.md), [v0.5.5-alpha](docs/RELEASE-v0.5.5-alpha.md), [v0.5.4-alpha](docs/RELEASE-v0.5.4-alpha.md), [v0.5.3-alpha](docs/RELEASE-v0.5.3-alpha.md), [v0.5.2-alpha](docs/RELEASE-v0.5.2-alpha.md), [v0.5.1-alpha](docs/RELEASE-v0.5.1-alpha.md), [v0.5.0-alpha](docs/RELEASE-v0.5.0-alpha.md), [v0.4.9-alpha](docs/RELEASE-v0.4.9-alpha.md), [v0.4.8-alpha](docs/RELEASE-v0.4.8-alpha.md), [v0.4.7-alpha](docs/RELEASE-v0.4.7-alpha.md), [v0.4.6-alpha](docs/RELEASE-v0.4.6-alpha.md), [v0.4.5-alpha](docs/RELEASE-v0.4.5-alpha.md), [v0.4.4-alpha](docs/RELEASE-v0.4.4-alpha.md), [v0.4.3-alpha](docs/RELEASE-v0.4.3-alpha.md), [v0.4.2-alpha](docs/RELEASE-v0.4.2-alpha.md).
+**Latest release: v0.6.6-alpha** — **Guard Dog:** disk I/O **drop-% math fix** (no bogus 100% alerts), **benchmark on/off**, **mute only disk I/O email/SMS**. **Node-RED:** **`deploy.sh`** stops container before writing flows, **restores global/flow context** so Configurator saves are not wiped. See **[docs/RELEASE-v0.6.6-alpha.md](docs/RELEASE-v0.6.6-alpha.md)**. Prior: [v0.6.5-alpha](docs/RELEASE-v0.6.5-alpha.md) (KML + ArcGIS stable-ID / Purge), [v0.6.4-alpha](docs/RELEASE-v0.6.4-alpha.md). Older: [v0.6.1-alpha](docs/RELEASE-v0.6.1-alpha.md), [v0.6.0-alpha](docs/RELEASE-v0.6.0-alpha.md), [v0.5.9-alpha](docs/RELEASE-v0.5.9-alpha.md), [v0.5.8-alpha](docs/RELEASE-v0.5.8-alpha.md), [v0.5.7-alpha](docs/RELEASE-v0.5.7-alpha.md), [v0.5.6-alpha](docs/RELEASE-v0.5.6-alpha.md), [v0.5.5-alpha](docs/RELEASE-v0.5.5-alpha.md), [v0.5.4-alpha](docs/RELEASE-v0.5.4-alpha.md), [v0.5.3-alpha](docs/RELEASE-v0.5.3-alpha.md), [v0.5.2-alpha](docs/RELEASE-v0.5.2-alpha.md), [v0.5.1-alpha](docs/RELEASE-v0.5.1-alpha.md), [v0.5.0-alpha](docs/RELEASE-v0.5.0-alpha.md), [v0.4.9-alpha](docs/RELEASE-v0.4.9-alpha.md), [v0.4.8-alpha](docs/RELEASE-v0.4.8-alpha.md), [v0.4.7-alpha](docs/RELEASE-v0.4.7-alpha.md), [v0.4.6-alpha](docs/RELEASE-v0.4.6-alpha.md), [v0.4.5-alpha](docs/RELEASE-v0.4.5-alpha.md), [v0.4.4-alpha](docs/RELEASE-v0.4.4-alpha.md), [v0.4.3-alpha](docs/RELEASE-v0.4.3-alpha.md), [v0.4.2-alpha](docs/RELEASE-v0.4.2-alpha.md).
 
 **Something broken?** Wrong sidebar version, **Update Now** error, merge/rebase/tag-clobber messages, or you are not sure the VPS ever pulled the real repo → go to **[Universal recovery (SSH)](#universal-recovery-ssh)** and run the one block there. **Point people at that section**; it is the single source of truth.
 
@@ -299,6 +299,17 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v0.6.6-alpha — 2026-04-20
+
+**Guard Dog — disk I/O alerts fixed + controls; Node-RED — safe deploy**
+- **Disk I/O watch script:** **`bc`** percentage fix — no more false **100%** “drop” when 1h and 24h averages differ slightly.
+- **Guard Dog UI:** turn **disk I/O benchmark** on/off (systemd timer); turn **email/SMS for disk I/O only** on/off (other alerts unchanged). Settings sync to **`takdiskioguard.timer`** and **`/opt/tak-guarddog/diskio_email_off`**.
+- **`nodered/deploy.sh`:** **stop container → write merged flows → restore Node-RED global/flow context → start** so Configurator-backed **`global.json`** is not wiped during deploy.
+
+Full notes: [docs/RELEASE-v0.6.6-alpha.md](docs/RELEASE-v0.6.6-alpha.md). Node-RED pointer: [nodered/CHANGELOG-nodered-v0.6.6-alpha.md](nodered/CHANGELOG-nodered-v0.6.6-alpha.md). Maintainer pre-release: [docs/TESTING-UPDATES.md](docs/TESTING-UPDATES.md); Node-RED smoke tests: [docs/TESTING-NODERED-DEPLOYS.md](docs/TESTING-NODERED-DEPLOYS.md). Selective merge + tag: [docs/COMMANDS.md](docs/COMMANDS.md) → *Merge dev → main (selective — release only)*.
+
+---
 
 ### v0.6.5-alpha — 2026-04-17
 
