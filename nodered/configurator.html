@@ -805,13 +805,19 @@
     <div class="field-grid">
       <div style="grid-column:1/-1">
         <label for="kmlNetworkLinkUrl">KML / Network Link URL</label>
-        <input type="text" id="kmlNetworkLinkUrl" placeholder="https://…/overlay.kml" style="width:100%;box-sizing:border-box">
+        <div class="row" style="margin-top:0.35rem">
+          <input type="text" id="kmlNetworkLinkUrl" class="grow" placeholder="https://…/overlay.kml" style="width:100%;box-sizing:border-box">
+          <button type="button" id="btnKmlFetch" onclick="fetchKmlFields()">Fetch fields</button>
+        </div>
+        <p style="font-size:0.78rem;color:#94a3b8;margin:0.45rem 0 0;line-height:1.45">Same workflow as ArcGIS: paste the URL, click <strong>Fetch fields</strong>, then pick stable ID, label tokens, and remarks from the discovered columns (FIRIS-style HTML tables and ExtendedData are supported).</p>
       </div>
       <div>
         <label for="kmlPollInterval">Poll interval (minutes)</label>
         <input type="number" id="kmlPollInterval" min="1" max="1440" value="5" placeholder="5">
       </div>
     </div>
+    <div id="kmlFetchStatus"></div>
+    <div id="kmlSampleData"></div>
   </div>
 
   <div class="step" id="kmlStep2">
@@ -874,33 +880,39 @@
         </select>
       </div>
     </div>
-    <div class="field-grid" style="margin-top:1rem">
+
+    <h3 style="font-size:0.95rem;color:#e2e8f0;margin:1.25rem 0 0.5rem">Field mapping <span class="badge badge-oid" style="font-size:0.65rem">after Fetch fields</span></h3>
+    <div class="field-grid">
       <div style="grid-column:1/-1">
-        <label for="kmlIdFields">Stable ID field(s)</label>
-        <input type="text" id="kmlIdFields" value="GlobalID"
-          placeholder="e.g. GlobalID — or name, mission for feeds without GlobalID"
-          style="width:100%;margin-top:0.35rem;padding:0.45rem 0.5rem;font-size:0.88rem;background:#0a0a1a;border:1px solid #1a1a4e;color:#fff;border-radius:4px;box-sizing:border-box">
-        <div style="font-size:0.75rem;color:#64748b;margin-top:0.35rem">FIRIS / ArcGIS HTML KML usually includes <code>GlobalID</code>. Single field preferred; multiple fields produce a synthetic UID.</div>
-      </div>
-      <div style="grid-column:1/-1">
-        <label for="kmlLabelFields">Fields included in label hash (comma-separated)</label>
-        <input type="text" id="kmlLabelFields" value="type, description, mission"
-          placeholder="type, description, mission"
-          style="width:100%;margin-top:0.35rem;padding:0.45rem 0.5rem;font-size:0.88rem;background:#0a0a1a;border:1px solid #1a1a4e;color:#fff;border-radius:4px;box-sizing:border-box">
+        <label>Stable ID field(s) <span class="badge badge-oid">pick 1 preferred — or combine for synthetic UID</span></label>
+        <div style="padding:0.35rem;background:#0d0d2b;border-radius:4px;margin-top:0.35rem">
+          <div id="kml_idFieldsAvailable" style="display:flex;flex-wrap:wrap;gap:0.3rem;margin-bottom:0.35rem"></div>
+          <div id="kml_idFieldsSelected" style="display:flex;flex-wrap:wrap;gap:0.3rem;min-height:1.6rem;padding:0.3rem;background:#050514;border-radius:3px"></div>
+        </div>
+        <div id="kml_idFieldsPreview" style="font-size:0.75rem;color:#888;margin-top:0.3rem">(fetch fields in step 1 first)</div>
       </div>
     </div>
+
     <div style="margin-top:1rem;padding:0.85rem;background:#0d0d2b;border:1px solid #333;border-radius:8px">
-      <label style="font-size:0.9rem;color:#e2e8f0">Map label (callsign) template</label>
-      <p style="font-size:0.78rem;color:#94a3b8;margin:0.35rem 0 0.55rem;line-height:1.45">Attributes come from the KML: <strong>standard</strong> <code>&lt;ExtendedData&gt;</code> / <code>&lt;SimpleData&gt;</code>, and <strong>ArcGIS-style HTML tables</strong> inside <code>&lt;description&gt;</code> (like FIRIS). Use placeholders that match column names, e.g. <code>{type}</code>, <code>{description}</code>, <code>{mission}</code>, <code>{source}</code>, <code>{GlobalID}</code>. Keys with spaces work: <code>{Created On}</code>.</p>
-      <input type="text" id="kmlLabelTemplate" placeholder="{type} | {description}"
-        style="width:100%;margin-top:0.35rem;padding:0.45rem 0.5rem;font-size:0.88rem;background:#0a0a1a;border:1px solid #1a1a4e;color:#fff;border-radius:4px;box-sizing:border-box"
-        value="{type} | {description}">
+      <label style="font-size:0.9rem;color:#e2e8f0">Label (callsign)</label>
+      <p style="font-size:0.78rem;color:#94a3b8;margin:0.35rem 0 0.55rem;line-height:1.4">Click fields to build the template (same as ArcGIS). Optional text is shown <strong>before</strong> field placeholders. Columns match KML attributes (HTML table, ExtendedData, plus <code>name</code> / <code>OBJECTID</code>).</p>
+      <div id="kml_uniformLabelPills" style="display:flex;flex-wrap:wrap;gap:4px;margin-top:0.35rem;min-height:1.5rem"></div>
+      <input type="text" id="kml_uniformLabelCustomText" placeholder="Custom text before field values (optional)" value=""
+        style="width:100%;margin-top:0.55rem;padding:0.45rem 0.5rem;font-size:0.88rem;background:#0a0a1a;border:1px solid #1a1a4e;color:#fff;border-radius:4px;box-sizing:border-box"
+        oninput="refreshUniformLabelPreview()">
+      <div style="margin-top:0.4rem;font-size:0.75rem;color:#64748b">Preview: <span id="kml_uniformLabelPreview" style="color:#2ec4b6;font-family:system-ui,sans-serif"></span></div>
     </div>
+
     <div style="margin-top:1rem">
-      <label for="kmlRemarksFields">Remarks — attribute names (comma-separated)</label>
-      <input type="text" id="kmlRemarksFields" value="type, mission, source, description" placeholder="type, mission, source"
-        style="width:100%;margin-top:0.35rem;padding:0.45rem 0.5rem;font-size:0.88rem;background:#0a0a1a;border:1px solid #1a1a4e;color:#fff;border-radius:4px;box-sizing:border-box">
-      <div style="font-size:0.75rem;color:#64748b;margin-top:0.35rem">Same as ArcGIS: each field is shown as <code>fieldName: value</code> in CoT remarks.</div>
+      <label>Remarks — click fields to add in order</label>
+      <div id="kml_remarksAvailable" style="display:flex;flex-wrap:wrap;gap:0.3rem;margin-top:0.5rem"></div>
+      <div style="margin-top:0.6rem">
+        <label style="font-size:0.85rem">Selected (in order)</label>
+        <div id="kml_remarksSelected" style="display:flex;flex-wrap:wrap;gap:0.3rem;margin-top:0.3rem;min-height:2rem;padding:0.5rem;background:#0a0a1a;border-radius:4px;border:1px solid #1a1a4e"></div>
+      </div>
+      <div style="margin-top:0.4rem;font-size:0.75rem;color:#666">
+        Remarks preview: <span id="kml_remarksPreview" style="color:#2ec4b6">FieldA: value | FieldB: value</span>
+      </div>
     </div>
   </div>
 
@@ -1462,9 +1474,20 @@ function setClassRemarksRaw(v, raw) {
   state.classMappings[v].remarksFields = raw.split(',').map(function(s) { return s.trim(); }).filter(Boolean);
 }
 
+/** ArcGIS uses bare ids; KML field pickers use kml_ prefix (same state.idFields / uniformLabelFields / remarksFields). */
+function fieldUiId(base) {
+  return _sourceType === 'kml' ? 'kml_' + base : base;
+}
+function idPillId(name) {
+  return (_sourceType === 'kml' ? 'kml_idpill-' : 'idpill-') + name;
+}
+function remarkPillId(name) {
+  return (_sourceType === 'kml' ? 'kml_rpill-' : 'rpill-') + name;
+}
+
 function computeUniformLabelTemplate() {
   var parts = [];
-  var el = document.getElementById('uniformLabelCustomText');
+  var el = document.getElementById(fieldUiId('uniformLabelCustomText'));
   var txt = el ? String(el.value || '').trim() : '';
   if (txt) parts.push(txt);
   var fields = state.uniformLabelFields || [];
@@ -1473,19 +1496,20 @@ function computeUniformLabelTemplate() {
 }
 
 function refreshUniformLabelPreview() {
-  var el = document.getElementById('uniformLabelPreview');
+  var el = document.getElementById(fieldUiId('uniformLabelPreview'));
   if (!el) return;
   var t = computeUniformLabelTemplate().trim();
   el.textContent = t || '(none — callsign falls back to feature UID)';
 }
 
 function renderUniformLabelUI() {
-  var container = document.getElementById('uniformLabelPills');
+  var container = document.getElementById(fieldUiId('uniformLabelPills'));
   if (!container) return;
   var fields = state.fields || [];
   var selected = state.uniformLabelFields || [];
   if (fields.length === 0) {
-    container.innerHTML = '<span style="color:#64748b;font-size:0.8rem">Load layer fields in Step 2 first.</span>';
+    container.innerHTML = '<span style="color:#64748b;font-size:0.8rem">'
+      + (_sourceType === 'kml' ? 'Fetch fields in step 1 first.' : 'Load layer fields in Step 2 first.') + '</span>';
     refreshUniformLabelPreview();
     return;
   }
@@ -1517,7 +1541,7 @@ function applyUniformLabelStyleFromObject(sc) {
   } else if (sc.labelField) {
     state.uniformLabelFields = [sc.labelField];
   }
-  var customEl = document.getElementById('uniformLabelCustomText');
+  var customEl = document.getElementById(fieldUiId('uniformLabelCustomText'));
   if (customEl) {
     if (sc.labelCustomText != null && String(sc.labelCustomText).length) {
       customEl.value = sc.labelCustomText;
@@ -1681,6 +1705,109 @@ async function fetchService() {
     status('svcStatus', 'Fetch failed: ' + e.message, false);
   } finally {
     setLoading('btnFetch', false);
+  }
+}
+
+/* ── KML: sample table (same markup/classes as ArcGIS sample features) ── */
+function kmlEscHtml(v, maxLen) {
+  if (v == null) return '';
+  var s = String(v);
+  if (maxLen > 0 && s.length > maxLen) s = s.substring(0, maxLen) + '\u2026';
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function renderKmlSampleTable(columnKeys, rows) {
+  var el = document.getElementById('kmlSampleData');
+  if (!el) return;
+  if (!columnKeys || !columnKeys.length || !rows || !rows.length) {
+    el.innerHTML = '';
+    return;
+  }
+  var html = '<div class="sample-wrap"><table class="sample-table"><tr>';
+  columnKeys.forEach(function(k) {
+    html += '<th>' + kmlEscHtml(k, 0) + '</th>';
+  });
+  html += '</tr>';
+  rows.forEach(function(row) {
+    html += '<tr>';
+    columnKeys.forEach(function(k) {
+      var v = row[k];
+      html += '<td>' + kmlEscHtml(v, 50) + '</td>';
+    });
+    html += '</tr>';
+  });
+  html += '</table></div>';
+  el.innerHTML =
+    '<label style="margin-top:1rem;display:block">Sample placemark attributes (' + rows.length + ' row' + (rows.length === 1 ? '' : 's') + ')</label>' + html;
+}
+
+function clearKmlSampleTable() {
+  var el = document.getElementById('kmlSampleData');
+  if (el) el.innerHTML = '';
+}
+
+/* ── KML: discover fields (ArcGIS-style Fetch) ── */
+async function fetchKmlFields() {
+  var raw = (document.getElementById('kmlNetworkLinkUrl').value || '').trim();
+  if (!raw) {
+    status('kmlFetchStatus', 'Enter a KML or network link URL first', false);
+    return;
+  }
+  if (_sourceType !== 'kml') pickSourceType('kml');
+  clearKmlSampleTable();
+  setLoading('btnKmlFetch', true);
+  try {
+    var res = await fetch('/arcgis-tak/kml/fetch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: raw })
+    });
+    var data = await res.json();
+    if (data.error) {
+      status('kmlFetchStatus', 'Error: ' + data.error, false);
+      return;
+    }
+    var keys = data.keys || [];
+    if (keys.length === 0) {
+      status('kmlFetchStatus', 'No attributes found — check URL, or ensure placemarks include geometry', false);
+      clearKmlSampleTable();
+      state.fields = [];
+      populateIdFieldsPicker();
+      populateRemarksPicker();
+      renderUniformLabelUI();
+      return;
+    }
+    var sampleRows = (data.samples && data.samples.length) ? data.samples : (data.sample && Object.keys(data.sample).length ? [data.sample] : []);
+    renderKmlSampleTable(keys, sampleRows);
+    state.fields = keys.map(function(k) { return { name: k, type: 'kml' }; });
+    populateIdFieldsPicker();
+    state.idFields = [];
+    var gpg = state.fields.find(function(f) { return /^GlobalID$/i.test(f.name); });
+    var oid = state.fields.find(function(f) { return /^OBJECTID$/i.test(f.name); });
+    if (gpg) addIdField(gpg.name);
+    else if (oid) addIdField(oid.name);
+    populateRemarksPicker();
+    var prefer = ['type', 'mission', 'source', 'description'];
+    prefer.forEach(function(name) {
+      if (keys.indexOf(name) >= 0) addRemarkField(name);
+    });
+    state.uniformLabelFields = [];
+    var defLf = state.fields.find(function(f) {
+      var n = f.name.toLowerCase();
+      return n === 'mission' || n === 'incidentname' || n === 'type' || n === 'description';
+    });
+    if (defLf) state.uniformLabelFields = [defLf.name];
+    else if (state.fields[0]) state.uniformLabelFields = [state.fields[0].name];
+    renderUniformLabelUI();
+    var extra = (data.placemarksWithGeometry != null)
+      ? (' — sampled ' + data.placemarksWithGeometry + ' feature(s) with geometry')
+      : '';
+    status('kmlFetchStatus', keys.length + ' attribute key(s) discovered' + extra, true);
+  } catch (e) {
+    clearKmlSampleTable();
+    status('kmlFetchStatus', 'Fetch failed: ' + e.message, false);
+  } finally {
+    setLoading('btnKmlFetch', false);
   }
 }
 
@@ -2051,11 +2178,13 @@ function populateRemarksPicker() {
   state.remarksFields = [];
   var html = '';
   state.fields.forEach(function(f) {
-    html += '<span class="remark-pill available" id="rpill-' + f.name + '" onclick="addRemarkField(\'' + f.name.replace(/'/g, "\\'") + '\')">'
+    html += '<span class="remark-pill available" id="' + remarkPillId(f.name) + '" onclick="addRemarkField(\'' + f.name.replace(/'/g, "\\'") + '\')">'
       + f.name + '</span>';
   });
-  document.getElementById('remarksAvailable').innerHTML = html;
-  document.getElementById('remarksSelected').innerHTML = '<span style="color:#555">Click fields above to add</span>';
+  var ra = document.getElementById(fieldUiId('remarksAvailable'));
+  var rs = document.getElementById(fieldUiId('remarksSelected'));
+  if (ra) ra.innerHTML = html;
+  if (rs) rs.innerHTML = '<span style="color:#555">Click fields above to add</span>';
   updateRemarksPreview();
 }
 
@@ -2064,7 +2193,7 @@ function addRemarkField(name) {
   state.remarksFields.push(name);
   renderRemarksSelected();
   updateRemarksPreview();
-  var pill = document.getElementById('rpill-' + name);
+  var pill = document.getElementById(remarkPillId(name));
   if (pill) pill.classList.add('used');
 }
 
@@ -2073,13 +2202,15 @@ function removeRemarkField(idx) {
   state.remarksFields.splice(idx, 1);
   renderRemarksSelected();
   updateRemarksPreview();
-  var pill = document.getElementById('rpill-' + name);
+  var pill = document.getElementById(remarkPillId(name));
   if (pill) pill.classList.remove('used');
 }
 
 function renderRemarksSelected() {
+  var rs = document.getElementById(fieldUiId('remarksSelected'));
+  if (!rs) return;
   if (state.remarksFields.length === 0) {
-    document.getElementById('remarksSelected').innerHTML = '<span style="color:#555">Click fields above to add</span>';
+    rs.innerHTML = '<span style="color:#555">Click fields above to add</span>';
     return;
   }
   var html = '';
@@ -2087,11 +2218,12 @@ function renderRemarksSelected() {
     html += '<span class="remark-pill selected" onclick="removeRemarkField(' + i + ')">'
       + name + ' &times;</span>';
   });
-  document.getElementById('remarksSelected').innerHTML = html;
+  rs.innerHTML = html;
 }
 
 function updateRemarksPreview() {
-  var el = document.getElementById('remarksPreview');
+  var el = document.getElementById(fieldUiId('remarksPreview'));
+  if (!el) return;
   if (state.remarksFields.length === 0) {
     el.textContent = '(none selected)';
     return;
@@ -2109,6 +2241,27 @@ state.idFields = [];
 
 function populateIdFieldsPicker() {
   state.idFields = [];
+  if (_sourceType === 'kml') {
+    var htmlK = '';
+    (state.fields || []).forEach(function(f) {
+      var fn = f.name;
+      var short = (f.type && String(f.type).indexOf('esri') === 0)
+        ? String(f.type).replace('esriFieldType', '')
+        : 'attr';
+      var isId = (f.type === 'esriFieldTypeOID' || f.type === 'esriFieldTypeGlobalID')
+        || /^(OBJECTID|GlobalID|globalid|FID)$/i.test(fn);
+      var tag = isId ? ' << ID' : '';
+      htmlK += '<span class="remark-pill available" id="' + idPillId(fn) + '" onclick="addIdField(\'' + fn.replace(/'/g, "\\'") + '\')">'
+        + fn + ' <span style="opacity:.6;font-size:.7rem">(' + short + ')</span>' + tag + '</span>';
+    });
+    var elA = document.getElementById(fieldUiId('idFieldsAvailable'));
+    if (elA) elA.innerHTML = htmlK;
+    var elS = document.getElementById(fieldUiId('idFieldsSelected'));
+    if (elS) elS.innerHTML = '<span style="color:#555">Click field(s) above to add</span>';
+    updateIdFieldsPreview();
+    return;
+  }
+
   var html = '';
   var autoPick = null;
 
@@ -2146,13 +2299,13 @@ function populateIdFieldsPicker() {
     var partial = multi && !inAll ? ' <span style="color:#c77;font-size:.7rem">(in ' + f.presentIn + '/' + totalLayers + ')</span>' : '';
     var style = multi && !inAll ? ' style="opacity:.55"' : '';
     var title = multi && !inAll ? ' title="Only in ' + f.presentIn + ' of ' + totalLayers + ' selected layers — other layers will hash as empty string for this field"' : '';
-    html += '<span class="remark-pill available" id="idpill-' + f.name + '"' + style + title
+    html += '<span class="remark-pill available" id="' + idPillId(f.name) + '"' + style + title
       + ' onclick="addIdField(\'' + f.name.replace(/'/g, "\\'") + '\')">'
       + f.name + ' <span style="opacity:.6;font-size:.7rem">(' + short + ')</span>' + tag + partial + '</span>';
     if (isId && !autoPick && inAll) autoPick = f.name;
   });
-  document.getElementById('idFieldsAvailable').innerHTML = html;
-  document.getElementById('idFieldsSelected').innerHTML = '<span style="color:#555">Click field(s) above to add</span>';
+  document.getElementById(fieldUiId('idFieldsAvailable')).innerHTML = html;
+  document.getElementById(fieldUiId('idFieldsSelected')).innerHTML = '<span style="color:#555">Click field(s) above to add</span>';
   updateIdFieldsPreview();
   if (autoPick) addIdField(autoPick);
 }
@@ -2162,7 +2315,7 @@ function addIdField(name) {
   state.idFields.push(name);
   renderIdFieldsSelected();
   updateIdFieldsPreview();
-  var pill = document.getElementById('idpill-' + name);
+  var pill = document.getElementById(idPillId(name));
   if (pill) pill.classList.add('used');
 }
 
@@ -2171,12 +2324,12 @@ function removeIdField(idx) {
   state.idFields.splice(idx, 1);
   renderIdFieldsSelected();
   updateIdFieldsPreview();
-  var pill = document.getElementById('idpill-' + name);
+  var pill = document.getElementById(idPillId(name));
   if (pill) pill.classList.remove('used');
 }
 
 function renderIdFieldsSelected() {
-  var el = document.getElementById('idFieldsSelected');
+  var el = document.getElementById(fieldUiId('idFieldsSelected'));
   if (!el) return;
   if (state.idFields.length === 0) {
     el.innerHTML = '<span style="color:#555">Click field(s) above to add</span>';
@@ -2191,7 +2344,7 @@ function renderIdFieldsSelected() {
 }
 
 function updateIdFieldsPreview() {
-  var el = document.getElementById('idFieldsPreview');
+  var el = document.getElementById(fieldUiId('idFieldsPreview'));
   if (!el) return;
   if (state.idFields.length === 0) {
     el.textContent = '(none selected — falls back to row index, UIDs will not be stable)';
@@ -2402,6 +2555,16 @@ function pickSourceType(type) {
   document.getElementById('arcgisSteps').style.display = type === 'arcgis' ? 'block' : 'none';
   document.getElementById('tfrSteps').style.display = type === 'faa_tfr' ? 'block' : 'none';
   document.getElementById('kmlSteps').style.display = type === 'kml' ? 'block' : 'none';
+  if (type === 'kml') {
+    state.fields = [];
+    state.layerFields = {};
+    state.idFields = [];
+    state.uniformLabelFields = [];
+    state.remarksFields = [];
+    populateIdFieldsPicker();
+    populateRemarksPicker();
+    renderUniformLabelUI();
+  }
 }
 
 function showSteps() {
@@ -2542,10 +2705,18 @@ function resetForm() {
   document.getElementById('kmlLabelsOn').value = 'true';
   document.getElementById('kmlLabelUpperCase').value = 'false';
   document.getElementById('kmlCenterLabel').value = 'true';
-  document.getElementById('kmlIdFields').value = 'GlobalID';
-  document.getElementById('kmlLabelFields').value = 'type, description, mission';
-  document.getElementById('kmlLabelTemplate').value = '{type} | {description}';
-  document.getElementById('kmlRemarksFields').value = 'type, mission, source, description';
+  document.getElementById('kml_uniformLabelCustomText').value = '';
+  document.getElementById('kml_idFieldsAvailable').innerHTML = '';
+  document.getElementById('kml_idFieldsSelected').innerHTML = '<span style="color:#555">Click field(s) above to add</span>';
+  var kmlIdPrev = document.getElementById('kml_idFieldsPreview');
+  if (kmlIdPrev) { kmlIdPrev.textContent = '(fetch fields in step 1 first)'; kmlIdPrev.style.color = '#888'; }
+  document.getElementById('kml_uniformLabelPills').innerHTML = '';
+  document.getElementById('kml_uniformLabelPreview').textContent = '';
+  document.getElementById('kml_remarksAvailable').innerHTML = '';
+  document.getElementById('kml_remarksSelected').innerHTML = '';
+  document.getElementById('kml_remarksPreview').textContent = '';
+  document.getElementById('kmlFetchStatus').innerHTML = '';
+  clearKmlSampleTable();
   document.getElementById('kmlConfigName').value = '';
   document.getElementById('kmlMissionName').value = '';
   document.getElementById('kmlUidPrefix').value = 'kml-';
@@ -2655,12 +2826,36 @@ async function selectConfig(idx) {
       if (c.style.labelUpperCase != null) document.getElementById('kmlLabelUpperCase').value = String(c.style.labelUpperCase);
       if (c.style.centerLabel != null) document.getElementById('kmlCenterLabel').value = String(c.style.centerLabel);
     }
-    var defId = (c.mapping && c.mapping.idFields && c.mapping.idFields.length) ? c.mapping.idFields.join(', ') : 'GlobalID';
-    document.getElementById('kmlIdFields').value = defId;
-    var defLf = (c.style && c.style.labelFields && c.style.labelFields.length) ? c.style.labelFields.join(', ') : 'type, description, mission';
-    document.getElementById('kmlLabelFields').value = defLf;
-    document.getElementById('kmlLabelTemplate').value = (c.style && c.style.labelTemplate) ? c.style.labelTemplate : '{type} | {description}';
-    document.getElementById('kmlRemarksFields').value = (c.remarksFields && c.remarksFields.length) ? c.remarksFields.join(', ') : 'type, mission, source, description';
+    var keySet = {};
+    function addKmlKey(k) {
+      if (k != null && String(k).trim()) keySet[String(k).trim()] = true;
+    }
+    if (c.mapping && c.mapping.idFields) c.mapping.idFields.forEach(addKmlKey);
+    if (c.style && c.style.labelFields) c.style.labelFields.forEach(addKmlKey);
+    if (c.remarksFields) c.remarksFields.forEach(addKmlKey);
+    var lt0 = (c.style && c.style.labelTemplate) ? String(c.style.labelTemplate) : '';
+    var rm = /\{([^}]+)\}/g;
+    var mm;
+    while ((mm = rm.exec(lt0)) !== null) addKmlKey(mm[1]);
+    state.fields = Object.keys(keySet).sort().map(function(n) { return { name: n, type: 'kml' }; });
+    if (state.fields.length === 0) {
+      state.fields = [{ name: 'name', type: 'kml' }, { name: 'OBJECTID', type: 'kml' }];
+    }
+    populateIdFieldsPicker();
+    state.idFields = [];
+    var loadedKmlIds = (c.mapping && c.mapping.idFields && c.mapping.idFields.length)
+      ? c.mapping.idFields.slice()
+      : (c.mapping && c.mapping.idField ? [c.mapping.idField] : []);
+    loadedKmlIds.forEach(function(f) { addIdField(f); });
+    renderIdFieldsSelected();
+    updateIdFieldsPreview();
+    if (c.style) applyUniformLabelStyleFromObject(c.style);
+    else renderUniformLabelUI();
+    state.remarksFields = [];
+    populateRemarksPicker();
+    if (c.remarksFields && c.remarksFields.length) {
+      c.remarksFields.forEach(function(f) { addRemarkField(f); });
+    }
     document.getElementById('kmlConfigName').value = c.configName || '';
     document.getElementById('kmlMissionName').value = c.missionName || '';
     document.getElementById('kmlUidPrefix').value = c.uidPrefix || 'kml-';
@@ -2668,7 +2863,7 @@ async function selectConfig(idx) {
     document.getElementById('kmlDataSyncEnabled').checked = c.dataSyncEnabled !== false;
     document.getElementById('kmlStrictMode').checked = (c.strictMode !== false);
     document.getElementById('kmlConfigOutput').textContent = JSON.stringify(c, null, 2);
-    status('kmlSaveStatus', 'Loaded "' + (c.configName || 'config') + '" — edit and Save to publish changes', true);
+    status('kmlSaveStatus', 'Loaded "' + (c.configName || 'config') + '" — Fetch fields to refresh column list from live KML, or edit and Save', true);
     return;
   }
 
@@ -2962,17 +3157,10 @@ async function saveKmlConfig() {
   }
   var configName = (document.getElementById('kmlConfigName').value || '').trim() || 'KML';
   var missionName = (document.getElementById('kmlMissionName').value || '').trim();
-  var remarksRaw = (document.getElementById('kmlRemarksFields').value || '').trim();
-  var remarksFields = remarksRaw ? remarksRaw.split(',').map(function(s) { return s.trim(); }).filter(Boolean) : ['description'];
-  var labelT = (document.getElementById('kmlLabelTemplate').value || '').trim() || '{name}';
-
-  function kmlCsv(s) {
-    return (s || '').split(',').map(function(x) { return x.trim(); }).filter(Boolean);
-  }
-  var idFields = kmlCsv(document.getElementById('kmlIdFields').value);
-  if (idFields.length === 0) idFields = ['name'];
-  var styleLabelFields = kmlCsv(document.getElementById('kmlLabelFields').value);
-  if (styleLabelFields.length === 0) styleLabelFields = ['name'];
+  var idFields = (state.idFields && state.idFields.length) ? state.idFields.slice() : ['name'];
+  var labelT = computeUniformLabelTemplate().trim();
+  var customEl = document.getElementById(fieldUiId('uniformLabelCustomText'));
+  var labelCustom = customEl ? String(customEl.value || '').trim() : '';
 
   var config = {
     sourceType: 'kml',
@@ -3001,17 +3189,17 @@ async function saveKmlConfig() {
       strokeStyle: 'solid',
       closed: true,
       labelsOn: document.getElementById('kmlLabelsOn').value === 'true',
-      labelField: styleLabelFields[0],
-      labelFields: styleLabelFields.slice(),
-      labelCustomText: null,
-      labelTemplate: labelT,
+      labelField: (state.uniformLabelFields && state.uniformLabelFields.length) ? state.uniformLabelFields[0] : null,
+      labelFields: (state.uniformLabelFields && state.uniformLabelFields.length) ? state.uniformLabelFields.slice() : null,
+      labelCustomText: labelCustom || null,
+      labelTemplate: labelT || null,
       labelUpperCase: document.getElementById('kmlLabelUpperCase').value === 'true',
       centerLabel: document.getElementById('kmlCenterLabel').value === 'true'
     },
     classField: null,
     classes: null,
-    remarksTemplate: null,
-    remarksFields: remarksFields,
+    remarksTemplate: getRemarksTemplate(),
+    remarksFields: state.remarksFields.length > 0 ? state.remarksFields.slice() : null,
     ttlValue: 0,
     ttlUnit: 'hours',
     uidPrefix: (document.getElementById('kmlUidPrefix').value || '').trim() || 'kml-',
