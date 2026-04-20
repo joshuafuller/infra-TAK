@@ -17101,7 +17101,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 {{ sidebar_html }}
 <div class="main">
   <div class="page-header">
-    <h1><img src="{{ mediamtx_logo_url }}" alt="MediaMTX" style="height:28px;vertical-align:middle;margin-right:8px">{% if mediamtx_version or editor_version %}<span style="font-weight:500;color:var(--text-dim);font-size:16px">· MediaMTX v{{ mediamtx_version }}{% if editor_version %} / editor v{{ editor_version }}{% endif %}</span>{% endif %}{% if mediamtx_update_available and mediamtx_latest %} <span style="font-size:12px;color:var(--cyan);font-weight:600;margin-left:8px">MediaMTX v{{ mediamtx_latest }} available</span>{% endif %}{% if editor_update_available and editor_latest %} <span style="font-size:12px;color:var(--cyan);font-weight:600;margin-left:8px">editor v{{ editor_latest }} available</span>{% endif %}</h1>
+    <h1 style="display:flex;align-items:flex-end;gap:0"><img src="{{ mediamtx_logo_url }}" alt="MediaMTX" style="height:28px;margin-right:8px">{% if mediamtx_version or editor_version %}<span style="font-weight:500;color:var(--text-dim);font-size:16px;line-height:1">· MediaMTX v{{ mediamtx_version }}{% if editor_version %} / editor v{{ editor_version }}{% endif %}</span>{% endif %}{% if mediamtx_update_available and mediamtx_latest %} <span style="font-size:12px;color:var(--cyan);font-weight:600;margin-left:8px;line-height:1">MediaMTX v{{ mediamtx_latest }} available</span>{% endif %}{% if editor_update_available and editor_latest %} <span style="font-size:12px;color:var(--cyan);font-weight:600;margin-left:8px;line-height:1">editor v{{ editor_latest }} available</span>{% endif %}</h1>
     <p>Video Streaming Server (bluenviron) + Web Editor (takwerx)</p>
   </div>
 
