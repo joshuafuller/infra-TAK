@@ -926,7 +926,7 @@
         <div id="kml_remarksSelected" style="display:flex;flex-wrap:wrap;gap:0.3rem;margin-top:0.3rem;min-height:2rem;padding:0.5rem;background:#0a0a1a;border-radius:4px;border:1px solid #1a1a4e"></div>
       </div>
       <div style="margin-top:0.4rem;font-size:0.75rem;color:#666">
-        Remarks preview: <span id="kml_remarksPreview" style="color:#2ec4b6">FieldA: value | FieldB: value</span>
+        Remarks preview: <span id="kml_remarksPreview" style="color:#2ec4b6"></span>
       </div>
     </div>
   </div>
@@ -937,33 +937,45 @@
       <label style="display:flex;align-items:center;gap:0.5rem;cursor:pointer">
         <input type="checkbox" id="kmlDataSyncEnabled" checked>
         <span style="font-size:0.95rem;color:#fff">Data Sync Mission</span>
+        <span style="font-size:0.78rem;color:#888">(uncheck for broadcast-only / channel streaming)</span>
       </label>
     </div>
     <div class="field-grid" style="margin-bottom:1rem">
       <div>
         <label for="kmlConfigName">Config name</label>
-        <input type="text" id="kmlConfigName" placeholder="e.g. LIVE KML OVERLAY">
+        <input type="text" id="kmlConfigName" placeholder="Shown in Saved list &amp; Node-RED debug (e.g. KML CA AIR INTEL)">
       </div>
+      <div></div>
+    </div>
+    <div class="field-grid" style="margin-bottom:1rem">
       <div>
         <label for="kmlMissionName">TAK Mission name</label>
-        <input type="text" id="kmlMissionName" placeholder="e.g. KML FEED">
+        <input type="text" id="kmlMissionName" placeholder="e.g. KML CA AIR INTEL">
+      </div>
+      <div style="font-size:0.78rem;color:#888;align-self:end;padding-bottom:0.5rem">
+        Uses admin cert for streaming &amp; Mission API (port 8089)
       </div>
     </div>
+    <input type="hidden" id="kmlCreatorUid" value="admin">
     <div class="field-grid" style="margin-bottom:1rem">
       <div>
         <label for="kmlUidPrefix">UID prefix</label>
         <input type="text" id="kmlUidPrefix" value="kml-" placeholder="kml-">
       </div>
       <div>
-        <label for="kmlCreatorUid">Creator UID</label>
-        <input type="text" id="kmlCreatorUid" value="admin">
+        <label for="kmlPollIntervalStep3">Poll interval (minutes)</label>
+        <input type="number" id="kmlPollIntervalStep3" min="1" max="1440" value="5" placeholder="5">
       </div>
     </div>
     <div style="margin-bottom:1rem;padding:0.6rem 0.8rem;background:#0d1a2e;border:1px solid #1a3a5e;border-radius:4px">
       <label style="display:flex;align-items:center;gap:0.5rem;cursor:pointer;font-size:0.9rem;color:#fff">
         <input type="checkbox" id="kmlStrictMode" checked>
         <span>Strict mission ownership</span>
+        <span style="font-size:0.78rem;color:#888">(this feed exclusively manages its mission — removes orphans from config changes)</span>
       </label>
+      <div style="font-size:0.75rem;color:#888;margin-top:0.35rem;margin-left:1.6rem">
+        Uncheck only if this mission also contains items from other feeds or manual operator adds.
+      </div>
     </div>
     <div class="field-grid" style="margin-bottom:1rem">
       <div>
@@ -980,10 +992,17 @@
       </div>
     </div>
     <div class="row">
-      <button type="button" onclick="saveKmlConfig()">Save KML Config</button>
+      <button type="button" onclick="generateKmlConfig()">Save &amp; Generate Config JSON</button>
+      <button type="button" class="btn-secondary" onclick="copyKmlConfig()">Copy to Clipboard</button>
+      <button type="button" class="btn-secondary" onclick="downloadKmlConfig()">Download</button>
+      <button type="button" class="btn-secondary" onclick="exportKmlTemplate()" title="Export mapping template for reuse">Export Template</button>
+      <label class="btn-secondary" style="display:inline-flex;align-items:center;cursor:pointer">
+        Import Template
+        <input type="file" accept=".json" onchange="importKmlTemplate(event)" style="display:none">
+      </label>
     </div>
     <div id="kmlSaveStatus"></div>
-    <div class="config-output" id="kmlConfigOutput" style="margin-top:0.75rem"></div>
+    <div class="config-output" id="kmlConfigOutput"></div>
   </div>
 
   </div><!-- end kmlSteps -->
@@ -1776,11 +1795,12 @@ function clearKmlSampleTable() {
 }
 
 /* ── KML: discover fields (ArcGIS-style Fetch) ── */
-async function fetchKmlFields() {
+async function fetchKmlFields(opts) {
+  var noAutoSelect = opts && opts.noAutoSelect;
   var raw = (document.getElementById('kmlNetworkLinkUrl').value || '').trim();
   if (!raw) {
-    status('kmlFetchStatus', 'Enter a KML or network link URL first', false);
-    return;
+    if (!noAutoSelect) status('kmlFetchStatus', 'Enter a KML or network link URL first', false);
+    return null;
   }
   if (_sourceType !== 'kml') pickSourceType('kml');
   clearKmlSampleTable();
@@ -1794,7 +1814,7 @@ async function fetchKmlFields() {
     var data = await res.json();
     if (data.error) {
       status('kmlFetchStatus', 'Error: ' + data.error, false);
-      return;
+      return null;
     }
     var keys = data.keys || [];
     if (keys.length === 0) {
@@ -1804,17 +1824,11 @@ async function fetchKmlFields() {
       populateIdFieldsPicker();
       populateRemarksPicker();
       renderUniformLabelUI();
-      return;
+      return data;
     }
     var sampleRows = (data.samples && data.samples.length) ? data.samples : (data.sample && Object.keys(data.sample).length ? [data.sample] : []);
     renderKmlSampleTable(keys, sampleRows);
     state.fields = keys.map(function(k) { return { name: k, type: 'kml' }; });
-    populateIdFieldsPicker();
-    state.idFields = [];
-    var gpg = state.fields.find(function(f) { return /^GlobalID$/i.test(f.name); });
-    var oid = state.fields.find(function(f) { return /^OBJECTID$/i.test(f.name); });
-    if (gpg) addIdField(gpg.name);
-    else if (oid) addIdField(oid.name);
     // Populate time field and dedup selects
     var tfSel = document.getElementById('kmlTimeField');
     var ddSel = document.getElementById('kmlDedupField');
@@ -1824,29 +1838,25 @@ async function fetchKmlFields() {
       var o1 = document.createElement('option'); o1.value = k; o1.textContent = k; tfSel.appendChild(o1);
       var o2 = document.createElement('option'); o2.value = k; o2.textContent = k; ddSel.appendChild(o2);
     });
-    // Auto-suggest time field for common patterns
-    var timeGuess = keys.find(function(k) { return /^(time|date|timestamp|datetime|created|updated|start_time)$/i.test(k); });
-    if (timeGuess) tfSel.value = timeGuess;
+    populateIdFieldsPicker();
+    state.idFields = [];
     populateRemarksPicker();
-    var prefer = ['type', 'mission', 'source', 'description'];
-    prefer.forEach(function(name) {
-      if (keys.indexOf(name) >= 0) addRemarkField(name);
-    });
     state.uniformLabelFields = [];
-    var defLf = state.fields.find(function(f) {
-      var n = f.name.toLowerCase();
-      return n === 'mission' || n === 'incidentname' || n === 'type' || n === 'description';
-    });
-    if (defLf) state.uniformLabelFields = [defLf.name];
-    else if (state.fields[0]) state.uniformLabelFields = [state.fields[0].name];
     renderUniformLabelUI();
+    if (!noAutoSelect) {
+      // Auto-suggest time field for common patterns (only on fresh fetch by user)
+      var timeGuess = keys.find(function(k) { return /^(time|date|timestamp|datetime|created|updated|start_time)$/i.test(k); });
+      if (timeGuess) tfSel.value = timeGuess;
+    }
     var extra = (data.placemarksWithGeometry != null)
       ? (' — sampled ' + data.placemarksWithGeometry + ' feature(s) with geometry')
       : '';
     status('kmlFetchStatus', keys.length + ' attribute key(s) discovered' + extra, true);
+    return data;
   } catch (e) {
     clearKmlSampleTable();
     status('kmlFetchStatus', 'Fetch failed: ' + e.message, false);
+    return null;
   } finally {
     setLoading('btnKmlFetch', false);
   }
@@ -2734,6 +2744,7 @@ function resetForm() {
 
   document.getElementById('kmlNetworkLinkUrl').value = '';
   document.getElementById('kmlPollInterval').value = '5';
+  document.getElementById('kmlPollIntervalStep3').value = '5';
   document.getElementById('kmlStrokeColor').value = '#FF0000';
   document.getElementById('kmlStrokeColorPick').value = '#FF0000';
   updSwatch('swKmlStroke', '#FF0000');
@@ -2852,7 +2863,9 @@ async function selectConfig(idx) {
 
   if (type === 'kml') {
     document.getElementById('kmlNetworkLinkUrl').value = (c.source && c.source.networkLinkUrl) ? c.source.networkLinkUrl : '';
-    document.getElementById('kmlPollInterval').value = (c.pollInterval != null && c.pollInterval > 0) ? c.pollInterval : 5;
+    var kmlPollVal = (c.pollInterval != null && c.pollInterval > 0) ? c.pollInterval : 5;
+    document.getElementById('kmlPollInterval').value = kmlPollVal;
+    document.getElementById('kmlPollIntervalStep3').value = kmlPollVal;
     if (c.style) {
       var ksc = c.style.strokeColor || '#FF0000';
       var kfc = c.style.fillColor || '#FF0000';
@@ -2872,22 +2885,19 @@ async function selectConfig(idx) {
       if (c.style.labelUpperCase != null) document.getElementById('kmlLabelUpperCase').value = String(c.style.labelUpperCase);
       if (c.style.centerLabel != null) document.getElementById('kmlCenterLabel').value = String(c.style.centerLabel);
     }
-    var keySet = {};
-    function addKmlKey(k) {
-      if (k != null && String(k).trim()) keySet[String(k).trim()] = true;
-    }
-    if (c.mapping && c.mapping.idFields) c.mapping.idFields.forEach(addKmlKey);
-    if (c.style && c.style.labelFields) c.style.labelFields.forEach(addKmlKey);
-    if (c.remarksFields) c.remarksFields.forEach(addKmlKey);
-    var lt0 = (c.style && c.style.labelTemplate) ? String(c.style.labelTemplate) : '';
-    var rm = /\{([^}]+)\}/g;
-    var mm;
-    while ((mm = rm.exec(lt0)) !== null) addKmlKey(mm[1]);
-    state.fields = Object.keys(keySet).sort().map(function(n) { return { name: n, type: 'kml' }; });
-    if (state.fields.length === 0) {
-      state.fields = [{ name: 'name', type: 'kml' }, { name: 'OBJECTID', type: 'kml' }];
-    }
-    populateIdFieldsPicker();
+    document.getElementById('kmlConfigName').value = c.configName || '';
+    document.getElementById('kmlMissionName').value = c.missionName || '';
+    document.getElementById('kmlUidPrefix').value = c.uidPrefix || 'kml-';
+    document.getElementById('kmlCreatorUid').value = (c.creatorUid != null && c.creatorUid !== '') ? c.creatorUid : 'admin';
+    document.getElementById('kmlDataSyncEnabled').checked = c.dataSyncEnabled !== false;
+    document.getElementById('kmlStrictMode').checked = (c.strictMode !== false);
+    document.getElementById('kmlTtlValue').value = (c.ttlValue != null) ? c.ttlValue : 0;
+    document.getElementById('kmlTtlUnit').value = c.ttlUnit || 'hours';
+    document.getElementById('kmlConfigOutput').textContent = JSON.stringify(c, null, 2);
+    // Fetch live KML to show sample table, then restore saved field selections
+    status('kmlFetchStatus', 'Fetching KML to show sample data…', true);
+    await fetchKmlFields({ noAutoSelect: true });
+    // Restore ID pills
     state.idFields = [];
     var loadedKmlIds = (c.mapping && c.mapping.idFields && c.mapping.idFields.length)
       ? c.mapping.idFields.slice()
@@ -2895,36 +2905,22 @@ async function selectConfig(idx) {
     loadedKmlIds.forEach(function(f) { addIdField(f); });
     renderIdFieldsSelected();
     updateIdFieldsPreview();
-    // Restore time field and dedup selects from saved field list
+    // Restore time field and dedup
     var kmlTfSel = document.getElementById('kmlTimeField');
     var kmlDdSel = document.getElementById('kmlDedupField');
-    kmlTfSel.innerHTML = '<option value="">(none — no time filter)</option>';
-    kmlDdSel.innerHTML = '<option value="">(none — keep all features)</option>';
-    state.fields.forEach(function(f) {
-      var o1 = document.createElement('option'); o1.value = f.name; o1.textContent = f.name; kmlTfSel.appendChild(o1);
-      var o2 = document.createElement('option'); o2.value = f.name; o2.textContent = f.name; kmlDdSel.appendChild(o2);
-    });
     if (c.mapping && c.mapping.timeField) kmlTfSel.value = c.mapping.timeField;
     document.getElementById('kmlTimeFieldEpochMs').checked = !!(c.mapping && c.mapping.timeFieldEpochMs);
     if (c.mapping && c.mapping.dedupField) kmlDdSel.value = c.mapping.dedupField;
-    // Restore TTL
-    document.getElementById('kmlTtlValue').value = (c.ttlValue != null) ? c.ttlValue : 0;
-    document.getElementById('kmlTtlUnit').value = c.ttlUnit || 'hours';
+    // Restore label
     if (c.style) applyUniformLabelStyleFromObject(c.style);
     else renderUniformLabelUI();
+    // Restore remarks
     state.remarksFields = [];
     populateRemarksPicker();
     if (c.remarksFields && c.remarksFields.length) {
       c.remarksFields.forEach(function(f) { addRemarkField(f); });
     }
-    document.getElementById('kmlConfigName').value = c.configName || '';
-    document.getElementById('kmlMissionName').value = c.missionName || '';
-    document.getElementById('kmlUidPrefix').value = c.uidPrefix || 'kml-';
-    document.getElementById('kmlCreatorUid').value = (c.creatorUid != null && c.creatorUid !== '') ? c.creatorUid : 'admin';
-    document.getElementById('kmlDataSyncEnabled').checked = c.dataSyncEnabled !== false;
-    document.getElementById('kmlStrictMode').checked = (c.strictMode !== false);
-    document.getElementById('kmlConfigOutput').textContent = JSON.stringify(c, null, 2);
-    status('kmlSaveStatus', 'Loaded "' + (c.configName || 'config') + '" — click Fetch in step 1 to refresh columns from live KML, or edit and Save', true);
+    status('kmlSaveStatus', 'Loaded "' + (c.configName || 'config') + '" — edit and Save to publish changes', true);
     return;
   }
 
@@ -3209,21 +3205,15 @@ async function saveTfrConfig() {
 
 /* ── KML Network Link save ── */
 
-async function saveKmlConfig() {
+function buildKmlConfigObject() {
   var url = (document.getElementById('kmlNetworkLinkUrl').value || '').trim();
-  if (!url) {
-    document.getElementById('kmlSaveStatus').textContent = 'Enter a network link URL';
-    document.getElementById('kmlSaveStatus').style.color = '#e94560';
-    return;
-  }
   var configName = (document.getElementById('kmlConfigName').value || '').trim() || 'KML';
   var missionName = (document.getElementById('kmlMissionName').value || '').trim();
   var idFields = (state.idFields && state.idFields.length) ? state.idFields.slice() : ['name'];
   var labelT = computeUniformLabelTemplate().trim();
   var customEl = document.getElementById(fieldUiId('uniformLabelCustomText'));
   var labelCustom = customEl ? String(customEl.value || '').trim() : '';
-
-  var config = {
+  return {
     sourceType: 'kml',
     configName: configName,
     source: {
@@ -3269,10 +3259,22 @@ async function saveKmlConfig() {
     streamPort: 8089,
     missionName: missionName,
     creatorUid: (document.getElementById('kmlCreatorUid').value || '').trim() || 'admin',
-    pollInterval: parseInt(document.getElementById('kmlPollInterval').value, 10) || 5,
+    pollInterval: parseInt(document.getElementById('kmlPollIntervalStep3').value, 10) || parseInt(document.getElementById('kmlPollInterval').value, 10) || 5,
     strictMode: document.getElementById('kmlStrictMode').checked,
     generated: new Date().toISOString()
   };
+}
+
+async function generateKmlConfig() {
+  var url = (document.getElementById('kmlNetworkLinkUrl').value || '').trim();
+  if (!url) {
+    document.getElementById('kmlSaveStatus').textContent = 'Enter a network link URL';
+    document.getElementById('kmlSaveStatus').style.color = '#e94560';
+    return;
+  }
+  var config = buildKmlConfigObject();
+  var configName = config.configName;
+  var missionName = config.missionName;
 
   document.getElementById('kmlConfigOutput').textContent = JSON.stringify(config, null, 2);
 
@@ -3294,6 +3296,93 @@ async function saveKmlConfig() {
     document.getElementById('kmlSaveStatus').textContent = 'Error: ' + e.message;
     document.getElementById('kmlSaveStatus').style.color = '#e94560';
   }
+}
+
+function copyKmlConfig() {
+  var t = document.getElementById('kmlConfigOutput').textContent;
+  if (t) navigator.clipboard.writeText(t).then(function() {
+    status('kmlSaveStatus', 'Copied to clipboard', true);
+  });
+}
+
+function downloadKmlConfig() {
+  var t = document.getElementById('kmlConfigOutput').textContent;
+  if (!t) return;
+  var cfg = {};
+  try { cfg = JSON.parse(t); } catch(e) {}
+  var blob = new Blob([t], { type: 'application/json' });
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = (cfg.configName || 'kml-config').replace(/[^a-zA-Z0-9_-]/g, '_') + '.json';
+  a.click();
+}
+
+function exportKmlTemplate() {
+  var cfg = buildKmlConfigObject();
+  var tmpl = {
+    _templateVersion: 1,
+    mapping: cfg.mapping,
+    filter: cfg.filter,
+    style: cfg.style,
+    remarksTemplate: cfg.remarksTemplate,
+    remarksFields: cfg.remarksFields,
+    ttlValue: cfg.ttlValue,
+    ttlUnit: cfg.ttlUnit,
+    uidPrefix: cfg.uidPrefix,
+    dataSyncEnabled: cfg.dataSyncEnabled
+  };
+  var blob = new Blob([JSON.stringify(tmpl, null, 2)], { type: 'application/json' });
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = (cfg.configName || 'kml-template').replace(/[^a-zA-Z0-9_-]/g, '_') + '-template.json';
+  a.click();
+}
+
+function importKmlTemplate(event) {
+  var file = event.target.files[0];
+  if (!file) return;
+  var reader = new FileReader();
+  reader.onload = function(e) {
+    try {
+      var tmpl = JSON.parse(e.target.result);
+      if (tmpl.mapping) {
+        var tmplIds = (tmpl.mapping.idFields && tmpl.mapping.idFields.length)
+          ? tmpl.mapping.idFields.slice()
+          : (tmpl.mapping.idField ? [tmpl.mapping.idField] : []);
+        if (tmplIds.length) {
+          state.idFields = [];
+          tmplIds.forEach(function(f) { addIdField(f); });
+        }
+        if (tmpl.mapping.timeField) document.getElementById('kmlTimeField').value = tmpl.mapping.timeField;
+        if (tmpl.mapping.timeFieldEpochMs != null) document.getElementById('kmlTimeFieldEpochMs').checked = !!tmpl.mapping.timeFieldEpochMs;
+        if (tmpl.mapping.dedupField) document.getElementById('kmlDedupField').value = tmpl.mapping.dedupField;
+      }
+      if (tmpl.style) {
+        if (tmpl.style.strokeColor) { document.getElementById('kmlStrokeColor').value = tmpl.style.strokeColor; document.getElementById('kmlStrokeColorPick').value = tmpl.style.strokeColor; updSwatch('swKmlStroke', tmpl.style.strokeColor); }
+        if (tmpl.style.fillColor) { document.getElementById('kmlFillColor').value = tmpl.style.fillColor; document.getElementById('kmlFillColorPick').value = tmpl.style.fillColor; updSwatch('swKmlFill', tmpl.style.fillColor); }
+        if (tmpl.style.fillAlpha != null) { document.getElementById('kmlFillAlpha').value = tmpl.style.fillAlpha; document.getElementById('kmlFillAlphaVal').textContent = tmpl.style.fillAlpha + '%'; }
+        if (tmpl.style.strokeWeight) document.getElementById('kmlStrokeWeight').value = String(tmpl.style.strokeWeight);
+        if (tmpl.style.labelsOn != null) document.getElementById('kmlLabelsOn').value = String(tmpl.style.labelsOn);
+        if (tmpl.style.labelUpperCase != null) document.getElementById('kmlLabelUpperCase').value = String(tmpl.style.labelUpperCase);
+        if (tmpl.style.centerLabel != null) document.getElementById('kmlCenterLabel').value = String(tmpl.style.centerLabel);
+        if (tmpl.style.labelFields && tmpl.style.labelFields.length) applyUniformLabelStyleFromObject(tmpl.style);
+      }
+      if (tmpl.remarksFields && tmpl.remarksFields.length) {
+        state.remarksFields = [];
+        populateRemarksPicker();
+        tmpl.remarksFields.forEach(function(f) { addRemarkField(f); });
+      }
+      if (tmpl.ttlValue != null) document.getElementById('kmlTtlValue').value = tmpl.ttlValue;
+      if (tmpl.ttlUnit) document.getElementById('kmlTtlUnit').value = tmpl.ttlUnit;
+      if (tmpl.uidPrefix) document.getElementById('kmlUidPrefix').value = tmpl.uidPrefix;
+      if (tmpl.dataSyncEnabled != null) document.getElementById('kmlDataSyncEnabled').checked = tmpl.dataSyncEnabled;
+      status('kmlSaveStatus', 'Template imported — review and Save', true);
+    } catch(ex) {
+      status('kmlSaveStatus', 'Template import failed: ' + ex.message, false);
+    }
+    event.target.value = '';
+  };
+  reader.readAsText(file);
 }
 
 /* ── Dynamic engine tab management ── */
