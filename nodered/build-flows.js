@@ -1747,11 +1747,43 @@ const FN_KML_BUILD_URL = [
   "return msg;"
 ].join('\n');
 
+/** Check for NetworkLink in the fetched KML — no require(), pure sync.
+ *  Output 1: has NetworkLink → go to hr_kml_inner
+ *  Output 2: no NetworkLink  → go straight to parse_kml
+ */
+const FN_KML_CHECK_NL = [
+  "var sc = msg.statusCode || 200;",
+  "var cfg = msg._config;",
+  "if (sc >= 400) {",
+  "  node.warn((cfg && cfg.configName || 'KML') + ': HTTP ' + sc + ' fetching KML');",
+  "  msg.payload = { features: [] };",
+  "  msg._arcgisStatus = sc;",
+  "  return [null, msg];",
+  "}",
+  "var xml = typeof msg.payload === 'string' ? msg.payload",
+  "  : (Buffer.isBuffer(msg.payload) ? msg.payload.toString('utf8') : String(msg.payload || ''));",
+  "var nlm = xml.match(/<NetworkLink[\\s\\S]*?<\\/NetworkLink>/i);",
+  "if (nlm) {",
+  "  var hm = nlm[0].match(/<href[^>]*>([\\s\\S]*?)<\\/href>/i);",
+  "  var href = hm ? hm[1].replace(/<[^>]+>/g,'').trim() : '';",
+  "  if (href) {",
+  "    var base = (cfg && cfg.source && cfg.source.networkLinkUrl) ? cfg.source.networkLinkUrl : '';",
+  "    if (/^https?:\\/\\//i.test(href)) { msg.url = href; }",
+  "    else if (href.indexOf('//') === 0) { msg.url = (base.match(/^https?:/i) || ['http:'])[0] + href; }",
+  "    else { try { msg.url = new URL(href, base).href; } catch(e) { msg.url = href; } }",
+  "    msg.method = 'GET';",
+  "    msg.headers = { Accept: 'application/vnd.google-earth.kml+xml, application/xml, text/xml, */*' };",
+  "    msg.payload = null;",
+  "    return [msg, null];",
+  "  }",
+  "}",
+  "return [null, msg];"
+].join('\n');
+
+/** Pure synchronous KML → Feature JSON — no require(), no async, no network. */
 const FN_KML_TO_FEATURES = [
   "var cfg = msg._config;",
-  "var tak = msg.takSettings;",
-  "var topic = msg.topic;",
-  "var startUrl = (cfg.source && cfg.source.networkLinkUrl) ? String(cfg.source.networkLinkUrl).trim() : '';",
+  "var sc = msg.statusCode || 200;",
   "",
   "function xmlFromPayload(p) {",
   "  if (typeof p === 'string') return p;",
@@ -1869,70 +1901,17 @@ const FN_KML_TO_FEATURES = [
   "  return features;",
   "}",
   "",
-  "function networkHref(xml) {",
-  "  var m = xml.match(/<NetworkLink[^>]*>[\\s\\S]*?<\\/NetworkLink>/i);",
-  "  if (!m) return '';",
-  "  var h = m[0].match(/<href[^>]*>([\\s\\S]*?)<\\/href>/i);",
-  "  if (!h) return '';",
-  "  return h[1].replace(/<[^>]+>/g,'').trim();",
+  "if (sc >= 400) {",
+  "  node.warn((cfg && cfg.configName || 'KML') + ': HTTP ' + sc);",
+  "  msg.payload = { features: [] };",
+  "  msg._arcgisStatus = sc;",
+  "  return msg;",
   "}",
-  "",
-  "var xml0 = xmlFromPayload(msg.payload);",
-  "var st0 = msg.statusCode || 200;",
-  "var urlMod = require('url');",
-  "var https = require('https');",
-  "var http = require('http');",
-  "",
-  "function fetchInner(u, cb) {",
-  "  var lib = u.indexOf('https') === 0 ? https : http;",
-  "  lib.get(u, function(res) {",
-  "    var chunks = [];",
-  "    res.on('data', function(c) { chunks.push(c); });",
-  "    res.on('end', function() {",
-  "      var body = Buffer.concat(chunks).toString('utf8');",
-  "      cb(null, body, res.statusCode);",
-  "    });",
-  "  }).on('error', function(e) { cb(e); });",
-  "}",
-  "",
-  "function finish(xmlBody, status) {",
-  "  var feats = parsePlacemarks(xmlBody);",
-  "  msg.payload = { features: feats };",
-  "  msg._arcgisStatus = status || 200;",
-  "  msg._config = cfg;",
-  "  msg.takSettings = tak;",
-  "  msg.topic = topic;",
-  "  msg._layerName = '';",
-  "}",
-  "",
-  "var innerHref = networkHref(xml0);",
-  "if (innerHref) {",
-  "  var target = '';",
-  "  if (/^https?:\\/\\//i.test(innerHref)) target = innerHref;",
-  "  else if (innerHref.indexOf('//') === 0 && startUrl) {",
-  "    var pr = urlMod.parse(startUrl);",
-  "    target = (pr.protocol || 'http:') + innerHref;",
-  "  } else if (startUrl) target = urlMod.resolve(startUrl, innerHref);",
-  "  if (target) {",
-  "    fetchInner(target, function(err, xml1, st1) {",
-  "      if (err) {",
-  "        node.warn((cfg.configName || 'KML') + ' KML NetworkLink fetch: ' + err.message);",
-  "        msg.payload = { features: [] };",
-  "        msg._arcgisStatus = 500;",
-  "        msg._config = cfg;",
-  "        msg.takSettings = tak;",
-  "        msg.topic = topic;",
-  "        msg._layerName = '';",
-  "        return node.send(msg);",
-  "      }",
-  "      finish(xml1, st1);",
-  "      node.send(msg);",
-  "    });",
-  "    return;",
-  "  }",
-  "}",
-  "",
-  "finish(xml0, st0);",
+  "var xml = xmlFromPayload(msg.payload);",
+  "var feats = parsePlacemarks(xml);",
+  "msg.payload = { features: feats };",
+  "msg._arcgisStatus = 200;",
+  "msg._layerName = '';",
   "return msg;"
 ].join('\n');
 
@@ -1989,7 +1968,26 @@ function makeKmlEngineTab(feed) {
       url: '', tls: '', persist: false, proxy: '',
       insecureHTTPParser: false, authType: '',
       senderr: false, headers: [],
-      x: 400, y: 200, wires: [[P + 'parse_kml']]
+      x: 380, y: 200, wires: [[P + 'check_nl']]
+    },
+    {
+      id: P + 'check_nl', type: 'function', z: FID,
+      name: 'Check NetworkLink',
+      _templateKey: 'kml.check_nl',
+      func: FN_KML_CHECK_NL,
+      outputs: 2, timeout: '', noerr: 0,
+      initialize: '', finalize: '', libs: [],
+      x: 560, y: 200,
+      wires: [[P + 'http_kml_inner'], [P + 'parse_kml']]
+    },
+    {
+      id: P + 'http_kml_inner', type: 'http request', z: FID,
+      name: 'GET inner KML',
+      method: 'use', ret: 'txt', paytoqs: 'ignore',
+      url: '', tls: '', persist: false, proxy: '',
+      insecureHTTPParser: false, authType: '',
+      senderr: false, headers: [],
+      x: 760, y: 160, wires: [[P + 'parse_kml']]
     },
     {
       id: P + 'parse_kml', type: 'function', z: FID,
@@ -1998,10 +1996,10 @@ function makeKmlEngineTab(feed) {
       func: FN_KML_TO_FEATURES,
       outputs: 1, timeout: '', noerr: 0,
       initialize: '', finalize: '', libs: [],
-      x: 500, y: 200, wires: [[P + 'parse']]
+      x: 960, y: 200, wires: [[P + 'parse']]
     }
   ];
-  nodes.splice(iq, 2, kmlChain[0], kmlChain[1], kmlChain[2]);
+  nodes.splice(iq, 2, kmlChain[0], kmlChain[1], kmlChain[2], kmlChain[3], kmlChain[4]);
   return nodes;
 }
 
