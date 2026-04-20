@@ -155,6 +155,71 @@ const FN_KML_FETCH_FIELDS = [
   "return null;"
 ].join('\n');
 
+/** Pure XML parse — no require(), called after the http request node fetches the KML text. */
+const FN_KML_PARSE_FIELDS = [
+  "var sc = msg.statusCode || 200;",
+  "if (sc >= 400) { msg.payload = { error: 'HTTP ' + sc }; return msg; }",
+  "var xml = typeof msg.payload === 'string' ? msg.payload",
+  "  : (Buffer.isBuffer(msg.payload) ? msg.payload.toString('utf8') : String(msg.payload || ''));",
+  "function decodeXmlText(s) {",
+  "  if (!s) return '';",
+  "  return String(s).replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&amp;/g,'&')",
+  "    .replace(/&quot;/g,'\"').replace(/&#39;/g,\"'\").replace(/&nbsp;/g,' ').trim();",
+  "}",
+  "function parseHtmlAttrTable(html) {",
+  "  var out = {};",
+  "  if (!html || html.indexOf('<td') < 0) return out;",
+  "  var re = /<td[^>]*>([\\s\\S]*?)<\\/td>\\s*<td[^>]*>([\\s\\S]*?)<\\/td>/gi;",
+  "  var m;",
+  "  while ((m = re.exec(html)) !== null) {",
+  "    var k = decodeXmlText(m[1].replace(/<[^>]+>/g,'').replace(/&nbsp;/g,' ').trim());",
+  "    var v = decodeXmlText(m[2].replace(/<[^>]+>/g,'').trim());",
+  "    if (/^<Null>$/i.test(v)) v = '';",
+  "    if (k) out[k] = v;",
+  "  }",
+  "  return out;",
+  "}",
+  "function parseExtData(block) {",
+  "  var out = {};",
+  "  var em = block.match(/<ExtendedData[^>]*>([\\s\\S]*?)<\\/ExtendedData>/i);",
+  "  if (!em) return out;",
+  "  var inner = em[1];",
+  "  var re = /<SimpleData[^>]*name=[\"']([^\"']*)[\"'][^>]*>([\\s\\S]*?)<\\/SimpleData>/gi;",
+  "  var m;",
+  "  while ((m = re.exec(inner)) !== null) { var k=decodeXmlText(m[1]),v=decodeXmlText(m[2].replace(/<[^>]+>/g,'')); if(k) out[k]=v; }",
+  "  re = /<Data[^>]*name=[\"']([^\"']*)[\"'][^>]*>[\\s\\S]*?<value>([\\s\\S]*?)<\\/value>/gi;",
+  "  while ((m = re.exec(inner)) !== null) { var k2=decodeXmlText(m[1]),v2=decodeXmlText(m[2].replace(/<[^>]+>/g,'')); if(k2) out[k2]=v2; }",
+  "  return out;",
+  "}",
+  "var keyObj = {}; var samples = []; var nGeo = 0; var totalPm = 0;",
+  "var re = /<Placemark([^>]*)>([\\s\\S]*?)<\\/Placemark>/gi; var m;",
+  "while ((m = re.exec(xml)) !== null) { totalPm++; }",
+  "re = /<Placemark([^>]*)>([\\s\\S]*?)<\\/Placemark>/gi;",
+  "while ((m = re.exec(xml)) !== null && nGeo < 20) {",
+  "  var block = m[2];",
+  "  var hasGeo = /<Point[^>]*>/i.test(block)||/<Polygon[^>]*>/i.test(block)||/<LineString[^>]*>/i.test(block);",
+  "  if (!hasGeo) continue;",
+  "  var nm = block.match(/<name[^>]*>([\\s\\S]*?)<\\/name>/i);",
+  "  var pmName = nm ? nm[1].replace(/<[^>]+>/g,'').trim() : 'Placemark';",
+  "  var dm = block.match(/<description[^>]*>([\\s\\S]*?)<\\/description>/i);",
+  "  var descRaw = dm ? dm[1] : '';",
+  "  var ext = parseExtData(block);",
+  "  var tbl = parseHtmlAttrTable(descRaw);",
+  "  var attrs = {}; var k;",
+  "  for (k in ext) attrs[k] = ext[k];",
+  "  for (k in tbl) attrs[k] = tbl[k];",
+  "  attrs.name = pmName; attrs.OBJECTID = nGeo;",
+  "  if (!attrs.description) attrs.description = descRaw.replace(/<[^>]+>/g,' ').replace(/\\s+/g,' ').trim();",
+  "  Object.keys(attrs).forEach(function(k){ keyObj[k]=true; });",
+  "  if (samples.length < 15) samples.push(attrs);",
+  "  nGeo++;",
+  "}",
+  "if (nGeo === 0) { msg.payload = { error: 'No placemarks with geometry found in KML' }; return msg; }",
+  "var keys = Object.keys(keyObj).sort();",
+  "msg.payload = { ok: true, keys: keys, sample: samples[0]||{}, samples: samples, placemarksWithGeometry: nGeo, placemarkTags: totalPm };",
+  "return msg;"
+].join('\n');
+
 // ════════════════════════════════════════════════════════════════
 //  Configurator tab — shared UI + persistence (global context)
 // ════════════════════════════════════════════════════════════════
@@ -445,25 +510,93 @@ const configFlows = [
     x: 1000, y: 540, wires: []
   },
 
+  // ── KML field discovery (Fetch button) ─────────────────────────
+  // Uses the same HTTP request node pattern as the ArcGIS proxy so
+  // async require() issues in function nodes cannot cause spinning.
+  // Flow: POST → prep URL → GET KML → check NetworkLink →
+  //       [no NL] parse → respond
+  //       [has NL] GET inner → parse → respond
   {
     id: 'hi_kml_fetch', type: 'http in', z: CFG_TAB,
     name: 'POST /arcgis-tak/kml/fetch',
     url: '/arcgis-tak/kml/fetch', method: 'post',
     upload: false, swaggerDoc: '',
-    x: 200, y: 580, wires: [['fn_kml_fetch']]
+    x: 200, y: 580, wires: [['fn_kml_prep']]
   },
   {
-    id: 'fn_kml_fetch', type: 'function', z: CFG_TAB,
-    name: 'KML discover attribute keys',
-    func: FN_KML_FETCH_FIELDS,
+    id: 'fn_kml_prep', type: 'function', z: CFG_TAB,
+    name: 'Set KML URL',
+    func: [
+      "var u = String((msg.payload && msg.payload.url) || '').trim();",
+      "if (!u) { msg.payload = { error: 'Missing url' }; return [null, msg]; }",
+      "msg._kmlStartUrl = u;",
+      "msg.url = u;",
+      "msg.method = 'GET';",
+      "msg.headers = { Accept: 'application/vnd.google-earth.kml+xml, application/xml, text/xml, */*' };",
+      "return [msg, null];"
+    ].join('\n'),
+    outputs: 2, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 400, y: 580, wires: [['hr_kml_main'], ['ho_kml_fetch']]
+  },
+  {
+    id: 'hr_kml_main', type: 'http request', z: CFG_TAB,
+    name: 'GET KML (outer)',
+    method: 'use', ret: 'txt', paytoqs: 'ignore',
+    url: '', tls: '', persist: false, proxy: '',
+    insecureHTTPParser: false, authType: '',
+    senderr: false, headers: [],
+    x: 600, y: 560, wires: [['fn_kml_check_nl']]
+  },
+  {
+    id: 'fn_kml_check_nl', type: 'function', z: CFG_TAB,
+    name: 'Check NetworkLink',
+    func: [
+      "var sc = msg.statusCode || 200;",
+      "if (sc >= 400) { msg.payload = { error: 'HTTP ' + sc }; return [null, msg]; }",
+      "var xml = msg.payload || '';",
+      "var nlm = xml.match(/<NetworkLink[^>]*>[\\s\\S]*?<\\/NetworkLink>/i);",
+      "if (nlm) {",
+      "  var hm = nlm[0].match(/<href[^>]*>([\\s\\S]*?)<\\/href>/i);",
+      "  var href = hm ? hm[1].replace(/<[^>]+>/g,'').trim() : '';",
+      "  if (href) {",
+      "    var base = msg._kmlStartUrl || '';",
+      "    if (/^https?:\\/\\//i.test(href)) { msg.url = href; }",
+      "    else if (href.indexOf('//') === 0) { msg.url = (base.match(/^https?:/i) || ['http:'])[0] + href; }",
+      "    else { try { msg.url = new URL(href, base).href; } catch(e) { msg.url = href; } }",
+      "    msg.method = 'GET';",
+      "    msg.headers = { Accept: 'application/vnd.google-earth.kml+xml, application/xml, text/xml, */*' };",
+      "    msg.payload = null;",
+      "    return [msg, null, null];",
+      "  }",
+      "}",
+      "return [null, msg, null];"
+    ].join('\n'),
+    outputs: 3, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 800, y: 560, wires: [['hr_kml_inner'], ['fn_kml_parse'], ['ho_kml_fetch']]
+  },
+  {
+    id: 'hr_kml_inner', type: 'http request', z: CFG_TAB,
+    name: 'GET KML (inner NetworkLink)',
+    method: 'use', ret: 'txt', paytoqs: 'ignore',
+    url: '', tls: '', persist: false, proxy: '',
+    insecureHTTPParser: false, authType: '',
+    senderr: false, headers: [],
+    x: 1020, y: 540, wires: [['fn_kml_parse']]
+  },
+  {
+    id: 'fn_kml_parse', type: 'function', z: CFG_TAB,
+    name: 'Parse KML → attribute keys',
+    func: FN_KML_PARSE_FIELDS,
     outputs: 1, timeout: '', noerr: 0,
     initialize: '', finalize: '', libs: [],
-    x: 430, y: 580, wires: [['ho_kml_fetch']]
+    x: 1020, y: 600, wires: [['ho_kml_fetch']]
   },
   {
     id: 'ho_kml_fetch', type: 'http response', z: CFG_TAB,
     name: '', statusCode: '', headers: {},
-    x: 640, y: 580, wires: []
+    x: 1220, y: 580, wires: []
   },
 
   // ── Config persistence (global context) ──
