@@ -893,6 +893,21 @@
       </div>
     </div>
 
+    <div class="field-grid" style="margin-top:1rem">
+      <div>
+        <label for="kmlTimeField">Time field <span class="badge badge-date">suggested: Date / timestamp type</span></label>
+        <select id="kmlTimeField"><option value="">(none — no time filter)</option></select>
+        <label style="display:flex;align-items:center;gap:0.4rem;margin-top:0.5rem;font-size:0.85rem;font-weight:normal">
+          <input type="checkbox" id="kmlTimeFieldEpochMs">
+          Time values are epoch milliseconds (use rolling window vs <code>DATE</code> literal)
+        </label>
+      </div>
+      <div>
+        <label for="kmlDedupField">Deduplicate by <span class="badge badge-oid">keep latest per value</span></label>
+        <select id="kmlDedupField"><option value="">(none — keep all features)</option></select>
+      </div>
+    </div>
+
     <div style="margin-top:1rem;padding:0.85rem;background:#0d0d2b;border:1px solid #333;border-radius:8px">
       <label style="font-size:0.9rem;color:#e2e8f0">Label (callsign)</label>
       <p style="font-size:0.78rem;color:#94a3b8;margin:0.35rem 0 0.55rem;line-height:1.4">Click fields to build the template (same as ArcGIS). Optional text is shown <strong>before</strong> field placeholders. Columns match KML attributes (HTML table, ExtendedData, plus <code>name</code> / <code>OBJECTID</code>).</p>
@@ -949,6 +964,20 @@
         <input type="checkbox" id="kmlStrictMode" checked>
         <span>Strict mission ownership</span>
       </label>
+    </div>
+    <div class="field-grid" style="margin-bottom:1rem">
+      <div>
+        <label for="kmlTtlValue">Time window (filters by time field when set; also sets CoT stale)</label>
+        <div class="row" style="margin-top:0.35rem;align-items:center">
+          <input type="number" id="kmlTtlValue" value="0" min="0" step="any" class="grow" style="max-width:160px">
+          <select id="kmlTtlUnit" style="max-width:160px">
+            <option value="minutes">Minutes</option>
+            <option value="hours" selected>Hours</option>
+            <option value="days">Days</option>
+          </select>
+        </div>
+        <div style="font-size:0.75rem;color:#888;margin-top:0.4rem">Use <strong>0</strong> for no time filter and default CoT stale (1h).</div>
+      </div>
     </div>
     <div class="row">
       <button type="button" onclick="saveKmlConfig()">Save KML Config</button>
@@ -1786,6 +1815,18 @@ async function fetchKmlFields() {
     var oid = state.fields.find(function(f) { return /^OBJECTID$/i.test(f.name); });
     if (gpg) addIdField(gpg.name);
     else if (oid) addIdField(oid.name);
+    // Populate time field and dedup selects
+    var tfSel = document.getElementById('kmlTimeField');
+    var ddSel = document.getElementById('kmlDedupField');
+    tfSel.innerHTML = '<option value="">(none — no time filter)</option>';
+    ddSel.innerHTML = '<option value="">(none — keep all features)</option>';
+    keys.forEach(function(k) {
+      var o1 = document.createElement('option'); o1.value = k; o1.textContent = k; tfSel.appendChild(o1);
+      var o2 = document.createElement('option'); o2.value = k; o2.textContent = k; ddSel.appendChild(o2);
+    });
+    // Auto-suggest time field for common patterns
+    var timeGuess = keys.find(function(k) { return /^(time|date|timestamp|datetime|created|updated|start_time)$/i.test(k); });
+    if (timeGuess) tfSel.value = timeGuess;
     populateRemarksPicker();
     var prefer = ['type', 'mission', 'source', 'description'];
     prefer.forEach(function(name) {
@@ -2717,6 +2758,11 @@ function resetForm() {
   document.getElementById('kml_remarksPreview').textContent = '';
   document.getElementById('kmlFetchStatus').innerHTML = '';
   clearKmlSampleTable();
+  document.getElementById('kmlTimeField').innerHTML = '<option value="">(none — no time filter)</option>';
+  document.getElementById('kmlTimeFieldEpochMs').checked = false;
+  document.getElementById('kmlDedupField').innerHTML = '<option value="">(none — keep all features)</option>';
+  document.getElementById('kmlTtlValue').value = '0';
+  document.getElementById('kmlTtlUnit').value = 'hours';
   document.getElementById('kmlConfigName').value = '';
   document.getElementById('kmlMissionName').value = '';
   document.getElementById('kmlUidPrefix').value = 'kml-';
@@ -2849,6 +2895,21 @@ async function selectConfig(idx) {
     loadedKmlIds.forEach(function(f) { addIdField(f); });
     renderIdFieldsSelected();
     updateIdFieldsPreview();
+    // Restore time field and dedup selects from saved field list
+    var kmlTfSel = document.getElementById('kmlTimeField');
+    var kmlDdSel = document.getElementById('kmlDedupField');
+    kmlTfSel.innerHTML = '<option value="">(none — no time filter)</option>';
+    kmlDdSel.innerHTML = '<option value="">(none — keep all features)</option>';
+    state.fields.forEach(function(f) {
+      var o1 = document.createElement('option'); o1.value = f.name; o1.textContent = f.name; kmlTfSel.appendChild(o1);
+      var o2 = document.createElement('option'); o2.value = f.name; o2.textContent = f.name; kmlDdSel.appendChild(o2);
+    });
+    if (c.mapping && c.mapping.timeField) kmlTfSel.value = c.mapping.timeField;
+    document.getElementById('kmlTimeFieldEpochMs').checked = !!(c.mapping && c.mapping.timeFieldEpochMs);
+    if (c.mapping && c.mapping.dedupField) kmlDdSel.value = c.mapping.dedupField;
+    // Restore TTL
+    document.getElementById('kmlTtlValue').value = (c.ttlValue != null) ? c.ttlValue : 0;
+    document.getElementById('kmlTtlUnit').value = c.ttlUnit || 'hours';
     if (c.style) applyUniformLabelStyleFromObject(c.style);
     else renderUniformLabelUI();
     state.remarksFields = [];
@@ -3176,9 +3237,9 @@ async function saveKmlConfig() {
     mapping: {
       idField: idFields[0],
       idFields: idFields.slice(),
-      timeField: null,
-      timeFieldEpochMs: false,
-      dedupField: null
+      timeField: document.getElementById('kmlTimeField').value || null,
+      timeFieldEpochMs: document.getElementById('kmlTimeFieldEpochMs').checked,
+      dedupField: document.getElementById('kmlDedupField').value || null
     },
     filter: { field: null, values: null },
     style: {
@@ -3200,8 +3261,8 @@ async function saveKmlConfig() {
     classes: null,
     remarksTemplate: getRemarksTemplate(),
     remarksFields: state.remarksFields.length > 0 ? state.remarksFields.slice() : null,
-    ttlValue: 0,
-    ttlUnit: 'hours',
+    ttlValue: parseFloat(document.getElementById('kmlTtlValue').value) || 0,
+    ttlUnit: document.getElementById('kmlTtlUnit').value || 'hours',
     uidPrefix: (document.getElementById('kmlUidPrefix').value || '').trim() || 'kml-',
     dataSyncEnabled: document.getElementById('kmlDataSyncEnabled').checked,
     streamCertUser: '',
