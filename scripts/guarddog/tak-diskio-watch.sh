@@ -91,17 +91,23 @@ if [ "$(echo "$AVG_1H < $WARN_MBPS" | bc -l 2>/dev/null)" = "1" ]; then
   ALERT_REASON="Last-hour average (${AVG_1H} MB/s) is below ${WARN_MBPS} MB/s threshold"
 fi
 
+# Use scale>=2 for the division — scale=0 truncates AVG_1H/AVG_24H to 0 whenever it is <1,
+# which incorrectly yields a 100% "drop" and spams alerts on normal noise (~1% swings).
 if [ "$(echo "$AVG_24H > 0" | bc -l 2>/dev/null)" = "1" ]; then
-  DROP_PCT=$(echo "scale=0; (1 - $AVG_1H / $AVG_24H) * 100" | bc -l 2>/dev/null || echo "0")
-  if [ "${DROP_PCT%%.*}" -ge 70 ] 2>/dev/null; then
+  DROP_PCT=$(echo "scale=2; (1 - $AVG_1H / $AVG_24H) * 100" | bc -l 2>/dev/null || echo "0")
+  if [ "$(echo "$DROP_PCT >= 70" | bc -l 2>/dev/null)" = "1" ]; then
     NEED_ALERT=true
     ALERT_REASON="${ALERT_REASON:+$ALERT_REASON\n}Last-hour average dropped ${DROP_PCT}% from 24h average (${AVG_24H} MB/s → ${AVG_1H} MB/s)"
   fi
 fi
 
 # ── 6. Send alert (max once per 6 hours) ──
+# Skip email/SMS only when /opt/tak-guarddog/diskio_email_off exists (set from Guard Dog UI).
+# Benchmark + CSV + syslog above still run.
 if $NEED_ALERT; then
-  if [ ! -f "$ALERT_SENT_FILE" ] || [ "$(find "$ALERT_SENT_FILE" -mmin +360 2>/dev/null)" ]; then
+  if [ -f /opt/tak-guarddog/diskio_email_off ]; then
+    logger -t takguard-diskio "Alert condition met — email/SMS disabled for disk I/O (UI); not sending."
+  elif [ ! -f "$ALERT_SENT_FILE" ] || [ "$(find "$ALERT_SENT_FILE" -mmin +360 2>/dev/null)" ]; then
     touch "$ALERT_SENT_FILE"
 
     RECENT=$(tail -n 8 "$HISTORY" | tail -n +1)

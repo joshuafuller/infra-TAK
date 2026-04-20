@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.6.5-alpha"
+VERSION = "0.6.6-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -3209,6 +3209,8 @@ def guarddog_page():
         gd_needs_update=gd_needs_update, gd_deployed_version=_gd_dep_ver,
         guarddog_alert_email=settings.get('guarddog_alert_email', ''),
         guarddog_server_nickname=settings.get('guarddog_server_nickname', ''),
+        guarddog_diskio_monitor_enabled=_guarddog_diskio_monitor_enabled(settings),
+        guarddog_diskio_email_enabled=_guarddog_diskio_email_enabled(settings),
         guarddog_sms=settings.get('guarddog_sms', {}),
         guarddog_services=guarddog_services,
         guarddog_docs_url=guarddog_docs_url,
@@ -4237,6 +4239,64 @@ def _guarddog_timer_list():
             'takauthentikguard.timer', 'takmediamtxguard.timer', 'taknoderedguard.timer', 'takcloudtakguard.timer',
             'taktakportalguard.timer', 'takfedhubguard.timer']
 
+GUARDDOG_DISKIO_TIMER = 'takdiskioguard.timer'
+
+
+def _guarddog_diskio_monitor_enabled(settings=None):
+    """Whether the disk I/O benchmark timer should run (default True). Stored in settings.json."""
+    if settings is None:
+        settings = load_settings()
+    v = settings.get('guarddog_diskio_monitor_enabled')
+    if v is None:
+        return True
+    return bool(v)
+
+
+def _guarddog_diskio_email_enabled(settings=None):
+    """Whether disk I/O degradation sends email/SMS (default True). Benchmark still runs if disabled."""
+    if settings is None:
+        settings = load_settings()
+    v = settings.get('guarddog_diskio_email_enabled')
+    if v is None:
+        return True
+    return bool(v)
+
+
+def _guarddog_sync_diskio_email_off_file(settings=None):
+    """Create/remove diskio_email_off so tak-diskio-watch.sh skips notifications only."""
+    if not os.path.exists('/opt/tak-guarddog'):
+        return
+    if settings is None:
+        settings = load_settings()
+    path = '/opt/tak-guarddog/diskio_email_off'
+    if not _guarddog_diskio_email_enabled(settings):
+        try:
+            with open(path, 'w') as f:
+                f.write('')
+        except OSError:
+            pass
+    else:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _guarddog_apply_diskio_timer(settings=None):
+    """Enable or disable takdiskioguard.timer per settings. No-op if Guard Dog not installed or globally disabled."""
+    if not os.path.exists('/opt/tak-guarddog'):
+        return
+    if not _guarddog_is_enabled():
+        return
+    if settings is None:
+        settings = load_settings()
+    if _guarddog_diskio_monitor_enabled(settings):
+        subprocess.run(['systemctl', 'enable', '--now', GUARDDOG_DISKIO_TIMER], capture_output=True, text=True, timeout=15)
+    else:
+        subprocess.run(['systemctl', 'stop', GUARDDOG_DISKIO_TIMER], capture_output=True, timeout=8)
+        subprocess.run(['systemctl', 'disable', GUARDDOG_DISKIO_TIMER], capture_output=True, timeout=8)
+
+
 def _guarddog_is_enabled():
     """True if Guard Dog timers are enabled (at least the core 8089 timer)."""
     r = subprocess.run(['systemctl', 'is-enabled', 'tak8089guard.timer'], capture_output=True, text=True, timeout=5)
@@ -4267,7 +4327,37 @@ def guarddog_enable():
         subprocess.run(['systemctl', 'start', t], capture_output=True, timeout=5)
     subprocess.run(['systemctl', 'enable', 'tak-health.service'], capture_output=True, timeout=5)
     subprocess.run(['systemctl', 'start', 'tak-health.service'], capture_output=True, timeout=5)
+    _s = load_settings()
+    _guarddog_apply_diskio_timer(_s)
+    _guarddog_sync_diskio_email_off_file(_s)
     return jsonify({'success': True, 'enabled': True})
+
+@app.route('/api/guarddog/diskio-monitor', methods=['POST'])
+@login_required
+def guarddog_diskio_monitor_save():
+    """Save disk I/O benchmark on/off and/or email/SMS for disk I/O alerts; sync systemd + diskio_email_off file."""
+    if not os.path.exists('/opt/tak-guarddog'):
+        return jsonify({'success': False, 'error': 'Guard Dog is not installed'}), 400
+    data = request.json or {}
+    if 'enabled' not in data and 'email_enabled' not in data:
+        return jsonify({'success': False, 'error': 'Provide enabled and/or email_enabled (booleans)'}), 400
+    settings = load_settings()
+    if 'enabled' in data:
+        if not isinstance(data['enabled'], bool):
+            return jsonify({'success': False, 'error': 'enabled must be a boolean'}), 400
+        settings['guarddog_diskio_monitor_enabled'] = data['enabled']
+    if 'email_enabled' in data:
+        if not isinstance(data['email_enabled'], bool):
+            return jsonify({'success': False, 'error': 'email_enabled must be a boolean'}), 400
+        settings['guarddog_diskio_email_enabled'] = data['email_enabled']
+    save_settings(settings)
+    _guarddog_apply_diskio_timer(settings)
+    _guarddog_sync_diskio_email_off_file(settings)
+    return jsonify({
+        'success': True,
+        'enabled': _guarddog_diskio_monitor_enabled(settings),
+        'email_enabled': _guarddog_diskio_email_enabled(settings),
+    })
 
 @app.route('/api/guarddog/apply-docker-log-limits', methods=['POST'])
 @login_required
@@ -4400,6 +4490,9 @@ def guarddog_update():
             pass
         # Refresh Guard Dog monitor cache so UI flips without waiting for background refresh.
         _guarddog_refresh_page_cache()
+        _su = load_settings()
+        _guarddog_apply_diskio_timer(_su)
+        _guarddog_sync_diskio_email_off_file(_su)
         return jsonify({'success': True, 'message': 'Guard Dog scripts updated, timers installed, and reloaded.'})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)[:300]}), 500
@@ -4419,7 +4512,7 @@ def guarddog_uninstall():
         subprocess.run(['systemctl', 'disable', t], capture_output=True, timeout=5)
     subprocess.run(['systemctl', 'stop', 'tak-health.service'], capture_output=True, timeout=5)
     subprocess.run(['systemctl', 'disable', 'tak-health.service'], capture_output=True, timeout=5)
-    services_extra = ['tak8089guard.service', 'takoomguard.service', 'takdiskguard.service', 'takdbguard.service',
+    services_extra = ['tak8089guard.service', 'takoomguard.service', 'takdiskguard.service', 'takdiskioguard.service', 'takdbguard.service',
                       'takcotdbguard.service', 'taknetguard.service', 'takprocessguard.service', 'takcertguard.service',
                       'takintcaguard.service',
                       'takauthentikguard.service', 'takmediamtxguard.service', 'taknoderedguard.service', 'takcloudtakguard.service', 'taktakportalguard.service', 'tak-health.service']
@@ -5002,6 +5095,8 @@ def run_guarddog_deploy(alert_email):
             rs = subprocess.run(['systemctl', 'start', t], capture_output=True, text=True, timeout=5)
             if rs.returncode != 0:
                 plog(f"⚠ systemctl start {t} failed (continuing): {rs.stderr or rs.stdout or 'unknown'}")
+        _guarddog_apply_diskio_timer(settings)
+        _guarddog_sync_diskio_email_off_file(settings)
         re = subprocess.run(['systemctl', 'enable', 'tak-health.service'], capture_output=True, text=True, timeout=5)
         if re.returncode != 0:
             plog(f"✗ systemctl enable tak-health.service failed: {re.stderr or re.stdout or 'unknown'}")
@@ -15712,7 +15807,23 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
         <button id="gd-dio-refresh-btn" class="btn btn-ghost" style="padding:4px 12px;font-size:11px" onclick="gdRefreshDiskIO()">Refresh</button>
       </div>
     </div>
-    <p style="font-size:12px;color:var(--text-dim);margin-bottom:14px">Benchmarked every 15 minutes. Alerts if the last-hour average drops below 50 MB/s or falls 70%+ from the 24h average (noisy neighbor detection).</p>
+    <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:10px">
+      <div style="display:flex;flex-wrap:wrap;align-items:center;gap:10px">
+        <label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text-secondary);cursor:pointer;user-select:none">
+          <input type="checkbox" id="gd-dio-enabled" {% if guarddog_diskio_monitor_enabled %}checked{% endif %} onchange="gdSaveDiskioSettings()"/>
+          Run disk I/O benchmark (systemd timer, CSV + dashboard)
+        </label>
+        <span id="gd-dio-enabled-msg" style="font-size:11px;color:var(--text-dim);min-height:14px"></span>
+      </div>
+      <label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text-secondary);cursor:pointer;user-select:none;margin-left:0">
+        <input type="checkbox" id="gd-dio-email" {% if guarddog_diskio_email_enabled %}checked{% endif %} onchange="gdSaveDiskioSettings()"/>
+        Send email &amp; SMS for disk I/O degradation (other Guard Dog alerts unchanged)
+      </label>
+    </div>
+    {% if not gd.running %}
+    <p style="font-size:11px;color:var(--text-dim);margin:-4px 0 10px 0">Preference is saved. The timer runs only when Guard Dog is enabled above.</p>
+    {% endif %}
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:14px">When the benchmark runs: samples every 15 minutes. Notifications (if enabled above) when the last-hour average drops below 50 MB/s or falls 70%+ from the 24h average. Scripts still update with <strong>Update Guard Dog</strong> or console restart.</p>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px;margin-bottom:16px">
       <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">Current</div><span id="gd-dio-current" style="font-weight:600;font-size:14px">—</span></div>
       <div style="padding:8px 12px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:8px"><div style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px">1h avg</div><span id="gd-dio-1h" style="font-weight:600;font-size:14px">—</span></div>
@@ -28541,6 +28652,8 @@ def _auto_update_guarddog():
         ident = _guarddog_server_identifier(settings)
         with open('/opt/tak-guarddog/server_identifier', 'w') as f:
             f.write(ident)
+        _guarddog_apply_diskio_timer(settings)
+        _guarddog_sync_diskio_email_off_file(settings)
     except Exception as e:
         print(f"Guard Dog auto-update skipped: {e}")
 
