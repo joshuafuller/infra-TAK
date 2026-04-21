@@ -20252,7 +20252,7 @@ networks:
                 config_content = f.read()
 
             auth_block = (
-                '    <auth default="ldap" x509groups="true" x509addAnonymous="false" x509useGroupCache="true" x509useGroupCacheDefaultActive="true" x509checkRevocation="true">\n'
+                '    <auth default="ldap" x509groups="true" x509addAnonymous="false" x509useGroupCache="true" x509useGroupCacheDefaultActive="true" x509checkRevocation="true" x509useGroupCacheRequiresExtKeyUsage="false">\n'
                 f'        <ldap url="ldap://{host}:389" userstring="cn={{username}},ou=users,dc=takldap" updateinterval="30" groupprefix="cn=tak_" groupNameExtractorRegex="cn=tak_(.*?)(?:,|$)" serviceAccountDN="cn=adm_ldapservice,ou=users,dc=takldap" serviceAccountCredential="'
                 + ldap_svc_pass
                 + '" groupBaseRDN="ou=groups,dc=takldap" userBaseRDN="ou=users,dc=takldap" dnAttributeName="DN" nameAttr="CN" adminGroup="ROLE_ADMIN"/>\n'
@@ -21288,7 +21288,7 @@ entries:
 
                 # Build the new auth block — matches TAK Portal reference exactly
                 auth_block = (
-                    '    <auth default="ldap" x509groups="true" x509addAnonymous="false" x509useGroupCache="true" x509useGroupCacheDefaultActive="true" x509checkRevocation="true">\n'
+                    '    <auth default="ldap" x509groups="true" x509addAnonymous="false" x509useGroupCache="true" x509useGroupCacheDefaultActive="true" x509checkRevocation="true" x509useGroupCacheRequiresExtKeyUsage="false">\n'
                     '        <ldap url="ldap://127.0.0.1:389" userstring="cn={username},ou=users,dc=takldap" updateinterval="30" groupprefix="cn=tak_" groupNameExtractorRegex="cn=tak_(.*?)(?:,|$)" serviceAccountDN="cn=adm_ldapservice,ou=users,dc=takldap" serviceAccountCredential="'
                     + ldap_pass
                     + '" groupBaseRDN="ou=groups,dc=takldap" userBaseRDN="ou=users,dc=takldap" dnAttributeName="DN" nameAttr="CN" adminGroup="ROLE_ADMIN"/>\n'
@@ -23369,7 +23369,7 @@ def _apply_ldap_to_coreconfig():
     auth_block = ''
     auth_block += '    <auth default="ldap" x509groups="true" x509addAnonymous="false"'
     auth_block += ' x509useGroupCache="true" x509useGroupCacheDefaultActive="true"'
-    auth_block += ' x509checkRevocation="true">\n'
+    auth_block += ' x509checkRevocation="true" x509useGroupCacheRequiresExtKeyUsage="false">\n'
     auth_block += ldap_line + '\n'
     auth_block += '    </auth>'
     # Sanity check the block we built
