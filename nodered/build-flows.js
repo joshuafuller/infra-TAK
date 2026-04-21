@@ -1529,13 +1529,11 @@ function makeEngineTab(feed) {
         "}",
         "msg.payload = '';",
         "node.warn('Subscribing to ' + missionName + ' as ' + creatorUid);",
-        "var _https = require('https');",
-        "var _fs = require('fs');",
         "var _tak = tak; var _mn = missionName; var _uid = creatorUid;",
         "setTimeout(function() {",
         "  try {",
         "    var _c = '/certs/admin.pem'; var _k = '/certs/admin.key';",
-        "    var _co = _fs.existsSync(_c) ? { cert: _fs.readFileSync(_c), key: _fs.readFileSync(_k), passphrase: 'atakatak' } : {};",
+        "    var _co = _nodeFs.existsSync(_c) ? { cert: _nodeFs.readFileSync(_c), key: _nodeFs.readFileSync(_k), passphrase: 'atakatak' } : {};",
         "    var _ro = Object.assign({ hostname: _tak.serverUrl.replace(/^https?:\\/\\//i,'').replace(/\\/$/,''),",
         "      port: parseInt(String(_tak.missionApiPort || 8443)),",
         "      path: '/Marti/api/missions/' + encodeURIComponent(_mn) + '/role?username=' + encodeURIComponent(_uid) + '&clientUid=' + encodeURIComponent(_uid) + '&role=MISSION_OWNER',",
@@ -1543,7 +1541,7 @@ function makeEngineTab(feed) {
         "      headers: { 'accept': '*/*', 'Content-Type': 'application/json', 'Content-Length': '0' }",
         "    }, _co);",
         "    if (_tak.missionBearerToken) _ro.headers.Authorization = 'Bearer ' + String(_tak.missionBearerToken).trim();",
-        "    var _r = _https.request(_ro, function(rs) { node.warn('Elevated ' + _uid + ' to MISSION_OWNER on ' + _mn + ' (HTTP ' + rs.statusCode + ')'); });",
+        "    var _r = _nodeHttps.request(_ro, function(rs) { node.warn('Elevated ' + _uid + ' to MISSION_OWNER on ' + _mn + ' (HTTP ' + rs.statusCode + ')'); });",
         "    _r.on('error', function(e) { node.warn('Elevation error: ' + e.message); });",
         "    _r.end();",
         "  } catch(e) { node.warn('Elevation setup error: ' + e.message); }",
@@ -1551,7 +1549,10 @@ function makeEngineTab(feed) {
         "return msg;"
       ].join('\n'),
       outputs: 1, timeout: '', noerr: 0,
-      initialize: "global.set('_subscribed', {});", finalize: '', libs: [],
+      initialize: "global.set('_subscribed', {});", finalize: '', libs: [
+        { var: '_nodeHttps', module: 'https' },
+        { var: '_nodeFs', module: 'fs' }
+      ],
       x: 180, y: 300, wires: [[P + 'http_sub']]
     },
     {
@@ -2457,13 +2458,11 @@ function makeTfrEngineTab(feed) {
     "}",
     "msg.payload = '';",
     "node.warn('Subscribing to ' + missionName + ' as ' + creatorUid);",
-    "var _https = require('https');",
-    "var _fs = require('fs');",
     "var _tak = tak; var _mn = missionName; var _uid = creatorUid;",
     "setTimeout(function() {",
     "  try {",
     "    var _c = '/certs/admin.pem'; var _k = '/certs/admin.key';",
-    "    var _co = _fs.existsSync(_c) ? { cert: _fs.readFileSync(_c), key: _fs.readFileSync(_k), passphrase: 'atakatak' } : {};",
+    "    var _co = _nodeFs.existsSync(_c) ? { cert: _nodeFs.readFileSync(_c), key: _nodeFs.readFileSync(_k), passphrase: 'atakatak' } : {};",
     "    var _ro = Object.assign({ hostname: _tak.serverUrl.replace(/^https?:\\/\\//i,'').replace(/\\/$/,''),",
     "      port: parseInt(String(_tak.missionApiPort || 8443)),",
     "      path: '/Marti/api/missions/' + encodeURIComponent(_mn) + '/role?username=' + encodeURIComponent(_uid) + '&clientUid=' + encodeURIComponent(_uid) + '&role=MISSION_OWNER',",
@@ -2471,7 +2470,7 @@ function makeTfrEngineTab(feed) {
     "      headers: { 'accept': '*/*', 'Content-Type': 'application/json', 'Content-Length': '0' }",
     "    }, _co);",
     "    if (_tak.missionBearerToken) _ro.headers.Authorization = 'Bearer ' + String(_tak.missionBearerToken).trim();",
-    "    var _r = _https.request(_ro, function(rs) { node.warn('Elevated ' + _uid + ' to MISSION_OWNER on ' + _mn + ' (HTTP ' + rs.statusCode + ')'); });",
+    "    var _r = _nodeHttps.request(_ro, function(rs) { node.warn('Elevated ' + _uid + ' to MISSION_OWNER on ' + _mn + ' (HTTP ' + rs.statusCode + ')'); });",
     "    _r.on('error', function(e) { node.warn('Elevation error: ' + e.message); });",
     "    _r.end();",
     "  } catch(e) { node.warn('Elevation setup error: ' + e.message); }",
@@ -2767,7 +2766,10 @@ function makeTfrEngineTab(feed) {
       _templateKey: 'shared.build_sub',
       func: FN_SUB,
       outputs: 1, timeout: '', noerr: 0,
-      initialize: '', finalize: '', libs: [],
+      initialize: '', finalize: '', libs: [
+        { var: '_nodeHttps', module: 'https' },
+        { var: '_nodeFs', module: 'fs' }
+      ],
       x: 400, y: 460, wires: [[P + 'http_sub']]
     },
     {
