@@ -13249,20 +13249,41 @@ def run_email_deploy(provider_key, smtp_user, smtp_pass, from_addr, from_name):
         plog(f"📧 Step 1/5 — Installing Postfix...")
         if pkg_mgr == 'apt':
             wait_for_apt_lock(plog, log)
+            # Resolve mailname: prefer saved FQDN, fall back to hostname -f, hard-fallback to hostname
+            # hostname -f can return an unresolvable name on some VPS configs, causing
+            # mydomain to be derived as "0" and postfix install to fail with
+            # "meter mydomain: bad parameter value: 0"
+            fqdn_result = subprocess.run('hostname -f 2>/dev/null || hostname', shell=True, capture_output=True, text=True)
+            fqdn = (settings.get('fqdn') or fqdn_result.stdout.strip() or 'localhost').strip()
+            if not fqdn or fqdn == '0':
+                fqdn = settings.get('fqdn', 'localhost')
             subprocess.run(
-                'echo "postfix postfix/mailname string $(hostname -f)" | debconf-set-selections && '
+                f'echo "postfix postfix/mailname string {fqdn}" | debconf-set-selections && '
                 'echo "postfix postfix/main_mailer_type string Internet Site" | debconf-set-selections',
                 shell=True, capture_output=True, timeout=30)
             r = subprocess.run(
                 'DEBIAN_FRONTEND=noninteractive apt-get install -y postfix libsasl2-modules 2>&1',
                 shell=True, capture_output=True, text=True, timeout=300)
+            if r.returncode != 0:
+                # Attempt recovery: set myhostname/mydomain explicitly then retry dpkg --configure
+                plog(f"⚠ Postfix install hit error, attempting recovery (mydomain fix)...")
+                subprocess.run(
+                    f'postconf -e "myhostname={fqdn}" 2>/dev/null; '
+                    f'postconf -e "mydomain={fqdn.split(".", 1)[-1] if "." in fqdn else fqdn}" 2>/dev/null; '
+                    'dpkg --configure postfix 2>&1 || true',
+                    shell=True, capture_output=True, timeout=60)
+                r = subprocess.run('dpkg -l postfix 2>&1', shell=True, capture_output=True, text=True)
+                if 'ii' not in r.stdout:
+                    plog(f"✗ Postfix install failed: {r.stdout[-500:]}")
+                    status.update({'running': False, 'error': True})
+                    return
         else:
             r = subprocess.run('dnf install -y postfix cyrus-sasl-plain 2>&1',
                 shell=True, capture_output=True, text=True, timeout=300)
-        if r.returncode != 0:
-            plog(f"✗ Postfix install failed: {r.stdout[-500:]}")
-            status.update({'running': False, 'error': True})
-            return
+            if r.returncode != 0:
+                plog(f"✗ Postfix install failed: {r.stdout[-500:]}")
+                status.update({'running': False, 'error': True})
+                return
         plog("✓ Postfix installed")
 
         plog(f"📧 Step 2/5 — Configuring main.cf...")
