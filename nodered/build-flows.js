@@ -2936,9 +2936,10 @@ fs.writeFileSync(out, JSON.stringify(allFlows, null, 2));
 console.log('flows.json generated  (' + allFlows.length + ' nodes, ' + FEEDS.length + ' engine tabs)  →  ' + out);
 
 // Write template function map (ArcGIS + TFR + KML) for deploy.sh dynamic-tab sync
+// Format: { key: { func, libs } } — deploy.sh syncs both func and libs
 const templateFuncMap = {};
 [...templateNodes, ...tfrTemplateNodes, ...kmlTemplateNodes].forEach(n => {
-  if (n._templateKey) templateFuncMap[n._templateKey] = n.func;
+  if (n._templateKey) templateFuncMap[n._templateKey] = { func: n.func, libs: n.libs || [] };
 });
 fs.writeFileSync(path.join(__dirname, 'template-functions.json'), JSON.stringify(templateFuncMap));
 console.log('template-functions.json: ' + Object.keys(templateFuncMap).length + ' keys');

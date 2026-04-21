@@ -171,9 +171,12 @@ docker exec "$CONTAINER" node -e "
         n._templateKey = key;
       }
     }
-    if (key && funcTemplates[key] && n.func !== funcTemplates[key]) {
-      n.func = funcTemplates[key];
-      nSync++;
+    if (key && funcTemplates[key]) {
+      var tpl = funcTemplates[key];
+      var newFunc = (typeof tpl === 'object' && tpl.func !== undefined) ? tpl.func : tpl;
+      var newLibs = (typeof tpl === 'object' && tpl.libs !== undefined) ? tpl.libs : null;
+      if (n.func !== newFunc) { n.func = newFunc; nSync++; }
+      if (newLibs) n.libs = newLibs;
     }
   });
   console.log('    Synced ' + nSync + ' function nodes in dynamic engine tabs');
