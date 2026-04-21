@@ -1529,10 +1529,30 @@ function makeEngineTab(feed) {
         "}",
         "msg.payload = '';",
         "node.warn('Subscribing to ' + missionName + ' as ' + creatorUid);",
+        "var _tak = tak; var _mn = missionName; var _uid = creatorUid;",
+        "setTimeout(function() {",
+        "  try {",
+        "    var _c = '/certs/admin.pem'; var _k = '/certs/admin.key';",
+        "    var _co = _nodeFs.existsSync(_c) ? { cert: _nodeFs.readFileSync(_c), key: _nodeFs.readFileSync(_k), passphrase: 'atakatak' } : {};",
+        "    var _ro = Object.assign({ hostname: _tak.serverUrl.replace(/^https?:\\/\\//i,'').replace(/\\/$/,''),",
+        "      port: parseInt(String(_tak.missionApiPort || 8443)),",
+        "      path: '/Marti/api/missions/' + encodeURIComponent(_mn) + '/role?username=' + encodeURIComponent(_uid) + '&clientUid=' + encodeURIComponent(_uid) + '&role=MISSION_OWNER',",
+        "      method: 'PUT', rejectUnauthorized: false,",
+        "      headers: { 'accept': '*/*', 'Content-Type': 'application/json', 'Content-Length': '0' }",
+        "    }, _co);",
+        "    if (_tak.missionBearerToken) _ro.headers.Authorization = 'Bearer ' + String(_tak.missionBearerToken).trim();",
+        "    var _r = _nodeHttps.request(_ro, function(rs) { node.warn('Elevated ' + _uid + ' to MISSION_OWNER on ' + _mn + ' (HTTP ' + rs.statusCode + ')'); });",
+        "    _r.on('error', function(e) { node.warn('Elevation error: ' + e.message); });",
+        "    _r.end();",
+        "  } catch(e) { node.warn('Elevation setup error: ' + e.message); }",
+        "}, 5000);",
         "return msg;"
       ].join('\n'),
       outputs: 1, timeout: '', noerr: 0,
-      initialize: "global.set('_subscribed', {});", finalize: '', libs: [],
+      initialize: "global.set('_subscribed', {});", finalize: '', libs: [
+        { var: '_nodeHttps', module: 'https' },
+        { var: '_nodeFs', module: 'fs' }
+      ],
       x: 180, y: 300, wires: [[P + 'http_sub']]
     },
     {
@@ -1542,7 +1562,42 @@ function makeEngineTab(feed) {
       url: '', tls: 'tls_tak', persist: false, proxy: '',
       insecureHTTPParser: false, authType: '',
       senderr: false, headers: [],
-      x: 380, y: 300, wires: [[P + 'debug_sub']]
+      x: 380, y: 300, wires: [[P + 'fn_elevate']]
+    },
+    {
+      id: P + 'fn_elevate', type: 'function', z: FID,
+      name: 'Elevate to MISSION_OWNER',
+      func: [
+        "var tak = msg.takSettings;",
+        "var cfg = msg._config;",
+        "var missionName = cfg.missionName;",
+        "var host = String(tak.serverUrl || '').replace(/^https?:\\/\\//i, '').replace(/\\/$/, '');",
+        "var creatorUid = String((cfg && cfg.creatorUid) || (tak && tak.creatorUid) || 'nodered').trim();",
+        "msg.url = 'https://' + host + ':' + (tak.missionApiPort || 8443)",
+        "  + '/Marti/api/missions/' + encodeURIComponent(missionName)",
+        "  + '/role?username=' + encodeURIComponent(creatorUid)",
+        "  + '&clientUid=' + encodeURIComponent(creatorUid)",
+        "  + '&role=MISSION_OWNER';",
+        "msg.method = 'PUT';",
+        "msg.headers = { 'accept': '*/*', 'Content-Type': 'application/json' };",
+        "if (tak && tak.missionBearerToken) {",
+        "  msg.headers.Authorization = 'Bearer ' + String(tak.missionBearerToken).trim();",
+        "}",
+        "msg.payload = '';",
+        "node.warn('Elevating ' + creatorUid + ' to MISSION_OWNER on ' + missionName);",
+        "return msg;"
+      ].join('\n'),
+      outputs: 1, timeout: '', noerr: 0, initialize: '', finalize: '', libs: [],
+      x: 580, y: 300, wires: [[P + 'http_elevate']]
+    },
+    {
+      id: P + 'http_elevate', type: 'http request', z: FID,
+      name: 'Set MISSION_OWNER role',
+      method: 'use', ret: 'txt', paytoqs: 'ignore',
+      url: '', tls: 'tls_tak', persist: false, proxy: '',
+      insecureHTTPParser: false, authType: '',
+      senderr: false, headers: [],
+      x: 780, y: 300, wires: [[P + 'debug_sub']]
     },
     {
       id: P + 'debug_sub', type: 'debug', z: FID,
@@ -1550,7 +1605,7 @@ function makeEngineTab(feed) {
       active: true, tosidebar: true, console: false, tostatus: true,
       complete: 'true', targetType: 'full',
       statusVal: 'topic', statusType: 'auto',
-      x: 580, y: 300, wires: []
+      x: 980, y: 300, wires: []
     },
 
     // ── GET mission + Reconcile ──
@@ -2403,6 +2458,44 @@ function makeTfrEngineTab(feed) {
     "}",
     "msg.payload = '';",
     "node.warn('Subscribing to ' + missionName + ' as ' + creatorUid);",
+    "var _tak = tak; var _mn = missionName; var _uid = creatorUid;",
+    "setTimeout(function() {",
+    "  try {",
+    "    var _c = '/certs/admin.pem'; var _k = '/certs/admin.key';",
+    "    var _co = _nodeFs.existsSync(_c) ? { cert: _nodeFs.readFileSync(_c), key: _nodeFs.readFileSync(_k), passphrase: 'atakatak' } : {};",
+    "    var _ro = Object.assign({ hostname: _tak.serverUrl.replace(/^https?:\\/\\//i,'').replace(/\\/$/,''),",
+    "      port: parseInt(String(_tak.missionApiPort || 8443)),",
+    "      path: '/Marti/api/missions/' + encodeURIComponent(_mn) + '/role?username=' + encodeURIComponent(_uid) + '&clientUid=' + encodeURIComponent(_uid) + '&role=MISSION_OWNER',",
+    "      method: 'PUT', rejectUnauthorized: false,",
+    "      headers: { 'accept': '*/*', 'Content-Type': 'application/json', 'Content-Length': '0' }",
+    "    }, _co);",
+    "    if (_tak.missionBearerToken) _ro.headers.Authorization = 'Bearer ' + String(_tak.missionBearerToken).trim();",
+    "    var _r = _nodeHttps.request(_ro, function(rs) { node.warn('Elevated ' + _uid + ' to MISSION_OWNER on ' + _mn + ' (HTTP ' + rs.statusCode + ')'); });",
+    "    _r.on('error', function(e) { node.warn('Elevation error: ' + e.message); });",
+    "    _r.end();",
+    "  } catch(e) { node.warn('Elevation setup error: ' + e.message); }",
+    "}, 5000);",
+    "return msg;"
+  ].join('\n');
+
+  const FN_ELEVATE_ROLE = [
+    "var tak = msg.takSettings;",
+    "var cfg = msg._config;",
+    "var missionName = cfg.missionName;",
+    "var host = String(tak.serverUrl || '').replace(/^https?:\\/\\//i, '').replace(/\\/$/, '');",
+    "var creatorUid = String((cfg && cfg.creatorUid) || (tak && tak.creatorUid) || 'nodered').trim();",
+    "msg.url = 'https://' + host + ':' + (tak.missionApiPort || 8443)",
+    "  + '/Marti/api/missions/' + encodeURIComponent(missionName)",
+    "  + '/role?username=' + encodeURIComponent(creatorUid)",
+    "  + '&clientUid=' + encodeURIComponent(creatorUid)",
+    "  + '&role=MISSION_OWNER';",
+    "msg.method = 'PUT';",
+    "msg.headers = { 'accept': '*/*', 'Content-Type': 'application/json' };",
+    "if (tak && tak.missionBearerToken) {",
+    "  msg.headers.Authorization = 'Bearer ' + String(tak.missionBearerToken).trim();",
+    "}",
+    "msg.payload = '';",
+    "node.warn('Elevating ' + creatorUid + ' to MISSION_OWNER on ' + missionName);",
     "return msg;"
   ].join('\n');
 
@@ -2673,7 +2766,10 @@ function makeTfrEngineTab(feed) {
       _templateKey: 'shared.build_sub',
       func: FN_SUB,
       outputs: 1, timeout: '', noerr: 0,
-      initialize: '', finalize: '', libs: [],
+      initialize: '', finalize: '', libs: [
+        { var: '_nodeHttps', module: 'https' },
+        { var: '_nodeFs', module: 'fs' }
+      ],
       x: 400, y: 460, wires: [[P + 'http_sub']]
     },
     {
@@ -2683,7 +2779,23 @@ function makeTfrEngineTab(feed) {
       url: '', tls: 'tls_tak', persist: false, proxy: '',
       insecureHTTPParser: false, authType: '',
       senderr: false, headers: [],
-      x: 600, y: 460, wires: [[P + 'debug_sub']]
+      x: 600, y: 460, wires: [[P + 'fn_elevate']]
+    },
+    {
+      id: P + 'fn_elevate', type: 'function', z: FID,
+      name: 'Elevate to MISSION_OWNER',
+      func: FN_ELEVATE_ROLE,
+      outputs: 1, timeout: '', noerr: 0, initialize: '', finalize: '', libs: [],
+      x: 800, y: 460, wires: [[P + 'http_elevate']]
+    },
+    {
+      id: P + 'http_elevate', type: 'http request', z: FID,
+      name: 'Set MISSION_OWNER role',
+      method: 'use', ret: 'txt', paytoqs: 'ignore',
+      url: '', tls: 'tls_tak', persist: false, proxy: '',
+      insecureHTTPParser: false, authType: '',
+      senderr: false, headers: [],
+      x: 1000, y: 460, wires: [[P + 'debug_sub']]
     },
     {
       id: P + 'debug_sub', type: 'debug', z: FID,
@@ -2691,7 +2803,7 @@ function makeTfrEngineTab(feed) {
       active: true, tosidebar: true, console: false, tostatus: true,
       complete: 'true', targetType: 'full',
       statusVal: 'topic', statusType: 'auto',
-      x: 800, y: 460, wires: [[]]
+      x: 1200, y: 460, wires: [[]]
     },
 
     {
@@ -2824,9 +2936,10 @@ fs.writeFileSync(out, JSON.stringify(allFlows, null, 2));
 console.log('flows.json generated  (' + allFlows.length + ' nodes, ' + FEEDS.length + ' engine tabs)  →  ' + out);
 
 // Write template function map (ArcGIS + TFR + KML) for deploy.sh dynamic-tab sync
+// Format: { key: { func, libs } } — deploy.sh syncs both func and libs
 const templateFuncMap = {};
 [...templateNodes, ...tfrTemplateNodes, ...kmlTemplateNodes].forEach(n => {
-  if (n._templateKey) templateFuncMap[n._templateKey] = n.func;
+  if (n._templateKey) templateFuncMap[n._templateKey] = { func: n.func, libs: n.libs || [] };
 });
 fs.writeFileSync(path.join(__dirname, 'template-functions.json'), JSON.stringify(templateFuncMap));
 console.log('template-functions.json: ' + Object.keys(templateFuncMap).length + ' keys');

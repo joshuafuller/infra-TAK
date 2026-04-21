@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.6.6-alpha"
+VERSION = "0.6.7-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -281,7 +281,7 @@ CADDYFILE_USER_BLOCKS_MARKER = "# --- User-added blocks (do not remove) ---"
 # CloudTAK official icon (SVG data URL)
 CLOUDTAK_ICON = "data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiPz48c3ZnIGlkPSJMYXllcl8xIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHhtbG5zOnhsaW5rPSJodHRwOi8vd3d3LnczLm9yZy8xOTk5L3hsaW5rIiB2aWV3Qm94PSIwIDAgNzQuMyA0Ni42MiI+PGRlZnM+PHN0eWxlPi5jbHMtMXtmaWxsOnVybCgjbGluZWFyLWdyYWRpZW50LTIpO30uY2xzLTJ7ZmlsbDp1cmwoI2xpbmVhci1ncmFkaWVudCk7fTwvc3R5bGU+PGxpbmVhckdyYWRpZW50IGlkPSJsaW5lYXItZ3JhZGllbnQiIHgxPSIxNC4zOCIgeTE9IjguOTMiIHgyPSI2Ni45MiIgeTI9IjYxLjQ3IiBncmFkaWVudFVuaXRzPSJ1c2VyU3BhY2VPblVzZSI+PHN0b3Agb2Zmc2V0PSIwIiBzdG9wLWNvbG9yPSIjZmY5ODIwIi8+PHN0b3Agb2Zmc2V0PSIuNDIiIHN0b3AtY29sb3I9IiNmZmNlMDQiLz48c3RvcCBvZmZzZXQ9Ii40OSIgc3RvcC1jb2xvcj0iZ29sZCIvPjwvbGluZWFyR3JhZGllbnQ+PGxpbmVhckdyYWRpZW50IGlkPSJsaW5lYXItZ3JhZGllbnQtMiIgeDE9IjU5LjI3IiB5MT0iLS4zOCIgeDI9IjcyLjc0IiB5Mj0iMTIuMDgiIGdyYWRpZW50VW5pdHM9InVzZXJTcGFjZU9uVXNlIj48c3RvcCBvZmZzZXQ9IjAiIHN0b3AtY29sb3I9IiNmZjk4MjAiLz48c3RvcCBvZmZzZXQ9Ii4yOSIgc3RvcC1jb2xvcj0iI2ZmYjYxMCIvPjxzdG9wIG9mZnNldD0iLjU3IiBzdG9wLWNvbG9yPSJnb2xkIi8+PC9saW5lYXJHcmFkaWVudD48L2RlZnM+PHBhdGggY2xhc3M9ImNscy0yIiBkPSJNNzIuMDUsMjMuNTVjLTEuMjYtMS44OC0zLjAxLTMuNDUtNS4yMS00LjY1LTEuODUtMS4wMS0zLjY5LTEuNTktNS4wNi0xLjkxLS40Mi0xLjc0LTEuMjMtNC4yOC0yLjc3LTYuODVDNTYuNDQsNS44OCw1MS4zNy42Nyw0MS43LjA2Yy0uNTktLjA0LTEuMTgtLjA2LTEuNzUtLjA2LTcuODIsMC0xMi4wNCwzLjUyLTE0LjE5LDYuNDctLjkxLDEuMjQtMS41MywyLjQ4LTEuOTUsMy41NS0uODYtLjEzLTEuODYtLjIyLTIuOTMtLjIyLTMuNTYsMC02LjUyLDEuMDgtOC41NCwzLjEzLTEuOTEsMS45Mi0zLjIsNC4yNi0zLjczLDYuNzUtLjA5LjQxLS4xNS44LS4xOSwxLjE2LS45NS40Ny0yLjEyLDEuMTYtMy4yOSwyLjExQzEuNTYsMjUuODMtLjIsMjkuNjcuMDIsMzQuMDZjLjIyLDQuNDEsMi4yNyw3Ljk2LDUuOTQsMTAuMjksMi42LDEuNjUsNS4xLDIuMTksNS4zOCwyLjIzbC4yMi4wM2guMjJzNDguODYsMCw0OC44NiwwaC4xcy4xLDAsLjEsMGMuMzQtLjAyLDMuMzktLjI2LDYuNTQtMi4xMywzLjA0LTEuOCw2LjctNS40NSw2LjkyLTEyLjU2LjEtMy4xOC0uNjYtNS45OS0yLjI0LTguMzZaTTE0LjQzLDE1YzEuNzUtMS43Nyw0LjI0LTIuMjYsNi40NS0yLjI2LDIuNzEsMCw0Ljk5LjczLDQuOTkuNzMsMCwwLDEuMzMtMTAuNTMsMTQuMDctMTAuNTMuNSwwLDEuMDMuMDIsMS41Ny4wNSwxNi4yNCwxLjAzLDE3Ljc0LDE2LjU0LDE3Ljc0LDE2LjU0LDAsMCw0LjY3LjQyLDguMjEsMy4zMS0zLjQ3LDMuMjItNC45NSw1LjE5LTEyLjc3LDUuNzUtOC42NS42MS03LjQ3LDMuOTUtNy40NywzLjk1bC00LjA1LTguOThoNS43OWMuMTQtMi44NS0uODctNS42NS01LjMxLTUuNjVoLTguNDlsLTYuNTYsMTQuNjJzMS45Ni0zLjMxLTYuNjktMy45NWMtNy42OS0uNTUtNy41OC0yLjY5LTEwLjYxLTUuODgtLjA2LS41OC0uMjYtNC4zLDMuMTMtNy43MloiLz48cGF0aCBjbGFzcz0iY2xzLTEiIGQ9Ik02MS43OSwzLjczaDIuNTl2LjY0aC0uOTN2Mi4zOGgtLjc0di0yLjM4aC0uOTN2LS42NFpNNjcuMDUsMy43M2wtLjc3LDIuMDMtLjc3LTIuMDNoLS45M3YzLjAzaC43di0ybC43MywyaC41NGwuNzMtMnYyaC43di0zLjAzaC0uOTNaIi8+PC9zdmc+"
 # MediaMTX official logo (external URL to avoid long inline strings)
-MEDIAMTX_LOGO_URL = "https://raw.githubusercontent.com/bluenviron/mediamtx/main/logo.png"
+MEDIAMTX_LOGO_URL = "/static/mediamtx-logo.png"
 # MediaMTX web editor: regular repo (no LDAP); when Authentik/LDAP is installed we use LDAP branch if set
 MEDIAMTX_EDITOR_REPO = "https://github.com/takwerx/mediamtx-installer.git"
 MEDIAMTX_EDITOR_PATH = "config-editor"  # subdir containing mediamtx_config_editor.py
@@ -5759,6 +5759,16 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
         if cert_pass and cert_pass != 'atakatak':
             meta_cmds += f" && sudo sed -i 's/^CAPASS=.*/CAPASS={shlex.quote(cert_pass)}/' cert-metadata.sh"
             meta_cmds += f" && sudo sed -i 's/^PASS=.*/PASS={shlex.quote(cert_pass)}/' cert-metadata.sh"
+        # Pre-flight: passwordless sudo required — SSH sessions have no TTY for password prompts
+        ok_sudo, sudo_out = _ssh_probe(remote, 'sudo -n true 2>&1', timeout=10)
+        if not ok_sudo or 'password' in (sudo_out or '').lower():
+            plog('✗ Certificate generation failed — SSH user requires a sudo password')
+            plog('  Fix on the Federation Hub host:')
+            plog('    echo "$(whoami) ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/infra-tak-nopasswd')
+            plog('  Or SSH as root. Then retry.')
+            status_dict.update({'running': False, 'complete': True, 'error': True})
+            return
+
         ok_meta, meta_out = _ssh_probe(remote, meta_cmds, timeout=30)
         if not ok_meta:
             plog(f'⚠ cert-metadata.sh patch warning: {meta_out}')
@@ -6201,6 +6211,16 @@ def run_fedhub_remote_rotate_ca(new_root_ca=None, new_int_ca=None):
         if cert_pass and cert_pass != 'atakatak':
             meta_cmds += f" && sudo sed -i 's/^CAPASS=.*/CAPASS={shlex.quote(cert_pass)}/' cert-metadata.sh"
             meta_cmds += f" && sudo sed -i 's/^PASS=.*/PASS={shlex.quote(cert_pass)}/' cert-metadata.sh"
+        # Pre-flight: passwordless sudo required — SSH sessions have no TTY for password prompts
+        ok_sudo, sudo_out = _ssh_probe(remote, 'sudo -n true 2>&1', timeout=10)
+        if not ok_sudo or 'password' in (sudo_out or '').lower():
+            plog('✗ Certificate rotation failed — SSH user requires a sudo password')
+            plog('  Fix on the Federation Hub host:')
+            plog('    echo "$(whoami) ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/infra-tak-nopasswd')
+            plog('  Or SSH as root. Then retry.')
+            fedhub_rotate_status.update({'running': False, 'complete': True, 'error': True})
+            return
+
         ok_meta, meta_out = _ssh_probe(remote, meta_cmds, timeout=30)
         if not ok_meta:
             plog(f'⚠ cert-metadata patch warning: {(meta_out or "")[:240]}')
@@ -13249,20 +13269,41 @@ def run_email_deploy(provider_key, smtp_user, smtp_pass, from_addr, from_name):
         plog(f"📧 Step 1/5 — Installing Postfix...")
         if pkg_mgr == 'apt':
             wait_for_apt_lock(plog, log)
+            # Resolve mailname: prefer saved FQDN, fall back to hostname -f, hard-fallback to hostname
+            # hostname -f can return an unresolvable name on some VPS configs, causing
+            # mydomain to be derived as "0" and postfix install to fail with
+            # "meter mydomain: bad parameter value: 0"
+            fqdn_result = subprocess.run('hostname -f 2>/dev/null || hostname', shell=True, capture_output=True, text=True)
+            fqdn = (settings.get('fqdn') or fqdn_result.stdout.strip() or 'localhost').strip()
+            if not fqdn or fqdn == '0':
+                fqdn = settings.get('fqdn', 'localhost')
             subprocess.run(
-                'echo "postfix postfix/mailname string $(hostname -f)" | debconf-set-selections && '
+                f'echo "postfix postfix/mailname string {fqdn}" | debconf-set-selections && '
                 'echo "postfix postfix/main_mailer_type string Internet Site" | debconf-set-selections',
                 shell=True, capture_output=True, timeout=30)
             r = subprocess.run(
                 'DEBIAN_FRONTEND=noninteractive apt-get install -y postfix libsasl2-modules 2>&1',
                 shell=True, capture_output=True, text=True, timeout=300)
+            if r.returncode != 0:
+                # Attempt recovery: set myhostname/mydomain explicitly then retry dpkg --configure
+                plog(f"⚠ Postfix install hit error, attempting recovery (mydomain fix)...")
+                subprocess.run(
+                    f'postconf -e "myhostname={fqdn}" 2>/dev/null; '
+                    f'postconf -e "mydomain={fqdn.split(".", 1)[-1] if "." in fqdn else fqdn}" 2>/dev/null; '
+                    'dpkg --configure postfix 2>&1 || true',
+                    shell=True, capture_output=True, timeout=60)
+                r = subprocess.run('dpkg -l postfix 2>&1', shell=True, capture_output=True, text=True)
+                if 'ii' not in r.stdout:
+                    plog(f"✗ Postfix install failed: {r.stdout[-500:]}")
+                    status.update({'running': False, 'error': True})
+                    return
         else:
             r = subprocess.run('dnf install -y postfix cyrus-sasl-plain 2>&1',
                 shell=True, capture_output=True, text=True, timeout=300)
-        if r.returncode != 0:
-            plog(f"✗ Postfix install failed: {r.stdout[-500:]}")
-            status.update({'running': False, 'error': True})
-            return
+            if r.returncode != 0:
+                plog(f"✗ Postfix install failed: {r.stdout[-500:]}")
+                status.update({'running': False, 'error': True})
+                return
         plog("✓ Postfix installed")
 
         plog(f"📧 Step 2/5 — Configuring main.cf...")
@@ -17101,7 +17142,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 {{ sidebar_html }}
 <div class="main">
   <div class="page-header">
-    <h1><img src="{{ mediamtx_logo_url }}" alt="MediaMTX" style="height:28px;vertical-align:middle;margin-right:8px">MediaMTX{% if mediamtx_version or editor_version %} <span style="font-weight:500;color:var(--text-dim);font-size:16px">· MediaMTX v{{ mediamtx_version }}{% if editor_version %} / editor v{{ editor_version }}{% endif %}</span>{% endif %}{% if mediamtx_update_available and mediamtx_latest %} <span style="font-size:12px;color:var(--cyan);font-weight:600;margin-left:8px">MediaMTX v{{ mediamtx_latest }} available</span>{% endif %}{% if editor_update_available and editor_latest %} <span style="font-size:12px;color:var(--cyan);font-weight:600;margin-left:8px">editor v{{ editor_latest }} available</span>{% endif %}</h1>
+    <h1 style="display:flex;align-items:flex-end;gap:0"><img src="{{ mediamtx_logo_url }}" alt="MediaMTX" style="height:28px;margin-right:8px">{% if mediamtx_version or editor_version %}<span style="font-weight:500;color:var(--text-dim);font-size:16px;line-height:1">· MediaMTX v{{ mediamtx_version }}{% if editor_version %} / editor v{{ editor_version }}{% endif %}</span>{% endif %}{% if mediamtx_update_available and mediamtx_latest %} <span style="font-size:12px;color:var(--cyan);font-weight:600;margin-left:8px;line-height:1">MediaMTX v{{ mediamtx_latest }} available</span>{% endif %}{% if editor_update_available and editor_latest %} <span style="font-size:12px;color:var(--cyan);font-weight:600;margin-left:8px;line-height:1">editor v{{ editor_latest }} available</span>{% endif %}</h1>
     <p>Video Streaming Server (bluenviron) + Web Editor (takwerx)</p>
   </div>
 
@@ -20252,7 +20293,7 @@ networks:
                 config_content = f.read()
 
             auth_block = (
-                '    <auth default="ldap" x509groups="true" x509addAnonymous="false" x509useGroupCache="true" x509useGroupCacheDefaultActive="true" x509checkRevocation="true">\n'
+                '    <auth default="ldap" x509groups="true" x509addAnonymous="false" x509useGroupCache="true" x509useGroupCacheDefaultActive="true" x509checkRevocation="true" x509useGroupCacheRequiresExtKeyUsage="false">\n'
                 f'        <ldap url="ldap://{host}:389" userstring="cn={{username}},ou=users,dc=takldap" updateinterval="30" groupprefix="cn=tak_" groupNameExtractorRegex="cn=tak_(.*?)(?:,|$)" serviceAccountDN="cn=adm_ldapservice,ou=users,dc=takldap" serviceAccountCredential="'
                 + ldap_svc_pass
                 + '" groupBaseRDN="ou=groups,dc=takldap" userBaseRDN="ou=users,dc=takldap" dnAttributeName="DN" nameAttr="CN" adminGroup="ROLE_ADMIN"/>\n'
@@ -21288,7 +21329,7 @@ entries:
 
                 # Build the new auth block — matches TAK Portal reference exactly
                 auth_block = (
-                    '    <auth default="ldap" x509groups="true" x509addAnonymous="false" x509useGroupCache="true" x509useGroupCacheDefaultActive="true" x509checkRevocation="true">\n'
+                    '    <auth default="ldap" x509groups="true" x509addAnonymous="false" x509useGroupCache="true" x509useGroupCacheDefaultActive="true" x509checkRevocation="true" x509useGroupCacheRequiresExtKeyUsage="false">\n'
                     '        <ldap url="ldap://127.0.0.1:389" userstring="cn={username},ou=users,dc=takldap" updateinterval="30" groupprefix="cn=tak_" groupNameExtractorRegex="cn=tak_(.*?)(?:,|$)" serviceAccountDN="cn=adm_ldapservice,ou=users,dc=takldap" serviceAccountCredential="'
                     + ldap_pass
                     + '" groupBaseRDN="ou=groups,dc=takldap" userBaseRDN="ou=users,dc=takldap" dnAttributeName="DN" nameAttr="CN" adminGroup="ROLE_ADMIN"/>\n'
@@ -23369,7 +23410,7 @@ def _apply_ldap_to_coreconfig():
     auth_block = ''
     auth_block += '    <auth default="ldap" x509groups="true" x509addAnonymous="false"'
     auth_block += ' x509useGroupCache="true" x509useGroupCacheDefaultActive="true"'
-    auth_block += ' x509checkRevocation="true">\n'
+    auth_block += ' x509checkRevocation="true" x509useGroupCacheRequiresExtKeyUsage="false">\n'
     auth_block += ldap_line + '\n'
     auth_block += '    </auth>'
     # Sanity check the block we built
