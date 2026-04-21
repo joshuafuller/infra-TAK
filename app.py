@@ -5759,6 +5759,16 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
         if cert_pass and cert_pass != 'atakatak':
             meta_cmds += f" && sudo sed -i 's/^CAPASS=.*/CAPASS={shlex.quote(cert_pass)}/' cert-metadata.sh"
             meta_cmds += f" && sudo sed -i 's/^PASS=.*/PASS={shlex.quote(cert_pass)}/' cert-metadata.sh"
+        # Pre-flight: passwordless sudo required — SSH sessions have no TTY for password prompts
+        ok_sudo, sudo_out = _ssh_probe(remote, 'sudo -n true 2>&1', timeout=10)
+        if not ok_sudo or 'password' in (sudo_out or '').lower():
+            plog('✗ Certificate generation failed — SSH user requires a sudo password')
+            plog('  Fix on the Federation Hub host:')
+            plog('    echo "$(whoami) ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/infra-tak-nopasswd')
+            plog('  Or SSH as root. Then retry.')
+            status_dict.update({'running': False, 'complete': True, 'error': True})
+            return
+
         ok_meta, meta_out = _ssh_probe(remote, meta_cmds, timeout=30)
         if not ok_meta:
             plog(f'⚠ cert-metadata.sh patch warning: {meta_out}')
@@ -6201,6 +6211,16 @@ def run_fedhub_remote_rotate_ca(new_root_ca=None, new_int_ca=None):
         if cert_pass and cert_pass != 'atakatak':
             meta_cmds += f" && sudo sed -i 's/^CAPASS=.*/CAPASS={shlex.quote(cert_pass)}/' cert-metadata.sh"
             meta_cmds += f" && sudo sed -i 's/^PASS=.*/PASS={shlex.quote(cert_pass)}/' cert-metadata.sh"
+        # Pre-flight: passwordless sudo required — SSH sessions have no TTY for password prompts
+        ok_sudo, sudo_out = _ssh_probe(remote, 'sudo -n true 2>&1', timeout=10)
+        if not ok_sudo or 'password' in (sudo_out or '').lower():
+            plog('✗ Certificate rotation failed — SSH user requires a sudo password')
+            plog('  Fix on the Federation Hub host:')
+            plog('    echo "$(whoami) ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/infra-tak-nopasswd')
+            plog('  Or SSH as root. Then retry.')
+            fedhub_rotate_status.update({'running': False, 'complete': True, 'error': True})
+            return
+
         ok_meta, meta_out = _ssh_probe(remote, meta_cmds, timeout=30)
         if not ok_meta:
             plog(f'⚠ cert-metadata patch warning: {(meta_out or "")[:240]}')
