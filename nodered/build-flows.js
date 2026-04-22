@@ -2796,31 +2796,37 @@ function makeTfrEngineTab(feed) {
       url: '', tls: 'tls_tak', persist: false, proxy: '',
       insecureHTTPParser: false, authType: '',
       senderr: false, headers: [],
-      x: 600, y: 460, wires: [[P + 'fn_elevate']]
+      x: 600, y: 460, wires: [[P + 'fn_sub_log']]
     },
     {
-      id: P + 'fn_elevate', type: 'function', z: FID,
-      name: 'Elevate to MISSION_OWNER',
-      func: FN_ELEVATE_ROLE,
+      id: P + 'fn_sub_log', type: 'function', z: FID,
+      name: 'Log subscribe result',
+      func: [
+        "var cfg = msg._config || {};",
+        "var missionName = cfg.missionName || '?';",
+        "var sc = msg.statusCode || '?';",
+        "// Elevation is handled inline (setTimeout in Build subscribe URL).",
+        "// If subscribe returned 5xx, clear _subscribed so next poll retries.",
+        "if (typeof sc === 'number' && sc >= 500) {",
+        "  var sub = global.get('_subscribed') || {};",
+        "  delete sub[missionName];",
+        "  global.set('_subscribed', sub);",
+        "  node.warn('Subscribe ' + missionName + ' returned HTTP ' + sc + ' — cleared cache, will retry next poll');",
+        "} else {",
+        "  node.warn('Subscribe ' + missionName + ' HTTP ' + sc + ' — elevation handled inline');",
+        "}",
+        "return msg;"
+      ].join('\n'),
       outputs: 1, timeout: '', noerr: 0, initialize: '', finalize: '', libs: [],
-      x: 800, y: 460, wires: [[P + 'http_elevate']]
-    },
-    {
-      id: P + 'http_elevate', type: 'http request', z: FID,
-      name: 'Set MISSION_OWNER role',
-      method: 'use', ret: 'txt', paytoqs: 'ignore',
-      url: '', tls: 'tls_tak', persist: false, proxy: '',
-      insecureHTTPParser: false, authType: '',
-      senderr: false, headers: [],
-      x: 1000, y: 460, wires: [[P + 'debug_sub']]
+      x: 800, y: 460, wires: [[P + 'debug_sub']]
     },
     {
       id: P + 'debug_sub', type: 'debug', z: FID,
       name: 'Subscribe result ' + feed.configName,
       active: true, tosidebar: true, console: false, tostatus: true,
-      complete: 'true', targetType: 'full',
-      statusVal: 'topic', statusType: 'auto',
-      x: 1200, y: 460, wires: [[]]
+      complete: 'payload', targetType: 'msg',
+      statusVal: '', statusType: 'auto',
+      x: 1000, y: 460, wires: [[]]
     },
 
     {
