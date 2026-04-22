@@ -753,6 +753,146 @@ const configFlows = [
     x: 640, y: 900, wires: []
   },
 
+  // ── Tablet Command config persistence ──
+  {
+    id: 'c_tc', type: 'comment', z: CFG_TAB,
+    name: '── Tablet Command Config ──',
+    info: '', x: 260, y: 960, wires: []
+  },
+  {
+    id: 'hi_tc_save', type: 'http in', z: CFG_TAB,
+    name: 'POST /tc/config/save',
+    url: '/tc/config/save', method: 'post',
+    upload: false, swaggerDoc: '',
+    x: 200, y: 1000, wires: [['fn_tc_save']]
+  },
+  {
+    id: 'fn_tc_save', type: 'function', z: CFG_TAB,
+    name: 'Save TC config',
+    func: [
+      "var cfg = msg.payload || {};",
+      "if (!cfg.id) { msg.payload = { ok:false, error:'missing id' }; return msg; }",
+      "var configs = global.get('tc_configs') || [];",
+      "var idx = configs.findIndex(function(c){ return c.id === cfg.id; });",
+      "if (idx >= 0) { configs[idx] = cfg; } else { configs.push(cfg); }",
+      "global.set('tc_configs', configs);",
+      "msg.payload = { ok: true, configCount: configs.length };",
+      "return msg;"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 430, y: 1000, wires: [['ho_tc_save']]
+  },
+  {
+    id: 'ho_tc_save', type: 'http response', z: CFG_TAB,
+    name: '', statusCode: '200', headers: { 'content-type': 'application/json' },
+    x: 640, y: 1000, wires: []
+  },
+  {
+    id: 'hi_tc_delete', type: 'http in', z: CFG_TAB,
+    name: 'POST /tc/config/delete',
+    url: '/tc/config/delete', method: 'post',
+    upload: false, swaggerDoc: '',
+    x: 200, y: 1040, wires: [['fn_tc_delete']]
+  },
+  {
+    id: 'fn_tc_delete', type: 'function', z: CFG_TAB,
+    name: 'Delete TC config',
+    func: [
+      "var id = (msg.payload||{}).id;",
+      "if (!id) { msg.payload = { ok:false, error:'missing id' }; return msg; }",
+      "var configs = (global.get('tc_configs')||[]).filter(function(c){ return c.id !== id; });",
+      "global.set('tc_configs', configs);",
+      "global.set('tc_units_'+id, null);",
+      "msg.payload = { ok: true };",
+      "return msg;"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 430, y: 1040, wires: [['ho_tc_delete']]
+  },
+  {
+    id: 'ho_tc_delete', type: 'http response', z: CFG_TAB,
+    name: '', statusCode: '200', headers: { 'content-type': 'application/json' },
+    x: 640, y: 1040, wires: []
+  },
+  {
+    id: 'hi_tc_load', type: 'http in', z: CFG_TAB,
+    name: 'GET /tc/config/load',
+    url: '/tc/config/load', method: 'get',
+    upload: false, swaggerDoc: '',
+    x: 200, y: 1080, wires: [['fn_tc_load']]
+  },
+  {
+    id: 'fn_tc_load', type: 'function', z: CFG_TAB,
+    name: 'Load TC configs',
+    func: [
+      "var configs = global.get('tc_configs') || [];",
+      "msg.payload = { configs: configs };",
+      "return msg;"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 430, y: 1080, wires: [['ho_tc_load']]
+  },
+  {
+    id: 'ho_tc_load', type: 'http response', z: CFG_TAB,
+    name: '', statusCode: '200', headers: { 'content-type': 'application/json' },
+    x: 640, y: 1080, wires: []
+  },
+  {
+    id: 'hi_tc_units_save', type: 'http in', z: CFG_TAB,
+    name: 'POST /tc/units/save',
+    url: '/tc/units/save', method: 'post',
+    upload: false, swaggerDoc: '',
+    x: 200, y: 1120, wires: [['fn_tc_units_save']]
+  },
+  {
+    id: 'fn_tc_units_save', type: 'function', z: CFG_TAB,
+    name: 'Save TC known units',
+    func: [
+      "var id    = (msg.payload||{}).id;",
+      "var units = (msg.payload||{}).units || {};",
+      "if (!id) { msg.payload = { ok:false, error:'missing id' }; return msg; }",
+      "global.set('tc_units_'+id, units);",
+      "msg.payload = { ok: true, count: Object.keys(units).length };",
+      "return msg;"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 430, y: 1120, wires: [['ho_tc_units_save']]
+  },
+  {
+    id: 'ho_tc_units_save', type: 'http response', z: CFG_TAB,
+    name: '', statusCode: '200', headers: { 'content-type': 'application/json' },
+    x: 640, y: 1120, wires: []
+  },
+  {
+    id: 'hi_tc_units_load', type: 'http in', z: CFG_TAB,
+    name: 'GET /tc/units/load',
+    url: '/tc/units/load', method: 'get',
+    upload: false, swaggerDoc: '',
+    x: 200, y: 1160, wires: [['fn_tc_units_load']]
+  },
+  {
+    id: 'fn_tc_units_load', type: 'function', z: CFG_TAB,
+    name: 'Load TC known units',
+    func: [
+      "var id = msg.req && msg.req.query && msg.req.query.id;",
+      "var units = id ? (global.get('tc_units_'+id) || {}) : {};",
+      "msg.payload = { units: units };",
+      "return msg;"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 430, y: 1160, wires: [['ho_tc_units_load']]
+  },
+  {
+    id: 'ho_tc_units_load', type: 'http response', z: CFG_TAB,
+    name: '', statusCode: '200', headers: { 'content-type': 'application/json' },
+    x: 640, y: 1160, wires: []
+  },
+
   // ── Force re-subscribe ──
   {
     id: 'hi_force_sub', type: 'http in', z: CFG_TAB,
@@ -2908,6 +3048,217 @@ function makeTfrEngineTab(feed) {
 //  in ATAK (TAK Settings → Data Packages → Network Links or via
 //  Overlay Manager → Add → URL).  Refresh: match your poll interval.
 // ════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
+//  Tablet Command AVL engine
+//  One card per agency in the Configurator → one Node-RED tab per card.
+//  Streams CoT via TCP to TAK server — no DataSync / no KML.
+//  Schema: latitude, longitude, radioName, time(epoch ms), vehicleStatus
+// ════════════════════════════════════════════════════════════════
+
+const TC_COT_TYPE_FN = [
+  "function tcCotType(r) {",
+  "  r = (r||'').toUpperCase().replace(/\\s+/g,'');",
+  "  if (/^E\\d|^ENG/.test(r))                       return 'a-f-G-E-V-C'; // Engine",
+  "  if (/^(T|TRK|LAD|TK)\\d/.test(r))               return 'a-f-G-E-V-C'; // Truck/Ladder",
+  "  if (/^(M|MED|AMB|ALS|BLS)\\d/.test(r))          return 'a-f-G-E-V-M'; // Medical",
+  "  if (/^(BC|BAT|CHIEF|AC|DC|DIV|CMD)/.test(r))    return 'a-f-G-E-V-C'; // Chief/Command",
+  "  if (/^(H|HELO|AIR|HT|CHP)\\d/.test(r))          return 'a-f-A-C-H';   // Helicopter",
+  "  if (/^(WT|WAT|WATER)\\d/.test(r))               return 'a-f-G-E-V-C'; // Water Tender",
+  "  if (/^(RES|RESCUE|SQ|SQUAD)\\d/.test(r))        return 'a-f-G-E-V-C'; // Rescue/Squad",
+  "  if (/^(HAZ|HM)\\d/.test(r))                     return 'a-f-G-E-V-C'; // Hazmat",
+  "  return 'a-f-G-E-V-C'; // default: friendly ground vehicle",
+  "}"
+].join('\n');
+
+function makeTCEngineTab(feed) {
+  const FID = 'flow_tc_' + feed.id;
+  const P   = feed.id + '_tc_';
+
+  const FN_TC_INIT = [
+    "var cfg = (global.get('tc_configs')||[]).find(function(c){return c.id==='"+feed.id+"';});",
+    "global.set('tc_last_fetch_"+feed.id+"', 0); // force immediate first poll",
+    "if (!cfg) { node.warn('TC "+feed.configName+": config not found in global context'); return null; }",
+    "return msg;"
+  ].join('\n');
+
+  const FN_TC_POLL = [
+    "var cfg = (global.get('tc_configs')||[]).find(function(c){return c.id==='"+feed.id+"';});",
+    "if (!cfg || !cfg.activated) return null;",
+    "var intervalMs = Math.max(1, cfg.pollInterval||1) * 60000;",
+    "var lastFetch  = global.get('tc_last_fetch_"+feed.id+"') || 0;",
+    "if ((Date.now() - lastFetch) < intervalMs) return null;",
+    "return msg;"
+  ].join('\n');
+
+  const FN_TC_BUILD_URL = [
+    "var cfg = (global.get('tc_configs')||[]).find(function(c){return c.id==='"+feed.id+"';});",
+    "if (!cfg || !cfg.activated) return null;",
+    "var base = (cfg.agencyUrl||'').replace(/\\/+$/,'');",
+    "msg.url    = base + '/0/query?where=1%3D1&outFields=*&returnGeometry=false&f=json';",
+    "msg.method = 'GET';",
+    "msg.headers = { 'User-Agent': 'infra-TAK/tabletcommand' };",
+    "msg._tcCfg = cfg;",
+    "return msg;"
+  ].join('\n');
+
+  const FN_TC_BUILD_COT = [
+    TC_COT_TYPE_FN,
+    "",
+    "var cfg   = msg._tcCfg || (global.get('tc_configs')||[]).find(function(c){return c.id==='"+feed.id+"';}) || {};",
+    "var data  = msg.payload || {};",
+    "var feats = data.features || [];",
+    "var knownUnits = global.get('tc_units_"+feed.id+"') || {};",
+    "var tak   = global.get('tak_settings') || {};",
+    "var host  = tak.takHost || 'host.docker.internal';",
+    "var port  = Number(tak.streamingPort || tak.streamPort || 8089);",
+    "var staleMs = (cfg.staleMinutes||5) * 60000;",
+    "var sent  = 0;",
+    "",
+    "global.set('tc_last_fetch_"+feed.id+"', Date.now());",
+    "",
+    "feats.forEach(function(f) {",
+    "  var a = f.attributes || {};",
+    "  var radioName = (a.radioName||'').trim();",
+    "  if (!radioName) return;",
+    "  var lat = parseFloat(a.latitude);",
+    "  var lon = parseFloat(a.longitude);",
+    "  if (isNaN(lat)||isNaN(lon)) return;",
+    "  var ts    = a.time ? new Date(a.time) : new Date();",
+    "  var stale = new Date(ts.getTime() + staleMs);",
+    "  var uid   = 'tc-' + (a.deviceUuid || ('obj-'+a.OBJECTID));",
+    "  var ov    = knownUnits[radioName] || knownUnits[radioName.toUpperCase()] || {};",
+    "  var callsign = ov.callsign || radioName;",
+    "  var cotType  = ov.cotType  || tcCotType(radioName);",
+    "  var remarks  = (cfg.configName||'TC') + ' | ' + radioName",
+    "                 + ' | Status: ' + (a.vehicleStatus||'') + ' | ' + ts.toLocaleString();",
+    "  var cotMsg = {",
+    "    payload: {",
+    "      event: {",
+    "        _attributes: {",
+    "          version:'2.0', uid:uid, type:cotType,",
+    "          how:'m-g',",
+    "          time:ts.toISOString(), start:ts.toISOString(), stale:stale.toISOString()",
+    "        },",
+    "        point:  { _attributes:{ lat:String(lat), lon:String(lon), hae:'9999999.0', ce:'50', le:'9999999.0' } },",
+    "        detail: {",
+    "          contact: [{ _attributes:{ callsign:callsign } }],",
+    "          remarks: remarks,",
+    "          status:  [{ _attributes:{ readiness:'true' } }]",
+    "        }",
+    "      }",
+    "    },",
+    "    host: host,",
+    "    port: port",
+    "  };",
+    "  node.send(cotMsg);",
+    "  sent++;",
+    "});",
+    "node.warn('TC "+feed.configName+": '+sent+' CoT events streamed from '+feats.length+' features');",
+    "return null;"
+  ].join('\n');
+
+  return [
+    // ── Tab ──
+    {
+      id: FID, type: 'tab',
+      label: 'TC: ' + feed.configName,
+      disabled: false,
+      info: 'Tablet Command AVL engine for ' + feed.configName + '. Streams CoT via TCP — no DataSync.'
+    },
+
+    // ── Startup inject → immediate first poll ──
+    {
+      id: P+'init_inj', type: 'inject', z: FID,
+      name: 'Startup init',
+      props: [{ p:'payload' }],
+      repeat: '', crontab: '',
+      once: true, onceDelay: '3',
+      topic: '', payload: '', payloadType: 'date',
+      x: 160, y: 40, wires: [[P+'init_fn']]
+    },
+    {
+      id: P+'init_fn', type: 'function', z: FID,
+      name: 'Init TC config',
+      func: FN_TC_INIT,
+      outputs: 1, timeout: '', noerr: 0,
+      initialize: '', finalize: '', libs: [],
+      x: 380, y: 40, wires: [[P+'poll_fn']]
+    },
+
+    // ── 60-second timer → poll check ──
+    {
+      id: P+'timer', type: 'inject', z: FID,
+      name: 'Every 60 s',
+      props: [{ p:'payload' }],
+      repeat: '60', crontab: '',
+      once: false, onceDelay: '0',
+      topic: '', payload: '', payloadType: 'date',
+      x: 160, y: 100, wires: [[P+'poll_fn']]
+    },
+    {
+      id: P+'poll_fn', type: 'function', z: FID,
+      name: 'Check poll interval',
+      func: FN_TC_POLL,
+      outputs: 1, timeout: '', noerr: 0,
+      initialize: '', finalize: '', libs: [],
+      x: 380, y: 100, wires: [[P+'build_url']]
+    },
+
+    // ── Build URL → HTTP request → Build CoT ──
+    {
+      id: P+'build_url', type: 'function', z: FID,
+      name: 'Build TC query URL',
+      func: FN_TC_BUILD_URL,
+      outputs: 1, timeout: '', noerr: 0,
+      initialize: '', finalize: '', libs: [],
+      x: 600, y: 100, wires: [[P+'http_req']]
+    },
+    {
+      id: P+'http_req', type: 'http request', z: FID,
+      name: 'GET TC FeatureServer',
+      method: 'GET', ret: 'obj', paytoqs: 'ignore',
+      url: '', tls: '', persist: false, proxy: '',
+      insecureHTTPParser: false, authType: '',
+      senderr: false, headers: [],
+      x: 840, y: 100, wires: [[P+'build_cot']]
+    },
+    {
+      id: P+'build_cot', type: 'function', z: FID,
+      name: 'Build + stream CoT',
+      func: FN_TC_BUILD_COT,
+      outputs: 1, timeout: '', noerr: 0,
+      initialize: '', finalize: '', libs: [],
+      x: 1080, y: 100, wires: [[P+'cot_xml']]
+    },
+
+    // ── CoT JSON → XML → TCP out ──
+    {
+      id: P+'cot_xml', type: 'function', z: FID,
+      name: 'CoT JSON -> XML',
+      _templateKey: 'shared.cot_to_xml',
+      func: FN_COT_TO_XML,
+      outputs: 1, timeout: '', noerr: 0,
+      initialize: '', finalize: '', libs: [],
+      x: 300, y: 200, wires: [[P+'tcp_out']]
+    },
+    {
+      id: P+'tcp_out', type: 'tcp out', z: FID,
+      name: 'CoT -> TAK :8089',
+      host: 'host.docker.internal', port: '8089', beserver: 'client',
+      base64: false, doend: false, addCR: false,
+      x: 520, y: 200, wires: []
+    },
+    {
+      id: P+'dbg', type: 'debug', z: FID,
+      name: 'TC poll log',
+      active: true, tosidebar: true, console: false, tostatus: true,
+      complete: 'payload', targetType: 'msg',
+      statusVal: '', statusType: 'auto',
+      x: 1300, y: 100, wires: []
+    }
+  ];
+}
+
 const IPAWS_TAB_ID = 'flow_ipaws';
 
 // ── Check poll interval then build NWS API request ──────────────
@@ -3550,6 +3901,9 @@ const tfrEngineTabTemplate = JSON.stringify(tfrTemplateNodes);
 const kmlTemplateNodes = makeKmlEngineTab(templateFeed);
 const kmlEngineTabTemplate = JSON.stringify(kmlTemplateNodes);
 
+const tcTemplateNodes = makeTCEngineTab(templateFeed);
+const tcEngineTabTemplate = JSON.stringify(tcTemplateNodes);
+
 // ════════════════════════════════════════════════════════════════
 //  Assembly
 // ════════════════════════════════════════════════════════════════
@@ -3565,10 +3919,10 @@ const out = path.join(__dirname, 'flows.json');
 fs.writeFileSync(out, JSON.stringify(allFlows, null, 2));
 console.log('flows.json generated  (' + allFlows.length + ' nodes, ' + FEEDS.length + ' engine tabs)  →  ' + out);
 
-// Write template function map (ArcGIS + TFR + KML) for deploy.sh dynamic-tab sync
+// Write template function map (ArcGIS + TFR + KML + TC) for deploy.sh dynamic-tab sync
 // Format: { key: { func, libs } } — deploy.sh syncs both func and libs
 const templateFuncMap = {};
-[...templateNodes, ...tfrTemplateNodes, ...kmlTemplateNodes].forEach(n => {
+[...templateNodes, ...tfrTemplateNodes, ...kmlTemplateNodes, ...tcTemplateNodes].forEach(n => {
   if (n._templateKey) templateFuncMap[n._templateKey] = { func: n.func, libs: n.libs || [] };
 });
 fs.writeFileSync(path.join(__dirname, 'template-functions.json'), JSON.stringify(templateFuncMap));
@@ -3642,8 +3996,29 @@ try {
     );
   }
 
+  // TC template
+  const tcStart = '/* __TC_ENGINE_TAB_TEMPLATE_START__ */';
+  const tcEnd   = '/* __TC_ENGINE_TAB_TEMPLATE_END__ */';
+  const tcB64 = Buffer.from(tcEngineTabTemplate, 'utf8').toString('base64');
+  const tcBlock = tcStart + '\n'
+    + 'var TC_ENGINE_TAB_TEMPLATE = decodeURIComponent(escape(atob("' + tcB64 + '")));\n'
+    + tcEnd;
+  if (htmlContent.includes(tcStart)) {
+    const re4 = new RegExp(
+      tcStart.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      + '[\\s\\S]*?'
+      + tcEnd.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    );
+    htmlContent = htmlContent.replace(re4, tcBlock);
+  } else {
+    htmlContent = htmlContent.replace(
+      kmlEnd,
+      kmlEnd + '\n' + tcBlock
+    );
+  }
+
   fs.writeFileSync(htmlPath, htmlContent);
-  console.log('Engine tab templates injected into configurator.html (ArcGIS + TFR + KML)');
+  console.log('Engine tab templates injected into configurator.html (ArcGIS + TFR + KML + TC)');
 } catch(e) {
   console.log('Skipped configurator.html template injection (' + e.code + ')');
 }
