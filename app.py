@@ -15297,6 +15297,7 @@ def _run_nodered_deploy_remote(settings, deploy_cfg, plog):
   userDir: '/data',
   httpAdminRoot: '/',
   httpNodeRoot: '/',
+  httpStatic: '/data/public',
   contextStorage: {
     default: {
       module: 'localfilesystem'
@@ -15419,6 +15420,7 @@ def run_nodered_deploy():
   userDir: '/data',
   httpAdminRoot: '/',
   httpNodeRoot: '/',
+  httpStatic: '/data/public',
   contextStorage: {
     default: {
       module: 'localfilesystem'

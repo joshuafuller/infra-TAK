@@ -2903,6 +2903,412 @@ function makeTfrEngineTab(feed) {
 }
 
 // ════════════════════════════════════════════════════════════════
+//  IPAWS Alerts tab — KML network link for ATAK
+//  Serves GET /ipaws/alerts.kml  — add that URL as a KML Network Link
+//  in ATAK (TAK Settings → Data Packages → Network Links or via
+//  Overlay Manager → Add → URL).  Refresh: match your poll interval.
+// ════════════════════════════════════════════════════════════════
+const IPAWS_TAB_ID = 'flow_ipaws';
+
+// ── Build NWS API request ────────────────────────────────────────
+const FN_IPAWS_BUILD_REQ = [
+  "var cfg = global.get('ipaws_config') || {};",
+  "var params = ['status=actual'];",
+  "if (cfg.states && cfg.states.length > 0) {",
+  "  params.push('area=' + cfg.states.map(function(s){return String(s).trim().toUpperCase();}).filter(Boolean).join(','));",
+  "}",
+  "if (cfg.severity && cfg.severity.length > 0) {",
+  "  params.push('severity=' + cfg.severity.join(','));",
+  "}",
+  "msg._ipawsHost = (msg.req && msg.req.headers && msg.req.headers.host) ? msg.req.headers.host : 'localhost:1880';",
+  "msg._ipawsProto = (msg.req && msg.req.protocol) ? msg.req.protocol : 'http';",
+  "msg.url = 'https://api.weather.gov/alerts/active?' + params.join('&');",
+  "msg.method = 'GET';",
+  "msg.headers = { 'User-Agent': '(infra-TAK IPAWS, nodered@localhost)', 'Accept': 'application/geo+json' };",
+  "return msg;"
+].join('\n');
+
+// ── Parse NWS GeoJSON → KML ──────────────────────────────────────
+const FN_IPAWS_BUILD_KML = [
+  "var data = msg.payload;",
+  "var host  = msg._ipawsHost  || 'localhost:1880';",
+  "var proto = msg._ipawsProto || 'http';",
+  "var cfg   = global.get('ipaws_config') || {};",
+  "var iconBase = cfg.iconBaseUrl || (proto + '://' + host + '/icons/ipaws/');",
+  "if (iconBase.slice(-1) !== '/') iconBase += '/';",
+  "",
+  "if (msg.statusCode >= 400 || !data || !Array.isArray(data.features)) {",
+  "  var errKml = '<?xml version=\"1.0\" encoding=\"UTF-8\"?>' +",
+  "    '<kml xmlns=\"http://www.opengis.net/kml/2.2\"><Document>' +",
+  "    '<name>IPAWS Error</name>' +",
+  "    '<description>NWS API error — HTTP ' + (msg.statusCode||'?') + '</description>' +",
+  "    '</Document></kml>';",
+  "  msg.payload = errKml;",
+  "  return msg;",
+  "}",
+  "var features = data.features;",
+  "",
+  "// Event type → icon filename",
+  "var ICON_MAP = {",
+  "  'Tornado Warning':'tornado','Tornado Watch':'tornado','Tornado Emergency':'tornado',",
+  "  'Severe Thunderstorm Warning':'severe-thunderstorm','Severe Thunderstorm Watch':'severe-thunderstorm',",
+  "  'Flash Flood Warning':'flood','Flash Flood Watch':'flood','Flash Flood Emergency':'flood',",
+  "  'Flood Warning':'flood','Flood Watch':'flood','Flood Advisory':'flood','Flood Statement':'flood',",
+  "  'Areal Flood Warning':'flood','Areal Flood Watch':'flood','Areal Flood Advisory':'flood',",
+  "  'Red Flag Warning':'fire','Fire Weather Watch':'fire','Fire Warning':'fire',",
+  "  'Hurricane Warning':'hurricane','Hurricane Watch':'hurricane',",
+  "  'Hurricane Local Statement':'hurricane','Post-Tropical Cyclone Warning':'hurricane',",
+  "  'Tropical Storm Warning':'tropical-storm','Tropical Storm Watch':'tropical-storm',",
+  "  'Tsunami Warning':'tsunami','Tsunami Watch':'tsunami','Tsunami Advisory':'tsunami',",
+  "  'Storm Surge Warning':'tsunami','Storm Surge Watch':'tsunami',",
+  "  'High Wind Warning':'wind','High Wind Watch':'wind','Wind Advisory':'wind',",
+  "  'Extreme Wind Warning':'wind','Lake Wind Advisory':'wind',",
+  "  'Winter Storm Warning':'winter','Winter Storm Watch':'winter','Blizzard Warning':'winter',",
+  "  'Ice Storm Warning':'winter','Winter Weather Advisory':'winter','Snow Squall Warning':'winter',",
+  "  'Heavy Snow Warning':'winter','Freezing Rain Advisory':'winter','Sleet Warning':'winter',",
+  "  'Excessive Heat Warning':'heat','Excessive Heat Watch':'heat','Heat Advisory':'heat',",
+  "  'Wind Chill Warning':'extreme-cold','Wind Chill Watch':'extreme-cold','Wind Chill Advisory':'extreme-cold',",
+  "  'Freeze Warning':'extreme-cold','Freeze Watch':'extreme-cold','Frost Advisory':'extreme-cold',",
+  "  'Hard Freeze Warning':'extreme-cold','Hard Freeze Watch':'extreme-cold',",
+  "  'Hazardous Materials Warning':'hazmat','Nuclear Power Plant Warning':'hazmat',",
+  "  'Radiological Hazard Warning':'hazmat','Chemical Hazard Warning':'hazmat',",
+  "  'Earthquake Warning':'earthquake',",
+  "  'Volcano Warning':'volcano','Volcano Watch':'volcano',",
+  "  'Ashfall Warning':'dust-ashfall','Ashfall Advisory':'dust-ashfall',",
+  "  'Dust Storm Warning':'dust-ashfall','Blowing Dust Advisory':'dust-ashfall',",
+  "  'Dense Smoke Advisory':'air-quality','Air Quality Alert':'air-quality','Air Stagnation Advisory':'air-quality',",
+  "  'Coastal Flood Warning':'marine','Coastal Flood Watch':'marine','Coastal Flood Advisory':'marine',",
+  "  'High Surf Warning':'marine','High Surf Advisory':'marine','Special Marine Warning':'marine',",
+  "  'Lake Shore Flood Warning':'marine','Beach Hazards Statement':'marine',",
+  "  'Shelter In Place Warning':'civil-emergency','Law Enforcement Warning':'civil-emergency',",
+  "  'Local Area Emergency':'civil-emergency','Civil Emergency Message':'civil-emergency',",
+  "  'Evacuation Immediate':'civil-emergency','Civil Danger Warning':'civil-emergency',",
+  "  'Immediate Evacuation Warning':'civil-emergency','911 Telephone Outage Emergency':'civil-emergency'",
+  "};",
+  "",
+  "// Severity → KML polygon/line colors (AABBGGRR format)",
+  "var SEV_COLOR = {",
+  "  'Extreme':  { fill:'660000ff', line:'ff0000ff' },",
+  "  'Severe':   { fill:'6600a5ff', line:'ff00a5ff' },",
+  "  'Moderate': { fill:'6600ffff', line:'ff00ffff' },",
+  "  'Minor':    { fill:'66ff6400', line:'ffff6400' },",
+  "  'Unknown':  { fill:'66808080', line:'ff808080' }",
+  "};",
+  "",
+  "function xmlEsc(s) {",
+  "  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;');",
+  "}",
+  "",
+  "function ringCoords(coords) {",
+  "  return coords.map(function(c){return c[0]+','+c[1]+',0';}).join(' ');",
+  "}",
+  "",
+  "function centroid(coords) {",
+  "  var ln=0,lt=0,n=coords.length;",
+  "  for(var i=0;i<n;i++){ln+=coords[i][0];lt+=coords[i][1];}",
+  "  return {lon:ln/n, lat:lt/n};",
+  "}",
+  "",
+  "function getRings(geom) {",
+  "  // Returns array of coordinate rings from GeoJSON Polygon or MultiPolygon",
+  "  if (!geom) return [];",
+  "  if (geom.type === 'Polygon' && geom.coordinates && geom.coordinates[0]) {",
+  "    return [geom.coordinates[0]];",
+  "  }",
+  "  if (geom.type === 'MultiPolygon' && geom.coordinates) {",
+  "    return geom.coordinates.map(function(p){return p[0]||[];}).filter(function(r){return r.length>2;});",
+  "  }",
+  "  return [];",
+  "}",
+  "",
+  "var usedStyles = {};",
+  "var placemarkXml = [];",
+  "var nWithGeo = 0;",
+  "",
+  "features.forEach(function(f) {",
+  "  var p = f.properties || {};",
+  "  var event    = p.event    || 'Unknown';",
+  "  var severity = p.severity || 'Unknown';",
+  "  var icon = ICON_MAP[event] || 'civil-emergency';",
+  "  var sc   = SEV_COLOR[severity] || SEV_COLOR['Unknown'];",
+  "  var styleId = icon + '-' + severity.toLowerCase();",
+  "  usedStyles[styleId] = { icon: icon, sc: sc };",
+  "",
+  "  var rings = getRings(f.geometry);",
+  "  if (rings.length === 0) return; // skip alerts without polygon",
+  "  nWithGeo++;",
+  "",
+  "  var firstRing = rings[0];",
+  "  var cen = centroid(firstRing);",
+  "",
+  "  // ── Build rich HTML description (matches GoTAK metadata layout) ──",
+  "  var areaDesc  = p.areaDesc   || '';",
+  "  var descText  = p.description || '';",
+  "  var instr     = p.instruction || '';",
+  "  var headline  = p.headline   || (event + ' — ' + areaDesc.split(';')[0].trim());",
+  "  var sender    = p.senderName || p.sender || '';",
+  "  var expires   = p.expires   || p.ends   || '';",
+  "  var onset     = p.onset     || p.effective || '';",
+  "  var response  = p.response  || '';",
+  "",
+  "  var descHtml = '<b>&#128205; Areas:</b><br/>' + areaDesc.replace(/;/g,'<br/>')",
+  "    + '<br/><br/><b>&#128196; Details:</b><br/>' + descText.replace(/\\*/g,'•').replace(/\\n/g,'<br/>')",
+  "    + (instr ? '<br/><br/><b>&#9888;&#65039; Instructions:</b><br/>' + instr.replace(/\\n/g,'<br/>') : '')",
+  "    + '<br/><br/><table>'",
+  "    + '<tr><td><b>Severity</b></td><td>' + severity + '</td></tr>'",
+  "    + '<tr><td><b>Certainty</b></td><td>' + (p.certainty||'') + '</td></tr>'",
+  "    + '<tr><td><b>Urgency</b></td><td>' + (p.urgency||'') + '</td></tr>'",
+  "    + (response ? '<tr><td><b>Response</b></td><td>' + response + '</td></tr>' : '')",
+  "    + (sender   ? '<tr><td><b>Issued by</b></td><td>' + sender + '</td></tr>' : '')",
+  "    + (onset    ? '<tr><td><b>Effective</b></td><td>' + onset + '</td></tr>' : '')",
+  "    + (expires  ? '<tr><td><b>Expires</b></td><td>' + expires + '</td></tr>' : '')",
+  "    + '</table>';",
+  "",
+  "  var pmName = xmlEsc(event + ' — ' + areaDesc.split(';')[0].trim());",
+  "",
+  "  var timeBlock = '';",
+  "  if (onset || expires) {",
+  "    timeBlock = '<TimeSpan>'",
+  "      + (onset   ? '<begin>' + xmlEsc(onset)   + '</begin>' : '')",
+  "      + (expires ? '<end>'   + xmlEsc(expires) + '</end>'   : '')",
+  "      + '</TimeSpan>';",
+  "  }",
+  "",
+  "  var descBlock = '<description><![CDATA[' + descHtml + ']]></description>';",
+  "",
+  "  // Polygon(s)",
+  "  rings.forEach(function(ring) {",
+  "    if (ring.length < 3) return;",
+  "    placemarkXml.push(",
+  "      '<Placemark>',",
+  "      '<name>' + pmName + '</name>',",
+  "      '<styleUrl>#poly-' + styleId + '</styleUrl>',",
+  "      timeBlock,",
+  "      descBlock,",
+  "      '<Polygon><tessellate>1</tessellate>',",
+  "      '<outerBoundaryIs><LinearRing>',",
+  "      '<coordinates>' + ringCoords(ring) + '</coordinates>',",
+  "      '</LinearRing></outerBoundaryIs></Polygon>',",
+  "      '</Placemark>'",
+  "    );",
+  "  });",
+  "",
+  "  // Center icon marker",
+  "  placemarkXml.push(",
+  "    '<Placemark>',",
+  "    '<name>' + pmName + '</name>',",
+  "    '<styleUrl>#icon-' + styleId + '</styleUrl>',",
+  "    timeBlock,",
+  "    descBlock,",
+  "    '<Point><coordinates>' + cen.lon + ',' + cen.lat + ',0</coordinates></Point>',",
+  "    '</Placemark>'",
+  "  );",
+  "});",
+  "",
+  "// Build style elements",
+  "var styleXml = [];",
+  "Object.keys(usedStyles).forEach(function(sid) {",
+  "  var s   = usedStyles[sid];",
+  "  var url = xmlEsc(iconBase + s.icon + '.png');",
+  "  styleXml.push(",
+  "    '<Style id=\"poly-' + sid + '\">',",
+  "    '<LineStyle><color>' + s.sc.line + '</color><width>2</width></LineStyle>',",
+  "    '<PolyStyle><color>' + s.sc.fill + '</color><outline>1</outline></PolyStyle>',",
+  "    '</Style>',",
+  "    '<Style id=\"icon-' + sid + '\">',",
+  "    '<IconStyle><scale>1.2</scale><Icon><href>' + url + '</href></Icon></IconStyle>',",
+  "    '<LabelStyle><scale>0.8</scale></LabelStyle>',",
+  "    '</Style>'",
+  "  );",
+  "});",
+  "",
+  "var now = new Date().toISOString();",
+  "msg.payload = [",
+  "  '<?xml version=\"1.0\" encoding=\"UTF-8\"?>',",
+  "  '<kml xmlns=\"http://www.opengis.net/kml/2.2\">',",
+  "  '<Document>',",
+  "  '<name>IPAWS Active Alerts</name>',",
+  "  '<description>NWS Active Alerts — ' + now + ' — ' + features.length + ' alerts, ' + nWithGeo + ' with geometry</description>',",
+  "  styleXml.join('\\n'),",
+  "  placemarkXml.join('\\n'),",
+  "  '</Document></kml>'",
+  "].join('\\n');",
+  "node.warn('IPAWS KML: ' + features.length + ' alerts (' + nWithGeo + ' with polygon geometry)');",
+  "return msg;"
+].join('\n');
+
+// ── Save IPAWS config ────────────────────────────────────────────
+const FN_IPAWS_SAVE_CFG = [
+  "var body = msg.payload || {};",
+  "var existing = global.get('ipaws_config') || {};",
+  "var updated = Object.assign({}, existing, body);",
+  "global.set('ipaws_config', updated);",
+  "msg.payload = { ok: true, config: updated };",
+  "return msg;"
+].join('\n');
+
+// ── Get IPAWS config ─────────────────────────────────────────────
+const FN_IPAWS_GET_CFG = [
+  "var cfg = global.get('ipaws_config') || {};",
+  "msg.payload = { ok: true, config: cfg };",
+  "return msg;"
+].join('\n');
+
+// ── Init default config on startup ──────────────────────────────
+const FN_IPAWS_INIT = [
+  "var existing = global.get('ipaws_config');",
+  "if (!existing || !existing._initialized) {",
+  "  global.set('ipaws_config', {",
+  "    _initialized: true,",
+  "    severity: ['Extreme', 'Severe'],",
+  "    states: [],",
+  "    iconBaseUrl: ''",
+  "  });",
+  "  node.warn('IPAWS: default config initialized (Extreme + Severe, all states)');",
+  "}",
+  "return null;"
+].join('\n');
+
+function makeIpawsTab() {
+  const Z = IPAWS_TAB_ID;
+  return [
+    {
+      id: Z, type: 'tab',
+      label: 'IPAWS Alerts',
+      disabled: false,
+      info: 'FEMA IPAWS / NWS active alerts KML feed for ATAK. ' +
+            'Add /ipaws/alerts.kml as a KML Network Link in ATAK ' +
+            '(Overlay Manager → Add → URL). ' +
+            'Configure via POST /ipaws/config with {states:["CA"], severity:["Extreme","Severe"]}.'
+    },
+
+    // ── Startup init ─────────────────────────────────────────────
+    {
+      id: Z + '_init_inj', type: 'inject', z: Z,
+      name: 'Startup init',
+      props: [{ p: 'payload' }],
+      repeat: '', crontab: '',
+      once: true, onceDelay: '1',
+      topic: '', payload: '', payloadType: 'date',
+      x: 160, y: 40, wires: [[Z + '_init_fn']]
+    },
+    {
+      id: Z + '_init_fn', type: 'function', z: Z,
+      name: 'Init default config',
+      func: FN_IPAWS_INIT,
+      outputs: 1, timeout: '', noerr: 0,
+      initialize: '', finalize: '', libs: [],
+      x: 380, y: 40, wires: [[]]
+    },
+
+    // ── KML endpoint ─────────────────────────────────────────────
+    {
+      id: Z + '_c_kml', type: 'comment', z: Z,
+      name: '── GET /ipaws/alerts.kml  ← ATAK Network Link URL ──',
+      info: '', x: 280, y: 100, wires: []
+    },
+    {
+      id: Z + '_hi_kml', type: 'http in', z: Z,
+      name: 'GET /ipaws/alerts.kml',
+      url: '/ipaws/alerts.kml', method: 'get',
+      upload: false, swaggerDoc: '',
+      x: 180, y: 140, wires: [[Z + '_fn_req']]
+    },
+    {
+      id: Z + '_fn_req', type: 'function', z: Z,
+      name: 'Build NWS request',
+      func: FN_IPAWS_BUILD_REQ,
+      outputs: 1, timeout: '', noerr: 0,
+      initialize: '', finalize: '', libs: [],
+      x: 400, y: 140, wires: [[Z + '_http_nws']]
+    },
+    {
+      id: Z + '_http_nws', type: 'http request', z: Z,
+      name: 'GET NWS alerts',
+      method: 'use', ret: 'obj', paytoqs: 'ignore',
+      url: '', tls: '', persist: false, proxy: '',
+      insecureHTTPParser: false, authType: '',
+      senderr: false, headers: [],
+      x: 620, y: 140, wires: [[Z + '_fn_kml']]
+    },
+    {
+      id: Z + '_fn_kml', type: 'function', z: Z,
+      name: 'Build IPAWS KML',
+      func: FN_IPAWS_BUILD_KML,
+      outputs: 1, timeout: '', noerr: 0,
+      initialize: '', finalize: '', libs: [],
+      x: 840, y: 140, wires: [[Z + '_ho_kml']]
+    },
+    {
+      id: Z + '_ho_kml', type: 'http response', z: Z,
+      name: '', statusCode: '200',
+      headers: {
+        'content-type': 'application/vnd.google-earth.kml+xml; charset=utf-8',
+        'cache-control': 'no-cache, no-store, must-revalidate'
+      },
+      x: 1040, y: 140, wires: []
+    },
+    {
+      id: Z + '_dbg_kml', type: 'debug', z: Z,
+      name: 'KML log',
+      active: true, tosidebar: true, console: false, tostatus: true,
+      complete: 'true', targetType: 'full',
+      statusVal: '', statusType: 'auto',
+      x: 1040, y: 200, wires: []
+    },
+
+    // ── Config API ───────────────────────────────────────────────
+    {
+      id: Z + '_c_cfg', type: 'comment', z: Z,
+      name: '── Config API  GET/POST /ipaws/config ──',
+      info: '', x: 220, y: 260, wires: []
+    },
+    {
+      id: Z + '_hi_cfg_get', type: 'http in', z: Z,
+      name: 'GET /ipaws/config',
+      url: '/ipaws/config', method: 'get',
+      upload: false, swaggerDoc: '',
+      x: 180, y: 300, wires: [[Z + '_fn_get_cfg']]
+    },
+    {
+      id: Z + '_fn_get_cfg', type: 'function', z: Z,
+      name: 'Get IPAWS config',
+      func: FN_IPAWS_GET_CFG,
+      outputs: 1, timeout: '', noerr: 0,
+      initialize: '', finalize: '', libs: [],
+      x: 400, y: 300, wires: [[Z + '_ho_cfg_get']]
+    },
+    {
+      id: Z + '_ho_cfg_get', type: 'http response', z: Z,
+      name: '', statusCode: '200',
+      headers: { 'content-type': 'application/json' },
+      x: 620, y: 300, wires: []
+    },
+    {
+      id: Z + '_hi_cfg_post', type: 'http in', z: Z,
+      name: 'POST /ipaws/config',
+      url: '/ipaws/config', method: 'post',
+      upload: false, swaggerDoc: '',
+      x: 180, y: 360, wires: [[Z + '_fn_save_cfg']]
+    },
+    {
+      id: Z + '_fn_save_cfg', type: 'function', z: Z,
+      name: 'Save IPAWS config',
+      func: FN_IPAWS_SAVE_CFG,
+      outputs: 1, timeout: '', noerr: 0,
+      initialize: '', finalize: '', libs: [],
+      x: 400, y: 360, wires: [[Z + '_ho_cfg_post']]
+    },
+    {
+      id: Z + '_ho_cfg_post', type: 'http response', z: Z,
+      name: '', statusCode: '200',
+      headers: { 'content-type': 'application/json' },
+      x: 620, y: 360, wires: []
+    }
+  ];
+}
+
+// ════════════════════════════════════════════════════════════════
 //  Engine tab templates (embedded in configurator.html for dynamic creation)
 // ════════════════════════════════════════════════════════════════
 
@@ -2923,7 +3329,8 @@ const kmlEngineTabTemplate = JSON.stringify(kmlTemplateNodes);
 const allFlows = [
   ...configFlows,
   ...tlsNodes,
-  ...FEEDS.flatMap(f => makeEngineTab(f))
+  ...FEEDS.flatMap(f => makeEngineTab(f)),
+  ...makeIpawsTab()
 ];
 
 const out = path.join(__dirname, 'flows.json');

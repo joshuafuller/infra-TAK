@@ -24,6 +24,14 @@ if [ -f "$SCRIPT_DIR/icon-catalog.json" ]; then
   docker cp "$SCRIPT_DIR/icon-catalog.json" "$CONTAINER:/data/icon-catalog.json"
   echo "    Icon catalog: copied to /data/icon-catalog.json"
 fi
+
+# Copy static assets (IPAWS icons, etc.) to /data/public inside container
+# Node-RED serves /data/public at the root URL via httpStatic (set in settings.js)
+if [ -d "$SCRIPT_DIR/static" ]; then
+  docker exec "$CONTAINER" mkdir -p /data/public
+  docker cp "$SCRIPT_DIR/static/." "$CONTAINER:/data/public/"
+  echo "    Static assets: copied nodered/static/ → /data/public/"
+fi
 docker exec "$CONTAINER" node /tmp/build-flows.js
 docker cp "$CONTAINER:/tmp/flows.json" "$NEW_FLOWS"
 docker cp "$CONTAINER:/tmp/template-functions.json" "/tmp/template-functions.json" 2>/dev/null || true
