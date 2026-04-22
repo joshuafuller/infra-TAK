@@ -2913,6 +2913,7 @@ const IPAWS_TAB_ID = 'flow_ipaws';
 // ── Build NWS API request ────────────────────────────────────────
 const FN_IPAWS_BUILD_REQ = [
   "var cfg = global.get('ipaws_config') || {};",
+  "if (cfg.activated === false) { return null; } // no NWS traffic when not activated",
   "var params = ['status=actual'];",
   "if (cfg.states && cfg.states.length > 0) {",
   "  params.push('area=' + cfg.states.map(function(s){return String(s).trim().toUpperCase();}).filter(Boolean).join(','));",
