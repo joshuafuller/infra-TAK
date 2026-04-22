@@ -8480,7 +8480,7 @@ def generate_caddyfile(settings=None):
             lines.append(f"    route {{")
             lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
             lines.append(f"        @nodered_public {{")
-            lines.append(f"            path /ipaws/* /icons/ipaws/*")
+            lines.append(f"            path /ipaws/alerts.kml /icons/ipaws/*")
             lines.append(f"        }}")
             lines.append(f"        reverse_proxy @nodered_public {nodered_up}")
             lines.append(f"        forward_auth {ak_up} {{")
