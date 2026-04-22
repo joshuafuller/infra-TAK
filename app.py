@@ -8479,6 +8479,10 @@ def generate_caddyfile(settings=None):
         if ak.get('installed'):
             lines.append(f"    route {{")
             lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
+            lines.append(f"        @nodered_public {{")
+            lines.append(f"            path /ipaws/* /icons/ipaws/*")
+            lines.append(f"        }}")
+            lines.append(f"        reverse_proxy @nodered_public {nodered_up}")
             lines.append(f"        forward_auth {ak_up} {{")
             lines.append(f"            uri /outpost.goauthentik.io/auth/caddy")
             lines.append(f"            trusted_proxies private_ranges")
