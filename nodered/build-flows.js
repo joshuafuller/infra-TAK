@@ -2488,32 +2488,20 @@ function makeTfrEngineTab(feed) {
   ].join('\n');
 
   const FN_ELEVATE_ROLE = [
-    "var tak = msg.takSettings;",
-    "var cfg = msg._config;",
-    "var missionName = cfg.missionName;",
-    "var subStatus = msg.statusCode || '?';",
-    "// If subscribe returned 5xx, clear the cache so the next poll retries.",
-    "if (typeof subStatus === 'number' && subStatus >= 500) {",
+    "var cfg = msg._config || {};",
+    "var missionName = cfg.missionName || '?';",
+    "var sc = msg.statusCode || '?';",
+    "// Elevation is handled inline (setTimeout admin.pem in Build subscribe URL).",
+    "// If subscribe returned 5xx, clear _subscribed so the next poll retries.",
+    "if (typeof sc === 'number' && sc >= 500) {",
     "  var sub = global.get('_subscribed') || {};",
     "  delete sub[missionName];",
     "  global.set('_subscribed', sub);",
-    "  node.warn('Subscribe ' + missionName + ' returned HTTP ' + subStatus + ' — will retry next poll');",
+    "  node.warn('Subscribe ' + missionName + ' HTTP ' + sc + ' — cleared cache, will retry next poll');",
+    "} else {",
+    "  node.warn('Subscribe ' + missionName + ' HTTP ' + sc + ' OK — elevation handled inline');",
     "}",
-    "var host = String(tak.serverUrl || '').replace(/^https?:\\/\\//i, '').replace(/\\/$/, '');",
-    "var creatorUid = String((cfg && cfg.creatorUid) || (tak && tak.creatorUid) || 'nodered').trim();",
-    "msg.url = 'https://' + host + ':' + (tak.missionApiPort || 8443)",
-    "  + '/Marti/api/missions/' + encodeURIComponent(missionName)",
-    "  + '/role?username=' + encodeURIComponent(creatorUid)",
-    "  + '&clientUid=' + encodeURIComponent(creatorUid)",
-    "  + '&role=MISSION_OWNER';",
-    "msg.method = 'PUT';",
-    "msg.headers = { 'accept': '*/*', 'Content-Type': 'application/json' };",
-    "if (tak && tak.missionBearerToken) {",
-    "  msg.headers.Authorization = 'Bearer ' + String(tak.missionBearerToken).trim();",
-    "}",
-    "msg.payload = '';",
-    "node.warn('Elevating ' + creatorUid + ' to MISSION_OWNER on ' + missionName + ' (subscribe was HTTP ' + subStatus + ')');",
-    "return msg;"
+    "return null;"
   ].join('\n');
 
   // Mission GET URL build (shared with ArcGIS)
@@ -2796,27 +2784,12 @@ function makeTfrEngineTab(feed) {
       url: '', tls: 'tls_tak', persist: false, proxy: '',
       insecureHTTPParser: false, authType: '',
       senderr: false, headers: [],
-      x: 600, y: 460, wires: [[P + 'fn_sub_log']]
+      x: 600, y: 460, wires: [[P + 'fn_elevate']]
     },
     {
-      id: P + 'fn_sub_log', type: 'function', z: FID,
-      name: 'Log subscribe result',
-      func: [
-        "var cfg = msg._config || {};",
-        "var missionName = cfg.missionName || '?';",
-        "var sc = msg.statusCode || '?';",
-        "// Elevation is handled inline (setTimeout in Build subscribe URL).",
-        "// If subscribe returned 5xx, clear _subscribed so next poll retries.",
-        "if (typeof sc === 'number' && sc >= 500) {",
-        "  var sub = global.get('_subscribed') || {};",
-        "  delete sub[missionName];",
-        "  global.set('_subscribed', sub);",
-        "  node.warn('Subscribe ' + missionName + ' returned HTTP ' + sc + ' — cleared cache, will retry next poll');",
-        "} else {",
-        "  node.warn('Subscribe ' + missionName + ' HTTP ' + sc + ' — elevation handled inline');",
-        "}",
-        "return msg;"
-      ].join('\n'),
+      id: P + 'fn_elevate', type: 'function', z: FID,
+      name: 'Elevate to MISSION_OWNER',
+      func: FN_ELEVATE_ROLE,
       outputs: 1, timeout: '', noerr: 0, initialize: '', finalize: '', libs: [],
       x: 800, y: 460, wires: [[P + 'debug_sub']]
     },
@@ -2824,8 +2797,8 @@ function makeTfrEngineTab(feed) {
       id: P + 'debug_sub', type: 'debug', z: FID,
       name: 'Subscribe result ' + feed.configName,
       active: true, tosidebar: true, console: false, tostatus: true,
-      complete: 'payload', targetType: 'msg',
-      statusVal: '', statusType: 'auto',
+      complete: 'true', targetType: 'full',
+      statusVal: 'topic', statusType: 'auto',
       x: 1000, y: 460, wires: [[]]
     },
 
