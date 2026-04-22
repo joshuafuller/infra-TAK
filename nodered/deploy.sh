@@ -267,6 +267,29 @@ if [ -f "$NR_CTX_FLOW_CFG" ]; then
   echo "    Context: restored flow tab (legacy migration source)"
 fi
 rm -f /tmp/flows_current.json /tmp/flows_cred_backup.json /tmp/flows_merged.json "$NR_CTX_GLOBAL" "$NR_CTX_FLOW_CFG"
+
+# Ensure contextStorage:localfilesystem is in settings.js so Node-RED actually reads
+# global.json from disk on startup.  Without this, an older install (memory-only context)
+# will boot with empty in-memory state and wipe all Configurator configs.
+NR_SETTINGS=""
+for _p in /data/settings.js /usr/src/node-red/settings.js; do
+  if docker exec "$CONTAINER" test -f "$_p" 2>/dev/null; then
+    NR_SETTINGS="$_p"
+    break
+  fi
+done
+if [ -n "$NR_SETTINGS" ]; then
+  HAS_CTX=$(docker exec "$CONTAINER" grep -c 'contextStorage' "$NR_SETTINGS" 2>/dev/null || echo 0)
+  if [ "$HAS_CTX" = "0" ]; then
+    echo "    settings.js: adding contextStorage (localfilesystem) — required for config persistence"
+    docker exec "$CONTAINER" sed -i 's/^};$/,\n  contextStorage: {\n    default: { module: "localfilesystem" }\n  }\n};/' "$NR_SETTINGS"
+  else
+    echo "    settings.js: contextStorage already present ✓"
+  fi
+else
+  echo "    settings.js: not found in container — skipping contextStorage check"
+fi
+
 docker start "$CONTAINER"
 docker exec "$CONTAINER" sh -c "rm -f /tmp/flows_*.json /tmp/build-flows.js /tmp/configurator.html" 2>/dev/null || true
 
