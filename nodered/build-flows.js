@@ -1324,7 +1324,8 @@ function makeEngineTab(feed) {
     "} else if (Object.keys(prevHashes).length > 0) {",
     "  node.warn(topicCfg + ': 0 features from ArcGIS — keeping previous hashes to avoid false churn');",
     "}",
-    "if (coldStart) node.warn(topicCfg + ' cold start: seeded ' + nSeed + ' hashes without re-streaming');",
+    "if (coldStart && nSeed > 0) node.warn(topicCfg + ' cold start: seeded ' + nSeed + ' hashes without re-streaming');",
+    "if (coldStart && nSeed === 0) node.warn(topicCfg + ' cold start: no ArcGIS features this poll, nothing to reconcile');",
     "",
     "if (newUids.length > 0) {",
     "  node.send([",
@@ -1567,10 +1568,18 @@ function makeEngineTab(feed) {
     {
       id: P + 'fn_elevate', type: 'function', z: FID,
       name: 'Elevate to MISSION_OWNER',
+      _templateKey: 'arcgis.fn_elevate',
       func: [
         "var tak = msg.takSettings;",
         "var cfg = msg._config;",
         "var missionName = cfg.missionName;",
+        "var subStatus = msg.statusCode || '?';",
+        "// Log subscribe result for diagnostics. Elevation is also handled inline (setTimeout).",
+        "// Do NOT clear _subscribed on 5xx — TAK Server returns 500 for re-subscribe on read-only",
+        "// missions / already-subscribed users. Clearing would cause retry spam every poll.",
+        "if (typeof subStatus === 'number' && subStatus >= 400) {",
+        "  node.warn('Subscribe ' + missionName + ' HTTP ' + subStatus + ' (already subscribed or read-only — normal)');",
+        "}",
         "var host = String(tak.serverUrl || '').replace(/^https?:\\/\\//i, '').replace(/\\/$/, '');",
         "var creatorUid = String((cfg && cfg.creatorUid) || (tak && tak.creatorUid) || 'nodered').trim();",
         "msg.url = 'https://' + host + ':' + (tak.missionApiPort || 8443)",
@@ -1584,7 +1593,7 @@ function makeEngineTab(feed) {
         "  msg.headers.Authorization = 'Bearer ' + String(tak.missionBearerToken).trim();",
         "}",
         "msg.payload = '';",
-        "node.warn('Elevating ' + creatorUid + ' to MISSION_OWNER on ' + missionName);",
+        "node.warn('Elevating ' + creatorUid + ' to MISSION_OWNER on ' + missionName + ' (subscribe was HTTP ' + subStatus + ')');",
         "return msg;"
       ].join('\n'),
       outputs: 1, timeout: '', noerr: 0, initialize: '', finalize: '', libs: [],
@@ -2479,24 +2488,18 @@ function makeTfrEngineTab(feed) {
   ].join('\n');
 
   const FN_ELEVATE_ROLE = [
-    "var tak = msg.takSettings;",
-    "var cfg = msg._config;",
-    "var missionName = cfg.missionName;",
-    "var host = String(tak.serverUrl || '').replace(/^https?:\\/\\//i, '').replace(/\\/$/, '');",
-    "var creatorUid = String((cfg && cfg.creatorUid) || (tak && tak.creatorUid) || 'nodered').trim();",
-    "msg.url = 'https://' + host + ':' + (tak.missionApiPort || 8443)",
-    "  + '/Marti/api/missions/' + encodeURIComponent(missionName)",
-    "  + '/role?username=' + encodeURIComponent(creatorUid)",
-    "  + '&clientUid=' + encodeURIComponent(creatorUid)",
-    "  + '&role=MISSION_OWNER';",
-    "msg.method = 'PUT';",
-    "msg.headers = { 'accept': '*/*', 'Content-Type': 'application/json' };",
-    "if (tak && tak.missionBearerToken) {",
-    "  msg.headers.Authorization = 'Bearer ' + String(tak.missionBearerToken).trim();",
+    "var cfg = msg._config || {};",
+    "var missionName = cfg.missionName || '?';",
+    "var sc = msg.statusCode || '?';",
+    "// Elevation is handled inline (setTimeout admin.pem in Build subscribe URL).",
+    "// Log subscribe result only — do NOT clear _subscribed on 5xx.",
+    "// TAK Server returns 500 for re-subscribe on read-only missions; clearing causes retry spam.",
+    "if (typeof sc === 'number' && sc >= 400) {",
+    "  node.warn('Subscribe ' + missionName + ' HTTP ' + sc + ' (already subscribed or read-only — normal)');",
+    "} else {",
+    "  node.warn('Subscribe ' + missionName + ' HTTP ' + sc + ' OK — elevation handled inline');",
     "}",
-    "msg.payload = '';",
-    "node.warn('Elevating ' + creatorUid + ' to MISSION_OWNER on ' + missionName);",
-    "return msg;"
+    "return null;"
   ].join('\n');
 
   // Mission GET URL build (shared with ArcGIS)
@@ -2784,18 +2787,10 @@ function makeTfrEngineTab(feed) {
     {
       id: P + 'fn_elevate', type: 'function', z: FID,
       name: 'Elevate to MISSION_OWNER',
+      _templateKey: 'kml.fn_elevate',
       func: FN_ELEVATE_ROLE,
       outputs: 1, timeout: '', noerr: 0, initialize: '', finalize: '', libs: [],
-      x: 800, y: 460, wires: [[P + 'http_elevate']]
-    },
-    {
-      id: P + 'http_elevate', type: 'http request', z: FID,
-      name: 'Set MISSION_OWNER role',
-      method: 'use', ret: 'txt', paytoqs: 'ignore',
-      url: '', tls: 'tls_tak', persist: false, proxy: '',
-      insecureHTTPParser: false, authType: '',
-      senderr: false, headers: [],
-      x: 1000, y: 460, wires: [[P + 'debug_sub']]
+      x: 800, y: 460, wires: [[P + 'debug_sub']]
     },
     {
       id: P + 'debug_sub', type: 'debug', z: FID,
@@ -2803,7 +2798,7 @@ function makeTfrEngineTab(feed) {
       active: true, tosidebar: true, console: false, tostatus: true,
       complete: 'true', targetType: 'full',
       statusVal: 'topic', statusType: 'auto',
-      x: 1200, y: 460, wires: [[]]
+      x: 1000, y: 460, wires: [[]]
     },
 
     {
