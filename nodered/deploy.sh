@@ -153,6 +153,7 @@ docker exec "$CONTAINER" node -e "
     'TFR Reconcile (diff)': { tfr: 'tfr.reconcile' },
     'Build KML URL': { kml: 'kml.build_url' },
     'KML to Feature JSON': { kml: 'kml.xml_to_features' },
+    'Elevate to MISSION_OWNER': { arcgis: 'arcgis.fn_elevate', kml: 'kml.fn_elevate' },
     'Build subscribe URL': { arcgis: 'shared.build_sub', tfr: 'shared.build_sub', kml: 'shared.build_sub' },
     'Build mission GET URL': { arcgis: 'shared.build_m', tfr: 'shared.build_m', kml: 'shared.build_m' },
     'CoT JSON -> XML': { arcgis: 'shared.cot_to_xml', tfr: 'shared.cot_to_xml', kml: 'shared.cot_to_xml' },

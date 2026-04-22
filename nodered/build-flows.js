@@ -1568,6 +1568,7 @@ function makeEngineTab(feed) {
     {
       id: P + 'fn_elevate', type: 'function', z: FID,
       name: 'Elevate to MISSION_OWNER',
+      _templateKey: 'arcgis.fn_elevate',
       func: [
         "var tak = msg.takSettings;",
         "var cfg = msg._config;",
@@ -2789,6 +2790,7 @@ function makeTfrEngineTab(feed) {
     {
       id: P + 'fn_elevate', type: 'function', z: FID,
       name: 'Elevate to MISSION_OWNER',
+      _templateKey: 'kml.fn_elevate',
       func: FN_ELEVATE_ROLE,
       outputs: 1, timeout: '', noerr: 0, initialize: '', finalize: '', libs: [],
       x: 800, y: 460, wires: [[P + 'debug_sub']]
