@@ -5,6 +5,28 @@ const path = require('path');
 const html    = fs.readFileSync(path.join(__dirname, 'configurator.html'), 'utf8');
 const CFG_TAB = 'flow_arcgis_cfg';
 
+// Shared snippet: write a timestamped backup of all config keys to /data/config-backups/
+// on the Docker volume immediately after any save operation.
+const CFG_BACKUP_SNIPPET = [
+  "try {",
+  "  var _bfs = require('fs');",
+  "  var _bd  = '/data/config-backups';",
+  "  if (!_bfs.existsSync(_bd)) _bfs.mkdirSync(_bd, { recursive: true });",
+  "  var _snap = {",
+  "    timestamp:      new Date().toISOString(),",
+  "    arcgis_configs: global.get('arcgis_configs') || [],",
+  "    tc_configs:     global.get('tc_configs')     || [],",
+  "    tak_settings:   global.get('tak_settings')   || {},",
+  "    ipaws_config:   global.get('ipaws_config')   || {}",
+  "  };",
+  "  var _ts = new Date().toISOString().replace(/[:.]/g,'_');",
+  "  _bfs.writeFileSync(_bd+'/latest.json', JSON.stringify(_snap,null,2));",
+  "  _bfs.writeFileSync(_bd+'/backup_'+_ts+'.json', JSON.stringify(_snap,null,2));",
+  "  var _all = _bfs.readdirSync(_bd).filter(function(f){return f.startsWith('backup_');}).sort();",
+  "  while (_all.length > 20) { _bfs.unlinkSync(_bd+'/'+_all.shift()); }",
+  "} catch(_be) { node.warn('Config auto-backup failed: '+_be.message); }"
+].join('\n');
+
 // ╔══════════════════════════════════════════════════════════════╗
 // ║  FEEDS — STATIC ArcGIS engine tabs in the shipped flows.   ║
 // ║  Leave EMPTY. Do not ship named feeds (e.g. CA AIR INTEL) in ║
@@ -627,6 +649,7 @@ const configFlows = [
       "if (idx >= 0) { configs[idx] = config; }",
       "else           { configs.push(config); }",
       "global.set('arcgis_configs', configs);",
+      CFG_BACKUP_SNIPPET + "\n",
       "var certUser = (config.streamCertUser || '').trim();",
       "if (certUser) {",
       "  try {",
@@ -662,6 +685,7 @@ const configFlows = [
     name: 'Replace all configs',
     func: [
       "global.set('arcgis_configs', msg.payload.configs || []);",
+      CFG_BACKUP_SNIPPET + "\n",
       "msg.payload = { ok: true };",
       "return msg;"
     ].join('\n'),
@@ -717,6 +741,7 @@ const configFlows = [
     name: 'Save TAK settings',
     func: [
       "global.set('tak_settings', msg.payload);",
+      CFG_BACKUP_SNIPPET + "\n",
       "msg.payload = { ok: true };",
       "return msg;"
     ].join('\n'),
@@ -776,6 +801,7 @@ const configFlows = [
       "var idx = configs.findIndex(function(c){ return c.id === cfg.id; });",
       "if (idx >= 0) { configs[idx] = cfg; } else { configs.push(cfg); }",
       "global.set('tc_configs', configs);",
+      CFG_BACKUP_SNIPPET + "\n",
       "msg.payload = { ok: true, configCount: configs.length };",
       "return msg;"
     ].join('\n'),
@@ -891,6 +917,105 @@ const configFlows = [
     id: 'ho_tc_units_load', type: 'http response', z: CFG_TAB,
     name: '', statusCode: '200', headers: { 'content-type': 'application/json' },
     x: 640, y: 1160, wires: []
+  },
+
+  // ── Config backup list / restore ──
+  {
+    id: 'c_backups', type: 'comment', z: CFG_TAB,
+    name: '── Config Backups ──',
+    info: '', x: 260, y: 1220, wires: []
+  },
+  {
+    id: 'hi_cfg_bk_list', type: 'http in', z: CFG_TAB,
+    name: 'GET /config/backups',
+    url: '/config/backups', method: 'get',
+    upload: false, swaggerDoc: '',
+    x: 200, y: 1260, wires: [['fn_cfg_bk_list']]
+  },
+  {
+    id: 'fn_cfg_bk_list', type: 'function', z: CFG_TAB,
+    name: 'List config backups',
+    func: [
+      "try {",
+      "  var _fs = require('fs');",
+      "  var _bd = '/data/config-backups';",
+      "  if (!_fs.existsSync(_bd)) { msg.payload = { backups: [] }; return msg; }",
+      "  var files = _fs.readdirSync(_bd).filter(function(f){",
+      "    return f === 'latest.json' || f.startsWith('backup_');",
+      "  }).sort().reverse();",
+      "  var backups = files.map(function(f) {",
+      "    try {",
+      "      var d = JSON.parse(_fs.readFileSync(_bd+'/'+f,'utf8'));",
+      "      return {",
+      "        filename: f,",
+      "        timestamp: d.timestamp || null,",
+      "        arcgis_count: (d.arcgis_configs||[]).length,",
+      "        tc_count: (d.tc_configs||[]).length,",
+      "        has_tak: !!(d.tak_settings && Object.keys(d.tak_settings).length),",
+      "        has_ipaws: !!(d.ipaws_config && d.ipaws_config._initialized)",
+      "      };",
+      "    } catch(e) { return { filename: f, error: e.message }; }",
+      "  });",
+      "  msg.payload = { backups: backups };",
+      "} catch(e) {",
+      "  msg.payload = { error: e.message, backups: [] };",
+      "}",
+      "return msg;"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 430, y: 1260, wires: [['ho_cfg_bk_list']]
+  },
+  {
+    id: 'ho_cfg_bk_list', type: 'http response', z: CFG_TAB,
+    name: '', statusCode: '200', headers: { 'content-type': 'application/json' },
+    x: 640, y: 1260, wires: []
+  },
+  {
+    id: 'hi_cfg_restore', type: 'http in', z: CFG_TAB,
+    name: 'POST /config/restore',
+    url: '/config/restore', method: 'post',
+    upload: false, swaggerDoc: '',
+    x: 200, y: 1300, wires: [['fn_cfg_restore']]
+  },
+  {
+    id: 'fn_cfg_restore', type: 'function', z: CFG_TAB,
+    name: 'Restore from backup',
+    func: [
+      "var filename = (msg.payload||{}).filename;",
+      "if (!filename) { msg.payload = { ok:false, error:'missing filename' }; return msg; }",
+      "// Prevent path traversal",
+      "if (filename.indexOf('/') >= 0 || filename.indexOf('..') >= 0) {",
+      "  msg.payload = { ok:false, error:'invalid filename' }; return msg;",
+      "}",
+      "try {",
+      "  var _fs = require('fs');",
+      "  var src = '/data/config-backups/' + filename;",
+      "  var d = JSON.parse(_fs.readFileSync(src, 'utf8'));",
+      "  if (d.arcgis_configs !== undefined) global.set('arcgis_configs', d.arcgis_configs);",
+      "  if (d.tc_configs     !== undefined) global.set('tc_configs',     d.tc_configs);",
+      "  if (d.tak_settings   !== undefined) global.set('tak_settings',   d.tak_settings);",
+      "  if (d.ipaws_config   !== undefined) global.set('ipaws_config',   d.ipaws_config);",
+      "  msg.payload = {",
+      "    ok: true,",
+      "    restored_from: filename,",
+      "    timestamp: d.timestamp,",
+      "    arcgis_count: (d.arcgis_configs||[]).length,",
+      "    tc_count: (d.tc_configs||[]).length",
+      "  };",
+      "} catch(e) {",
+      "  msg.payload = { ok: false, error: e.message };",
+      "}",
+      "return msg;"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 430, y: 1300, wires: [['ho_cfg_restore']]
+  },
+  {
+    id: 'ho_cfg_restore', type: 'http response', z: CFG_TAB,
+    name: '', statusCode: '200', headers: { 'content-type': 'application/json' },
+    x: 640, y: 1300, wires: []
   },
 
   // ── Force re-subscribe ──
@@ -3668,6 +3793,7 @@ const FN_IPAWS_SAVE_CFG = [
   "global.set('ipaws_config', updated);",
   "// Reset fetch timestamp so next timer tick triggers immediate re-fetch with new settings",
   "global.set('ipaws_last_fetch', 0);",
+  CFG_BACKUP_SNIPPET,
   "msg.payload = { ok: true, config: updated };",
   "return msg;"
 ].join('\n');
