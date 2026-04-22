@@ -15309,6 +15309,9 @@ def _run_nodered_deploy_remote(settings, deploy_cfg, plog):
       module: 'localfilesystem'
     }
   },
+  functionGlobalContext: {
+    nodeHttps: require('https')
+  },
   editorTheme: {
     header: {
       title: 'infra-TAK Node-RED  —  <a href="/configurator" target="_blank" style="color:#2ec4b6;text-decoration:underline">Open Configurator</a>'
@@ -15431,6 +15434,9 @@ def run_nodered_deploy():
     default: {
       module: 'localfilesystem'
     }
+  },
+  functionGlobalContext: {
+    nodeHttps: require('https')
   },
   editorTheme: {
     header: {

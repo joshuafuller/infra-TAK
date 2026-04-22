@@ -3258,7 +3258,7 @@ const FN_IPAWS_BUILD_KML = [
   "}",
   "",
   "// ── Async path: fetch missing zone geometries then build KML ───",
-  "var https = require('https');",
+  "var https = global.get('nodeHttps');",
   "function fetchZone(u) {",
   "  return new Promise(function(resolve) {",
   "    var req = https.get(u, { headers: { 'User-Agent': '(infra-TAK IPAWS, nodered@localhost)', 'Accept': 'application/geo+json' } }, function(res) {",
