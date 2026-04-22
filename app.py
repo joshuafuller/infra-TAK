@@ -28967,16 +28967,17 @@ def _post_update_auto_deploy():
                         _auto_deploy_active.pop('nodered', None)
 
             def _auto_nodered_settings(nr_dir):
-                """Ensure Node-RED settings.js has editorTheme with Configurator link."""
+                """Ensure Node-RED settings.js has required keys (editorTheme, httpStatic, functionGlobalContext)."""
                 settings_path = os.path.join(nr_dir, 'settings.js')
                 if not os.path.exists(settings_path):
                     return
                 try:
                     with open(settings_path) as f:
                         content = f.read()
+                    changed = False
                     if 'editorTheme' not in content:
                         print("Post-update: adding editorTheme to Node-RED settings.js")
-                        new_content = content.replace(
+                        content = content.replace(
                             '};',
                             """,
   editorTheme: {
@@ -28987,8 +28988,26 @@ def _post_update_auto_deploy():
 };""",
                             1
                         )
+                        changed = True
+                    if 'httpStatic' not in content:
+                        print("Post-update: adding httpStatic to Node-RED settings.js")
+                        content = content.replace('};', ",\n  httpStatic: '/data/public'\n};", 1)
+                        changed = True
+                    if 'functionGlobalContext' not in content:
+                        print("Post-update: adding functionGlobalContext to Node-RED settings.js")
+                        content = content.replace(
+                            '};',
+                            """,
+  functionGlobalContext: {
+    nodeHttps: require('https')
+  }
+};""",
+                            1
+                        )
+                        changed = True
+                    if changed:
                         with open(settings_path, 'w') as f:
-                            f.write(new_content)
+                            f.write(content)
                         subprocess.run('docker restart nodered', shell=True, capture_output=True, timeout=60)
                         print("Post-update: Node-RED settings.js updated and restarted")
                 except Exception as e:
