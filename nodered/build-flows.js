@@ -2910,10 +2910,20 @@ function makeTfrEngineTab(feed) {
 // ════════════════════════════════════════════════════════════════
 const IPAWS_TAB_ID = 'flow_ipaws';
 
-// ── Build NWS API request ────────────────────────────────────────
+// ── Check poll interval then build NWS API request ──────────────
+// Called by the 60-second timer inject; only proceeds if interval has elapsed.
+const FN_IPAWS_POLL = [
+  "var cfg = global.get('ipaws_config') || {};",
+  "if (!cfg.activated) return null;",
+  "var intervalMs = Math.max(1, cfg.pollInterval || 1) * 60 * 1000;",
+  "var lastFetch = global.get('ipaws_last_fetch') || 0;",
+  "if ((Date.now() - lastFetch) < intervalMs) return null;",
+  "return msg;"
+].join('\n');
+
 const FN_IPAWS_BUILD_REQ = [
   "var cfg = global.get('ipaws_config') || {};",
-  "if (cfg.activated === false) { return null; } // no NWS traffic when not activated",
+  "if (!cfg.activated) return null;",
   "var params = ['status=actual'];",
   "if (cfg.states && cfg.states.length > 0) {",
   "  params.push('area=' + cfg.states.map(function(s){return String(s).trim().toUpperCase();}).filter(Boolean).join(','));",
@@ -2921,8 +2931,6 @@ const FN_IPAWS_BUILD_REQ = [
   "if (cfg.severity && cfg.severity.length > 0) {",
   "  params.push('severity=' + cfg.severity.join(','));",
   "}",
-  "msg._ipawsHost = (msg.req && msg.req.headers && msg.req.headers.host) ? msg.req.headers.host : 'localhost:1880';",
-  "msg._ipawsProto = (msg.req && msg.req.protocol) ? msg.req.protocol : 'http';",
   "msg.url = 'https://api.weather.gov/alerts/active?' + params.join('&');",
   "msg.method = 'GET';",
   "msg.headers = { 'User-Agent': '(infra-TAK IPAWS, nodered@localhost)', 'Accept': 'application/geo+json' };",
@@ -3251,13 +3259,16 @@ const FN_IPAWS_BUILD_KML = [
   "  return kml;",
   "}",
   "",
-  "// ── Sync path: all zones already cached ────────────────────────",
+  "// ── Sync path: all zones already cached — store KML and done ──",
   "if (toFetch.length === 0) {",
-  "  msg.payload = buildKml(zoneCache);",
+  "  var kml = buildKml(zoneCache);",
+  "  global.set('ipaws_kml_cache', { kml: kml, ts: Date.now() });",
+  "  global.set('ipaws_last_fetch', Date.now());",
+  "  msg.payload = 'IPAWS: cache updated — ' + features.length + ' alerts at ' + new Date().toISOString();",
   "  return msg;",
   "}",
   "",
-  "// ── Async path: fetch missing zone geometries then build KML ───",
+  "// ── Async path: fetch missing zone geometries then store KML ───",
   "var https = global.get('nodeHttps');",
   "function fetchZone(u) {",
   "  return new Promise(function(resolve) {",
@@ -3282,11 +3293,17 @@ const FN_IPAWS_BUILD_KML = [
   "  });",
   "  global.set(ZONE_CACHE_KEY, zoneCache);",
   "  node.warn('IPAWS: zone fetch done — ' + newCount + '/' + toFetch.length + ' geometries retrieved');",
-  "  msg.payload = buildKml(zoneCache);",
+  "  var kml = buildKml(zoneCache);",
+  "  global.set('ipaws_kml_cache', { kml: kml, ts: Date.now() });",
+  "  global.set('ipaws_last_fetch', Date.now());",
+  "  msg.payload = 'IPAWS: cache updated — ' + features.length + ' alerts (zone fetch) at ' + new Date().toISOString();",
   "  node.send(msg);",
   "}).catch(function(err) {",
   "  node.warn('IPAWS zone fetch error: ' + (err.message || err) + ' — using partial cache');",
-  "  msg.payload = buildKml(zoneCache);",
+  "  var kml = buildKml(zoneCache);",
+  "  global.set('ipaws_kml_cache', { kml: kml, ts: Date.now() });",
+  "  global.set('ipaws_last_fetch', Date.now());",
+  "  msg.payload = 'IPAWS: cache updated with partial zone data — ' + features.length + ' alerts';",
   "  node.send(msg);",
   "});",
   "return; // async — node.send() called from Promise"
@@ -3298,6 +3315,8 @@ const FN_IPAWS_SAVE_CFG = [
   "var existing = global.get('ipaws_config') || {};",
   "var updated = Object.assign({}, existing, body);",
   "global.set('ipaws_config', updated);",
+  "// Reset fetch timestamp so next timer tick triggers immediate re-fetch with new settings",
+  "global.set('ipaws_last_fetch', 0);",
   "msg.payload = { ok: true, config: updated };",
   "return msg;"
 ].join('\n');
@@ -3318,11 +3337,39 @@ const FN_IPAWS_INIT = [
   "    activated: false,",
   "    severity: ['Extreme', 'Severe'],",
   "    states: [],",
+  "    pollInterval: 1,",
   "    iconBaseUrl: ''",
   "  });",
   "  node.warn('IPAWS: default config initialized — activate via Configurator to enable KML feed');",
   "}",
-  "return null;"
+  "return msg; // chain to poll_fn for immediate first fetch attempt"
+].join('\n');
+
+// ── Serve cached KML to ATAK clients ────────────────────────────
+// HTTP handler — instant response from global context cache.
+const FN_IPAWS_SERVE_KML = [
+  "var cfg = global.get('ipaws_config') || {};",
+  "if (!cfg.activated) {",
+  "  msg.payload = '<kml xmlns=\"http://www.opengis.net/kml/2.2\"><Document>' +",
+  "    '<name>IPAWS Alerts (inactive)</name>' +",
+  "    '<description>IPAWS feed not yet activated. Open the infra-TAK Configurator and click Deploy IPAWS.</description>' +",
+  "    '</Document></kml>';",
+  "  msg.headers = { 'Content-Type': 'application/vnd.google-earth.kml+xml; charset=utf-8' };",
+  "  return msg;",
+  "}",
+  "var cache = global.get('ipaws_kml_cache');",
+  "if (!cache || !cache.kml) {",
+  "  var mins = cfg.pollInterval || 1;",
+  "  msg.payload = '<kml xmlns=\"http://www.opengis.net/kml/2.2\"><Document>' +",
+  "    '<name>IPAWS Alerts (initializing)</name>' +",
+  "    '<description>Feed is initializing — first build within ' + mins + ' minute(s). Check back shortly.</description>' +",
+  "    '</Document></kml>';",
+  "  msg.headers = { 'Content-Type': 'application/vnd.google-earth.kml+xml; charset=utf-8' };",
+  "  return msg;",
+  "}",
+  "msg.payload = cache.kml;",
+  "msg.headers = { 'Content-Type': 'application/vnd.google-earth.kml+xml; charset=utf-8' };",
+  "return msg;"
 ].join('\n');
 
 function makeIpawsTab() {
@@ -3332,19 +3379,20 @@ function makeIpawsTab() {
       id: Z, type: 'tab',
       label: 'IPAWS Alerts',
       disabled: false,
-      info: 'FEMA IPAWS / NWS active alerts KML feed for ATAK. ' +
-            'Add /ipaws/alerts.kml as a KML Network Link in ATAK ' +
-            '(Overlay Manager → Add → URL). ' +
-            'Configure via POST /ipaws/config with {states:["CA"], severity:["Extreme","Severe"]}.'
+      info: 'FEMA IPAWS / NWS active alerts KML feed for ATAK.\n' +
+            'KML is pre-built on a configurable timer (default: every 1 min).\n' +
+            'GET /ipaws/alerts.kml instantly serves the cached KML — any number of\n' +
+            'ATAK clients at any poll interval only costs 1 NWS API call per interval.\n' +
+            'Configure via Configurator or POST /ipaws/config.'
     },
 
-    // ── Startup init ─────────────────────────────────────────────
+    // ── Startup init → immediate first poll attempt ───────────────
     {
       id: Z + '_init_inj', type: 'inject', z: Z,
       name: 'Startup init',
       props: [{ p: 'payload' }],
       repeat: '', crontab: '',
-      once: true, onceDelay: '1',
+      once: true, onceDelay: '2',
       topic: '', payload: '', payloadType: 'date',
       x: 160, y: 40, wires: [[Z + '_init_fn']]
     },
@@ -3354,21 +3402,26 @@ function makeIpawsTab() {
       func: FN_IPAWS_INIT,
       outputs: 1, timeout: '', noerr: 0,
       initialize: '', finalize: '', libs: [],
-      x: 380, y: 40, wires: [[]]
+      x: 400, y: 40, wires: [[Z + '_poll_fn']]
     },
 
-    // ── KML endpoint ─────────────────────────────────────────────
+    // ── 60-second timer → poll check → NWS fetch ─────────────────
     {
-      id: Z + '_c_kml', type: 'comment', z: Z,
-      name: '── GET /ipaws/alerts.kml  ← ATAK Network Link URL ──',
-      info: '', x: 280, y: 100, wires: []
+      id: Z + '_timer_inj', type: 'inject', z: Z,
+      name: 'Every 60 s',
+      props: [{ p: 'payload' }],
+      repeat: '60', crontab: '',
+      once: false, onceDelay: '0',
+      topic: '', payload: '', payloadType: 'date',
+      x: 160, y: 100, wires: [[Z + '_poll_fn']]
     },
     {
-      id: Z + '_hi_kml', type: 'http in', z: Z,
-      name: 'GET /ipaws/alerts.kml',
-      url: '/ipaws/alerts.kml', method: 'get',
-      upload: false, swaggerDoc: '',
-      x: 180, y: 140, wires: [[Z + '_fn_req']]
+      id: Z + '_poll_fn', type: 'function', z: Z,
+      name: 'Check poll interval',
+      func: FN_IPAWS_POLL,
+      outputs: 1, timeout: '', noerr: 0,
+      initialize: '', finalize: '', libs: [],
+      x: 400, y: 100, wires: [[Z + '_fn_req']]
     },
     {
       id: Z + '_fn_req', type: 'function', z: Z,
@@ -3376,7 +3429,7 @@ function makeIpawsTab() {
       func: FN_IPAWS_BUILD_REQ,
       outputs: 1, timeout: '', noerr: 0,
       initialize: '', finalize: '', libs: [],
-      x: 400, y: 140, wires: [[Z + '_http_nws']]
+      x: 640, y: 100, wires: [[Z + '_http_nws']]
     },
     {
       id: Z + '_http_nws', type: 'http request', z: Z,
@@ -3385,46 +3438,65 @@ function makeIpawsTab() {
       url: '', tls: '', persist: false, proxy: '',
       insecureHTTPParser: false, authType: '',
       senderr: false, headers: [],
-      x: 620, y: 140, wires: [[Z + '_fn_kml']]
+      x: 880, y: 100, wires: [[Z + '_fn_kml']]
     },
     {
       id: Z + '_fn_kml', type: 'function', z: Z,
-      name: 'Build IPAWS KML',
+      name: 'Build + cache IPAWS KML',
       func: FN_IPAWS_BUILD_KML,
       outputs: 1, timeout: '', noerr: 0,
       initialize: '', finalize: '', libs: [],
-      x: 840, y: 140, wires: [[Z + '_ho_kml']]
+      x: 1120, y: 100, wires: [[Z + '_dbg_kml']]
+    },
+    {
+      id: Z + '_dbg_kml', type: 'debug', z: Z,
+      name: 'Cache update log',
+      active: true, tosidebar: true, console: false, tostatus: true,
+      complete: 'payload', targetType: 'msg',
+      statusVal: '', statusType: 'auto',
+      x: 1360, y: 100, wires: []
+    },
+
+    // ── KML endpoint — instant serve from cache ───────────────────
+    {
+      id: Z + '_c_kml', type: 'comment', z: Z,
+      name: '── GET /ipaws/alerts.kml  ← ATAK Network Link URL (served from cache) ──',
+      info: '', x: 320, y: 200, wires: []
+    },
+    {
+      id: Z + '_hi_kml', type: 'http in', z: Z,
+      name: 'GET /ipaws/alerts.kml',
+      url: '/ipaws/alerts.kml', method: 'get',
+      upload: false, swaggerDoc: '',
+      x: 180, y: 240, wires: [[Z + '_fn_serve']]
+    },
+    {
+      id: Z + '_fn_serve', type: 'function', z: Z,
+      name: 'Serve cached KML',
+      func: FN_IPAWS_SERVE_KML,
+      outputs: 1, timeout: '', noerr: 0,
+      initialize: '', finalize: '', libs: [],
+      x: 420, y: 240, wires: [[Z + '_ho_kml']]
     },
     {
       id: Z + '_ho_kml', type: 'http response', z: Z,
       name: '', statusCode: '200',
-      headers: {
-        'content-type': 'application/vnd.google-earth.kml+xml; charset=utf-8',
-        'cache-control': 'no-cache, no-store, must-revalidate'
-      },
-      x: 1040, y: 140, wires: []
-    },
-    {
-      id: Z + '_dbg_kml', type: 'debug', z: Z,
-      name: 'KML log',
-      active: true, tosidebar: true, console: false, tostatus: true,
-      complete: 'true', targetType: 'full',
-      statusVal: '', statusType: 'auto',
-      x: 1040, y: 200, wires: []
+      headers: {},
+      x: 640, y: 240, wires: []
     },
 
     // ── Config API ───────────────────────────────────────────────
     {
       id: Z + '_c_cfg', type: 'comment', z: Z,
       name: '── Config API  GET/POST /ipaws/config ──',
-      info: '', x: 220, y: 260, wires: []
+      info: '', x: 220, y: 340, wires: []
     },
     {
       id: Z + '_hi_cfg_get', type: 'http in', z: Z,
       name: 'GET /ipaws/config',
       url: '/ipaws/config', method: 'get',
       upload: false, swaggerDoc: '',
-      x: 180, y: 300, wires: [[Z + '_fn_get_cfg']]
+      x: 180, y: 380, wires: [[Z + '_fn_get_cfg']]
     },
     {
       id: Z + '_fn_get_cfg', type: 'function', z: Z,
@@ -3432,20 +3504,20 @@ function makeIpawsTab() {
       func: FN_IPAWS_GET_CFG,
       outputs: 1, timeout: '', noerr: 0,
       initialize: '', finalize: '', libs: [],
-      x: 400, y: 300, wires: [[Z + '_ho_cfg_get']]
+      x: 420, y: 380, wires: [[Z + '_ho_cfg_get']]
     },
     {
       id: Z + '_ho_cfg_get', type: 'http response', z: Z,
       name: '', statusCode: '200',
       headers: { 'content-type': 'application/json' },
-      x: 620, y: 300, wires: []
+      x: 660, y: 380, wires: []
     },
     {
       id: Z + '_hi_cfg_post', type: 'http in', z: Z,
       name: 'POST /ipaws/config',
       url: '/ipaws/config', method: 'post',
       upload: false, swaggerDoc: '',
-      x: 180, y: 360, wires: [[Z + '_fn_save_cfg']]
+      x: 180, y: 440, wires: [[Z + '_fn_save_cfg']]
     },
     {
       id: Z + '_fn_save_cfg', type: 'function', z: Z,
@@ -3453,13 +3525,13 @@ function makeIpawsTab() {
       func: FN_IPAWS_SAVE_CFG,
       outputs: 1, timeout: '', noerr: 0,
       initialize: '', finalize: '', libs: [],
-      x: 400, y: 360, wires: [[Z + '_ho_cfg_post']]
+      x: 420, y: 440, wires: [[Z + '_ho_cfg_post']]
     },
     {
       id: Z + '_ho_cfg_post', type: 'http response', z: Z,
       name: '', statusCode: '200',
       headers: { 'content-type': 'application/json' },
-      x: 620, y: 360, wires: []
+      x: 660, y: 440, wires: []
     }
   ];
 }

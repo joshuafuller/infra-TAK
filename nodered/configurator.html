@@ -1025,7 +1025,7 @@
       <div id="ipawsInactiveBadge" style="display:none;padding:0.3rem 0.8rem;border-radius:20px;font-size:0.8rem;font-weight:700;background:#1a1a4e;color:#64748b;border:1px solid #334155">○ Not Deployed</div>
     </div>
     <p style="font-size:0.82rem;color:#94a3b8;margin-bottom:1rem;line-height:1.45">
-      Fetches active alerts from <strong>api.weather.gov</strong> on every ATAK poll and serves them as a KML network link with NAPSG Public Alert icons and severity-colored polygons.
+      Polls <strong>api.weather.gov</strong> on a configurable timer and pre-builds a cached KML. ATAK clients receive the cached KML instantly — any number of users at any refresh interval costs just one NWS API call per poll cycle.
       Click <strong>Deploy IPAWS</strong> to activate the feed, then add the URL to ATAK.
     </p>
 
@@ -1034,6 +1034,20 @@
       <button type="button" id="btnDeployIpaws" onclick="deployIpaws()" style="padding:0.65rem 1.6rem;background:#2ec4b6;border:none;border-radius:6px;color:#000;font-weight:700;font-size:1rem;cursor:pointer;letter-spacing:0.02em">&#9654; Deploy IPAWS</button>
       <button type="button" id="btnDeactivateIpaws" onclick="deactivateIpaws()" style="display:none;padding:0.65rem 1.2rem;background:#1a1a4e;border:1px solid #ef4444;border-radius:6px;color:#ef4444;font-weight:600;cursor:pointer">Deactivate</button>
       <span id="ipawsStatus" style="font-size:0.82rem;color:#64748b"></span>
+    </div>
+
+    <!-- Poll interval -->
+    <div style="display:flex;align-items:center;gap:1rem;margin-bottom:1.2rem;flex-wrap:wrap">
+      <label style="font-size:0.85rem;color:#94a3b8;white-space:nowrap;margin:0">NWS poll interval</label>
+      <select id="ipawsPollInterval" style="background:#1a1a4e;color:#e2e8f0;border:1px solid #334155;border-radius:6px;padding:0.35rem 0.7rem;font-size:0.9rem">
+        <option value="1">Every 1 minute</option>
+        <option value="2">Every 2 minutes</option>
+        <option value="5">Every 5 minutes</option>
+        <option value="10">Every 10 minutes</option>
+        <option value="15">Every 15 minutes</option>
+        <option value="30">Every 30 minutes</option>
+      </select>
+      <span style="font-size:0.78rem;color:#64748b">KML is pre-built on this schedule; ATAK clients can poll at any interval</span>
     </div>
 
     <!-- KML URL (always shown) -->
@@ -1150,7 +1164,8 @@
     <div style="margin-top:1.5rem;padding:0.8rem 1rem;background:#1a1a4e;border-radius:8px;border-left:3px solid #2ec4b6">
       <div style="font-size:0.78rem;color:#94a3b8;line-height:1.6">
         <strong style="color:#e2e8f0">ATAK setup:</strong>
-        Overlay Manager → <strong>+</strong> → <strong>Add URL</strong> → paste the URL above → set refresh to <strong>5 min</strong> → OK.<br>
+        Overlay Manager → <strong>+</strong> → <strong>Add URL</strong> → paste the URL above → set any refresh interval → OK.<br>
+        The KML is pre-built server-side on the poll interval above. Any ATAK refresh interval works — faster is fine, the server never makes more than 1 NWS API call per cycle.<br>
         Alert polygons are colored by severity (🔴 Extreme, 🟠 Severe, 🟡 Moderate, 🔵 Minor).
         Icons use <a href="https://www.napsgfoundation.org/all-resources/symbology-library/" target="_blank" style="color:#2ec4b6">NAPSG Public Alert symbols</a> (CC BY 4.0).
       </div>
@@ -2725,7 +2740,7 @@ function renderConfigList() {
       '<div><div class="cc-name">IPAWS / NWS Active Alerts' +
       '<span style="display:inline-block;margin-left:0.6rem;padding:0.1rem 0.5rem;border-radius:10px;font-size:0.7rem;font-weight:700;background:#14532d;color:#4ade80;border:1px solid #4ade80;vertical-align:middle">● ACTIVE</span>' +
       '</div>' +
-      '<div class="cc-detail">api.weather.gov | ' + _esc(stateList) + ' | Severity: ' + _esc(sevList) + '</div></div>' +
+      '<div class="cc-detail">api.weather.gov | Poll: ' + (cfg.pollInterval || 1) + 'min | ' + _esc(stateList) + ' | Severity: ' + _esc(sevList) + '</div></div>' +
       '<div class="cc-actions"></div>' +
       '</div>';
   }
@@ -2873,6 +2888,10 @@ function loadIpawsConfig() {
     });
     _updateIpawsStateCount();
     document.getElementById('ipawsIconBase').value = cfg.iconBaseUrl || '';
+    var pi = document.getElementById('ipawsPollInterval');
+    var pv = String(cfg.pollInterval || 1);
+    var opt = pi.querySelector('option[value="' + pv + '"]');
+    pi.value = opt ? pv : '1';
     // activated: undefined (legacy) or true → treat as active
     _ipawsSetActiveUI(cfg.activated !== false);
     document.getElementById('ipawsStatus').textContent = '';
@@ -2890,7 +2909,8 @@ function _ipawsBuildBody(activated) {
   if (document.getElementById('ipawsSevMinor').checked)    sev.push('Minor');
   var states = Array.from(document.querySelectorAll('#ipawsStatesPills .remark-pill.selected')).map(function(p){ return p.dataset.code; });
   var iconBase = document.getElementById('ipawsIconBase').value.trim();
-  var body = { severity: sev, states: states, activated: activated };
+  var pollInterval = parseInt(document.getElementById('ipawsPollInterval').value, 10) || 1;
+  var body = { severity: sev, states: states, activated: activated, pollInterval: pollInterval };
   if (iconBase) body.iconBaseUrl = iconBase;
   return body;
 }
