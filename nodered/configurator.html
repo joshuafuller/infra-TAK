@@ -1020,13 +1020,24 @@
   <div id="ipawsSteps" style="display:none">
 
   <div class="step">
-    <h2>IPAWS / NWS Active Alerts — ATAK KML Network Link</h2>
+    <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.75rem;margin-bottom:1rem">
+      <h2 style="margin:0">IPAWS / NWS Active Alerts — ATAK KML Network Link</h2>
+      <div id="ipawsActiveBadge" style="display:none;padding:0.3rem 0.8rem;border-radius:20px;font-size:0.8rem;font-weight:700;background:#14532d;color:#4ade80;border:1px solid #4ade80">● ACTIVE</div>
+      <div id="ipawsInactiveBadge" style="display:none;padding:0.3rem 0.8rem;border-radius:20px;font-size:0.8rem;font-weight:700;background:#1a1a4e;color:#64748b;border:1px solid #334155">○ Not Deployed</div>
+    </div>
     <p style="font-size:0.82rem;color:#94a3b8;margin-bottom:1rem;line-height:1.45">
-      Node-RED serves a live KML feed at <code id="ipawsKmlUrl" style="color:#2ec4b6">/ipaws/alerts.kml</code> that fetches active alerts from <strong>api.weather.gov</strong> on every ATAK poll.
-      Add this URL as a <strong>KML Network Link</strong> in ATAK (<em>Overlay Manager → + → URL</em>) with a 5-minute refresh.
-      Alerts with polygon geometry show as colored areas + icon markers. Tap any marker for full NWS alert text.
+      Fetches active alerts from <strong>api.weather.gov</strong> on every ATAK poll and serves them as a KML network link with NAPSG Public Alert icons and severity-colored polygons.
+      Click <strong>Deploy IPAWS</strong> to activate the feed, then add the URL to ATAK.
     </p>
 
+    <!-- Deploy / Deactivate bar -->
+    <div id="ipawsDeployBar" style="display:flex;gap:0.75rem;align-items:center;margin-bottom:1.2rem;flex-wrap:wrap">
+      <button type="button" id="btnDeployIpaws" onclick="deployIpaws()" style="padding:0.65rem 1.6rem;background:#2ec4b6;border:none;border-radius:6px;color:#000;font-weight:700;font-size:1rem;cursor:pointer;letter-spacing:0.02em">&#9654; Deploy IPAWS</button>
+      <button type="button" id="btnDeactivateIpaws" onclick="deactivateIpaws()" style="display:none;padding:0.65rem 1.2rem;background:#1a1a4e;border:1px solid #ef4444;border-radius:6px;color:#ef4444;font-weight:600;cursor:pointer">Deactivate</button>
+      <span id="ipawsStatus" style="font-size:0.82rem;color:#64748b"></span>
+    </div>
+
+    <!-- KML URL (always shown) -->
     <div style="background:#1a1a4e;border-radius:8px;padding:1rem;margin-bottom:1.2rem">
       <div style="font-size:0.78rem;color:#64748b;margin-bottom:0.4rem;text-transform:uppercase;letter-spacing:0.05em">ATAK Network Link URL</div>
       <div style="display:flex;gap:0.5rem;align-items:center">
@@ -1035,6 +1046,7 @@
       </div>
     </div>
 
+    <!-- Settings -->
     <div class="row" style="gap:1.5rem;flex-wrap:wrap">
       <div style="flex:1;min-width:240px">
         <label>Severity filter</label>
@@ -1062,16 +1074,15 @@
       </div>
 
       <div style="flex:1;min-width:240px">
-        <label for="ipawsIconBase">Icon base URL <span style="color:#64748b;font-weight:400">(optional)</span></label>
-        <p style="font-size:0.78rem;color:#64748b;margin:0 0 0.5rem">Auto-detected from the page URL. Only override if icons are served from a different host.</p>
-        <input type="text" id="ipawsIconBase" placeholder="auto-detected" style="width:100%;box-sizing:border-box">
+        <label for="ipawsIconBase">Icon base URL <span style="color:#64748b;font-weight:400">(optional — uses NAPSG CDN by default)</span></label>
+        <p style="font-size:0.78rem;color:#64748b;margin:0 0 0.5rem">Leave blank to use the NAPSG Public Alert symbol CDN. Override only if self-hosting icons.</p>
+        <input type="text" id="ipawsIconBase" placeholder="https://napsg-web.s3.amazonaws.com/…" style="width:100%;box-sizing:border-box">
       </div>
     </div>
 
     <div style="margin-top:1.2rem;display:flex;gap:0.75rem;align-items:center">
-      <button type="button" onclick="saveIpawsConfig()" style="padding:0.6rem 1.4rem;background:#2ec4b6;border:none;border-radius:6px;color:#000;font-weight:700;cursor:pointer">Save Config</button>
-      <button type="button" onclick="loadIpawsConfig()" style="padding:0.6rem 1.2rem;background:#1a1a4e;border:1px solid #2ec4b6;border-radius:6px;color:#2ec4b6;font-weight:600;cursor:pointer">Reload</button>
-      <span id="ipawsStatus" style="font-size:0.82rem;color:#64748b"></span>
+      <button type="button" onclick="saveIpawsConfig()" style="padding:0.5rem 1.2rem;background:#1a1a4e;border:1px solid #2ec4b6;border-radius:6px;color:#2ec4b6;font-weight:600;cursor:pointer">Save Settings</button>
+      <button type="button" onclick="loadIpawsConfig()" style="padding:0.5rem 1rem;background:#1a1a4e;border:1px solid #334155;border-radius:6px;color:#94a3b8;font-weight:600;cursor:pointer">Reload</button>
     </div>
 
     <div style="margin-top:1.5rem;padding:0.8rem 1rem;background:#1a1a4e;border-radius:8px;border-left:3px solid #2ec4b6">
@@ -1079,7 +1090,7 @@
         <strong style="color:#e2e8f0">ATAK setup:</strong>
         Overlay Manager → <strong>+</strong> → <strong>Add URL</strong> → paste the URL above → set refresh to <strong>5 min</strong> → OK.<br>
         Alert polygons are colored by severity (🔴 Extreme, 🟠 Severe, 🟡 Moderate, 🔵 Minor).
-        Each alert shows a custom icon + tap for full NWS text including area, details, and instructions.
+        Icons use <a href="https://www.napsgfoundation.org/all-resources/symbology-library/" target="_blank" style="color:#2ec4b6">NAPSG Public Alert symbols</a> (CC BY 4.0).
       </div>
     </div>
   </div>
@@ -2725,6 +2736,13 @@ function hideSourcePicker() {
 }
 
 // ── IPAWS config functions ───────────────────────────────────────
+function _ipawsSetActiveUI(active) {
+  document.getElementById('ipawsActiveBadge').style.display   = active ? 'inline-block' : 'none';
+  document.getElementById('ipawsInactiveBadge').style.display = active ? 'none' : 'inline-block';
+  document.getElementById('btnDeployIpaws').style.display     = active ? 'none' : 'inline-block';
+  document.getElementById('btnDeactivateIpaws').style.display = active ? 'inline-block' : 'none';
+}
+
 function loadIpawsConfig() {
   fetch('/ipaws/config').then(function(r){ return r.json(); }).then(function(d) {
     var cfg = d.config || {};
@@ -2735,15 +2753,16 @@ function loadIpawsConfig() {
     document.getElementById('ipawsSevMinor').checked   = sev.indexOf('Minor')   >= 0;
     document.getElementById('ipawsStates').value   = (cfg.states || []).join(',');
     document.getElementById('ipawsIconBase').value = cfg.iconBaseUrl || '';
-    document.getElementById('ipawsStatus').textContent = 'Loaded';
-    document.getElementById('ipawsStatus').style.color = '#2ec4b6';
+    // activated: undefined (legacy) or true → treat as active
+    _ipawsSetActiveUI(cfg.activated !== false);
+    document.getElementById('ipawsStatus').textContent = '';
   }).catch(function() {
     document.getElementById('ipawsStatus').textContent = 'Could not load config';
     document.getElementById('ipawsStatus').style.color = '#f87171';
   });
 }
 
-function saveIpawsConfig() {
+function _ipawsBuildBody(activated) {
   var sev = [];
   if (document.getElementById('ipawsSevExtreme').checked)  sev.push('Extreme');
   if (document.getElementById('ipawsSevSevere').checked)   sev.push('Severe');
@@ -2752,14 +2771,56 @@ function saveIpawsConfig() {
   var statesRaw = document.getElementById('ipawsStates').value.trim();
   var states = statesRaw ? statesRaw.split(',').map(function(s){return s.trim().toUpperCase();}).filter(Boolean) : [];
   var iconBase = document.getElementById('ipawsIconBase').value.trim();
-  var body = { severity: sev, states: states };
+  var body = { severity: sev, states: states, activated: activated };
   if (iconBase) body.iconBaseUrl = iconBase;
+  return body;
+}
+
+function deployIpaws() {
+  var btn = document.getElementById('btnDeployIpaws');
+  btn.disabled = true; btn.textContent = 'Deploying…';
   fetch('/ipaws/config', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(_ipawsBuildBody(true))
   }).then(function(r){ return r.json(); }).then(function() {
-    document.getElementById('ipawsStatus').textContent = '✓ Saved';
+    _ipawsSetActiveUI(true);
+    document.getElementById('ipawsStatus').textContent = '✓ IPAWS activated';
+    document.getElementById('ipawsStatus').style.color = '#4ade80';
+    setTimeout(function(){ document.getElementById('ipawsStatus').textContent = ''; }, 4000);
+  }).catch(function() {
+    document.getElementById('ipawsStatus').textContent = 'Deploy failed — is Node-RED running?';
+    document.getElementById('ipawsStatus').style.color = '#f87171';
+  }).finally(function() {
+    btn.disabled = false; btn.textContent = '▶ Deploy IPAWS';
+  });
+}
+
+function deactivateIpaws() {
+  if (!confirm('Deactivate IPAWS? The KML endpoint will return an empty feed until re-deployed.')) return;
+  fetch('/ipaws/config', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(_ipawsBuildBody(false))
+  }).then(function(r){ return r.json(); }).then(function() {
+    _ipawsSetActiveUI(false);
+    document.getElementById('ipawsStatus').textContent = 'Deactivated';
+    document.getElementById('ipawsStatus').style.color = '#94a3b8';
+    setTimeout(function(){ document.getElementById('ipawsStatus').textContent = ''; }, 3000);
+  }).catch(function() {
+    document.getElementById('ipawsStatus').textContent = 'Request failed';
+    document.getElementById('ipawsStatus').style.color = '#f87171';
+  });
+}
+
+function saveIpawsConfig() {
+  fetch('/ipaws/config').then(function(r){ return r.json(); }).then(function(d) {
+    var currentActivated = (d.config || {}).activated;
+    var activated = currentActivated !== false; // preserve current activation state
+    return fetch('/ipaws/config', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(_ipawsBuildBody(activated))
+    });
+  }).then(function(r){ return r.json(); }).then(function() {
+    document.getElementById('ipawsStatus').textContent = '✓ Settings saved';
     document.getElementById('ipawsStatus').style.color = '#2ec4b6';
     setTimeout(function(){ document.getElementById('ipawsStatus').textContent = ''; }, 3000);
   }).catch(function() {
