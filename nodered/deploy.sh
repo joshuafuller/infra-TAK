@@ -45,15 +45,30 @@ docker cp "$CONTAINER:/data/flows_cred.json" "/tmp/flows_cred_backup.json" 2>/de
 
 # Configurator configs + TAK settings live in Node-RED context files (global + legacy flow tab).
 # We re-apply these after replacing flows.json so a hot reload cannot persist an empty global state.
+#
+# IMPORTANT: Always use the Node-RED REST API as the primary source for global context.
+# Older installs without contextStorage:localfilesystem only store context in memory — the
+# file on disk may be absent or stale. The API always returns the live in-memory state.
 echo "==> Backing up Node-RED context (Configurator / TAK settings)"
 NR_CTX_GLOBAL="/tmp/nr_ctx_global.json"
 NR_CTX_FLOW_CFG="/tmp/nr_ctx_flow_arcgis_cfg.json"
 rm -f "$NR_CTX_GLOBAL" "$NR_CTX_FLOW_CFG"
-docker cp "$CONTAINER:/data/context/global/global.json" "$NR_CTX_GLOBAL" 2>/dev/null || true
-docker cp "$CONTAINER:/data/context/flow/flow_arcgis_cfg.json" "$NR_CTX_FLOW_CFG" 2>/dev/null || true
-if [ -f "$NR_CTX_GLOBAL" ] || [ -f "$NR_CTX_FLOW_CFG" ]; then
-  echo "    Context backup: global=$([ -f "$NR_CTX_GLOBAL" ] && echo yes || echo no) flow_arcgis_cfg=$([ -f "$NR_CTX_FLOW_CFG" ] && echo yes || echo no)"
+
+# Try Node-RED REST API first (live in-memory context — works for both memory and filesystem storage)
+NR_API_CTX=$(docker exec "$CONTAINER" curl -sf --max-time 8 http://localhost:1880/context/global 2>/dev/null || echo "")
+if [ -n "$NR_API_CTX" ] && [ "$NR_API_CTX" != "{}" ] && [ "$NR_API_CTX" != "null" ]; then
+  echo "$NR_API_CTX" > "$NR_CTX_GLOBAL"
+  echo "    Context backup: REST API (live) — $(wc -c < "$NR_CTX_GLOBAL" | tr -d ' ') bytes"
+else
+  # Fall back to file copy (localfilesystem storage)
+  docker cp "$CONTAINER:/data/context/global/global.json" "$NR_CTX_GLOBAL" 2>/dev/null || true
+  if [ -f "$NR_CTX_GLOBAL" ]; then
+    echo "    Context backup: file — $(wc -c < "$NR_CTX_GLOBAL" | tr -d ' ') bytes"
+  else
+    echo "    Context backup: none found (new install or memory-only storage)"
+  fi
 fi
+docker cp "$CONTAINER:/data/context/flow/flow_arcgis_cfg.json" "$NR_CTX_FLOW_CFG" 2>/dev/null || true
 
 # Run merge inside the container (node is available there)
 docker cp "$NEW_FLOWS" "$CONTAINER:/tmp/flows_new.json"
@@ -241,10 +256,13 @@ if [ -f "/tmp/flows_cred_backup.json" ]; then
   echo "    Credentials: restored"
 fi
 if [ -f "$NR_CTX_GLOBAL" ]; then
+  # Ensure the context directory exists inside the container (may be missing on fresh volumes)
+  docker exec "$CONTAINER" mkdir -p /data/context/global 2>/dev/null || true
   docker cp "$NR_CTX_GLOBAL" "$CONTAINER:/data/context/global/global.json"
   echo "    Context: restored global (arcgis_configs / tak_settings)"
 fi
 if [ -f "$NR_CTX_FLOW_CFG" ]; then
+  docker exec "$CONTAINER" mkdir -p /data/context/flow 2>/dev/null || true
   docker cp "$NR_CTX_FLOW_CFG" "$CONTAINER:/data/context/flow/flow_arcgis_cfg.json"
   echo "    Context: restored flow tab (legacy migration source)"
 fi

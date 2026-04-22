@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.7.0-alpha"
+VERSION = "0.7.1-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -28967,7 +28967,7 @@ def _post_update_auto_deploy():
                         _auto_deploy_active.pop('nodered', None)
 
             def _auto_nodered_settings(nr_dir):
-                """Ensure Node-RED settings.js has required keys (editorTheme, httpStatic, functionGlobalContext)."""
+                """Ensure Node-RED settings.js has required keys (editorTheme, httpStatic, functionGlobalContext, contextStorage)."""
                 settings_path = os.path.join(nr_dir, 'settings.js')
                 if not os.path.exists(settings_path):
                     return
@@ -29000,6 +29000,47 @@ def _post_update_auto_deploy():
                             """,
   functionGlobalContext: {
     nodeHttps: require('https')
+  }
+};""",
+                            1
+                        )
+                        changed = True
+                    if 'contextStorage' not in content:
+                        print("Post-update: adding contextStorage (localfilesystem) to Node-RED settings.js")
+                        # Before switching to filesystem storage, export the current in-memory
+                        # context via the Node-RED REST API and write it to disk.  Without this
+                        # step, older installs (memory-only context) lose all Configurator configs
+                        # on the first restart after migration.
+                        try:
+                            ctx_r = subprocess.run(
+                                'docker exec nodered curl -sf --max-time 8 http://localhost:1880/context/global',
+                                shell=True, capture_output=True, text=True, timeout=15
+                            )
+                            ctx_data = (ctx_r.stdout or '').strip()
+                            if ctx_data and ctx_data not in ('{}', 'null', ''):
+                                import tempfile
+                                subprocess.run(
+                                    'docker exec nodered mkdir -p /data/context/global',
+                                    shell=True, capture_output=True, timeout=10
+                                )
+                                with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tf:
+                                    tf.write(ctx_data)
+                                    tmp_ctx = tf.name
+                                subprocess.run(
+                                    f'docker cp {shlex.quote(tmp_ctx)} nodered:/data/context/global/global.json',
+                                    shell=True, capture_output=True, timeout=15
+                                )
+                                os.remove(tmp_ctx)
+                                print("Post-update: in-memory context exported to filesystem before migration")
+                        except Exception as ctx_e:
+                            print(f"Post-update: context pre-export warning (non-fatal): {ctx_e}")
+                        content = content.replace(
+                            '};',
+                            """,
+  contextStorage: {
+    default: {
+      module: 'localfilesystem'
+    }
   }
 };""",
                             1
