@@ -52,7 +52,9 @@ docker cp "$CONTAINER:/data/flows_cred.json" "/tmp/flows_cred_backup.json" 2>/de
 echo "==> Backing up Node-RED context (Configurator / TAK settings)"
 NR_CTX_GLOBAL="/tmp/nr_ctx_global.json"
 NR_CTX_FLOW_CFG="/tmp/nr_ctx_flow_arcgis_cfg.json"
+PERSISTENT_CTX_BACKUP="/opt/tak/nodered-ctx-backup.json"
 rm -f "$NR_CTX_GLOBAL" "$NR_CTX_FLOW_CFG"
+mkdir -p /opt/tak
 
 # Try Node-RED REST API first (live in-memory context — works for both memory and filesystem storage)
 NR_API_CTX=$(docker exec "$CONTAINER" curl -sf --max-time 8 http://localhost:1880/context/global 2>/dev/null || echo "")
@@ -65,10 +67,55 @@ else
   if [ -f "$NR_CTX_GLOBAL" ]; then
     echo "    Context backup: file — $(wc -c < "$NR_CTX_GLOBAL" | tr -d ' ') bytes"
   else
-    echo "    Context backup: none found (new install or memory-only storage)"
+    echo "    Context backup: none found from live container"
   fi
 fi
 docker cp "$CONTAINER:/data/context/flow/flow_arcgis_cfg.json" "$NR_CTX_FLOW_CFG" 2>/dev/null || true
+
+# ── SAFETY GATE ──────────────────────────────────────────────────────────────
+# Validate the backup has meaningful content (at least one known config key).
+# If it is empty, fall back to the persistent host-side snapshot from the last
+# successful deploy.  If neither exists, ABORT — never wipe configs silently.
+_ctx_is_valid() {
+  local f="$1"
+  [ -f "$f" ] || return 1
+  local sz
+  sz=$(wc -c < "$f" | tr -d ' ')
+  [ "$sz" -gt 50 ] || return 1
+  # Must contain at least one real config key
+  grep -qE '"(arcgis_configs|tak_settings|tfr_configs|tc_configs|pp_config|pulsepoint_config|ipaws_config)"' "$f" || return 1
+  return 0
+}
+
+if _ctx_is_valid "$NR_CTX_GLOBAL"; then
+  # Good live backup — also update the persistent snapshot for next time
+  cp "$NR_CTX_GLOBAL" "$PERSISTENT_CTX_BACKUP"
+  echo "    Persistent snapshot updated: $PERSISTENT_CTX_BACKUP"
+elif _ctx_is_valid "$PERSISTENT_CTX_BACKUP"; then
+  echo "    WARNING: live context backup empty/invalid — falling back to persistent snapshot"
+  echo "    Snapshot: $PERSISTENT_CTX_BACKUP ($(wc -c < "$PERSISTENT_CTX_BACKUP" | tr -d ' ') bytes)"
+  cp "$PERSISTENT_CTX_BACKUP" "$NR_CTX_GLOBAL"
+else
+  echo ""
+  echo "  ╔══════════════════════════════════════════════════════════════════╗"
+  echo "  ║  DEPLOY ABORTED — could not back up Node-RED context            ║"
+  echo "  ║                                                                  ║"
+  echo "  ║  Neither the live container API nor the persistent snapshot      ║"
+  echo "  ║  ($PERSISTENT_CTX_BACKUP)"
+  echo "  ║  returned valid config data.                                     ║"
+  echo "  ║                                                                  ║"
+  echo "  ║  Proceeding would wipe all saved Configurator configs.           ║"
+  echo "  ║  To override (e.g. intentional fresh install):                   ║"
+  echo "  ║    bash nodered/deploy.sh --force-empty-context                  ║"
+  echo "  ╚══════════════════════════════════════════════════════════════════╝"
+  echo ""
+  if [ "${1:-}" = "--force-empty-context" ]; then
+    echo "    --force-empty-context passed — proceeding without context restore."
+  else
+    exit 1
+  fi
+fi
+# ── END SAFETY GATE ──────────────────────────────────────────────────────────
 
 # Run merge inside the container (node is available there)
 docker cp "$NEW_FLOWS" "$CONTAINER:/tmp/flows_new.json"
