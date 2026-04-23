@@ -20074,7 +20074,7 @@ entries:
       geoip_binding: bind_continent
       network_binding: bind_asn
       remember_me_offset: seconds=0
-      session_duration: seconds=0
+      session_duration: seconds=120
     identifiers:
       name: ldap-authentication-login
     model: authentik_stages_user_login.userloginstage
@@ -20126,7 +20126,6 @@ entries:
       authorization_flow: !KeyOf ldap-authentication-flow
       base_dn: !Context basedn
       bind_mode: cached
-      token_validity: "minutes=2"
       gid_start_number: 4000
       invalidation_flow: !Find [authentik_flows.flow, [slug, default-invalidation-flow]]
       mfa_support: false
@@ -21116,7 +21115,7 @@ entries:
       geoip_binding: bind_continent
       network_binding: bind_asn
       remember_me_offset: seconds=0
-      session_duration: seconds=0
+      session_duration: seconds=120
     identifiers:
       name: ldap-authentication-login
     model: authentik_stages_user_login.userloginstage
@@ -21168,7 +21167,6 @@ entries:
       authorization_flow: !KeyOf ldap-authentication-flow
       base_dn: !Context basedn
       bind_mode: cached
-      token_validity: "minutes=2"
       gid_start_number: 4000
       invalidation_flow: !Find [authentik_flows.flow, [slug, default-invalidation-flow]]
       mfa_support: false
@@ -21733,7 +21731,6 @@ entries:
                                     data=json.dumps({'name': 'LDAP', 'authentication_flow': ldap_bind_flow,
                                         'authorization_flow': ldap_bind_flow, 'invalidation_flow': inv_flow_pk,
                                         'base_dn': 'DC=takldap', 'bind_mode': 'cached',
-                                        'token_validity': 'minutes=2',
                                         'search_mode': 'cached', 'mfa_support': False}).encode(),
                                     headers=ak_headers, method='POST')
                                 resp = urllib.request.urlopen(req, timeout=10)
@@ -23275,7 +23272,7 @@ def _ensure_ldap_flow_authentication_none():
                 login_stage = _find_stage('stages/user_login/', 'ldap-authentication-login')
                 if not login_stage:
                     login_stage = _create_ldap_stage('stages/user_login/', 'ldap-authentication-login', {
-                        'session_duration': 'seconds=0', 'remember_me_offset': 'seconds=0'})
+                        'session_duration': 'seconds=120', 'remember_me_offset': 'seconds=0'})
                 if id_stage and pw_stage and login_stage:
                     existing_orders = {b.get('order') for b in ldap_bindings}
                     binding_specs = [(10, id_stage), (15, pw_stage), (20, login_stage)]
@@ -23290,6 +23287,14 @@ def _ensure_ldap_flow_authentication_none():
                                 pass
                 else:
                     return False, f'LDAP stages not found/created: id={id_stage} pw={pw_stage} login={login_stage}'
+            # Always enforce short session_duration on ldap-authentication-login so password
+            # changes propagate within 2 minutes (cached bind mode caches for session lifetime)
+            _login_stage_pk = _find_stage('stages/user_login/', 'ldap-authentication-login')
+            if _login_stage_pk:
+                try:
+                    _patch(f'stages/user_login/{_login_stage_pk}/', {'session_duration': 'seconds=120'})
+                except urllib.error.HTTPError:
+                    pass
             providers = _get('providers/ldap/?search=LDAP').get('results', [])
             ldap_prov = next((p for p in providers if p.get('name') == 'LDAP'), providers[0] if providers else None)
             if ldap_prov:
@@ -23298,7 +23303,6 @@ def _ensure_ldap_flow_authentication_none():
                         'authentication_flow': ldap_flow_pk,
                         'authorization_flow': ldap_flow_pk,
                         'bind_mode': 'cached',
-                        'token_validity': 'minutes=2',
                         'search_mode': 'cached'})
                 except urllib.error.HTTPError as e:
                     body = ''
@@ -23346,7 +23350,6 @@ def _ensure_ldap_flow_authentication_none():
                     'authentication_flow': new_flow_pk,
                     'authorization_flow': new_flow_pk,
                     'bind_mode': 'cached',
-                    'token_validity': 'minutes=2',
                     'search_mode': 'cached'})
     except urllib.error.HTTPError as e:
         try:
