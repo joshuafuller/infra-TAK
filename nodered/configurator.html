@@ -3704,7 +3704,7 @@ async function saveTcConfig(activate) {
     _tcActiveCfg = cfg;
     if (activate) {
       status.textContent = 'Saving & creating flow…'; status.style.color = '#94a3b8';
-      await ensureTCEngineTab(cfg.configName);
+      await ensureTCEngineTab(cfg.configName, cfg.cotStreamPort);
     }
     status.textContent = '✓ Saved' + (activate ? ' & activated' : ''); status.style.color = '#4ade80';
     await renderConfigList();
@@ -3714,7 +3714,7 @@ async function saveTcConfig(activate) {
   }
 }
 
-async function ensureTCEngineTab(configName) {
+async function ensureTCEngineTab(configName, cotStreamPort) {
   if (!configName || !configName.trim()) return;
   var feedId = feedIdFromName(configName);
   var tabId = 'flow_tc_' + feedId;
@@ -3737,6 +3737,15 @@ async function ensureTCEngineTab(configName) {
   raw = raw.replace(/__FEED_ID__/g, feedId);
   raw = raw.replace(/__CONFIG_NAME__/g, safeName);
   var nodes = JSON.parse(raw);
+
+  // Patch the tcp out node port directly — persistent connections use the node's
+  // static port config, not msg.port, so we must bake the correct port in here.
+  var effectivePort = (cotStreamPort && cotStreamPort > 0) ? cotStreamPort : 8089;
+  var tcpNode = nodes.find(function(n) { return n.type === 'tcp out'; });
+  if (tcpNode) {
+    tcpNode.port = String(effectivePort);
+    tcpNode.name = 'CoT -> TAK :' + effectivePort;
+  }
 
   var tab = nodes.find(function(n) { return n.type === 'tab'; });
   var tabNodes = nodes.filter(function(n) { return n.type !== 'tab'; });
