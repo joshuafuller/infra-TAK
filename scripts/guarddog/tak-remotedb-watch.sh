@@ -1,13 +1,14 @@
 #!/bin/bash
-# Guard Dog: Remote Database Server monitor (two-server mode).
-# Checks that Server One (DB) is reachable on the configured port
-# and PostgreSQL is accepting connections. Alerts + logs on failure.
+# Guard Dog: Remote Database monitor.
+# Works for two-server mode (SSH-managed DB on Server One) and
+# external/managed DB mode (AWS RDS, Azure, etc. — TCP-only, no SSH).
 #
 # Placeholders replaced at deploy time:
-#   DB_HOST_PLACEHOLDER        → Server One IP/hostname
+#   DB_HOST_PLACEHOLDER        → Server One IP/hostname or managed DB endpoint
 #   DB_PORT_PLACEHOLDER        → Database port (default 5432)
-#   SSH_KEY_PLACEHOLDER        → SSH key path for Server One
-#   SSH_USER_PLACEHOLDER       → SSH user for Server One
+#   SSH_KEY_PLACEHOLDER        → SSH key path (empty for managed DB mode)
+#   SSH_USER_PLACEHOLDER       → SSH user (empty for managed DB mode)
+#   EXTERNAL_DB_PLACEHOLDER    → "true" for managed DB, "" for two-server
 #   ALERT_EMAIL_PLACEHOLDER    → Alert email (empty = no email)
 
 SERVER_IDENTIFIER=$(cat /opt/tak-guarddog/server_identifier 2>/dev/null || echo "$(hostname)")
@@ -15,6 +16,7 @@ DB_HOST="DB_HOST_PLACEHOLDER"
 DB_PORT="DB_PORT_PLACEHOLDER"
 SSH_KEY="SSH_KEY_PLACEHOLDER"
 SSH_USER="SSH_USER_PLACEHOLDER"
+EXTERNAL_DB="EXTERNAL_DB_PLACEHOLDER"
 
 ALERT_SENT_FILE="/var/lib/takguard/remotedb_alert_sent"
 LAST_RESTART_FILE="/var/lib/takguard/last_restart_time"
@@ -87,13 +89,35 @@ fi
 touch "$ALERT_SENT_FILE"
 TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
-if $RESTARTED; then
+if [ "$EXTERNAL_DB" = "true" ]; then
+  RESTART_MSG="This is a managed/external database (RDS, Azure, etc.). Guard Dog cannot restart it automatically. Contact your cloud provider or database administrator to investigate."
+elif $RESTARTED; then
   RESTART_MSG="Guard Dog attempted a remote restart and PostgreSQL is now responding."
 else
   RESTART_MSG="Guard Dog attempted a remote restart but PostgreSQL is still not responding. Manual intervention required."
 fi
 
 SUBJ="TAK Server Remote Database Alert on $SERVER_IDENTIFIER"
+if [ "$EXTERNAL_DB" = "true" ]; then
+BODY="The managed database endpoint ($DB_HOST:$DB_PORT) is not reachable from this TAK Server.
+
+Server: $SERVER_IDENTIFIER
+Time (UTC): $TS
+Consecutive failures: $FAIL_COUNT
+Details: $DETAILS
+
+$RESTART_MSG
+
+Check from this server:
+  timeout 5 bash -c '</dev/tcp/$DB_HOST/$DB_PORT' && echo OPEN || echo CLOSED
+  pg_isready -h $DB_HOST -p $DB_PORT
+
+Actions:
+  - Check your cloud provider console for database status and maintenance windows
+  - Verify security group / firewall rules allow traffic from this VM to $DB_HOST:$DB_PORT
+  - Check for scheduled maintenance or failover events
+"
+else
 BODY="The remote database server ($DB_HOST:$DB_PORT) is not healthy.
 
 Server: $SERVER_IDENTIFIER
@@ -111,6 +135,7 @@ Check on Server One ($DB_HOST):
   sudo pg_ctlcluster 15 main status
   sudo -u postgres psql -lqt
 "
+fi
 
 [ -n "ALERT_EMAIL_PLACEHOLDER" ] && echo -e "$BODY" | /opt/tak-guarddog/send-alert-email.sh "$SUBJ" "ALERT_EMAIL_PLACEHOLDER"
 if [ -f /opt/tak-guarddog/sms_send.sh ]; then
@@ -120,7 +145,9 @@ if [ -f /opt/tak-guarddog/sms_send.sh ]; then
   rm -f "$TMPF"
 fi
 mkdir -p /var/log/takguard
-if $RESTARTED; then
+if [ "$EXTERNAL_DB" = "true" ]; then
+  echo "$(date): Managed DB ($DB_HOST) unreachable — no auto-restart (external provider)" >> /var/log/takguard/restarts.log
+elif $RESTARTED; then
   echo "$(date): Remote DB ($DB_HOST) was down, restarted successfully via SSH" >> /var/log/takguard/restarts.log
 else
   echo "$(date): Remote DB ($DB_HOST) is down, restart FAILED" >> /var/log/takguard/restarts.log
