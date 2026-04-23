@@ -17,7 +17,8 @@ const CFG_BACKUP_SNIPPET = [
   "    arcgis_configs: global.get('arcgis_configs') || [],",
   "    tc_configs:     global.get('tc_configs')     || [],",
   "    tak_settings:   global.get('tak_settings')   || {},",
-  "    ipaws_config:   global.get('ipaws_config')   || {}",
+  "    ipaws_config:   global.get('ipaws_config')   || {},",
+  "    pulsepoint_config: global.get('pulsepoint_config') || {}",
   "  };",
   "  var _ts = new Date().toISOString().replace(/[:.]/g,'_');",
   "  _bfs.writeFileSync(_bd+'/latest.json', JSON.stringify(_snap,null,2));",
@@ -1048,7 +1049,8 @@ const configFlows = [
       "        arcgis_count: (d.arcgis_configs||[]).length,",
       "        tc_count: (d.tc_configs||[]).length,",
       "        has_tak: !!(d.tak_settings && Object.keys(d.tak_settings).length),",
-      "        has_ipaws: !!(d.ipaws_config && d.ipaws_config._initialized)",
+      "        has_ipaws: !!(d.ipaws_config && d.ipaws_config._initialized),",
+      "        has_pulsepoint: !!(d.pulsepoint_config && d.pulsepoint_config._initialized)",
       "      };",
       "    } catch(e) { return { filename: f, error: e.message }; }",
       "  });",
@@ -1092,6 +1094,7 @@ const configFlows = [
       "  if (d.tc_configs     !== undefined) global.set('tc_configs',     d.tc_configs);",
       "  if (d.tak_settings   !== undefined) global.set('tak_settings',   d.tak_settings);",
       "  if (d.ipaws_config   !== undefined) global.set('ipaws_config',   d.ipaws_config);",
+      "  if (d.pulsepoint_config !== undefined) global.set('pulsepoint_config', d.pulsepoint_config);",
       "  msg.payload = {",
       "    ok: true,",
       "    restored_from: filename,",
@@ -3315,8 +3318,10 @@ function makeTCEngineTab(feed) {
     "var feats = data.features || [];",
     "var knownUnits = global.get('tc_units_"+feed.id+"') || {};",
     "var tak   = global.get('tak_settings') || {};",
-    "var host  = tak.takHost || 'host.docker.internal';",
-    "var port  = Number(tak.streamingPort || tak.streamPort || 8089);",
+    "var host  = String(tak.serverUrl || '').replace(/^https?:\\/\\//i, '').replace(/\\/$/, '').trim() || tak.takHost || 'host.docker.internal';",
+    "var baseP = Number(tak.streamingPort || tak.streamPort || 8089);",
+    "var tcP   = Number(tak.tcStreamingPort);",
+    "var port  = (tcP > 0 && tcP < 65536) ? tcP : baseP;",
     "var staleMs = (cfg.staleMinutes||5) * 60000;",
     "var sent  = 0;",
     "",
@@ -4099,6 +4104,366 @@ function makeIpawsTab() {
 }
 
 // ════════════════════════════════════════════════════════════════
+//  PulsePoint — streaming CoT over TCP (same delivery model as Tablet Command;
+//  not KML / not Data Sync). Polls PulsePoint web API per [snstac/pulsecot](https://github.com/snstac/pulsecot).
+// ════════════════════════════════════════════════════════════════
+
+const PULSEPOINT_TAB_ID = 'flow_pulsepoint';
+
+const FN_PP_INIT = [
+  "var existing = global.get('pulsepoint_config');",
+  "if (!existing || !existing._initialized) {",
+  "  global.set('pulsepoint_config', {",
+  "    _initialized: true,",
+  "    activated: false,",
+  "    agencyIds: '',",
+  "    pollIntervalSec: 120,",
+  "    cotStaleSec: 600,",
+  "    ppBaseUrl: 'https://api.pulsepoint.org/v1/webapp',",
+  "    uniformIcon: null",
+  "  });",
+  "  node.warn('PulsePoint: default config — activate via Configurator');",
+  "}",
+  "if (!global.get('pulsepoint_prev_uids')) global.set('pulsepoint_prev_uids', {});",
+  "global.set('pulsepoint_last_fetch', 0);",
+  "return msg;"
+].join('\n');
+
+const FN_PP_POLL = [
+  "var cfg = global.get('pulsepoint_config') || {};",
+  "if (!cfg.activated) return null;",
+  "var intervalMs = Math.max(15, Number(cfg.pollIntervalSec) || 120) * 1000;",
+  "var lastFetch = global.get('pulsepoint_last_fetch') || 0;",
+  "if ((Date.now() - lastFetch) < intervalMs) return null;",
+  "return msg;"
+].join('\n');
+
+// HTTPS GET + AES decode (same algorithm as pulsecot gnu.decode_pulse).
+const FN_PP_FETCH = [
+  "var cfg = global.get('pulsepoint_config') || {};",
+  "if (!cfg.activated) return null;",
+  "var rawIds = String(cfg.agencyIds || '').split(/[,\\s]+/).map(function(s){ return s.trim(); }).filter(Boolean);",
+  "if (!rawIds.length) { node.warn('PulsePoint: no agency IDs configured'); return null; }",
+  "var https = global.get('nodeHttps');",
+  "if (!https) { node.warn('PulsePoint: nodeHttps missing'); return null; }",
+  "var urlMod = require('url');",
+  "var crypto = require('crypto');",
+  "var base = String(cfg.ppBaseUrl || 'https://api.pulsepoint.org/v1/webapp').replace(/\\/+$/, '');",
+  "var hdr = {",
+  "  'accept': '*/*',",
+  "  'accept-language': 'en-US,en;q=0.9',",
+  "  'user-agent': 'infra-TAK/pulsepoint',",
+  "  'referer': 'https://web.pulsepoint.org/'",
+  "};",
+  "function decodePulse(data) {",
+  "  if (!data || !data.ct || !data.iv || !data.s) return data;",
+  "  var ct = Buffer.from(data.ct, 'base64');",
+  "  var iv = Buffer.from(String(data.iv), 'hex');",
+  "  var salt = Buffer.from(String(data.s), 'hex');",
+  "  var ekey = 'CommonIncidents';",
+  "  var token = ekey[13] + ekey[1] + ekey[2] + 'brady' + '5' + 'r' + ekey.toLowerCase()[6] + ekey[5] + 'gs';",
+  "  var key = Buffer.alloc(0);",
+  "  var block = null;",
+  "  while (key.length < 32) {",
+  "    var h = crypto.createHash('md5');",
+  "    if (block) h.update(block);",
+  "    h.update(token, 'utf8');",
+  "    h.update(salt);",
+  "    block = h.digest();",
+  "    key = Buffer.concat([key, block]);",
+  "  }",
+  "  key = key.slice(0, 32);",
+  "  var decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);",
+  "  var dec = Buffer.concat([decipher.update(ct), decipher.finalize()]);",
+  "  var q = 34;",
+  "  var end = dec.lastIndexOf(q);",
+  "  if (end < 1) throw new Error('decode: no trailing quote');",
+  "  var txt = dec.slice(1, end).toString('utf8');",
+  "  txt = txt.split(String.fromCharCode(92,34)).join(String.fromCharCode(34));",
+  "  txt = txt.split(String.fromCharCode(92,92,34)).join(String.fromCharCode(39));",
+  "  return JSON.parse(txt);",
+  "}",
+  "function activeList(dec) {",
+  "  if (!dec || typeof dec !== 'object') return [];",
+  "  var w = dec.incidents;",
+  "  if (!w) return [];",
+  "  var act = w.active;",
+  "  if (Array.isArray(act)) return act;",
+  "  if (act && typeof act === 'object') return Object.keys(act).map(function(k){ return act[k]; });",
+  "  return [];",
+  "}",
+  "function getJson(u, cb) {",
+  "  var p = urlMod.parse(u);",
+  "  var opts = { hostname: p.hostname, port: p.port || 443, path: p.path, method: 'GET', headers: hdr };",
+  "  var req = https.request(opts, function(res) {",
+  "    var buf = '';",
+  "    res.setEncoding('utf8');",
+  "    res.on('data', function(c){ buf += c; });",
+  "    res.on('end', function(){",
+  "      try { cb(null, res.statusCode, JSON.parse(buf)); }",
+  "      catch(e) { cb(e, res.statusCode, null); }",
+  "    });",
+  "  });",
+  "  req.on('error', function(e){ cb(e); });",
+  "  req.setTimeout(25000, function(){ try { req.destroy(); } catch(_e){} cb(new Error('timeout')); });",
+  "  req.end();",
+  "}",
+  "var pending = rawIds.length;",
+  "var all = [];",
+  "var errs = [];",
+  "rawIds.forEach(function(aid) {",
+  "  var u = base + '?resource=incidents&agencyid=' + encodeURIComponent(aid);",
+  "  getJson(u, function(err, code, j) {",
+  "    if (err) errs.push(aid + ':' + err.message);",
+  "    else if (code !== 200) errs.push(aid + ':HTTP' + code);",
+  "    else try {",
+  "      var dec = (j && j.ct) ? decodePulse(j) : j;",
+  "      activeList(dec).forEach(function(inc) { if (inc && inc.ID) all.push(inc); });",
+  "    } catch(e2) { errs.push(aid + ':' + e2.message); }",
+  "    pending--;",
+  "    if (pending > 0) return;",
+  "    if (errs.length) node.warn('PulsePoint fetch: ' + errs.join(' | '));",
+  "    var sk = {}; var dedup = [];",
+  "    all.forEach(function(inc) {",
+  "      var u = 'PP-' + String(inc.AgencyID||'x') + '-' + String(inc.ID);",
+  "      if (sk[u]) return;",
+  "      sk[u] = true;",
+  "      dedup.push(inc);",
+  "    });",
+  "    msg._ppIncidents = dedup;",
+  "    node.send(msg);",
+  "  });",
+  "});",
+  "return;"
+].join('\n');
+
+const FN_PP_BUILD_COT = [
+  "var cfg = global.get('pulsepoint_config') || {};",
+  "if (!cfg.activated) return null;",
+  "var incidents = msg._ppIncidents || [];",
+  "var tak = global.get('tak_settings') || {};",
+  "var host = String(tak.serverUrl || '').replace(/^https?:\\/\\//i, '').replace(/\\/$/, '').trim() || tak.takHost || 'host.docker.internal';",
+  "var baseP = Number(tak.streamingPort || tak.streamPort || 8089);",
+  "var ppP = Number(tak.pulsepointStreamingPort);",
+  "var port = (ppP > 0 && ppP < 65536) ? ppP : baseP;",
+  "var icon = cfg.uniformIcon || {};",
+  "var cotType = String(icon.cotType || 'a-u-G').trim() || 'a-u-G';",
+  "var iconpath = String(icon.iconsetpath || '').trim();",
+  "if (!iconpath) iconpath = 'f7f71666-8b28-4b57-9fbb-e38e61d33b79/Google/caution.png';",
+  "var staleSec = Math.max(30, Number(cfg.cotStaleSec) || 600);",
+  "var prev = global.get('pulsepoint_prev_uids') || {};",
+  "var curr = {};",
+  "var nowIso = new Date().toISOString();",
+  "global.set('pulsepoint_last_fetch', Date.now());",
+  "incidents.forEach(function(inc) {",
+  "  var lat = parseFloat(inc.Latitude);",
+  "  var lon = parseFloat(inc.Longitude);",
+  "  if (isNaN(lat) || isNaN(lon)) return;",
+  "  if (String(inc.Latitude) === '0.0000000000' && String(inc.Longitude) === '0.0000000000') return;",
+  "  var uid = 'PP-' + String(inc.AgencyID || 'x') + '-' + String(inc.ID);",
+  "  curr[uid] = true;",
+  "});",
+  "var stalePast = new Date(Date.now() - 5000).toISOString();",
+  "Object.keys(prev).forEach(function(uid) {",
+  "  if (curr[uid]) return;",
+  "  node.send({",
+  "    payload: {",
+  "      event: {",
+  "        _attributes: { version:'2.0', uid:uid, type:cotType, how:'m-g', time: nowIso, start: nowIso, stale: stalePast },",
+  "        point: { _attributes:{ lat:'0', lon:'0', hae:'9999999.0', ce:'9999999', le:'9999999.0' } },",
+  "        detail: { status: [{ _attributes:{ readiness:'false' } }] }",
+  "      }",
+  "    },",
+  "    host: host, port: port",
+  "  });",
+  "});",
+  "var sent = 0;",
+  "incidents.forEach(function(inc) {",
+  "  var lat = parseFloat(inc.Latitude);",
+  "  var lon = parseFloat(inc.Longitude);",
+  "  if (isNaN(lat) || isNaN(lon)) return;",
+  "  if (String(inc.Latitude) === '0.0000000000' && String(inc.Longitude) === '0.0000000000') return;",
+  "  var uid = 'PP-' + String(inc.AgencyID || 'x') + '-' + String(inc.ID);",
+  "  var startStr = inc.CallReceivedDateTime || nowIso;",
+  "  var st = new Date(startStr);",
+  "  if (isNaN(st.getTime())) st = new Date();",
+  "  var stl = new Date(st.getTime() + staleSec * 1000);",
+  "  var ct = inc.PulsePointIncidentCallType || '';",
+  "  var addr = (inc.FullDisplayAddress || '').trim();",
+  "  var cs = (addr || ct || 'PulsePoint').substring(0, 100);",
+  "  var remarks = 'PulsePoint | ' + ct + ' | ' + addr;",
+  "  var detail = {",
+  "    contact: [{ _attributes:{ callsign: cs } }],",
+  "    remarks: remarks,",
+  "    status: [{ _attributes:{ readiness:'true' } }]",
+  "  };",
+  "  if (iconpath) detail.usericon = [{ _attributes:{ iconsetpath: iconpath } }];",
+  "  node.send({",
+  "    payload: {",
+  "      event: {",
+  "        _attributes: {",
+  "          version:'2.0', uid: uid, type: cotType, how:'m-g',",
+  "          time: st.toISOString(), start: st.toISOString(), stale: stl.toISOString()",
+  "        },",
+  "        point: { _attributes:{ lat:String(lat), lon:String(lon), hae:'9999999.0', ce:'50', le:'9999999.0' } },",
+  "        detail: detail",
+  "      }",
+  "    },",
+  "    host: host, port: port",
+  "  });",
+  "  sent++;",
+  "});",
+  "global.set('pulsepoint_prev_uids', curr);",
+  "var dropped = 0;",
+  "Object.keys(prev).forEach(function(u){ if (!curr[u]) dropped++; });",
+  "node.warn('PulsePoint: ' + sent + ' CoT streamed (TCP), ' + dropped + ' cleared');",
+  "return null;"
+].join('\n');
+
+const FN_PP_SAVE_CFG = [
+  "var body = msg.payload || {};",
+  "var existing = global.get('pulsepoint_config') || {};",
+  "var updated = Object.assign({}, existing, body);",
+  "global.set('pulsepoint_config', updated);",
+  "if (updated.activated === false) { global.set('pulsepoint_prev_uids', {}); }",
+  "global.set('pulsepoint_last_fetch', 0);",
+  CFG_BACKUP_SNIPPET,
+  "msg.payload = { ok: true, config: updated };",
+  "return msg;"
+].join('\n');
+
+const FN_PP_GET_CFG = [
+  "var cfg = global.get('pulsepoint_config') || {};",
+  "msg.payload = { ok: true, config: cfg };",
+  "return msg;"
+].join('\n');
+
+function makePulsepointTab() {
+  const Z = PULSEPOINT_TAB_ID;
+  return [
+    {
+      id: Z, type: 'tab',
+      label: 'PulsePoint → CoT stream',
+      disabled: false,
+      info: 'Polls PulsePoint incidents and streams plain CoT over TCP to TAK (same path as Tablet Command / ArcGIS streaming). Not KML. Configure via Configurator or POST /pulsepoint/config.'
+    },
+    {
+      id: Z + '_init_inj', type: 'inject', z: Z,
+      name: 'Startup init',
+      props: [{ p: 'payload' }],
+      repeat: '', crontab: '',
+      once: true, onceDelay: '2',
+      topic: '', payload: '', payloadType: 'date',
+      x: 160, y: 40, wires: [[Z + '_init_fn']]
+    },
+    {
+      id: Z + '_init_fn', type: 'function', z: Z,
+      name: 'Init PulsePoint',
+      func: FN_PP_INIT,
+      outputs: 1, timeout: '', noerr: 0,
+      initialize: '', finalize: '', libs: [],
+      x: 400, y: 40, wires: [[Z + '_poll_fn']]
+    },
+    {
+      id: Z + '_timer', type: 'inject', z: Z,
+      name: 'Every 60 s',
+      props: [{ p: 'payload' }],
+      repeat: '60', crontab: '',
+      once: false, onceDelay: '0',
+      topic: '', payload: '', payloadType: 'date',
+      x: 160, y: 100, wires: [[Z + '_poll_fn']]
+    },
+    {
+      id: Z + '_poll_fn', type: 'function', z: Z,
+      name: 'Check poll interval',
+      func: FN_PP_POLL,
+      outputs: 1, timeout: '', noerr: 0,
+      initialize: '', finalize: '', libs: [],
+      x: 400, y: 100, wires: [[Z + '_fetch_fn']]
+    },
+    {
+      id: Z + '_fetch_fn', type: 'function', z: Z,
+      name: 'Fetch agencies (HTTPS+decode)',
+      func: FN_PP_FETCH,
+      outputs: 1, timeout: '', noerr: 0,
+      initialize: '', finalize: '', libs: [],
+      x: 640, y: 100, wires: [[Z + '_build_cot']]
+    },
+    {
+      id: Z + '_build_cot', type: 'function', z: Z,
+      name: 'Build + stream CoT',
+      func: FN_PP_BUILD_COT,
+      outputs: 1, timeout: '', noerr: 0,
+      initialize: '', finalize: '', libs: [],
+      x: 900, y: 100, wires: [[Z + '_cot_xml']]
+    },
+    {
+      id: Z + '_cot_xml', type: 'function', z: Z,
+      name: 'CoT JSON -> XML',
+      _templateKey: 'shared.cot_to_xml',
+      func: FN_COT_TO_XML,
+      outputs: 1, timeout: '', noerr: 0,
+      initialize: '', finalize: '', libs: [],
+      x: 1140, y: 100, wires: [[Z + '_tcp_out']]
+    },
+    {
+      id: Z + '_tcp_out', type: 'tcp out', z: Z,
+      name: 'CoT -> TAK (PulsePoint port)',
+      host: 'host.docker.internal', port: '8089', beserver: 'client',
+      base64: false, doend: false, addCR: false,
+      x: 1360, y: 100, wires: []
+    },
+    {
+      id: Z + '_c_cfg', type: 'comment', z: Z,
+      name: '── GET/POST /pulsepoint/config ──',
+      info: '', x: 200, y: 200, wires: []
+    },
+    {
+      id: Z + '_hi_get', type: 'http in', z: Z,
+      name: 'GET /pulsepoint/config',
+      url: '/pulsepoint/config', method: 'get',
+      upload: false, swaggerDoc: '',
+      x: 180, y: 240, wires: [[Z + '_fn_get']]
+    },
+    {
+      id: Z + '_fn_get', type: 'function', z: Z,
+      name: 'Get PulsePoint config',
+      func: FN_PP_GET_CFG,
+      outputs: 1, timeout: '', noerr: 0,
+      initialize: '', finalize: '', libs: [],
+      x: 420, y: 240, wires: [[Z + '_ho_get']]
+    },
+    {
+      id: Z + '_ho_get', type: 'http response', z: Z,
+      name: '', statusCode: '200',
+      headers: { 'content-type': 'application/json' },
+      x: 660, y: 240, wires: []
+    },
+    {
+      id: Z + '_hi_post', type: 'http in', z: Z,
+      name: 'POST /pulsepoint/config',
+      url: '/pulsepoint/config', method: 'post',
+      upload: false, swaggerDoc: '',
+      x: 180, y: 300, wires: [[Z + '_fn_save']]
+    },
+    {
+      id: Z + '_fn_save', type: 'function', z: Z,
+      name: 'Save PulsePoint config',
+      func: FN_PP_SAVE_CFG,
+      outputs: 1, timeout: '', noerr: 0,
+      initialize: '', finalize: '', libs: [],
+      x: 420, y: 300, wires: [[Z + '_ho_post']]
+    },
+    {
+      id: Z + '_ho_post', type: 'http response', z: Z,
+      name: '', statusCode: '200',
+      headers: { 'content-type': 'application/json' },
+      x: 660, y: 300, wires: []
+    }
+  ];
+}
+
+// ════════════════════════════════════════════════════════════════
 //  Engine tab templates (embedded in configurator.html for dynamic creation)
 // ════════════════════════════════════════════════════════════════
 
@@ -4123,7 +4488,8 @@ const allFlows = [
   ...configFlows,
   ...tlsNodes,
   ...FEEDS.flatMap(f => makeEngineTab(f)),
-  ...makeIpawsTab()
+  ...makeIpawsTab(),
+  ...makePulsepointTab()
 ];
 
 const out = path.join(__dirname, 'flows.json');
