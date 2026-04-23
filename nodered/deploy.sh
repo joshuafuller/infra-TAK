@@ -365,11 +365,12 @@ done
 
 if [ "$NR_READY" = "true" ] && [ -f "$NR_CTX_GLOBAL" ]; then
   echo "==> Pushing context via REST API (/config/deploy-restore)..."
-  # The file was already copied to the container at /data/context/global/global.json
-  _RESTORE_RESP=$(docker exec "$CONTAINER" curl -sf --max-time 10 \
+  # Read from the HOST backup file via stdin so we never depend on the container's
+  # /data/context/global/global.json, which Node-RED may overwrite at startup.
+  _RESTORE_RESP=$(docker exec -i "$CONTAINER" curl -sf --max-time 15 \
     -X POST http://localhost:1880/config/deploy-restore \
     -H 'Content-Type: application/json' \
-    -d @/data/context/global/global.json 2>/dev/null || echo "")
+    --data-binary @- 2>/dev/null < "$NR_CTX_GLOBAL" || echo "")
   if echo "$_RESTORE_RESP" | grep -q '"ok":true'; then
     _KEYS=$(echo "$_RESTORE_RESP" | grep -o '"restored":\[[^]]*\]' || echo "")
     echo "    Context restored via API ✓  $_KEYS"
