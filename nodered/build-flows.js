@@ -247,9 +247,10 @@ const FN_KML_PARSE_FIELDS = [
 //  Configurator tab — shared UI + persistence (global context)
 // ════════════════════════════════════════════════════════════════
 
-// Tablet Command: default ATAK catalog icons + CoT helpers (used by CFG tab + TC engine template)
-const TC_ICON_FIRE = '34ae1613-9645-4222-a9d2-e5f243dea2865/FireTruck.png';
-const TC_ICON_AMB  = '34ae1613-9645-4222-a9d2-e5f243dea2865/Ambulance.png';
+// Tablet Command: default ATAK OSM iconset icons + CoT helpers (used by CFG tab + TC engine template)
+// OSM iconset uid: 6d781afb-89a6-4c07-b2b9-a89748b6a38f  (Service group)
+const TC_ICON_FIRE = '6d781afb-89a6-4c07-b2b9-a89748b6a38f/firebrigade.png';
+const TC_ICON_AMB  = '6d781afb-89a6-4c07-b2b9-a89748b6a38f/emergency.png';
 
 const TC_COT_TYPE_FN = [
   "function tcCotType(r) {",
