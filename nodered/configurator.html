@@ -1324,7 +1324,11 @@
       <input type="text" id="tcAgencyName" placeholder="e.g. Corona FD" style="width:100%;box-sizing:border-box;margin-bottom:0.75rem">
 
       <label>Tablet Command Feature Service URL</label>
-      <input type="text" id="tcAgencyUrl" placeholder="https://api.tabletcommand.com/esri/tc-file/YOUR_TOKEN/FeatureServer" style="width:100%;box-sizing:border-box;margin-bottom:0.75rem">
+      <div style="display:flex;gap:0.5rem;align-items:center;margin-bottom:0.75rem">
+        <input type="text" id="tcAgencyUrl" placeholder="https://api.tabletcommand.com/esri/tc-file/YOUR_TOKEN/FeatureServer" style="flex:1;box-sizing:border-box">
+        <button id="btnTcTest" onclick="testTcConnection()" style="white-space:nowrap;padding:0.35rem 0.9rem;background:#1e40af;color:#e2e8f0;border:1px solid #334155;border-radius:6px;cursor:pointer;font-size:0.85rem">Test</button>
+      </div>
+      <div id="tcTestResult" style="display:none;margin-bottom:0.75rem;padding:0.4rem 0.75rem;border-radius:6px;font-size:0.85rem"></div>
 
       <!-- Poll interval -->
       <label>Poll interval (fastest is 1 min — Tablet Command updates AVL at most once per minute)</label>
@@ -3528,6 +3532,7 @@ function selectTcConfig(cfg) {
   document.getElementById('tcStaleMinutes').value = String(cfg.staleMinutes || '5');
   document.getElementById('tcCotStreamPort').value = cfg.cotStreamPort ? String(cfg.cotStreamPort) : '';
   document.getElementById('tcTakDestinationLabel').value = cfg.takDestinationLabel || '';
+  var _tr = document.getElementById('tcTestResult'); if (_tr) { _tr.style.display = 'none'; _tr.textContent = ''; }
   refreshTcTakRouteDisplay();
   // Load known units from server
   fetch('/tc/units/load?id=' + encodeURIComponent(cfg.id)).then(function(r){ return r.json(); }).then(function(d) {
@@ -3697,11 +3702,121 @@ async function saveTcConfig(activate) {
     await fetch('/tc/config/save', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(cfg) });
     await fetch('/tc/units/save',  { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ id: cfg.id, units: units }) });
     _tcActiveCfg = cfg;
+    if (activate) {
+      status.textContent = 'Saving & creating flow…'; status.style.color = '#94a3b8';
+      await ensureTCEngineTab(cfg.configName);
+    }
     status.textContent = '✓ Saved' + (activate ? ' & activated' : ''); status.style.color = '#4ade80';
     await renderConfigList();
     setTimeout(function(){ hideSteps(); }, 800);
   } catch(e) {
     status.textContent = 'Save failed'; status.style.color = '#f87171';
+  }
+}
+
+async function ensureTCEngineTab(configName) {
+  if (!configName || !configName.trim()) return;
+  var feedId = feedIdFromName(configName);
+  var tabId = 'flow_tc_' + feedId;
+  var tabLabel = 'TC: ' + configName;
+
+  try {
+    var check = await fetch('/flow/' + tabId);
+    if (check.ok) return;
+  } catch(e) {}
+
+  // Also check if a tab with this label already exists
+  try {
+    var allFlows = await fetch('/flows').then(function(r) { return r.json(); });
+    var existing = allFlows.find(function(n) { return n.type === 'tab' && n.label === tabLabel; });
+    if (existing) return;
+  } catch(e) {}
+
+  var safeName = configName.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  var raw = TC_ENGINE_TAB_TEMPLATE;
+  raw = raw.replace(/__FEED_ID__/g, feedId);
+  raw = raw.replace(/__CONFIG_NAME__/g, safeName);
+  var nodes = JSON.parse(raw);
+
+  var tab = nodes.find(function(n) { return n.type === 'tab'; });
+  var tabNodes = nodes.filter(function(n) { return n.type !== 'tab'; });
+
+  var body = {
+    id: tabId,
+    label: tabLabel,
+    disabled: false,
+    info: tab ? tab.info : '',
+    nodes: tabNodes
+  };
+
+  try {
+    var res = await fetch('/flow', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Node-RED-Deployment-Type': 'flows' },
+      body: JSON.stringify(body)
+    });
+    if (res.ok) {
+      console.log('TC engine tab created: ' + tabLabel);
+      try {
+        var allFlows2 = await fetch('/flows').then(function(r) { return r.json(); });
+        await fetch('/flows', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Node-RED-Deployment-Type': 'full' },
+          body: JSON.stringify(allFlows2)
+        });
+        console.log('Full re-deploy triggered for TC tab');
+      } catch(e2) { console.warn('TC re-deploy failed: ' + e2.message); }
+    } else {
+      console.warn('TC engine tab creation returned ' + res.status);
+    }
+  } catch(e) {
+    console.warn('TC engine tab creation failed: ' + e.message);
+  }
+}
+
+async function testTcConnection() {
+  var url = (document.getElementById('tcAgencyUrl') || {}).value || '';
+  url = url.trim();
+  var btn = document.getElementById('btnTcTest');
+  var result = document.getElementById('tcTestResult');
+  if (!url) {
+    result.style.display = 'block';
+    result.style.background = '#450a0a';
+    result.style.color = '#fca5a5';
+    result.textContent = '✗ Enter a URL first';
+    return;
+  }
+  btn.disabled = true;
+  btn.textContent = '…';
+  result.style.display = 'block';
+  result.style.background = '#1e293b';
+  result.style.color = '#94a3b8';
+  result.textContent = 'Testing connection…';
+  try {
+    var r = await fetch('/tc/config/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agencyUrl: url })
+    });
+    var d = await r.json();
+    if (d.ok) {
+      result.style.background = '#052e16';
+      result.style.color = '#86efac';
+      var info = d.name ? (' — ' + d.name) : '';
+      info += d.type ? (' (' + d.type + ')') : '';
+      result.textContent = '✓ Connected' + info;
+    } else {
+      result.style.background = '#450a0a';
+      result.style.color = '#fca5a5';
+      result.textContent = '✗ ' + (d.error || 'Connection failed');
+    }
+  } catch(e) {
+    result.style.background = '#450a0a';
+    result.style.color = '#fca5a5';
+    result.textContent = '✗ Request failed: ' + e.message;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Test';
   }
 }
 
