@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Latest release: v0.7.2-alpha** — **Tablet Command AVL integration.** Per-agency config cards in the Configurator stream fire/EMS vehicle positions from Tablet Command Feature Services directly to ATAK as live CoT events (TCP :8089, no DataSync). Each agency card includes a known-units CSV remapping table for custom callsigns and CoT types. See **[docs/RELEASE-v0.7.2-alpha.md](docs/RELEASE-v0.7.2-alpha.md)**. Prior: [v0.7.1-alpha](docs/RELEASE-v0.7.1-alpha.md) — **Critical fix: Configurator configs no longer wiped on Update Now.** Root cause: older installs without `contextStorage: localfilesystem` stored Node-RED global context in memory only — any container restart lost all configs. Fix: (1) `_auto_nodered_settings()` now detects and migrates missing `contextStorage`, safely exporting in-memory state to disk first. (2) `deploy.sh` now uses the Node-RED REST API (`/context/global`) as the primary backup source — works regardless of storage type. See **[docs/RELEASE-v0.7.1-alpha.md](docs/RELEASE-v0.7.1-alpha.md)**. Prior: [v0.7.0-alpha](docs/RELEASE-v0.7.0-alpha.md) (IPAWS KML network link, zone polygons, NAPSG icons), [v0.6.8-alpha](docs/RELEASE-v0.6.8-alpha.md) (Node-RED deploy sync fix), [v0.6.7-alpha](docs/RELEASE-v0.6.7-alpha.md) (DataSync read-only missions, shared missions), [v0.6.5-alpha](docs/RELEASE-v0.6.5-alpha.md) (KML + ArcGIS stable-ID / Purge), [v0.6.4-alpha](docs/RELEASE-v0.6.4-alpha.md). Older: [v0.6.1-alpha](docs/RELEASE-v0.6.1-alpha.md), [v0.6.0-alpha](docs/RELEASE-v0.6.0-alpha.md), [v0.5.9-alpha](docs/RELEASE-v0.5.9-alpha.md), [v0.5.8-alpha](docs/RELEASE-v0.5.8-alpha.md), [v0.5.7-alpha](docs/RELEASE-v0.5.7-alpha.md), [v0.5.6-alpha](docs/RELEASE-v0.5.6-alpha.md), [v0.5.5-alpha](docs/RELEASE-v0.5.5-alpha.md), [v0.5.4-alpha](docs/RELEASE-v0.5.4-alpha.md), [v0.5.3-alpha](docs/RELEASE-v0.5.3-alpha.md), [v0.5.2-alpha](docs/RELEASE-v0.5.2-alpha.md), [v0.5.1-alpha](docs/RELEASE-v0.5.1-alpha.md), [v0.5.0-alpha](docs/RELEASE-v0.5.0-alpha.md), [v0.4.9-alpha](docs/RELEASE-v0.4.9-alpha.md), [v0.4.8-alpha](docs/RELEASE-v0.4.8-alpha.md), [v0.4.7-alpha](docs/RELEASE-v0.4.7-alpha.md), [v0.4.6-alpha](docs/RELEASE-v0.4.6-alpha.md), [v0.4.5-alpha](docs/RELEASE-v0.4.5-alpha.md), [v0.4.4-alpha](docs/RELEASE-v0.4.4-alpha.md), [v0.4.3-alpha](docs/RELEASE-v0.4.3-alpha.md), [v0.4.2-alpha](docs/RELEASE-v0.4.2-alpha.md).
+**Latest release: v0.7.3-alpha** — **Immediate password propagation.** Password changes made in TAK Portal now take effect on ATAK/iTAK within 2 minutes instead of up to 24 hours. Root cause: the `ldap-authentication-login` User Login stage had `session_duration: seconds=0` (browser session lifetime), so Authentik's cached LDAP bind held old credentials until the cache expired. Fix: `session_duration: seconds=120`. Enforced on every Resync run — existing deployments self-heal with one Resync. See **[docs/RELEASE-v0.7.3-alpha.md](docs/RELEASE-v0.7.3-alpha.md)**. Prior: [v0.7.2-alpha](docs/RELEASE-v0.7.2-alpha.md) — **Tablet Command AVL integration.** Per-agency config cards in the Configurator stream fire/EMS vehicle positions from Tablet Command Feature Services directly to ATAK as live CoT events (TCP :8089, no DataSync). Each agency card includes a known-units CSV remapping table for custom callsigns and CoT types. See **[docs/RELEASE-v0.7.2-alpha.md](docs/RELEASE-v0.7.2-alpha.md)**. Prior: [v0.7.1-alpha](docs/RELEASE-v0.7.1-alpha.md) — **Critical fix: Configurator configs no longer wiped on Update Now.** Root cause: older installs without `contextStorage: localfilesystem` stored Node-RED global context in memory only — any container restart lost all configs. Fix: (1) `_auto_nodered_settings()` now detects and migrates missing `contextStorage`, safely exporting in-memory state to disk first. (2) `deploy.sh` now uses the Node-RED REST API (`/context/global`) as the primary backup source — works regardless of storage type. See **[docs/RELEASE-v0.7.1-alpha.md](docs/RELEASE-v0.7.1-alpha.md)**. Prior: [v0.7.0-alpha](docs/RELEASE-v0.7.0-alpha.md) (IPAWS KML network link, zone polygons, NAPSG icons), [v0.6.8-alpha](docs/RELEASE-v0.6.8-alpha.md) (Node-RED deploy sync fix), [v0.6.7-alpha](docs/RELEASE-v0.6.7-alpha.md) (DataSync read-only missions, shared missions), [v0.6.5-alpha](docs/RELEASE-v0.6.5-alpha.md) (KML + ArcGIS stable-ID / Purge), [v0.6.4-alpha](docs/RELEASE-v0.6.4-alpha.md). Older: [v0.6.1-alpha](docs/RELEASE-v0.6.1-alpha.md), [v0.6.0-alpha](docs/RELEASE-v0.6.0-alpha.md), [v0.5.9-alpha](docs/RELEASE-v0.5.9-alpha.md), [v0.5.8-alpha](docs/RELEASE-v0.5.8-alpha.md), [v0.5.7-alpha](docs/RELEASE-v0.5.7-alpha.md), [v0.5.6-alpha](docs/RELEASE-v0.5.6-alpha.md), [v0.5.5-alpha](docs/RELEASE-v0.5.5-alpha.md), [v0.5.4-alpha](docs/RELEASE-v0.5.4-alpha.md), [v0.5.3-alpha](docs/RELEASE-v0.5.3-alpha.md), [v0.5.2-alpha](docs/RELEASE-v0.5.2-alpha.md), [v0.5.1-alpha](docs/RELEASE-v0.5.1-alpha.md), [v0.5.0-alpha](docs/RELEASE-v0.5.0-alpha.md), [v0.4.9-alpha](docs/RELEASE-v0.4.9-alpha.md), [v0.4.8-alpha](docs/RELEASE-v0.4.8-alpha.md), [v0.4.7-alpha](docs/RELEASE-v0.4.7-alpha.md), [v0.4.6-alpha](docs/RELEASE-v0.4.6-alpha.md), [v0.4.5-alpha](docs/RELEASE-v0.4.5-alpha.md), [v0.4.4-alpha](docs/RELEASE-v0.4.4-alpha.md), [v0.4.3-alpha](docs/RELEASE-v0.4.3-alpha.md), [v0.4.2-alpha](docs/RELEASE-v0.4.2-alpha.md).
 
 **Something broken?** Wrong sidebar version, **Update Now** error, merge/rebase/tag-clobber messages, or you are not sure the VPS ever pulled the real repo → go to **[Universal recovery (SSH)](#universal-recovery-ssh)** and run the one block there. **Point people at that section**; it is the single source of truth.
 
@@ -299,6 +299,29 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v0.7.3-alpha — 2026-04-23
+
+**Immediate password propagation — LDAP session cache fix**
+- **Root cause:** Authentik LDAP outpost uses `bind_mode: cached`. The `ldap-authentication-login` User Login stage had `session_duration: seconds=0` — defaulting to a full browser session (~24 hours). Password changes in TAK Portal did not invalidate the cached bind, so old credentials worked for up to 24 hours after a reset.
+- **Fix:** `session_duration: seconds=120` on the `ldap-authentication-login` stage. Cached LDAP sessions now expire in 2 minutes. New password takes effect on the device immediately after the cache clears.
+- **Self-healing:** Every **Resync LDAP to TAK Server** run patches the live stage — existing deployments converge automatically.
+- **Note:** `token_validity` on the LDAP provider (a previous investigation path) is silently ignored by Authentik for LDAP providers. `session_duration` on the login stage is the only effective knob.
+
+Full notes: [docs/RELEASE-v0.7.3-alpha.md](docs/RELEASE-v0.7.3-alpha.md).
+
+---
+
+### v0.7.2-alpha — 2026-04-23
+
+**Tablet Command AVL Integration**
+- Stream fire/EMS/law vehicle positions from Tablet Command Feature Services to ATAK as live CoT events (TCP :8089, no DataSync).
+- Per-agency config cards in the Configurator; each card includes a known-units CSV remapping table for custom callsigns and CoT types.
+- CoT type auto-detection from radio name prefix (engine, truck, medic, chief, helicopter, water tender, rescue).
+
+Full notes: [docs/RELEASE-v0.7.2-alpha.md](docs/RELEASE-v0.7.2-alpha.md).
+
+---
 
 ### v0.6.6-alpha — 2026-04-20
 
