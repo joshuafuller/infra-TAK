@@ -1215,23 +1215,67 @@
     "y": 1215,
     "wires": [
       [
-        "fn_tc_test"
+        "fn_tc_test_build"
       ]
     ]
   },
   {
-    "id": "fn_tc_test",
+    "id": "fn_tc_test_build",
     "type": "function",
     "z": "flow_arcgis_cfg",
-    "name": "Test TC endpoint",
-    "func": "var body = msg.payload || {};\nvar agencyUrl = (body.agencyUrl || '').trim().replace(/\\/+$/, '');\nif (!agencyUrl) {\n  msg.payload = { ok: false, error: 'No URL provided' };\n  return msg;\n}\nvar https = require('https');\nvar http = require('http');\nvar url = require('url');\nvar testUrl = agencyUrl + '/0?f=json';\nvar parsed = url.parse(testUrl);\nvar lib = parsed.protocol === 'https:' ? https : http;\nvar opts = {\n  hostname: parsed.hostname,\n  port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),\n  path: parsed.path,\n  method: 'GET',\n  rejectUnauthorized: false,\n  headers: { 'User-Agent': 'infra-TAK/tc-test', 'Accept': 'application/json' },\n  timeout: 10000\n};\nvar send = node.send.bind(node);\nvar req = lib.request(opts, function(res) {\n  var raw = '';\n  res.on('data', function(c){ raw += c; });\n  res.on('end', function() {\n    try {\n      var d = JSON.parse(raw);\n      if (d.error) {\n        msg.payload = { ok: false, error: 'Service error: ' + (d.error.message || JSON.stringify(d.error)) };\n      } else {\n        msg.payload = {\n          ok: true,\n          name: d.name || d.serviceName || 'Unnamed service',\n          type: d.type || d.geometryType || '',\n          featureCount: (d.count != null) ? d.count : null,\n          status: res.statusCode\n        };\n      }\n    } catch(e) {\n      msg.payload = { ok: res.statusCode < 400, status: res.statusCode, raw: raw.substring(0, 200) };\n    }\n    send(msg);\n  });\n});\nreq.on('error', function(e) {\n  msg.payload = { ok: false, error: e.message };\n  send(msg);\n});\nreq.on('timeout', function() {\n  req.destroy();\n  msg.payload = { ok: false, error: 'Connection timed out (10s)' };\n  send(msg);\n});\nreq.end();\nreturn;",
+    "name": "Build TC test URL",
+    "func": "var body = msg.payload || {};\nvar agencyUrl = (body.agencyUrl || '').trim().replace(/\\/+$/, '');\nif (!agencyUrl) {\n  msg.payload = { ok: false, error: 'No URL provided' };\n  msg._tcTestSkip = true;\n  return msg;\n}\nmsg._tcTestOriginReq = msg.req;\nmsg._tcTestOriginRes = msg.res;\nmsg.url = agencyUrl + '/0?f=json';\nmsg.method = 'GET';\nmsg.headers = { 'User-Agent': 'infra-TAK/tc-test', 'Accept': 'application/json' };\nreturn msg;",
     "outputs": 1,
     "timeout": "",
     "noerr": 0,
     "initialize": "",
     "finalize": "",
     "libs": [],
-    "x": 430,
+    "x": 410,
+    "y": 1215,
+    "wires": [
+      [
+        "http_tc_test"
+      ]
+    ]
+  },
+  {
+    "id": "http_tc_test",
+    "type": "http request",
+    "z": "flow_arcgis_cfg",
+    "name": "GET TC layer info",
+    "method": "GET",
+    "ret": "obj",
+    "paytoqs": "ignore",
+    "url": "",
+    "tls": "",
+    "persist": false,
+    "proxy": "",
+    "insecureHTTPParser": false,
+    "authType": "",
+    "senderror": false,
+    "headers": [],
+    "x": 620,
+    "y": 1215,
+    "wires": [
+      [
+        "fn_tc_test_parse"
+      ]
+    ]
+  },
+  {
+    "id": "fn_tc_test_parse",
+    "type": "function",
+    "z": "flow_arcgis_cfg",
+    "name": "Parse TC test result",
+    "func": "if (msg._tcTestSkip) { return msg; }\nvar d = msg.payload || {};\nvar sc = msg.statusCode || 200;\nif (d.error) {\n  msg.payload = { ok: false, error: 'Service error: ' + (d.error.message || JSON.stringify(d.error)) };\n} else if (sc >= 400) {\n  msg.payload = { ok: false, error: 'HTTP ' + sc };\n} else {\n  msg.payload = {\n    ok: true,\n    name: d.name || d.serviceName || 'Feature Layer',\n    type: d.geometryType || d.type || '',\n    status: sc\n  };\n}\nmsg.req = msg._tcTestOriginReq;\nmsg.res = msg._tcTestOriginRes;\nreturn msg;",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 820,
     "y": 1215,
     "wires": [
       [
@@ -1248,7 +1292,7 @@
     "headers": {
       "content-type": "application/json"
     },
-    "x": 640,
+    "x": 1020,
     "y": 1215,
     "wires": []
   },
