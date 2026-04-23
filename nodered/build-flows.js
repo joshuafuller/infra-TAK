@@ -246,6 +246,82 @@ const FN_KML_PARSE_FIELDS = [
 //  Configurator tab — shared UI + persistence (global context)
 // ════════════════════════════════════════════════════════════════
 
+// Tablet Command: default ATAK catalog icons + CoT helpers (used by CFG tab + TC engine template)
+const TC_ICON_FIRE = '34ae1613-9645-4222-a9d2-e5f243dea2865/FireTruck.png';
+const TC_ICON_AMB  = '34ae1613-9645-4222-a9d2-e5f243dea2865/Ambulance.png';
+
+const TC_COT_TYPE_FN = [
+  "function tcCotType(r) {",
+  "  r = (r||'').toUpperCase().replace(/\\s+/g,'');",
+  "  if (/^E\\d|^ENG/.test(r))                       return 'a-f-G-E-V-C'; // Engine",
+  "  if (/^(T|TRK|LAD|TK)\\d/.test(r))               return 'a-f-G-E-V-C'; // Truck/Ladder",
+  "  if (/^(M|MED|AMB|ALS|BLS)\\d/.test(r))          return 'a-f-G-E-V-M'; // Medical",
+  "  if (/^(BC|BAT|CHIEF|AC|DC|DIV|CMD)/.test(r))    return 'a-f-G-E-V-C'; // Chief/Command",
+  "  if (/^(H|HELO|AIR|HT|CHP)\\d/.test(r))          return 'a-f-A-C-H';   // Helicopter",
+  "  if (/^(WT|WAT|WATER)\\d/.test(r))               return 'a-f-G-E-V-C'; // Water Tender",
+  "  if (/^(RES|RESCUE|SQ|SQUAD)\\d/.test(r))        return 'a-f-G-E-V-C'; // Rescue/Squad",
+  "  if (/^(HAZ|HM)\\d/.test(r))                     return 'a-f-G-E-V-C'; // Hazmat",
+  "  return 'a-f-G-E-V-C'; // default: friendly ground vehicle",
+  "}",
+  "function tcDefaultIconset(ct) {",
+  "  if (ct === 'a-f-G-E-V-M') return '" + TC_ICON_AMB + "';",
+  "  if (ct === 'a-f-A-C-H') return '';",
+  "  return '" + TC_ICON_FIRE + "';",
+  "}"
+].join('\n');
+
+const FN_TC_FEED_SNAPSHOT = [
+  TC_COT_TYPE_FN,
+  '',
+  'var body = msg.payload || {};',
+  "var agencyUrl = (body.agencyUrl || '').trim();",
+  'if (!agencyUrl) { msg.payload = { ok:false, error:"agencyUrl required" }; return msg; }',
+  'var parsed;',
+  'try { parsed = new URL(agencyUrl); } catch (e) { msg.payload = { ok:false, error:"invalid URL" }; return msg; }',
+  "if (parsed.protocol !== 'https:') { msg.payload = { ok:false, error:'https only' }; return msg; }",
+  "if (!/tabletcommand\\.com$/i.test(parsed.hostname)) { msg.payload = { ok:false, error:'hostname must end with tabletcommand.com' }; return msg; }",
+  "var base = agencyUrl.replace(/\\/+$/, '');",
+  "var qurl = base + '/0/query?where=1%3D1&outFields=*&returnGeometry=false&f=json';",
+  "var https = global.get('nodeHttps');",
+  'if (!https) { msg.payload = { ok:false, error:"nodeHttps missing in Node-RED functionGlobalContext" }; return msg; }',
+  "https.get(qurl, { headers: { 'User-Agent': 'infra-TAK/tc-feed-snapshot' } }, function (res) {",
+  "  var chunks = [];",
+  "  res.on('data', function (d) { chunks.push(d); });",
+  "  res.on('end', function () {",
+  '    try {',
+  "      var txt = Buffer.concat(chunks).toString('utf8');",
+  '      var data = JSON.parse(txt);',
+  "      if (res.statusCode !== 200) { msg.payload = { ok:false, error:'HTTP '+res.statusCode, body: txt.slice(0,500) }; return node.send(msg); }",
+  '      var feats = data.features || [];',
+  '      function escCell(s) {',
+  "        s = String(s == null ? '' : s);",
+  "        if (/[\",\\n\\r]/.test(s)) return '\"' + s.replace(/\"/g,'\"\"') + '\"';",
+  '        return s;',
+  '      }',
+  "      var lines = ['radioName,callsign,cotType,iconsetpath'];",
+  '      var seen = {};',
+  '      feats.forEach(function (f) {',
+  "        var a = f.attributes || {};",
+  "        var radio = (a.radioName || '').trim();",
+  '        if (!radio || seen[radio]) return;',
+  '        seen[radio] = true;',
+  "        var ct = tcCotType(radio);",
+  "        var ic = tcDefaultIconset(ct);",
+  "        lines.push([escCell(radio), escCell(radio), escCell(ct), escCell(ic)].join(','));",
+  '      });',
+  "      msg.payload = { ok:true, count: Object.keys(seen).length, csv: lines.join('\\n') };",
+  '    } catch (e) {',
+  "      msg.payload = { ok:false, error: e.message };",
+  '    }',
+  '    node.send(msg);',
+  '  });',
+  "}).on('error', function (e) {",
+  "  msg.payload = { ok:false, error: e.message };",
+  '  node.send(msg);',
+  '});',
+  'return null;'
+].join('\n');
+
 const configFlows = [
   {
     id: CFG_TAB, type: 'tab',
@@ -917,6 +993,26 @@ const configFlows = [
     id: 'ho_tc_units_load', type: 'http response', z: CFG_TAB,
     name: '', statusCode: '200', headers: { 'content-type': 'application/json' },
     x: 640, y: 1160, wires: []
+  },
+  {
+    id: 'hi_tc_feed_snapshot', type: 'http in', z: CFG_TAB,
+    name: 'POST /tc/feed/snapshot',
+    url: '/tc/feed/snapshot', method: 'post',
+    upload: false, swaggerDoc: '',
+    x: 200, y: 1200, wires: [['fn_tc_feed_snapshot']]
+  },
+  {
+    id: 'fn_tc_feed_snapshot', type: 'function', z: CFG_TAB,
+    name: 'TC live feed → CSV template',
+    func: FN_TC_FEED_SNAPSHOT,
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 430, y: 1200, wires: [['ho_tc_feed_snapshot']]
+  },
+  {
+    id: 'ho_tc_feed_snapshot', type: 'http response', z: CFG_TAB,
+    name: '', statusCode: '200', headers: { 'content-type': 'application/json' },
+    x: 640, y: 1200, wires: []
   },
 
   // ── Config backup list / restore ──
@@ -3180,21 +3276,6 @@ function makeTfrEngineTab(feed) {
 //  Schema: latitude, longitude, radioName, time(epoch ms), vehicleStatus
 // ════════════════════════════════════════════════════════════════
 
-const TC_COT_TYPE_FN = [
-  "function tcCotType(r) {",
-  "  r = (r||'').toUpperCase().replace(/\\s+/g,'');",
-  "  if (/^E\\d|^ENG/.test(r))                       return 'a-f-G-E-V-C'; // Engine",
-  "  if (/^(T|TRK|LAD|TK)\\d/.test(r))               return 'a-f-G-E-V-C'; // Truck/Ladder",
-  "  if (/^(M|MED|AMB|ALS|BLS)\\d/.test(r))          return 'a-f-G-E-V-M'; // Medical",
-  "  if (/^(BC|BAT|CHIEF|AC|DC|DIV|CMD)/.test(r))    return 'a-f-G-E-V-C'; // Chief/Command",
-  "  if (/^(H|HELO|AIR|HT|CHP)\\d/.test(r))          return 'a-f-A-C-H';   // Helicopter",
-  "  if (/^(WT|WAT|WATER)\\d/.test(r))               return 'a-f-G-E-V-C'; // Water Tender",
-  "  if (/^(RES|RESCUE|SQ|SQUAD)\\d/.test(r))        return 'a-f-G-E-V-C'; // Rescue/Squad",
-  "  if (/^(HAZ|HM)\\d/.test(r))                     return 'a-f-G-E-V-C'; // Hazmat",
-  "  return 'a-f-G-E-V-C'; // default: friendly ground vehicle",
-  "}"
-].join('\n');
-
 function makeTCEngineTab(feed) {
   const FID = 'flow_tc_' + feed.id;
   const P   = feed.id + '_tc_';
@@ -3254,8 +3335,16 @@ function makeTCEngineTab(feed) {
     "  var ov    = knownUnits[radioName] || knownUnits[radioName.toUpperCase()] || {};",
     "  var callsign = ov.callsign || radioName;",
     "  var cotType  = ov.cotType  || tcCotType(radioName);",
+    "  var iconRaw  = (ov.iconsetpath && String(ov.iconsetpath).trim()) || '';",
+    "  var iconpath = iconRaw || tcDefaultIconset(cotType);",
     "  var remarks  = (cfg.configName||'TC') + ' | ' + radioName",
     "                 + ' | Status: ' + (a.vehicleStatus||'') + ' | ' + ts.toLocaleString();",
+    "  var detail = {",
+    "    contact: [{ _attributes:{ callsign:callsign } }],",
+    "    remarks: remarks,",
+    "    status:  [{ _attributes:{ readiness:'true' } }]",
+    "  };",
+    "  if (iconpath) detail.usericon = [{ _attributes: { iconsetpath: iconpath } }];",
     "  var cotMsg = {",
     "    payload: {",
     "      event: {",
@@ -3265,11 +3354,7 @@ function makeTCEngineTab(feed) {
     "          time:ts.toISOString(), start:ts.toISOString(), stale:stale.toISOString()",
     "        },",
     "        point:  { _attributes:{ lat:String(lat), lon:String(lon), hae:'9999999.0', ce:'50', le:'9999999.0' } },",
-    "        detail: {",
-    "          contact: [{ _attributes:{ callsign:callsign } }],",
-    "          remarks: remarks,",
-    "          status:  [{ _attributes:{ readiness:'true' } }]",
-    "        }",
+    "        detail: detail",
     "      }",
     "    },",
     "    host: host,",
