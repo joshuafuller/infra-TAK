@@ -1190,6 +1190,40 @@ const configFlows = [
     x: 640, y: 1300, wires: []
   },
 
+  // ── Deploy-time context restore (called by deploy.sh after container starts) ──
+  // Accepts the full backed-up context JSON and pushes it into global context via
+  // global.set() so it works regardless of contextStorage backend (memory or filesystem).
+  {
+    id: 'hi_deploy_restore', type: 'http in', z: CFG_TAB,
+    name: 'POST /config/deploy-restore',
+    url: '/config/deploy-restore', method: 'post',
+    upload: false, swaggerDoc: '',
+    x: 200, y: 1340, wires: [['fn_deploy_restore']]
+  },
+  {
+    id: 'fn_deploy_restore', type: 'function', z: CFG_TAB,
+    name: 'Deploy restore — set global context',
+    func: [
+      "var d = msg.payload || {};",
+      "var restored = [];",
+      "var KEYS = ['arcgis_configs','tc_configs','tak_settings','ipaws_config','pulsepoint_config',",
+      "            'tfr_config','kml_configs','pp_config'];",
+      "KEYS.forEach(function(k) {",
+      "  if (d[k] !== undefined) { global.set(k, d[k]); restored.push(k); }",
+      "});",
+      "msg.payload = { ok: true, restored: restored };",
+      "return msg;"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 440, y: 1340, wires: [['ho_deploy_restore']]
+  },
+  {
+    id: 'ho_deploy_restore', type: 'http response', z: CFG_TAB,
+    name: '', statusCode: '200', headers: { 'content-type': 'application/json' },
+    x: 660, y: 1340, wires: []
+  },
+
   // ── Force re-subscribe ──
   {
     id: 'hi_force_sub', type: 'http in', z: CFG_TAB,

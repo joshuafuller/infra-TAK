@@ -290,11 +290,43 @@ docker exec "$CONTAINER" node -e "
   fi
 done
 
+# ── Patch settings.js on the HOST before the stop/start cycle ────────────────
+# settings.js lives at ~/node-red/settings.js on the host and is volume-mounted
+# into the container.  We patch it here (no docker exec needed) so Node-RED reads
+# contextStorage:localfilesystem on restart and picks up the global.json file copy.
+echo "==> Ensuring contextStorage:localfilesystem in settings.js"
+NR_SETTINGS_HOST="$HOME/node-red/settings.js"
+if [ -f "$NR_SETTINGS_HOST" ]; then
+  if ! grep -q 'contextStorage' "$NR_SETTINGS_HOST" 2>/dev/null; then
+    echo "    $NR_SETTINGS_HOST: adding contextStorage (localfilesystem)"
+    node -e "
+      var fs = require('fs');
+      var src = fs.readFileSync('$NR_SETTINGS_HOST', 'utf8');
+      src = src.replace(/^};\\s*\$/m,
+        ',\\n  contextStorage: {\\n    default: { module: \"localfilesystem\" }\\n  }\\n};');
+      if (src.indexOf('contextStorage') === -1) {
+        src = src.trimEnd() + '\\nmodule.exports = Object.assign(module.exports || {}, {\\n  contextStorage: { default: { module: \"localfilesystem\" } }\\n});\\n';
+      }
+      fs.writeFileSync('$NR_SETTINGS_HOST', src);
+      console.log('    contextStorage written to $NR_SETTINGS_HOST');
+    " 2>&1 | sed 's/^/    /' || true
+  else
+    echo "    settings.js: contextStorage already present ✓"
+  fi
+else
+  echo "    WARNING: settings.js not found at $NR_SETTINGS_HOST"
+  echo "    API-based restore (post-startup) will ensure configs survive regardless."
+fi
+
 # Copy merged flows to host, then stop Node-RED before writing /data/flows.json.
 # Writing flows.json while NR is running can hot-reload; the migration inject may run before
 # global context is loaded from disk and empty state can be persisted — wiping Configurator saves.
 echo "==> Installing merged flows (stop → write → restore context → start)"
 docker cp "$CONTAINER:/tmp/flows_merged.json" "/tmp/flows_merged.json"
+
+# Pre-create context dirs while the container is still running (docker exec fails on stopped containers)
+docker exec "$CONTAINER" mkdir -p /data/context/global /data/context/flow 2>/dev/null || true
+
 docker stop -t 30 "$CONTAINER"
 docker cp "/tmp/flows_merged.json" "$CONTAINER:/data/flows.json"
 # Restore credentials file so TLS cert data survives the deploy
@@ -302,43 +334,55 @@ if [ -f "/tmp/flows_cred_backup.json" ]; then
   docker cp "/tmp/flows_cred_backup.json" "$CONTAINER:/data/flows_cred.json"
   echo "    Credentials: restored"
 fi
+# Write the context file so Node-RED reads it on startup (requires contextStorage:localfilesystem)
 if [ -f "$NR_CTX_GLOBAL" ]; then
-  # Ensure the context directory exists inside the container (may be missing on fresh volumes)
-  docker exec "$CONTAINER" mkdir -p /data/context/global 2>/dev/null || true
   docker cp "$NR_CTX_GLOBAL" "$CONTAINER:/data/context/global/global.json"
-  echo "    Context: restored global (arcgis_configs / tak_settings)"
+  echo "    Context file: written to /data/context/global/global.json"
 fi
 if [ -f "$NR_CTX_FLOW_CFG" ]; then
-  docker exec "$CONTAINER" mkdir -p /data/context/flow 2>/dev/null || true
   docker cp "$NR_CTX_FLOW_CFG" "$CONTAINER:/data/context/flow/flow_arcgis_cfg.json"
-  echo "    Context: restored flow tab (legacy migration source)"
+  echo "    Context file: restored flow tab (legacy)"
 fi
-rm -f /tmp/flows_current.json /tmp/flows_cred_backup.json /tmp/flows_merged.json "$NR_CTX_GLOBAL" "$NR_CTX_FLOW_CFG"
-
-# Ensure contextStorage:localfilesystem is in settings.js so Node-RED actually reads
-# global.json from disk on startup.  Without this, an older install (memory-only context)
-# will boot with empty in-memory state and wipe all Configurator configs.
-NR_SETTINGS=""
-for _p in /data/settings.js /usr/src/node-red/settings.js; do
-  if docker exec "$CONTAINER" test -f "$_p" 2>/dev/null; then
-    NR_SETTINGS="$_p"
-    break
-  fi
-done
-if [ -n "$NR_SETTINGS" ]; then
-  HAS_CTX=$(docker exec "$CONTAINER" grep -c 'contextStorage' "$NR_SETTINGS" 2>/dev/null || echo 0)
-  if [ "$HAS_CTX" = "0" ]; then
-    echo "    settings.js: adding contextStorage (localfilesystem) — required for config persistence"
-    docker exec "$CONTAINER" sed -i 's/^};$/,\n  contextStorage: {\n    default: { module: "localfilesystem" }\n  }\n};/' "$NR_SETTINGS"
-  else
-    echo "    settings.js: contextStorage already present ✓"
-  fi
-else
-  echo "    settings.js: not found in container — skipping contextStorage check"
-fi
+rm -f /tmp/flows_current.json /tmp/flows_cred_backup.json /tmp/flows_merged.json
 
 docker start "$CONTAINER"
 docker exec "$CONTAINER" sh -c "rm -f /tmp/flows_*.json /tmp/build-flows.js /tmp/configurator.html" 2>/dev/null || true
+
+# ── Post-startup API context restore (belt-and-suspenders) ────────────────────
+# Push the backed-up context via the new /config/deploy-restore Node-RED endpoint.
+# This works regardless of contextStorage backend — sets values directly in live memory.
+# Combined with the file copy above (localfilesystem) this is a double guarantee.
+echo "==> Waiting for Node-RED to be ready..."
+NR_READY=false
+for _i in $(seq 1 30); do
+  if docker exec "$CONTAINER" curl -sf --max-time 3 http://localhost:1880/context/global > /dev/null 2>&1; then
+    NR_READY=true
+    echo "    Node-RED ready (${_i}s)"
+    break
+  fi
+  sleep 1
+done
+
+if [ "$NR_READY" = "true" ] && [ -f "$NR_CTX_GLOBAL" ]; then
+  echo "==> Pushing context via REST API (/config/deploy-restore)..."
+  # The file was already copied to the container at /data/context/global/global.json
+  _RESTORE_RESP=$(docker exec "$CONTAINER" curl -sf --max-time 10 \
+    -X POST http://localhost:1880/config/deploy-restore \
+    -H 'Content-Type: application/json' \
+    -d @/data/context/global/global.json 2>/dev/null || echo "")
+  if echo "$_RESTORE_RESP" | grep -q '"ok":true'; then
+    _KEYS=$(echo "$_RESTORE_RESP" | grep -o '"restored":\[[^]]*\]' || echo "")
+    echo "    Context restored via API ✓  $_KEYS"
+  else
+    echo "    WARNING: API restore returned: $_RESTORE_RESP"
+    echo "    Context may still be loaded from the file written above — check the UI."
+  fi
+elif [ "$NR_READY" = "false" ]; then
+  echo "    WARNING: Node-RED did not become ready within 30s — skipping API restore"
+  echo "    Config file was already written to /data/context/global/global.json"
+fi
+# Always clean up host temp files
+rm -f "$NR_CTX_GLOBAL" "$NR_CTX_FLOW_CFG"
 
 echo ""
 echo "==> Deploy complete."
