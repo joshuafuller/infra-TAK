@@ -3464,7 +3464,7 @@ function makeTCEngineTab(feed) {
       id: P+'tcp_out', type: 'tcp out', z: FID,
       name: 'CoT -> TAK :8089',
       host: 'host.docker.internal', port: '8089', beserver: 'client',
-      base64: false, doend: false, addCR: false,
+      base64: false, doend: false, addCR: false, tls: 'tls_tak',
       x: 520, y: 200, wires: []
     },
     {
@@ -4413,7 +4413,7 @@ function makePulsepointTab() {
       id: Z + '_tcp_out', type: 'tcp out', z: Z,
       name: 'CoT -> TAK (PulsePoint port)',
       host: 'host.docker.internal', port: '8089', beserver: 'client',
-      base64: false, doend: false, addCR: false,
+      base64: false, doend: false, addCR: false, tls: 'tls_tak',
       x: 1360, y: 100, wires: []
     },
     {
