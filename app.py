@@ -20126,6 +20126,7 @@ entries:
       authorization_flow: !KeyOf ldap-authentication-flow
       base_dn: !Context basedn
       bind_mode: cached
+      token_validity: "minutes=2"
       gid_start_number: 4000
       invalidation_flow: !Find [authentik_flows.flow, [slug, default-invalidation-flow]]
       mfa_support: false
@@ -21167,6 +21168,7 @@ entries:
       authorization_flow: !KeyOf ldap-authentication-flow
       base_dn: !Context basedn
       bind_mode: cached
+      token_validity: "minutes=2"
       gid_start_number: 4000
       invalidation_flow: !Find [authentik_flows.flow, [slug, default-invalidation-flow]]
       mfa_support: false
@@ -21731,6 +21733,7 @@ entries:
                                     data=json.dumps({'name': 'LDAP', 'authentication_flow': ldap_bind_flow,
                                         'authorization_flow': ldap_bind_flow, 'invalidation_flow': inv_flow_pk,
                                         'base_dn': 'DC=takldap', 'bind_mode': 'cached',
+                                        'token_validity': 'minutes=2',
                                         'search_mode': 'cached', 'mfa_support': False}).encode(),
                                     headers=ak_headers, method='POST')
                                 resp = urllib.request.urlopen(req, timeout=10)
@@ -23295,6 +23298,7 @@ def _ensure_ldap_flow_authentication_none():
                         'authentication_flow': ldap_flow_pk,
                         'authorization_flow': ldap_flow_pk,
                         'bind_mode': 'cached',
+                        'token_validity': 'minutes=2',
                         'search_mode': 'cached'})
                 except urllib.error.HTTPError as e:
                     body = ''
@@ -23342,6 +23346,7 @@ def _ensure_ldap_flow_authentication_none():
                     'authentication_flow': new_flow_pk,
                     'authorization_flow': new_flow_pk,
                     'bind_mode': 'cached',
+                    'token_validity': 'minutes=2',
                     'search_mode': 'cached'})
     except urllib.error.HTTPError as e:
         try:
