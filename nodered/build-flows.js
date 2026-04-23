@@ -3361,14 +3361,14 @@ function makeTCEngineTab(feed) {
   const P   = feed.id + '_tc_';
 
   const FN_TC_INIT = [
-    "var cfg = (global.get('tc_configs')||[]).find(function(c){return c.id==='"+feed.id+"';});",
+    "var cfg = (global.get('tc_configs')||[]).find(function(c){return c.configName==='"+feed.configName+"';});",
     "global.set('tc_last_fetch_"+feed.id+"', 0); // force immediate first poll",
     "if (!cfg) { node.warn('TC "+feed.configName+": config not found in global context'); return null; }",
     "return msg;"
   ].join('\n');
 
   const FN_TC_POLL = [
-    "var cfg = (global.get('tc_configs')||[]).find(function(c){return c.id==='"+feed.id+"';});",
+    "var cfg = (global.get('tc_configs')||[]).find(function(c){return c.configName==='"+feed.configName+"';});",
     "if (!cfg || !cfg.activated) return null;",
     "var intervalMs = Math.max(1, cfg.pollInterval||1) * 60000;",
     "var lastFetch  = global.get('tc_last_fetch_"+feed.id+"') || 0;",
@@ -3377,7 +3377,7 @@ function makeTCEngineTab(feed) {
   ].join('\n');
 
   const FN_TC_BUILD_URL = [
-    "var cfg = (global.get('tc_configs')||[]).find(function(c){return c.id==='"+feed.id+"';});",
+    "var cfg = (global.get('tc_configs')||[]).find(function(c){return c.configName==='"+feed.configName+"';});",
     "if (!cfg || !cfg.activated) return null;",
     "var base = (cfg.agencyUrl||'').replace(/\\/+$/,'');",
     "msg.url    = base + '/0/query?where=1%3D1&outFields=*&returnGeometry=false&f=json';",
@@ -3390,7 +3390,7 @@ function makeTCEngineTab(feed) {
   const FN_TC_BUILD_COT = [
     TC_COT_TYPE_FN,
     "",
-    "var cfg   = msg._tcCfg || (global.get('tc_configs')||[]).find(function(c){return c.id==='"+feed.id+"';}) || {};",
+    "var cfg   = msg._tcCfg || (global.get('tc_configs')||[]).find(function(c){return c.configName==='"+feed.configName+"';}) || {};",
     "var data  = msg.payload || {};",
     "var feats = data.features || [];",
     "var knownUnits = global.get('tc_units_"+feed.id+"') || {};",
