@@ -2974,6 +2974,24 @@ async function loadSavedConfigs() {
   ]);
 
   var hasAnything = _savedConfigs.length > 0 || _ipawsActiveCfg || _pulsepointActiveCfg || _extraCounts > 0;
+
+  // Auto-restore from latest.json if context appears empty (e.g. after full deploy timing race)
+  if (!hasAnything) {
+    try {
+      var _ar = await fetch('/config/restore', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filename: 'latest.json' }) });
+      var _ad = await _ar.json();
+      if (_ad.ok && (_ad.arcgis_count > 0 || _ad.tc_count > 0)) {
+        console.log('Auto-restored from latest.json:', _ad);
+        _savedConfigs = []; _extraCounts = 0;
+        await Promise.allSettled([
+          fetch('/arcgis-tak/config/load').then(function(r){return r.json();}).then(function(d){ var c=d.configs; _savedConfigs = Array.isArray(c)?c:[]; }).catch(function(){}),
+          fetch('/tc/config/load').then(function(r){return r.json();}).then(function(d){ _extraCounts += (d.configs||[]).length; }).catch(function(){})
+        ]);
+        hasAnything = _savedConfigs.length > 0 || _ipawsActiveCfg || _pulsepointActiveCfg || _extraCounts > 0;
+      }
+    } catch(_are) { console.warn('Auto-restore attempt failed:', _are.message); }
+  }
+
   if (!hasAnything) {
     document.getElementById('savedConfigBar').style.display = 'none';
     showSteps();
@@ -3872,7 +3890,7 @@ async function ensureTCEngineTab(configName, cotStreamPort) {
         console.log('Full re-deploy triggered for TC tab');
         // Full deploy may reinitialize context from disk before the last global.set() was
         // flushed. Restore from the backup file that CFG_BACKUP_SNIPPET wrote during save.
-        await new Promise(function(r){ setTimeout(r, 1500); }); // wait for NR to settle
+        await new Promise(function(r){ setTimeout(r, 4000); }); // wait for NR to settle after full deploy
         try {
           var restoreRes = await fetch('/config/restore', {
             method: 'POST',

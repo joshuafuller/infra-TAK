@@ -936,9 +936,11 @@ const configFlows = [
     id: 'fn_tc_load', type: 'function', z: CFG_TAB,
     name: 'Load TC configs',
     func: [
-      "var _raw = global.get('tc_configs'); if (_raw && typeof _raw === 'object' && !Array.isArray(_raw) && 'msg' in _raw) { try { _raw = JSON.parse(_raw.msg); } catch(e) { _raw = []; } }",
+      "var _raw = global.get('tc_configs');",
+      "if (_raw && typeof _raw === 'object' && !Array.isArray(_raw) && 'msg' in _raw) { try { _raw = JSON.parse(_raw.msg); } catch(e) { _raw = []; } }",
+      "if (typeof _raw === 'string') { try { _raw = JSON.parse(_raw); } catch(e) { _raw = []; } }",
       "var configs = (Array.isArray(_raw) ? _raw : null) || [];",
-      "msg.payload = { configs: configs };",
+      "msg.payload = { configs: configs, _ctx_type: typeof global.get('tc_configs') };",
       "return msg;"
     ].join('\n'),
     outputs: 1, timeout: '', noerr: 0,
