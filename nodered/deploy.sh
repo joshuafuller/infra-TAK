@@ -435,15 +435,8 @@ else
   echo "    API-based restore (post-startup) will ensure configs survive regardless."
 fi
 
-# Ensure 'fs' is available in functionGlobalContext so backup function nodes can write files
-docker cp "$CONTAINER:/data/settings.js" /tmp/_nr_settings.js 2>/dev/null && \
-python3 - /tmp/_nr_settings.js << 'PYEOF' 2>/dev/null && docker cp /tmp/_nr_settings.js "$CONTAINER:/data/settings.js" && echo "    settings.js: fs in functionGlobalContext ✓" || echo "    settings.js: fs patch skipped"
-import sys, re
-src = open(sys.argv[1]).read()
-if 'fs: require' not in src and "fs:require" not in src:
-    src = re.sub(r'(functionGlobalContext\s*:\s*\{)', r'\1\n    fs: require("fs"),', src)
-    open(sys.argv[1], 'w').write(src)
-PYEOF
+# Copy settings.js out while container is running (cp fails after stop)
+docker cp "$CONTAINER:/data/settings.js" /tmp/_nr_settings.js 2>/dev/null || true
 
 # Copy merged flows to host, then stop Node-RED before writing /data/flows.json.
 # Writing flows.json while NR is running can hot-reload; the migration inject may run before
@@ -455,6 +448,21 @@ docker cp "$CONTAINER:/tmp/flows_merged.json" "/tmp/flows_merged.json"
 docker exec "$CONTAINER" mkdir -p /data/context/global /data/context/flow 2>/dev/null || true
 
 docker stop -t 30 "$CONTAINER"
+# Patch settings.js to add fs to functionGlobalContext (must be done after stop, file was busy while running)
+if [ -f /tmp/_nr_settings.js ]; then
+  python3 - /tmp/_nr_settings.js << 'PYEOF' 2>/dev/null || true
+import sys, re
+f = sys.argv[1]
+src = open(f).read()
+if 'fs: require' not in src and 'fs:require' not in src:
+    src = re.sub(r'(functionGlobalContext\s*:\s*\{)', r'\1\n    fs: require("fs"),', src)
+    open(f, 'w').write(src)
+    print('patched')
+PYEOF
+  docker cp /tmp/_nr_settings.js "$CONTAINER:/data/settings.js" 2>/dev/null && \
+    echo "    settings.js: fs in functionGlobalContext ✓" || \
+    echo "    settings.js: fs patch failed (manual fix: add fs: require('fs') to functionGlobalContext)"
+fi
 docker cp "/tmp/flows_merged.json" "$CONTAINER:/data/flows.json"
 # Restore credentials file so TLS cert data survives the deploy
 if [ -f "/tmp/flows_cred_backup.json" ]; then
