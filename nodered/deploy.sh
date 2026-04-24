@@ -72,6 +72,33 @@ else
     echo "    Context backup: none found from live container"
   fi
 fi
+
+# ── Normalise the backup file ────────────────────────────────────────────────
+# The localfilesystem context REST API returns values wrapped as {msg: value}
+# and the whole response is nested under a 'default' key.  Strip both layers so
+# the backup file (and the global.json we write) contains clean key:value pairs.
+if [ -f "$NR_CTX_GLOBAL" ]; then
+  python3 - "$NR_CTX_GLOBAL" << 'PYEOF' 2>/dev/null && mv /tmp/_nr_ctx_clean.json "$NR_CTX_GLOBAL" || true
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)  # leave file untouched on parse error
+# Unwrap 'default' namespace
+if 'default' in d and isinstance(d['default'], dict):
+    d = d['default']
+def unwrap(v):
+    if isinstance(v, dict) and list(v.keys()) == ['msg']:
+        inner = v['msg']
+        if isinstance(inner, str):
+            try: return json.loads(inner)
+            except: return inner
+        return inner
+    return v
+clean = {k: unwrap(v) for k, v in d.items()}
+json.dump(clean, open('/tmp/_nr_ctx_clean.json', 'w'))
+PYEOF
+fi
 docker cp "$CONTAINER:/data/context/flow/flow_arcgis_cfg.json" "$NR_CTX_FLOW_CFG" 2>/dev/null || true
 
 # ── SAFETY GATE ──────────────────────────────────────────────────────────────
@@ -95,10 +122,19 @@ except Exception:
 # localfilesystem storage wraps everything under a 'default' key
 if 'default' in d and isinstance(d['default'], dict):
     d = d['default']
+def unwrap(v):
+    # localfilesystem REST API wraps values as {msg: value}
+    if isinstance(v, dict) and list(v.keys()) == ['msg']:
+        inner = v['msg']
+        if isinstance(inner, str):
+            try: return json.loads(inner)
+            except: return inner
+        return inner
+    return v
 keys = ['arcgis_configs','tak_settings','tc_configs','pp_config',
         'pulsepoint_config','ipaws_config','tfr_config','kml_configs']
 for k in keys:
-    v = d.get(k)
+    v = unwrap(d.get(k))
     if v is None:
         continue
     # Non-empty array/list
@@ -124,11 +160,19 @@ except Exception:
 # localfilesystem storage wraps everything under a 'default' key
 if 'default' in d and isinstance(d['default'], dict):
     d = d['default']
+def unwrap(v):
+    if isinstance(v, dict) and list(v.keys()) == ['msg']:
+        inner = v['msg']
+        if isinstance(inner, str):
+            try: return json.loads(inner)
+            except: return inner
+        return inner
+    return v
 keys = ['arcgis_configs','tak_settings','tc_configs','pp_config',
         'pulsepoint_config','ipaws_config','tfr_config','kml_configs']
 parts = []
 for k in keys:
-    v = d.get(k)
+    v = unwrap(d.get(k))
     if v is None:
         continue
     if isinstance(v, list):
