@@ -20,6 +20,8 @@ fi
 echo "==> Rebuilding flows.json"
 docker cp "$SCRIPT_DIR/build-flows.js" "$CONTAINER:/tmp/build-flows.js"
 docker cp "$SCRIPT_DIR/configurator.html" "$CONTAINER:/tmp/configurator.html"
+# docker cp sets root ownership — make files writable by the node process so build-flows.js can inject templates
+docker exec "$CONTAINER" chmod 666 /tmp/build-flows.js /tmp/configurator.html 2>/dev/null || true
 if [ -f "$SCRIPT_DIR/icon-catalog.json" ]; then
   docker cp "$SCRIPT_DIR/icon-catalog.json" "$CONTAINER:/data/icon-catalog.json"
   echo "    Icon catalog: copied to /data/icon-catalog.json"
