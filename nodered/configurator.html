@@ -3064,7 +3064,7 @@ async function renderConfigList() {
       '</div>' +
       '<div class="cc-detail">' + _esc(String(pcfg.agencyIds || '').substring(0, 80)) + ' | Poll: ' + (pcfg.pollIntervalSec || 120) + 's' +
       '<br><span style="font-size:0.78rem;color:#64748b">' + _esc(ppLine + (ppNote ? ' · note: ' + ppNote : '')) + '</span></div></div>' +
-      '<div class="cc-actions"></div></div>';
+      '<div class="cc-actions"><button class="btn-secondary" style="color:#f87171;border-color:#7f1d1d" onclick="event.stopPropagation();deletePulsepointConfig()">Delete</button></div></div>';
   }
   var tcConfigs = [];
   try {
@@ -3084,7 +3084,9 @@ async function renderConfigList() {
       '<div class="cc-detail">' + _esc(detail) + ' | Poll: ' + (cfg.pollInterval || 1) + 'min' +
       (sum ? '<br><span style="font-size:0.78rem;color:#64748b">' + _esc(sum) + '</span>' : '') +
       '</div></div>' +
-      '<div class="cc-actions"></div>' +
+      '<div class="cc-actions">' +
+      '<button class="btn-secondary" style="color:#f87171;border-color:#7f1d1d" onclick="event.stopPropagation();deleteTcConfigById(\'' + _esc(id) + '\')">Delete</button>' +
+      '</div>' +
       '</div>';
   });
   _savedConfigs.forEach(function(c, i) {
@@ -3935,6 +3937,28 @@ async function deleteTcConfig() {
   } catch(e) {
     document.getElementById('tcSaveStatus').textContent = 'Delete failed';
   }
+}
+
+async function deleteTcConfigById(id) {
+  if (!confirm('Delete this Tablet Command config?')) return;
+  try {
+    await fetch('/tc/config/delete', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ id: id }) });
+    if (_tcActiveCfg && _tcActiveCfg.id === id) { _tcActiveCfg = null; hideSteps(); }
+    await renderConfigList();
+  } catch(e) { alert('Delete failed: ' + e.message); }
+}
+
+async function deletePulsepointConfig() {
+  if (!confirm('Delete PulsePoint config? This will deactivate and clear the integration.')) return;
+  try {
+    await fetch('/pulsepoint/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agencyIds: '', activated: false, pollIntervalSec: 120 })
+    });
+    _pulsepointActiveCfg = null;
+    await renderConfigList();
+  } catch(e) { alert('Delete failed: ' + e.message); }
 }
 
 function resetForm() {
