@@ -430,13 +430,25 @@ PYEOF
       echo "    settings.js: contextStorage already present ✓"
     fi
   fi
+  # Ensure fs is exposed to function nodes (patch host file directly — it's volume-mounted)
+  if ! grep -q 'fs: require' "$NR_SETTINGS_HOST" 2>/dev/null && ! grep -q 'fs:require' "$NR_SETTINGS_HOST" 2>/dev/null; then
+    python3 - "$NR_SETTINGS_HOST" << 'PYEOF' 2>/dev/null || true
+import sys, re
+f = sys.argv[1]
+src = open(f).read()
+src2 = re.sub(r'(functionGlobalContext\s*:\s*\{)', r'\1\n    fs: require("fs"),', src)
+if src2 != src:
+    open(f, 'w').write(src2)
+    print('    fs: require added to functionGlobalContext')
+PYEOF
+    echo "    settings.js: fs in functionGlobalContext ✓"
+  else
+    echo "    settings.js: fs in functionGlobalContext already present ✓"
+  fi
 else
   echo "    WARNING: settings.js not found at $NR_SETTINGS_HOST"
   echo "    API-based restore (post-startup) will ensure configs survive regardless."
 fi
-
-# Copy settings.js out while container is running (cp fails after stop)
-docker cp "$CONTAINER:/data/settings.js" /tmp/_nr_settings.js 2>/dev/null || true
 
 # Copy merged flows to host, then stop Node-RED before writing /data/flows.json.
 # Writing flows.json while NR is running can hot-reload; the migration inject may run before
@@ -448,21 +460,6 @@ docker cp "$CONTAINER:/tmp/flows_merged.json" "/tmp/flows_merged.json"
 docker exec "$CONTAINER" mkdir -p /data/context/global /data/context/flow 2>/dev/null || true
 
 docker stop -t 30 "$CONTAINER"
-# Patch settings.js to add fs to functionGlobalContext (must be done after stop, file was busy while running)
-if [ -f /tmp/_nr_settings.js ]; then
-  python3 - /tmp/_nr_settings.js << 'PYEOF' 2>/dev/null || true
-import sys, re
-f = sys.argv[1]
-src = open(f).read()
-if 'fs: require' not in src and 'fs:require' not in src:
-    src = re.sub(r'(functionGlobalContext\s*:\s*\{)', r'\1\n    fs: require("fs"),', src)
-    open(f, 'w').write(src)
-    print('patched')
-PYEOF
-  docker cp /tmp/_nr_settings.js "$CONTAINER:/data/settings.js" 2>/dev/null && \
-    echo "    settings.js: fs in functionGlobalContext ✓" || \
-    echo "    settings.js: fs patch failed (manual fix: add fs: require('fs') to functionGlobalContext)"
-fi
 docker cp "/tmp/flows_merged.json" "$CONTAINER:/data/flows.json"
 # Restore credentials file so TLS cert data survives the deploy
 if [ -f "/tmp/flows_cred_backup.json" ]; then
