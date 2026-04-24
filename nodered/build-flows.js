@@ -9,7 +9,7 @@ const CFG_TAB = 'flow_arcgis_cfg';
 // on the Docker volume immediately after any save operation.
 const CFG_BACKUP_SNIPPET = [
   "try {",
-  "  var _bfs = require('fs');",
+  "  var _bfs = global.get('fs') || require('fs');",
   "  var _bd  = '/data/config-backups';",
   "  if (!_bfs.existsSync(_bd)) _bfs.mkdirSync(_bd, { recursive: true });",
   "  var _snap = {",
