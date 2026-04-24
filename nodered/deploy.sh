@@ -73,27 +73,72 @@ fi
 docker cp "$CONTAINER:/data/context/flow/flow_arcgis_cfg.json" "$NR_CTX_FLOW_CFG" 2>/dev/null || true
 
 # ── SAFETY GATE ──────────────────────────────────────────────────────────────
-# Validate the backup has meaningful content (at least one known config key).
-# If it is empty, fall back to the persistent host-side snapshot from the last
-# successful deploy.  If neither exists, ABORT — never wipe configs silently.
+# Validate the backup has meaningful content: at least one config key as an
+# actual TOP-LEVEL JSON key with non-empty content.
+# grep alone is NOT sufficient — key names appear inside JS code strings
+# stored in context by Node-RED function nodes (false positives).
+# Use python3 to parse the JSON and check actual top-level key presence.
 _ctx_is_valid() {
   local f="$1"
   [ -f "$f" ] || return 1
   local sz
   sz=$(wc -c < "$f" | tr -d ' ')
   [ "$sz" -gt 50 ] || return 1
-  # Must contain at least one real config key
-  grep -qE '"(arcgis_configs|tak_settings|tfr_configs|tc_configs|pp_config|pulsepoint_config|ipaws_config)"' "$f" || return 1
-  return 0
+  python3 - "$f" 2>/dev/null << 'PYEOF'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+keys = ['arcgis_configs','tak_settings','tc_configs','pp_config',
+        'pulsepoint_config','ipaws_config','tfr_config','kml_configs']
+for k in keys:
+    v = d.get(k)
+    if v is None:
+        continue
+    # Non-empty array/list
+    if isinstance(v, list) and len(v) > 0:
+        sys.exit(0)
+    # Dict with at least one key
+    if isinstance(v, dict) and v:
+        sys.exit(0)
+sys.exit(1)
+PYEOF
 }
 
+# Show exactly which top-level config keys are in a file (for debug output)
+_ctx_summary() {
+  local f="$1"
+  [ -f "$f" ] || { echo "(file missing)"; return; }
+  python3 - "$f" 2>/dev/null << 'PYEOF' || echo "(parse error)"
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+keys = ['arcgis_configs','tak_settings','tc_configs','pp_config',
+        'pulsepoint_config','ipaws_config','tfr_config','kml_configs']
+parts = []
+for k in keys:
+    v = d.get(k)
+    if v is None:
+        continue
+    if isinstance(v, list):
+        parts.append(k + '(' + str(len(v)) + ')')
+    elif isinstance(v, dict) and v:
+        parts.append(k)
+print(', '.join(parts) if parts else '(no config keys)')
+PYEOF
+}
+
+echo "    Context keys (live):  $(_ctx_summary "$NR_CTX_GLOBAL")"
 if _ctx_is_valid "$NR_CTX_GLOBAL"; then
   # Good live backup — also update the persistent snapshot for next time
   cp "$NR_CTX_GLOBAL" "$PERSISTENT_CTX_BACKUP"
   echo "    Persistent snapshot updated: $PERSISTENT_CTX_BACKUP"
 elif _ctx_is_valid "$PERSISTENT_CTX_BACKUP"; then
-  echo "    WARNING: live context backup empty/invalid — falling back to persistent snapshot"
-  echo "    Snapshot: $PERSISTENT_CTX_BACKUP ($(wc -c < "$PERSISTENT_CTX_BACKUP" | tr -d ' ') bytes)"
+  echo "    WARNING: live context has no saved configs — falling back to persistent snapshot"
+  echo "    Snapshot keys: $(_ctx_summary "$PERSISTENT_CTX_BACKUP")"
   cp "$PERSISTENT_CTX_BACKUP" "$NR_CTX_GLOBAL"
 else
   echo ""
@@ -365,12 +410,14 @@ done
 
 if [ "$NR_READY" = "true" ] && [ -f "$NR_CTX_GLOBAL" ]; then
   echo "==> Pushing context via REST API (/config/deploy-restore)..."
-  # Read from the HOST backup file via stdin so we never depend on the container's
-  # /data/context/global/global.json, which Node-RED may overwrite at startup.
-  _RESTORE_RESP=$(docker exec -i "$CONTAINER" curl -sf --max-time 15 \
+  # Copy the host backup to a temp path the container owns (Node-RED never writes here).
+  # Then use -d @path inside the container — avoids all stdin/bash redirection issues.
+  docker cp "$NR_CTX_GLOBAL" "$CONTAINER:/tmp/ctx_deploy_restore.json"
+  _RESTORE_RESP=$(docker exec "$CONTAINER" curl -sf --max-time 15 \
     -X POST http://localhost:1880/config/deploy-restore \
     -H 'Content-Type: application/json' \
-    --data-binary @- 2>/dev/null < "$NR_CTX_GLOBAL" || echo "")
+    -d @/tmp/ctx_deploy_restore.json 2>/dev/null || echo "")
+  docker exec "$CONTAINER" rm -f /tmp/ctx_deploy_restore.json 2>/dev/null || true
   if echo "$_RESTORE_RESP" | grep -q '"ok":true'; then
     _KEYS=$(echo "$_RESTORE_RESP" | grep -o '"restored":\[[^]]*\]' || echo "")
     echo "    Context restored via API ✓  $_KEYS"
