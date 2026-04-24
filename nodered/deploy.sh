@@ -403,28 +403,29 @@ NR_SETTINGS_HOST="$HOME/node-red/settings.js"
 if [ -f "$NR_SETTINGS_HOST" ]; then
   if ! grep -q 'contextStorage' "$NR_SETTINGS_HOST" 2>/dev/null; then
     echo "    $NR_SETTINGS_HOST: adding contextStorage (localfilesystem + flushInterval:0)"
-    node -e "
-      var fs = require('fs');
-      var src = fs.readFileSync('$NR_SETTINGS_HOST', 'utf8');
-      src = src.replace(/^};\\s*\$/m,
-        ',\\n  contextStorage: {\\n    default: { module: \"localfilesystem\", config: { flushInterval: 0 } }\\n  }\\n};');
-      if (src.indexOf('contextStorage') === -1) {
-        src = src.trimEnd() + '\\nmodule.exports = Object.assign(module.exports || {}, {\\n  contextStorage: { default: { module: \"localfilesystem\", config: { flushInterval: 0 } } }\\n});\\n';
-      }
-      fs.writeFileSync('$NR_SETTINGS_HOST', src);
-      console.log('    contextStorage written to $NR_SETTINGS_HOST');
-    " 2>&1 | sed 's/^/    /' || true
+    python3 - "$NR_SETTINGS_HOST" << 'PYEOF' 2>/dev/null || true
+import sys, re
+f = sys.argv[1]
+src = open(f).read()
+add = '\n  contextStorage: {\n    default: { module: "localfilesystem", config: { flushInterval: 0 } }\n  }\n};'
+src2 = re.sub(r'^};\s*$', add, src, flags=re.MULTILINE)
+if src2 == src:
+    src2 = src.rstrip() + '\nmodule.exports = Object.assign(module.exports || {}, {\n  contextStorage: { default: { module: "localfilesystem", config: { flushInterval: 0 } } }\n});\n'
+open(f, 'w').write(src2)
+print('    contextStorage written to ' + f)
+PYEOF
   else
     # Already present — ensure flushInterval:0 is set for synchronous writes
     if ! grep -q 'flushInterval' "$NR_SETTINGS_HOST" 2>/dev/null; then
-      node -e "
-        var fs = require('fs');
-        var src = fs.readFileSync('$NR_SETTINGS_HOST', 'utf8');
-        src = src.replace(/(module:\\s*[\"']localfilesystem[\"']\\s*)(})/g,
-          '\$1, config: { flushInterval: 0 } \$2');
-        fs.writeFileSync('$NR_SETTINGS_HOST', src);
-        console.log('    flushInterval: 0 added to contextStorage');
-      " 2>&1 | sed 's/^/    /' || true
+      python3 - "$NR_SETTINGS_HOST" << 'PYEOF' 2>/dev/null || true
+import sys, re
+f = sys.argv[1]
+src = open(f).read()
+src2 = re.sub(r"(module\s*:\s*[\"']localfilesystem[\"']\s*)(})", r'\1, config: { flushInterval: 0 } }', src)
+open(f, 'w').write(src2)
+print('    flushInterval: 0 added to contextStorage')
+PYEOF
+      echo "    settings.js: flushInterval:0 patched ✓"
     else
       echo "    settings.js: contextStorage already present ✓"
     fi
