@@ -435,21 +435,15 @@ else
   echo "    API-based restore (post-startup) will ensure configs survive regardless."
 fi
 
-# Ensure 'fs' is available in functionGlobalContext so CFG_BACKUP_SNIPPET can write backups
-NR_SETTINGS_CONTAINER="/data/settings.js"
-if docker exec "$CONTAINER" grep -q 'functionGlobalContext' "$NR_SETTINGS_CONTAINER" 2>/dev/null; then
-  if ! docker exec "$CONTAINER" grep -q "'fs'" "$NR_SETTINGS_CONTAINER" 2>/dev/null && \
-     ! docker exec "$CONTAINER" grep -q '"fs"' "$NR_SETTINGS_CONTAINER" 2>/dev/null; then
-    docker exec "$CONTAINER" node -e "
-      var fs=require('fs'), src=fs.readFileSync('$NR_SETTINGS_CONTAINER','utf8');
-      src=src.replace(/(functionGlobalContext\s*:\s*\{)/, '\$1\n    fs: require(\"fs\"),');
-      fs.writeFileSync('$NR_SETTINGS_CONTAINER', src);
-      console.log('    settings.js: fs added to functionGlobalContext');
-    " 2>/dev/null && echo "    settings.js: fs added to functionGlobalContext ✓" || true
-  else
-    echo "    settings.js: fs already in functionGlobalContext ✓"
-  fi
-fi
+# Ensure 'fs' is available in functionGlobalContext so backup function nodes can write files
+docker cp "$CONTAINER:/data/settings.js" /tmp/_nr_settings.js 2>/dev/null && \
+python3 - /tmp/_nr_settings.js << 'PYEOF' 2>/dev/null && docker cp /tmp/_nr_settings.js "$CONTAINER:/data/settings.js" && echo "    settings.js: fs in functionGlobalContext ✓" || echo "    settings.js: fs patch skipped"
+import sys, re
+src = open(sys.argv[1]).read()
+if 'fs: require' not in src and "fs:require" not in src:
+    src = re.sub(r'(functionGlobalContext\s*:\s*\{)', r'\1\n    fs: require("fs"),', src)
+    open(sys.argv[1], 'w').write(src)
+PYEOF
 
 # Copy merged flows to host, then stop Node-RED before writing /data/flows.json.
 # Writing flows.json while NR is running can hot-reload; the migration inject may run before
