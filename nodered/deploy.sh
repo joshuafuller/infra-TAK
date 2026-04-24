@@ -92,6 +92,9 @@ try:
     d = json.load(open(sys.argv[1]))
 except Exception:
     sys.exit(1)
+# localfilesystem storage wraps everything under a 'default' key
+if 'default' in d and isinstance(d['default'], dict):
+    d = d['default']
 keys = ['arcgis_configs','tak_settings','tc_configs','pp_config',
         'pulsepoint_config','ipaws_config','tfr_config','kml_configs']
 for k in keys:
@@ -118,6 +121,9 @@ try:
     d = json.load(open(sys.argv[1]))
 except Exception:
     sys.exit(1)
+# localfilesystem storage wraps everything under a 'default' key
+if 'default' in d and isinstance(d['default'], dict):
+    d = d['default']
 keys = ['arcgis_configs','tak_settings','tc_configs','pp_config',
         'pulsepoint_config','ipaws_config','tfr_config','kml_configs']
 parts = []

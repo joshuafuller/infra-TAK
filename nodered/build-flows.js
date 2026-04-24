@@ -1215,6 +1215,8 @@ const configFlows = [
       "  try { d = JSON.parse(d.toString()); } catch(e) { d = {}; }",
       "}",
       "if (!d || typeof d !== 'object' || Array.isArray(d)) d = {};",
+      "// localfilesystem contextStorage wraps keys under a 'default' envelope",
+      "if (d['default'] && typeof d['default'] === 'object' && !Array.isArray(d['default'])) d = d['default'];",
       "var restored = [];",
       "var KEYS = ['arcgis_configs','tc_configs','tak_settings','ipaws_config','pulsepoint_config',",
       "            'tfr_config','kml_configs','pp_config'];",
