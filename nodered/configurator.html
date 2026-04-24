@@ -2964,28 +2964,24 @@ async function loadSavedConfigs() {
     window._takSettingsCache = tj.settings || {};
   } catch (e) {}
 
-  var tcConfigCount = 0;
-  try {
-    var tcr = await fetch('/tc/config/load');
-    var tcd = await tcr.json();
-    tcConfigCount = (tcd.configs || []).length;
-  } catch (e) {}
+  // Fetch all config sources in parallel — any non-empty source means show the list
+  var _extraCounts = 0;
+  await Promise.allSettled([
+    fetch('/tc/config/load').then(function(r){return r.json();}).then(function(d){ _extraCounts += (d.configs||[]).length; }).catch(function(){}),
+    fetch('/kml/config/load').then(function(r){return r.json();}).then(function(d){ _extraCounts += (d.configs||[]).length; }).catch(function(){}),
+    fetch('/arcgis-tak/config/load').then(function(r){return r.json();}).then(function(d){ _savedConfigs = d.configs||[]; }).catch(function(){})
+  ]);
 
-  try {
-    var res = await fetch('/arcgis-tak/config/load');
-    var data = await res.json();
-    _savedConfigs = data.configs || [];
-    var hasAnything = _savedConfigs.length > 0 || _ipawsActiveCfg || _pulsepointActiveCfg || tcConfigCount > 0;
-    if (!hasAnything) {
-      document.getElementById('savedConfigBar').style.display = 'none';
-      showSteps();
-      return;
-    }
+  var hasAnything = _savedConfigs.length > 0 || _ipawsActiveCfg || _pulsepointActiveCfg || _extraCounts > 0;
+  if (!hasAnything) {
+    document.getElementById('savedConfigBar').style.display = 'none';
+    showSteps();
+    return;
+  }
 
-    document.getElementById('savedConfigBar').style.display = 'block';
-    await renderConfigList();
-    hideSteps();
-  } catch (e) {}
+  document.getElementById('savedConfigBar').style.display = 'block';
+  await renderConfigList();
+  hideSteps();
 }
 
 function _esc(s) {
