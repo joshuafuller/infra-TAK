@@ -493,6 +493,33 @@ if [ "$NR_READY" = "true" ] && [ -f "$NR_CTX_GLOBAL" ]; then
   if echo "$_RESTORE_RESP" | grep -q '"ok":true'; then
     _KEYS=$(echo "$_RESTORE_RESP" | grep -o '"restored":\[[^]]*\]' || echo "")
     echo "    Context restored via API ✓  $_KEYS"
+    # Also write /data/config-backups/latest.json so Emergency Restore has an entry
+    docker exec "$CONTAINER" sh -c '
+      mkdir -p /data/config-backups
+      node -e "
+        var g=global;
+        var fs=require(\"fs\");
+        var http=require(\"http\");
+        http.get(\"http://localhost:1880/context/global\",function(r){
+          var b=\"\";r.on(\"data\",function(c){b+=c;});
+          r.on(\"end\",function(){
+            try{
+              var d=JSON.parse(b);
+              if(d.default)d=d.default;
+              function uw(v){if(v&&typeof v===\"object\"&&!Array.isArray(v)&&\"msg\"in v){var i=v.msg;if(typeof i===\"string\"){try{return JSON.parse(i);}catch(e){return i;}}return i;}return v;}
+              var snap={timestamp:new Date().toISOString(),
+                arcgis_configs:uw(d.arcgis_configs)||[],
+                tc_configs:uw(d.tc_configs)||[],
+                tak_settings:uw(d.tak_settings)||{},
+                ipaws_config:uw(d.ipaws_config)||{},
+                pulsepoint_config:uw(d.pulsepoint_config)||{}};
+              fs.writeFileSync(\"/data/config-backups/latest.json\",JSON.stringify(snap,null,2));
+              console.log(\"    Backup: wrote /data/config-backups/latest.json\");
+            }catch(e){console.log(\"    Backup write failed: \"+e.message);}
+          });
+        });
+      " 2>/dev/null || true
+    ' 2>/dev/null || true
   else
     echo "    WARNING: API restore returned: $_RESTORE_RESP"
     echo "    Context may still be loaded from the file written above — check the UI."
