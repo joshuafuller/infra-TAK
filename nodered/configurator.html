@@ -2969,9 +2969,8 @@ async function loadSavedConfigs() {
   // PulsePoint + IPAWS already loaded above into _pulsepointActiveCfg / _ipawsActiveCfg
   var _extraCounts = 0;
   await Promise.allSettled([
-    fetch('/arcgis-tak/config/load').then(function(r){return r.json();}).then(function(d){ _savedConfigs = d.configs||[]; }).catch(function(){}),
-    fetch('/tc/config/load').then(function(r){return r.json();}).then(function(d){ _extraCounts += (d.configs||[]).length; }).catch(function(){}),
-    fetch('/kml/config/load').then(function(r){return r.json();}).then(function(d){ _extraCounts += (d.configs||[]).length; }).catch(function(){})
+    fetch('/arcgis-tak/config/load').then(function(r){return r.json();}).then(function(d){ var c=d.configs; _savedConfigs = Array.isArray(c)?c:[]; }).catch(function(){}),
+    fetch('/tc/config/load').then(function(r){return r.json();}).then(function(d){ _extraCounts += (d.configs||[]).length; }).catch(function(){})
   ]);
 
   var hasAnything = _savedConfigs.length > 0 || _ipawsActiveCfg || _pulsepointActiveCfg || _extraCounts > 0;

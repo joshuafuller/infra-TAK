@@ -787,7 +787,8 @@ const configFlows = [
     id: 'fn_load', type: 'function', z: CFG_TAB,
     name: 'Load from global context',
     func: [
-      "var configs = global.get('arcgis_configs') || [];",
+      "var _raw = global.get('arcgis_configs'); if (_raw && typeof _raw === 'object' && !Array.isArray(_raw) && 'msg' in _raw) { try { _raw = JSON.parse(_raw.msg); } catch(e) { _raw = []; } }",
+      "var configs = (Array.isArray(_raw) ? _raw : null) || [];",
       "msg.payload = { configs: configs };",
       "return msg;"
     ].join('\n'),
