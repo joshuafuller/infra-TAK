@@ -249,8 +249,8 @@ const FN_KML_PARSE_FIELDS = [
 
 // Tablet Command: default ATAK OSM iconset icons + CoT helpers (used by CFG tab + TC engine template)
 // OSM iconset uid: 6d781afb-89a6-4c07-b2b9-a89748b6a38f  (Service group)
-const TC_ICON_FIRE = '6d781afb-89a6-4c07-b2b9-a89748b6a38f/firebrigade.png';
-const TC_ICON_AMB  = '6d781afb-89a6-4c07-b2b9-a89748b6a38f/emergency.png';
+const TC_ICON_FIRE = '6d781afb-89a6-4c07-b2b9-a89748b6a38f/Service/firebrigade.png';
+const TC_ICON_AMB  = '6d781afb-89a6-4c07-b2b9-a89748b6a38f/Service/emergency.png';
 
 const TC_COT_TYPE_FN = [
   "function tcCotType(r) {",
