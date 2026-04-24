@@ -4195,9 +4195,9 @@ async function loadBackupList() {
       if (b.tfr_count)    _bparts.push('TFR: '    + b.tfr_count);
       if (b.kml_count)    _bparts.push('KML: '    + b.kml_count);
       if (b.tc_count)     _bparts.push('TC: '     + b.tc_count);
-      if (b.has_tak)      _bparts.push('TAK✓');
-      if (b.has_ipaws)    _bparts.push('IPAWS✓');
-      if (b.has_pulsepoint) _bparts.push('PP✓');
+      if (b.has_tak)        _bparts.push('TAK settings✓');
+      if (b.has_ipaws)      _bparts.push('IPAWS active');
+      if (b.has_pulsepoint) _bparts.push('PulsePoint active');
       opt.textContent = _bparts.join('  ');
       sel.appendChild(opt);
     });
