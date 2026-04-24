@@ -2978,7 +2978,7 @@ async function loadSavedConfigs() {
   // Auto-restore from latest.json if context appears empty (e.g. after full deploy timing race)
   if (!hasAnything) {
     try {
-      var _ar = await fetch('/config/restore', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filename: 'latest.json' }) });
+      var _ar = await fetch('/config/restore', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filename: 'ctx:0' }) });
       var _ad = await _ar.json();
       if (_ad.ok && (_ad.arcgis_count > 0 || _ad.tc_count > 0)) {
         console.log('Auto-restored from latest.json:', _ad);
@@ -3895,7 +3895,7 @@ async function ensureTCEngineTab(configName, cotStreamPort) {
           var restoreRes = await fetch('/config/restore', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ filename: 'latest.json' })
+            body: JSON.stringify({ filename: 'ctx:0' })
           });
           var restoreData = await restoreRes.json();
           console.log('Context re-pushed after flow deploy:', restoreData);
