@@ -1350,7 +1350,7 @@
       <!-- CoT Remarks -->
       <div style="border:1px solid #1a1a4e;border-radius:8px;padding:1rem;margin-bottom:1.2rem;background:#080818">
         <div style="font-weight:600;margin-bottom:0.4rem;color:#2ec4b6">CoT Remarks</div>
-        <p style="font-size:0.8rem;color:#94a3b8;margin:0 0 0.7rem">Click fields to add them to remarks in order. Click a selected field again to remove it.</p>
+        <p style="font-size:0.8rem;color:#94a3b8;margin:0 0 0.7rem">Hit <strong style="color:#e2e8f0">Test</strong> on the URL above to load real fields from your feed. The pills below are common TC field names shown until then.</p>
         <div id="tcRemarksAvailable" style="display:flex;flex-wrap:wrap;gap:0.35rem;margin-bottom:0.5rem"></div>
         <div style="margin-bottom:0.5rem">
           <label style="font-size:0.82rem;color:#94a3b8">Selected (in order)</label>
@@ -3552,6 +3552,18 @@ var TC_REMARK_FIELDS = [
 ];
 var _tcRemarksFields = [];
 
+// Replace the available-fields list with real fields from the TC feed (after Test).
+// Keeps any already-selected keys that exist in the new field list; removes invalid ones.
+function tcLoadRemarksFields(fields) {
+  TC_REMARK_FIELDS = fields; // replace static list with live data
+  // Drop any selected keys that don't exist in the new field list
+  var validKeys = fields.map(function(f){ return f.key; });
+  _tcRemarksFields = _tcRemarksFields.filter(function(k){ return validKeys.indexOf(k) >= 0; });
+  tcRenderRemarks();
+  var result = document.getElementById('tcTestResult');
+  if (result) result.textContent += ' — remarks fields updated from live feed';
+}
+
 function tcRenderRemarks() {
   var avail = document.getElementById('tcRemarksAvailable');
   var sel   = document.getElementById('tcRemarksSelected');
@@ -3890,7 +3902,13 @@ async function testTcConnection() {
       result.style.color = '#86efac';
       var info = d.name ? (' — ' + d.name) : '';
       info += d.type ? (' (' + d.type + ')') : '';
+      var fCount = d.fields ? d.fields.length : 0;
+      info += fCount ? (' · ' + fCount + ' fields') : '';
       result.textContent = '✓ Connected' + info;
+      // Populate the remarks picker with real field names from the feed
+      if (d.fields && d.fields.length) {
+        tcLoadRemarksFields(d.fields);
+      }
     } else {
       result.style.background = '#450a0a';
       result.style.color = '#fca5a5';
