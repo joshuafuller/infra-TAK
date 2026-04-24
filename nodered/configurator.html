@@ -1531,7 +1531,7 @@ function renderIconGrid() {
   groups.forEach(function(g) {
     (cat.groups[g] || []).forEach(function(icon) {
       if (count > 500) return;
-      var iPath = cat.uid + '/' + icon.f;
+      var iPath = cat.uid + '/' + g + '/' + icon.f;
       var label = icon.f.replace(/\.png$/i, '').replace(/[-_]/g, ' ');
       grid.appendChild(buildIconItem(icon, iPath, label, ''));
       count++;
@@ -1554,7 +1554,7 @@ function searchIcons() {
         if (count > 200) return;
         var label = icon.f.replace(/\.png$/i, '').replace(/[-_]/g, ' ');
         if (label.toLowerCase().indexOf(q) === -1 && g.toLowerCase().indexOf(q) === -1) return;
-        var iPath = cat.uid + '/' + icon.f;
+        var iPath = cat.uid + '/' + g + '/' + icon.f;
         grid.appendChild(buildIconItem(icon, iPath, label, setName + ' > ' + g));
         count++;
       });
