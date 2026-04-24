@@ -402,20 +402,32 @@ echo "==> Ensuring contextStorage:localfilesystem in settings.js"
 NR_SETTINGS_HOST="$HOME/node-red/settings.js"
 if [ -f "$NR_SETTINGS_HOST" ]; then
   if ! grep -q 'contextStorage' "$NR_SETTINGS_HOST" 2>/dev/null; then
-    echo "    $NR_SETTINGS_HOST: adding contextStorage (localfilesystem)"
+    echo "    $NR_SETTINGS_HOST: adding contextStorage (localfilesystem + flushInterval:0)"
     node -e "
       var fs = require('fs');
       var src = fs.readFileSync('$NR_SETTINGS_HOST', 'utf8');
       src = src.replace(/^};\\s*\$/m,
-        ',\\n  contextStorage: {\\n    default: { module: \"localfilesystem\" }\\n  }\\n};');
+        ',\\n  contextStorage: {\\n    default: { module: \"localfilesystem\", config: { flushInterval: 0 } }\\n  }\\n};');
       if (src.indexOf('contextStorage') === -1) {
-        src = src.trimEnd() + '\\nmodule.exports = Object.assign(module.exports || {}, {\\n  contextStorage: { default: { module: \"localfilesystem\" } }\\n});\\n';
+        src = src.trimEnd() + '\\nmodule.exports = Object.assign(module.exports || {}, {\\n  contextStorage: { default: { module: \"localfilesystem\", config: { flushInterval: 0 } } }\\n});\\n';
       }
       fs.writeFileSync('$NR_SETTINGS_HOST', src);
       console.log('    contextStorage written to $NR_SETTINGS_HOST');
     " 2>&1 | sed 's/^/    /' || true
   else
-    echo "    settings.js: contextStorage already present ✓"
+    # Already present — ensure flushInterval:0 is set for synchronous writes
+    if ! grep -q 'flushInterval' "$NR_SETTINGS_HOST" 2>/dev/null; then
+      node -e "
+        var fs = require('fs');
+        var src = fs.readFileSync('$NR_SETTINGS_HOST', 'utf8');
+        src = src.replace(/(module:\\s*[\"']localfilesystem[\"']\\s*)(})/g,
+          '\$1, config: { flushInterval: 0 } \$2');
+        fs.writeFileSync('$NR_SETTINGS_HOST', src);
+        console.log('    flushInterval: 0 added to contextStorage');
+      " 2>&1 | sed 's/^/    /' || true
+    else
+      echo "    settings.js: contextStorage already present ✓"
+    fi
   fi
 else
   echo "    WARNING: settings.js not found at $NR_SETTINGS_HOST"

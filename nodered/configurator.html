@@ -3865,6 +3865,18 @@ async function ensureTCEngineTab(configName, cotStreamPort) {
           body: JSON.stringify(allFlows2)
         });
         console.log('Full re-deploy triggered for TC tab');
+        // Full deploy may reinitialize context from disk before the last global.set() was
+        // flushed. Restore from the backup file that CFG_BACKUP_SNIPPET wrote during save.
+        await new Promise(function(r){ setTimeout(r, 1500); }); // wait for NR to settle
+        try {
+          var restoreRes = await fetch('/config/restore', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ filename: 'latest.json' })
+          });
+          var restoreData = await restoreRes.json();
+          console.log('Context re-pushed after flow deploy:', restoreData);
+        } catch(e3) { console.warn('Context re-push failed: ' + e3.message); }
       } catch(e2) { console.warn('TC re-deploy failed: ' + e2.message); }
     } else {
       console.warn('TC engine tab creation returned ' + res.status);
