@@ -521,7 +521,7 @@ if [ "$NR_READY" = "true" ] && [ -f "$NR_CTX_GLOBAL" ]; then
             try{
               var d=JSON.parse(b);
               if(d.default)d=d.default;
-              function uw(v){if(v&&typeof v===\"object\"&&!Array.isArray(v)&&\"msg\"in v){var i=v.msg;if(typeof i===\"string\"){try{return JSON.parse(i);}catch(e){return i;}}return i;}return v;}
+              function uw(v){if(v&&typeof v===\"object\"&&!Array.isArray(v)&&\"msg\"in v){var i=v.msg;if(typeof i===\"string\"){try{return JSON.parse(i);}catch(e){return i;}}return i;}if(typeof v===\"string\"){try{return JSON.parse(v);}catch(e){return v;}}return v;}
               var snap={timestamp:new Date().toISOString(),
                 arcgis_configs:uw(d.arcgis_configs)||[],
                 tc_configs:uw(d.tc_configs)||[],
