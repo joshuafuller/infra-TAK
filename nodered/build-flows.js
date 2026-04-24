@@ -875,7 +875,8 @@ const configFlows = [
     func: [
       "var cfg = msg.payload || {};",
       "if (!cfg.id) { msg.payload = { ok:false, error:'missing id' }; return msg; }",
-      "var configs = global.get('tc_configs') || [];",
+      "var _raw = global.get('tc_configs'); if (_raw && typeof _raw === 'object' && !Array.isArray(_raw) && 'msg' in _raw) { try { _raw = JSON.parse(_raw.msg); } catch(e) { _raw = []; } }",
+      "var configs = (Array.isArray(_raw) ? _raw : null) || [];",
       "var idx = configs.findIndex(function(c){ return c.id === cfg.id; });",
       "if (idx >= 0) { configs[idx] = cfg; } else { configs.push(cfg); }",
       "global.set('tc_configs', configs);",
@@ -905,7 +906,8 @@ const configFlows = [
     func: [
       "var id = (msg.payload||{}).id;",
       "if (!id) { msg.payload = { ok:false, error:'missing id' }; return msg; }",
-      "var configs = (global.get('tc_configs')||[]).filter(function(c){ return c.id !== id; });",
+      "var _raw = global.get('tc_configs'); if (_raw && typeof _raw === 'object' && !Array.isArray(_raw) && 'msg' in _raw) { try { _raw = JSON.parse(_raw.msg); } catch(e) { _raw = []; } }",
+      "var configs = (Array.isArray(_raw) ? _raw : []).filter(function(c){ return c.id !== id; });",
       "global.set('tc_configs', configs);",
       "global.set('tc_units_'+id, null);",
       "msg.payload = { ok: true };",
@@ -931,7 +933,8 @@ const configFlows = [
     id: 'fn_tc_load', type: 'function', z: CFG_TAB,
     name: 'Load TC configs',
     func: [
-      "var configs = global.get('tc_configs') || [];",
+      "var _raw = global.get('tc_configs'); if (_raw && typeof _raw === 'object' && !Array.isArray(_raw) && 'msg' in _raw) { try { _raw = JSON.parse(_raw.msg); } catch(e) { _raw = []; } }",
+      "var configs = (Array.isArray(_raw) ? _raw : null) || [];",
       "msg.payload = { configs: configs };",
       "return msg;"
     ].join('\n'),
@@ -1217,9 +1220,9 @@ const configFlows = [
       "if (!d || typeof d !== 'object' || Array.isArray(d)) d = {};",
       "// localfilesystem contextStorage wraps keys under a 'default' envelope",
       "if (d['default'] && typeof d['default'] === 'object' && !Array.isArray(d['default'])) d = d['default'];",
-      "// localfilesystem context REST API wraps each value as {msg: value} — unwrap it",
+      "// localfilesystem context REST API wraps each value as {msg: <json>, format: <hint>} — unwrap it",
       "function unwrapCtxVal(v) {",
-      "  if (v && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length === 1 && 'msg' in v) {",
+      "  if (v && typeof v === 'object' && !Array.isArray(v) && 'msg' in v) {",
       "    var inner = v.msg;",
       "    if (typeof inner === 'string') { try { return JSON.parse(inner); } catch(e) { return inner; } }",
       "    return inner;",

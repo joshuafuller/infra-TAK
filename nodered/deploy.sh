@@ -20,8 +20,9 @@ fi
 echo "==> Rebuilding flows.json"
 docker cp "$SCRIPT_DIR/build-flows.js" "$CONTAINER:/tmp/build-flows.js"
 docker cp "$SCRIPT_DIR/configurator.html" "$CONTAINER:/tmp/configurator.html"
-# docker cp sets root ownership — make files writable by the node process so build-flows.js can inject templates
-docker exec "$CONTAINER" chmod 666 /tmp/build-flows.js /tmp/configurator.html 2>/dev/null || true
+# docker cp sets root ownership — chmod as root so the node process can write templates
+docker exec --user root "$CONTAINER" chmod 666 /tmp/build-flows.js /tmp/configurator.html 2>/dev/null || \
+  docker exec "$CONTAINER" chmod 666 /tmp/build-flows.js /tmp/configurator.html 2>/dev/null || true
 if [ -f "$SCRIPT_DIR/icon-catalog.json" ]; then
   docker cp "$SCRIPT_DIR/icon-catalog.json" "$CONTAINER:/data/icon-catalog.json"
   echo "    Icon catalog: copied to /data/icon-catalog.json"
@@ -29,14 +30,19 @@ fi
 
 # Copy static assets (IPAWS icons, etc.) to /data/public inside container
 # Node-RED serves /data/public at the root URL via httpStatic (set in settings.js)
-if [ -d "$SCRIPT_DIR/static" ]; then
+docker exec --user root "$CONTAINER" mkdir -p /data/public 2>/dev/null || \
   docker exec "$CONTAINER" mkdir -p /data/public
+if [ -d "$SCRIPT_DIR/static" ]; then
   docker cp "$SCRIPT_DIR/static/." "$CONTAINER:/data/public/"
   echo "    Static assets: copied nodered/static/ → /data/public/"
 fi
 docker exec "$CONTAINER" node /tmp/build-flows.js
 docker cp "$CONTAINER:/tmp/flows.json" "$NEW_FLOWS"
 docker cp "$CONTAINER:/tmp/template-functions.json" "/tmp/template-functions.json" 2>/dev/null || true
+# Copy template-injected configurator.html to the public directory Node-RED serves
+docker exec --user root "$CONTAINER" cp /tmp/configurator.html /data/public/configurator.html 2>/dev/null || \
+  docker cp "$SCRIPT_DIR/configurator.html" "$CONTAINER:/data/public/configurator.html"
+echo "    Configurator: copied to /data/public/configurator.html"
 
 # Back up current flows + credentials from running container
 echo "==> Backing up current config from container"
@@ -88,7 +94,8 @@ except Exception:
 if 'default' in d and isinstance(d['default'], dict):
     d = d['default']
 def unwrap(v):
-    if isinstance(v, dict) and list(v.keys()) == ['msg']:
+    # localfilesystem wraps as {msg: <json>, format: <hint>} — detect by 'msg' key presence
+    if isinstance(v, dict) and 'msg' in v:
         inner = v['msg']
         if isinstance(inner, str):
             try: return json.loads(inner)
@@ -123,8 +130,8 @@ except Exception:
 if 'default' in d and isinstance(d['default'], dict):
     d = d['default']
 def unwrap(v):
-    # localfilesystem REST API wraps values as {msg: value}
-    if isinstance(v, dict) and list(v.keys()) == ['msg']:
+    # localfilesystem wraps as {msg: <json>, format: <hint>} — detect by 'msg' key presence
+    if isinstance(v, dict) and 'msg' in v:
         inner = v['msg']
         if isinstance(inner, str):
             try: return json.loads(inner)
@@ -161,7 +168,7 @@ except Exception:
 if 'default' in d and isinstance(d['default'], dict):
     d = d['default']
 def unwrap(v):
-    if isinstance(v, dict) and list(v.keys()) == ['msg']:
+    if isinstance(v, dict) and 'msg' in v:
         inner = v['msg']
         if isinstance(inner, str):
             try: return json.loads(inner)
