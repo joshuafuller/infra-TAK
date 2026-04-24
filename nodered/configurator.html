@@ -4190,7 +4190,15 @@ async function loadBackupList() {
       var opt = document.createElement('option');
       opt.value = b.filename;
       var ts = b.timestamp ? new Date(b.timestamp).toLocaleString() : b.filename;
-      opt.textContent = ts + ' — ArcGIS/TFR/KML: ' + b.arcgis_count + '  TC: ' + b.tc_count + (b.has_tak ? '  TAK✓' : '') + (b.has_ipaws ? '  IPAWS✓' : '') + (b.filename === 'latest.json' ? '  [LATEST]' : '');
+      var _bparts = [ts];
+      if (b.arcgis_count) _bparts.push('ArcGIS: ' + b.arcgis_count);
+      if (b.tfr_count)    _bparts.push('TFR: '    + b.tfr_count);
+      if (b.kml_count)    _bparts.push('KML: '    + b.kml_count);
+      if (b.tc_count)     _bparts.push('TC: '     + b.tc_count);
+      if (b.has_tak)      _bparts.push('TAK✓');
+      if (b.has_ipaws)    _bparts.push('IPAWS✓');
+      if (b.has_pulsepoint) _bparts.push('PP✓');
+      opt.textContent = _bparts.join('  ');
       sel.appendChild(opt);
     });
     st.textContent = d.backups.length + ' backup(s) found. Select one and click Restore.';
@@ -4211,7 +4219,7 @@ async function restoreBackup() {
     var d = await r.json();
     if (d.ok) {
       st.style.color = '#4ade80';
-      st.textContent = '✓ Restored from ' + (d.timestamp ? new Date(d.timestamp).toLocaleString() : fn) + ' — ArcGIS/TFR/KML: ' + d.arcgis_count + '  TC: ' + d.tc_count + '. Reloading page…';
+      st.textContent = '✓ Restored from ' + (d.timestamp ? new Date(d.timestamp).toLocaleString() : fn) + '  TC: ' + d.tc_count + '. Reloading page…';
       setTimeout(function(){ location.reload(); }, 1800);
     } else {
       st.style.color = '#f87171';
