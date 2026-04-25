@@ -125,17 +125,24 @@ def unwrap(v):
     return v
 clean = {}
 warnings = []
+quarantined = {}
 for k, raw in d.items():
     n = unwrap(raw)
     exp = EXPECTED.get(k)
     if exp == 'array' and not isinstance(n, list):
-        warnings.append(f'  COERCED {k}: {type(n).__name__} -> []')
+        # NEVER silently coerce non-empty data to []. Quarantine the original.
+        if isinstance(n, str) and n: quarantined[k+'_quarantine'] = n
+        elif isinstance(n, dict) and n: quarantined[k+'_quarantine'] = n
+        warnings.append(f'  COERCED {k}: {type(n).__name__} -> []  (original quarantined as {k}_quarantine)')
         n = []
-    elif exp == 'object' and not (isinstance(n, dict) and not (isinstance(n, list))):
+    elif exp == 'object' and not (isinstance(n, dict) and not isinstance(n, list)):
         if not isinstance(n, dict):
-            warnings.append(f'  COERCED {k}: {type(n).__name__} -> {{}}')
+            if n: quarantined[k+'_quarantine'] = n
+            warnings.append(f'  COERCED {k}: {type(n).__name__} -> {{}}  (original quarantined as {k}_quarantine)')
             n = {}
     clean[k] = n
+# Carry quarantined originals through so they survive the deploy
+clean.update(quarantined)
 # Ensure all expected keys exist (initialize empties if missing — prevents
 # downstream `if d[k] is undefined` skips that leave engines without data)
 for k, exp in EXPECTED.items():
@@ -520,9 +527,57 @@ docker cp "$CONTAINER:/tmp/flows_merged.json" "/tmp/flows_merged.json"
 # writes as root and causes EACCES on startup.
 docker exec "$CONTAINER" mkdir -p /data/context/global /data/context/flow 2>/dev/null || true
 if [ -f "$NR_CTX_GLOBAL" ]; then
-  docker exec "$CONTAINER" sh -c "cat > /data/context/global/global.json" < "$NR_CTX_GLOBAL" 2>/dev/null \
-    || docker cp "$NR_CTX_GLOBAL" "$CONTAINER:/data/context/global/global.json"
-  echo "    Context file: written to /data/context/global/global.json"
+  # SAFETY GATE: refuse to write if the new file would SHRINK any *_configs key
+  # from non-empty to empty. This is the strongest never-lose-data guarantee — even
+  # if the live REST backup somehow returned empty data, we keep what's on disk.
+  EXISTING_CTX=$(mktemp)
+  docker exec "$CONTAINER" cat /data/context/global/global.json > "$EXISTING_CTX" 2>/dev/null || echo '{}' > "$EXISTING_CTX"
+  SHRINK_CHECK=$(python3 - "$EXISTING_CTX" "$NR_CTX_GLOBAL" << 'PYEOF' 2>/dev/null
+import json, sys
+def load(fn):
+    try: d = json.load(open(fn))
+    except: return {}
+    if isinstance(d, dict) and 'default' in d and isinstance(d['default'], dict): d = d['default']
+    return d if isinstance(d, dict) else {}
+def unwrap(v):
+    if isinstance(v, dict) and 'msg' in v:
+        m = v['msg']
+        if isinstance(m, str):
+            try: return json.loads(m)
+            except: return m
+        return m
+    if isinstance(v, str):
+        try: return json.loads(v)
+        except: return v
+    return v
+def count(v):
+    v = unwrap(v)
+    if isinstance(v, list): return len(v)
+    if isinstance(v, dict): return len(v)
+    return 0
+old = load(sys.argv[1])
+new = load(sys.argv[2])
+shrunk = []
+for k in ('arcgis_configs','tc_configs','pp_configs','tak_settings','ipaws_config'):
+    o, n = count(old.get(k)), count(new.get(k))
+    if o > 0 and n == 0:
+        shrunk.append(f'{k}: {o} -> 0')
+if shrunk:
+    print('SHRINK_DETECTED: ' + '; '.join(shrunk))
+PYEOF
+)
+  if echo "$SHRINK_CHECK" | grep -q '^SHRINK_DETECTED'; then
+    echo "    !! REFUSING to overwrite global.json — would shrink data:"
+    echo "    !! $SHRINK_CHECK"
+    echo "    !! Keeping existing on-disk context. New backup is at $NR_CTX_GLOBAL."
+    rm -f "$EXISTING_CTX"
+  else
+    docker exec "$CONTAINER" sh -c "cat > /data/context/global/global.json" < "$NR_CTX_GLOBAL" 2>/dev/null \
+      || docker cp "$NR_CTX_GLOBAL" "$CONTAINER:/data/context/global/global.json"
+    echo "    Context file: written to /data/context/global/global.json"
+    rm -f "$EXISTING_CTX"
+  fi
+  unset EXISTING_CTX SHRINK_CHECK
 fi
 if [ -f "$NR_CTX_FLOW_CFG" ]; then
   docker exec "$CONTAINER" sh -c "cat > /data/context/flow/flow_arcgis_cfg.json" < "$NR_CTX_FLOW_CFG" 2>/dev/null \
