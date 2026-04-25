@@ -476,6 +476,8 @@ fi
 rm -f /tmp/flows_current.json /tmp/flows_cred_backup.json /tmp/flows_merged.json
 
 docker start "$CONTAINER"
+# Fix ownership on context files written by docker cp (cp writes as root; Node-RED runs as node-red)
+docker exec "$CONTAINER" sh -c "chown -R node-red:node-red /data/context 2>/dev/null || chown -R 1000:1000 /data/context 2>/dev/null || true"
 docker exec "$CONTAINER" sh -c "rm -f /tmp/flows_*.json /tmp/build-flows.js /tmp/configurator.html" 2>/dev/null || true
 
 # ── Post-startup API context restore (belt-and-suspenders) ────────────────────

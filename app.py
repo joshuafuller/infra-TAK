@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.7.1-alpha"
+VERSION = "0.7.2-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -29183,6 +29183,11 @@ def _post_update_auto_deploy():
                                     shell=True, capture_output=True, timeout=15
                                 )
                                 os.remove(tmp_ctx)
+                                # Fix ownership — docker cp writes as root; Node-RED runs as node-red
+                                subprocess.run(
+                                    'docker exec nodered sh -c "chown -R node-red:node-red /data/context 2>/dev/null || chown -R 1000:1000 /data/context 2>/dev/null || true"',
+                                    shell=True, capture_output=True, timeout=10
+                                )
                                 print("Post-update: in-memory context exported to filesystem before migration")
                         except Exception as ctx_e:
                             print(f"Post-update: context pre-export warning (non-fatal): {ctx_e}")
