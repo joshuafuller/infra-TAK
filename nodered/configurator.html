@@ -619,18 +619,18 @@
         <div id="certPreview" style="font-size:0.75rem;color:#666;margin-top:0.2rem"></div>
       </div>
     </div>
-    <div class="field-grid" style="margin-bottom:1rem">
+    <div id="arcgisStreamPortField" class="field-grid" style="display:none;margin-bottom:1rem">
       <div>
         <label for="streamPort">CoT TCP stream port</label>
         <input type="number" id="streamPort" min="1" max="65535" value="8089" placeholder="e.g. 8089">
         <div style="font-size:0.72rem;color:#64748b;margin-top:0.25rem;line-height:1.35">TCP port Node-RED uses to stream CoT to TAK Server. Set a discrete port per source so TAK Server can route each feed to a specific channel or group.</div>
       </div>
     </div>
-    <div class="field-grid" style="margin-bottom:1rem">
+    <div id="arcgisTakDestinationLabelField" class="field-grid" style="display:none;margin-bottom:1rem">
       <div style="grid-column:1/-1">
         <label for="arcgisTakDestinationLabel">Saved-list note <span style="color:#64748b;font-weight:400">(optional)</span></label>
-        <input type="text" id="arcgisTakDestinationLabel" placeholder="e.g. Data Sync channel name on server, or which TAK group uses this stream">
-        <div style="font-size:0.72rem;color:#64748b;margin-top:0.25rem;line-height:1.35">For operators only — shown on the saved config card. Not sent in CoT. Use it to record how this feed is wired on TAK Server (mission / Data Sync vs streaming port).</div>
+        <input type="text" id="arcgisTakDestinationLabel" placeholder="e.g. which TAK group / channel this stream feeds">
+        <div style="font-size:0.72rem;color:#64748b;margin-top:0.25rem;line-height:1.35">For operators only — shown on the saved config card. Not sent in CoT.</div>
       </div>
     </div>
     <input type="hidden" id="configCreatorUid" value="admin">
@@ -2094,6 +2094,9 @@ function toggleDataSync() {
   var on = document.getElementById('dataSyncEnabled').checked;
   document.getElementById('dataSyncFields').style.display = on ? '' : 'none';
   document.getElementById('streamFields').style.display = on ? 'none' : '';
+  document.getElementById('arcgisStreamPortField').style.display = on ? 'none' : '';
+  document.getElementById('arcgisTakDestinationLabelField').style.display = on ? 'none' : '';
+  document.getElementById('strictModeBlock').style.display = on ? '' : 'none';
 }
 
 function updateCertPreview() {
@@ -4107,6 +4110,7 @@ function resetForm() {
   document.getElementById('serviceUrl').value = '';
   document.getElementById('configName').value = '';
   document.getElementById('dataSyncEnabled').checked = true;
+  toggleDataSync();
   document.getElementById('streamCertUser').value = '';
   document.getElementById('streamPort').value = '8089';
   document.getElementById('missionName').value = '';
@@ -4573,6 +4577,7 @@ async function selectConfig(idx) {
   }
   if (c.uidPrefix) document.getElementById('uidPrefix').value = c.uidPrefix;
   document.getElementById('dataSyncEnabled').checked = c.dataSyncEnabled !== false;
+  toggleDataSync();
   document.getElementById('streamCertUser').value = c.streamCertUser || '';
   document.getElementById('streamPort').value = (c.cotStreamPort > 0) ? c.cotStreamPort : (c.streamPort > 0 ? c.streamPort : 8089);
   if (c.missionName) document.getElementById('missionName').value = c.missionName;
