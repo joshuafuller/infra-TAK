@@ -5,6 +5,49 @@ const path = require('path');
 const html    = fs.readFileSync(path.join(__dirname, 'configurator.html'), 'utf8');
 const CFG_TAB = 'flow_arcgis_cfg';
 
+// Shared snippet: write a timestamped backup of all config keys to /data/config-backups/
+// on the Docker volume immediately after any save operation.
+// Coerce any global.get() result into a clean array. Handles three rotten formats:
+//   1) localfilesystem REST envelope: { msg: "[]", format: "..." }
+//   2) double-serialized strings:     "[]"
+//   3) anything non-array (null, {}, undefined) → []
+// This MUST be used in every fn_save/fn_delete/fn_*_save before calling
+// .findIndex / .push / .filter on configs, otherwise function nodes throw
+// TypeError, never return msg, and the http-in request hangs forever.
+const ARRAY_GUARD = [
+  "function _coerceArr(_v) {",
+  "  if (_v && typeof _v === 'object' && !Array.isArray(_v) && 'msg' in _v) {",
+  "    var _m = _v.msg;",
+  "    if (typeof _m === 'string') { try { _v = JSON.parse(_m); } catch(_e) { _v = []; } }",
+  "    else _v = _m;",
+  "  }",
+  "  if (typeof _v === 'string') { try { _v = JSON.parse(_v); } catch(_e) { _v = []; } }",
+  "  return Array.isArray(_v) ? _v : [];",
+  "}"
+].join('\n');
+
+// Backup stored directly in global context (no fs/filesystem needed).
+// With localfilesystem context storage it persists to /data/context/global/global.json automatically.
+const CFG_BACKUP_SNIPPET = [
+  "try {",
+  "  function _parseForSnap(v){if(v&&typeof v==='object'&&!Array.isArray(v)&&'msg'in v){var m=v.msg;if(typeof m==='string'){try{return JSON.parse(m);}catch(e){return m;}}return m;}if(typeof v==='string'){try{return JSON.parse(v);}catch(e){return v;}}return v;}",
+  "  var _snap = {",
+  "    timestamp:         new Date().toISOString(),",
+  "    arcgis_configs:    _parseForSnap(global.get('arcgis_configs'))    || [],",
+  "    tc_configs:        _parseForSnap(global.get('tc_configs'))        || [],",
+  "    tak_settings:      _parseForSnap(global.get('tak_settings'))      || {},",
+  "    ipaws_config:      _parseForSnap(global.get('ipaws_config'))      || {},",
+  "    pp_configs:        _parseForSnap(global.get('pp_configs'))        || []",
+  "  };",
+  "  // Keep rolling list of up to 10 snapshots in context (no fs required)",
+  "  var _hist = global.get('ctx_backups') || [];",
+  "  if (!Array.isArray(_hist)) _hist = [];",
+  "  _hist.unshift(_snap);",
+  "  if (_hist.length > 10) _hist = _hist.slice(0, 10);",
+  "  global.set('ctx_backups', _hist);",
+  "} catch(_be) { node.warn('Config backup failed: '+_be.message); }"
+].join('\n');
+
 // ╔══════════════════════════════════════════════════════════════╗
 // ║  FEEDS — STATIC ArcGIS engine tabs in the shipped flows.   ║
 // ║  Leave EMPTY. Do not ship named feeds (e.g. CA AIR INTEL) in ║
@@ -223,6 +266,83 @@ const FN_KML_PARSE_FIELDS = [
 // ════════════════════════════════════════════════════════════════
 //  Configurator tab — shared UI + persistence (global context)
 // ════════════════════════════════════════════════════════════════
+
+// Tablet Command: default ATAK OSM iconset icons + CoT helpers (used by CFG tab + TC engine template)
+// OSM iconset uid: 6d781afb-89a6-4c07-b2b9-a89748b6a38f  (Service group)
+const TC_ICON_FIRE = '6d781afb-89a6-4c07-b2b9-a89748b6a38f/Service/firebrigade.png';
+const TC_ICON_AMB  = '6d781afb-89a6-4c07-b2b9-a89748b6a38f/Service/emergency.png';
+
+const TC_COT_TYPE_FN = [
+  "function tcCotType(r) {",
+  "  r = (r||'').toUpperCase().replace(/\\s+/g,'');",
+  "  if (/^E\\d|^ENG/.test(r))                       return 'a-f-G-E-V-C'; // Engine",
+  "  if (/^(T|TRK|LAD|TK)\\d/.test(r))               return 'a-f-G-E-V-C'; // Truck/Ladder",
+  "  if (/^(M|MED|AMB|ALS|BLS)\\d/.test(r))          return 'a-f-G-E-V-M'; // Medical",
+  "  if (/^(BC|BAT|CHIEF|AC|DC|DIV|CMD)/.test(r))    return 'a-f-G-E-V-C'; // Chief/Command",
+  "  if (/^(H|HELO|AIR|HT|CHP)\\d/.test(r))          return 'a-f-A-C-H';   // Helicopter",
+  "  if (/^(WT|WAT|WATER)\\d/.test(r))               return 'a-f-G-E-V-C'; // Water Tender",
+  "  if (/^(RES|RESCUE|SQ|SQUAD)\\d/.test(r))        return 'a-f-G-E-V-C'; // Rescue/Squad",
+  "  if (/^(HAZ|HM)\\d/.test(r))                     return 'a-f-G-E-V-C'; // Hazmat",
+  "  return 'a-f-G-E-V-C'; // default: friendly ground vehicle",
+  "}",
+  "function tcDefaultIconset(ct) {",
+  "  if (ct === 'a-f-G-E-V-M') return '" + TC_ICON_AMB + "';",
+  "  if (ct === 'a-f-A-C-H') return '';",
+  "  return '" + TC_ICON_FIRE + "';",
+  "}"
+].join('\n');
+
+const FN_TC_FEED_SNAPSHOT = [
+  TC_COT_TYPE_FN,
+  '',
+  'var body = msg.payload || {};',
+  "var agencyUrl = (body.agencyUrl || '').trim();",
+  'if (!agencyUrl) { msg.payload = { ok:false, error:"agencyUrl required" }; return msg; }',
+  'var parsed;',
+  'try { parsed = new URL(agencyUrl); } catch (e) { msg.payload = { ok:false, error:"invalid URL" }; return msg; }',
+  "if (parsed.protocol !== 'https:') { msg.payload = { ok:false, error:'https only' }; return msg; }",
+  "if (!/tabletcommand\\.com$/i.test(parsed.hostname)) { msg.payload = { ok:false, error:'hostname must end with tabletcommand.com' }; return msg; }",
+  "var base = agencyUrl.replace(/\\/+$/, '');",
+  "var qurl = base + '/0/query?where=1%3D1&outFields=*&returnGeometry=false&f=json';",
+  "var https = global.get('nodeHttps');",
+  'if (!https) { msg.payload = { ok:false, error:"nodeHttps missing in Node-RED functionGlobalContext" }; return msg; }',
+  "https.get(qurl, { headers: { 'User-Agent': 'infra-TAK/tc-feed-snapshot' } }, function (res) {",
+  "  var chunks = [];",
+  "  res.on('data', function (d) { chunks.push(d); });",
+  "  res.on('end', function () {",
+  '    try {',
+  "      var txt = Buffer.concat(chunks).toString('utf8');",
+  '      var data = JSON.parse(txt);',
+  "      if (res.statusCode !== 200) { msg.payload = { ok:false, error:'HTTP '+res.statusCode, body: txt.slice(0,500) }; return node.send(msg); }",
+  '      var feats = data.features || [];',
+  '      function escCell(s) {',
+  "        s = String(s == null ? '' : s);",
+  "        if (/[\",\\n\\r]/.test(s)) return '\"' + s.replace(/\"/g,'\"\"') + '\"';",
+  '        return s;',
+  '      }',
+  "      var lines = ['radioName,callsign,cotType,iconsetpath'];",
+  '      var seen = {};',
+  '      feats.forEach(function (f) {',
+  "        var a = f.attributes || {};",
+  "        var radio = (a.radioName || '').trim();",
+  '        if (!radio || seen[radio]) return;',
+  '        seen[radio] = true;',
+  "        var ct = tcCotType(radio);",
+  "        var ic = tcDefaultIconset(ct);",
+  "        lines.push([escCell(radio), escCell(radio), escCell(ct), escCell(ic)].join(','));",
+  '      });',
+  "      msg.payload = { ok:true, count: Object.keys(seen).length, csv: lines.join('\\n') };",
+  '    } catch (e) {',
+  "      msg.payload = { ok:false, error: e.message };",
+  '    }',
+  '    node.send(msg);',
+  '  });',
+  "}).on('error', function (e) {",
+  "  msg.payload = { ok:false, error: e.message };",
+  '  node.send(msg);',
+  '});',
+  'return null;'
+].join('\n');
 
 const configFlows = [
   {
@@ -616,8 +736,9 @@ const configFlows = [
     id: 'fn_save', type: 'function', z: CFG_TAB,
     name: 'Save to global context',
     func: [
+      ARRAY_GUARD,
       "var config  = msg.payload;",
-      "var configs = global.get('arcgis_configs') || [];",
+      "var configs = _coerceArr(global.get('arcgis_configs'));",
       "var idx = configs.findIndex(function(c) {",
       "  if (config.sourceType === 'faa_tfr') return c.configName === config.configName && c.sourceType === 'faa_tfr';",
       "  if (config.sourceType === 'kml') return c.configName === config.configName && c.sourceType === 'kml';",
@@ -627,10 +748,11 @@ const configFlows = [
       "if (idx >= 0) { configs[idx] = config; }",
       "else           { configs.push(config); }",
       "global.set('arcgis_configs', configs);",
+      CFG_BACKUP_SNIPPET + "\n",
       "var certUser = (config.streamCertUser || '').trim();",
       "if (certUser) {",
       "  try {",
-      "    var fs = require('fs');",
+      "  var fs = global.get('fs') || require('fs');",
       "    var pem = '/certs/' + certUser + '.pem';",
       "    var key = '/certs/' + certUser + '.key';",
       "    if (fs.existsSync(pem)) fs.chmodSync(pem, 0o644);",
@@ -662,6 +784,7 @@ const configFlows = [
     name: 'Replace all configs',
     func: [
       "global.set('arcgis_configs', msg.payload.configs || []);",
+      CFG_BACKUP_SNIPPET + "\n",
       "msg.payload = { ok: true };",
       "return msg;"
     ].join('\n'),
@@ -685,7 +808,10 @@ const configFlows = [
     id: 'fn_load', type: 'function', z: CFG_TAB,
     name: 'Load from global context',
     func: [
-      "var configs = global.get('arcgis_configs') || [];",
+      "var _raw = global.get('arcgis_configs');",
+      "if (_raw && typeof _raw === 'object' && !Array.isArray(_raw) && 'msg' in _raw) { try { _raw = JSON.parse(_raw.msg); } catch(e) { _raw = []; } }",
+      "if (typeof _raw === 'string') { try { _raw = JSON.parse(_raw); } catch(e) { _raw = []; } }",
+      "var configs = (Array.isArray(_raw) ? _raw : null) || [];",
       "msg.payload = { configs: configs };",
       "return msg;"
     ].join('\n'),
@@ -717,6 +843,7 @@ const configFlows = [
     name: 'Save TAK settings',
     func: [
       "global.set('tak_settings', msg.payload);",
+      CFG_BACKUP_SNIPPET + "\n",
       "msg.payload = { ok: true };",
       "return msg;"
     ].join('\n'),
@@ -751,6 +878,422 @@ const configFlows = [
     id: 'ho_tak_load', type: 'http response', z: CFG_TAB,
     name: '', statusCode: '', headers: {},
     x: 640, y: 900, wires: []
+  },
+
+  // ── Tablet Command config persistence ──
+  {
+    id: 'c_tc', type: 'comment', z: CFG_TAB,
+    name: '── Tablet Command Config ──',
+    info: '', x: 260, y: 960, wires: []
+  },
+  {
+    id: 'hi_tc_save', type: 'http in', z: CFG_TAB,
+    name: 'POST /tc/config/save',
+    url: '/tc/config/save', method: 'post',
+    upload: false, swaggerDoc: '',
+    x: 200, y: 1000, wires: [['fn_tc_save']]
+  },
+  {
+    id: 'fn_tc_save', type: 'function', z: CFG_TAB,
+    name: 'Save TC config',
+    func: [
+      ARRAY_GUARD,
+      "var cfg = msg.payload || {};",
+      "if (!cfg.id) { msg.payload = { ok:false, error:'missing id' }; return msg; }",
+      "var configs = _coerceArr(global.get('tc_configs'));",
+      "var idx = configs.findIndex(function(c){ return c.id === cfg.id; });",
+      "if (idx >= 0) { configs[idx] = cfg; } else { configs.push(cfg); }",
+      "global.set('tc_configs', configs);",
+      CFG_BACKUP_SNIPPET + "\n",
+      "msg.payload = { ok: true, configCount: configs.length };",
+      "return msg;"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 430, y: 1000, wires: [['ho_tc_save']]
+  },
+  {
+    id: 'ho_tc_save', type: 'http response', z: CFG_TAB,
+    name: '', statusCode: '200', headers: { 'content-type': 'application/json' },
+    x: 640, y: 1000, wires: []
+  },
+  {
+    id: 'hi_tc_delete', type: 'http in', z: CFG_TAB,
+    name: 'POST /tc/config/delete',
+    url: '/tc/config/delete', method: 'post',
+    upload: false, swaggerDoc: '',
+    x: 200, y: 1040, wires: [['fn_tc_delete']]
+  },
+  {
+    id: 'fn_tc_delete', type: 'function', z: CFG_TAB,
+    name: 'Delete TC config',
+    func: [
+      ARRAY_GUARD,
+      "var id = (msg.payload||{}).id;",
+      "if (!id) { msg.payload = { ok:false, error:'missing id' }; return msg; }",
+      "var configs = _coerceArr(global.get('tc_configs')).filter(function(c){ return c.id !== id; });",
+      "global.set('tc_configs', configs);",
+      "global.set('tc_units_'+id, null);",
+      CFG_BACKUP_SNIPPET + "\n",
+      "msg.payload = { ok: true };",
+      "return msg;"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 430, y: 1040, wires: [['ho_tc_delete']]
+  },
+  {
+    id: 'ho_tc_delete', type: 'http response', z: CFG_TAB,
+    name: '', statusCode: '200', headers: { 'content-type': 'application/json' },
+    x: 640, y: 1040, wires: []
+  },
+  {
+    id: 'hi_tc_load', type: 'http in', z: CFG_TAB,
+    name: 'GET /tc/config/load',
+    url: '/tc/config/load', method: 'get',
+    upload: false, swaggerDoc: '',
+    x: 200, y: 1080, wires: [['fn_tc_load']]
+  },
+  {
+    id: 'fn_tc_load', type: 'function', z: CFG_TAB,
+    name: 'Load TC configs',
+    func: [
+      "var _raw = global.get('tc_configs');",
+      "if (_raw && typeof _raw === 'object' && !Array.isArray(_raw) && 'msg' in _raw) { try { _raw = JSON.parse(_raw.msg); } catch(e) { _raw = []; } }",
+      "if (typeof _raw === 'string') { try { _raw = JSON.parse(_raw); } catch(e) { _raw = []; } }",
+      "var configs = (Array.isArray(_raw) ? _raw : null) || [];",
+      "msg.payload = { configs: configs, _ctx_type: typeof global.get('tc_configs') };",
+      "return msg;"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 430, y: 1080, wires: [['ho_tc_load']]
+  },
+  {
+    id: 'ho_tc_load', type: 'http response', z: CFG_TAB,
+    name: '', statusCode: '200', headers: { 'content-type': 'application/json' },
+    x: 640, y: 1080, wires: []
+  },
+  {
+    id: 'hi_tc_units_save', type: 'http in', z: CFG_TAB,
+    name: 'POST /tc/units/save',
+    url: '/tc/units/save', method: 'post',
+    upload: false, swaggerDoc: '',
+    x: 200, y: 1120, wires: [['fn_tc_units_save']]
+  },
+  {
+    id: 'fn_tc_units_save', type: 'function', z: CFG_TAB,
+    name: 'Save TC known units',
+    func: [
+      "var id    = (msg.payload||{}).id;",
+      "var units = (msg.payload||{}).units || {};",
+      "if (!id) { msg.payload = { ok:false, error:'missing id' }; return msg; }",
+      "global.set('tc_units_'+id, units);",
+      "msg.payload = { ok: true, count: Object.keys(units).length };",
+      "return msg;"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 430, y: 1120, wires: [['ho_tc_units_save']]
+  },
+  {
+    id: 'ho_tc_units_save', type: 'http response', z: CFG_TAB,
+    name: '', statusCode: '200', headers: { 'content-type': 'application/json' },
+    x: 640, y: 1120, wires: []
+  },
+  {
+    id: 'hi_tc_units_load', type: 'http in', z: CFG_TAB,
+    name: 'GET /tc/units/load',
+    url: '/tc/units/load', method: 'get',
+    upload: false, swaggerDoc: '',
+    x: 200, y: 1160, wires: [['fn_tc_units_load']]
+  },
+  {
+    id: 'fn_tc_units_load', type: 'function', z: CFG_TAB,
+    name: 'Load TC known units',
+    func: [
+      "var id = msg.req && msg.req.query && msg.req.query.id;",
+      "var units = id ? (global.get('tc_units_'+id) || {}) : {};",
+      "msg.payload = { units: units };",
+      "return msg;"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 430, y: 1160, wires: [['ho_tc_units_load']]
+  },
+  {
+    id: 'ho_tc_units_load', type: 'http response', z: CFG_TAB,
+    name: '', statusCode: '200', headers: { 'content-type': 'application/json' },
+    x: 640, y: 1160, wires: []
+  },
+  {
+    id: 'hi_tc_feed_snapshot', type: 'http in', z: CFG_TAB,
+    name: 'POST /tc/feed/snapshot',
+    url: '/tc/feed/snapshot', method: 'post',
+    upload: false, swaggerDoc: '',
+    x: 200, y: 1200, wires: [['fn_tc_feed_snapshot']]
+  },
+  {
+    id: 'fn_tc_feed_snapshot', type: 'function', z: CFG_TAB,
+    name: 'TC live feed → CSV template',
+    func: FN_TC_FEED_SNAPSHOT,
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 430, y: 1200, wires: [['ho_tc_feed_snapshot']]
+  },
+  {
+    id: 'ho_tc_feed_snapshot', type: 'http response', z: CFG_TAB,
+    name: '', statusCode: '200', headers: { 'content-type': 'application/json' },
+    x: 640, y: 1200, wires: []
+  },
+
+  // ── TC connection test (build URL → http request → parse → respond) ──
+  {
+    id: 'hi_tc_test', type: 'http in', z: CFG_TAB,
+    name: 'POST /tc/config/test',
+    url: '/tc/config/test', method: 'post',
+    upload: false, swaggerDoc: '',
+    x: 200, y: 1215, wires: [['fn_tc_test_build']]
+  },
+  {
+    id: 'fn_tc_test_build', type: 'function', z: CFG_TAB,
+    name: 'Build TC test URL',
+    func: [
+      "var body = msg.payload || {};",
+      "var agencyUrl = (body.agencyUrl || '').trim().replace(/\\/+$/, '');",
+      "if (!agencyUrl) {",
+      "  msg.payload = { ok: false, error: 'No URL provided' };",
+      "  msg._tcTestSkip = true;",
+      "  return msg;",
+      "}",
+      "msg._tcTestOriginReq = msg.req;",
+      "msg._tcTestOriginRes = msg.res;",
+      "msg.url = agencyUrl + '/0?f=json';",
+      "msg.method = 'GET';",
+      "msg.headers = { 'User-Agent': 'infra-TAK/tc-test', 'Accept': 'application/json' };",
+      "return msg;"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 410, y: 1215, wires: [['http_tc_test']]
+  },
+  {
+    id: 'http_tc_test', type: 'http request', z: CFG_TAB,
+    name: 'GET TC layer info',
+    method: 'GET', ret: 'obj',
+    paytoqs: 'ignore', url: '', tls: '',
+    persist: false, proxy: '', insecureHTTPParser: false,
+    authType: '', senderror: false, headers: [],
+    x: 620, y: 1215, wires: [['fn_tc_test_parse']]
+  },
+  {
+    id: 'fn_tc_test_parse', type: 'function', z: CFG_TAB,
+    name: 'Parse TC test result',
+    func: [
+      "if (msg._tcTestSkip) { return msg; }",
+      "var d = msg.payload || {};",
+      "var sc = msg.statusCode || 200;",
+      "if (d.error) {",
+      "  msg.payload = { ok: false, error: 'Service error: ' + (d.error.message || JSON.stringify(d.error)) };",
+      "} else if (sc >= 400) {",
+      "  msg.payload = { ok: false, error: 'HTTP ' + sc };",
+      "} else {",
+      "  // Extract field names from layer metadata (for remarks picker)",
+      "  var SKIP = ['Shape__Area','Shape__Length','Shape_Area','Shape_Length','objectid','OBJECTID','GlobalID','globalid'];",
+      "  var fields = (d.fields || []).map(function(f){ return { key: f.name, label: f.alias || f.name }; })",
+      "    .filter(function(f){ return SKIP.indexOf(f.key) === -1 && f.key.toLowerCase() !== 'shape'; });",
+      "  msg.payload = {",
+      "    ok: true,",
+      "    name: d.name || d.serviceName || 'Feature Layer',",
+      "    type: d.geometryType || d.type || '',",
+      "    status: sc,",
+      "    fields: fields",
+      "  };",
+      "}",
+      "msg.req = msg._tcTestOriginReq;",
+      "msg.res = msg._tcTestOriginRes;",
+      "return msg;"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 820, y: 1215, wires: [['ho_tc_test']]
+  },
+  {
+    id: 'ho_tc_test', type: 'http response', z: CFG_TAB,
+    name: '', statusCode: '200', headers: { 'content-type': 'application/json' },
+    x: 1020, y: 1215, wires: []
+  },
+
+  // ── Config backup list / restore ──
+  {
+    id: 'c_backups', type: 'comment', z: CFG_TAB,
+    name: '── Config Backups ──',
+    info: '', x: 260, y: 1220, wires: []
+  },
+  {
+    id: 'hi_cfg_bk_list', type: 'http in', z: CFG_TAB,
+    name: 'GET /config/backups',
+    url: '/config/backups', method: 'get',
+    upload: false, swaggerDoc: '',
+    x: 200, y: 1260, wires: [['fn_cfg_bk_list']]
+  },
+  {
+    id: 'fn_cfg_bk_list', type: 'function', z: CFG_TAB,
+    name: 'List config backups',
+    func: [
+      "function _pc(v){if(v&&typeof v==='object'&&!Array.isArray(v)&&'msg'in v){var m=v.msg;if(typeof m==='string'){try{return JSON.parse(m);}catch(e){return m;}}return m;}if(typeof v==='string'){try{return JSON.parse(v);}catch(e){return v;}}return v;}",
+      "function _snapInfo(d, filename) {",
+      "  var ac=_pc(d.arcgis_configs); if(!Array.isArray(ac)) ac=[];",
+      "  var tc=_pc(d.tc_configs);     if(!Array.isArray(tc)) tc=[];",
+      "  return { filename: filename, timestamp: d.timestamp||null,",
+      "    arcgis_count: ac.filter(function(c){return c.sourceType==='arcgis'||!c.sourceType;}).length,",
+      "    tfr_count:    ac.filter(function(c){return c.sourceType==='faa_tfr';}).length,",
+      "    kml_count:    ac.filter(function(c){return c.sourceType==='kml';}).length,",
+      "    tc_count: tc.length,",
+      "    has_tak: !!(d.tak_settings && Object.keys(d.tak_settings||{}).length),",
+      "    has_ipaws: !!(d.ipaws_config && d.ipaws_config.activated),",
+      "    has_pulsepoint: !!(d.pp_configs && Array.isArray(d.pp_configs) && d.pp_configs.some(function(c){return c.activated;})) };",
+      "}",
+      "var backups = [];",
+      "// Primary: context-stored snapshots (no fs needed)",
+      "try {",
+      "  var _hist = global.get('ctx_backups') || [];",
+      "  if (!Array.isArray(_hist)) _hist = [];",
+      "  _hist.forEach(function(snap, i) {",
+      "    try { backups.push(_snapInfo(snap, 'ctx:' + i)); } catch(e) {}",
+      "  });",
+      "} catch(e) {}",
+      "// Secondary: filesystem backups (if available)",
+      "try {",
+      "  var _fs = global.get('fs');",
+      "  if (_fs) {",
+      "    var _bd = '/data/config-backups';",
+      "    if (_fs.existsSync(_bd)) {",
+      "      var files = _fs.readdirSync(_bd).filter(function(f){ return f==='latest.json'||f.startsWith('backup_'); }).sort().reverse();",
+      "      files.forEach(function(f) {",
+      "        try { var d=JSON.parse(_fs.readFileSync(_bd+'/'+f,'utf8')); backups.push(_snapInfo(d,'fs:'+f)); } catch(e) {}",
+      "      });",
+      "    }",
+      "  }",
+      "} catch(e) {}",
+      "msg.payload = { backups: backups };",
+      "return msg;"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 430, y: 1260, wires: [['ho_cfg_bk_list']]
+  },
+  {
+    id: 'ho_cfg_bk_list', type: 'http response', z: CFG_TAB,
+    name: '', statusCode: '200', headers: { 'content-type': 'application/json' },
+    x: 640, y: 1260, wires: []
+  },
+  {
+    id: 'hi_cfg_restore', type: 'http in', z: CFG_TAB,
+    name: 'POST /config/restore',
+    url: '/config/restore', method: 'post',
+    upload: false, swaggerDoc: '',
+    x: 200, y: 1300, wires: [['fn_cfg_restore']]
+  },
+  {
+    id: 'fn_cfg_restore', type: 'function', z: CFG_TAB,
+    name: 'Restore from backup',
+    func: [
+      "function _pc(v){if(v&&typeof v==='object'&&!Array.isArray(v)&&'msg'in v){var m=v.msg;if(typeof m==='string'){try{return JSON.parse(m);}catch(e){return m;}}return m;}if(typeof v==='string'){try{return JSON.parse(v);}catch(e){return v;}}return v;}",
+      "var filename = (msg.payload||{}).filename;",
+      "if (!filename) { msg.payload = { ok:false, error:'missing filename' }; return msg; }",
+      "try {",
+      "  var d;",
+      "  if (filename.indexOf('ctx:') === 0) {",
+      "    // Restore from context-stored snapshot",
+      "    var idx = parseInt(filename.slice(4), 10);",
+      "    var _hist = global.get('ctx_backups') || [];",
+      "    if (!Array.isArray(_hist) || !_hist[idx]) { msg.payload={ok:false,error:'backup index not found'}; return msg; }",
+      "    d = _hist[idx];",
+      "  } else {",
+      "    // Restore from filesystem backup",
+      "    var fn2 = filename.indexOf('fs:') === 0 ? filename.slice(3) : filename;",
+      "    if (fn2.indexOf('/') >= 0 || fn2.indexOf('..') >= 0) { msg.payload={ok:false,error:'invalid filename'}; return msg; }",
+      "    var _fs = global.get('fs');",
+      "    if (!_fs) { msg.payload={ok:false,error:'fs not available — use a context backup instead'}; return msg; }",
+      "    d = JSON.parse(_fs.readFileSync('/data/config-backups/'+fn2,'utf8'));",
+      "  }",
+      "  var ac=_pc(d.arcgis_configs); if(!Array.isArray(ac)) ac=[];",
+      "  var tc=_pc(d.tc_configs);     if(!Array.isArray(tc)) tc=[];",
+      "  var ts=_pc(d.tak_settings);   if(!ts||typeof ts!=='object'||Array.isArray(ts)) ts={};",
+      "  var ip=_pc(d.ipaws_config);   if(!ip||typeof ip!=='object'||Array.isArray(ip)) ip={};",
+      "  var pp=_pc(d.pp_configs);     if(!Array.isArray(pp)) pp=[];",
+      "  global.set('arcgis_configs',    ac);",
+      "  global.set('tc_configs',        tc);",
+      "  global.set('tak_settings',      ts);",
+      "  global.set('ipaws_config',      ip);",
+      "  global.set('pp_configs',        pp);",
+      "  msg.payload = { ok:true, restored_from:filename, timestamp:d.timestamp, arcgis_count:ac.length, tc_count:tc.length };",
+      "} catch(e) {",
+      "  msg.payload = { ok:false, error:e.message };",
+      "}",
+      "return msg;"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 430, y: 1300, wires: [['ho_cfg_restore']]
+  },
+  {
+    id: 'ho_cfg_restore', type: 'http response', z: CFG_TAB,
+    name: '', statusCode: '200', headers: { 'content-type': 'application/json' },
+    x: 640, y: 1300, wires: []
+  },
+
+  // ── Deploy-time context restore (called by deploy.sh after container starts) ──
+  // Accepts the full backed-up context JSON and pushes it into global context via
+  // global.set() so it works regardless of contextStorage backend (memory or filesystem).
+  {
+    id: 'hi_deploy_restore', type: 'http in', z: CFG_TAB,
+    name: 'POST /config/deploy-restore',
+    url: '/config/deploy-restore', method: 'post',
+    upload: false, swaggerDoc: '',
+    x: 200, y: 1340, wires: [['fn_deploy_restore']]
+  },
+  {
+    id: 'fn_deploy_restore', type: 'function', z: CFG_TAB,
+    name: 'Deploy restore — set global context',
+    func: [
+      "var d = msg.payload;",
+      "// Body parser may deliver a Buffer or string if Content-Type negotiation fails",
+      "if (typeof d === 'string' || Buffer.isBuffer(d)) {",
+      "  try { d = JSON.parse(d.toString()); } catch(e) { d = {}; }",
+      "}",
+      "if (!d || typeof d !== 'object' || Array.isArray(d)) d = {};",
+      "// localfilesystem contextStorage wraps keys under a 'default' envelope",
+      "if (d['default'] && typeof d['default'] === 'object' && !Array.isArray(d['default'])) d = d['default'];",
+      "// localfilesystem context REST API wraps each value as {msg: <json>, format: <hint>} — unwrap it.",
+      "// Also handles bare strings: deploy.sh sometimes serializes values to JSON-strings; if we wrote",
+      "// those into context as-is, downstream fn_save would crash on configs.findIndex (TypeError).",
+      "function unwrapCtxVal(v) {",
+      "  if (v && typeof v === 'object' && !Array.isArray(v) && 'msg' in v) {",
+      "    var inner = v.msg;",
+      "    if (typeof inner === 'string') { try { return JSON.parse(inner); } catch(e) { return inner; } }",
+      "    return inner;",
+      "  }",
+      "  if (typeof v === 'string') { try { return JSON.parse(v); } catch(e) { return v; } }",
+      "  return v;",
+      "}",
+      "var restored = [];",
+      "var KEYS = ['arcgis_configs','tc_configs','tak_settings','ipaws_config','pp_configs'];",
+      "KEYS.forEach(function(k) {",
+      "  if (d[k] !== undefined) { global.set(k, unwrapCtxVal(d[k])); restored.push(k); }",
+      "});",
+      "msg.payload = { ok: true, restored: restored, keys_in_payload: Object.keys(d).filter(function(k){ return KEYS.indexOf(k)>=0; }) };",
+      "return msg;"
+    ].join('\n'),
+    outputs: 1, timeout: '', noerr: 0,
+    initialize: '', finalize: '', libs: [],
+    x: 440, y: 1340, wires: [['ho_deploy_restore']]
+  },
+  {
+    id: 'ho_deploy_restore', type: 'http response', z: CFG_TAB,
+    name: '', statusCode: '200', headers: { 'content-type': 'application/json' },
+    x: 660, y: 1340, wires: []
   },
 
   // ── Force re-subscribe ──
@@ -1314,7 +1857,7 @@ function makeEngineTab(feed) {
     "      { payload: feat.cot, topic: topicCfg,",
     "        _missionName: cfg.missionName,",
     "        host: host,",
-    "        port: Number(tak.streamingPort || tak.streamPort || 8089) },",
+    "        port: Number(cfg.cotStreamPort) || Number(cfg.streamPort) || Number(tak.streamingPort) || Number(tak.streamPort) || 8089 },",
     "      null",
     "    ]);",
     "  } else { nSkip++; }",
@@ -2141,6 +2684,10 @@ const FN_TFR_FILTER_SPLIT = [
 const FN_TFR_PARSE_BUILD_COT = [
   "var xml = msg.payload;",
   "var cfg = msg._config;",
+  "var tak = global.get('tak_settings') || {};",
+  "var tfrHost = String(tak.serverUrl || '').replace(/^https?:\\/\\//i, '').replace(/\\/$/, '').trim() || tak.takHost || 'host.docker.internal';",
+  "var tfrBaseP = Number(tak.streamingPort || tak.streamPort || 8089);",
+  "var tfrPort = Number(cfg.cotStreamPort) || tfrBaseP;",
   "",
   "function hexArgb(hex, a) {",
   "  var r = parseInt(hex.substr(1,2),16);",
@@ -2329,7 +2876,8 @@ const FN_TFR_PARSE_BUILD_COT = [
   "        point: { _attributes: { lat: String(lat), lon: String(lon), hae: '9999999.0', ce: '9999999.0', le: '9999999.0' } },",
   "        detail: detail",
   "      } },",
-  "      topic: cfg.configName, _missionName: cfg.missionName",
+  "      topic: cfg.configName, _missionName: cfg.missionName,",
+  "      host: tfrHost, port: tfrPort",
   "    });",
   "  }",
   "} catch(e) { node.warn(cfg.configName + ' TFR parse error: ' + e.message); }",
@@ -2908,6 +3456,215 @@ function makeTfrEngineTab(feed) {
 //  in ATAK (TAK Settings → Data Packages → Network Links or via
 //  Overlay Manager → Add → URL).  Refresh: match your poll interval.
 // ════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
+//  Tablet Command AVL engine
+//  One card per agency in the Configurator → one Node-RED tab per card.
+//  Streams CoT via TCP to TAK server — no DataSync / no KML.
+//  Schema: latitude, longitude, radioName, time(epoch ms), vehicleStatus
+// ════════════════════════════════════════════════════════════════
+
+function makeTCEngineTab(feed) {
+  const FID = 'flow_tc_' + feed.id;
+  const P   = feed.id + '_tc_';
+
+  const FN_TC_INIT = [
+    "var cfg = (global.get('tc_configs')||[]).find(function(c){return c.configName==='"+feed.configName+"';});",
+    "global.set('tc_last_fetch_"+feed.id+"', 0); // force immediate first poll",
+    "if (!cfg) { node.warn('TC "+feed.configName+": config not found in global context'); return null; }",
+    "return msg;"
+  ].join('\n');
+
+  const FN_TC_POLL = [
+    "var cfg = (global.get('tc_configs')||[]).find(function(c){return c.configName==='"+feed.configName+"';});",
+    "if (!cfg || !cfg.activated) return null;",
+    "var intervalMs = Math.max(1, cfg.pollInterval||1) * 60000;",
+    "var lastFetch  = global.get('tc_last_fetch_"+feed.id+"') || 0;",
+    "if ((Date.now() - lastFetch) < intervalMs) return null;",
+    "return msg;"
+  ].join('\n');
+
+  const FN_TC_BUILD_URL = [
+    "var cfg = (global.get('tc_configs')||[]).find(function(c){return c.configName==='"+feed.configName+"';});",
+    "if (!cfg || !cfg.activated) return null;",
+    "var base = (cfg.agencyUrl||'').replace(/\\/+$/,'');",
+    "msg.url    = base + '/0/query?where=1%3D1&outFields=*&returnGeometry=false&f=json';",
+    "msg.method = 'GET';",
+    "msg.headers = { 'User-Agent': 'infra-TAK/tabletcommand' };",
+    "msg._tcCfg = cfg;",
+    "return msg;"
+  ].join('\n');
+
+  const FN_TC_BUILD_COT = [
+    TC_COT_TYPE_FN,
+    "",
+    "var cfg   = msg._tcCfg || (global.get('tc_configs')||[]).find(function(c){return c.configName==='"+feed.configName+"';}) || {};",
+    "var data  = msg.payload || {};",
+    "var feats = data.features || [];",
+    "var knownUnits = global.get('tc_units_"+feed.id+"') || {};",
+    "var tak   = global.get('tak_settings') || {};",
+    "var host  = String(tak.serverUrl || '').replace(/^https?:\\/\\//i, '').replace(/\\/$/, '').trim() || tak.takHost || 'host.docker.internal';",
+    "var baseP = Number(tak.streamingPort || tak.streamPort || 8089);",
+    "var port  = Number(cfg.cotStreamPort) || baseP;",
+    "var staleMs = (cfg.staleMinutes||5) * 60000;",
+    "var sent  = 0;",
+    "",
+    "global.set('tc_last_fetch_"+feed.id+"', Date.now());",
+    "",
+    "feats.forEach(function(f) {",
+    "  var a = f.attributes || {};",
+    "  var radioName = (a.radioName||'').trim();",
+    "  if (!radioName) return;",
+    "  var lat = parseFloat(a.latitude);",
+    "  var lon = parseFloat(a.longitude);",
+    "  if (isNaN(lat)||isNaN(lon)) return;",
+    "  var ts    = a.time ? new Date(a.time) : new Date();",
+    "  var stale = new Date(ts.getTime() + staleMs);",
+    "  var uid   = 'tc-' + (a.deviceUuid || ('obj-'+a.OBJECTID));",
+    "  var ov    = knownUnits[radioName] || knownUnits[radioName.toUpperCase()] || {};",
+    "  var callsign = ov.callsign || radioName;",
+    "  var cotType  = ov.cotType  || tcCotType(radioName);",
+    "  var iconRaw  = (ov.iconsetpath && String(ov.iconsetpath).trim()) || '';",
+    "  var iconpath = iconRaw || tcDefaultIconset(cotType);",
+    "  var _rmkFields = cfg.remarksFields && cfg.remarksFields.length ? cfg.remarksFields : null;",
+    "  var remarks;",
+    "  if (_rmkFields) {",
+    "    var _rp = _rmkFields.map(function(k){ return k + ': ' + (a[k]||''); });",
+    "    if (cfg.remarksCustomText) _rp.push(cfg.remarksCustomText);",
+    "    remarks = _rp.join(' | ');",
+    "  } else {",
+    "    remarks = (cfg.configName||'TC') + ' | ' + radioName",
+    "             + ' | Status: ' + (a.vehicleStatus||'') + ' | ' + ts.toLocaleString();",
+    "  }",
+    "  var detail = {",
+    "    contact: [{ _attributes:{ callsign:callsign } }],",
+    "    remarks: remarks,",
+    "    status:  [{ _attributes:{ readiness:'true' } }]",
+    "  };",
+    "  if (iconpath) detail.usericon = [{ _attributes: { iconsetpath: iconpath } }];",
+    "  var cotMsg = {",
+    "    payload: {",
+    "      event: {",
+    "        _attributes: {",
+    "          version:'2.0', uid:uid, type:cotType,",
+    "          how:'m-g',",
+    "          time:ts.toISOString(), start:ts.toISOString(), stale:stale.toISOString()",
+    "        },",
+    "        point:  { _attributes:{ lat:String(lat), lon:String(lon), hae:'9999999.0', ce:'50', le:'9999999.0' } },",
+    "        detail: detail",
+    "      }",
+    "    },",
+    "    host: host,",
+    "    port: port",
+    "  };",
+    "  node.send(cotMsg);",
+    "  sent++;",
+    "});",
+    "node.warn('TC "+feed.configName+": '+sent+' CoT events streamed from '+feats.length+' features');",
+    "return null;"
+  ].join('\n');
+
+  return [
+    // ── Tab ──
+    {
+      id: FID, type: 'tab',
+      label: 'TC: ' + feed.configName,
+      disabled: false,
+      info: 'Tablet Command AVL engine for ' + feed.configName + '. Streams CoT via TCP — no DataSync.'
+    },
+
+    // ── Startup inject → immediate first poll ──
+    {
+      id: P+'init_inj', type: 'inject', z: FID,
+      name: 'Startup init',
+      props: [{ p:'payload' }],
+      repeat: '', crontab: '',
+      once: true, onceDelay: '3',
+      topic: '', payload: '', payloadType: 'date',
+      x: 160, y: 40, wires: [[P+'init_fn']]
+    },
+    {
+      id: P+'init_fn', type: 'function', z: FID,
+      name: 'Init TC config',
+      func: FN_TC_INIT,
+      outputs: 1, timeout: '', noerr: 0,
+      initialize: '', finalize: '', libs: [],
+      x: 380, y: 40, wires: [[P+'poll_fn']]
+    },
+
+    // ── 60-second timer → poll check ──
+    {
+      id: P+'timer', type: 'inject', z: FID,
+      name: 'Every 60 s',
+      props: [{ p:'payload' }],
+      repeat: '60', crontab: '',
+      once: false, onceDelay: '0',
+      topic: '', payload: '', payloadType: 'date',
+      x: 160, y: 100, wires: [[P+'poll_fn']]
+    },
+    {
+      id: P+'poll_fn', type: 'function', z: FID,
+      name: 'Check poll interval',
+      func: FN_TC_POLL,
+      outputs: 1, timeout: '', noerr: 0,
+      initialize: '', finalize: '', libs: [],
+      x: 380, y: 100, wires: [[P+'build_url']]
+    },
+
+    // ── Build URL → HTTP request → Build CoT ──
+    {
+      id: P+'build_url', type: 'function', z: FID,
+      name: 'Build TC query URL',
+      func: FN_TC_BUILD_URL,
+      outputs: 1, timeout: '', noerr: 0,
+      initialize: '', finalize: '', libs: [],
+      x: 600, y: 100, wires: [[P+'http_req']]
+    },
+    {
+      id: P+'http_req', type: 'http request', z: FID,
+      name: 'GET TC FeatureServer',
+      method: 'GET', ret: 'obj', paytoqs: 'ignore',
+      url: '', tls: '', persist: false, proxy: '',
+      insecureHTTPParser: false, authType: '',
+      senderr: false, headers: [],
+      x: 840, y: 100, wires: [[P+'build_cot']]
+    },
+    {
+      id: P+'build_cot', type: 'function', z: FID,
+      name: 'Build + stream CoT',
+      func: FN_TC_BUILD_COT,
+      outputs: 1, timeout: '', noerr: 0,
+      initialize: '', finalize: '', libs: [],
+      x: 1080, y: 100, wires: [[P+'cot_xml']]
+    },
+
+    // ── CoT JSON → XML → TCP out ──
+    {
+      id: P+'cot_xml', type: 'function', z: FID,
+      name: 'CoT JSON -> XML',
+      _templateKey: 'shared.cot_to_xml',
+      func: FN_COT_TO_XML,
+      outputs: 1, timeout: '', noerr: 0,
+      initialize: '', finalize: '', libs: [],
+      x: 300, y: 200, wires: [[P+'tcp_out']]
+    },
+    {
+      id: P+'tcp_out', type: 'tcp out', z: FID,
+      name: 'CoT -> TAK :8089',
+      host: 'host.docker.internal', port: '8089', beserver: 'client',
+      base64: false, doend: false, addCR: false, tls: 'tls_tak',
+      x: 520, y: 200, wires: []
+    },
+    {
+      id: P+'dbg', type: 'debug', z: FID,
+      name: 'TC poll log',
+      active: true, tosidebar: true, console: false, tostatus: true,
+      complete: 'payload', targetType: 'msg',
+      statusVal: '', statusType: 'auto',
+      x: 1300, y: 100, wires: []
+    }
+  ];
+}
+
 const IPAWS_TAB_ID = 'flow_ipaws';
 
 // ── Check poll interval then build NWS API request ──────────────
@@ -3317,6 +4074,7 @@ const FN_IPAWS_SAVE_CFG = [
   "global.set('ipaws_config', updated);",
   "// Reset fetch timestamp so next timer tick triggers immediate re-fetch with new settings",
   "global.set('ipaws_last_fetch', 0);",
+  CFG_BACKUP_SNIPPET,
   "msg.payload = { ok: true, config: updated };",
   "return msg;"
 ].join('\n');
@@ -3537,6 +4295,364 @@ function makeIpawsTab() {
 }
 
 // ════════════════════════════════════════════════════════════════
+//  PulsePoint — streaming CoT over TCP (same delivery model as Tablet Command;
+//  not KML / not Data Sync). Polls PulsePoint web API per [snstac/pulsecot](https://github.com/snstac/pulsecot).
+// ════════════════════════════════════════════════════════════════
+
+const PULSEPOINT_TAB_ID = 'flow_pulsepoint_cfg';
+
+// ── Per-agency poll check (parameterised by __CONFIG_NAME__) ──────────────────
+const FN_PP_POLL_V2 = [
+  "var _cn = '__CONFIG_NAME__';",
+  "var _cfgs = global.get('pp_configs') || [];",
+  "if (!Array.isArray(_cfgs)) { try { _cfgs = JSON.parse(_cfgs); } catch(e) { _cfgs = []; } }",
+  "var cfg = _cfgs.find(function(c){ return c.configName === _cn; }) || {};",
+  "if (!cfg.activated) return null;",
+  "var intervalMs = Math.max(15, Number(cfg.pollIntervalSec) || 120) * 1000;",
+  "var lastKey = 'pp_last_fetch___FEED_ID__';",
+  "var lastFetch = global.get(lastKey) || 0;",
+  "if ((Date.now() - lastFetch) < intervalMs) return null;",
+  "msg._ppCfg = cfg;",
+  "return msg;"
+].join('\n');
+
+// ── Per-agency fetch (parameterised) ─────────────────────────────────────────
+// Reads cfg from msg._ppCfg (set by poll check)
+
+// HTTPS GET + AES decode (same algorithm as pulsecot gnu.decode_pulse).
+const FN_PP_FETCH_V2 = [
+  "var cfg = msg._ppCfg || {};",
+  "if (!cfg.activated) return null;",
+  "var rawIds = String(cfg.agencyIds || '').split(/[,\\s]+/).map(function(s){ return s.trim(); }).filter(Boolean);",
+  "if (!rawIds.length) { node.warn('PulsePoint: no agency IDs configured'); return null; }",
+  "var https = global.get('nodeHttps');",
+  "if (!https) { node.warn('PulsePoint: nodeHttps missing'); return null; }",
+  "var urlMod = require('url');",
+  "var crypto = require('crypto');",
+  "var base = String(cfg.ppBaseUrl || 'https://api.pulsepoint.org/v1/webapp').replace(/\\/+$/, '');",
+  "var hdr = {",
+  "  'accept': '*/*',",
+  "  'accept-language': 'en-US,en;q=0.9',",
+  "  'user-agent': 'infra-TAK/pulsepoint',",
+  "  'referer': 'https://web.pulsepoint.org/'",
+  "};",
+  "function decodePulse(data) {",
+  "  if (!data || !data.ct || !data.iv || !data.s) return data;",
+  "  var ct = Buffer.from(data.ct, 'base64');",
+  "  var iv = Buffer.from(String(data.iv), 'hex');",
+  "  var salt = Buffer.from(String(data.s), 'hex');",
+  "  var ekey = 'CommonIncidents';",
+  "  var token = ekey[13] + ekey[1] + ekey[2] + 'brady' + '5' + 'r' + ekey.toLowerCase()[6] + ekey[5] + 'gs';",
+  "  var key = Buffer.alloc(0);",
+  "  var block = null;",
+  "  while (key.length < 32) {",
+  "    var h = crypto.createHash('md5');",
+  "    if (block) h.update(block);",
+  "    h.update(token, 'utf8');",
+  "    h.update(salt);",
+  "    block = h.digest();",
+  "    key = Buffer.concat([key, block]);",
+  "  }",
+  "  key = key.slice(0, 32);",
+  "  var decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);",
+  "  var dec = Buffer.concat([decipher.update(ct), decipher.finalize()]);",
+  "  var q = 34;",
+  "  var end = dec.lastIndexOf(q);",
+  "  if (end < 1) throw new Error('decode: no trailing quote');",
+  "  var txt = dec.slice(1, end).toString('utf8');",
+  "  txt = txt.split(String.fromCharCode(92,34)).join(String.fromCharCode(34));",
+  "  txt = txt.split(String.fromCharCode(92,92,34)).join(String.fromCharCode(39));",
+  "  return JSON.parse(txt);",
+  "}",
+  "function activeList(dec) {",
+  "  if (!dec || typeof dec !== 'object') return [];",
+  "  var w = dec.incidents;",
+  "  if (!w) return [];",
+  "  var act = w.active;",
+  "  if (Array.isArray(act)) return act;",
+  "  if (act && typeof act === 'object') return Object.keys(act).map(function(k){ return act[k]; });",
+  "  return [];",
+  "}",
+  "function getJson(u, cb) {",
+  "  var p = urlMod.parse(u);",
+  "  var opts = { hostname: p.hostname, port: p.port || 443, path: p.path, method: 'GET', headers: hdr };",
+  "  var req = https.request(opts, function(res) {",
+  "    var buf = '';",
+  "    res.setEncoding('utf8');",
+  "    res.on('data', function(c){ buf += c; });",
+  "    res.on('end', function(){",
+  "      try { cb(null, res.statusCode, JSON.parse(buf)); }",
+  "      catch(e) { cb(e, res.statusCode, null); }",
+  "    });",
+  "  });",
+  "  req.on('error', function(e){ cb(e); });",
+  "  req.setTimeout(25000, function(){ try { req.destroy(); } catch(_e){} cb(new Error('timeout')); });",
+  "  req.end();",
+  "}",
+  "var pending = rawIds.length;",
+  "var all = [];",
+  "var errs = [];",
+  "rawIds.forEach(function(aid) {",
+  "  var u = base + '?resource=incidents&agencyid=' + encodeURIComponent(aid);",
+  "  getJson(u, function(err, code, j) {",
+  "    if (err) errs.push(aid + ':' + err.message);",
+  "    else if (code !== 200) errs.push(aid + ':HTTP' + code);",
+  "    else try {",
+  "      var dec = (j && j.ct) ? decodePulse(j) : j;",
+  "      activeList(dec).forEach(function(inc) { if (inc && inc.ID) all.push(inc); });",
+  "    } catch(e2) { errs.push(aid + ':' + e2.message); }",
+  "    pending--;",
+  "    if (pending > 0) return;",
+  "    if (errs.length) node.warn('PulsePoint fetch: ' + errs.join(' | '));",
+  "    var sk = {}; var dedup = [];",
+  "    all.forEach(function(inc) {",
+  "      var u = 'PP-' + String(inc.AgencyID||'x') + '-' + String(inc.ID);",
+  "      if (sk[u]) return;",
+  "      sk[u] = true;",
+  "      dedup.push(inc);",
+  "    });",
+  "    msg._ppIncidents = dedup;",
+  "    node.send(msg);",
+  "  });",
+  "});",
+  "return;"
+].join('\n');
+
+const FN_PP_BUILD_COT_V2 = [
+  "var cfg = msg._ppCfg || {};",
+  "if (!cfg.activated) return null;",
+  "var incidents = msg._ppIncidents || [];",
+  "var tak = global.get('tak_settings') || {};",
+  "var host = String(tak.serverUrl || '').replace(/^https?:\\/\\//i, '').replace(/\\/$/, '').trim() || tak.takHost || 'host.docker.internal';",
+  "var baseP = Number(tak.streamingPort || tak.streamPort || 8089);",
+  "var port = Number(cfg.cotStreamPort) || baseP;",
+  "var icon = cfg.uniformIcon || {};",
+  "var cotType = String(icon.cotType || 'a-u-G').trim() || 'a-u-G';",
+  "var iconpath = String(icon.iconsetpath || '').trim();",
+  "if (!iconpath) iconpath = 'f7f71666-8b28-4b57-9fbb-e38e61d33b79/Google/caution.png';",
+  "var staleSec = Math.max(30, Number(cfg.cotStaleSec) || 600);",
+  "var _prevKey = 'pp_prev_uids___FEED_ID__';",
+  "var prev = global.get(_prevKey) || {};",
+  "var curr = {};",
+  "var nowIso = new Date().toISOString();",
+  "incidents.forEach(function(inc) {",
+  "  var lat = parseFloat(inc.Latitude);",
+  "  var lon = parseFloat(inc.Longitude);",
+  "  if (isNaN(lat) || isNaN(lon)) return;",
+  "  if (String(inc.Latitude) === '0.0000000000' && String(inc.Longitude) === '0.0000000000') return;",
+  "  var uid = 'PP-' + String(inc.AgencyID || 'x') + '-' + String(inc.ID);",
+  "  curr[uid] = true;",
+  "});",
+  "var stalePast = new Date(Date.now() - 5000).toISOString();",
+  "Object.keys(prev).forEach(function(uid) {",
+  "  if (curr[uid]) return;",
+  "  node.send({",
+  "    payload: {",
+  "      event: {",
+  "        _attributes: { version:'2.0', uid:uid, type:cotType, how:'m-g', time: nowIso, start: nowIso, stale: stalePast },",
+  "        point: { _attributes:{ lat:'0', lon:'0', hae:'9999999.0', ce:'9999999', le:'9999999.0' } },",
+  "        detail: { status: [{ _attributes:{ readiness:'false' } }] }",
+  "      }",
+  "    },",
+  "    host: host, port: port",
+  "  });",
+  "});",
+  "var sent = 0;",
+  "incidents.forEach(function(inc) {",
+  "  var lat = parseFloat(inc.Latitude);",
+  "  var lon = parseFloat(inc.Longitude);",
+  "  if (isNaN(lat) || isNaN(lon)) return;",
+  "  if (String(inc.Latitude) === '0.0000000000' && String(inc.Longitude) === '0.0000000000') return;",
+  "  var uid = 'PP-' + String(inc.AgencyID || 'x') + '-' + String(inc.ID);",
+  "  var startStr = inc.CallReceivedDateTime || nowIso;",
+  "  var st = new Date(startStr);",
+  "  if (isNaN(st.getTime())) st = new Date();",
+  "  var stl = new Date(st.getTime() + staleSec * 1000);",
+  "  var ct = inc.PulsePointIncidentCallType || '';",
+  "  var addr = (inc.FullDisplayAddress || '').trim();",
+  "  var cs = (addr || ct || 'PulsePoint').substring(0, 100);",
+  "  var remarks = 'PulsePoint | ' + ct + ' | ' + addr;",
+  "  var detail = {",
+  "    contact: [{ _attributes:{ callsign: cs } }],",
+  "    remarks: remarks,",
+  "    status: [{ _attributes:{ readiness:'true' } }]",
+  "  };",
+  "  if (iconpath) detail.usericon = [{ _attributes:{ iconsetpath: iconpath } }];",
+  "  node.send({",
+  "    payload: {",
+  "      event: {",
+  "        _attributes: {",
+  "          version:'2.0', uid: uid, type: cotType, how:'m-g',",
+  "          time: st.toISOString(), start: st.toISOString(), stale: stl.toISOString()",
+  "        },",
+  "        point: { _attributes:{ lat:String(lat), lon:String(lon), hae:'9999999.0', ce:'50', le:'9999999.0' } },",
+  "        detail: detail",
+  "      }",
+  "    },",
+  "    host: host, port: port",
+  "  });",
+  "  sent++;",
+  "});",
+  "global.set(_prevKey, curr);",
+  "global.set('pp_last_fetch___FEED_ID__', Date.now());",
+  "var dropped = 0;",
+  "Object.keys(prev).forEach(function(u){ if (!curr[u]) dropped++; });",
+  "node.warn('PulsePoint: ' + sent + ' CoT streamed (TCP), ' + dropped + ' cleared');",
+  "return null;"
+].join('\n');
+
+// ── PP config CRUD (array-based, like TC) ────────────────────────────────────
+const FN_PP_SAVE = [
+  ARRAY_GUARD,
+  "var cfg = msg.payload || {};",
+  "if (!cfg.id) { msg.payload = { ok:false, error:'missing id' }; return msg; }",
+  "var configs = _coerceArr(global.get('pp_configs'));",
+  "var idx = configs.findIndex(function(c){ return c.id === cfg.id; });",
+  "if (idx >= 0) { configs[idx] = cfg; } else { configs.push(cfg); }",
+  "global.set('pp_configs', configs);",
+  CFG_BACKUP_SNIPPET,
+  "msg.payload = { ok: true, configCount: configs.length };",
+  "return msg;"
+].join('\n');
+
+const FN_PP_LOAD = [
+  ARRAY_GUARD,
+  "var configs = _coerceArr(global.get('pp_configs'));",
+  "msg.payload = { configs: configs };",
+  "return msg;"
+].join('\n');
+
+const FN_PP_DELETE = [
+  ARRAY_GUARD,
+  "var id = (msg.payload || {}).id;",
+  "if (!id) { msg.payload = { ok:false, error:'missing id' }; return msg; }",
+  "var configs = _coerceArr(global.get('pp_configs')).filter(function(c){ return c.id !== id; });",
+  "global.set('pp_configs', configs);",
+  CFG_BACKUP_SNIPPET,
+  "msg.payload = { ok: true, configCount: configs.length };",
+  "return msg;"
+].join('\n');
+
+function makePulsepointTab() {
+  const Z = PULSEPOINT_TAB_ID;
+  return [
+    {
+      id: Z, type: 'tab',
+      label: 'PulsePoint Config API',
+      disabled: false,
+      info: 'CRUD endpoints for multi-agency PulsePoint configs (pp_configs[]). Per-agency engine tabs created dynamically via Configurator.'
+    },
+    // ── Save ──────────────────────────────────────────────────────
+    {
+      id: Z + '_hi_save', type: 'http in', z: Z,
+      name: 'POST /pp/config/save', url: '/pp/config/save', method: 'post',
+      upload: false, swaggerDoc: '', x: 180, y: 80, wires: [[Z + '_fn_save']]
+    },
+    {
+      id: Z + '_fn_save', type: 'function', z: Z,
+      name: 'Save PP config', func: FN_PP_SAVE,
+      outputs: 1, timeout: '', noerr: 0, initialize: '', finalize: '', libs: [],
+      x: 420, y: 80, wires: [[Z + '_ho_save']]
+    },
+    {
+      id: Z + '_ho_save', type: 'http response', z: Z,
+      name: '', statusCode: '200', headers: { 'content-type': 'application/json' },
+      x: 640, y: 80, wires: []
+    },
+    // ── Load ──────────────────────────────────────────────────────
+    {
+      id: Z + '_hi_load', type: 'http in', z: Z,
+      name: 'GET /pp/config/load', url: '/pp/config/load', method: 'get',
+      upload: false, swaggerDoc: '', x: 180, y: 140, wires: [[Z + '_fn_load']]
+    },
+    {
+      id: Z + '_fn_load', type: 'function', z: Z,
+      name: 'Load PP configs', func: FN_PP_LOAD,
+      outputs: 1, timeout: '', noerr: 0, initialize: '', finalize: '', libs: [],
+      x: 420, y: 140, wires: [[Z + '_ho_load']]
+    },
+    {
+      id: Z + '_ho_load', type: 'http response', z: Z,
+      name: '', statusCode: '200', headers: { 'content-type': 'application/json' },
+      x: 640, y: 140, wires: []
+    },
+    // ── Delete ────────────────────────────────────────────────────
+    {
+      id: Z + '_hi_del', type: 'http in', z: Z,
+      name: 'POST /pp/config/delete', url: '/pp/config/delete', method: 'post',
+      upload: false, swaggerDoc: '', x: 180, y: 200, wires: [[Z + '_fn_del']]
+    },
+    {
+      id: Z + '_fn_del', type: 'function', z: Z,
+      name: 'Delete PP config', func: FN_PP_DELETE,
+      outputs: 1, timeout: '', noerr: 0, initialize: '', finalize: '', libs: [],
+      x: 420, y: 200, wires: [[Z + '_ho_del']]
+    },
+    {
+      id: Z + '_ho_del', type: 'http response', z: Z,
+      name: '', statusCode: '200', headers: { 'content-type': 'application/json' },
+      x: 640, y: 200, wires: []
+    }
+  ];
+}
+
+// ── PP engine tab template (one per agency, created by configurator UI) ───────
+function makePPEngineTab(feed) {
+  const Z = 'flow_pp_' + feed.id;
+  const cn = feed.configName;
+  const poll = FN_PP_POLL_V2
+    .replace(/__CONFIG_NAME__/g, cn)
+    .replace(/__FEED_ID__/g, feed.id);
+  const fetch = FN_PP_FETCH_V2.replace(/__FEED_ID__/g, feed.id);
+  const build = FN_PP_BUILD_COT_V2.replace(/__FEED_ID__/g, feed.id);
+  return [
+    { id: Z, type: 'tab', label: 'PP: ' + cn, disabled: false, info: '' },
+    {
+      id: Z + '_timer', type: 'inject', z: Z,
+      name: 'Every 60 s', props: [{ p: 'payload' }],
+      repeat: '60', crontab: '', once: true, onceDelay: '3',
+      topic: '', payload: '', payloadType: 'date',
+      x: 160, y: 80, wires: [[Z + '_poll']]
+    },
+    {
+      id: Z + '_poll', type: 'function', z: Z,
+      name: 'Poll check', func: poll,
+      _templateKey: 'pp.poll.' + feed.id,
+      outputs: 1, timeout: '', noerr: 0, initialize: '', finalize: '', libs: [],
+      x: 380, y: 80, wires: [[Z + '_fetch']]
+    },
+    {
+      id: Z + '_fetch', type: 'function', z: Z,
+      name: 'Fetch + decode', func: fetch,
+      _templateKey: 'pp.fetch.' + feed.id,
+      outputs: 1, timeout: '', noerr: 0, initialize: '', finalize: '', libs: [],
+      x: 600, y: 80, wires: [[Z + '_build']]
+    },
+    {
+      id: Z + '_build', type: 'function', z: Z,
+      name: 'Build CoT', func: build,
+      _templateKey: 'pp.build.' + feed.id,
+      outputs: 1, timeout: '', noerr: 0, initialize: '', finalize: '', libs: [],
+      x: 820, y: 80, wires: [[Z + '_xml']]
+    },
+    {
+      id: Z + '_xml', type: 'function', z: Z,
+      name: 'CoT → XML', func: FN_COT_TO_XML,
+      _templateKey: 'shared.cot_to_xml',
+      outputs: 1, timeout: '', noerr: 0, initialize: '', finalize: '', libs: [],
+      x: 1040, y: 80, wires: [[Z + '_tcp']]
+    },
+    {
+      id: Z + '_tcp', type: 'tcp out', z: Z,
+      name: 'CoT → TAK', host: 'host.docker.internal',
+      port: String(feed.cotStreamPort || 8089),
+      beserver: 'client', base64: false, doend: false, addCR: false, tls: 'tls_tak',
+      x: 1260, y: 80, wires: []
+    }
+  ];
+}
+
+// ════════════════════════════════════════════════════════════════
 //  Engine tab templates (embedded in configurator.html for dynamic creation)
 // ════════════════════════════════════════════════════════════════
 
@@ -3550,6 +4666,12 @@ const tfrEngineTabTemplate = JSON.stringify(tfrTemplateNodes);
 const kmlTemplateNodes = makeKmlEngineTab(templateFeed);
 const kmlEngineTabTemplate = JSON.stringify(kmlTemplateNodes);
 
+const tcTemplateNodes = makeTCEngineTab(templateFeed);
+const tcEngineTabTemplate = JSON.stringify(tcTemplateNodes);
+
+const ppTemplateNodes = makePPEngineTab({ id: '__FEED_ID__', configName: '__CONFIG_NAME__', cotStreamPort: 8089 });
+const ppEngineTabTemplate = JSON.stringify(ppTemplateNodes);
+
 // ════════════════════════════════════════════════════════════════
 //  Assembly
 // ════════════════════════════════════════════════════════════════
@@ -3558,17 +4680,18 @@ const allFlows = [
   ...configFlows,
   ...tlsNodes,
   ...FEEDS.flatMap(f => makeEngineTab(f)),
-  ...makeIpawsTab()
+  ...makeIpawsTab(),
+  ...makePulsepointTab()
 ];
 
 const out = path.join(__dirname, 'flows.json');
 fs.writeFileSync(out, JSON.stringify(allFlows, null, 2));
 console.log('flows.json generated  (' + allFlows.length + ' nodes, ' + FEEDS.length + ' engine tabs)  →  ' + out);
 
-// Write template function map (ArcGIS + TFR + KML) for deploy.sh dynamic-tab sync
+// Write template function map (ArcGIS + TFR + KML + TC) for deploy.sh dynamic-tab sync
 // Format: { key: { func, libs } } — deploy.sh syncs both func and libs
 const templateFuncMap = {};
-[...templateNodes, ...tfrTemplateNodes, ...kmlTemplateNodes].forEach(n => {
+[...templateNodes, ...tfrTemplateNodes, ...kmlTemplateNodes, ...tcTemplateNodes, ...ppTemplateNodes].forEach(n => {
   if (n._templateKey) templateFuncMap[n._templateKey] = { func: n.func, libs: n.libs || [] };
 });
 fs.writeFileSync(path.join(__dirname, 'template-functions.json'), JSON.stringify(templateFuncMap));
@@ -3642,8 +4765,47 @@ try {
     );
   }
 
+  // TC template
+  const tcStart = '/* __TC_ENGINE_TAB_TEMPLATE_START__ */';
+  const tcEnd   = '/* __TC_ENGINE_TAB_TEMPLATE_END__ */';
+  const tcB64 = Buffer.from(tcEngineTabTemplate, 'utf8').toString('base64');
+  const tcBlock = tcStart + '\n'
+    + 'var TC_ENGINE_TAB_TEMPLATE = decodeURIComponent(escape(atob("' + tcB64 + '")));\n'
+    + tcEnd;
+  if (htmlContent.includes(tcStart)) {
+    const re4 = new RegExp(
+      tcStart.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      + '[\\s\\S]*?'
+      + tcEnd.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    );
+    htmlContent = htmlContent.replace(re4, tcBlock);
+  } else {
+    htmlContent = htmlContent.replace(
+      kmlEnd,
+      kmlEnd + '\n' + tcBlock
+    );
+  }
+
+  // PP template
+  const ppStart = '/* __PP_ENGINE_TAB_TEMPLATE_START__ */';
+  const ppEnd   = '/* __PP_ENGINE_TAB_TEMPLATE_END__ */';
+  const ppB64 = Buffer.from(ppEngineTabTemplate, 'utf8').toString('base64');
+  const ppBlock = ppStart + '\n'
+    + 'var PP_ENGINE_TAB_TEMPLATE = decodeURIComponent(escape(atob("' + ppB64 + '")));\n'
+    + ppEnd;
+  if (htmlContent.includes(ppStart)) {
+    const re5 = new RegExp(
+      ppStart.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      + '[\\s\\S]*?'
+      + ppEnd.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    );
+    htmlContent = htmlContent.replace(re5, ppBlock);
+  } else {
+    htmlContent = htmlContent.replace(tcEnd, tcEnd + '\n' + ppBlock);
+  }
+
   fs.writeFileSync(htmlPath, htmlContent);
-  console.log('Engine tab templates injected into configurator.html (ArcGIS + TFR + KML)');
+  console.log('Engine tab templates injected into configurator.html (ArcGIS + TFR + KML + TC + PP)');
 } catch(e) {
   console.log('Skipped configurator.html template injection (' + e.code + ')');
 }

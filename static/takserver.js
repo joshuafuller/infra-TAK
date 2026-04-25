@@ -829,6 +829,8 @@ async function connectLdap(){
         var split=document.getElementById('dep_mode_split');
         if(single)single.addEventListener('change',function(){toggleTwoServerPanel();updateUploadHint();updateDeployModeFirstHint();});
         if(split)split.addEventListener('change',function(){toggleTwoServerPanel();updateUploadHint();updateDeployModeFirstHint();});
+        var extdb=document.getElementById('dep_mode_external_db');
+        if(extdb)extdb.addEventListener('change',function(){toggleTwoServerPanel();updateUploadHint();updateDeployModeFirstHint();});
         fetch('/api/upload/takserver/existing').then(r=>r.json()).then(d=>{
             var hasAny=(d.packages&&d.packages.length)||d.gpg_key||d.policy;
             if(hasAny){
@@ -1122,11 +1124,34 @@ function initTakDeployModeUI(rootEl){
       '<div id="two-server-runbook" style="display:none;margin-top:10px;background:#0c0f1a;border:1px solid var(--border);border-radius:8px;padding:12px;font-family:\'JetBrains Mono\',monospace;font-size:11px;white-space:pre-wrap"></div>',
       '</div>'
     ].join('');
-    card.insertAdjacentHTML('afterbegin',html);
+    // External / managed database panel
+    var extHtml=[
+      '<div id="external-db-config-panel" style="display:none;margin-bottom:20px;padding:16px;background:rgba(20,184,166,0.06);border:1px solid var(--border);border-radius:10px">',
+      '<div style="font-family:\'JetBrains Mono\',monospace;font-size:13px;color:var(--text-dim);margin-bottom:12px;text-transform:uppercase;letter-spacing:1px;font-weight:600">External / Managed Database</div>',
+      '<div style="font-size:12px;color:var(--text-dim);margin-bottom:10px">TAK Server runs on this VM. PostgreSQL is hosted externally (AWS RDS, Azure Database, etc.). infra-TAK skips all Server One steps and points CoreConfig.xml at your endpoint.</div>',
+      '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:12px">',
+      '<div class="form-field"><label>DB Endpoint (host / FQDN)</label><input type="text" id="edb_host" placeholder="mydb.xxx.rds.amazonaws.com"></div>',
+      '<div class="form-field"><label>Port</label><input type="number" id="edb_port" value="5432"></div>',
+      '<div class="form-field"><label>Database Name</label><input type="text" id="edb_name" value="cot"></div>',
+      '<div class="form-field"><label>Username</label><input type="text" id="edb_user" value="martiuser"></div>',
+      '</div>',
+      '<div class="form-field" style="margin-bottom:12px"><label>Password</label><input type="password" id="edb_password" placeholder="DB user password" autocomplete="off" style="width:100%;padding:8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px"></div>',
+      '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px">',
+      '<button type="button" onclick="saveExternalDbConfig()" style="padding:8px 14px;background:rgba(20,184,166,0.15);color:var(--teal,#14b8a6);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer">1. Save Config</button>',
+      '<button type="button" onclick="testExternalDbConnection()" style="padding:8px 14px;background:rgba(59,130,246,0.15);color:var(--accent);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer">2. Test Connection</button>',
+      '<div style="font-size:11px;color:var(--text-dim);align-self:center">Then fill Certificate Information below and click Deploy TAK Server.</div>',
+      '</div>',
+      '<div id="external-db-msg" style="margin-top:10px;font-size:12px;color:var(--text-dim)"></div>',
+      '<div id="external-db-checks" style="display:none;margin-top:10px;background:#0c0f1a;border:1px solid var(--border);border-radius:8px;padding:12px;font-family:\'JetBrains Mono\',monospace;font-size:11px;white-space:pre-wrap"></div>',
+      '</div>'
+    ].join('');
+    card.insertAdjacentHTML('afterbegin',html+extHtml);
     var single=document.getElementById('dep_mode_single');
     var split=document.getElementById('dep_mode_split');
+    var extdb=document.getElementById('dep_mode_external_db');
     if(single)single.addEventListener('change',toggleTwoServerPanel);
     if(split)split.addEventListener('change',toggleTwoServerPanel);
+    if(extdb)extdb.addEventListener('change',toggleTwoServerPanel);
     toggleTwoServerPanel();
     toggleServerTwoLocal();
 }
@@ -1140,9 +1165,9 @@ function updateDeployModeFirstHint(){
     var el=document.getElementById('deploy-mode-first-hint');
     if(!el)return;
     var mode=getTakDeploymentMode();
-    el.textContent=(mode==='two_server')
-      ?'Split mode: upload both takserver-database and takserver-core packages (optional: .pol + .key).'
-      :'One server: upload the single takserver package (optional: .pol + .key).';
+    if(mode==='two_server')el.textContent='Split mode: upload both takserver-database and takserver-core packages (optional: .pol + .key).';
+    else if(mode==='external_db')el.textContent='External DB mode: upload the single takserver .deb — PostgreSQL is your managed cloud endpoint.';
+    else el.textContent='One server: upload the single takserver package (optional: .pol + .key).';
 }
 
 function packageHasDatabase(fn){return fn&&String(fn).toLowerCase().indexOf('database')!==-1;}
@@ -1169,8 +1194,10 @@ function validateUploadsForMode(){
     if(!hasBothSplitPackages())return{ok:false,message:'Split server requires both takserver-database and takserver-core packages. Upload both, or switch to One Server and upload the single takserver package.'};
     return{ok:true};
   }
+  // single_server and external_db both require the full combined package
   if(hasOnlySplitPackages()||pkg.some(function(p){return packageHasCore(p.filename)||packageHasDatabase(p.filename);})){
-    return{ok:false,message:'You chose One Server but uploaded split packages (core and/or database). For One Server upload the single takserver .deb/.rpm. Or switch to Split Server and upload both database and core.'};
+    var modeLabel=(mode==='external_db')?'External DB':'One Server';
+    return{ok:false,message:'You chose '+modeLabel+' but uploaded split packages (core and/or database). Upload the single combined takserver .deb/.rpm instead. Or switch to Split Server.'};
   }
   return{ok:true};
 }
@@ -1188,6 +1215,10 @@ function updateUploadHint(){
       if(ubuntu)html='<strong style="color:var(--text-secondary)">Split server (Ubuntu) — from tak.gov:</strong><br>Required: <span style="color:var(--cyan)">takserver-database_X.X_all.deb</span> and <span style="color:var(--cyan)">takserver-core_X.X_all.deb</span><br>Optional: <span style="color:var(--text-secondary)">deb_policy.pol</span> + <span style="color:var(--text-secondary)">takserver-public-gpg.key</span>'+line2;
       else if(rocky)html='<strong style="color:var(--text-secondary)">Split server (Rocky/RHEL) — from tak.gov:</strong><br>Required: <span style="color:var(--cyan)">takserver-database</span> and <span style="color:var(--cyan)">takserver-core</span> .rpm<br>Optional: <span style="color:var(--text-secondary)">takserver-public-gpg.key</span>'+line2;
       else html='<strong style="color:var(--text-secondary)">Split server:</strong><br>Required: <span style="color:var(--cyan)">takserver-database</span> and <span style="color:var(--cyan)">takserver-core</span> .deb or .rpm<br>Optional: .pol + .key'+line2;
+    }else if(mode==='external_db'){
+      if(ubuntu)html='<strong style="color:var(--text-secondary)">External DB (Ubuntu) — from tak.gov:</strong><br>Required: <span style="color:var(--cyan)">takserver_X.X_all.deb</span> (full package, not core/database split)<br>Optional: <span style="color:var(--text-secondary)">deb_policy.pol</span> + <span style="color:var(--text-secondary)">takserver-public-gpg.key</span>'+line2;
+      else if(rocky)html='<strong style="color:var(--text-secondary)">External DB (Rocky/RHEL) — from tak.gov:</strong><br>Required: <span style="color:var(--cyan)">takserver-X.X.noarch.rpm</span> (full package)<br>Optional: <span style="color:var(--text-secondary)">takserver-public-gpg.key</span>'+line2;
+      else html='<strong style="color:var(--text-secondary)">External DB:</strong><br>Required: full <span style="color:var(--cyan)">takserver</span> .deb or .rpm (not the split core/database packages)<br>Optional: .pol + .key'+line2;
     }else{
       if(ubuntu)html='<strong style="color:var(--text-secondary)">One server (Ubuntu) — from tak.gov:</strong><br>Required: <span style="color:var(--cyan)">takserver_X.X_all.deb</span><br>Optional: <span style="color:var(--text-secondary)">deb_policy.pol</span> + <span style="color:var(--text-secondary)">takserver-public-gpg.key</span>'+line2;
       else if(rocky)html='<strong style="color:var(--text-secondary)">One server (Rocky/RHEL) — from tak.gov:</strong><br>Required: <span style="color:var(--cyan)">takserver-X.X.noarch.rpm</span><br>Optional: <span style="color:var(--text-secondary)">takserver-public-gpg.key</span>'+line2;
@@ -1198,13 +1229,15 @@ function updateUploadHint(){
 
 function toggleTwoServerPanel(){
     var mode=getTakDeploymentMode();
-    var panel=document.getElementById('two-server-config-panel');
+    var splitPanel=document.getElementById('two-server-config-panel');
+    var extPanel=document.getElementById('external-db-config-panel');
     var hint=document.getElementById('dep_mode_hint');
-    if(panel)panel.style.display=(mode==='two_server'?'block':'none');
+    if(splitPanel)splitPanel.style.display=(mode==='two_server'?'block':'none');
+    if(extPanel)extPanel.style.display=(mode==='external_db'?'block':'none');
     if(hint){
-      hint.textContent=(mode==='two_server')
-        ?'Split mode selected. Save config, run preflight, then apply Server One and Server Two steps in order.'
-        :'One server selected. This path is recommended up to ~500 concurrent users.';
+      if(mode==='two_server')hint.textContent='Split mode selected. Save config, run preflight, then apply Server One and Server Two steps in order.';
+      else if(mode==='external_db')hint.textContent='External DB mode selected. Configure your managed database endpoint, test the connection, then deploy TAK Server.';
+      else hint.textContent='One server selected. This path is recommended up to ~500 concurrent users.';
     }
     updateUploadHint();
 }
@@ -1261,6 +1294,13 @@ function collectTakDeploymentConfigFromForm(){
         name:(document.getElementById('ts_db_name')||{}).value||'cot',
         user:(document.getElementById('ts_db_user')||{}).value||'martiuser',
         password:(document.getElementById('ts_db_password')||{}).value||''
+      },
+      external_db:{
+        host:(document.getElementById('edb_host')||{}).value||'',
+        port:parseInt((document.getElementById('edb_port')||{}).value||'5432',10),
+        name:(document.getElementById('edb_name')||{}).value||'cot',
+        user:(document.getElementById('edb_user')||{}).value||'martiuser',
+        password:(document.getElementById('edb_password')||{}).value||''
       }
     };
 }
@@ -1270,6 +1310,8 @@ function populateTakDeploymentConfigForm(cfg){
     takDeploymentConfigCache=cfg;
     if(cfg.mode==='two_server'){
       var split=document.getElementById('dep_mode_split');if(split)split.checked=true;
+    }else if(cfg.mode==='external_db'){
+      var extdb=document.getElementById('dep_mode_external_db');if(extdb)extdb.checked=true;
     }else{
       var single=document.getElementById('dep_mode_single');if(single)single.checked=true;
     }
@@ -1295,6 +1337,13 @@ function populateTakDeploymentConfigForm(cfg){
     set('ts_db_password',cfg.database&&cfg.database.password);
     var pwHint=document.getElementById('ts_db_password_hint');
     if(pwHint){pwHint.textContent=(cfg.database&&cfg.database.password)?'✓ DB password saved (from step 4). Step 5 and Deploy TAK Server will use it.':'Step 4 reads this from Server One over SSH when it deploys. Paste here only if step 4 could not read it.';}
+    // External DB fields
+    var edb=cfg.external_db||{};
+    set('edb_host',edb.host);
+    set('edb_port',edb.port||5432);
+    set('edb_name',edb.name||'cot');
+    set('edb_user',edb.user||'martiuser');
+    set('edb_password',edb.password);
     toggleTwoServerAuthInputs('one');
     toggleTwoServerAuthInputs('two');
     toggleServerTwoLocal();
@@ -1311,18 +1360,45 @@ async function loadTakDeploymentConfig(){
 }
 
 async function saveTakDeploymentConfig(silent){
-    var msg=document.getElementById('two-server-msg');
+    var mode=getTakDeploymentMode();
+    var msg=document.getElementById(mode==='external_db'?'external-db-msg':'two-server-msg');
     try{
       var cfg=collectTakDeploymentConfigFromForm();
       var r=await fetch('/api/takserver/deployment-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:cfg})});
       var d=await r.json();
       if(!d.success)throw new Error(d.error||'Save failed');
       takDeploymentConfigCache=d.config;
-      if(msg&&!silent){msg.textContent='✓ Split config saved';msg.style.color='var(--green)';}
+      if(msg&&!silent){msg.textContent='✓ Config saved';msg.style.color='var(--green)';}
       return d.config;
     }catch(e){
       if(msg&&!silent){msg.textContent='✗ '+e.message;msg.style.color='var(--red)';}
       throw e;
+    }
+}
+
+async function saveExternalDbConfig(silent){
+    return saveTakDeploymentConfig(silent);
+}
+
+async function testExternalDbConnection(){
+    var msg=document.getElementById('external-db-msg');
+    var out=document.getElementById('external-db-checks');
+    if(msg){msg.textContent='Testing connection…';msg.style.color='var(--cyan)';}
+    try{
+      var cfg=await saveExternalDbConfig(true);
+      if(out){out.style.display='block';out.textContent='Connecting…';}
+      var r=await fetch('/api/takserver/external-db/test-connection',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:cfg})});
+      var d=await r.json();
+      var lines=['External DB Connection Test ─ '+d.host+':'+d.port];
+      (d.checks||[]).forEach(function(c){
+        var icon=c.ok===null?'[SKIP] ':(c.ok?'[OK]   ':'[FAIL] ');
+        lines.push(icon+c.name+(c.detail?' — '+c.detail:''));
+      });
+      if(out)out.textContent=lines.join('\n');
+      if(msg){msg.textContent=d.success?'✓ Connection OK':'⚠ Connection check failed — review results above';msg.style.color=d.success?'var(--green)':'var(--yellow)';}
+    }catch(e){
+      if(msg){msg.textContent='✗ '+e.message;msg.style.color='var(--red)';}
+      if(out){out.style.display='block';out.textContent=e.message;}
     }
 }
 

@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.7.0-alpha"
+VERSION = "0.7.1-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -1883,6 +1883,78 @@ def takserver_two_server_preflight():
         }
     })
 
+@app.route('/api/takserver/external-db/test-connection', methods=['POST'])
+@login_required
+def takserver_external_db_test_connection():
+    """Test TCP + pg_isready connectivity to an external/managed PostgreSQL endpoint.
+    Does not require SSH — runs checks from the local host (Server Two / TAK Server VM).
+    """
+    data = request.get_json() or {}
+    settings = load_settings()
+    cfg = _get_tak_deployment_config(settings)
+    if isinstance(data.get('config'), dict):
+        cfg = _normalize_tak_deployment_config(_deep_merge_dict(cfg, data.get('config')))
+    edb = cfg.get('external_db', {})
+    db_host = (edb.get('host') or '').strip()
+    db_port = int(edb.get('port') or 5432)
+    db_name = (edb.get('name') or 'cot').strip()
+    db_user = (edb.get('user') or 'martiuser').strip()
+    db_pass = (edb.get('password') or '').strip()
+    if not db_host:
+        return jsonify({'success': False, 'error': 'No database host configured', 'checks': []}), 400
+
+    checks = []
+
+    def add_check(name, ok, detail=''):
+        checks.append({'name': name, 'ok': bool(ok), 'detail': (detail or '')[:400]})
+
+    # Check 1: TCP reachability
+    tcp_ok = False
+    try:
+        r = subprocess.run(
+            ['bash', '-c', f'timeout 8 bash -c "</dev/tcp/{db_host}/{db_port}" && echo OPEN || echo CLOSED'],
+            capture_output=True, text=True, timeout=12
+        )
+        tcp_ok = 'OPEN' in (r.stdout or '')
+        add_check(f'TCP {db_host}:{db_port}', tcp_ok, r.stdout.strip() if not tcp_ok else f'Connected to {db_host}:{db_port}')
+    except Exception as e:
+        add_check(f'TCP {db_host}:{db_port}', False, str(e)[:200])
+
+    # Check 2: pg_isready (if pg_isready available locally)
+    pg_ready_ok = False
+    try:
+        r = subprocess.run(
+            ['pg_isready', '-h', db_host, '-p', str(db_port), '-d', db_name, '-U', db_user, '-t', '8'],
+            capture_output=True, text=True, timeout=12
+        )
+        pg_ready_ok = r.returncode == 0
+        add_check(f'pg_isready ({db_name}@{db_host})', pg_ready_ok, (r.stdout or r.stderr or '').strip()[:200])
+    except FileNotFoundError:
+        add_check('pg_isready', None, 'pg_isready not installed locally — TCP check only')
+    except Exception as e:
+        add_check('pg_isready', False, str(e)[:200])
+
+    # Check 3: psql auth (if password provided and psql available)
+    if db_pass and tcp_ok:
+        try:
+            env = dict(os.environ, PGPASSWORD=db_pass)
+            r = subprocess.run(
+                ['psql', '-h', db_host, '-p', str(db_port), '-U', db_user, '-d', db_name,
+                 '-c', 'SELECT version();', '--no-password', '-t', '-A'],
+                capture_output=True, text=True, timeout=15, env=env
+            )
+            auth_ok = r.returncode == 0
+            add_check(f'psql auth ({db_user}@{db_name})', auth_ok,
+                      (r.stdout or r.stderr or '').strip()[:200] if not auth_ok else 'Authenticated successfully')
+        except FileNotFoundError:
+            add_check('psql auth', None, 'psql client not installed locally — skipped')
+        except Exception as e:
+            add_check('psql auth', False, str(e)[:200])
+
+    all_ok = all(c['ok'] for c in checks if c.get('ok') is not None)
+    return jsonify({'success': all_ok, 'checks': checks, 'host': db_host, 'port': db_port})
+
+
 @app.route('/api/takserver/two-server/ensure-ssh-key', methods=['POST'])
 @login_required
 def takserver_two_server_ensure_ssh_key():
@@ -3157,7 +3229,7 @@ def guarddog_page():
     guarddog_monitors_tak.extend([
         {'name': 'OOM', 'id': 'oom', 'interval': '1 min', 'desc': 'Scans TAK Server logs for OutOfMemoryError. Auto-restarts TAK Server and sends alert when detected.'},
         {'name': 'Disk', 'id': 'disk', 'interval': '1 hour', 'desc': 'Checks root and TAK logs filesystem usage. Alert only when usage exceeds 80% (warning) or 90% (critical).'},
-        {'name': 'Certificate', 'id': 'cert', 'interval': 'Daily', 'desc': 'Checks Let\'s Encrypt / TAK Server cert expiry. Alert when 40 days or less remaining until expiry.'},
+        {'name': 'Certificate', 'id': 'cert', 'interval': 'Daily', 'desc': 'Checks TAK Server Let\'s Encrypt JKS cert expiry. Auto-renewal runs at 35 days remaining. Alert fires at 25 days — meaning renewal failed and action is required.'},
         {'name': 'Root CA / Intermediate CA', 'id': 'intca', 'interval': 'Escalating', 'desc': 'Monitors Root CA and Intermediate CA certificate expiry. First alert at 90 days, then at 75, 60, 45, 30 days, then daily until expiry.'},
     ])
     guarddog_services = [
@@ -3178,7 +3250,7 @@ def guarddog_page():
             {'name': 'Port 9100 (UI)', 'id': 'fedhub_port', 'interval': '1 min', 'desc': f'Checks that Federation Hub UI port 9100 is listening on {fh_host}. Alerts after 3 failures.'},
             {'name': 'MongoDB', 'id': 'fedhub_mongo', 'interval': '5 min', 'desc': f'Checks mongod service is active on {fh_host}. Alerts on failure.'},
             {'name': 'Disk', 'id': 'fedhub_disk', 'interval': '1 hour', 'desc': f'Checks root filesystem usage on {fh_host}. Alert at 80%+ (warning) or 90%+ (critical).'},
-            {'name': 'TLS certificate', 'id': 'fedhub_cert', 'interval': 'Daily', 'desc': f'Checks Federation Hub server TLS cert (<hostname>.pem) on {fh_host}. Alert when 40 days or less remaining.'},
+            {'name': 'TLS certificate', 'id': 'fedhub_cert', 'interval': 'Daily', 'desc': f'Checks Federation Hub server TLS cert (<hostname>.pem) on {fh_host}. Alert when 25 days or less remaining (below auto-renewal window).'},
             {'name': 'Root CA / Intermediate CA', 'id': 'fedhub_intca', 'interval': 'Escalating', 'desc': f'Monitors Root CA and Intermediate CA expiry on {fh_host} (same 90-day escalation as TAK Server intca).'},
         ]})
     guarddog_services.extend([
@@ -3296,34 +3368,61 @@ def _find_ssh_key_for_server_one(s1_cfg):
 
 
 def _sync_guarddog_remote_db_from_settings(settings=None):
-    """Rewrite guarddog.conf + tak-remotedb-*.sh from saved TAK deployment (fixes stale IP after DB migration).
-    Also try-restarts tak-health.service so it reloads guarddog.conf (endpoint reads conf at startup)."""
+    """Rewrite guarddog.conf + tak-remotedb-*.sh from saved TAK deployment.
+    Handles two-server (SSH-managed DB) and external_db (managed DB, no SSH).
+    Also try-restarts tak-health.service so it reloads guarddog.conf."""
     if settings is None:
         settings = load_settings()
     tak_cfg = _get_tak_deployment_config(settings)
-    if tak_cfg.get('mode') != 'two_server':
-        return True, 'skipped (not two-server)'
-    s1_host = (tak_cfg.get('server_one', {}).get('host') or '').strip()
-    if not s1_host:
-        return False, 'no Server One host in settings'
+    mode = tak_cfg.get('mode', 'single_server')
+    if mode not in ('two_server', 'external_db'):
+        return True, 'skipped (single-server mode)'
+
     gd_dir = '/opt/tak-guarddog'
     scripts_dir = os.path.join(BASE_DIR, 'scripts', 'guarddog')
     if not os.path.isdir(gd_dir):
         return True, 'skipped (Guard Dog not installed)'
-    s1 = dict(tak_cfg.get('server_one', {}))
-    s1_user = (s1.get('ssh_user') or 'root').strip() or 'root'
-    db_port = str(int(tak_cfg.get('database', {}).get('port') or 5432))
-    kp = _find_ssh_key_for_server_one(s1) or ''
-    ssh_key_path = os.path.expanduser(kp) if kp else ''
+
+    is_external = (mode == 'external_db')
+
+    if is_external:
+        edb = tak_cfg.get('external_db', {})
+        db_host = (edb.get('host') or '').strip()
+        db_port = str(int(edb.get('port') or 5432))
+        # No SSH for managed DB — Guard Dog does TCP-only monitoring
+        ssh_key_path = ''
+        s1_user = ''
+    else:
+        s1 = dict(tak_cfg.get('server_one', {}))
+        db_host = (s1.get('host') or '').strip()
+        db_port = str(int(tak_cfg.get('database', {}).get('port') or 5432))
+        kp = _find_ssh_key_for_server_one(s1) or ''
+        ssh_key_path = os.path.expanduser(kp) if kp else ''
+        s1_user = (s1.get('ssh_user') or 'root').strip() or 'root'
+
+    if not db_host:
+        return False, 'no database host in settings'
+
     alert_email = (settings.get('guarddog_alert_email') or '').strip()
     try:
-        gd_conf = {'two_server': True, 'db_host': s1_host, 'db_port': int(db_port)}
+        gd_conf = {
+            'two_server': not is_external,
+            'external_db': is_external,
+            'db_host': db_host,
+            'db_port': int(db_port),
+        }
         with open(os.path.join(gd_dir, 'guarddog.conf'), 'w') as f:
             json.dump(gd_conf, f)
     except Exception as e:
         return False, f'guarddog.conf: {e}'
+
     cert_pass = _get_tak_cert_password(settings)
+    external_db_flag = 'true' if is_external else ''
+    # Skip scripts that require SSH to Server One when in external_db mode
+    scripts_to_skip_for_external = {'tak-remotedb-auth-watch.sh'}
     for name in ('tak-remotedb-watch.sh', 'tak-remotedb-auth-watch.sh', 'tak-cotdb-watch.sh', 'tak-auto-vacuum.sh', 'tak-db-repack.sh', 'tak-retention-guard.sh'):
+        if is_external and name in scripts_to_skip_for_external:
+            continue
         src = os.path.join(scripts_dir, name)
         dest = os.path.join(gd_dir, name)
         if not os.path.isfile(src):
@@ -3334,9 +3433,10 @@ def _sync_guarddog_remote_db_from_settings(settings=None):
                 .replace('ALERT_EMAIL_PLACEHOLDER', alert_email)
                 .replace('ALERT_SMS_PLACEHOLDER', '')
                 .replace('CERT_PASS_PLACEHOLDER', cert_pass)
-                .replace('CONSOLE_VERSION_PLACEHOLDER', VERSION))
+                .replace('CONSOLE_VERSION_PLACEHOLDER', VERSION)
+                .replace('EXTERNAL_DB_PLACEHOLDER', external_db_flag))
             content = (content
-                .replace('DB_HOST_PLACEHOLDER', s1_host)
+                .replace('DB_HOST_PLACEHOLDER', db_host)
                 .replace('DB_PORT_PLACEHOLDER', db_port)
                 .replace('SSH_KEY_PLACEHOLDER', ssh_key_path)
                 .replace('SSH_USER_PLACEHOLDER', s1_user))
@@ -3352,7 +3452,8 @@ def _sync_guarddog_remote_db_from_settings(settings=None):
         )
     except Exception:
         pass
-    return True, f'synced remote DB monitors to {s1_host}:{db_port}'
+    mode_label = 'external managed DB' if is_external else 'two-server'
+    return True, f'synced {mode_label} DB monitors to {db_host}:{db_port}'
 
 
 def _remotedb_host_port_from_tak_settings():
@@ -6402,13 +6503,14 @@ def _caddy_letsencrypt_days_left(settings):
 
 
 def _caddy_cert_days_color(days_left):
-    """Return color for cert days display; matches Guard Dog Certificate monitor (alert at 40 days)."""
+    """Return color for Caddy Let's Encrypt cert display.
+    Renewal script fires at <=35d, Caddy renews at <=30d. If we're below 30d
+    the renewal already ran and failed — go straight to red, no yellow.
+    """
     if days_left is None:
         return None
-    if days_left <= 14:
-        return 'red'   # critical
-    if days_left <= 40:
-        return 'yellow'  # Guard Dog fires email at <= 40 days
+    if days_left < 30:
+        return 'red'    # Renewal should have fired and rebuilt the JKS — it didn't
     return 'green'
 
 
@@ -6520,7 +6622,7 @@ def caddy_deploy():
 @app.route('/api/caddy/cert-days')
 @login_required
 def caddy_cert_days():
-    """Days until Let's Encrypt cert expires; color matches Guard Dog (yellow <=40d, red <=14d)."""
+    """Days until Caddy Let's Encrypt cert expires. Yellow <=25d (missed renewal window), red <=7d."""
     settings = load_settings()
     days = _caddy_letsencrypt_days_left(settings)
     color = _caddy_cert_days_color(days)
@@ -8082,7 +8184,7 @@ def _authentik_application_open_in_new_tab(ak_url, ak_headers, slug, plog=None):
 def _tak_deployment_defaults():
     """Default TAK deployment shape (single-server by default, optional two-server fields)."""
     return {
-        'mode': 'single_server',  # single_server | two_server
+        'mode': 'single_server',  # single_server | two_server | external_db
         'server_one': {  # Manual naming from TAK guide: "Server One: Database Server"
             'host': '',
             'ssh_user': 'root',
@@ -8109,6 +8211,16 @@ def _tak_deployment_defaults():
             'password': '',
             'enable_postgres_tls': True,
         },
+        # External / managed database (AWS RDS, Azure Database for PostgreSQL, etc.)
+        # Used when mode == 'external_db'. TAK Server runs on this VM; PostgreSQL is
+        # fully managed externally (no SSH, no infra-TAK management of the DB host).
+        'external_db': {
+            'host': '',        # RDS endpoint / FQDN / IP
+            'port': 5432,
+            'name': 'cot',
+            'user': 'martiuser',
+            'password': '',
+        },
     }
 
 def _deep_merge_dict(base, override):
@@ -8125,7 +8237,23 @@ def _normalize_tak_deployment_config(cfg):
     """Validate and normalize TAK deployment settings for persistence/runtime use."""
     c = _deep_merge_dict(_tak_deployment_defaults(), cfg or {})
     mode = (c.get('mode') or 'single_server').strip().lower()
-    c['mode'] = 'two_server' if mode == 'two_server' else 'single_server'
+    if mode == 'two_server':
+        c['mode'] = 'two_server'
+    elif mode == 'external_db':
+        c['mode'] = 'external_db'
+    else:
+        c['mode'] = 'single_server'
+    # Normalize external_db block
+    edb = c.get('external_db', {}) if isinstance(c.get('external_db'), dict) else {}
+    edb['host'] = (edb.get('host') or '').strip()
+    try:
+        edb['port'] = int(edb.get('port') or 5432)
+    except Exception:
+        edb['port'] = 5432
+    edb['name'] = (edb.get('name') or 'cot').strip() or 'cot'
+    edb['user'] = (edb.get('user') or 'martiuser').strip() or 'martiuser'
+    edb['password'] = (edb.get('password') or '').strip()
+    c['external_db'] = edb
     for key in ('server_one', 'server_two'):
         host_cfg = c.get(key, {}) if isinstance(c.get(key), dict) else {}
         host_cfg['host'] = (host_cfg.get('host') or '').strip()
@@ -8914,14 +9042,14 @@ def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
     renewal_script = f'''#!/bin/bash
 # TAK Server Let's Encrypt Certificate Renewal
 # Triggered monthly by systemd timer. Rebuilds TAK JKS from Caddy cert when
-# within 40 days of expiry, then restarts TAK Server.
+# within 35 days of expiry, then restarts TAK Server.
 set -euo pipefail
 
 TAK_DOMAIN="{takserver_host}"
 CERT_DIR="{cert_dir}"
 CERT_CRT="$CERT_DIR/$TAK_DOMAIN.crt"
 CERT_KEY="$CERT_DIR/$TAK_DOMAIN.key"
-RENEW_WINDOW_DAYS=40
+RENEW_WINDOW_DAYS=35
 LOG_FILE="/var/log/takserver-cert-renewal.log"
 
 log() {{ echo "[$(date -Is)] $*" | tee -a "$LOG_FILE"; }}
@@ -19947,7 +20075,7 @@ entries:
       geoip_binding: bind_continent
       network_binding: bind_asn
       remember_me_offset: seconds=0
-      session_duration: seconds=0
+      session_duration: seconds=120
     identifiers:
       name: ldap-authentication-login
     model: authentik_stages_user_login.userloginstage
@@ -20988,7 +21116,7 @@ entries:
       geoip_binding: bind_continent
       network_binding: bind_asn
       remember_me_offset: seconds=0
-      session_duration: seconds=0
+      session_duration: seconds=120
     identifiers:
       name: ldap-authentication-login
     model: authentik_stages_user_login.userloginstage
@@ -23145,7 +23273,7 @@ def _ensure_ldap_flow_authentication_none():
                 login_stage = _find_stage('stages/user_login/', 'ldap-authentication-login')
                 if not login_stage:
                     login_stage = _create_ldap_stage('stages/user_login/', 'ldap-authentication-login', {
-                        'session_duration': 'seconds=0', 'remember_me_offset': 'seconds=0'})
+                        'session_duration': 'seconds=120', 'remember_me_offset': 'seconds=0'})
                 if id_stage and pw_stage and login_stage:
                     existing_orders = {b.get('order') for b in ldap_bindings}
                     binding_specs = [(10, id_stage), (15, pw_stage), (20, login_stage)]
@@ -23160,6 +23288,14 @@ def _ensure_ldap_flow_authentication_none():
                                 pass
                 else:
                     return False, f'LDAP stages not found/created: id={id_stage} pw={pw_stage} login={login_stage}'
+            # Always enforce short session_duration on ldap-authentication-login so password
+            # changes propagate within 2 minutes (cached bind mode caches for session lifetime)
+            _login_stage_pk = _find_stage('stages/user_login/', 'ldap-authentication-login')
+            if _login_stage_pk:
+                try:
+                    _patch(f'stages/user_login/{_login_stage_pk}/', {'session_duration': 'seconds=120'})
+                except urllib.error.HTTPError:
+                    pass
             providers = _get('providers/ldap/?search=LDAP').get('results', [])
             ldap_prov = next((p for p in providers if p.get('name') == 'LDAP'), providers[0] if providers else None)
             if ldap_prov:
@@ -26414,6 +26550,7 @@ def deploy_takserver():
     tak_deploy_cfg = _get_tak_deployment_config(settings)
     requested_mode = (data.get('deployment_mode') or tak_deploy_cfg.get('mode') or 'single_server').strip().lower()
     is_two_server = requested_mode == 'two_server'
+    is_external_db = requested_mode == 'external_db'
     try:
         for field, key in [('Country', 'cert_country'), ('State', 'cert_state'),
                            ('City', 'cert_city'), ('Organization', 'cert_org'),
@@ -26429,10 +26566,12 @@ def deploy_takserver():
             return jsonify({'error': 'No takserver-core package found in uploads. For two-server deploy, upload both takserver-core and takserver-database .deb files.'}), 400
         selected_pkg = core_pkg
     else:
+        # single_server and external_db both use the full combined takserver .deb
         single_pkgs = [f for f in pkg_files if '-database' not in f.lower() and '-core' not in f.lower()]
         if not single_pkgs:
             split_names = ', '.join(pkg_files)
-            return jsonify({'error': f'Only split packages found ({split_names}). For one-server deploy, upload the single takserver .deb (not takserver-database or takserver-core). Remove the wrong files and upload the correct package.'}), 400
+            mode_label = 'External / Managed Database' if is_external_db else 'one-server'
+            return jsonify({'error': f'Only split packages found ({split_names}). For {mode_label} deploy, upload the single takserver .deb (not takserver-database or takserver-core). Remove the wrong files and upload the correct package.'}), 400
         selected_pkg = single_pkgs[0]
     try:
         intermediate_days = int(data.get('intermediate_ca_validity_days') or 730)
@@ -26452,7 +26591,8 @@ def deploy_takserver():
     config = {
         'package_path': os.path.join(UPLOAD_DIR, selected_pkg),
         'two_server': is_two_server,
-        'tak_deploy_cfg': tak_deploy_cfg if is_two_server else None,
+        'external_db': is_external_db,
+        'tak_deploy_cfg': tak_deploy_cfg if (is_two_server or is_external_db) else None,
         'cert_country': data.get('cert_country', 'US'), 'cert_state': data.get('cert_state', 'CA'),
         'cert_city': data.get('cert_city', ''), 'cert_org': data.get('cert_org', ''),
         'cert_ou': data.get('cert_ou', ''), 'root_ca_name': data.get('root_ca_name', 'ROOT-CA-01'),
@@ -26671,37 +26811,48 @@ def run_takserver_deploy(config):
         if config.get('enable_admin_ui') or config.get('enable_webtak'):
             log_step(f"WebTAK: AdminUI={admin_ui}, WebTAK={webtak}")
             run_cmd(f'sed -i \'s|"cert_https"/|"cert_https" enableAdminUI="{admin_ui}" enableWebtak="{webtak}" enableNonAdminUI="false"/|g\' /opt/tak/CoreConfig.xml')
-        # For two-server: ensure JDBC URL and password point to Server One
+        # For two-server and external_db: ensure JDBC URL and password point to the remote DB host
         import re
-        if config.get('two_server') and config.get('tak_deploy_cfg'):
+        _needs_jdbc_patch = (config.get('two_server') or config.get('external_db')) and config.get('tak_deploy_cfg')
+        if _needs_jdbc_patch:
             tc = config['tak_deploy_cfg']
-            s1_host = (tc.get('server_one', {}).get('host') or '').strip()
-            db_port = int(tc.get('database', {}).get('port') or 5432)
-            db_pass = (tc.get('database', {}).get('password') or '').strip()
-            s1_cfg = tc.get('server_one', {})
-            # If password is missing, fetch it live from Server One
-            if not db_pass and s1_host and s1_cfg:
-                log_step("Two-server: DB password not cached — fetching from Server One...")
-                try:
-                    db_pass, _ = _fetch_db_password_from_server_one(s1_cfg)
-                    if db_pass:
-                        log_step("✓ Fetched DB password from Server One")
-                        settings = load_settings()
-                        _tcfg = _get_tak_deployment_config(settings)
-                        _tcfg.setdefault('database', {})['password'] = db_pass
-                        settings['tak_deployment'] = _tcfg
-                        save_settings(settings)
-                except Exception:
-                    pass
-                if not db_pass:
-                    log_step("⚠ Could not fetch DB password from Server One — TAK Server may not authenticate to PostgreSQL")
-            if s1_host:
-                jdbc_url = f'jdbc:postgresql://{s1_host}:{db_port}/cot'
-                log_step(f"Two-server: ensuring JDBC points to {s1_host}:{db_port}...")
+            if config.get('external_db'):
+                # External/managed DB — credentials come from the external_db config block
+                edb = tc.get('external_db', {})
+                db_host = (edb.get('host') or '').strip()
+                db_port = int(edb.get('port') or 5432)
+                db_pass = (edb.get('password') or '').strip()
+                mode_label = 'External DB'
+            else:
+                # Two-server — credentials come from server_one / database config
+                db_host = (tc.get('server_one', {}).get('host') or '').strip()
+                db_port = int(tc.get('database', {}).get('port') or 5432)
+                db_pass = (tc.get('database', {}).get('password') or '').strip()
+                s1_cfg = tc.get('server_one', {})
+                mode_label = 'Two-server'
+                # If password is missing, fetch it live from Server One
+                if not db_pass and db_host and s1_cfg:
+                    log_step("Two-server: DB password not cached — fetching from Server One...")
+                    try:
+                        db_pass, _ = _fetch_db_password_from_server_one(s1_cfg)
+                        if db_pass:
+                            log_step("✓ Fetched DB password from Server One")
+                            settings = load_settings()
+                            _tcfg = _get_tak_deployment_config(settings)
+                            _tcfg.setdefault('database', {})['password'] = db_pass
+                            settings['tak_deployment'] = _tcfg
+                            save_settings(settings)
+                    except Exception:
+                        pass
+                    if not db_pass:
+                        log_step("⚠ Could not fetch DB password from Server One — TAK Server may not authenticate to PostgreSQL")
+            if db_host:
+                jdbc_url = f'jdbc:postgresql://{db_host}:{db_port}/cot'
+                log_step(f"{mode_label}: ensuring JDBC points to {db_host}:{db_port}...")
                 try:
                     r = subprocess.run(['cat', '/opt/tak/CoreConfig.xml'], capture_output=True, text=True, timeout=5)
                     cc = r.stdout or ''
-                    needs_patch = 'jdbc:postgresql://127.0.0.1' in cc or s1_host not in cc
+                    needs_patch = 'jdbc:postgresql://127.0.0.1' in cc or db_host not in cc
                     # Also patch if password in file is empty
                     if not needs_patch and db_pass:
                         pw_match = re.search(r'password="([^"]*)"', cc)
@@ -26712,9 +26863,9 @@ def run_takserver_deploy(config):
                         if db_pass:
                             cc = re.sub(r'(<connection[^>]*password=")[^"]*(")', lambda m: m.group(1) + db_pass + m.group(2), cc)
                         subprocess.run(['tee', '/opt/tak/CoreConfig.xml'], input=cc, capture_output=True, text=True, timeout=5)
-                        log_step(f"✓ JDBC URL and password set for {s1_host}:{db_port}")
+                        log_step(f"✓ JDBC URL and password set for {db_host}:{db_port}")
                     else:
-                        log_step(f"✓ JDBC URL already points to {s1_host}")
+                        log_step(f"✓ JDBC URL already points to {db_host}")
                 except Exception as e:
                     log_step(f"⚠ Could not verify JDBC URL: {e}")
         log_step("✓ CoreConfig.xml configured")
@@ -28576,8 +28727,9 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div style="display:flex;gap:18px;flex-wrap:wrap;margin-bottom:8px">
 <label style="display:flex;align-items:center;gap:8px;color:var(--text-secondary);cursor:pointer"><input type="radio" name="deployment_mode" id="dep_mode_single" value="single_server" checked style="accent-color:var(--accent)"> One Server <span style="color:var(--text-dim);font-size:12px">(single takserver .deb/.rpm)</span></label>
 <label style="display:flex;align-items:center;gap:8px;color:var(--text-secondary);cursor:pointer"><input type="radio" name="deployment_mode" id="dep_mode_split" value="two_server" style="accent-color:var(--accent)"> Split Server <span style="color:var(--text-dim);font-size:12px">(takserver-database + takserver-core)</span></label>
+<label style="display:flex;align-items:center;gap:8px;color:var(--text-secondary);cursor:pointer"><input type="radio" name="deployment_mode" id="dep_mode_external_db" value="external_db" style="accent-color:var(--accent)"> External / Managed DB <span style="color:var(--text-dim);font-size:12px">(AWS RDS, Azure, Cloud SQL)</span></label>
 </div>
-<div id="deploy-mode-first-hint" style="font-size:12px;color:var(--text-dim)">Choose One Server, then upload the single takserver package. Or choose Split Server and upload both database and core packages.</div>
+<div id="deploy-mode-first-hint" style="font-size:12px;color:var(--text-dim)">Choose One Server for a standard install. Split Server uses separate DB and core packages. External / Managed DB points TAK Server at your cloud-hosted PostgreSQL.</div>
 </div>
 <div class="upload-area" id="upload-area" data-os-type="{{ settings.get('os_type', '') }}" ondrop="handleDrop(event)" ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)" onclick="var i=document.getElementById('file-input');i.value='';i.click()">
 <div class="upload-icon">📦</div><div class="upload-text">Drop your TAK Server files here</div>
@@ -28967,7 +29119,7 @@ def _post_update_auto_deploy():
                         _auto_deploy_active.pop('nodered', None)
 
             def _auto_nodered_settings(nr_dir):
-                """Ensure Node-RED settings.js has required keys (editorTheme, httpStatic, functionGlobalContext)."""
+                """Ensure Node-RED settings.js has required keys (editorTheme, httpStatic, functionGlobalContext, contextStorage)."""
                 settings_path = os.path.join(nr_dir, 'settings.js')
                 if not os.path.exists(settings_path):
                     return
@@ -29000,6 +29152,47 @@ def _post_update_auto_deploy():
                             """,
   functionGlobalContext: {
     nodeHttps: require('https')
+  }
+};""",
+                            1
+                        )
+                        changed = True
+                    if 'contextStorage' not in content:
+                        print("Post-update: adding contextStorage (localfilesystem) to Node-RED settings.js")
+                        # Before switching to filesystem storage, export the current in-memory
+                        # context via the Node-RED REST API and write it to disk.  Without this
+                        # step, older installs (memory-only context) lose all Configurator configs
+                        # on the first restart after migration.
+                        try:
+                            ctx_r = subprocess.run(
+                                'docker exec nodered curl -sf --max-time 8 http://localhost:1880/context/global',
+                                shell=True, capture_output=True, text=True, timeout=15
+                            )
+                            ctx_data = (ctx_r.stdout or '').strip()
+                            if ctx_data and ctx_data not in ('{}', 'null', ''):
+                                import tempfile
+                                subprocess.run(
+                                    'docker exec nodered mkdir -p /data/context/global',
+                                    shell=True, capture_output=True, timeout=10
+                                )
+                                with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tf:
+                                    tf.write(ctx_data)
+                                    tmp_ctx = tf.name
+                                subprocess.run(
+                                    f'docker cp {shlex.quote(tmp_ctx)} nodered:/data/context/global/global.json',
+                                    shell=True, capture_output=True, timeout=15
+                                )
+                                os.remove(tmp_ctx)
+                                print("Post-update: in-memory context exported to filesystem before migration")
+                        except Exception as ctx_e:
+                            print(f"Post-update: context pre-export warning (non-fatal): {ctx_e}")
+                        content = content.replace(
+                            '};',
+                            """,
+  contextStorage: {
+    default: {
+      module: 'localfilesystem'
+    }
   }
 };""",
                             1
