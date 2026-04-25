@@ -1245,24 +1245,19 @@
   <div id="pulsepointSteps" style="display:none">
     <div class="step">
       <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.75rem;margin-bottom:0.75rem">
-        <h2 style="margin:0;display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap"><img src="/pulsepoint-logo.png" alt="" width="40" height="40" style="width:40px;height:40px;border-radius:8px;object-fit:contain" loading="lazy"> PulsePoint open incidents → TAK</h2>
-        <div id="ppActiveBadge" style="display:none;padding:0.3rem 0.8rem;border-radius:20px;font-size:0.8rem;font-weight:700;background:#14532d;color:#4ade80;border:1px solid #4ade80">● ACTIVE</div>
-        <div id="ppInactiveBadge" style="display:none;padding:0.3rem 0.8rem;border-radius:20px;font-size:0.8rem;font-weight:700;background:#1a1a4e;color:#64748b;border:1px solid #334155">○ Not deployed</div>
+        <h2 style="margin:0;display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap"><img src="/pulsepoint-logo.png" alt="" width="40" height="40" style="width:40px;height:40px;border-radius:8px;object-fit:contain" loading="lazy"> PulsePoint agency → TAK</h2>
       </div>
-      <p style="font-size:0.85rem;color:#94a3b8;margin:0 0 1rem">Polls the PulsePoint web API and pushes <strong style="color:#e2e8f0">plain CoT over TCP</strong> to your TAK Server — same idea as <strong>Tablet Command</strong>, not a KML network link. One <strong>global icon</strong> from the point library for all incidents. Inspired by <a href="https://github.com/snstac/pulsecot" target="_blank" rel="noopener" style="color:#2ec4b6">pulsecot</a>.</p>
-      <div id="ppTakRouteInfo" style="margin:0 0 1rem;padding:0.75rem 1rem;background:#1a1a4e;border-radius:8px;border-left:3px solid #c41e3a;font-size:0.78rem;color:#94a3b8;line-height:1.55">
-        <strong style="color:#e2e8f0">Where CoT goes on TAK Server</strong><br>
-        Host from <strong style="color:#2ec4b6">TAK Settings</strong> → TAK Server URL. TCP port is <strong style="color:#e2e8f0">PulsePoint TCP port</strong> when set there, otherwise the default <strong style="color:#e2e8f0">streaming port</strong> (often 8089).
-        <div id="ppTakRouteLine" style="margin-top:0.5rem;font-family:ui-monospace,monospace;font-size:0.76rem;color:#cbd5e1">Loading…</div>
-      </div>
+      <p style="font-size:0.85rem;color:#94a3b8;margin:0 0 1rem">Each agency is an independent stream. Configure agency ID(s), pick a discrete CoT port (→ TAK channel/group), and activate. Same model as Tablet Command — one flow tab per agency.</p>
+      <input type="hidden" id="ppConfigId">
+      <label for="ppConfigName">Agency name <span style="color:#64748b;font-weight:400">(your label)</span></label>
+      <input type="text" id="ppConfigName" placeholder="e.g. LA County Fire" style="width:100%;box-sizing:border-box;margin-bottom:0.75rem">
+      <label for="ppAgencyIds">PulsePoint Agency ID(s) <span style="color:#64748b;font-weight:400">(comma-separated, e.g. EMS1384,21105)</span></label>
+      <input type="text" id="ppAgencyIds" placeholder="EMS1384" style="width:100%;box-sizing:border-box;margin-bottom:0.75rem">
       <div style="display:flex;gap:0.75rem;align-items:center;margin-bottom:1rem;flex-wrap:wrap">
-        <button type="button" id="btnDeployPp" onclick="deployPulsepoint()" style="padding:0.65rem 1.4rem;background:#c41e3a;border:none;border-radius:6px;color:#fff;font-weight:700;font-size:0.95rem;cursor:pointer">Deploy PulsePoint</button>
-        <button type="button" class="btn-secondary" onclick="deactivatePulsepoint()">Deactivate</button>
+        <button type="button" onclick="savePpConfig(true)" style="padding:0.65rem 1.4rem;background:#c41e3a;border:none;border-radius:6px;color:#fff;font-weight:700;font-size:0.95rem;cursor:pointer">Save &amp; Activate</button>
+        <button type="button" class="btn-secondary" onclick="savePpConfig(false)">Save only</button>
         <span id="ppDeployStatus" style="font-size:0.82rem;color:#64748b"></span>
       </div>
-      <p style="font-size:0.78rem;color:#64748b;margin:0 0 1rem">After saving or deploying, run <strong style="color:#94a3b8">Deploy Flows</strong> (or Update Now) if the PulsePoint tab is new or changed in Node-RED. ATAK receives plain CoT on the TCP stream — not KML.</p>
-      <label for="ppAgencyIds">Agency ID(s) <span style="color:#64748b;font-weight:400">(comma-separated, e.g. EMS1384,21105)</span></label>
-      <input type="text" id="ppAgencyIds" placeholder="EMS1384" style="width:100%;box-sizing:border-box;margin-bottom:0.75rem">
       <label for="ppPollSec">Poll interval (seconds)</label>
       <input type="number" id="ppPollSec" min="15" value="120" style="width:100%;max-width:200px;box-sizing:border-box;margin-bottom:0.75rem;background:#1a1a4e;color:#e2e8f0;border:1px solid #334155;border-radius:6px;padding:0.35rem 0.6rem">
       <label for="ppCotStale">CoT stale time (seconds)</label>
@@ -2941,7 +2936,7 @@ function downloadConfig() {
 var _savedConfigs = [];
 var _activeConfigIdx = -1;
 var _ipawsActiveCfg = null; // non-null when IPAWS is active
-var _pulsepointActiveCfg = null;
+var _ppConfigs = []; // multi-agency PulsePoint configs
 
 async function loadSavedConfigs() {
   // Load IPAWS status in parallel
@@ -2952,11 +2947,10 @@ async function loadSavedConfigs() {
     _ipawsActiveCfg = (cfg.activated !== false) ? cfg : null;
   } catch (e) { _ipawsActiveCfg = null; }
   try {
-    var pr = await fetch('/pulsepoint/config');
+    var pr = await fetch('/pp/config/load');
     var pd = await pr.json();
-    var pc = pd.config || {};
-    _pulsepointActiveCfg = (pc.activated === true) ? pc : null;
-  } catch (e) { _pulsepointActiveCfg = null; }
+    _ppConfigs = Array.isArray(pd.configs) ? pd.configs : [];
+  } catch (e) { _ppConfigs = []; }
 
   try {
     var tr = await fetch('/arcgis-tak/tak-settings/load');
@@ -2966,14 +2960,13 @@ async function loadSavedConfigs() {
 
   // Fetch all config sources in parallel — any non-empty source means show the list
   // ArcGIS + TFR share /arcgis-tak/config/load (TFR uses sourceType:'faa_tfr')
-  // PulsePoint + IPAWS already loaded above into _pulsepointActiveCfg / _ipawsActiveCfg
   var _extraCounts = 0;
   await Promise.allSettled([
     fetch('/arcgis-tak/config/load').then(function(r){return r.json();}).then(function(d){ var c=d.configs; _savedConfigs = Array.isArray(c)?c:[]; }).catch(function(){}),
     fetch('/tc/config/load').then(function(r){return r.json();}).then(function(d){ _extraCounts += (d.configs||[]).length; }).catch(function(){})
   ]);
 
-  var hasAnything = _savedConfigs.length > 0 || _ipawsActiveCfg || _pulsepointActiveCfg || _extraCounts > 0;
+  var hasAnything = _savedConfigs.length > 0 || _ipawsActiveCfg || _ppConfigs.length > 0 || _extraCounts > 0;
 
   // Auto-restore from latest.json if context appears empty (e.g. after full deploy timing race)
   if (!hasAnything) {
@@ -2985,9 +2978,10 @@ async function loadSavedConfigs() {
         _savedConfigs = []; _extraCounts = 0;
         await Promise.allSettled([
           fetch('/arcgis-tak/config/load').then(function(r){return r.json();}).then(function(d){ var c=d.configs; _savedConfigs = Array.isArray(c)?c:[]; }).catch(function(){}),
-          fetch('/tc/config/load').then(function(r){return r.json();}).then(function(d){ _extraCounts += (d.configs||[]).length; }).catch(function(){})
+          fetch('/tc/config/load').then(function(r){return r.json();}).then(function(d){ _extraCounts += (d.configs||[]).length; }).catch(function(){}),
+          fetch('/pp/config/load').then(function(r){return r.json();}).then(function(d){ _ppConfigs = Array.isArray(d.configs)?d.configs:[]; _extraCounts += _ppConfigs.length; }).catch(function(){})
         ]);
-        hasAnything = _savedConfigs.length > 0 || _ipawsActiveCfg || _pulsepointActiveCfg || _extraCounts > 0;
+        hasAnything = _savedConfigs.length > 0 || _ipawsActiveCfg || _ppConfigs.length > 0 || _extraCounts > 0;
       }
     } catch(_are) { console.warn('Auto-restore attempt failed:', _are.message); }
   }
@@ -3075,20 +3069,23 @@ async function renderConfigList() {
       '<div class="cc-actions"></div>' +
       '</div>';
   }
-  if (_pulsepointActiveCfg) {
-    var pcfg = _pulsepointActiveCfg;
+  // PulsePoint — one card per agency (multi-instance like TC)
+  _ppConfigs.forEach(function(pcfg) {
+    var ppAct = pcfg.activated
+      ? '<span style="display:inline-block;margin-left:0.6rem;padding:0.1rem 0.5rem;border-radius:10px;font-size:0.7rem;font-weight:700;background:#14532d;color:#4ade80;border:1px solid #4ade80;vertical-align:middle">● ACTIVE</span>'
+      : '<span style="display:inline-block;margin-left:0.6rem;padding:0.1rem 0.5rem;border-radius:10px;font-size:0.7rem;font-weight:700;background:#1a1a4e;color:#64748b;border:1px solid #334155;vertical-align:middle">○ Inactive</span>';
     var hp = takResolvedHostPort(takSnap);
     var ppPort = cfgEffectiveCotPort(pcfg, takSnap);
     var ppNote = (pcfg.takDestinationLabel || '').trim();
     var ppLine = 'TAK: TCP CoT → ' + hp.host + ':' + ppPort;
-    html += '<div class="config-card" onclick="selectPulsepointConfig()" title="Click to edit PulsePoint">' +
-      '<div><div class="cc-name"><img src="/pulsepoint-logo.png" alt="" width="22" height="22" style="width:22px;height:22px;border-radius:5px;vertical-align:middle;margin-right:0.35rem;object-fit:contain" loading="lazy">PulsePoint (streaming CoT)' +
-      '<span style="display:inline-block;margin-left:0.6rem;padding:0.1rem 0.5rem;border-radius:10px;font-size:0.7rem;font-weight:700;background:#14532d;color:#4ade80;border:1px solid #4ade80;vertical-align:middle">● ACTIVE</span>' +
-      '</div>' +
-      '<div class="cc-detail">' + _esc(String(pcfg.agencyIds || '').substring(0, 80)) + ' | Poll: ' + (pcfg.pollIntervalSec || 120) + 's' +
+    var ppIds = _esc(String(pcfg.agencyIds || '').substring(0, 60));
+    html += '<div class="config-card" onclick="openPpConfig(\'' + _esc(pcfg.id) + '\')" title="Click to edit PulsePoint config">' +
+      '<div><div class="cc-name"><img src="/pulsepoint-logo.png" alt="" width="22" height="22" style="width:22px;height:22px;border-radius:5px;vertical-align:middle;margin-right:0.35rem;object-fit:contain" loading="lazy">' +
+      _esc(pcfg.configName || 'PulsePoint Agency') + ppAct + '</div>' +
+      '<div class="cc-detail">' + ppIds + ' | Poll: ' + (pcfg.pollIntervalSec || 120) + 's' +
       '<br><span style="font-size:0.78rem;color:#64748b">' + _esc(ppLine + (ppNote ? ' · note: ' + ppNote : '')) + '</span></div></div>' +
-      '<div class="cc-actions"><button class="btn-secondary" style="color:#f87171;border-color:#7f1d1d" onclick="event.stopPropagation();deletePulsepointConfig()">Delete</button></div></div>';
-  }
+      '<div class="cc-actions"><button class="btn-secondary" style="color:#f87171;border-color:#7f1d1d" onclick="event.stopPropagation();deletePpConfig(\'' + _esc(pcfg.id) + '\')">Delete</button></div></div>';
+  });
   var tcConfigs = [];
   try {
     var tr = await fetch('/tc/config/load');
@@ -3226,7 +3223,17 @@ async function selectIpawsConfig() {
   document.getElementById('savedConfigBar').style.display = 'block';
 }
 
+// selectPulsepointConfig — opens a blank PP form for a new agency
 async function selectPulsepointConfig() {
+  _ppActiveCfg = null;
+  document.getElementById('ppConfigId').value = '';
+  document.getElementById('ppConfigName').value = '';
+  document.getElementById('ppAgencyIds').value = '';
+  document.getElementById('ppPollSec').value = '120';
+  document.getElementById('ppCotStale').value = '600';
+  document.getElementById('ppCotStreamPort').value = '';
+  document.getElementById('ppTakDestinationLabel').value = '';
+  state.ppUniformIcon = null;
   _activeConfigIdx = -1;
   await renderConfigList();
   showSteps();
@@ -3414,24 +3421,123 @@ function copyIpawsUrl() {
 }
 
 // ════════════════════════════════════════════════════════════════
-//  PulsePoint — streaming CoT over TCP (not KML)
+//  PulsePoint — multi-agency streaming CoT (like TC)
 // ════════════════════════════════════════════════════════════════
-function _ppSetActiveUI(active) {
-  var ab = document.getElementById('ppActiveBadge');
-  var ib = document.getElementById('ppInactiveBadge');
-  var dep = document.getElementById('btnDeployPp');
-  if (ab) ab.style.display = active ? 'inline-block' : 'none';
-  if (ib) ib.style.display = active ? 'none' : 'inline-block';
-  if (dep) dep.style.display = active ? 'none' : 'inline-block';
+var _ppActiveCfg = null; // config currently open in the PP form
+
+function openPpConfig(id) {
+  fetch('/pp/config/load').then(function(r){ return r.json(); }).then(function(d) {
+    var cfg = (d.configs || []).find(function(c){ return c.id === id; });
+    if (!cfg) return;
+    _ppActiveCfg = cfg;
+    showSteps();
+    pickSourceType('pulsepoint');
+    _ppFillForm(cfg);
+    document.getElementById('savedConfigBar').style.display = 'block';
+  });
 }
 
-function _ppCollectPayload(activated) {
+function _ppFillForm(cfg) {
+  document.getElementById('ppConfigId').value = cfg.id || '';
+  document.getElementById('ppConfigName').value = cfg.configName || '';
+  document.getElementById('ppAgencyIds').value = cfg.agencyIds || '';
+  document.getElementById('ppPollSec').value = String(Math.max(15, Number(cfg.pollIntervalSec) || 120));
+  document.getElementById('ppCotStale').value = String(Math.max(30, Number(cfg.cotStaleSec) || 600));
+  document.getElementById('ppCotStreamPort').value = cfg.cotStreamPort ? String(cfg.cotStreamPort) : '';
+  document.getElementById('ppTakDestinationLabel').value = cfg.takDestinationLabel || '';
+  var u = cfg.uniformIcon;
+  if (u && u.iconsetpath) {
+    state.ppUniformIcon = { iconsetpath: u.iconsetpath, cotType: u.cotType || 'a-u-G', label: (u.iconsetpath||'').split('/').pop()||'Icon', b64: '' };
+    var ct = document.getElementById('ppPointCotType'); if (ct) ct.value = state.ppUniformIcon.cotType;
+    var lbl = document.getElementById('ppPointIconLabel'); if (lbl) lbl.textContent = state.ppUniformIcon.label;
+  } else {
+    state.ppUniformIcon = null;
+    var ct0 = document.getElementById('ppPointCotType'); if (ct0) ct0.value = 'a-u-G';
+    var lbl0 = document.getElementById('ppPointIconLabel'); if (lbl0) lbl0.textContent = 'No icon selected — default caution marker will be used';
+  }
+  var st = document.getElementById('ppDeployStatus'); if (st) { st.textContent = ''; }
+}
+
+async function savePpConfig(activate) {
+  var st = document.getElementById('ppDeployStatus');
+  var cfg = _ppBuildConfig(activate);
+  if (!cfg.agencyIds) { if (st) { st.textContent = 'Enter at least one agency ID'; st.style.color = '#f87171'; } return; }
+  if (!cfg.configName) { if (st) { st.textContent = 'Agency name required'; st.style.color = '#f87171'; } return; }
+  if (st) { st.textContent = 'Saving…'; st.style.color = '#94a3b8'; }
+  try {
+    var r = await fetch('/pp/config/save', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cfg) });
+    var d = await r.json();
+    if (!d.ok) throw new Error(d.error || 'save failed');
+    _ppActiveCfg = cfg;
+    // Refresh local list
+    var lr = await fetch('/pp/config/load');
+    var ld = await lr.json();
+    _ppConfigs = Array.isArray(ld.configs) ? ld.configs : [];
+    if (activate && cfg.configName) {
+      if (st) { st.textContent = 'Creating flow…'; st.style.color = '#94a3b8'; }
+      await ensurePPEngineTab(cfg.configName, cfg.cotStreamPort);
+    }
+    if (st) { st.textContent = '✓ Saved' + (activate ? ' & activated' : ''); st.style.color = '#4ade80'; }
+    await renderConfigList();
+    setTimeout(function(){ hideSteps(); }, 800);
+  } catch(e) {
+    if (st) { st.textContent = 'Save failed: ' + e.message; st.style.color = '#f87171'; }
+  }
+}
+
+async function deletePpConfig(id) {
+  if (!confirm('Delete this PulsePoint agency config?')) return;
+  try {
+    await fetch('/pp/config/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: id }) });
+    var lr = await fetch('/pp/config/load');
+    var ld = await lr.json();
+    _ppConfigs = Array.isArray(ld.configs) ? ld.configs : [];
+    await renderConfigList();
+  } catch(e) { alert('Delete failed: ' + e.message); }
+}
+
+async function ensurePPEngineTab(configName, cotStreamPort) {
+  if (!configName || !configName.trim()) return;
+  var feedId = feedIdFromName(configName);
+  var tabId = 'flow_pp_' + feedId;
+  var tabLabel = 'PP: ' + configName;
+  try { var ck = await fetch('/flow/' + tabId); if (ck.ok) return; } catch(e) {}
+  try {
+    var allFlows = await fetch('/flows').then(function(r){ return r.json(); });
+    var existing = allFlows.find(function(n){ return n.type === 'tab' && n.label === tabLabel; });
+    if (existing) return;
+  } catch(e) {}
+  var safeName = configName.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  var raw = PP_ENGINE_TAB_TEMPLATE;
+  raw = raw.replace(/__FEED_ID__/g, feedId).replace(/__CONFIG_NAME__/g, safeName);
+  var nodes = JSON.parse(raw);
+  var effectivePort = (cotStreamPort && cotStreamPort > 0) ? cotStreamPort : 8089;
+  var tcpNode = nodes.find(function(n){ return n.type === 'tcp out'; });
+  if (tcpNode) { tcpNode.port = String(effectivePort); tcpNode.name = 'CoT → TAK :' + effectivePort; }
+  var tab = nodes.find(function(n){ return n.type === 'tab'; });
+  var tabNodes = nodes.filter(function(n){ return n.type !== 'tab'; });
+  try {
+    var res = await fetch('/flow', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Node-RED-Deployment-Type': 'flows' }, body: JSON.stringify({ id: tabId, label: tabLabel, disabled: false, info: tab ? tab.info : '', nodes: tabNodes }) });
+    if (res.ok) {
+      var allFlows2 = await fetch('/flows').then(function(r){ return r.json(); });
+      await fetch('/flows', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Node-RED-Deployment-Type': 'full' }, body: JSON.stringify(allFlows2) });
+      await new Promise(function(r){ setTimeout(r, 4000); });
+      try { await fetch('/config/restore', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filename: 'ctx:0' }) }); } catch(e3) {}
+    }
+  } catch(e) { console.warn('PP engine tab creation failed:', e.message); }
+}
+
+function _ppBuildConfig(activated) {
   var poll = parseInt(document.getElementById('ppPollSec').value, 10) || 120;
   poll = Math.max(15, poll);
   var stale = parseInt(document.getElementById('ppCotStale').value, 10) || 600;
   stale = Math.max(30, stale);
   var ppPortRaw = parseInt(document.getElementById('ppCotStreamPort').value, 10);
+  var existingId = (document.getElementById('ppConfigId') || {}).value || '';
   var body = {
+    id: existingId || ('pp_' + Date.now()),
+    sourceType: 'pulsepoint',
+    configName: (document.getElementById('ppConfigName').value || '').trim() || 'PulsePoint Agency',
     activated: !!activated,
     agencyIds: (document.getElementById('ppAgencyIds').value || '').trim(),
     pollIntervalSec: poll,
@@ -3452,8 +3558,8 @@ function _ppCollectPayload(activated) {
 
 function loadPulsepointConfig() {
   var st = document.getElementById('ppDeployStatus');
-  fetch('/pulsepoint/config').then(function(r) { return r.json(); }).then(function(d) {
-    var cfg = d.config || {};
+  fetch('/pp/config/load').then(function(r) { return r.json(); }).then(function(d) {
+    var cfg = (_ppActiveCfg && (d.configs||[]).find(function(c){return c.id===_ppActiveCfg.id;})) || (d.configs||[])[0] || {};
     document.getElementById('ppAgencyIds').value = cfg.agencyIds || '';
     document.getElementById('ppPollSec').value = String(Math.max(15, Number(cfg.pollIntervalSec) || 120));
     document.getElementById('ppCotStale').value = String(Math.max(30, Number(cfg.cotStaleSec) || 600));
@@ -3494,9 +3600,14 @@ function loadPulsepointConfig() {
 }
 
 async function deployPulsepoint() {
+  // Legacy shim — redirect to new save+activate flow
+  await savePpConfig(true);
+}
+
+async function _deployPulsepoint_UNUSED() {
   var btn = document.getElementById('btnDeployPp');
   var st = document.getElementById('ppDeployStatus');
-  var body = _ppCollectPayload(true);
+  var body = _ppBuildConfig(true);
   if (!body.agencyIds) {
     if (st) { st.textContent = 'Enter at least one agency ID'; st.style.color = '#f87171'; }
     return;
@@ -3520,17 +3631,23 @@ async function deployPulsepoint() {
 }
 
 async function deactivatePulsepoint() {
+  // Legacy shim
+  if (_ppActiveCfg && _ppActiveCfg.id) {
+    _ppActiveCfg.activated = false;
+    await savePpConfig(false);
+  }
+}
+
+async function _deactivatePulsepoint_UNUSED() {
   if (!confirm('Deactivate PulsePoint? TCP CoT streaming will stop until you deploy again.')) return;
   var st = document.getElementById('ppDeployStatus');
   try {
-    var body = _ppCollectPayload(false);
-    var r = await fetch('/pulsepoint/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    var body = _ppBuildConfig(false);
+    var r = await fetch('/pp/config/save', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     var d = await r.json();
     if (!d.ok) throw new Error(d.error || 'failed');
-    _pulsepointActiveCfg = null;
-    _ppSetActiveUI(false);
+    _ppActiveCfg = null;
     await renderConfigList();
-    if (_savedConfigs.length === 0) document.getElementById('savedConfigBar').style.display = 'none';
     if (st) { st.textContent = 'Deactivated'; st.style.color = '#94a3b8'; }
     setTimeout(function() { if (st) st.textContent = ''; }, 3000);
   } catch (e) {
@@ -3539,23 +3656,9 @@ async function deactivatePulsepoint() {
 }
 
 async function savePulsepointConfig() {
-  var st = document.getElementById('ppDeployStatus');
-  try {
-    var r0 = await fetch('/pulsepoint/config');
-    var d0 = await r0.json();
-    var act = (d0.config || {}).activated === true;
-    var body = _ppCollectPayload(act);
-    var r = await fetch('/pulsepoint/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-    var d = await r.json();
-    if (!d.ok) throw new Error(d.error || 'failed');
-    _pulsepointActiveCfg = body.activated ? (d.config || body) : null;
-    _ppSetActiveUI(body.activated === true);
-    await renderConfigList();
-    if (st) { st.textContent = '✓ Settings saved'; st.style.color = '#2ec4b6'; }
-    setTimeout(function() { hideSteps(); }, 600);
-  } catch (e) {
-    if (st) { st.textContent = 'Save failed'; st.style.color = '#f87171'; }
-  }
+  // Legacy shim — keep existing activated state
+  var act = _ppActiveCfg ? !!_ppActiveCfg.activated : false;
+  await savePpConfig(act);
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -3984,16 +4087,8 @@ async function deleteTcConfigById(id) {
 }
 
 async function deletePulsepointConfig() {
-  if (!confirm('Delete PulsePoint config? This will deactivate and clear the integration.')) return;
-  try {
-    await fetch('/pulsepoint/config', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ agencyIds: '', activated: false, pollIntervalSec: 120 })
-    });
-    _pulsepointActiveCfg = null;
-    await renderConfigList();
-  } catch(e) { alert('Delete failed: ' + e.message); }
+  // Legacy shim
+  if (_ppActiveCfg && _ppActiveCfg.id) await deletePpConfig(_ppActiveCfg.id);
 }
 
 function resetForm() {
@@ -4973,6 +5068,9 @@ var KML_ENGINE_TAB_TEMPLATE = decodeURIComponent(escape(atob("W3siaWQiOiJmbG93X2
 /* __TC_ENGINE_TAB_TEMPLATE_START__ */
 var TC_ENGINE_TAB_TEMPLATE = decodeURIComponent(escape(atob("W3siaWQiOiJmbG93X3RjX19fRkVFRF9JRF9fIiwidHlwZSI6InRhYiIsImxhYmVsIjoiVEM6IF9fQ09ORklHX05BTUVfXyIsImRpc2FibGVkIjpmYWxzZSwiaW5mbyI6IlRhYmxldCBDb21tYW5kIEFWTCBlbmdpbmUgZm9yIF9fQ09ORklHX05BTUVfXy4gU3RyZWFtcyBDb1QgdmlhIFRDUCDigJQgbm8gRGF0YVN5bmMuIn0seyJpZCI6Il9fRkVFRF9JRF9fX3RjX2luaXRfaW5qIiwidHlwZSI6ImluamVjdCIsInoiOiJmbG93X3RjX19fRkVFRF9JRF9fIiwibmFtZSI6IlN0YXJ0dXAgaW5pdCIsInByb3BzIjpbeyJwIjoicGF5bG9hZCJ9XSwicmVwZWF0IjoiIiwiY3JvbnRhYiI6IiIsIm9uY2UiOnRydWUsIm9uY2VEZWxheSI6IjMiLCJ0b3BpYyI6IiIsInBheWxvYWQiOiIiLCJwYXlsb2FkVHlwZSI6ImRhdGUiLCJ4IjoxNjAsInkiOjQwLCJ3aXJlcyI6W1siX19GRUVEX0lEX19fdGNfaW5pdF9mbiJdXX0seyJpZCI6Il9fRkVFRF9JRF9fX3RjX2luaXRfZm4iLCJ0eXBlIjoiZnVuY3Rpb24iLCJ6IjoiZmxvd190Y19fX0ZFRURfSURfXyIsIm5hbWUiOiJJbml0IFRDIGNvbmZpZyIsImZ1bmMiOiJ2YXIgY2ZnID0gKGdsb2JhbC5nZXQoJ3RjX2NvbmZpZ3MnKXx8W10pLmZpbmQoZnVuY3Rpb24oYyl7cmV0dXJuIGMuY29uZmlnTmFtZT09PSdfX0NPTkZJR19OQU1FX18nO30pO1xuZ2xvYmFsLnNldCgndGNfbGFzdF9mZXRjaF9fX0ZFRURfSURfXycsIDApOyAvLyBmb3JjZSBpbW1lZGlhdGUgZmlyc3QgcG9sbFxuaWYgKCFjZmcpIHsgbm9kZS53YXJuKCdUQyBfX0NPTkZJR19OQU1FX186IGNvbmZpZyBub3QgZm91bmQgaW4gZ2xvYmFsIGNvbnRleHQnKTsgcmV0dXJuIG51bGw7IH1cbnJldHVybiBtc2c7Iiwib3V0cHV0cyI6MSwidGltZW91dCI6IiIsIm5vZXJyIjowLCJpbml0aWFsaXplIjoiIiwiZmluYWxpemUiOiIiLCJsaWJzIjpbXSwieCI6MzgwLCJ5Ijo0MCwid2lyZXMiOltbIl9fRkVFRF9JRF9fX3RjX3BvbGxfZm4iXV19LHsiaWQiOiJfX0ZFRURfSURfX190Y190aW1lciIsInR5cGUiOiJpbmplY3QiLCJ6IjoiZmxvd190Y19fX0ZFRURfSURfXyIsIm5hbWUiOiJFdmVyeSA2MCBzIiwicHJvcHMiOlt7InAiOiJwYXlsb2FkIn1dLCJyZXBlYXQiOiI2MCIsImNyb250YWIiOiIiLCJvbmNlIjpmYWxzZSwib25jZURlbGF5IjoiMCIsInRvcGljIjoiIiwicGF5bG9hZCI6IiIsInBheWxvYWRUeXBlIjoiZGF0ZSIsIngiOjE2MCwieSI6MTAwLCJ3aXJlcyI6W1siX19GRUVEX0lEX19fdGNfcG9sbF9mbiJdXX0seyJpZCI6Il9fRkVFRF9JRF9fX3RjX3BvbGxfZm4iLCJ0eXBlIjoiZnVuY3Rpb24iLCJ6IjoiZmxvd190Y19fX0ZFRURfSURfXyIsIm5hbWUiOiJDaGVjayBwb2xsIGludGVydmFsIiwiZnVuYyI6InZhciBjZmcgPSAoZ2xvYmFsLmdldCgndGNfY29uZmlncycpfHxbXSkuZmluZChmdW5jdGlvbihjKXtyZXR1cm4gYy5jb25maWdOYW1lPT09J19fQ09ORklHX05BTUVfXyc7fSk7XG5pZiAoIWNmZyB8fCAhY2ZnLmFjdGl2YXRlZCkgcmV0dXJuIG51bGw7XG52YXIgaW50ZXJ2YWxNcyA9IE1hdGgubWF4KDEsIGNmZy5wb2xsSW50ZXJ2YWx8fDEpICogNjAwMDA7XG52YXIgbGFzdEZldGNoICA9IGdsb2JhbC5nZXQoJ3RjX2xhc3RfZmV0Y2hfX19GRUVEX0lEX18nKSB8fCAwO1xuaWYgKChEYXRlLm5vdygpIC0gbGFzdEZldGNoKSA8IGludGVydmFsTXMpIHJldHVybiBudWxsO1xucmV0dXJuIG1zZzsiLCJvdXRwdXRzIjoxLCJ0aW1lb3V0IjoiIiwibm9lcnIiOjAsImluaXRpYWxpemUiOiIiLCJmaW5hbGl6ZSI6IiIsImxpYnMiOltdLCJ4IjozODAsInkiOjEwMCwid2lyZXMiOltbIl9fRkVFRF9JRF9fX3RjX2J1aWxkX3VybCJdXX0seyJpZCI6Il9fRkVFRF9JRF9fX3RjX2J1aWxkX3VybCIsInR5cGUiOiJmdW5jdGlvbiIsInoiOiJmbG93X3RjX19fRkVFRF9JRF9fIiwibmFtZSI6IkJ1aWxkIFRDIHF1ZXJ5IFVSTCIsImZ1bmMiOiJ2YXIgY2ZnID0gKGdsb2JhbC5nZXQoJ3RjX2NvbmZpZ3MnKXx8W10pLmZpbmQoZnVuY3Rpb24oYyl7cmV0dXJuIGMuY29uZmlnTmFtZT09PSdfX0NPTkZJR19OQU1FX18nO30pO1xuaWYgKCFjZmcgfHwgIWNmZy5hY3RpdmF0ZWQpIHJldHVybiBudWxsO1xudmFyIGJhc2UgPSAoY2ZnLmFnZW5jeVVybHx8JycpLnJlcGxhY2UoL1xcLyskLywnJyk7XG5tc2cudXJsICAgID0gYmFzZSArICcvMC9xdWVyeT93aGVyZT0xJTNEMSZvdXRGaWVsZHM9KiZyZXR1cm5HZW9tZXRyeT1mYWxzZSZmPWpzb24nO1xubXNnLm1ldGhvZCA9ICdHRVQnO1xubXNnLmhlYWRlcnMgPSB7ICdVc2VyLUFnZW50JzogJ2luZnJhLVRBSy90YWJsZXRjb21tYW5kJyB9O1xubXNnLl90Y0NmZyA9IGNmZztcbnJldHVybiBtc2c7Iiwib3V0cHV0cyI6MSwidGltZW91dCI6IiIsIm5vZXJyIjowLCJpbml0aWFsaXplIjoiIiwiZmluYWxpemUiOiIiLCJsaWJzIjpbXSwieCI6NjAwLCJ5IjoxMDAsIndpcmVzIjpbWyJfX0ZFRURfSURfX190Y19odHRwX3JlcSJdXX0seyJpZCI6Il9fRkVFRF9JRF9fX3RjX2h0dHBfcmVxIiwidHlwZSI6Imh0dHAgcmVxdWVzdCIsInoiOiJmbG93X3RjX19fRkVFRF9JRF9fIiwibmFtZSI6IkdFVCBUQyBGZWF0dXJlU2VydmVyIiwibWV0aG9kIjoiR0VUIiwicmV0Ijoib2JqIiwicGF5dG9xcyI6Imlnbm9yZSIsInVybCI6IiIsInRscyI6IiIsInBlcnNpc3QiOmZhbHNlLCJwcm94eSI6IiIsImluc2VjdXJlSFRUUFBhcnNlciI6ZmFsc2UsImF1dGhUeXBlIjoiIiwic2VuZGVyciI6ZmFsc2UsImhlYWRlcnMiOltdLCJ4Ijo4NDAsInkiOjEwMCwid2lyZXMiOltbIl9fRkVFRF9JRF9fX3RjX2J1aWxkX2NvdCJdXX0seyJpZCI6Il9fRkVFRF9JRF9fX3RjX2J1aWxkX2NvdCIsInR5cGUiOiJmdW5jdGlvbiIsInoiOiJmbG93X3RjX19fRkVFRF9JRF9fIiwibmFtZSI6IkJ1aWxkICsgc3RyZWFtIENvVCIsImZ1bmMiOiJmdW5jdGlvbiB0Y0NvdFR5cGUocikge1xuICByID0gKHJ8fCcnKS50b1VwcGVyQ2FzZSgpLnJlcGxhY2UoL1xccysvZywnJyk7XG4gIGlmICgvXkVcXGR8XkVORy8udGVzdChyKSkgICAgICAgICAgICAgICAgICAgICAgIHJldHVybiAnYS1mLUctRS1WLUMnOyAvLyBFbmdpbmVcbiAgaWYgKC9eKFR8VFJLfExBRHxUSylcXGQvLnRlc3QocikpICAgICAgICAgICAgICAgcmV0dXJuICdhLWYtRy1FLVYtQyc7IC8vIFRydWNrL0xhZGRlclxuICBpZiAoL14oTXxNRUR8QU1CfEFMU3xCTFMpXFxkLy50ZXN0KHIpKSAgICAgICAgICByZXR1cm4gJ2EtZi1HLUUtVi1NJzsgLy8gTWVkaWNhbFxuICBpZiAoL14oQkN8QkFUfENISUVGfEFDfERDfERJVnxDTUQpLy50ZXN0KHIpKSAgICByZXR1cm4gJ2EtZi1HLUUtVi1DJzsgLy8gQ2hpZWYvQ29tbWFuZFxuICBpZiAoL14oSHxIRUxPfEFJUnxIVHxDSFApXFxkLy50ZXN0KHIpKSAgICAgICAgICByZXR1cm4gJ2EtZi1BLUMtSCc7ICAgLy8gSGVsaWNvcHRlclxuICBpZiAoL14oV1R8V0FUfFdBVEVSKVxcZC8udGVzdChyKSkgICAgICAgICAgICAgICByZXR1cm4gJ2EtZi1HLUUtVi1DJzsgLy8gV2F0ZXIgVGVuZGVyXG4gIGlmICgvXihSRVN8UkVTQ1VFfFNRfFNRVUFEKVxcZC8udGVzdChyKSkgICAgICAgIHJldHVybiAnYS1mLUctRS1WLUMnOyAvLyBSZXNjdWUvU3F1YWRcbiAgaWYgKC9eKEhBWnxITSlcXGQvLnRlc3QocikpICAgICAgICAgICAgICAgICAgICAgcmV0dXJuICdhLWYtRy1FLVYtQyc7IC8vIEhhem1hdFxuICByZXR1cm4gJ2EtZi1HLUUtVi1DJzsgLy8gZGVmYXVsdDogZnJpZW5kbHkgZ3JvdW5kIHZlaGljbGVcbn1cbmZ1bmN0aW9uIHRjRGVmYXVsdEljb25zZXQoY3QpIHtcbiAgaWYgKGN0ID09PSAnYS1mLUctRS1WLU0nKSByZXR1cm4gJzZkNzgxYWZiLTg5YTYtNGMwNy1iMmI5LWE4OTc0OGI2YTM4Zi9TZXJ2aWNlL2VtZXJnZW5jeS5wbmcnO1xuICBpZiAoY3QgPT09ICdhLWYtQS1DLUgnKSByZXR1cm4gJyc7XG4gIHJldHVybiAnNmQ3ODFhZmItODlhNi00YzA3LWIyYjktYTg5NzQ4YjZhMzhmL1NlcnZpY2UvZmlyZWJyaWdhZGUucG5nJztcbn1cblxudmFyIGNmZyAgID0gbXNnLl90Y0NmZyB8fCAoZ2xvYmFsLmdldCgndGNfY29uZmlncycpfHxbXSkuZmluZChmdW5jdGlvbihjKXtyZXR1cm4gYy5jb25maWdOYW1lPT09J19fQ09ORklHX05BTUVfXyc7fSkgfHwge307XG52YXIgZGF0YSAgPSBtc2cucGF5bG9hZCB8fCB7fTtcbnZhciBmZWF0cyA9IGRhdGEuZmVhdHVyZXMgfHwgW107XG52YXIga25vd25Vbml0cyA9IGdsb2JhbC5nZXQoJ3RjX3VuaXRzX19fRkVFRF9JRF9fJykgfHwge307XG52YXIgdGFrICAgPSBnbG9iYWwuZ2V0KCd0YWtfc2V0dGluZ3MnKSB8fCB7fTtcbnZhciBob3N0ICA9IFN0cmluZyh0YWsuc2VydmVyVXJsIHx8ICcnKS5yZXBsYWNlKC9eaHR0cHM/OlxcL1xcLy9pLCAnJykucmVwbGFjZSgvXFwvJC8sICcnKS50cmltKCkgfHwgdGFrLnRha0hvc3QgfHwgJ2hvc3QuZG9ja2VyLmludGVybmFsJztcbnZhciBiYXNlUCA9IE51bWJlcih0YWsuc3RyZWFtaW5nUG9ydCB8fCB0YWsuc3RyZWFtUG9ydCB8fCA4MDg5KTtcbnZhciBwb3J0ICA9IE51bWJlcihjZmcuY290U3RyZWFtUG9ydCkgfHwgYmFzZVA7XG52YXIgc3RhbGVNcyA9IChjZmcuc3RhbGVNaW51dGVzfHw1KSAqIDYwMDAwO1xudmFyIHNlbnQgID0gMDtcblxuZ2xvYmFsLnNldCgndGNfbGFzdF9mZXRjaF9fX0ZFRURfSURfXycsIERhdGUubm93KCkpO1xuXG5mZWF0cy5mb3JFYWNoKGZ1bmN0aW9uKGYpIHtcbiAgdmFyIGEgPSBmLmF0dHJpYnV0ZXMgfHwge307XG4gIHZhciByYWRpb05hbWUgPSAoYS5yYWRpb05hbWV8fCcnKS50cmltKCk7XG4gIGlmICghcmFkaW9OYW1lKSByZXR1cm47XG4gIHZhciBsYXQgPSBwYXJzZUZsb2F0KGEubGF0aXR1ZGUpO1xuICB2YXIgbG9uID0gcGFyc2VGbG9hdChhLmxvbmdpdHVkZSk7XG4gIGlmIChpc05hTihsYXQpfHxpc05hTihsb24pKSByZXR1cm47XG4gIHZhciB0cyAgICA9IGEudGltZSA/IG5ldyBEYXRlKGEudGltZSkgOiBuZXcgRGF0ZSgpO1xuICB2YXIgc3RhbGUgPSBuZXcgRGF0ZSh0cy5nZXRUaW1lKCkgKyBzdGFsZU1zKTtcbiAgdmFyIHVpZCAgID0gJ3RjLScgKyAoYS5kZXZpY2VVdWlkIHx8ICgnb2JqLScrYS5PQkpFQ1RJRCkpO1xuICB2YXIgb3YgICAgPSBrbm93blVuaXRzW3JhZGlvTmFtZV0gfHwga25vd25Vbml0c1tyYWRpb05hbWUudG9VcHBlckNhc2UoKV0gfHwge307XG4gIHZhciBjYWxsc2lnbiA9IG92LmNhbGxzaWduIHx8IHJhZGlvTmFtZTtcbiAgdmFyIGNvdFR5cGUgID0gb3YuY290VHlwZSAgfHwgdGNDb3RUeXBlKHJhZGlvTmFtZSk7XG4gIHZhciBpY29uUmF3ICA9IChvdi5pY29uc2V0cGF0aCAmJiBTdHJpbmcob3YuaWNvbnNldHBhdGgpLnRyaW0oKSkgfHwgJyc7XG4gIHZhciBpY29ucGF0aCA9IGljb25SYXcgfHwgdGNEZWZhdWx0SWNvbnNldChjb3RUeXBlKTtcbiAgdmFyIF9ybWtGaWVsZHMgPSBjZmcucmVtYXJrc0ZpZWxkcyAmJiBjZmcucmVtYXJrc0ZpZWxkcy5sZW5ndGggPyBjZmcucmVtYXJrc0ZpZWxkcyA6IG51bGw7XG4gIHZhciByZW1hcmtzO1xuICBpZiAoX3Jta0ZpZWxkcykge1xuICAgIHZhciBfcnAgPSBfcm1rRmllbGRzLm1hcChmdW5jdGlvbihrKXsgcmV0dXJuIGsgKyAnOiAnICsgKGFba118fCcnKTsgfSk7XG4gICAgaWYgKGNmZy5yZW1hcmtzQ3VzdG9tVGV4dCkgX3JwLnB1c2goY2ZnLnJlbWFya3NDdXN0b21UZXh0KTtcbiAgICByZW1hcmtzID0gX3JwLmpvaW4oJyB8ICcpO1xuICB9IGVsc2Uge1xuICAgIHJlbWFya3MgPSAoY2ZnLmNvbmZpZ05hbWV8fCdUQycpICsgJyB8ICcgKyByYWRpb05hbWVcbiAgICAgICAgICAgICArICcgfCBTdGF0dXM6ICcgKyAoYS52ZWhpY2xlU3RhdHVzfHwnJykgKyAnIHwgJyArIHRzLnRvTG9jYWxlU3RyaW5nKCk7XG4gIH1cbiAgdmFyIGRldGFpbCA9IHtcbiAgICBjb250YWN0OiBbeyBfYXR0cmlidXRlczp7IGNhbGxzaWduOmNhbGxzaWduIH0gfV0sXG4gICAgcmVtYXJrczogcmVtYXJrcyxcbiAgICBzdGF0dXM6ICBbeyBfYXR0cmlidXRlczp7IHJlYWRpbmVzczondHJ1ZScgfSB9XVxuICB9O1xuICBpZiAoaWNvbnBhdGgpIGRldGFpbC51c2VyaWNvbiA9IFt7IF9hdHRyaWJ1dGVzOiB7IGljb25zZXRwYXRoOiBpY29ucGF0aCB9IH1dO1xuICB2YXIgY290TXNnID0ge1xuICAgIHBheWxvYWQ6IHtcbiAgICAgIGV2ZW50OiB7XG4gICAgICAgIF9hdHRyaWJ1dGVzOiB7XG4gICAgICAgICAgdmVyc2lvbjonMi4wJywgdWlkOnVpZCwgdHlwZTpjb3RUeXBlLFxuICAgICAgICAgIGhvdzonbS1nJyxcbiAgICAgICAgICB0aW1lOnRzLnRvSVNPU3RyaW5nKCksIHN0YXJ0OnRzLnRvSVNPU3RyaW5nKCksIHN0YWxlOnN0YWxlLnRvSVNPU3RyaW5nKClcbiAgICAgICAgfSxcbiAgICAgICAgcG9pbnQ6ICB7IF9hdHRyaWJ1dGVzOnsgbGF0OlN0cmluZyhsYXQpLCBsb246U3RyaW5nKGxvbiksIGhhZTonOTk5OTk5OS4wJywgY2U6JzUwJywgbGU6Jzk5OTk5OTkuMCcgfSB9LFxuICAgICAgICBkZXRhaWw6IGRldGFpbFxuICAgICAgfVxuICAgIH0sXG4gICAgaG9zdDogaG9zdCxcbiAgICBwb3J0OiBwb3J0XG4gIH07XG4gIG5vZGUuc2VuZChjb3RNc2cpO1xuICBzZW50Kys7XG59KTtcbm5vZGUud2FybignVEMgX19DT05GSUdfTkFNRV9fOiAnK3NlbnQrJyBDb1QgZXZlbnRzIHN0cmVhbWVkIGZyb20gJytmZWF0cy5sZW5ndGgrJyBmZWF0dXJlcycpO1xucmV0dXJuIG51bGw7Iiwib3V0cHV0cyI6MSwidGltZW91dCI6IiIsIm5vZXJyIjowLCJpbml0aWFsaXplIjoiIiwiZmluYWxpemUiOiIiLCJsaWJzIjpbXSwieCI6MTA4MCwieSI6MTAwLCJ3aXJlcyI6W1siX19GRUVEX0lEX19fdGNfY290X3htbCJdXX0seyJpZCI6Il9fRkVFRF9JRF9fX3RjX2NvdF94bWwiLCJ0eXBlIjoiZnVuY3Rpb24iLCJ6IjoiZmxvd190Y19fX0ZFRURfSURfXyIsIm5hbWUiOiJDb1QgSlNPTiAtPiBYTUwiLCJfdGVtcGxhdGVLZXkiOiJzaGFyZWQuY290X3RvX3htbCIsImZ1bmMiOiJ2YXIgZSA9IG1zZy5wYXlsb2FkICYmIG1zZy5wYXlsb2FkLmV2ZW50O1xuaWYgKCFlIHx8ICFlLl9hdHRyaWJ1dGVzKSByZXR1cm4gbnVsbDtcbnZhciBhID0gZS5fYXR0cmlidXRlcztcbnZhciBwID0gZS5wb2ludC5fYXR0cmlidXRlcztcbnZhciBkID0gZS5kZXRhaWwgfHwge307XG5cbnZhciB4bWwgPSAnPGV2ZW50IHZlcnNpb249XCInICsgYS52ZXJzaW9uICsgJ1wiIHVpZD1cIicgKyBhLnVpZCArICdcIiB0eXBlPVwiJyArIGEudHlwZSArICdcIidcbiAgKyAnIGhvdz1cIicgKyBhLmhvdyArICdcIiB0aW1lPVwiJyArIGEudGltZSArICdcIiBzdGFydD1cIicgKyBhLnN0YXJ0ICsgJ1wiIHN0YWxlPVwiJyArIGEuc3RhbGUgKyAnXCI+J1xuICArICc8cG9pbnQgbGF0PVwiJyArIHAubGF0ICsgJ1wiIGxvbj1cIicgKyBwLmxvbiArICdcIiBoYWU9XCInICsgcC5oYWUgKyAnXCIgY2U9XCInICsgcC5jZSArICdcIiBsZT1cIicgKyBwLmxlICsgJ1wiLz4nXG4gICsgJzxkZXRhaWw+JztcblxuaWYgKGQuY29udGFjdCAmJiBkLmNvbnRhY3RbMF0pIHhtbCArPSAnPGNvbnRhY3QgY2FsbHNpZ249XCInICsgZC5jb250YWN0WzBdLl9hdHRyaWJ1dGVzLmNhbGxzaWduICsgJ1wiLz4nO1xuaWYgKGQucmVtYXJrcyAhPSBudWxsKSB4bWwgKz0gJzxyZW1hcmtzPicgKyBTdHJpbmcoZC5yZW1hcmtzKS5yZXBsYWNlKC8mL2csJyZhbXA7JykucmVwbGFjZSgvPC9nLCcmbHQ7JykgKyAnPC9yZW1hcmtzPic7XG5pZiAoZC5zdHJva2VDb2xvciAmJiBkLnN0cm9rZUNvbG9yWzBdKSB4bWwgKz0gJzxzdHJva2VDb2xvciB2YWx1ZT1cIicgKyBkLnN0cm9rZUNvbG9yWzBdLl9hdHRyaWJ1dGVzLnZhbHVlICsgJ1wiLz4nO1xuaWYgKGQuc3Ryb2tlV2VpZ2h0ICYmIGQuc3Ryb2tlV2VpZ2h0WzBdKSB4bWwgKz0gJzxzdHJva2VXZWlnaHQgdmFsdWU9XCInICsgZC5zdHJva2VXZWlnaHRbMF0uX2F0dHJpYnV0ZXMudmFsdWUgKyAnXCIvPic7XG5pZiAoZC5maWxsQ29sb3IgJiYgZC5maWxsQ29sb3JbMF0pIHhtbCArPSAnPGZpbGxDb2xvciB2YWx1ZT1cIicgKyBkLmZpbGxDb2xvclswXS5fYXR0cmlidXRlcy52YWx1ZSArICdcIi8+JztcbmlmIChkLmxhYmVsc19vbiAmJiBkLmxhYmVsc19vblswXSkgeG1sICs9ICc8bGFiZWxzX29uIHZhbHVlPVwiJyArIGQubGFiZWxzX29uWzBdLl9hdHRyaWJ1dGVzLnZhbHVlICsgJ1wiLz4nO1xuXG5pZiAoZC5saW5rICYmIGQubGluay5sZW5ndGgpIHtcbiAgZm9yICh2YXIgaSA9IDA7IGkgPCBkLmxpbmsubGVuZ3RoOyBpKyspIHtcbiAgICB2YXIgbGEgPSBkLmxpbmtbaV0uX2F0dHJpYnV0ZXM7XG4gICAgaWYgKGxhLnBvaW50KSB7XG4gICAgICB4bWwgKz0gJzxsaW5rIHBvaW50PVwiJyArIGxhLnBvaW50ICsgJ1wiLz4nO1xuICAgIH0gZWxzZSBpZiAobGEudXJsKSB7XG4gICAgICB4bWwgKz0gJzxsaW5rIHVybD1cIicgKyBsYS51cmwucmVwbGFjZSgvJi9nLCcmYW1wOycpICsgJ1wiJztcbiAgICAgIGlmIChsYS5yZW1hcmtzKSB4bWwgKz0gJyByZW1hcmtzPVwiJyArIGxhLnJlbWFya3MucmVwbGFjZSgvJi9nLCcmYW1wOycpLnJlcGxhY2UoL1wiL2csJyZxdW90OycpICsgJ1wiJztcbiAgICAgIGlmIChsYS5yZWxhdGlvbikgeG1sICs9ICcgcmVsYXRpb249XCInICsgbGEucmVsYXRpb24gKyAnXCInO1xuICAgICAgaWYgKGxhLm1pbWUpIHhtbCArPSAnIG1pbWU9XCInICsgbGEubWltZSArICdcIic7XG4gICAgICB4bWwgKz0gJy8+JztcbiAgICB9XG4gIH1cbn1cblxuaWYgKGQudXNlcmljb24gJiYgZC51c2VyaWNvblswXSkgeG1sICs9ICc8dXNlcmljb24gaWNvbnNldHBhdGg9XCInICsgZC51c2VyaWNvblswXS5fYXR0cmlidXRlcy5pY29uc2V0cGF0aCArICdcIi8+JztcbmlmIChkLmhlaWdodCAmJiBkLmhlaWdodFswXSkgeG1sICs9ICc8aGVpZ2h0IHZhbHVlPVwiJyArIGQuaGVpZ2h0WzBdLl9hdHRyaWJ1dGVzLnZhbHVlICsgJ1wiLz4nO1xuaWYgKGQuc3RhdHVzICYmIGQuc3RhdHVzWzBdKSB4bWwgKz0gJzxzdGF0dXMgcmVhZGluZXNzPVwiJyArIGQuc3RhdHVzWzBdLl9hdHRyaWJ1dGVzLnJlYWRpbmVzcyArICdcIi8+JztcbmlmIChkLnByZWNpc2lvbmxvY2F0aW9uICYmIGQucHJlY2lzaW9ubG9jYXRpb25bMF0pIHhtbCArPSAnPHByZWNpc2lvbmxvY2F0aW9uIGFsdHNyYz1cIicgKyBkLnByZWNpc2lvbmxvY2F0aW9uWzBdLl9hdHRyaWJ1dGVzLmFsdHNyYyArICdcIi8+JztcbmlmIChkLl9nZW9mZW5jZSAmJiBkLl9nZW9mZW5jZVswXSkge1xuICB2YXIgZ2YgPSBkLl9nZW9mZW5jZVswXS5fYXR0cmlidXRlcztcbiAgeG1sICs9ICc8X2dlb2ZlbmNlIGVsZXZhdGlvbk1vbml0b3JlZD1cIicgKyBnZi5lbGV2YXRpb25Nb25pdG9yZWQgKyAnXCInXG4gICAgKyAnIG1pbkVsZXZhdGlvbj1cIicgKyBnZi5taW5FbGV2YXRpb24gKyAnXCInXG4gICAgKyAnIG1vbml0b3I9XCInICsgZ2YubW9uaXRvciArICdcIidcbiAgICArICcgdHJpZ2dlcj1cIicgKyBnZi50cmlnZ2VyICsgJ1wiJ1xuICAgICsgJyB0cmFja2luZz1cIicgKyBnZi50cmFja2luZyArICdcIidcbiAgICArICcgbWF4RWxldmF0aW9uPVwiJyArIGdmLm1heEVsZXZhdGlvbiArICdcIidcbiAgICArICcgYm91bmRpbmdTcGhlcmU9XCInICsgZ2YuYm91bmRpbmdTcGhlcmUgKyAnXCIvPic7XG59XG5cbmlmIChtc2cuX21pc3Npb25OYW1lKSB7XG4gIHhtbCArPSAnPG1hcnRpPjxkZXN0IG1pc3Npb249XCInICsgbXNnLl9taXNzaW9uTmFtZSArICdcIi8+PC9tYXJ0aT4nO1xufVxueG1sICs9ICc8L2RldGFpbD48L2V2ZW50Plxcbic7XG5cbm1zZy5wYXlsb2FkID0gQnVmZmVyLmZyb20oeG1sLCAndXRmOCcpO1xuaWYgKG1zZy5wYXlsb2FkLmxlbmd0aCA+IDUwMDApIG5vZGUud2FybignQ29UICcgKyBhLnVpZCArICc6ICcgKyBtc2cucGF5bG9hZC5sZW5ndGggKyAnIGJ5dGVzJyk7XG5yZXR1cm4gbXNnOyIsIm91dHB1dHMiOjEsInRpbWVvdXQiOiIiLCJub2VyciI6MCwiaW5pdGlhbGl6ZSI6IiIsImZpbmFsaXplIjoiIiwibGlicyI6W10sIngiOjMwMCwieSI6MjAwLCJ3aXJlcyI6W1siX19GRUVEX0lEX19fdGNfdGNwX291dCJdXX0seyJpZCI6Il9fRkVFRF9JRF9fX3RjX3RjcF9vdXQiLCJ0eXBlIjoidGNwIG91dCIsInoiOiJmbG93X3RjX19fRkVFRF9JRF9fIiwibmFtZSI6IkNvVCAtPiBUQUsgOjgwODkiLCJob3N0IjoiaG9zdC5kb2NrZXIuaW50ZXJuYWwiLCJwb3J0IjoiODA4OSIsImJlc2VydmVyIjoiY2xpZW50IiwiYmFzZTY0IjpmYWxzZSwiZG9lbmQiOmZhbHNlLCJhZGRDUiI6ZmFsc2UsInRscyI6InRsc190YWsiLCJ4Ijo1MjAsInkiOjIwMCwid2lyZXMiOltdfSx7ImlkIjoiX19GRUVEX0lEX19fdGNfZGJnIiwidHlwZSI6ImRlYnVnIiwieiI6ImZsb3dfdGNfX19GRUVEX0lEX18iLCJuYW1lIjoiVEMgcG9sbCBsb2ciLCJhY3RpdmUiOnRydWUsInRvc2lkZWJhciI6dHJ1ZSwiY29uc29sZSI6ZmFsc2UsInRvc3RhdHVzIjp0cnVlLCJjb21wbGV0ZSI6InBheWxvYWQiLCJ0YXJnZXRUeXBlIjoibXNnIiwic3RhdHVzVmFsIjoiIiwic3RhdHVzVHlwZSI6ImF1dG8iLCJ4IjoxMzAwLCJ5IjoxMDAsIndpcmVzIjpbXX1d")));
 /* __TC_ENGINE_TAB_TEMPLATE_END__ */
+/* __PP_ENGINE_TAB_TEMPLATE_START__ */
+var PP_ENGINE_TAB_TEMPLATE = decodeURIComponent(escape(atob("W3siaWQiOiJmbG93X3BwX19fRkVFRF9JRF9fIiwidHlwZSI6InRhYiIsImxhYmVsIjoiUFA6IF9fQ09ORklHX05BTUVfXyIsImRpc2FibGVkIjpmYWxzZSwiaW5mbyI6IiJ9LHsiaWQiOiJmbG93X3BwX19fRkVFRF9JRF9fX3RpbWVyIiwidHlwZSI6ImluamVjdCIsInoiOiJmbG93X3BwX19fRkVFRF9JRF9fIiwibmFtZSI6IkV2ZXJ5IDYwIHMiLCJwcm9wcyI6W3sicCI6InBheWxvYWQifV0sInJlcGVhdCI6IjYwIiwiY3JvbnRhYiI6IiIsIm9uY2UiOnRydWUsIm9uY2VEZWxheSI6IjMiLCJ0b3BpYyI6IiIsInBheWxvYWQiOiIiLCJwYXlsb2FkVHlwZSI6ImRhdGUiLCJ4IjoxNjAsInkiOjgwLCJ3aXJlcyI6W1siZmxvd19wcF9fX0ZFRURfSURfX19wb2xsIl1dfSx7ImlkIjoiZmxvd19wcF9fX0ZFRURfSURfX19wb2xsIiwidHlwZSI6ImZ1bmN0aW9uIiwieiI6ImZsb3dfcHBfX19GRUVEX0lEX18iLCJuYW1lIjoiUG9sbCBjaGVjayIsImZ1bmMiOiJ2YXIgX2NuID0gJ19fQ09ORklHX05BTUVfXyc7XG52YXIgX2NmZ3MgPSBnbG9iYWwuZ2V0KCdwcF9jb25maWdzJykgfHwgW107XG5pZiAoIUFycmF5LmlzQXJyYXkoX2NmZ3MpKSB7IHRyeSB7IF9jZmdzID0gSlNPTi5wYXJzZShfY2Zncyk7IH0gY2F0Y2goZSkgeyBfY2ZncyA9IFtdOyB9IH1cbnZhciBjZmcgPSBfY2Zncy5maW5kKGZ1bmN0aW9uKGMpeyByZXR1cm4gYy5jb25maWdOYW1lID09PSBfY247IH0pIHx8IHt9O1xuaWYgKCFjZmcuYWN0aXZhdGVkKSByZXR1cm4gbnVsbDtcbnZhciBpbnRlcnZhbE1zID0gTWF0aC5tYXgoMTUsIE51bWJlcihjZmcucG9sbEludGVydmFsU2VjKSB8fCAxMjApICogMTAwMDtcbnZhciBsYXN0S2V5ID0gJ3BwX2xhc3RfZmV0Y2hfX19GRUVEX0lEX18nO1xudmFyIGxhc3RGZXRjaCA9IGdsb2JhbC5nZXQobGFzdEtleSkgfHwgMDtcbmlmICgoRGF0ZS5ub3coKSAtIGxhc3RGZXRjaCkgPCBpbnRlcnZhbE1zKSByZXR1cm4gbnVsbDtcbm1zZy5fcHBDZmcgPSBjZmc7XG5yZXR1cm4gbXNnOyIsIl90ZW1wbGF0ZUtleSI6InBwLnBvbGwuX19GRUVEX0lEX18iLCJvdXRwdXRzIjoxLCJ0aW1lb3V0IjoiIiwibm9lcnIiOjAsImluaXRpYWxpemUiOiIiLCJmaW5hbGl6ZSI6IiIsImxpYnMiOltdLCJ4IjozODAsInkiOjgwLCJ3aXJlcyI6W1siZmxvd19wcF9fX0ZFRURfSURfX19mZXRjaCJdXX0seyJpZCI6ImZsb3dfcHBfX19GRUVEX0lEX19fZmV0Y2giLCJ0eXBlIjoiZnVuY3Rpb24iLCJ6IjoiZmxvd19wcF9fX0ZFRURfSURfXyIsIm5hbWUiOiJGZXRjaCArIGRlY29kZSIsImZ1bmMiOiJ2YXIgY2ZnID0gbXNnLl9wcENmZyB8fCB7fTtcbmlmICghY2ZnLmFjdGl2YXRlZCkgcmV0dXJuIG51bGw7XG52YXIgcmF3SWRzID0gU3RyaW5nKGNmZy5hZ2VuY3lJZHMgfHwgJycpLnNwbGl0KC9bLFxcc10rLykubWFwKGZ1bmN0aW9uKHMpeyByZXR1cm4gcy50cmltKCk7IH0pLmZpbHRlcihCb29sZWFuKTtcbmlmICghcmF3SWRzLmxlbmd0aCkgeyBub2RlLndhcm4oJ1B1bHNlUG9pbnQ6IG5vIGFnZW5jeSBJRHMgY29uZmlndXJlZCcpOyByZXR1cm4gbnVsbDsgfVxudmFyIGh0dHBzID0gZ2xvYmFsLmdldCgnbm9kZUh0dHBzJyk7XG5pZiAoIWh0dHBzKSB7IG5vZGUud2FybignUHVsc2VQb2ludDogbm9kZUh0dHBzIG1pc3NpbmcnKTsgcmV0dXJuIG51bGw7IH1cbnZhciB1cmxNb2QgPSByZXF1aXJlKCd1cmwnKTtcbnZhciBjcnlwdG8gPSByZXF1aXJlKCdjcnlwdG8nKTtcbnZhciBiYXNlID0gU3RyaW5nKGNmZy5wcEJhc2VVcmwgfHwgJ2h0dHBzOi8vYXBpLnB1bHNlcG9pbnQub3JnL3YxL3dlYmFwcCcpLnJlcGxhY2UoL1xcLyskLywgJycpO1xudmFyIGhkciA9IHtcbiAgJ2FjY2VwdCc6ICcqLyonLFxuICAnYWNjZXB0LWxhbmd1YWdlJzogJ2VuLVVTLGVuO3E9MC45JyxcbiAgJ3VzZXItYWdlbnQnOiAnaW5mcmEtVEFLL3B1bHNlcG9pbnQnLFxuICAncmVmZXJlcic6ICdodHRwczovL3dlYi5wdWxzZXBvaW50Lm9yZy8nXG59O1xuZnVuY3Rpb24gZGVjb2RlUHVsc2UoZGF0YSkge1xuICBpZiAoIWRhdGEgfHwgIWRhdGEuY3QgfHwgIWRhdGEuaXYgfHwgIWRhdGEucykgcmV0dXJuIGRhdGE7XG4gIHZhciBjdCA9IEJ1ZmZlci5mcm9tKGRhdGEuY3QsICdiYXNlNjQnKTtcbiAgdmFyIGl2ID0gQnVmZmVyLmZyb20oU3RyaW5nKGRhdGEuaXYpLCAnaGV4Jyk7XG4gIHZhciBzYWx0ID0gQnVmZmVyLmZyb20oU3RyaW5nKGRhdGEucyksICdoZXgnKTtcbiAgdmFyIGVrZXkgPSAnQ29tbW9uSW5jaWRlbnRzJztcbiAgdmFyIHRva2VuID0gZWtleVsxM10gKyBla2V5WzFdICsgZWtleVsyXSArICdicmFkeScgKyAnNScgKyAncicgKyBla2V5LnRvTG93ZXJDYXNlKClbNl0gKyBla2V5WzVdICsgJ2dzJztcbiAgdmFyIGtleSA9IEJ1ZmZlci5hbGxvYygwKTtcbiAgdmFyIGJsb2NrID0gbnVsbDtcbiAgd2hpbGUgKGtleS5sZW5ndGggPCAzMikge1xuICAgIHZhciBoID0gY3J5cHRvLmNyZWF0ZUhhc2goJ21kNScpO1xuICAgIGlmIChibG9jaykgaC51cGRhdGUoYmxvY2spO1xuICAgIGgudXBkYXRlKHRva2VuLCAndXRmOCcpO1xuICAgIGgudXBkYXRlKHNhbHQpO1xuICAgIGJsb2NrID0gaC5kaWdlc3QoKTtcbiAgICBrZXkgPSBCdWZmZXIuY29uY2F0KFtrZXksIGJsb2NrXSk7XG4gIH1cbiAga2V5ID0ga2V5LnNsaWNlKDAsIDMyKTtcbiAgdmFyIGRlY2lwaGVyID0gY3J5cHRvLmNyZWF0ZURlY2lwaGVyaXYoJ2Flcy0yNTYtY2JjJywga2V5LCBpdik7XG4gIHZhciBkZWMgPSBCdWZmZXIuY29uY2F0KFtkZWNpcGhlci51cGRhdGUoY3QpLCBkZWNpcGhlci5maW5hbGl6ZSgpXSk7XG4gIHZhciBxID0gMzQ7XG4gIHZhciBlbmQgPSBkZWMubGFzdEluZGV4T2YocSk7XG4gIGlmIChlbmQgPCAxKSB0aHJvdyBuZXcgRXJyb3IoJ2RlY29kZTogbm8gdHJhaWxpbmcgcXVvdGUnKTtcbiAgdmFyIHR4dCA9IGRlYy5zbGljZSgxLCBlbmQpLnRvU3RyaW5nKCd1dGY4Jyk7XG4gIHR4dCA9IHR4dC5zcGxpdChTdHJpbmcuZnJvbUNoYXJDb2RlKDkyLDM0KSkuam9pbihTdHJpbmcuZnJvbUNoYXJDb2RlKDM0KSk7XG4gIHR4dCA9IHR4dC5zcGxpdChTdHJpbmcuZnJvbUNoYXJDb2RlKDkyLDkyLDM0KSkuam9pbihTdHJpbmcuZnJvbUNoYXJDb2RlKDM5KSk7XG4gIHJldHVybiBKU09OLnBhcnNlKHR4dCk7XG59XG5mdW5jdGlvbiBhY3RpdmVMaXN0KGRlYykge1xuICBpZiAoIWRlYyB8fCB0eXBlb2YgZGVjICE9PSAnb2JqZWN0JykgcmV0dXJuIFtdO1xuICB2YXIgdyA9IGRlYy5pbmNpZGVudHM7XG4gIGlmICghdykgcmV0dXJuIFtdO1xuICB2YXIgYWN0ID0gdy5hY3RpdmU7XG4gIGlmIChBcnJheS5pc0FycmF5KGFjdCkpIHJldHVybiBhY3Q7XG4gIGlmIChhY3QgJiYgdHlwZW9mIGFjdCA9PT0gJ29iamVjdCcpIHJldHVybiBPYmplY3Qua2V5cyhhY3QpLm1hcChmdW5jdGlvbihrKXsgcmV0dXJuIGFjdFtrXTsgfSk7XG4gIHJldHVybiBbXTtcbn1cbmZ1bmN0aW9uIGdldEpzb24odSwgY2IpIHtcbiAgdmFyIHAgPSB1cmxNb2QucGFyc2UodSk7XG4gIHZhciBvcHRzID0geyBob3N0bmFtZTogcC5ob3N0bmFtZSwgcG9ydDogcC5wb3J0IHx8IDQ0MywgcGF0aDogcC5wYXRoLCBtZXRob2Q6ICdHRVQnLCBoZWFkZXJzOiBoZHIgfTtcbiAgdmFyIHJlcSA9IGh0dHBzLnJlcXVlc3Qob3B0cywgZnVuY3Rpb24ocmVzKSB7XG4gICAgdmFyIGJ1ZiA9ICcnO1xuICAgIHJlcy5zZXRFbmNvZGluZygndXRmOCcpO1xuICAgIHJlcy5vbignZGF0YScsIGZ1bmN0aW9uKGMpeyBidWYgKz0gYzsgfSk7XG4gICAgcmVzLm9uKCdlbmQnLCBmdW5jdGlvbigpe1xuICAgICAgdHJ5IHsgY2IobnVsbCwgcmVzLnN0YXR1c0NvZGUsIEpTT04ucGFyc2UoYnVmKSk7IH1cbiAgICAgIGNhdGNoKGUpIHsgY2IoZSwgcmVzLnN0YXR1c0NvZGUsIG51bGwpOyB9XG4gICAgfSk7XG4gIH0pO1xuICByZXEub24oJ2Vycm9yJywgZnVuY3Rpb24oZSl7IGNiKGUpOyB9KTtcbiAgcmVxLnNldFRpbWVvdXQoMjUwMDAsIGZ1bmN0aW9uKCl7IHRyeSB7IHJlcS5kZXN0cm95KCk7IH0gY2F0Y2goX2Upe30gY2IobmV3IEVycm9yKCd0aW1lb3V0JykpOyB9KTtcbiAgcmVxLmVuZCgpO1xufVxudmFyIHBlbmRpbmcgPSByYXdJZHMubGVuZ3RoO1xudmFyIGFsbCA9IFtdO1xudmFyIGVycnMgPSBbXTtcbnJhd0lkcy5mb3JFYWNoKGZ1bmN0aW9uKGFpZCkge1xuICB2YXIgdSA9IGJhc2UgKyAnP3Jlc291cmNlPWluY2lkZW50cyZhZ2VuY3lpZD0nICsgZW5jb2RlVVJJQ29tcG9uZW50KGFpZCk7XG4gIGdldEpzb24odSwgZnVuY3Rpb24oZXJyLCBjb2RlLCBqKSB7XG4gICAgaWYgKGVycikgZXJycy5wdXNoKGFpZCArICc6JyArIGVyci5tZXNzYWdlKTtcbiAgICBlbHNlIGlmIChjb2RlICE9PSAyMDApIGVycnMucHVzaChhaWQgKyAnOkhUVFAnICsgY29kZSk7XG4gICAgZWxzZSB0cnkge1xuICAgICAgdmFyIGRlYyA9IChqICYmIGouY3QpID8gZGVjb2RlUHVsc2UoaikgOiBqO1xuICAgICAgYWN0aXZlTGlzdChkZWMpLmZvckVhY2goZnVuY3Rpb24oaW5jKSB7IGlmIChpbmMgJiYgaW5jLklEKSBhbGwucHVzaChpbmMpOyB9KTtcbiAgICB9IGNhdGNoKGUyKSB7IGVycnMucHVzaChhaWQgKyAnOicgKyBlMi5tZXNzYWdlKTsgfVxuICAgIHBlbmRpbmctLTtcbiAgICBpZiAocGVuZGluZyA+IDApIHJldHVybjtcbiAgICBpZiAoZXJycy5sZW5ndGgpIG5vZGUud2FybignUHVsc2VQb2ludCBmZXRjaDogJyArIGVycnMuam9pbignIHwgJykpO1xuICAgIHZhciBzayA9IHt9OyB2YXIgZGVkdXAgPSBbXTtcbiAgICBhbGwuZm9yRWFjaChmdW5jdGlvbihpbmMpIHtcbiAgICAgIHZhciB1ID0gJ1BQLScgKyBTdHJpbmcoaW5jLkFnZW5jeUlEfHwneCcpICsgJy0nICsgU3RyaW5nKGluYy5JRCk7XG4gICAgICBpZiAoc2tbdV0pIHJldHVybjtcbiAgICAgIHNrW3VdID0gdHJ1ZTtcbiAgICAgIGRlZHVwLnB1c2goaW5jKTtcbiAgICB9KTtcbiAgICBtc2cuX3BwSW5jaWRlbnRzID0gZGVkdXA7XG4gICAgbm9kZS5zZW5kKG1zZyk7XG4gIH0pO1xufSk7XG5yZXR1cm47IiwiX3RlbXBsYXRlS2V5IjoicHAuZmV0Y2guX19GRUVEX0lEX18iLCJvdXRwdXRzIjoxLCJ0aW1lb3V0IjoiIiwibm9lcnIiOjAsImluaXRpYWxpemUiOiIiLCJmaW5hbGl6ZSI6IiIsImxpYnMiOltdLCJ4Ijo2MDAsInkiOjgwLCJ3aXJlcyI6W1siZmxvd19wcF9fX0ZFRURfSURfX19idWlsZCJdXX0seyJpZCI6ImZsb3dfcHBfX19GRUVEX0lEX19fYnVpbGQiLCJ0eXBlIjoiZnVuY3Rpb24iLCJ6IjoiZmxvd19wcF9fX0ZFRURfSURfXyIsIm5hbWUiOiJCdWlsZCBDb1QiLCJmdW5jIjoidmFyIGNmZyA9IG1zZy5fcHBDZmcgfHwge307XG5pZiAoIWNmZy5hY3RpdmF0ZWQpIHJldHVybiBudWxsO1xudmFyIGluY2lkZW50cyA9IG1zZy5fcHBJbmNpZGVudHMgfHwgW107XG52YXIgdGFrID0gZ2xvYmFsLmdldCgndGFrX3NldHRpbmdzJykgfHwge307XG52YXIgaG9zdCA9IFN0cmluZyh0YWsuc2VydmVyVXJsIHx8ICcnKS5yZXBsYWNlKC9eaHR0cHM/OlxcL1xcLy9pLCAnJykucmVwbGFjZSgvXFwvJC8sICcnKS50cmltKCkgfHwgdGFrLnRha0hvc3QgfHwgJ2hvc3QuZG9ja2VyLmludGVybmFsJztcbnZhciBiYXNlUCA9IE51bWJlcih0YWsuc3RyZWFtaW5nUG9ydCB8fCB0YWsuc3RyZWFtUG9ydCB8fCA4MDg5KTtcbnZhciBwb3J0ID0gTnVtYmVyKGNmZy5jb3RTdHJlYW1Qb3J0KSB8fCBiYXNlUDtcbnZhciBpY29uID0gY2ZnLnVuaWZvcm1JY29uIHx8IHt9O1xudmFyIGNvdFR5cGUgPSBTdHJpbmcoaWNvbi5jb3RUeXBlIHx8ICdhLXUtRycpLnRyaW0oKSB8fCAnYS11LUcnO1xudmFyIGljb25wYXRoID0gU3RyaW5nKGljb24uaWNvbnNldHBhdGggfHwgJycpLnRyaW0oKTtcbmlmICghaWNvbnBhdGgpIGljb25wYXRoID0gJ2Y3ZjcxNjY2LThiMjgtNGI1Ny05ZmJiLWUzOGU2MWQzM2I3OS9Hb29nbGUvY2F1dGlvbi5wbmcnO1xudmFyIHN0YWxlU2VjID0gTWF0aC5tYXgoMzAsIE51bWJlcihjZmcuY290U3RhbGVTZWMpIHx8IDYwMCk7XG52YXIgX3ByZXZLZXkgPSAncHBfcHJldl91aWRzX19fRkVFRF9JRF9fJztcbnZhciBwcmV2ID0gZ2xvYmFsLmdldChfcHJldktleSkgfHwge307XG52YXIgY3VyciA9IHt9O1xudmFyIG5vd0lzbyA9IG5ldyBEYXRlKCkudG9JU09TdHJpbmcoKTtcbmluY2lkZW50cy5mb3JFYWNoKGZ1bmN0aW9uKGluYykge1xuICB2YXIgbGF0ID0gcGFyc2VGbG9hdChpbmMuTGF0aXR1ZGUpO1xuICB2YXIgbG9uID0gcGFyc2VGbG9hdChpbmMuTG9uZ2l0dWRlKTtcbiAgaWYgKGlzTmFOKGxhdCkgfHwgaXNOYU4obG9uKSkgcmV0dXJuO1xuICBpZiAoU3RyaW5nKGluYy5MYXRpdHVkZSkgPT09ICcwLjAwMDAwMDAwMDAnICYmIFN0cmluZyhpbmMuTG9uZ2l0dWRlKSA9PT0gJzAuMDAwMDAwMDAwMCcpIHJldHVybjtcbiAgdmFyIHVpZCA9ICdQUC0nICsgU3RyaW5nKGluYy5BZ2VuY3lJRCB8fCAneCcpICsgJy0nICsgU3RyaW5nKGluYy5JRCk7XG4gIGN1cnJbdWlkXSA9IHRydWU7XG59KTtcbnZhciBzdGFsZVBhc3QgPSBuZXcgRGF0ZShEYXRlLm5vdygpIC0gNTAwMCkudG9JU09TdHJpbmcoKTtcbk9iamVjdC5rZXlzKHByZXYpLmZvckVhY2goZnVuY3Rpb24odWlkKSB7XG4gIGlmIChjdXJyW3VpZF0pIHJldHVybjtcbiAgbm9kZS5zZW5kKHtcbiAgICBwYXlsb2FkOiB7XG4gICAgICBldmVudDoge1xuICAgICAgICBfYXR0cmlidXRlczogeyB2ZXJzaW9uOicyLjAnLCB1aWQ6dWlkLCB0eXBlOmNvdFR5cGUsIGhvdzonbS1nJywgdGltZTogbm93SXNvLCBzdGFydDogbm93SXNvLCBzdGFsZTogc3RhbGVQYXN0IH0sXG4gICAgICAgIHBvaW50OiB7IF9hdHRyaWJ1dGVzOnsgbGF0OicwJywgbG9uOicwJywgaGFlOic5OTk5OTk5LjAnLCBjZTonOTk5OTk5OScsIGxlOic5OTk5OTk5LjAnIH0gfSxcbiAgICAgICAgZGV0YWlsOiB7IHN0YXR1czogW3sgX2F0dHJpYnV0ZXM6eyByZWFkaW5lc3M6J2ZhbHNlJyB9IH1dIH1cbiAgICAgIH1cbiAgICB9LFxuICAgIGhvc3Q6IGhvc3QsIHBvcnQ6IHBvcnRcbiAgfSk7XG59KTtcbnZhciBzZW50ID0gMDtcbmluY2lkZW50cy5mb3JFYWNoKGZ1bmN0aW9uKGluYykge1xuICB2YXIgbGF0ID0gcGFyc2VGbG9hdChpbmMuTGF0aXR1ZGUpO1xuICB2YXIgbG9uID0gcGFyc2VGbG9hdChpbmMuTG9uZ2l0dWRlKTtcbiAgaWYgKGlzTmFOKGxhdCkgfHwgaXNOYU4obG9uKSkgcmV0dXJuO1xuICBpZiAoU3RyaW5nKGluYy5MYXRpdHVkZSkgPT09ICcwLjAwMDAwMDAwMDAnICYmIFN0cmluZyhpbmMuTG9uZ2l0dWRlKSA9PT0gJzAuMDAwMDAwMDAwMCcpIHJldHVybjtcbiAgdmFyIHVpZCA9ICdQUC0nICsgU3RyaW5nKGluYy5BZ2VuY3lJRCB8fCAneCcpICsgJy0nICsgU3RyaW5nKGluYy5JRCk7XG4gIHZhciBzdGFydFN0ciA9IGluYy5DYWxsUmVjZWl2ZWREYXRlVGltZSB8fCBub3dJc287XG4gIHZhciBzdCA9IG5ldyBEYXRlKHN0YXJ0U3RyKTtcbiAgaWYgKGlzTmFOKHN0LmdldFRpbWUoKSkpIHN0ID0gbmV3IERhdGUoKTtcbiAgdmFyIHN0bCA9IG5ldyBEYXRlKHN0LmdldFRpbWUoKSArIHN0YWxlU2VjICogMTAwMCk7XG4gIHZhciBjdCA9IGluYy5QdWxzZVBvaW50SW5jaWRlbnRDYWxsVHlwZSB8fCAnJztcbiAgdmFyIGFkZHIgPSAoaW5jLkZ1bGxEaXNwbGF5QWRkcmVzcyB8fCAnJykudHJpbSgpO1xuICB2YXIgY3MgPSAoYWRkciB8fCBjdCB8fCAnUHVsc2VQb2ludCcpLnN1YnN0cmluZygwLCAxMDApO1xuICB2YXIgcmVtYXJrcyA9ICdQdWxzZVBvaW50IHwgJyArIGN0ICsgJyB8ICcgKyBhZGRyO1xuICB2YXIgZGV0YWlsID0ge1xuICAgIGNvbnRhY3Q6IFt7IF9hdHRyaWJ1dGVzOnsgY2FsbHNpZ246IGNzIH0gfV0sXG4gICAgcmVtYXJrczogcmVtYXJrcyxcbiAgICBzdGF0dXM6IFt7IF9hdHRyaWJ1dGVzOnsgcmVhZGluZXNzOid0cnVlJyB9IH1dXG4gIH07XG4gIGlmIChpY29ucGF0aCkgZGV0YWlsLnVzZXJpY29uID0gW3sgX2F0dHJpYnV0ZXM6eyBpY29uc2V0cGF0aDogaWNvbnBhdGggfSB9XTtcbiAgbm9kZS5zZW5kKHtcbiAgICBwYXlsb2FkOiB7XG4gICAgICBldmVudDoge1xuICAgICAgICBfYXR0cmlidXRlczoge1xuICAgICAgICAgIHZlcnNpb246JzIuMCcsIHVpZDogdWlkLCB0eXBlOiBjb3RUeXBlLCBob3c6J20tZycsXG4gICAgICAgICAgdGltZTogc3QudG9JU09TdHJpbmcoKSwgc3RhcnQ6IHN0LnRvSVNPU3RyaW5nKCksIHN0YWxlOiBzdGwudG9JU09TdHJpbmcoKVxuICAgICAgICB9LFxuICAgICAgICBwb2ludDogeyBfYXR0cmlidXRlczp7IGxhdDpTdHJpbmcobGF0KSwgbG9uOlN0cmluZyhsb24pLCBoYWU6Jzk5OTk5OTkuMCcsIGNlOic1MCcsIGxlOic5OTk5OTk5LjAnIH0gfSxcbiAgICAgICAgZGV0YWlsOiBkZXRhaWxcbiAgICAgIH1cbiAgICB9LFxuICAgIGhvc3Q6IGhvc3QsIHBvcnQ6IHBvcnRcbiAgfSk7XG4gIHNlbnQrKztcbn0pO1xuZ2xvYmFsLnNldChfcHJldktleSwgY3Vycik7XG5nbG9iYWwuc2V0KCdwcF9sYXN0X2ZldGNoX19fRkVFRF9JRF9fJywgRGF0ZS5ub3coKSk7XG52YXIgZHJvcHBlZCA9IDA7XG5PYmplY3Qua2V5cyhwcmV2KS5mb3JFYWNoKGZ1bmN0aW9uKHUpeyBpZiAoIWN1cnJbdV0pIGRyb3BwZWQrKzsgfSk7XG5ub2RlLndhcm4oJ1B1bHNlUG9pbnQ6ICcgKyBzZW50ICsgJyBDb1Qgc3RyZWFtZWQgKFRDUCksICcgKyBkcm9wcGVkICsgJyBjbGVhcmVkJyk7XG5yZXR1cm4gbnVsbDsiLCJfdGVtcGxhdGVLZXkiOiJwcC5idWlsZC5fX0ZFRURfSURfXyIsIm91dHB1dHMiOjEsInRpbWVvdXQiOiIiLCJub2VyciI6MCwiaW5pdGlhbGl6ZSI6IiIsImZpbmFsaXplIjoiIiwibGlicyI6W10sIngiOjgyMCwieSI6ODAsIndpcmVzIjpbWyJmbG93X3BwX19fRkVFRF9JRF9fX3htbCJdXX0seyJpZCI6ImZsb3dfcHBfX19GRUVEX0lEX19feG1sIiwidHlwZSI6ImZ1bmN0aW9uIiwieiI6ImZsb3dfcHBfX19GRUVEX0lEX18iLCJuYW1lIjoiQ29UIOKGkiBYTUwiLCJmdW5jIjoidmFyIGUgPSBtc2cucGF5bG9hZCAmJiBtc2cucGF5bG9hZC5ldmVudDtcbmlmICghZSB8fCAhZS5fYXR0cmlidXRlcykgcmV0dXJuIG51bGw7XG52YXIgYSA9IGUuX2F0dHJpYnV0ZXM7XG52YXIgcCA9IGUucG9pbnQuX2F0dHJpYnV0ZXM7XG52YXIgZCA9IGUuZGV0YWlsIHx8IHt9O1xuXG52YXIgeG1sID0gJzxldmVudCB2ZXJzaW9uPVwiJyArIGEudmVyc2lvbiArICdcIiB1aWQ9XCInICsgYS51aWQgKyAnXCIgdHlwZT1cIicgKyBhLnR5cGUgKyAnXCInXG4gICsgJyBob3c9XCInICsgYS5ob3cgKyAnXCIgdGltZT1cIicgKyBhLnRpbWUgKyAnXCIgc3RhcnQ9XCInICsgYS5zdGFydCArICdcIiBzdGFsZT1cIicgKyBhLnN0YWxlICsgJ1wiPidcbiAgKyAnPHBvaW50IGxhdD1cIicgKyBwLmxhdCArICdcIiBsb249XCInICsgcC5sb24gKyAnXCIgaGFlPVwiJyArIHAuaGFlICsgJ1wiIGNlPVwiJyArIHAuY2UgKyAnXCIgbGU9XCInICsgcC5sZSArICdcIi8+J1xuICArICc8ZGV0YWlsPic7XG5cbmlmIChkLmNvbnRhY3QgJiYgZC5jb250YWN0WzBdKSB4bWwgKz0gJzxjb250YWN0IGNhbGxzaWduPVwiJyArIGQuY29udGFjdFswXS5fYXR0cmlidXRlcy5jYWxsc2lnbiArICdcIi8+JztcbmlmIChkLnJlbWFya3MgIT0gbnVsbCkgeG1sICs9ICc8cmVtYXJrcz4nICsgU3RyaW5nKGQucmVtYXJrcykucmVwbGFjZSgvJi9nLCcmYW1wOycpLnJlcGxhY2UoLzwvZywnJmx0OycpICsgJzwvcmVtYXJrcz4nO1xuaWYgKGQuc3Ryb2tlQ29sb3IgJiYgZC5zdHJva2VDb2xvclswXSkgeG1sICs9ICc8c3Ryb2tlQ29sb3IgdmFsdWU9XCInICsgZC5zdHJva2VDb2xvclswXS5fYXR0cmlidXRlcy52YWx1ZSArICdcIi8+JztcbmlmIChkLnN0cm9rZVdlaWdodCAmJiBkLnN0cm9rZVdlaWdodFswXSkgeG1sICs9ICc8c3Ryb2tlV2VpZ2h0IHZhbHVlPVwiJyArIGQuc3Ryb2tlV2VpZ2h0WzBdLl9hdHRyaWJ1dGVzLnZhbHVlICsgJ1wiLz4nO1xuaWYgKGQuZmlsbENvbG9yICYmIGQuZmlsbENvbG9yWzBdKSB4bWwgKz0gJzxmaWxsQ29sb3IgdmFsdWU9XCInICsgZC5maWxsQ29sb3JbMF0uX2F0dHJpYnV0ZXMudmFsdWUgKyAnXCIvPic7XG5pZiAoZC5sYWJlbHNfb24gJiYgZC5sYWJlbHNfb25bMF0pIHhtbCArPSAnPGxhYmVsc19vbiB2YWx1ZT1cIicgKyBkLmxhYmVsc19vblswXS5fYXR0cmlidXRlcy52YWx1ZSArICdcIi8+JztcblxuaWYgKGQubGluayAmJiBkLmxpbmsubGVuZ3RoKSB7XG4gIGZvciAodmFyIGkgPSAwOyBpIDwgZC5saW5rLmxlbmd0aDsgaSsrKSB7XG4gICAgdmFyIGxhID0gZC5saW5rW2ldLl9hdHRyaWJ1dGVzO1xuICAgIGlmIChsYS5wb2ludCkge1xuICAgICAgeG1sICs9ICc8bGluayBwb2ludD1cIicgKyBsYS5wb2ludCArICdcIi8+JztcbiAgICB9IGVsc2UgaWYgKGxhLnVybCkge1xuICAgICAgeG1sICs9ICc8bGluayB1cmw9XCInICsgbGEudXJsLnJlcGxhY2UoLyYvZywnJmFtcDsnKSArICdcIic7XG4gICAgICBpZiAobGEucmVtYXJrcykgeG1sICs9ICcgcmVtYXJrcz1cIicgKyBsYS5yZW1hcmtzLnJlcGxhY2UoLyYvZywnJmFtcDsnKS5yZXBsYWNlKC9cIi9nLCcmcXVvdDsnKSArICdcIic7XG4gICAgICBpZiAobGEucmVsYXRpb24pIHhtbCArPSAnIHJlbGF0aW9uPVwiJyArIGxhLnJlbGF0aW9uICsgJ1wiJztcbiAgICAgIGlmIChsYS5taW1lKSB4bWwgKz0gJyBtaW1lPVwiJyArIGxhLm1pbWUgKyAnXCInO1xuICAgICAgeG1sICs9ICcvPic7XG4gICAgfVxuICB9XG59XG5cbmlmIChkLnVzZXJpY29uICYmIGQudXNlcmljb25bMF0pIHhtbCArPSAnPHVzZXJpY29uIGljb25zZXRwYXRoPVwiJyArIGQudXNlcmljb25bMF0uX2F0dHJpYnV0ZXMuaWNvbnNldHBhdGggKyAnXCIvPic7XG5pZiAoZC5oZWlnaHQgJiYgZC5oZWlnaHRbMF0pIHhtbCArPSAnPGhlaWdodCB2YWx1ZT1cIicgKyBkLmhlaWdodFswXS5fYXR0cmlidXRlcy52YWx1ZSArICdcIi8+JztcbmlmIChkLnN0YXR1cyAmJiBkLnN0YXR1c1swXSkgeG1sICs9ICc8c3RhdHVzIHJlYWRpbmVzcz1cIicgKyBkLnN0YXR1c1swXS5fYXR0cmlidXRlcy5yZWFkaW5lc3MgKyAnXCIvPic7XG5pZiAoZC5wcmVjaXNpb25sb2NhdGlvbiAmJiBkLnByZWNpc2lvbmxvY2F0aW9uWzBdKSB4bWwgKz0gJzxwcmVjaXNpb25sb2NhdGlvbiBhbHRzcmM9XCInICsgZC5wcmVjaXNpb25sb2NhdGlvblswXS5fYXR0cmlidXRlcy5hbHRzcmMgKyAnXCIvPic7XG5pZiAoZC5fZ2VvZmVuY2UgJiYgZC5fZ2VvZmVuY2VbMF0pIHtcbiAgdmFyIGdmID0gZC5fZ2VvZmVuY2VbMF0uX2F0dHJpYnV0ZXM7XG4gIHhtbCArPSAnPF9nZW9mZW5jZSBlbGV2YXRpb25Nb25pdG9yZWQ9XCInICsgZ2YuZWxldmF0aW9uTW9uaXRvcmVkICsgJ1wiJ1xuICAgICsgJyBtaW5FbGV2YXRpb249XCInICsgZ2YubWluRWxldmF0aW9uICsgJ1wiJ1xuICAgICsgJyBtb25pdG9yPVwiJyArIGdmLm1vbml0b3IgKyAnXCInXG4gICAgKyAnIHRyaWdnZXI9XCInICsgZ2YudHJpZ2dlciArICdcIidcbiAgICArICcgdHJhY2tpbmc9XCInICsgZ2YudHJhY2tpbmcgKyAnXCInXG4gICAgKyAnIG1heEVsZXZhdGlvbj1cIicgKyBnZi5tYXhFbGV2YXRpb24gKyAnXCInXG4gICAgKyAnIGJvdW5kaW5nU3BoZXJlPVwiJyArIGdmLmJvdW5kaW5nU3BoZXJlICsgJ1wiLz4nO1xufVxuXG5pZiAobXNnLl9taXNzaW9uTmFtZSkge1xuICB4bWwgKz0gJzxtYXJ0aT48ZGVzdCBtaXNzaW9uPVwiJyArIG1zZy5fbWlzc2lvbk5hbWUgKyAnXCIvPjwvbWFydGk+Jztcbn1cbnhtbCArPSAnPC9kZXRhaWw+PC9ldmVudD5cXG4nO1xuXG5tc2cucGF5bG9hZCA9IEJ1ZmZlci5mcm9tKHhtbCwgJ3V0ZjgnKTtcbmlmIChtc2cucGF5bG9hZC5sZW5ndGggPiA1MDAwKSBub2RlLndhcm4oJ0NvVCAnICsgYS51aWQgKyAnOiAnICsgbXNnLnBheWxvYWQubGVuZ3RoICsgJyBieXRlcycpO1xucmV0dXJuIG1zZzsiLCJfdGVtcGxhdGVLZXkiOiJzaGFyZWQuY290X3RvX3htbCIsIm91dHB1dHMiOjEsInRpbWVvdXQiOiIiLCJub2VyciI6MCwiaW5pdGlhbGl6ZSI6IiIsImZpbmFsaXplIjoiIiwibGlicyI6W10sIngiOjEwNDAsInkiOjgwLCJ3aXJlcyI6W1siZmxvd19wcF9fX0ZFRURfSURfX190Y3AiXV19LHsiaWQiOiJmbG93X3BwX19fRkVFRF9JRF9fX3RjcCIsInR5cGUiOiJ0Y3Agb3V0IiwieiI6ImZsb3dfcHBfX19GRUVEX0lEX18iLCJuYW1lIjoiQ29UIOKGkiBUQUsiLCJob3N0IjoiaG9zdC5kb2NrZXIuaW50ZXJuYWwiLCJwb3J0IjoiODA4OSIsImJlc2VydmVyIjoiY2xpZW50IiwiYmFzZTY0IjpmYWxzZSwiZG9lbmQiOmZhbHNlLCJhZGRDUiI6ZmFsc2UsInRscyI6InRsc190YWsiLCJ4IjoxMjYwLCJ5Ijo4MCwid2lyZXMiOltdfV0=")));
+/* __PP_ENGINE_TAB_TEMPLATE_END__ */
 </script>
 </body>
 </html>

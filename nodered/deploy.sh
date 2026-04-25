@@ -138,8 +138,7 @@ def unwrap(v):
             except: return inner
         return inner
     return v
-keys = ['arcgis_configs','tak_settings','tc_configs','pp_config',
-        'pulsepoint_config','ipaws_config','tfr_config','kml_configs']
+keys = ['arcgis_configs','tak_settings','tc_configs','pp_configs','ipaws_config']
 for k in keys:
     v = unwrap(d.get(k))
     if v is None:
@@ -175,8 +174,7 @@ def unwrap(v):
             except: return inner
         return inner
     return v
-keys = ['arcgis_configs','tak_settings','tc_configs','pp_config',
-        'pulsepoint_config','ipaws_config','tfr_config','kml_configs']
+keys = ['arcgis_configs','tak_settings','tc_configs','pp_configs','ipaws_config']
 parts = []
 for k in keys:
     v = unwrap(d.get(k))
@@ -527,7 +525,7 @@ if [ "$NR_READY" = "true" ] && [ -f "$NR_CTX_GLOBAL" ]; then
                 tc_configs:uw(d.tc_configs)||[],
                 tak_settings:uw(d.tak_settings)||{},
                 ipaws_config:uw(d.ipaws_config)||{},
-                pulsepoint_config:uw(d.pulsepoint_config)||{}};
+                pp_configs:uw(d.pp_configs)||[]};
               fs.writeFileSync(\"/data/config-backups/latest.json\",JSON.stringify(snap,null,2));
               console.log(\"    Backup: wrote /data/config-backups/latest.json\");
             }catch(e){console.log(\"    Backup write failed: \"+e.message);}
