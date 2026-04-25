@@ -83,28 +83,89 @@ fi
 # The localfilesystem context REST API returns values wrapped as {msg: value}
 # and the whole response is nested under a 'default' key.  Strip both layers so
 # the backup file (and the global.json we write) contains clean key:value pairs.
+#
+# This step ALSO type-coerces:
+#   *_configs  → must be an array (else replace with [])
+#   *_settings, *_config → must be an object (else replace with {})
+# because v0.7.4 hit a case where arcgis_configs ended up as a JSON-stringified
+# literal `"[...]"`. Engine tabs do `global.get('arcgis_configs') || []` and
+# iterate — when given a string they iterate over characters, silently failing.
+# Better to write `[]` than to write a string and let engines silently break.
+#
+# stderr is intentionally NOT swallowed — if the script crashes, we want to know.
 if [ -f "$NR_CTX_GLOBAL" ]; then
-  python3 - "$NR_CTX_GLOBAL" << 'PYEOF' 2>/dev/null && mv /tmp/_nr_ctx_clean.json "$NR_CTX_GLOBAL" || true
+  if python3 - "$NR_CTX_GLOBAL" > /tmp/_nr_ctx_normalize.log 2>&1 << 'PYEOF'
 import json, sys
+EXPECTED = {
+    'arcgis_configs': 'array',
+    'tc_configs':     'array',
+    'pp_configs':     'array',
+    'tak_settings':   'object',
+    'ipaws_config':   'object',
+}
 try:
     d = json.load(open(sys.argv[1]))
-except Exception:
-    sys.exit(0)  # leave file untouched on parse error
-# Unwrap 'default' namespace
+except Exception as e:
+    print('NORMALIZE FAILED at json.load: ' + str(e), file=sys.stderr)
+    sys.exit(2)
+# Strip Node-RED REST API 'default' namespace
 if 'default' in d and isinstance(d['default'], dict):
     d = d['default']
 def unwrap(v):
-    # localfilesystem wraps as {msg: <json>, format: <hint>} — detect by 'msg' key presence
     if isinstance(v, dict) and 'msg' in v:
         inner = v['msg']
         if isinstance(inner, str):
             try: return json.loads(inner)
-            except: return inner
+            except Exception: return inner
         return inner
+    if isinstance(v, str):
+        # Stringified JSON stored as literal string (arcgis_configs corruption case)
+        try: return json.loads(v)
+        except Exception: return v
     return v
-clean = {k: unwrap(v) for k, v in d.items()}
-json.dump(clean, open('/tmp/_nr_ctx_clean.json', 'w'))
+clean = {}
+warnings = []
+for k, raw in d.items():
+    n = unwrap(raw)
+    exp = EXPECTED.get(k)
+    if exp == 'array' and not isinstance(n, list):
+        warnings.append(f'  COERCED {k}: {type(n).__name__} -> []')
+        n = []
+    elif exp == 'object' and not (isinstance(n, dict) and not (isinstance(n, list))):
+        if not isinstance(n, dict):
+            warnings.append(f'  COERCED {k}: {type(n).__name__} -> {{}}')
+            n = {}
+    clean[k] = n
+# Ensure all expected keys exist (initialize empties if missing — prevents
+# downstream `if d[k] is undefined` skips that leave engines without data)
+for k, exp in EXPECTED.items():
+    if k not in clean:
+        clean[k] = [] if exp == 'array' else {}
+        warnings.append(f'  INITIALIZED {k}: missing -> {"[]" if exp=="array" else "{}"}')
+with open('/tmp/_nr_ctx_clean.json', 'w') as f:
+    json.dump(clean, f)
+if warnings:
+    print('Normalize warnings:')
+    for w in warnings: print(w)
+print('Normalize OK — wrote /tmp/_nr_ctx_clean.json')
+sys.exit(0)
 PYEOF
+  then
+    # Show normalize warnings inline so we don't silently corrupt user data again
+    grep -E '(COERCED|INITIALIZED|Normalize)' /tmp/_nr_ctx_normalize.log 2>/dev/null \
+      | sed 's/^/    /' || true
+    if [ -f /tmp/_nr_ctx_clean.json ]; then
+      mv /tmp/_nr_ctx_clean.json "$NR_CTX_GLOBAL"
+      echo "    Context backup: normalized successfully"
+    else
+      echo "    WARNING: normalize python ran but produced no output file — keeping raw API response"
+    fi
+  else
+    echo "    !! NORMALIZE FAILED — backup will be in raw API format (still usable, but not ideal)"
+    echo "    !! python output:"
+    sed 's/^/      /' /tmp/_nr_ctx_normalize.log 2>/dev/null || true
+  fi
+  rm -f /tmp/_nr_ctx_normalize.log
 fi
 docker cp "$CONTAINER:/data/context/flow/flow_arcgis_cfg.json" "$NR_CTX_FLOW_CFG" 2>/dev/null || true
 
