@@ -467,7 +467,7 @@
           <input type="color" id="strokeColorPick" value="#FF0000"
                  oninput="document.getElementById('strokeColor').value=this.value;updSwatch('swStroke',this.value)">
           <input type="text" id="strokeColor" value="#FF0000" style="width:110px"
-                 oninput="updSwatch('swStroke',this.value);document.getElementById('strokeColorPick').value=this.value">
+                 oninput="updSwatch('swStroke',this.value);syncColorPick('strokeColorPick',this.value)">
           <div class="color-swatch" id="swStroke" style="background:#FF0000"></div>
         </div>
       </div>
@@ -477,7 +477,7 @@
           <input type="color" id="fillColorPick" value="#FF0000"
                  oninput="document.getElementById('fillColor').value=this.value;updSwatch('swFill',this.value)">
           <input type="text" id="fillColor" value="#FF0000" style="width:110px"
-                 oninput="updSwatch('swFill',this.value);document.getElementById('fillColorPick').value=this.value">
+                 oninput="updSwatch('swFill',this.value);syncColorPick('fillColorPick',this.value)">
           <div class="color-swatch" id="swFill" style="background:#FF0000"></div>
         </div>
       </div>
@@ -803,7 +803,7 @@
           <input type="color" id="tfrStrokeColorPick" value="#FF6600"
                  oninput="document.getElementById('tfrStrokeColor').value=this.value;updSwatch('swTfrStroke',this.value)">
           <input type="text" id="tfrStrokeColor" value="#FF6600" style="width:110px"
-                 oninput="updSwatch('swTfrStroke',this.value);document.getElementById('tfrStrokeColorPick').value=this.value">
+                 oninput="updSwatch('swTfrStroke',this.value);syncColorPick('tfrStrokeColorPick',this.value)">
           <div class="color-swatch" id="swTfrStroke" style="background:#FF6600"></div>
         </div>
       </div>
@@ -813,7 +813,7 @@
           <input type="color" id="tfrFillColorPick" value="#FF6600"
                  oninput="document.getElementById('tfrFillColor').value=this.value;updSwatch('swTfrFill',this.value)">
           <input type="text" id="tfrFillColor" value="#FF6600" style="width:110px"
-                 oninput="updSwatch('swTfrFill',this.value);document.getElementById('tfrFillColorPick').value=this.value">
+                 oninput="updSwatch('swTfrFill',this.value);syncColorPick('tfrFillColorPick',this.value)">
           <div class="color-swatch" id="swTfrFill" style="background:#FF6600"></div>
         </div>
       </div>
@@ -905,7 +905,7 @@
           <input type="color" id="kmlStrokeColorPick" value="#FF0000"
                  oninput="document.getElementById('kmlStrokeColor').value=this.value;updSwatch('swKmlStroke',this.value)">
           <input type="text" id="kmlStrokeColor" value="#FF0000" style="width:110px"
-                 oninput="updSwatch('swKmlStroke',this.value);document.getElementById('kmlStrokeColorPick').value=this.value">
+                 oninput="updSwatch('swKmlStroke',this.value);syncColorPick('kmlStrokeColorPick',this.value)">
           <div class="color-swatch" id="swKmlStroke" style="background:#FF0000"></div>
         </div>
       </div>
@@ -915,7 +915,7 @@
           <input type="color" id="kmlFillColorPick" value="#FF0000"
                  oninput="document.getElementById('kmlFillColor').value=this.value;updSwatch('swKmlFill',this.value)">
           <input type="text" id="kmlFillColor" value="#FF0000" style="width:110px"
-                 oninput="updSwatch('swKmlFill',this.value);document.getElementById('kmlFillColorPick').value=this.value">
+                 oninput="updSwatch('swKmlFill',this.value);syncColorPick('kmlFillColorPick',this.value)">
           <div class="color-swatch" id="swKmlFill" style="background:#FF0000"></div>
         </div>
       </div>
@@ -2090,6 +2090,16 @@ function updSwatch(id, v) {
   document.getElementById(id).style.background = v;
 }
 
+// Only assign to <input type="color"> when the value is a valid #rrggbb,
+// avoiding noisy "does not conform to the required format" warnings as the
+// user is mid-typing a hex color.
+function syncColorPick(pickId, v) {
+  if (typeof v === 'string' && /^#[0-9A-Fa-f]{6}$/.test(v)) {
+    var el = document.getElementById(pickId);
+    if (el) el.value = v;
+  }
+}
+
 function toggleDataSync() {
   var on = document.getElementById('dataSyncEnabled').checked;
   document.getElementById('dataSyncFields').style.display = on ? '' : 'none';
@@ -2911,24 +2921,52 @@ async function generateConfig() {
 
   document.getElementById('configOutput').textContent = JSON.stringify(config, null, 2);
   status('saveStatus', 'Saving…', true);
+  console.log('[save] POST /arcgis-tak/config/save', config.configName);
 
   try {
-    var r = await fetch('/arcgis-tak/config/save', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(config)
-    });
-    await r.json();
-    status('saveStatus', '✓ Saved "' + config.configName + '"', true);
-    if (config.missionName) {
-      ensureEngineTab(config.configName); // fire-and-forget, full redeploy runs in background
+    // Hard 15s timeout so the UI can never hang silently
+    var ac = new AbortController();
+    var killer = setTimeout(function(){ ac.abort(); }, 15000);
+    var r;
+    try {
+      r = await fetch('/arcgis-tak/config/save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(config),
+        signal: ac.signal
+      });
+    } finally { clearTimeout(killer); }
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    var saveResp = await r.json();
+    console.log('[save] response', saveResp);
+    status('saveStatus', '✓ Saved "' + config.configName + '" — refreshing list…', true);
+
+    // Reload the saved-config list FIRST so the UI is consistent immediately.
+    // ensureEngineTab triggers a full Node-RED redeploy (3-10s) which may make
+    // /arcgis-tak/config/load briefly 502; reload list first to avoid that.
+    try {
+      _savedConfigs = [];
+      await loadSavedConfigs();
+    } catch(le) {
+      console.warn('[save] loadSavedConfigs failed (non-fatal):', le);
     }
-    _savedConfigs = [];
-    await loadSavedConfigs();
+
+    // Now collapse the form — even if engine deploy is still running.
     resetForm();
     hideSteps();
+    status('saveStatus', '✓ Saved "' + config.configName + '"', true);
+
+    // Kick off engine deploy in the background. Do NOT await.
+    if (config.missionName) {
+      console.log('[save] kicking off ensureEngineTab in background');
+      Promise.resolve().then(function(){ try { ensureEngineTab(config.configName); } catch(_){} });
+    }
   } catch(e) {
-    status('saveStatus', 'Save failed: ' + (e.message || 'unknown error'), false);
+    console.error('[save] FAILED', e);
+    var msg = e && e.name === 'AbortError'
+      ? 'Save timed out after 15s — check Node-RED is running'
+      : 'Save failed: ' + (e.message || 'unknown error');
+    status('saveStatus', msg, false);
   }
 }
 
@@ -2955,32 +2993,36 @@ var _activeConfigIdx = -1;
 var _ipawsActiveCfg = null; // non-null when IPAWS is active
 var _ppConfigs = []; // multi-agency PulsePoint configs
 
-async function loadSavedConfigs() {
-  // Load IPAWS status in parallel
-  try {
-    var ir = await fetch('/ipaws/config');
-    var id = await ir.json();
-    var cfg = id.config || {};
-    _ipawsActiveCfg = (cfg.activated !== false) ? cfg : null;
-  } catch (e) { _ipawsActiveCfg = null; }
-  try {
-    var pr = await fetch('/pp/config/load');
-    var pd = await pr.json();
-    _ppConfigs = Array.isArray(pd.configs) ? pd.configs : [];
-  } catch (e) { _ppConfigs = []; }
+// fetch with a hard timeout — never let the UI hang on a stuck Node-RED endpoint
+function _fetchT(url, opts, ms) {
+  ms = ms || 10000;
+  var ac = new AbortController();
+  var t = setTimeout(function(){ ac.abort(); }, ms);
+  var o = Object.assign({}, opts || {}, { signal: ac.signal });
+  return fetch(url, o).finally(function(){ clearTimeout(t); });
+}
 
-  try {
-    var tr = await fetch('/arcgis-tak/tak-settings/load');
-    var tj = await tr.json();
-    window._takSettingsCache = tj.settings || {};
-  } catch (e) {}
+async function loadSavedConfigs() {
+  // Load IPAWS status, PP configs, and TAK settings in parallel — each independently bounded
+  await Promise.allSettled([
+    _fetchT('/ipaws/config').then(function(r){return r.json();}).then(function(id){
+      var cfg = id.config || {};
+      _ipawsActiveCfg = (cfg.activated !== false) ? cfg : null;
+    }).catch(function(){ _ipawsActiveCfg = null; }),
+    _fetchT('/pp/config/load').then(function(r){return r.json();}).then(function(pd){
+      _ppConfigs = Array.isArray(pd.configs) ? pd.configs : [];
+    }).catch(function(){ _ppConfigs = []; }),
+    _fetchT('/arcgis-tak/tak-settings/load').then(function(r){return r.json();}).then(function(tj){
+      window._takSettingsCache = tj.settings || {};
+    }).catch(function(){})
+  ]);
 
   // Fetch all config sources in parallel — any non-empty source means show the list
   // ArcGIS + TFR share /arcgis-tak/config/load (TFR uses sourceType:'faa_tfr')
   var _extraCounts = 0;
   await Promise.allSettled([
-    fetch('/arcgis-tak/config/load').then(function(r){return r.json();}).then(function(d){ var c=d.configs; _savedConfigs = Array.isArray(c)?c:[]; }).catch(function(){}),
-    fetch('/tc/config/load').then(function(r){return r.json();}).then(function(d){ _extraCounts += (d.configs||[]).length; }).catch(function(){})
+    _fetchT('/arcgis-tak/config/load').then(function(r){return r.json();}).then(function(d){ var c=d.configs; _savedConfigs = Array.isArray(c)?c:[]; }).catch(function(){}),
+    _fetchT('/tc/config/load').then(function(r){return r.json();}).then(function(d){ _extraCounts += (d.configs||[]).length; }).catch(function(){})
   ]);
 
   var hasAnything = _savedConfigs.length > 0 || _ipawsActiveCfg || _ppConfigs.length > 0 || _extraCounts > 0;
@@ -2988,15 +3030,15 @@ async function loadSavedConfigs() {
   // Auto-restore from latest.json if context appears empty (e.g. after full deploy timing race)
   if (!hasAnything) {
     try {
-      var _ar = await fetch('/config/restore', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filename: 'ctx:0' }) });
+      var _ar = await _fetchT('/config/restore', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filename: 'ctx:0' }) });
       var _ad = await _ar.json();
       if (_ad.ok && (_ad.arcgis_count > 0 || _ad.tc_count > 0)) {
         console.log('Auto-restored from latest.json:', _ad);
         _savedConfigs = []; _extraCounts = 0;
         await Promise.allSettled([
-          fetch('/arcgis-tak/config/load').then(function(r){return r.json();}).then(function(d){ var c=d.configs; _savedConfigs = Array.isArray(c)?c:[]; }).catch(function(){}),
-          fetch('/tc/config/load').then(function(r){return r.json();}).then(function(d){ _extraCounts += (d.configs||[]).length; }).catch(function(){}),
-          fetch('/pp/config/load').then(function(r){return r.json();}).then(function(d){ _ppConfigs = Array.isArray(d.configs)?d.configs:[]; _extraCounts += _ppConfigs.length; }).catch(function(){})
+          _fetchT('/arcgis-tak/config/load').then(function(r){return r.json();}).then(function(d){ var c=d.configs; _savedConfigs = Array.isArray(c)?c:[]; }).catch(function(){}),
+          _fetchT('/tc/config/load').then(function(r){return r.json();}).then(function(d){ _extraCounts += (d.configs||[]).length; }).catch(function(){}),
+          _fetchT('/pp/config/load').then(function(r){return r.json();}).then(function(d){ _ppConfigs = Array.isArray(d.configs)?d.configs:[]; _extraCounts += _ppConfigs.length; }).catch(function(){})
         ]);
         hasAnything = _savedConfigs.length > 0 || _ipawsActiveCfg || _ppConfigs.length > 0 || _extraCounts > 0;
       }
