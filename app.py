@@ -6509,7 +6509,7 @@ def _caddy_cert_days_color(days_left):
     """
     if days_left is None:
         return None
-    if days_left <= 30:
+    if days_left < 30:
         return 'red'    # Renewal should have fired and rebuilt the JKS — it didn't
     return 'green'
 
