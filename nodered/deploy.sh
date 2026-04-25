@@ -454,8 +454,20 @@ fi
 echo "==> Installing merged flows (stop → write → restore context → start)"
 docker cp "$CONTAINER:/tmp/flows_merged.json" "/tmp/flows_merged.json"
 
-# Pre-create context dirs while the container is still running (docker exec fails on stopped containers)
+# Pre-create context dirs and write context files BEFORE stopping — docker exec runs as the
+# container user (node-red) so files get correct ownership. docker cp to a stopped container
+# writes as root and causes EACCES on startup.
 docker exec "$CONTAINER" mkdir -p /data/context/global /data/context/flow 2>/dev/null || true
+if [ -f "$NR_CTX_GLOBAL" ]; then
+  docker exec "$CONTAINER" sh -c "cat > /data/context/global/global.json" < "$NR_CTX_GLOBAL" 2>/dev/null \
+    || docker cp "$NR_CTX_GLOBAL" "$CONTAINER:/data/context/global/global.json"
+  echo "    Context file: written to /data/context/global/global.json"
+fi
+if [ -f "$NR_CTX_FLOW_CFG" ]; then
+  docker exec "$CONTAINER" sh -c "cat > /data/context/flow/flow_arcgis_cfg.json" < "$NR_CTX_FLOW_CFG" 2>/dev/null \
+    || docker cp "$NR_CTX_FLOW_CFG" "$CONTAINER:/data/context/flow/flow_arcgis_cfg.json"
+  echo "    Context file: restored flow tab (legacy)"
+fi
 
 docker stop -t 30 "$CONTAINER"
 docker cp "/tmp/flows_merged.json" "$CONTAINER:/data/flows.json"
@@ -464,20 +476,14 @@ if [ -f "/tmp/flows_cred_backup.json" ]; then
   docker cp "/tmp/flows_cred_backup.json" "$CONTAINER:/data/flows_cred.json"
   echo "    Credentials: restored"
 fi
-# Write the context file so Node-RED reads it on startup (requires contextStorage:localfilesystem)
-if [ -f "$NR_CTX_GLOBAL" ]; then
-  docker cp "$NR_CTX_GLOBAL" "$CONTAINER:/data/context/global/global.json"
-  echo "    Context file: written to /data/context/global/global.json"
-fi
-if [ -f "$NR_CTX_FLOW_CFG" ]; then
-  docker cp "$NR_CTX_FLOW_CFG" "$CONTAINER:/data/context/flow/flow_arcgis_cfg.json"
-  echo "    Context file: restored flow tab (legacy)"
-fi
 rm -f /tmp/flows_current.json /tmp/flows_cred_backup.json /tmp/flows_merged.json
 
 docker start "$CONTAINER"
-# Fix ownership on context files written by docker cp (cp writes as root; Node-RED runs as node-red)
-docker exec "$CONTAINER" sh -c "chown -R node-red:node-red /data/context 2>/dev/null || chown -R 1000:1000 /data/context 2>/dev/null || true"
+# Belt-and-suspenders: fix any files that fell through to docker cp path (runs fast, before Node-RED opens files)
+VOLUME_PATH=$(docker inspect "$CONTAINER" --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}' 2>/dev/null || true)
+if [ -n "$VOLUME_PATH" ] && [ -d "$VOLUME_PATH/context" ]; then
+  chown -R 1000:1000 "$VOLUME_PATH/context" 2>/dev/null || true
+fi
 docker exec "$CONTAINER" sh -c "rm -f /tmp/flows_*.json /tmp/build-flows.js /tmp/configurator.html" 2>/dev/null || true
 
 # ── Post-startup API context restore (belt-and-suspenders) ────────────────────
