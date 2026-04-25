@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.7.2-alpha"
+VERSION = "0.7.3-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -15434,11 +15434,13 @@ def _run_nodered_deploy_remote(settings, deploy_cfg, plog):
   httpStatic: '/data/public',
   contextStorage: {
     default: {
-      module: 'localfilesystem'
+      module: 'localfilesystem',
+      config: { flushInterval: 0 }
     }
   },
   functionGlobalContext: {
-    nodeHttps: require('https')
+    nodeHttps: require('https'),
+    fs: require('fs')
   },
   editorTheme: {
     header: {
@@ -15560,11 +15562,13 @@ def run_nodered_deploy():
   httpStatic: '/data/public',
   contextStorage: {
     default: {
-      module: 'localfilesystem'
+      module: 'localfilesystem',
+      config: { flushInterval: 0 }
     }
   },
   functionGlobalContext: {
-    nodeHttps: require('https')
+    nodeHttps: require('https'),
+    fs: require('fs')
   },
   editorTheme: {
     header: {
@@ -29160,9 +29164,19 @@ def _post_update_auto_deploy():
                     if 'contextStorage' not in content:
                         print("Post-update: adding contextStorage (localfilesystem) to Node-RED settings.js")
                         # Before switching to filesystem storage, export the current in-memory
-                        # context via the Node-RED REST API and write it to disk.  Without this
-                        # step, older installs (memory-only context) lose all Configurator configs
-                        # on the first restart after migration.
+                        # context via the Node-RED REST API, NORMALISE it to the on-disk format
+                        # localfilesystem expects, and write it to disk AS THE NODE-RED USER.
+                        #
+                        # The REST API wraps values as {default: {key: {msg: "...", format: "..."}}}.
+                        # localfilesystem on disk expects plain {key: value} (verified against
+                        # node-red source: localfilesystem.js open() does Object.keys(data).forEach
+                        # cache.set(scope, key, data[key])). Writing the wrapped format causes
+                        # Node-RED to load a single bogus key "default" and the configs are
+                        # invisible to global.get() — wiping all Configurator state.
+                        #
+                        # Use `docker exec ... sh -c "cat > path"` (NOT docker cp) so the file
+                        # gets written as the node-red user. docker cp writes as root and triggers
+                        # EACCES when Node-RED restarts (UID 1000 can't read root-owned file).
                         try:
                             ctx_r = subprocess.run(
                                 'docker exec nodered curl -sf --max-time 8 http://localhost:1880/context/global',
@@ -29170,25 +29184,54 @@ def _post_update_auto_deploy():
                             )
                             ctx_data = (ctx_r.stdout or '').strip()
                             if ctx_data and ctx_data not in ('{}', 'null', ''):
-                                import tempfile
+                                # Normalise REST API wrapping → on-disk localfilesystem format
+                                try:
+                                    parsed = json.loads(ctx_data)
+                                    if isinstance(parsed, dict) and 'default' in parsed and isinstance(parsed['default'], dict):
+                                        parsed = parsed['default']
+                                    def _unwrap_msg(v):
+                                        if isinstance(v, dict) and 'msg' in v:
+                                            inner = v['msg']
+                                            if isinstance(inner, str):
+                                                try:
+                                                    return json.loads(inner)
+                                                except Exception:
+                                                    return inner
+                                            return inner
+                                        return v
+                                    if isinstance(parsed, dict):
+                                        parsed = {k: _unwrap_msg(v) for k, v in parsed.items()}
+                                    ctx_normalised = json.dumps(parsed)
+                                except Exception as parse_e:
+                                    print(f"Post-update: context normalise failed ({parse_e}) — writing raw response (may not load)")
+                                    ctx_normalised = ctx_data
+                                # Pre-create dir as node-red user
                                 subprocess.run(
                                     'docker exec nodered mkdir -p /data/context/global',
                                     shell=True, capture_output=True, timeout=10
                                 )
-                                with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tf:
-                                    tf.write(ctx_data)
-                                    tmp_ctx = tf.name
-                                subprocess.run(
-                                    f'docker cp {shlex.quote(tmp_ctx)} nodered:/data/context/global/global.json',
-                                    shell=True, capture_output=True, timeout=15
+                                # Write file as node-red user via docker exec stdin redirect — NOT docker cp
+                                proc = subprocess.run(
+                                    'docker exec -i nodered sh -c "cat > /data/context/global/global.json"',
+                                    shell=True, input=ctx_normalised.encode('utf-8'),
+                                    capture_output=True, timeout=15
                                 )
-                                os.remove(tmp_ctx)
-                                # Fix ownership — docker cp writes as root; Node-RED runs as node-red
-                                subprocess.run(
-                                    'docker exec nodered sh -c "chown -R node-red:node-red /data/context 2>/dev/null || chown -R 1000:1000 /data/context 2>/dev/null || true"',
-                                    shell=True, capture_output=True, timeout=10
-                                )
-                                print("Post-update: in-memory context exported to filesystem before migration")
+                                if proc.returncode != 0:
+                                    # Fallback: docker cp + chown (older docker versions w/o -i support)
+                                    import tempfile
+                                    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tf:
+                                        tf.write(ctx_normalised)
+                                        tmp_ctx = tf.name
+                                    subprocess.run(
+                                        f'docker cp {shlex.quote(tmp_ctx)} nodered:/data/context/global/global.json',
+                                        shell=True, capture_output=True, timeout=15
+                                    )
+                                    os.remove(tmp_ctx)
+                                    subprocess.run(
+                                        'docker exec nodered sh -c "chown -R node-red:node-red /data/context 2>/dev/null || chown -R 1000:1000 /data/context 2>/dev/null || true"',
+                                        shell=True, capture_output=True, timeout=10
+                                    )
+                                print("Post-update: in-memory context exported (normalised) to filesystem before migration")
                         except Exception as ctx_e:
                             print(f"Post-update: context pre-export warning (non-fatal): {ctx_e}")
                         content = content.replace(
@@ -29196,7 +29239,8 @@ def _post_update_auto_deploy():
                             """,
   contextStorage: {
     default: {
-      module: 'localfilesystem'
+      module: 'localfilesystem',
+      config: { flushInterval: 0 }
     }
   }
 };""",

@@ -83,28 +83,96 @@ fi
 # The localfilesystem context REST API returns values wrapped as {msg: value}
 # and the whole response is nested under a 'default' key.  Strip both layers so
 # the backup file (and the global.json we write) contains clean key:value pairs.
+#
+# This step ALSO type-coerces:
+#   *_configs  → must be an array (else replace with [])
+#   *_settings, *_config → must be an object (else replace with {})
+# because v0.7.4 hit a case where arcgis_configs ended up as a JSON-stringified
+# literal `"[...]"`. Engine tabs do `global.get('arcgis_configs') || []` and
+# iterate — when given a string they iterate over characters, silently failing.
+# Better to write `[]` than to write a string and let engines silently break.
+#
+# stderr is intentionally NOT swallowed — if the script crashes, we want to know.
 if [ -f "$NR_CTX_GLOBAL" ]; then
-  python3 - "$NR_CTX_GLOBAL" << 'PYEOF' 2>/dev/null && mv /tmp/_nr_ctx_clean.json "$NR_CTX_GLOBAL" || true
+  if python3 - "$NR_CTX_GLOBAL" > /tmp/_nr_ctx_normalize.log 2>&1 << 'PYEOF'
 import json, sys
+EXPECTED = {
+    'arcgis_configs': 'array',
+    'tc_configs':     'array',
+    'pp_configs':     'array',
+    'tak_settings':   'object',
+    'ipaws_config':   'object',
+}
 try:
     d = json.load(open(sys.argv[1]))
-except Exception:
-    sys.exit(0)  # leave file untouched on parse error
-# Unwrap 'default' namespace
+except Exception as e:
+    print('NORMALIZE FAILED at json.load: ' + str(e), file=sys.stderr)
+    sys.exit(2)
+# Strip Node-RED REST API 'default' namespace
 if 'default' in d and isinstance(d['default'], dict):
     d = d['default']
 def unwrap(v):
-    # localfilesystem wraps as {msg: <json>, format: <hint>} — detect by 'msg' key presence
     if isinstance(v, dict) and 'msg' in v:
         inner = v['msg']
         if isinstance(inner, str):
             try: return json.loads(inner)
-            except: return inner
+            except Exception: return inner
         return inner
+    if isinstance(v, str):
+        # Stringified JSON stored as literal string (arcgis_configs corruption case)
+        try: return json.loads(v)
+        except Exception: return v
     return v
-clean = {k: unwrap(v) for k, v in d.items()}
-json.dump(clean, open('/tmp/_nr_ctx_clean.json', 'w'))
+clean = {}
+warnings = []
+quarantined = {}
+for k, raw in d.items():
+    n = unwrap(raw)
+    exp = EXPECTED.get(k)
+    if exp == 'array' and not isinstance(n, list):
+        # NEVER silently coerce non-empty data to []. Quarantine the original.
+        if isinstance(n, str) and n: quarantined[k+'_quarantine'] = n
+        elif isinstance(n, dict) and n: quarantined[k+'_quarantine'] = n
+        warnings.append(f'  COERCED {k}: {type(n).__name__} -> []  (original quarantined as {k}_quarantine)')
+        n = []
+    elif exp == 'object' and not (isinstance(n, dict) and not isinstance(n, list)):
+        if not isinstance(n, dict):
+            if n: quarantined[k+'_quarantine'] = n
+            warnings.append(f'  COERCED {k}: {type(n).__name__} -> {{}}  (original quarantined as {k}_quarantine)')
+            n = {}
+    clean[k] = n
+# Carry quarantined originals through so they survive the deploy
+clean.update(quarantined)
+# Ensure all expected keys exist (initialize empties if missing — prevents
+# downstream `if d[k] is undefined` skips that leave engines without data)
+for k, exp in EXPECTED.items():
+    if k not in clean:
+        clean[k] = [] if exp == 'array' else {}
+        warnings.append(f'  INITIALIZED {k}: missing -> {"[]" if exp=="array" else "{}"}')
+with open('/tmp/_nr_ctx_clean.json', 'w') as f:
+    json.dump(clean, f)
+if warnings:
+    print('Normalize warnings:')
+    for w in warnings: print(w)
+print('Normalize OK — wrote /tmp/_nr_ctx_clean.json')
+sys.exit(0)
 PYEOF
+  then
+    # Show normalize warnings inline so we don't silently corrupt user data again
+    grep -E '(COERCED|INITIALIZED|Normalize)' /tmp/_nr_ctx_normalize.log 2>/dev/null \
+      | sed 's/^/    /' || true
+    if [ -f /tmp/_nr_ctx_clean.json ]; then
+      mv /tmp/_nr_ctx_clean.json "$NR_CTX_GLOBAL"
+      echo "    Context backup: normalized successfully"
+    else
+      echo "    WARNING: normalize python ran but produced no output file — keeping raw API response"
+    fi
+  else
+    echo "    !! NORMALIZE FAILED — backup will be in raw API format (still usable, but not ideal)"
+    echo "    !! python output:"
+    sed 's/^/      /' /tmp/_nr_ctx_normalize.log 2>/dev/null || true
+  fi
+  rm -f /tmp/_nr_ctx_normalize.log
 fi
 docker cp "$CONTAINER:/data/context/flow/flow_arcgis_cfg.json" "$NR_CTX_FLOW_CFG" 2>/dev/null || true
 
@@ -454,8 +522,68 @@ fi
 echo "==> Installing merged flows (stop → write → restore context → start)"
 docker cp "$CONTAINER:/tmp/flows_merged.json" "/tmp/flows_merged.json"
 
-# Pre-create context dirs while the container is still running (docker exec fails on stopped containers)
+# Pre-create context dirs and write context files BEFORE stopping — docker exec runs as the
+# container user (node-red) so files get correct ownership. docker cp to a stopped container
+# writes as root and causes EACCES on startup.
 docker exec "$CONTAINER" mkdir -p /data/context/global /data/context/flow 2>/dev/null || true
+if [ -f "$NR_CTX_GLOBAL" ]; then
+  # SAFETY GATE: refuse to write if the new file would SHRINK any *_configs key
+  # from non-empty to empty. This is the strongest never-lose-data guarantee — even
+  # if the live REST backup somehow returned empty data, we keep what's on disk.
+  EXISTING_CTX=$(mktemp)
+  docker exec "$CONTAINER" cat /data/context/global/global.json > "$EXISTING_CTX" 2>/dev/null || echo '{}' > "$EXISTING_CTX"
+  SHRINK_CHECK=$(python3 - "$EXISTING_CTX" "$NR_CTX_GLOBAL" << 'PYEOF' 2>/dev/null
+import json, sys
+def load(fn):
+    try: d = json.load(open(fn))
+    except: return {}
+    if isinstance(d, dict) and 'default' in d and isinstance(d['default'], dict): d = d['default']
+    return d if isinstance(d, dict) else {}
+def unwrap(v):
+    if isinstance(v, dict) and 'msg' in v:
+        m = v['msg']
+        if isinstance(m, str):
+            try: return json.loads(m)
+            except: return m
+        return m
+    if isinstance(v, str):
+        try: return json.loads(v)
+        except: return v
+    return v
+def count(v):
+    v = unwrap(v)
+    if isinstance(v, list): return len(v)
+    if isinstance(v, dict): return len(v)
+    return 0
+old = load(sys.argv[1])
+new = load(sys.argv[2])
+shrunk = []
+for k in ('arcgis_configs','tc_configs','pp_configs','tak_settings','ipaws_config'):
+    o, n = count(old.get(k)), count(new.get(k))
+    if o > 0 and n == 0:
+        shrunk.append(f'{k}: {o} -> 0')
+if shrunk:
+    print('SHRINK_DETECTED: ' + '; '.join(shrunk))
+PYEOF
+)
+  if echo "$SHRINK_CHECK" | grep -q '^SHRINK_DETECTED'; then
+    echo "    !! REFUSING to overwrite global.json — would shrink data:"
+    echo "    !! $SHRINK_CHECK"
+    echo "    !! Keeping existing on-disk context. New backup is at $NR_CTX_GLOBAL."
+    rm -f "$EXISTING_CTX"
+  else
+    docker exec "$CONTAINER" sh -c "cat > /data/context/global/global.json" < "$NR_CTX_GLOBAL" 2>/dev/null \
+      || docker cp "$NR_CTX_GLOBAL" "$CONTAINER:/data/context/global/global.json"
+    echo "    Context file: written to /data/context/global/global.json"
+    rm -f "$EXISTING_CTX"
+  fi
+  unset EXISTING_CTX SHRINK_CHECK
+fi
+if [ -f "$NR_CTX_FLOW_CFG" ]; then
+  docker exec "$CONTAINER" sh -c "cat > /data/context/flow/flow_arcgis_cfg.json" < "$NR_CTX_FLOW_CFG" 2>/dev/null \
+    || docker cp "$NR_CTX_FLOW_CFG" "$CONTAINER:/data/context/flow/flow_arcgis_cfg.json"
+  echo "    Context file: restored flow tab (legacy)"
+fi
 
 docker stop -t 30 "$CONTAINER"
 docker cp "/tmp/flows_merged.json" "$CONTAINER:/data/flows.json"
@@ -464,20 +592,14 @@ if [ -f "/tmp/flows_cred_backup.json" ]; then
   docker cp "/tmp/flows_cred_backup.json" "$CONTAINER:/data/flows_cred.json"
   echo "    Credentials: restored"
 fi
-# Write the context file so Node-RED reads it on startup (requires contextStorage:localfilesystem)
-if [ -f "$NR_CTX_GLOBAL" ]; then
-  docker cp "$NR_CTX_GLOBAL" "$CONTAINER:/data/context/global/global.json"
-  echo "    Context file: written to /data/context/global/global.json"
-fi
-if [ -f "$NR_CTX_FLOW_CFG" ]; then
-  docker cp "$NR_CTX_FLOW_CFG" "$CONTAINER:/data/context/flow/flow_arcgis_cfg.json"
-  echo "    Context file: restored flow tab (legacy)"
-fi
 rm -f /tmp/flows_current.json /tmp/flows_cred_backup.json /tmp/flows_merged.json
 
 docker start "$CONTAINER"
-# Fix ownership on context files written by docker cp (cp writes as root; Node-RED runs as node-red)
-docker exec "$CONTAINER" sh -c "chown -R node-red:node-red /data/context 2>/dev/null || chown -R 1000:1000 /data/context 2>/dev/null || true"
+# Belt-and-suspenders: fix any files that fell through to docker cp path (runs fast, before Node-RED opens files)
+VOLUME_PATH=$(docker inspect "$CONTAINER" --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}' 2>/dev/null || true)
+if [ -n "$VOLUME_PATH" ] && [ -d "$VOLUME_PATH/context" ]; then
+  chown -R 1000:1000 "$VOLUME_PATH/context" 2>/dev/null || true
+fi
 docker exec "$CONTAINER" sh -c "rm -f /tmp/flows_*.json /tmp/build-flows.js /tmp/configurator.html" 2>/dev/null || true
 
 # ── Post-startup API context restore (belt-and-suspenders) ────────────────────
