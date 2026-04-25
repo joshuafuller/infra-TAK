@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Latest release: v0.7.3-alpha** — ⚠️ **Existing deployments: TAK Server page → Resync LDAP to TAK Server after pulling.** Two major areas: **(1) Immediate password propagation** — password changes in TAK Portal now take effect on ATAK/iTAK within 2 minutes instead of up to 24 hours (root cause: `ldap-authentication-login` stage had `session_duration: seconds=0`; fix: `seconds=120`, enforced on every Resync). **(2) Node-RED Configurator critical fix** — ArcGIS/TFR/KML save was hanging indefinitely due to `TypeError: configs.findIndex is not a function` in `fn_save`; context values were silently stored as stringified arrays after deploy/restore, crashing the save function node before it could respond. Fixed with a `_coerceArr()` guard injected into all CRUD mutators. Also: multi-agency PulsePoint (per-agency engine tabs + ports, like Tablet Command), ArcGIS DataSync form field visibility, save UX hardening (15s timeout, console diagnostics, race-free collapse), and color input warning fixes. See **[docs/RELEASE-v0.7.3-alpha.md](docs/RELEASE-v0.7.3-alpha.md)**. Prior: [v0.7.2-alpha](docs/RELEASE-v0.7.2-alpha.md) — **Tablet Command AVL integration.** Per-agency config cards in the Configurator stream fire/EMS vehicle positions from Tablet Command Feature Services directly to ATAK as live CoT events (TCP :8089, no DataSync). Each agency card includes a known-units CSV remapping table for custom callsigns and CoT types. See **[docs/RELEASE-v0.7.2-alpha.md](docs/RELEASE-v0.7.2-alpha.md)**. Prior: [v0.7.1-alpha](docs/RELEASE-v0.7.1-alpha.md) — **Critical fix: Configurator configs no longer wiped on Update Now.** Root cause: older installs without `contextStorage: localfilesystem` stored Node-RED global context in memory only — any container restart lost all configs. Fix: (1) `_auto_nodered_settings()` now detects and migrates missing `contextStorage`, safely exporting in-memory state to disk first. (2) `deploy.sh` now uses the Node-RED REST API (`/context/global`) as the primary backup source — works regardless of storage type. See **[docs/RELEASE-v0.7.1-alpha.md](docs/RELEASE-v0.7.1-alpha.md)**. Prior: [v0.7.0-alpha](docs/RELEASE-v0.7.0-alpha.md) (IPAWS KML network link, zone polygons, NAPSG icons), [v0.6.8-alpha](docs/RELEASE-v0.6.8-alpha.md) (Node-RED deploy sync fix), [v0.6.7-alpha](docs/RELEASE-v0.6.7-alpha.md) (DataSync read-only missions, shared missions), [v0.6.5-alpha](docs/RELEASE-v0.6.5-alpha.md) (KML + ArcGIS stable-ID / Purge), [v0.6.4-alpha](docs/RELEASE-v0.6.4-alpha.md). Older: [v0.6.1-alpha](docs/RELEASE-v0.6.1-alpha.md), [v0.6.0-alpha](docs/RELEASE-v0.6.0-alpha.md), [v0.5.9-alpha](docs/RELEASE-v0.5.9-alpha.md), [v0.5.8-alpha](docs/RELEASE-v0.5.8-alpha.md), [v0.5.7-alpha](docs/RELEASE-v0.5.7-alpha.md), [v0.5.6-alpha](docs/RELEASE-v0.5.6-alpha.md), [v0.5.5-alpha](docs/RELEASE-v0.5.5-alpha.md), [v0.5.4-alpha](docs/RELEASE-v0.5.4-alpha.md), [v0.5.3-alpha](docs/RELEASE-v0.5.3-alpha.md), [v0.5.2-alpha](docs/RELEASE-v0.5.2-alpha.md), [v0.5.1-alpha](docs/RELEASE-v0.5.1-alpha.md), [v0.5.0-alpha](docs/RELEASE-v0.5.0-alpha.md), [v0.4.9-alpha](docs/RELEASE-v0.4.9-alpha.md), [v0.4.8-alpha](docs/RELEASE-v0.4.8-alpha.md), [v0.4.7-alpha](docs/RELEASE-v0.4.7-alpha.md), [v0.4.6-alpha](docs/RELEASE-v0.4.6-alpha.md), [v0.4.5-alpha](docs/RELEASE-v0.4.5-alpha.md), [v0.4.4-alpha](docs/RELEASE-v0.4.4-alpha.md), [v0.4.3-alpha](docs/RELEASE-v0.4.3-alpha.md), [v0.4.2-alpha](docs/RELEASE-v0.4.2-alpha.md).
+**Latest release: v0.7.1-alpha** — ⚠️ **Existing deployments: TAK Server page → Resync LDAP to TAK Server after pulling.** Six areas: **(1) Critical: Node-RED configs no longer wiped on Update Now** — older installs without `contextStorage: localfilesystem` lost all configs on any container restart; fix exports live in-memory context to disk before patching. **(2) Tablet Command AVL** — stream fire/EMS vehicle positions from Tablet Command Feature Services to ATAK as live CoT events, per-agency with remapping table. **(3) LDAP password propagation** — password changes now take effect in 2 minutes instead of 24 hours (`session_duration: seconds=120`). **(4) ArcGIS save hang fixed** — `TypeError: configs.findIndex` caused the save to hang indefinitely; fixed with `_coerceArr()` in all CRUD mutators. **(5) External DB** — deploy TAK Server against AWS RDS, Azure Database for PostgreSQL, or any cloud PostgreSQL. **(6) Cert display** — cert card stays green until <30 days (renewal already ran); no more false orange alerts. See **[docs/RELEASE-v0.7.1-alpha.md](docs/RELEASE-v0.7.1-alpha.md)**. Prior: [v0.7.0-alpha](docs/RELEASE-v0.7.0-alpha.md) (IPAWS KML network link, zone polygons, NAPSG icons), [v0.6.8-alpha](docs/RELEASE-v0.6.8-alpha.md) (Node-RED deploy sync fix), [v0.6.7-alpha](docs/RELEASE-v0.6.7-alpha.md) (DataSync read-only missions, shared missions), [v0.6.5-alpha](docs/RELEASE-v0.6.5-alpha.md) (KML + ArcGIS stable-ID / Purge), [v0.6.4-alpha](docs/RELEASE-v0.6.4-alpha.md). Older: [v0.6.1-alpha](docs/RELEASE-v0.6.1-alpha.md), [v0.6.0-alpha](docs/RELEASE-v0.6.0-alpha.md), [v0.5.9-alpha](docs/RELEASE-v0.5.9-alpha.md), [v0.5.8-alpha](docs/RELEASE-v0.5.8-alpha.md), [v0.5.7-alpha](docs/RELEASE-v0.5.7-alpha.md), [v0.5.6-alpha](docs/RELEASE-v0.5.6-alpha.md), [v0.5.5-alpha](docs/RELEASE-v0.5.5-alpha.md), [v0.5.4-alpha](docs/RELEASE-v0.5.4-alpha.md), [v0.5.3-alpha](docs/RELEASE-v0.5.3-alpha.md), [v0.5.2-alpha](docs/RELEASE-v0.5.2-alpha.md), [v0.5.1-alpha](docs/RELEASE-v0.5.1-alpha.md), [v0.5.0-alpha](docs/RELEASE-v0.5.0-alpha.md), [v0.4.9-alpha](docs/RELEASE-v0.4.9-alpha.md), [v0.4.8-alpha](docs/RELEASE-v0.4.8-alpha.md), [v0.4.7-alpha](docs/RELEASE-v0.4.7-alpha.md), [v0.4.6-alpha](docs/RELEASE-v0.4.6-alpha.md), [v0.4.5-alpha](docs/RELEASE-v0.4.5-alpha.md), [v0.4.4-alpha](docs/RELEASE-v0.4.4-alpha.md), [v0.4.3-alpha](docs/RELEASE-v0.4.3-alpha.md), [v0.4.2-alpha](docs/RELEASE-v0.4.2-alpha.md).
 
 **Something broken?** Wrong sidebar version, **Update Now** error, merge/rebase/tag-clobber messages, or you are not sure the VPS ever pulled the real repo → go to **[Universal recovery (SSH)](#universal-recovery-ssh)** and run the one block there. **Point people at that section**; it is the single source of truth.
 
@@ -300,42 +300,27 @@ Each page has buttons that do specific things. Here's what they do and when to u
 
 ## Changelog
 
-### v0.7.3-alpha — 2026-04-24
+### v0.7.1-alpha — 2026-04-24
 
-> ⚠️ **Existing deployments:** TAK Server page → **Resync LDAP to TAK Server** after pulling. Takes 30 seconds and self-heals the LDAP session cache fix.
+> ⚠️ **Existing deployments:** TAK Server page → **Resync LDAP to TAK Server** after pulling.
 
-**Immediate password propagation — LDAP session cache fix**
-- **Root cause:** Authentik LDAP outpost uses `bind_mode: cached`. The `ldap-authentication-login` User Login stage had `session_duration: seconds=0` — defaulting to a full browser session (~24 hours). Password changes in TAK Portal did not invalidate the cached bind, so old credentials worked for up to 24 hours after a reset.
-- **Fix:** `session_duration: seconds=120`. Cached LDAP sessions now expire in 2 minutes. New password works on device within 2 minutes of reset.
-- **Self-healing:** Every **Resync LDAP to TAK Server** run patches the live stage — one click and existing deployments converge automatically.
+- **Critical: Node-RED configs no longer wiped on Update Now** — older installs without `contextStorage: localfilesystem` lost all Configurator configs on any container restart. Fix: `_auto_nodered_settings()` detects missing storage, exports live in-memory context to disk via REST API before patching, then migrates to filesystem storage. `deploy.sh` also uses REST API backup first.
+- **Tablet Command AVL** — stream fire/EMS vehicle positions from Tablet Command Feature Services to ATAK as live CoT events. Per-agency config cards with known-units CSV remapping table (custom callsigns + CoT type overrides). CoT type auto-detected from radio name prefix.
+- **LDAP password propagation** — `ldap-authentication-login` stage `session_duration` fixed from `seconds=0` (24-hour cache) to `seconds=120`. Password changes take effect in 2 minutes. Self-healing via Resync.
+- **ArcGIS save hang fixed** — `TypeError: configs.findIndex` caused save to hang indefinitely when context stored as stringified array after deploy/restore. Fixed with `_coerceArr()` in all CRUD mutators + `unwrapCtxVal` patched to prevent re-corruption.
+- **External DB** — deploy TAK Server against AWS RDS, Azure Database for PostgreSQL, Google Cloud SQL, or any PostgreSQL 15 host. Test Connection button, Guard Dog cloud-aware alerts, full setup guide in `docs/EXTERNAL-DB-SETUP.md`.
+- **Cert display** — cert card green at ≥30 days, red at <30 days (renewal ran and failed). No more false orange at 40 days. Guard Dog alert threshold corrected to 25 days.
 
-**Node-RED Configurator — ArcGIS save hang fixed (critical)**
-- **Root cause (Node-RED logs):** `TypeError: configs.findIndex is not a function` in `fn_save`. After a deploy/restore cycle, `global.get('arcgis_configs')` returned a stringified array (`"[]"`) instead of a real JS array. The function threw, never returned `msg`, and the HTTP request hung until timeout — causing "Saving…" to display forever.
-- **Fix:** New `_coerceArr()` helper unwraps all three bad context formats (REST envelope, bare string, non-array) injected into every CRUD mutator: `fn_save`, `fn_tc_save`, `fn_tc_delete`, `FN_PP_SAVE`, `FN_PP_LOAD`, `FN_PP_DELETE`. Root cause of the corruption (`unwrapCtxVal` not handling bare strings in `/config/deploy-restore`) also patched.
-
-**Node-RED Configurator — multi-agency PulsePoint**
-- PulsePoint refactored from a single global config to a per-agency model matching Tablet Command. Each agency gets its own config card, engine tab, CoT streaming port, and PulsePoint API credentials. Existing single configs auto-migrate.
-
-**Node-RED Configurator — save UX hardening**
-- Hard 15s AbortController timeout on all save fetches — UI shows a real error instead of hanging silently.
-- All `loadSavedConfigs` fetches wrapped with 10s timeouts via `_fetchT()` — a single stuck Node-RED endpoint can no longer hang the page.
-- Race-free post-save collapse: reload list → collapse form → engine deploy in background (in that order).
-
-**Node-RED Configurator — ArcGIS DataSync form**
-- Stream port and saved-list note fields now hide when DataSync mode is selected (they only apply to CoT streaming).
-
-Full notes: [docs/RELEASE-v0.7.3-alpha.md](docs/RELEASE-v0.7.3-alpha.md).
+Full notes: [docs/RELEASE-v0.7.1-alpha.md](docs/RELEASE-v0.7.1-alpha.md).
 
 ---
 
-### v0.7.2-alpha — 2026-04-23
+### v0.7.0-alpha — 2026-04-22
 
-**Tablet Command AVL Integration**
-- Stream fire/EMS/law vehicle positions from Tablet Command Feature Services to ATAK as live CoT events (TCP :8089, no DataSync).
-- Per-agency config cards in the Configurator; each card includes a known-units CSV remapping table for custom callsigns and CoT types.
-- CoT type auto-detection from radio name prefix (engine, truck, medic, chief, helicopter, water tender, rescue).
+**IPAWS — timer-based KML cache, zone polygons, NAPSG icons**
+- Timer-based KML cache with configurable poll interval; NWS zone polygon fetch; NAPSG Public Alert icons via CDN; Deploy/Deactivate button in Configurator.
 
-Full notes: [docs/RELEASE-v0.7.2-alpha.md](docs/RELEASE-v0.7.2-alpha.md).
+Full notes: [docs/RELEASE-v0.7.0-alpha.md](docs/RELEASE-v0.7.0-alpha.md).
 
 ---
 
