@@ -2921,7 +2921,7 @@ async function generateConfig() {
     await r.json();
     status('saveStatus', '✓ Saved "' + config.configName + '"', true);
     if (config.missionName) {
-      await ensureEngineTab(config.configName);
+      ensureEngineTab(config.configName); // fire-and-forget, full redeploy runs in background
     }
     _savedConfigs = [];
     await loadSavedConfigs();
