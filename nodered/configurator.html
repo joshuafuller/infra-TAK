@@ -2833,7 +2833,7 @@ function getCurrentConfigData() {
 }
 
 /* ── Step 5: Generate config ── */
-function generateConfig() {
+async function generateConfig() {
   var allValues = getAllFilterValues();
   var filterField = state.filterField || (allValues.length > 0 ? 'source' : null);
   var whereClause = null;
@@ -2910,21 +2910,26 @@ function generateConfig() {
   };
 
   document.getElementById('configOutput').textContent = JSON.stringify(config, null, 2);
+  status('saveStatus', 'Saving…', true);
 
-  fetch('/arcgis-tak/config/save', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(config)
-  }).then(function(r) { return r.json(); })
-    .then(function(d) {
-      if (config.missionName) {
-        ensureEngineTab(config.configName);
-      }
-      _savedConfigs = [];
-      loadSavedConfigs();
-      setTimeout(function() { resetForm(); hideSteps(); }, 500);
-    })
-    .catch(function() {});
+  try {
+    var r = await fetch('/arcgis-tak/config/save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(config)
+    });
+    await r.json();
+    status('saveStatus', '✓ Saved "' + config.configName + '"', true);
+    if (config.missionName) {
+      await ensureEngineTab(config.configName);
+    }
+    _savedConfigs = [];
+    await loadSavedConfigs();
+    resetForm();
+    hideSteps();
+  } catch(e) {
+    status('saveStatus', 'Save failed: ' + (e.message || 'unknown error'), false);
+  }
 }
 
 function copyConfig() {
