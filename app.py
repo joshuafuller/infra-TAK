@@ -3229,7 +3229,7 @@ def guarddog_page():
     guarddog_monitors_tak.extend([
         {'name': 'OOM', 'id': 'oom', 'interval': '1 min', 'desc': 'Scans TAK Server logs for OutOfMemoryError. Auto-restarts TAK Server and sends alert when detected.'},
         {'name': 'Disk', 'id': 'disk', 'interval': '1 hour', 'desc': 'Checks root and TAK logs filesystem usage. Alert only when usage exceeds 80% (warning) or 90% (critical).'},
-        {'name': 'Certificate', 'id': 'cert', 'interval': 'Daily', 'desc': 'Checks Let\'s Encrypt / TAK Server cert expiry. Alert when 40 days or less remaining until expiry.'},
+        {'name': 'Certificate', 'id': 'cert', 'interval': 'Daily', 'desc': 'Checks TAK Server Let\'s Encrypt JKS cert expiry. Auto-renewal runs at 35 days remaining. Alert fires at 25 days — meaning renewal failed and action is required.'},
         {'name': 'Root CA / Intermediate CA', 'id': 'intca', 'interval': 'Escalating', 'desc': 'Monitors Root CA and Intermediate CA certificate expiry. First alert at 90 days, then at 75, 60, 45, 30 days, then daily until expiry.'},
     ])
     guarddog_services = [
@@ -3250,7 +3250,7 @@ def guarddog_page():
             {'name': 'Port 9100 (UI)', 'id': 'fedhub_port', 'interval': '1 min', 'desc': f'Checks that Federation Hub UI port 9100 is listening on {fh_host}. Alerts after 3 failures.'},
             {'name': 'MongoDB', 'id': 'fedhub_mongo', 'interval': '5 min', 'desc': f'Checks mongod service is active on {fh_host}. Alerts on failure.'},
             {'name': 'Disk', 'id': 'fedhub_disk', 'interval': '1 hour', 'desc': f'Checks root filesystem usage on {fh_host}. Alert at 80%+ (warning) or 90%+ (critical).'},
-            {'name': 'TLS certificate', 'id': 'fedhub_cert', 'interval': 'Daily', 'desc': f'Checks Federation Hub server TLS cert (<hostname>.pem) on {fh_host}. Alert when 40 days or less remaining.'},
+            {'name': 'TLS certificate', 'id': 'fedhub_cert', 'interval': 'Daily', 'desc': f'Checks Federation Hub server TLS cert (<hostname>.pem) on {fh_host}. Alert when 25 days or less remaining (below auto-renewal window).'},
             {'name': 'Root CA / Intermediate CA', 'id': 'fedhub_intca', 'interval': 'Escalating', 'desc': f'Monitors Root CA and Intermediate CA expiry on {fh_host} (same 90-day escalation as TAK Server intca).'},
         ]})
     guarddog_services.extend([
@@ -9044,14 +9044,14 @@ def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
     renewal_script = f'''#!/bin/bash
 # TAK Server Let's Encrypt Certificate Renewal
 # Triggered monthly by systemd timer. Rebuilds TAK JKS from Caddy cert when
-# within 40 days of expiry, then restarts TAK Server.
+# within 35 days of expiry, then restarts TAK Server.
 set -euo pipefail
 
 TAK_DOMAIN="{takserver_host}"
 CERT_DIR="{cert_dir}"
 CERT_CRT="$CERT_DIR/$TAK_DOMAIN.crt"
 CERT_KEY="$CERT_DIR/$TAK_DOMAIN.key"
-RENEW_WINDOW_DAYS=40
+RENEW_WINDOW_DAYS=35
 LOG_FILE="/var/log/takserver-cert-renewal.log"
 
 log() {{ echo "[$(date -Is)] $*" | tee -a "$LOG_FILE"; }}
