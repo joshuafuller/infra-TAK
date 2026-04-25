@@ -6504,15 +6504,13 @@ def _caddy_letsencrypt_days_left(settings):
 
 def _caddy_cert_days_color(days_left):
     """Return color for Caddy Let's Encrypt cert display.
-    Caddy auto-renews at 30 days remaining — only flag yellow/red if it missed that window.
-    Note: Guard Dog's cert monitor watches the TAK Server JKS cert, NOT this Caddy LE cert.
+    Renewal script fires at <=35d, Caddy renews at <=30d. If we're below 30d
+    the renewal already ran and failed — go straight to red, no yellow.
     """
     if days_left is None:
         return None
-    if days_left <= 7:
-        return 'red'    # Caddy definitely failed to renew — action required
-    if days_left <= 25:
-        return 'yellow' # Below Caddy's 30-day renewal trigger — renewal should have happened
+    if days_left <= 30:
+        return 'red'    # Renewal should have fired and rebuilt the JKS — it didn't
     return 'green'
 
 
