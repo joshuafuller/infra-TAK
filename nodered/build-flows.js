@@ -7,6 +7,25 @@ const CFG_TAB = 'flow_arcgis_cfg';
 
 // Shared snippet: write a timestamped backup of all config keys to /data/config-backups/
 // on the Docker volume immediately after any save operation.
+// Coerce any global.get() result into a clean array. Handles three rotten formats:
+//   1) localfilesystem REST envelope: { msg: "[]", format: "..." }
+//   2) double-serialized strings:     "[]"
+//   3) anything non-array (null, {}, undefined) → []
+// This MUST be used in every fn_save/fn_delete/fn_*_save before calling
+// .findIndex / .push / .filter on configs, otherwise function nodes throw
+// TypeError, never return msg, and the http-in request hangs forever.
+const ARRAY_GUARD = [
+  "function _coerceArr(_v) {",
+  "  if (_v && typeof _v === 'object' && !Array.isArray(_v) && 'msg' in _v) {",
+  "    var _m = _v.msg;",
+  "    if (typeof _m === 'string') { try { _v = JSON.parse(_m); } catch(_e) { _v = []; } }",
+  "    else _v = _m;",
+  "  }",
+  "  if (typeof _v === 'string') { try { _v = JSON.parse(_v); } catch(_e) { _v = []; } }",
+  "  return Array.isArray(_v) ? _v : [];",
+  "}"
+].join('\n');
+
 // Backup stored directly in global context (no fs/filesystem needed).
 // With localfilesystem context storage it persists to /data/context/global/global.json automatically.
 const CFG_BACKUP_SNIPPET = [
@@ -717,8 +736,9 @@ const configFlows = [
     id: 'fn_save', type: 'function', z: CFG_TAB,
     name: 'Save to global context',
     func: [
+      ARRAY_GUARD,
       "var config  = msg.payload;",
-      "var configs = global.get('arcgis_configs') || [];",
+      "var configs = _coerceArr(global.get('arcgis_configs'));",
       "var idx = configs.findIndex(function(c) {",
       "  if (config.sourceType === 'faa_tfr') return c.configName === config.configName && c.sourceType === 'faa_tfr';",
       "  if (config.sourceType === 'kml') return c.configName === config.configName && c.sourceType === 'kml';",
@@ -877,10 +897,10 @@ const configFlows = [
     id: 'fn_tc_save', type: 'function', z: CFG_TAB,
     name: 'Save TC config',
     func: [
+      ARRAY_GUARD,
       "var cfg = msg.payload || {};",
       "if (!cfg.id) { msg.payload = { ok:false, error:'missing id' }; return msg; }",
-      "var _raw = global.get('tc_configs'); if (_raw && typeof _raw === 'object' && !Array.isArray(_raw) && 'msg' in _raw) { try { _raw = JSON.parse(_raw.msg); } catch(e) { _raw = []; } }",
-      "var configs = (Array.isArray(_raw) ? _raw : null) || [];",
+      "var configs = _coerceArr(global.get('tc_configs'));",
       "var idx = configs.findIndex(function(c){ return c.id === cfg.id; });",
       "if (idx >= 0) { configs[idx] = cfg; } else { configs.push(cfg); }",
       "global.set('tc_configs', configs);",
@@ -908,12 +928,13 @@ const configFlows = [
     id: 'fn_tc_delete', type: 'function', z: CFG_TAB,
     name: 'Delete TC config',
     func: [
+      ARRAY_GUARD,
       "var id = (msg.payload||{}).id;",
       "if (!id) { msg.payload = { ok:false, error:'missing id' }; return msg; }",
-      "var _raw = global.get('tc_configs'); if (_raw && typeof _raw === 'object' && !Array.isArray(_raw) && 'msg' in _raw) { try { _raw = JSON.parse(_raw.msg); } catch(e) { _raw = []; } }",
-      "var configs = (Array.isArray(_raw) ? _raw : []).filter(function(c){ return c.id !== id; });",
+      "var configs = _coerceArr(global.get('tc_configs')).filter(function(c){ return c.id !== id; });",
       "global.set('tc_configs', configs);",
       "global.set('tc_units_'+id, null);",
+      CFG_BACKUP_SNIPPET + "\n",
       "msg.payload = { ok: true };",
       "return msg;"
     ].join('\n'),
@@ -1245,13 +1266,16 @@ const configFlows = [
       "if (!d || typeof d !== 'object' || Array.isArray(d)) d = {};",
       "// localfilesystem contextStorage wraps keys under a 'default' envelope",
       "if (d['default'] && typeof d['default'] === 'object' && !Array.isArray(d['default'])) d = d['default'];",
-      "// localfilesystem context REST API wraps each value as {msg: <json>, format: <hint>} — unwrap it",
+      "// localfilesystem context REST API wraps each value as {msg: <json>, format: <hint>} — unwrap it.",
+      "// Also handles bare strings: deploy.sh sometimes serializes values to JSON-strings; if we wrote",
+      "// those into context as-is, downstream fn_save would crash on configs.findIndex (TypeError).",
       "function unwrapCtxVal(v) {",
       "  if (v && typeof v === 'object' && !Array.isArray(v) && 'msg' in v) {",
       "    var inner = v.msg;",
       "    if (typeof inner === 'string') { try { return JSON.parse(inner); } catch(e) { return inner; } }",
       "    return inner;",
       "  }",
+      "  if (typeof v === 'string') { try { return JSON.parse(v); } catch(e) { return v; } }",
       "  return v;",
       "}",
       "var restored = [];",
@@ -4479,12 +4503,10 @@ const FN_PP_BUILD_COT_V2 = [
 
 // ── PP config CRUD (array-based, like TC) ────────────────────────────────────
 const FN_PP_SAVE = [
+  ARRAY_GUARD,
   "var cfg = msg.payload || {};",
   "if (!cfg.id) { msg.payload = { ok:false, error:'missing id' }; return msg; }",
-  "var _raw = global.get('pp_configs');",
-  "if (_raw && typeof _raw === 'object' && !Array.isArray(_raw) && 'msg' in _raw) { try { _raw = JSON.parse(_raw.msg); } catch(e) { _raw = []; } }",
-  "if (typeof _raw === 'string') { try { _raw = JSON.parse(_raw); } catch(e) { _raw = []; } }",
-  "var configs = Array.isArray(_raw) ? _raw : [];",
+  "var configs = _coerceArr(global.get('pp_configs'));",
   "var idx = configs.findIndex(function(c){ return c.id === cfg.id; });",
   "if (idx >= 0) { configs[idx] = cfg; } else { configs.push(cfg); }",
   "global.set('pp_configs', configs);",
@@ -4494,21 +4516,17 @@ const FN_PP_SAVE = [
 ].join('\n');
 
 const FN_PP_LOAD = [
-  "var _raw = global.get('pp_configs');",
-  "if (_raw && typeof _raw === 'object' && !Array.isArray(_raw) && 'msg' in _raw) { try { _raw = JSON.parse(_raw.msg); } catch(e) { _raw = []; } }",
-  "if (typeof _raw === 'string') { try { _raw = JSON.parse(_raw); } catch(e) { _raw = []; } }",
-  "var configs = Array.isArray(_raw) ? _raw : [];",
+  ARRAY_GUARD,
+  "var configs = _coerceArr(global.get('pp_configs'));",
   "msg.payload = { configs: configs };",
   "return msg;"
 ].join('\n');
 
 const FN_PP_DELETE = [
+  ARRAY_GUARD,
   "var id = (msg.payload || {}).id;",
   "if (!id) { msg.payload = { ok:false, error:'missing id' }; return msg; }",
-  "var _raw = global.get('pp_configs');",
-  "if (typeof _raw === 'string') { try { _raw = JSON.parse(_raw); } catch(e) { _raw = []; } }",
-  "var configs = Array.isArray(_raw) ? _raw : [];",
-  "configs = configs.filter(function(c){ return c.id !== id; });",
+  "var configs = _coerceArr(global.get('pp_configs')).filter(function(c){ return c.id !== id; });",
   "global.set('pp_configs', configs);",
   CFG_BACKUP_SNIPPET,
   "msg.payload = { ok: true, configCount: configs.length };",
