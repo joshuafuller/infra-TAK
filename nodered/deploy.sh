@@ -266,6 +266,18 @@ elif _ctx_is_valid "$PERSISTENT_CTX_BACKUP"; then
   echo "    Snapshot keys: $(_ctx_summary "$PERSISTENT_CTX_BACKUP")"
   cp "$PERSISTENT_CTX_BACKUP" "$NR_CTX_GLOBAL"
 else
+  # Neither live context nor persistent snapshot has real config data.
+  # Check if this is a fresh install (Node-RED has never had configs) vs
+  # a corruption/loss event (Node-RED previously had configs that are now gone).
+  # We distinguish by: has the Node-RED data volume ever had a flows.json with
+  # infra-TAK routes? If flows.json has zero http-in nodes, it's a fresh install.
+  NR_HTTP_ROUTES=$(docker exec "$CONTAINER" python3 -c \
+    "import json; f=json.load(open('/data/flows.json')); print(len([n for n in f if n.get('type')=='http in']))" \
+    2>/dev/null || echo "0")
+  if [ "$NR_HTTP_ROUTES" = "0" ]; then
+    # Fresh install — no routes, no configs, nothing to protect. Proceed.
+    echo "    Fresh install detected (no existing flows/configs) — proceeding with empty context."
+  else
   echo ""
   echo "  ╔══════════════════════════════════════════════════════════════════╗"
   echo "  ║  DEPLOY ABORTED — could not back up Node-RED context            ║"
@@ -284,6 +296,7 @@ else
   else
     exit 1
   fi
+  fi  # end: has existing routes (not fresh install)
 fi
 # ── END SAFETY GATE ──────────────────────────────────────────────────────────
 
