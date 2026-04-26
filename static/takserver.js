@@ -831,6 +831,7 @@ async function connectLdap(){
         if(split)split.addEventListener('change',function(){toggleTwoServerPanel();updateUploadHint();updateDeployModeFirstHint();});
         var extdb=document.getElementById('dep_mode_external_db');
         if(extdb)extdb.addEventListener('change',function(){toggleTwoServerPanel();updateUploadHint();updateDeployModeFirstHint();});
+        loadTakDeploymentConfig();
         fetch('/api/upload/takserver/existing').then(r=>r.json()).then(d=>{
             var hasAny=(d.packages&&d.packages.length)||d.gpg_key||d.policy;
             if(hasAny){
