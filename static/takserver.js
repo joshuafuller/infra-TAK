@@ -1046,10 +1046,14 @@ function showDeployConfig(){
     initTakDeployModeUI(cd);
     var modeChosenOnPage=getTakDeploymentMode();
     loadTakDeploymentConfig().then(function(){
-      var single=document.getElementById('dep_mode_single');
-      var split=document.getElementById('dep_mode_split');
-      if(modeChosenOnPage==='two_server'&&split){split.checked=true;if(single)single.checked=false;}
-      else if(single){single.checked=true;if(split)split.checked=false;}
+      // Only force single/split if the user explicitly chose it before clicking Configure
+      // and the saved config doesn't override it. external_db is always restored from saved config.
+      var restoredMode=getTakDeploymentMode();
+      if(restoredMode==='single_server'&&modeChosenOnPage==='two_server'){
+        var single=document.getElementById('dep_mode_single');
+        var split=document.getElementById('dep_mode_split');
+        if(split){split.checked=true;if(single)single.checked=false;}
+      }
       toggleTwoServerPanel();
       updateUploadHint();
       updateDeployModeFirstHint();
