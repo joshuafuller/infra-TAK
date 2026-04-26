@@ -21803,7 +21803,7 @@ entries:
                                         plog(f"  ✓ Created LDAP outpost (token_id={outpost_token_id})")
                                     except urllib.error.HTTPError as e:
                                         err = e.read().decode()[:200]
-                                        if e.code == 400:
+                                        if e.code in (400, 405):
                                             req = urllib.request.Request(f'{ak_url}/api/v3/outposts/instances/?search=LDAP',
                                                 headers=ak_headers)
                                             resp = urllib.request.urlopen(req, timeout=10)
