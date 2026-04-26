@@ -831,6 +831,7 @@ async function connectLdap(){
         if(split)split.addEventListener('change',function(){toggleTwoServerPanel();updateUploadHint();updateDeployModeFirstHint();});
         var extdb=document.getElementById('dep_mode_external_db');
         if(extdb)extdb.addEventListener('change',function(){toggleTwoServerPanel();updateUploadHint();updateDeployModeFirstHint();});
+        loadTakDeploymentConfig();
         fetch('/api/upload/takserver/existing').then(r=>r.json()).then(d=>{
             var hasAny=(d.packages&&d.packages.length)||d.gpg_key||d.policy;
             if(hasAny){
@@ -1045,10 +1046,14 @@ function showDeployConfig(){
     initTakDeployModeUI(cd);
     var modeChosenOnPage=getTakDeploymentMode();
     loadTakDeploymentConfig().then(function(){
-      var single=document.getElementById('dep_mode_single');
-      var split=document.getElementById('dep_mode_split');
-      if(modeChosenOnPage==='two_server'&&split){split.checked=true;if(single)single.checked=false;}
-      else if(single){single.checked=true;if(split)split.checked=false;}
+      // Only force single/split if the user explicitly chose it before clicking Configure
+      // and the saved config doesn't override it. external_db is always restored from saved config.
+      var restoredMode=getTakDeploymentMode();
+      if(restoredMode==='single_server'&&modeChosenOnPage==='two_server'){
+        var single=document.getElementById('dep_mode_single');
+        var split=document.getElementById('dep_mode_split');
+        if(split){split.checked=true;if(single)single.checked=false;}
+      }
       toggleTwoServerPanel();
       updateUploadHint();
       updateDeployModeFirstHint();
@@ -1135,7 +1140,17 @@ function initTakDeployModeUI(rootEl){
       '<div class="form-field"><label>Database Name</label><input type="text" id="edb_name" value="cot"></div>',
       '<div class="form-field"><label>Username</label><input type="text" id="edb_user" value="martiuser"></div>',
       '</div>',
-      '<div class="form-field" style="margin-bottom:12px"><label>Password</label><input type="password" id="edb_password" placeholder="DB user password" autocomplete="off" style="width:100%;padding:8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px"></div>',
+      '<div class="form-field" style="margin-bottom:12px"><label>App User Password</label><div style="position:relative"><input type="password" id="edb_password" placeholder="DB user password (leave blank to auto-generate)" autocomplete="off" style="width:100%;padding:8px 48px 8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px"><button type="button" id="edb-password-toggle" onclick="toggleSinglePassword(\'edb_password\',\'edb-password-toggle\')" style="position:absolute;right:10px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:12px;font-family:JetBrains Mono,monospace">show</button></div></div>',
+      '<div style="margin:14px 0 10px;padding:12px;background:rgba(99,102,241,0.06);border:1px solid rgba(99,102,241,0.2);border-radius:8px">',
+      '<div style="font-size:11px;color:var(--text-dim);margin-bottom:8px;text-transform:uppercase;letter-spacing:0.5px;font-weight:600">Provision Database — Admin Credentials</div>',
+      '<div style="font-size:11px;color:var(--text-dim);margin-bottom:10px">Used once to create the app user and grant permissions. Not stored.</div>',
+      '<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:10px">',
+      '<div class="form-field"><label>Admin Username</label><input type="text" id="edb_admin_user" value="postgres" autocomplete="off" style="width:100%;padding:8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px"></div>',
+      '<div class="form-field"><label>Admin Password</label><div style="position:relative"><input type="password" id="edb_admin_pass" placeholder="RDS master password" autocomplete="off" style="width:100%;padding:8px 48px 8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px"><button type="button" id="edb-admin-pass-toggle" onclick="toggleSinglePassword(\'edb_admin_pass\',\'edb-admin-pass-toggle\')" style="position:absolute;right:10px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:12px;font-family:JetBrains Mono,monospace">show</button></div></div>',
+      '</div>',
+      '<button type="button" onclick="provisionExternalDb()" id="edb_provision_btn" style="padding:8px 14px;background:rgba(99,102,241,0.2);color:#a5b4fc;border:1px solid rgba(99,102,241,0.3);border-radius:8px;font-size:12px;cursor:pointer">3. Provision Database (create user &amp; grants)</button>',
+      '<div id="external-db-provision-log" style="display:none;margin-top:10px;background:#0c0f1a;border:1px solid var(--border);border-radius:8px;padding:12px;font-family:\'JetBrains Mono\',monospace;font-size:11px;white-space:pre-wrap;color:var(--text-secondary)"></div>',
+      '</div>',
       '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px">',
       '<button type="button" onclick="saveExternalDbConfig()" style="padding:8px 14px;background:rgba(20,184,166,0.15);color:var(--teal,#14b8a6);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer">1. Save Config</button>',
       '<button type="button" onclick="testExternalDbConnection()" style="padding:8px 14px;background:rgba(59,130,246,0.15);color:var(--accent);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer">2. Test Connection</button>',
@@ -1399,6 +1414,47 @@ async function testExternalDbConnection(){
     }catch(e){
       if(msg){msg.textContent='✗ '+e.message;msg.style.color='var(--red)';}
       if(out){out.style.display='block';out.textContent=e.message;}
+    }
+}
+
+async function provisionExternalDb(){
+    var msg=document.getElementById('external-db-msg');
+    var logEl=document.getElementById('external-db-provision-log');
+    var btn=document.getElementById('edb_provision_btn');
+    var adminUser=(document.getElementById('edb_admin_user')||{}).value||'postgres';
+    var adminPass=(document.getElementById('edb_admin_pass')||{}).value||'';
+    if(!adminPass){if(msg){msg.textContent='✗ Admin password is required to provision';msg.style.color='var(--red)';}return;}
+    if(btn)btn.disabled=true;
+    if(msg){msg.textContent='Provisioning database user…';msg.style.color='var(--cyan)';}
+    if(logEl){logEl.style.display='block';logEl.textContent='Starting…';}
+    try{
+      var cfg=await saveExternalDbConfig(true);
+      var edb=(cfg&&cfg.external_db)||{};
+      var body={
+        db_host:edb.host||'',db_port:edb.port||5432,db_name:edb.name||'cot',
+        app_user:edb.user||'martiuser',app_pass:edb.password||'',
+        admin_user:adminUser,admin_pass:adminPass,config:cfg
+      };
+      var r=await fetch('/api/takserver/external-db/provision',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+      var d=await r.json();
+      if(logEl)logEl.textContent=(d.log||[]).join('\n');
+      if(d.success){
+        if(msg){msg.textContent='✓ Database provisioned — ready to Test Connection and Deploy';msg.style.color='var(--green)';}
+        // If server generated a password, fill it into the password field
+        if(d.generated_pass&&d.app_pass){
+          var pwEl=document.getElementById('edb_password');
+          if(pwEl)pwEl.value=d.app_pass;
+          if(logEl)logEl.textContent+=(logEl.textContent?'\n':'')+'\n  ↳ Auto-generated password filled into App User Password field — click Save Config.';
+          await saveExternalDbConfig(true);
+        }
+      }else{
+        if(msg){msg.textContent='✗ '+(d.error||'Provision failed');msg.style.color='var(--red)';}
+      }
+    }catch(e){
+      if(msg){msg.textContent='✗ '+e.message;msg.style.color='var(--red)';}
+      if(logEl){logEl.style.display='block';logEl.textContent=e.message;}
+    }finally{
+      if(btn)btn.disabled=false;
     }
 }
 
