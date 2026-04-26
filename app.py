@@ -1991,6 +1991,13 @@ def takserver_external_db_provision():
     ok, out = run_sql(f'GRANT ALL PRIVILEGES ON DATABASE {db_name} TO {app_user};', 'grant db')
     plog(f'  {"✓" if ok else "✗"} GRANT ALL ON DATABASE: {out if not ok else "OK"}')
 
+    # Step 3b: Grant rds_superuser on AWS RDS (required for CREATE EXTENSION postgis)
+    is_rds = '.rds.amazonaws.com' in db_host
+    if is_rds:
+        plog(f'  AWS RDS detected — granting rds_superuser to {app_user} (required for PostGIS)...')
+        ok, out = run_sql(f'GRANT rds_superuser TO {app_user};', 'grant rds_superuser')
+        plog(f'  {"✓" if ok else "✗"} rds_superuser grant: {out if not ok else "OK"}')
+
     # Step 4: Grant schema privileges (must connect to the target database)
     plog(f'  Granting schema privileges...')
     schema_sql = (
@@ -26868,6 +26875,31 @@ def run_takserver_deploy(config):
                 log_step("✗ FATAL: /opt/tak not found after install"); deploy_status.update({'error': True, 'running': False}); return
             log_step("✓ TAK Server installed")
 
+        # For external_db: patch CoreConfig JDBC URL NOW, before first start,
+        # so TAKServer's own SchemaManager (triggered by systemd) targets the right DB.
+        if config.get('external_db') and config.get('tak_deploy_cfg'):
+            _edb_early = config['tak_deploy_cfg'].get('external_db', {})
+            _edb_host_early = (_edb_early.get('host') or '').strip()
+            _edb_port_early = int(_edb_early.get('port') or 5432)
+            _edb_pass_early = (_edb_early.get('password') or '').strip()
+            _edb_user_early = (_edb_early.get('username') or 'martiuser').strip()
+            if _edb_host_early and os.path.exists('/opt/tak/CoreConfig.xml'):
+                log_step(f"External DB: pre-patching CoreConfig JDBC → {_edb_host_early}:{_edb_port_early} (before first start)...")
+                try:
+                    import re as _re_early
+                    with open('/opt/tak/CoreConfig.xml', 'r') as _f:
+                        _cc = _f.read()
+                    _jdbc_early = f'jdbc:postgresql://{_edb_host_early}:{_edb_port_early}/cot'
+                    _cc = _re_early.sub(r'jdbc:postgresql://[^"]*', _jdbc_early, _cc)
+                    _cc = _re_early.sub(r'(<connection[^>]*username=")[^"]*(")', lambda m: m.group(1) + _edb_user_early + m.group(2), _cc)
+                    if _edb_pass_early:
+                        _cc = _re_early.sub(r'(<connection[^>]*password=")[^"]*(")', lambda m: m.group(1) + _edb_pass_early + m.group(2), _cc)
+                    with open('/opt/tak/CoreConfig.xml', 'w') as _f:
+                        _f.write(_cc)
+                    log_step(f"✓ CoreConfig JDBC pre-patched to {_edb_host_early}:{_edb_port_early}")
+                except Exception as _e:
+                    log_step(f"⚠ Could not pre-patch CoreConfig JDBC: {_e}")
+
         log_step(""); log_step("━━━ Step 5/9: Starting TAK Server ━━━")
         run_cmd('systemctl daemon-reload')
         changed, resync_msg = _resync_ldap_credential_to_coreconfig()
@@ -27041,6 +27073,27 @@ def run_takserver_deploy(config):
             log_step(f"LDAP resync: {resync_msg}")
         run_cmd('systemctl stop takserver'); time.sleep(10)
         run_cmd('pkill -9 -f takserver 2>/dev/null; true', check=False); time.sleep(5)
+
+        # For external_db: run SchemaManager explicitly against RDS now that CoreConfig
+        # points at the correct host. This is the definitive schema migration for RDS —
+        # the startup-triggered one from Step 5 already ran against the correct host
+        # (due to the early JDBC patch), but we run it again here as a safety net in
+        # case the first run was interrupted or the operator skipped Provision Database.
+        if config.get('external_db') and os.path.exists('/opt/tak/db-utils/SchemaManager.jar'):
+            log_step("External DB: running SchemaManager against RDS (ensuring schema is current)...")
+            sm_r = subprocess.run(
+                'sudo -u tak java -jar /opt/tak/db-utils/SchemaManager.jar upgrade 2>&1',
+                shell=True, capture_output=True, text=True, timeout=300
+            )
+            sm_out = (sm_r.stdout or '') + (sm_r.stderr or '')
+            for line in sm_out.strip().split('\n')[:30]:
+                if line.strip():
+                    deploy_log.append(f"  {line.rstrip()}")
+            if sm_r.returncode == 0 or 'SchemaManager complete' in sm_out or 'already up to date' in sm_out.lower():
+                log_step("✓ SchemaManager upgrade complete (RDS schema ready)")
+            else:
+                log_step(f"⚠ SchemaManager exited {sm_r.returncode} — check logs above. TAK Server may still start if schema was partially applied.")
+
         run_cmd('systemctl start takserver')
         log_step("Waiting 10 minutes for full initialization before promoting admin...")
         total_wait = 600
