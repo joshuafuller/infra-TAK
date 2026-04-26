@@ -274,9 +274,41 @@ else
   NR_HTTP_ROUTES=$(docker exec "$CONTAINER" python3 -c \
     "import json; f=json.load(open('/data/flows.json')); print(len([n for n in f if n.get('type')=='http in']))" \
     2>/dev/null || echo "0")
-  if [ "$NR_HTTP_ROUTES" = "0" ]; then
-    # Fresh install — no routes, no configs, nothing to protect. Proceed.
-    echo "    Fresh install detected (no existing flows/configs) — proceeding with empty context."
+  # Also check if the live backup confirmed all counts as zero (not corrupted, just empty).
+  # If the API returned a valid response but everything is count=0, it's a legitimately
+  # unconfigured server — not a corruption event. Safe to proceed.
+  NR_ALL_ZERO=$(python3 - "$NR_CTX_GLOBAL" 2>/dev/null << 'PYEOF'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    print('no'); sys.exit(0)
+if isinstance(d, dict) and 'default' in d: d = d['default']
+def unwrap(v):
+    if isinstance(v, dict) and 'msg' in v:
+        m = v['msg']
+        if isinstance(m, str):
+            try: return json.loads(m)
+            except: return m
+        return m
+    if isinstance(v, str):
+        try: return json.loads(v)
+        except: return v
+    return v
+for k in ('arcgis_configs','tc_configs','pp_configs'):
+    v = unwrap(d.get(k))
+    if isinstance(v, list) and len(v) > 0:
+        print('no'); sys.exit(0)
+print('yes')
+PYEOF
+)
+  if [ "$NR_HTTP_ROUTES" = "0" ] || [ "$NR_ALL_ZERO" = "yes" ]; then
+    # Fresh install or legitimately unconfigured server — nothing to protect. Proceed.
+    if [ "$NR_HTTP_ROUTES" = "0" ]; then
+      echo "    Fresh install detected (no existing flows) — proceeding with empty context."
+    else
+      echo "    Unconfigured server (flows exist but no feeds saved) — proceeding with empty context."
+    fi
   else
   echo ""
   echo "  ╔══════════════════════════════════════════════════════════════════╗"
