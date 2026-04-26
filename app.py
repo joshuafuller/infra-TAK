@@ -1883,6 +1883,151 @@ def takserver_two_server_preflight():
         }
     })
 
+@app.route('/api/takserver/external-db/provision', methods=['POST'])
+@login_required
+def takserver_external_db_provision():
+    """Provision the TAK Server database user on an external/managed PostgreSQL instance.
+    Installs postgresql-client if needed, connects as the admin user, creates the app user
+    (martiuser by default), grants required privileges, and returns a log of what was done.
+    """
+    import secrets, string
+    data = request.get_json() or {}
+    settings = load_settings()
+    cfg = _get_tak_deployment_config(settings)
+    if isinstance(data.get('config'), dict):
+        cfg = _normalize_tak_deployment_config(_deep_merge_dict(cfg, data.get('config')))
+    edb = cfg.get('external_db', {})
+
+    db_host    = (data.get('db_host')    or edb.get('host')     or '').strip()
+    db_port    = int(data.get('db_port') or edb.get('port')     or 5432)
+    db_name    = (data.get('db_name')    or edb.get('name')     or 'cot').strip()
+    app_user   = (data.get('app_user')   or edb.get('user')     or 'martiuser').strip()
+    app_pass   = (data.get('app_pass')   or '').strip()
+    admin_user = (data.get('admin_user') or 'postgres').strip()
+    admin_pass = (data.get('admin_pass') or '').strip()
+
+    if not db_host:
+        return jsonify({'success': False, 'error': 'No database host provided', 'log': []}), 400
+    if not admin_pass:
+        return jsonify({'success': False, 'error': 'Admin password is required to provision the database', 'log': []}), 400
+
+    log = []
+
+    def plog(msg):
+        log.append(msg)
+
+    # Auto-generate app password if not provided
+    generated_pass = False
+    if not app_pass:
+        alphabet = string.ascii_letters + string.digits + '!@#%^&*'
+        app_pass = ''.join(secrets.choice(alphabet) for _ in range(24))
+        generated_pass = True
+        plog(f'  Generated strong password for {app_user}')
+
+    # Install postgresql-client if psql not available
+    try:
+        r = subprocess.run(['which', 'psql'], capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            plog('  psql not found — installing postgresql-client...')
+            r2 = subprocess.run(
+                ['apt-get', 'install', '-y', 'postgresql-client'],
+                capture_output=True, text=True, timeout=120
+            )
+            if r2.returncode != 0:
+                plog(f'  ✗ Failed to install postgresql-client: {(r2.stderr or r2.stdout or "")[:300]}')
+                return jsonify({'success': False, 'log': log, 'error': 'Could not install postgresql-client'}), 500
+            plog('  ✓ postgresql-client installed')
+        else:
+            plog('  ✓ psql available')
+    except Exception as e:
+        plog(f'  ✗ Error checking psql: {e}')
+        return jsonify({'success': False, 'log': log, 'error': str(e)}), 500
+
+    def run_sql(sql, label, use_db=None):
+        """Run a SQL statement as the admin user. Returns (ok, output)."""
+        try:
+            target_db = use_db or db_name
+            env = dict(os.environ, PGPASSWORD=admin_pass)
+            r = subprocess.run(
+                ['psql', '-h', db_host, '-p', str(db_port), '-U', admin_user, '-d', target_db,
+                 '-c', sql, '--no-password', '-t', '-A'],
+                capture_output=True, text=True, timeout=20, env=env
+            )
+            ok = r.returncode == 0
+            out = (r.stdout or r.stderr or '').strip()[:300]
+            return ok, out
+        except Exception as e:
+            return False, str(e)[:300]
+
+    # Step 1: Verify admin connection
+    plog(f'  Connecting as {admin_user} to {db_host}:{db_port}/{db_name}...')
+    ok, out = run_sql('SELECT 1;', 'admin connect')
+    if not ok:
+        plog(f'  ✗ Admin connection failed: {out}')
+        return jsonify({'success': False, 'log': log, 'error': f'Cannot connect as {admin_user}: {out}'}), 400
+    plog(f'  ✓ Connected as {admin_user}')
+
+    # Step 2: Create app user if it doesn't exist
+    plog(f'  Checking if user {app_user} exists...')
+    ok, out = run_sql(f"SELECT 1 FROM pg_roles WHERE rolname='{app_user}';", 'check user')
+    user_exists = ok and '1' in out
+    if user_exists:
+        plog(f'  User {app_user} already exists — updating password...')
+        ok, out = run_sql(f"ALTER USER {app_user} WITH PASSWORD '{app_pass}';", 'alter user')
+        if not ok:
+            plog(f'  ✗ Failed to update password: {out}')
+        else:
+            plog(f'  ✓ Password updated for {app_user}')
+    else:
+        plog(f'  Creating user {app_user}...')
+        ok, out = run_sql(f"CREATE USER {app_user} WITH PASSWORD '{app_pass}';", 'create user')
+        if not ok:
+            plog(f'  ✗ Failed to create user: {out}')
+            return jsonify({'success': False, 'log': log, 'error': f'Could not create user {app_user}: {out}'}), 500
+        plog(f'  ✓ Created user {app_user}')
+
+    # Step 3: Grant database privileges
+    plog(f'  Granting privileges on database {db_name} to {app_user}...')
+    ok, out = run_sql(f'GRANT ALL PRIVILEGES ON DATABASE {db_name} TO {app_user};', 'grant db')
+    plog(f'  {"✓" if ok else "✗"} GRANT ALL ON DATABASE: {out if not ok else "OK"}')
+
+    # Step 4: Grant schema privileges (must connect to the target database)
+    plog(f'  Granting schema privileges...')
+    schema_sql = (
+        f'GRANT ALL ON SCHEMA public TO {app_user}; '
+        f'ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO {app_user}; '
+        f'ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO {app_user};'
+    )
+    ok, out = run_sql(schema_sql, 'grant schema', use_db=db_name)
+    plog(f'  {"✓" if ok else "✗"} Schema grants: {out if not ok else "OK"}')
+
+    # Step 5: Verify app user can connect
+    plog(f'  Verifying {app_user} can authenticate...')
+    try:
+        env = dict(os.environ, PGPASSWORD=app_pass)
+        r = subprocess.run(
+            ['psql', '-h', db_host, '-p', str(db_port), '-U', app_user, '-d', db_name,
+             '-c', 'SELECT version();', '--no-password', '-t', '-A'],
+            capture_output=True, text=True, timeout=15, env=env
+        )
+        if r.returncode == 0:
+            plog(f'  ✓ {app_user} authenticated successfully')
+        else:
+            plog(f'  ⚠ {app_user} auth check: {(r.stderr or r.stdout or "").strip()[:200]}')
+    except Exception as e:
+        plog(f'  ⚠ Auth verify error: {e}')
+
+    plog(f'  ✓ Database provisioned — {app_user}@{db_host}:{db_port}/{db_name}')
+
+    return jsonify({
+        'success': True,
+        'log': log,
+        'app_user': app_user,
+        'app_pass': app_pass if generated_pass else None,
+        'generated_pass': generated_pass,
+    })
+
+
 @app.route('/api/takserver/external-db/test-connection', methods=['POST'])
 @login_required
 def takserver_external_db_test_connection():
