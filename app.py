@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.7.5-alpha"
+VERSION = "0.7.6-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -14872,7 +14872,16 @@ def _ensure_authentik_console_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
                     if results:
                         pk = results[0]['pk']
                         provider_pks.append(pk)
-                    log(f"  ✓ Proxy provider already exists: {name}")
+                        try:
+                            req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/{pk}/',
+                                data=json.dumps({'external_host': host, 'cookie_domain': cookie_domain}).encode(),
+                                headers=_ak_headers, method='PATCH')
+                            _urlreq.urlopen(req, timeout=10)
+                            log(f"  ✓ Proxy provider already exists: {name} (external_host updated to {host})")
+                        except Exception:
+                            log(f"  ✓ Proxy provider already exists: {name}")
+                    else:
+                        log(f"  ✓ Proxy provider already exists: {name}")
                 else:
                     log(f"  ⚠ Provider error {name}: {str(e)[:80]}")
             if pk:
