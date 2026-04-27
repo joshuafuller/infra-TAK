@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.7.8-alpha"
+VERSION = "0.7.9-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -21120,6 +21120,9 @@ def run_authentik_deploy(reconfigure=False):
                                 subprocess.run(f'cd {ak_dir} && docker compose up -d --force-recreate ldap 2>&1', shell=True, capture_output=True, text=True, timeout=60)
                                 subprocess.run(f'cd {ak_dir} && docker compose restart server worker 2>&1', shell=True, capture_output=True, text=True, timeout=90)
                                 plog("  \u2713 Restarted Authentik (LDAP + server/worker to pick up new domain)")
+                                plog("  Waiting for Authentik to come back online...")
+                                _wait_for_authentik_api(ak_url, ak_headers, max_attempts=36, plog=plog, require_200=True)
+                                plog("  \u2713 Authentik is online and ready")
                             except Exception as e:
                                 plog(f"  \u26a0 Domain sync: {str(e)[:80]}")
                     else:
