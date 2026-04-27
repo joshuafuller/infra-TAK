@@ -10687,11 +10687,13 @@ def run_takportal_deploy():
                 provider_pk = None
                 if flow_pk and inv_flow_pk:
                     try:
+                        _tp_host = f'https://{_get_service_domain(settings, "takportal") or f"takportal.{fqdn}"}'
+                        _tp_cookie = f'.{fqdn.split(":")[0]}'
                         req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/',
                             data=json_mod.dumps({'name': 'TAK Portal Proxy', 'authorization_flow': flow_pk,
                                 'invalidation_flow': inv_flow_pk,
-                                'external_host': f'https://takportal.{fqdn}', 'mode': 'forward_single',
-                                'token_validity': 'hours=24', 'cookie_domain': f'.{fqdn.split(":")[0]}'}).encode(),
+                                'external_host': _tp_host, 'mode': 'forward_single',
+                                'token_validity': 'hours=24', 'cookie_domain': _tp_cookie}).encode(),
                             headers=_ak_headers, method='POST')
                         resp = _urlreq.urlopen(req, timeout=10)
                         provider_pk = json_mod.loads(resp.read().decode())['pk']
@@ -10703,7 +10705,14 @@ def run_takportal_deploy():
                             results = json_mod.loads(resp.read().decode())['results']
                             if results:
                                 provider_pk = results[0]['pk']
-                            plog(f"  \u2713 Proxy provider already exists")
+                                try:
+                                    req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/{provider_pk}/',
+                                        data=json_mod.dumps({'external_host': _tp_host, 'cookie_domain': _tp_cookie}).encode(),
+                                        headers=_ak_headers, method='PATCH')
+                                    _urlreq.urlopen(req, timeout=10)
+                                except Exception:
+                                    pass
+                            plog(f"  \u2713 Proxy provider already exists (external_host updated)")
                         else:
                             plog(f"  \u26a0 Proxy provider error: {str(e)[:100]}")
 
@@ -14648,11 +14657,13 @@ def _ensure_authentik_nodered_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
         # Create proxy provider (same payload structure as TAK Portal)
         provider_pk = None
         try:
+            _nr_host = f'https://{_get_service_domain(settings, "nodered") if settings else f"nodered.{fqdn}"}'
+            _cookie = f'.{fqdn.split(":")[0]}'
             req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/',
                 data=json.dumps({'name': 'Node-RED Proxy', 'authorization_flow': flow_pk,
                     'invalidation_flow': inv_flow_pk,
-                    'external_host': f'https://nodered.{fqdn}', 'mode': 'forward_single',
-                    'token_validity': 'hours=24', 'cookie_domain': f'.{fqdn.split(":")[0]}'}).encode(),
+                    'external_host': _nr_host, 'mode': 'forward_single',
+                    'token_validity': 'hours=24', 'cookie_domain': _cookie}).encode(),
                 headers=_ak_headers, method='POST')
             resp = _urlreq.urlopen(req, timeout=10)
             provider_pk = json.loads(resp.read().decode())['pk']
@@ -14666,12 +14677,12 @@ def _ensure_authentik_nodered_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
                     provider_pk = results[0]['pk']
                     try:
                         req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/{provider_pk}/',
-                            data=json.dumps({'external_host': f'https://nodered.{fqdn}', 'cookie_domain': f'.{fqdn.split(":")[0]}'}).encode(),
+                            data=json.dumps({'external_host': _nr_host, 'cookie_domain': _cookie}).encode(),
                             headers=_ak_headers, method='PATCH')
                         _urlreq.urlopen(req, timeout=10)
                     except Exception:
                         pass
-                log("  ✓ Proxy provider already exists (external_host updated to nodered subdomain)")
+                log("  ✓ Proxy provider already exists (external_host updated)")
             else:
                 log(f"  ⚠ Proxy provider error: {str(e)[:100]}")
 
@@ -15273,7 +15284,7 @@ def _sync_authentik_takportal_provider_url(settings, plog=None):
         return
     ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
     base = fqdn.split(':')[0].split('/')[0]
-    desired_host = f'https://takportal.{base}'
+    desired_host = f'https://{_get_service_domain(settings, "takportal") or f"takportal.{base}"}'
     desired_cookie = f'.{base}'
     provider_pk = None
     try:
