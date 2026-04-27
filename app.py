@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.7.4-alpha"
+VERSION = "0.7.5-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -6927,23 +6927,26 @@ def caddy_get_domains():
     for key, label, mod_key, installed in svc_defs:
         setting_key = f'{key}_domain' if key != 'mediamtx' else 'mediamtx_domain'
         custom = settings.get(setting_key, '')
+        alias = settings.get(f'{key}_domain_alias', '')
         services.append({
             'key': key, 'label': label, 'domain': sd[key],
             'default': f'{SERVICE_DOMAIN_DEFAULTS[key]}.{fqdn}' if fqdn else '',
-            'custom': custom, 'installed': installed,
+            'custom': custom, 'alias': alias, 'installed': installed,
         })
     return jsonify({'fqdn': fqdn, 'services': services})
 
 @app.route('/api/caddy/domains', methods=['POST'])
 @login_required
 def caddy_save_domains():
-    """Save per-service domain overrides and regenerate Caddyfile."""
+    """Save per-service domain overrides (and optional aliases) and regenerate Caddyfile."""
     data = request.get_json() or {}
     domains = data.get('domains', {})
+    aliases = data.get('aliases', {})
     settings = load_settings()
     fqdn = settings.get('fqdn', '')
     for key in SERVICE_DOMAIN_DEFAULTS:
         setting_key = f'{key}_domain' if key != 'mediamtx' else 'mediamtx_domain'
+        alias_key = f'{key}_domain_alias'
         if key in domains:
             val = domains[key].strip().lower()
             default_val = f'{SERVICE_DOMAIN_DEFAULTS[key]}.{fqdn}' if fqdn else ''
@@ -6951,6 +6954,12 @@ def caddy_save_domains():
                 settings[setting_key] = val
             elif setting_key in settings:
                 del settings[setting_key]
+        if key in aliases:
+            av = aliases[key].strip().lower()
+            if av:
+                settings[alias_key] = av
+            elif alias_key in settings:
+                del settings[alias_key]
     save_settings(settings)
     generate_caddyfile(settings)
     threading.Thread(target=_caddy_restart_after_response, daemon=True).start()
@@ -8689,6 +8698,10 @@ def _safe_migration_db_host(hostname):
     return False
 
 
+def _get_service_alias(settings, service_key):
+    """Return the configured alias domain for a service (or empty string)."""
+    return settings.get(f'{service_key}_domain_alias', '').strip()
+
 def generate_caddyfile(settings=None):
     """Generate Caddyfile based on current settings and deployed services.
     Each service gets its own domain (customizable per-service, defaults to subdomain of base FQDN)."""
@@ -8701,6 +8714,16 @@ def generate_caddyfile(settings=None):
 
     lines = [f"# infra-TAK - Auto-generated Caddyfile", f"# Base Domain: {domain}", ""]
     sd = _get_all_service_domains(settings)
+
+    def _emit_alias_redirect(alias, canonical):
+        """Emit a 301-redirect stanza: alias → canonical."""
+        if not alias or alias == canonical:
+            return
+        lines.append(f"# Alias → redirect to canonical {canonical}")
+        lines.append(f"{alias} {{")
+        lines.append(f"    redir https://{canonical}{{uri}} permanent")
+        lines.append(f"}}")
+        lines.append("")
     ak_up = _get_authentik_upstream(settings)
 
     ak = modules.get('authentik', {})
@@ -8750,6 +8773,7 @@ def generate_caddyfile(settings=None):
         lines.append(f"    }}")
     lines.append(f"}}")
     lines.append("")
+    _emit_alias_redirect(_get_service_alias(settings, 'infratak'), infratak_host)
 
     if nodered.get('installed'):
         nodered_host = sd['nodered']
@@ -8775,6 +8799,7 @@ def generate_caddyfile(settings=None):
             lines.append(f"    reverse_proxy {nodered_up}")
         lines.append(f"}}")
         lines.append("")
+        _emit_alias_redirect(_get_service_alias(settings, 'nodered'), nodered_host)
 
     tak = modules.get('takserver', {})
     if tak.get('installed'):
@@ -8791,6 +8816,7 @@ def generate_caddyfile(settings=None):
         lines.append(f"    }}")
         lines.append(f"}}")
         lines.append("")
+        _emit_alias_redirect(_get_service_alias(settings, 'takserver'), tak_host)
 
     ak = modules.get('authentik', {})
     if ak.get('installed'):
@@ -8808,6 +8834,7 @@ def generate_caddyfile(settings=None):
             lines.append(f"    reverse_proxy {ak_up}")
             lines.append(f"}}")
             lines.append("")
+        _emit_alias_redirect(_get_service_alias(settings, 'authentik'), ak_host)
 
     portal = modules.get('takportal', {})
     if portal.get('installed'):
@@ -8839,6 +8866,7 @@ def generate_caddyfile(settings=None):
             lines.append(f"    reverse_proxy {portal_up}")
         lines.append(f"}}")
         lines.append("")
+        _emit_alias_redirect(_get_service_alias(settings, 'takportal'), portal_host)
 
     cloudtak = modules.get('cloudtak', {})
     if cloudtak.get('installed'):
@@ -8857,24 +8885,24 @@ def generate_caddyfile(settings=None):
         lines.append(f"    }}")
         lines.append(f"}}")
         lines.append("")
-        lines.append(f"# CloudTAK Tile Server (CORS for map origin)")
+        _emit_alias_redirect(_get_service_alias(settings, 'cloudtak_map'), ct_map)
+        lines.append(f"# CloudTAK Tile Server")
         lines.append(f"{ct_tiles} {{")
-        lines.append(f"    header Access-Control-Allow-Origin *")
         lines.append(f"    reverse_proxy {ct_up['tiles']}")
         lines.append(f"}}")
         lines.append("")
+        _emit_alias_redirect(_get_service_alias(settings, 'cloudtak_tiles'), ct_tiles)
         lines.append(f"# CloudTAK Media (video) — /stream/* → HLS, rest → MediaMTX API")
         lines.append(f"{ct_video} {{")
         lines.append(f"    handle /stream/* {{")
-        lines.append(f"        header Access-Control-Allow-Origin *")
         lines.append(f"        reverse_proxy {ct_up['video_hls']}")
         lines.append(f"    }}")
         lines.append(f"    handle {{")
-        lines.append(f"        header Access-Control-Allow-Origin *")
         lines.append(f"        reverse_proxy {ct_up['video_api']}")
         lines.append(f"    }}")
         lines.append(f"}}")
         lines.append("")
+        _emit_alias_redirect(_get_service_alias(settings, 'cloudtak_video'), ct_video)
 
     mtx = modules.get('mediamtx', {})
     if mtx.get('installed'):
@@ -8916,6 +8944,7 @@ def generate_caddyfile(settings=None):
             lines.append(f"    reverse_proxy {mtx_up}")
         lines.append(f"}}")
         lines.append("")
+        _emit_alias_redirect(_get_service_alias(settings, 'mediamtx'), mtx_host)
 
     fedhub = modules.get('fedhub', {})
     if fedhub.get('installed'):
@@ -8973,6 +9002,7 @@ def generate_caddyfile(settings=None):
                     lines.append(f"    {rp_line}")
             lines.append(f"}}")
             lines.append("")
+            _emit_alias_redirect(_get_service_alias(settings, 'fedhub'), fh_host)
 
     caddyfile = '\n'.join(lines)
     # Preserve user-added blocks (e.g. health.tntak.net for Uptime Robot) that sit below the marker.
@@ -18950,9 +18980,10 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <summary style="cursor:pointer;font-family:'JetBrains Mono',monospace;font-size:14px;font-weight:600;color:var(--text-secondary);padding:12px 0;user-select:none">Service Domains <span style="font-size:11px;color:var(--text-dim);font-weight:400">— customize per-service domains</span></summary>
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-top:8px">
 <div style="font-size:12px;color:var(--text-dim);margin-bottom:16px;line-height:1.5">Override any service's domain. Leave blank to use the default (<code style="background:rgba(255,255,255,.05);padding:1px 5px;border-radius:3px">prefix.basedomain</code>). Enter a full domain (e.g. <code style="background:rgba(255,255,255,.05);padding:1px 5px;border-radius:3px">mystreams.tv</code>) or just a prefix (e.g. <code style="background:rgba(255,255,255,.05);padding:1px 5px;border-radius:3px">live</code> → <code style="background:rgba(255,255,255,.05);padding:1px 5px;border-radius:3px">live.{{ settings.get('fqdn','') }}</code>).</div>
-<div id="svc-domains-grid" style="display:grid;grid-template-columns:140px 1fr;gap:8px 16px;align-items:center">
+<div id="svc-domains-grid" style="display:grid;grid-template-columns:140px 1fr 1fr;gap:8px 16px;align-items:center">
 <div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;padding-bottom:4px;border-bottom:1px solid var(--border)">Service</div>
 <div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;padding-bottom:4px;border-bottom:1px solid var(--border)">Domain</div>
+<div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;padding-bottom:4px;border-bottom:1px solid var(--border)">Alias <span style="font-weight:400;text-transform:none;letter-spacing:0">(optional — migration / old URL)</span></div>
 </div>
 <div id="svc-domains-loading" style="text-align:center;padding:20px;color:var(--text-dim);font-size:12px">Loading...</div>
 <div style="display:flex;gap:12px;align-items:center;margin-top:16px;padding-top:16px;border-top:1px solid var(--border)">
@@ -19081,19 +19112,19 @@ async function loadServiceDomains(){
             var nameDiv=document.createElement('div');
             nameDiv.style.cssText='font-family:"JetBrains Mono",monospace;font-size:12px;font-weight:500;color:'+(s.installed?'var(--text-primary)':'var(--text-dim)')+';display:flex;align-items:center;gap:6px;padding:8px 0';
             nameDiv.innerHTML=s.label+(s.installed?'':' <span style="font-size:9px;color:var(--text-dim);background:rgba(71,85,105,.3);padding:1px 6px;border-radius:3px">not installed</span>');
-            var inputDiv=document.createElement('div');
-            inputDiv.style.cssText='padding:4px 0';
-            var inp=document.createElement('input');
-            inp.type='text';inp.id='svc-domain-'+s.key;
-            inp.value=s.custom||'';
-            inp.placeholder=s.default||s.key;
-            inp.style.cssText='width:100%;padding:8px 12px;background:var(--bg-deep);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:"JetBrains Mono",monospace;font-size:12px;outline:none;transition:border-color .2s';
-            inp.onfocus=function(){this.style.borderColor='var(--cyan)'};
-            inp.onblur=function(){this.style.borderColor='var(--border)'};
-            if(!s.installed){inp.style.opacity='0.5'}
-            inputDiv.appendChild(inp);
+            function mkInput(id,val,ph){
+                var d2=document.createElement('div');d2.style.cssText='padding:4px 0';
+                var i=document.createElement('input');
+                i.type='text';i.id=id;i.value=val||'';i.placeholder=ph||'';
+                i.style.cssText='width:100%;padding:8px 12px;background:var(--bg-deep);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:"JetBrains Mono",monospace;font-size:12px;outline:none;transition:border-color .2s';
+                i.onfocus=function(){this.style.borderColor='var(--cyan)'};
+                i.onblur=function(){this.style.borderColor='var(--border)'};
+                if(!s.installed){i.style.opacity='0.5'}
+                d2.appendChild(i);return d2;
+            }
             grid.appendChild(nameDiv);
-            grid.appendChild(inputDiv);
+            grid.appendChild(mkInput('svc-domain-'+s.key, s.custom, s.default||s.key));
+            grid.appendChild(mkInput('svc-alias-'+s.key, s.alias, 'e.g. old-name.'+d.fqdn));
         });
         window._svcDomainKeys=d.services.map(function(s){return s.key});
     }catch(e){
@@ -19106,13 +19137,15 @@ async function saveDomains(){
     var status=document.getElementById('save-domains-status');
     btn.disabled=true;btn.textContent='Saving...';btn.style.opacity='0.7';
     status.textContent='';status.style.color='var(--cyan)';
-    var domains={};
+    var domains={};var aliases={};
     (window._svcDomainKeys||[]).forEach(function(k){
         var inp=document.getElementById('svc-domain-'+k);
         if(inp)domains[k]=inp.value.trim();
+        var ainp=document.getElementById('svc-alias-'+k);
+        if(ainp)aliases[k]=ainp.value.trim();
     });
     try{
-        var r=await fetch('/api/caddy/domains',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({domains:domains})});
+        var r=await fetch('/api/caddy/domains',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({domains:domains,aliases:aliases})});
         var d=await r.json();
         if(d.success){
             status.style.color='var(--green)';status.textContent='Saved — Caddy reloading…';
