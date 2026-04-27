@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.7.7-alpha"
+VERSION = "0.7.8-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -14874,13 +14874,23 @@ def _ensure_authentik_console_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
                 pk = _existing[name]
                 provider_pks.append(pk)
                 try:
+                    # GET current provider so we can send a valid full-object PATCH
+                    _get_req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/{pk}/', headers=_ak_headers)
+                    _current = json.loads(_urlreq.urlopen(_get_req, timeout=10).read().decode())
+                    _current['external_host'] = host
+                    _current['cookie_domain'] = cookie_domain
                     req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/{pk}/',
-                        data=json.dumps({'external_host': host, 'cookie_domain': cookie_domain}).encode(),
-                        headers=_ak_headers, method='PATCH')
+                        data=json.dumps(_current).encode(),
+                        headers=_ak_headers, method='PUT')
                     _urlreq.urlopen(req, timeout=10)
                     log(f"  ✓ Proxy provider updated: {name} → {host}")
                 except Exception as e:
-                    log(f"  ⚠ Proxy provider PATCH failed: {name}: {str(e)[:80]}")
+                    _err_body = ''
+                    try:
+                        _err_body = e.read().decode()[:200]
+                    except Exception:
+                        pass
+                    log(f"  ⚠ Proxy provider update failed: {name}: {str(e)[:80]} {_err_body}")
             else:
                 try:
                     req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/',
