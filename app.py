@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.7.6-alpha"
+VERSION = "0.7.7-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -14861,40 +14861,40 @@ def _ensure_authentik_console_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
         provider_pks = []
         base_domain = fqdn.split(':')[0]
         cookie_domain = f'.{base_domain}'
+        # Fetch all existing proxy providers once — avoids POST→catch-400→search dance
+        try:
+            _list_req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/?page_size=200', headers=_ak_headers)
+            _existing = {p['name']: p['pk'] for p in json.loads(_urlreq.urlopen(_list_req, timeout=10).read().decode()).get('results', [])}
+        except Exception as e:
+            _existing = {}
+            log(f"  ⚠ Could not list proxy providers: {str(e)[:80]}")
         for name, slug, host in entries:
             pk = None
-            try:
-                req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/',
-                    data=json.dumps({'name': name, 'authorization_flow': flow_pk,
-                        'invalidation_flow': inv_flow_pk,
-                        'external_host': host, 'mode': 'forward_single',
-                        'token_validity': 'hours=24', 'cookie_domain': cookie_domain}).encode(),
-                    headers=_ak_headers, method='POST')
-                resp = _urlreq.urlopen(req, timeout=10)
-                pk = json.loads(resp.read().decode())['pk']
+            if name in _existing:
+                pk = _existing[name]
                 provider_pks.append(pk)
-                log(f"  ✓ Proxy provider created: {name}")
-            except Exception as e:
-                if hasattr(e, 'code') and e.code == 400:
-                    import urllib.parse as _uparse
-                    req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/?search={_uparse.quote(name)}', headers=_ak_headers)
+                try:
+                    req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/{pk}/',
+                        data=json.dumps({'external_host': host, 'cookie_domain': cookie_domain}).encode(),
+                        headers=_ak_headers, method='PATCH')
+                    _urlreq.urlopen(req, timeout=10)
+                    log(f"  ✓ Proxy provider updated: {name} → {host}")
+                except Exception as e:
+                    log(f"  ⚠ Proxy provider PATCH failed: {name}: {str(e)[:80]}")
+            else:
+                try:
+                    req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/',
+                        data=json.dumps({'name': name, 'authorization_flow': flow_pk,
+                            'invalidation_flow': inv_flow_pk,
+                            'external_host': host, 'mode': 'forward_single',
+                            'token_validity': 'hours=24', 'cookie_domain': cookie_domain}).encode(),
+                        headers=_ak_headers, method='POST')
                     resp = _urlreq.urlopen(req, timeout=10)
-                    results = json.loads(resp.read().decode())['results']
-                    if results:
-                        pk = results[0]['pk']
-                        provider_pks.append(pk)
-                        try:
-                            req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/{pk}/',
-                                data=json.dumps({'external_host': host, 'cookie_domain': cookie_domain}).encode(),
-                                headers=_ak_headers, method='PATCH')
-                            _urlreq.urlopen(req, timeout=10)
-                            log(f"  ✓ Proxy provider already exists: {name} (external_host updated to {host})")
-                        except Exception:
-                            log(f"  ✓ Proxy provider already exists: {name}")
-                    else:
-                        log(f"  ✓ Proxy provider already exists: {name}")
-                else:
-                    log(f"  ⚠ Provider error {name}: {str(e)[:80]}")
+                    pk = json.loads(resp.read().decode())['pk']
+                    provider_pks.append(pk)
+                    log(f"  ✓ Proxy provider created: {name} → {host}")
+                except Exception as e:
+                    log(f"  ⚠ Proxy provider create failed: {name}: {str(e)[:80]}")
             if pk:
                 try:
                     req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/',
