@@ -20417,7 +20417,7 @@ entries:
   postgresql:
     image: docker.io/library/postgres:16-alpine
     restart: unless-stopped
-    command: postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=10s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6
+    command: postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=30s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
       start_period: 20s
@@ -20863,9 +20863,9 @@ def _ensure_authentik_compose_patches(compose_path, plog=None):
             lines = f.readlines()
         changed = False
 
-        pg_cmd = 'postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=10s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
+        pg_cmd = 'postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=30s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
         has_pg_cmd = any('max_connections=300' in l for l in lines)
-        needs_pg_update = has_pg_cmd and (not any('idle_in_transaction_session_timeout' in l for l in lines) or any('idle_in_transaction_session_timeout=300s' in l for l in lines) or any('idle_in_transaction_session_timeout=30s' in l for l in lines) or any('idle_in_transaction_session_timeout=120s' in l for l in lines))
+        needs_pg_update = has_pg_cmd and (not any('idle_in_transaction_session_timeout' in l for l in lines) or any('idle_in_transaction_session_timeout=300s' in l for l in lines) or any('idle_in_transaction_session_timeout=10s' in l for l in lines) or any('idle_in_transaction_session_timeout=120s' in l for l in lines))
         if not has_pg_cmd:
             patched = []
             for line in lines:
@@ -20951,7 +20951,7 @@ def _apply_authentik_pg_tuning(ak_dir, plog):
                 f'cd {ak_dir} && docker compose up -d --force-recreate postgresql 2>&1',
                 shell=True, capture_output=True, text=True, timeout=120
             )
-            plog("  ✓ PostgreSQL recreated with updated tuning (idle_in_transaction_session_timeout=10s)")
+            plog("  ✓ PostgreSQL recreated with updated tuning (idle_in_transaction_session_timeout=30s)")
         else:
             subprocess.run(
                 f'cd {ak_dir} && docker compose exec -T postgresql psql -U authentik -d authentik -c "SELECT pg_reload_conf();" 2>&1',
@@ -21470,26 +21470,26 @@ entries:
                 needs_write = True
                 plog("  Added blueprint mount to server & worker")
             # Add postgres command-line tuning (max_connections, idle_session_timeout, tcp_keepalives)
-            pg_cmd = 'postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=10s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
+            pg_cmd = 'postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=30s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
             has_pg_cmd = any('max_connections=300' in l for l in lines)
-            needs_pg_update = has_pg_cmd and (not any('idle_in_transaction_session_timeout' in l for l in lines) or any('idle_in_transaction_session_timeout=300s' in l for l in lines) or any('idle_in_transaction_session_timeout=30s' in l for l in lines) or any('idle_in_transaction_session_timeout=120s' in l for l in lines))
-            if not has_pg_cmd:
-                patched = []
-                for line in lines:
-                    patched.append(line)
-                    if 'image: docker.io/library/postgres:' in line:
-                        indent = line[:len(line) - len(line.lstrip())]
-                        patched.append(f'{indent}command: {pg_cmd}\n')
-                lines = patched
-                needs_write = True
-                plog("  Added PostgreSQL command-line tuning")
+        needs_pg_update = has_pg_cmd and (not any('idle_in_transaction_session_timeout' in l for l in lines) or any('idle_in_transaction_session_timeout=300s' in l for l in lines) or any('idle_in_transaction_session_timeout=10s' in l for l in lines) or any('idle_in_transaction_session_timeout=120s' in l for l in lines))
+        if not has_pg_cmd:
+            patched = []
+            for line in lines:
+                patched.append(line)
+                if 'image: docker.io/library/postgres:' in line:
+                    indent = line[:len(line) - len(line.lstrip())]
+                    patched.append(f'{indent}command: {pg_cmd}\n')
+            lines = patched
+            needs_write = True
+            plog("  Added PostgreSQL command-line tuning")
             elif needs_pg_update:
                 for i, line in enumerate(lines):
                     if 'command: postgres' in line and 'max_connections' in line:
                         indent = line[:len(line) - len(line.lstrip())]
                         lines[i] = f'{indent}command: {pg_cmd}\n'
                         needs_write = True
-                        plog("  Updated PostgreSQL idle_in_transaction_session_timeout to 10s")
+                        plog("  Updated PostgreSQL idle_in_transaction_session_timeout to 30s")
                         break
 
             # Pin AUTHENTIK_TAG to latest stable release
