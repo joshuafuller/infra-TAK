@@ -29337,19 +29337,60 @@ def _startup_migrations():
         import traceback; traceback.print_exc()
 
 def _post_update_auto_deploy():
-    """After a console update, automatically re-deploy Guard Dog and reconfigure Authentik."""
+    """After a console update, automatically re-deploy Guard Dog and reconfigure Authentik.
+
+    NOTE on the version-save race (v0.8.4 fix):
+    Earlier versions saved last_console_version BEFORE the migration thread ran. During
+    a `systemctl restart`, gunicorn often briefly spawns and reaps a transient worker
+    before the new master takes over. That transient worker would import the module,
+    save the new version, spawn the daemon thread (which sleeps 10s before doing
+    anything), and then be killed by the master — taking the daemon thread with it.
+    The next worker would see last_ver == VERSION and short-circuit; migrations
+    silently never ran. Fix: only save last_console_version AFTER migrations
+    complete, gated by a stale-tolerant lockfile so multiple workers don't race.
+    """
     try:
         s = load_settings()
         last_ver = s.get('last_console_version', '')
         if last_ver == VERSION:
             return
-        s['last_console_version'] = VERSION
-        save_settings(s)
+
+        lock_path = '/tmp/takwerx-post-update.lock'
+
+        def _lock_holder_alive():
+            try:
+                with open(lock_path) as _lf:
+                    parts = _lf.read().split()
+                holder_pid = int(parts[0]) if parts else 0
+                if holder_pid <= 0:
+                    return False
+                try:
+                    os.kill(holder_pid, 0)
+                    return True
+                except (ProcessLookupError, PermissionError):
+                    return False
+            except (FileNotFoundError, ValueError, IndexError, OSError):
+                return False
+
+        try:
+            if os.path.exists(lock_path):
+                age = time.time() - os.path.getmtime(lock_path)
+                if not _lock_holder_alive() or age > 1800:
+                    try:
+                        os.unlink(lock_path)
+                    except FileNotFoundError:
+                        pass
+                else:
+                    return
+            with open(lock_path, 'x') as _lf:
+                _lf.write(f"{os.getpid()} {VERSION}\n")
+        except (FileExistsError, OSError):
+            return
 
         if last_ver == '':
-            print(f"Post-update: first run of auto-deploy at {VERSION}, running full deploy")
+            print(f"Post-update: first run of auto-deploy at {VERSION}, running full deploy", flush=True)
         else:
-            print(f"Post-update: version changed {last_ver} → {VERSION}, scheduling auto-deploy")
+            print(f"Post-update: version changed {last_ver} → {VERSION}, scheduling auto-deploy", flush=True)
 
         def _run_post_update():
             import time
@@ -29870,7 +29911,26 @@ def _post_update_auto_deploy():
 
             print("Post-update: auto-deploy complete")
 
-        threading.Thread(target=_run_post_update, daemon=True).start()
+        def _run_post_update_guarded():
+            try:
+                _run_post_update()
+            except Exception as _e:
+                print(f"Post-update: migration thread error: {_e}", flush=True)
+            finally:
+                try:
+                    s_done = load_settings()
+                    s_done['last_console_version'] = VERSION
+                    save_settings(s_done)
+                    print(f"Post-update: last_console_version saved as {VERSION}", flush=True)
+                except Exception as _e:
+                    print(f"Post-update: failed to save last_console_version: {_e}", flush=True)
+                try:
+                    if os.path.exists(lock_path):
+                        os.unlink(lock_path)
+                except Exception:
+                    pass
+
+        threading.Thread(target=_run_post_update_guarded, daemon=True).start()
     except Exception as e:
         print(f"Post-update auto-deploy error: {e}")
 
