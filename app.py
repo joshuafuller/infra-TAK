@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.8.1-alpha"
+VERSION = "0.8.2-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -29242,6 +29242,32 @@ def _post_update_auto_deploy():
                                 print("Post-update: patched LDAP AUTHENTIK_HOST → internal Docker URL, restarted ldap (outpost was not connected)")
             except Exception as _e:
                 print(f"Post-update: LDAP AUTHENTIK_HOST fix skipped: {_e}")
+
+            # Ensure AUTHENTIK_WEB_WORKERS=4 so the flow executor has enough capacity to handle
+            # bind storms after restarts without thundering-herd overload. Only restarts the
+            # server container (not ldap) — server restarts are fast and do not clear bind caches.
+            try:
+                ak_env = os.path.expanduser('~/authentik/.env')
+                if os.path.exists(ak_env):
+                    with open(ak_env) as _f:
+                        _env_text = _f.read()
+                    import re as _re2
+                    _existing = _re2.search(r'^AUTHENTIK_WEB_WORKERS\s*=\s*(\d+)', _env_text, _re2.M)
+                    _current_workers = int(_existing.group(1)) if _existing else 0
+                    if _current_workers < 4:
+                        if _existing:
+                            _env_text = _re2.sub(r'^AUTHENTIK_WEB_WORKERS\s*=.*', 'AUTHENTIK_WEB_WORKERS=4', _env_text, flags=_re2.M)
+                        else:
+                            _env_text = _env_text.rstrip('\n') + '\nAUTHENTIK_WEB_WORKERS=4\n'
+                        with open(ak_env, 'w') as _f:
+                            _f.write(_env_text)
+                        subprocess.run('cd ~/authentik && docker compose restart server',
+                            shell=True, capture_output=True, text=True, timeout=120)
+                        print("Post-update: set AUTHENTIK_WEB_WORKERS=4 and restarted server (ldap untouched)")
+                    else:
+                        print(f"Post-update: AUTHENTIK_WEB_WORKERS already={_current_workers}, no change")
+            except Exception as _e:
+                print(f"Post-update: AUTHENTIK_WEB_WORKERS fix skipped: {_e}")
 
             # Re-deploy Guard Dog (updated scripts + timers)
             if os.path.exists('/opt/tak-guarddog') and os.path.exists('/opt/tak'):

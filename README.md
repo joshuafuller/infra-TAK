@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Latest release: v0.8.1-alpha** — **Hotfix:** v0.8.0 post-update migration restarted the LDAP outpost on all existing installs, clearing cached bind sessions and causing a thundering-herd reconnect storm (CPU spike, Postgres exhaustion) on active deployments. Migration now only runs if the outpost is actually broken. See **[docs/RELEASE-v0.8.1-alpha.md](docs/RELEASE-v0.8.1-alpha.md)**. Prior: **v0.8.0-alpha** — LDAP outpost TLS fix for fresh installs. Prior: **v0.7.9-alpha** — Authentik reconfigure waits for API ready. Prior: [v0.7.0-alpha](docs/RELEASE-v0.7.0-alpha.md) (IPAWS KML network link, zone polygons, NAPSG icons), [v0.6.8-alpha](docs/RELEASE-v0.6.8-alpha.md) (Node-RED deploy sync fix), [v0.6.7-alpha](docs/RELEASE-v0.6.7-alpha.md) (DataSync read-only missions, shared missions), [v0.6.5-alpha](docs/RELEASE-v0.6.5-alpha.md) (KML + ArcGIS stable-ID / Purge), [v0.6.4-alpha](docs/RELEASE-v0.6.4-alpha.md). Older: [v0.6.1-alpha](docs/RELEASE-v0.6.1-alpha.md), [v0.6.0-alpha](docs/RELEASE-v0.6.0-alpha.md), [v0.5.9-alpha](docs/RELEASE-v0.5.9-alpha.md), [v0.5.8-alpha](docs/RELEASE-v0.5.8-alpha.md), [v0.5.7-alpha](docs/RELEASE-v0.5.7-alpha.md), [v0.5.6-alpha](docs/RELEASE-v0.5.6-alpha.md), [v0.5.5-alpha](docs/RELEASE-v0.5.5-alpha.md), [v0.5.4-alpha](docs/RELEASE-v0.5.4-alpha.md), [v0.5.3-alpha](docs/RELEASE-v0.5.3-alpha.md), [v0.5.2-alpha](docs/RELEASE-v0.5.2-alpha.md), [v0.5.1-alpha](docs/RELEASE-v0.5.1-alpha.md), [v0.5.0-alpha](docs/RELEASE-v0.5.0-alpha.md), [v0.4.9-alpha](docs/RELEASE-v0.4.9-alpha.md), [v0.4.8-alpha](docs/RELEASE-v0.4.8-alpha.md), [v0.4.7-alpha](docs/RELEASE-v0.4.7-alpha.md), [v0.4.6-alpha](docs/RELEASE-v0.4.6-alpha.md), [v0.4.5-alpha](docs/RELEASE-v0.4.5-alpha.md), [v0.4.4-alpha](docs/RELEASE-v0.4.4-alpha.md), [v0.4.3-alpha](docs/RELEASE-v0.4.3-alpha.md), [v0.4.2-alpha](docs/RELEASE-v0.4.2-alpha.md).
+**Latest release: v0.8.2-alpha** — **Fix:** post-update migration now automatically sets `AUTHENTIK_WEB_WORKERS=4` so active deployments have enough capacity to handle bind storms after restarts. Restarts only the server (not ldap — bind caches preserved). No operator action required. See **[docs/RELEASE-v0.8.2-alpha.md](docs/RELEASE-v0.8.2-alpha.md)**. Prior: **v0.8.1-alpha** — LDAP migration conditional hotfix. Prior: **v0.8.0-alpha** — LDAP outpost TLS fix for fresh installs. Prior: **v0.7.9-alpha** — Authentik reconfigure waits for API ready. Prior: [v0.7.0-alpha](docs/RELEASE-v0.7.0-alpha.md) (IPAWS KML network link, zone polygons, NAPSG icons), [v0.6.8-alpha](docs/RELEASE-v0.6.8-alpha.md) (Node-RED deploy sync fix), [v0.6.7-alpha](docs/RELEASE-v0.6.7-alpha.md) (DataSync read-only missions, shared missions), [v0.6.5-alpha](docs/RELEASE-v0.6.5-alpha.md) (KML + ArcGIS stable-ID / Purge), [v0.6.4-alpha](docs/RELEASE-v0.6.4-alpha.md). Older: [v0.6.1-alpha](docs/RELEASE-v0.6.1-alpha.md), [v0.6.0-alpha](docs/RELEASE-v0.6.0-alpha.md), [v0.5.9-alpha](docs/RELEASE-v0.5.9-alpha.md), [v0.5.8-alpha](docs/RELEASE-v0.5.8-alpha.md), [v0.5.7-alpha](docs/RELEASE-v0.5.7-alpha.md), [v0.5.6-alpha](docs/RELEASE-v0.5.6-alpha.md), [v0.5.5-alpha](docs/RELEASE-v0.5.5-alpha.md), [v0.5.4-alpha](docs/RELEASE-v0.5.4-alpha.md), [v0.5.3-alpha](docs/RELEASE-v0.5.3-alpha.md), [v0.5.2-alpha](docs/RELEASE-v0.5.2-alpha.md), [v0.5.1-alpha](docs/RELEASE-v0.5.1-alpha.md), [v0.5.0-alpha](docs/RELEASE-v0.5.0-alpha.md), [v0.4.9-alpha](docs/RELEASE-v0.4.9-alpha.md), [v0.4.8-alpha](docs/RELEASE-v0.4.8-alpha.md), [v0.4.7-alpha](docs/RELEASE-v0.4.7-alpha.md), [v0.4.6-alpha](docs/RELEASE-v0.4.6-alpha.md), [v0.4.5-alpha](docs/RELEASE-v0.4.5-alpha.md), [v0.4.4-alpha](docs/RELEASE-v0.4.4-alpha.md), [v0.4.3-alpha](docs/RELEASE-v0.4.3-alpha.md), [v0.4.2-alpha](docs/RELEASE-v0.4.2-alpha.md).
 
 **Something broken?** Wrong sidebar version, **Update Now** error, merge/rebase/tag-clobber messages, or you are not sure the VPS ever pulled the real repo → go to **[Universal recovery (SSH)](#universal-recovery-ssh)** and run the one block there. **Point people at that section**; it is the single source of truth.
 
@@ -299,6 +299,16 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v0.8.2-alpha — 2026-04-28
+
+**Fix: auto-set `AUTHENTIK_WEB_WORKERS=4` on update**
+- Post-update migration now sets `AUTHENTIK_WEB_WORKERS=4` in `~/authentik/.env` if not already at 4+, then restarts only the server container (ldap untouched, bind caches preserved).
+- Prevents thundering-herd overload on active deployments after restarts.
+
+Full notes: [docs/RELEASE-v0.8.2-alpha.md](docs/RELEASE-v0.8.2-alpha.md).
+
+---
 
 ### v0.8.1-alpha — 2026-04-28
 
