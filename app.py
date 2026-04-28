@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.8.2-alpha"
+VERSION = "0.8.3-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -20417,7 +20417,7 @@ entries:
   postgresql:
     image: docker.io/library/postgres:16-alpine
     restart: unless-stopped
-    command: postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=120s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6
+    command: postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=10s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
       start_period: 20s
@@ -20863,9 +20863,9 @@ def _ensure_authentik_compose_patches(compose_path, plog=None):
             lines = f.readlines()
         changed = False
 
-        pg_cmd = 'postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=120s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
+        pg_cmd = 'postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=10s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
         has_pg_cmd = any('max_connections=300' in l for l in lines)
-        needs_pg_update = has_pg_cmd and (not any('idle_in_transaction_session_timeout' in l for l in lines) or any('idle_in_transaction_session_timeout=300s' in l for l in lines) or any('idle_in_transaction_session_timeout=30s' in l for l in lines))
+        needs_pg_update = has_pg_cmd and (not any('idle_in_transaction_session_timeout' in l for l in lines) or any('idle_in_transaction_session_timeout=300s' in l for l in lines) or any('idle_in_transaction_session_timeout=30s' in l for l in lines) or any('idle_in_transaction_session_timeout=120s' in l for l in lines))
         if not has_pg_cmd:
             patched = []
             for line in lines:
@@ -20928,9 +20928,9 @@ def _ensure_authentik_compose_patches(compose_path, plog=None):
 
 
 def _apply_authentik_pg_tuning(ak_dir, plog):
-    """Ensure compose has PG tuning args, clear stale ALTER SYSTEM entries, and reload config."""
+    """Ensure compose has PG tuning args, force-recreate postgresql if args changed, clear stale ALTER SYSTEM entries."""
     compose_path = os.path.join(ak_dir, 'docker-compose.yml')
-    _ensure_authentik_compose_patches(compose_path, plog)
+    compose_changed = _ensure_authentik_compose_patches(compose_path, plog)
     try:
         pg_container = subprocess.run(
             f'cd {ak_dir} && docker compose ps -q postgresql 2>/dev/null',
@@ -20939,15 +20939,25 @@ def _apply_authentik_pg_tuning(ak_dir, plog):
         if not pg_container:
             plog("  PostgreSQL container not found, skipping PG tuning runtime check")
             return
+        # Clear any ALTER SYSTEM overrides so compose command-line args are authoritative
         subprocess.run(
             f'cd {ak_dir} && docker compose exec -T postgresql psql -U authentik -d authentik -c "ALTER SYSTEM RESET ALL;" 2>&1',
             shell=True, capture_output=True, text=True, timeout=15
         )
-        subprocess.run(
-            f'cd {ak_dir} && docker compose exec -T postgresql psql -U authentik -d authentik -c "SELECT pg_reload_conf();" 2>&1',
-            shell=True, capture_output=True, text=True, timeout=15
-        )
-        plog("  ✓ PostgreSQL: ALTER SYSTEM entries cleared, compose command-line args apply on next restart")
+        if compose_changed:
+            # Command-line args changed — must recreate the container for them to take effect
+            plog("  PostgreSQL tuning args changed — recreating container to apply new idle_in_transaction_session_timeout")
+            subprocess.run(
+                f'cd {ak_dir} && docker compose up -d --force-recreate postgresql 2>&1',
+                shell=True, capture_output=True, text=True, timeout=120
+            )
+            plog("  ✓ PostgreSQL recreated with updated tuning (idle_in_transaction_session_timeout=10s)")
+        else:
+            subprocess.run(
+                f'cd {ak_dir} && docker compose exec -T postgresql psql -U authentik -d authentik -c "SELECT pg_reload_conf();" 2>&1',
+                shell=True, capture_output=True, text=True, timeout=15
+            )
+            plog("  ✓ PostgreSQL: tuning already current, config reloaded")
     except Exception as e:
         plog(f"  ⚠ PG tuning cleanup skipped: {e}")
 
@@ -21460,9 +21470,9 @@ entries:
                 needs_write = True
                 plog("  Added blueprint mount to server & worker")
             # Add postgres command-line tuning (max_connections, idle_session_timeout, tcp_keepalives)
-            pg_cmd = 'postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=120s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
+            pg_cmd = 'postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=10s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
             has_pg_cmd = any('max_connections=300' in l for l in lines)
-            needs_pg_update = has_pg_cmd and (not any('idle_in_transaction_session_timeout' in l for l in lines) or any('idle_in_transaction_session_timeout=300s' in l for l in lines) or any('idle_in_transaction_session_timeout=30s' in l for l in lines))
+            needs_pg_update = has_pg_cmd and (not any('idle_in_transaction_session_timeout' in l for l in lines) or any('idle_in_transaction_session_timeout=300s' in l for l in lines) or any('idle_in_transaction_session_timeout=30s' in l for l in lines) or any('idle_in_transaction_session_timeout=120s' in l for l in lines))
             if not has_pg_cmd:
                 patched = []
                 for line in lines:
@@ -21479,7 +21489,7 @@ entries:
                         indent = line[:len(line) - len(line.lstrip())]
                         lines[i] = f'{indent}command: {pg_cmd}\n'
                         needs_write = True
-                        plog("  Updated PostgreSQL idle_in_transaction_session_timeout to 120s")
+                        plog("  Updated PostgreSQL idle_in_transaction_session_timeout to 10s")
                         break
 
             # Pin AUTHENTIK_TAG to latest stable release
