@@ -29411,38 +29411,40 @@ def _post_update_auto_deploy():
                 except Exception as e:
                     print(f"Post-update: cert-metadata.sh fixup skipped: {e}")
 
-            # Fix LDAP outpost AUTHENTIK_HOST if it was incorrectly set to external HTTPS URL (v0.8.0)
-            # ONLY patch if the outpost is currently broken (TLS error / not connected). If the outpost
-            # is healthy and connected, leave it alone — restarting a working outpost clears all cached
-            # bind sessions and causes a thundering-herd reconnect storm under load (high CPU / Postgres
-            # connection exhaustion). Only disrupt if there is actually a problem to fix.
+            # Fix LDAP outpost AUTHENTIK_HOST if it was set to external HTTPS URL AND the outpost is
+            # confirmed broken with `tls: internal error` (the original v0.8.0 use case — Caddy ACME
+            # not yet completed when LDAP outpost tried to dial https://<fqdn>). DO NOT patch on
+            # ambiguous states like "no connect-success line in log yet" — that's just a fresh
+            # restart that hasn't finished its TLS handshake, and clobbering a working FQDN config
+            # IS the v0.8.4 regression we're fixing. Conservative rule: only patch on positive
+            # evidence of TLS failure. Look at a wide log window (--tail=400) so we don't miss the
+            # original error after the outpost has been running for a while.
             try:
                 ak_compose = os.path.expanduser('~/authentik/docker-compose.yml')
                 if os.path.exists(ak_compose):
                     with open(ak_compose) as _f:
                         _comp = _f.read()
                     if 'AUTHENTIK_HOST:' in _comp and 'http://authentik-server-1:9000' not in _comp:
-                        # Check if outpost is healthy before touching anything
-                        _log_r = subprocess.run('docker logs authentik-ldap-1 --tail=60 2>&1',
-                            shell=True, capture_output=True, text=True, timeout=10)
-                        _log = _log_r.stdout or ''
-                        _is_connected = 'successfully connected websocket' in _log.lower()
-                        _has_tls_error = 'remote error: tls: internal error' in _log.lower()
-                        if _is_connected and not _has_tls_error:
-                            print("Post-update: LDAP outpost connected and healthy — AUTHENTIK_HOST migration skipped to avoid disrupting active sessions")
-                        else:
+                        _log_r = subprocess.run('docker logs authentik-ldap-1 --tail=400 2>&1',
+                            shell=True, capture_output=True, text=True, timeout=15)
+                        _log = (_log_r.stdout or '').lower()
+                        _has_tls_error = ('remote error: tls: internal error' in _log
+                                          or 'x509: certificate' in _log
+                                          or 'certificate signed by unknown authority' in _log)
+                        if _has_tls_error:
                             import re as _re
                             _fixed = _re.sub(r'(AUTHENTIK_HOST:\s*)\S+', r'\1http://authentik-server-1:9000', _comp)
-                            # Remove stale extra_hosts block for the fqdn (leave host.docker.internal entries alone)
                             _fixed = _re.sub(r'\n    extra_hosts:\n(?:      - "[^h][^"]*:host-gateway"\n)+', '\n', _fixed)
                             if _fixed != _comp:
                                 with open(ak_compose, 'w') as _f:
                                     _f.write(_fixed)
                                 subprocess.run('cd ~/authentik && docker compose up -d ldap',
                                     shell=True, capture_output=True, text=True, timeout=60)
-                                print("Post-update: patched LDAP AUTHENTIK_HOST → internal Docker URL, restarted ldap (outpost was not connected)")
+                                print("Post-update: patched LDAP AUTHENTIK_HOST → internal Docker URL, restarted ldap (confirmed TLS error)", flush=True)
+                        else:
+                            print("Post-update: LDAP outpost on FQDN with no TLS errors — leaving routing alone (v0.8.0 migration skipped)", flush=True)
             except Exception as _e:
-                print(f"Post-update: LDAP AUTHENTIK_HOST fix skipped: {_e}")
+                print(f"Post-update: LDAP AUTHENTIK_HOST fix skipped: {_e}", flush=True)
 
             # v0.8.4: Reverse the v0.8.0 internal-URL migration for boxes whose outpost is
             # spiraling on the direct path. See _apply_authentik_ldap_routing_repair for full
