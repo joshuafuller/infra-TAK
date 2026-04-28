@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.8.4-alpha"
+VERSION = "0.8.5-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -20965,9 +20965,101 @@ def _apply_authentik_pg_tuning(ak_dir, plog):
         plog(f"  ⚠ PG tuning cleanup skipped: {e}")
 
 
+def _detect_authentik_ldap_spiral(plog=None):
+    """v0.8.5: Detect Authentik LDAP outpost spiral via dual signals.
+
+    Returns (spiraling: bool, evidence: dict). Evidence dict contains:
+      - 'outpost_markers': dict of marker -> count from last 1000 lines of LDAP container log
+      - 'outpost_unique_markers': int (count of distinct marker types matched)
+      - 'pg_idle_in_trans': int (idle-in-transaction connections from authentik-server)
+      - 'pg_total_conns': int (total connections to authentik DB)
+      - 'reason': str (which signal(s) tripped, or why not)
+
+    Spiral confirmed when EITHER:
+      - LDAP outpost log shows ≥2 unique spiral markers in last 1000 lines (the v0.8.4 signal)
+      - Postgres has ≥30 connections in 'idle in transaction' state
+        (durable signal — survives LDAP container recreate, can't be hidden by high bind volume)
+    """
+    evidence = {'outpost_markers': {}, 'outpost_unique_markers': 0,
+                'pg_idle_in_trans': -1, 'pg_total_conns': -1, 'reason': ''}
+
+    # Outpost log signal — bumped --tail from 200 to 1000 (high-volume binds otherwise drown out
+    # rare spiral markers; on ssdnodes during v0.8.4 testing, 14 markers existed in last 200 lines
+    # by bash grep but the migration's --tail 200 sample showed 0 because all 200 entries were
+    # benign 'Bind request' lines).
+    try:
+        _log_r = subprocess.run('docker logs authentik-ldap-1 --tail 1000 2>&1',
+            shell=True, capture_output=True, text=True, timeout=15)
+        _log_lower = (_log_r.stdout or '').lower()
+        marker_patterns = {
+            'result code 50': 'result code 50',
+            'nil pointer': 'nil pointer',
+            'failed to execute flow': '"event":"failed to execute flow"',
+            'eof': '": eof"',
+            '502 bad gateway': '502 bad gateway',
+            '503 service unavailable': '503 service unavailable',
+            'exceeded stage recursion': 'exceeded stage recursion',
+        }
+        unique = 0
+        for label, pat in marker_patterns.items():
+            n = _log_lower.count(pat)
+            evidence['outpost_markers'][label] = n
+            if n > 0:
+                unique += 1
+        evidence['outpost_unique_markers'] = unique
+    except Exception as e:
+        evidence['outpost_markers'] = {'_error': str(e)}
+
+    # Postgres state signal (the durable signal). Authentik's psycopg pool sits in
+    # 'idle in transaction' on the policybindingmodel SELECT during a spiral; healthy
+    # boxes sit at 0-3. Trigger threshold: ≥30 to leave plenty of headroom over a normal
+    # baseline (at request peaks healthy boxes can hit 10-15 briefly).
+    try:
+        _pg = subprocess.run(
+            'docker exec authentik-postgresql-1 psql -U authentik -d authentik -tA -c '
+            '"SELECT '
+            '  (SELECT count(*) FROM pg_stat_activity WHERE state=\'idle in transaction\' AND application_name LIKE \'%authentik%\'),'
+            '  (SELECT count(*) FROM pg_stat_activity WHERE datname=\'authentik\');"',
+            shell=True, capture_output=True, text=True, timeout=10
+        )
+        _out = (_pg.stdout or '').strip()
+        if '|' in _out:
+            parts = _out.split('|')
+            evidence['pg_idle_in_trans'] = int(parts[0]) if parts[0].strip().isdigit() else -1
+            evidence['pg_total_conns'] = int(parts[1]) if parts[1].strip().isdigit() else -1
+    except Exception as e:
+        evidence['pg_idle_in_trans'] = -1
+        evidence['pg_total_conns'] = -1
+
+    # Decide
+    outpost_signal = evidence['outpost_unique_markers'] >= 2
+    pg_signal = evidence['pg_idle_in_trans'] >= 30
+    spiraling = outpost_signal or pg_signal
+
+    if pg_signal and outpost_signal:
+        evidence['reason'] = (f"both signals tripped: outpost {evidence['outpost_unique_markers']} unique markers "
+                              f"+ postgres {evidence['pg_idle_in_trans']} idle-in-trans")
+    elif pg_signal:
+        evidence['reason'] = f"postgres signal: {evidence['pg_idle_in_trans']} idle-in-trans (≥30 threshold)"
+    elif outpost_signal:
+        evidence['reason'] = f"outpost log signal: {evidence['outpost_unique_markers']} unique markers (≥2 threshold)"
+    else:
+        evidence['reason'] = (f"no spiral: outpost {evidence['outpost_unique_markers']}/2 markers, "
+                              f"postgres {evidence['pg_idle_in_trans']} idle-in-trans (need ≥30)")
+
+    if plog:
+        plog(f"  spiral check: {evidence['reason']}")
+        if evidence['outpost_markers']:
+            mk = ', '.join(f"{k}={v}" for k, v in evidence['outpost_markers'].items() if isinstance(v, int) and v > 0)
+            plog(f"  outpost markers (last 1000 lines): {mk or '(none)'}")
+
+    return spiraling, evidence
+
+
 def _apply_authentik_ldap_routing_repair(ak_dir, plog):
     """v0.8.4: Reverse v0.8.0's LDAP outpost AUTHENTIK_HOST migration for boxes whose
-    outpost is spiraling on the direct internal URL.
+    outpost is spiraling on the direct internal URL. v0.8.5: dual-signal detection
+    (postgres + outpost log) so high-volume normal binds can't hide the spiral evidence.
 
     Problem (April 2026): v0.8.0 changed the LDAP outpost from `https://<fqdn>` (via Caddy)
     to `http://authentik-server-1:9000` (direct Docker network) to fix `tls: internal error`
@@ -20977,20 +21069,19 @@ def _apply_authentik_ldap_routing_repair(ak_dir, plog):
     evaluation. The result is a Postgres query storm (200+ active queries), outpost
     nil-pointer panics, EOFs, and CPU pegging — the spiral.
 
-    Fix: detect boxes that are (a) on the direct internal URL, (b) showing the spiral
-    signature in outpost logs, and (c) have a configured FQDN that Caddy can serve.
-    Reroute the LDAP outpost back through Caddy (`https://<fqdn>` + `extra_hosts:host-gateway`)
-    and force-recreate ONLY the LDAP container. Validate by checking the outpost reconnects;
-    on failure, restore the backup and recreate back to internal URL.
+    Fix: detect via durable postgres state signal (≥30 idle-in-trans from authentik-server)
+    OR outpost log markers. If on internal URL, FQDN configured, Caddy serving, switch to
+    `https://<fqdn>` + `extra_hosts:host-gateway` and force-recreate ONLY the LDAP container.
+    Validate; on failure, restore backup.
 
     Cardinal rule from HANDOFF-LDAP-AUTHENTIK.md: NEVER restart the LDAP outpost unless
-    it's provably broken. The spiral signature (Result Code 50 / nil pointer / EOF / 503)
-    counts as "provably broken" — a healthy outpost will not have those in recent logs.
+    it's provably broken. Postgres storm + spiral markers count as "provably broken".
     Idempotent: no-ops on healthy boxes, on FQDN-routed boxes, or on boxes without an FQDN.
     """
     compose_path = os.path.join(ak_dir, 'docker-compose.yml')
     env_path = os.path.join(ak_dir, '.env')
     if not os.path.exists(compose_path) or not os.path.exists(env_path):
+        plog("  routing repair: ~/authentik/docker-compose.yml or .env missing — skipping (Authentik not installed)")
         return
     try:
         fqdn = ''
@@ -21001,41 +21092,35 @@ def _apply_authentik_ldap_routing_repair(ak_dir, plog):
                     fqdn = _ls.split('https://', 1)[1].split('/', 1)[0].strip()
                     break
         if not fqdn:
-            plog("  v0.8.4 routing repair: no FQDN in .env (AUTHENTIK_HOST=https://...) — skipping")
+            plog("  routing repair: no FQDN in .env (need AUTHENTIK_HOST=https://...) — skipping")
             return
 
         with open(compose_path) as _f:
             compose_text = _f.read()
         if 'AUTHENTIK_HOST: http://authentik-server-1:9000' not in compose_text:
-            plog("  v0.8.4 routing repair: LDAP not on internal URL — already routed correctly, skipping")
+            plog("  routing repair: LDAP service already on FQDN routing in compose — skipping (already correct)")
             return
 
-        _log_r = subprocess.run('docker logs authentik-ldap-1 --tail 200 2>&1',
-            shell=True, capture_output=True, text=True, timeout=10)
-        _log = (_log_r.stdout or '').lower()
-        spiral_markers = ['result code 50', 'nil pointer', '"event":"failed to execute flow"',
-                          'eof', '502 bad gateway', '503 service unavailable',
-                          'exceeded stage recursion depth']
-        spiral_hits = sum(1 for m in spiral_markers if m in _log)
-        if spiral_hits < 2:
-            plog(f"  v0.8.4 routing repair: outpost not showing spiral signature ({spiral_hits}/2 markers) — leaving alone")
+        spiraling, evidence = _detect_authentik_ldap_spiral(plog)
+        if not spiraling:
+            plog(f"  routing repair: no spiral evidence — leaving alone (outpost healthy or pre-spiral)")
             return
-        plog(f"  v0.8.4 routing repair: outpost shows spiral signature on http://authentik-server-1:9000 ({spiral_hits} markers)")
+        plog(f"  routing repair: spiral CONFIRMED on http://authentik-server-1:9000 — proceeding to migrate to FQDN")
 
         _probe = subprocess.run(
             f'docker exec authentik-ldap-1 wget --spider --timeout=5 -q https://{fqdn}/-/health/live/ 2>&1; echo EXIT=$?',
             shell=True, capture_output=True, text=True, timeout=15
         )
         if 'EXIT=0' not in (_probe.stdout or ''):
-            plog(f"  v0.8.4 routing repair: cannot reach https://{fqdn} from LDAP container — skipping (Caddy not ready or DNS issue)")
+            plog(f"  routing repair: cannot reach https://{fqdn} from LDAP container — skipping (Caddy not ready or DNS issue; box would end up worse)")
             return
-        plog(f"  v0.8.4 routing repair: https://{fqdn} reachable from LDAP container — migrating routing")
+        plog(f"  routing repair: caddy probe https://{fqdn}/-/health/live/ OK — migrating routing")
 
         import time as _t
-        backup_path = f'{compose_path}.bak.v0.8.4.{int(_t.time())}'
+        backup_path = f'{compose_path}.bak.routing-repair.{int(_t.time())}'
         with open(backup_path, 'w') as _f:
             _f.write(compose_text)
-        plog(f"  Backed up compose to {backup_path}")
+        plog(f"  routing repair: backed up compose to {backup_path}")
 
         new_lines = []
         in_ldap = False
@@ -21066,25 +21151,26 @@ def _apply_authentik_ldap_routing_repair(ak_dir, plog):
             new_lines.append(line)
 
         if not ldap_image_seen:
-            plog("  v0.8.4 routing repair: LDAP image line not found in compose — aborting (no changes)")
+            plog("  routing repair: LDAP image line not found in compose — aborting (no changes)")
             return
 
         new_text = ''.join(new_lines)
         with open(compose_path, 'w') as _f:
             _f.write(new_text)
-        plog(f"  Rewrote LDAP service: AUTHENTIK_HOST=https://{fqdn} + extra_hosts:host-gateway")
+        plog(f"  routing repair: rewrote LDAP service → AUTHENTIK_HOST=https://{fqdn} + extra_hosts:host-gateway")
 
-        plog("  Recreating LDAP container only (server/worker/db untouched)...")
+        plog("  routing repair: recreating LDAP container only (server/worker/db untouched)...")
         _r = subprocess.run(
             f'cd {ak_dir} && docker compose up -d --no-deps --force-recreate ldap 2>&1',
             shell=True, capture_output=True, text=True, timeout=90
         )
         if _r.returncode != 0:
-            plog(f"  ⚠ LDAP recreate failed, restoring backup: {(_r.stdout or '')[-300:]}")
+            plog(f"  ⚠ routing repair: LDAP recreate failed, restoring backup: {(_r.stdout or '')[-300:]}")
             with open(compose_path, 'w') as _f:
                 _f.write(compose_text)
             subprocess.run(f'cd {ak_dir} && docker compose up -d --no-deps --force-recreate ldap',
                 shell=True, capture_output=True, text=True, timeout=90)
+            _record_spiral_repair_attempt('recreate_failed', evidence)
             return
 
         _t.sleep(30)
@@ -21096,17 +21182,106 @@ def _apply_authentik_ldap_routing_repair(ak_dir, plog):
         has_route_err = '503 service unavailable' in _val_out or '502 bad gateway' in _val_out
 
         if connected and not has_tls_err and not has_route_err:
-            plog(f"  ✓ v0.8.4 routing repair: LDAP outpost healthy on https://{fqdn} via Caddy (spiral broken)")
+            plog(f"  ✓ routing repair: LDAP outpost healthy on https://{fqdn} via Caddy (spiral broken)")
+            _record_spiral_repair_attempt('success', evidence)
             return
 
-        plog(f"  ⚠ v0.8.4 routing repair: validation failed (connected={connected}, tls_err={has_tls_err}, route_err={has_route_err}) — restoring backup")
+        plog(f"  ⚠ routing repair: validation failed (connected={connected}, tls_err={has_tls_err}, route_err={has_route_err}) — restoring backup")
         with open(compose_path, 'w') as _f:
             _f.write(compose_text)
         subprocess.run(f'cd {ak_dir} && docker compose up -d --no-deps --force-recreate ldap',
             shell=True, capture_output=True, text=True, timeout=90)
-        plog("  Restored LDAP routing to http://authentik-server-1:9000 (validation failed; FQDN path not viable on this box)")
+        plog("  routing repair: restored LDAP routing to http://authentik-server-1:9000 (validation failed; FQDN path not viable on this box)")
+        _record_spiral_repair_attempt('validation_failed', evidence)
     except Exception as e:
-        plog(f"  ⚠ v0.8.4 routing repair error (no changes applied): {e}")
+        plog(f"  ⚠ routing repair error (no changes applied): {e}")
+
+
+def _record_spiral_repair_attempt(outcome, evidence):
+    """Persist last spiral repair attempt to settings.json for rate limiting and operator visibility."""
+    try:
+        s = load_settings()
+        s['authentik_spiral_last_repair'] = {
+            'ts': int(time.time()),
+            'outcome': outcome,
+            'evidence': {k: v for k, v in evidence.items() if k != 'outpost_markers'},
+            'outpost_markers': evidence.get('outpost_markers', {}),
+        }
+        save_settings(s)
+    except Exception:
+        pass
+
+
+def _authentik_spiral_monitor():
+    """v0.8.5: Periodic background monitor for the LDAP routing spiral.
+
+    The post-update one-shot routing repair has a timing weakness: it runs immediately after
+    Update Now, but a spiral may not have manifested yet. Or the spiral may be intermittent
+    and miss the sample window. This thread re-checks every 10 minutes and runs the
+    idempotent routing repair if the dual-signal detector confirms a spiral.
+
+    Rate limit: at most one repair attempt per 6 hours (whether successful or not). This
+    prevents thrashing in pathological states (e.g. Caddy unreachable + spiral both true)
+    where the repair would skip every 10 min anyway, but be loud about it.
+
+    Single-instance lock: gunicorn runs N workers; only ONE may run the monitor. We use
+    a PID-checked lockfile (/tmp/takwerx-spiral-monitor.lock); on startup, if the lock
+    holder PID is dead, we steal it. This way restarts always have a live monitor.
+
+    Idempotent: no-ops on healthy boxes, FQDN-routed boxes, no-FQDN boxes, and on boxes
+    where Authentik isn't installed.
+    """
+    import time as _t
+    lock_path = '/tmp/takwerx-spiral-monitor.lock'
+
+    # Try to acquire the singleton lock. If another worker already holds it AND that PID
+    # is alive, this worker exits the function (no monitor here, the other worker has it).
+    try:
+        if os.path.exists(lock_path):
+            try:
+                with open(lock_path) as _lf:
+                    holder_pid = int((_lf.read() or '0').strip())
+                if holder_pid > 0:
+                    try:
+                        os.kill(holder_pid, 0)
+                        print(f"[spiral monitor] PID {holder_pid} already holds the monitor lock — this worker stands down", flush=True)
+                        return
+                    except (ProcessLookupError, PermissionError):
+                        pass  # holder dead, we steal
+            except Exception:
+                pass  # corrupt lockfile, overwrite
+        with open(lock_path, 'w') as _lf:
+            _lf.write(str(os.getpid()))
+        print(f"[spiral monitor] PID {os.getpid()} acquired monitor lock — starting (10 min interval, 6h repair rate limit)", flush=True)
+    except Exception as e:
+        print(f"[spiral monitor] could not acquire lock (non-fatal): {e}", flush=True)
+        return
+
+    while True:
+        try:
+            _t.sleep(600)
+            ak_dir = os.path.expanduser('~/authentik')
+            if not os.path.exists(os.path.join(ak_dir, 'docker-compose.yml')):
+                continue
+
+            s = load_settings()
+            last_attempt = s.get('authentik_spiral_last_repair') or {}
+            last_ts = last_attempt.get('ts', 0)
+            if _t.time() - last_ts < 6 * 3600:
+                continue
+
+            spiraling, evidence = _detect_authentik_ldap_spiral(plog=None)
+            if not spiraling:
+                continue
+
+            print(f"[spiral monitor] spiral signature detected: {evidence['reason']}", flush=True)
+            print(f"[spiral monitor] running idempotent routing repair...", flush=True)
+            _apply_authentik_ldap_routing_repair(ak_dir, lambda m: print(f"[spiral monitor] {m}", flush=True))
+        except Exception as e:
+            try:
+                print(f"[spiral monitor] iteration error (will retry in 10 min): {e}", flush=True)
+            except Exception:
+                pass
 
 
 def run_authentik_deploy(reconfigure=False):
@@ -29938,6 +30113,15 @@ def _post_update_auto_deploy():
 
 _startup_migrations()
 _post_update_auto_deploy()
+
+# v0.8.5: periodic LDAP routing spiral monitor (self-healing for boxes whose spiral
+# manifests after the post-update one-shot check). Idempotent, rate-limited (max 1
+# repair per 6h), no-op on healthy boxes / non-Authentik installs.
+try:
+    import threading as _threading_spiral
+    _threading_spiral.Thread(target=_authentik_spiral_monitor, daemon=True, name='authentik-spiral-monitor').start()
+except Exception as _e:
+    print(f"[startup] failed to start spiral monitor (non-fatal): {_e}", flush=True)
 
 # === Main Entry Point (fallback for direct python3 app.py) ===
 if __name__ == '__main__':
