@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.7.9-alpha"
+VERSION = "0.8.0-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -20535,14 +20535,6 @@ networks:
     external: true
 """
     compose_content = compose_content.replace('2026.2.0', _ak_latest)
-    _ak_host_for_ldap = _get_authentik_host(settings)
-    if _ak_host_for_ldap:
-        compose_content = compose_content.replace(
-            'AUTHENTIK_HOST: http://authentik-server-1:9000',
-            f'AUTHENTIK_HOST: https://{_ak_host_for_ldap}')
-        compose_content = compose_content.replace(
-            f'    image: ghcr.io/goauthentik/ldap:${{AUTHENTIK_TAG:-{_ak_latest}}}\n    ports:',
-            f'    image: ghcr.io/goauthentik/ldap:${{AUTHENTIK_TAG:-{_ak_latest}}}\n    extra_hosts:\n      - "{_ak_host_for_ldap}:host-gateway"\n    ports:')
     with open('/tmp/authentik_remote_compose.yml', 'w') as f:
         f.write(compose_content)
     ok, _ = _module_copy(deploy_cfg, '/tmp/authentik_remote_compose.yml', '/tmp/docker-compose.yml', log_fn=plog)
@@ -21084,17 +21076,6 @@ def run_authentik_deploy(reconfigure=False):
                                     new_env.append(f'AUTHENTIK_HOST={ak_base}\n')
                                 with open(env_path, 'w') as f:
                                     f.writelines(new_env)
-                                with open(compose_path) as f:
-                                    comp_lines = f.readlines()
-                                comp_new = []
-                                for line in comp_lines:
-                                    if 'AUTHENTIK_HOST:' in line:
-                                        line = re.sub(r'AUTHENTIK_HOST:\s*\S+', f'AUTHENTIK_HOST: {ak_base}', line)
-                                    if ':host-gateway"' in line and '"' in line:
-                                        line = re.sub(r'(")([^"]+)(":host-gateway")', r'\1' + ak_host + r'\3', line)
-                                    comp_new.append(line)
-                                with open(compose_path, 'w') as f:
-                                    f.writelines(comp_new)
                                 req = urllib.request.Request(f'{ak_url}/api/v3/core/brands/', headers=ak_headers)
                                 resp = urllib.request.urlopen(req, timeout=10)
                                 brands = json.loads(resp.read().decode())['results']
@@ -21540,12 +21521,7 @@ entries:
 
             ldap_image = f"ghcr.io/goauthentik/ldap:${{AUTHENTIK_TAG:-{ak_tag}}}"
             if not any('ghcr.io/goauthentik/ldap' in l for l in lines):
-                _ak_host = _get_authentik_host(settings)
-                if _ak_host:
-                    _ak_ldap_url = f"https://{_ak_host}"
-                    ldap_svc = f"  ldap:\n    image: {ldap_image}\n    extra_hosts:\n      - \"{_ak_host}:host-gateway\"\n    ports:\n    - 127.0.0.1:389:3389\n    - 127.0.0.1:636:6636\n    environment:\n      AUTHENTIK_HOST: {_ak_ldap_url}\n      AUTHENTIK_INSECURE: \"true\"\n      AUTHENTIK_TOKEN: placeholder\n    restart: unless-stopped\n    healthcheck:\n      test: [\"CMD\", \"wget\", \"--spider\", \"-q\", \"http://localhost:9300/outpost.goauthentik.io/ping\"]\n      start_period: 30s\n      interval: 30s\n      timeout: 5s\n      retries: 3\n    depends_on:\n      server:\n        condition: service_healthy\n"
-                else:
-                    ldap_svc = f"  ldap:\n    image: {ldap_image}\n    ports:\n    - 127.0.0.1:389:3389\n    - 127.0.0.1:636:6636\n    environment:\n      AUTHENTIK_HOST: http://authentik-server-1:9000\n      AUTHENTIK_INSECURE: \"true\"\n      AUTHENTIK_TOKEN: placeholder\n    restart: unless-stopped\n    healthcheck:\n      test: [\"CMD\", \"wget\", \"--spider\", \"-q\", \"http://localhost:9300/outpost.goauthentik.io/ping\"]\n      start_period: 30s\n      interval: 30s\n      timeout: 5s\n      retries: 3\n    depends_on:\n      server:\n        condition: service_healthy\n"
+                ldap_svc = f"  ldap:\n    image: {ldap_image}\n    ports:\n    - 127.0.0.1:389:3389\n    - 127.0.0.1:636:6636\n    environment:\n      AUTHENTIK_HOST: http://authentik-server-1:9000\n      AUTHENTIK_INSECURE: \"true\"\n      AUTHENTIK_TOKEN: placeholder\n    restart: unless-stopped\n    healthcheck:\n      test: [\"CMD\", \"wget\", \"--spider\", \"-q\", \"http://localhost:9300/outpost.goauthentik.io/ping\"]\n      start_period: 30s\n      interval: 30s\n      timeout: 5s\n      retries: 3\n    depends_on:\n      server:\n        condition: service_healthy\n"
                 new_lines = []
                 for line in lines:
                     if line.startswith('volumes:'):
@@ -29233,6 +29209,29 @@ def _post_update_auto_deploy():
                         print(f"Post-update: fixed cert-metadata.sh ownership to tak:tak")
                 except Exception as e:
                     print(f"Post-update: cert-metadata.sh fixup skipped: {e}")
+
+            # Fix LDAP outpost AUTHENTIK_HOST if it was incorrectly set to external HTTPS URL (v0.8.0)
+            # On single-box installs the LDAP container should always use the internal Docker service URL.
+            # Old code generated https://<fqdn> + extra_hosts:host-gateway, which breaks on fresh installs
+            # because Caddy hasn't finished its ACME challenge yet and sends tls: internal error.
+            try:
+                ak_compose = os.path.expanduser('~/authentik/docker-compose.yml')
+                if os.path.exists(ak_compose):
+                    with open(ak_compose) as _f:
+                        _comp = _f.read()
+                    if 'AUTHENTIK_HOST:' in _comp and 'http://authentik-server-1:9000' not in _comp:
+                        import re as _re
+                        _fixed = _re.sub(r'(AUTHENTIK_HOST:\s*)\S+', r'\1http://authentik-server-1:9000', _comp)
+                        # Remove stale extra_hosts block for the fqdn (leave host.docker.internal entries alone)
+                        _fixed = _re.sub(r'\n    extra_hosts:\n(?:      - "[^h][^"]*:host-gateway"\n)+', '\n', _fixed)
+                        if _fixed != _comp:
+                            with open(ak_compose, 'w') as _f:
+                                _f.write(_fixed)
+                            subprocess.run('cd ~/authentik && docker compose up -d ldap',
+                                shell=True, capture_output=True, text=True, timeout=60)
+                            print("Post-update: patched LDAP AUTHENTIK_HOST → internal Docker URL, restarted ldap")
+            except Exception as _e:
+                print(f"Post-update: LDAP AUTHENTIK_HOST fix skipped: {_e}")
 
             # Re-deploy Guard Dog (updated scripts + timers)
             if os.path.exists('/opt/tak-guarddog') and os.path.exists('/opt/tak'):
