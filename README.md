@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Latest release: v0.7.9-alpha** — ⚠️ **Existing deployments: TAK Server page → Resync LDAP to TAK Server if you haven't already.** **Bug fix:** After **Authentik → Update Config & Reconnect**, reconfigure now waits for Authentik to be fully online before completing — eliminates 400 errors on protected services immediately after reconfigure. See **[docs/RELEASE-v0.7.9-alpha.md](docs/RELEASE-v0.7.9-alpha.md)**. Prior: **v0.7.8-alpha** — proxy provider GET→PUT fix. Prior: [v0.7.0-alpha](docs/RELEASE-v0.7.0-alpha.md) (IPAWS KML network link, zone polygons, NAPSG icons), [v0.6.8-alpha](docs/RELEASE-v0.6.8-alpha.md) (Node-RED deploy sync fix), [v0.6.7-alpha](docs/RELEASE-v0.6.7-alpha.md) (DataSync read-only missions, shared missions), [v0.6.5-alpha](docs/RELEASE-v0.6.5-alpha.md) (KML + ArcGIS stable-ID / Purge), [v0.6.4-alpha](docs/RELEASE-v0.6.4-alpha.md). Older: [v0.6.1-alpha](docs/RELEASE-v0.6.1-alpha.md), [v0.6.0-alpha](docs/RELEASE-v0.6.0-alpha.md), [v0.5.9-alpha](docs/RELEASE-v0.5.9-alpha.md), [v0.5.8-alpha](docs/RELEASE-v0.5.8-alpha.md), [v0.5.7-alpha](docs/RELEASE-v0.5.7-alpha.md), [v0.5.6-alpha](docs/RELEASE-v0.5.6-alpha.md), [v0.5.5-alpha](docs/RELEASE-v0.5.5-alpha.md), [v0.5.4-alpha](docs/RELEASE-v0.5.4-alpha.md), [v0.5.3-alpha](docs/RELEASE-v0.5.3-alpha.md), [v0.5.2-alpha](docs/RELEASE-v0.5.2-alpha.md), [v0.5.1-alpha](docs/RELEASE-v0.5.1-alpha.md), [v0.5.0-alpha](docs/RELEASE-v0.5.0-alpha.md), [v0.4.9-alpha](docs/RELEASE-v0.4.9-alpha.md), [v0.4.8-alpha](docs/RELEASE-v0.4.8-alpha.md), [v0.4.7-alpha](docs/RELEASE-v0.4.7-alpha.md), [v0.4.6-alpha](docs/RELEASE-v0.4.6-alpha.md), [v0.4.5-alpha](docs/RELEASE-v0.4.5-alpha.md), [v0.4.4-alpha](docs/RELEASE-v0.4.4-alpha.md), [v0.4.3-alpha](docs/RELEASE-v0.4.3-alpha.md), [v0.4.2-alpha](docs/RELEASE-v0.4.2-alpha.md).
+**Latest release: v0.8.0-alpha** — **Bug fix:** LDAP outpost `tls: internal error` on fresh installs — the outpost was incorrectly configured to reach Authentik via the external HTTPS domain instead of the internal Docker service name, causing TLS failures and exponential backoff on new deployments. Auto-heals on update. See **[docs/RELEASE-v0.8.0-alpha.md](docs/RELEASE-v0.8.0-alpha.md)**. Prior: **v0.7.9-alpha** — Authentik reconfigure waits for API ready before completing. Prior: **v0.7.8-alpha** — proxy provider GET→PUT fix. Prior: [v0.7.0-alpha](docs/RELEASE-v0.7.0-alpha.md) (IPAWS KML network link, zone polygons, NAPSG icons), [v0.6.8-alpha](docs/RELEASE-v0.6.8-alpha.md) (Node-RED deploy sync fix), [v0.6.7-alpha](docs/RELEASE-v0.6.7-alpha.md) (DataSync read-only missions, shared missions), [v0.6.5-alpha](docs/RELEASE-v0.6.5-alpha.md) (KML + ArcGIS stable-ID / Purge), [v0.6.4-alpha](docs/RELEASE-v0.6.4-alpha.md). Older: [v0.6.1-alpha](docs/RELEASE-v0.6.1-alpha.md), [v0.6.0-alpha](docs/RELEASE-v0.6.0-alpha.md), [v0.5.9-alpha](docs/RELEASE-v0.5.9-alpha.md), [v0.5.8-alpha](docs/RELEASE-v0.5.8-alpha.md), [v0.5.7-alpha](docs/RELEASE-v0.5.7-alpha.md), [v0.5.6-alpha](docs/RELEASE-v0.5.6-alpha.md), [v0.5.5-alpha](docs/RELEASE-v0.5.5-alpha.md), [v0.5.4-alpha](docs/RELEASE-v0.5.4-alpha.md), [v0.5.3-alpha](docs/RELEASE-v0.5.3-alpha.md), [v0.5.2-alpha](docs/RELEASE-v0.5.2-alpha.md), [v0.5.1-alpha](docs/RELEASE-v0.5.1-alpha.md), [v0.5.0-alpha](docs/RELEASE-v0.5.0-alpha.md), [v0.4.9-alpha](docs/RELEASE-v0.4.9-alpha.md), [v0.4.8-alpha](docs/RELEASE-v0.4.8-alpha.md), [v0.4.7-alpha](docs/RELEASE-v0.4.7-alpha.md), [v0.4.6-alpha](docs/RELEASE-v0.4.6-alpha.md), [v0.4.5-alpha](docs/RELEASE-v0.4.5-alpha.md), [v0.4.4-alpha](docs/RELEASE-v0.4.4-alpha.md), [v0.4.3-alpha](docs/RELEASE-v0.4.3-alpha.md), [v0.4.2-alpha](docs/RELEASE-v0.4.2-alpha.md).
 
 **Something broken?** Wrong sidebar version, **Update Now** error, merge/rebase/tag-clobber messages, or you are not sure the VPS ever pulled the real repo → go to **[Universal recovery (SSH)](#universal-recovery-ssh)** and run the one block there. **Point people at that section**; it is the single source of truth.
 
@@ -299,6 +299,17 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v0.8.0-alpha — 2026-04-28
+
+**Bug fix: LDAP outpost `tls: internal error` on fresh installs**
+- On new deployments with an FQDN configured, the LDAP outpost was generated with `AUTHENTIK_HOST: https://<fqdn>` instead of the internal Docker service URL. On first boot, Caddy hasn't finished its ACME challenge yet, so it sends a TLS `internal_error` alert. The LDAP outpost then enters exponential backoff (3s → 6s → 12s → … → 12+ min between retries) and never recovers on its own.
+- Fix: all three code paths that generated or overwrote the LDAP outpost URL now unconditionally use `http://authentik-server-1:9000`. No `extra_hosts` entry is generated.
+- Auto-heals on update: post-update migration patches any existing broken `docker-compose.yml` and restarts the `ldap` container.
+
+Full notes: [docs/RELEASE-v0.8.0-alpha.md](docs/RELEASE-v0.8.0-alpha.md).
+
+---
 
 ### v0.7.2-alpha — 2026-04-24
 
