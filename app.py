@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.8.3-alpha"
+VERSION = "0.8.4-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -20865,7 +20865,10 @@ def _ensure_authentik_compose_patches(compose_path, plog=None):
 
         pg_cmd = 'postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=30s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
         has_pg_cmd = any('max_connections=300' in l for l in lines)
-        needs_pg_update = has_pg_cmd and (not any('idle_in_transaction_session_timeout' in l for l in lines) or any('idle_in_transaction_session_timeout=300s' in l for l in lines) or any('idle_in_transaction_session_timeout=10s' in l for l in lines) or any('idle_in_transaction_session_timeout=120s' in l for l in lines))
+        # v0.8.4: catch ANY value other than 30s (was: explicit 300s/10s/120s only — missed manual sed values like 15s)
+        _pg_full = ''.join(lines)
+        _pg_match = re.search(r'idle_in_transaction_session_timeout=(\d+)s', _pg_full)
+        needs_pg_update = has_pg_cmd and (not _pg_match or _pg_match.group(1) != '30')
         if not has_pg_cmd:
             patched = []
             for line in lines:
@@ -20960,6 +20963,150 @@ def _apply_authentik_pg_tuning(ak_dir, plog):
             plog("  ✓ PostgreSQL: tuning already current, config reloaded")
     except Exception as e:
         plog(f"  ⚠ PG tuning cleanup skipped: {e}")
+
+
+def _apply_authentik_ldap_routing_repair(ak_dir, plog):
+    """v0.8.4: Reverse v0.8.0's LDAP outpost AUTHENTIK_HOST migration for boxes whose
+    outpost is spiraling on the direct internal URL.
+
+    Problem (April 2026): v0.8.0 changed the LDAP outpost from `https://<fqdn>` (via Caddy)
+    to `http://authentik-server-1:9000` (direct Docker network) to fix `tls: internal error`
+    on fresh installs. On established busy installs that have working Caddy, the direct
+    path bypasses Caddy's HTTP/2 multiplexing and connection pooling, allowing parallel
+    unbounded requests that expose Authentik 2026.2.2's slow `policybindingmodel` flow
+    evaluation. The result is a Postgres query storm (200+ active queries), outpost
+    nil-pointer panics, EOFs, and CPU pegging — the spiral.
+
+    Fix: detect boxes that are (a) on the direct internal URL, (b) showing the spiral
+    signature in outpost logs, and (c) have a configured FQDN that Caddy can serve.
+    Reroute the LDAP outpost back through Caddy (`https://<fqdn>` + `extra_hosts:host-gateway`)
+    and force-recreate ONLY the LDAP container. Validate by checking the outpost reconnects;
+    on failure, restore the backup and recreate back to internal URL.
+
+    Cardinal rule from HANDOFF-LDAP-AUTHENTIK.md: NEVER restart the LDAP outpost unless
+    it's provably broken. The spiral signature (Result Code 50 / nil pointer / EOF / 503)
+    counts as "provably broken" — a healthy outpost will not have those in recent logs.
+    Idempotent: no-ops on healthy boxes, on FQDN-routed boxes, or on boxes without an FQDN.
+    """
+    compose_path = os.path.join(ak_dir, 'docker-compose.yml')
+    env_path = os.path.join(ak_dir, '.env')
+    if not os.path.exists(compose_path) or not os.path.exists(env_path):
+        return
+    try:
+        fqdn = ''
+        with open(env_path) as _f:
+            for _l in _f:
+                _ls = _l.strip()
+                if _ls.startswith('AUTHENTIK_HOST=') and 'https://' in _ls:
+                    fqdn = _ls.split('https://', 1)[1].split('/', 1)[0].strip()
+                    break
+        if not fqdn:
+            plog("  v0.8.4 routing repair: no FQDN in .env (AUTHENTIK_HOST=https://...) — skipping")
+            return
+
+        with open(compose_path) as _f:
+            compose_text = _f.read()
+        if 'AUTHENTIK_HOST: http://authentik-server-1:9000' not in compose_text:
+            plog("  v0.8.4 routing repair: LDAP not on internal URL — already routed correctly, skipping")
+            return
+
+        _log_r = subprocess.run('docker logs authentik-ldap-1 --tail 200 2>&1',
+            shell=True, capture_output=True, text=True, timeout=10)
+        _log = (_log_r.stdout or '').lower()
+        spiral_markers = ['result code 50', 'nil pointer', '"event":"failed to execute flow"',
+                          'eof', '502 bad gateway', '503 service unavailable',
+                          'exceeded stage recursion depth']
+        spiral_hits = sum(1 for m in spiral_markers if m in _log)
+        if spiral_hits < 2:
+            plog(f"  v0.8.4 routing repair: outpost not showing spiral signature ({spiral_hits}/2 markers) — leaving alone")
+            return
+        plog(f"  v0.8.4 routing repair: outpost shows spiral signature on http://authentik-server-1:9000 ({spiral_hits} markers)")
+
+        _probe = subprocess.run(
+            f'docker exec authentik-ldap-1 wget --spider --timeout=5 -q https://{fqdn}/-/health/live/ 2>&1; echo EXIT=$?',
+            shell=True, capture_output=True, text=True, timeout=15
+        )
+        if 'EXIT=0' not in (_probe.stdout or ''):
+            plog(f"  v0.8.4 routing repair: cannot reach https://{fqdn} from LDAP container — skipping (Caddy not ready or DNS issue)")
+            return
+        plog(f"  v0.8.4 routing repair: https://{fqdn} reachable from LDAP container — migrating routing")
+
+        import time as _t
+        backup_path = f'{compose_path}.bak.v0.8.4.{int(_t.time())}'
+        with open(backup_path, 'w') as _f:
+            _f.write(compose_text)
+        plog(f"  Backed up compose to {backup_path}")
+
+        new_lines = []
+        in_ldap = False
+        ldap_image_seen = False
+        ldap_has_extra_hosts = False
+        for line in compose_text.splitlines(keepends=True):
+            if line.startswith('  ldap:'):
+                in_ldap = True
+                ldap_has_extra_hosts = False
+                new_lines.append(line)
+                continue
+            if in_ldap and re.match(r'^  [a-z_-]+:\s*$', line):
+                in_ldap = False
+            if in_ldap:
+                if 'extra_hosts:' in line:
+                    ldap_has_extra_hosts = True
+                if 'image: ghcr.io/goauthentik/ldap' in line:
+                    new_lines.append(line)
+                    if not ldap_has_extra_hosts:
+                        new_lines.append('    extra_hosts:\n')
+                        new_lines.append(f'      - "{fqdn}:host-gateway"\n')
+                    ldap_image_seen = True
+                    continue
+                if 'AUTHENTIK_HOST:' in line:
+                    indent = line[:len(line) - len(line.lstrip())]
+                    new_lines.append(f'{indent}AUTHENTIK_HOST: https://{fqdn}\n')
+                    continue
+            new_lines.append(line)
+
+        if not ldap_image_seen:
+            plog("  v0.8.4 routing repair: LDAP image line not found in compose — aborting (no changes)")
+            return
+
+        new_text = ''.join(new_lines)
+        with open(compose_path, 'w') as _f:
+            _f.write(new_text)
+        plog(f"  Rewrote LDAP service: AUTHENTIK_HOST=https://{fqdn} + extra_hosts:host-gateway")
+
+        plog("  Recreating LDAP container only (server/worker/db untouched)...")
+        _r = subprocess.run(
+            f'cd {ak_dir} && docker compose up -d --no-deps --force-recreate ldap 2>&1',
+            shell=True, capture_output=True, text=True, timeout=90
+        )
+        if _r.returncode != 0:
+            plog(f"  ⚠ LDAP recreate failed, restoring backup: {(_r.stdout or '')[-300:]}")
+            with open(compose_path, 'w') as _f:
+                _f.write(compose_text)
+            subprocess.run(f'cd {ak_dir} && docker compose up -d --no-deps --force-recreate ldap',
+                shell=True, capture_output=True, text=True, timeout=90)
+            return
+
+        _t.sleep(30)
+        _val = subprocess.run('docker logs authentik-ldap-1 --since 30s 2>&1',
+            shell=True, capture_output=True, text=True, timeout=10)
+        _val_out = (_val.stdout or '').lower()
+        connected = 'successfully connected websocket' in _val_out
+        has_tls_err = 'remote error: tls' in _val_out or 'tls: internal error' in _val_out
+        has_route_err = '503 service unavailable' in _val_out or '502 bad gateway' in _val_out
+
+        if connected and not has_tls_err and not has_route_err:
+            plog(f"  ✓ v0.8.4 routing repair: LDAP outpost healthy on https://{fqdn} via Caddy (spiral broken)")
+            return
+
+        plog(f"  ⚠ v0.8.4 routing repair: validation failed (connected={connected}, tls_err={has_tls_err}, route_err={has_route_err}) — restoring backup")
+        with open(compose_path, 'w') as _f:
+            _f.write(compose_text)
+        subprocess.run(f'cd {ak_dir} && docker compose up -d --no-deps --force-recreate ldap',
+            shell=True, capture_output=True, text=True, timeout=90)
+        plog("  Restored LDAP routing to http://authentik-server-1:9000 (validation failed; FQDN path not viable on this box)")
+    except Exception as e:
+        plog(f"  ⚠ v0.8.4 routing repair error (no changes applied): {e}")
 
 
 def run_authentik_deploy(reconfigure=False):
@@ -21472,7 +21619,10 @@ entries:
             # Add postgres command-line tuning (max_connections, idle_session_timeout, tcp_keepalives)
             pg_cmd = 'postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=30s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
             has_pg_cmd = any('max_connections=300' in l for l in lines)
-        needs_pg_update = has_pg_cmd and (not any('idle_in_transaction_session_timeout' in l for l in lines) or any('idle_in_transaction_session_timeout=300s' in l for l in lines) or any('idle_in_transaction_session_timeout=10s' in l for l in lines) or any('idle_in_transaction_session_timeout=120s' in l for l in lines))
+        # v0.8.4: catch ANY value other than 30s
+        _pg_full = ''.join(lines)
+        _pg_match = re.search(r'idle_in_transaction_session_timeout=(\d+)s', _pg_full)
+        needs_pg_update = has_pg_cmd and (not _pg_match or _pg_match.group(1) != '30')
         if not has_pg_cmd:
             patched = []
             for line in lines:
@@ -29252,6 +29402,17 @@ def _post_update_auto_deploy():
                                 print("Post-update: patched LDAP AUTHENTIK_HOST → internal Docker URL, restarted ldap (outpost was not connected)")
             except Exception as _e:
                 print(f"Post-update: LDAP AUTHENTIK_HOST fix skipped: {_e}")
+
+            # v0.8.4: Reverse the v0.8.0 internal-URL migration for boxes whose outpost is
+            # spiraling on the direct path. See _apply_authentik_ldap_routing_repair for full
+            # diagnosis. Health-gated, validated, with automatic rollback. No-ops on healthy
+            # boxes and on boxes already routed via FQDN.
+            try:
+                _ak_dir_v084 = os.path.expanduser('~/authentik')
+                if os.path.exists(os.path.join(_ak_dir_v084, 'docker-compose.yml')):
+                    _apply_authentik_ldap_routing_repair(_ak_dir_v084, lambda m: print(f"Post-update: {m}"))
+            except Exception as _e:
+                print(f"Post-update: v0.8.4 LDAP routing repair skipped: {_e}")
 
             # Ensure AUTHENTIK_WEB_WORKERS=4 so the flow executor has enough capacity to handle
             # bind storms after restarts without thundering-herd overload. Only restarts the
