@@ -21483,14 +21483,14 @@ entries:
             lines = patched
             needs_write = True
             plog("  Added PostgreSQL command-line tuning")
-            elif needs_pg_update:
-                for i, line in enumerate(lines):
-                    if 'command: postgres' in line and 'max_connections' in line:
-                        indent = line[:len(line) - len(line.lstrip())]
-                        lines[i] = f'{indent}command: {pg_cmd}\n'
-                        needs_write = True
-                        plog("  Updated PostgreSQL idle_in_transaction_session_timeout to 30s")
-                        break
+        elif needs_pg_update:
+            for i, line in enumerate(lines):
+                if 'command: postgres' in line and 'max_connections' in line:
+                    indent = line[:len(line) - len(line.lstrip())]
+                    lines[i] = f'{indent}command: {pg_cmd}\n'
+                    needs_write = True
+                    plog("  Updated PostgreSQL idle_in_transaction_session_timeout to 30s")
+                    break
 
             # Pin AUTHENTIK_TAG to latest stable release
             ak_tag = _get_authentik_latest_release_tag(use_cache=False) or '2026.2.1'
