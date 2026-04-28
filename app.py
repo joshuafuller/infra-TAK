@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.8.0-alpha"
+VERSION = "0.8.1-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -29211,25 +29211,35 @@ def _post_update_auto_deploy():
                     print(f"Post-update: cert-metadata.sh fixup skipped: {e}")
 
             # Fix LDAP outpost AUTHENTIK_HOST if it was incorrectly set to external HTTPS URL (v0.8.0)
-            # On single-box installs the LDAP container should always use the internal Docker service URL.
-            # Old code generated https://<fqdn> + extra_hosts:host-gateway, which breaks on fresh installs
-            # because Caddy hasn't finished its ACME challenge yet and sends tls: internal error.
+            # ONLY patch if the outpost is currently broken (TLS error / not connected). If the outpost
+            # is healthy and connected, leave it alone — restarting a working outpost clears all cached
+            # bind sessions and causes a thundering-herd reconnect storm under load (high CPU / Postgres
+            # connection exhaustion). Only disrupt if there is actually a problem to fix.
             try:
                 ak_compose = os.path.expanduser('~/authentik/docker-compose.yml')
                 if os.path.exists(ak_compose):
                     with open(ak_compose) as _f:
                         _comp = _f.read()
                     if 'AUTHENTIK_HOST:' in _comp and 'http://authentik-server-1:9000' not in _comp:
-                        import re as _re
-                        _fixed = _re.sub(r'(AUTHENTIK_HOST:\s*)\S+', r'\1http://authentik-server-1:9000', _comp)
-                        # Remove stale extra_hosts block for the fqdn (leave host.docker.internal entries alone)
-                        _fixed = _re.sub(r'\n    extra_hosts:\n(?:      - "[^h][^"]*:host-gateway"\n)+', '\n', _fixed)
-                        if _fixed != _comp:
-                            with open(ak_compose, 'w') as _f:
-                                _f.write(_fixed)
-                            subprocess.run('cd ~/authentik && docker compose up -d ldap',
-                                shell=True, capture_output=True, text=True, timeout=60)
-                            print("Post-update: patched LDAP AUTHENTIK_HOST → internal Docker URL, restarted ldap")
+                        # Check if outpost is healthy before touching anything
+                        _log_r = subprocess.run('docker logs authentik-ldap-1 --tail=60 2>&1',
+                            shell=True, capture_output=True, text=True, timeout=10)
+                        _log = _log_r.stdout or ''
+                        _is_connected = 'successfully connected websocket' in _log.lower()
+                        _has_tls_error = 'remote error: tls: internal error' in _log.lower()
+                        if _is_connected and not _has_tls_error:
+                            print("Post-update: LDAP outpost connected and healthy — AUTHENTIK_HOST migration skipped to avoid disrupting active sessions")
+                        else:
+                            import re as _re
+                            _fixed = _re.sub(r'(AUTHENTIK_HOST:\s*)\S+', r'\1http://authentik-server-1:9000', _comp)
+                            # Remove stale extra_hosts block for the fqdn (leave host.docker.internal entries alone)
+                            _fixed = _re.sub(r'\n    extra_hosts:\n(?:      - "[^h][^"]*:host-gateway"\n)+', '\n', _fixed)
+                            if _fixed != _comp:
+                                with open(ak_compose, 'w') as _f:
+                                    _f.write(_fixed)
+                                subprocess.run('cd ~/authentik && docker compose up -d ldap',
+                                    shell=True, capture_output=True, text=True, timeout=60)
+                                print("Post-update: patched LDAP AUTHENTIK_HOST → internal Docker URL, restarted ldap (outpost was not connected)")
             except Exception as _e:
                 print(f"Post-update: LDAP AUTHENTIK_HOST fix skipped: {_e}")
 
