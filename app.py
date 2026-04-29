@@ -20970,43 +20970,63 @@ def _detect_authentik_ldap_spiral(plog=None):
 
     Returns (spiraling: bool, evidence: dict). Evidence dict contains:
       - 'outpost_markers': dict of marker -> count from last 1000 lines of LDAP container log
-      - 'outpost_unique_markers': int (count of distinct marker types matched)
+      - 'outpost_spiral_specific_markers': int (count of distinct spiral-specific marker types matched)
+      - 'outpost_general_markers': int (count of distinct general marker types — recorded but doesn't trip)
       - 'pg_idle_in_trans': int (idle-in-transaction connections from authentik-server)
       - 'pg_total_conns': int (total connections to authentik DB)
       - 'reason': str (which signal(s) tripped, or why not)
 
     Spiral confirmed when EITHER:
-      - LDAP outpost log shows ≥2 unique spiral markers in last 1000 lines (the v0.8.4 signal)
+      - LDAP outpost log shows ≥1 SPIRAL-SPECIFIC marker in last 1000 lines
+        (`result code 50`, `nil pointer`, `exceeded stage recursion`, 502, 503 — these
+        do not appear on healthy boxes)
       - Postgres has ≥30 connections in 'idle in transaction' state
         (durable signal — survives LDAP container recreate, can't be hidden by high bind volume)
+
+    GENERAL markers (`failed to execute flow`, `EOF`) are tracked for forensics but do
+    not trip the gate alone — they appear on healthy boxes (user types wrong password,
+    LDAP client disconnects normally) and produced false positives during v0.8.5 dev
+    testing on tak-10 (transient restart artifacts: 2 unique markers, idle-in-trans=0,
+    box completely healthy). Postgres signal remains as the unmaskable backup for any
+    spiral that doesn't hit a spiral-specific marker.
     """
-    evidence = {'outpost_markers': {}, 'outpost_unique_markers': 0,
-                'pg_idle_in_trans': -1, 'pg_total_conns': -1, 'reason': ''}
+    evidence = {'outpost_markers': {}, 'outpost_spiral_specific_markers': 0,
+                'outpost_general_markers': 0, 'pg_idle_in_trans': -1,
+                'pg_total_conns': -1, 'reason': ''}
 
     # Outpost log signal — bumped --tail from 200 to 1000 (high-volume binds otherwise drown out
     # rare spiral markers; on ssdnodes during v0.8.4 testing, 14 markers existed in last 200 lines
     # by bash grep but the migration's --tail 200 sample showed 0 because all 200 entries were
     # benign 'Bind request' lines).
+    spiral_specific_patterns = {
+        'result code 50': 'result code 50',                 # LDAP "unwilling to perform" — Authentik flow refusing
+        'nil pointer': 'nil pointer',                        # Go runtime crash in outpost
+        'exceeded stage recursion': 'exceeded stage recursion',  # responder signature
+        '502 bad gateway': '502 bad gateway',                # upstream Authentik overloaded
+        '503 service unavailable': '503 service unavailable',  # upstream Authentik refusing connections
+    }
+    general_patterns = {
+        'failed to execute flow': '"event":"failed to execute flow"',  # any auth fail incl. user typos
+        'eof': '": eof"',                                    # normal LDAP client disconnect produces this
+    }
     try:
         _log_r = subprocess.run('docker logs authentik-ldap-1 --tail 1000 2>&1',
             shell=True, capture_output=True, text=True, timeout=15)
         _log_lower = (_log_r.stdout or '').lower()
-        marker_patterns = {
-            'result code 50': 'result code 50',
-            'nil pointer': 'nil pointer',
-            'failed to execute flow': '"event":"failed to execute flow"',
-            'eof': '": eof"',
-            '502 bad gateway': '502 bad gateway',
-            '503 service unavailable': '503 service unavailable',
-            'exceeded stage recursion': 'exceeded stage recursion',
-        }
-        unique = 0
-        for label, pat in marker_patterns.items():
+        spiral_specific_unique = 0
+        general_unique = 0
+        for label, pat in spiral_specific_patterns.items():
             n = _log_lower.count(pat)
             evidence['outpost_markers'][label] = n
             if n > 0:
-                unique += 1
-        evidence['outpost_unique_markers'] = unique
+                spiral_specific_unique += 1
+        for label, pat in general_patterns.items():
+            n = _log_lower.count(pat)
+            evidence['outpost_markers'][label] = n
+            if n > 0:
+                general_unique += 1
+        evidence['outpost_spiral_specific_markers'] = spiral_specific_unique
+        evidence['outpost_general_markers'] = general_unique
     except Exception as e:
         evidence['outpost_markers'] = {'_error': str(e)}
 
@@ -21031,20 +21051,20 @@ def _detect_authentik_ldap_spiral(plog=None):
         evidence['pg_idle_in_trans'] = -1
         evidence['pg_total_conns'] = -1
 
-    # Decide
-    outpost_signal = evidence['outpost_unique_markers'] >= 2
+    outpost_signal = evidence['outpost_spiral_specific_markers'] >= 1
     pg_signal = evidence['pg_idle_in_trans'] >= 30
     spiraling = outpost_signal or pg_signal
 
     if pg_signal and outpost_signal:
-        evidence['reason'] = (f"both signals tripped: outpost {evidence['outpost_unique_markers']} unique markers "
+        evidence['reason'] = (f"both signals tripped: outpost {evidence['outpost_spiral_specific_markers']} spiral-specific markers "
                               f"+ postgres {evidence['pg_idle_in_trans']} idle-in-trans")
     elif pg_signal:
         evidence['reason'] = f"postgres signal: {evidence['pg_idle_in_trans']} idle-in-trans (≥30 threshold)"
     elif outpost_signal:
-        evidence['reason'] = f"outpost log signal: {evidence['outpost_unique_markers']} unique markers (≥2 threshold)"
+        evidence['reason'] = f"outpost log signal: {evidence['outpost_spiral_specific_markers']} spiral-specific markers (≥1 threshold)"
     else:
-        evidence['reason'] = (f"no spiral: outpost {evidence['outpost_unique_markers']}/2 markers, "
+        evidence['reason'] = (f"no spiral: outpost {evidence['outpost_spiral_specific_markers']} spiral-specific markers "
+                              f"(general markers {evidence['outpost_general_markers']}/2 — informational only), "
                               f"postgres {evidence['pg_idle_in_trans']} idle-in-trans (need ≥30)")
 
     if plog:
