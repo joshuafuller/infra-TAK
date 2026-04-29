@@ -21383,6 +21383,89 @@ def _ensure_authentik_ldap_outpost_on_fqdn(plog):
         plog(f"  ⚠ proactive routing error (no changes applied): {e}")
 
 
+def _ensure_authentik_gunicorn_timeout(plog, value=120):
+    """v0.8.5 PROACTIVE migration: bump Authentik server gunicorn worker timeout from the
+    upstream default (30s) to 120s. Closes a class of cascade failures observed on heavy-
+    LDAP-load boxes (3+ binds/sec sustained) where Authentik 2026.2.2's flow planner
+    occasionally exceeds 30s, gunicorn SIGABRTs the worker mid-request, in-flight TCP
+    connections drop, Caddy returns 502 to the LDAP outpost, the outpost retries, and the
+    next request hits "exceeded stage recursion depth" inside the same flow.
+
+    Mechanism: a single env var `GUNICORN_CMD_ARGS=--timeout=120` appended to ~/authentik/.env.
+    Gunicorn picks it up automatically at process start. Ignored by the worker container
+    (celery, not gunicorn) — harmless presence.
+
+    Safety profile (why this is safe everywhere, not just slow boxes):
+      - On healthy/fast boxes: timeout never fires. No behavioral change.
+      - On heavy-load/slow-flow boxes: absorbs slow plans without dropping connections.
+      - On boxes that already set GUNICORN_CMD_ARGS (operator override, future Authentik
+        defaults, etc.): idempotent no-op (we never overwrite).
+      - Operator-revertible: delete the line + recreate server. No state coupling.
+
+    Triggers a server-only `docker compose up -d --no-deps --force-recreate server` to apply.
+    Worker, postgresql, redis, ldap untouched — keeps blast radius to ~10-30s of API
+    unavailability (cached LDAP service-account sessions survive; live binds retry).
+
+    Idempotent. Skip-on-precondition: ~/authentik missing, env already has the var, etc.
+    """
+    ak_dir = os.path.expanduser('~/authentik')
+    env_path = os.path.join(ak_dir, '.env')
+    compose_path = os.path.join(ak_dir, 'docker-compose.yml')
+    if not os.path.exists(env_path) or not os.path.exists(compose_path):
+        plog("  gunicorn timeout: ~/authentik not installed — skipping")
+        return
+
+    try:
+        with open(env_path) as _f:
+            env_text = _f.read()
+        if 'GUNICORN_CMD_ARGS' in env_text:
+            plog("  gunicorn timeout: GUNICORN_CMD_ARGS already set in .env — skipping (idempotent)")
+            return
+
+        import time as _t
+        backup_path = f'{env_path}.bak.gunicorn-timeout.{int(_t.time())}'
+        with open(backup_path, 'w') as _f:
+            _f.write(env_text)
+
+        new_line = f'GUNICORN_CMD_ARGS=--timeout={int(value)}\n'
+        sep = '' if env_text.endswith('\n') or not env_text else '\n'
+        new_text = env_text + sep + new_line
+        with open(env_path, 'w') as _f:
+            _f.write(new_text)
+        plog(f"  gunicorn timeout: appended GUNICORN_CMD_ARGS=--timeout={int(value)} to ~/authentik/.env (backup: {os.path.basename(backup_path)})")
+
+        plog("  gunicorn timeout: recreating Authentik server container only (worker/db/redis/ldap untouched)...")
+        _r = subprocess.run(
+            f'cd {ak_dir} && docker compose up -d --no-deps --force-recreate server 2>&1',
+            shell=True, capture_output=True, text=True, timeout=120
+        )
+        if _r.returncode != 0:
+            plog(f"  ⚠ gunicorn timeout: server recreate failed — env applied but not yet active: {(_r.stdout or '')[-300:]}")
+            return
+
+        _t.sleep(15)
+        _v = subprocess.run(
+            'docker exec authentik-server-1 printenv GUNICORN_CMD_ARGS 2>&1',
+            shell=True, capture_output=True, text=True, timeout=10
+        )
+        if f'--timeout={int(value)}' in (_v.stdout or ''):
+            plog(f"  ✓ gunicorn timeout: server container running with --timeout={int(value)} (was upstream default 30s)")
+            try:
+                s = load_settings()
+                s['authentik_gunicorn_timeout_migration'] = {
+                    'ts': int(_t.time()),
+                    'outcome': 'success',
+                    'value': int(value),
+                }
+                save_settings(s)
+            except Exception:
+                pass
+        else:
+            plog(f"  ⚠ gunicorn timeout: server restarted but printenv didn't surface the value — non-fatal, will be picked up on next restart: {((_v.stdout or '') + (_v.stderr or ''))[:200]}")
+    except Exception as e:
+        plog(f"  ⚠ gunicorn timeout error (no changes applied): {e}")
+
+
 def _authentik_spiral_monitor():
     """v0.8.5: Periodic background monitor for the LDAP routing spiral.
 
@@ -22984,6 +23067,10 @@ entries:
             _ensure_authentik_ldap_outpost_on_fqdn(plog)
         except Exception as _e:
             plog(f"  ⚠ Proactive routing migration skipped: {_e}")
+        try:
+            _ensure_authentik_gunicorn_timeout(plog)
+        except Exception as _e:
+            plog(f"  ⚠ Gunicorn timeout migration skipped: {_e}")
         plog("  ✓ Deploy complete.")
         _update_boot_stagger_service()
         authentik_deploy_status.update({'running': False, 'complete': True, 'error': False})
@@ -27810,6 +27897,10 @@ def run_takserver_deploy(config):
                 _ensure_authentik_ldap_outpost_on_fqdn(log_step)
             except Exception as _e:
                 log_step(f"  ⚠ Proactive routing migration skipped: {_e}")
+            try:
+                _ensure_authentik_gunicorn_timeout(log_step)
+            except Exception as _e:
+                log_step(f"  ⚠ Gunicorn timeout migration skipped: {_e}")
 
         # If Caddy is already running with a domain, install LE cert on 8446 now.
         # This handles the case where Caddy was deployed before TAK Server.
@@ -29898,6 +29989,16 @@ def _post_update_auto_deploy():
                 _ensure_authentik_ldap_outpost_on_fqdn(lambda m: print(f"Post-update: {m}"))
             except Exception as _e:
                 print(f"Post-update: proactive routing migration skipped: {_e}")
+
+            # v0.8.5: Gunicorn worker timeout bump (30s → 120s) — closes the SIGABRT cascade
+            # observed on heavy-LDAP-load boxes (3+ binds/sec) where Authentik 2026.2.2's flow
+            # planner exceeds 30s and gunicorn kills the worker mid-request, dropping in-flight
+            # connections and triggering 502→outpost-retry→stage-recursion. Idempotent no-op
+            # on boxes where the env var is already set or ~/authentik isn't installed.
+            try:
+                _ensure_authentik_gunicorn_timeout(lambda m: print(f"Post-update: {m}"))
+            except Exception as _e:
+                print(f"Post-update: gunicorn timeout migration skipped: {_e}")
 
             # v0.8.4: Reactive routing repair — for boxes already actively spiraling on the
             # direct path. Spiral-signature gated (postgres + outpost log dual signal),
