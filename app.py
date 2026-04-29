@@ -21212,6 +21212,157 @@ def _record_spiral_repair_attempt(outcome, evidence):
         pass
 
 
+def _ensure_authentik_ldap_outpost_on_fqdn(plog):
+    """v0.8.5 PROACTIVE routing migration. Complements _apply_authentik_ldap_routing_repair
+    (reactive) by migrating any box where the LDAP outpost is on internal direct routing
+    (`http://authentik-server-1:9000`) to FQDN routing (`https://<fqdn>`) — without waiting
+    for a spiral signature to appear in logs.
+
+    Why proactive? The reactive repair gates on "spiral signature in outpost logs" which can
+    miss boxes where: (a) cached service-account sessions hide the failures, (b) outpost
+    logs got wiped by container restart, (c) the box hasn't started spiraling yet but will
+    once load grows. Responder (April 2026) was exactly this case: latent bug, masked by
+    cached adm_ldapservice session, exploded when webadmin (no cache) tried a fresh bind.
+
+    Preconditions for migration (ALL required):
+      1. ~/authentik/docker-compose.yml + .env present
+      2. Outpost AUTHENTIK_HOST == http://authentik-server-1:9000 (internal direct)
+      3. .env has AUTHENTIK_HOST=https://<fqdn> (FQDN configured)
+      4. https://<fqdn>/-/health/live/ reachable from inside the LDAP container (Caddy up)
+      5. TAK Server installed at /opt/tak (heavy LDAP load profile — not light/console-only)
+
+    Only when ALL pass do we migrate. Failure on any → log skip reason and exit. Idempotent.
+
+    Cardinal rule: NEVER restart the LDAP outpost unless something is wrong. "Wrong routing
+    + heavy load + healthy FQDN target available" qualifies — the alternative is waiting for
+    the user to hit the spiral and lose webadmin access.
+    """
+    ak_dir = os.path.expanduser('~/authentik')
+    compose_path = os.path.join(ak_dir, 'docker-compose.yml')
+    env_path = os.path.join(ak_dir, '.env')
+    if not os.path.exists(compose_path) or not os.path.exists(env_path):
+        plog("  proactive routing: ~/authentik not installed — skipping")
+        return
+
+    try:
+        if not os.path.exists('/opt/tak'):
+            plog("  proactive routing: TAK Server not installed — leaving outpost on internal routing (light-load profile)")
+            return
+
+        fqdn = ''
+        with open(env_path) as _f:
+            for _l in _f:
+                _ls = _l.strip()
+                if _ls.startswith('AUTHENTIK_HOST=') and 'https://' in _ls:
+                    fqdn = _ls.split('https://', 1)[1].split('/', 1)[0].strip()
+                    break
+        if not fqdn:
+            plog("  proactive routing: no FQDN in .env — skipping (no migration target)")
+            return
+
+        with open(compose_path) as _f:
+            compose_text = _f.read()
+        if 'AUTHENTIK_HOST: http://authentik-server-1:9000' not in compose_text:
+            plog("  proactive routing: outpost already on FQDN — skipping (already correct)")
+            return
+
+        _probe = subprocess.run(
+            f'docker exec authentik-ldap-1 wget --spider --timeout=5 -q https://{fqdn}/-/health/live/ 2>&1; echo EXIT=$?',
+            shell=True, capture_output=True, text=True, timeout=15
+        )
+        if 'EXIT=0' not in (_probe.stdout or ''):
+            plog(f"  proactive routing: cannot reach https://{fqdn} from LDAP container — skipping (Caddy/DNS not ready; retry later)")
+            return
+        plog(f"  proactive routing: all preconditions met (TAK installed, FQDN configured, Caddy reachable) — migrating outpost to FQDN")
+
+        import time as _t
+        backup_path = f'{compose_path}.bak.proactive-routing.{int(_t.time())}'
+        with open(backup_path, 'w') as _f:
+            _f.write(compose_text)
+        plog(f"  proactive routing: backed up compose to {backup_path}")
+
+        new_lines = []
+        in_ldap = False
+        ldap_image_seen = False
+        ldap_has_extra_hosts = False
+        for line in compose_text.splitlines(keepends=True):
+            if line.startswith('  ldap:'):
+                in_ldap = True
+                ldap_has_extra_hosts = False
+                new_lines.append(line)
+                continue
+            if in_ldap and re.match(r'^  [a-z_-]+:\s*$', line):
+                in_ldap = False
+            if in_ldap:
+                if 'extra_hosts:' in line:
+                    ldap_has_extra_hosts = True
+                if 'image: ghcr.io/goauthentik/ldap' in line:
+                    new_lines.append(line)
+                    if not ldap_has_extra_hosts:
+                        new_lines.append('    extra_hosts:\n')
+                        new_lines.append(f'      - "{fqdn}:host-gateway"\n')
+                    ldap_image_seen = True
+                    continue
+                if 'AUTHENTIK_HOST:' in line:
+                    indent = line[:len(line) - len(line.lstrip())]
+                    new_lines.append(f'{indent}AUTHENTIK_HOST: https://{fqdn}\n')
+                    continue
+            new_lines.append(line)
+
+        if not ldap_image_seen:
+            plog("  proactive routing: LDAP image line not found in compose — aborting (no changes)")
+            return
+
+        new_text = ''.join(new_lines)
+        with open(compose_path, 'w') as _f:
+            _f.write(new_text)
+        plog(f"  proactive routing: rewrote LDAP service → AUTHENTIK_HOST=https://{fqdn} + extra_hosts:host-gateway")
+
+        plog("  proactive routing: recreating LDAP container only (server/worker/db untouched)...")
+        _r = subprocess.run(
+            f'cd {ak_dir} && docker compose up -d --no-deps --force-recreate ldap 2>&1',
+            shell=True, capture_output=True, text=True, timeout=90
+        )
+        if _r.returncode != 0:
+            plog(f"  ⚠ proactive routing: LDAP recreate failed, restoring backup: {(_r.stdout or '')[-300:]}")
+            with open(compose_path, 'w') as _f:
+                _f.write(compose_text)
+            subprocess.run(f'cd {ak_dir} && docker compose up -d --no-deps --force-recreate ldap',
+                shell=True, capture_output=True, text=True, timeout=90)
+            return
+
+        _t.sleep(30)
+        _val = subprocess.run('docker logs authentik-ldap-1 --since 30s 2>&1',
+            shell=True, capture_output=True, text=True, timeout=10)
+        _val_out = (_val.stdout or '').lower()
+        connected = 'successfully connected websocket' in _val_out
+        has_tls_err = 'remote error: tls' in _val_out or 'tls: internal error' in _val_out
+        has_route_err = '503 service unavailable' in _val_out or '502 bad gateway' in _val_out
+
+        if connected and not has_tls_err and not has_route_err:
+            plog(f"  ✓ proactive routing: LDAP outpost healthy on https://{fqdn} via Caddy")
+            try:
+                s = load_settings()
+                s['authentik_proactive_routing_migration'] = {
+                    'ts': int(_t.time()),
+                    'outcome': 'success',
+                    'fqdn': fqdn,
+                }
+                save_settings(s)
+            except Exception:
+                pass
+            return
+
+        plog(f"  ⚠ proactive routing: validation failed (connected={connected}, tls_err={has_tls_err}, route_err={has_route_err}) — restoring backup")
+        with open(compose_path, 'w') as _f:
+            _f.write(compose_text)
+        subprocess.run(f'cd {ak_dir} && docker compose up -d --no-deps --force-recreate ldap',
+            shell=True, capture_output=True, text=True, timeout=90)
+        plog("  proactive routing: restored LDAP routing to internal direct (FQDN path not viable on this box; will retry later)")
+    except Exception as e:
+        plog(f"  ⚠ proactive routing error (no changes applied): {e}")
+
+
 def _authentik_spiral_monitor():
     """v0.8.5: Periodic background monitor for the LDAP routing spiral.
 
@@ -21264,6 +21415,15 @@ def _authentik_spiral_monitor():
             if not os.path.exists(os.path.join(ak_dir, 'docker-compose.yml')):
                 continue
 
+            # PROACTIVE pass first: if outpost is on internal routing and all preconditions
+            # for FQDN migration are met, migrate now — don't wait for spiral. Idempotent on
+            # FQDN-routed boxes so this is a 0.5s no-op when there's nothing to do.
+            try:
+                _ensure_authentik_ldap_outpost_on_fqdn(lambda m: print(f"[spiral monitor] {m}", flush=True))
+            except Exception as _proactive_e:
+                print(f"[spiral monitor] proactive routing pass error (non-fatal): {_proactive_e}", flush=True)
+
+            # REACTIVE pass: spiral signature → routing repair (rate-limited to 1 attempt per 6h).
             s = load_settings()
             last_attempt = s.get('authentik_spiral_last_repair') or {}
             last_ts = last_attempt.get('ts', 0)
@@ -22796,6 +22956,14 @@ entries:
             plog("  2. Email Relay: SMTP is already configured — this deploy applied or will apply Authentik email when that step succeeded above.")
         plog("  3. TAK Server: deploy only after this log shows the LDAP SA bind verified (above).")
         plog("=" * 50)
+        # v0.8.5: Proactive routing migration — if TAK Server is already installed when
+        # Authentik is deployed (re-deploy / reconfigure path), migrate outpost to FQDN
+        # immediately. No-op for first-time Authentik-then-TAK order; runs at TAK deploy
+        # time instead. Heavy-load boxes get FQDN routing without waiting for spiral.
+        try:
+            _ensure_authentik_ldap_outpost_on_fqdn(plog)
+        except Exception as _e:
+            plog(f"  ⚠ Proactive routing migration skipped: {_e}")
         plog("  ✓ Deploy complete.")
         _update_boot_stagger_service()
         authentik_deploy_status.update({'running': False, 'complete': True, 'error': False})
@@ -23558,12 +23726,18 @@ def _test_ldap_bind(ldap_pass):
     return 'authenticated' in log and ('adm_ldapservice' in log or 'ldapservice' in log)
 
 
-def _test_ldap_bind_dn(bind_dn, bind_pass):
-    """Best-effort LDAP bind signal for a specific DN via outpost logs.
+def _test_ldap_bind_dn_verdict(bind_dn, bind_pass):
+    """v0.8.5: Tri-state LDAP bind probe.
 
-    We don't trust ldapsearch exit codes against Authentik LDAP outpost, so this checks
-    whether the outpost received a bind request for the DN and that recent lines don't
-    show obvious credential errors for that DN.
+    Returns one of:
+      'ok'           — bind confirmed (ldapsearch success OR success marker in outpost logs)
+      'fail'         — bind confirmed failed (failure markers / credential errors)
+      'inconclusive' — could not determine (ldapsearch unavailable AND no decisive marker)
+
+    Callers must NOT take destructive action on 'inconclusive' — that's the bug that hit
+    `responder` (April 2026): missing ldapsearch + recursion-only outpost logs caused a
+    false 'fail' that triggered DELETE+POST recreate of webadmin, which then 400'd because
+    the original user still existed (DELETE async/raced).
     """
     settings = load_settings()
     ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
@@ -23575,17 +23749,29 @@ def _test_ldap_bind_dn(bind_dn, bind_pass):
             ldap_host = remote_host
     dn = (bind_dn or '').strip().lower()
     if not dn:
-        return False
+        return 'fail'
     user_hint = ''
     if dn.startswith('cn=') and ',' in dn:
         user_hint = dn.split(',', 1)[0].replace('cn=', '').strip()
     success_markers = ('authenticated', 'bind successful', 'login successful')
     failure_markers = ('invalid credentials', 'access denied', 'insufficient access')
+    # 'exceeded stage recursion depth' is the responder spiral signature — NOT a credential
+    # failure. Treat as inconclusive so callers don't destroy the user record on a routing bug.
+    spiral_markers = ('exceeded stage recursion depth', 'nil pointer dereference', 'eof')
 
-    for _ in range(3):
-        # Primary signal: explicit ldapsearch success for this bind DN/password.
+    # Try to install ldapsearch once at the top — best chance of getting a decisive result.
+    has_ldapsearch = shutil.which('ldapsearch') is not None
+    if not has_ldapsearch and not is_remote:
         try:
-            if shutil.which('ldapsearch'):
+            _ensure_ldapsearch()
+            has_ldapsearch = shutil.which('ldapsearch') is not None
+        except Exception:
+            pass
+
+    saw_spiral = False
+    for _ in range(3):
+        if has_ldapsearch and not is_remote:
+            try:
                 lr = subprocess.run(
                     ['ldapsearch', '-x', '-H', f'ldap://{ldap_host}:389',
                      '-D', bind_dn, '-w', bind_pass,
@@ -23593,9 +23779,11 @@ def _test_ldap_bind_dn(bind_dn, bind_pass):
                     capture_output=True, text=True, timeout=15)
                 out = ((lr.stdout or '') + '\n' + (lr.stderr or '')).lower()
                 if lr.returncode == 0 and 'invalid credentials' not in out:
-                    return True
-        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
-            pass
+                    return 'ok'
+                if 'invalid credentials' in out:
+                    return 'fail'
+            except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+                pass
 
         time.sleep(2)
         if is_remote:
@@ -23608,27 +23796,45 @@ def _test_ldap_bind_dn(bind_dn, bind_pass):
                 shell=True, capture_output=True, text=True, timeout=10)
             log = (r.stdout or '').lower()
 
+        if any(m in log for m in spiral_markers):
+            saw_spiral = True
+
         lines = []
         for ln in log.splitlines():
             if dn in ln or (user_hint and user_hint in ln):
                 lines.append(ln)
         if not lines:
             continue
-        # Check success FIRST — a recent success trumps a stale flow-error from outpost startup
         if any(any(m in ln for m in success_markers) for ln in lines):
-            return True
+            return 'ok'
         if any(any(m in ln for m in failure_markers) for ln in lines):
-            return False
+            return 'fail'
         has_flow_error = any(
             'failed to execute flow' in ln.lower() or 'ak-stage-flow-error' in ln.lower()
             for ln in lines)
         has_cred_error = any(
             'flow error' in ln.lower() and ('password' in ln.lower() or 'invalid' in ln.lower())
             for ln in lines)
-        if has_flow_error or has_cred_error:
-            return False
+        if has_cred_error:
+            return 'fail'
+        # Plain "failed to execute flow" without credential markers is the spiral signature
+        # on misrouted boxes — inconclusive, don't destroy the user.
+        if has_flow_error:
+            saw_spiral = True
 
-    return False
+    return 'inconclusive' if saw_spiral or not has_ldapsearch else 'fail'
+
+
+def _test_ldap_bind_dn(bind_dn, bind_pass):
+    """Backward-compatible wrapper that returns True only for confirmed-ok binds.
+
+    Note: callers that distinguish a confirmed-fail vs. inconclusive (especially destructive
+    recovery paths) should use `_test_ldap_bind_dn_verdict` directly. This wrapper conflates
+    'fail' and 'inconclusive' as False and is preserved for read-only callers (e.g. final
+    deploy verification, sync status checks) where the worst case of a false-False is just
+    the user being told to investigate manually.
+    """
+    return _test_ldap_bind_dn_verdict(bind_dn, bind_pass) == 'ok'
 
 
 def _authentik_deploy_final_verify_ldap_sa(ldap_svc_pass, plog, attempts=12, delay_sec=5):
@@ -24221,12 +24427,43 @@ def _ensure_authentik_webadmin(skip_bind_verify=False):
         ready, ready_status = _wait_ldap_outpost_ready(timeout_secs=180)
         if not ready:
             return False, f'webadmin set, but LDAP outpost not ready (status: {ready_status})'
-        if not _test_ldap_bind_dn('cn=webadmin,ou=users,dc=takldap', webadmin_pass):
+        # v0.8.5: Tri-state probe. Only do destructive recovery (DELETE + recreate) on a
+        # CONFIRMED 'fail'. On 'inconclusive' (missing ldapsearch, spiral markers, or flow
+        # errors with no credential signal) the bind is likely fine — possibly a routing
+        # spiral hiding the success log. Destroying the user there causes the responder
+        # 'username must be unique' regression. Trigger proactive routing migration instead.
+        verdict = _test_ldap_bind_dn_verdict('cn=webadmin,ou=users,dc=takldap', webadmin_pass)
+        if verdict == 'inconclusive':
+            try:
+                _ensure_authentik_ldap_outpost_on_fqdn(lambda m: print(f"[webadmin sync] {m}", flush=True))
+            except Exception:
+                pass
+            return True, None
+        if verdict == 'fail':
             try:
                 req_del = _req.Request(f'{url}/api/v3/core/users/{webadmin_pk}/', headers=headers, method='DELETE')
                 _req.urlopen(req_del, timeout=10)
             except Exception:
                 pass
+            # Confirm DELETE actually removed the user before POSTing — guards against the
+            # responder 400 'username must be unique' (DELETE silently failing or async).
+            existed_after = False
+            try:
+                req_check = _req.Request(f'{url}/api/v3/core/users/?search=webadmin', headers=headers)
+                check_results = json.loads(_req.urlopen(req_check, timeout=10).read().decode()).get('results', [])
+                existed_after = any(u.get('username') == 'webadmin' for u in check_results)
+            except Exception:
+                pass
+            if existed_after:
+                # Don't POST a duplicate. Patch + reset password on the existing record instead.
+                req = _req.Request(f'{url}/api/v3/core/users/{webadmin_pk}/set_password/',
+                    data=json.dumps({'password': webadmin_pass}).encode(),
+                    headers=headers, method='POST')
+                try:
+                    _req.urlopen(req, timeout=10)
+                except Exception:
+                    pass
+                return False, 'webadmin bind failed; DELETE was not honored. Skipped destructive recreate to avoid duplicate. Investigate Authentik flow/policy.'
             rebuilt = _create_webadmin_user()
             webadmin_pk = rebuilt['pk']
             req = _req.Request(
@@ -24253,7 +24490,8 @@ def _ensure_authentik_webadmin(skip_bind_verify=False):
                 subprocess.run('cd ~/authentik && docker compose up -d --force-recreate ldap 2>&1',
                     shell=True, capture_output=True, text=True, timeout=90)
             ready2, ready_status2 = _wait_ldap_outpost_ready(timeout_secs=180)
-            if (not ready2) or (not _test_ldap_bind_dn('cn=webadmin,ou=users,dc=takldap', webadmin_pass)):
+            verdict2 = _test_ldap_bind_dn_verdict('cn=webadmin,ou=users,dc=takldap', webadmin_pass)
+            if (not ready2) or verdict2 == 'fail':
                 return False, f'webadmin exists but LDAP bind verification failed (DN/password). Outpost status: {ready_status2}'
         return True, None
     except urllib.error.HTTPError as e:
@@ -27543,6 +27781,16 @@ def run_takserver_deploy(config):
             _remove_webadmin_from_userauth()
             log_step("  ✓ Removed any flat-file webadmin shadow (8446 → LDAP only)")
 
+        # v0.8.5: Now that TAK Server is installed (heavy LDAP load profile activated),
+        # proactively migrate the LDAP outpost to FQDN routing if it's still on internal direct.
+        # This prevents the responder-class bug where heavy load on internal routing causes
+        # flow-execution recursion that's masked by cached service-account sessions.
+        if _get_authentik_env_content(settings):
+            try:
+                _ensure_authentik_ldap_outpost_on_fqdn(log_step)
+            except Exception as _e:
+                log_step(f"  ⚠ Proactive routing migration skipped: {_e}")
+
         # If Caddy is already running with a domain, install LE cert on 8446 now.
         # This handles the case where Caddy was deployed before TAK Server.
         fqdn = settings.get('fqdn', '')
@@ -29621,10 +29869,20 @@ def _post_update_auto_deploy():
             except Exception as _e:
                 print(f"Post-update: LDAP AUTHENTIK_HOST fix skipped: {_e}", flush=True)
 
-            # v0.8.4: Reverse the v0.8.0 internal-URL migration for boxes whose outpost is
-            # spiraling on the direct path. See _apply_authentik_ldap_routing_repair for full
-            # diagnosis. Health-gated, validated, with automatic rollback. No-ops on healthy
-            # boxes and on boxes already routed via FQDN.
+            # v0.8.5: PROACTIVE routing migration — if outpost is on internal direct routing
+            # AND TAK Server is installed AND FQDN+Caddy are reachable, migrate to FQDN now.
+            # Doesn't wait for spiral signature. This is the primary defense for the responder-
+            # class bug (latent misroute hidden by cached service-account session, exploded on
+            # fresh webadmin bind). No-ops on FQDN-routed boxes and on light-load boxes.
+            try:
+                _ensure_authentik_ldap_outpost_on_fqdn(lambda m: print(f"Post-update: {m}"))
+            except Exception as _e:
+                print(f"Post-update: proactive routing migration skipped: {_e}")
+
+            # v0.8.4: Reactive routing repair — for boxes already actively spiraling on the
+            # direct path. Spiral-signature gated (postgres + outpost log dual signal),
+            # validated, with automatic rollback. Runs after the proactive pass so a
+            # successful proactive migration short-circuits this. No-ops on healthy boxes.
             try:
                 _ak_dir_v084 = os.path.expanduser('~/authentik')
                 if os.path.exists(os.path.join(_ak_dir_v084, 'docker-compose.yml')):
