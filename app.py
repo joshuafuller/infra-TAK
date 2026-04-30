@@ -1129,12 +1129,42 @@ def _get_cpu_model_local():
     return None
 
 
+def _get_vcpu_count_local():
+    """Return number of vCPUs visible to the OS (nproc), or None."""
+    try:
+        import os as _os
+        n = _os.cpu_count()
+        if n:
+            return n
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(['nproc'], capture_output=True, text=True, timeout=5)
+        v = r.stdout.strip()
+        if v.isdigit():
+            return int(v)
+    except Exception:
+        pass
+    return None
+
+
 def _get_cpu_model_remote(remote_cfg):
     """Return CPU model name on remote host via SSH, or None."""
     try:
         ok, out = _ssh_probe(remote_cfg, "grep -m1 -E 'model name|Processor' /proc/cpuinfo 2>/dev/null | sed 's/^[^:]*:[[:space:]]*//'", timeout=5)
         if ok and out:
             return out.strip() or None
+    except Exception:
+        pass
+    return None
+
+
+def _get_vcpu_count_remote(remote_cfg):
+    """Return vCPU count on remote host via SSH, or None."""
+    try:
+        ok, out = _ssh_probe(remote_cfg, 'nproc 2>/dev/null', timeout=5)
+        if ok and out and out.strip().isdigit():
+            return int(out.strip())
     except Exception:
         pass
     return None
@@ -1414,6 +1444,9 @@ def _top_processes_local():
         cpu_model = _get_cpu_model_local()
         if cpu_model:
             result['processor'] = cpu_model
+        vcpu = _get_vcpu_count_local()
+        if vcpu:
+            result['vcpu_count'] = vcpu
         disk_io = _get_disk_io_local()
         if disk_io is not None:
             result['disk_io_read_mbs'], result['disk_io_write_mbs'], result['disk_io_source'] = disk_io
@@ -1456,6 +1489,9 @@ def _top_processes_remote(remote_cfg):
         cpu_model = _get_cpu_model_remote(remote_cfg)
         if cpu_model:
             result['processor'] = cpu_model
+        vcpu = _get_vcpu_count_remote(remote_cfg)
+        if vcpu:
+            result['vcpu_count'] = vcpu
         disk_io = _get_disk_io_remote(remote_cfg)
         if disk_io is not None:
             result['disk_io_read_mbs'], result['disk_io_write_mbs'], result['disk_io_source'] = disk_io
@@ -29051,13 +29087,13 @@ function formatRamGb(memPct,totalRamGb){if(totalRamGb==null)return '';var gb=(Nu
 function cpuColor(pct){var n=Number(pct||0);if(n>=90)return 'var(--red)';if(n>=70)return '#eab308';return 'var(--green)';}
 function diskIoColor(currentMbs,speedTestMbs){var c=Number(currentMbs||0);var s=Number(speedTestMbs);if(s>0){var pct=(c/s)*100;if(pct>=75)return 'var(--red)';if(pct>=40)return '#eab308';return 'var(--green)';}if(c>=100)return 'var(--red)';if(c>=30)return '#eab308';return 'var(--green)';}
 function renderResourceBreakdown(div,data,hostId){
-    var err=data.error,cpuTop=data.cpu_top,memTop=data.mem_top,totalRamGb=data.total_ram_gb,processor=data.processor,diskRead=data.disk_io_read_mbs,diskWrite=data.disk_io_write_mbs,diskSrc=data.disk_io_source,speedRead=data.disk_speed_test_read_mbs,speedWrite=data.disk_speed_test_write_mbs,speedErr=data.disk_speed_test_error;
+    var err=data.error,cpuTop=data.cpu_top,memTop=data.mem_top,totalRamGb=data.total_ram_gb,processor=data.processor,vcpuCount=data.vcpu_count,diskRead=data.disk_io_read_mbs,diskWrite=data.disk_io_write_mbs,diskSrc=data.disk_io_source,speedRead=data.disk_speed_test_read_mbs,speedWrite=data.disk_speed_test_write_mbs,speedErr=data.disk_speed_test_error;
     if(err){div.innerHTML='<span style="color:var(--red)">'+escapeHtml(err)+'</span>'+(hostId?' <button type="button" onclick="refreshResourceBreakdown(\\''+hostId+'\\')" style="margin-left:8px;padding:2px 8px;font-size:10px;background:rgba(59,130,246,0.2);color:var(--cyan);border:1px solid var(--border);border-radius:4px;cursor:pointer">Refresh</button>':'');return;}
     var tbl='width:100%;border-collapse:collapse;font-size:10px;text-align:left', th='padding:2px 8px 2px 0;color:var(--cyan);font-weight:600;border-bottom:1px solid var(--border)', td='padding:2px 8px 2px 0;border-bottom:1px solid rgba(255,255,255,0.06)', r='text-align:right';
     var html='';
-    if(processor)html+='<div style="margin-bottom:4px;color:var(--text-dim);font-size:10px">Processor: '+escapeHtml(processor)+'</div>';
+    if(processor){var procLine=escapeHtml(processor);if(vcpuCount)procLine+=' <span style="color:var(--cyan);font-weight:600">&middot; '+vcpuCount+' vCPUs</span>';html+='<div style="margin-bottom:4px;color:var(--text-dim);font-size:10px">Processor: '+procLine+'</div>';}
     if(totalRamGb!=null)html+='<div style="margin-bottom:4px;color:var(--text-dim)">Total RAM: '+totalRamGb+' GB</div>';
-    if(diskWrite!=null){var dw=Number(diskWrite),isSrc=diskSrc==='sync';var cwLabel=isSrc?'(sync, Guard Dog)':'(vmstat, cached — may not reflect real disk speed)';var cwColor=isSrc?diskIoColor(dw,speedWrite):'#9ca3af';var ioLine='Disk I/O '+cwLabel+': ';if(diskRead!=null){var dr=Number(diskRead),cr=isSrc?cwColor:cwColor;ioLine+='<span style="color:'+cr+'">'+dr.toFixed(2)+' MB/s</span> read, ';}ioLine+='<span style="color:'+cwColor+'">'+dw.toFixed(2)+' MB/s</span> write';html+='<div style="margin-bottom:4px;font-size:10px">'+ioLine+'</div>';}
+    if(diskWrite!=null&&diskSrc==='sync'){var dw=Number(diskWrite),cwColor=diskIoColor(dw,speedWrite);var ioLine='Disk I/O (sync, Guard Dog): ';if(diskRead!=null){ioLine+='<span style="color:'+cwColor+'">'+Number(diskRead).toFixed(2)+' MB/s</span> read, ';}ioLine+='<span style="color:'+cwColor+'">'+dw.toFixed(2)+' MB/s</span> write';html+='<div style="margin-bottom:4px;font-size:10px">'+ioLine+'</div>';}
     if(speedWrite!=null)html+='<div style="margin-bottom:6px;color:var(--cyan);font-size:10px">Disk speed test (256 MiB sync): <strong>'+Number(speedWrite).toFixed(0)+' MB/s</strong> write</div>';
     else if(speedErr)html+='<div style="margin-bottom:6px;color:var(--text-dim);font-size:10px">Disk speed test: <span style="color:var(--red)">'+escapeHtml(speedErr)+'</span></div>';
     var ramCell='padding:2px 8px 2px 0;border-bottom:1px solid rgba(255,255,255,0.06);text-align:right;color:var(--text-dim);white-space:nowrap';
