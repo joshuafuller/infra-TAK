@@ -21546,6 +21546,33 @@ def _ensure_authentik_gunicorn_timeout(plog, value=120):
         plog(f"  ⚠ gunicorn timeout error (no changes applied): {e}")
 
 
+def _authentik_admin_api_recently_active(seconds=60):
+    """v0.8.7 safety gate: returns True if a non-GET admin API request hit the
+    Authentik server in the last `seconds` seconds.
+
+    Used by `_authentik_periodic_restart_monitor` to DEFER the scheduled restart
+    when an operator is actively creating/editing users, providers, flows, etc.
+    The recreate causes a ~5-15s 502 window; if an admin happens to be mid-form
+    submit during that window they could lose work. Deferring means: if activity
+    quiets for 60s we fire; otherwise we wait another 5 min and check again.
+
+    NOT used by the ASGI loop reactive trigger — if the server is in an ASGI
+    reconnect loop, the box is already 502'ing every request, so deferring would
+    only prolong the pain. The loop fix is non-negotiable.
+
+    Cheap (~1s docker logs grep). Always returns False on error — fail-open so a
+    container/log glitch never blocks the periodic restart entirely.
+    """
+    try:
+        r = subprocess.run(
+            f'docker logs authentik-server-1 --since {seconds}s 2>&1 | grep -E "\\\"(POST|PUT|PATCH|DELETE) /api/v3/" | head -1',
+            shell=True, capture_output=True, text=True, timeout=15
+        )
+        return bool((r.stdout or '').strip())
+    except Exception:
+        return False
+
+
 def _detect_authentik_asgi_websocket_loop():
     """v0.8.7: Detect Authentik server stuck in an ASGI WebSocket reconnect loop.
 
@@ -21724,6 +21751,18 @@ def _authentik_periodic_restart_monitor():
                     last_run_ts = 0
             if last_run_ts and (_t.time() - last_run_ts) < min_interval_h * 3600:
                 continue
+
+            # Mission-critical safety gate (v0.8.7): if an admin is actively making
+            # users / editing providers / etc. (recent non-GET POSTs to /api/v3/),
+            # defer this cycle and re-check in 5 min. The recreate's ~5-15s 502
+            # window could otherwise drop a mid-form submission. Reactive ASGI path
+            # bypasses this gate intentionally — see _authentik_admin_api_recently_active().
+            try:
+                if _authentik_admin_api_recently_active(60):
+                    print(f"[periodic restart] admin API active in last 60s — deferring this cycle, will retry in 5 min", flush=True)
+                    continue
+            except Exception as _gate_e:
+                print(f"[periodic restart] admin activity gate error (treating as quiet, proceeding): {_gate_e}", flush=True)
 
             print(f"[periodic restart] firing scheduled restart (hour_local={target_hour}, last_run={last_run_str or 'never'})", flush=True)
             _recreate_authentik_server_worker(
