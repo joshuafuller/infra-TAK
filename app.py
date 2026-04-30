@@ -29085,16 +29085,16 @@ async function toggleUU(cb){
 }
 function formatRamGb(memPct,totalRamGb){if(totalRamGb==null)return '';var gb=(Number(memPct||0)/100)*totalRamGb;return gb.toFixed(2)+' GB';}
 function cpuColor(pct){var n=Number(pct||0);if(n>=90)return 'var(--red)';if(n>=70)return '#eab308';return 'var(--green)';}
-function diskIoColor(currentMbs,speedTestMbs){var c=Number(currentMbs||0);var s=Number(speedTestMbs);if(s>0){var pct=(c/s)*100;if(pct>=75)return 'var(--red)';if(pct>=40)return '#eab308';return 'var(--green)';}if(c>=100)return 'var(--red)';if(c>=30)return '#eab308';return 'var(--green)';}
+function diskIoColor(mbs){var m=Number(mbs||0);if(m>=200)return 'var(--green)';if(m>=80)return '#eab308';return 'var(--red)';}
 function renderResourceBreakdown(div,data,hostId){
     var err=data.error,cpuTop=data.cpu_top,memTop=data.mem_top,totalRamGb=data.total_ram_gb,processor=data.processor,vcpuCount=data.vcpu_count,diskRead=data.disk_io_read_mbs,diskWrite=data.disk_io_write_mbs,diskSrc=data.disk_io_source,speedRead=data.disk_speed_test_read_mbs,speedWrite=data.disk_speed_test_write_mbs,speedErr=data.disk_speed_test_error;
     if(err){div.innerHTML='<span style="color:var(--red)">'+escapeHtml(err)+'</span>'+(hostId?' <button type="button" onclick="refreshResourceBreakdown(\\''+hostId+'\\')" style="margin-left:8px;padding:2px 8px;font-size:10px;background:rgba(59,130,246,0.2);color:var(--cyan);border:1px solid var(--border);border-radius:4px;cursor:pointer">Refresh</button>':'');return;}
     var tbl='width:100%;border-collapse:collapse;font-size:10px;text-align:left', th='padding:2px 8px 2px 0;color:var(--cyan);font-weight:600;border-bottom:1px solid var(--border)', td='padding:2px 8px 2px 0;border-bottom:1px solid rgba(255,255,255,0.06)', r='text-align:right';
     var html='';
-    if(processor){var procLine=escapeHtml(processor);if(vcpuCount)procLine+=' <span style="color:var(--cyan);font-weight:600">&middot; '+vcpuCount+' vCPUs</span>';html+='<div style="margin-bottom:4px;color:var(--text-dim);font-size:10px">Processor: '+procLine+'</div>';}
+    if(processor){html+='<div style="margin-bottom:2px;color:var(--text-dim);font-size:10px">Processor: '+escapeHtml(processor)+'</div>';if(vcpuCount)html+='<div style="margin-bottom:4px;padding-left:8px;color:var(--cyan);font-size:10px;font-weight:600">'+vcpuCount+' vCPUs</div>';}
     if(totalRamGb!=null)html+='<div style="margin-bottom:4px;color:var(--text-dim)">Total RAM: '+totalRamGb+' GB</div>';
-    if(diskWrite!=null&&diskSrc==='sync'){var dw=Number(diskWrite),cwColor=diskIoColor(dw,speedWrite);var ioLine='Disk I/O (sync, Guard Dog): ';if(diskRead!=null){ioLine+='<span style="color:'+cwColor+'">'+Number(diskRead).toFixed(2)+' MB/s</span> read, ';}ioLine+='<span style="color:'+cwColor+'">'+dw.toFixed(2)+' MB/s</span> write';html+='<div style="margin-bottom:4px;font-size:10px">'+ioLine+'</div>';}
-    if(speedWrite!=null)html+='<div style="margin-bottom:6px;color:var(--cyan);font-size:10px">Disk speed test (256 MiB sync): <strong>'+Number(speedWrite).toFixed(0)+' MB/s</strong> write</div>';
+    if(diskWrite!=null&&diskSrc==='sync'){var dw=Number(diskWrite),cwColor=diskIoColor(dw);html+='<div style="margin-bottom:4px;font-size:10px">Disk write speed (Guard Dog): <span style="color:'+cwColor+'">'+dw.toFixed(0)+' MB/s</span></div>';}
+    if(speedWrite!=null){var sw=Number(speedWrite),swColor=diskIoColor(sw);html+='<div style="margin-bottom:6px;font-size:10px">Disk speed test (256 MiB): <span style="color:'+swColor+'">'+sw.toFixed(0)+' MB/s</span></div>';}
     else if(speedErr)html+='<div style="margin-bottom:6px;color:var(--text-dim);font-size:10px">Disk speed test: <span style="color:var(--red)">'+escapeHtml(speedErr)+'</span></div>';
     var ramCell='padding:2px 8px 2px 0;border-bottom:1px solid rgba(255,255,255,0.06);text-align:right;color:var(--text-dim);white-space:nowrap';
     if(cpuTop&&cpuTop.length){
