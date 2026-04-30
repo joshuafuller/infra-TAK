@@ -23102,6 +23102,18 @@ entries:
             time.sleep(5)
         if not _ldap_healthy:
             plog("  ⚠ LDAP outpost not healthy yet — proceeding to bind check anyway")
+        # Re-apply the flow fix right before the final bind check. The Authentik worker
+        # may have re-processed blueprints async during Step 12, resetting password_stage
+        # on ldap-identification-stage — which causes "exceeded stage recursion depth".
+        # Calling this here ensures the fix is applied AFTER any blueprint re-processing.
+        try:
+            ok_fn, err_fn = _ensure_ldap_flow_authentication_none()
+            if ok_fn:
+                plog("  ✓ LDAP flow re-verified (no recursion)")
+            else:
+                plog(f"  ⚠ LDAP flow re-verify: {err_fn or 'skipped'}")
+        except Exception as _e:
+            plog(f"  ⚠ LDAP flow re-verify skipped: {_e}")
         time.sleep(3)
         if not _authentik_deploy_final_verify_ldap_sa(ldap_svc_pass, plog, attempts=24, delay_sec=10):
             _update_boot_stagger_service()
