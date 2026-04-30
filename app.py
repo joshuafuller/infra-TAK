@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.8.5-alpha"
+VERSION = "0.8.6-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -1129,6 +1129,25 @@ def _get_cpu_model_local():
     return None
 
 
+def _get_vcpu_count_local():
+    """Return number of vCPUs visible to the OS (nproc), or None."""
+    try:
+        import os as _os
+        n = _os.cpu_count()
+        if n:
+            return n
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(['nproc'], capture_output=True, text=True, timeout=5)
+        v = r.stdout.strip()
+        if v.isdigit():
+            return int(v)
+    except Exception:
+        pass
+    return None
+
+
 def _get_cpu_model_remote(remote_cfg):
     """Return CPU model name on remote host via SSH, or None."""
     try:
@@ -1140,8 +1159,48 @@ def _get_cpu_model_remote(remote_cfg):
     return None
 
 
+def _get_vcpu_count_remote(remote_cfg):
+    """Return vCPU count on remote host via SSH, or None."""
+    try:
+        ok, out = _ssh_probe(remote_cfg, 'nproc 2>/dev/null', timeout=5)
+        if ok and out and out.strip().isdigit():
+            return int(out.strip())
+    except Exception:
+        pass
+    return None
+
+
+_GUARDDOG_DISKIO_CSV = '/var/lib/takguard/diskio_history.csv'
+
+
+def _read_guarddog_latest_write_mbs():
+    """Return the most recent sync write speed (MB/s) from Guard Dog's diskio_history.csv, or None."""
+    try:
+        if not os.path.exists(_GUARDDOG_DISKIO_CSV):
+            return None
+        last_val = None
+        with open(_GUARDDOG_DISKIO_CSV) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                parts = line.split(',')
+                if len(parts) >= 2:
+                    try:
+                        last_val = float(parts[1])
+                    except ValueError:
+                        pass
+        return last_val
+    except Exception:
+        return None
+
+
 def _get_disk_io_local():
-    """Return (read_mbs, write_mbs) from vmstat 1 2 (1-second sample). Blocks are 512 bytes. None on failure."""
+    """Return (read_mbs, write_mbs, source) from Guard Dog CSV (sync) or vmstat (cached). source is 'sync' or 'cached'."""
+    # Prefer Guard Dog CSV — already uses dd oflag=dsync, trustworthy
+    gd_write = _read_guarddog_latest_write_mbs()
+    if gd_write is not None:
+        return (None, gd_write, 'sync')
     try:
         r = subprocess.run(
             'vmstat 1 2 2>/dev/null | tail -1 | awk \'{print $9,$10}\'',
@@ -1153,19 +1212,33 @@ def _get_disk_io_local():
         if len(parts) < 2:
             return None
         bi, bo = int(parts[0]), int(parts[1])
-        # blocks/s, 512 bytes per block -> MB/s
+        # blocks/s, 512 bytes per block -> MB/s (buffer cache speed, not real disk throughput)
         read_mbs = round((bi * 512) / (1024 * 1024), 2)
         write_mbs = round((bo * 512) / (1024 * 1024), 2)
-        return (read_mbs, write_mbs)
+        return (read_mbs, write_mbs, 'cached')
     except Exception:
         return None
 
 
 def _get_disk_io_remote(remote_cfg):
-    """Return (read_mbs, write_mbs) on remote host from vmstat 1 2, or None."""
+    """Return (read_mbs, write_mbs, source) on remote host. Prefers Guard Dog CSV (sync), falls back to vmstat (cached)."""
     if not remote_cfg or not (remote_cfg.get('host') or '').strip():
         return None
     try:
+        # Try Guard Dog CSV first (sync, trustworthy)
+        ok_gd, out_gd = _ssh_probe(
+            remote_cfg,
+            f"tail -20 {_GUARDDOG_DISKIO_CSV} 2>/dev/null | grep -v '^#' | grep ',' | tail -1",
+            timeout=5
+        )
+        if ok_gd and out_gd and ',' in out_gd:
+            parts = out_gd.strip().split(',')
+            if len(parts) >= 2:
+                try:
+                    return (None, float(parts[1]), 'sync')
+                except ValueError:
+                    pass
+        # Fall back to vmstat (cached)
         ok, out = _ssh_probe(
             remote_cfg,
             "vmstat 1 2 2>/dev/null | tail -1 | awk '{print $9,$10}'",
@@ -1179,7 +1252,7 @@ def _get_disk_io_remote(remote_cfg):
         bi, bo = int(parts[0]), int(parts[1])
         read_mbs = round((bi * 512) / (1024 * 1024), 2)
         write_mbs = round((bo * 512) / (1024 * 1024), 2)
-        return (read_mbs, write_mbs)
+        return (read_mbs, write_mbs, 'cached')
     except Exception:
         return None
 
@@ -1219,7 +1292,8 @@ def _parse_dd_speed_mbs(stderr_or_stdout):
 
 
 def _run_disk_speed_test_local():
-    """Run 256 MiB write then read. Returns dict with disk_speed_test_read_mbs/write_mbs or disk_speed_test_error."""
+    """Run 256 MiB sync write (oflag=dsync). Returns dict with disk_speed_test_write_mbs or disk_speed_test_error.
+    Uses oflag=dsync to match start.sh and Guard Dog — measures real hardware throughput, not buffer cache."""
     path = _disk_speed_test_path()
     if not path:
         return {'disk_speed_test_error': 'no writable temp dir'}
@@ -1227,15 +1301,15 @@ def _run_disk_speed_test_local():
     try:
         rw = subprocess.run(
             [dd, 'if=/dev/zero', 'of=' + path,
-             'bs=1M', 'count=' + str(_DISK_SPEED_TEST_SIZE_MB), 'oflag=direct'],
-            capture_output=True, text=True, timeout=60
+             'bs=1M', 'count=' + str(_DISK_SPEED_TEST_SIZE_MB), 'oflag=dsync'],
+            capture_output=True, text=True, timeout=120
         )
         out_w = (rw.stdout or '') + (rw.stderr or '')
         write_mbs = _parse_dd_speed_mbs(out_w)
         if write_mbs is None and rw.returncode != 0:
             rw2 = subprocess.run(
                 [dd, 'if=/dev/zero', 'of=' + path, 'bs=1M', 'count=' + str(_DISK_SPEED_TEST_SIZE_MB)],
-                capture_output=True, text=True, timeout=60
+                capture_output=True, text=True, timeout=120
             )
             write_mbs = _parse_dd_speed_mbs((rw2.stdout or '') + (rw2.stderr or ''))
         if write_mbs is None:
@@ -1370,9 +1444,12 @@ def _top_processes_local():
         cpu_model = _get_cpu_model_local()
         if cpu_model:
             result['processor'] = cpu_model
+        vcpu = _get_vcpu_count_local()
+        if vcpu:
+            result['vcpu_count'] = vcpu
         disk_io = _get_disk_io_local()
         if disk_io is not None:
-            result['disk_io_read_mbs'], result['disk_io_write_mbs'] = disk_io
+            result['disk_io_read_mbs'], result['disk_io_write_mbs'], result['disk_io_source'] = disk_io
         result.update(_run_disk_speed_test_local())
         return result
     except Exception:
@@ -1412,9 +1489,12 @@ def _top_processes_remote(remote_cfg):
         cpu_model = _get_cpu_model_remote(remote_cfg)
         if cpu_model:
             result['processor'] = cpu_model
+        vcpu = _get_vcpu_count_remote(remote_cfg)
+        if vcpu:
+            result['vcpu_count'] = vcpu
         disk_io = _get_disk_io_remote(remote_cfg)
         if disk_io is not None:
-            result['disk_io_read_mbs'], result['disk_io_write_mbs'] = disk_io
+            result['disk_io_read_mbs'], result['disk_io_write_mbs'], result['disk_io_source'] = disk_io
         result.update(_run_disk_speed_test_remote(remote_cfg))
         return result
     except Exception as e:
@@ -22080,129 +22160,129 @@ entries:
                     plog("  Updated PostgreSQL idle_in_transaction_session_timeout to 30s")
                     break
 
-            # Pin AUTHENTIK_TAG to latest stable release
-            ak_tag = _get_authentik_latest_release_tag(use_cache=False) or '2026.2.1'
-            plog(f"  Authentik version: {ak_tag}")
-            for i, l in enumerate(lines):
-                m = re.search(r'AUTHENTIK_TAG:-([^}]+)', l)
-                if m and m.group(1).strip() != ak_tag:
-                    lines[i] = l.replace(f'AUTHENTIK_TAG:-{m.group(1)}', f'AUTHENTIK_TAG:-{ak_tag}')
-                    needs_write = True
-            # Inject healthchecks for server and worker if missing (upstream compose may not have them)
-            if not any('ak healthcheck' in l or 'ak", "healthcheck' in l for l in lines):
-                _hc_block = '    healthcheck:\n      test: ["CMD", "ak", "healthcheck"]\n      start_period: 600s\n      interval: 30s\n      timeout: 10s\n      retries: 5\n'
-                patched = []
-                for i, line in enumerate(lines):
-                    patched.append(line)
-                    if line.strip() == 'command: server' or line.strip() == 'command: worker':
-                        patched.append(_hc_block)
-                lines = patched
+        # Pin AUTHENTIK_TAG to latest stable release
+        ak_tag = _get_authentik_latest_release_tag(use_cache=False) or '2026.2.1'
+        plog(f"  Authentik version: {ak_tag}")
+        for i, l in enumerate(lines):
+            m = re.search(r'AUTHENTIK_TAG:-([^}]+)', l)
+            if m and m.group(1).strip() != ak_tag:
+                lines[i] = l.replace(f'AUTHENTIK_TAG:-{m.group(1)}', f'AUTHENTIK_TAG:-{ak_tag}')
                 needs_write = True
-                plog("  Added healthchecks for server and worker")
-            else:
-                # Upstream compose has healthchecks — ensure start_period is long enough for first-run migrations
-                for i, line in enumerate(lines):
-                    if 'start_period' in line and 'start_period: 600s' not in line:
-                        # Only patch start_period inside server/worker healthcheck blocks (not pg/redis)
-                        # Check if this is under a server or worker service by looking backwards
-                        for j in range(i - 1, max(i - 15, 0), -1):
-                            if lines[j].strip().startswith('command: server') or lines[j].strip().startswith('command: worker'):
-                                lines[i] = re.sub(r'start_period:\s*\S+', 'start_period: 600s', line)
-                                needs_write = True
-                                break
-                            if lines[j].strip().startswith('image:') and 'postgres' in lines[j]:
-                                break
-                            if lines[j].strip().startswith('image:') and 'redis' in lines[j]:
-                                break
-                if needs_write:
-                    plog("  Updated healthcheck start_period to 600s for first-run migrations")
-
-            ldap_image = f"ghcr.io/goauthentik/ldap:${{AUTHENTIK_TAG:-{ak_tag}}}"
-            if not any('ghcr.io/goauthentik/ldap' in l for l in lines):
-                ldap_svc = f"  ldap:\n    image: {ldap_image}\n    ports:\n    - 127.0.0.1:389:3389\n    - 127.0.0.1:636:6636\n    environment:\n      AUTHENTIK_HOST: http://authentik-server-1:9000\n      AUTHENTIK_INSECURE: \"true\"\n      AUTHENTIK_TOKEN: placeholder\n    restart: unless-stopped\n    healthcheck:\n      test: [\"CMD\", \"wget\", \"--spider\", \"-q\", \"http://localhost:9300/outpost.goauthentik.io/ping\"]\n      start_period: 30s\n      interval: 30s\n      timeout: 5s\n      retries: 3\n    depends_on:\n      server:\n        condition: service_healthy\n"
-                new_lines = []
-                for line in lines:
-                    if line.startswith('volumes:'):
-                        new_lines.append(ldap_svc)
-                    new_lines.append(line)
-                lines = new_lines
-                needs_write = True
-                plog("  Added LDAP outpost container")
-            else:
-                # Ensure existing LDAP block uses AUTHENTIK_TAG so Update pulls same version as server
-                for i, line in enumerate(lines):
-                    m = re.search(r'image:\s*ghcr\.io/goauthentik/ldap:([^\s\n]+)', line)
-                    if m:
-                        current = m.group(1)
-                        if not current.startswith('${AUTHENTIK_TAG'):
-                            lines[i] = line.replace(f'ghcr.io/goauthentik/ldap:{current}', ldap_image, 1)
+        # Inject healthchecks for server and worker if missing (upstream compose may not have them)
+        if not any('ak healthcheck' in l or 'ak", "healthcheck' in l for l in lines):
+            _hc_block = '    healthcheck:\n      test: ["CMD", "ak", "healthcheck"]\n      start_period: 600s\n      interval: 30s\n      timeout: 10s\n      retries: 5\n'
+            patched = []
+            for i, line in enumerate(lines):
+                patched.append(line)
+                if line.strip() == 'command: server' or line.strip() == 'command: worker':
+                    patched.append(_hc_block)
+            lines = patched
+            needs_write = True
+            plog("  Added healthchecks for server and worker")
+        else:
+            # Upstream compose has healthchecks — ensure start_period is long enough for first-run migrations
+            for i, line in enumerate(lines):
+                if 'start_period' in line and 'start_period: 600s' not in line:
+                    # Only patch start_period inside server/worker healthcheck blocks (not pg/redis)
+                    # Check if this is under a server or worker service by looking backwards
+                    for j in range(i - 1, max(i - 15, 0), -1):
+                        if lines[j].strip().startswith('command: server') or lines[j].strip().startswith('command: worker'):
+                            lines[i] = re.sub(r'start_period:\s*\S+', 'start_period: 600s', line)
                             needs_write = True
-                            plog(f"  Updated LDAP image to use AUTHENTIK_TAG (default {ak_tag})")
-                        break
+                            break
+                        if lines[j].strip().startswith('image:') and 'postgres' in lines[j]:
+                            break
+                        if lines[j].strip().startswith('image:') and 'redis' in lines[j]:
+                            break
             if needs_write:
-                with open(compose_path, 'w') as f:
-                    f.writelines(lines)
-                plog("\u2713 Docker Compose patched")
-            else:
-                plog("\u2713 Docker Compose already patched")
-            if _patch_authentik_compose_network():
-                plog("  \u2713 infratak network added to docker-compose.yml")
+                plog("  Updated healthcheck start_period to 600s for first-run migrations")
 
-            # Step 7: Pull and start core services (no verbose docker output in log)
-            plog("")
-            plog("\u2501\u2501\u2501 Step 7/10: Pulling Images & Starting Containers \u2501\u2501\u2501")
-            # Ensure 4GB swap before stressing the box (reduces OOM/unhealthy on small VPS)
-            try:
-                r_sw = subprocess.run(['swapon', '--show'], capture_output=True, text=True, timeout=5)
-                if r_sw.returncode == 0 and '/swapfile' in (r_sw.stdout or ''):
-                    plog("  Swap already configured")
-                else:
-                    if os.path.exists('/swapfile'):
-                        subprocess.run(['swapon', '/swapfile'], capture_output=True, timeout=5)
-                        with open('/etc/fstab', 'r') as f:
-                            fstab = f.read()
-                        if '/swapfile' not in fstab:
-                            with open('/etc/fstab', 'a') as f:
-                                f.write('\n/swapfile swap swap defaults 0 0\n')
-                        plog("  Swap file enabled")
-                    else:
-                        subprocess.run(['fallocate', '-l', '4G', '/swapfile'], check=True, timeout=30)
-                        os.chmod('/swapfile', 0o600)
-                        subprocess.run(['mkswap', '/swapfile'], check=True, capture_output=True, timeout=10)
-                        subprocess.run(['swapon', '/swapfile'], check=True, timeout=10)
-                        with open('/etc/fstab', 'r') as f:
-                            fstab = f.read()
-                        if '/swapfile' not in fstab:
-                            with open('/etc/fstab', 'a') as f:
-                                f.write('\n/swapfile swap swap defaults 0 0\n')
-                        plog("  4GB swap configured (reduces Authentik OOM on small VPS)")
-            except Exception as e:
-                plog(f"  \u26a0 Swap setup skipped: {e}")
-            plog("  Pulling images (this may take a few minutes)...")
-            r = subprocess.run(f'cd {ak_dir} && docker compose pull 2>&1', shell=True, capture_output=True, text=True, timeout=600)
-            if r.returncode != 0:
-                plog(f"  \u26a0 Pull had issues: {r.stderr.strip()[:200] if r.stderr else r.stdout.strip()[:200]}")
-            else:
-                plog("  \u2713 Images pulled")
-            plog("  Starting PostgreSQL...")
-            r = subprocess.run(f'cd {ak_dir} && docker compose up -d postgresql 2>&1', shell=True, capture_output=True, text=True, timeout=60)
-            if r.returncode != 0:
-                plog(f"  \u26a0 Postgres start had issues: {r.stderr.strip()[:200] if r.stderr else r.stdout.strip()[:200]}")
-            for attempt in range(24):
-                rp = subprocess.run(f'cd {ak_dir} && docker compose exec -T postgresql pg_isready 2>/dev/null', shell=True, capture_output=True, text=True, timeout=10)
-                if rp.returncode == 0:
-                    plog("  \u2713 PostgreSQL ready")
+        ldap_image = f"ghcr.io/goauthentik/ldap:${{AUTHENTIK_TAG:-{ak_tag}}}"
+        if not any('ghcr.io/goauthentik/ldap' in l for l in lines):
+            ldap_svc = f"  ldap:\n    image: {ldap_image}\n    ports:\n    - 127.0.0.1:389:3389\n    - 127.0.0.1:636:6636\n    environment:\n      AUTHENTIK_HOST: http://authentik-server-1:9000\n      AUTHENTIK_INSECURE: \"true\"\n      AUTHENTIK_TOKEN: placeholder\n    restart: unless-stopped\n    healthcheck:\n      test: [\"CMD\", \"wget\", \"--spider\", \"-q\", \"http://localhost:9300/outpost.goauthentik.io/ping\"]\n      start_period: 30s\n      interval: 30s\n      timeout: 5s\n      retries: 3\n    depends_on:\n      server:\n        condition: service_healthy\n"
+            new_lines = []
+            for line in lines:
+                if line.startswith('volumes:'):
+                    new_lines.append(ldap_svc)
+                new_lines.append(line)
+            lines = new_lines
+            needs_write = True
+            plog("  Added LDAP outpost container")
+        else:
+            # Ensure existing LDAP block uses AUTHENTIK_TAG so Update pulls same version as server
+            for i, line in enumerate(lines):
+                m = re.search(r'image:\s*ghcr\.io/goauthentik/ldap:([^\s\n]+)', line)
+                if m:
+                    current = m.group(1)
+                    if not current.startswith('${AUTHENTIK_TAG'):
+                        lines[i] = line.replace(f'ghcr.io/goauthentik/ldap:{current}', ldap_image, 1)
+                        needs_write = True
+                        plog(f"  Updated LDAP image to use AUTHENTIK_TAG (default {ak_tag})")
                     break
-                time.sleep(2)
+        if needs_write:
+            with open(compose_path, 'w') as f:
+                f.writelines(lines)
+            plog("\u2713 Docker Compose patched")
+        else:
+            plog("\u2713 Docker Compose already patched")
+        if _patch_authentik_compose_network():
+            plog("  \u2713 infratak network added to docker-compose.yml")
+
+        # Step 7: Pull and start core services (no verbose docker output in log)
+        plog("")
+        plog("\u2501\u2501\u2501 Step 7/10: Pulling Images & Starting Containers \u2501\u2501\u2501")
+        # Ensure 4GB swap before stressing the box (reduces OOM/unhealthy on small VPS)
+        try:
+            r_sw = subprocess.run(['swapon', '--show'], capture_output=True, text=True, timeout=5)
+            if r_sw.returncode == 0 and '/swapfile' in (r_sw.stdout or ''):
+                plog("  Swap already configured")
             else:
-                plog("  \u26a0 PostgreSQL not ready in time, starting server anyway")
-            plog("  Starting server and worker...")
-            r = subprocess.run(f'cd {ak_dir} && docker compose up -d server worker 2>&1', shell=True, capture_output=True, text=True, timeout=120)
-            _ensure_infratak_network_for_authentik()
-            if r.returncode != 0:
-                plog(f"  \u26a0 Start had issues: {r.stderr.strip()[:200] if r.stderr else r.stdout.strip()[:200]}")
-            else:
-                plog("  \u2713 Core services started")
+                if os.path.exists('/swapfile'):
+                    subprocess.run(['swapon', '/swapfile'], capture_output=True, timeout=5)
+                    with open('/etc/fstab', 'r') as f:
+                        fstab = f.read()
+                    if '/swapfile' not in fstab:
+                        with open('/etc/fstab', 'a') as f:
+                            f.write('\n/swapfile swap swap defaults 0 0\n')
+                    plog("  Swap file enabled")
+                else:
+                    subprocess.run(['fallocate', '-l', '4G', '/swapfile'], check=True, timeout=30)
+                    os.chmod('/swapfile', 0o600)
+                    subprocess.run(['mkswap', '/swapfile'], check=True, capture_output=True, timeout=10)
+                    subprocess.run(['swapon', '/swapfile'], check=True, timeout=10)
+                    with open('/etc/fstab', 'r') as f:
+                        fstab = f.read()
+                    if '/swapfile' not in fstab:
+                        with open('/etc/fstab', 'a') as f:
+                            f.write('\n/swapfile swap swap defaults 0 0\n')
+                    plog("  4GB swap configured (reduces Authentik OOM on small VPS)")
+        except Exception as e:
+            plog(f"  \u26a0 Swap setup skipped: {e}")
+        plog("  Pulling images (this may take a few minutes)...")
+        r = subprocess.run(f'cd {ak_dir} && docker compose pull 2>&1', shell=True, capture_output=True, text=True, timeout=600)
+        if r.returncode != 0:
+            plog(f"  \u26a0 Pull had issues: {r.stderr.strip()[:200] if r.stderr else r.stdout.strip()[:200]}")
+        else:
+            plog("  \u2713 Images pulled")
+        plog("  Starting PostgreSQL...")
+        r = subprocess.run(f'cd {ak_dir} && docker compose up -d postgresql 2>&1', shell=True, capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            plog(f"  \u26a0 Postgres start had issues: {r.stderr.strip()[:200] if r.stderr else r.stdout.strip()[:200]}")
+        for attempt in range(24):
+            rp = subprocess.run(f'cd {ak_dir} && docker compose exec -T postgresql pg_isready 2>/dev/null', shell=True, capture_output=True, text=True, timeout=10)
+            if rp.returncode == 0:
+                plog("  \u2713 PostgreSQL ready")
+                break
+            time.sleep(2)
+        else:
+            plog("  \u26a0 PostgreSQL not ready in time, starting server anyway")
+        plog("  Starting server and worker...")
+        r = subprocess.run(f'cd {ak_dir} && docker compose up -d server worker 2>&1', shell=True, capture_output=True, text=True, timeout=120)
+        _ensure_infratak_network_for_authentik()
+        if r.returncode != 0:
+            plog(f"  \u26a0 Start had issues: {r.stderr.strip()[:200] if r.stderr else r.stdout.strip()[:200]}")
+        else:
+            plog("  \u2713 Core services started")
 
         # Step 8: Wait for Authentik API to be ready
         plog("")
@@ -23030,7 +23110,47 @@ entries:
                 time.sleep(5)
         if not _ldap_port_ready:
             plog("  ⚠ LDAP port 389 not open after 180s — bind check may fail")
-        time.sleep(5)
+        # Wait for LDAP container Docker health to be 'healthy' before burning SA bind attempts.
+        # Port open only means the container process started — it still needs to sync with
+        # the Authentik server before it will accept bind requests. On slow VPS (< 200 MB/s)
+        # this sync takes 2-5 minutes. Without this wait, all 24 bind attempts are consumed
+        # while the outpost is still initialising. Cap wait at 5 min (300s).
+        plog("  Waiting for LDAP outpost to be healthy...")
+        _ldap_healthy = False
+        _ldap_wait_start = time.time()
+        for _lh in range(60):  # 60 × 5s = 300s max
+            try:
+                r_lh = subprocess.run(
+                    'docker inspect --format "{{.State.Health.Status}}" authentik-ldap-1 2>/dev/null',
+                    shell=True, capture_output=True, text=True, timeout=5
+                )
+                _h_status = (r_lh.stdout or '').strip().lower()
+                if _h_status == 'healthy':
+                    _elapsed = int(time.time() - _ldap_wait_start)
+                    plog(f"  ✓ LDAP outpost healthy ({_elapsed}s)")
+                    _ldap_healthy = True
+                    break
+                if _h_status in ('', 'none') and _lh > 6:
+                    # Container has no healthcheck — fall through after a brief wait
+                    break
+            except Exception:
+                pass
+            time.sleep(5)
+        if not _ldap_healthy:
+            plog("  ⚠ LDAP outpost not healthy yet — proceeding to bind check anyway")
+        # Re-apply the flow fix right before the final bind check. The Authentik worker
+        # may have re-processed blueprints async during Step 12, resetting password_stage
+        # on ldap-identification-stage — which causes "exceeded stage recursion depth".
+        # Calling this here ensures the fix is applied AFTER any blueprint re-processing.
+        try:
+            ok_fn, err_fn = _ensure_ldap_flow_authentication_none()
+            if ok_fn:
+                plog("  ✓ LDAP flow re-verified (no recursion)")
+            else:
+                plog(f"  ⚠ LDAP flow re-verify: {err_fn or 'skipped'}")
+        except Exception as _e:
+            plog(f"  ⚠ LDAP flow re-verify skipped: {_e}")
+        time.sleep(3)
         if not _authentik_deploy_final_verify_ldap_sa(ldap_svc_pass, plog, attempts=24, delay_sec=10):
             _update_boot_stagger_service()
             authentik_deploy_status.update({'running': False, 'complete': False, 'error': True})
@@ -23879,10 +23999,16 @@ def _test_ldap_bind_dn_verdict(bind_dn, bind_pass):
     for _ in range(3):
         if has_ldapsearch and not is_remote:
             try:
+                # Search ou=users (not dc= root) so the search itself also succeeds.
+                # Authentik doesn't expose a root object at dc=takldap, so a base-scope
+                # search there returns LDAP error 32 ("no such object") even when the
+                # bind succeeded — causing ldapsearch to exit non-zero every time.
+                _cn = user_hint or 'adm_ldapservice'
                 lr = subprocess.run(
                     ['ldapsearch', '-x', '-H', f'ldap://{ldap_host}:389',
                      '-D', bind_dn, '-w', bind_pass,
-                     '-b', 'dc=takldap', '-s', 'base', '(objectClass=*)'],
+                     '-b', 'ou=users,dc=takldap', '-s', 'one',
+                     f'(cn={_cn})', 'cn'],
                     capture_output=True, text=True, timeout=15)
                 out = ((lr.stdout or '') + '\n' + (lr.stderr or '')).lower()
                 if lr.returncode == 0 and 'invalid credentials' not in out:
@@ -23892,14 +24018,17 @@ def _test_ldap_bind_dn_verdict(bind_dn, bind_pass):
             except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
                 pass
 
-        time.sleep(2)
+        # Sleep long enough that any log entry written by the bind above has been
+        # flushed and captured before we read docker logs.  2 s was a race on slow
+        # Azure disks where the log landed at the same second as our check.
+        time.sleep(5)
         if is_remote:
             ok, out = _ssh_probe(ak_cfg.get('remote', {}),
-                'docker logs authentik-ldap-1 --since 45s 2>&1', timeout=15)
+                'docker logs authentik-ldap-1 --since 90s 2>&1', timeout=15)
             log = (out or '').lower()
         else:
             r = subprocess.run(
-                'docker logs authentik-ldap-1 --since 45s 2>&1',
+                'docker logs authentik-ldap-1 --since 90s 2>&1',
                 shell=True, capture_output=True, text=True, timeout=10)
             log = (r.stdout or '').lower()
 
@@ -23961,6 +24090,20 @@ def _authentik_deploy_final_verify_ldap_sa(ldap_svc_pass, plog, attempts=12, del
         if _test_ldap_bind_dn(sa_dn, ldap_svc_pass):
             plog("  \u2713 LDAP service-account bind verified (adm_ldapservice). Safe to proceed to TAK Server.")
             return True
+        # Fallback: directly check Docker logs for a recent "authenticated from session"
+        # entry for the SA.  This catches the case where ldapsearch's exit code is
+        # misleading (e.g. bind succeeds but base-scope search returns LDAP error 32)
+        # and _test_ldap_bind_dn_verdict mis-classifies the result as inconclusive.
+        try:
+            r_fb = subprocess.run(
+                'docker logs authentik-ldap-1 --since 90s 2>&1',
+                shell=True, capture_output=True, text=True, timeout=10)
+            fb_log = (r_fb.stdout or '').lower()
+            if 'authenticated from session' in fb_log and 'adm_ldapservice' in fb_log:
+                plog("  \u2713 LDAP SA bind verified via Docker log (authenticated from session). Safe to proceed.")
+                return True
+        except Exception:
+            pass
         if i < attempts:
             time.sleep(delay_sec)
     plog("  \u2717 Final LDAP SA bind failed after Caddy/SMTP/restart.")
@@ -28942,16 +29085,16 @@ async function toggleUU(cb){
 }
 function formatRamGb(memPct,totalRamGb){if(totalRamGb==null)return '';var gb=(Number(memPct||0)/100)*totalRamGb;return gb.toFixed(2)+' GB';}
 function cpuColor(pct){var n=Number(pct||0);if(n>=90)return 'var(--red)';if(n>=70)return '#eab308';return 'var(--green)';}
-function diskIoColor(currentMbs,speedTestMbs){var c=Number(currentMbs||0);var s=Number(speedTestMbs);if(s>0){var pct=(c/s)*100;if(pct>=75)return 'var(--red)';if(pct>=40)return '#eab308';return 'var(--green)';}if(c>=100)return 'var(--red)';if(c>=30)return '#eab308';return 'var(--green)';}
+function diskIoColor(mbs){var m=Number(mbs||0);if(m>=200)return 'var(--green)';if(m>=80)return '#eab308';return 'var(--red)';}
 function renderResourceBreakdown(div,data,hostId){
-    var err=data.error,cpuTop=data.cpu_top,memTop=data.mem_top,totalRamGb=data.total_ram_gb,processor=data.processor,diskRead=data.disk_io_read_mbs,diskWrite=data.disk_io_write_mbs,speedRead=data.disk_speed_test_read_mbs,speedWrite=data.disk_speed_test_write_mbs,speedErr=data.disk_speed_test_error;
+    var err=data.error,cpuTop=data.cpu_top,memTop=data.mem_top,totalRamGb=data.total_ram_gb,processor=data.processor,vcpuCount=data.vcpu_count,diskRead=data.disk_io_read_mbs,diskWrite=data.disk_io_write_mbs,diskSrc=data.disk_io_source,speedRead=data.disk_speed_test_read_mbs,speedWrite=data.disk_speed_test_write_mbs,speedErr=data.disk_speed_test_error;
     if(err){div.innerHTML='<span style="color:var(--red)">'+escapeHtml(err)+'</span>'+(hostId?' <button type="button" onclick="refreshResourceBreakdown(\\''+hostId+'\\')" style="margin-left:8px;padding:2px 8px;font-size:10px;background:rgba(59,130,246,0.2);color:var(--cyan);border:1px solid var(--border);border-radius:4px;cursor:pointer">Refresh</button>':'');return;}
     var tbl='width:100%;border-collapse:collapse;font-size:10px;text-align:left', th='padding:2px 8px 2px 0;color:var(--cyan);font-weight:600;border-bottom:1px solid var(--border)', td='padding:2px 8px 2px 0;border-bottom:1px solid rgba(255,255,255,0.06)', r='text-align:right';
     var html='';
-    if(processor)html+='<div style="margin-bottom:4px;color:var(--text-dim);font-size:10px">Processor: '+escapeHtml(processor)+'</div>';
+    if(processor){html+='<div style="margin-bottom:2px;color:var(--text-dim);font-size:10px">Processor: '+escapeHtml(processor)+'</div>';if(vcpuCount)html+='<div style="margin-bottom:4px;padding-left:8px;color:var(--cyan);font-size:10px;font-weight:600">'+vcpuCount+' vCPUs</div>';}
     if(totalRamGb!=null)html+='<div style="margin-bottom:4px;color:var(--text-dim)">Total RAM: '+totalRamGb+' GB</div>';
-    if(diskRead!=null&&diskWrite!=null){var dr=Number(diskRead),dw=Number(diskWrite);var cr=diskIoColor(dr,speedRead),cw=diskIoColor(dw,speedWrite);html+='<div style="margin-bottom:4px;font-size:10px">Disk I/O (current): <span style="color:'+cr+'">'+dr.toFixed(2)+' MB/s</span> read, <span style="color:'+cw+'">'+dw.toFixed(2)+' MB/s</span> write</div>';}
-    if(speedRead!=null&&speedWrite!=null)html+='<div style="margin-bottom:6px;color:var(--cyan);font-size:10px">Disk speed test (256 MiB): <strong>'+Number(speedRead).toFixed(0)+' MB/s</strong> read, <strong>'+Number(speedWrite).toFixed(0)+' MB/s</strong> write</div>';
+    if(diskWrite!=null&&diskSrc==='sync'){var dw=Number(diskWrite),cwColor=diskIoColor(dw);html+='<div style="margin-bottom:4px;font-size:10px">Disk write speed (Guard Dog): <span style="color:'+cwColor+'">'+dw.toFixed(0)+' MB/s</span></div>';}
+    if(speedWrite!=null){var sw=Number(speedWrite),swColor=diskIoColor(sw);html+='<div style="margin-bottom:6px;font-size:10px">Disk speed test (256 MiB): <span style="color:'+swColor+'">'+sw.toFixed(0)+' MB/s</span></div>';}
     else if(speedErr)html+='<div style="margin-bottom:6px;color:var(--text-dim);font-size:10px">Disk speed test: <span style="color:var(--red)">'+escapeHtml(speedErr)+'</span></div>';
     var ramCell='padding:2px 8px 2px 0;border-bottom:1px solid rgba(255,255,255,0.06);text-align:right;color:var(--text-dim);white-space:nowrap';
     if(cpuTop&&cpuTop.length){
