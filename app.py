@@ -23074,7 +23074,35 @@ entries:
                 time.sleep(5)
         if not _ldap_port_ready:
             plog("  ⚠ LDAP port 389 not open after 180s — bind check may fail")
-        time.sleep(5)
+        # Wait for LDAP container Docker health to be 'healthy' before burning SA bind attempts.
+        # Port open only means the container process started — it still needs to sync with
+        # the Authentik server before it will accept bind requests. On slow VPS (< 200 MB/s)
+        # this sync takes 2-5 minutes. Without this wait, all 24 bind attempts are consumed
+        # while the outpost is still initialising. Cap wait at 5 min (300s).
+        plog("  Waiting for LDAP outpost to be healthy...")
+        _ldap_healthy = False
+        _ldap_wait_start = time.time()
+        for _lh in range(60):  # 60 × 5s = 300s max
+            try:
+                r_lh = subprocess.run(
+                    'docker inspect --format "{{.State.Health.Status}}" authentik-ldap-1 2>/dev/null',
+                    shell=True, capture_output=True, text=True, timeout=5
+                )
+                _h_status = (r_lh.stdout or '').strip().lower()
+                if _h_status == 'healthy':
+                    _elapsed = int(time.time() - _ldap_wait_start)
+                    plog(f"  ✓ LDAP outpost healthy ({_elapsed}s)")
+                    _ldap_healthy = True
+                    break
+                if _h_status in ('', 'none') and _lh > 6:
+                    # Container has no healthcheck — fall through after a brief wait
+                    break
+            except Exception:
+                pass
+            time.sleep(5)
+        if not _ldap_healthy:
+            plog("  ⚠ LDAP outpost not healthy yet — proceeding to bind check anyway")
+        time.sleep(3)
         if not _authentik_deploy_final_verify_ldap_sa(ldap_svc_pass, plog, attempts=24, delay_sec=10):
             _update_boot_stagger_service()
             authentik_deploy_status.update({'running': False, 'complete': False, 'error': True})
