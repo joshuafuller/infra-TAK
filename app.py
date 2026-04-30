@@ -21668,6 +21668,199 @@ def _recreate_authentik_server_worker(plog, reason):
     return ok
 
 
+def _authentik_apply_official_tunings(plog):
+    """v0.8.7: Apply Authentik's officially documented tunings to ~/authentik/.env.
+
+    Apr 30 2026 discovery on tak-10: the v0.8.2 migration set AUTHENTIK_WEB_WORKERS=4
+    in .env, but Authentik 2026.x reads AUTHENTIK_WEB__WORKERS (DOUBLE underscore).
+    Confirmed by `docker top authentik-server-1` showing 2 gunicorn workers (default)
+    despite our config saying 4. Every box in the fleet has been running with half
+    the worker count we thought, since v0.8.2.
+
+    Reference: https://docs.goauthentik.io/install-config/configuration/
+
+    Tunings applied (idempotent — only adds keys missing from .env, never overwrites):
+      - Removes AUTHENTIK_WEB_WORKERS=N (wrong name, was being ignored since v0.8.2)
+      - Adds AUTHENTIK_WEB__WORKERS=4 (correct name; 2x default capacity)
+      - Adds AUTHENTIK_CACHE__TIMEOUT_FLOWS=600 (2x default; flows rarely change)
+      - Adds AUTHENTIK_CACHE__TIMEOUT_POLICIES=600 (2x default; policies rarely change)
+      - Adds AUTHENTIK_LOG_LEVEL=warning (down from info; reduces log overhead)
+
+    Records outcome to settings.authentik_official_tunings for operator audit.
+
+    Caller responsible for restarting the server container after this — env vars are
+    only read at gunicorn startup. Use `_recreate_authentik_server_worker(plog, reason)`.
+
+    Returns True if .env was modified (caller should restart), False if no-op.
+    """
+    ak_dir = os.path.expanduser('~/authentik')
+    env_path = os.path.join(ak_dir, '.env')
+    if not os.path.exists(env_path):
+        plog("  authentik tunings: ~/authentik/.env not found — skipping (Authentik not installed)")
+        return False
+
+    try:
+        with open(env_path) as f:
+            content = f.read()
+    except Exception as e:
+        plog(f"  authentik tunings: read error: {e}")
+        return False
+
+    lines = content.splitlines()
+    actions = []
+
+    new_lines = []
+    removed_old = False
+    for ln in lines:
+        if re.match(r'^AUTHENTIK_WEB_WORKERS\s*=', ln):
+            removed_old = True
+            continue
+        new_lines.append(ln)
+    if removed_old:
+        actions.append('removed AUTHENTIK_WEB_WORKERS (single-underscore wrong name; was being silently ignored since v0.8.2)')
+
+    target_settings = [
+        ('AUTHENTIK_WEB__WORKERS', '4', '4 web workers (vs default 2)'),
+        ('AUTHENTIK_CACHE__TIMEOUT_FLOWS', '600', 'flows cache 600s (vs default 300s) — reduces DB pressure'),
+        ('AUTHENTIK_CACHE__TIMEOUT_POLICIES', '600', 'policies cache 600s (vs default 300s) — reduces DB pressure'),
+        ('AUTHENTIK_LOG_LEVEL', 'warning', 'log level warning (vs default info) — reduces log overhead'),
+    ]
+    for key, value, description in target_settings:
+        existing = next((ln for ln in new_lines if re.match(rf'^{re.escape(key)}\s*=', ln)), None)
+        if existing is not None:
+            actions.append(f'preserved existing operator-set value: {existing.strip()}')
+            continue
+        new_lines.append(f'{key}={value}')
+        actions.append(f'added {key}={value} — {description}')
+
+    new_content = '\n'.join(new_lines).rstrip('\n') + '\n'
+
+    if new_content == content:
+        plog("  authentik tunings: no changes needed (idempotent — already applied or all keys operator-set)")
+        try:
+            s = load_settings()
+            cfg = s.get('authentik_official_tunings') or {}
+            cfg['last_check_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+            cfg['last_outcome'] = 'idempotent-noop'
+            s['authentik_official_tunings'] = cfg
+            save_settings(s)
+        except Exception:
+            pass
+        return False
+
+    try:
+        with open(env_path, 'w') as f:
+            f.write(new_content)
+        plog("  authentik tunings: .env updated:")
+        for action in actions:
+            plog(f"    - {action}")
+    except Exception as e:
+        plog(f"  authentik tunings: write error (no changes applied): {e}")
+        return False
+
+    try:
+        s = load_settings()
+        cfg = s.get('authentik_official_tunings') or {}
+        cfg['last_check_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+        cfg['last_outcome'] = 'applied'
+        cfg['last_actions'] = actions
+        s['authentik_official_tunings'] = cfg
+        save_settings(s)
+    except Exception:
+        pass
+
+    return True
+
+
+def _authentik_verify_runtime_config(plog):
+    """v0.8.7: Verify Authentik's runtime config matches what .env intends.
+
+    Apr 30 2026 lesson: setting AUTHENTIK_WEB_WORKERS=4 in .env was silently ignored
+    for 5 releases. We never knew because we never verified. This function closes
+    the loop by reading what Authentik actually loaded at runtime.
+
+    Two probes:
+      1. `docker exec authentik-worker-1 ak dump_config` for cache.* and log_level
+         (the dump shows YAML config Authentik's Python code reads).
+      2. `docker top authentik-server-1` to count actual gunicorn worker processes
+         (web.workers is consumed by the launcher script, not visible in dump_config).
+
+    Persists pass/fail to settings.authentik_runtime_config_check for operator audit.
+
+    Should be called AFTER a server recreate that should have applied new env vars.
+    Always safe to call. Returns the results dict or None on probe failure.
+    """
+    expected = {
+        'cache.timeout_flows': 600,
+        'cache.timeout_policies': 600,
+        'log_level': 'warning',
+    }
+
+    cfg = None
+    try:
+        r = subprocess.run(
+            'docker exec authentik-worker-1 ak dump_config 2>/dev/null',
+            shell=True, capture_output=True, text=True, timeout=30
+        )
+        if r.returncode != 0:
+            plog(f"  authentik config verify: ak dump_config failed (rc={r.returncode}); skipping verification")
+            return None
+        out = r.stdout or ''
+        idx = out.find('{')
+        if idx < 0:
+            plog("  authentik config verify: no JSON in dump_config output; skipping")
+            return None
+        cfg = json.loads(out[idx:])
+    except Exception as e:
+        plog(f"  authentik config verify: parse error: {e}")
+        return None
+
+    def get_path(d, path):
+        for part in path.split('.'):
+            if not isinstance(d, dict) or part not in d:
+                return None
+            d = d[part]
+        return d
+
+    results = {}
+    for path, expected_val in expected.items():
+        actual = get_path(cfg, path)
+        results[path] = {'expected': expected_val, 'actual': actual, 'pass': actual == expected_val}
+
+    try:
+        r2 = subprocess.run(
+            "docker top authentik-server-1 -o pid,cmd 2>/dev/null | grep -c 'gunicorn: worker'",
+            shell=True, capture_output=True, text=True, timeout=10
+        )
+        worker_count = int((r2.stdout or '0').strip().split('\n')[0] or '0')
+        results['web.workers (process count)'] = {
+            'expected': 4, 'actual': worker_count, 'pass': worker_count == 4
+        }
+    except Exception as _e:
+        results['web.workers (process count)'] = {'expected': 4, 'actual': '?', 'pass': False, 'error': str(_e)[:100]}
+
+    fails = [k for k, v in results.items() if not v.get('pass')]
+    if fails:
+        plog(f"  authentik config verify: {len(fails)} mismatch(es):")
+        for k in fails:
+            plog(f"    {k}: expected={results[k]['expected']}, actual={results[k]['actual']}")
+    else:
+        plog("  authentik config verify: all checks passed (workers=4, cache=600s, log_level=warning)")
+
+    try:
+        s = load_settings()
+        cfg_record = s.get('authentik_runtime_config_check') or {}
+        cfg_record['last_check_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+        cfg_record['last_results'] = results
+        cfg_record['last_outcome'] = 'pass' if not fails else 'fail'
+        s['authentik_runtime_config_check'] = cfg_record
+        save_settings(s)
+    except Exception:
+        pass
+
+    return results
+
+
 def _authentik_periodic_restart_monitor():
     """v0.8.7: Daily auto-restart of Authentik server + worker for runtime state hygiene.
 
@@ -30273,6 +30466,28 @@ def _startup_migrations():
                 print(f"Startup migration: Guard Dog stamped at {VERSION}")
             except Exception as gu_err:
                 print(f"Startup migration: Guard Dog stamp error: {gu_err}")
+
+        # v0.8.7: Apply Authentik official tunings (env var name fix + cache + log level).
+        # The function is idempotent: returns False if no changes needed (every startup
+        # after the first), so the recreate only fires once per box. Migrates the v0.8.2
+        # AUTHENTIK_WEB_WORKERS=4 (single underscore — silently ignored by Authentik 2026.x)
+        # to AUTHENTIK_WEB__WORKERS=4 (correct double-underscore name).
+        try:
+            if os.path.exists(os.path.expanduser('~/authentik/.env')):
+                changed = _authentik_apply_official_tunings(lambda m: print(f"Startup migration: {m}", flush=True))
+                if changed:
+                    print("Startup migration: authentik .env updated — recreating server+worker to apply", flush=True)
+                    _recreate_authentik_server_worker(
+                        lambda m: print(f"Startup migration: {m}", flush=True),
+                        reason='official-tunings-migration'
+                    )
+                    time.sleep(15)
+                    _authentik_verify_runtime_config(lambda m: print(f"Startup migration: {m}", flush=True))
+                else:
+                    # Run verifier even when no changes — closes the audit loop on every startup.
+                    _authentik_verify_runtime_config(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as ak_tune_err:
+            print(f"Startup migration: authentik tunings error (non-fatal): {ak_tune_err}")
     except Exception as e:
         print(f"Startup migration error: {e}")
         import traceback; traceback.print_exc()
@@ -30418,31 +30633,24 @@ def _post_update_auto_deploy():
             except Exception as _e:
                 print(f"Post-update: v0.8.4 LDAP routing repair skipped: {_e}")
 
-            # Ensure AUTHENTIK_WEB_WORKERS=4 so the flow executor has enough capacity to handle
-            # bind storms after restarts without thundering-herd overload. Only restarts the
-            # server container (not ldap) — server restarts are fast and do not clear bind caches.
+            # v0.8.7 SUPERSEDES v0.8.2 worker count migration.
+            # The v0.8.2 migration wrote AUTHENTIK_WEB_WORKERS (single underscore), but
+            # Authentik 2026.x requires AUTHENTIK_WEB__WORKERS (double underscore). The
+            # value was silently ignored on every box for ~5 releases. Apr 30 2026 dump_config
+            # on tak-10 confirmed: 2 actual gunicorn workers despite "=4" in .env.
+            # _authentik_apply_official_tunings handles the rename + applies cache/log tunings.
             try:
-                ak_env = os.path.expanduser('~/authentik/.env')
-                if os.path.exists(ak_env):
-                    with open(ak_env) as _f:
-                        _env_text = _f.read()
-                    import re as _re2
-                    _existing = _re2.search(r'^AUTHENTIK_WEB_WORKERS\s*=\s*(\d+)', _env_text, _re2.M)
-                    _current_workers = int(_existing.group(1)) if _existing else 0
-                    if _current_workers < 4:
-                        if _existing:
-                            _env_text = _re2.sub(r'^AUTHENTIK_WEB_WORKERS\s*=.*', 'AUTHENTIK_WEB_WORKERS=4', _env_text, flags=_re2.M)
-                        else:
-                            _env_text = _env_text.rstrip('\n') + '\nAUTHENTIK_WEB_WORKERS=4\n'
-                        with open(ak_env, 'w') as _f:
-                            _f.write(_env_text)
-                        subprocess.run('cd ~/authentik && docker compose restart server',
-                            shell=True, capture_output=True, text=True, timeout=120)
-                        print("Post-update: set AUTHENTIK_WEB_WORKERS=4 and restarted server (ldap untouched)")
-                    else:
-                        print(f"Post-update: AUTHENTIK_WEB_WORKERS already={_current_workers}, no change")
+                if os.path.exists(os.path.expanduser('~/authentik/.env')):
+                    changed = _authentik_apply_official_tunings(lambda m: print(f"Post-update: {m}", flush=True))
+                    if changed:
+                        _recreate_authentik_server_worker(
+                            lambda m: print(f"Post-update: {m}", flush=True),
+                            reason='official-tunings-migration'
+                        )
+                        time.sleep(15)
+                        _authentik_verify_runtime_config(lambda m: print(f"Post-update: {m}", flush=True))
             except Exception as _e:
-                print(f"Post-update: AUTHENTIK_WEB_WORKERS fix skipped: {_e}")
+                print(f"Post-update: authentik tunings migration skipped: {_e}")
 
             # Re-deploy Guard Dog (updated scripts + timers)
             if os.path.exists('/opt/tak-guarddog') and os.path.exists('/opt/tak'):
