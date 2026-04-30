@@ -23963,10 +23963,16 @@ def _test_ldap_bind_dn_verdict(bind_dn, bind_pass):
     for _ in range(3):
         if has_ldapsearch and not is_remote:
             try:
+                # Search ou=users (not dc= root) so the search itself also succeeds.
+                # Authentik doesn't expose a root object at dc=takldap, so a base-scope
+                # search there returns LDAP error 32 ("no such object") even when the
+                # bind succeeded — causing ldapsearch to exit non-zero every time.
+                _cn = user_hint or 'adm_ldapservice'
                 lr = subprocess.run(
                     ['ldapsearch', '-x', '-H', f'ldap://{ldap_host}:389',
                      '-D', bind_dn, '-w', bind_pass,
-                     '-b', 'dc=takldap', '-s', 'base', '(objectClass=*)'],
+                     '-b', 'ou=users,dc=takldap', '-s', 'one',
+                     f'(cn={_cn})', 'cn'],
                     capture_output=True, text=True, timeout=15)
                 out = ((lr.stdout or '') + '\n' + (lr.stderr or '')).lower()
                 if lr.returncode == 0 and 'invalid credentials' not in out:
@@ -23976,14 +23982,17 @@ def _test_ldap_bind_dn_verdict(bind_dn, bind_pass):
             except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
                 pass
 
-        time.sleep(2)
+        # Sleep long enough that any log entry written by the bind above has been
+        # flushed and captured before we read docker logs.  2 s was a race on slow
+        # Azure disks where the log landed at the same second as our check.
+        time.sleep(5)
         if is_remote:
             ok, out = _ssh_probe(ak_cfg.get('remote', {}),
-                'docker logs authentik-ldap-1 --since 45s 2>&1', timeout=15)
+                'docker logs authentik-ldap-1 --since 90s 2>&1', timeout=15)
             log = (out or '').lower()
         else:
             r = subprocess.run(
-                'docker logs authentik-ldap-1 --since 45s 2>&1',
+                'docker logs authentik-ldap-1 --since 90s 2>&1',
                 shell=True, capture_output=True, text=True, timeout=10)
             log = (r.stdout or '').lower()
 
@@ -24045,6 +24054,20 @@ def _authentik_deploy_final_verify_ldap_sa(ldap_svc_pass, plog, attempts=12, del
         if _test_ldap_bind_dn(sa_dn, ldap_svc_pass):
             plog("  \u2713 LDAP service-account bind verified (adm_ldapservice). Safe to proceed to TAK Server.")
             return True
+        # Fallback: directly check Docker logs for a recent "authenticated from session"
+        # entry for the SA.  This catches the case where ldapsearch's exit code is
+        # misleading (e.g. bind succeeds but base-scope search returns LDAP error 32)
+        # and _test_ldap_bind_dn_verdict mis-classifies the result as inconclusive.
+        try:
+            r_fb = subprocess.run(
+                'docker logs authentik-ldap-1 --since 90s 2>&1',
+                shell=True, capture_output=True, text=True, timeout=10)
+            fb_log = (r_fb.stdout or '').lower()
+            if 'authenticated from session' in fb_log and 'adm_ldapservice' in fb_log:
+                plog("  \u2713 LDAP SA bind verified via Docker log (authenticated from session). Safe to proceed.")
+                return True
+        except Exception:
+            pass
         if i < attempts:
             time.sleep(delay_sec)
     plog("  \u2717 Final LDAP SA bind failed after Caddy/SMTP/restart.")
