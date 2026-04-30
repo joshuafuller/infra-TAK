@@ -443,15 +443,22 @@ if command -v firewall-cmd >/dev/null 2>&1; then
     firewall-cmd --reload >/dev/null 2>&1 || true
 fi
 
-# Get access URL
+# Get access URL — on Azure/AWS the private IP is returned by hostname -I
+# Try to resolve the public IP so operators get the right URL
 SERVER_IP=$(hostname -I | awk '{print $1}')
+PUBLIC_IP=$(curl -s --max-time 3 https://api.ipify.org 2>/dev/null || echo "")
 
 echo ""
 echo -e "${GREEN}${BOLD}  ╔══════════════════════════════════════════════════════╗${NC}"
 echo -e "${GREEN}${BOLD}  ║  infra-TAK is running!                               ║${NC}"
 echo -e "${GREEN}${BOLD}  ╚══════════════════════════════════════════════════════╝${NC}"
 echo ""
-echo -e "  ${BOLD}Access:${NC} https://$SERVER_IP:5001"
+if [ -n "$PUBLIC_IP" ] && [ "$PUBLIC_IP" != "$SERVER_IP" ]; then
+    echo -e "  ${BOLD}Access (public):${NC}  https://$PUBLIC_IP:5001"
+    echo -e "  ${BOLD}Access (private):${NC} https://$SERVER_IP:5001"
+else
+    echo -e "  ${BOLD}Access:${NC} https://$SERVER_IP:5001"
+fi
 echo -e "  ${YELLOW}(Accept the self-signed certificate warning in your browser)${NC}"
 echo ""
 echo -e "  ${BOLD}Service:${NC} systemctl status takwerx-console"
