@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.8.6-alpha"
+VERSION = "0.8.7-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -21546,6 +21546,197 @@ def _ensure_authentik_gunicorn_timeout(plog, value=120):
         plog(f"  ⚠ gunicorn timeout error (no changes applied): {e}")
 
 
+def _detect_authentik_asgi_websocket_loop():
+    """v0.8.7: Detect Authentik server stuck in an ASGI WebSocket reconnect loop.
+
+    Symptom (observed Apr 30 2026 on tak-10): server logs show recurring
+        RuntimeError: Expected ASGI message 'websocket.send' or 'websocket.close',
+        but got 'websocket.accept'
+    every ~3 seconds, indicating one or more outposts are stuck reconnecting. The
+    server pegs CPU as it churns through the failed handshakes, but otherwise looks
+    healthy (no thundering herd, no TLS error, normal bind volume).
+
+    Returns (looping: bool, evidence: dict). looping=True when the count in the
+    last 60s is >= 5 (a sustained loop, not a one-off blip during normal restart).
+
+    Idempotent / safe to call frequently. ~1s cost (single docker logs invocation).
+    """
+    try:
+        r = subprocess.run(
+            'docker logs authentik-server-1 --since 60s 2>&1 | grep -cE "Expected ASGI message|Unexpected ASGI message" || true',
+            shell=True, capture_output=True, text=True, timeout=15
+        )
+        try:
+            count = int((r.stdout or '0').strip().split('\n')[0] or '0')
+        except Exception:
+            count = 0
+        looping = count >= 5
+        return looping, {'asgi_error_count_60s': count, 'threshold': 5}
+    except Exception as e:
+        return False, {'error': str(e)[:200]}
+
+
+def _recreate_authentik_server_worker(plog, reason):
+    """v0.8.7: Force-recreate Authentik server + worker containers (NEVER ldap).
+
+    This is the only durable cure for runtime state drift on Authentik 2026.x boxes
+    (license check leak, async task accumulation, ASGI handler leaks, connection
+    pool fragmentation, celery beat schedule decay). On Apr 30 2026 we proved on
+    tak-10 that identical hardware + identical config + identical workload can
+    produce wildly different CPU profiles after several days of uptime — server
+    p50 140%+ vs sibling box at p50 1.9%. The ONLY durable fix was a fresh recreate.
+
+    NEVER touches the LDAP outpost — preserves bind cache, prevents thundering herd.
+    Records outcome to settings.json under authentik_periodic_restart for operator
+    visibility and rate-limiting (12h floor between recreates regardless of trigger).
+
+    Args:
+        plog: callable(msg) — for human-readable progress logging
+        reason: short tag identifying the trigger (e.g. 'scheduled-24h', 'asgi-loop-12-errors-60s')
+    Returns: True on success, False otherwise.
+    """
+    ak_dir = os.path.expanduser('~/authentik')
+    if not os.path.exists(os.path.join(ak_dir, 'docker-compose.yml')):
+        plog("  authentik recreate: ~/authentik not installed, skipping")
+        return False
+
+    started = time.time()
+    plog(f"  authentik recreate: starting (reason={reason}, target=server+worker, ldap=untouched)")
+
+    ok = False
+    err_text = ''
+    try:
+        r = subprocess.run(
+            'cd ~/authentik && docker compose up -d --force-recreate --no-deps server worker',
+            shell=True, capture_output=True, text=True, timeout=180
+        )
+        ok = (r.returncode == 0)
+        if not ok:
+            err_text = ((r.stderr or '') + (r.stdout or ''))[:300]
+    except Exception as e:
+        ok = False
+        err_text = f"exception: {e}"[:300]
+
+    duration = int(time.time() - started)
+    if ok:
+        plog(f"  ✓ authentik recreate complete in {duration}s (server+worker recreated, ldap preserved)")
+    else:
+        plog(f"  ✗ authentik recreate failed (duration={duration}s): {err_text}")
+
+    try:
+        s = load_settings()
+        cfg = s.get('authentik_periodic_restart') or {}
+        cfg['last_run_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+        cfg['last_outcome'] = 'ok' if ok else 'failed'
+        cfg['last_duration_s'] = duration
+        cfg['last_reason'] = reason
+        if not ok:
+            cfg['last_error'] = err_text
+        elif 'last_error' in cfg:
+            del cfg['last_error']
+        s['authentik_periodic_restart'] = cfg
+        save_settings(s)
+    except Exception:
+        pass
+    return ok
+
+
+def _authentik_periodic_restart_monitor():
+    """v0.8.7: Daily auto-restart of Authentik server + worker for runtime state hygiene.
+
+    Why: Even on healthy boxes with identical hardware/config/workload, Authentik
+    2026.x server processes accumulate runtime state over days of uptime. On Apr 30
+    2026 we proved this on tak-10: server CPU pegged at p50 140%+ for hours despite
+    no thundering herd, no ASGI loop, normal bind volume, and an identical config to
+    its sibling box (responder) at p50 1.9%. The ONLY durable fix was a force-recreate
+    of server + worker. This thread automates that fix on a 24h cadence.
+
+    Cadence: checks every 5 min; fires during a configurable off-peak hour (default
+    04:00 box-local). LDAP outpost is NEVER touched (preserves bind cache).
+
+    Skip rules:
+      - settings.authentik_periodic_restart.enabled == False → no-op
+      - last successful restart < min_interval_hours ago → skip
+      - Authentik not installed → no-op
+      - current hour != hour_local → skip (only fires in the configured window)
+
+    Single-instance lock: same pattern as _authentik_spiral_monitor (PID-checked
+    lockfile). Only ONE worker runs the monitor across the gunicorn process pool.
+
+    Idempotent: safe to call at module load on every gunicorn worker startup.
+    """
+    import time as _t
+    lock_path = '/tmp/takwerx-periodic-restart.lock'
+    try:
+        if os.path.exists(lock_path):
+            try:
+                with open(lock_path) as _lf:
+                    holder_pid = int((_lf.read() or '0').strip())
+                if holder_pid > 0:
+                    try:
+                        os.kill(holder_pid, 0)
+                        print(f"[periodic restart] PID {holder_pid} already holds the lock — this worker stands down", flush=True)
+                        return
+                    except (ProcessLookupError, PermissionError):
+                        pass  # holder dead, steal
+            except Exception:
+                pass  # corrupt lockfile, overwrite
+        with open(lock_path, 'w') as _lf:
+            _lf.write(str(os.getpid()))
+        print(f"[periodic restart] PID {os.getpid()} acquired lock — starting (5min check, fires once per 24h at hour_local=04 by default)", flush=True)
+    except Exception as e:
+        print(f"[periodic restart] could not acquire lock (non-fatal): {e}", flush=True)
+        return
+
+    while True:
+        try:
+            _t.sleep(300)  # check every 5 min — cheap, just a clock + settings read
+            ak_dir = os.path.expanduser('~/authentik')
+            if not os.path.exists(os.path.join(ak_dir, 'docker-compose.yml')):
+                continue
+
+            s = load_settings()
+            cfg = s.get('authentik_periodic_restart') or {}
+            if cfg.get('enabled', True) is False:
+                continue
+
+            try:
+                target_hour = int(cfg.get('hour_local', 4))
+            except Exception:
+                target_hour = 4
+            try:
+                min_interval_h = int(cfg.get('min_interval_hours', 12))
+            except Exception:
+                min_interval_h = 12
+
+            now = datetime.now()
+            if now.hour != target_hour:
+                continue
+
+            last_run_str = cfg.get('last_run_utc') or ''
+            last_run_ts = 0
+            if last_run_str:
+                try:
+                    from datetime import timezone as _tz
+                    _dt_naive = datetime.strptime(last_run_str, '%Y-%m-%dT%H:%M:%SZ')
+                    last_run_ts = int(_dt_naive.replace(tzinfo=_tz.utc).timestamp())
+                except Exception:
+                    last_run_ts = 0
+            if last_run_ts and (_t.time() - last_run_ts) < min_interval_h * 3600:
+                continue
+
+            print(f"[periodic restart] firing scheduled restart (hour_local={target_hour}, last_run={last_run_str or 'never'})", flush=True)
+            _recreate_authentik_server_worker(
+                lambda m: print(f"[periodic restart] {m}", flush=True),
+                reason='scheduled-24h'
+            )
+        except Exception as e:
+            try:
+                print(f"[periodic restart] iteration error (will retry in 5 min): {e}", flush=True)
+            except Exception:
+                pass
+
+
 def _authentik_spiral_monitor():
     """v0.8.5: Periodic background monitor for the LDAP routing spiral.
 
@@ -21606,8 +21797,42 @@ def _authentik_spiral_monitor():
             except Exception as _proactive_e:
                 print(f"[spiral monitor] proactive routing pass error (non-fatal): {_proactive_e}", flush=True)
 
-            # REACTIVE pass: spiral signature → routing repair (rate-limited to 1 attempt per 6h).
             s = load_settings()
+
+            # v0.8.7 ASGI WebSocket loop pass: cheap log scan; if server is stuck in the
+            # outpost reconnect loop (>= 5 errors in last 60s), force-recreate server+worker
+            # to clear the runtime state (LDAP outpost is NOT touched). Rate-limited via the
+            # periodic-restart 12h interval — don't recreate twice within 12h regardless of
+            # cause (scheduled or reactive).
+            try:
+                _pr_cfg = s.get('authentik_periodic_restart') or {}
+                _last_run_str = _pr_cfg.get('last_run_utc') or ''
+                _last_run_ts = 0
+                if _last_run_str:
+                    try:
+                        from datetime import timezone as _tz
+                        _last_run_ts = int(datetime.strptime(_last_run_str, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=_tz.utc).timestamp())
+                    except Exception:
+                        _last_run_ts = 0
+                try:
+                    _min_interval_h = int(_pr_cfg.get('min_interval_hours', 12))
+                except Exception:
+                    _min_interval_h = 12
+                if not _last_run_ts or (_t.time() - _last_run_ts) >= _min_interval_h * 3600:
+                    looping, asgi_evidence = _detect_authentik_asgi_websocket_loop()
+                    if looping:
+                        _err_count = asgi_evidence.get('asgi_error_count_60s', '?')
+                        print(f"[spiral monitor] ASGI WebSocket loop detected: {_err_count} errors in last 60s — recreating server+worker", flush=True)
+                        _recreate_authentik_server_worker(
+                            lambda m: print(f"[spiral monitor] {m}", flush=True),
+                            reason=f'asgi-loop-{_err_count}-errors-60s'
+                        )
+                        # Recreate just ran; skip the spiral-routing reactive pass this cycle.
+                        continue
+            except Exception as _asgi_e:
+                print(f"[spiral monitor] ASGI loop check error (non-fatal): {_asgi_e}", flush=True)
+
+            # REACTIVE pass: spiral signature → routing repair (rate-limited to 1 attempt per 6h).
             last_attempt = s.get('authentik_spiral_last_repair') or {}
             last_ts = last_attempt.get('ts', 0)
             if _t.time() - last_ts < 6 * 3600:
@@ -30644,6 +30869,17 @@ try:
     _threading_spiral.Thread(target=_authentik_spiral_monitor, daemon=True, name='authentik-spiral-monitor').start()
 except Exception as _e:
     print(f"[startup] failed to start spiral monitor (non-fatal): {_e}", flush=True)
+
+# v0.8.7: periodic auto-restart of Authentik server+worker for runtime state hygiene.
+# Apr 30 2026 tak-10 incident proved that identical hardware+config+workload boxes
+# can drift to wildly different CPU profiles after days of uptime. The ONLY durable
+# fix is force-recreate of server+worker (LDAP outpost untouched, bind cache preserved).
+# Default cadence: once per day at hour_local=04. Single-instance via lockfile.
+try:
+    import threading as _threading_restart
+    _threading_restart.Thread(target=_authentik_periodic_restart_monitor, daemon=True, name='authentik-periodic-restart').start()
+except Exception as _e:
+    print(f"[startup] failed to start periodic restart monitor (non-fatal): {_e}", flush=True)
 
 # === Main Entry Point (fallback for direct python3 app.py) ===
 if __name__ == '__main__':
