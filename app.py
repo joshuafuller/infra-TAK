@@ -21828,11 +21828,16 @@ def _authentik_verify_runtime_config(plog):
         results[path] = {'expected': expected_val, 'actual': actual, 'pass': actual == expected_val}
 
     try:
+        # Apr 30 2026 fix: don't pass `-o pid,cmd` to `docker top` — on some Linux
+        # distros that reformats/truncates the CMD column and the grep for
+        # 'gunicorn: worker' misses entirely, returning a false-negative 0.
+        # The default `docker top` output always includes the full CMD column.
         r2 = subprocess.run(
-            "docker top authentik-server-1 -o pid,cmd 2>/dev/null | grep -c 'gunicorn: worker'",
+            'docker top authentik-server-1 2>/dev/null',
             shell=True, capture_output=True, text=True, timeout=10
         )
-        worker_count = int((r2.stdout or '0').strip().split('\n')[0] or '0')
+        out = r2.stdout or ''
+        worker_count = sum(1 for ln in out.splitlines() if 'gunicorn: worker' in ln)
         results['web.workers (process count)'] = {
             'expected': 4, 'actual': worker_count, 'pass': worker_count == 4
         }
