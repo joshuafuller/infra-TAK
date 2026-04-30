@@ -21768,16 +21768,29 @@ def _authentik_verify_runtime_config(plog):
         results[path] = {'expected': expected_val, 'actual': actual, 'pass': actual == expected_val}
 
     try:
-        # Apr 30 2026 fix: don't pass `-o pid,cmd` to `docker top` — on some Linux
+        # Apr 30 2026 fix #1: don't pass `-o pid,cmd` to `docker top` — on some Linux
         # distros that reformats/truncates the CMD column and the grep for
         # 'gunicorn: worker' misses entirely, returning a false-negative 0.
         # The default `docker top` output always includes the full CMD column.
-        r2 = subprocess.run(
-            'docker top authentik-server-1 2>/dev/null',
-            shell=True, capture_output=True, text=True, timeout=10
-        )
-        out = r2.stdout or ''
-        worker_count = sum(1 for ln in out.splitlines() if 'gunicorn: worker' in ln)
+        #
+        # Apr 30 2026 fix #2 (responder spot-check): retry on worker_count==0 to
+        # tolerate the race where the freshly-recreated server container is up but
+        # gunicorn hasn't yet forked its workers. On slow disks that fork can take
+        # 20-40s after the container starts. Without retry, the verifier writes
+        # last_outcome=fail even though the runtime stabilizes correctly seconds
+        # later. We retry every 5s up to 6 times (max 30s total) — only count as
+        # genuine failure if 0 workers persist past that window.
+        worker_count = 0
+        for _attempt in range(6):
+            r2 = subprocess.run(
+                'docker top authentik-server-1 2>/dev/null',
+                shell=True, capture_output=True, text=True, timeout=10
+            )
+            out = r2.stdout or ''
+            worker_count = sum(1 for ln in out.splitlines() if 'gunicorn: worker' in ln)
+            if worker_count > 0:
+                break
+            time.sleep(5)
         results['web.workers (process count)'] = {
             'expected': 4, 'actual': worker_count, 'pass': worker_count == 4
         }
