@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.8.7-alpha"
+VERSION = "0.8.8-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -20381,7 +20381,7 @@ entries:
     state: present
     id: ldap-authentication-login
   - attrs:
-      evaluate_on_plan: true
+      evaluate_on_plan: false
       invalid_response_action: retry
       policy_engine_mode: any
       re_evaluate_policies: true
@@ -20393,7 +20393,7 @@ entries:
     state: present
     id: ldap-identification-stage-flow-binding
   - attrs:
-      evaluate_on_plan: true
+      evaluate_on_plan: false
       invalid_response_action: retry
       policy_engine_mode: any
       re_evaluate_policies: true
@@ -20405,7 +20405,7 @@ entries:
     state: present
     id: ldap-authentication-password-binding
   - attrs:
-      evaluate_on_plan: true
+      evaluate_on_plan: false
       invalid_response_action: retry
       policy_engine_mode: any
       re_evaluate_policies: true
@@ -20497,7 +20497,7 @@ entries:
   postgresql:
     image: docker.io/library/postgres:16-alpine
     restart: unless-stopped
-    command: postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=30s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6
+    command: postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
       start_period: 20s
@@ -20943,12 +20943,15 @@ def _ensure_authentik_compose_patches(compose_path, plog=None):
             lines = f.readlines()
         changed = False
 
-        pg_cmd = 'postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=30s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
+        pg_cmd = 'postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
         has_pg_cmd = any('max_connections=300' in l for l in lines)
-        # v0.8.4: catch ANY value other than 30s (was: explicit 300s/10s/120s only — missed manual sed values like 15s)
+        # v0.8.8: catch ANY value other than 300s (was 30s in v0.8.4 — too aggressive on slow disks:
+        # Authentik startup migrations exceeded 30s in idle-in-tx state on 1795-IOPS storage,
+        # got killed mid-flight, leaving stale advisory locks and a permanent server crash loop.
+        # 300s tightly bounds zombie idle-in-tx sessions while tolerating slow-disk migrations.)
         _pg_full = ''.join(lines)
         _pg_match = re.search(r'idle_in_transaction_session_timeout=(\d+)s', _pg_full)
-        needs_pg_update = has_pg_cmd and (not _pg_match or _pg_match.group(1) != '30')
+        needs_pg_update = has_pg_cmd and (not _pg_match or _pg_match.group(1) != '300')
         if not has_pg_cmd:
             patched = []
             for line in lines:
@@ -21034,7 +21037,7 @@ def _apply_authentik_pg_tuning(ak_dir, plog):
                 f'cd {ak_dir} && docker compose up -d --force-recreate postgresql 2>&1',
                 shell=True, capture_output=True, text=True, timeout=120
             )
-            plog("  ✓ PostgreSQL recreated with updated tuning (idle_in_transaction_session_timeout=30s)")
+            plog("  ✓ PostgreSQL recreated with updated tuning (idle_in_transaction_session_timeout=300s)")
         else:
             subprocess.run(
                 f'cd {ak_dir} && docker compose exec -T postgresql psql -U authentik -d authentik -c "SELECT pg_reload_conf();" 2>&1',
@@ -21797,13 +21800,43 @@ def _authentik_verify_runtime_config(plog):
     except Exception as _e:
         results['web.workers (process count)'] = {'expected': 4, 'actual': '?', 'pass': False, 'error': str(_e)[:100]}
 
+    # v0.8.8 probe: Postgres idle_in_transaction_session_timeout. If this is still 30s
+    # the server WILL crash-loop on slow-disk migration (1795 IOPS box on ssdnodes
+    # exhibited this on Apr 30 2026 — Django startup migrations >30s in idle-in-tx).
+    # 300s gives slow disks ~10x headroom while still bounding zombie idle-in-tx sessions.
+    try:
+        r3 = subprocess.run(
+            "docker exec authentik-postgresql-1 psql -U authentik -d authentik -tAc "
+            "\"SHOW idle_in_transaction_session_timeout;\"",
+            shell=True, capture_output=True, text=True, timeout=10
+        )
+        raw = (r3.stdout or '').strip()
+        # Postgres SHOW returns values like "300s", "5min", "300000ms" — normalize to ms
+        ms_actual = None
+        if raw:
+            mm = re.match(r'^(\d+)\s*(ms|s|min)?$', raw)
+            if mm:
+                n = int(mm.group(1))
+                unit = (mm.group(2) or 's').lower()
+                ms_actual = n if unit == 'ms' else (n * 1000 if unit == 's' else n * 60000)
+        ms_expected = 300_000
+        results['pg.idle_in_transaction_session_timeout'] = {
+            'expected': '300s',
+            'actual': raw or '?',
+            'pass': ms_actual == ms_expected
+        }
+    except Exception as _e:
+        results['pg.idle_in_transaction_session_timeout'] = {
+            'expected': '300s', 'actual': '?', 'pass': False, 'error': str(_e)[:100]
+        }
+
     fails = [k for k, v in results.items() if not v.get('pass')]
     if fails:
         plog(f"  authentik config verify: {len(fails)} mismatch(es):")
         for k in fails:
             plog(f"    {k}: expected={results[k]['expected']}, actual={results[k]['actual']}")
     else:
-        plog("  authentik config verify: all checks passed (workers=4, cache=600s, log_level=warning)")
+        plog("  authentik config verify: all checks passed (workers=4, cache=600s, log_level=warning, pg_idle_timeout=300s)")
 
     try:
         s = load_settings()
@@ -21817,6 +21850,300 @@ def _authentik_verify_runtime_config(plog):
         pass
 
     return results
+
+
+def _authentik_fix_ldap_flow_recursion(plog):
+    """v0.8.8: Fix the LDAP flow stage-binding recursion bug.
+
+    Apr 30 2026 discovery on a slow-disk ssdnodes box: Postgres CPU sustained at
+    900-1500% with five backends running 86-second `SELECT FROM
+    authentik_policies_policybindingmodel` queries. LDAP bind volume was 0.36/sec
+    (essentially idle). Root cause: every stage binding on `ldap-authentication-flow`
+    had BOTH `evaluate_on_plan=true` AND `re_evaluate_policies=true`. That combo
+    triggers a cascading policy re-evaluation on every step of every authentication
+    plan: each step re-runs all policy lookups, which re-triggers plan generation,
+    which re-evaluates policies, ad infinitum until the disk catches up. Compare to
+    `default-authentication-flow` which has `evaluate_on_plan=false,
+    re_evaluate_policies=true` — that flow has zero recursion and works fine.
+    Setting `evaluate_on_plan=false` on the three ldap-flow bindings dropped
+    Postgres CPU 115x (~900% → ~7.8%) within 60 seconds and zero long-running
+    queries persisted. The bug was latent on every box that ever ran our blueprint
+    (which includes every infra-TAK install since the LDAP feature shipped); fast
+    disks hide it because each policy query completes in microseconds.
+
+    What this function does:
+      1. Queries Authentik's Postgres directly for stage bindings on the
+         `ldap-authentication-flow` slug with `evaluate_on_plan=true`.
+      2. If any are found, runs an idempotent UPDATE setting them to false.
+         (Leaves `re_evaluate_policies=true` alone — that matches the
+         default flow and isn't part of the recursion combo.)
+      3. If rows were updated, restarts authentik-server-1 ONLY (cardinal rule:
+         LDAP outpost stays untouched, no thundering herd) so the in-memory
+         flow plan cache is rebuilt with the new binding state.
+      4. Persists outcome to `settings.authentik_ldap_flow_recursion_fix` for
+         operator audit.
+
+    Idempotent: returns False if no rows needed fixing (every startup after the
+    first), so the server restart only fires once per box.
+
+    Returns True if fixes were applied (caller may want to log loudly), False
+    if no-op or skipped because the Authentik PG container isn't running.
+    """
+    pg_container = 'authentik-postgresql-1'
+    server_container = 'authentik-server-1'
+
+    try:
+        r = subprocess.run(
+            f"docker ps -q --filter name={pg_container}",
+            shell=True, capture_output=True, text=True, timeout=10
+        )
+        if not (r.stdout or '').strip():
+            plog("  ldap flow recursion: authentik-postgresql-1 not running — skipping")
+            return False
+    except Exception as e:
+        plog(f"  ldap flow recursion: docker probe failed: {e}")
+        return False
+
+    count_sql = (
+        "SELECT COUNT(*) FROM authentik_flows_flowstagebinding fsb "
+        "JOIN authentik_flows_flow f ON f.flow_uuid = fsb.target_id "
+        "WHERE f.slug = 'ldap-authentication-flow' AND fsb.evaluate_on_plan = true;"
+    )
+    try:
+        r = subprocess.run(
+            f"docker exec -i {pg_container} psql -U authentik -d authentik -tAc \"{count_sql}\"",
+            shell=True, capture_output=True, text=True, timeout=15
+        )
+        if r.returncode != 0:
+            plog(f"  ldap flow recursion: count query failed: {(r.stderr or '')[:200]}")
+            return False
+        bad_count = int((r.stdout or '0').strip() or '0')
+    except Exception as e:
+        plog(f"  ldap flow recursion: count parse error: {e}")
+        return False
+
+    if bad_count == 0:
+        plog("  ldap flow recursion: no bindings need fixing (idempotent — already correct)")
+        try:
+            s = load_settings()
+            cfg = s.get('authentik_ldap_flow_recursion_fix') or {}
+            cfg['last_check_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+            cfg['last_outcome'] = 'idempotent-noop'
+            cfg['last_bad_count'] = 0
+            s['authentik_ldap_flow_recursion_fix'] = cfg
+            save_settings(s)
+        except Exception:
+            pass
+        return False
+
+    plog(f"  ldap flow recursion: found {bad_count} stage binding(s) with evaluate_on_plan=true — fixing")
+
+    update_sql = (
+        "UPDATE authentik_flows_flowstagebinding "
+        "SET evaluate_on_plan = false "
+        "WHERE target_id IN (SELECT flow_uuid FROM authentik_flows_flow WHERE slug = 'ldap-authentication-flow') "
+        "AND evaluate_on_plan = true;"
+    )
+    try:
+        r = subprocess.run(
+            f"docker exec -i {pg_container} psql -U authentik -d authentik -c \"{update_sql}\"",
+            shell=True, capture_output=True, text=True, timeout=15
+        )
+        if r.returncode != 0:
+            plog(f"  ldap flow recursion: UPDATE failed: {(r.stderr or '')[:200]}")
+            try:
+                s = load_settings()
+                cfg = s.get('authentik_ldap_flow_recursion_fix') or {}
+                cfg['last_check_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+                cfg['last_outcome'] = 'failed'
+                cfg['last_error'] = (r.stderr or '')[:200]
+                s['authentik_ldap_flow_recursion_fix'] = cfg
+                save_settings(s)
+            except Exception:
+                pass
+            return False
+    except Exception as e:
+        plog(f"  ldap flow recursion: UPDATE exception: {e}")
+        return False
+
+    plog(f"  ✓ ldap flow recursion: UPDATE applied to {bad_count} binding(s)")
+
+    plog(f"  ldap flow recursion: restarting {server_container} (server only — ldap outpost untouched) to clear flow cache")
+    try:
+        r = subprocess.run(
+            f"docker restart {server_container}",
+            shell=True, capture_output=True, text=True, timeout=60
+        )
+        restart_ok = (r.returncode == 0)
+        if not restart_ok:
+            plog(f"  ✗ ldap flow recursion: server restart failed: {(r.stderr or '')[:200]}")
+    except Exception as e:
+        plog(f"  ✗ ldap flow recursion: server restart exception: {e}")
+        restart_ok = False
+
+    try:
+        s = load_settings()
+        cfg = s.get('authentik_ldap_flow_recursion_fix') or {}
+        cfg['last_check_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+        cfg['last_outcome'] = 'fixed' if restart_ok else 'fixed-restart-failed'
+        cfg['last_bad_count'] = bad_count
+        s['authentik_ldap_flow_recursion_fix'] = cfg
+        save_settings(s)
+    except Exception:
+        pass
+
+    return True
+
+
+def _authentik_fix_pg_idle_timeout(plog):
+    """v0.8.8: Bump idle_in_transaction_session_timeout from 30s to 300s and
+    unstick any in-flight crash loop caused by the old value.
+
+    Apr 30 2026 discovery on the same slow-disk ssdnodes box that surfaced the
+    LDAP flow recursion bug: after the recursion was fixed, the Authentik server
+    started crash-looping with `psycopg.errors.IdleInTransactionSessionTimeout:
+    terminating connection due to idle-in-transaction timeout`. Root cause: in
+    v0.8.4 we set Postgres `idle_in_transaction_session_timeout=30s` to bound
+    zombie idle-in-tx sessions. On 1795-IOPS storage, Authentik's Django startup
+    migrations can sit in idle-in-tx state for >30s waiting on fsync. Postgres
+    kills the migration mid-flight, leaving a stale advisory lock that prevents
+    the next server boot from acquiring the migration lock — and the server
+    crash-loops forever (`waiting to acquire database lock`).
+
+    Fast disks complete migrations in seconds and never hit this. Slow disks
+    were silently broken until we shipped v0.8.7 + v0.8.8 fixes that triggered
+    enough server restarts to expose the latent issue.
+
+    What this function does:
+      1. Reads ~/authentik/docker-compose.yml; checks the Postgres
+         `idle_in_transaction_session_timeout` arg.
+      2. If still =30s, calls `_ensure_authentik_compose_patches` (which now
+         writes 300s) and force-recreates the Postgres container. The recreate
+         kills ALL sessions, which clears any stale advisory locks the previous
+         crash loop left behind.
+      3. Waits for Postgres to come back ready, then restarts authentik-server
+         and authentik-worker in case they were crash-looping. This is safe
+         even on healthy boxes — same restart cardinal rule as the recursion
+         fix: server + worker only, LDAP outpost untouched.
+      4. Audits outcome to `settings.authentik_pg_idle_timeout_fix`.
+
+    Idempotent: returns False on already-300s boxes (every startup after first).
+    Returns True if the bump was applied.
+    """
+    ak_dir = os.path.expanduser('~/authentik')
+    compose_path = os.path.join(ak_dir, 'docker-compose.yml')
+    if not os.path.exists(compose_path):
+        plog("  pg idle timeout: ~/authentik/docker-compose.yml not found — skipping (Authentik not installed)")
+        return False
+
+    try:
+        with open(compose_path) as f:
+            compose_content = f.read()
+    except Exception as e:
+        plog(f"  pg idle timeout: read error: {e}")
+        return False
+
+    m = re.search(r'idle_in_transaction_session_timeout=(\d+)s', compose_content)
+    if not m:
+        plog("  pg idle timeout: no idle_in_transaction_session_timeout found in compose — skipping (compose not yet patched)")
+        return False
+    current = int(m.group(1))
+    if current == 300:
+        plog("  pg idle timeout: already 300s (idempotent — no-op)")
+        try:
+            s = load_settings()
+            cfg = s.get('authentik_pg_idle_timeout_fix') or {}
+            cfg['last_check_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+            cfg['last_outcome'] = 'idempotent-noop'
+            cfg['last_value'] = '300s'
+            s['authentik_pg_idle_timeout_fix'] = cfg
+            save_settings(s)
+        except Exception:
+            pass
+        return False
+
+    plog(f"  pg idle timeout: found idle_in_transaction_session_timeout={current}s — bumping to 300s (slow-disk safe)")
+
+    try:
+        changed = _ensure_authentik_compose_patches(compose_path, plog)
+    except Exception as e:
+        plog(f"  ✗ pg idle timeout: compose patch failed: {e}")
+        return False
+
+    if not changed:
+        plog("  pg idle timeout: compose patcher reported no change — unexpected; skipping recreate")
+        return False
+
+    plog("  pg idle timeout: force-recreating Postgres (kills stuck sessions, clears stale advisory locks, applies new timeout)")
+    try:
+        r = subprocess.run(
+            f'cd {ak_dir} && docker compose up -d --force-recreate postgresql 2>&1',
+            shell=True, capture_output=True, text=True, timeout=180
+        )
+        if r.returncode != 0:
+            plog(f"  ✗ pg idle timeout: Postgres recreate failed: {(r.stdout or r.stderr or '')[:300]}")
+            try:
+                s = load_settings()
+                cfg = s.get('authentik_pg_idle_timeout_fix') or {}
+                cfg['last_check_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+                cfg['last_outcome'] = 'failed-recreate'
+                cfg['last_error'] = (r.stdout or r.stderr or '')[:300]
+                s['authentik_pg_idle_timeout_fix'] = cfg
+                save_settings(s)
+            except Exception:
+                pass
+            return False
+    except Exception as e:
+        plog(f"  ✗ pg idle timeout: Postgres recreate exception: {e}")
+        return False
+
+    plog("  pg idle timeout: waiting up to 60s for Postgres to be ready")
+    pg_ready = False
+    for _attempt in range(12):
+        time.sleep(5)
+        try:
+            r = subprocess.run(
+                f'cd {ak_dir} && docker compose exec -T postgresql pg_isready -d authentik -U authentik 2>&1',
+                shell=True, capture_output=True, text=True, timeout=10
+            )
+            if r.returncode == 0 and 'accepting connections' in (r.stdout or ''):
+                pg_ready = True
+                break
+        except Exception:
+            pass
+    if pg_ready:
+        plog("  ✓ pg idle timeout: Postgres ready")
+    else:
+        plog("  ⚠ pg idle timeout: Postgres pg_isready did not confirm ready in 60s — proceeding anyway")
+
+    plog("  pg idle timeout: restarting authentik-server-1 and authentik-worker-1 (clears any crash-loop state — LDAP outpost untouched)")
+    restart_ok = True
+    for cn in ('authentik-server-1', 'authentik-worker-1'):
+        try:
+            r = subprocess.run(
+                f'docker restart {cn}',
+                shell=True, capture_output=True, text=True, timeout=60
+            )
+            if r.returncode != 0:
+                plog(f"  ✗ pg idle timeout: {cn} restart failed: {(r.stderr or '')[:200]}")
+                restart_ok = False
+        except Exception as e:
+            plog(f"  ✗ pg idle timeout: {cn} restart exception: {e}")
+            restart_ok = False
+
+    try:
+        s = load_settings()
+        cfg = s.get('authentik_pg_idle_timeout_fix') or {}
+        cfg['last_check_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+        cfg['last_outcome'] = 'fixed' if restart_ok else 'fixed-restart-failed'
+        cfg['last_previous_value'] = f'{current}s'
+        cfg['last_new_value'] = '300s'
+        s['authentik_pg_idle_timeout_fix'] = cfg
+        save_settings(s)
+    except Exception:
+        pass
+
+    return True
 
 
 def _authentik_spiral_monitor():
@@ -22275,7 +22602,7 @@ entries:
     state: present
     id: ldap-authentication-login
   - attrs:
-      evaluate_on_plan: true
+      evaluate_on_plan: false
       invalid_response_action: retry
       policy_engine_mode: any
       re_evaluate_policies: true
@@ -22287,7 +22614,7 @@ entries:
     state: present
     id: ldap-identification-stage-flow-binding
   - attrs:
-      evaluate_on_plan: true
+      evaluate_on_plan: false
       invalid_response_action: retry
       policy_engine_mode: any
       re_evaluate_policies: true
@@ -22299,7 +22626,7 @@ entries:
     state: present
     id: ldap-authentication-password-binding
   - attrs:
-      evaluate_on_plan: true
+      evaluate_on_plan: false
       invalid_response_action: retry
       policy_engine_mode: any
       re_evaluate_policies: true
@@ -22409,12 +22736,12 @@ entries:
                 needs_write = True
                 plog("  Added blueprint mount to server & worker")
             # Add postgres command-line tuning (max_connections, idle_session_timeout, tcp_keepalives)
-            pg_cmd = 'postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=30s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
+            pg_cmd = 'postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
             has_pg_cmd = any('max_connections=300' in l for l in lines)
-        # v0.8.4: catch ANY value other than 30s
+        # v0.8.8: catch ANY value other than 300s (was 30s — too aggressive for slow-disk startup migrations)
         _pg_full = ''.join(lines)
         _pg_match = re.search(r'idle_in_transaction_session_timeout=(\d+)s', _pg_full)
-        needs_pg_update = has_pg_cmd and (not _pg_match or _pg_match.group(1) != '30')
+        needs_pg_update = has_pg_cmd and (not _pg_match or _pg_match.group(1) != '300')
         if not has_pg_cmd:
             patched = []
             for line in lines:
@@ -22431,7 +22758,7 @@ entries:
                     indent = line[:len(line) - len(line.lstrip())]
                     lines[i] = f'{indent}command: {pg_cmd}\n'
                     needs_write = True
-                    plog("  Updated PostgreSQL idle_in_transaction_session_timeout to 30s")
+                    plog("  Updated PostgreSQL idle_in_transaction_session_timeout to 300s")
                     break
 
         # Pin AUTHENTIK_TAG to latest stable release
@@ -24545,7 +24872,7 @@ def _ensure_ldap_flow_authentication_none():
                             try:
                                 _post('flows/bindings/', {
                                     'target': ldap_flow_pk, 'stage': stage_pk, 'order': order,
-                                    'evaluate_on_plan': True, 're_evaluate_policies': True,
+                                    'evaluate_on_plan': False, 're_evaluate_policies': True,
                                     'policy_engine_mode': 'any', 'invalid_response_action': 'retry'})
                             except urllib.error.HTTPError:
                                 pass
@@ -30305,6 +30632,31 @@ def _startup_migrations():
                     _authentik_verify_runtime_config(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as ak_tune_err:
             print(f"Startup migration: authentik tunings error (non-fatal): {ak_tune_err}")
+
+        # v0.8.8: Bump idle_in_transaction_session_timeout 30s → 300s. MUST run before
+        # the recursion fix below, because the recursion fix restarts authentik-server,
+        # and on a slow-disk box with the old 30s timeout the new server's Django startup
+        # migrations would get killed mid-flight and crash-loop the box. Idempotent:
+        # no-op on already-300s boxes, and on first-fire it force-recreates Postgres
+        # which kills any stale advisory locks left by previous crash loops.
+        try:
+            _pg_changed = _authentik_fix_pg_idle_timeout(lambda m: print(f"Startup migration: {m}", flush=True))
+            if _pg_changed:
+                # The verifier above ran with the pre-migration 30s/600s value and recorded
+                # last_outcome=fail. Re-run it now that Postgres has the new 300s so the
+                # operator audit reflects current truth instead of stale "fail".
+                _authentik_verify_runtime_config(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as ak_pg_err:
+            print(f"Startup migration: pg idle timeout fix error (non-fatal): {ak_pg_err}")
+
+        # v0.8.8: Fix LDAP flow stage-binding recursion (evaluate_on_plan=true + re_evaluate_policies=true).
+        # Idempotent — only fires the SQL UPDATE + server restart on boxes where the bug
+        # is still present (i.e. boxes deployed before v0.8.8). On already-fixed boxes
+        # this is a single COUNT query and a settings.json audit write.
+        try:
+            _authentik_fix_ldap_flow_recursion(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as ak_recursion_err:
+            print(f"Startup migration: ldap flow recursion fix error (non-fatal): {ak_recursion_err}")
     except Exception as e:
         print(f"Startup migration error: {e}")
         import traceback; traceback.print_exc()
@@ -30468,6 +30820,29 @@ def _post_update_auto_deploy():
                         _authentik_verify_runtime_config(lambda m: print(f"Post-update: {m}", flush=True))
             except Exception as _e:
                 print(f"Post-update: authentik tunings migration skipped: {_e}")
+
+            # v0.8.8: Bump idle_in_transaction_session_timeout 30s → 300s. MUST run before
+            # the recursion fix below — see _startup_migrations comment for rationale.
+            # On a stuck crash-looping box this also unsticks the box by force-recreating
+            # Postgres (kills stale advisory locks) and restarting server+worker.
+            try:
+                if os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
+                    _pg_changed = _authentik_fix_pg_idle_timeout(lambda m: print(f"Post-update: {m}", flush=True))
+                    if _pg_changed:
+                        # Re-run the verifier so the post-migration 300s value lands in the
+                        # operator audit instead of the stale pre-migration value.
+                        _authentik_verify_runtime_config(lambda m: print(f"Post-update: {m}", flush=True))
+            except Exception as _e:
+                print(f"Post-update: pg idle timeout fix skipped: {_e}")
+
+            # v0.8.8: Fix LDAP flow stage-binding recursion bug. Idempotent — only fixes
+            # bindings that still have evaluate_on_plan=true (boxes deployed before v0.8.8).
+            # If fixes were applied, restarts authentik-server-1 only (LDAP outpost untouched).
+            try:
+                if os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
+                    _authentik_fix_ldap_flow_recursion(lambda m: print(f"Post-update: {m}", flush=True))
+            except Exception as _e:
+                print(f"Post-update: ldap flow recursion fix skipped: {_e}")
 
             # Re-deploy Guard Dog (updated scripts + timers)
             if os.path.exists('/opt/tak-guarddog') and os.path.exists('/opt/tak'):
