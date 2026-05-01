@@ -30640,7 +30640,12 @@ def _startup_migrations():
         # no-op on already-300s boxes, and on first-fire it force-recreates Postgres
         # which kills any stale advisory locks left by previous crash loops.
         try:
-            _authentik_fix_pg_idle_timeout(lambda m: print(f"Startup migration: {m}", flush=True))
+            _pg_changed = _authentik_fix_pg_idle_timeout(lambda m: print(f"Startup migration: {m}", flush=True))
+            if _pg_changed:
+                # The verifier above ran with the pre-migration 30s/600s value and recorded
+                # last_outcome=fail. Re-run it now that Postgres has the new 300s so the
+                # operator audit reflects current truth instead of stale "fail".
+                _authentik_verify_runtime_config(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as ak_pg_err:
             print(f"Startup migration: pg idle timeout fix error (non-fatal): {ak_pg_err}")
 
@@ -30822,7 +30827,11 @@ def _post_update_auto_deploy():
             # Postgres (kills stale advisory locks) and restarting server+worker.
             try:
                 if os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
-                    _authentik_fix_pg_idle_timeout(lambda m: print(f"Post-update: {m}", flush=True))
+                    _pg_changed = _authentik_fix_pg_idle_timeout(lambda m: print(f"Post-update: {m}", flush=True))
+                    if _pg_changed:
+                        # Re-run the verifier so the post-migration 300s value lands in the
+                        # operator audit instead of the stale pre-migration value.
+                        _authentik_verify_runtime_config(lambda m: print(f"Post-update: {m}", flush=True))
             except Exception as _e:
                 print(f"Post-update: pg idle timeout fix skipped: {_e}")
 
