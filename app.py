@@ -588,7 +588,7 @@ NODERED_LOGO_URL_2 = "https://nodered.org/about/resources/media/node-red-icon-2.
 AUTHENTIK_LOGO_URL = "https://raw.githubusercontent.com/goauthentik/authentik/main/web/icons/icon_left_brand.png"
 # Caddy official logo for dark backgrounds — white text (Wikimedia Commons)
 CADDY_LOGO_URL = "https://upload.wikimedia.org/wikipedia/commons/5/56/Caddyserver_logo_dark.svg"
-FAIL2BAN_LOGO_URL = "https://avatars.githubusercontent.com/u/30953?s=128&v=4"
+FAIL2BAN_LOGO_URL = "https://avatars.githubusercontent.com/u/1087378?s=128&v=4"
 # TAK (Team Awareness Kit) official brand logo from tak.gov
 TAK_LOGO_URL = "https://tak.gov/assets/logos/brand-06b80939.svg"
 # Login page logo: put your TAKWERX logo at static/takwerx-logo.png
@@ -16854,7 +16854,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:\'DM Sans\'
 <div style="margin-bottom:28px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
 <div>
 <div style="display:flex;align-items:center;gap:12px;margin-bottom:6px">
-<img src="https://avatars.githubusercontent.com/u/30953?s=128&v=4" alt="Fail2ban" style="height:40px;width:auto;border-radius:6px">
+<img src="https://avatars.githubusercontent.com/u/1087378?s=128&v=4" alt="Fail2ban" style="height:40px;width:auto;border-radius:6px">
 <span style="font-family:\'JetBrains Mono\',monospace;font-weight:700;font-size:20px">Fail2ban</span>
 </div>
 <div style="font-size:13px;color:var(--text-dim)">Brute-force IP blocking for Authentik login events.</div>
