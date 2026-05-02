@@ -160,7 +160,10 @@ def inject_cloudtak_icon():
     from markupsafe import Markup
     d = {'cloudtak_icon': CLOUDTAK_ICON, 'mediamtx_logo_url': MEDIAMTX_LOGO_URL, 'nodered_logo_url': NODERED_LOGO_URL, 'authentik_logo_url': AUTHENTIK_LOGO_URL, 'caddy_logo_url': CADDY_LOGO_URL, 'tak_logo_url': TAK_LOGO_URL}
     if not request.path.startswith('/api') and not request.path.startswith('/cloudtak/page.js'):
-        d['sidebar_html'] = Markup(render_sidebar(detect_modules(), request.path.strip('/') or 'console', takwerx_logo_url=_login_logo_url()))
+        _settings = load_settings()
+        _banner = render_custom_banner(_settings)
+        _sidebar = render_sidebar(detect_modules(), request.path.strip('/') or 'console', takwerx_logo_url=_login_logo_url())
+        d['sidebar_html'] = Markup(_banner + _sidebar)
     return d
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -273,7 +276,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.8.9-alpha"
+VERSION = "0.9.0-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -806,6 +809,54 @@ def detect_modules():
         'description': 'Postfix relay — notifications for TAK Portal & MediaMTX', 'icon': '📧', 'route': '/emailrelay', 'priority': 9}
     return dict(sorted(modules.items(), key=lambda x: x[1].get('priority', 99)))
 
+def render_custom_banner(settings):
+    """Return HTML (style + fixed div) for the custom identification banner, or '' if disabled.
+
+    Uses position:fixed so it overlays the top of every page without touching individual
+    templates. The accompanying <style> block pushes body content down by the banner height
+    so nothing is obscured.
+    """
+    cust = settings.get('customization', {}) if settings else {}
+    if not cust.get('banner_enabled'):
+        return ''
+    text = html.escape((cust.get('banner_text') or '')[:120]).strip()
+    if not text:
+        return ''
+    logo_b64 = cust.get('agency_logo_b64') or ''
+    if logo_b64:
+        logo_img = (
+            f'<img src="{html.escape(logo_b64)}" alt="Agency Logo" '
+            'style="height:34px;width:auto;max-height:34px;object-fit:contain;flex-shrink:0">'
+        )
+    else:
+        logo_img = (
+            '<span style="font-family:\'Orbitron\',sans-serif;font-size:12px;font-weight:700;'
+            'color:var(--cyan,#06b6d4);letter-spacing:.08em;flex-shrink:0">infra-TAK</span>'
+        )
+    return (
+        '<style>'
+        'body{padding-top:52px!important}'
+        '.custom-banner{'
+        'position:fixed;top:0;left:0;right:0;height:52px;z-index:210;'
+        'display:flex;align-items:center;justify-content:center;gap:18px;'
+        'padding:0 24px;'
+        'background:var(--bg-surface,#0f1219);'
+        'border-bottom:2px solid var(--border,rgba(59,130,246,.15));'
+        'font-family:\'JetBrains Mono\',monospace;font-weight:700;font-size:14px;'
+        'letter-spacing:.07em;color:var(--text-primary,#f1f5f9);'
+        'text-align:center'
+        '}'
+        '.custom-banner-text{flex:1;text-align:center;overflow:hidden;'
+        'white-space:nowrap;text-overflow:ellipsis}'
+        '</style>'
+        '<div class="custom-banner">'
+        f'{logo_img}'
+        f'<span class="custom-banner-text">{text}</span>'
+        f'{logo_img}'
+        '</div>'
+    )
+
+
 def render_sidebar(modules, active_path, takwerx_logo_url=None):
     """Build sidebar nav HTML: Console and Marketplace always; tool links only when installed.
     active_path is the current path (e.g. 'console', 'nodered') for highlighting.
@@ -821,6 +872,8 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
     parts = [logo]
     parts.append(link('/console', '<span class="nav-icon material-symbols-outlined">dashboard</span>Console'))
     parts.append(link('/firewall', '<span class="nav-icon material-symbols-outlined">shield_locked</span>Firewall'))
+    if os.path.exists('/etc/fail2ban'):
+        parts.append(link('/fail2ban', '<span class="nav-icon material-symbols-outlined">block</span>Fail2ban'))
     gd = modules.get('guarddog', {})
     if gd.get('installed'):
         parts.append(link('/guarddog', '<span class="nav-icon" style="font-size:22px;line-height:1">🐕</span><span>Guard Dog</span>', 'Guard Dog'))
@@ -852,6 +905,7 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
     if email.get('installed'):
         parts.append(link('/emailrelay', '<span class="nav-icon material-symbols-outlined">outgoing_mail</span>Email Relay'))
     parts.append(link('/marketplace', '<span class="nav-icon material-symbols-outlined">shopping_cart</span>Marketplace'))
+    parts.append(link('/customization', '<span class="nav-icon material-symbols-outlined">tune</span>Customization'))
     parts.append(link('/help', '<span class="nav-icon material-symbols-outlined">help</span>Help'))
     parts.append(
         '<button type="button" onclick="toggleTheme()" class="nav-item" id="theme-toggle-btn" '
@@ -1602,6 +1656,73 @@ def marketplace_page():
     r = make_response(resp)
     r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
     return r
+
+@app.route('/customization')
+@login_required
+def customization_page():
+    """Customization: banner text, agency logo, and branding settings."""
+    settings = load_settings()
+    from flask import make_response
+    r = make_response(render_template_string(CUSTOMIZATION_TEMPLATE,
+        settings=settings, version=VERSION,
+        customization=settings.get('customization', {})))
+    r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
+    return r
+
+@app.route('/api/customization/settings', methods=['GET'])
+@login_required
+def customization_settings_get():
+    """Return current customization config (without logo bytes for speed)."""
+    s = load_settings()
+    cust = dict(s.get('customization', {}))
+    cust.pop('agency_logo_b64', None)
+    has_logo = bool(s.get('customization', {}).get('agency_logo_b64'))
+    cust['has_logo'] = has_logo
+    return jsonify(cust)
+
+@app.route('/api/customization/settings', methods=['POST'])
+@login_required
+def customization_settings_post():
+    """Save banner_enabled and banner_text."""
+    data = request.get_json(force=True) or {}
+    banner_enabled = bool(data.get('banner_enabled', False))
+    banner_text = str(data.get('banner_text', '')).strip()[:120]
+    s = load_settings()
+    cust = s.setdefault('customization', {})
+    cust['banner_enabled'] = banner_enabled
+    cust['banner_text'] = banner_text
+    save_settings(s)
+    return jsonify({'ok': True})
+
+@app.route('/api/customization/logo', methods=['POST'])
+@login_required
+def customization_logo_post():
+    """Accept a PNG/SVG/JPEG logo upload (≤512 KB), store base64 in settings."""
+    import base64
+    f = request.files.get('logo')
+    if not f:
+        return jsonify({'error': 'No file uploaded'}), 400
+    allowed = {'image/png', 'image/svg+xml', 'image/jpeg', 'image/jpg'}
+    mime = f.mimetype or ''
+    if mime not in allowed:
+        return jsonify({'error': f'Unsupported type: {mime}. Use PNG, SVG, or JPEG.'}), 400
+    data = f.read(512 * 1024 + 1)
+    if len(data) > 512 * 1024:
+        return jsonify({'error': 'File too large (max 512 KB)'}), 400
+    b64 = 'data:' + mime + ';base64,' + base64.b64encode(data).decode()
+    s = load_settings()
+    s.setdefault('customization', {})['agency_logo_b64'] = b64
+    save_settings(s)
+    return jsonify({'ok': True, 'data_uri': b64})
+
+@app.route('/api/customization/logo', methods=['DELETE'])
+@login_required
+def customization_logo_delete():
+    """Remove agency logo, reverting banner logos to infra-TAK text mark."""
+    s = load_settings()
+    s.setdefault('customization', {}).pop('agency_logo_b64', None)
+    save_settings(s)
+    return jsonify({'ok': True})
 
 @app.route('/help')
 @login_required
@@ -3886,6 +4007,163 @@ def firewall_delete_rule_api():
         return jsonify({'success': True, 'message': f'Deleted rule #{number}', 'status': st2})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)[:160]}), 500
+
+@app.route('/fail2ban')
+@login_required
+def fail2ban_page():
+    """Fail2ban: brute-force protection dashboard."""
+    settings = load_settings()
+    from flask import make_response
+    r = make_response(render_template_string(FAIL2BAN_TEMPLATE,
+        settings=settings, version=VERSION,
+        installed=os.path.exists('/etc/fail2ban'),
+        setup=settings.get('fail2ban_setup', {})))
+    r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
+    return r
+
+def _f2b_is_available():
+    """Return True if fail2ban-client is on the path."""
+    return bool(subprocess.run(['which', 'fail2ban-client'],
+                               capture_output=True).returncode == 0)
+
+def _f2b_parse_status(raw):
+    """Parse fail2ban-client status authentik output into a dict."""
+    result = {'currently_failed': 0, 'total_failed': 0, 'currently_banned': 0,
+              'total_banned': 0, 'banned_ips': []}
+    if not raw:
+        return result
+    for line in raw.splitlines():
+        line = line.strip()
+        if 'Currently failed:' in line:
+            try: result['currently_failed'] = int(line.split(':')[1].strip())
+            except Exception: pass
+        elif 'Total failed:' in line:
+            try: result['total_failed'] = int(line.split(':')[1].strip())
+            except Exception: pass
+        elif 'Currently banned:' in line:
+            try: result['currently_banned'] = int(line.split(':')[1].strip())
+            except Exception: pass
+        elif 'Total banned:' in line:
+            try: result['total_banned'] = int(line.split(':')[1].strip())
+            except Exception: pass
+        elif 'Banned IP list:' in line:
+            ips_raw = line.split(':', 1)[1].strip()
+            result['banned_ips'] = [ip.strip() for ip in ips_raw.split() if ip.strip()]
+    return result
+
+def _f2b_read_jail_config():
+    """Read current thresholds from the infratak-authentik jail config file."""
+    jail_path = '/etc/fail2ban/jail.d/infratak-authentik.conf'
+    cfg = {'maxretry': 5, 'findtime': 600, 'bantime': 3600}
+    if not os.path.exists(jail_path):
+        return cfg
+    try:
+        with open(jail_path) as _f:
+            for line in _f:
+                line = line.strip()
+                for key in ('maxretry', 'findtime', 'bantime'):
+                    if line.startswith(key):
+                        try: cfg[key] = int(line.split('=')[1].strip())
+                        except Exception: pass
+    except Exception:
+        pass
+    return cfg
+
+def _f2b_write_jail_config(maxretry, findtime, bantime):
+    """Rewrite the infratak-authentik jail config with new thresholds."""
+    jail_path = '/etc/fail2ban/jail.d/infratak-authentik.conf'
+    os.makedirs('/etc/fail2ban/jail.d', exist_ok=True)
+    jail_conf = (
+        "[authentik]\n"
+        "enabled  = true\n"
+        "filter   = authentik\n"
+        "logpath  = /var/log/authentik/auth.log\n"
+        f"maxretry = {maxretry}\n"
+        f"findtime = {findtime}\n"
+        f"bantime  = {bantime}\n"
+        "action   = ufw\n"
+    )
+    with open(jail_path, 'w') as _f:
+        _f.write(jail_conf)
+
+@app.route('/api/fail2ban/status')
+@login_required
+def fail2ban_status_api():
+    """Return fail2ban jail status for the authentik jail."""
+    if not _f2b_is_available():
+        return jsonify({'available': False, 'error': 'fail2ban not installed'})
+    try:
+        r = subprocess.run(['fail2ban-client', 'status', 'authentik'],
+                           capture_output=True, text=True, timeout=10)
+        status = _f2b_parse_status(r.stdout)
+        status['available'] = True
+        status['jail_config'] = _f2b_read_jail_config()
+        status['forwarder_active'] = (subprocess.run(
+            ['systemctl', 'is-active', 'authentik-log-forwarder'],
+            capture_output=True, text=True).stdout.strip() == 'active')
+        return jsonify(status)
+    except Exception as e:
+        return jsonify({'available': False, 'error': str(e)[:200]})
+
+@app.route('/api/fail2ban/config', methods=['POST'])
+@login_required
+def fail2ban_config_api():
+    """Update jail thresholds (maxretry, findtime, bantime) and reload fail2ban."""
+    if not _f2b_is_available():
+        return jsonify({'ok': False, 'error': 'fail2ban not installed'}), 400
+    data = request.get_json(force=True) or {}
+    try:
+        maxretry = max(1, min(50, int(data.get('maxretry', 5))))
+        findtime = max(60, min(86400, int(data.get('findtime', 600))))
+        bantime = max(60, min(2592000, int(data.get('bantime', 3600))))
+    except (ValueError, TypeError) as e:
+        return jsonify({'ok': False, 'error': f'Invalid value: {e}'}), 400
+    try:
+        _f2b_write_jail_config(maxretry, findtime, bantime)
+        subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+        return jsonify({'ok': True, 'maxretry': maxretry, 'findtime': findtime, 'bantime': bantime})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+import re as _re_f2b
+_VALID_IP_RE = _re_f2b.compile(
+    r'^(\d{1,3}\.){3}\d{1,3}$|^[0-9a-fA-F:]+:[0-9a-fA-F:]+$')
+
+@app.route('/api/fail2ban/unban', methods=['POST'])
+@login_required
+def fail2ban_unban_api():
+    """Unban a specific IP from the authentik jail."""
+    if not _f2b_is_available():
+        return jsonify({'ok': False, 'error': 'fail2ban not installed'}), 400
+    data = request.get_json(force=True) or {}
+    ip = str(data.get('ip', '')).strip()
+    if not ip or not _VALID_IP_RE.match(ip):
+        return jsonify({'ok': False, 'error': 'Invalid IP address'}), 400
+    try:
+        r = subprocess.run(['fail2ban-client', 'set', 'authentik', 'unbanip', ip],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            return jsonify({'ok': True, 'ip': ip})
+        return jsonify({'ok': False, 'error': r.stderr.strip()[:200] or 'Unban failed'}), 500
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+@app.route('/api/fail2ban/log')
+@login_required
+def fail2ban_log_api():
+    """Return last 100 lines from /var/log/fail2ban.log filtered to [authentik] jail."""
+    log_path = '/var/log/fail2ban.log'
+    if not os.path.exists(log_path):
+        return jsonify({'lines': [], 'error': 'fail2ban.log not found'})
+    try:
+        r = subprocess.run(['tail', '-n', '300', log_path],
+                           capture_output=True, text=True, timeout=5)
+        all_lines = r.stdout.splitlines()
+        filtered = [l for l in all_lines if 'authentik' in l.lower()][-100:]
+        return jsonify({'lines': filtered})
+    except Exception as e:
+        return jsonify({'lines': [], 'error': str(e)[:200]})
+
 
 def _parse_guarddog_log_date(line):
     """Return (date, display_str) for a restarts.log line, or (None, line) if unparseable."""
@@ -16453,6 +16731,226 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 <script src="/guarddog.js?v={{ version }}"></script>
 </body></html>
 '''
+
+
+FAIL2BAN_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Fail2ban — infra-TAK</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet">
+<style>
+:root{--bg-deep:#080b14;--bg-surface:#0f1219;--bg-card:#161b26;--border:#1e2736;--text-primary:#f1f5f9;--text-secondary:#cbd5e1;--text-dim:#94a3b8;--accent:#3b82f6;--cyan:#06b6d4;--green:#10b981;--red:#ef4444;--yellow:#eab308}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg-deep);color:var(--text-primary);font-family:\'DM Sans\',sans-serif;min-height:100vh;display:flex;flex-direction:row}
+.sidebar{width:220px;min-width:220px;background:var(--bg-surface);border-right:1px solid var(--border);padding:24px 0;flex-shrink:0}
+.material-symbols-outlined{font-family:\'Material Symbols Outlined\';font-weight:400;font-style:normal;font-size:20px;line-height:1;letter-spacing:normal;white-space:nowrap;direction:ltr;-webkit-font-smoothing:antialiased}
+.nav-icon.material-symbols-outlined{font-size:22px;width:22px;text-align:center}
+.sidebar-logo{padding:0 20px 24px;border-bottom:1px solid var(--border);margin-bottom:16px}
+.sidebar-logo span{font-size:15px;font-weight:700}.sidebar-logo small{display:block;font-size:10px;color:var(--text-dim);font-family:\'JetBrains Mono\',monospace;margin-top:2px}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;color:var(--text-secondary);text-decoration:none;font-size:13px;font-weight:500;transition:all .15s;border-left:2px solid transparent}
+.nav-item:hover{color:var(--text-primary);background:rgba(255,255,255,.03)}.nav-item.active{color:var(--cyan);background:rgba(6,182,212,.06);border-left-color:var(--cyan)}
+.nav-icon{font-size:15px;width:18px;text-align:center}
+.main{flex:1;min-width:0;overflow-y:auto;padding:32px}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:20px}
+.card-title{font-size:13px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:16px;font-family:\'JetBrains Mono\',monospace}
+.stat-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:0}
+@media(max-width:900px){.stat-grid{grid-template-columns:repeat(2,1fr)}}
+.stat-card{background:var(--bg-card);border:1px solid var(--border);border-radius:10px;padding:16px;text-align:center}
+.stat-value{font-family:\'JetBrains Mono\',monospace;font-size:28px;font-weight:700;margin-bottom:4px}
+.stat-label{font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em}
+.stat-value.red{color:var(--red)}.stat-value.green{color:var(--green)}.stat-value.yellow{color:var(--yellow)}.stat-value.cyan{color:var(--cyan)}
+.form-row{margin-bottom:16px}
+.form-label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px;font-family:\'JetBrains Mono\',monospace}
+.form-input{width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px;color:var(--text-primary);font-size:13px;font-family:\'JetBrains Mono\',monospace;outline:none;transition:border-color .2s}
+.form-input:focus{border-color:var(--cyan)}
+.form-hint{font-size:11px;color:var(--text-dim);margin-top:5px}
+.btn-primary{background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;padding:10px 22px;border-radius:8px;cursor:pointer;font-family:\'JetBrains Mono\',monospace;font-size:13px;font-weight:600;transition:opacity .2s}
+.btn-primary:hover{opacity:.85}
+.btn-danger-sm{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.3);padding:4px 10px;border-radius:6px;cursor:pointer;font-size:11px;font-family:\'JetBrains Mono\',monospace}
+.btn-danger-sm:hover{background:rgba(239,68,68,.2)}
+.ban-table{width:100%;border-collapse:collapse;font-size:13px}
+.ban-table th{text-align:left;font-family:\'JetBrains Mono\',monospace;font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em;padding:8px 12px;border-bottom:1px solid var(--border)}
+.ban-table td{padding:10px 12px;border-bottom:1px solid var(--border);font-family:\'JetBrains Mono\',monospace;font-size:12px}
+.ban-table tr:last-child td{border-bottom:none}
+.ban-table tr:hover td{background:rgba(255,255,255,.02)}
+.log-box{background:#060910;border:1px solid var(--border);border-radius:8px;padding:14px;font-family:\'JetBrains Mono\',monospace;font-size:11px;color:var(--text-dim);max-height:280px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;line-height:1.6}
+.badge{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:20px;font-size:11px;font-family:\'JetBrains Mono\',monospace;font-weight:600}
+.badge-green{background:rgba(16,185,129,.1);color:var(--green);border:1px solid rgba(16,185,129,.25)}
+.badge-red{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.25)}
+.badge-yellow{background:rgba(234,179,8,.1);color:var(--yellow);border:1px solid rgba(234,179,8,.25)}
+.dot{width:7px;height:7px;border-radius:50%;background:currentColor;display:inline-block}
+.dot-pulse{animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.not-installed-banner{background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.25);border-radius:12px;padding:28px;text-align:center;margin-bottom:24px}
+.toast{position:fixed;bottom:24px;right:24px;padding:12px 20px;border-radius:8px;font-family:\'JetBrains Mono\',monospace;font-size:13px;z-index:9999;display:none}
+.toast.success{background:rgba(16,185,129,.15);border:1px solid rgba(16,185,129,.4);color:var(--green)}
+.toast.error{background:rgba(239,68,68,.15);border:1px solid rgba(239,68,68,.4);color:var(--red)}
+</style></head><body>
+{{ sidebar_html }}
+<div class="main">
+<div style="margin-bottom:28px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
+<div>
+<div style="font-family:\'JetBrains Mono\',monospace;font-weight:700;font-size:20px;margin-bottom:6px">Fail2ban</div>
+<div style="font-size:13px;color:var(--text-dim)">Brute-force IP blocking for Authentik login events.</div>
+</div>
+<span id="forwarder-badge" class="badge badge-yellow"><span class="dot"></span>Loading…</span>
+</div>
+
+{% if not installed %}
+<div class="not-installed-banner">
+<span class="material-symbols-outlined" style="font-size:40px;color:var(--accent);margin-bottom:12px;display:block">security</span>
+<div style="font-size:15px;font-weight:600;margin-bottom:8px">fail2ban not yet installed</div>
+<div style="font-size:13px;color:var(--text-dim);max-width:460px;margin:0 auto;line-height:1.6">
+fail2ban installs automatically on the next console restart once the v0.8.9 trusted-proxy prerequisite is confirmed. Check Settings for <code style="font-family:\'JetBrains Mono\',monospace;font-size:11px;background:rgba(255,255,255,.06);padding:2px 5px;border-radius:3px">authentik_trusted_proxy_cidrs_fix.last_outcome</code>.
+</div>
+</div>
+{% else %}
+
+<!-- Stats -->
+<div class="stat-grid" id="stat-grid" style="margin-bottom:20px">
+<div class="stat-card"><div class="stat-value red" id="stat-banned">—</div><div class="stat-label">Currently Banned</div></div>
+<div class="stat-card"><div class="stat-value yellow" id="stat-failed">—</div><div class="stat-label">Currently Failed</div></div>
+<div class="stat-card"><div class="stat-value cyan" id="stat-total-banned">—</div><div class="stat-label">Total Banned (session)</div></div>
+<div class="stat-card"><div class="stat-value" id="stat-total-failed" style="color:var(--text-dim)">—</div><div class="stat-label">Total Failed (session)</div></div>
+</div>
+
+<!-- Banned IPs -->
+<div class="card">
+<div class="card-title" style="display:flex;align-items:center;justify-content:space-between">
+<span>Currently Banned IPs</span>
+<button onclick="loadStatus()" style="background:none;border:none;cursor:pointer;color:var(--text-dim);font-size:12px;font-family:\'JetBrains Mono\',monospace">↻ Refresh</button>
+</div>
+<div id="ban-list-container">
+<div style="color:var(--text-dim);font-size:13px;font-family:\'JetBrains Mono\',monospace">Loading…</div>
+</div>
+</div>
+
+<!-- Configuration -->
+<div class="card">
+<div class="card-title">Jail Configuration</div>
+<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:16px">
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Max Retries</label>
+<input class="form-input" id="cfg-maxretry" type="number" min="1" max="50" value="5">
+<div class="form-hint">Failed logins before ban</div>
+</div>
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Find Window (seconds)</label>
+<input class="form-input" id="cfg-findtime" type="number" min="60" max="86400" value="600">
+<div class="form-hint">Time window to count failures</div>
+</div>
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Ban Duration (seconds)</label>
+<input class="form-input" id="cfg-bantime" type="number" min="60" max="2592000" value="3600">
+<div class="form-hint">How long to ban the IP</div>
+</div>
+</div>
+<div style="margin-top:20px">
+<button class="btn-primary" onclick="saveConfig()">Save &amp; Reload</button>
+<span style="font-size:11px;color:var(--text-dim);margin-left:12px">Applies immediately — active bans unaffected</span>
+</div>
+</div>
+
+<!-- Activity Log -->
+<div class="card">
+<div class="card-title" style="display:flex;align-items:center;justify-content:space-between">
+<span>Recent Activity</span>
+<span style="font-size:11px;color:var(--text-dim);font-weight:400">Last 100 authentik events — auto-refreshes every 30s</span>
+</div>
+<div class="log-box" id="log-box">Loading…</div>
+</div>
+
+{% endif %}
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+function showToast(msg, type) {
+  var t = document.getElementById(\'toast\');
+  t.textContent = msg; t.className = \'toast \' + type; t.style.display = \'block\';
+  setTimeout(function(){ t.style.display = \'none\'; }, 3500);
+}
+
+{% if installed %}
+function loadStatus() {
+  fetch(\'/api/fail2ban/status\').then(r=>r.json()).then(d=>{
+    if (!d.available) {
+      document.getElementById(\'stat-banned\').textContent = \'N/A\';
+      document.getElementById(\'forwarder-badge\').innerHTML = \'<span class="dot"></span>fail2ban unavailable\';
+      return;
+    }
+    document.getElementById(\'stat-banned\').textContent = d.currently_banned || 0;
+    document.getElementById(\'stat-failed\').textContent = d.currently_failed || 0;
+    document.getElementById(\'stat-total-banned\').textContent = d.total_banned || 0;
+    document.getElementById(\'stat-total-failed\').textContent = d.total_failed || 0;
+
+    var fb = document.getElementById(\'forwarder-badge\');
+    if (d.forwarder_active) {
+      fb.className = \'badge badge-green\';
+      fb.innerHTML = \'<span class="dot dot-pulse"></span>Log Forwarder Active\';
+    } else {
+      fb.className = \'badge badge-red\';
+      fb.innerHTML = \'<span class="dot"></span>Log Forwarder Stopped\';
+    }
+
+    var cfg = d.jail_config || {};
+    if (cfg.maxretry) document.getElementById(\'cfg-maxretry\').value = cfg.maxretry;
+    if (cfg.findtime) document.getElementById(\'cfg-findtime\').value = cfg.findtime;
+    if (cfg.bantime)  document.getElementById(\'cfg-bantime\').value  = cfg.bantime;
+
+    var ips = d.banned_ips || [];
+    var c = document.getElementById(\'ban-list-container\');
+    if (!ips.length) {
+      c.innerHTML = \'<div style="color:var(--text-dim);font-size:13px;font-family:\'JetBrains Mono\',monospace;padding:8px 0">No IPs currently banned.</div>\';
+    } else {
+      var rows = ips.map(ip =>
+        \'<tr><td>\' + ip + \'</td><td><button class="btn-danger-sm" onclick="unbanIP(\\\'\'+ ip +\'\\\')">\' +
+        \'Unban</button></td></tr>\'
+      ).join(\'\');
+      c.innerHTML = \'<table class="ban-table"><thead><tr><th>IP Address</th><th>Action</th></tr></thead><tbody>\' + rows + \'</tbody></table>\';
+    }
+  }).catch(()=> showToast(\'Failed to load status\', \'error\'));
+}
+
+function loadLog() {
+  fetch(\'/api/fail2ban/log\').then(r=>r.json()).then(d=>{
+    var box = document.getElementById(\'log-box\');
+    if (d.lines && d.lines.length) {
+      box.textContent = d.lines.join(\'\\n\');
+      box.scrollTop = box.scrollHeight;
+    } else {
+      box.textContent = d.error || \'No authentik events in fail2ban.log yet.\';
+    }
+  }).catch(()=>{ document.getElementById(\'log-box\').textContent = \'Error loading log.\'; });
+}
+
+function saveConfig() {
+  var body = {
+    maxretry: parseInt(document.getElementById(\'cfg-maxretry\').value) || 5,
+    findtime: parseInt(document.getElementById(\'cfg-findtime\').value) || 600,
+    bantime:  parseInt(document.getElementById(\'cfg-bantime\').value)  || 3600
+  };
+  fetch(\'/api/fail2ban/config\', {method:\'POST\', headers:{\'Content-Type\':\'application/json\'}, body:JSON.stringify(body)})
+    .then(r=>r.json()).then(d=>{
+      if (d.ok) showToast(\'Config saved and fail2ban reloaded.\', \'success\');
+      else showToast(d.error || \'Save failed\', \'error\');
+    }).catch(()=>showToast(\'Network error\', \'error\'));
+}
+
+function unbanIP(ip) {
+  if (!confirm(\'Unban \' + ip + \'?\')) return;
+  fetch(\'/api/fail2ban/unban\', {method:\'POST\', headers:{\'Content-Type\':\'application/json\'}, body:JSON.stringify({ip:ip})})
+    .then(r=>r.json()).then(d=>{
+      if (d.ok) { showToast(ip + \' unbanned.\', \'success\'); loadStatus(); }
+      else showToast(d.error || \'Unban failed\', \'error\');
+    }).catch(()=>showToast(\'Network error\', \'error\'));
+}
+
+loadStatus();
+loadLog();
+setInterval(function(){ loadStatus(); loadLog(); }, 30000);
+{% endif %}
+</script>
+</body></html>'''
 
 
 FIREWALL_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
@@ -29635,6 +30133,190 @@ async function doApplySshPort(){
 </script></body></html>'''
 
 # === Console Template (installed services only) ===
+CUSTOMIZATION_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Customization — infra-TAK</title>
+<style>
+''' + BASE_CSS + '''
+body{display:flex;flex-direction:row;min-height:100vh}
+.sidebar{width:220px;min-width:220px;background:var(--bg-surface);border-right:1px solid var(--border);padding:24px 0;flex-shrink:0}
+.sidebar-logo{padding:0 20px 24px;border-bottom:1px solid var(--border);margin-bottom:16px}
+.sidebar-logo span{font-size:15px;font-weight:700}.sidebar-logo small{display:block;font-size:10px;color:var(--text-dim);font-family:\'JetBrains Mono\',monospace;margin-top:2px}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;color:var(--text-secondary);text-decoration:none;font-size:13px;font-weight:500;transition:all .15s;border-left:2px solid transparent}
+.nav-item:hover{color:var(--text-primary);background:rgba(255,255,255,.03)}
+.nav-item.active{color:var(--cyan);background:rgba(6,182,212,.06);border-left-color:var(--cyan)}
+.nav-icon{font-size:15px;width:18px;text-align:center}
+.main{flex:1;min-width:0;overflow-y:auto;padding:32px}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:20px}
+.card-title{font-family:\'JetBrains Mono\',monospace;font-size:13px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:20px}
+.form-row{margin-bottom:16px}
+.form-label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px;font-family:\'JetBrains Mono\',monospace}
+.form-input{width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px;color:var(--text-primary);font-size:13px;font-family:\'JetBrains Mono\',monospace;outline:none;transition:border-color .2s}
+.form-input:focus{border-color:var(--cyan)}
+.form-hint{font-size:11px;color:var(--text-dim);margin-top:5px}
+.toggle-row{display:flex;align-items:center;justify-content:space-between;padding:14px 0}
+.toggle-label{font-size:13px;color:var(--text-secondary)}
+.toggle{position:relative;display:inline-block;width:44px;height:24px}
+.toggle input{opacity:0;width:0;height:0}
+.toggle-slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:#1e2736;border-radius:24px;transition:.3s}
+.toggle-slider:before{position:absolute;content:"";height:18px;width:18px;left:3px;bottom:3px;background:#64748b;border-radius:50%;transition:.3s}
+input:checked+.toggle-slider{background:rgba(6,182,212,.2);border:1px solid var(--cyan)}
+input:checked+.toggle-slider:before{transform:translateX(20px);background:var(--cyan)}
+.btn-primary{background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;padding:10px 22px;border-radius:8px;cursor:pointer;font-family:\'JetBrains Mono\',monospace;font-size:13px;font-weight:600;transition:opacity .2s}
+.btn-primary:hover{opacity:.85}
+.btn-ghost{background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border);padding:10px 18px;border-radius:8px;cursor:pointer;font-size:13px;font-family:\'JetBrains Mono\',monospace}
+.btn-ghost:hover{background:rgba(255,255,255,.08)}
+.btn-danger{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.3);padding:8px 14px;border-radius:8px;cursor:pointer;font-size:12px;font-family:\'JetBrains Mono\',monospace}
+.btn-danger:hover{background:rgba(239,68,68,.2)}
+.upload-area{border:2px dashed var(--border);border-radius:10px;padding:28px;text-align:center;cursor:pointer;transition:border-color .2s;margin-bottom:12px}
+.upload-area:hover,.upload-area.drag{border-color:var(--cyan);background:rgba(6,182,212,.04)}
+.upload-area input[type=file]{display:none}
+.logo-preview{max-height:60px;max-width:200px;object-fit:contain;border-radius:6px;border:1px solid var(--border);padding:6px;background:rgba(255,255,255,.03)}
+.banner-preview{display:flex;align-items:center;justify-content:center;gap:18px;padding:14px 24px;background:var(--bg-card);border:1px solid var(--border);border-radius:10px;font-family:\'JetBrains Mono\',monospace;font-weight:700;font-size:14px;letter-spacing:.06em;color:var(--text-primary);margin-top:16px;min-height:52px}
+.banner-preview-logo{height:34px;width:auto;max-height:34px;object-fit:contain;flex-shrink:0}
+.banner-preview-text{flex:1;text-align:center;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.toast{position:fixed;bottom:24px;right:24px;padding:12px 20px;border-radius:8px;font-family:\'JetBrains Mono\',monospace;font-size:13px;z-index:9999;display:none;animation:fadeIn .2s}
+.toast.success{background:rgba(16,185,129,.15);border:1px solid rgba(16,185,129,.4);color:var(--green)}
+.toast.error{background:rgba(239,68,68,.15);border:1px solid rgba(239,68,68,.4);color:var(--red)}
+@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+</style></head><body>
+{{ sidebar_html }}
+<div class="main">
+<div class="top-bar"></div>
+<div style="margin-bottom:28px">
+<div style="font-family:\'JetBrains Mono\',monospace;font-weight:700;font-size:20px;margin-bottom:6px">Customization</div>
+<div style="font-size:13px;color:var(--text-dim)">Custom banner and agency branding for this infra-TAK instance.</div>
+</div>
+
+<!-- Banner Card -->
+<div class="card">
+<div class="card-title">Custom Identification Banner</div>
+<div style="font-size:12px;color:var(--text-dim);margin-bottom:20px;line-height:1.6">
+When enabled, a banner appears at the top of every page showing your text flanked by your agency logo (or the infra-TAK mark if no logo is uploaded).
+Useful for operators managing multiple infra-TAK instances.
+</div>
+<div class="toggle-row">
+<span class="toggle-label">Enable banner</span>
+<label class="toggle"><input type="checkbox" id="banner-enabled" {% if customization.get(\'banner_enabled\') %}checked{% endif %}><span class="toggle-slider"></span></label>
+</div>
+<div class="form-row">
+<label class="form-label">Banner Text <span style="color:var(--text-dim)">(max 120 chars)</span></label>
+<input class="form-input" id="banner-text" type="text" maxlength="120"
+  placeholder="e.g. REGION 5 OPS CENTER — ALPHA UNIT"
+  value="{{ customization.get(\'banner_text\', \'\') | e }}">
+<div class="form-hint">This text appears centered in the banner on every page.</div>
+</div>
+<div class="form-row">
+<div class="form-label">Live Preview</div>
+<div class="banner-preview" id="banner-preview">
+<span id="preview-logo-left" class="preview-logo-holder"></span>
+<span class="banner-preview-text" id="preview-text">{{ customization.get(\'banner_text\', \'\') | e }}</span>
+<span id="preview-logo-right" class="preview-logo-holder"></span>
+</div>
+</div>
+<div style="margin-top:20px">
+<button class="btn-primary" onclick="saveBanner()">Save Banner Settings</button>
+</div>
+</div>
+
+<!-- Agency Logo Card -->
+<div class="card">
+<div class="card-title">Agency Logo</div>
+<div style="font-size:12px;color:var(--text-dim);margin-bottom:20px;line-height:1.6">
+Upload your agency logo (PNG, SVG, or JPEG — max 512 KB). It will appear on both sides of the banner text.
+If no logo is uploaded, the infra-TAK mark is used instead.
+</div>
+{% if customization.get(\'agency_logo_b64\') %}
+<div style="margin-bottom:16px">
+<div class="form-label">Current Logo</div>
+<img src="{{ customization.get(\'agency_logo_b64\') }}" alt="Agency Logo" class="logo-preview">
+</div>
+<button class="btn-danger" onclick="removeLogo()">Remove Logo</button>
+{% else %}
+<div style="font-size:12px;color:var(--text-dim);margin-bottom:12px">No logo uploaded — infra-TAK mark is used.</div>
+{% endif %}
+<div class="upload-area" id="upload-area" onclick="document.getElementById(\'logo-file\').click()"
+  ondragover="event.preventDefault();this.classList.add(\'drag\')"
+  ondragleave="this.classList.remove(\'drag\')"
+  ondrop="handleDrop(event)">
+<input type="file" id="logo-file" accept="image/png,image/svg+xml,image/jpeg" onchange="uploadLogo(this.files[0])">
+<span class="material-symbols-outlined" style="font-size:32px;color:var(--text-dim);margin-bottom:8px;display:block">upload</span>
+<div style="font-size:13px;color:var(--text-secondary);margin-bottom:4px">Click or drag to upload logo</div>
+<div style="font-size:11px;color:var(--text-dim)">PNG, SVG, or JPEG &mdash; max 512 KB</div>
+</div>
+</div>
+
+</div>
+<div class="toast" id="toast"></div>
+<script>
+// Populate preview logos on load
+(function(){
+  var b64 = {{ customization.get(\'agency_logo_b64\', \'\') | tojson }};
+  setPreviewLogos(b64);
+  updatePreviewText();
+})();
+
+function setPreviewLogos(b64) {
+  var html = b64
+    ? \'<img src="\' + b64 + \'" alt="" class="banner-preview-logo">\'
+    : \'<span style="font-family:Orbitron,sans-serif;font-size:12px;font-weight:700;color:#06b6d4;letter-spacing:.08em">infra-TAK</span>\';
+  document.getElementById(\'preview-logo-left\').innerHTML = html;
+  document.getElementById(\'preview-logo-right\').innerHTML = html;
+}
+
+function updatePreviewText() {
+  var t = document.getElementById(\'banner-text\').value || \'Banner text preview\';
+  document.getElementById(\'preview-text\').textContent = t;
+}
+
+document.getElementById(\'banner-text\').addEventListener(\'input\', updatePreviewText);
+
+function showToast(msg, type) {
+  var t = document.getElementById(\'toast\');
+  t.textContent = msg; t.className = \'toast \' + type; t.style.display = \'block\';
+  setTimeout(function(){ t.style.display = \'none\'; }, 3000);
+}
+
+function saveBanner() {
+  fetch(\'/api/customization/settings\', {
+    method: \'POST\',
+    headers: {\'Content-Type\': \'application/json\'},
+    body: JSON.stringify({
+      banner_enabled: document.getElementById(\'banner-enabled\').checked,
+      banner_text: document.getElementById(\'banner-text\').value.trim()
+    })
+  }).then(r => r.json()).then(d => {
+    if (d.ok) { showToast(\'Banner settings saved.\', \'success\'); setTimeout(()=>location.reload(),600); }
+    else showToast(d.error || \'Save failed\', \'error\');
+  }).catch(()=>showToast(\'Network error\', \'error\'));
+}
+
+function uploadLogo(file) {
+  if (!file) return;
+  if (file.size > 512*1024) { showToast(\'File too large (max 512 KB)\', \'error\'); return; }
+  var fd = new FormData(); fd.append(\'logo\', file);
+  fetch(\'/api/customization/logo\', {method:\'POST\', body:fd})
+    .then(r=>r.json()).then(d=>{
+      if (d.ok) { setPreviewLogos(d.data_uri); showToast(\'Logo uploaded.\', \'success\'); setTimeout(()=>location.reload(),600); }
+      else showToast(d.error || \'Upload failed\', \'error\');
+    }).catch(()=>showToast(\'Network error\', \'error\'));
+}
+
+function handleDrop(e) {
+  e.preventDefault();
+  document.getElementById(\'upload-area\').classList.remove(\'drag\');
+  var file = e.dataTransfer.files[0];
+  if (file) uploadLogo(file);
+}
+
+function removeLogo() {
+  fetch(\'/api/customization/logo\', {method:\'DELETE\'})
+    .then(r=>r.json()).then(d=>{
+      if (d.ok) { setPreviewLogos(null); showToast(\'Logo removed.\', \'success\'); setTimeout(()=>location.reload(),600); }
+      else showToast(d.error || \'Error\', \'error\');
+    }).catch(()=>showToast(\'Network error\', \'error\'));
+}
+</script>
+</body></html>'''
+
 CONSOLE_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Console — infra-TAK</title>
 <style>
 ''' + BASE_CSS + '''
@@ -30653,6 +31335,144 @@ def _auto_update_guarddog():
 
 _auto_update_guarddog()
 
+def _fail2ban_install_and_configure(plog):
+    """Install and configure fail2ban for Authentik brute-force protection (v0.9.0).
+
+    Prerequisites:
+    - Authentik must be installed (~/authentik/.env must exist)
+    - v0.8.9 trusted-proxy CIDR fix must be confirmed applied — otherwise fail2ban
+      would ban 172.18.0.1 (Docker bridge) and DoS the entire Caddy→Authentik path.
+
+    What this does (idempotent):
+    1. Guards on prerequisite (authentik_trusted_proxy_cidrs_fix applied/noop)
+    2. Guards on idempotency (fail2ban_setup.last_outcome == 'applied')
+    3. Installs fail2ban via apt/yum
+    4. Creates /var/log/authentik/ log directory
+    5. Writes authentik-log-forwarder.service (tails docker logs → flat file)
+    6. Writes /etc/fail2ban/filter.d/authentik.conf (matches login_failed JSON lines)
+    7. Writes /etc/fail2ban/jail.d/infratak-authentik.conf (ufw action, default thresholds)
+    8. Enables and starts both services
+    9. Records last_outcome='applied' to settings.fail2ban_setup
+    """
+    import datetime as _dt2
+    s = load_settings()
+    plog("fail2ban migration: checking prerequisites")
+
+    # Prerequisite: v0.8.9 trusted-proxy fix must be confirmed (applied or idempotent-noop)
+    proxy_outcome = s.get('authentik_trusted_proxy_cidrs_fix', {}).get('last_outcome', '')
+    if proxy_outcome not in ('applied', 'idempotent-noop'):
+        plog(
+            "fail2ban migration: SKIPPED — v0.8.9 trusted-proxy CIDR fix not yet confirmed "
+            f"(last_outcome={proxy_outcome!r}). Re-runs automatically once the prerequisite is met."
+        )
+        return False
+
+    # Prerequisite: Authentik must be installed
+    if not os.path.exists(os.path.expanduser('~/authentik/.env')):
+        plog("fail2ban migration: SKIPPED — Authentik not installed on this host")
+        return False
+
+    # Idempotency check
+    if s.get('fail2ban_setup', {}).get('last_outcome') == 'applied':
+        plog("fail2ban migration: idempotent-noop (already applied)")
+        return False
+
+    pkg_mgr = s.get('pkg_mgr', 'apt')
+
+    # Step 1: Install fail2ban
+    plog("fail2ban migration: installing fail2ban")
+    if pkg_mgr == 'apt':
+        result = subprocess.run(['apt-get', 'install', '-y', 'fail2ban'],
+                                capture_output=True, text=True)
+    else:
+        result = subprocess.run(['yum', 'install', '-y', 'fail2ban'],
+                                capture_output=True, text=True)
+    if result.returncode != 0:
+        plog(f"fail2ban migration: FAILED — package install error: {result.stderr[:300]}")
+        return False
+    plog("fail2ban migration: fail2ban installed")
+
+    # Step 2: Create log directory
+    os.makedirs('/var/log/authentik', exist_ok=True)
+    plog("fail2ban migration: created /var/log/authentik/")
+
+    # Step 3: Write log forwarder systemd service
+    forwarder_service = (
+        "[Unit]\n"
+        "Description=Authentik Docker Log Forwarder for fail2ban\n"
+        "After=docker.service\n"
+        "Requires=docker.service\n\n"
+        "[Service]\n"
+        "Type=simple\n"
+        "Restart=always\n"
+        "RestartSec=10\n"
+        "ExecStart=/bin/bash -c 'docker logs -f authentik-server-1 2>&1 >> /var/log/authentik/auth.log'\n"
+        "StandardOutput=null\n"
+        "StandardError=null\n\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n"
+    )
+    svc_path = '/etc/systemd/system/authentik-log-forwarder.service'
+    with open(svc_path, 'w') as _f:
+        _f.write(forwarder_service)
+    plog(f"fail2ban migration: wrote {svc_path}")
+
+    # Step 4: Write fail2ban filter (matches Authentik JSON log lines)
+    os.makedirs('/etc/fail2ban/filter.d', exist_ok=True)
+    filter_conf = (
+        "[Definition]\n"
+        "# Match Authentik JSON log lines containing login_failed events.\n"
+        "# Authentik emits structured JSON; client_ip contains the real IP since v0.8.9\n"
+        "# fixed AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS.\n"
+        "failregex = \"action\": \"login_failed\".*\"client_ip\": \"<HOST>\"\n"
+        "            \"client_ip\": \"<HOST>\".*\"action\": \"login_failed\"\n"
+        "ignoreregex =\n"
+    )
+    filter_path = '/etc/fail2ban/filter.d/authentik.conf'
+    with open(filter_path, 'w') as _f:
+        _f.write(filter_conf)
+    plog(f"fail2ban migration: wrote {filter_path}")
+
+    # Step 5: Write jail config with fleet defaults
+    os.makedirs('/etc/fail2ban/jail.d', exist_ok=True)
+    jail_conf = (
+        "[authentik]\n"
+        "enabled  = true\n"
+        "filter   = authentik\n"
+        "logpath  = /var/log/authentik/auth.log\n"
+        "# 5 failed logins within 10 minutes → ban for 1 hour\n"
+        "maxretry = 5\n"
+        "findtime = 600\n"
+        "bantime  = 3600\n"
+        "action   = ufw\n"
+    )
+    jail_path = '/etc/fail2ban/jail.d/infratak-authentik.conf'
+    with open(jail_path, 'w') as _f:
+        _f.write(jail_conf)
+    plog(f"fail2ban migration: wrote {jail_path}")
+
+    # Step 6: Reload systemd and enable/start services
+    subprocess.run(['systemctl', 'daemon-reload'], capture_output=True)
+    subprocess.run(['systemctl', 'enable', '--now', 'authentik-log-forwarder'],
+                   capture_output=True)
+    subprocess.run(['systemctl', 'enable', '--now', 'fail2ban'],
+                   capture_output=True)
+    plog("fail2ban migration: services enabled and started")
+
+    # Step 7: Record outcome
+    s2 = load_settings()
+    s2['fail2ban_setup'] = {
+        'last_outcome': 'applied',
+        'applied_at': _dt2.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'filter_path': filter_path,
+        'jail_path': jail_path,
+        'log_forwarder_service': svc_path,
+    }
+    save_settings(s2)
+    plog("fail2ban migration: complete — outcome recorded to settings.fail2ban_setup")
+    return True
+
+
 # === Startup migrations: fix known bad settings and regenerate Caddy if needed ===
 def _startup_migrations():
     try:
@@ -30782,6 +31602,14 @@ def _startup_migrations():
                     _authentik_verify_runtime_config(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as ak_proxy_err:
             print(f"Startup migration: trusted proxy CIDRs fix error (non-fatal): {ak_proxy_err}")
+
+        # v0.9.0: Install and configure fail2ban for Authentik brute-force protection.
+        # Requires v0.8.9 trusted-proxy fix confirmed applied (guards internally).
+        # No-op on installs without Authentik. Idempotent.
+        try:
+            _fail2ban_install_and_configure(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _f2b_err:
+            print(f"Startup migration: fail2ban setup error (non-fatal): {_f2b_err}")
     except Exception as e:
         print(f"Startup migration error: {e}")
         import traceback; traceback.print_exc()
@@ -30985,6 +31813,12 @@ def _post_update_auto_deploy():
                         _authentik_verify_runtime_config(lambda m: print(f"Post-update: {m}", flush=True))
             except Exception as _e:
                 print(f"Post-update: trusted proxy CIDRs fix skipped: {_e}")
+
+            # v0.9.0: Install and configure fail2ban (requires v0.8.9 trusted-proxy fix).
+            try:
+                _fail2ban_install_and_configure(lambda m: print(f"Post-update: {m}", flush=True))
+            except Exception as _f2b_err:
+                print(f"Post-update: fail2ban setup error (non-fatal): {_f2b_err}")
 
             # Re-deploy Guard Dog (updated scripts + timers)
             if os.path.exists('/opt/tak-guarddog') and os.path.exists('/opt/tak'):
