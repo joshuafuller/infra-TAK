@@ -4150,6 +4150,48 @@ def _f2b_write_jail_config(maxretry, findtime, bantime):
     with open(jail_path, 'w') as _f:
         _f.write(jail_conf)
 
+def _f2b_tak_jail_enabled():
+    """Return True if the infratak-takserver jail config file exists."""
+    return os.path.exists('/etc/fail2ban/jail.d/infratak-takserver.conf')
+
+def _f2b_read_tak_jail_config():
+    """Read current thresholds from the infratak-takserver jail config file."""
+    jail_path = '/etc/fail2ban/jail.d/infratak-takserver.conf'
+    cfg = {'maxretry': 20, 'findtime': 300, 'bantime': 3600}
+    if not os.path.exists(jail_path):
+        return cfg
+    try:
+        with open(jail_path) as _f:
+            for line in _f:
+                line = line.strip()
+                for key in ('maxretry', 'findtime', 'bantime'):
+                    if line.startswith(key):
+                        try: cfg[key] = int(line.split('=')[1].strip())
+                        except Exception: pass
+    except Exception:
+        pass
+    return cfg
+
+def _f2b_write_tak_jail_config(maxretry, findtime, bantime):
+    """Write the infratak-takserver jail config with given thresholds."""
+    jail_path = '/etc/fail2ban/jail.d/infratak-takserver.conf'
+    os.makedirs('/etc/fail2ban/jail.d', exist_ok=True)
+    guarddog_action = ""
+    if os.path.exists('/etc/fail2ban/action.d/infratak-guarddog.conf'):
+        guarddog_action = "\n         infratak-guarddog-takserver"
+    jail_conf = (
+        "[takserver]\n"
+        "enabled  = true\n"
+        "filter   = takserver\n"
+        "logpath  = /opt/tak/logs/takserver-messaging.log\n"
+        f"maxretry = {maxretry}\n"
+        f"findtime = {findtime}\n"
+        f"bantime  = {bantime}\n"
+        f"action   = ufw{guarddog_action}\n"
+    )
+    with open(jail_path, 'w') as _f:
+        _f.write(jail_conf)
+
 @app.route('/api/fail2ban/status')
 @login_required
 def fail2ban_status_api():
@@ -4227,6 +4269,83 @@ def fail2ban_log_api():
         return jsonify({'lines': filtered})
     except Exception as e:
         return jsonify({'lines': [], 'error': str(e)[:200]})
+
+@app.route('/api/fail2ban/takserver/status')
+@login_required
+def fail2ban_tak_status_api():
+    """Return fail2ban status for the takserver jail plus install/filter state."""
+    tak_installed = os.path.exists('/opt/tak/logs')
+    filter_ready  = os.path.exists('/etc/fail2ban/filter.d/takserver.conf')
+    jail_enabled  = _f2b_tak_jail_enabled()
+    cfg           = _f2b_read_tak_jail_config()
+    status = {
+        'available':      _f2b_is_available(),
+        'tak_installed':  tak_installed,
+        'filter_ready':   filter_ready,
+        'jail_enabled':   jail_enabled,
+        'jail_config':    cfg,
+        'currently_banned': 0, 'currently_failed': 0,
+        'total_banned': 0,     'total_failed': 0,
+        'banned_ips': [],
+    }
+    if jail_enabled and _f2b_is_available():
+        try:
+            r = subprocess.run(['fail2ban-client', 'status', 'takserver'],
+                               capture_output=True, text=True, timeout=10)
+            status.update(_f2b_parse_status(r.stdout))
+        except Exception as e:
+            status['error'] = str(e)[:200]
+    return jsonify(status)
+
+@app.route('/api/fail2ban/takserver/config', methods=['POST'])
+@login_required
+def fail2ban_tak_config_api():
+    """Enable/disable the TAK Server jail and update its thresholds."""
+    if not _f2b_is_available():
+        return jsonify({'ok': False, 'error': 'fail2ban not installed'}), 400
+    data    = request.get_json(force=True) or {}
+    enabled = bool(data.get('enabled', False))
+    if not enabled:
+        jail_path = '/etc/fail2ban/jail.d/infratak-takserver.conf'
+        if os.path.exists(jail_path):
+            os.remove(jail_path)
+        subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+        return jsonify({'ok': True, 'enabled': False})
+    if not os.path.exists('/etc/fail2ban/filter.d/takserver.conf'):
+        return jsonify({'ok': False,
+                        'error': 'TAK Server filter not installed yet — restart the console to trigger migration'}), 400
+    try:
+        maxretry = max(1,  min(100,     int(data.get('maxretry', 20))))
+        findtime = max(60, min(86400,   int(data.get('findtime', 300))))
+        bantime  = max(60, min(2592000, int(data.get('bantime',  3600))))
+    except (ValueError, TypeError) as e:
+        return jsonify({'ok': False, 'error': f'Invalid value: {e}'}), 400
+    try:
+        _f2b_write_tak_jail_config(maxretry, findtime, bantime)
+        subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+        return jsonify({'ok': True, 'enabled': True,
+                        'maxretry': maxretry, 'findtime': findtime, 'bantime': bantime})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+@app.route('/api/fail2ban/takserver/unban', methods=['POST'])
+@login_required
+def fail2ban_tak_unban_api():
+    """Unban a specific IP from the takserver jail."""
+    if not _f2b_is_available():
+        return jsonify({'ok': False, 'error': 'fail2ban not installed'}), 400
+    data = request.get_json(force=True) or {}
+    ip   = str(data.get('ip', '')).strip()
+    if not ip or not _VALID_IP_RE.match(ip):
+        return jsonify({'ok': False, 'error': 'Invalid IP address'}), 400
+    try:
+        r = subprocess.run(['fail2ban-client', 'set', 'takserver', 'unbanip', ip],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            return jsonify({'ok': True, 'ip': ip})
+        return jsonify({'ok': False, 'error': r.stderr.strip()[:200] or 'Unban failed'}), 500
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
 
 
 def _parse_guarddog_log_date(line):
@@ -16926,6 +17045,63 @@ fail2ban installs automatically on the next console restart once the v0.8.9 trus
 <div class="log-box" id="log-box">Loading…</div>
 </div>
 
+<!-- TAK Server Jail -->
+<div class="card" id="tak-jail-card" style="display:none">
+<div class="card-title" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0">
+<div style="display:flex;align-items:center;gap:10px">
+<span>TAK Server Jail</span>
+<span class="badge badge-yellow" id="tak-jail-badge" style="font-size:10px;padding:2px 8px">Loading…</span>
+</div>
+<label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:0">
+<span style="font-size:12px;color:var(--text-dim);font-family:\'JetBrains Mono\',monospace">Enable</span>
+<div class="toggle-wrap" style="position:relative;width:40px;height:22px">
+<input type="checkbox" id="tak-toggle" onchange="toggleTakJail()" style="opacity:0;width:0;height:0;position:absolute">
+<span id="tak-toggle-track" onclick="document.getElementById(\'tak-toggle\').click()" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
+<span id="tak-toggle-thumb" style="position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform .2s;pointer-events:none"></span>
+</div>
+</label>
+</div>
+
+<div id="tak-not-ready" style="display:none;margin-top:16px;font-size:13px;color:var(--text-dim)">
+TAK Server filter not yet installed — restart the console to complete setup.
+</div>
+
+<div id="tak-enabled-section" style="display:none">
+<div class="stat-grid" style="margin-top:20px;margin-bottom:20px">
+<div class="stat-card"><div class="stat-value red" id="tak-stat-banned">0</div><div class="stat-label">Currently Banned</div></div>
+<div class="stat-card"><div class="stat-value yellow" id="tak-stat-failed">0</div><div class="stat-label">Currently Failed</div></div>
+<div class="stat-card"><div class="stat-value cyan" id="tak-stat-total-banned">0</div><div class="stat-label">Total Banned (session)</div></div>
+<div class="stat-card"><div class="stat-value" id="tak-stat-total-failed" style="color:var(--text-dim)">0</div><div class="stat-label">Total Failed (session)</div></div>
+</div>
+
+<div id="tak-ban-list-container" style="margin-bottom:20px">
+<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>
+</div>
+
+<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:16px">
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Max Retries</label>
+<input class="form-input" id="tak-cfg-maxretry" type="number" min="1" max="100" value="20">
+<div class="form-hint">Attempts before ban</div>
+</div>
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Find Window (minutes)</label>
+<input class="form-input" id="tak-cfg-findtime" type="number" min="1" max="1440" value="5">
+<div class="form-hint">Time window to count attempts</div>
+</div>
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Ban Duration (minutes)</label>
+<input class="form-input" id="tak-cfg-bantime" type="number" min="1" max="43200" value="60">
+<div class="form-hint">How long to ban the IP</div>
+</div>
+</div>
+<div style="margin-top:16px">
+<button class="btn-primary" onclick="saveTakConfig()">Save &amp; Reload</button>
+<span style="font-size:11px;color:var(--text-dim);margin-left:12px">Monitors port 7001 &amp; 8089 — bans cert probes / port scanners</span>
+</div>
+</div>
+</div>
+
 {% endif %}
 </div>
 <div class="toast" id="toast"></div>
@@ -17016,6 +17192,120 @@ loadStatus();
 loadLog();
 setInterval(function(){ loadStatus(); loadLog(); }, 30000);
 {% endif %}
+
+// TAK Server Jail
+(function(){
+  var takReady = false;
+
+  function _updateToggleStyle(on) {
+    var track = document.getElementById(\'tak-toggle-track\');
+    var thumb = document.getElementById(\'tak-toggle-thumb\');
+    if (!track) return;
+    track.style.background = on ? \'var(--cyan)\' : \'var(--border)\';
+    thumb.style.transform   = on ? \'translateX(18px)\' : \'none\';
+  }
+
+  function _updateBadge(enabled, filterReady) {
+    var b = document.getElementById(\'tak-jail-badge\');
+    if (!b) return;
+    if (!filterReady) {
+      b.className = \'badge badge-yellow\'; b.textContent = \'Filter installing…\';
+    } else if (enabled) {
+      b.className = \'badge badge-green\'; b.textContent = \'Active\';
+    } else {
+      b.className = \'badge badge-yellow\'; b.textContent = \'Disabled\';
+    }
+  }
+
+  window.loadTakStatus = function() {
+    fetch(\'/api/fail2ban/takserver/status\').then(function(r){ return r.json(); }).then(function(d){
+      var card = document.getElementById(\'tak-jail-card\');
+      if (!d.tak_installed) { if (card) card.style.display = \'none\'; return; }
+      if (card) card.style.display = \'\';
+
+      var notReady = document.getElementById(\'tak-not-ready\');
+      var enabledSec = document.getElementById(\'tak-enabled-section\');
+      var toggle = document.getElementById(\'tak-toggle\');
+      takReady = d.filter_ready;
+
+      _updateBadge(d.jail_enabled, d.filter_ready);
+      _updateToggleStyle(d.jail_enabled);
+      if (toggle) toggle.checked = d.jail_enabled;
+
+      if (!d.filter_ready) {
+        if (notReady)   notReady.style.display   = \'\';
+        if (enabledSec) enabledSec.style.display  = \'none\';
+        return;
+      }
+      if (notReady) notReady.style.display = \'none\';
+
+      if (d.jail_enabled) {
+        if (enabledSec) enabledSec.style.display = \'\';
+        document.getElementById(\'tak-stat-banned\').textContent       = d.currently_banned  !== undefined ? d.currently_banned  : 0;
+        document.getElementById(\'tak-stat-failed\').textContent       = d.currently_failed  !== undefined ? d.currently_failed  : 0;
+        document.getElementById(\'tak-stat-total-banned\').textContent = d.total_banned       !== undefined ? d.total_banned       : 0;
+        document.getElementById(\'tak-stat-total-failed\').textContent = d.total_failed       !== undefined ? d.total_failed       : 0;
+        var cfg = d.jail_config || {};
+        if (cfg.maxretry) document.getElementById(\'tak-cfg-maxretry\').value = cfg.maxretry;
+        if (cfg.findtime) document.getElementById(\'tak-cfg-findtime\').value = Math.round(cfg.findtime / 60);
+        if (cfg.bantime)  document.getElementById(\'tak-cfg-bantime\').value  = Math.round(cfg.bantime  / 60);
+        var ips = d.banned_ips || [];
+        var c = document.getElementById(\'tak-ban-list-container\');
+        if (!ips.length) {
+          c.innerHTML = \'<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>\';
+        } else {
+          var rows = ips.map(function(ip){
+            return \'<tr><td>\' + ip + \'</td><td><button class="btn-danger-sm" onclick="unbanTakIP(\\\'\'+ ip +\'\\\')">\' +
+                   \'Unban</button></td></tr>\';
+          }).join(\'\');
+          c.innerHTML = \'<table class="ban-table"><thead><tr><th>IP Address</th><th>Action</th></tr></thead><tbody>\' + rows + \'</tbody></table>\';
+        }
+      } else {
+        if (enabledSec) enabledSec.style.display = \'none\';
+      }
+    }).catch(function(){});
+  };
+
+  window.toggleTakJail = function() {
+    var enabled = document.getElementById(\'tak-toggle\').checked;
+    _updateToggleStyle(enabled);
+    if (!enabled) {
+      fetch(\'/api/fail2ban/takserver/config\', {method:\'POST\', headers:{\'Content-Type\':\'application/json\'}, body:JSON.stringify({enabled:false})})
+        .then(function(r){ return r.json(); }).then(function(d){
+          if (d.ok) { showToast(\'TAK Server jail disabled.\', \'success\'); loadTakStatus(); }
+          else { showToast(d.error || \'Failed to disable\', \'error\'); loadTakStatus(); }
+        }).catch(function(){ showToast(\'Network error\', \'error\'); loadTakStatus(); });
+    } else {
+      saveTakConfig();
+    }
+  };
+
+  window.saveTakConfig = function() {
+    var body = {
+      enabled:  true,
+      maxretry: parseInt(document.getElementById(\'tak-cfg-maxretry\').value) || 20,
+      findtime: (parseInt(document.getElementById(\'tak-cfg-findtime\').value) || 5)  * 60,
+      bantime:  (parseInt(document.getElementById(\'tak-cfg-bantime\').value)  || 60) * 60
+    };
+    fetch(\'/api/fail2ban/takserver/config\', {method:\'POST\', headers:{\'Content-Type\':\'application/json\'}, body:JSON.stringify(body)})
+      .then(function(r){ return r.json(); }).then(function(d){
+        if (d.ok) { showToast(\'TAK Server jail \' + (d.enabled ? \'enabled and saved.\' : \'disabled.\'), \'success\'); loadTakStatus(); }
+        else showToast(d.error || \'Save failed\', \'error\');
+      }).catch(function(){ showToast(\'Network error\', \'error\'); });
+  };
+
+  window.unbanTakIP = function(ip) {
+    if (!confirm(\'Unban \' + ip + \' from TAK Server jail?\')) return;
+    fetch(\'/api/fail2ban/takserver/unban\', {method:\'POST\', headers:{\'Content-Type\':\'application/json\'}, body:JSON.stringify({ip:ip})})
+      .then(function(r){ return r.json(); }).then(function(d){
+        if (d.ok) { showToast(ip + \' unbanned.\', \'success\'); loadTakStatus(); }
+        else showToast(d.error || \'Unban failed\', \'error\');
+      }).catch(function(){ showToast(\'Network error\', \'error\'); });
+  };
+
+  loadTakStatus();
+  setInterval(loadTakStatus, 30000);
+})();
 </script>
 </body></html>'''
 
@@ -31697,7 +31987,7 @@ def _fail2ban_add_guarddog_hook(plog):
         return False
 
     s = load_settings()
-    if s.get('fail2ban_setup', {}).get('guarddog_hook') == 'applied_v2':
+    if s.get('fail2ban_setup', {}).get('guarddog_hook') == 'applied_v3':
         plog("fail2ban guarddog hook: idempotent-noop (already applied)")
         return False
 
@@ -31738,7 +32028,8 @@ def _find_settings():
 
 
 def main():
-    ip = sys.argv[1] if len(sys.argv) > 1 else 'unknown'
+    ip   = sys.argv[1] if len(sys.argv) > 1 else 'unknown'
+    jail = sys.argv[2] if len(sys.argv) > 2 else 'authentik'
     settings_path = _find_settings()
     if not settings_path:
         print("infratak-f2b-notify: settings.json not found — no email sent",
@@ -31758,7 +32049,7 @@ def main():
               file=sys.stderr)
         sys.exit(0)
 
-    relay    = settings.get('email_relay', {})
+    relay     = settings.get('email_relay', {})
     from_addr = relay.get('from_addr', 'noreply@localhost')
     from_name = relay.get('from_name', 'Guard Dog')
     server_id = (settings.get('server_nickname') or
@@ -31766,13 +32057,21 @@ def main():
                  settings.get('server_ip', 'infra-TAK'))
     ts = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
 
-    subject = f'[{server_id}] fail2ban: Banned {ip}'
+    _reasons = {
+        'authentik':  'Too many failed Authentik login attempts',
+        'takserver':  'Too many failed TAK Server connection attempts (port scan / cert probe)',
+    }
+    reason     = _reasons.get(jail.lower(), f'Too many failed {jail} attempts')
+    jail_label = {'authentik': 'Authentik', 'takserver': 'TAK Server'}.get(jail.lower(), jail)
+
+    subject = f'[{server_id}] fail2ban: Banned {ip} ({jail_label})'
     body = (
         f'fail2ban has banned the following IP address:\n\n'
         f'  IP:     {ip}\n'
+        f'  Jail:   {jail_label}\n'
         f'  Server: {server_id}\n'
         f'  Time:   {ts}\n'
-        f'  Reason: Too many failed Authentik login attempts\n\n'
+        f'  Reason: {reason}\n\n'
         f'To unban this IP, open your infra-TAK console → Fail2ban page.\n'
     )
 
@@ -31808,7 +32107,7 @@ if __name__ == '__main__':
         " && echo \"`/bin/date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ`"
         " | fail2ban: Banned <ip> (Authentik brute-force)\""
         " >> /var/log/takguard/restarts.log"
-        " ; /usr/bin/env python3 /usr/local/sbin/infratak-f2b-notify <ip>\n"
+        " ; /usr/bin/env python3 /usr/local/sbin/infratak-f2b-notify <ip> authentik\n"
         "actionunban =\n"
     )
     action_path = '/etc/fail2ban/action.d/infratak-guarddog.conf'
@@ -31828,10 +32127,87 @@ if __name__ == '__main__':
 
     # ── Step 5: Record outcome ────────────────────────────────────────────────
     s2 = load_settings()
-    s2.setdefault('fail2ban_setup', {})['guarddog_hook'] = 'applied_v2'
+    s2.setdefault('fail2ban_setup', {})['guarddog_hook'] = 'applied_v3'
     s2['fail2ban_setup']['guarddog_hook_applied_at'] = _dt3.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
     save_settings(s2)
     plog("fail2ban guarddog hook: complete — email alerts + dashboard log active")
+    return True
+
+
+def _fail2ban_takserver_filter(plog):
+    """Write fail2ban filter for TAK Server TLS/handshake failures (v0.9.0 — idempotent).
+
+    Writes /etc/fail2ban/filter.d/takserver.conf (regex + custom datepattern for
+    TAK Server's YYYY-MM-DD-HH:MM:SS log format) and
+    /etc/fail2ban/action.d/infratak-guarddog-takserver.conf (Guard Dog log + email).
+
+    Does NOT enable the jail — the operator toggles that on the Fail2ban page.
+    Prerequisites: fail2ban installed AND /opt/tak exists (TAK Server installed).
+    Idempotent: skips if settings.fail2ban_setup.takserver_filter == 'applied'.
+    """
+    import datetime as _dt4
+    if not os.path.exists('/etc/fail2ban'):
+        plog("fail2ban takserver filter: SKIPPED — fail2ban not installed")
+        return False
+    if not os.path.exists('/opt/tak'):
+        plog("fail2ban takserver filter: SKIPPED — TAK Server not installed (/opt/tak absent)")
+        return False
+
+    s = load_settings()
+    if s.get('fail2ban_setup', {}).get('takserver_filter') == 'applied':
+        plog("fail2ban takserver filter: idempotent-noop (already applied)")
+        return False
+
+    plog("fail2ban takserver filter: writing filter and action files")
+
+    # ── Filter: match Netty TLS/handshake rejection lines ─────────────────────
+    # Log format: 2026-05-02-15:58:55.145 [...] ERROR ... NioNettyServerHandler error.
+    #             ... Remote address: 1.2.3.4; ... Certificate error: peer not verified;
+    # %% in ini = literal % after ConfigParser → shell sees %Y, etc.
+    os.makedirs('/etc/fail2ban/filter.d', exist_ok=True)
+    filter_conf = (
+        "[Definition]\n"
+        "# Match TAK Server (Netty) TLS/SSL/handshake rejection lines.\n"
+        "# Covers: PEER_DID_NOT_RETURN_A_CERTIFICATE, NO_SHARED_CIPHER,\n"
+        "#         UNSUPPORTED_PROTOCOL, NotSslRecordException.\n"
+        "# Log timestamp format: 2026-05-02-15:58:55.145 (YYYY-MM-DD-HH:MM:SS.mmm)\n"
+        "failregex = NioNettyServerHandler error.*Remote address: <HOST>;\n"
+        "ignoreregex =\n"
+        "datepattern = %%Y-%%m-%%d-%%H:%%M:%%S\n"
+        "              {^LN-BEG}\n"
+    )
+    filter_path = '/etc/fail2ban/filter.d/takserver.conf'
+    with open(filter_path, 'w') as _f:
+        _f.write(filter_conf)
+    plog(f"fail2ban takserver filter: wrote {filter_path}")
+
+    # ── Guard Dog action for TAK Server jail ──────────────────────────────────
+    os.makedirs('/var/log/takguard', exist_ok=True)
+    os.makedirs('/etc/fail2ban/action.d', exist_ok=True)
+    tak_action_conf = (
+        "[Definition]\n"
+        "actionban  = mkdir -p /var/log/takguard"
+        " && echo \"`/bin/date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ`"
+        " | fail2ban: Banned <ip> (TAK Server port scan)\""
+        " >> /var/log/takguard/restarts.log"
+        " ; /usr/bin/env python3 /usr/local/sbin/infratak-f2b-notify <ip> takserver\n"
+        "actionunban =\n"
+    )
+    tak_action_path = '/etc/fail2ban/action.d/infratak-guarddog-takserver.conf'
+    with open(tak_action_path, 'w') as _f:
+        _f.write(tak_action_conf)
+    plog(f"fail2ban takserver filter: wrote {tak_action_path}")
+
+    # Reload so the new filter is recognized (jail stays disabled until operator enables it)
+    subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+    plog("fail2ban takserver filter: fail2ban reloaded — filter ready, jail disabled by default")
+
+    # Record outcome
+    s2 = load_settings()
+    s2.setdefault('fail2ban_setup', {})['takserver_filter'] = 'applied'
+    s2['fail2ban_setup']['takserver_filter_applied_at'] = _dt4.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+    save_settings(s2)
+    plog("fail2ban takserver filter: complete")
     return True
 
 
@@ -31976,6 +32352,10 @@ def _startup_migrations():
             _fail2ban_add_guarddog_hook(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _f2b_gd_err:
             print(f"Startup migration: fail2ban guarddog hook error (non-fatal): {_f2b_gd_err}")
+        try:
+            _fail2ban_takserver_filter(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _f2b_tak_err:
+            print(f"Startup migration: fail2ban takserver filter error (non-fatal): {_f2b_tak_err}")
     except Exception as e:
         print(f"Startup migration error: {e}")
         import traceback; traceback.print_exc()
@@ -32189,6 +32569,10 @@ def _post_update_auto_deploy():
                 _fail2ban_add_guarddog_hook(lambda m: print(f"Post-update: {m}", flush=True))
             except Exception as _f2b_gd_err:
                 print(f"Post-update: fail2ban guarddog hook error (non-fatal): {_f2b_gd_err}")
+            try:
+                _fail2ban_takserver_filter(lambda m: print(f"Post-update: {m}", flush=True))
+            except Exception as _f2b_tak_err:
+                print(f"Post-update: fail2ban takserver filter error (non-fatal): {_f2b_tak_err}")
 
             # Re-deploy Guard Dog (updated scripts + timers)
             if os.path.exists('/opt/tak-guarddog') and os.path.exists('/opt/tak'):
