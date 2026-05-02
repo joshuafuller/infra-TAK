@@ -743,6 +743,25 @@ def detect_modules():
         gd_running = 'tak8089guard' in r.stdout
     modules['guarddog'] = {'name': 'Guard Dog', 'installed': gd_installed, 'running': gd_running,
         'description': 'Health monitoring and auto-recovery', 'icon': '🐕', 'route': '/guarddog', 'priority': 5}
+    # Fail2ban
+    f2b_installed = (os.path.exists('/etc/fail2ban') and
+                     subprocess.run(['which', 'fail2ban-client'], capture_output=True).returncode == 0)
+    f2b_running = False
+    f2b_version = None
+    if f2b_installed:
+        r = subprocess.run(['systemctl', 'is-active', 'fail2ban'], capture_output=True, text=True)
+        f2b_running = r.stdout.strip() == 'active'
+        try:
+            v = subprocess.run(['fail2ban-client', '--version'], capture_output=True, text=True, timeout=5)
+            f2b_version = (v.stdout.strip().splitlines()[0] if v.stdout.strip() else None)
+        except Exception:
+            pass
+    modules['fail2ban'] = {
+        'name': 'Fail2ban', 'installed': f2b_installed, 'running': f2b_running,
+        'version': f2b_version,
+        'description': 'Brute-force IP blocking for Authentik & TAK Server',
+        'icon': '🛡️', 'icon_url': FAIL2BAN_LOGO_URL, 'route': '/fail2ban', 'priority': 6,
+    }
     # Node-RED (container name is "nodered" from compose container_name); local or remote deploy
     nodered_cfg = _get_module_deployment_config(settings, 'nodered_deployment')
     nodered_installed = False
@@ -4195,7 +4214,7 @@ def _f2b_write_tak_jail_config(maxretry, findtime, bantime):
 @app.route('/api/fail2ban/status')
 @login_required
 def fail2ban_status_api():
-    """Return fail2ban jail status for the authentik jail."""
+    """Return fail2ban jail status for the authentik jail, plus version info."""
     if not _f2b_is_available():
         return jsonify({'available': False, 'error': 'fail2ban not installed'})
     try:
@@ -4207,6 +4226,7 @@ def fail2ban_status_api():
         status['forwarder_active'] = (subprocess.run(
             ['systemctl', 'is-active', 'authentik-log-forwarder'],
             capture_output=True, text=True).stdout.strip() == 'active')
+        status['version'] = _f2b_get_version()
         return jsonify(status)
     except Exception as e:
         return jsonify({'available': False, 'error': str(e)[:200]})
@@ -4346,6 +4366,124 @@ def fail2ban_tak_unban_api():
         return jsonify({'ok': False, 'error': r.stderr.strip()[:200] or 'Unban failed'}), 500
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+
+def _f2b_get_version():
+    """Return installed fail2ban version string, or None."""
+    try:
+        r = subprocess.run(['fail2ban-client', '--version'], capture_output=True, text=True, timeout=5)
+        lines = r.stdout.strip().splitlines()
+        return lines[0] if lines else None
+    except Exception:
+        return None
+
+def _f2b_get_available_version():
+    """Return the apt candidate version for fail2ban, or None."""
+    try:
+        r = subprocess.run(['apt-cache', 'policy', 'fail2ban'], capture_output=True, text=True, timeout=8)
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if line.startswith('Candidate:'):
+                return line.split(':', 1)[1].strip()
+    except Exception:
+        pass
+    return None
+
+# fail2ban install status dict (tracks background install progress)
+_f2b_install_status = {'running': False, 'log': [], 'done': False, 'ok': False}
+
+@app.route('/api/fail2ban/install', methods=['POST'])
+@login_required
+def fail2ban_install_api():
+    """Install fail2ban via the Marketplace. Runs in background; poll /api/fail2ban/install/status."""
+    global _f2b_install_status
+    if _f2b_install_status.get('running'):
+        return jsonify({'ok': False, 'error': 'Install already in progress'}), 400
+    if _f2b_is_available():
+        return jsonify({'ok': False, 'error': 'fail2ban is already installed'}), 400
+
+    _f2b_install_status = {'running': True, 'log': [], 'done': False, 'ok': False}
+
+    def _plog(msg):
+        _f2b_install_status['log'].append(msg)
+        print(f"fail2ban install: {msg}", flush=True)
+
+    def _run():
+        global _f2b_install_status
+        try:
+            ok1 = _fail2ban_install_and_configure(_plog)
+            if not ok1 and not _f2b_is_available():
+                _f2b_install_status.update({'running': False, 'done': True, 'ok': False})
+                return
+            _fail2ban_add_guarddog_hook(_plog)
+            _fail2ban_takserver_filter(_plog)
+            _f2b_install_status.update({'running': False, 'done': True, 'ok': True})
+        except Exception as e:
+            _plog(f"ERROR: {e}")
+            _f2b_install_status.update({'running': False, 'done': True, 'ok': False})
+
+    import threading
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({'ok': True, 'message': 'Install started'})
+
+@app.route('/api/fail2ban/install/status')
+@login_required
+def fail2ban_install_status_api():
+    """Poll install progress."""
+    return jsonify({
+        'running': _f2b_install_status.get('running', False),
+        'done':    _f2b_install_status.get('done', False),
+        'ok':      _f2b_install_status.get('ok', False),
+        'log':     _f2b_install_status.get('log', []),
+    })
+
+@app.route('/api/fail2ban/uninstall', methods=['POST'])
+@login_required
+def fail2ban_uninstall_api():
+    """Remove fail2ban, its configs, and clear settings.fail2ban_setup."""
+    log = []
+    def _plog(msg):
+        log.append(msg)
+        print(f"fail2ban uninstall: {msg}", flush=True)
+    try:
+        # Stop and disable services
+        subprocess.run(['systemctl', 'stop', 'fail2ban'], capture_output=True)
+        subprocess.run(['systemctl', 'disable', 'fail2ban'], capture_output=True)
+        subprocess.run(['systemctl', 'stop', 'authentik-log-forwarder'], capture_output=True)
+        subprocess.run(['systemctl', 'disable', 'authentik-log-forwarder'], capture_output=True)
+        _plog("Services stopped and disabled")
+        # Remove package
+        s = load_settings()
+        pkg_mgr = s.get('pkg_mgr', 'apt')
+        if pkg_mgr == 'apt':
+            subprocess.run(['apt-get', 'remove', '-y', 'fail2ban'], capture_output=True)
+        else:
+            subprocess.run(['yum', 'remove', '-y', 'fail2ban'], capture_output=True)
+        _plog("fail2ban package removed")
+        # Remove config files
+        for path in [
+            '/etc/fail2ban/jail.d/infratak-authentik.conf',
+            '/etc/fail2ban/jail.d/infratak-takserver.conf',
+            '/etc/fail2ban/filter.d/authentik.conf',
+            '/etc/fail2ban/filter.d/takserver.conf',
+            '/etc/fail2ban/action.d/infratak-guarddog.conf',
+            '/etc/fail2ban/action.d/infratak-guarddog-takserver.conf',
+            '/etc/systemd/system/authentik-log-forwarder.service',
+            '/usr/local/sbin/infratak-f2b-notify',
+        ]:
+            if os.path.exists(path):
+                os.remove(path)
+        subprocess.run(['systemctl', 'daemon-reload'], capture_output=True)
+        _plog("Config files and systemd unit removed")
+        # Clear settings
+        s2 = load_settings()
+        s2.pop('fail2ban_setup', None)
+        save_settings(s2)
+        _plog("Settings cleared")
+        return jsonify({'ok': True, 'log': log})
+    except Exception as e:
+        _plog(f"ERROR: {e}")
+        return jsonify({'ok': False, 'error': str(e)[:200], 'log': log}), 500
 
 
 def _parse_guarddog_log_date(line):
@@ -16974,20 +17112,26 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:\'DM Sans\'
 <div>
 <div style="display:flex;align-items:center;gap:12px;margin-bottom:6px">
 <img src="https://avatars.githubusercontent.com/u/1087378?s=128&v=4" alt="Fail2ban" style="height:40px;width:auto;border-radius:6px">
+<div>
 <span style="font-family:\'JetBrains Mono\',monospace;font-weight:700;font-size:20px">Fail2ban</span>
+<span id="f2b-version-badge" style="font-family:\'JetBrains Mono\',monospace;font-size:10px;color:var(--text-dim);margin-left:10px"></span>
 </div>
-<div style="font-size:13px;color:var(--text-dim)">Brute-force IP blocking for Authentik login events.</div>
+</div>
+<div style="font-size:13px;color:var(--text-dim)">Brute-force IP blocking for Authentik &amp; TAK Server.</div>
 </div>
 <span id="forwarder-badge" class="badge badge-yellow"><span class="dot"></span>Loading…</span>
 </div>
 
 {% if not installed %}
 <div class="not-installed-banner">
-<span class="material-symbols-outlined" style="font-size:40px;color:var(--accent);margin-bottom:12px;display:block">security</span>
-<div style="font-size:15px;font-weight:600;margin-bottom:8px">fail2ban not yet installed</div>
-<div style="font-size:13px;color:var(--text-dim);max-width:460px;margin:0 auto;line-height:1.6">
-fail2ban installs automatically on the next console restart once the v0.8.9 trusted-proxy prerequisite is confirmed. Check Settings for <code style="font-family:\'JetBrains Mono\',monospace;font-size:11px;background:rgba(255,255,255,.06);padding:2px 5px;border-radius:3px">authentik_trusted_proxy_cidrs_fix.last_outcome</code>.
+<img src="https://avatars.githubusercontent.com/u/1087378?s=128&v=4" alt="Fail2ban" style="height:56px;width:auto;border-radius:8px;margin-bottom:16px;display:block;margin-left:auto;margin-right:auto">
+<div style="font-size:15px;font-weight:600;margin-bottom:8px">fail2ban is not installed</div>
+<div style="font-size:13px;color:var(--text-dim);max-width:480px;margin:0 auto 20px;line-height:1.6">
+Blocks brute-force login attempts on Authentik and port scans on TAK Server.
+Bans IPs via UFW and sends Guard Dog email alerts.
 </div>
+<button id="install-btn" class="btn-primary" onclick="startInstall()" style="margin-bottom:16px">Install Fail2ban</button>
+<div id="install-log-box" style="display:none;background:#060910;border:1px solid var(--border);border-radius:8px;padding:14px;font-family:\'JetBrains Mono\',monospace;font-size:11px;color:var(--text-dim);max-height:220px;overflow-y:auto;white-space:pre-wrap;text-align:left;max-width:580px;margin:0 auto"></div>
 </div>
 {% else %}
 
@@ -17113,6 +17257,44 @@ function showToast(msg, type) {
   setTimeout(function(){ t.style.display = \'none\'; }, 3500);
 }
 
+{% if not installed %}
+var _installPoll = null;
+function startInstall() {
+  document.getElementById(\'install-btn\').disabled = true;
+  document.getElementById(\'install-btn\').textContent = \'Installing…\';
+  document.getElementById(\'install-log-box\').style.display = \'block\';
+  document.getElementById(\'install-log-box\').textContent = \'Starting installation…\\n\';
+  fetch(\'/api/fail2ban/install\', {method:\'POST\', headers:{\'Content-Type\':\'application/json\'}, body:\'{}\'})
+    .then(function(r){ return r.json(); }).then(function(d){
+      if (!d.ok) {
+        document.getElementById(\'install-log-box\').textContent += \'Error: \' + (d.error || \'Unknown error\');
+        document.getElementById(\'install-btn\').disabled = false;
+        document.getElementById(\'install-btn\').textContent = \'Install Fail2ban\';
+        return;
+      }
+      _installPoll = setInterval(pollInstall, 1500);
+    }).catch(function(){ document.getElementById(\'install-log-box\').textContent += \'Network error.\'; });
+}
+function pollInstall() {
+  fetch(\'/api/fail2ban/install/status\').then(function(r){ return r.json(); }).then(function(d){
+    var box = document.getElementById(\'install-log-box\');
+    box.textContent = (d.log || []).join(\'\\n\');
+    box.scrollTop = box.scrollHeight;
+    if (d.done) {
+      clearInterval(_installPoll);
+      if (d.ok) {
+        box.textContent += \'\\n✓ Installation complete — reloading…\';
+        setTimeout(function(){ window.location.reload(); }, 1500);
+      } else {
+        box.textContent += \'\\n✗ Installation failed. Check logs above.\';
+        document.getElementById(\'install-btn\').disabled = false;
+        document.getElementById(\'install-btn\').textContent = \'Retry Install\';
+      }
+    }
+  }).catch(function(){});
+}
+{% endif %}
+
 {% if installed %}
 function loadStatus() {
   fetch(\'/api/fail2ban/status\').then(r=>r.json()).then(d=>{
@@ -17125,6 +17307,8 @@ function loadStatus() {
     document.getElementById(\'stat-failed\').textContent = d.currently_failed || 0;
     document.getElementById(\'stat-total-banned\').textContent = d.total_banned || 0;
     document.getElementById(\'stat-total-failed\').textContent = d.total_failed || 0;
+    var vb = document.getElementById(\'f2b-version-badge\');
+    if (vb && d.version) vb.textContent = d.version;
 
     var fb = document.getElementById(\'forwarder-badge\');
     if (d.forwarder_active) {
@@ -32341,13 +32525,8 @@ def _startup_migrations():
         except Exception as ak_proxy_err:
             print(f"Startup migration: trusted proxy CIDRs fix error (non-fatal): {ak_proxy_err}")
 
-        # v0.9.0: Install and configure fail2ban for Authentik brute-force protection.
-        # Requires v0.8.9 trusted-proxy fix confirmed applied (guards internally).
-        # No-op on installs without Authentik. Idempotent.
-        try:
-            _fail2ban_install_and_configure(lambda m: print(f"Startup migration: {m}", flush=True))
-        except Exception as _f2b_err:
-            print(f"Startup migration: fail2ban setup error (non-fatal): {_f2b_err}")
+        # v0.9.0: fail2ban post-install config migrations (only run if fail2ban is already installed
+        # by the operator via the Marketplace — _fail2ban_install_and_configure is NOT auto-run).
         try:
             _fail2ban_add_guarddog_hook(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _f2b_gd_err:
@@ -32560,11 +32739,7 @@ def _post_update_auto_deploy():
             except Exception as _e:
                 print(f"Post-update: trusted proxy CIDRs fix skipped: {_e}")
 
-            # v0.9.0: Install and configure fail2ban (requires v0.8.9 trusted-proxy fix).
-            try:
-                _fail2ban_install_and_configure(lambda m: print(f"Post-update: {m}", flush=True))
-            except Exception as _f2b_err:
-                print(f"Post-update: fail2ban setup error (non-fatal): {_f2b_err}")
+            # v0.9.0: fail2ban post-install config migrations (only if already installed by operator).
             try:
                 _fail2ban_add_guarddog_hook(lambda m: print(f"Post-update: {m}", flush=True))
             except Exception as _f2b_gd_err:
