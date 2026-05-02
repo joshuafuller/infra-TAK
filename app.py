@@ -31678,14 +31678,18 @@ def _fail2ban_install_and_configure(plog):
 
 
 def _fail2ban_add_guarddog_hook(plog):
-    """Add Guard Dog notification action to fail2ban (v0.9.0 — idempotent).
+    """Add Guard Dog email notification + dashboard log hook to fail2ban (v0.9.0 — idempotent).
 
-    Writes /etc/fail2ban/action.d/infratak-guarddog.conf and updates the jail
-    config so every Authentik ban appends an ISO line to /var/log/takguard/restarts.log,
-    making the event visible on the Guard Dog dashboard.
+    1. Writes /usr/local/sbin/infratak-f2b-notify — a Python script that reads
+       guarddog_alert_email from settings.json and sends a ban alert via the
+       same localhost:25 Postfix relay that Guard Dog uses.
+    2. Writes /etc/fail2ban/action.d/infratak-guarddog.conf — appends an ISO
+       line to /var/log/takguard/restarts.log AND calls the email notify script.
+    3. Rewrites the jail config to include the infratak-guarddog action alongside ufw.
+    4. Reloads fail2ban.
 
-    Prerequisites: fail2ban must already be installed (/etc/fail2ban must exist).
-    Idempotent: skips if settings.fail2ban_setup.guarddog_hook == 'applied'.
+    Prerequisites: fail2ban must be installed (/etc/fail2ban must exist).
+    Idempotent: skips if settings.fail2ban_setup.guarddog_hook == 'applied_v2'.
     """
     import datetime as _dt3
     if not os.path.exists('/etc/fail2ban'):
@@ -31693,23 +31697,118 @@ def _fail2ban_add_guarddog_hook(plog):
         return False
 
     s = load_settings()
-    if s.get('fail2ban_setup', {}).get('guarddog_hook') == 'applied':
+    if s.get('fail2ban_setup', {}).get('guarddog_hook') == 'applied_v2':
         plog("fail2ban guarddog hook: idempotent-noop (already applied)")
         return False
 
-    plog("fail2ban guarddog hook: writing action file")
+    plog("fail2ban guarddog hook: writing email notify script and action file")
 
-    # Ensure the Guard Dog log directory exists (harmless if Guard Dog not yet installed)
+    # ── Step 1: Python email notification helper ───────────────────────────────
+    notify_script = r'''#!/usr/bin/env python3
+"""infratak-f2b-notify: email alert when fail2ban bans an IP (Authentik jail).
+Called by fail2ban action: infratak-f2b-notify <ip>
+Reads guarddog_alert_email + email_relay from infra-TAK settings.json.
+Sends via localhost:25 (same Postfix relay Guard Dog uses). Exits cleanly
+if email is not configured so fail2ban does not treat it as an error.
+"""
+import sys, os, json, smtplib, subprocess
+from email.mime.text import MIMEText
+from datetime import datetime, timezone
+
+
+def _find_settings():
+    """Locate settings.json by asking systemd for the console working dir."""
+    try:
+        r = subprocess.run(
+            ['systemctl', 'show', 'takwerx-console', '--property=WorkingDirectory'],
+            capture_output=True, text=True, timeout=5)
+        wd = r.stdout.strip().split('=', 1)[-1].strip()
+        if wd:
+            p = os.path.join(wd, '.config', 'settings.json')
+            if os.path.exists(p):
+                return p
+    except Exception:
+        pass
+    for d in ['/opt/infra-TAK', '/root/infra-TAK', '/home/ubuntu/infra-TAK',
+              '/home/admin/infra-TAK']:
+        p = os.path.join(d, '.config', 'settings.json')
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def main():
+    ip = sys.argv[1] if len(sys.argv) > 1 else 'unknown'
+    settings_path = _find_settings()
+    if not settings_path:
+        print("infratak-f2b-notify: settings.json not found — no email sent",
+              file=sys.stderr)
+        sys.exit(0)
+
+    try:
+        with open(settings_path) as f:
+            settings = json.load(f)
+    except Exception as e:
+        print(f"infratak-f2b-notify: could not read settings: {e}", file=sys.stderr)
+        sys.exit(0)
+
+    to_addr = (settings.get('guarddog_alert_email') or '').strip()
+    if not to_addr:
+        print("infratak-f2b-notify: guarddog_alert_email not set — no email sent",
+              file=sys.stderr)
+        sys.exit(0)
+
+    relay    = settings.get('email_relay', {})
+    from_addr = relay.get('from_addr', 'noreply@localhost')
+    from_name = relay.get('from_name', 'Guard Dog')
+    server_id = (settings.get('server_nickname') or
+                 settings.get('fqdn') or
+                 settings.get('server_ip', 'infra-TAK'))
+    ts = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+
+    subject = f'[{server_id}] fail2ban: Banned {ip}'
+    body = (
+        f'fail2ban has banned the following IP address:\n\n'
+        f'  IP:     {ip}\n'
+        f'  Server: {server_id}\n'
+        f'  Time:   {ts}\n'
+        f'  Reason: Too many failed Authentik login attempts\n\n'
+        f'To unban this IP, open your infra-TAK console → Fail2ban page.\n'
+    )
+
+    msg = MIMEText(body, 'plain', 'utf-8')
+    msg['From'] = f'{from_name} <{from_addr}>'
+    msg['To'] = to_addr
+    msg['Subject'] = subject
+
+    try:
+        with smtplib.SMTP('localhost', 25, timeout=15) as smtp:
+            smtp.sendmail(from_addr, [to_addr], msg.as_string())
+        print(f"infratak-f2b-notify: alert sent to {to_addr}", file=sys.stderr)
+    except Exception as e:
+        print(f"infratak-f2b-notify: email failed: {e}", file=sys.stderr)
+
+
+if __name__ == '__main__':
+    main()
+'''
+    notify_path = '/usr/local/sbin/infratak-f2b-notify'
+    with open(notify_path, 'w') as _f:
+        _f.write(notify_script)
+    os.chmod(notify_path, 0o755)
+    plog(f"fail2ban guarddog hook: wrote {notify_path}")
+
+    # ── Step 2: fail2ban action definition ────────────────────────────────────
+    # %% in ini = literal % after ConfigParser interpolation → shell %
+    # On actionban: write Guard Dog dashboard log line + send email alert
     os.makedirs('/var/log/takguard', exist_ok=True)
-
-    # Write the fail2ban action definition
-    # Note: %% in this ini file = literal % after ConfigParser interpolation → shell %
     action_conf = (
         "[Definition]\n"
-        "actionban  = mkdir -p /var/log/takguard && "
-        "echo \"`/bin/date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ` | "
-        "fail2ban: Banned <ip> (Authentik brute-force)\" "
-        ">> /var/log/takguard/restarts.log\n"
+        "actionban  = mkdir -p /var/log/takguard"
+        " && echo \"`/bin/date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ`"
+        " | fail2ban: Banned <ip> (Authentik brute-force)\""
+        " >> /var/log/takguard/restarts.log"
+        " ; /usr/bin/env python3 /usr/local/sbin/infratak-f2b-notify <ip>\n"
         "actionunban =\n"
     )
     action_path = '/etc/fail2ban/action.d/infratak-guarddog.conf'
@@ -31718,21 +31817,21 @@ def _fail2ban_add_guarddog_hook(plog):
         _f.write(action_conf)
     plog(f"fail2ban guarddog hook: wrote {action_path}")
 
-    # Rewrite jail config to include infratak-guarddog action
+    # ── Step 3: Rewrite jail config to include both ufw + infratak-guarddog ───
     cfg = _f2b_read_jail_config()
     _f2b_write_jail_config(cfg['maxretry'], cfg['findtime'], cfg['bantime'])
     plog("fail2ban guarddog hook: updated jail config with infratak-guarddog action")
 
-    # Reload fail2ban to pick up the new action
+    # ── Step 4: Reload fail2ban ───────────────────────────────────────────────
     subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
     plog("fail2ban guarddog hook: fail2ban reloaded")
 
-    # Record outcome
+    # ── Step 5: Record outcome ────────────────────────────────────────────────
     s2 = load_settings()
-    s2.setdefault('fail2ban_setup', {})['guarddog_hook'] = 'applied'
+    s2.setdefault('fail2ban_setup', {})['guarddog_hook'] = 'applied_v2'
     s2['fail2ban_setup']['guarddog_hook_applied_at'] = _dt3.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
     save_settings(s2)
-    plog("fail2ban guarddog hook: complete")
+    plog("fail2ban guarddog hook: complete — email alerts + dashboard log active")
     return True
 
 
