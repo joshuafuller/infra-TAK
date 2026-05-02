@@ -300,6 +300,20 @@ Each page has buttons that do specific things. Here's what they do and when to u
 
 ## Changelog
 
+### v0.8.9-alpha — 2026-05-01
+
+**Headline: Authentik security — real client IP fix (fleet-wide silent bug since the Caddy→Authentik wiring shipped).**
+- **THE BUG:** Every Authentik login event (successful, failed, timed-out) on every infra-TAK install has been recorded with `client_ip: "172.18.0.1"` — the Docker bridge gateway — instead of the real public IP of the user's device. Root cause: `AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS` defaults to "trust nothing" in Authentik. Caddy forwards `X-Forwarded-For` correctly but Authentik discards it. Same silent-default pattern as the v0.8.7 `AUTHENTIK_WEB__WORKERS` bug — same official docs page. Impact: audit logs wrong since the project began; Reputation policy (v0.9.0) would be useless; fail2ban would ban `172.18.0.1` (the Docker gateway) and DoS the entire stack.
+- **Fix:** NEW idempotent migration `_authentik_fix_trusted_proxy_cidrs(plog)` appends `AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS=172.16.0.0/12,127.0.0.1/32,::1/128` to `~/authentik/.env`. `172.16.0.0/12` covers all Docker bridge subnets fleet-wide. Idempotent — operator-set values are never overwritten. Triggers `_recreate_authentik_server_worker` (server+worker only, LDAP outpost untouched). Wired into `_startup_migrations` AND `_post_update_auto_deploy`; runs after the v0.8.8 recursion fix to batch restarts on old boxes. Persists `last_outcome` to `settings.authentik_trusted_proxy_cidrs_fix`.
+- **Verifier extended** — 4th probe reads `listen.trusted_proxy_cidrs` from `ak dump_config`, asserts `172.16.0.0/12` is present. Success log includes `trusted_proxy_cidrs=172.16.0.0/12`.
+- **Migration window:** ~35-60s on first upgrade (server+worker recreate + verifier run); sub-second no-op on every subsequent restart. LDAP outpost stays up — TAK Server clients and field users unaffected.
+- **Validated May 1 2026** on tak-10 and responder: `ak dump_config` confirms CIDRs loaded; `ak shell` query on `Event.objects.filter(action='login_failed')` returns real WAN IP `174.244.110.118` (not `172.18.0.1`). Overnight soak both boxes: `idempotent-noop` + verifier `pass`.
+- **No UI changes.** fail2ban and Authentik Reputation policy parked to v0.9.x — this fix is a prerequisite for both.
+
+Full notes: [docs/RELEASE-v0.8.9-alpha.md](docs/RELEASE-v0.8.9-alpha.md). Plan: [docs/PLAN-v0.8.9.md](docs/PLAN-v0.8.9.md).
+
+---
+
 ### v0.8.8-alpha — 2026-04-30
 
 **Headline: LDAP flow stage-binding recursion fix — latent fleet-wide bug since the LDAP feature shipped.**
