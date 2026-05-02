@@ -273,7 +273,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.8.8-alpha"
+VERSION = "0.8.9-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -21715,6 +21715,91 @@ def _authentik_apply_official_tunings(plog):
     return True
 
 
+def _authentik_fix_trusted_proxy_cidrs(plog):
+    """v0.8.9: Fix Authentik recording Docker bridge gateway IP instead of real client IP.
+
+    May 2026 discovery on takserver2: a deliberate failed login from a cellular phone
+    was recorded by Authentik as client_ip: "172.18.0.1" (the Docker bridge gateway),
+    not the phone's real public IP. Root cause: Authentik defaults to trusting NO
+    proxy headers — it discards X-Forwarded-For from Caddy and records the immediate
+    upstream (the Docker bridge) as the client IP.
+
+    This is the same silent-default pattern as the v0.8.7 AUTHENTIK_WEB__WORKERS bug:
+    a wrong default, silently in effect on every install since the Caddy→Authentik
+    wiring went in, only visible if you check.
+
+    Impact: every audit log, every Reputation policy decision (v0.9.0), and every
+    fail2ban jail that reads client_ip has been wrong on every infra-TAK install.
+
+    Reference: https://docs.goauthentik.io/install-config/configuration/
+    (AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS — same doc that surfaced the v0.8.7 bug)
+
+    Fix: set AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS=172.16.0.0/12,127.0.0.1/32,::1/128
+      - 172.16.0.0/12 covers all observed Docker bridge subnets fleet-wide
+        (172.17 default, 172.18 authentik, 172.19 tak-portal, 172.20 infratak, 172.21 cloudtak)
+      - 127.0.0.1/32 and ::1/128 cover loopback probes (Guard Dog health checks)
+
+    When applied: triggers _recreate_authentik_server_worker (server+worker only,
+    LDAP outpost untouched). Idempotent — no-op if key already present.
+
+    Returns True if .env was modified (caller should restart), False if no-op.
+    """
+    ak_dir = os.path.expanduser('~/authentik')
+    env_path = os.path.join(ak_dir, '.env')
+    if not os.path.exists(env_path):
+        plog("  trusted proxy CIDRs: ~/authentik/.env not found — skipping (Authentik not installed)")
+        return False
+
+    try:
+        with open(env_path) as f:
+            content = f.read()
+    except Exception as e:
+        plog(f"  trusted proxy CIDRs: read error: {e}")
+        return False
+
+    key = 'AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS'
+    value = '172.16.0.0/12,127.0.0.1/32,::1/128'
+
+    existing = next((ln for ln in content.splitlines() if re.match(rf'^{re.escape(key)}\s*=', ln)), None)
+    if existing is not None:
+        plog(f"  trusted proxy CIDRs: already set ({existing.strip()}) — idempotent-noop")
+        try:
+            s = load_settings()
+            cfg = s.get('authentik_trusted_proxy_cidrs_fix') or {}
+            cfg['last_check_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+            cfg['last_outcome'] = 'idempotent-noop'
+            cfg['last_value'] = existing.strip()
+            s['authentik_trusted_proxy_cidrs_fix'] = cfg
+            save_settings(s)
+        except Exception:
+            pass
+        return False
+
+    new_content = content.rstrip('\n') + f'\n{key}={value}\n'
+    try:
+        with open(env_path, 'w') as f:
+            f.write(new_content)
+        plog(f"  trusted proxy CIDRs: appended {key}={value}")
+        plog(f"    Authentik will now record real client IPs (not Docker bridge 172.18.0.1)")
+        plog(f"    This fixes audit logs, Reputation policy (v0.9.0), and future fail2ban jails")
+    except Exception as e:
+        plog(f"  trusted proxy CIDRs: write error (no changes applied): {e}")
+        return False
+
+    try:
+        s = load_settings()
+        cfg = s.get('authentik_trusted_proxy_cidrs_fix') or {}
+        cfg['last_check_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+        cfg['last_outcome'] = 'applied'
+        cfg['last_value'] = f'{key}={value}'
+        s['authentik_trusted_proxy_cidrs_fix'] = cfg
+        save_settings(s)
+    except Exception:
+        pass
+
+    return True
+
+
 def _authentik_verify_runtime_config(plog):
     """v0.8.7: Verify Authentik's runtime config matches what .env intends.
 
@@ -21722,11 +21807,12 @@ def _authentik_verify_runtime_config(plog):
     for 5 releases. We never knew because we never verified. This function closes
     the loop by reading what Authentik actually loaded at runtime.
 
-    Two probes:
-      1. `docker exec authentik-worker-1 ak dump_config` for cache.* and log_level
-         (the dump shows YAML config Authentik's Python code reads).
+    Three probes:
+      1. `docker exec authentik-worker-1 ak dump_config` for cache.*, log_level,
+         and listen.trusted_proxy_cidrs (the dump shows YAML config Authentik reads).
       2. `docker top authentik-server-1` to count actual gunicorn worker processes
          (web.workers is consumed by the launcher script, not visible in dump_config).
+      3. `SHOW idle_in_transaction_session_timeout` against Postgres (v0.8.8 addition).
 
     Persists pass/fail to settings.authentik_runtime_config_check for operator audit.
 
@@ -21830,13 +21916,32 @@ def _authentik_verify_runtime_config(plog):
             'expected': '300s', 'actual': '?', 'pass': False, 'error': str(_e)[:100]
         }
 
+    # v0.8.9 probe: trusted_proxy_cidrs. If Authentik is still recording 172.18.0.1
+    # for every login event, audit logs and future Reputation policy are wrong for every
+    # box in the fleet. dump_config exposes listen.trusted_proxy_cidrs at runtime.
+    try:
+        _cidrs_raw = get_path(cfg, 'listen.trusted_proxy_cidrs') if cfg else None
+        # Authentik may return a list or a comma-string depending on version.
+        _cidrs_str = ','.join(_cidrs_raw) if isinstance(_cidrs_raw, list) else (_cidrs_raw or '')
+        _has_docker_cidr = '172.16.0.0/12' in _cidrs_str
+        results['listen.trusted_proxy_cidrs'] = {
+            'expected': '172.16.0.0/12 (Docker bridge subnet)',
+            'actual': _cidrs_str or '(not set)',
+            'pass': _has_docker_cidr
+        }
+    except Exception as _e:
+        results['listen.trusted_proxy_cidrs'] = {
+            'expected': '172.16.0.0/12', 'actual': '?', 'pass': False, 'error': str(_e)[:100]
+        }
+
     fails = [k for k, v in results.items() if not v.get('pass')]
     if fails:
         plog(f"  authentik config verify: {len(fails)} mismatch(es):")
         for k in fails:
             plog(f"    {k}: expected={results[k]['expected']}, actual={results[k]['actual']}")
     else:
-        plog("  authentik config verify: all checks passed (workers=4, cache=600s, log_level=warning, pg_idle_timeout=300s)")
+        plog("  authentik config verify: all checks passed "
+             "(workers=4, cache=600s, log_level=warning, pg_idle_timeout=300s, trusted_proxy_cidrs=172.16.0.0/12)")
 
     try:
         s = load_settings()
@@ -30657,6 +30762,26 @@ def _startup_migrations():
             _authentik_fix_ldap_flow_recursion(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as ak_recursion_err:
             print(f"Startup migration: ldap flow recursion fix error (non-fatal): {ak_recursion_err}")
+
+        # v0.8.9: Fix Authentik recording Docker bridge IP (172.18.0.1) instead of real
+        # client IP. Every infra-TAK install since the Caddy→Authentik wiring went in has
+        # been logging the wrong IP in every audit event. Sets
+        # AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS=172.16.0.0/12,127.0.0.1/32,::1/128 in
+        # ~/authentik/.env and recreates server+worker (LDAP outpost untouched).
+        # Runs AFTER the recursion fix so only one server restart is needed on old boxes.
+        try:
+            if os.path.exists(os.path.expanduser('~/authentik/.env')):
+                _proxy_changed = _authentik_fix_trusted_proxy_cidrs(lambda m: print(f"Startup migration: {m}", flush=True))
+                if _proxy_changed:
+                    print("Startup migration: trusted proxy CIDRs applied — recreating server+worker", flush=True)
+                    _recreate_authentik_server_worker(
+                        lambda m: print(f"Startup migration: {m}", flush=True),
+                        reason='trusted-proxy-cidrs-migration'
+                    )
+                    time.sleep(15)
+                    _authentik_verify_runtime_config(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as ak_proxy_err:
+            print(f"Startup migration: trusted proxy CIDRs fix error (non-fatal): {ak_proxy_err}")
     except Exception as e:
         print(f"Startup migration error: {e}")
         import traceback; traceback.print_exc()
@@ -30843,6 +30968,23 @@ def _post_update_auto_deploy():
                     _authentik_fix_ldap_flow_recursion(lambda m: print(f"Post-update: {m}", flush=True))
             except Exception as _e:
                 print(f"Post-update: ldap flow recursion fix skipped: {_e}")
+
+            # v0.8.9: Fix Authentik recording Docker bridge IP instead of real client IP.
+            # Runs after the recursion fix so any server+worker recreate is batched. The
+            # recreate here is lightweight (env-var change only; no Postgres touch).
+            try:
+                if os.path.exists(os.path.expanduser('~/authentik/.env')):
+                    _proxy_changed = _authentik_fix_trusted_proxy_cidrs(lambda m: print(f"Post-update: {m}", flush=True))
+                    if _proxy_changed:
+                        print("Post-update: trusted proxy CIDRs applied — recreating server+worker", flush=True)
+                        _recreate_authentik_server_worker(
+                            lambda m: print(f"Post-update: {m}", flush=True),
+                            reason='trusted-proxy-cidrs-migration'
+                        )
+                        time.sleep(15)
+                        _authentik_verify_runtime_config(lambda m: print(f"Post-update: {m}", flush=True))
+            except Exception as _e:
+                print(f"Post-update: trusted proxy CIDRs fix skipped: {_e}")
 
             # Re-deploy Guard Dog (updated scripts + timers)
             if os.path.exists('/opt/tak-guarddog') and os.path.exists('/opt/tak'):
