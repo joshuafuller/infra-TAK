@@ -588,6 +588,7 @@ NODERED_LOGO_URL_2 = "https://nodered.org/about/resources/media/node-red-icon-2.
 AUTHENTIK_LOGO_URL = "https://raw.githubusercontent.com/goauthentik/authentik/main/web/icons/icon_left_brand.png"
 # Caddy official logo for dark backgrounds — white text (Wikimedia Commons)
 CADDY_LOGO_URL = "https://upload.wikimedia.org/wikipedia/commons/5/56/Caddyserver_logo_dark.svg"
+FAIL2BAN_LOGO_URL = "https://avatars.githubusercontent.com/u/30953?s=128&v=4"
 # TAK (Team Awareness Kit) official brand logo from tak.gov
 TAK_LOGO_URL = "https://tak.gov/assets/logos/brand-06b80939.svg"
 # Login page logo: put your TAKWERX logo at static/takwerx-logo.png
@@ -920,7 +921,7 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
     parts.append(link('/console', '<span class="nav-icon material-symbols-outlined">dashboard</span>Console'))
     parts.append(link('/firewall', '<span class="nav-icon material-symbols-outlined">shield_locked</span>Firewall'))
     if os.path.exists('/etc/fail2ban'):
-        parts.append(link('/fail2ban', '<span class="nav-icon material-symbols-outlined">block</span>Fail2ban'))
+        parts.append(link('/fail2ban', f'<img src="{html.escape(FAIL2BAN_LOGO_URL)}" alt="Fail2ban" class="nav-icon" style="height:24px;width:auto;max-width:72px;object-fit:contain;display:block"><span>Fail2ban</span>', 'Fail2ban'))
     gd = modules.get('guarddog', {})
     if gd.get('installed'):
         parts.append(link('/guarddog', '<span class="nav-icon" style="font-size:22px;line-height:1">🐕</span><span>Guard Dog</span>', 'Guard Dog'))
@@ -4133,6 +4134,9 @@ def _f2b_write_jail_config(maxretry, findtime, bantime):
     """Rewrite the infratak-authentik jail config with new thresholds."""
     jail_path = '/etc/fail2ban/jail.d/infratak-authentik.conf'
     os.makedirs('/etc/fail2ban/jail.d', exist_ok=True)
+    guarddog_action = ""
+    if os.path.exists('/etc/fail2ban/action.d/infratak-guarddog.conf'):
+        guarddog_action = "\n         infratak-guarddog"
     jail_conf = (
         "[authentik]\n"
         "enabled  = true\n"
@@ -4141,7 +4145,7 @@ def _f2b_write_jail_config(maxretry, findtime, bantime):
         f"maxretry = {maxretry}\n"
         f"findtime = {findtime}\n"
         f"bantime  = {bantime}\n"
-        "action   = ufw\n"
+        f"action   = ufw{guarddog_action}\n"
     )
     with open(jail_path, 'w') as _f:
         _f.write(jail_conf)
@@ -16849,7 +16853,10 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:\'DM Sans\'
 <div class="main">
 <div style="margin-bottom:28px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
 <div>
-<div style="font-family:\'JetBrains Mono\',monospace;font-weight:700;font-size:20px;margin-bottom:6px">Fail2ban</div>
+<div style="display:flex;align-items:center;gap:12px;margin-bottom:6px">
+<img src="https://avatars.githubusercontent.com/u/30953?s=128&v=4" alt="Fail2ban" style="height:40px;width:auto;border-radius:6px">
+<span style="font-family:\'JetBrains Mono\',monospace;font-weight:700;font-size:20px">Fail2ban</span>
+</div>
 <div style="font-size:13px;color:var(--text-dim)">Brute-force IP blocking for Authentik login events.</div>
 </div>
 <span id="forwarder-badge" class="badge badge-yellow"><span class="dot"></span>Loading…</span>
@@ -16894,13 +16901,13 @@ fail2ban installs automatically on the next console restart once the v0.8.9 trus
 <div class="form-hint">Failed logins before ban</div>
 </div>
 <div class="form-row" style="margin-bottom:0">
-<label class="form-label">Find Window (seconds)</label>
-<input class="form-input" id="cfg-findtime" type="number" min="60" max="86400" value="600">
+<label class="form-label">Find Window (minutes)</label>
+<input class="form-input" id="cfg-findtime" type="number" min="1" max="1440" value="10">
 <div class="form-hint">Time window to count failures</div>
 </div>
 <div class="form-row" style="margin-bottom:0">
-<label class="form-label">Ban Duration (seconds)</label>
-<input class="form-input" id="cfg-bantime" type="number" min="60" max="2592000" value="3600">
+<label class="form-label">Ban Duration (minutes)</label>
+<input class="form-input" id="cfg-bantime" type="number" min="1" max="43200" value="60">
 <div class="form-hint">How long to ban the IP</div>
 </div>
 </div>
@@ -16954,13 +16961,13 @@ function loadStatus() {
 
     var cfg = d.jail_config || {};
     if (cfg.maxretry) document.getElementById(\'cfg-maxretry\').value = cfg.maxretry;
-    if (cfg.findtime) document.getElementById(\'cfg-findtime\').value = cfg.findtime;
-    if (cfg.bantime)  document.getElementById(\'cfg-bantime\').value  = cfg.bantime;
+    if (cfg.findtime) document.getElementById(\'cfg-findtime\').value = Math.round(cfg.findtime / 60);
+    if (cfg.bantime)  document.getElementById(\'cfg-bantime\').value  = Math.round(cfg.bantime / 60);
 
     var ips = d.banned_ips || [];
     var c = document.getElementById(\'ban-list-container\');
     if (!ips.length) {
-      c.innerHTML = \'<div style="color:var(--text-dim);font-size:13px;font-family:\'JetBrains Mono\',monospace;padding:8px 0">No IPs currently banned.</div>\';
+      c.innerHTML = \'<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:8px 0">No IPs currently banned.</div>\';
     } else {
       var rows = ips.map(ip =>
         \'<tr><td>\' + ip + \'</td><td><button class="btn-danger-sm" onclick="unbanIP(\\\'\'+ ip +\'\\\')">\' +
@@ -16986,8 +16993,8 @@ function loadLog() {
 function saveConfig() {
   var body = {
     maxretry: parseInt(document.getElementById(\'cfg-maxretry\').value) || 5,
-    findtime: parseInt(document.getElementById(\'cfg-findtime\').value) || 600,
-    bantime:  parseInt(document.getElementById(\'cfg-bantime\').value)  || 3600
+    findtime: (parseInt(document.getElementById(\'cfg-findtime\').value) || 10) * 60,
+    bantime:  (parseInt(document.getElementById(\'cfg-bantime\').value)  || 60) * 60
   };
   fetch(\'/api/fail2ban/config\', {method:\'POST\', headers:{\'Content-Type\':\'application/json\'}, body:JSON.stringify(body)})
     .then(r=>r.json()).then(d=>{
@@ -31670,6 +31677,65 @@ def _fail2ban_install_and_configure(plog):
     return True
 
 
+def _fail2ban_add_guarddog_hook(plog):
+    """Add Guard Dog notification action to fail2ban (v0.9.0 — idempotent).
+
+    Writes /etc/fail2ban/action.d/infratak-guarddog.conf and updates the jail
+    config so every Authentik ban appends an ISO line to /var/log/takguard/restarts.log,
+    making the event visible on the Guard Dog dashboard.
+
+    Prerequisites: fail2ban must already be installed (/etc/fail2ban must exist).
+    Idempotent: skips if settings.fail2ban_setup.guarddog_hook == 'applied'.
+    """
+    import datetime as _dt3
+    if not os.path.exists('/etc/fail2ban'):
+        plog("fail2ban guarddog hook: SKIPPED — fail2ban not installed yet")
+        return False
+
+    s = load_settings()
+    if s.get('fail2ban_setup', {}).get('guarddog_hook') == 'applied':
+        plog("fail2ban guarddog hook: idempotent-noop (already applied)")
+        return False
+
+    plog("fail2ban guarddog hook: writing action file")
+
+    # Ensure the Guard Dog log directory exists (harmless if Guard Dog not yet installed)
+    os.makedirs('/var/log/takguard', exist_ok=True)
+
+    # Write the fail2ban action definition
+    # Note: %% in this ini file = literal % after ConfigParser interpolation → shell %
+    action_conf = (
+        "[Definition]\n"
+        "actionban  = mkdir -p /var/log/takguard && "
+        "echo \"`/bin/date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ` | "
+        "fail2ban: Banned <ip> (Authentik brute-force)\" "
+        ">> /var/log/takguard/restarts.log\n"
+        "actionunban =\n"
+    )
+    action_path = '/etc/fail2ban/action.d/infratak-guarddog.conf'
+    os.makedirs('/etc/fail2ban/action.d', exist_ok=True)
+    with open(action_path, 'w') as _f:
+        _f.write(action_conf)
+    plog(f"fail2ban guarddog hook: wrote {action_path}")
+
+    # Rewrite jail config to include infratak-guarddog action
+    cfg = _f2b_read_jail_config()
+    _f2b_write_jail_config(cfg['maxretry'], cfg['findtime'], cfg['bantime'])
+    plog("fail2ban guarddog hook: updated jail config with infratak-guarddog action")
+
+    # Reload fail2ban to pick up the new action
+    subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+    plog("fail2ban guarddog hook: fail2ban reloaded")
+
+    # Record outcome
+    s2 = load_settings()
+    s2.setdefault('fail2ban_setup', {})['guarddog_hook'] = 'applied'
+    s2['fail2ban_setup']['guarddog_hook_applied_at'] = _dt3.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+    save_settings(s2)
+    plog("fail2ban guarddog hook: complete")
+    return True
+
+
 # === Startup migrations: fix known bad settings and regenerate Caddy if needed ===
 def _startup_migrations():
     try:
@@ -31807,6 +31873,10 @@ def _startup_migrations():
             _fail2ban_install_and_configure(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _f2b_err:
             print(f"Startup migration: fail2ban setup error (non-fatal): {_f2b_err}")
+        try:
+            _fail2ban_add_guarddog_hook(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _f2b_gd_err:
+            print(f"Startup migration: fail2ban guarddog hook error (non-fatal): {_f2b_gd_err}")
     except Exception as e:
         print(f"Startup migration error: {e}")
         import traceback; traceback.print_exc()
@@ -32016,6 +32086,10 @@ def _post_update_auto_deploy():
                 _fail2ban_install_and_configure(lambda m: print(f"Post-update: {m}", flush=True))
             except Exception as _f2b_err:
                 print(f"Post-update: fail2ban setup error (non-fatal): {_f2b_err}")
+            try:
+                _fail2ban_add_guarddog_hook(lambda m: print(f"Post-update: {m}", flush=True))
+            except Exception as _f2b_gd_err:
+                print(f"Post-update: fail2ban guarddog hook error (non-fatal): {_f2b_gd_err}")
 
             # Re-deploy Guard Dog (updated scripts + timers)
             if os.path.exists('/opt/tak-guarddog') and os.path.exists('/opt/tak'):
