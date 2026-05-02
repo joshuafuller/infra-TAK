@@ -10513,6 +10513,27 @@ def _get_mediamtx_version_info():
     return out
 
 
+def _get_fail2ban_version_info():
+    """Return {version, update_available, latest} for the fail2ban console card."""
+    import re as _re_f2bv
+    installed_raw = _f2b_get_version()  # e.g. "Fail2Ban v1.1.0"
+    installed = None
+    if installed_raw:
+        m = _re_f2bv.search(r'v?(\d[\d.]+)', installed_raw)
+        installed = m.group(1) if m else None
+    available = _f2b_get_available_version()  # e.g. "1.1.0-1"
+    update_available = False
+    if installed and available:
+        av_clean = available.split('-')[0].split('+')[0]
+        try:
+            def _tv(v):
+                return tuple(int(p) for p in v.split('.')[:3])
+            update_available = _tv(av_clean) > _tv(installed)
+        except Exception:
+            pass
+    return {'version': installed, 'update_available': update_available, 'latest': available}
+
+
 def get_all_module_versions():
     """Return dict of module_key -> {version, update_available, latest?} for console cards."""
     modules = detect_modules()
@@ -10541,6 +10562,8 @@ def get_all_module_versions():
         result['takserver'] = _get_takserver_version_info()
     if modules.get('fedhub', {}).get('installed'):
         result['fedhub'] = _get_fedhub_version_info()
+    if modules.get('fail2ban', {}).get('installed'):
+        result['fail2ban'] = _get_fail2ban_version_info()
     # Guard Dog: version/update follow infra-TAK (scripts ship with console; "Update Guard Dog" uses same codebase)
     if modules.get('guarddog', {}).get('installed'):
         gd_latest = update_cache.get('latest')
