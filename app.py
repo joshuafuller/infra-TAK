@@ -17215,6 +17215,8 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:\'DM Sans\'
 .dot-pulse{animation:pulse 2s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
 @keyframes f2b-spin{to{transform:rotate(360deg)}}
+.ip-chip{display:inline-flex;align-items:center;gap:5px;background:rgba(6,182,212,0.08);border:1px solid rgba(6,182,212,0.25);color:var(--cyan);font-family:monospace;font-size:11px;padding:3px 8px;border-radius:4px}
+.ip-chip button{background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:12px;padding:0;line-height:1}.ip-chip button:hover{color:var(--red)}
 .not-installed-banner{background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.25);border-radius:12px;padding:28px;text-align:center;margin-bottom:24px}
 .toast{position:fixed;bottom:24px;right:24px;padding:12px 20px;border-radius:8px;font-family:\'JetBrains Mono\',monospace;font-size:13px;z-index:9999;display:none}
 .toast.success{background:rgba(16,185,129,.15);border:1px solid rgba(16,185,129,.4);color:var(--green)}
@@ -17290,8 +17292,9 @@ Bans IPs via UFW and sends Guard Dog email alerts.
 </div>
 <div class="form-row" style="margin-top:16px;margin-bottom:0">
 <label class="form-label">Whitelist (ignoreip)</label>
-<input class="form-input" id="cfg-ignoreip" type="text" placeholder="e.g. 192.168.1.10 10.0.0.0/24" style="font-family:monospace">
-<div class="form-hint">Space-separated IPs / CIDRs that Fail2ban will never ban. localhost is always exempt.</div>
+<input class="form-input" id="cfg-ignoreip" type="text" placeholder="e.g. 192.168.1.10 10.0.0.0/24" style="font-family:monospace" oninput="renderChips(\'cfg-ignoreip\',\'cfg-ignoreip-chips\')">
+<div class="form-hint">Space-separated IPs / CIDRs — localhost is always exempt. Type or paste, then Save &amp; Reload.</div>
+<div id="cfg-ignoreip-chips" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px"></div>
 </div>
 <div style="margin-top:16px">
 <button class="btn-primary" onclick="saveConfig()">Save &amp; Reload</button>
@@ -17375,8 +17378,9 @@ TAK Server filter not yet installed — restart the console to complete setup.
 </div>
 <div class="form-row" style="margin-top:16px;margin-bottom:0">
 <label class="form-label">Whitelist (ignoreip)</label>
-<input class="form-input" id="tak-cfg-ignoreip" type="text" placeholder="e.g. 192.168.1.10 10.0.0.0/24" style="font-family:monospace">
-<div class="form-hint">Space-separated IPs / CIDRs that Fail2ban will never ban. localhost is always exempt.</div>
+<input class="form-input" id="tak-cfg-ignoreip" type="text" placeholder="e.g. 192.168.1.10 10.0.0.0/24" style="font-family:monospace" oninput="renderChips(\'tak-cfg-ignoreip\',\'tak-cfg-ignoreip-chips\')">
+<div class="form-hint">Space-separated IPs / CIDRs — localhost is always exempt. Type or paste, then Save &amp; Reload.</div>
+<div id="tak-cfg-ignoreip-chips" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px"></div>
 </div>
 <div style="margin-top:16px">
 <button class="btn-primary" onclick="saveTakConfig()">Save &amp; Reload</button>
@@ -17393,6 +17397,26 @@ function showToast(msg, type) {
   var t = document.getElementById(\'toast\');
   t.textContent = msg; t.className = \'toast \' + type; t.style.display = \'block\';
   setTimeout(function(){ t.style.display = \'none\'; }, 3500);
+}
+
+function renderChips(inputId, chipsId) {
+  var input = document.getElementById(inputId);
+  var container = document.getElementById(chipsId);
+  if (!input || !container) return;
+  var ips = input.value.trim().split(/\s+/).filter(function(s){ return s.length > 0; });
+  if (!ips.length) { container.innerHTML = \'\'; return; }
+  container.innerHTML = ips.map(function(ip) {
+    return \'<span class="ip-chip">\' + ip +
+      \'<button title="Remove" onclick="removeChip(\\\'\'+ inputId +\'\\\',\\\'\'+ chipsId +\'\\\',\\\'\'+ ip +\'\\\')">&times;</button></span>\';
+  }).join(\'\');
+}
+
+function removeChip(inputId, chipsId, ip) {
+  var input = document.getElementById(inputId);
+  if (!input) return;
+  var ips = input.value.trim().split(/\s+/).filter(function(s){ return s.length > 0 && s !== ip; });
+  input.value = ips.join(\' \');
+  renderChips(inputId, chipsId);
 }
 
 {% if not installed %}
@@ -17485,7 +17509,10 @@ function loadStatus(cb) {
     if (cfg.findtime) document.getElementById(\'cfg-findtime\').value = Math.round(cfg.findtime / 60);
     if (cfg.bantime)  document.getElementById(\'cfg-bantime\').value  = Math.round(cfg.bantime / 60);
     var ignoreipEl = document.getElementById(\'cfg-ignoreip\');
-    if (ignoreipEl) ignoreipEl.value = (cfg.ignoreip || \'\').replace(/127\\.0\\.0\\.1\\/8\\s*::1\\s*/,\'\').trim();
+    if (ignoreipEl) {
+      ignoreipEl.value = (cfg.ignoreip || \'\').replace(/127\\.0\\.0\\.1\\/8\\s*::1\\s*/,\'\').trim();
+      renderChips(\'cfg-ignoreip\', \'cfg-ignoreip-chips\');
+    }
 
     var ips = d.banned_ips || [];
     var c = document.getElementById(\'ban-list-container\');
@@ -17668,7 +17695,10 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
         if (cfg.findtime) document.getElementById(\'tak-cfg-findtime\').value = Math.round(cfg.findtime / 60);
         if (cfg.bantime)  document.getElementById(\'tak-cfg-bantime\').value  = Math.round(cfg.bantime  / 60);
         var takIgnoreipEl = document.getElementById(\'tak-cfg-ignoreip\');
-        if (takIgnoreipEl) takIgnoreipEl.value = (cfg.ignoreip || \'\').replace(/127\\.0\\.0\\.1\\/8\\s*::1\\s*/,\'\').trim();
+        if (takIgnoreipEl) {
+          takIgnoreipEl.value = (cfg.ignoreip || \'\').replace(/127\\.0\\.0\\.1\\/8\\s*::1\\s*/,\'\').trim();
+          renderChips(\'tak-cfg-ignoreip\', \'tak-cfg-ignoreip-chips\');
+        }
         var ips = d.banned_ips || [];
         var c = document.getElementById(\'tak-ban-list-container\');
         if (!ips.length) {
