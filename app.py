@@ -855,6 +855,18 @@ def render_custom_banner(settings):
             ":wght@600;700;800&display=swap');"
         )
 
+    # Server identity sub-line (IP | FQDN)
+    _ip = html.escape((settings.get('server_ip') or '').strip())
+    _fqdn = html.escape((settings.get('fqdn') or '').split(':')[0].strip())
+    if _ip and _fqdn:
+        _id_str = f'{_ip} | {_fqdn}'
+    else:
+        _id_str = _ip or _fqdn
+    identity_html = (
+        f'<span class="custom-banner-sub">{_id_str}</span>'
+        if _id_str else ''
+    )
+
     if logo_b64:
         logo_img = (
             f'<img src="{html.escape(logo_b64)}" alt="Agency Logo" '
@@ -880,11 +892,13 @@ def render_custom_banner(settings):
         'text-align:center'
         '}'
         '.custom-banner-text{flex:1;text-align:center;overflow:hidden;'
-        'white-space:nowrap;text-overflow:ellipsis}'
+        'display:flex;flex-direction:column;align-items:center;gap:3px}'
+        '.custom-banner-sub{font-size:11px;font-weight:400;opacity:.6;'
+        'letter-spacing:.04em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}'
         '</style>'
         '<div class="custom-banner">'
         f'{logo_img}'
-        f'<span class="custom-banner-text">{text}</span>'
+        f'<span class="custom-banner-text">{text}{identity_html}</span>'
         f'{logo_img}'
         '</div>'
     )
@@ -30302,7 +30316,14 @@ Useful for operators managing multiple infra-TAK instances.
 <div class="form-label">Live Preview</div>
 <div class="banner-preview" id="banner-preview">
 <span id="preview-logo-left" class="preview-logo-holder"></span>
-<span class="banner-preview-text" id="preview-text">{{ customization.get(\'banner_text\', \'\') | e }}</span>
+<span class="banner-preview-text" id="preview-text-wrap" style="display:flex;flex-direction:column;align-items:center;gap:3px">
+<span id="preview-text">{{ customization.get(\'banner_text\', \'\') | e }}</span>
+{% if settings.get(\'server_ip\') or settings.get(\'fqdn\') %}
+<span style="font-size:11px;font-weight:400;opacity:.6;letter-spacing:.04em">
+  {{ settings.get(\'server_ip\',\'\') }}{% if settings.get(\'server_ip\') and settings.get(\'fqdn\') %} | {% endif %}{{ settings.get(\'fqdn\',\'\').split(\':\')[0] }}
+</span>
+{% endif %}
+</span>
 <span id="preview-logo-right" class="preview-logo-holder"></span>
 </div>
 </div>
