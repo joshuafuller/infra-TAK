@@ -843,6 +843,10 @@ def render_custom_banner(settings):
     if not _re_banner.match(r'^#[0-9a-fA-F]{3,8}$', banner_color):
         banner_color = '#f1f5f9'
 
+    # Font size — small/medium/large presets
+    _size_map = {'small': 14, 'medium': 20, 'large': 28}
+    font_size = _size_map.get(cust.get('banner_size', 'medium'), 20)
+
     # Import Orbitron from Google Fonts if selected (not in BASE_CSS by default)
     font_import = ''
     if font_key == 'Orbitron':
@@ -871,7 +875,7 @@ def render_custom_banner(settings):
         'padding:0 24px;'
         'background:var(--bg-surface,#0f1219);'
         'border-bottom:2px solid var(--border,rgba(59,130,246,.15));'
-        f'font-family:{font_family};font-weight:700;font-size:15px;'
+        f'font-family:{font_family};font-weight:700;font-size:{font_size}px;'
         f'letter-spacing:.07em;color:{banner_color};'
         'text-align:center'
         '}'
@@ -1723,12 +1727,16 @@ def customization_settings_post():
     banner_color = str(data.get('banner_color', '#f1f5f9')).strip()
     if not _re_cust.match(r'^#[0-9a-fA-F]{3,8}$', banner_color):
         banner_color = '#f1f5f9'
+    banner_size = str(data.get('banner_size', 'medium'))
+    if banner_size not in ('small', 'medium', 'large'):
+        banner_size = 'medium'
     s = load_settings()
     cust = s.setdefault('customization', {})
     cust['banner_enabled'] = banner_enabled
     cust['banner_text'] = banner_text
     cust['banner_font'] = banner_font
     cust['banner_color'] = banner_color
+    cust['banner_size'] = banner_size
     save_settings(s)
     return jsonify({'ok': True})
 
@@ -30264,6 +30272,15 @@ Useful for operators managing multiple infra-TAK instances.
 </div>
 
 <div class="form-row">
+<div class="form-label">Text Size</div>
+<div style="display:flex;gap:8px;margin-top:4px">
+<button class="font-btn" id="size-btn-small"  onclick="selectSize(\'small\')"  style="font-size:11px">Small</button>
+<button class="font-btn" id="size-btn-medium" onclick="selectSize(\'medium\')" style="font-size:13px">Medium</button>
+<button class="font-btn" id="size-btn-large"  onclick="selectSize(\'large\')"  style="font-size:16px">Large</button>
+</div>
+</div>
+
+<div class="form-row">
 <div class="form-label">Text Color</div>
 <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:6px">
 <button class="color-swatch" title="White" data-color="#f1f5f9" style="background:#f1f5f9" onclick="selectColor(\'#f1f5f9\',this)"></button>
@@ -30334,6 +30351,8 @@ If no logo is uploaded, the infra-TAK mark is used instead.
 
 var _currentFont  = {{ customization.get(\'banner_font\', \'JetBrains Mono\') | tojson }};
 var _currentColor = {{ customization.get(\'banner_color\', \'#f1f5f9\') | tojson }};
+var _currentSize  = {{ customization.get(\'banner_size\', \'medium\') | tojson }};
+var _sizePxMap = {\'small\': \'14px\', \'medium\': \'20px\', \'large\': \'28px\'};
 var _fontFamilyMap = {
   \'JetBrains Mono\': "\'JetBrains Mono\', monospace",
   \'Orbitron\':       "\'Orbitron\', sans-serif",
@@ -30347,6 +30366,7 @@ var _fontFamilyMap = {
   setPreviewLogos(b64);
   setFontActive(_currentFont);
   setColorActive(_currentColor);
+  setSizeActive(_currentSize);
   updatePreview();
 })();
 
@@ -30364,6 +30384,20 @@ function updatePreview() {
   document.getElementById(\'preview-text\').textContent = t;
   p.style.fontFamily = _fontFamilyMap[_currentFont] || "\'JetBrains Mono\', monospace";
   p.style.color = _currentColor;
+  p.style.fontSize = _sizePxMap[_currentSize] || \'20px\';
+}
+
+function selectSize(size) {
+  _currentSize = size;
+  setSizeActive(size);
+  updatePreview();
+}
+
+function setSizeActive(size) {
+  [\'small\', \'medium\', \'large\'].forEach(function(k){
+    var el = document.getElementById(\'size-btn-\' + k);
+    if (el) el.classList.toggle(\'active\', k === size);
+  });
 }
 
 function selectFont(font) {
@@ -30422,7 +30456,8 @@ function saveBanner() {
       banner_enabled: document.getElementById(\'banner-enabled\').checked,
       banner_text: document.getElementById(\'banner-text\').value.trim(),
       banner_font: _currentFont,
-      banner_color: _currentColor
+      banner_color: _currentColor,
+      banner_size: _currentSize
     })
   }).then(r => r.json()).then(d => {
     if (d.ok) { showToast(\'Banner settings saved.\', \'success\'); setTimeout(()=>location.reload(),600); }
