@@ -4132,9 +4132,9 @@ def _f2b_parse_status(raw):
     return result
 
 def _f2b_read_jail_config():
-    """Read current thresholds from the infratak-authentik jail config file."""
+    """Read current thresholds and ignoreip from the infratak-authentik jail config file."""
     jail_path = '/etc/fail2ban/jail.d/infratak-authentik.conf'
-    cfg = {'maxretry': 5, 'findtime': 600, 'bantime': 3600}
+    cfg = {'maxretry': 5, 'findtime': 600, 'bantime': 3600, 'ignoreip': ''}
     if not os.path.exists(jail_path):
         return cfg
     try:
@@ -4145,17 +4145,20 @@ def _f2b_read_jail_config():
                     if line.startswith(key):
                         try: cfg[key] = int(line.split('=')[1].strip())
                         except Exception: pass
+                if line.startswith('ignoreip'):
+                    cfg['ignoreip'] = line.split('=', 1)[1].strip()
     except Exception:
         pass
     return cfg
 
-def _f2b_write_jail_config(maxretry, findtime, bantime):
-    """Rewrite the infratak-authentik jail config with new thresholds."""
+def _f2b_write_jail_config(maxretry, findtime, bantime, ignoreip=''):
+    """Rewrite the infratak-authentik jail config with new thresholds and ignoreip whitelist."""
     jail_path = '/etc/fail2ban/jail.d/infratak-authentik.conf'
     os.makedirs('/etc/fail2ban/jail.d', exist_ok=True)
     guarddog_action = ""
     if os.path.exists('/etc/fail2ban/action.d/infratak-guarddog.conf'):
         guarddog_action = "\n         infratak-guarddog"
+    ignoreip_line = f"ignoreip = 127.0.0.1/8 ::1{' ' + ignoreip.strip() if ignoreip.strip() else ''}\n"
     jail_conf = (
         "[authentik]\n"
         "enabled  = true\n"
@@ -4164,6 +4167,7 @@ def _f2b_write_jail_config(maxretry, findtime, bantime):
         f"maxretry = {maxretry}\n"
         f"findtime = {findtime}\n"
         f"bantime  = {bantime}\n"
+        f"{ignoreip_line}"
         f"action   = ufw{guarddog_action}\n"
     )
     with open(jail_path, 'w') as _f:
@@ -4174,9 +4178,9 @@ def _f2b_tak_jail_enabled():
     return os.path.exists('/etc/fail2ban/jail.d/infratak-takserver.conf')
 
 def _f2b_read_tak_jail_config():
-    """Read current thresholds from the infratak-takserver jail config file."""
+    """Read current thresholds and ignoreip from the infratak-takserver jail config file."""
     jail_path = '/etc/fail2ban/jail.d/infratak-takserver.conf'
-    cfg = {'maxretry': 20, 'findtime': 300, 'bantime': 3600}
+    cfg = {'maxretry': 20, 'findtime': 300, 'bantime': 3600, 'ignoreip': ''}
     if not os.path.exists(jail_path):
         return cfg
     try:
@@ -4187,17 +4191,20 @@ def _f2b_read_tak_jail_config():
                     if line.startswith(key):
                         try: cfg[key] = int(line.split('=')[1].strip())
                         except Exception: pass
+                if line.startswith('ignoreip'):
+                    cfg['ignoreip'] = line.split('=', 1)[1].strip()
     except Exception:
         pass
     return cfg
 
-def _f2b_write_tak_jail_config(maxretry, findtime, bantime):
+def _f2b_write_tak_jail_config(maxretry, findtime, bantime, ignoreip=''):
     """Write the infratak-takserver jail config with given thresholds."""
     jail_path = '/etc/fail2ban/jail.d/infratak-takserver.conf'
     os.makedirs('/etc/fail2ban/jail.d', exist_ok=True)
     guarddog_action = ""
     if os.path.exists('/etc/fail2ban/action.d/infratak-guarddog.conf'):
         guarddog_action = "\n         infratak-guarddog-takserver"
+    ignoreip_line = f"ignoreip = 127.0.0.1/8 ::1{' ' + ignoreip.strip() if ignoreip.strip() else ''}\n"
     jail_conf = (
         "[takserver]\n"
         "enabled  = true\n"
@@ -4206,6 +4213,7 @@ def _f2b_write_tak_jail_config(maxretry, findtime, bantime):
         f"maxretry = {maxretry}\n"
         f"findtime = {findtime}\n"
         f"bantime  = {bantime}\n"
+        f"{ignoreip_line}"
         f"action   = ufw{guarddog_action}\n"
     )
     with open(jail_path, 'w') as _f:
@@ -4244,10 +4252,11 @@ def fail2ban_config_api():
         bantime = max(60, min(2592000, int(data.get('bantime', 3600))))
     except (ValueError, TypeError) as e:
         return jsonify({'ok': False, 'error': f'Invalid value: {e}'}), 400
+    ignoreip = str(data.get('ignoreip', '')).strip()
     try:
-        _f2b_write_jail_config(maxretry, findtime, bantime)
+        _f2b_write_jail_config(maxretry, findtime, bantime, ignoreip)
         subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
-        return jsonify({'ok': True, 'maxretry': maxretry, 'findtime': findtime, 'bantime': bantime})
+        return jsonify({'ok': True, 'maxretry': maxretry, 'findtime': findtime, 'bantime': bantime, 'ignoreip': ignoreip})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)[:200]}), 500
 
@@ -4340,11 +4349,13 @@ def fail2ban_tak_config_api():
         bantime  = max(60, min(2592000, int(data.get('bantime',  3600))))
     except (ValueError, TypeError) as e:
         return jsonify({'ok': False, 'error': f'Invalid value: {e}'}), 400
+    ignoreip = str(data.get('ignoreip', '')).strip()
     try:
-        _f2b_write_tak_jail_config(maxretry, findtime, bantime)
+        _f2b_write_tak_jail_config(maxretry, findtime, bantime, ignoreip)
         subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
         return jsonify({'ok': True, 'enabled': True,
-                        'maxretry': maxretry, 'findtime': findtime, 'bantime': bantime})
+                        'maxretry': maxretry, 'findtime': findtime, 'bantime': bantime,
+                        'ignoreip': ignoreip})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)[:200]}), 500
 
@@ -17197,7 +17208,12 @@ Bans IPs via UFW and sends Guard Dog email alerts.
 <div class="form-hint">How long to ban the IP</div>
 </div>
 </div>
-<div style="margin-top:20px">
+<div class="form-row" style="margin-top:16px;margin-bottom:0">
+<label class="form-label">Whitelist (ignoreip)</label>
+<input class="form-input" id="cfg-ignoreip" type="text" placeholder="e.g. 192.168.1.10 10.0.0.0/24" style="font-family:monospace">
+<div class="form-hint">Space-separated IPs / CIDRs that Fail2ban will never ban. localhost is always exempt.</div>
+</div>
+<div style="margin-top:16px">
 <button class="btn-primary" onclick="saveConfig()">Save &amp; Reload</button>
 <span style="font-size:11px;color:var(--text-dim);margin-left:12px">Applies immediately — active bans unaffected</span>
 </div>
@@ -17262,9 +17278,13 @@ TAK Server filter not yet installed — restart the console to complete setup.
 <div class="form-hint">How long to ban the IP</div>
 </div>
 </div>
+<div class="form-row" style="margin-top:16px;margin-bottom:0">
+<label class="form-label">Whitelist (ignoreip)</label>
+<input class="form-input" id="tak-cfg-ignoreip" type="text" placeholder="e.g. 192.168.1.10 10.0.0.0/24" style="font-family:monospace">
+<div class="form-hint">Space-separated IPs / CIDRs that Fail2ban will never ban. localhost is always exempt.</div>
+</div>
 <div style="margin-top:16px">
 <button class="btn-primary" onclick="saveTakConfig()">Save &amp; Reload</button>
-<span style="font-size:11px;color:var(--text-dim);margin-left:12px">Monitors port 7001 &amp; 8089 — bans cert probes / port scanners</span>
 </div>
 </div>
 </div>
@@ -17346,6 +17366,8 @@ function loadStatus() {
     if (cfg.maxretry) document.getElementById(\'cfg-maxretry\').value = cfg.maxretry;
     if (cfg.findtime) document.getElementById(\'cfg-findtime\').value = Math.round(cfg.findtime / 60);
     if (cfg.bantime)  document.getElementById(\'cfg-bantime\').value  = Math.round(cfg.bantime / 60);
+    var ignoreipEl = document.getElementById(\'cfg-ignoreip\');
+    if (ignoreipEl) ignoreipEl.value = (cfg.ignoreip || \'\').replace(/127\\.0\\.0\\.1\\/8\\s*::1\\s*/,\'\').trim();
 
     var ips = d.banned_ips || [];
     var c = document.getElementById(\'ban-list-container\');
@@ -17377,7 +17399,8 @@ function saveConfig() {
   var body = {
     maxretry: parseInt(document.getElementById(\'cfg-maxretry\').value) || 5,
     findtime: (parseInt(document.getElementById(\'cfg-findtime\').value) || 10) * 60,
-    bantime:  (parseInt(document.getElementById(\'cfg-bantime\').value)  || 60) * 60
+    bantime:  (parseInt(document.getElementById(\'cfg-bantime\').value)  || 60) * 60,
+    ignoreip: (document.getElementById(\'cfg-ignoreip\').value || \'\').trim()
   };
   fetch(\'/api/fail2ban/config\', {method:\'POST\', headers:{\'Content-Type\':\'application/json\'}, body:JSON.stringify(body)})
     .then(r=>r.json()).then(d=>{
@@ -17456,6 +17479,8 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
         if (cfg.maxretry) document.getElementById(\'tak-cfg-maxretry\').value = cfg.maxretry;
         if (cfg.findtime) document.getElementById(\'tak-cfg-findtime\').value = Math.round(cfg.findtime / 60);
         if (cfg.bantime)  document.getElementById(\'tak-cfg-bantime\').value  = Math.round(cfg.bantime  / 60);
+        var takIgnoreipEl = document.getElementById(\'tak-cfg-ignoreip\');
+        if (takIgnoreipEl) takIgnoreipEl.value = (cfg.ignoreip || \'\').replace(/127\\.0\\.0\\.1\\/8\\s*::1\\s*/,\'\').trim();
         var ips = d.banned_ips || [];
         var c = document.getElementById(\'tak-ban-list-container\');
         if (!ips.length) {
@@ -17492,7 +17517,8 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
       enabled:  true,
       maxretry: parseInt(document.getElementById(\'tak-cfg-maxretry\').value) || 20,
       findtime: (parseInt(document.getElementById(\'tak-cfg-findtime\').value) || 5)  * 60,
-      bantime:  (parseInt(document.getElementById(\'tak-cfg-bantime\').value)  || 60) * 60
+      bantime:  (parseInt(document.getElementById(\'tak-cfg-bantime\').value)  || 60) * 60,
+      ignoreip: (document.getElementById(\'tak-cfg-ignoreip\').value || \'\').trim()
     };
     fetch(\'/api/fail2ban/takserver/config\', {method:\'POST\', headers:{\'Content-Type\':\'application/json\'}, body:JSON.stringify(body)})
       .then(function(r){ return r.json(); }).then(function(d){
@@ -32325,7 +32351,7 @@ if __name__ == '__main__':
 
     # ── Step 3: Rewrite jail config to include both ufw + infratak-guarddog ───
     cfg = _f2b_read_jail_config()
-    _f2b_write_jail_config(cfg['maxretry'], cfg['findtime'], cfg['bantime'])
+    _f2b_write_jail_config(cfg['maxretry'], cfg['findtime'], cfg['bantime'], cfg.get('ignoreip', ''))
     plog("fail2ban guarddog hook: updated jail config with infratak-guarddog action")
 
     # ── Step 4: Reload fail2ban ───────────────────────────────────────────────
