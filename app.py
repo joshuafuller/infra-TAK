@@ -4402,40 +4402,62 @@ def fail2ban_tak_ban_api():
 @app.route('/api/fail2ban/takserver/watching')
 @login_required
 def fail2ban_tak_watching_api():
-    """Return IPs currently being watched (found but not yet banned) by the takserver jail."""
+    """Return IPs currently being watched (found but not yet banned) by the takserver jail.
+
+    fail2ban logs Found via fail2ban.filter and Ban/Unban via fail2ban.actions.
+    Only look at log lines within 2x the configured findtime window so stale
+    entries don't show as 'active'.
+    """
     import re as _re_watch
+    import datetime as _dt
     log_path = '/var/log/fail2ban.log'
     result = []
     try:
-        with open(log_path) as _lf:
-            lines = _lf.readlines()
-        found_re  = _re_watch.compile(r'(\S+)\s+fail2ban\.actions\s+.*\[takserver\] Found (\S+)')
-        ban_re    = _re_watch.compile(r'(\S+)\s+fail2ban\.actions\s+.*\[takserver\] Ban (\S+)')
-        unban_re  = _re_watch.compile(r'(\S+)\s+fail2ban\.actions\s+.*\[takserver\] Unban (\S+)')
-        # Build per-IP: list of find timestamps, set of banned timestamps/states
-        found_times = {}   # ip -> [timestamp_str, ...]
+        # Determine find window from jail config (default 300s) — use 2x as lookback
+        cfg = _f2b_read_tak_jail_config()
+        findtime_s = cfg.get('findtime', 300)
+        lookback_s = max(findtime_s * 2, 600)
+        cutoff = _dt.datetime.utcnow() - _dt.timedelta(seconds=lookback_s)
+
+        # Regex: Found comes from fail2ban.filter, Ban/Unban from fail2ban.actions
+        # Log line format: "2026-05-02 19:10:00,123 fail2ban.filter [PID]: INFO [jail] Found 1.2.3.4"
+        found_re = _re_watch.compile(
+            r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+\s+fail2ban\.filter\s+.*\[takserver\] Found (\S+)')
+        ban_re   = _re_watch.compile(
+            r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+\s+fail2ban\.actions\s+.*\[takserver\] Ban (\S+)')
+        unban_re = _re_watch.compile(
+            r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+\s+fail2ban\.actions\s+.*\[takserver\] Unban (\S+)')
+
+        found_times = {}  # ip -> [datetime, ...]
         banned_ips  = set()
-        for line in lines:
-            line = line.strip()
-            m = found_re.search(line)
-            if m:
-                ts, ip = m.group(1), m.group(2)
-                found_times.setdefault(ip, []).append(ts)
-                continue
-            m = ban_re.search(line)
-            if m:
-                banned_ips.add(m.group(2))
-                continue
-            m = unban_re.search(line)
-            if m:
-                # If unbanned, they can accumulate fresh finds again
-                banned_ips.discard(m.group(2))
+
+        with open(log_path) as _lf:
+            for line in _lf:
+                line = line.strip()
+                m = found_re.match(line)
+                if m:
+                    try:
+                        ts = _dt.datetime.strptime(m.group(1), '%Y-%m-%d %H:%M:%S')
+                    except ValueError:
+                        continue
+                    if ts >= cutoff:
+                        ip = m.group(2)
+                        found_times.setdefault(ip, []).append(ts)
+                    continue
+                m = ban_re.match(line)
+                if m:
+                    banned_ips.add(m.group(2))
+                    continue
+                m = unban_re.match(line)
+                if m:
+                    banned_ips.discard(m.group(2))
+
         for ip, times in found_times.items():
             if ip not in banned_ips:
                 result.append({
                     'ip':        ip,
                     'attempts':  len(times),
-                    'last_seen': times[-1],
+                    'last_seen': times[-1].strftime('%Y-%m-%d %H:%M:%S'),
                 })
         result.sort(key=lambda x: x['attempts'], reverse=True)
     except FileNotFoundError:
