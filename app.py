@@ -17201,6 +17201,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:\'DM Sans\'
 .dot{width:7px;height:7px;border-radius:50%;background:currentColor;display:inline-block}
 .dot-pulse{animation:pulse 2s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+@keyframes f2b-spin{to{transform:rotate(360deg)}}
 .not-installed-banner{background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.25);border-radius:12px;padding:28px;text-align:center;margin-bottom:24px}
 .toast{position:fixed;bottom:24px;right:24px;padding:12px 20px;border-radius:8px;font-family:\'JetBrains Mono\',monospace;font-size:13px;z-index:9999;display:none}
 .toast.success{background:rgba(16,185,129,.15);border:1px solid rgba(16,185,129,.4);color:var(--green)}
@@ -17247,7 +17248,7 @@ Bans IPs via UFW and sends Guard Dog email alerts.
 <div class="card">
 <div class="card-title" style="display:flex;align-items:center;justify-content:space-between">
 <span>Currently Banned IPs</span>
-<button onclick="loadStatus()" style="background:none;border:none;cursor:pointer;color:var(--text-dim);font-size:12px;font-family:\'JetBrains Mono\',monospace">↻ Refresh</button>
+<button id="auth-refresh-btn" onclick="manualRefresh()" style="background:none;border:none;cursor:pointer;color:var(--text-dim);font-size:12px;font-family:\'JetBrains Mono\',monospace;display:inline-flex;align-items:center;gap:5px"><span id="auth-refresh-icon" style="display:inline-block;transition:transform 0.4s">↻</span> Refresh</button>
 </div>
 <div id="ban-list-container">
 <div style="color:var(--text-dim);font-size:13px;font-family:\'JetBrains Mono\',monospace">Loading…</div>
@@ -17301,6 +17302,8 @@ Bans IPs via UFW and sends Guard Dog email alerts.
 <span>TAK Server Jail</span>
 <span class="badge badge-yellow" id="tak-jail-badge" style="font-size:10px;padding:2px 8px">Loading…</span>
 </div>
+<div style="display:flex;align-items:center;gap:16px">
+<button id="tak-refresh-btn" onclick="manualTakRefresh()" style="background:none;border:none;cursor:pointer;color:var(--text-dim);font-size:12px;font-family:\'JetBrains Mono\',monospace;display:inline-flex;align-items:center;gap:5px;padding:0"><span id="tak-refresh-icon" style="display:inline-block;transition:transform 0.4s">↻</span> Refresh</button>
 <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:0">
 <span style="font-size:12px;color:var(--text-dim);font-family:\'JetBrains Mono\',monospace">Enable</span>
 <div class="toggle-wrap" style="position:relative;width:40px;height:22px">
@@ -17309,6 +17312,7 @@ Bans IPs via UFW and sends Guard Dog email alerts.
 <span id="tak-toggle-thumb" style="position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform .2s;pointer-events:none"></span>
 </div>
 </label>
+</div>
 </div>
 
 <div id="tak-not-ready" style="display:none;margin-top:16px;font-size:13px;color:var(--text-dim)">
@@ -17417,7 +17421,30 @@ function pollInstall() {
 {% endif %}
 
 {% if installed %}
-function loadStatus() {
+function _spinIcon(iconId, spinning) {
+  var el = document.getElementById(iconId);
+  if (!el) return;
+  if (spinning) {
+    el.style.display = \'inline-block\';
+    el.style.animation = \'f2b-spin 0.6s linear infinite\';
+  } else {
+    el.style.animation = \'\';
+    el.style.transform = \'rotate(0deg)\';
+  }
+}
+
+function manualRefresh() {
+  _spinIcon(\'auth-refresh-icon\', true);
+  var btn = document.getElementById(\'auth-refresh-btn\');
+  if (btn) btn.disabled = true;
+  loadStatus(function() {
+    _spinIcon(\'auth-refresh-icon\', false);
+    if (btn) btn.disabled = false;
+  });
+  loadLog();
+}
+
+function loadStatus(cb) {
   fetch(\'/api/fail2ban/status\').then(r=>r.json()).then(d=>{
     if (!d.available) {
       document.getElementById(\'stat-banned\').textContent = \'N/A\';
@@ -17458,7 +17485,8 @@ function loadStatus() {
       ).join(\'\');
       c.innerHTML = \'<table class="ban-table"><thead><tr><th>IP Address</th><th>Action</th></tr></thead><tbody>\' + rows + \'</tbody></table>\';
     }
-  }).catch(()=> showToast(\'Failed to load status\', \'error\'));
+    if (typeof cb === \'function\') cb();
+  }).catch(()=>{ showToast(\'Failed to load status\', \'error\'); if (typeof cb === \'function\') cb(); });
 }
 
 function loadLog() {
@@ -17583,7 +17611,18 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
     }
   }
 
-  window.loadTakStatus = function() {
+  window.manualTakRefresh = function() {
+    _spinIcon(\'tak-refresh-icon\', true);
+    var btn = document.getElementById(\'tak-refresh-btn\');
+    if (btn) btn.disabled = true;
+    window.loadTakStatus(function() {
+      _spinIcon(\'tak-refresh-icon\', false);
+      if (btn) btn.disabled = false;
+    });
+    if (watchingPanelOpen) _loadWatchingList();
+  };
+
+  window.loadTakStatus = function(cb) {
     fetch(\'/api/fail2ban/takserver/status\').then(function(r){ return r.json(); }).then(function(d){
       var card = document.getElementById(\'tak-jail-card\');
       if (!d.tak_installed) { if (card) card.style.display = \'none\'; return; }
@@ -17631,7 +17670,8 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
       } else {
         if (enabledSec) enabledSec.style.display = \'none\';
       }
-    }).catch(function(){});
+      if (typeof cb === \'function\') cb();
+    }).catch(function(){ if (typeof cb === \'function\') cb(); });
   };
 
   window.toggleTakJail = function() {
