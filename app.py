@@ -816,17 +816,46 @@ def render_custom_banner(settings):
     templates. The accompanying <style> block pushes body content down by the banner height
     so nothing is obscured.
     """
+    import re as _re_banner
     cust = settings.get('customization', {}) if settings else {}
     if not cust.get('banner_enabled'):
         return ''
     text = html.escape((cust.get('banner_text') or '')[:120]).strip()
     if not text:
         return ''
+
     logo_b64 = cust.get('agency_logo_b64') or ''
+    logo_h = 68  # doubled from original 34px
+    banner_h = 84  # tall enough to frame the larger logo with padding
+
+    # Font — map friendly names to CSS font-family stacks
+    _font_map = {
+        'JetBrains Mono': "'JetBrains Mono', monospace",
+        'Orbitron':        "'Orbitron', sans-serif",
+        'DM Sans':         "'DM Sans', sans-serif",
+        'System UI':       "system-ui, -apple-system, sans-serif",
+    }
+    font_key = cust.get('banner_font', 'JetBrains Mono')
+    font_family = _font_map.get(font_key, "'JetBrains Mono', monospace")
+
+    # Color — validated hex only, fallback to white
+    banner_color = cust.get('banner_color', '#f1f5f9') or '#f1f5f9'
+    if not _re_banner.match(r'^#[0-9a-fA-F]{3,8}$', banner_color):
+        banner_color = '#f1f5f9'
+
+    # Import Orbitron from Google Fonts if selected (not in BASE_CSS by default)
+    font_import = ''
+    if font_key == 'Orbitron':
+        font_import = (
+            "@import url('https://fonts.googleapis.com/css2?family=Orbitron"
+            ":wght@600;700;800&display=swap');"
+        )
+
     if logo_b64:
         logo_img = (
             f'<img src="{html.escape(logo_b64)}" alt="Agency Logo" '
-            'style="height:34px;width:auto;max-height:34px;object-fit:contain;flex-shrink:0">'
+            f'style="height:{logo_h}px;width:auto;max-height:{logo_h}px;'
+            'object-fit:contain;flex-shrink:0">'
         )
     else:
         logo_img = (
@@ -834,16 +863,16 @@ def render_custom_banner(settings):
             'color:var(--cyan,#06b6d4);letter-spacing:.08em;flex-shrink:0">infra-TAK</span>'
         )
     return (
-        '<style>'
-        'body{padding-top:52px!important}'
+        f'<style>{font_import}'
+        f'body{{padding-top:{banner_h}px!important}}'
         '.custom-banner{'
-        'position:fixed;top:0;left:0;right:0;height:52px;z-index:210;'
+        f'position:fixed;top:0;left:0;right:0;height:{banner_h}px;z-index:210;'
         'display:flex;align-items:center;justify-content:center;gap:18px;'
         'padding:0 24px;'
         'background:var(--bg-surface,#0f1219);'
         'border-bottom:2px solid var(--border,rgba(59,130,246,.15));'
-        'font-family:\'JetBrains Mono\',monospace;font-weight:700;font-size:14px;'
-        'letter-spacing:.07em;color:var(--text-primary,#f1f5f9);'
+        f'font-family:{font_family};font-weight:700;font-size:15px;'
+        f'letter-spacing:.07em;color:{banner_color};'
         'text-align:center'
         '}'
         '.custom-banner-text{flex:1;text-align:center;overflow:hidden;'
@@ -1683,14 +1712,23 @@ def customization_settings_get():
 @app.route('/api/customization/settings', methods=['POST'])
 @login_required
 def customization_settings_post():
-    """Save banner_enabled and banner_text."""
+    """Save banner_enabled, banner_text, banner_font, and banner_color."""
+    import re as _re_cust
     data = request.get_json(force=True) or {}
     banner_enabled = bool(data.get('banner_enabled', False))
     banner_text = str(data.get('banner_text', '')).strip()[:120]
+    banner_font = str(data.get('banner_font', 'JetBrains Mono'))
+    if banner_font not in ('JetBrains Mono', 'Orbitron', 'DM Sans', 'System UI'):
+        banner_font = 'JetBrains Mono'
+    banner_color = str(data.get('banner_color', '#f1f5f9')).strip()
+    if not _re_cust.match(r'^#[0-9a-fA-F]{3,8}$', banner_color):
+        banner_color = '#f1f5f9'
     s = load_settings()
     cust = s.setdefault('customization', {})
     cust['banner_enabled'] = banner_enabled
     cust['banner_text'] = banner_text
+    cust['banner_font'] = banner_font
+    cust['banner_color'] = banner_color
     save_settings(s)
     return jsonify({'ok': True})
 
@@ -30170,8 +30208,14 @@ input:checked+.toggle-slider:before{transform:translateX(20px);background:var(--
 .upload-area:hover,.upload-area.drag{border-color:var(--cyan);background:rgba(6,182,212,.04)}
 .upload-area input[type=file]{display:none}
 .logo-preview{max-height:60px;max-width:200px;object-fit:contain;border-radius:6px;border:1px solid var(--border);padding:6px;background:rgba(255,255,255,.03)}
-.banner-preview{display:flex;align-items:center;justify-content:center;gap:18px;padding:14px 24px;background:var(--bg-card);border:1px solid var(--border);border-radius:10px;font-family:\'JetBrains Mono\',monospace;font-weight:700;font-size:14px;letter-spacing:.06em;color:var(--text-primary);margin-top:16px;min-height:52px}
-.banner-preview-logo{height:34px;width:auto;max-height:34px;object-fit:contain;flex-shrink:0}
+.banner-preview{display:flex;align-items:center;justify-content:center;gap:18px;padding:8px 24px;background:var(--bg-card);border:1px solid var(--border);border-radius:10px;font-weight:700;font-size:15px;letter-spacing:.07em;color:var(--text-primary);margin-top:16px;min-height:84px}
+.banner-preview-logo{height:68px;width:auto;max-height:68px;object-fit:contain;flex-shrink:0}
+.font-btn{background:rgba(255,255,255,.04);border:1px solid var(--border);border-radius:7px;padding:8px 14px;cursor:pointer;font-size:12px;color:var(--text-secondary);transition:all .15s;white-space:nowrap}
+.font-btn:hover{border-color:var(--border-hover);color:var(--text-primary)}
+.font-btn.active{border-color:var(--cyan);background:rgba(6,182,212,.08);color:var(--cyan)}
+.color-swatch{width:30px;height:30px;border-radius:50%;cursor:pointer;border:2px solid transparent;transition:all .15s;flex-shrink:0}
+.color-swatch:hover{transform:scale(1.15)}
+.color-swatch.active{border-color:#fff;box-shadow:0 0 0 2px var(--cyan)}
 .banner-preview-text{flex:1;text-align:center;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
 .toast{position:fixed;bottom:24px;right:24px;padding:12px 20px;border-radius:8px;font-family:\'JetBrains Mono\',monospace;font-size:13px;z-index:9999;display:none;animation:fadeIn .2s}
 .toast.success{background:rgba(16,185,129,.15);border:1px solid rgba(16,185,129,.4);color:var(--green)}
@@ -30204,6 +30248,39 @@ Useful for operators managing multiple infra-TAK instances.
   value="{{ customization.get(\'banner_text\', \'\') | e }}">
 <div class="form-hint">This text appears centered in the banner on every page.</div>
 </div>
+
+<div class="form-row">
+<div class="form-label">Font</div>
+<div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:4px">
+<button class="font-btn" id="font-btn-jetbrains" data-font="JetBrains Mono"
+  style="font-family:\'JetBrains Mono\',monospace" onclick="selectFont(\'JetBrains Mono\')">JetBrains Mono</button>
+<button class="font-btn" id="font-btn-orbitron" data-font="Orbitron"
+  style="font-family:\'Orbitron\',sans-serif" onclick="selectFont(\'Orbitron\')">Orbitron</button>
+<button class="font-btn" id="font-btn-dmsans" data-font="DM Sans"
+  style="font-family:\'DM Sans\',sans-serif" onclick="selectFont(\'DM Sans\')">DM Sans</button>
+<button class="font-btn" id="font-btn-system" data-font="System UI"
+  style="font-family:system-ui,-apple-system,sans-serif" onclick="selectFont(\'System UI\')">System UI</button>
+</div>
+</div>
+
+<div class="form-row">
+<div class="form-label">Text Color</div>
+<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:6px">
+<button class="color-swatch" title="White" data-color="#f1f5f9" style="background:#f1f5f9" onclick="selectColor(\'#f1f5f9\',this)"></button>
+<button class="color-swatch" title="Cyan" data-color="#06b6d4" style="background:#06b6d4" onclick="selectColor(\'#06b6d4\',this)"></button>
+<button class="color-swatch" title="Amber" data-color="#f59e0b" style="background:#f59e0b" onclick="selectColor(\'#f59e0b\',this)"></button>
+<button class="color-swatch" title="Green" data-color="#10b981" style="background:#10b981" onclick="selectColor(\'#10b981\',this)"></button>
+<button class="color-swatch" title="Red" data-color="#ef4444" style="background:#ef4444" onclick="selectColor(\'#ef4444\',this)"></button>
+<button class="color-swatch" title="Gold" data-color="#fbbf24" style="background:#fbbf24" onclick="selectColor(\'#fbbf24\',this)"></button>
+<div style="display:flex;align-items:center;gap:6px;margin-left:4px">
+<input type="color" id="banner-color-picker" value="{{ customization.get(\'banner_color\',\'#f1f5f9\') }}"
+  style="width:30px;height:30px;border-radius:50%;border:2px solid var(--border);padding:0;cursor:pointer;background:none"
+  oninput="onColorPicker(this.value)">
+<span style="font-size:11px;color:var(--text-dim);font-family:\'JetBrains Mono\',monospace" id="color-hex-label">{{ customization.get(\'banner_color\',\'#f1f5f9\') }}</span>
+</div>
+</div>
+</div>
+
 <div class="form-row">
 <div class="form-label">Live Preview</div>
 <div class="banner-preview" id="banner-preview">
@@ -30247,27 +30324,89 @@ If no logo is uploaded, the infra-TAK mark is used instead.
 </div>
 <div class="toast" id="toast"></div>
 <script>
+// Load Orbitron from Google Fonts so it renders correctly in font buttons
+(function(){
+  var l = document.createElement(\'link\');
+  l.rel = \'stylesheet\';
+  l.href = \'https://fonts.googleapis.com/css2?family=Orbitron:wght@600;700;800&display=swap\';
+  document.head.appendChild(l);
+})();
+
+var _currentFont  = {{ customization.get(\'banner_font\', \'JetBrains Mono\') | tojson }};
+var _currentColor = {{ customization.get(\'banner_color\', \'#f1f5f9\') | tojson }};
+var _fontFamilyMap = {
+  \'JetBrains Mono\': "\'JetBrains Mono\', monospace",
+  \'Orbitron\':       "\'Orbitron\', sans-serif",
+  \'DM Sans\':        "\'DM Sans\', sans-serif",
+  \'System UI\':      "system-ui, -apple-system, sans-serif"
+};
+
 // Populate preview logos on load
 (function(){
   var b64 = {{ customization.get(\'agency_logo_b64\', \'\') | tojson }};
   setPreviewLogos(b64);
-  updatePreviewText();
+  setFontActive(_currentFont);
+  setColorActive(_currentColor);
+  updatePreview();
 })();
 
 function setPreviewLogos(b64) {
-  var html = b64
+  var markup = b64
     ? \'<img src="\' + b64 + \'" alt="" class="banner-preview-logo">\'
     : \'<span style="font-family:Orbitron,sans-serif;font-size:12px;font-weight:700;color:#06b6d4;letter-spacing:.08em">infra-TAK</span>\';
-  document.getElementById(\'preview-logo-left\').innerHTML = html;
-  document.getElementById(\'preview-logo-right\').innerHTML = html;
+  document.getElementById(\'preview-logo-left\').innerHTML = markup;
+  document.getElementById(\'preview-logo-right\').innerHTML = markup;
 }
 
-function updatePreviewText() {
+function updatePreview() {
   var t = document.getElementById(\'banner-text\').value || \'Banner text preview\';
+  var p = document.getElementById(\'banner-preview\');
   document.getElementById(\'preview-text\').textContent = t;
+  p.style.fontFamily = _fontFamilyMap[_currentFont] || "\'JetBrains Mono\', monospace";
+  p.style.color = _currentColor;
 }
 
-document.getElementById(\'banner-text\').addEventListener(\'input\', updatePreviewText);
+function selectFont(font) {
+  _currentFont = font;
+  setFontActive(font);
+  updatePreview();
+}
+
+function setFontActive(font) {
+  [\'jetbrains\', \'orbitron\', \'dmsans\', \'system\'].forEach(function(k){
+    var el = document.getElementById(\'font-btn-\' + k);
+    if (el) el.classList.remove(\'active\');
+  });
+  var keyMap = {\'JetBrains Mono\': \'jetbrains\', \'Orbitron\': \'orbitron\', \'DM Sans\': \'dmsans\', \'System UI\': \'system\'};
+  var el = document.getElementById(\'font-btn-\' + keyMap[font]);
+  if (el) el.classList.add(\'active\');
+}
+
+function selectColor(hex, el) {
+  _currentColor = hex;
+  document.getElementById(\'banner-color-picker\').value = hex;
+  document.getElementById(\'color-hex-label\').textContent = hex;
+  document.querySelectorAll(\'.color-swatch\').forEach(function(s){ s.classList.remove(\'active\'); });
+  if (el) el.classList.add(\'active\');
+  updatePreview();
+}
+
+function onColorPicker(hex) {
+  _currentColor = hex;
+  document.getElementById(\'color-hex-label\').textContent = hex;
+  document.querySelectorAll(\'.color-swatch\').forEach(function(s){ s.classList.remove(\'active\'); });
+  updatePreview();
+}
+
+function setColorActive(hex) {
+  document.getElementById(\'banner-color-picker\').value = hex;
+  document.getElementById(\'color-hex-label\').textContent = hex;
+  document.querySelectorAll(\'.color-swatch\').forEach(function(s){
+    s.classList.toggle(\'active\', s.getAttribute(\'data-color\') === hex);
+  });
+}
+
+document.getElementById(\'banner-text\').addEventListener(\'input\', updatePreview);
 
 function showToast(msg, type) {
   var t = document.getElementById(\'toast\');
@@ -30281,7 +30420,9 @@ function saveBanner() {
     headers: {\'Content-Type\': \'application/json\'},
     body: JSON.stringify({
       banner_enabled: document.getElementById(\'banner-enabled\').checked,
-      banner_text: document.getElementById(\'banner-text\').value.trim()
+      banner_text: document.getElementById(\'banner-text\').value.trim(),
+      banner_font: _currentFont,
+      banner_color: _currentColor
     })
   }).then(r => r.json()).then(d => {
     if (d.ok) { showToast(\'Banner settings saved.\', \'success\'); setTimeout(()=>location.reload(),600); }
