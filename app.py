@@ -4379,6 +4379,72 @@ def fail2ban_tak_unban_api():
         return jsonify({'ok': False, 'error': str(e)[:200]}), 500
 
 
+@app.route('/api/fail2ban/takserver/ban', methods=['POST'])
+@login_required
+def fail2ban_tak_ban_api():
+    """Manually ban a specific IP in the takserver jail immediately."""
+    if not _f2b_is_available():
+        return jsonify({'ok': False, 'error': 'fail2ban not installed'}), 400
+    data = request.get_json(force=True) or {}
+    ip   = str(data.get('ip', '')).strip()
+    if not ip or not _VALID_IP_RE.match(ip):
+        return jsonify({'ok': False, 'error': 'Invalid IP address'}), 400
+    try:
+        r = subprocess.run(['fail2ban-client', 'set', 'takserver', 'banip', ip],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            return jsonify({'ok': True, 'ip': ip})
+        return jsonify({'ok': False, 'error': r.stderr.strip()[:200] or 'Ban failed'}), 500
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+
+@app.route('/api/fail2ban/takserver/watching')
+@login_required
+def fail2ban_tak_watching_api():
+    """Return IPs currently being watched (found but not yet banned) by the takserver jail."""
+    import re as _re_watch
+    log_path = '/var/log/fail2ban.log'
+    result = []
+    try:
+        with open(log_path) as _lf:
+            lines = _lf.readlines()
+        found_re  = _re_watch.compile(r'(\S+)\s+fail2ban\.actions\s+.*\[takserver\] Found (\S+)')
+        ban_re    = _re_watch.compile(r'(\S+)\s+fail2ban\.actions\s+.*\[takserver\] Ban (\S+)')
+        unban_re  = _re_watch.compile(r'(\S+)\s+fail2ban\.actions\s+.*\[takserver\] Unban (\S+)')
+        # Build per-IP: list of find timestamps, set of banned timestamps/states
+        found_times = {}   # ip -> [timestamp_str, ...]
+        banned_ips  = set()
+        for line in lines:
+            line = line.strip()
+            m = found_re.search(line)
+            if m:
+                ts, ip = m.group(1), m.group(2)
+                found_times.setdefault(ip, []).append(ts)
+                continue
+            m = ban_re.search(line)
+            if m:
+                banned_ips.add(m.group(2))
+                continue
+            m = unban_re.search(line)
+            if m:
+                # If unbanned, they can accumulate fresh finds again
+                banned_ips.discard(m.group(2))
+        for ip, times in found_times.items():
+            if ip not in banned_ips:
+                result.append({
+                    'ip':        ip,
+                    'attempts':  len(times),
+                    'last_seen': times[-1],
+                })
+        result.sort(key=lambda x: x['attempts'], reverse=True)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200], 'watching': []}), 500
+    return jsonify({'ok': True, 'watching': result})
+
+
 def _f2b_get_version():
     """Return installed fail2ban version string, or None."""
     try:
@@ -17250,11 +17316,23 @@ TAK Server filter not yet installed — restart the console to complete setup.
 </div>
 
 <div id="tak-enabled-section" style="display:none">
-<div class="stat-grid" style="margin-top:20px;margin-bottom:20px">
+<div class="stat-grid" style="margin-top:20px;margin-bottom:8px">
 <div class="stat-card"><div class="stat-value red" id="tak-stat-banned">0</div><div class="stat-label">Currently Banned</div></div>
-<div class="stat-card"><div class="stat-value yellow" id="tak-stat-failed">0</div><div class="stat-label">Currently Failed</div></div>
+<div class="stat-card" id="tak-watching-toggle" onclick="toggleWatchingPanel()" style="cursor:pointer;transition:border-color 0.2s" title="Click to see IPs being watched">
+<div class="stat-value yellow" id="tak-stat-failed">0</div>
+<div class="stat-label">Currently Failed <span style="font-size:10px;color:var(--text-dim)" id="tak-watching-caret">▼ details</span></div>
+</div>
 <div class="stat-card"><div class="stat-value cyan" id="tak-stat-total-banned">0</div><div class="stat-label">Total Banned (session)</div></div>
 <div class="stat-card"><div class="stat-value" id="tak-stat-total-failed" style="color:var(--text-dim)">0</div><div class="stat-label">Total Failed (session)</div></div>
+</div>
+
+<div id="tak-watching-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
+<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">
+  IPs Under Watch — failed attempts within find window, not yet banned
+</div>
+<div id="tak-watching-list">
+  <div style="color:var(--text-dim);font-size:13px;font-family:monospace">Loading…</div>
+</div>
 </div>
 
 <div id="tak-ban-list-container" style="margin-bottom:20px">
@@ -17426,6 +17504,64 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
 // TAK Server Jail
 (function(){
   var takReady = false;
+  var watchingPanelOpen = false;
+
+  window.toggleWatchingPanel = function() {
+    watchingPanelOpen = !watchingPanelOpen;
+    var panel  = document.getElementById(\'tak-watching-panel\');
+    var caret  = document.getElementById(\'tak-watching-caret\');
+    var toggle = document.getElementById(\'tak-watching-toggle\');
+    if (!panel) return;
+    if (watchingPanelOpen) {
+      panel.style.display = \'block\';
+      if (caret)  caret.textContent = \'▲ hide\';
+      if (toggle) toggle.style.borderColor = \'var(--yellow)\';
+      _loadWatchingList();
+    } else {
+      panel.style.display = \'none\';
+      if (caret)  caret.textContent = \'▼ details\';
+      if (toggle) toggle.style.borderColor = \'\';
+    }
+  };
+
+  function _loadWatchingList() {
+    fetch(\'/api/fail2ban/takserver/watching\').then(function(r){ return r.json(); }).then(function(d){
+      var el = document.getElementById(\'tak-watching-list\');
+      if (!el) return;
+      var list = d.watching || [];
+      if (!list.length) {
+        el.innerHTML = \'<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently under watch.</div>\';
+        return;
+      }
+      var rows = list.map(function(w){
+        return \'<tr>\' +
+          \'<td style="font-family:monospace;padding:6px 12px 6px 0;color:var(--text-primary)">\' + w.ip + \'</td>\' +
+          \'<td style="padding:6px 12px 6px 0;color:var(--yellow);font-family:monospace">\' + w.attempts + \'</td>\' +
+          \'<td style="padding:6px 12px 6px 0;color:var(--text-dim);font-family:monospace;font-size:11px">\' + w.last_seen + \'</td>\' +
+          \'<td style="padding:6px 0"><button class="btn-danger-sm" onclick="manualBanTakIP(\\\'\'+ w.ip +\'\\\')" title="Manually ban this IP now">Ban Now</button></td>\' +
+          \'</tr>\';
+      }).join(\'\');
+      el.innerHTML = \'<table style="width:100%;border-collapse:collapse">\' +
+        \'<thead><tr>\' +
+        \'<th style="text-align:left;font-size:11px;color:var(--text-dim);padding:0 12px 8px 0;text-transform:uppercase;letter-spacing:.06em">IP Address</th>\' +
+        \'<th style="text-align:left;font-size:11px;color:var(--text-dim);padding:0 12px 8px 0;text-transform:uppercase;letter-spacing:.06em">Attempts</th>\' +
+        \'<th style="text-align:left;font-size:11px;color:var(--text-dim);padding:0 12px 8px 0;text-transform:uppercase;letter-spacing:.06em">Last Seen</th>\' +
+        \'<th style="text-align:left;font-size:11px;color:var(--text-dim);padding:0 0 8px 0;text-transform:uppercase;letter-spacing:.06em">Action</th>\' +
+        \'</tr></thead><tbody>\' + rows + \'</tbody></table>\';
+    }).catch(function(){
+      var el = document.getElementById(\'tak-watching-list\');
+      if (el) el.innerHTML = \'<div style="color:var(--text-dim);font-size:12px">Error loading watch list.</div>\';
+    });
+  }
+
+  window.manualBanTakIP = function(ip) {
+    if (!confirm(\'Manually ban \' + ip + \' from the TAK Server jail now?\')) return;
+    fetch(\'/api/fail2ban/takserver/ban\', {method:\'POST\', headers:{\'Content-Type\':\'application/json\'}, body:JSON.stringify({ip:ip})})
+      .then(function(r){ return r.json(); }).then(function(d){
+        if (d.ok) { showToast(ip + \' banned.\', \'success\'); loadTakStatus(); if (watchingPanelOpen) _loadWatchingList(); }
+        else showToast(d.error || \'Ban failed\', \'error\');
+      }).catch(function(){ showToast(\'Network error\', \'error\'); });
+  };
 
   function _updateToggleStyle(on) {
     var track = document.getElementById(\'tak-toggle-track\');
@@ -17537,7 +17673,7 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
   };
 
   loadTakStatus();
-  setInterval(loadTakStatus, 30000);
+  setInterval(function(){ loadTakStatus(); if (watchingPanelOpen) _loadWatchingList(); }, 30000);
 })();
 </script>
 </body></html>'''
