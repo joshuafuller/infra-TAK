@@ -4402,62 +4402,53 @@ def fail2ban_tak_ban_api():
 @app.route('/api/fail2ban/takserver/watching')
 @login_required
 def fail2ban_tak_watching_api():
-    """Return IPs currently being watched (found but not yet banned) by the takserver jail.
+    """Return IPs seen in the takserver jail (found but not currently banned).
 
     fail2ban logs Found via fail2ban.filter and Ban/Unban via fail2ban.actions.
-    Only look at log lines within 2x the configured findtime window so stale
-    entries don't show as 'active'.
+    We scan the whole log, track ban/unban state per IP, and return IPs that
+    have found entries but are not currently banned. No time filtering — fail2ban
+    is the authoritative source for 'currently failed' count; we just reveal which IPs.
     """
     import re as _re_watch
-    import datetime as _dt
     log_path = '/var/log/fail2ban.log'
     result = []
     try:
-        # Determine find window from jail config (default 300s) — use 2x as lookback
-        cfg = _f2b_read_tak_jail_config()
-        findtime_s = cfg.get('findtime', 300)
-        lookback_s = max(findtime_s * 2, 600)
-        cutoff = _dt.datetime.utcnow() - _dt.timedelta(seconds=lookback_s)
+        # Found: fail2ban.filter  — "2026-05-02 21:36:29,811 fail2ban.filter         [PID]: INFO    [takserver] Found 1.2.3.4 - ..."
+        # Ban/Unban: fail2ban.actions
+        found_re = _re_watch.compile(r'\[takserver\] Found (\d[\d.:a-fA-F]+)')
+        ban_re   = _re_watch.compile(r'\[takserver\] Ban (\d[\d.:a-fA-F]+)')
+        unban_re = _re_watch.compile(r'\[takserver\] Unban (\d[\d.:a-fA-F]+)')
+        ts_re    = _re_watch.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})')
 
-        # Regex: Found comes from fail2ban.filter, Ban/Unban from fail2ban.actions
-        # Log line format: "2026-05-02 19:10:00,123 fail2ban.filter [PID]: INFO [jail] Found 1.2.3.4"
-        found_re = _re_watch.compile(
-            r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+\s+fail2ban\.filter\s+.*\[takserver\] Found (\S+)')
-        ban_re   = _re_watch.compile(
-            r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+\s+fail2ban\.actions\s+.*\[takserver\] Ban (\S+)')
-        unban_re = _re_watch.compile(
-            r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+\s+fail2ban\.actions\s+.*\[takserver\] Unban (\S+)')
-
-        found_times = {}  # ip -> [datetime, ...]
+        found_data  = {}  # ip -> {'count': N, 'last_seen': str}
         banned_ips  = set()
 
         with open(log_path) as _lf:
             for line in _lf:
-                line = line.strip()
-                m = found_re.match(line)
+                m = ban_re.search(line)
                 if m:
-                    try:
-                        ts = _dt.datetime.strptime(m.group(1), '%Y-%m-%d %H:%M:%S')
-                    except ValueError:
-                        continue
-                    if ts >= cutoff:
-                        ip = m.group(2)
-                        found_times.setdefault(ip, []).append(ts)
+                    banned_ips.add(m.group(1))
                     continue
-                m = ban_re.match(line)
+                m = unban_re.search(line)
                 if m:
-                    banned_ips.add(m.group(2))
+                    banned_ips.discard(m.group(1))
                     continue
-                m = unban_re.match(line)
+                m = found_re.search(line)
                 if m:
-                    banned_ips.discard(m.group(2))
+                    ip = m.group(1)
+                    ts_m = ts_re.match(line)
+                    ts = ts_m.group(1) if ts_m else ''
+                    if ip not in found_data:
+                        found_data[ip] = {'count': 0, 'last_seen': ts}
+                    found_data[ip]['count'] += 1
+                    found_data[ip]['last_seen'] = ts
 
-        for ip, times in found_times.items():
+        for ip, data in found_data.items():
             if ip not in banned_ips:
                 result.append({
                     'ip':        ip,
-                    'attempts':  len(times),
-                    'last_seen': times[-1].strftime('%Y-%m-%d %H:%M:%S'),
+                    'attempts':  data['count'],
+                    'last_seen': data['last_seen'],
                 })
         result.sort(key=lambda x: x['attempts'], reverse=True)
     except FileNotFoundError:
