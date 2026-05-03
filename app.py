@@ -276,7 +276,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.1-alpha"
+VERSION = "0.9.3-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -1981,6 +1981,27 @@ def update_apply():
             out['workaround'] = f'On the server run: sudo git config --global --add safe.directory {console_dir}'
         return out
 
+    # v0.9.3: Record current version for one-step rollback before updating
+    try:
+        _pre_update_version = VERSION
+        _s = load_settings()
+        # Determine the current git tag so rollback can fetch it
+        _cur_tag_r = subprocess.run(
+            ['git', f'--git-dir={os.path.join(console_dir, ".git")}',
+             f'--work-tree={console_dir}', 'describe', '--tags', '--exact-match'],
+            capture_output=True, text=True, timeout=10
+        )
+        _cur_tag = (_cur_tag_r.stdout or '').strip() if _cur_tag_r.returncode == 0 else f'v{VERSION}'
+        _s['console_rollback'] = {
+            'available':   True,
+            'version':     VERSION,
+            'tag':         _cur_tag,
+            'snapshot_at': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+        }
+        save_settings(_s)
+    except Exception:
+        pass
+
     try:
         # Never use pull --rebase in Update Now.
         # Field installs can be detached/tagged or have stale rebase metadata; rebase causes customer-facing conflicts.
@@ -2031,6 +2052,48 @@ def update_apply():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)[:200]})
 
+@app.route('/api/console/rollback', methods=['POST'])
+@login_required
+def console_rollback_api():
+    """Roll back the console to the version saved before the last Update Now."""
+    console_dir = os.path.dirname(os.path.abspath(__file__))
+    s = load_settings()
+    rb = s.get('console_rollback') or {}
+    if not rb.get('available'):
+        return jsonify({'ok': False, 'error': 'No rollback available (no snapshot recorded before last update)'}), 400
+    prev_tag = rb.get('tag', '').strip()
+    if not prev_tag:
+        return jsonify({'ok': False, 'error': 'Rollback tag not recorded'}), 400
+    try:
+        git_cfg = ['git', '-c', f'safe.directory={console_dir}']
+        # Fetch the tag from origin
+        fetch_r = subprocess.run(
+            git_cfg + ['fetch', 'https://github.com/takwerx/infra-TAK.git',
+                       f'refs/tags/{prev_tag}:refs/tags/{prev_tag}'],
+            cwd=console_dir, capture_output=True, text=True, timeout=60,
+            env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'}
+        )
+        checkout_r = subprocess.run(
+            git_cfg + ['checkout', '--force', prev_tag],
+            cwd=console_dir, capture_output=True, text=True, timeout=30,
+            env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'}
+        )
+        if checkout_r.returncode != 0:
+            err = (checkout_r.stderr or '').strip() or 'git checkout failed'
+            return jsonify({'ok': False, 'error': err}), 500
+        # Clear rollback availability (one rollback per update)
+        s['console_rollback'] = {'available': False}
+        save_settings(s)
+        subprocess.Popen('sleep 2 && systemctl restart takwerx-console', shell=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return jsonify({
+            'ok': True, 'tag': prev_tag,
+            'message': f'Rolled back to {prev_tag}. Console is restarting.'
+        })
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+
 @app.route('/takserver')
 @login_required
 def takserver_page():
@@ -2063,6 +2126,7 @@ def takserver_page():
         tak_migrate_status.update({'complete': False})
     return render_template_string(TAKSERVER_TEMPLATE,
         settings=_settings, modules=modules, tak=tak, tak_version=tak_version,
+        tak_installed=tak.get('installed', False),
         show_connect_ldap=show_connect_ldap, ldap_connected=ldap_connected,
         authentik_base_url=_get_authentik_base_url(_settings),
         takserver_base_url=_get_takserver_base_url(_settings),
@@ -4219,6 +4283,52 @@ def _f2b_write_tak_jail_config(maxretry, findtime, bantime, ignoreip=''):
     with open(jail_path, 'w') as _f:
         _f.write(jail_conf)
 
+def _f2b_ssh_jail_enabled():
+    """Return True if the infratak-sshd jail config file exists."""
+    return os.path.exists('/etc/fail2ban/jail.d/infratak-sshd.conf')
+
+def _f2b_read_ssh_jail_config():
+    """Read current thresholds and ignoreip from the infratak-sshd jail config file."""
+    jail_path = '/etc/fail2ban/jail.d/infratak-sshd.conf'
+    cfg = {'maxretry': 3, 'findtime': 600, 'bantime': 3600, 'ignoreip': ''}
+    if not os.path.exists(jail_path):
+        return cfg
+    try:
+        with open(jail_path) as _f:
+            for line in _f:
+                line = line.strip()
+                for key in ('maxretry', 'findtime', 'bantime'):
+                    if line.startswith(key):
+                        try: cfg[key] = int(line.split('=')[1].strip())
+                        except Exception: pass
+                if line.startswith('ignoreip'):
+                    cfg['ignoreip'] = line.split('=', 1)[1].strip()
+    except Exception:
+        pass
+    return cfg
+
+def _f2b_write_ssh_jail_config(maxretry, findtime, bantime, ignoreip=''):
+    """Write the infratak-sshd jail config with given thresholds."""
+    jail_path = '/etc/fail2ban/jail.d/infratak-sshd.conf'
+    os.makedirs('/etc/fail2ban/jail.d', exist_ok=True)
+    guarddog_action = ""
+    if os.path.exists('/etc/fail2ban/action.d/infratak-guarddog.conf'):
+        guarddog_action = "\n         infratak-guarddog"
+    ignoreip_line = f"ignoreip = 127.0.0.1/8 ::1{' ' + ignoreip.strip() if ignoreip.strip() else ''}\n"
+    jail_conf = (
+        "[sshd]\n"
+        "enabled  = true\n"
+        "filter   = sshd\n"
+        "logpath  = /var/log/auth.log\n"
+        f"maxretry = {maxretry}\n"
+        f"findtime = {findtime}\n"
+        f"bantime  = {bantime}\n"
+        f"{ignoreip_line}"
+        f"action   = ufw{guarddog_action}\n"
+    )
+    with open(jail_path, 'w') as _f:
+        _f.write(jail_conf)
+
 def _f2b_authentik_jail_enabled():
     """Return True if the infratak-authentik jail config file exists."""
     return os.path.exists('/etc/fail2ban/jail.d/infratak-authentik.conf')
@@ -4562,6 +4672,83 @@ def _f2b_get_available_version():
     except Exception:
         pass
     return None
+
+@app.route('/api/fail2ban/ssh/status')
+@login_required
+def fail2ban_ssh_status_api():
+    """Return fail2ban status for the SSH jail."""
+    if not _f2b_is_available():
+        return jsonify({'available': False, 'error': 'fail2ban not installed'})
+    try:
+        r = subprocess.run(['fail2ban-client', 'status', 'sshd'],
+                           capture_output=True, text=True, timeout=10)
+        status = _f2b_parse_status(r.stdout)
+        status['available']      = True
+        status['daemon_running'] = (subprocess.run(
+            ['systemctl', 'is-active', 'fail2ban'],
+            capture_output=True, text=True).stdout.strip() == 'active')
+        status['jail_enabled']   = _f2b_ssh_jail_enabled()
+        status['jail_config']    = _f2b_read_ssh_jail_config()
+        return jsonify(status)
+    except Exception as e:
+        return jsonify({'available': False, 'error': str(e)[:200]})
+
+
+@app.route('/api/fail2ban/ssh/config', methods=['POST'])
+@login_required
+def fail2ban_ssh_config_api():
+    """Enable/disable the SSH jail and update its thresholds."""
+    if not _f2b_is_available():
+        return jsonify({'ok': False, 'error': 'fail2ban not installed'}), 400
+    data    = request.get_json(force=True) or {}
+    enabled = bool(data.get('enabled', False))
+    if not enabled:
+        jail_path = '/etc/fail2ban/jail.d/infratak-sshd.conf'
+        if os.path.exists(jail_path):
+            os.remove(jail_path)
+        subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+        return jsonify({'ok': True, 'enabled': False})
+    try:
+        maxretry = max(1,  min(50,      int(data.get('maxretry', 3))))
+        findtime = max(60, min(86400,   int(data.get('findtime', 600))))
+        bantime  = max(60, min(2592000, int(data.get('bantime',  3600))))
+    except (ValueError, TypeError) as e:
+        return jsonify({'ok': False, 'error': f'Invalid value: {e}'}), 400
+    ignoreip = str(data.get('ignoreip', '')).strip()
+    try:
+        _f2b_write_ssh_jail_config(maxretry, findtime, bantime, ignoreip)
+        # Ensure the fail2ban daemon is running before reloading
+        _svc = subprocess.run(['systemctl', 'is-active', 'fail2ban'],
+                              capture_output=True, text=True)
+        if _svc.stdout.strip() != 'active':
+            subprocess.run(['systemctl', 'enable', '--now', 'fail2ban'],
+                           capture_output=True)
+        subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+        return jsonify({'ok': True, 'enabled': True,
+                        'maxretry': maxretry, 'findtime': findtime, 'bantime': bantime})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+
+@app.route('/api/fail2ban/ssh/unban', methods=['POST'])
+@login_required
+def fail2ban_ssh_unban_api():
+    """Unban a specific IP from the SSH jail."""
+    if not _f2b_is_available():
+        return jsonify({'ok': False, 'error': 'fail2ban not installed'}), 400
+    data = request.get_json(force=True) or {}
+    ip   = str(data.get('ip', '')).strip()
+    if not ip or not _VALID_IP_RE.match(ip):
+        return jsonify({'ok': False, 'error': 'Invalid IP address'}), 400
+    try:
+        r = subprocess.run(['fail2ban-client', 'set', 'sshd', 'unbanip', ip],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            return jsonify({'ok': True, 'ip': ip})
+        return jsonify({'ok': False, 'error': r.stderr.strip()[:200] or 'Unban failed'}), 500
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
 
 # fail2ban install status dict (tracks background install progress)
 _f2b_install_status = {'running': False, 'log': [], 'done': False, 'ok': False}
@@ -17418,6 +17605,54 @@ Bans IPs via UFW and sends Guard Dog email alerts.
 </div><!-- /auth-enabled-section -->
 </div><!-- /Authentik Jail card -->
 
+<!-- SSH Jail -->
+<div class="card" id="ssh-jail-card">
+<div class="card-title" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0">
+<div style="display:flex;align-items:center;gap:10px">
+<span>SSH Jail</span>
+<span class="badge badge-red" id="ssh-jail-badge" style="font-size:10px;padding:2px 8px"><span class="dot"></span>Disabled</span>
+</div>
+<div style="display:flex;align-items:center;gap:16px">
+<button id="ssh-refresh-btn" onclick="manualSshRefresh()" style="background:none;border:none;cursor:pointer;color:var(--text-dim);font-size:12px;font-family:\'JetBrains Mono\',monospace;display:inline-flex;align-items:center;gap:5px;padding:0"><span id="ssh-refresh-icon" style="display:inline-block;transition:transform 0.4s">↻</span> Refresh</button>
+<label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:0">
+<span style="font-size:12px;color:var(--text-dim);font-family:\'JetBrains Mono\',monospace">Enable</span>
+<div class="toggle-wrap" style="position:relative;width:40px;height:22px">
+<input type="checkbox" id="ssh-toggle" onchange="toggleSshJail()" style="opacity:0;width:0;height:0;position:absolute">
+<span id="ssh-toggle-track" onclick="document.getElementById(\'ssh-toggle\').click()" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
+<span id="ssh-toggle-thumb" style="position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform .2s;pointer-events:none"></span>
+</div>
+</label>
+</div>
+</div>
+<div style="font-size:12px;color:var(--text-dim);margin-top:8px">Monitors <code>/var/log/auth.log</code> for failed SSH login attempts. Guard Dog email alert fires on ban. Default thresholds are stricter than Authentik — SSH brute-force is higher severity.</div>
+
+<div id="ssh-enabled-section" style="display:none">
+<div class="stat-grid" style="margin-top:20px;margin-bottom:8px">
+<div class="stat-card"><div class="stat-value red" id="ssh-stat-banned">0</div><div class="stat-label">Currently Banned</div></div>
+<div class="stat-card"><div class="stat-value yellow" id="ssh-stat-failed">0</div><div class="stat-label">Currently Failed</div></div>
+<div class="stat-card"><div class="stat-value cyan" id="ssh-stat-total-banned">0</div><div class="stat-label">Total Banned (session)</div></div>
+</div>
+
+<div id="ssh-ban-list-container" style="margin-bottom:20px">
+<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>
+</div>
+
+<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:16px">
+<div><label class="label-sm">Max Retries</label><input type="number" id="ssh-cfg-maxretry" value="3" min="1" max="50" class="cfg-input"></div>
+<div><label class="label-sm">Find Window (min)</label><input type="number" id="ssh-cfg-findtime" value="10" min="1" max="1440" class="cfg-input"></div>
+<div><label class="label-sm">Ban Duration (min)</label><input type="number" id="ssh-cfg-bantime" value="60" min="1" max="43200" class="cfg-input"></div>
+</div>
+<div style="margin-bottom:12px">
+<label class="label-sm">Whitelist (ignoreip) — comma or space-separated IPs/CIDRs</label>
+<input type="text" id="ssh-cfg-ignoreip" class="cfg-input" style="width:100%" placeholder="e.g. 10.0.0.5, 192.168.1.0/24" oninput="renderChips(\'ssh-cfg-ignoreip\',\'ssh-cfg-ignoreip-chips\')">
+<div id="ssh-cfg-ignoreip-chips" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px"></div>
+</div>
+<div style="display:flex;gap:8px">
+<button class="cfg-save-btn" onclick="saveSshConfig()">Save Config</button>
+</div>
+</div><!-- /ssh-enabled-section -->
+</div><!-- /SSH Jail card -->
+
 <!-- TAK Server Jail -->
 <div class="card" id="tak-jail-card" style="display:none">
 <div class="card-title" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0">
@@ -17910,6 +18145,96 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
 
   loadTakStatus();
   setInterval(function(){ loadTakStatus(); if (watchingPanelOpen) _loadWatchingList(); }, 30000);
+})();
+
+// SSH Jail
+(function(){
+  var sshCard = document.getElementById(\'ssh-jail-card\');
+  if (!sshCard) return;
+
+  function loadSshStatus() {
+    fetch(\'/api/fail2ban/ssh/status\').then(function(r){ return r.json(); }).then(function(d){
+      if (!d.available) return;
+      var badge  = document.getElementById(\'ssh-jail-badge\');
+      var toggle = document.getElementById(\'ssh-toggle\');
+      var sec    = document.getElementById(\'ssh-enabled-section\');
+      if (badge) {
+        if (d.jail_enabled) { badge.className = \'badge badge-green\'; badge.innerHTML = \'<span class="dot dot-pulse"></span>Active\'; }
+        else                { badge.className = \'badge badge-red\';   badge.innerHTML = \'<span class="dot"></span>Disabled\'; }
+      }
+      if (toggle) toggle.checked = d.jail_enabled;
+      if (sec)    sec.style.display = d.jail_enabled ? \'\' : \'none\';
+      if (d.jail_enabled) {
+        document.getElementById(\'ssh-stat-banned\').textContent       = d.currently_banned  !== undefined ? d.currently_banned  : 0;
+        document.getElementById(\'ssh-stat-failed\').textContent       = d.currently_failed  !== undefined ? d.currently_failed  : 0;
+        document.getElementById(\'ssh-stat-total-banned\').textContent = d.total_banned       !== undefined ? d.total_banned       : 0;
+        var cfg = d.jail_config || {};
+        if (cfg.maxretry) document.getElementById(\'ssh-cfg-maxretry\').value = cfg.maxretry;
+        if (cfg.findtime) document.getElementById(\'ssh-cfg-findtime\').value = Math.round(cfg.findtime / 60);
+        if (cfg.bantime)  document.getElementById(\'ssh-cfg-bantime\').value  = Math.round(cfg.bantime  / 60);
+        var ipEl = document.getElementById(\'ssh-cfg-ignoreip\');
+        if (ipEl) { ipEl.value = (cfg.ignoreip || \'\').replace(/127\\.0\\.0\\.1\\/8\\s*::1\\s*/,\'\').trim(); renderChips(\'ssh-cfg-ignoreip\', \'ssh-cfg-ignoreip-chips\'); }
+        var ips = d.banned_ips || [];
+        var c   = document.getElementById(\'ssh-ban-list-container\');
+        if (c) {
+          if (!ips.length) {
+            c.innerHTML = \'<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>\';
+          } else {
+            var rows = ips.map(function(ip){ return \'<tr><td>\' + ip + \'</td><td><button class="btn-danger-sm" onclick="unbanSshIP(\\\'\'+ ip +\'\\\')">\' + \'Unban</button></td></tr>\'; }).join(\'\');
+            c.innerHTML = \'<table class="ban-table"><thead><tr><th>IP Address</th><th>Action</th></tr></thead><tbody>\' + rows + \'</tbody></table>\';
+          }
+        }
+      }
+    }).catch(function(){});
+  }
+
+  window.toggleSshJail = function() {
+    var enabled = document.getElementById(\'ssh-toggle\').checked;
+    if (!enabled) {
+      fetch(\'/api/fail2ban/ssh/config\', {method:\'POST\', headers:{\'Content-Type\':\'application/json\'}, body:JSON.stringify({enabled:false})})
+        .then(function(r){ return r.json(); }).then(function(d){
+          if (d.ok) { showToast(\'SSH jail disabled.\', \'success\'); loadSshStatus(); }
+          else { showToast(d.error || \'Failed to disable\', \'error\'); loadSshStatus(); }
+        }).catch(function(){ showToast(\'Network error\', \'error\'); loadSshStatus(); });
+    } else {
+      saveSshConfig();
+    }
+  };
+
+  window.saveSshConfig = function() {
+    var body = {
+      enabled:  true,
+      maxretry: parseInt(document.getElementById(\'ssh-cfg-maxretry\').value) || 3,
+      findtime: (parseInt(document.getElementById(\'ssh-cfg-findtime\').value) || 10) * 60,
+      bantime:  (parseInt(document.getElementById(\'ssh-cfg-bantime\').value)  || 60) * 60,
+      ignoreip: (document.getElementById(\'ssh-cfg-ignoreip\').value || \'\').trim()
+    };
+    fetch(\'/api/fail2ban/ssh/config\', {method:\'POST\', headers:{\'Content-Type\':\'application/json\'}, body:JSON.stringify(body)})
+      .then(function(r){ return r.json(); }).then(function(d){
+        if (d.ok) { showToast(\'SSH jail \' + (d.enabled ? \'enabled and saved.\' : \'disabled.\'), \'success\'); loadSshStatus(); }
+        else showToast(d.error || \'Save failed\', \'error\');
+      }).catch(function(){ showToast(\'Network error\', \'error\'); });
+  };
+
+  window.unbanSshIP = function(ip) {
+    if (!confirm(\'Unban \' + ip + \' from SSH jail?\')) return;
+    fetch(\'/api/fail2ban/ssh/unban\', {method:\'POST\', headers:{\'Content-Type\':\'application/json\'}, body:JSON.stringify({ip:ip})})
+      .then(function(r){ return r.json(); }).then(function(d){
+        if (d.ok) { showToast(ip + \' unbanned.\', \'success\'); loadSshStatus(); }
+        else showToast(d.error || \'Unban failed\', \'error\');
+      }).catch(function(){ showToast(\'Network error\', \'error\'); });
+  };
+
+  window.manualSshRefresh = function() {
+    _spinIcon(\'ssh-refresh-icon\', true);
+    var btn = document.getElementById(\'ssh-refresh-btn\');
+    if (btn) btn.disabled = true;
+    loadSshStatus();
+    setTimeout(function(){ _spinIcon(\'ssh-refresh-icon\', false); if (btn) btn.disabled = false; }, 1200);
+  };
+
+  loadSshStatus();
+  setInterval(loadSshStatus, 30000);
 })();
 </script>
 </body></html>'''
@@ -21663,6 +21988,135 @@ def authentik_uninstall():
     return jsonify({'success': True, 'steps': steps})
 
 
+@app.route('/api/authentik/reputation/status')
+@login_required
+def authentik_reputation_status_api():
+    """Return current Authentik Reputation Policy status and top flagged IPs."""
+    import urllib.request as _req
+    settings = load_settings()
+    ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or \
+               _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
+    if not ak_token:
+        return jsonify({'ok': False, 'error': 'Authentik token not found'})
+    url     = _get_authentik_api_url(settings)
+    headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+    try:
+        rep_cfg = settings.get('authentik_reputation_policy') or {}
+        req = _req.Request(
+            f'{url}/api/v3/policies/reputation/?search=infratak-brute-force',
+            headers=headers
+        )
+        resp    = json.loads(_req.urlopen(req, timeout=8).read().decode())
+        policy  = next((p for p in resp.get('results', [])
+                        if p.get('name') == 'infratak-brute-force'), None)
+        enabled = policy is not None
+        threshold = (policy or {}).get('threshold', rep_cfg.get('threshold', -5))
+        # Fetch current scores (top offenders)
+        scores = []
+        try:
+            req2   = _req.Request(f'{url}/api/v3/policies/reputation/scores/?page_size=20', headers=headers)
+            s_resp = json.loads(_req.urlopen(req2, timeout=8).read().decode())
+            scores = [{'ip': e.get('ip'), 'score': e.get('score', 0)}
+                      for e in s_resp.get('results', []) if e.get('ip')]
+            scores.sort(key=lambda x: x['score'])
+        except Exception:
+            pass
+        return jsonify({
+            'ok': True, 'enabled': enabled,
+            'policy_pk': (policy or {}).get('pk'),
+            'threshold': threshold,
+            'scores': scores,
+            'last_applied': rep_cfg.get('applied_at'),
+        })
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]})
+
+
+@app.route('/api/authentik/reputation/config', methods=['POST'])
+@login_required
+def authentik_reputation_config_api():
+    """Enable or disable the reputation policy, and update threshold."""
+    import urllib.request as _req
+    settings = load_settings()
+    ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or \
+               _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
+    if not ak_token:
+        return jsonify({'ok': False, 'error': 'Authentik token not found'}), 400
+    url     = _get_authentik_api_url(settings)
+    headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+    data      = request.get_json(force=True) or {}
+    enabled   = bool(data.get('enabled', True))
+    threshold = int(data.get('threshold', -5))
+    try:
+        req  = _req.Request(
+            f'{url}/api/v3/policies/reputation/?search=infratak-brute-force',
+            headers=headers
+        )
+        resp = json.loads(_req.urlopen(req, timeout=8).read().decode())
+        policy = next((p for p in resp.get('results', [])
+                       if p.get('name') == 'infratak-brute-force'), None)
+        if not enabled:
+            if policy:
+                del_req = _req.Request(
+                    f'{url}/api/v3/policies/reputation/{policy["pk"]}/',
+                    headers=headers, method='DELETE'
+                )
+                try:
+                    _req.urlopen(del_req, timeout=8)
+                except Exception:
+                    pass
+            s = load_settings()
+            rc = s.get('authentik_reputation_policy') or {}
+            rc['last_outcome'] = 'disabled'
+            rc['threshold']    = threshold
+            s['authentik_reputation_policy'] = rc
+            save_settings(s)
+            return jsonify({'ok': True, 'enabled': False})
+        # Enable: create or update policy + (re)bind
+        s = load_settings()
+        rc = s.get('authentik_reputation_policy') or {}
+        rc['last_outcome'] = ''  # reset so _authentik_setup_reputation_policy re-applies
+        rc['threshold']    = threshold
+        s['authentik_reputation_policy'] = rc
+        save_settings(s)
+        applied = _authentik_setup_reputation_policy(lambda m: None)
+        return jsonify({'ok': True, 'enabled': True, 'applied': applied, 'threshold': threshold})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+
+@app.route('/api/authentik/reputation/scores/clear', methods=['POST'])
+@login_required
+def authentik_reputation_clear_scores_api():
+    """Clear all reputation scores (bulk delete)."""
+    import urllib.request as _req
+    settings = load_settings()
+    ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or \
+               _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
+    if not ak_token:
+        return jsonify({'ok': False, 'error': 'Authentik token not found'}), 400
+    url     = _get_authentik_api_url(settings)
+    headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+    try:
+        # Fetch all score PKs and delete them
+        req    = _req.Request(f'{url}/api/v3/policies/reputation/scores/?page_size=100', headers=headers)
+        scores = json.loads(_req.urlopen(req, timeout=8).read().decode()).get('results', [])
+        deleted = 0
+        for sc in scores:
+            try:
+                del_req = _req.Request(
+                    f'{url}/api/v3/policies/reputation/scores/{sc["pk"]}/',
+                    headers=headers, method='DELETE'
+                )
+                _req.urlopen(del_req, timeout=8)
+                deleted += 1
+            except Exception:
+                pass
+        return jsonify({'ok': True, 'deleted': deleted})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+
 def _run_authentik_deploy_remote(settings, deploy_cfg, plog):
     """Deploy Authentik on a remote host via SSH (Docker Compose)."""
     import secrets as _sec
@@ -23558,6 +24012,159 @@ def _authentik_fix_ldap_flow_recursion(plog):
         pass
 
     return True
+
+
+def _authentik_setup_reputation_policy(plog):
+    """v0.9.2: Create and bind an Authentik ReputationPolicy on the ldap-authentication-flow.
+
+    This adds a flow-level brute-force check that runs *inside* Authentik before
+    the password stage. Every failed login decrements the source-IP score by 1.
+    When the score drops below the threshold the policy denies the flow immediately.
+    Scores recover over time. This is complementary to Fail2ban (which blocks at
+    the host firewall level) — reputation policy trips first (faster, lower threshold).
+
+    Idempotency key: settings.authentik_reputation_policy.last_outcome in
+    {applied, idempotent-noop}.
+
+    Returns True if applied (first run), False if no-op or skipped.
+    """
+    import urllib.request as _req
+    import urllib.error
+
+    ak_env = os.path.expanduser('~/authentik/.env')
+    if not os.path.exists(ak_env):
+        plog("  reputation policy: ~/authentik/.env not found — skipping (Authentik not installed)")
+        return False
+
+    settings = load_settings()
+    ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or \
+               _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
+    if not ak_token:
+        plog("  reputation policy: no Authentik token found — skipping")
+        return False
+
+    url     = _get_authentik_api_url(settings)
+    headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+
+    # Check if Authentik server is reachable
+    try:
+        _req.urlopen(_req.Request(f'{url}/api/v3/core/users/?page_size=1', headers=headers), timeout=8)
+    except Exception as e:
+        plog(f"  reputation policy: Authentik API unreachable ({e}) — skipping")
+        return False
+
+    # Check idempotency
+    rep_cfg = settings.get('authentik_reputation_policy') or {}
+    if rep_cfg.get('last_outcome') in ('applied', 'idempotent-noop'):
+        # Still record the check time
+        try:
+            s = load_settings()
+            rc = s.get('authentik_reputation_policy') or {}
+            rc['last_check_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+            rc['last_outcome'] = 'idempotent-noop'
+            s['authentik_reputation_policy'] = rc
+            save_settings(s)
+        except Exception:
+            pass
+        plog("  reputation policy: already applied (idempotent — skipping)")
+        return False
+
+    plog("  reputation policy: applying for the first time…")
+    threshold = rep_cfg.get('threshold', -5)
+
+    try:
+        # 1. Check if a reputation policy named 'infratak-brute-force' already exists
+        req = _req.Request(f'{url}/api/v3/policies/reputation/?search=infratak-brute-force', headers=headers)
+        resp = json.loads(_req.urlopen(req, timeout=10).read().decode())
+        policy_obj = next((p for p in resp.get('results', [])
+                           if p.get('name') == 'infratak-brute-force'), None)
+
+        if not policy_obj:
+            plog("  reputation policy: creating ReputationPolicy…")
+            policy_data = {
+                'name':             'infratak-brute-force',
+                'threshold':        threshold,
+                'check_ip':         True,
+                'check_username':   True,
+            }
+            req = _req.Request(
+                f'{url}/api/v3/policies/reputation/',
+                data=json.dumps(policy_data).encode(),
+                headers=headers, method='POST'
+            )
+            policy_obj = json.loads(_req.urlopen(req, timeout=10).read().decode())
+            plog(f"  reputation policy: created policy pk={policy_obj['pk']}")
+        else:
+            plog(f"  reputation policy: policy exists pk={policy_obj['pk']}")
+
+        policy_pk = policy_obj['pk']
+
+        # 2. Find the ldap-authentication-flow pk
+        req = _req.Request(
+            f'{url}/api/v3/flows/instances/?slug=ldap-authentication-flow',
+            headers=headers
+        )
+        flows = json.loads(_req.urlopen(req, timeout=10).read().decode())['results']
+        ldap_flow = next((f for f in flows if f.get('slug') == 'ldap-authentication-flow'), None)
+        if not ldap_flow:
+            plog("  reputation policy: ldap-authentication-flow not found — skipping bind")
+        else:
+            flow_pk = ldap_flow['pk']
+            # 3. Check if binding already exists
+            req = _req.Request(
+                f'{url}/api/v3/policies/bindings/?policy={policy_pk}&target={flow_pk}',
+                headers=headers
+            )
+            bindings = json.loads(_req.urlopen(req, timeout=10).read().decode())['results']
+            if not bindings:
+                plog("  reputation policy: binding policy to ldap-authentication-flow…")
+                bind_data = {
+                    'policy':          policy_pk,
+                    'target':          flow_pk,
+                    'order':           0,
+                    'enabled':         True,
+                    'negate':          False,
+                    'timeout':         30,
+                    'failure_result':  False,
+                }
+                req = _req.Request(
+                    f'{url}/api/v3/policies/bindings/',
+                    data=json.dumps(bind_data).encode(),
+                    headers=headers, method='POST'
+                )
+                _req.urlopen(req, timeout=10)
+                plog("  reputation policy: bound to ldap-authentication-flow")
+            else:
+                plog("  reputation policy: binding already exists")
+
+        # 4. Persist outcome
+        try:
+            s = load_settings()
+            rc = s.get('authentik_reputation_policy') or {}
+            rc['last_outcome']  = 'applied'
+            rc['applied_at']    = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+            rc['policy_pk']     = policy_pk
+            rc['threshold']     = threshold
+            s['authentik_reputation_policy'] = rc
+            save_settings(s)
+        except Exception:
+            pass
+
+        plog("  ✓ reputation policy: applied successfully")
+        return True
+
+    except Exception as e:
+        plog(f"  reputation policy: error — {e}")
+        try:
+            s = load_settings()
+            rc = s.get('authentik_reputation_policy') or {}
+            rc['last_outcome'] = 'error'
+            rc['last_error']   = str(e)[:200]
+            s['authentik_reputation_policy'] = rc
+            save_settings(s)
+        except Exception:
+            pass
+        return False
 
 
 def _authentik_fix_pg_idle_timeout(plog):
@@ -25666,6 +26273,40 @@ Additional admins: Authentik → Groups → authentik Admins → Users.
 <button onclick="window.location.href='/authentik'" style="padding:10px 24px;background:rgba(30,64,175,0.2);color:var(--cyan);border:1px solid var(--border);border-radius:8px;font-size:14px;font-weight:600;cursor:pointer">Refresh Page</button>
 </div>
 {% endif %}
+{% if ak.installed and ak.running %}
+<div class="section-title" style="margin-top:24px">Reputation Policy <span style="font-size:11px;color:var(--text-dim);font-weight:400;text-transform:none;letter-spacing:0">Flow-level brute-force blocking</span></div>
+<div class="card">
+<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+  <div>
+    <div style="font-size:13px;font-weight:600;color:var(--text-primary)">Authentik Reputation Policy</div>
+    <div style="font-size:12px;color:var(--text-dim);margin-top:4px">Blocks logins at the flow level when a source IP exceeds the failure threshold. Complementary to Fail2ban — trips first, lower overhead.</div>
+  </div>
+  <div style="display:flex;align-items:center;gap:12px">
+    <span id="rep-badge" style="font-family:JetBrains Mono,monospace;font-size:11px;color:var(--text-dim)">Loading...</span>
+    <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+      <input type="checkbox" id="rep-toggle" onchange="toggleReputation()" style="cursor:pointer;width:16px;height:16px">
+      <span style="font-size:12px;color:var(--text-secondary)">Enable</span>
+    </label>
+  </div>
+</div>
+<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">
+  <label style="font-size:12px;color:var(--text-secondary);white-space:nowrap">Score threshold:</label>
+  <input type="number" id="rep-threshold" value="-5" min="-100" max="-1" style="width:80px;background:#0a0e1a;border:1px solid var(--border);border-radius:6px;padding:6px 10px;color:var(--text-primary);font-size:13px;font-family:JetBrains Mono,monospace">
+  <span style="font-size:11px;color:var(--text-dim)">Each failed login = −1 score. Block when score ≤ threshold.</span>
+  <button onclick="toggleReputation()" style="padding:6px 14px;background:var(--accent);color:#fff;border:none;border-radius:6px;font-size:12px;cursor:pointer;white-space:nowrap">Save</button>
+</div>
+<div style="font-size:12px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px">Top Flagged IPs</div>
+<table style="width:100%;border-collapse:collapse">
+  <thead><tr><th style="text-align:left;padding:4px 10px;font-size:11px;color:var(--text-dim);font-weight:600">IP</th><th style="text-align:left;padding:4px 10px;font-size:11px;color:var(--text-dim);font-weight:600">Score</th></tr></thead>
+  <tbody id="rep-score-table"></tbody>
+</table>
+<div style="margin-top:12px">
+  <button onclick="clearRepScores()" style="padding:6px 14px;background:rgba(239,68,68,0.1);color:var(--red);border:1px solid rgba(239,68,68,0.3);border-radius:6px;font-size:12px;cursor:pointer">Clear All Scores</button>
+  <button onclick="(function(){fetch('/api/authentik/reputation/status').then(function(r){return r.json();}).then(function(d){var t=document.getElementById(\'rep-score-table\');t.innerHTML=\'\';(d.scores||[]).forEach(function(s){var tr=document.createElement(\'tr\');tr.innerHTML=\'<td style="padding:4px 10px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-secondary)">\'+s.ip+\'</td><td style="padding:4px 10px;font-family:JetBrains Mono,monospace;font-size:12px;color:\'+(s.score<-3?\'var(--red)\":\'var(--yellow)\')+\'">\'  +s.score+\'</td>\';t.appendChild(tr);});});})()" style="padding:6px 14px;background:rgba(59,130,246,0.1);color:var(--accent);border:1px solid rgba(59,130,246,0.3);border-radius:6px;font-size:12px;cursor:pointer;margin-left:8px">↻ Refresh</button>
+</div>
+</div>
+{% endif %}
+
 </div>
 <div class="modal-overlay" id="ak-uninstall-modal">
 <div class="modal">
@@ -25970,6 +26611,60 @@ document.addEventListener('DOMContentLoaded', function() {
 });
 
 {% if deploying %}pollDeployLog();{% endif %}
+{% if ak.installed and ak.running %}
+(function(){
+  function _repLoad(){
+    fetch('/api/authentik/reputation/status').then(function(r){return r.json();}).then(function(d){
+      if(!d.ok){return;}
+      var badge=document.getElementById('rep-badge');
+      var scoreTable=document.getElementById('rep-score-table');
+      var toggle=document.getElementById('rep-toggle');
+      if(badge){badge.textContent=d.enabled?'Enabled':'Disabled';badge.style.color=d.enabled?'var(--green)':'var(--text-dim)';}
+      if(toggle){toggle.checked=d.enabled;}
+      var threshEl=document.getElementById('rep-threshold');
+      if(threshEl&&d.threshold!==undefined){threshEl.value=d.threshold;}
+      if(scoreTable){
+        scoreTable.innerHTML='';
+        if(d.scores&&d.scores.length>0){
+          d.scores.forEach(function(s){
+            var tr=document.createElement('tr');
+            tr.innerHTML='<td style="padding:4px 10px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-secondary)">'+s.ip+'</td><td style="padding:4px 10px;font-family:JetBrains Mono,monospace;font-size:12px;color:'+(s.score<-3?'var(--red)':'var(--yellow)')+'">'+s.score+'</td>';
+            scoreTable.appendChild(tr);
+          });
+        }else{
+          var emptyTr=document.createElement('tr');
+          emptyTr.innerHTML='<td colspan="2" style="padding:6px 10px;font-size:12px;color:var(--text-dim)">No flagged IPs</td>';
+          scoreTable.appendChild(emptyTr);
+        }
+      }
+    }).catch(function(){});
+  }
+  window.toggleReputation=function(){
+    var en=document.getElementById('rep-toggle').checked;
+    var thr=parseInt(document.getElementById('rep-threshold').value||-5,10);
+    fetch('/api/authentik/reputation/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:en,threshold:thr})})
+      .then(function(r){return r.json();}).then(function(d){
+        if(d.ok){_repShowToast('Reputation policy '+(en?'enabled':'disabled')+'.','success');_repLoad();}
+        else{_repShowToast(d.error||'Failed','error');}
+      }).catch(function(){_repShowToast('Network error','error');});
+  };
+  window.clearRepScores=function(){
+    if(!confirm('Clear all reputation scores?'))return;
+    fetch('/api/authentik/reputation/scores/clear',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})
+      .then(function(r){return r.json();}).then(function(d){
+        if(d.ok){_repShowToast('Cleared '+d.deleted+' score(s).','success');_repLoad();}
+        else{_repShowToast(d.error||'Failed','error');}
+      }).catch(function(){_repShowToast('Network error','error');});
+  };
+  function _repShowToast(msg,type){
+    var t=document.getElementById('rep-toast');
+    if(!t){t=document.createElement('div');t.id='rep-toast';t.style.cssText='position:fixed;bottom:24px;right:24px;padding:12px 20px;border-radius:8px;font-size:13px;z-index:9999;transition:opacity 0.3s';document.body.appendChild(t);}
+    t.textContent=msg;t.style.background=type==='success'?'rgba(16,185,129,0.15)':'rgba(239,68,68,0.15)';t.style.border='1px solid '+(type==='success'?'rgba(16,185,129,0.4)':'rgba(239,68,68,0.4)');t.style.color=type==='success'?'var(--green)':'var(--red)';t.style.opacity='1';setTimeout(function(){t.style.opacity='0';},3500);
+  }
+  _repLoad();
+  setInterval(_repLoad,30000);
+})();
+{% endif %}
 </script>
 </body></html>'''
 
@@ -29209,6 +29904,515 @@ def _tak_upgrade_apt_install_streamed(cmd, cwd, upgrade_log, timeout_sec=600):
     return proc.returncode if proc.returncode is not None else 1
 
 
+SNAPSHOT_DIR = '/opt/tak/snapshots'
+
+def _tak_snapshot(label, plog=None):
+    """Create a TAK Server snapshot at /opt/tak/snapshots/<label>/.
+
+    Captures: installed TAK version, CoreConfig.xml, /etc/default/takserver,
+    PostgreSQL cot dump, and /opt/tak/certs/files/.
+
+    Returns (True, metadata_dict) on success, (False, error_str) on failure.
+    Idempotent — if the label already exists it is overwritten.
+    """
+    import shutil as _shutil
+    if plog is None:
+        plog = lambda m: print(m, flush=True)
+
+    snap_path = os.path.join(SNAPSHOT_DIR, label)
+    plog(f"  snapshot [{label}]: creating at {snap_path}")
+
+    try:
+        os.makedirs(snap_path, exist_ok=True)
+    except Exception as e:
+        return False, f"Could not create snapshot dir: {e}"
+
+    meta = {
+        'label':      label,
+        'taken_at':   datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'source':     'manual',
+        'tak_version': None,
+        'size_mb':    0,
+    }
+
+    # 1. TAK version
+    try:
+        r = subprocess.run(['dpkg', '-l', 'takserver'], capture_output=True, text=True, timeout=10)
+        for line in r.stdout.splitlines():
+            if line.startswith('ii') and 'takserver' in line:
+                parts = line.split()
+                meta['tak_version'] = parts[2] if len(parts) > 2 else None
+                break
+    except Exception as e:
+        plog(f"  snapshot: version probe failed: {e}")
+
+    # 2. CoreConfig.xml
+    cc_src = '/opt/tak/CoreConfig.xml'
+    if os.path.exists(cc_src):
+        try:
+            _shutil.copy2(cc_src, os.path.join(snap_path, 'CoreConfig.xml'))
+            plog("  snapshot: CoreConfig.xml copied")
+        except Exception as e:
+            plog(f"  snapshot: CoreConfig copy failed: {e}")
+    else:
+        plog("  snapshot: CoreConfig.xml not found — skipping")
+
+    # 3. /etc/default/takserver (JVM heap)
+    heap_src = '/etc/default/takserver'
+    if os.path.exists(heap_src):
+        try:
+            _shutil.copy2(heap_src, os.path.join(snap_path, 'takserver.default'))
+            plog("  snapshot: takserver.default copied")
+        except Exception as e:
+            plog(f"  snapshot: takserver.default copy failed: {e}")
+
+    # 4. PostgreSQL cot dump
+    pg_dump_path = os.path.join(snap_path, 'cot.pgdump')
+    pg_container = 'takserver-db'
+    try:
+        r = subprocess.run(
+            f'docker ps -q --filter name={pg_container}',
+            shell=True, capture_output=True, text=True, timeout=10
+        )
+        if (r.stdout or '').strip():
+            pg_cmd = (
+                f"docker exec {pg_container} pg_dump -U postgres -Fc cot"
+            )
+            with open(pg_dump_path, 'wb') as _f:
+                r2 = subprocess.run(
+                    pg_cmd, shell=True, stdout=_f, stderr=subprocess.PIPE, timeout=300
+                )
+            if r2.returncode == 0:
+                plog(f"  snapshot: cot pg_dump written ({os.path.getsize(pg_dump_path) // 1024} KB)")
+            else:
+                plog(f"  snapshot: pg_dump failed: {(r2.stderr or b'').decode()[:200]}")
+                try: os.remove(pg_dump_path)
+                except Exception: pass
+        else:
+            plog(f"  snapshot: {pg_container} not running — skipping pg_dump")
+    except Exception as e:
+        plog(f"  snapshot: pg_dump exception: {e}")
+
+    # 5. Certificates
+    certs_src = '/opt/tak/certs/files'
+    certs_dst = os.path.join(snap_path, 'certs')
+    if os.path.isdir(certs_src):
+        try:
+            if os.path.exists(certs_dst):
+                _shutil.rmtree(certs_dst)
+            _shutil.copytree(certs_src, certs_dst)
+            plog("  snapshot: certs/ copied")
+        except Exception as e:
+            plog(f"  snapshot: certs copy failed: {e}")
+    else:
+        plog("  snapshot: /opt/tak/certs/files not found — skipping")
+
+    # Compute total size
+    try:
+        total = 0
+        for dirpath, _, filenames in os.walk(snap_path):
+            for fn in filenames:
+                try: total += os.path.getsize(os.path.join(dirpath, fn))
+                except Exception: pass
+        meta['size_mb'] = round(total / (1024 * 1024), 1)
+    except Exception:
+        pass
+
+    # Persist to settings
+    try:
+        s = load_settings()
+        snaps = s.get('tak_snapshots') or []
+        # Remove any existing entry with same label
+        snaps = [sn for sn in snaps if sn.get('label') != label]
+        snaps.append(meta)
+        # Keep most recent 50
+        snaps.sort(key=lambda x: x.get('taken_at', ''), reverse=True)
+        s['tak_snapshots'] = snaps[:50]
+        save_settings(s)
+    except Exception as e:
+        plog(f"  snapshot: settings save failed: {e}")
+
+    plog(f"  ✓ snapshot [{label}]: done ({meta['size_mb']} MB, version={meta['tak_version']})")
+    return True, meta
+
+
+def _tak_rollback(label, plog=None):
+    """Restore TAK Server from snapshot at /opt/tak/snapshots/<label>/.
+
+    Steps:
+      1. Validate snapshot exists and has a pg_dump
+      2. systemctl stop takserver
+      3. Restore CoreConfig.xml, takserver.default, certs/
+      4. pg_restore --clean -d cot from snapshot
+      5. systemctl start takserver
+
+    Returns (True, None) on success, (False, error_str) on failure.
+    """
+    import shutil as _shutil
+    if plog is None:
+        plog = lambda m: print(m, flush=True)
+
+    snap_path = os.path.join(SNAPSHOT_DIR, label)
+    if not os.path.isdir(snap_path):
+        return False, f"Snapshot '{label}' not found at {snap_path}"
+
+    plog(f"  rollback [{label}]: starting")
+
+    # 1. Validate
+    pg_dump_path = os.path.join(snap_path, 'cot.pgdump')
+    if not os.path.exists(pg_dump_path):
+        return False, f"Snapshot '{label}' has no cot.pgdump — cannot restore database"
+
+    # 2. Stop TAK Server
+    plog("  rollback: stopping takserver…")
+    subprocess.run(['systemctl', 'stop', 'takserver'], capture_output=True, timeout=60)
+
+    # 3. Restore CoreConfig.xml
+    cc_src = os.path.join(snap_path, 'CoreConfig.xml')
+    if os.path.exists(cc_src):
+        try:
+            _shutil.copy2(cc_src, '/opt/tak/CoreConfig.xml')
+            plog("  rollback: CoreConfig.xml restored")
+        except Exception as e:
+            plog(f"  rollback: CoreConfig restore failed: {e}")
+
+    # 4. Restore JVM heap settings
+    heap_src = os.path.join(snap_path, 'takserver.default')
+    if os.path.exists(heap_src):
+        try:
+            _shutil.copy2(heap_src, '/etc/default/takserver')
+            plog("  rollback: takserver.default restored")
+        except Exception as e:
+            plog(f"  rollback: takserver.default restore failed: {e}")
+
+    # 5. Restore certs
+    certs_src = os.path.join(snap_path, 'certs')
+    certs_dst = '/opt/tak/certs/files'
+    if os.path.isdir(certs_src):
+        try:
+            if os.path.exists(certs_dst):
+                _shutil.rmtree(certs_dst)
+            _shutil.copytree(certs_src, certs_dst)
+            # Restore ownership (tak:tak) on certs
+            subprocess.run(
+                'chown -R tak:tak /opt/tak/certs/files 2>/dev/null; true',
+                shell=True, capture_output=True, timeout=15
+            )
+            plog("  rollback: certs/ restored")
+        except Exception as e:
+            plog(f"  rollback: certs restore failed: {e}")
+
+    # 6. pg_restore
+    pg_container = 'takserver-db'
+    plog("  rollback: restoring PostgreSQL cot database…")
+    try:
+        r = subprocess.run(
+            f'docker ps -q --filter name={pg_container}',
+            shell=True, capture_output=True, text=True, timeout=10
+        )
+        if (r.stdout or '').strip():
+            r2 = subprocess.run(
+                f'docker exec -i {pg_container} pg_restore -U postgres --clean -d cot',
+                shell=True,
+                stdin=open(pg_dump_path, 'rb'),
+                capture_output=True,
+                timeout=300
+            )
+            if r2.returncode == 0:
+                plog("  rollback: pg_restore successful")
+            else:
+                stderr = (r2.stderr or b'').decode()[:400]
+                # pg_restore may emit warnings but still succeed
+                if r2.returncode in (0, 1):
+                    plog(f"  rollback: pg_restore warnings (non-fatal): {stderr[:200]}")
+                else:
+                    plog(f"  rollback: pg_restore failed (exit {r2.returncode}): {stderr[:200]}")
+        else:
+            plog(f"  rollback: {pg_container} not running — skipping pg_restore")
+    except Exception as e:
+        plog(f"  rollback: pg_restore exception: {e}")
+
+    # 7. Start TAK Server
+    plog("  rollback: starting takserver…")
+    subprocess.run(['systemctl', 'start', 'takserver'], capture_output=True, timeout=90)
+
+    plog(f"  ✓ rollback [{label}]: complete")
+    return True, None
+
+
+# Snapshot/rollback log stream
+_snapshot_log   = []
+_snapshot_status = {'running': False, 'complete': False, 'error': False}
+
+def _tak_setup_snapshot_schedule(plog=None):
+    """v0.9.3: Write/update a systemd timer for scheduled TAK Server snapshots.
+
+    The timer calls POST /api/takserver/snapshot/run with source='scheduled'.
+    Schedule defaults to daily at 02:00 local time; operator can change via UI.
+    Idempotent — rewrites unit files each time so schedule changes take effect.
+    """
+    if plog is None:
+        plog = lambda m: print(m, flush=True)
+
+    settings  = load_settings()
+    snap_cfg  = settings.get('tak_snapshot_schedule') or {}
+    enabled   = snap_cfg.get('enabled', False)
+    frequency = snap_cfg.get('frequency', 'daily')   # 'daily' | 'weekly'
+    hour      = int(snap_cfg.get('hour', 2))
+    minute    = int(snap_cfg.get('minute', 0))
+    retention = int(snap_cfg.get('retention', 7))
+
+    # Read the console port from environment or default
+    try:
+        _port_r = subprocess.run(
+            "systemctl show takwerx-console --property=ExecStart 2>/dev/null | grep -o '\\-p [0-9]*' | awk '{print $2}'",
+            shell=True, capture_output=True, text=True, timeout=5
+        )
+        _port = (_port_r.stdout or '').strip() or '2121'
+    except Exception:
+        _port = '2121'
+
+    service_unit = f"""[Unit]
+Description=infra-TAK Scheduled TAK Server Snapshot
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/curl -s -X POST -H "Content-Type: application/json" \\
+    -b /opt/tak-console-session.cookie \\
+    http://127.0.0.1:{_port}/api/takserver/snapshot/run \\
+    -d '{{"source":"scheduled"}}'
+User=root
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+    if frequency == 'weekly':
+        on_calendar = f"Sat *-*-* {hour:02d}:{minute:02d}:00"
+    else:
+        on_calendar = f"*-*-* {hour:02d}:{minute:02d}:00"
+
+    timer_unit = f"""[Unit]
+Description=infra-TAK Scheduled TAK Server Snapshot Timer
+Requires=takserver-snapshot.service
+
+[Timer]
+OnCalendar={on_calendar}
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+"""
+
+    svc_path   = '/etc/systemd/system/takserver-snapshot.service'
+    timer_path = '/etc/systemd/system/takserver-snapshot.timer'
+
+    try:
+        with open(svc_path,   'w') as _f: _f.write(service_unit)
+        with open(timer_path, 'w') as _f: _f.write(timer_unit)
+        subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=10)
+
+        if enabled:
+            subprocess.run(['systemctl', 'enable', '--now', 'takserver-snapshot.timer'],
+                           capture_output=True, timeout=10)
+            plog(f"  snapshot schedule: enabled ({frequency} at {hour:02d}:{minute:02d}, retention={retention})")
+        else:
+            subprocess.run(['systemctl', 'disable', '--now', 'takserver-snapshot.timer'],
+                           capture_output=True, timeout=10)
+            plog("  snapshot schedule: disabled")
+        return True
+    except Exception as e:
+        plog(f"  snapshot schedule: error — {e}")
+        return False
+
+
+@app.route('/api/takserver/snapshot/schedule', methods=['GET'])
+@login_required
+def takserver_snapshot_schedule_get_api():
+    """Return current scheduled snapshot configuration."""
+    s   = load_settings()
+    cfg = s.get('tak_snapshot_schedule') or {
+        'enabled': False, 'frequency': 'daily', 'hour': 2, 'minute': 0, 'retention': 7
+    }
+    # Check if timer is actually active
+    r = subprocess.run(['systemctl', 'is-active', 'takserver-snapshot.timer'],
+                       capture_output=True, text=True)
+    cfg['timer_active'] = (r.stdout.strip() == 'active')
+    return jsonify(cfg)
+
+
+@app.route('/api/takserver/snapshot/schedule', methods=['POST'])
+@login_required
+def takserver_snapshot_schedule_post_api():
+    """Update scheduled snapshot configuration and rewrite the systemd timer."""
+    data = request.get_json(force=True) or {}
+    s    = load_settings()
+    cfg  = s.get('tak_snapshot_schedule') or {}
+    cfg['enabled']   = bool(data.get('enabled', False))
+    cfg['frequency'] = str(data.get('frequency', 'daily'))
+    cfg['hour']      = max(0, min(23, int(data.get('hour', 2))))
+    cfg['minute']    = max(0, min(59, int(data.get('minute', 0))))
+    cfg['retention'] = max(1, min(90, int(data.get('retention', 7))))
+    s['tak_snapshot_schedule'] = cfg
+    save_settings(s)
+    ok = _tak_setup_snapshot_schedule(lambda m: print(m, flush=True))
+    return jsonify({'ok': ok, 'config': cfg})
+
+
+@app.route('/api/takserver/snapshots')
+@login_required
+def takserver_snapshots_api():
+    """List all TAK Server snapshots from settings."""
+    s     = load_settings()
+    snaps = s.get('tak_snapshots') or []
+    snaps.sort(key=lambda x: x.get('taken_at', ''), reverse=True)
+    return jsonify({'snapshots': snaps})
+
+
+@app.route('/api/takserver/snapshot/run', methods=['POST'])
+@login_required
+def takserver_snapshot_run_api():
+    """Trigger a manual snapshot in the background."""
+    global _snapshot_status, _snapshot_log
+    if _snapshot_status.get('running'):
+        return jsonify({'ok': False, 'error': 'Snapshot already running'}), 409
+    data   = request.get_json(force=True) or {}
+    source = data.get('source', 'manual')
+    label  = data.get('label') or f"{source}-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
+    _snapshot_log = []
+    _snapshot_status = {'running': True, 'complete': False, 'error': False}
+
+    def _run():
+        global _snapshot_status
+        def plog(m):
+            entry = f"[{datetime.now().strftime('%H:%M:%S')}] {m}"
+            _snapshot_log.append(entry)
+            print(entry, flush=True)
+        ok, result = _tak_snapshot(label, plog)
+        if ok:
+            _snapshot_status = {'running': False, 'complete': True, 'error': False}
+            # Tag metadata with source
+            try:
+                s  = load_settings()
+                sn = s.get('tak_snapshots') or []
+                for snap in sn:
+                    if snap.get('label') == label:
+                        snap['source'] = source
+                s['tak_snapshots'] = sn
+                save_settings(s)
+            except Exception:
+                pass
+        else:
+            plog(f"Snapshot failed: {result}")
+            _snapshot_status = {'running': False, 'complete': False, 'error': True}
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({'ok': True, 'label': label})
+
+
+@app.route('/api/takserver/snapshot/status')
+@login_required
+def takserver_snapshot_status_api():
+    """Poll snapshot progress."""
+    return jsonify({
+        'running':  _snapshot_status.get('running', False),
+        'complete': _snapshot_status.get('complete', False),
+        'error':    _snapshot_status.get('error', False),
+        'log':      _snapshot_log[-100:],
+    })
+
+
+@app.route('/api/takserver/snapshot/<label>/download')
+@login_required
+def takserver_snapshot_download_api(label):
+    """Stream a .tar.gz of the snapshot directory for off-box export."""
+    import tarfile, io
+    snap_path = os.path.join(SNAPSHOT_DIR, label)
+    if not os.path.isdir(snap_path):
+        return jsonify({'error': 'Snapshot not found'}), 404
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode='w:gz') as tar:
+        tar.add(snap_path, arcname=label)
+    buf.seek(0)
+    from flask import send_file
+    return send_file(
+        buf,
+        as_attachment=True,
+        download_name=f'{label}.tar.gz',
+        mimetype='application/gzip'
+    )
+
+
+@app.route('/api/takserver/snapshot/<label>', methods=['DELETE'])
+@login_required
+def takserver_snapshot_delete_api(label):
+    """Delete a snapshot directory and its settings entry."""
+    import shutil as _shutil
+    snap_path = os.path.join(SNAPSHOT_DIR, label)
+    if os.path.isdir(snap_path):
+        try:
+            _shutil.rmtree(snap_path)
+        except Exception as e:
+            return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+    try:
+        s     = load_settings()
+        snaps = [sn for sn in (s.get('tak_snapshots') or []) if sn.get('label') != label]
+        s['tak_snapshots'] = snaps
+        save_settings(s)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+    return jsonify({'ok': True})
+
+
+# Rollback log stream
+_rollback_log    = []
+_rollback_status = {'running': False, 'complete': False, 'error': False}
+
+@app.route('/api/takserver/rollback', methods=['POST'])
+@login_required
+def takserver_rollback_api():
+    """Restore TAK Server from a named snapshot. Streams log via /api/takserver/rollback/log."""
+    global _rollback_status, _rollback_log
+    if _rollback_status.get('running'):
+        return jsonify({'ok': False, 'error': 'Rollback already running'}), 409
+    data  = request.get_json(force=True) or {}
+    label = (data.get('label') or '').strip()
+    if not label:
+        return jsonify({'ok': False, 'error': 'label is required'}), 400
+
+    _rollback_log    = []
+    _rollback_status = {'running': True, 'complete': False, 'error': False}
+
+    def _run():
+        global _rollback_status
+        def plog(m):
+            entry = f"[{datetime.now().strftime('%H:%M:%S')}] {m}"
+            _rollback_log.append(entry)
+            print(entry, flush=True)
+        ok, err = _tak_rollback(label, plog)
+        if ok:
+            _rollback_status = {'running': False, 'complete': True, 'error': False}
+        else:
+            plog(f"Rollback failed: {err}")
+            _rollback_status = {'running': False, 'complete': False, 'error': True}
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({'ok': True, 'label': label})
+
+
+@app.route('/api/takserver/rollback/log')
+@login_required
+def takserver_rollback_log_api():
+    """Stream rollback progress log."""
+    return jsonify({
+        'running':  _rollback_status.get('running', False),
+        'complete': _rollback_status.get('complete', False),
+        'error':    _rollback_status.get('error', False),
+        'log':      _rollback_log[-200:],
+    })
+
+
 def run_takserver_upgrade(pkg_path):
     def ulog(msg):
         entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
@@ -29229,6 +30433,28 @@ def run_takserver_upgrade(pkg_path):
                     ulog("✓ JVM heap settings backed up")
             except Exception:
                 heap_backup = None
+
+        # v0.9.3: Pre-upgrade snapshot — abort upgrade if snapshot fails
+        snap_label = f"pre-upgrade-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
+        ulog(f"Taking pre-upgrade snapshot [{snap_label}]…")
+        snap_ok, snap_result = _tak_snapshot(snap_label, ulog)
+        if snap_ok:
+            ulog(f"✓ Pre-upgrade snapshot saved — rollback available via Snapshots & Recovery")
+            # Tag source in settings
+            try:
+                _s = load_settings()
+                for sn in (_s.get('tak_snapshots') or []):
+                    if sn.get('label') == snap_label:
+                        sn['source'] = 'pre-upgrade'
+                save_settings(_s)
+            except Exception:
+                pass
+        else:
+            ulog(f"✗ Pre-upgrade snapshot failed — aborting upgrade to protect current data")
+            ulog(f"  Detail: {snap_result}")
+            upgrade_status.update({'running': False, 'complete': False, 'error': True})
+            return
+
         wait_for_unattended_upgrade_worker(ulog, upgrade_log)
         wait_for_apt_lock(ulog, upgrade_log)
         dpkg_result = _tak_upgrade_dpkg_configure_a(ulog, upgrade_log, pkg_path=pkg_path)
@@ -31489,6 +32715,15 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div id="update-details" style="display:none;margin-top:12px;padding-top:12px;border-top:1px solid var(--border);font-size:11px;color:var(--text-dim);white-space:pre-wrap;max-height:200px;overflow-y:auto"></div>
 <div id="update-status" style="display:none;margin-top:8px;font-size:11px"></div>
 </div>
+{% if settings.get('console_rollback', {}).get('available') %}
+<div id="console-rollback-bar" style="background:rgba(234,179,8,0.08);border:1px solid rgba(234,179,8,0.25);border-radius:10px;padding:12px 16px;margin-bottom:16px;display:flex;align-items:center;justify-content:space-between">
+<div>
+  <div style="font-size:12px;font-weight:600;color:var(--yellow)">↩ Rollback available — {{ settings.get('console_rollback', {}).get('tag', '') }}</div>
+  <div style="font-size:11px;color:var(--text-dim);margin-top:2px">Snapshot taken {{ settings.get('console_rollback', {}).get('snapshot_at', '') }} before last update</div>
+</div>
+<button onclick="doConsoleRollback()" style="padding:6px 14px;background:rgba(234,179,8,0.1);color:var(--yellow);border:1px solid rgba(234,179,8,0.3);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">Roll Back</button>
+</div>
+{% endif %}
 <div class="metrics-bar" id="metrics-bar">
 <div class="metric-card"><div class="metric-label">CPU</div><div class="metric-value" id="cpu-value">{{ metrics.cpu_percent }}%</div></div>
 <div class="metric-card"><div class="metric-label">Memory</div><div class="metric-value" id="ram-value">{{ metrics.ram_percent }}%</div><div class="metric-detail">{{ metrics.ram_used_gb }}GB / {{ metrics.ram_total_gb }}GB</div></div>
@@ -31775,6 +33010,20 @@ async function applyUpdate(){
     }catch(e){status.style.color='var(--red)';status.textContent='Error: '+e.message;btn.disabled=false;btn.textContent='Update Now';btn.style.opacity='1'}
 }
 checkUpdate();
+async function doConsoleRollback(){
+    if(!confirm('Roll back console to the previous version?\n\nThe console will restart. You may see 502 briefly.'))return;
+    var bar=document.getElementById('console-rollback-bar');
+    if(bar)bar.innerHTML='<div style="font-size:12px;color:var(--yellow)">Rolling back…</div>';
+    try{
+        var r=await fetch('/api/console/rollback',{method:'POST'});var d=await r.json();
+        if(d.ok){
+            if(bar)bar.innerHTML='<div style="font-size:12px;color:var(--green)">✓ '+d.message+'</div>';
+            setTimeout(function(){window.location.reload()},10000);
+        }else{
+            if(bar)bar.innerHTML='<div style="font-size:12px;color:var(--red)">✗ Error: '+(d.error||'failed')+'</div>';
+        }
+    }catch(e){if(bar)bar.innerHTML='<div style="font-size:12px;color:var(--red)">Network error: '+e.message+'</div>';}
+}
 </script></body></html>'''
 
 # === Marketplace Template (all services, deploy from here) ===
@@ -32319,6 +33568,49 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <button onclick="showDeployConfig()" style="padding:12px 32px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:15px;font-weight:600;cursor:pointer">Configure &amp; Deploy →</button>
 </div></div></div>
 {% endif %}
+
+<!-- Snapshots & Recovery -->
+{% if tak_installed %}
+<div style="margin-top:24px">
+<div class="section-title">Snapshots &amp; Recovery</div>
+<div class="card" style="margin-bottom:16px">
+<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+  <div>
+    <div style="font-size:13px;font-weight:600;color:var(--text-primary)">TAK Server Snapshots</div>
+    <div style="font-size:12px;color:var(--text-dim);margin-top:4px">Pre-upgrade snapshots are created automatically. Restore any snapshot with one click. Download for off-box backup.</div>
+  </div>
+  <div style="display:flex;gap:8px">
+    <button onclick="takeSnapshot()" id="snap-now-btn" style="padding:8px 16px;background:rgba(6,182,212,0.1);color:var(--cyan);border:1px solid rgba(6,182,212,0.3);border-radius:8px;font-size:12px;font-family:JetBrains Mono,monospace;cursor:pointer">📸 Take Snapshot Now</button>
+    <button onclick="loadSnapshots()" style="padding:8px 16px;background:transparent;color:var(--text-dim);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer">↻ Refresh</button>
+  </div>
+</div>
+<div id="snap-progress" style="display:none;font-family:JetBrains Mono,monospace;font-size:11px;color:var(--cyan);padding:8px 0;margin-bottom:12px"></div>
+<div id="snap-table-container">
+  <div style="color:var(--text-dim);font-size:13px">Loading snapshots…</div>
+</div>
+</div>
+
+<div class="card" style="margin-bottom:16px">
+<div style="font-size:13px;font-weight:600;color:var(--text-primary);margin-bottom:12px">Scheduled Snapshots</div>
+<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+  <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-secondary)">
+    <input type="checkbox" id="sched-enabled" onchange="saveSchedule()"> Enable
+  </label>
+  <select id="sched-freq" onchange="saveSchedule()" style="background:#0a0e1a;border:1px solid var(--border);color:var(--text-primary);border-radius:6px;padding:5px 10px;font-size:12px">
+    <option value="daily">Daily</option>
+    <option value="weekly">Weekly (Saturday)</option>
+  </select>
+  <span style="font-size:12px;color:var(--text-dim)">at</span>
+  <input type="number" id="sched-hour" value="2" min="0" max="23" style="width:55px;background:#0a0e1a;border:1px solid var(--border);color:var(--text-primary);border-radius:6px;padding:5px 8px;font-size:12px;font-family:JetBrains Mono,monospace" oninput="saveSchedule()">
+  <span style="font-size:12px;color:var(--text-dim)">:00 local time · Keep last</span>
+  <input type="number" id="sched-retention" value="7" min="1" max="90" style="width:55px;background:#0a0e1a;border:1px solid var(--border);color:var(--text-primary);border-radius:6px;padding:5px 8px;font-size:12px;font-family:JetBrains Mono,monospace" oninput="saveSchedule()">
+  <span style="font-size:12px;color:var(--text-dim)">snapshots</span>
+  <span id="sched-status" style="font-size:11px;color:var(--text-dim)"></span>
+</div>
+</div>
+</div>
+{% endif %}
+
 </div>
 <div class="modal-overlay" id="tak-uninstall-modal">
 <div class="modal">
@@ -32336,6 +33628,135 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 <footer class="footer"></footer>
 <script src="/log-tools.js?v={{ version }}"></script>
+<script>
+// Snapshots & Recovery
+var _snapPollTimer = null;
+function loadSnapshots(){
+  var c=document.getElementById('snap-table-container');
+  if(!c)return;
+  fetch('/api/takserver/snapshots').then(function(r){return r.json();}).then(function(d){
+    var snaps=d.snapshots||[];
+    if(!snaps.length){c.innerHTML='<div style="color:var(--text-dim);font-size:13px">No snapshots yet.</div>';return;}
+    var rows=snaps.map(function(s){
+      var src=s.source||'manual';
+      var srcColor=src==='pre-upgrade'?'var(--cyan)':src==='scheduled'?'var(--green)':'var(--text-dim)';
+      return '<tr style="border-bottom:1px solid var(--border)">'
+        +'<td style="padding:6px 8px;font-size:11px;font-family:JetBrains Mono,monospace;color:var(--text-secondary)">'+s.label+'</td>'
+        +'<td style="padding:6px 8px;font-size:11px;color:var(--text-dim)">'+( s.taken_at||'' ).replace('T',' ').replace('Z','')+'</td>'
+        +'<td style="padding:6px 8px;font-size:11px;color:'+srcColor+'">'+src+'</td>'
+        +'<td style="padding:6px 8px;font-size:11px;color:var(--text-dim)">'+(s.tak_version||'?')+'</td>'
+        +'<td style="padding:6px 8px;font-size:11px;color:var(--text-dim)">'+(s.size_mb||0)+' MB</td>'
+        +'<td style="padding:6px 8px;white-space:nowrap">'
+        +'<button onclick="restoreSnapshot(\''+s.label+'\')" style="padding:4px 10px;background:rgba(239,68,68,0.1);color:var(--red);border:1px solid rgba(239,68,68,0.3);border-radius:5px;font-size:11px;cursor:pointer;margin-right:4px">↩ Restore</button>'
+        +'<a href="/api/takserver/snapshot/'+encodeURIComponent(s.label)+'/download" style="padding:4px 10px;background:rgba(6,182,212,0.08);color:var(--cyan);border:1px solid rgba(6,182,212,0.2);border-radius:5px;font-size:11px;text-decoration:none;display:inline-block;margin-right:4px">⬇ Download</a>'
+        +'<button onclick="deleteSnapshot(\''+s.label+'\')" style="padding:4px 10px;background:transparent;color:var(--text-dim);border:1px solid var(--border);border-radius:5px;font-size:11px;cursor:pointer">✕</button>'
+        +'</td></tr>';
+    }).join('');
+    c.innerHTML='<table style="width:100%;border-collapse:collapse">'
+      +'<thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em">'
+      +'<th style="padding:4px 8px;text-align:left">Label</th>'
+      +'<th style="padding:4px 8px;text-align:left">Taken</th>'
+      +'<th style="padding:4px 8px;text-align:left">Source</th>'
+      +'<th style="padding:4px 8px;text-align:left">TAK Version</th>'
+      +'<th style="padding:4px 8px;text-align:left">Size</th>'
+      +'<th style="padding:4px 8px;text-align:left">Actions</th>'
+      +'</tr></thead><tbody>'+rows+'</tbody></table>';
+  }).catch(function(){c.innerHTML='<div style="color:var(--red);font-size:12px">Failed to load snapshots.</div>';});
+}
+
+function takeSnapshot(){
+  var btn=document.getElementById('snap-now-btn');
+  var prog=document.getElementById('snap-progress');
+  if(btn)btn.disabled=true;
+  if(prog){prog.style.display='';prog.textContent='Starting snapshot…';}
+  fetch('/api/takserver/snapshot/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:'manual'})})
+    .then(function(r){return r.json();}).then(function(d){
+      if(d.ok){
+        _snapPollTimer=setInterval(function(){
+          fetch('/api/takserver/snapshot/status').then(function(r){return r.json();}).then(function(s){
+            if(prog)prog.textContent=s.log&&s.log.length?s.log[s.log.length-1]:'Running…';
+            if(!s.running){
+              clearInterval(_snapPollTimer);
+              if(btn)btn.disabled=false;
+              if(prog)setTimeout(function(){prog.style.display='none';},3000);
+              loadSnapshots();
+            }
+          });
+        },1500);
+      }else{
+        if(prog){prog.textContent='Error: '+(d.error||'failed');prog.style.color='var(--red)';}
+        if(btn)btn.disabled=false;
+      }
+    }).catch(function(){if(btn)btn.disabled=false;if(prog)prog.textContent='Network error';});
+}
+
+function restoreSnapshot(label){
+  if(!confirm('Restore TAK Server from snapshot "'+label+'"?\n\nThis will:\n• Stop TAK Server\n• Restore CoreConfig.xml, certs, and database\n• Restart TAK Server\n\nCurrent data will be overwritten.'))return;
+  var prog=document.getElementById('snap-progress');
+  if(prog){prog.style.display='';prog.style.color='var(--yellow)';prog.textContent='Restoring snapshot…';}
+  fetch('/api/takserver/rollback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:label})})
+    .then(function(r){return r.json();}).then(function(d){
+      if(d.ok){
+        var poll=setInterval(function(){
+          fetch('/api/takserver/rollback/log').then(function(r){return r.json();}).then(function(s){
+            if(prog)prog.textContent=s.log&&s.log.length?s.log[s.log.length-1]:'Running…';
+            if(!s.running){
+              clearInterval(poll);
+              if(prog)prog.style.color=s.error?'var(--red)':'var(--green)';
+              loadSnapshots();
+            }
+          });
+        },1500);
+      }else{
+        if(prog){prog.style.color='var(--red)';prog.textContent='Error: '+(d.error||'failed');}
+      }
+    }).catch(function(){if(prog){prog.style.color='var(--red)';prog.textContent='Network error';}});
+}
+
+function deleteSnapshot(label){
+  if(!confirm('Delete snapshot "'+label+'"?'))return;
+  fetch('/api/takserver/snapshot/'+encodeURIComponent(label),{method:'DELETE'})
+    .then(function(r){return r.json();}).then(function(d){
+      if(d.ok)loadSnapshots();
+      else alert('Delete failed: '+(d.error||'unknown'));
+    });
+}
+
+function loadSchedule(){
+  fetch('/api/takserver/snapshot/schedule').then(function(r){return r.json();}).then(function(d){
+    var el=document.getElementById('sched-enabled');var freq=document.getElementById('sched-freq');
+    var hour=document.getElementById('sched-hour');var ret=document.getElementById('sched-retention');
+    var stat=document.getElementById('sched-status');
+    if(el)el.checked=!!d.enabled;
+    if(freq)freq.value=d.frequency||'daily';
+    if(hour)hour.value=d.hour!==undefined?d.hour:2;
+    if(ret)ret.value=d.retention||7;
+    if(stat)stat.textContent=d.timer_active?'● Timer active':'○ Timer inactive';
+  }).catch(function(){});
+}
+
+var _schedSaveTimer=null;
+function saveSchedule(){
+  clearTimeout(_schedSaveTimer);
+  _schedSaveTimer=setTimeout(function(){
+    var body={
+      enabled:!!(document.getElementById('sched-enabled')&&document.getElementById('sched-enabled').checked),
+      frequency:(document.getElementById('sched-freq')||{}).value||'daily',
+      hour:parseInt((document.getElementById('sched-hour')||{}).value||2,10),
+      minute:0,
+      retention:parseInt((document.getElementById('sched-retention')||{}).value||7,10)
+    };
+    fetch('/api/takserver/snapshot/schedule',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+      .then(function(r){return r.json();}).then(function(d){
+        var stat=document.getElementById('sched-status');
+        if(stat)stat.textContent=d.ok?(d.config.enabled?'● Saved & timer enabled':'○ Saved (disabled)'):'✗ Save failed';
+      });
+  },600);
+}
+
+loadSnapshots();
+loadSchedule();
+</script>
 <script src="/takserver.js"></script></body></html>'''
 
 # === Startup Banner (prints for both gunicorn and direct invocation) ===
@@ -32979,6 +34400,22 @@ def _startup_migrations():
             _fail2ban_takserver_filter(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _f2b_tak_err:
             print(f"Startup migration: fail2ban takserver filter error (non-fatal): {_f2b_tak_err}")
+
+        # v0.9.2: Create Authentik ReputationPolicy and bind to ldap-authentication-flow.
+        # Idempotent — only runs the API calls on first startup per box.
+        try:
+            if os.path.exists(os.path.expanduser('~/authentik/.env')):
+                _authentik_setup_reputation_policy(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _ak_rep_err:
+            print(f"Startup migration: authentik reputation policy error (non-fatal): {_ak_rep_err}")
+
+        # v0.9.3: Ensure TAK Server snapshot timer matches settings (idempotent rewrite).
+        try:
+            _s = load_settings()
+            if (_s.get('tak_snapshot_schedule') or {}).get('enabled'):
+                _tak_setup_snapshot_schedule(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _snap_err:
+            print(f"Startup migration: snapshot schedule error (non-fatal): {_snap_err}")
     except Exception as e:
         print(f"Startup migration error: {e}")
         import traceback; traceback.print_exc()
@@ -33192,6 +34629,13 @@ def _post_update_auto_deploy():
                 _fail2ban_takserver_filter(lambda m: print(f"Post-update: {m}", flush=True))
             except Exception as _f2b_tak_err:
                 print(f"Post-update: fail2ban takserver filter error (non-fatal): {_f2b_tak_err}")
+
+            # v0.9.2: Set up Authentik ReputationPolicy on ldap-authentication-flow.
+            try:
+                if os.path.exists(os.path.expanduser('~/authentik/.env')):
+                    _authentik_setup_reputation_policy(lambda m: print(f"Post-update: {m}", flush=True))
+            except Exception as _ak_rep_err:
+                print(f"Post-update: authentik reputation policy error (non-fatal): {_ak_rep_err}")
 
             # Re-deploy Guard Dog (updated scripts + timers)
             if os.path.exists('/opt/tak-guarddog') and os.path.exists('/opt/tak'):
