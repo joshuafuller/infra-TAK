@@ -4270,6 +4270,29 @@ def fail2ban_authentik_toggle_api():
     bantime  = int(data.get('bantime',  cfg.get('bantime',  3600)))
     try:
         _f2b_write_jail_config(maxretry, findtime, bantime, ignoreip)
+        # Re-write the log forwarder service file if it was never written
+        # (e.g. servers that installed Fail2ban before this service was introduced).
+        svc_path = '/etc/systemd/system/authentik-log-forwarder.service'
+        if not os.path.exists(svc_path):
+            forwarder_service = (
+                "[Unit]\n"
+                "Description=Authentik Docker Log Forwarder for fail2ban\n"
+                "After=docker.service\n"
+                "Requires=docker.service\n\n"
+                "[Service]\n"
+                "Type=simple\n"
+                "Restart=always\n"
+                "RestartSec=10\n"
+                "ExecStart=/bin/bash -c 'docker logs -f authentik-server-1 2>&1 >> /var/log/authentik/auth.log'\n"
+                "StandardOutput=null\n"
+                "StandardError=null\n\n"
+                "[Install]\n"
+                "WantedBy=multi-user.target\n"
+            )
+            os.makedirs('/var/log/authentik', exist_ok=True)
+            with open(svc_path, 'w') as _f:
+                _f.write(forwarder_service)
+            subprocess.run(['systemctl', 'daemon-reload'], capture_output=True)
         # Start log forwarder only if Authentik is running
         ak_running = subprocess.run(
             ['docker', 'ps', '--format', '{{.Names}}'],
