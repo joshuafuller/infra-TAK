@@ -276,7 +276,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.0-alpha"
+VERSION = "0.9.1-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -4234,9 +4234,12 @@ def fail2ban_status_api():
         r = subprocess.run(['fail2ban-client', 'status', 'authentik'],
                            capture_output=True, text=True, timeout=10)
         status = _f2b_parse_status(r.stdout)
-        status['available']     = True
-        status['jail_enabled']  = _f2b_authentik_jail_enabled()
-        status['jail_config']   = _f2b_read_jail_config()
+        status['available']      = True
+        status['daemon_running'] = (subprocess.run(
+            ['systemctl', 'is-active', 'fail2ban'],
+            capture_output=True, text=True).stdout.strip() == 'active')
+        status['jail_enabled']   = _f2b_authentik_jail_enabled()
+        status['jail_config']    = _f2b_read_jail_config()
         status['forwarder_active'] = (subprocess.run(
             ['systemctl', 'is-active', 'authentik-log-forwarder'],
             capture_output=True, text=True).stdout.strip() == 'active')
@@ -4293,6 +4296,12 @@ def fail2ban_authentik_toggle_api():
             with open(svc_path, 'w') as _f:
                 _f.write(forwarder_service)
             subprocess.run(['systemctl', 'daemon-reload'], capture_output=True)
+        # Ensure the fail2ban daemon is running before reloading jails
+        _svc = subprocess.run(['systemctl', 'is-active', 'fail2ban'],
+                              capture_output=True, text=True)
+        if _svc.stdout.strip() != 'active':
+            subprocess.run(['systemctl', 'enable', '--now', 'fail2ban'],
+                           capture_output=True)
         # Start log forwarder only if Authentik is running
         ak_running = subprocess.run(
             ['docker', 'ps', '--format', '{{.Names}}'],
@@ -4421,6 +4430,12 @@ def fail2ban_tak_config_api():
     ignoreip = str(data.get('ignoreip', '')).strip()
     try:
         _f2b_write_tak_jail_config(maxretry, findtime, bantime, ignoreip)
+        # Ensure the fail2ban daemon is running before reloading jails
+        _svc = subprocess.run(['systemctl', 'is-active', 'fail2ban'],
+                              capture_output=True, text=True)
+        if _svc.stdout.strip() != 'active':
+            subprocess.run(['systemctl', 'enable', '--now', 'fail2ban'],
+                           capture_output=True)
         subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
         return jsonify({'ok': True, 'enabled': True,
                         'maxretry': maxretry, 'findtime': findtime, 'bantime': bantime,
@@ -17307,6 +17322,10 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:\'DM Sans\'
 <span id="forwarder-badge" class="badge badge-yellow"><span class="dot"></span>Loading…</span>
 </div>
 
+<div id="daemon-warn" style="display:none;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.35);border-radius:10px;padding:14px 18px;margin-bottom:20px;font-family:\'JetBrains Mono\',monospace;font-size:13px;color:var(--red)">
+⚠ fail2ban daemon is not running — jails are inactive. Toggle any jail ON to auto-restart it, or run <code>systemctl enable --now fail2ban</code> on the server.
+</div>
+
 {% if not installed %}
 <div class="not-installed-banner">
 <img src="https://avatars.githubusercontent.com/u/1087378?s=128&v=4" alt="Fail2ban" style="height:56px;width:auto;border-radius:8px;margin-bottom:16px;display:block;margin-left:auto;margin-right:auto">
@@ -17616,6 +17635,9 @@ function loadStatus(cb) {
     }
     var jailEnabled = d.jail_enabled !== false;  // default true if key missing
     _applyAuthentikJailState(jailEnabled);
+    // Warn if the fail2ban daemon itself is not running
+    var daemonWarn = document.getElementById(\'daemon-warn\');
+    if (daemonWarn) daemonWarn.style.display = (d.daemon_running === false) ? \'\' : \'none\';
 
     document.getElementById(\'stat-banned\').textContent = d.currently_banned || 0;
     document.getElementById(\'stat-failed\').textContent = d.currently_failed || 0;
@@ -31508,7 +31530,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% for key, mod in modules.items() %}
 <a class="module-card" href="{{ mod.route }}" data-module="{{ key }}">
 <div class="module-header{% if mod.get('icon_url') %} module-header--logo{% endif %}">{% if mod.icon_data %}<img src="{{ mod.icon_data }}" alt="" class="module-icon" style="width:24px;height:24px;object-fit:contain">{% elif key == 'takportal' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">group</span>{% elif key == 'fedhub' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">hub</span>{% elif key == 'emailrelay' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">outgoing_mail</span>{% elif mod.get('icon_url') %}<img src="{{ mod.icon_url }}" alt="" class="module-icon" style="height:36px;width:auto;max-width:{% if key == 'takserver' %}72px{% else %}100px{% endif %};object-fit:contain">{% else %}<span class="module-icon">{{ mod.icon }}</span>{% endif %}
-{% if not mod.get('icon_url') or key == 'takportal' or key == 'fedhub' or key == 'emailrelay' %}<div class="module-name">{{ mod.name }}</div>{% endif %}
+{% if not mod.get('icon_url') or key in ('takportal', 'fedhub', 'emailrelay', 'fail2ban') %}<div class="module-name">{{ mod.name }}</div>{% endif %}
 </div>
 <div class="module-desc">{{ mod.description }}</div>
 {% if module_versions.get(key) %}{% set v = module_versions.get(key) %}{% if v.version or v.update_available %}<div class="meta-line module-version-line" id="module-version-{{ key }}" style="margin-bottom:4px">{% if v.version %}{% if key == 'mediamtx' %}{{ v.version }}{% else %}v{{ v.version }}{% endif %}{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% endif %}</div>{% endif %}{% endif %}
@@ -31829,7 +31851,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% for key, mod in modules.items() %}
 <a class="module-card" href="{{ mod.route }}" data-module="{{ key }}">
 <div class="module-header{% if mod.get('icon_url') %} module-header--logo{% endif %}">{% if mod.icon_data %}<img src="{{ mod.icon_data }}" alt="" class="module-icon" style="width:24px;height:24px;object-fit:contain">{% elif key == 'takportal' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">group</span>{% elif key == 'fedhub' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">hub</span>{% elif key == 'emailrelay' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">outgoing_mail</span>{% elif mod.get('icon_url') %}<img src="{{ mod.icon_url }}" alt="" class="module-icon" style="height:36px;width:auto;max-width:{% if key == 'takserver' %}72px{% else %}100px{% endif %};object-fit:contain">{% else %}<span class="module-icon">{{ mod.icon }}</span>{% endif %}
-{% if not mod.get('icon_url') or key == 'takportal' or key == 'fedhub' or key == 'emailrelay' %}<div class="module-name">{{ mod.name }}</div>{% endif %}
+{% if not mod.get('icon_url') or key in ('takportal', 'fedhub', 'emailrelay', 'fail2ban') %}<div class="module-name">{{ mod.name }}</div>{% endif %}
 </div>
 <div class="module-desc">{{ mod.description }}</div>
 <span class="module-status status-not-installed" id="module-status-{{ key }}" data-module="{{ key }}">Not Installed</span>
@@ -32545,7 +32567,19 @@ def _fail2ban_install_and_configure(plog):
         plog("fail2ban migration: Authentik not running — log forwarder will start when Authentik jail is enabled")
     subprocess.run(['systemctl', 'enable', '--now', 'fail2ban'],
                    capture_output=True)
-    plog("fail2ban migration: fail2ban enabled and started")
+    # Verify the daemon actually came up — apt installs it disabled on some images
+    import time as _time
+    for _attempt in range(3):
+        _time.sleep(2)
+        _r = subprocess.run(['systemctl', 'is-active', 'fail2ban'],
+                            capture_output=True, text=True)
+        if _r.stdout.strip() == 'active':
+            plog("fail2ban migration: fail2ban service is active")
+            break
+    else:
+        plog("fail2ban migration: FAILED — fail2ban service did not start after 3 attempts. "
+             "SSH to server and run: systemctl status fail2ban")
+        return False
 
     # Step 7: Record outcome
     s2 = load_settings()
