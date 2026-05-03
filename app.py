@@ -17609,8 +17609,9 @@ function toggleAuthentikJail() {
 function loadStatus(cb) {
   fetch(\'/api/fail2ban/status\').then(r=>r.json()).then(d=>{
     if (!d.available) {
-      document.getElementById(\'stat-banned\').textContent = \'N/A\';
-      document.getElementById(\'forwarder-badge\').innerHTML = \'<span class="dot"></span>fail2ban unavailable\';
+      var _fb = document.getElementById(\'forwarder-badge\');
+      if (_fb) { _fb.className = \'badge badge-yellow\'; _fb.innerHTML = \'<span class="dot"></span>Not installed\'; }
+      if (typeof cb === \'function\') cb();
       return;
     }
     var jailEnabled = d.jail_enabled !== false;  // default true if key missing
@@ -17765,7 +17766,7 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
     var track = document.getElementById(\'tak-toggle-track\');
     var thumb = document.getElementById(\'tak-toggle-thumb\');
     if (!track) return;
-    track.style.background = on ? \'var(--cyan)\' : \'var(--border)\';
+    track.style.background = on ? \'var(--green)\' : \'var(--border)\';
     thumb.style.transform   = on ? \'translateX(18px)\' : \'none\';
   }
 
@@ -17775,9 +17776,9 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
     if (!filterReady) {
       b.className = \'badge badge-yellow\'; b.textContent = \'Filter installing…\';
     } else if (enabled) {
-      b.className = \'badge badge-green\'; b.textContent = \'Active\';
+      b.className = \'badge badge-green\'; b.innerHTML = \'<span class="dot dot-pulse"></span>Active\';
     } else {
-      b.className = \'badge badge-yellow\'; b.textContent = \'Disabled\';
+      b.className = \'badge badge-red\'; b.innerHTML = \'<span class="dot"></span>Disabled\';
     }
   }
 
