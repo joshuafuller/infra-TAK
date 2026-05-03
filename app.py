@@ -4219,6 +4219,11 @@ def _f2b_write_tak_jail_config(maxretry, findtime, bantime, ignoreip=''):
     with open(jail_path, 'w') as _f:
         _f.write(jail_conf)
 
+def _f2b_authentik_jail_enabled():
+    """Return True if the infratak-authentik jail config file exists."""
+    return os.path.exists('/etc/fail2ban/jail.d/infratak-authentik.conf')
+
+
 @app.route('/api/fail2ban/status')
 @login_required
 def fail2ban_status_api():
@@ -4229,8 +4234,9 @@ def fail2ban_status_api():
         r = subprocess.run(['fail2ban-client', 'status', 'authentik'],
                            capture_output=True, text=True, timeout=10)
         status = _f2b_parse_status(r.stdout)
-        status['available'] = True
-        status['jail_config'] = _f2b_read_jail_config()
+        status['available']     = True
+        status['jail_enabled']  = _f2b_authentik_jail_enabled()
+        status['jail_config']   = _f2b_read_jail_config()
         status['forwarder_active'] = (subprocess.run(
             ['systemctl', 'is-active', 'authentik-log-forwarder'],
             capture_output=True, text=True).stdout.strip() == 'active')
@@ -4238,6 +4244,46 @@ def fail2ban_status_api():
         return jsonify(status)
     except Exception as e:
         return jsonify({'available': False, 'error': str(e)[:200]})
+
+
+@app.route('/api/fail2ban/authentik/config', methods=['POST'])
+@login_required
+def fail2ban_authentik_toggle_api():
+    """Enable or disable the Authentik jail (and its log forwarder)."""
+    if not _f2b_is_available():
+        return jsonify({'ok': False, 'error': 'fail2ban not installed'}), 400
+    data    = request.get_json(force=True) or {}
+    enabled = bool(data.get('enabled', False))
+    if not enabled:
+        jail_path = '/etc/fail2ban/jail.d/infratak-authentik.conf'
+        if os.path.exists(jail_path):
+            os.remove(jail_path)
+        subprocess.run(['systemctl', 'stop',    'authentik-log-forwarder'], capture_output=True)
+        subprocess.run(['systemctl', 'disable', 'authentik-log-forwarder'], capture_output=True)
+        subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+        return jsonify({'ok': True, 'enabled': False})
+    # Enable: write jail config (preserving existing thresholds/ignoreip if present)
+    cfg = _f2b_read_jail_config()
+    ignoreip = str(data.get('ignoreip', cfg.get('ignoreip', ''))).strip()
+    maxretry = int(data.get('maxretry', cfg.get('maxretry', 5)))
+    findtime = int(data.get('findtime', cfg.get('findtime', 600)))
+    bantime  = int(data.get('bantime',  cfg.get('bantime',  3600)))
+    try:
+        _f2b_write_jail_config(maxretry, findtime, bantime, ignoreip)
+        # Start log forwarder only if Authentik is running
+        ak_running = subprocess.run(
+            ['docker', 'ps', '--format', '{{.Names}}'],
+            capture_output=True, text=True).stdout
+        forwarder_msg = 'log forwarder not started (Authentik not running)'
+        if 'authentik' in ak_running:
+            subprocess.run(['systemctl', 'enable', '--now', 'authentik-log-forwarder'],
+                           capture_output=True)
+            forwarder_msg = 'log forwarder started'
+        subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+        return jsonify({'ok': True, 'enabled': True, 'forwarder': forwarder_msg})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
 
 @app.route('/api/fail2ban/config', methods=['POST'])
 @login_required
@@ -17251,20 +17297,37 @@ Bans IPs via UFW and sends Guard Dog email alerts.
 </div>
 {% else %}
 
-<!-- Stats -->
-<div class="stat-grid" id="stat-grid" style="margin-bottom:20px">
-<div class="stat-card"><div class="stat-value red" id="stat-banned">—</div><div class="stat-label">Currently Banned</div></div>
-<div class="stat-card"><div class="stat-value yellow" id="stat-failed">—</div><div class="stat-label">Currently Failed</div></div>
-<div class="stat-card"><div class="stat-value cyan" id="stat-total-banned">—</div><div class="stat-label">Total Banned (session)</div></div>
-<div class="stat-card"><div class="stat-value" id="stat-total-failed" style="color:var(--text-dim)">—</div><div class="stat-label">Total Failed (session)</div></div>
+<!-- Authentik Jail card -->
+<div class="card" style="margin-bottom:20px">
+<div class="card-title" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0">
+<div style="display:flex;align-items:center;gap:10px">
+<span>Authentik Jail</span>
+<span class="badge badge-yellow" id="auth-jail-badge" style="font-size:10px;padding:2px 8px">Loading…</span>
+</div>
+<div style="display:flex;align-items:center;gap:16px">
+<button id="auth-refresh-btn2" onclick="manualRefresh()" style="background:none;border:none;cursor:pointer;color:var(--text-dim);font-size:12px;font-family:\'JetBrains Mono\',monospace;display:inline-flex;align-items:center;gap:5px;padding:0"><span id="auth-refresh-icon2" style="display:inline-block;transition:transform 0.4s">↻</span> Refresh</button>
+<label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:0">
+<span style="font-size:12px;color:var(--text-dim);font-family:\'JetBrains Mono\',monospace">Enable</span>
+<div class="toggle-wrap" style="position:relative;width:40px;height:22px">
+<input type="checkbox" id="auth-toggle" onchange="toggleAuthentikJail()" style="opacity:0;width:0;height:0;position:absolute">
+<span id="auth-toggle-track" onclick="document.getElementById(\'auth-toggle\').click()" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
+<span id="auth-toggle-thumb" style="position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform .2s;pointer-events:none"></span>
+</div>
+</label>
+</div>
+</div>
+
+<div id="auth-enabled-section" style="display:none">
+<div class="stat-grid" id="stat-grid" style="margin-top:20px;margin-bottom:20px">
+<div class="stat-card"><div class="stat-value red" id="stat-banned">0</div><div class="stat-label">Currently Banned</div></div>
+<div class="stat-card"><div class="stat-value yellow" id="stat-failed">0</div><div class="stat-label">Currently Failed</div></div>
+<div class="stat-card"><div class="stat-value cyan" id="stat-total-banned">0</div><div class="stat-label">Total Banned (session)</div></div>
+<div class="stat-card"><div class="stat-value" id="stat-total-failed" style="color:var(--text-dim)">0</div><div class="stat-label">Total Failed (session)</div></div>
 </div>
 
 <!-- Banned IPs -->
-<div class="card">
-<div class="card-title" style="display:flex;align-items:center;justify-content:space-between">
-<span>Currently Banned IPs</span>
-<button id="auth-refresh-btn" onclick="manualRefresh()" style="background:none;border:none;cursor:pointer;color:var(--text-dim);font-size:12px;font-family:\'JetBrains Mono\',monospace;display:inline-flex;align-items:center;gap:5px"><span id="auth-refresh-icon" style="display:inline-block;transition:transform 0.4s">↻</span> Refresh</button>
-</div>
+<div class="card" style="margin-top:16px">
+<div class="card-title">Currently Banned IPs</div>
 <div id="ban-list-container">
 <div style="color:var(--text-dim);font-size:13px;font-family:\'JetBrains Mono\',monospace">Loading…</div>
 </div>
@@ -17303,13 +17366,15 @@ Bans IPs via UFW and sends Guard Dog email alerts.
 </div>
 
 <!-- Activity Log -->
-<div class="card">
+<div class="card" style="margin-top:16px">
 <div class="card-title" style="display:flex;align-items:center;justify-content:space-between">
 <span>Recent Activity</span>
 <span style="font-size:11px;color:var(--text-dim);font-weight:400">Last 100 authentik events — auto-refreshes every 30s</span>
 </div>
 <div class="log-box" id="log-box">Loading…</div>
 </div>
+</div><!-- /auth-enabled-section -->
+</div><!-- /Authentik Jail card -->
 
 <!-- TAK Server Jail -->
 <div class="card" id="tak-jail-card" style="display:none">
@@ -17471,14 +17536,51 @@ function _spinIcon(iconId, spinning) {
 }
 
 function manualRefresh() {
-  _spinIcon(\'auth-refresh-icon\', true);
-  var btn = document.getElementById(\'auth-refresh-btn\');
+  _spinIcon(\'auth-refresh-icon2\', true);
+  var btn = document.getElementById(\'auth-refresh-btn2\');
   if (btn) btn.disabled = true;
   loadStatus(function() {
-    _spinIcon(\'auth-refresh-icon\', false);
+    _spinIcon(\'auth-refresh-icon2\', false);
     if (btn) btn.disabled = false;
   });
   loadLog();
+}
+
+function _applyAuthentikJailState(enabled) {
+  var toggle = document.getElementById(\'auth-toggle\');
+  var track  = document.getElementById(\'auth-toggle-track\');
+  var thumb  = document.getElementById(\'auth-toggle-thumb\');
+  var badge  = document.getElementById(\'auth-jail-badge\');
+  var sec    = document.getElementById(\'auth-enabled-section\');
+  if (toggle) toggle.checked = enabled;
+  if (track)  track.style.background  = enabled ? \'var(--green)\' : \'var(--border)\';
+  if (thumb)  thumb.style.transform   = enabled ? \'translateX(18px)\' : \'translateX(0)\';
+  if (badge) {
+    badge.className = enabled ? \'badge badge-green\' : \'badge badge-red\';
+    badge.innerHTML = enabled
+      ? \'<span class="dot dot-pulse"></span>Active\'
+      : \'<span class="dot"></span>Disabled\';
+  }
+  if (sec) sec.style.display = enabled ? \'\' : \'none\';
+}
+
+function toggleAuthentikJail() {
+  var enabled = document.getElementById(\'auth-toggle\').checked;
+  fetch(\'/api/fail2ban/authentik/config\', {
+    method: \'POST\',
+    headers: {\'Content-Type\': \'application/json\'},
+    body: JSON.stringify({enabled: enabled})
+  }).then(r=>r.json()).then(d=>{
+    if (d.ok) {
+      _applyAuthentikJailState(enabled);
+      if (enabled && d.forwarder) showToast(\'Authentik jail enabled — \' + d.forwarder, \'success\');
+      else if (!enabled) showToast(\'Authentik jail disabled.\', \'success\');
+      loadStatus();
+    } else {
+      showToast(d.error || \'Toggle failed\', \'error\');
+      document.getElementById(\'auth-toggle\').checked = !enabled;
+    }
+  }).catch(()=>showToast(\'Network error\', \'error\'));
 }
 
 function loadStatus(cb) {
@@ -17488,6 +17590,9 @@ function loadStatus(cb) {
       document.getElementById(\'forwarder-badge\').innerHTML = \'<span class="dot"></span>fail2ban unavailable\';
       return;
     }
+    var jailEnabled = d.jail_enabled !== false;  // default true if key missing
+    _applyAuthentikJailState(jailEnabled);
+
     document.getElementById(\'stat-banned\').textContent = d.currently_banned || 0;
     document.getElementById(\'stat-failed\').textContent = d.currently_failed || 0;
     document.getElementById(\'stat-total-banned\').textContent = d.total_banned || 0;
@@ -17516,14 +17621,16 @@ function loadStatus(cb) {
 
     var ips = d.banned_ips || [];
     var c = document.getElementById(\'ban-list-container\');
-    if (!ips.length) {
-      c.innerHTML = \'<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:8px 0">No IPs currently banned.</div>\';
-    } else {
-      var rows = ips.map(ip =>
-        \'<tr><td>\' + ip + \'</td><td><button class="btn-danger-sm" onclick="unbanIP(\\\'\'+ ip +\'\\\')">\' +
-        \'Unban</button></td></tr>\'
-      ).join(\'\');
-      c.innerHTML = \'<table class="ban-table"><thead><tr><th>IP Address</th><th>Action</th></tr></thead><tbody>\' + rows + \'</tbody></table>\';
+    if (c) {
+      if (!ips.length) {
+        c.innerHTML = \'<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:8px 0">No IPs currently banned.</div>\';
+      } else {
+        var rows = ips.map(ip =>
+          \'<tr><td>\' + ip + \'</td><td><button class="btn-danger-sm" onclick="unbanIP(\\\'\'+ ip +\'\\\')">\' +
+          \'Unban</button></td></tr>\'
+        ).join(\'\');
+        c.innerHTML = \'<table class="ban-table"><thead><tr><th>IP Address</th><th>Action</th></tr></thead><tbody>\' + rows + \'</tbody></table>\';
+      }
     }
     if (typeof cb === \'function\') cb();
   }).catch(()=>{ showToast(\'Failed to load status\', \'error\'); if (typeof cb === \'function\') cb(); });
@@ -32399,11 +32506,22 @@ def _fail2ban_install_and_configure(plog):
 
     # Step 6: Reload systemd and enable/start services
     subprocess.run(['systemctl', 'daemon-reload'], capture_output=True)
-    subprocess.run(['systemctl', 'enable', '--now', 'authentik-log-forwarder'],
-                   capture_output=True)
+    # Only start the log forwarder if Authentik containers are actually running.
+    # If Authentik isn't deployed yet, the forwarder would crash-loop trying to
+    # tail a non-existent container. It will be started automatically when the
+    # Authentik jail is enabled from the UI after Authentik is deployed.
+    ak_running = subprocess.run(
+        ['docker', 'ps', '--format', '{{.Names}}'],
+        capture_output=True, text=True).stdout
+    if 'authentik' in ak_running:
+        subprocess.run(['systemctl', 'enable', '--now', 'authentik-log-forwarder'],
+                       capture_output=True)
+        plog("fail2ban migration: Authentik detected — log forwarder enabled and started")
+    else:
+        plog("fail2ban migration: Authentik not running — log forwarder will start when Authentik jail is enabled")
     subprocess.run(['systemctl', 'enable', '--now', 'fail2ban'],
                    capture_output=True)
-    plog("fail2ban migration: services enabled and started")
+    plog("fail2ban migration: fail2ban enabled and started")
 
     # Step 7: Record outcome
     s2 = load_settings()
