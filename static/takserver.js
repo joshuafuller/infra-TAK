@@ -2047,3 +2047,198 @@ function toggleFedFirewall(){
   }).catch(function(e){if(msg){msg.textContent='Error: '+e.message;msg.style.color='var(--red)';}if(btn)btn.disabled=false;});
 }
 if(document.getElementById('federation-body')){loadFederationInfo();}
+
+/* ── TAK Server Plugins ─────────────────────────────────────────────── */
+var _takPluginPendingFile=null,_takPluginPendingType=null,_takPluginLogIdx=0,_takPluginLogInterval=null;
+
+function takTogglePlugins(){
+  var body=document.getElementById('tak-plugins-body');
+  var icon=document.getElementById('tak-plugins-toggle-icon');
+  if(!body)return;
+  var show=body.style.display==='none';
+  body.style.display=show?'block':'none';
+  if(icon)icon.style.transform=show?'rotate(180deg)':'';
+  if(show)loadPlugins();
+}
+
+function loadPlugins(){
+  var el=document.getElementById('tak-plugins-list');
+  if(!el)return;
+  el.textContent='Loading...';
+  fetch('/api/takserver/plugins/list',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    if(!d.plugins||!d.plugins.length){
+      el.innerHTML='<span style="color:var(--text-dim)">No plugins installed. Upload a .jar to get started.</span>';
+      return;
+    }
+    var rows=d.plugins.map(function(p){
+      var name=p.jar||p.classname||'Unknown';
+      var configLabel=p.has_config
+        ?'<span style="color:var(--green);font-size:11px">&#10003; config</span>'
+        :'<span style="color:var(--text-dim);font-size:11px">no config yet</span>';
+      var classKey=p.classname||'';
+      var jarKey=p.jar||'';
+      var configBtn=classKey
+        ?'<button type="button" onclick="takPluginToggleConfig(\''+classKey+'\')" style="padding:4px 10px;background:transparent;color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-size:11px;cursor:pointer;font-family:\'JetBrains Mono\',monospace">Edit config</button>'
+        :'';
+      var removeBtn=jarKey
+        ?'<button type="button" onclick="takPluginRemove(\''+jarKey+'\')" style="padding:4px 10px;background:transparent;color:var(--red);border:1px solid rgba(239,68,68,0.3);border-radius:6px;font-size:11px;cursor:pointer;font-family:\'JetBrains Mono\',monospace">Remove</button>'
+        :'';
+      var configSection=classKey
+        ?'<div id="tak-plugin-cfg-'+classKey+'" style="display:none;margin-top:10px;padding:12px;background:rgba(6,182,212,0.04);border:1px solid var(--border);border-radius:8px">'
+          +'<div style="font-size:11px;color:var(--text-dim);margin-bottom:6px;font-family:\'JetBrains Mono\',monospace">'+classKey+'.yaml</div>'
+          +'<textarea id="tak-plugin-cfg-txt-'+classKey+'" style="width:100%;min-height:140px;background:#0a0e1a;border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:11px;padding:10px;box-sizing:border-box;resize:vertical" spellcheck="false"></textarea>'
+          +'<div style="display:flex;align-items:center;gap:10px;margin-top:8px">'
+          +'<button type="button" onclick="takPluginSaveConfig(\''+classKey+'\')" style="padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer">Save</button>'
+          +'<span id="tak-plugin-cfg-msg-'+classKey+'" style="font-size:11px;color:var(--text-dim)"></span>'
+          +'</div>'
+          +'</div>'
+        :'';
+      return '<div style="padding:10px 14px;background:rgba(6,182,212,0.03);border:1px solid var(--border);border-radius:8px;margin-bottom:8px">'
+        +'<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">'
+        +'<div><span style="font-family:\'JetBrains Mono\',monospace;font-size:13px;color:var(--text-primary)">'+name+'</span> '+configLabel+'</div>'
+        +'<div style="display:flex;gap:6px">'+configBtn+' '+removeBtn+'</div>'
+        +'</div>'
+        +configSection
+        +'</div>';
+    });
+    el.innerHTML=rows.join('');
+  }).catch(function(){el.textContent='Could not load plugin list.';});
+}
+
+function takPluginToggleConfig(classname){
+  var panel=document.getElementById('tak-plugin-cfg-'+classname);
+  if(!panel)return;
+  var showing=panel.style.display==='block';
+  panel.style.display=showing?'none':'block';
+  if(!showing){
+    var txt=document.getElementById('tak-plugin-cfg-txt-'+classname);
+    var msg=document.getElementById('tak-plugin-cfg-msg-'+classname);
+    if(txt)txt.value='Loading...';
+    fetch('/api/takserver/plugins/config/'+encodeURIComponent(classname),{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+      if(!txt)return;
+      if(d.exists){txt.value=d.content;}
+      else{txt.value='';if(msg){msg.textContent='Config will be generated on first run after restart';msg.style.color='var(--text-dim)';}}
+    }).catch(function(){if(txt)txt.value='';});
+  }
+}
+
+async function takPluginSaveConfig(classname){
+  var txt=document.getElementById('tak-plugin-cfg-txt-'+classname);
+  var msg=document.getElementById('tak-plugin-cfg-msg-'+classname);
+  if(!txt||!msg)return;
+  msg.textContent='Saving...';msg.style.color='var(--text-dim)';
+  try{
+    var r=await fetch('/api/takserver/plugins/config/'+encodeURIComponent(classname),{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:txt.value})});
+    var d=await r.json();
+    if(d.success){msg.textContent='\u2713 Saved — restart TAK Server to apply';msg.style.color='var(--green)';}
+    else{msg.textContent=d.error||'Save failed';msg.style.color='var(--red)';}
+  }catch(e){msg.textContent='Error: '+e.message;msg.style.color='var(--red)';}
+}
+
+function takPluginDrop(e){
+  e.preventDefault();
+  var area=document.getElementById('tak-plugin-upload-area');
+  if(area)area.classList.remove('dragover');
+  var file=e.dataTransfer&&e.dataTransfer.files&&e.dataTransfer.files[0];
+  if(file)_takPluginSetFile(file);
+}
+
+function takPluginFileChange(e){
+  var file=e.target&&e.target.files&&e.target.files[0];
+  if(file)_takPluginSetFile(file);
+  if(e.target)e.target.value='';
+}
+
+function _takPluginSetFile(file){
+  var n=(file.name||'').toLowerCase();
+  var msg=document.getElementById('tak-plugin-install-msg');
+  var btn=document.getElementById('tak-plugin-install-btn');
+  var fnEl=document.getElementById('tak-plugin-upload-filename');
+  var txtEl=document.getElementById('tak-plugin-upload-text');
+  if(!n.endsWith('.jar')&&!n.endsWith('.yaml')){
+    if(msg){msg.textContent='Only .jar and .yaml files are accepted';msg.style.color='var(--red)';}
+    return;
+  }
+  _takPluginPendingFile=file;
+  _takPluginPendingType=n.endsWith('.jar')?'jar':'yaml';
+  if(fnEl){fnEl.textContent=file.name;fnEl.style.display='block';}
+  if(txtEl)txtEl.style.display='none';
+  if(btn)btn.disabled=false;
+  if(msg){msg.textContent='';msg.style.color='';}
+}
+
+async function takPluginInstall(){
+  var btn=document.getElementById('tak-plugin-install-btn');
+  var msg=document.getElementById('tak-plugin-install-msg');
+  var logWrap=document.getElementById('tak-plugin-log-wrap');
+  var logEl=document.getElementById('tak-plugin-log');
+  if(!_takPluginPendingFile){if(msg){msg.textContent='Select a file first';msg.style.color='var(--red)';}return;}
+  if(btn)btn.disabled=true;
+  if(msg){msg.textContent='Uploading...';msg.style.color='var(--text-dim)';}
+  try{
+    var fd=new FormData();
+    fd.append('file',_takPluginPendingFile);
+    var r=await fetch('/api/upload/takserver-plugin',{method:'POST',credentials:'same-origin',body:fd});
+    var d=await r.json();
+    if(!d.success){if(msg){msg.textContent=d.error||'Upload failed';msg.style.color='var(--red)';}if(btn)btn.disabled=false;return;}
+    var fn=d.filename;
+    var type=d.type;
+    if(msg){msg.textContent='Installing...';msg.style.color='var(--text-dim)';}
+    var installUrl=type==='jar'?'/api/takserver/plugins/install-jar':'/api/takserver/plugins/install-yaml';
+    var r2=await fetch(installUrl,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:fn})});
+    var d2=await r2.json();
+    if(!d2.success){if(msg){msg.textContent=d2.error||'Install failed';msg.style.color='var(--red)';}if(btn)btn.disabled=false;return;}
+    if(type==='yaml'){
+      if(msg){msg.textContent='\u2713 Config file installed';msg.style.color='var(--green)';}
+      _takPluginShowRestartBanner();
+      if(btn)btn.disabled=false;
+      loadPlugins();
+      return;
+    }
+    if(logWrap)logWrap.style.display='block';
+    if(logEl)logEl.textContent='Connecting...';
+    _takPluginLogIdx=0;
+    if(msg){msg.textContent='';msg.style.color='';}
+    _takPluginPollLog();
+  }catch(e){if(msg){msg.textContent='Error: '+e.message;msg.style.color='var(--red)';}if(btn)btn.disabled=false;}
+}
+
+function _takPluginPollLog(){
+  var logEl=document.getElementById('tak-plugin-log');
+  var msg=document.getElementById('tak-plugin-install-msg');
+  var btn=document.getElementById('tak-plugin-install-btn');
+  function poll(){
+    fetch('/api/takserver/plugins/install/log?index='+_takPluginLogIdx,{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+      if(d.entries&&d.entries.length){if(_takPluginLogIdx===0&&logEl)logEl.textContent='';if(logEl){logEl.textContent+=d.entries.join('\n')+'\n';logEl.scrollTop=logEl.scrollHeight;}_takPluginLogIdx=d.total;}
+      if(!d.running){
+        if(btn)btn.disabled=false;
+        if(d.complete){
+          if(msg){msg.textContent='\u2713 Installed';msg.style.color='var(--green)';}
+          _takPluginShowRestartBanner();
+          loadPlugins();
+        }else if(d.error){if(msg){msg.textContent='Install failed';msg.style.color='var(--red)';}}
+      }else{setTimeout(poll,800);}
+    }).catch(function(){setTimeout(poll,1500);});
+  }
+  poll();
+}
+
+function _takPluginShowRestartBanner(){
+  var banner=document.getElementById('tak-plugins-restart-banner');
+  if(banner)banner.style.display='flex';
+}
+
+async function takPluginRemove(jarname){
+  if(!confirm('Remove '+jarname+' and its config file?\n\nTAK Server will need a restart.')){return;}
+  var msg=document.getElementById('tak-plugin-install-msg');
+  if(msg){msg.textContent='Removing...';msg.style.color='var(--text-dim)';}
+  try{
+    var r=await fetch('/api/takserver/plugins/remove/'+encodeURIComponent(jarname),{method:'POST',credentials:'same-origin'});
+    var d=await r.json();
+    if(d.success){
+      if(msg){msg.textContent='\u2713 Removed';msg.style.color='var(--green)';}
+      _takPluginShowRestartBanner();
+      loadPlugins();
+    }else{if(msg){msg.textContent=d.error||'Remove failed';msg.style.color='var(--red)';}}
+  }catch(e){if(msg){msg.textContent='Error: '+e.message;msg.style.color='var(--red)';}}
+}

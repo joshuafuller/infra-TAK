@@ -29506,6 +29506,195 @@ upgrade_status = {'running': False, 'complete': False, 'error': False}
 tak_migrate_log = []
 tak_migrate_status = {'running': False, 'complete': False, 'error': False}
 
+plugin_install_log = []
+plugin_install_status = {'running': False, 'complete': False, 'error': False}
+
+TAK_LIB_DIR = '/opt/tak/lib'
+TAK_PLUGINS_CONF_DIR = '/opt/tak/conf/plugins'
+
+
+@app.route('/api/takserver/plugins/list')
+@login_required
+def takserver_plugins_list():
+    """List installed plugins: union of JARs in /opt/tak/lib/ and YAMLs in /opt/tak/conf/plugins/."""
+    plugins = {}
+    if os.path.isdir(TAK_LIB_DIR):
+        r = subprocess.run(['sudo', 'ls', TAK_LIB_DIR], capture_output=True, text=True, timeout=5)
+        for fn in (r.stdout.splitlines() if r.returncode == 0 else []):
+            if fn.endswith('.jar'):
+                stem = fn[:-4]
+                plugins[stem] = {'jar': fn, 'classname': None, 'has_config': False}
+    if os.path.isdir(TAK_PLUGINS_CONF_DIR):
+        r2 = subprocess.run(['sudo', 'ls', TAK_PLUGINS_CONF_DIR], capture_output=True, text=True, timeout=5)
+        for fn in (r2.stdout.splitlines() if r2.returncode == 0 else []):
+            if fn.endswith('.yaml'):
+                classname = fn[:-5]
+                matched = False
+                for stem, entry in plugins.items():
+                    if stem.lower().replace('-', '').replace('_', '') in classname.lower().replace('.', '').replace('-', '').replace('_', ''):
+                        entry['classname'] = classname
+                        entry['has_config'] = True
+                        matched = True
+                        break
+                if not matched:
+                    plugins[classname] = {'jar': None, 'classname': classname, 'has_config': True}
+    result = sorted(plugins.values(), key=lambda x: (x['jar'] is None, x.get('jar') or x.get('classname', '')))
+    return jsonify({'plugins': result})
+
+
+@app.route('/api/upload/takserver-plugin', methods=['POST'])
+@login_required
+def upload_takserver_plugin():
+    """Accept .jar or .yaml plugin file, save to UPLOAD_DIR."""
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file uploaded'}), 400
+    f = request.files['file']
+    raw_name = f.filename or ''
+    fn = secure_filename(raw_name)
+    if not fn:
+        return jsonify({'error': 'Invalid filename'}), 400
+    if not fn.endswith('.jar') and not fn.endswith('.yaml'):
+        return jsonify({'error': 'Only .jar and .yaml files are accepted'}), 400
+    fp = os.path.join(UPLOAD_DIR, fn)
+    f.save(fp)
+    sz = round(os.path.getsize(fp) / (1024 * 1024), 2)
+    return jsonify({'success': True, 'filename': fn, 'size_mb': sz, 'type': 'jar' if fn.endswith('.jar') else 'yaml'})
+
+
+@app.route('/api/takserver/plugins/install-jar', methods=['POST'])
+@login_required
+def takserver_plugin_install_jar():
+    """Copy an uploaded .jar to /opt/tak/lib/."""
+    import re as _re
+    data = request.get_json() or {}
+    fn = data.get('filename', '')
+    if not fn or not fn.endswith('.jar'):
+        return jsonify({'error': 'No .jar filename provided'}), 400
+    if not _re.match(r'^[a-zA-Z0-9._-]+\.jar$', fn):
+        return jsonify({'error': 'Invalid filename'}), 400
+    src = os.path.join(UPLOAD_DIR, fn)
+    if not os.path.exists(src):
+        return jsonify({'error': f'File not found in uploads: {fn}'}), 404
+    dest = os.path.join(TAK_LIB_DIR, fn)
+    plugin_install_log.clear()
+    plugin_install_status.update({'running': True, 'complete': False, 'error': False})
+    def _do_install(src=src, dest=dest, fn=fn):
+        try:
+            plugin_install_log.append(f'Copying {fn} to {TAK_LIB_DIR}...')
+            r = subprocess.run(['sudo', 'mkdir', '-p', TAK_LIB_DIR], capture_output=True, text=True, timeout=10)
+            r2 = subprocess.run(['sudo', 'cp', src, dest], capture_output=True, text=True, timeout=30)
+            if r2.returncode != 0:
+                plugin_install_log.append(f'Error: {r2.stderr.strip() or "copy failed"}')
+                plugin_install_status.update({'running': False, 'error': True})
+                return
+            subprocess.run(['sudo', 'chmod', '644', dest], capture_output=True, text=True, timeout=10)
+            plugin_install_log.append(f'\u2713 {fn} installed to {TAK_LIB_DIR}')
+            plugin_install_log.append('Restart TAK Server to load the plugin.')
+            plugin_install_status.update({'running': False, 'complete': True})
+        except Exception as e:
+            plugin_install_log.append(f'Error: {str(e)[:200]}')
+            plugin_install_status.update({'running': False, 'error': True})
+    threading.Thread(target=_do_install, daemon=True).start()
+    return jsonify({'success': True})
+
+
+@app.route('/api/takserver/plugins/install-yaml', methods=['POST'])
+@login_required
+def takserver_plugin_install_yaml():
+    """Copy an uploaded plugin .yaml config to /opt/tak/conf/plugins/. Validates tak.server.plugins.* naming."""
+    import re as _re
+    data = request.get_json() or {}
+    fn = data.get('filename', '')
+    if not fn or not fn.endswith('.yaml'):
+        return jsonify({'error': 'No .yaml filename provided'}), 400
+    if not _re.match(r'^tak\.server\.plugins\.[a-zA-Z0-9._-]+\.yaml$', fn):
+        return jsonify({'error': 'Plugin config filename must be named tak.server.plugins.<ClassName>.yaml'}), 400
+    src = os.path.join(UPLOAD_DIR, fn)
+    if not os.path.exists(src):
+        return jsonify({'error': f'File not found in uploads: {fn}'}), 404
+    dest = os.path.join(TAK_PLUGINS_CONF_DIR, fn)
+    try:
+        subprocess.run(['sudo', 'mkdir', '-p', TAK_PLUGINS_CONF_DIR], capture_output=True, text=True, timeout=10)
+        r = subprocess.run(['sudo', 'cp', src, dest], capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            return jsonify({'error': r.stderr.strip() or 'Copy failed'}), 500
+        subprocess.run(['sudo', 'chmod', '644', dest], capture_output=True, text=True, timeout=10)
+        return jsonify({'success': True, 'filename': fn})
+    except Exception as e:
+        return jsonify({'error': str(e)[:200]}), 500
+
+
+@app.route('/api/takserver/plugins/config/<classname>')
+@login_required
+def takserver_plugin_config_get(classname):
+    """Read a plugin YAML config from /opt/tak/conf/plugins/."""
+    import re as _re
+    if not _re.match(r'^[a-zA-Z0-9._-]+$', classname):
+        return jsonify({'error': 'Invalid classname'}), 400
+    fn = classname if classname.endswith('.yaml') else classname + '.yaml'
+    path = os.path.join(TAK_PLUGINS_CONF_DIR, fn)
+    r = subprocess.run(['sudo', 'cat', path], capture_output=True, text=True, timeout=5)
+    if r.returncode != 0:
+        return jsonify({'exists': False, 'content': ''})
+    return jsonify({'exists': True, 'content': r.stdout})
+
+
+@app.route('/api/takserver/plugins/config/<classname>', methods=['POST'])
+@login_required
+def takserver_plugin_config_save(classname):
+    """Write a plugin YAML config back to /opt/tak/conf/plugins/."""
+    import re as _re
+    if not _re.match(r'^[a-zA-Z0-9._-]+$', classname):
+        return jsonify({'error': 'Invalid classname'}), 400
+    data = request.get_json() or {}
+    content = data.get('content', '')
+    fn = classname if classname.endswith('.yaml') else classname + '.yaml'
+    path = os.path.join(TAK_PLUGINS_CONF_DIR, fn)
+    try:
+        subprocess.run(['sudo', 'mkdir', '-p', TAK_PLUGINS_CONF_DIR], capture_output=True, text=True, timeout=10)
+        proc = subprocess.run(['sudo', 'tee', path], input=content, capture_output=True, text=True, timeout=10)
+        if proc.returncode != 0:
+            return jsonify({'error': proc.stderr.strip() or 'Write failed'}), 500
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)[:200]}), 500
+
+
+@app.route('/api/takserver/plugins/remove/<jarname>', methods=['POST'])
+@login_required
+def takserver_plugin_remove(jarname):
+    """Remove a plugin JAR from /opt/tak/lib/ and its matching YAML from /opt/tak/conf/plugins/."""
+    import re as _re
+    if not _re.match(r'^[a-zA-Z0-9._-]+\.jar$', jarname):
+        return jsonify({'error': 'Invalid jar filename'}), 400
+    jar_path = os.path.join(TAK_LIB_DIR, jarname)
+    r = subprocess.run(['sudo', 'test', '-f', jar_path], capture_output=True, timeout=5)
+    if r.returncode != 0:
+        return jsonify({'error': f'{jarname} not found in {TAK_LIB_DIR}'}), 404
+    try:
+        subprocess.run(['sudo', 'rm', jar_path], capture_output=True, text=True, timeout=10)
+        removed_yaml = []
+        if os.path.isdir(TAK_PLUGINS_CONF_DIR):
+            r2 = subprocess.run(['sudo', 'ls', TAK_PLUGINS_CONF_DIR], capture_output=True, text=True, timeout=5)
+            stem = jarname[:-4].lower().replace('-', '').replace('_', '')
+            for fn in (r2.stdout.splitlines() if r2.returncode == 0 else []):
+                if fn.endswith('.yaml') and stem in fn.lower().replace('.', '').replace('-', '').replace('_', ''):
+                    subprocess.run(['sudo', 'rm', os.path.join(TAK_PLUGINS_CONF_DIR, fn)],
+                                   capture_output=True, text=True, timeout=10)
+                    removed_yaml.append(fn)
+        return jsonify({'success': True, 'jar_removed': jarname, 'yaml_removed': removed_yaml})
+    except Exception as e:
+        return jsonify({'error': str(e)[:200]}), 500
+
+
+@app.route('/api/takserver/plugins/install/log')
+@login_required
+def takserver_plugin_install_log_api():
+    idx = int(request.args.get('index', 0))
+    return jsonify({'entries': plugin_install_log[idx:], 'total': len(plugin_install_log),
+        'running': plugin_install_status['running'], 'complete': plugin_install_status['complete'],
+        'error': plugin_install_status['error']})
+
 
 @app.route('/api/takserver/cert-password')
 @login_required
@@ -33352,6 +33541,39 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div class="section-title">Update log</div>
 <div id="upgrade-log" style="background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary);max-height:400px;overflow-y:auto;line-height:1.7;white-space:pre-wrap;margin-top:8px">{% if upgrading %}Connecting...{% else %}{% if upgrade_done %}Done.{% elif upgrade_error %}Update failed.{% endif %}{% endif %}</div>
 {% if upgrade_done %}<p style="margin-top:12px;font-size:13px;color:var(--text-secondary)">Update complete. <button type="button" onclick="window.location.reload()" style="padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer">Refresh page</button> to see the new version.</p>{% endif %}
+</div>
+</div>
+</div>
+{% endif %}
+{% if tak.installed %}
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:24px">
+<div style="display:flex;align-items:center;justify-content:space-between;padding:16px 24px;cursor:pointer" onclick="takTogglePlugins()" id="tak-plugins-header">
+<span class="section-title" style="margin-bottom:0">TAK Server Plugins</span>
+<span id="tak-plugins-toggle-icon" style="font-size:18px;color:var(--text-dim);transition:transform 0.2s ease">&#9662;</span>
+</div>
+<div id="tak-plugins-body" style="display:none;padding:0 24px 24px 24px;border-top:1px solid var(--border)">
+<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">Plugin JARs are loaded from <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">/opt/tak/lib/</span>. Upload a <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">.jar</span> to install a plugin, or a <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">tak.server.plugins.ClassName.yaml</span> to install a config file. TAK Server must be restarted after any change.</p>
+<div id="tak-plugins-restart-banner" style="display:none;background:rgba(234,179,8,0.08);border:1px solid rgba(234,179,8,0.35);border-radius:10px;padding:12px 16px;margin-bottom:16px;display:none;align-items:center;justify-content:space-between;gap:12px">
+<span style="font-size:13px;color:var(--yellow)">&#9888; Restart TAK Server to apply plugin changes.</span>
+<button type="button" onclick="takControl('restart')" style="padding:7px 16px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap">&#8635; Restart Now</button>
+</div>
+<div style="margin-bottom:20px">
+<div class="section-title" style="margin-bottom:10px">Installed Plugins</div>
+<div id="tak-plugins-list" style="font-size:13px;color:var(--text-dim)">Loading...</div>
+</div>
+<div class="section-title" style="margin-bottom:10px">Install Plugin</div>
+<div class="upload-area" id="tak-plugin-upload-area" style="padding:24px;margin-bottom:12px" onclick="document.getElementById('tak-plugin-file-input').click()" ondrop="takPluginDrop(event)" ondragover="event.preventDefault();this.classList.add('dragover')" ondragleave="event.preventDefault();this.classList.remove('dragover')">
+<input type="file" id="tak-plugin-file-input" style="display:none" accept=".jar,.yaml" onchange="takPluginFileChange(event)">
+<div id="tak-plugin-upload-text" style="color:var(--text-dim);font-size:13px">Click or drag to upload a plugin <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">.jar</span> or config <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">tak.server.plugins.ClassName.yaml</span></div>
+<div id="tak-plugin-upload-filename" style="display:none;font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--cyan);margin-top:8px"></div>
+</div>
+<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px">
+<button type="button" id="tak-plugin-install-btn" onclick="takPluginInstall()" style="padding:10px 22px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:14px;font-weight:600;cursor:pointer" disabled>Install Plugin</button>
+<span id="tak-plugin-install-msg" style="font-size:12px;color:var(--text-dim)"></span>
+</div>
+<div id="tak-plugin-log-wrap" style="display:none;margin-top:4px">
+<div class="section-title">Install log</div>
+<div id="tak-plugin-log" style="background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary);max-height:300px;overflow-y:auto;line-height:1.7;white-space:pre-wrap;margin-top:8px"></div>
 </div>
 </div>
 </div>
