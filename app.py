@@ -33152,8 +33152,6 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <span class="uu-spinner" data-target="{{ host.id }}" style="display:none"></span>
 <span class="uu-label" id="uu-label-{{ host.id }}" data-target="{{ host.id }}" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:{% if host.enabled %}var(--green){% else %}var(--text-dim){% endif %}">{% if host.enabled and host.running %}Running...{% elif host.enabled %}Enabled{% else %}Disabled{% endif %}</span>
 </div>
-<button type="button" onclick="event.stopPropagation();toggleResourceBreakdown('{{ host.id }}')" style="margin-top:8px;padding:4px 10px;background:rgba(59,130,246,0.15);color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">What's using CPU/RAM?</button>
-<div id="resource-breakdown-{{ host.id }}" style="display:none;margin-top:8px;padding-top:8px;border-top:1px solid var(--border);font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);max-height:200px;overflow-y:auto"></div>
 </div>
 {% endfor %}
 </div>
@@ -33210,53 +33208,7 @@ async function toggleUU(cb){
         else{cb.checked=!cb.checked;if(lb){lb.textContent=(action==='disable'?'Disable failed: ':'Enable failed: ')+(d.error||'unknown');lb.style.color='var(--red)';}}
     }catch(e){if(sp)sp.style.display='none';cb.checked=!cb.checked;if(lb){lb.textContent='Error';lb.style.color='var(--red)';}}
 }
-function formatRamGb(memPct,totalRamGb){if(totalRamGb==null)return '';var gb=(Number(memPct||0)/100)*totalRamGb;return gb.toFixed(2)+' GB';}
-function cpuColor(pct){var n=Number(pct||0);if(n>=90)return 'var(--red)';if(n>=70)return '#eab308';return 'var(--green)';}
-function diskIoColor(mbs){var m=Number(mbs||0);if(m>=200)return 'var(--green)';if(m>=80)return '#eab308';return 'var(--red)';}
-function renderResourceBreakdown(div,data,hostId){
-    var err=data.error,cpuTop=data.cpu_top,memTop=data.mem_top,totalRamGb=data.total_ram_gb,processor=data.processor,vcpuCount=data.vcpu_count,diskRead=data.disk_io_read_mbs,diskWrite=data.disk_io_write_mbs,diskSrc=data.disk_io_source,speedRead=data.disk_speed_test_read_mbs,speedWrite=data.disk_speed_test_write_mbs,speedErr=data.disk_speed_test_error;
-    if(err){div.innerHTML='<span style="color:var(--red)">'+escapeHtml(err)+'</span>'+(hostId?' <button type="button" onclick="refreshResourceBreakdown(\\''+hostId+'\\')" style="margin-left:8px;padding:2px 8px;font-size:10px;background:rgba(59,130,246,0.2);color:var(--cyan);border:1px solid var(--border);border-radius:4px;cursor:pointer">Refresh</button>':'');return;}
-    var tbl='width:100%;border-collapse:collapse;font-size:10px;text-align:left', th='padding:2px 8px 2px 0;color:var(--cyan);font-weight:600;border-bottom:1px solid var(--border)', td='padding:2px 8px 2px 0;border-bottom:1px solid rgba(255,255,255,0.06)', r='text-align:right';
-    var html='';
-    if(processor){html+='<div style="margin-bottom:2px;color:var(--text-dim);font-size:10px">Processor: '+escapeHtml(processor)+'</div>';if(vcpuCount)html+='<div style="margin-bottom:4px;padding-left:8px;color:var(--cyan);font-size:10px;font-weight:600">'+vcpuCount+' vCPUs</div>';}
-    if(totalRamGb!=null)html+='<div style="margin-bottom:4px;color:var(--text-dim)">Total RAM: '+totalRamGb+' GB</div>';
-    if(diskWrite!=null&&diskSrc==='sync'){var dw=Number(diskWrite),cwColor=diskIoColor(dw);html+='<div style="margin-bottom:4px;font-size:10px">Disk write speed (Guard Dog): <span style="color:'+cwColor+'">'+dw.toFixed(0)+' MB/s</span></div>';}
-    if(speedWrite!=null){var sw=Number(speedWrite),swColor=diskIoColor(sw);html+='<div style="margin-bottom:6px;font-size:10px">Disk speed test (256 MiB): <span style="color:'+swColor+'">'+sw.toFixed(0)+' MB/s</span></div>';}
-    else if(speedErr)html+='<div style="margin-bottom:6px;color:var(--text-dim);font-size:10px">Disk speed test: <span style="color:var(--red)">'+escapeHtml(speedErr)+'</span></div>';
-    var ramCell='padding:2px 8px 2px 0;border-bottom:1px solid rgba(255,255,255,0.06);text-align:right;color:var(--text-dim);white-space:nowrap';
-    if(cpuTop&&cpuTop.length){
-        html+='<div style="margin-bottom:10px"><strong style="color:var(--cyan)">Top by CPU</strong><table style="'+tbl+';margin-top:4px"><thead><tr><th style="'+th+'">Process</th><th style="'+th+';'+r+'">CPU %</th><th style="'+th+';'+r+'">RAM %</th>'+(totalRamGb!=null?'<th style="'+th+';'+r+'">RAM</th>':'')+'</tr></thead><tbody>';
-        cpuTop.forEach(function(p){var ramStr=formatRamGb(p.mem_pct,totalRamGb);var cpuPct=Number(p.cpu_pct||0);html+='<tr><td style="'+td+'">'+escapeHtml(p.name||'')+'</td><td style="'+td+';'+r+';color:'+cpuColor(cpuPct)+'">'+cpuPct.toFixed(1)+'%</td><td style="'+td+';'+r+'">'+Number(p.mem_pct||0).toFixed(1)+'%</td>'+(totalRamGb!=null?'<td style="'+ramCell+'">'+ramStr+'</td>':'')+'</tr>';});
-        html+='</tbody></table></div>';
-    }
-    if(memTop&&memTop.length){
-        html+='<div><strong style="color:var(--cyan)">Top by RAM</strong><table style="'+tbl+';margin-top:4px"><thead><tr><th style="'+th+'">Process</th><th style="'+th+';'+r+'">RAM %</th>'+(totalRamGb!=null?'<th style="'+th+';'+r+'">RAM</th>':'')+'<th style="'+th+';'+r+'">CPU %</th></tr></thead><tbody>';
-        memTop.forEach(function(p){var ramStr=formatRamGb(p.mem_pct,totalRamGb);var cpuPct=Number(p.cpu_pct||0);html+='<tr><td style="'+td+'">'+escapeHtml(p.name||'')+'</td><td style="'+td+';'+r+'">'+Number(p.mem_pct||0).toFixed(1)+'%</td>'+(totalRamGb!=null?'<td style="'+ramCell+'">'+ramStr+'</td>':'')+'<td style="'+td+';'+r+';color:'+cpuColor(cpuPct)+'">'+cpuPct.toFixed(1)+'%</td></tr>';});
-        html+='</tbody></table></div>';
-    }
-    if(!html)html='No process data.';
-    if(hostId)html+='<div style="margin-top:8px"><button type="button" onclick="refreshResourceBreakdown(\\''+hostId+'\\')" style="padding:4px 10px;font-size:10px;background:rgba(59,130,246,0.15);color:var(--cyan);border:1px solid var(--border);border-radius:6px;cursor:pointer">Refresh</button></div>';
-    div.innerHTML=html;
-}
-async function refreshResourceBreakdown(hostId){
-    var div=document.getElementById('resource-breakdown-'+hostId);if(!div)return;
-    div.removeAttribute('data-loaded');div.style.display='block';div.textContent='Loading… (disk speed test ~5–30s)';
-    try{var r=await fetch('/api/host-resource-usage?target='+encodeURIComponent(hostId));var d=await r.json();renderResourceBreakdown(div,d,hostId);div.setAttribute('data-loaded','1');}catch(e){div.innerHTML='<span style="color:var(--red)">Request failed</span>';div.setAttribute('data-loaded','1');}
-}
 function escapeHtml(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML;}
-async function toggleResourceBreakdown(hostId){
-    var div=document.getElementById('resource-breakdown-'+hostId);if(!div)return;
-    if(div.style.display==='block'){div.style.display='none';return;}
-    if(!div.getAttribute('data-loaded')){
-        div.style.display='block';div.textContent='Loading… (disk speed test ~5–30s)';
-        try{
-            var r=await fetch('/api/host-resource-usage?target='+encodeURIComponent(hostId));var d=await r.json();
-            renderResourceBreakdown(div,d,hostId);div.setAttribute('data-loaded','1');
-        }catch(e){div.innerHTML='<span style="color:var(--red)">Request failed</span>';div.setAttribute('data-loaded','1');}
-        return;
-    }
-    div.style.display='block';
-}
 setInterval(async()=>{try{const r=await fetch('/api/metrics');const d=await r.json();document.getElementById('cpu-value').textContent=d.cpu_percent+'%';document.getElementById('ram-value').textContent=d.ram_percent+'%';document.getElementById('disk-value').textContent=d.disk_percent+'%';document.getElementById('uptime-value').textContent=d.uptime;if(d.unattended_upgrades_hosts)updateUUHosts(d.unattended_upgrades_hosts);}catch(e){}},5000);
 function refreshModuleCards(){
     fetch('/api/modules').then(r=>r.json()).then(function(mods){
