@@ -17864,6 +17864,65 @@ Bans IPs via UFW and sends Guard Dog email alerts.
 </div>
 {% else %}
 
+<!-- Repeat Offender Protection -->
+<div class="card" id="recidive-card" style="margin-bottom:8px">
+<div class="card-title" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0">
+<div style="display:flex;align-items:center;gap:10px">
+<span>🛡 Repeat Offender Protection</span>
+<span class="badge badge-red" id="recidive-badge" style="font-size:10px;padding:2px 8px"><span class="dot"></span>Disabled</span>
+</div>
+<div style="display:flex;align-items:center;gap:16px">
+<button id="recidive-refresh-btn" onclick="manualRecidiveRefresh()" style="background:none;border:none;cursor:pointer;color:var(--text-dim);font-size:12px;font-family:\'JetBrains Mono\',monospace;display:inline-flex;align-items:center;gap:5px;padding:0"><span id="recidive-refresh-icon" style="display:inline-block;transition:transform 0.4s">↻</span> Refresh</button>
+<label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:0">
+<span style="font-size:12px;color:var(--text-dim);font-family:\'JetBrains Mono\',monospace">Enable</span>
+<div class="toggle-wrap" style="position:relative;width:40px;height:22px">
+<input type="checkbox" id="recidive-toggle" onchange="toggleRecidiveJail()" style="opacity:0;width:0;height:0;position:absolute">
+<span id="recidive-toggle-track" onclick="document.getElementById(\'recidive-toggle\').click()" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
+<span id="recidive-toggle-thumb" style="position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform .2s;pointer-events:none"></span>
+</div>
+</label>
+</div>
+</div>
+<div style="font-size:12px;color:var(--text-dim);margin-top:8px">Permanently bans repeat offenders. An IP banned by <strong>any</strong> jail N times within the watch window is blocked forever — until you manually unban them. Permanent bans survive reboots.</div>
+
+<div id="recidive-enabled-section" style="display:none">
+<div class="stat-grid" style="margin-top:20px;margin-bottom:8px">
+<div class="stat-card" id="recidive-banned-toggle" onclick="toggleRecidiveBanPanel()" style="cursor:pointer;transition:border-color 0.2s" title="Click to see permanently banned IPs">
+<div class="stat-value red" id="recidive-stat-banned">0</div>
+<div class="stat-label">Permanently Banned <span style="font-size:10px;color:var(--text-dim)" id="recidive-banned-caret">▼ details</span></div>
+</div>
+<div class="stat-card" title="Since the fail2ban service was last started or restarted">
+<div class="stat-value cyan" id="recidive-stat-total">0</div>
+<div class="stat-label">Total Caught <span style="font-size:9px;color:var(--text-dim)">(since last restart)</span></div>
+</div>
+</div>
+
+<div id="recidive-ban-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
+<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">Permanently Banned IPs <span style="font-size:9px;color:var(--red);background:rgba(239,68,68,0.1);padding:2px 6px;border-radius:4px;border:1px solid rgba(239,68,68,0.3)">∞ permanent</span></div>
+<input type="text" id="recidive-ban-search" oninput="filterRecidiveBanList()" placeholder="Search IP…" style="width:100%;box-sizing:border-box;margin-bottom:10px;padding:6px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px;outline:none">
+<div id="recidive-ban-list-container" style="max-height:240px;overflow-y:auto">
+<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs permanently banned.</div>
+</div>
+</div>
+
+<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:16px;margin-top:8px">
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Strikes before permanent ban</label>
+<input class="form-input" type="number" id="recidive-cfg-maxretry" value="3" min="2" max="20">
+<div class="form-hint">Bans in any jail that trigger a permanent block</div>
+</div>
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Watch window (hours)</label>
+<input class="form-input" type="number" id="recidive-cfg-findtime" value="24" min="1" max="720">
+<div class="form-hint">How far back to look — use 720 (30 days) for maximum strictness</div>
+</div>
+</div>
+<div style="margin-top:16px">
+<button class="btn-primary" onclick="saveRecidiveConfig()">Save &amp; Reload</button>
+</div>
+</div><!-- /recidive-enabled-section -->
+</div><!-- /Repeat Offender Protection card -->
+
 <!-- Authentik Jail card -->
 <div class="card" style="margin-bottom:20px">
 <div class="card-title" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0">
@@ -18070,12 +18129,9 @@ TAK Server filter not yet installed — restart the console to complete setup.
 </div>
 
 <div id="tak-watching-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
-<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">
-  IPs Under Watch — failed attempts within find window, not yet banned
-</div>
-<div id="tak-watching-list">
-  <div style="color:var(--text-dim);font-size:13px;font-family:monospace">Loading…</div>
-</div>
+<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">IPs Under Watch — failed attempts within find window, not yet banned</div>
+<input type="text" id="tak-watching-search" oninput="filterTakWatchingList()" placeholder="Search IP…" style="width:100%;box-sizing:border-box;margin-bottom:10px;padding:6px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px;outline:none">
+<div id="tak-watching-list"><div style="color:var(--text-dim);font-size:13px;font-family:monospace">Loading…</div></div>
 </div>
 
 <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:16px">
@@ -18106,65 +18162,6 @@ TAK Server filter not yet installed — restart the console to complete setup.
 </div>
 </div>
 </div>
-
-<!-- Repeat Offender Protection -->
-<div class="card" id="recidive-card" style="margin-top:8px">
-<div class="card-title" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0">
-<div style="display:flex;align-items:center;gap:10px">
-<span>🛡 Repeat Offender Protection</span>
-<span class="badge badge-red" id="recidive-badge" style="font-size:10px;padding:2px 8px"><span class="dot"></span>Disabled</span>
-</div>
-<div style="display:flex;align-items:center;gap:16px">
-<button id="recidive-refresh-btn" onclick="manualRecidiveRefresh()" style="background:none;border:none;cursor:pointer;color:var(--text-dim);font-size:12px;font-family:\'JetBrains Mono\',monospace;display:inline-flex;align-items:center;gap:5px;padding:0"><span id="recidive-refresh-icon" style="display:inline-block;transition:transform 0.4s">↻</span> Refresh</button>
-<label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:0">
-<span style="font-size:12px;color:var(--text-dim);font-family:\'JetBrains Mono\',monospace">Enable</span>
-<div class="toggle-wrap" style="position:relative;width:40px;height:22px">
-<input type="checkbox" id="recidive-toggle" onchange="toggleRecidiveJail()" style="opacity:0;width:0;height:0;position:absolute">
-<span id="recidive-toggle-track" onclick="document.getElementById(\'recidive-toggle\').click()" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
-<span id="recidive-toggle-thumb" style="position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform .2s;pointer-events:none"></span>
-</div>
-</label>
-</div>
-</div>
-<div style="font-size:12px;color:var(--text-dim);margin-top:8px">Permanently bans repeat offenders. An IP banned by <strong>any</strong> jail N times within the watch window is blocked forever — until you manually unban them. Permanent bans survive reboots.</div>
-
-<div id="recidive-enabled-section" style="display:none">
-<div class="stat-grid" style="margin-top:20px;margin-bottom:8px">
-<div class="stat-card" id="recidive-banned-toggle" onclick="toggleRecidiveBanPanel()" style="cursor:pointer;transition:border-color 0.2s" title="Click to see permanently banned IPs">
-<div class="stat-value red" id="recidive-stat-banned">0</div>
-<div class="stat-label">Permanently Banned <span style="font-size:10px;color:var(--text-dim)" id="recidive-banned-caret">▼ details</span></div>
-</div>
-<div class="stat-card" title="Since the fail2ban service was last started or restarted">
-<div class="stat-value cyan" id="recidive-stat-total">0</div>
-<div class="stat-label">Total Caught <span style="font-size:9px;color:var(--text-dim)">(since last restart)</span></div>
-</div>
-</div>
-
-<div id="recidive-ban-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
-<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">Permanently Banned IPs <span style="font-size:9px;color:var(--red);background:rgba(239,68,68,0.1);padding:2px 6px;border-radius:4px;border:1px solid rgba(239,68,68,0.3)">∞ permanent</span></div>
-<input type="text" id="recidive-ban-search" oninput="filterRecidiveBanList()" placeholder="Search IP…" style="width:100%;box-sizing:border-box;margin-bottom:10px;padding:6px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px;outline:none">
-<div id="recidive-ban-list-container" style="max-height:240px;overflow-y:auto">
-<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs permanently banned.</div>
-</div>
-</div>
-
-<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:16px;margin-top:8px">
-<div class="form-row" style="margin-bottom:0">
-<label class="form-label">Strikes before permanent ban</label>
-<input class="form-input" type="number" id="recidive-cfg-maxretry" value="3" min="2" max="20">
-<div class="form-hint">Bans in any jail that trigger a permanent block</div>
-</div>
-<div class="form-row" style="margin-bottom:0">
-<label class="form-label">Watch window (hours)</label>
-<input class="form-input" type="number" id="recidive-cfg-findtime" value="24" min="1" max="720">
-<div class="form-hint">How far back to look — use 720 (30 days) for maximum strictness</div>
-</div>
-</div>
-<div style="margin-top:16px">
-<button class="btn-primary" onclick="saveRecidiveConfig()">Save &amp; Reload</button>
-</div>
-</div><!-- /recidive-enabled-section -->
-</div><!-- /Repeat Offender Protection card -->
 
 {% endif %}
 </div>
@@ -18428,30 +18425,52 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
     }
   };
 
+  window._takWatchingList = [];
+  window._takWatchingSortCol = \'ip\';
+  window._takWatchingSortAsc = true;
+
+  window.renderTakWatchingList = function(list) {
+    var el = document.getElementById(\'tak-watching-list\'); if (!el) return;
+    if (!list.length) { el.innerHTML=\'<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently under watch.</div>\'; return; }
+    var col = window._takWatchingSortCol; var asc = window._takWatchingSortAsc;
+    var sorted = list.slice().sort(function(a,b){
+      if (col===\'ip\') { var d=_takIpToNum(a.ip)-_takIpToNum(b.ip); return asc?d:-d; }
+      return asc ? a.attempts-b.attempts : b.attempts-a.attempts;
+    });
+    var ipArrow  = col===\'ip\'      ? (asc?\' ▲\':\' ▼\') : \'\';
+    var attArrow = col===\'attempts\' ? (asc?\' ▲\':\' ▼\') : \'\';
+    var rows = sorted.map(function(w){
+      return \'<tr style="border-bottom:1px solid var(--border)">\'+
+        \'<td style="font-family:monospace;padding:5px 8px;color:var(--text-primary);font-size:12px">\'+w.ip+\'</td>\'+
+        \'<td style="padding:5px 8px;color:var(--yellow);font-family:monospace;font-size:12px">\'+w.attempts+\'</td>\'+
+        \'<td style="padding:5px 8px;color:var(--text-dim);font-family:monospace;font-size:11px">\'+w.last_seen+\'</td>\'+
+        \'<td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="manualBanTakIP(\\\'\'+w.ip+\'\\\')">Ban Now</button></td></tr>\';
+    }).join(\'\');
+    el.innerHTML=\'<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em">\'+
+      \'<th style="padding:4px 8px;text-align:left;cursor:pointer;user-select:none" onclick="toggleTakWatchingSort(\\\'ip\\\')">IP Address\'+ipArrow+\'</th>\'+
+      \'<th style="padding:4px 8px;text-align:left;cursor:pointer;user-select:none" onclick="toggleTakWatchingSort(\\\'attempts\\\')">Attempts\'+attArrow+\'</th>\'+
+      \'<th style="padding:4px 8px;text-align:left">Last Seen</th>\'+
+      \'<th style="padding:4px 8px;text-align:right">Action</th>\'+
+      \'</tr></thead><tbody>\'+rows+\'</tbody></table>\';
+  };
+
+  window.toggleTakWatchingSort = function(col) {
+    if (window._takWatchingSortCol === col) window._takWatchingSortAsc = !window._takWatchingSortAsc;
+    else { window._takWatchingSortCol = col; window._takWatchingSortAsc = col===\'attempts\' ? false : true; }
+    filterTakWatchingList();
+  };
+
+  window.filterTakWatchingList = function() {
+    var q = (document.getElementById(\'tak-watching-search\').value || \'\').trim().toLowerCase();
+    renderTakWatchingList(q ? window._takWatchingList.filter(function(w){ return w.ip.indexOf(q) !== -1; }) : window._takWatchingList);
+  };
+
   function _loadWatchingList() {
     fetch(\'/api/fail2ban/takserver/watching\').then(function(r){ return r.json(); }).then(function(d){
-      var el = document.getElementById(\'tak-watching-list\');
-      if (!el) return;
-      var list = d.watching || [];
-      if (!list.length) {
-        el.innerHTML = \'<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently under watch.</div>\';
-        return;
-      }
-      var rows = list.map(function(w){
-        return \'<tr>\' +
-          \'<td style="font-family:monospace;padding:6px 12px 6px 0;color:var(--text-primary)">\' + w.ip + \'</td>\' +
-          \'<td style="padding:6px 12px 6px 0;color:var(--yellow);font-family:monospace">\' + w.attempts + \'</td>\' +
-          \'<td style="padding:6px 12px 6px 0;color:var(--text-dim);font-family:monospace;font-size:11px">\' + w.last_seen + \'</td>\' +
-          \'<td style="padding:6px 0"><button class="btn-danger-sm" onclick="manualBanTakIP(\\\'\'+ w.ip +\'\\\')" title="Manually ban this IP now">Ban Now</button></td>\' +
-          \'</tr>\';
-      }).join(\'\');
-      el.innerHTML = \'<table style="width:100%;border-collapse:collapse">\' +
-        \'<thead><tr>\' +
-        \'<th style="text-align:left;font-size:11px;color:var(--text-dim);padding:0 12px 8px 0;text-transform:uppercase;letter-spacing:.06em">IP Address</th>\' +
-        \'<th style="text-align:left;font-size:11px;color:var(--text-dim);padding:0 12px 8px 0;text-transform:uppercase;letter-spacing:.06em">Attempts</th>\' +
-        \'<th style="text-align:left;font-size:11px;color:var(--text-dim);padding:0 12px 8px 0;text-transform:uppercase;letter-spacing:.06em">Last Seen</th>\' +
-        \'<th style="text-align:left;font-size:11px;color:var(--text-dim);padding:0 0 8px 0;text-transform:uppercase;letter-spacing:.06em">Action</th>\' +
-        \'</tr></thead><tbody>\' + rows + \'</tbody></table>\';
+      window._takWatchingList = d.watching || [];
+      var s = document.getElementById(\'tak-watching-search\');
+      var q = s ? s.value.trim().toLowerCase() : \'\';
+      renderTakWatchingList(q ? window._takWatchingList.filter(function(w){ return w.ip.indexOf(q) !== -1; }) : window._takWatchingList);
     }).catch(function(){
       var el = document.getElementById(\'tak-watching-list\');
       if (el) el.innerHTML = \'<div style="color:var(--text-dim);font-size:12px">Error loading watch list.</div>\';
