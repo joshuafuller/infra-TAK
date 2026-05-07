@@ -14024,6 +14024,53 @@ def cloudtak_uninstall_status_api():
         'error': cloudtak_uninstall_status.get('error')
     })
 
+@app.route('/api/cloudtak/reset-server-config', methods=['POST'])
+@login_required
+def cloudtak_reset_server_config():
+    """Clear CloudTAK's stored TAK Server auth so the bootstrap wizard runs again.
+
+    Nulls out the auth column in the servers table (cert + key) via psql inside
+    the postgis container, then restarts just the api container so it reloads
+    config from the database. Works for local and remote targets.
+    """
+    settings = load_settings()
+    cfg = _get_cloudtak_deployment_config(settings)
+    target_mode = (cfg.get('target_mode') or 'local').strip().lower()
+
+    sql_cmd = "UPDATE servers SET auth = NULL WHERE id = 1;"
+    psql_cmd = f"docker exec cloudtak-postgis-1 psql -U docker -d gis -c \"{sql_cmd}\" 2>&1"
+    restart_cmd = "cd ~/CloudTAK && docker compose restart api 2>&1"
+
+    if target_mode == 'remote':
+        rcfg = cfg.get('remote', {})
+        rhost = (rcfg.get('host') or '').strip()
+        if not rhost:
+            return jsonify({'success': False, 'error': 'Remote host not configured'}), 400
+        ok1, out1 = _ssh_probe(rcfg, psql_cmd, timeout=30)
+        if not ok1 or 'ERROR' in (out1 or '').upper():
+            return jsonify({'success': False, 'error': f'SQL reset failed on {rhost}: {(out1 or "unknown")[:200]}'}), 500
+        ok2, out2 = _ssh_probe(rcfg, restart_cmd, timeout=60)
+        if not ok2:
+            return jsonify({'success': False, 'error': f'API restart failed on {rhost}: {(out2 or "unknown")[:200]}'}), 500
+        return jsonify({'success': True, 'message': f'CloudTAK server config cleared on {rhost}. Visit map.{settings.get("fqdn","<domain>")} to re-run the bootstrap wizard.'})
+    else:
+        try:
+            r1 = subprocess.run(psql_cmd, shell=True, capture_output=True, text=True, timeout=30)
+            if r1.returncode != 0 or 'ERROR' in (r1.stdout + r1.stderr).upper():
+                return jsonify({'success': False, 'error': f'SQL reset failed: {(r1.stdout + r1.stderr)[:200]}'}), 500
+        except subprocess.TimeoutExpired:
+            return jsonify({'success': False, 'error': 'psql command timed out'}), 500
+        try:
+            cloudtak_dir = os.path.expanduser('~/CloudTAK')
+            r2 = subprocess.run('docker compose restart api 2>&1', shell=True, capture_output=True, text=True, timeout=60, cwd=cloudtak_dir)
+            if r2.returncode != 0:
+                return jsonify({'success': False, 'error': f'API restart failed: {(r2.stdout + r2.stderr)[:200]}'}), 500
+        except subprocess.TimeoutExpired:
+            return jsonify({'success': False, 'error': 'docker compose restart timed out'}), 500
+        fqdn = settings.get('fqdn', '')
+        return jsonify({'success': True, 'message': f'CloudTAK server config cleared. Visit {"map." + fqdn if fqdn else "CloudTAK"} to re-run the bootstrap wizard.'})
+
+
 def _cloudtak_build_env_content(settings, domain, signing_secret, minio_pass, remote_host=''):
     """Build CloudTAK .env content for local or remote target."""
     # Prefer explicit CloudTAK service domains when available (works even if fqdn is unset).
@@ -20894,6 +20941,29 @@ window.doUninstall = function() {
     cancelBtn.disabled = false;
   });
 };
+
+window.doCloudtakResetConfig = function() {
+  var msgEl = document.getElementById("ct-reset-msg");
+  var btn = document.getElementById("ct-reset-confirm-btn");
+  if (msgEl) { msgEl.textContent = "Resetting..."; msgEl.style.color = "var(--text-dim)"; }
+  if (btn) btn.disabled = true;
+  fetch("/api/cloudtak/reset-server-config", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    credentials: "same-origin"
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.success) {
+      if (msgEl) { msgEl.textContent = "\u2713 " + (d.message || "Config cleared. Re-run the bootstrap wizard."); msgEl.style.color = "var(--green)"; }
+      setTimeout(function() { document.getElementById("ct-reset-modal").classList.remove("open"); if (msgEl) msgEl.textContent = ""; if (btn) btn.disabled = false; }, 3500);
+    } else {
+      if (msgEl) { msgEl.textContent = "\u2717 " + (d.error || "Reset failed"); msgEl.style.color = "var(--red)"; }
+      if (btn) btn.disabled = false;
+    }
+  }).catch(function(err) {
+    if (msgEl) { msgEl.textContent = "Request failed: " + (err && err.message ? err.message : "network error"); msgEl.style.color = "var(--red)"; }
+    if (btn) btn.disabled = false;
+  });
+};
 '''
 
 CLOUDTAK_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
@@ -20988,7 +21058,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <div class="section-title" style="margin-top:20px">Controls</div>
   <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:24px">
   <div class="controls" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
-  {% if cloudtak.running %}<button class="control-btn" onclick="control('restart')">↻ Restart</button><button class="control-btn" onclick="startRedeploy()" id="redeploy-btn">🔄 Update config</button><button class="control-btn btn-update" onclick="startCloudtakUpdate()" id="cloudtak-update-btn"{% if cloudtak_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if cloudtak_update_available %} <span style="color:var(--cyan)" title="Update available: v{{ cloudtak_latest }}">●</span>{% endif %}</button><button class="control-btn btn-stop" onclick="control('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="control('start')">▶ Start</button><button class="control-btn" onclick="startRedeploy()" id="redeploy-btn">🔄 Update config</button><button class="control-btn btn-update" onclick="startCloudtakUpdate()" id="cloudtak-update-btn"{% if cloudtak_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if cloudtak_update_available %} <span style="color:var(--cyan)" title="Update available: v{{ cloudtak_latest }}">●</span>{% endif %}</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% endif %}
+  {% if cloudtak.running %}<button class="control-btn" onclick="control('restart')">↻ Restart</button><button class="control-btn" onclick="startRedeploy()" id="redeploy-btn">🔄 Update config</button><button class="control-btn btn-update" onclick="startCloudtakUpdate()" id="cloudtak-update-btn"{% if cloudtak_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if cloudtak_update_available %} <span style="color:var(--cyan)" title="Update available: v{{ cloudtak_latest }}">●</span>{% endif %}</button><button class="control-btn" onclick="document.getElementById('ct-reset-modal').classList.add('open')" style="color:var(--yellow);border-color:rgba(234,179,8,0.4)">🔑 Reset Config</button><button class="control-btn btn-stop" onclick="control('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="control('start')">▶ Start</button><button class="control-btn" onclick="startRedeploy()" id="redeploy-btn">🔄 Update config</button><button class="control-btn btn-update" onclick="startCloudtakUpdate()" id="cloudtak-update-btn"{% if cloudtak_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if cloudtak_update_available %} <span style="color:var(--cyan)" title="Update available: v{{ cloudtak_latest }}">●</span>{% endif %}</button><button class="control-btn" onclick="document.getElementById('ct-reset-modal').classList.add('open')" style="color:var(--yellow);border-color:rgba(234,179,8,0.4)">🔑 Reset Config</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% endif %}
   </div>
   <div id="control-status" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
   </div>
@@ -21130,6 +21200,19 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 </div>
 
 <!-- Uninstall modal -->
+<div class="modal-overlay" id="ct-reset-modal">
+  <div class="modal">
+    <h3>🔑 Reset CloudTAK Server Config?</h3>
+    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:8px">This clears the stored TAK Server connection (URL, cert, and admin account) from CloudTAK's database so you can re-run the bootstrap wizard with new TAK Server details.</p>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:4px">Your map data, tile layers, and user accounts remain intact. Only the TAK Server connection is cleared.</p>
+    <div class="modal-actions" style="margin-top:16px">
+      <button class="btn btn-ghost" onclick="document.getElementById('ct-reset-modal').classList.remove('open')">Cancel</button>
+      <button class="btn" id="ct-reset-confirm-btn" onclick="doCloudtakResetConfig()" style="background:linear-gradient(135deg,#92400e,#b45309);color:#fff;border:none">Reset Config</button>
+    </div>
+    <div id="ct-reset-msg" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
+  </div>
+</div>
+
 <div class="modal-overlay" id="uninstall-modal">
   <div class="modal">
     <h3>&#x26a0; Uninstall CloudTAK?</h3>
