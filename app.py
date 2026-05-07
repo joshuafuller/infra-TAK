@@ -13926,6 +13926,8 @@ services:
 {hosts_block}
     cap_drop:
       - ALL
+    cap_add:
+      - CHOWN
     security_opt:
       - no-new-privileges:true
   events:
