@@ -33416,7 +33416,7 @@ async function applyUpdate(){
 }
 checkUpdate();
 async function doConsoleRollback(){
-    if(!confirm('Roll back console to the previous version?\n\nThe console will restart. You may see 502 briefly.'))return;
+    if(!confirm('Roll back console to the previous version?\\n\\nThe console will restart. You may see 502 briefly.'))return;
     var bar=document.getElementById('console-rollback-bar');
     if(bar)bar.innerHTML='<div style="font-size:12px;color:var(--yellow)">Rolling back…</div>';
     try{
@@ -34112,9 +34112,9 @@ function loadSnapshots(fromBtn){
         +'<td style="padding:6px 8px;font-size:11px;color:var(--text-dim)">'+(s.tak_version||'?')+'</td>'
         +'<td style="padding:6px 8px;font-size:11px;color:var(--text-dim)">'+(s.size_mb||0)+' MB</td>'
         +'<td style="padding:6px 8px;white-space:nowrap">'
-        +'<button onclick="restoreSnapshot(\''+s.label+'\')" style="padding:4px 10px;background:rgba(239,68,68,0.1);color:var(--red);border:1px solid rgba(239,68,68,0.3);border-radius:5px;font-size:11px;cursor:pointer;margin-right:4px">↩ Restore</button>'
+        +'<button onclick="restoreSnapshot(\\''+s.label+'\\')" style="padding:4px 10px;background:rgba(239,68,68,0.1);color:var(--red);border:1px solid rgba(239,68,68,0.3);border-radius:5px;font-size:11px;cursor:pointer;margin-right:4px">↩ Restore</button>'
         +'<a href="/api/takserver/snapshot/'+encodeURIComponent(s.label)+'/download" style="padding:4px 10px;background:rgba(6,182,212,0.08);color:var(--cyan);border:1px solid rgba(6,182,212,0.2);border-radius:5px;font-size:11px;text-decoration:none;display:inline-block;margin-right:4px">⬇ Download</a>'
-        +'<button onclick="deleteSnapshot(\''+s.label+'\')" style="padding:4px 10px;background:transparent;color:var(--text-dim);border:1px solid var(--border);border-radius:5px;font-size:11px;cursor:pointer">✕</button>'
+        +'<button onclick="deleteSnapshot(\\''+s.label+'\\')" style="padding:4px 10px;background:transparent;color:var(--text-dim);border:1px solid var(--border);border-radius:5px;font-size:11px;cursor:pointer">✕</button>'
         +'</td></tr>';
     }).join('');
     c.innerHTML='<table style="width:100%;border-collapse:collapse">'
@@ -34160,7 +34160,7 @@ function takeSnapshot(){
 }
 
 function restoreSnapshot(label){
-  if(!confirm('Restore TAK Server from snapshot "'+label+'"?\n\nThis will:\n• Stop TAK Server\n• Restore CoreConfig.xml, UserAuthenticationFile.xml, certs, and database\n• Restart TAK Server\n\nCurrent data will be overwritten.'))return;
+  if(!confirm('Restore TAK Server from snapshot "'+label+'"?\\n\\nThis will:\\n• Stop TAK Server\\n• Restore CoreConfig.xml, UserAuthenticationFile.xml, certs, and database\\n• Restart TAK Server\\n\\nCurrent data will be overwritten.'))return;
   var prog=document.getElementById('snap-progress');
   if(prog){prog.style.display='';prog.style.color='var(--yellow)';prog.textContent='Restoring snapshot…';}
   fetch('/api/takserver/rollback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:label})})
