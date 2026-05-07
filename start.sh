@@ -37,6 +37,36 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 # ==========================================
+# Provision takwerx Service User
+# ==========================================
+provision_takwerx() {
+    echo -e "  Provisioning takwerx service user..."
+
+    if ! id -u takwerx &>/dev/null; then
+        useradd -m -s /bin/bash takwerx
+    fi
+    usermod -aG sudo,docker takwerx 2>/dev/null || usermod -aG sudo takwerx
+
+    # Passwordless sudo — app.py runs 100+ privileged operations (systemctl, apt, /etc/ writes)
+    echo 'takwerx ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/takwerx
+    chmod 440 /etc/sudoers.d/takwerx
+
+    # Migrate existing module data from /root/ to /home/takwerx/ (upgrade path)
+    for mod in authentik CloudTAK node-red TAK-Portal; do
+        if [ -d "/root/$mod" ] && [ ! -d "/home/takwerx/$mod" ]; then
+            echo -e "  Migrating /root/$mod → /home/takwerx/$mod"
+            mv "/root/$mod" "/home/takwerx/$mod"
+        fi
+    done
+
+    chown -R takwerx:takwerx /home/takwerx
+    chown -R takwerx:takwerx "$INSTALL_DIR"
+
+    echo -e "  ${GREEN}✓ takwerx user provisioned${NC}"
+    echo ""
+}
+
+# ==========================================
 # VPS Disk I/O Check
 # ==========================================
 check_disk_io() {
@@ -396,8 +426,9 @@ ExecStart=$GUNICORN_BIN $GUNICORN_ARGS app:app
 WorkingDirectory=$USE_DIR
 Restart=always
 RestartSec=5
-User=root
+User=takwerx
 Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/home/takwerx
 Environment=CONFIG_DIR=$USE_DIR/.config
 
 [Install]
@@ -423,6 +454,9 @@ fi
 
 # Always use self-signed cert for console (Caddy handles FQDN SSL)
 generate_self_signed_cert
+
+# Provision dedicated service user
+provision_takwerx
 
 # Create and start systemd service
 create_service
