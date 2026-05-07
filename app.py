@@ -30353,30 +30353,20 @@ def _tak_snapshot(label, plog=None):
         except Exception as e:
             plog(f"  snapshot: takserver.default copy failed: {e}")
 
-    # 4. PostgreSQL cot dump
+    # 4. PostgreSQL cot dump (native host postgres — not a container)
     pg_dump_path = os.path.join(snap_path, 'cot.pgdump')
-    pg_container = 'takserver-db'
     try:
-        r = subprocess.run(
-            f'docker ps -q --filter name={pg_container}',
-            shell=True, capture_output=True, text=True, timeout=10
-        )
-        if (r.stdout or '').strip():
-            pg_cmd = (
-                f"docker exec {pg_container} pg_dump -U postgres -Fc cot"
+        with open(pg_dump_path, 'wb') as _f:
+            r2 = subprocess.run(
+                'sudo -u postgres pg_dump -Fc cot',
+                shell=True, stdout=_f, stderr=subprocess.PIPE, timeout=300
             )
-            with open(pg_dump_path, 'wb') as _f:
-                r2 = subprocess.run(
-                    pg_cmd, shell=True, stdout=_f, stderr=subprocess.PIPE, timeout=300
-                )
-            if r2.returncode == 0:
-                plog(f"  snapshot: cot pg_dump written ({os.path.getsize(pg_dump_path) // 1024} KB)")
-            else:
-                plog(f"  snapshot: pg_dump failed: {(r2.stderr or b'').decode()[:200]}")
-                try: os.remove(pg_dump_path)
-                except Exception: pass
+        if r2.returncode == 0 and os.path.getsize(pg_dump_path) > 0:
+            plog(f"  snapshot: cot pg_dump written ({os.path.getsize(pg_dump_path) // 1024} KB)")
         else:
-            plog(f"  snapshot: {pg_container} not running — skipping pg_dump")
+            plog(f"  snapshot: pg_dump failed: {(r2.stderr or b'').decode()[:200]}")
+            try: os.remove(pg_dump_path)
+            except Exception: pass
     except Exception as e:
         plog(f"  snapshot: pg_dump exception: {e}")
 
