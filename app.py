@@ -34103,7 +34103,7 @@ function loadSnapshots(fromBtn){
         +'<td style="padding:6px 8px;white-space:nowrap">'
         +'<button onclick="restoreSnapshot(\\''+s.label+'\\')" style="padding:4px 10px;background:rgba(239,68,68,0.1);color:var(--red);border:1px solid rgba(239,68,68,0.3);border-radius:5px;font-size:11px;cursor:pointer;margin-right:4px">↩ Restore</button>'
         +'<a href="/api/takserver/snapshot/'+encodeURIComponent(s.label)+'/download" style="padding:4px 10px;background:rgba(6,182,212,0.08);color:var(--cyan);border:1px solid rgba(6,182,212,0.2);border-radius:5px;font-size:11px;text-decoration:none;display:inline-block;margin-right:4px">⬇ Download</a>'
-        +'<button onclick="deleteSnapshot(\\''+s.label+'\\')" style="padding:4px 10px;background:transparent;color:var(--text-dim);border:1px solid var(--border);border-radius:5px;font-size:11px;cursor:pointer">✕</button>'
+        +'<button onclick="deleteSnapshot(\\''+s.label+'\\')" style="padding:4px 10px;background:transparent;color:var(--text-dim);border:1px solid var(--border);border-radius:5px;font-size:11px;cursor:pointer">Delete</button>'
         +'</td></tr>';
     }).join('');
     c.innerHTML='<table style="width:100%;border-collapse:collapse">'
