@@ -34340,7 +34340,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">Plugin JARs are loaded from <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">/opt/tak/lib/</span>. Upload a <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">.jar</span> to install a plugin, or a <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">tak.server.plugins.ClassName.yaml</span> to install a config file. TAK Server must be restarted after any change.</p>
 <div id="tak-plugins-restart-banner" style="display:none;background:rgba(234,179,8,0.08);border:1px solid rgba(234,179,8,0.35);border-radius:10px;padding:12px 16px;margin-bottom:16px;display:none;align-items:center;justify-content:space-between;gap:12px">
 <span style="font-size:13px;color:var(--yellow)">&#9888; Restart TAK Server to apply plugin changes.</span>
-<button type="button" onclick="takControl('restart')" style="padding:7px 16px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap">&#8635; Restart Now</button>
+<button type="button" id="tak-plugin-restart-btn" onclick="takPluginRestartNow(this)" style="padding:7px 16px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap">&#8635; Restart Now</button>
 </div>
 <div style="margin-bottom:20px">
 <div class="section-title" style="margin-bottom:10px">Installed Plugins</div>

@@ -2267,6 +2267,19 @@ function _takPluginShowRestartBanner(){
   if(banner)banner.style.display='flex';
 }
 
+async function takPluginRestartNow(btn){
+  if(!confirm('Restart TAK Server now to apply plugin changes?'))return;
+  if(btn){btn.disabled=true;btn.textContent='Restarting\u2026';}
+  try{
+    await fetch('/api/takserver/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'restart',target:'core'})});
+    sessionStorage.setItem('tak_just_started','1');
+    window.location.reload();
+  }catch(e){
+    if(btn){btn.disabled=false;btn.textContent='\u21BB Restart Now';}
+    alert('Restart failed: '+e.message);
+  }
+}
+
 async function takPluginRemove(jarname){
   if(!confirm('Remove '+jarname+' and its config file?\n\nTAK Server will need a restart.')){return;}
   var msg=document.getElementById('tak-plugin-install-msg');
