@@ -11469,7 +11469,7 @@ def takportal_control():
         # and hardening patches now live in docker-compose.override.yml (not tracked
         # by git) so it's safe to discard dirty tracked files without losing anything.
         subprocess.run(
-            f'git -C {portal_dir} -c safe.directory={portal_dir} checkout -- .',
+            f'git -c safe.directory={portal_dir} -C {portal_dir} checkout -- .',
             shell=True, capture_output=True, text=True, timeout=15)
         pull = subprocess.run(
             f'cd {portal_dir} && git -c safe.directory={portal_dir} pull --rebase',
