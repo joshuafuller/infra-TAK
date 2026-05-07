@@ -1987,6 +1987,13 @@ def update_apply():
     console_dir = os.path.dirname(os.path.abspath(__file__))
     git_env = {'GIT_TERMINAL_PROMPT': '0'}
     git_cfg = ['git', '-c', f'safe.directory={console_dir}']
+    # Ensure root can operate on repos owned by other users (e.g. takwerx-owned
+    # ~/TAK-Portal and ~/CloudTAK on servers where the console runs as root).
+    # safe.directory=* is the standard approach for server/CI environments.
+    subprocess.run(
+        ['git', 'config', '--global', '--replace-all', 'safe.directory', '*'],
+        capture_output=True, timeout=5
+    )
     # Empty remote.origin.fetch: explicit refspecs are *additive* with defaults; without this,
     # `git fetch origin +refs/tags/foo:refs/tags/foo` still updates heads/tags per origin.fetch
     # and can hit "would clobber existing tag" on field installs.
@@ -14880,7 +14887,7 @@ def run_cloudtak_update():
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
             r = subprocess.run(
-                f'cd {cloudtak_dir} && git fetch --depth 1 origin tag {release_tag} && git checkout {release_tag}',
+                f'cd {cloudtak_dir} && git -c safe.directory={cloudtak_dir} fetch --depth 1 origin tag {release_tag} && git -c safe.directory={cloudtak_dir} checkout {release_tag}',
                 shell=True, capture_output=True, text=True, timeout=120)
             if r.returncode != 0:
                 plog(f"✗ Checkout failed: {r.stderr.strip()[:200]}")
