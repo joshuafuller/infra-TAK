@@ -32144,6 +32144,68 @@ def api_metrics():
         }]
     return jsonify(metrics)
 
+
+@app.route('/api/metrics/process-breakdown')
+@login_required
+def api_process_breakdown():
+    """Top 10 processes by CPU+RAM for the local host or a remote host (via SSH)."""
+    host_id = request.args.get('host_id', 'this_host')
+    settings = load_settings()
+
+    def _local_procs():
+        rows = []
+        try:
+            for p in sorted(
+                psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent', 'username']),
+                key=lambda x: (x.info.get('cpu_percent') or 0) + (x.info.get('memory_percent') or 0),
+                reverse=True
+            )[:10]:
+                rows.append({
+                    'pid': p.info.get('pid'),
+                    'name': (p.info.get('name') or '')[:28],
+                    'cpu': round(p.info.get('cpu_percent') or 0, 1),
+                    'mem': round(p.info.get('memory_percent') or 0, 1),
+                    'user': (p.info.get('username') or '')[:12],
+                })
+        except Exception:
+            pass
+        return rows
+
+    if host_id == 'this_host':
+        # First call seeds psutil's CPU interval; call twice with a short sleep for accuracy
+        psutil.cpu_percent(interval=None)
+        for p in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent', 'username']):
+            try:
+                p.cpu_percent(interval=None)
+            except Exception:
+                pass
+        import time as _time; _time.sleep(0.3)
+        return jsonify({'procs': _local_procs()})
+
+    # Remote host — find its SSH config from module deployment configs
+    remote_cfg = None
+    for cfg_key in ['nodered_deployment', 'mediamtx_deployment', 'authentik_deployment']:
+        cfg = _get_module_deployment_config(settings, cfg_key)
+        if cfg.get('target_mode') == 'remote' and cfg.get('deployed'):
+            rc = cfg.get('remote', {})
+            if rc.get('host', '').strip() == host_id or host_id == cfg_key:
+                remote_cfg = rc
+                break
+    if not remote_cfg:
+        return jsonify({'error': 'Remote host config not found', 'procs': []})
+    cmd = ("ps aux --sort=-%cpu 2>/dev/null | head -11 | tail -10 | "
+           "awk '{printf \"%s|%s|%s|%s\\n\",$1,$2,$3,$4}'")
+    ok, out = _ssh_probe(remote_cfg, cmd, timeout=10)
+    if not ok or not out:
+        return jsonify({'error': 'SSH probe failed', 'procs': []})
+    rows = []
+    for line in (out or '').strip().splitlines():
+        parts = line.split('|')
+        if len(parts) >= 4:
+            rows.append({'user': parts[0][:12], 'pid': parts[1], 'cpu': parts[2], 'mem': parts[3], 'name': '—'})
+    return jsonify({'procs': rows})
+
+
 def _run_unattended_upgrades_remote(remote_cfg, action):
     """Run enable/disable unattended-upgrades on remote host via SSH. Returns (success, result_dict)."""
     if action == 'disable':
@@ -33395,6 +33457,25 @@ async function applyUpdate(){
     }catch(e){status.style.color='var(--red)';status.textContent='Error: '+e.message;btn.disabled=false;btn.textContent='Update Now';btn.style.opacity='1'}
 }
 checkUpdate();
+async function toggleResourceBreakdown(hostId){
+  var el=document.getElementById('resource-breakdown-'+hostId);
+  if(!el)return;
+  if(el.style.display!=='none'){el.style.display='none';return;}
+  el.style.display='block';
+  el.innerHTML='<span style="opacity:0.5">Loading...</span>';
+  try{
+    var r=await fetch('/api/metrics/process-breakdown?host_id='+encodeURIComponent(hostId),{credentials:'same-origin'});
+    var d=await r.json();
+    if(d.error){el.innerHTML='<span style="color:var(--red)">'+d.error+'</span>';return;}
+    if(!d.procs||!d.procs.length){el.innerHTML='<span style="opacity:0.5">No data</span>';return;}
+    var h='<table style="width:100%;border-collapse:collapse"><tr style="color:var(--text-secondary);font-size:10px"><th style="text-align:left;padding:2px 6px">PID</th><th style="text-align:left;padding:2px 6px">Name</th><th style="text-align:right;padding:2px 6px">CPU%</th><th style="text-align:right;padding:2px 6px">MEM%</th><th style="text-align:left;padding:2px 6px">User</th></tr>';
+    d.procs.forEach(function(p){
+      h+='<tr><td style="padding:2px 6px;opacity:0.6">'+p.pid+'</td><td style="padding:2px 6px">'+p.name+'</td><td style="padding:2px 6px;text-align:right;color:var(--cyan)">'+p.cpu+'</td><td style="padding:2px 6px;text-align:right;color:var(--yellow)">'+p.mem+'</td><td style="padding:2px 6px;opacity:0.6">'+p.user+'</td></tr>';
+    });
+    h+='</table>';
+    el.innerHTML=h;
+  }catch(e){el.innerHTML='<span style="color:var(--red)">Error loading data</span>';}
+}
 async function doConsoleRollback(){
     if(!confirm('Roll back console to the previous version?\n\nThe console will restart. You may see 502 briefly.'))return;
     var bar=document.getElementById('console-rollback-bar');
