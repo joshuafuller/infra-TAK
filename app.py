@@ -34348,9 +34348,9 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 <div class="section-title" style="margin-bottom:10px">Install Plugin</div>
 <div class="upload-area" id="tak-plugin-upload-area" style="padding:24px;margin-bottom:12px" onclick="document.getElementById('tak-plugin-file-input').click()" ondrop="takPluginDrop(event)" ondragover="event.preventDefault();this.classList.add('dragover')" ondragleave="event.preventDefault();this.classList.remove('dragover')">
-<input type="file" id="tak-plugin-file-input" style="display:none" accept=".jar,.yaml" onchange="takPluginFileChange(event)">
-<div id="tak-plugin-upload-text" style="color:var(--text-dim);font-size:13px">Click or drag to upload a plugin <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">.jar</span> or config <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">tak.server.plugins.ClassName.yaml</span></div>
-<div id="tak-plugin-upload-filename" style="display:none;font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--cyan);margin-top:8px"></div>
+<input type="file" id="tak-plugin-file-input" style="display:none" accept=".jar,.yaml" multiple onchange="takPluginFileChange(event)">
+<div id="tak-plugin-upload-text" style="color:var(--text-dim);font-size:13px">Click or drag to upload a <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">.jar</span> and/or <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">tak.server.plugins.ClassName.yaml</span> — you can drop both at once</div>
+<div id="tak-plugin-upload-filelist" style="display:none;margin-top:10px;display:none;flex-direction:column;gap:4px"></div>
 </div>
 <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px">
 <button type="button" id="tak-plugin-install-btn" onclick="takPluginInstall()" style="padding:10px 22px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:14px;font-weight:600;cursor:pointer" disabled>Install Plugin</button>
