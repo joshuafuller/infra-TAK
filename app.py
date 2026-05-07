@@ -9422,10 +9422,6 @@ def _write_takportal_override():
             "    networks:\n"
             "      - default\n"
             f"      - {INFRATAK_DOCKER_NETWORK}\n"
-            "    cap_drop:\n"
-            "      - ALL\n"
-            "    security_opt:\n"
-            "      - no-new-privileges:true\n"
             "\n"
             "networks:\n"
             "  default: {}\n"
@@ -36078,9 +36074,11 @@ def _post_update_auto_deploy():
                             print("Post-update: Authentik compose already hardened — no changes needed")
                 except Exception as _e:
                     print(f"Post-update: Authentik hardening error (non-fatal): {_e}")
-                # TAK Portal — write/refresh override file (network + hardening)
+                # TAK Portal — write/refresh override file (infratak network only)
                 # v0.9.2+: override file instead of patching the git-tracked
                 # docker-compose.yml, which caused stash conflicts on git pull.
+                # No cap_drop — TAK Portal reads cert files owned by uid 889;
+                # cap_drop:ALL removes CAP_DAC_OVERRIDE and breaks cert access.
                 try:
                     tp_dir = os.path.expanduser('~/TAK-Portal')
                     if os.path.isdir(tp_dir):
