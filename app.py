@@ -21204,7 +21204,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <div class="modal">
     <h3>🔑 Reset CloudTAK Server Config?</h3>
     <p style="font-size:13px;color:var(--text-secondary);margin-bottom:8px">This clears the stored TAK Server connection (URL, cert, and admin account) from CloudTAK's database so you can re-run the bootstrap wizard with new TAK Server details.</p>
-    <p style="font-size:12px;color:var(--text-dim);margin-bottom:4px">Your map data, tile layers, and user accounts remain intact. Only the TAK Server connection is cleared.</p>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:4px">Your map data and tile layers remain intact. Only the TAK Server connection is cleared.</p>
     <div class="modal-actions" style="margin-top:16px">
       <button class="btn btn-ghost" onclick="document.getElementById('ct-reset-modal').classList.remove('open')">Cancel</button>
       <button class="btn" id="ct-reset-confirm-btn" onclick="doCloudtakResetConfig()" style="background:linear-gradient(135deg,#92400e,#b45309);color:#fff;border:none">Reset Config</button>
