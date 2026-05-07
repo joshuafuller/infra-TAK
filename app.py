@@ -17620,6 +17620,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:\'DM Sans\'
 .stat-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:0}
 @media(max-width:900px){.stat-grid{grid-template-columns:repeat(2,1fr)}}
 .stat-card{background:var(--bg-card);border:1px solid var(--border);border-radius:10px;padding:16px;text-align:center}
+.cfg-input{width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text-primary);font-size:13px;font-family:\'JetBrains Mono\',monospace;outline:none;transition:border-color .2s}.cfg-input:focus{border-color:var(--cyan)}
 .stat-value{font-family:\'JetBrains Mono\',monospace;font-size:28px;font-weight:700;margin-bottom:4px}
 .stat-label{font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em}
 .stat-value.red{color:var(--red)}.stat-value.green{color:var(--green)}.stat-value.yellow{color:var(--yellow)}.stat-value.cyan{color:var(--cyan)}
@@ -18323,6 +18324,10 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
         else                { badge.className = \'badge badge-red\';   badge.innerHTML = \'<span class="dot"></span>Disabled\'; }
       }
       if (toggle) toggle.checked = d.jail_enabled;
+      var sshTrack = document.getElementById(\'ssh-toggle-track\');
+      var sshThumb = document.getElementById(\'ssh-toggle-thumb\');
+      if (sshTrack) sshTrack.style.background = d.jail_enabled ? \'var(--green)\' : \'var(--border)\';
+      if (sshThumb) sshThumb.style.transform  = d.jail_enabled ? \'translateX(18px)\' : \'\';
       if (sec)    sec.style.display = d.jail_enabled ? \'\' : \'none\';
       if (d.jail_enabled) {
         document.getElementById(\'ssh-stat-banned\').textContent       = d.currently_banned  !== undefined ? d.currently_banned  : 0;
