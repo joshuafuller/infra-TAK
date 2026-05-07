@@ -31194,6 +31194,21 @@ def _tak_rollback(label, plog=None):
     plog("  rollback: starting takserver…")
     subprocess.run(_sudo_wrap(['systemctl', 'start', 'takserver']), capture_output=True, timeout=90)
 
+    # 8. Restart Node-RED so it resyncs mission state from the restored DB.
+    # Without this, Node-RED keeps trying to manage missions that were wiped by
+    # the rollback, causing NPEs in TAK Server's mission API on the next poll.
+    try:
+        r_nr = subprocess.run(
+            'docker restart nodered 2>/dev/null',
+            shell=True, capture_output=True, text=True, timeout=30
+        )
+        if r_nr.returncode == 0:
+            plog("  rollback: Node-RED restarted (mission state resynced)")
+        else:
+            plog("  rollback: Node-RED not running or restart skipped (non-fatal)")
+    except Exception as _e_nr:
+        plog(f"  rollback: Node-RED restart error (non-fatal): {_e_nr}")
+
     plog(f"  ✓ rollback [{label}]: complete")
     return True, None
 
