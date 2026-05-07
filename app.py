@@ -33153,7 +33153,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <span class="uu-label" id="uu-label-{{ host.id }}" data-target="{{ host.id }}" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:{% if host.enabled %}var(--green){% else %}var(--text-dim){% endif %}">{% if host.enabled and host.running %}Running...{% elif host.enabled %}Enabled{% else %}Disabled{% endif %}</span>
 </div>
 <button type="button" onclick="event.stopPropagation();toggleResourceBreakdown('{{ host.id }}')" style="margin-top:8px;padding:4px 10px;background:rgba(59,130,246,0.15);color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">What&#39;s using CPU/RAM?</button>
-<div id="resource-breakdown-{{ host.id }}" style="display:none;position:absolute;top:100%;left:0;right:0;z-index:20;margin-top:4px;padding:14px 16px;background:var(--bg-card);border:1px solid var(--border);border-radius:10px;font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim)"></div>
+<div id="resource-breakdown-{{ host.id }}" style="display:none;margin-top:8px;padding-top:8px;border-top:1px solid var(--border);background:var(--bg-card);font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim)"></div>
 </div>
 {% endfor %}
 <div class="section-title">Console</div>
