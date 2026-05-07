@@ -17982,6 +17982,7 @@ Bans IPs via UFW and sends Guard Dog email alerts.
 
 <div id="ssh-watching-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
 <div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">IPs Under Watch — failed attempts within find window, not yet banned</div>
+<input type="text" id="ssh-watching-search" oninput="filterSshWatchingList()" placeholder="Search IP…" style="width:100%;box-sizing:border-box;margin-bottom:10px;padding:6px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px;outline:none">
 <div id="ssh-watching-list"><div style="color:var(--text-dim);font-size:13px;font-family:monospace">Loading…</div></div>
 </div>
 
@@ -18723,24 +18724,52 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
     if (tog)   tog.style.borderColor = _sshWatchingOpen ? \'var(--yellow)\' : \'\';
     if (_sshWatchingOpen) _loadSshWatchingList();
   };
+  window._sshWatchingList = [];
+  window._sshWatchingSortCol = \'ip\';
+  window._sshWatchingSortAsc = true;
+
+  window.renderSshWatchingList = function(list) {
+    var el = document.getElementById(\'ssh-watching-list\'); if (!el) return;
+    if (!list.length) { el.innerHTML=\'<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently under watch.</div>\'; return; }
+    var col = window._sshWatchingSortCol; var asc = window._sshWatchingSortAsc;
+    var sorted = list.slice().sort(function(a,b){
+      if (col===\'ip\') { var d=_ipToNum(a.ip)-_ipToNum(b.ip); return asc?d:-d; }
+      return asc ? a.attempts-b.attempts : b.attempts-a.attempts;
+    });
+    var ipArrow  = col===\'ip\'      ? (asc?\' ▲\':\' ▼\') : \'\';
+    var attArrow = col===\'attempts\' ? (asc?\' ▲\':\' ▼\') : \'\';
+    var rows = sorted.map(function(w){
+      return \'<tr style="border-bottom:1px solid var(--border)">\'+
+        \'<td style="font-family:monospace;padding:5px 8px;color:var(--text-primary);font-size:12px">\'+w.ip+\'</td>\'+
+        \'<td style="padding:5px 8px;color:var(--yellow);font-family:monospace;font-size:12px">\'+w.attempts+\'</td>\'+
+        \'<td style="padding:5px 8px;color:var(--text-dim);font-family:monospace;font-size:11px">\'+w.last_seen+\'</td>\'+
+        \'<td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="manualBanSshIP(\\\'\'+w.ip+\'\\\')">Ban Now</button></td></tr>\';
+    }).join(\'\');
+    el.innerHTML=\'<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em">\'+
+      \'<th style="padding:4px 8px;text-align:left;cursor:pointer;user-select:none" onclick="toggleSshWatchingSort(\\\'ip\\\')">IP Address\'+ipArrow+\'</th>\'+
+      \'<th style="padding:4px 8px;text-align:left;cursor:pointer;user-select:none" onclick="toggleSshWatchingSort(\\\'attempts\\\')">Attempts\'+attArrow+\'</th>\'+
+      \'<th style="padding:4px 8px;text-align:left">Last Seen</th>\'+
+      \'<th style="padding:4px 8px;text-align:right">Action</th>\'+
+      \'</tr></thead><tbody>\'+rows+\'</tbody></table>\';
+  };
+
+  window.toggleSshWatchingSort = function(col) {
+    if (window._sshWatchingSortCol === col) window._sshWatchingSortAsc = !window._sshWatchingSortAsc;
+    else { window._sshWatchingSortCol = col; window._sshWatchingSortAsc = col===\'attempts\' ? false : true; }
+    filterSshWatchingList();
+  };
+
+  window.filterSshWatchingList = function() {
+    var q = (document.getElementById(\'ssh-watching-search\').value || \'\').trim().toLowerCase();
+    renderSshWatchingList(q ? window._sshWatchingList.filter(function(w){ return w.ip.indexOf(q) !== -1; }) : window._sshWatchingList);
+  };
+
   function _loadSshWatchingList() {
     fetch(\'/api/fail2ban/ssh/watching\').then(function(r){return r.json();}).then(function(d){
-      var el = document.getElementById(\'ssh-watching-list\'); if (!el) return;
-      var list = d.watching || [];
-      if (!list.length) { el.innerHTML=\'<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently under watch.</div>\'; return; }
-      var rows = list.map(function(w){
-        return \'<tr>\'+
-          \'<td style="font-family:monospace;padding:6px 12px 6px 0;color:var(--text-primary)">\'+w.ip+\'</td>\'+
-          \'<td style="padding:6px 12px 6px 0;color:var(--yellow);font-family:monospace">\'+w.attempts+\'</td>\'+
-          \'<td style="padding:6px 12px 6px 0;color:var(--text-dim);font-family:monospace;font-size:11px">\'+w.last_seen+\'</td>\'+
-          \'<td style="padding:6px 0"><button class="btn-danger-sm" onclick="manualBanSshIP(\\\'\'+w.ip+\'\\\')">Ban Now</button></td></tr>\';
-      }).join(\'\');
-      el.innerHTML=\'<table style="width:100%;border-collapse:collapse"><thead><tr>\'+
-        \'<th style="text-align:left;font-size:11px;color:var(--text-dim);padding:0 12px 8px 0;text-transform:uppercase;letter-spacing:.06em">IP Address</th>\'+
-        \'<th style="text-align:left;font-size:11px;color:var(--text-dim);padding:0 12px 8px 0;text-transform:uppercase;letter-spacing:.06em">Attempts</th>\'+
-        \'<th style="text-align:left;font-size:11px;color:var(--text-dim);padding:0 12px 8px 0;text-transform:uppercase;letter-spacing:.06em">Last Seen</th>\'+
-        \'<th style="text-align:left;font-size:11px;color:var(--text-dim);padding:0 0 8px 0;text-transform:uppercase;letter-spacing:.06em">Action</th>\'+
-        \'</tr></thead><tbody>\'+rows+\'</tbody></table>\';
+      window._sshWatchingList = d.watching || [];
+      var s = document.getElementById(\'ssh-watching-search\');
+      var q = s ? s.value.trim().toLowerCase() : \'\';
+      renderSshWatchingList(q ? window._sshWatchingList.filter(function(w){ return w.ip.indexOf(q) !== -1; }) : window._sshWatchingList);
     }).catch(function(){ var el=document.getElementById(\'ssh-watching-list\'); if(el) el.innerHTML=\'<div style="color:var(--text-dim);font-size:12px">Error loading watch list.</div>\'; });
   }
   window.manualBanSshIP = function(ip) {
