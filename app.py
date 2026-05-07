@@ -33523,6 +33523,7 @@ setInterval(async()=>{try{const r=await fetch('/api/metrics');const d=await r.js
 TAKSERVER_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>TAK Server — infra-TAK</title>
 <style>
 ''' + BASE_CSS + '''
+@keyframes spin{to{transform:rotate(360deg)}}
 .upload-area{border:2px dashed var(--border);border-radius:12px;padding:40px;text-align:center;cursor:pointer;transition:all 0.3s;background:rgba(15,23,42,0.3);margin-bottom:20px}
 .upload-area:hover,.upload-area.dragover{border-color:var(--accent);background:var(--accent-glow)}
 .upload-icon{font-size:40px;margin-bottom:12px}.upload-text{font-size:16px;color:var(--text-secondary);margin-bottom:8px}.upload-hint{font-size:13px;color:var(--text-dim);line-height:1.6}
@@ -34023,7 +34024,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
   </div>
   <div style="display:flex;gap:8px">
     <button onclick="takeSnapshot()" id="snap-now-btn" style="padding:8px 16px;background:rgba(6,182,212,0.1);color:var(--cyan);border:1px solid rgba(6,182,212,0.3);border-radius:8px;font-size:12px;font-family:JetBrains Mono,monospace;cursor:pointer">📸 Take Snapshot Now</button>
-    <button onclick="loadSnapshots()" style="padding:8px 16px;background:transparent;color:var(--text-dim);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer">↻ Refresh</button>
+    <button id="snap-refresh-btn" onclick="loadSnapshots(true)" style="padding:8px 16px;background:transparent;color:var(--text-dim);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer;transition:opacity .2s">↻ Refresh</button>
   </div>
 </div>
 <div id="snap-progress" style="display:none;font-family:JetBrains Mono,monospace;font-size:11px;color:var(--cyan);padding:8px 0;margin-bottom:12px"></div>
@@ -34091,12 +34092,16 @@ window.takToggleSection = function(id) {
 
 // Snapshots & Recovery
 var _snapPollTimer = null;
-function loadSnapshots(){
+function loadSnapshots(fromBtn){
   var c=document.getElementById('snap-table-container');
   if(!c)return;
-  fetch('/api/takserver/snapshots').then(function(r){return r.json();}).then(function(d){
+  var btn=document.getElementById('snap-refresh-btn');
+  if(btn){btn.disabled=true;btn.style.opacity='0.5';btn.textContent='↻ Loading…';}
+  c.innerHTML='<div style="color:var(--text-dim);font-size:13px;display:flex;align-items:center;gap:8px"><span style="display:inline-block;width:14px;height:14px;border:2px solid var(--cyan);border-top-color:transparent;border-radius:50%;animation:spin 0.7s linear infinite"></span>Loading snapshots…</div>';
+  fetch('/api/takserver/snapshots',{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.json();}).then(function(d){
+    if(btn){btn.disabled=false;btn.style.opacity='1';btn.textContent='↻ Refresh';}
     var snaps=d.snapshots||[];
-    if(!snaps.length){c.innerHTML='<div style="color:var(--text-dim);font-size:13px">No snapshots yet.</div>';return;}
+    if(!snaps.length){c.innerHTML='<div style="color:var(--text-dim);font-size:13px">No snapshots yet. Use "Take Snapshot Now" to create one.</div>';return;}
     var rows=snaps.map(function(s){
       var src=s.source||'manual';
       var srcColor=src==='pre-upgrade'?'var(--cyan)':src==='scheduled'?'var(--green)':'var(--text-dim)';
@@ -34121,7 +34126,11 @@ function loadSnapshots(){
       +'<th style="padding:4px 8px;text-align:left">Size</th>'
       +'<th style="padding:4px 8px;text-align:left">Actions</th>'
       +'</tr></thead><tbody>'+rows+'</tbody></table>';
-  }).catch(function(){c.innerHTML='<div style="color:var(--red);font-size:12px">Failed to load snapshots.</div>';});
+  }).catch(function(e){
+    var btn2=document.getElementById('snap-refresh-btn');
+    if(btn2){btn2.disabled=false;btn2.style.opacity='1';btn2.textContent='↻ Refresh';}
+    c.innerHTML='<div style="color:var(--red);font-size:12px">Failed to load snapshots — '+((e&&e.message)||'network error')+'</div>';
+  });
 }
 
 function takeSnapshot(){
