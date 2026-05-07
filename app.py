@@ -30355,6 +30355,7 @@ def _tak_snapshot(label, plog=None):
 
     # 4. PostgreSQL cot dump (native host postgres — not a container)
     pg_dump_path = os.path.join(snap_path, 'cot.pgdump')
+    plog("  snapshot: pg_dump starting — cot database (may take 30–90s for large databases)…")
     try:
         with open(pg_dump_path, 'wb') as _f:
             r2 = subprocess.run(
@@ -34131,11 +34132,18 @@ function takeSnapshot(){
       if(d.ok){
         _snapPollTimer=setInterval(function(){
           fetch('/api/takserver/snapshot/status').then(function(r){return r.json();}).then(function(s){
-            if(prog)prog.textContent=s.log&&s.log.length?s.log[s.log.length-1]:'Running…';
+            var msg=s.log&&s.log.length?s.log[s.log.length-1]:'Running\u2026';
+            if(prog){
+              if(s.running){
+                prog.innerHTML='<span style="display:inline-block;width:12px;height:12px;border:2px solid var(--cyan);border-top-color:transparent;border-radius:50%;animation:spin 0.7s linear infinite;vertical-align:middle;margin-right:6px"></span><span style="vertical-align:middle">'+msg+'</span>';
+              }else{
+                prog.textContent=msg;
+              }
+            }
             if(!s.running){
               clearInterval(_snapPollTimer);
               if(btn)btn.disabled=false;
-              if(prog)setTimeout(function(){prog.style.display='none';},3000);
+              if(prog)setTimeout(function(){prog.style.display='none';},4000);
               loadSnapshots();
             }
           });
