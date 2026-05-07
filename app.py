@@ -35264,15 +35264,32 @@ def _post_update_auto_deploy():
                             _ak = _f.read()
                         _ak_orig = _ak
                         if '/var/run/docker.sock' in _ak:
-                            _ak = _ak.replace('      - /var/run/docker.sock:/var/run/docker.sock\n', '')
+                            # Line-filter removal — handles any indentation level
+                            _ak = ''.join(
+                                l for l in _ak.splitlines(keepends=True)
+                                if '/var/run/docker.sock' not in l
+                            )
                             print("Post-update: Authentik — removed docker.sock from worker")
                         for _old, _new in (
                             ('command: server\n', 'cap_drop:\n      - ALL\n    security_opt:\n      - no-new-privileges:true\n    command: server\n'),
                             ('command: worker\n', 'cap_drop:\n      - ALL\n    security_opt:\n      - no-new-privileges:true\n    command: worker\n'),
-                            ('AUTHENTIK_TOKEN: placeholder\n    restart: unless-stopped\n    healthcheck:', 'AUTHENTIK_TOKEN: placeholder\n    restart: unless-stopped\n    cap_drop:\n      - ALL\n    security_opt:\n      - no-new-privileges:true\n    healthcheck:'),
                         ):
                             if _old in _ak and _new not in _ak:
                                 _ak = _ak.replace(_old, _new, 1)
+                        # LDAP cap_drop — section-based (anchor: ldap image line, not the token value)
+                        _ldap_start = _ak.find('\n  ldap:\n')
+                        if _ldap_start != -1:
+                            import re as _re_harden
+                            _ldap_end_m = _re_harden.search(r'\n(volumes:|networks:)', _ak[_ldap_start + 1:])
+                            _ldap_end = _ldap_start + 1 + (_ldap_end_m.start() if _ldap_end_m else len(_ak))
+                            _ldap_block = _ak[_ldap_start:_ldap_end]
+                            if 'cap_drop:' not in _ldap_block and 'restart: unless-stopped' in _ldap_block:
+                                _ldap_new = _ldap_block.replace(
+                                    '    restart: unless-stopped\n',
+                                    '    restart: unless-stopped\n    cap_drop:\n      - ALL\n    security_opt:\n      - no-new-privileges:true\n',
+                                    1
+                                )
+                                _ak = _ak[:_ldap_start] + _ldap_new + _ak[_ldap_end:]
                         if _ak != _ak_orig:
                             with open(ak_compose, 'w') as _f:
                                 _f.write(_ak)
@@ -35561,6 +35578,84 @@ def _post_update_auto_deploy():
                     except Exception as e:
                         print(f"Post-update: Authentik port hardening error: {e}")
 
+            def _auto_provision_takwerx():
+                """Idempotent: create takwerx user, migrate /root/ module dirs, update service unit.
+                Returns True if the systemd unit was modified (caller should restart)."""
+                import pwd as _pwd
+                service_updated = False
+                try:
+                    try:
+                        _pwd.getpwnam('takwerx')
+                        _user_existed = True
+                    except KeyError:
+                        _user_existed = False
+
+                    if not _user_existed:
+                        subprocess.run(_sudo_wrap(['useradd', '-m', '-s', '/bin/bash', 'takwerx']),
+                            capture_output=True, text=True)
+                        print("Post-update: takwerx user created")
+
+                    # Groups — idempotent
+                    subprocess.run(_sudo_wrap(['usermod', '-aG', 'sudo,docker', 'takwerx']),
+                        capture_output=True, text=True)
+
+                    # Sudoers
+                    _sudoers_path = '/etc/sudoers.d/takwerx'
+                    _sudoers_content = 'takwerx ALL=(ALL) NOPASSWD: ALL\n'
+                    try:
+                        _existing_sudoers = _read_priv(_sudoers_path)
+                    except Exception:
+                        _existing_sudoers = ''
+                    if _existing_sudoers.strip() != _sudoers_content.strip():
+                        _write_priv(_sudoers_path, _sudoers_content)
+                        subprocess.run(_sudo_wrap(['chmod', '440', _sudoers_path]),
+                            capture_output=True, text=True)
+
+                    # Migrate module dirs /root/ → /home/takwerx/
+                    for _mod in ('authentik', 'CloudTAK', 'node-red', 'TAK-Portal'):
+                        _src = f'/root/{_mod}'
+                        _dst = f'/home/takwerx/{_mod}'
+                        if os.path.isdir(_src) and not os.path.isdir(_dst):
+                            subprocess.run(_sudo_wrap(['mv', _src, _dst]),
+                                capture_output=True, text=True)
+                            print(f"Post-update: migrated {_src} → {_dst}")
+
+                    # chown
+                    subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx', '/home/takwerx']),
+                        capture_output=True, text=True)
+                    _install_dir = os.path.dirname(os.path.abspath(__file__))
+                    subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx', _install_dir]),
+                        capture_output=True, text=True)
+
+                    # Update service unit if still using root
+                    _svc_path = '/etc/systemd/system/takwerx-console.service'
+                    if os.path.exists(_svc_path):
+                        try:
+                            _svc = _read_priv(_svc_path)
+                        except Exception:
+                            _svc = ''
+                        _svc_orig = _svc
+                        if 'User=root' in _svc:
+                            _svc = _svc.replace('User=root', 'User=takwerx')
+                        if 'User=takwerx' not in _svc and '[Service]' in _svc:
+                            _svc = _svc.replace('[Service]\n', '[Service]\nUser=takwerx\n')
+                        if 'HOME=/home/takwerx' not in _svc and '[Service]' in _svc:
+                            _svc = _svc.replace('[Service]\n', '[Service]\nEnvironment=HOME=/home/takwerx\n')
+                        if _svc != _svc_orig:
+                            _write_priv(_svc_path, _svc)
+                            subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']),
+                                capture_output=True, text=True)
+                            service_updated = True
+                            print("Post-update: takwerx service unit updated — restarting as takwerx after deploy")
+                        elif not _user_existed:
+                            print("Post-update: takwerx user provisioned (service unit already correct)")
+                        else:
+                            print("Post-update: takwerx user already provisioned (idempotent)")
+                except Exception as _e:
+                    print(f"Post-update: takwerx provision error (non-fatal): {_e}")
+                return service_updated
+
+            _takwerx_needs_restart = _auto_provision_takwerx()
             _auto_authentik_ports()
             _auto_nodered()
             _auto_harden_containers()
@@ -35587,6 +35682,11 @@ def _post_update_auto_deploy():
             cloudtak_t.join(timeout=600)
 
             print("Post-update: auto-deploy complete")
+
+            if _takwerx_needs_restart:
+                print("Post-update: restarting console service as takwerx user")
+                subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takwerx-console']),
+                    capture_output=True, text=True)
 
         def _run_post_update_guarded():
             try:
