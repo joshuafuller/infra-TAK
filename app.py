@@ -17798,18 +17798,31 @@ Bans IPs via UFW and sends Guard Dog email alerts.
 <div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>
 </div>
 
-<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:16px">
-<div><label class="label-sm">Max Retries</label><input type="number" id="ssh-cfg-maxretry" value="3" min="1" max="50" class="cfg-input"></div>
-<div><label class="label-sm">Find Window (min)</label><input type="number" id="ssh-cfg-findtime" value="10" min="1" max="1440" class="cfg-input"></div>
-<div><label class="label-sm">Ban Duration (min)</label><input type="number" id="ssh-cfg-bantime" value="60" min="1" max="43200" class="cfg-input"></div>
+<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:16px">
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Max Retries</label>
+<input class="form-input" type="number" id="ssh-cfg-maxretry" value="3" min="1" max="50">
+<div class="form-hint">Attempts before ban</div>
 </div>
-<div style="margin-bottom:12px">
-<label class="label-sm">Whitelist (ignoreip) — comma or space-separated IPs/CIDRs</label>
-<input type="text" id="ssh-cfg-ignoreip" class="cfg-input" style="width:100%" placeholder="e.g. 10.0.0.5, 192.168.1.0/24" oninput="renderChips(\'ssh-cfg-ignoreip\',\'ssh-cfg-ignoreip-chips\')">
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Find Window (minutes)</label>
+<input class="form-input" type="number" id="ssh-cfg-findtime" value="10" min="1" max="1440">
+<div class="form-hint">Time window to count attempts</div>
+</div>
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Ban Duration (minutes)</label>
+<input class="form-input" type="number" id="ssh-cfg-bantime" value="60" min="1" max="43200">
+<div class="form-hint">How long to ban the IP</div>
+</div>
+</div>
+<div class="form-row" style="margin-top:16px;margin-bottom:0">
+<label class="form-label">Whitelist (ignoreip)</label>
+<input class="form-input" type="text" id="ssh-cfg-ignoreip" placeholder="e.g. 10.0.0.5, 192.168.1.0/24" style="font-family:monospace" oninput="renderChips(\'ssh-cfg-ignoreip\',\'ssh-cfg-ignoreip-chips\')">
+<div class="form-hint">Space-separated IPs / CIDRs — localhost is always exempt.</div>
 <div id="ssh-cfg-ignoreip-chips" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px"></div>
 </div>
-<div style="display:flex;gap:8px">
-<button class="cfg-save-btn" onclick="saveSshConfig()">Save Config</button>
+<div style="margin-top:16px">
+<button class="btn-primary" onclick="saveSshConfig()">Save &amp; Reload</button>
 </div>
 </div><!-- /ssh-enabled-section -->
 </div><!-- /SSH Jail card -->
@@ -32150,65 +32163,83 @@ def api_metrics():
     return jsonify(metrics)
 
 
-@app.route('/api/metrics/process-breakdown')
+@app.route('/api/host-resource-usage')
 @login_required
-def api_process_breakdown():
-    """Top 10 processes by CPU+RAM for the local host or a remote host (via SSH)."""
-    host_id = request.args.get('host_id', 'this_host')
-    settings = load_settings()
+def api_host_resource_usage():
+    """Process breakdown + disk I/O for the console host (local only for now).
 
-    def _local_procs():
-        rows = []
-        try:
-            for p in sorted(
-                psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent', 'username']),
-                key=lambda x: (x.info.get('cpu_percent') or 0) + (x.info.get('memory_percent') or 0),
-                reverse=True
-            )[:10]:
-                rows.append({
-                    'pid': p.info.get('pid'),
-                    'name': (p.info.get('name') or '')[:28],
-                    'cpu': round(p.info.get('cpu_percent') or 0, 1),
-                    'mem': round(p.info.get('memory_percent') or 0, 1),
-                    'user': (p.info.get('username') or '')[:12],
-                })
-        except Exception:
-            pass
-        return rows
-
-    if host_id == 'this_host':
-        # First call seeds psutil's CPU interval; call twice with a short sleep for accuracy
+    Returns the structure expected by renderResourceBreakdown() in the console template:
+    cpu_top, mem_top, total_ram_gb, processor, vcpu_count,
+    disk_io_read_mbs, disk_io_write_mbs, disk_io_source,
+    disk_speed_test_write_mbs, disk_speed_test_error.
+    """
+    import time as _t
+    try:
+        # Seed CPU measurement
         psutil.cpu_percent(interval=None)
-        for p in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent', 'username']):
+        for _p in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent']):
+            try: _p.cpu_percent(interval=None)
+            except Exception: pass
+        _t.sleep(0.5)
+
+        mem = psutil.virtual_memory()
+        total_ram_gb = round(mem.total / (1024**3), 2)
+
+        # Collect process stats
+        procs = []
+        for _p in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent']):
             try:
-                p.cpu_percent(interval=None)
+                procs.append({
+                    'name': (_p.info.get('name') or 'unknown')[:32],
+                    'cpu_pct': round(_p.info.get('cpu_percent') or 0, 1),
+                    'mem_pct': round(_p.info.get('memory_percent') or 0, 2),
+                })
             except Exception:
                 pass
-        import time as _time; _time.sleep(0.3)
-        return jsonify({'procs': _local_procs()})
 
-    # Remote host — find its SSH config from module deployment configs
-    remote_cfg = None
-    for cfg_key in ['nodered_deployment', 'mediamtx_deployment', 'authentik_deployment']:
-        cfg = _get_module_deployment_config(settings, cfg_key)
-        if cfg.get('target_mode') == 'remote' and cfg.get('deployed'):
-            rc = cfg.get('remote', {})
-            if rc.get('host', '').strip() == host_id or host_id == cfg_key:
-                remote_cfg = rc
-                break
-    if not remote_cfg:
-        return jsonify({'error': 'Remote host config not found', 'procs': []})
-    cmd = ("ps aux --sort=-%cpu 2>/dev/null | head -11 | tail -10 | "
-           "awk '{printf \"%s|%s|%s|%s\\n\",$1,$2,$3,$4}'")
-    ok, out = _ssh_probe(remote_cfg, cmd, timeout=10)
-    if not ok or not out:
-        return jsonify({'error': 'SSH probe failed', 'procs': []})
-    rows = []
-    for line in (out or '').strip().splitlines():
-        parts = line.split('|')
-        if len(parts) >= 4:
-            rows.append({'user': parts[0][:12], 'pid': parts[1], 'cpu': parts[2], 'mem': parts[3], 'name': '—'})
-    return jsonify({'procs': rows})
+        cpu_top = sorted(procs, key=lambda x: x['cpu_pct'], reverse=True)[:8]
+        mem_top = sorted(procs, key=lambda x: x['mem_pct'], reverse=True)[:8]
+
+        # Processor info
+        processor = None
+        vcpu_count = psutil.cpu_count(logical=True)
+        try:
+            with open('/proc/cpuinfo') as _f:
+                for _line in _f:
+                    if _line.startswith('model name'):
+                        processor = _line.split(':', 1)[1].strip()
+                        break
+        except Exception:
+            pass
+
+        # Disk I/O (1-second sample)
+        disk_read_mbs = disk_write_mbs = None
+        disk_src = None
+        try:
+            _d1 = psutil.disk_io_counters()
+            _t.sleep(1)
+            _d2 = psutil.disk_io_counters()
+            if _d1 and _d2:
+                disk_read_mbs = round((_d2.read_bytes - _d1.read_bytes) / 1e6, 1)
+                disk_write_mbs = round((_d2.write_bytes - _d1.write_bytes) / 1e6, 1)
+                disk_src = 'sync'
+        except Exception:
+            pass
+
+        return jsonify({
+            'cpu_top': cpu_top,
+            'mem_top': mem_top,
+            'total_ram_gb': total_ram_gb,
+            'processor': processor,
+            'vcpu_count': vcpu_count,
+            'disk_io_read_mbs': disk_read_mbs,
+            'disk_io_write_mbs': disk_write_mbs,
+            'disk_io_source': disk_src,
+            'disk_speed_test_write_mbs': None,
+            'disk_speed_test_error': None,
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)})
 
 
 def _run_unattended_upgrades_remote(remote_cfg, action):
@@ -33462,25 +33493,6 @@ async function applyUpdate(){
     }catch(e){status.style.color='var(--red)';status.textContent='Error: '+e.message;btn.disabled=false;btn.textContent='Update Now';btn.style.opacity='1'}
 }
 checkUpdate();
-async function toggleResourceBreakdown(hostId){
-  var el=document.getElementById('resource-breakdown-'+hostId);
-  if(!el)return;
-  if(el.style.display!=='none'){el.style.display='none';return;}
-  el.style.display='block';
-  el.innerHTML='<span style="opacity:0.5">Loading...</span>';
-  try{
-    var r=await fetch('/api/metrics/process-breakdown?host_id='+encodeURIComponent(hostId),{credentials:'same-origin'});
-    var d=await r.json();
-    if(d.error){el.innerHTML='<span style="color:var(--red)">'+d.error+'</span>';return;}
-    if(!d.procs||!d.procs.length){el.innerHTML='<span style="opacity:0.5">No data</span>';return;}
-    var h='<table style="width:100%;border-collapse:collapse"><tr style="color:var(--text-secondary);font-size:10px"><th style="text-align:left;padding:2px 6px">PID</th><th style="text-align:left;padding:2px 6px">Name</th><th style="text-align:right;padding:2px 6px">CPU%</th><th style="text-align:right;padding:2px 6px">MEM%</th><th style="text-align:left;padding:2px 6px">User</th></tr>';
-    d.procs.forEach(function(p){
-      h+='<tr><td style="padding:2px 6px;opacity:0.6">'+p.pid+'</td><td style="padding:2px 6px">'+p.name+'</td><td style="padding:2px 6px;text-align:right;color:var(--cyan)">'+p.cpu+'</td><td style="padding:2px 6px;text-align:right;color:var(--yellow)">'+p.mem+'</td><td style="padding:2px 6px;opacity:0.6">'+p.user+'</td></tr>';
-    });
-    h+='</table>';
-    el.innerHTML=h;
-  }catch(e){el.innerHTML='<span style="color:var(--red)">Error loading data</span>';}
-}
 async function doConsoleRollback(){
     if(!confirm('Roll back console to the previous version?\n\nThe console will restart. You may see 502 briefly.'))return;
     var bar=document.getElementById('console-rollback-bar');
