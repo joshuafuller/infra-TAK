@@ -31274,21 +31274,41 @@ def takserver_snapshot_status_api():
 @app.route('/api/takserver/snapshot/<label>/download')
 @login_required
 def takserver_snapshot_download_api(label):
-    """Stream a .tar.gz of the snapshot directory for off-box export."""
-    import tarfile, io
+    """Stream a .tar.gz of the snapshot directory directly to the client."""
+    import subprocess
     snap_path = os.path.join(SNAPSHOT_DIR, label)
     if not os.path.isdir(snap_path):
         return jsonify({'error': 'Snapshot not found'}), 404
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode='w:gz') as tar:
-        tar.add(snap_path, arcname=label)
-    buf.seek(0)
-    from flask import send_file
-    return send_file(
-        buf,
-        as_attachment=True,
-        download_name=f'{label}.tar.gz',
-        mimetype='application/gzip'
+
+    # Sanitise label so it never escapes the shell command
+    safe_label = os.path.basename(label)
+    if not safe_label or safe_label != label:
+        return jsonify({'error': 'Invalid label'}), 400
+
+    def _stream():
+        # Stream tar directly from disk — no in-memory buffering
+        proc = subprocess.Popen(
+            ['tar', '-czf', '-', '-C', SNAPSHOT_DIR, safe_label],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            while True:
+                chunk = proc.stdout.read(65536)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            proc.stdout.close()
+            proc.wait()
+
+    from flask import Response
+    return Response(
+        _stream(),
+        headers={
+            'Content-Disposition': f'attachment; filename="{safe_label}.tar.gz"',
+            'Content-Type': 'application/gzip',
+        }
     )
 
 
@@ -34121,6 +34141,12 @@ body{display:flex;flex-direction:row;min-height:100vh}
 .metric-label{font-family:'JetBrains Mono',monospace;font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--text-dim);margin-bottom:6px}
 .metric-value{font-family:'JetBrains Mono',monospace;font-size:24px;font-weight:700;color:var(--text-primary)}
 .metric-detail{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:4px}
+.badge{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:500;font-family:'JetBrains Mono',monospace}
+.badge-green{background:rgba(16,185,129,.1);color:var(--green);border:1px solid rgba(16,185,129,.25)}
+.badge-red{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.25)}
+.dot{width:7px;height:7px;border-radius:50%;background:currentColor;display:inline-block;flex-shrink:0}
+.dot-pulse{animation:tak-badge-pulse 2s infinite}
+@keyframes tak-badge-pulse{0%,100%{opacity:1}50%{opacity:.4}}
 </style></head><body data-tak-deploying="{{ 'true' if deploying or deploy_done or deploy_error else 'false' }}" data-tak-upgrading="{{ 'true' if upgrading else 'false' }}" data-tak-migrating="{{ 'true' if migrating else 'false' }}">
 {{ sidebar_html }}
 <div class="main">
@@ -34576,18 +34602,28 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 
 <div style="margin-top:20px;padding-top:20px;border-top:1px solid var(--border)">
-<div style="font-size:13px;font-weight:600;color:var(--text-primary);margin-bottom:12px">Scheduled Snapshots</div>
-<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
-  <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-secondary)">
-    <input type="checkbox" id="sched-enabled" onchange="saveSchedule()"> Enable
+<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+  <div style="display:flex;align-items:center;gap:10px">
+    <span style="font-size:13px;font-weight:600;color:var(--text-primary)">Scheduled Snapshots</span>
+    <span class="badge badge-red" id="sched-badge"><span class="dot"></span>Disabled</span>
+  </div>
+  <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:0">
+    <span style="font-size:12px;color:var(--text-dim);font-family:\'JetBrains Mono\',monospace">Enable</span>
+    <div style="position:relative;width:40px;height:22px">
+      <input type="checkbox" id="sched-enabled" onchange="saveSchedule()" style="opacity:0;width:0;height:0;position:absolute">
+      <span id="sched-toggle-track" onclick="document.getElementById(\'sched-enabled\').click()" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
+      <span id="sched-toggle-thumb" style="position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform .2s;pointer-events:none"></span>
+    </div>
   </label>
-  <select id="sched-freq" onchange="saveSchedule()" style="background:#0a0e1a;border:1px solid var(--border);color:var(--text-primary);border-radius:6px;padding:5px 10px;font-size:12px">
+</div>
+<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+  <select id="sched-freq" onchange="saveSchedule()" style="background:#0a0e1a;border:1px solid var(--border);color:var(--text-primary);border-radius:6px;padding:5px 10px;font-size:12px;font-family:\'JetBrains Mono\',monospace">
     <option value="daily">Daily</option>
     <option value="weekly">Weekly (Saturday)</option>
   </select>
   <span style="font-size:12px;color:var(--text-dim)">at</span>
   <input type="number" id="sched-hour" value="2" min="0" max="23" style="width:55px;background:#0a0e1a;border:1px solid var(--border);color:var(--text-primary);border-radius:6px;padding:5px 8px;font-size:12px;font-family:JetBrains Mono,monospace" oninput="saveSchedule()">
-  <span style="font-size:12px;color:var(--text-dim)">:00 local time · Keep last</span>
+  <span style="font-size:12px;color:var(--text-dim)">:00 local · keep last</span>
   <input type="number" id="sched-retention" value="7" min="1" max="90" style="width:55px;background:#0a0e1a;border:1px solid var(--border);color:var(--text-primary);border-radius:6px;padding:5px 8px;font-size:12px;font-family:JetBrains Mono,monospace" oninput="saveSchedule()">
   <span style="font-size:12px;color:var(--text-dim)">snapshots</span>
   <span id="sched-status" style="font-size:11px;color:var(--text-dim)"></span>
@@ -34740,16 +34776,31 @@ function deleteSnapshot(label){
     });
 }
 
+function _applySchedState(enabled){
+  var badge=document.getElementById('sched-badge');
+  var track=document.getElementById('sched-toggle-track');
+  var thumb=document.getElementById('sched-toggle-thumb');
+  var cb=document.getElementById('sched-enabled');
+  if(cb)cb.checked=!!enabled;
+  if(track)track.style.background=enabled?'var(--green)':'var(--border)';
+  if(thumb)thumb.style.transform=enabled?'translateX(18px)':'translateX(0)';
+  if(badge){
+    badge.className=enabled?'badge badge-green':'badge badge-red';
+    badge.innerHTML=enabled?'<span class="dot dot-pulse"></span>Active':'<span class="dot"></span>Disabled';
+  }
+}
+
 function loadSchedule(){
   fetch('/api/takserver/snapshot/schedule').then(function(r){return r.json();}).then(function(d){
-    var el=document.getElementById('sched-enabled');var freq=document.getElementById('sched-freq');
-    var hour=document.getElementById('sched-hour');var ret=document.getElementById('sched-retention');
+    var freq=document.getElementById('sched-freq');
+    var hour=document.getElementById('sched-hour');
+    var ret=document.getElementById('sched-retention');
     var stat=document.getElementById('sched-status');
-    if(el)el.checked=!!d.enabled;
+    _applySchedState(!!d.enabled);
     if(freq)freq.value=d.frequency||'daily';
     if(hour)hour.value=d.hour!==undefined?d.hour:2;
     if(ret)ret.value=d.retention||7;
-    if(stat)stat.textContent=d.timer_active?'● Timer active':'○ Timer inactive';
+    if(stat)stat.textContent=d.timer_active?'● Timer active':'';
   }).catch(function(){});
 }
 
@@ -34757,17 +34808,20 @@ var _schedSaveTimer=null;
 function saveSchedule(){
   clearTimeout(_schedSaveTimer);
   _schedSaveTimer=setTimeout(function(){
+    var enabled=!!(document.getElementById('sched-enabled')&&document.getElementById('sched-enabled').checked);
     var body={
-      enabled:!!(document.getElementById('sched-enabled')&&document.getElementById('sched-enabled').checked),
+      enabled:enabled,
       frequency:(document.getElementById('sched-freq')||{}).value||'daily',
       hour:parseInt((document.getElementById('sched-hour')||{}).value||2,10),
       minute:0,
       retention:parseInt((document.getElementById('sched-retention')||{}).value||7,10)
     };
+    _applySchedState(enabled);
     fetch('/api/takserver/snapshot/schedule',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
       .then(function(r){return r.json();}).then(function(d){
         var stat=document.getElementById('sched-status');
-        if(stat)stat.textContent=d.ok?(d.config.enabled?'● Saved & timer enabled':'○ Saved (disabled)'):'✗ Save failed';
+        if(d.ok){_applySchedState(d.config.enabled);if(stat)stat.textContent=d.config.enabled?'● Timer active':'';}
+        else{if(stat)stat.textContent='✗ Save failed';}
       });
   },600);
 }
