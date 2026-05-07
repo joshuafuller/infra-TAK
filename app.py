@@ -24289,6 +24289,8 @@ def _authentik_apply_official_tunings(plog):
 
     target_settings = [
         ('AUTHENTIK_WEB__WORKERS', '4', '4 web workers (vs default 2)'),
+        ('AUTHENTIK_WEB__MAX_REQUESTS', '0', 'disable gunicorn worker recycling — eliminates periodic LDAP websocket drops'),
+        ('AUTHENTIK_WEB__MAX_REQUESTS_JITTER', '0', 'disable max_requests jitter (pair with MAX_REQUESTS=0)'),
         ('AUTHENTIK_CACHE__TIMEOUT_FLOWS', '600', 'flows cache 600s (vs default 300s) — reduces DB pressure'),
         ('AUTHENTIK_CACHE__TIMEOUT_POLICIES', '600', 'policies cache 600s (vs default 300s) — reduces DB pressure'),
         ('AUTHENTIK_LOG_LEVEL', 'warning', 'log level warning (vs default info) — reduces log overhead'),
