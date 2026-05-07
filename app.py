@@ -18359,7 +18359,7 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
         if (cfg.bantime)  document.getElementById(\'ssh-cfg-bantime\').value  = Math.round(cfg.bantime  / 60);
         var ipEl = document.getElementById(\'ssh-cfg-ignoreip\');
         if (ipEl) { ipEl.value = (cfg.ignoreip || \'\').replace(/127\\.0\\.0\\.1\\/8\\s*::1\\s*/,\'\').trim(); renderChips(\'ssh-cfg-ignoreip\', \'ssh-cfg-ignoreip-chips\'); }
-        var ips = (d.banned_ips || []).slice().sort();
+        var ips = d.banned_ips || [];
         window._sshBannedIps = ips;
         renderSshBanList(ips);
         var caret = document.getElementById(\'ssh-banned-caret\');
@@ -18397,6 +18397,9 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
   };
 
   window._sshBannedIps = [];
+  window._sshSortAsc = true;
+
+  function _ipToNum(ip){var p=ip.split(\'.\');return p.length===4?((+p[0]<<24)|(+p[1]<<16)|(+p[2]<<8)|+p[3])>>>0:0;}
 
   window.renderSshBanList = function(ips) {
     var c = document.getElementById(\'ssh-ban-list-container\');
@@ -18405,12 +18408,21 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
       c.innerHTML = \'<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>\';
       return;
     }
-    var rows = ips.map(function(ip){
+    var sorted = ips.slice().sort(function(a,b){ var d=_ipToNum(a)-_ipToNum(b); return window._sshSortAsc?d:-d; });
+    var arrow = window._sshSortAsc ? \' ▲\' : \' ▼\';
+    var rows = sorted.map(function(ip){
       return \'<tr style="border-bottom:1px solid var(--border)">\'+
         \'<td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">\'+ip+\'</td>\'+
         \'<td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="unbanSshIP(\\\'\'+ip+\'\\\')">Unban</button></td></tr>\';
     }).join(\'\');
-    c.innerHTML = \'<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em"><th style="padding:4px 8px;text-align:left">IP Address</th><th style="padding:4px 8px;text-align:right">Action</th></tr></thead><tbody>\'+rows+\'</tbody></table>\';
+    c.innerHTML = \'<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em">\'+
+      \'<th style="padding:4px 8px;text-align:left;cursor:pointer;user-select:none" onclick="toggleSshSort()">IP Address\'+arrow+\'</th>\'+
+      \'<th style="padding:4px 8px;text-align:right">Action</th></tr></thead><tbody>\'+rows+\'</tbody></table>\';
+  };
+
+  window.toggleSshSort = function() {
+    window._sshSortAsc = !window._sshSortAsc;
+    filterSshBanList();
   };
 
   window.filterSshBanList = function() {
