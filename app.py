@@ -17708,18 +17708,21 @@ Bans IPs via UFW and sends Guard Dog email alerts.
 </div>
 
 <div id="auth-enabled-section" style="display:none">
-<div class="stat-grid" id="stat-grid" style="margin-top:20px;margin-bottom:20px">
-<div class="stat-card"><div class="stat-value red" id="stat-banned">0</div><div class="stat-label">Currently Banned</div></div>
+<div class="stat-grid" id="stat-grid" style="margin-top:20px;margin-bottom:8px">
+<div class="stat-card" id="auth-banned-toggle" onclick="toggleAuthBanPanel()" style="cursor:pointer;transition:border-color 0.2s" title="Click to see banned IPs">
+<div class="stat-value red" id="stat-banned">0</div>
+<div class="stat-label">Currently Banned <span style="font-size:10px;color:var(--text-dim)" id="auth-banned-caret">▼ details</span></div>
+</div>
 <div class="stat-card"><div class="stat-value yellow" id="stat-failed">0</div><div class="stat-label">Currently Failed</div></div>
 <div class="stat-card"><div class="stat-value cyan" id="stat-total-banned">0</div><div class="stat-label">Total Banned (session)</div></div>
 <div class="stat-card"><div class="stat-value" id="stat-total-failed" style="color:var(--text-dim)">0</div><div class="stat-label">Total Failed (session)</div></div>
 </div>
 
-<!-- Banned IPs -->
-<div class="card" style="margin-top:16px">
-<div class="card-title">Currently Banned IPs</div>
-<div id="ban-list-container">
-<div style="color:var(--text-dim);font-size:13px;font-family:\'JetBrains Mono\',monospace">Loading…</div>
+<div id="auth-ban-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
+<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">Banned IPs — click Unban to release</div>
+<input type="text" id="auth-ban-search" oninput="filterAuthBanList()" placeholder="Search IP…" style="width:100%;box-sizing:border-box;margin-bottom:10px;padding:6px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px;outline:none">
+<div id="ban-list-container" style="max-height:240px;overflow-y:auto">
+<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>
 </div>
 </div>
 
@@ -17860,13 +17863,24 @@ TAK Server filter not yet installed — restart the console to complete setup.
 
 <div id="tak-enabled-section" style="display:none">
 <div class="stat-grid" style="margin-top:20px;margin-bottom:8px">
-<div class="stat-card"><div class="stat-value red" id="tak-stat-banned">0</div><div class="stat-label">Currently Banned</div></div>
+<div class="stat-card" id="tak-banned-toggle" onclick="toggleTakBanPanel()" style="cursor:pointer;transition:border-color 0.2s" title="Click to see banned IPs">
+<div class="stat-value red" id="tak-stat-banned">0</div>
+<div class="stat-label">Currently Banned <span style="font-size:10px;color:var(--text-dim)" id="tak-banned-caret">▼ details</span></div>
+</div>
 <div class="stat-card" id="tak-watching-toggle" onclick="toggleWatchingPanel()" style="cursor:pointer;transition:border-color 0.2s" title="Click to see IPs being watched">
 <div class="stat-value yellow" id="tak-stat-failed">0</div>
 <div class="stat-label">Currently Failed <span style="font-size:10px;color:var(--text-dim)" id="tak-watching-caret">▼ details</span></div>
 </div>
 <div class="stat-card"><div class="stat-value cyan" id="tak-stat-total-banned">0</div><div class="stat-label">Total Banned (session)</div></div>
 <div class="stat-card"><div class="stat-value" id="tak-stat-total-failed" style="color:var(--text-dim)">0</div><div class="stat-label">Total Failed (session)</div></div>
+</div>
+
+<div id="tak-ban-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
+<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">Banned IPs — click Unban to release</div>
+<input type="text" id="tak-ban-search" oninput="filterTakBanList()" placeholder="Search IP…" style="width:100%;box-sizing:border-box;margin-bottom:10px;padding:6px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px;outline:none">
+<div id="tak-ban-list-container" style="max-height:240px;overflow-y:auto">
+<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>
+</div>
 </div>
 
 <div id="tak-watching-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
@@ -17876,10 +17890,6 @@ TAK Server filter not yet installed — restart the console to complete setup.
 <div id="tak-watching-list">
   <div style="color:var(--text-dim);font-size:13px;font-family:monospace">Loading…</div>
 </div>
-</div>
-
-<div id="tak-ban-list-container" style="margin-bottom:20px">
-<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>
 </div>
 
 <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:16px">
@@ -18082,20 +18092,32 @@ function loadStatus(cb) {
     }
 
     var ips = d.banned_ips || [];
-    var c = document.getElementById(\'ban-list-container\');
-    if (c) {
-      if (!ips.length) {
-        c.innerHTML = \'<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:8px 0">No IPs currently banned.</div>\';
-      } else {
-        var rows = ips.map(ip =>
-          \'<tr><td>\' + ip + \'</td><td><button class="btn-danger-sm" onclick="unbanIP(\\\'\'+ ip +\'\\\')">\' +
-          \'Unban</button></td></tr>\'
-        ).join(\'\');
-        c.innerHTML = \'<table class="ban-table"><thead><tr><th>IP Address</th><th>Action</th></tr></thead><tbody>\' + rows + \'</tbody></table>\';
-      }
-    }
+    window._authBannedIps = ips;
+    renderAuthBanList(ips);
+    var caret = document.getElementById(\'auth-banned-caret\');
+    if (caret) caret.textContent = ips.length ? \'▼ details\' : \'\';
     if (typeof cb === \'function\') cb();
   }).catch(()=>{ showToast(\'Failed to load status\', \'error\'); if (typeof cb === \'function\') cb(); });
+}
+
+window._authBannedIps = [];
+window._authSortAsc = true;
+function _authIpToNum(ip){var p=ip.split(\'.\');return p.length===4?((+p[0]<<24)|(+p[1]<<16)|(+p[2]<<8)|+p[3])>>>0:0;}
+function renderAuthBanList(ips){
+  var c=document.getElementById(\'ban-list-container\');if(!c)return;
+  if(!ips.length){c.innerHTML=\'<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>\';return;}
+  var sorted=ips.slice().sort(function(a,b){var d=_authIpToNum(a)-_authIpToNum(b);return window._authSortAsc?d:-d;});
+  var arrow=window._authSortAsc?\' ▲\':\' ▼\';
+  var rows=sorted.map(function(ip){return \'<tr style="border-bottom:1px solid var(--border)"><td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">\'+ip+\'</td><td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="unbanIP(\\\'\'+ip+\'\\\')">Unban</button></td></tr>\';}).join(\'\');
+  c.innerHTML=\'<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em"><th style="padding:4px 8px;text-align:left;cursor:pointer;user-select:none" onclick="toggleAuthSort()">IP Address\'+arrow+\'</th><th style="padding:4px 8px;text-align:right">Action</th></tr></thead><tbody>\'+rows+\'</tbody></table>\';
+}
+function toggleAuthSort(){window._authSortAsc=!window._authSortAsc;filterAuthBanList();}
+function filterAuthBanList(){var q=(document.getElementById(\'auth-ban-search\').value||\'\').trim().toLowerCase();renderAuthBanList(q?window._authBannedIps.filter(function(ip){return ip.toLowerCase().indexOf(q)!==-1;}):window._authBannedIps);}
+function toggleAuthBanPanel(){
+  var panel=document.getElementById(\'auth-ban-panel\');var caret=document.getElementById(\'auth-banned-caret\');if(!panel)return;
+  var open=panel.style.display!==\'none\';panel.style.display=open?\'none\':\'\';
+  if(caret)caret.textContent=open?\'▼ details\':\'▲ details\';
+  if(!open){var s=document.getElementById(\'auth-ban-search\');if(s)s.value=\'\';renderAuthBanList(window._authBannedIps);}
 }
 
 function loadLog() {
@@ -18269,16 +18291,10 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
           renderChips(\'tak-cfg-ignoreip\', \'tak-cfg-ignoreip-chips\');
         }
         var ips = d.banned_ips || [];
-        var c = document.getElementById(\'tak-ban-list-container\');
-        if (!ips.length) {
-          c.innerHTML = \'<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>\';
-        } else {
-          var rows = ips.map(function(ip){
-            return \'<tr><td>\' + ip + \'</td><td><button class="btn-danger-sm" onclick="unbanTakIP(\\\'\'+ ip +\'\\\')">\' +
-                   \'Unban</button></td></tr>\';
-          }).join(\'\');
-          c.innerHTML = \'<table class="ban-table"><thead><tr><th>IP Address</th><th>Action</th></tr></thead><tbody>\' + rows + \'</tbody></table>\';
-        }
+        window._takBannedIps = ips;
+        renderTakBanList(ips);
+        var caret = document.getElementById(\'tak-banned-caret\');
+        if (caret) caret.textContent = ips.length ? \'▼ details\' : \'\';
       } else {
         if (enabledSec) enabledSec.style.display = \'none\';
       }
@@ -18313,6 +18329,26 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
         if (d.ok) { showToast(\'TAK Server jail \' + (d.enabled ? \'enabled and saved.\' : \'disabled.\'), \'success\'); loadTakStatus(); }
         else showToast(d.error || \'Save failed\', \'error\');
       }).catch(function(){ showToast(\'Network error\', \'error\'); });
+  };
+
+  window._takBannedIps = [];
+  window._takSortAsc = true;
+  function _takIpToNum(ip){var p=ip.split(\'.\');return p.length===4?((+p[0]<<24)|(+p[1]<<16)|(+p[2]<<8)|+p[3])>>>0:0;}
+  window.renderTakBanList = function(ips){
+    var c=document.getElementById(\'tak-ban-list-container\');if(!c)return;
+    if(!ips.length){c.innerHTML=\'<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>\';return;}
+    var sorted=ips.slice().sort(function(a,b){var d=_takIpToNum(a)-_takIpToNum(b);return window._takSortAsc?d:-d;});
+    var arrow=window._takSortAsc?\' ▲\':\' ▼\';
+    var rows=sorted.map(function(ip){return \'<tr style="border-bottom:1px solid var(--border)"><td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">\'+ip+\'</td><td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="unbanTakIP(\\\'\'+ip+\'\\\')">Unban</button></td></tr>\';}).join(\'\');
+    c.innerHTML=\'<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em"><th style="padding:4px 8px;text-align:left;cursor:pointer;user-select:none" onclick="toggleTakSort()">IP Address\'+arrow+\'</th><th style="padding:4px 8px;text-align:right">Action</th></tr></thead><tbody>\'+rows+\'</tbody></table>\';
+  };
+  window.toggleTakSort = function(){window._takSortAsc=!window._takSortAsc;filterTakBanList();};
+  window.filterTakBanList = function(){var q=(document.getElementById(\'tak-ban-search\').value||\'\').trim().toLowerCase();renderTakBanList(q?window._takBannedIps.filter(function(ip){return ip.toLowerCase().indexOf(q)!==-1;}):window._takBannedIps);};
+  window.toggleTakBanPanel = function(){
+    var panel=document.getElementById(\'tak-ban-panel\');var caret=document.getElementById(\'tak-banned-caret\');if(!panel)return;
+    var open=panel.style.display!==\'none\';panel.style.display=open?\'none\':\'\';
+    if(caret)caret.textContent=open?\'▼ details\':\'▲ details\';
+    if(!open){var s=document.getElementById(\'tak-ban-search\');if(s)s.value=\'\';renderTakBanList(window._takBannedIps);}
   };
 
   window.unbanTakIP = function(ip) {
