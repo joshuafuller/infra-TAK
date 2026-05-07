@@ -1987,11 +1987,12 @@ def update_apply():
     console_dir = os.path.dirname(os.path.abspath(__file__))
     git_env = {'GIT_TERMINAL_PROMPT': '0'}
     git_cfg = ['git', '-c', f'safe.directory={console_dir}']
-    # Ensure root can operate on repos owned by other users (e.g. takwerx-owned
-    # ~/TAK-Portal and ~/CloudTAK on servers where the console runs as root).
-    # safe.directory=* is the standard approach for server/CI environments.
+    # Ensure git works on repos owned by other users (e.g. takwerx-owned
+    # ~/TAK-Portal and ~/CloudTAK when the console process HOME differs from
+    # the repo owner). --system writes to /etc/gitconfig — applies to every
+    # user on the machine, which is correct for a single-tenant server.
     subprocess.run(
-        ['git', 'config', '--global', '--replace-all', 'safe.directory', '*'],
+        ['git', 'config', '--system', '--replace-all', 'safe.directory', '*'],
         capture_output=True, timeout=5
     )
     # Empty remote.origin.fetch: explicit refspecs are *additive* with defaults; without this,
