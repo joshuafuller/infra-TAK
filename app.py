@@ -26992,28 +26992,35 @@ Additional admins: Authentik → Groups → authentik Admins → Users.
     <div style="font-size:13px;font-weight:600;color:var(--text-primary)">Authentik Reputation Policy</div>
     <div style="font-size:12px;color:var(--text-dim);margin-top:4px">Blocks logins at the flow level when a source IP exceeds the failure threshold. Complementary to Fail2ban — trips first, lower overhead.</div>
   </div>
-  <div style="display:flex;align-items:center;gap:12px">
-    <span id="rep-badge" style="font-family:JetBrains Mono,monospace;font-size:11px;color:var(--text-dim)">Loading...</span>
-    <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
-      <input type="checkbox" id="rep-toggle" onchange="toggleReputation()" style="cursor:pointer;width:16px;height:16px">
-      <span style="font-size:12px;color:var(--text-secondary)">Enable</span>
+  <div style="display:flex;align-items:center;gap:16px">
+    <span class="badge badge-red" id="rep-badge"><span class="dot"></span>Disabled</span>
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:0">
+      <span style="font-size:12px;color:var(--text-dim);font-family:\'JetBrains Mono\',monospace">Enable</span>
+      <div class="toggle-wrap" style="position:relative;width:40px;height:22px">
+        <input type="checkbox" id="rep-toggle" onchange="toggleReputation()" style="opacity:0;width:0;height:0;position:absolute">
+        <span id="rep-toggle-track" onclick="document.getElementById(\'rep-toggle\').click()" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
+        <span id="rep-toggle-thumb" style="position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform .2s;pointer-events:none"></span>
+      </div>
     </label>
   </div>
 </div>
 <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">
-  <label style="font-size:12px;color:var(--text-secondary);white-space:nowrap">Score threshold:</label>
-  <input type="number" id="rep-threshold" value="-5" min="-100" max="-1" style="width:80px;background:#0a0e1a;border:1px solid var(--border);border-radius:6px;padding:6px 10px;color:var(--text-primary);font-size:13px;font-family:JetBrains Mono,monospace">
-  <span style="font-size:11px;color:var(--text-dim)">Each failed login = −1 score. Block when score ≤ threshold.</span>
-  <button onclick="toggleReputation()" style="padding:6px 14px;background:var(--accent);color:#fff;border:none;border-radius:6px;font-size:12px;cursor:pointer;white-space:nowrap">Save</button>
+  <label style="font-size:12px;color:var(--text-dim);white-space:nowrap;font-family:\'JetBrains Mono\',monospace">Score threshold:</label>
+  <input class="form-input" type="number" id="rep-threshold" value="-5" min="-100" max="-1" style="width:80px">
+  <span style="font-size:11px;color:var(--text-dim)">Failed login = −1. Success = +1. Block when score ≤ threshold. Only IPs with negative scores are shown below.</span>
+  <button class="btn-primary" onclick="toggleReputation()" style="white-space:nowrap">Save</button>
 </div>
-<div style="font-size:12px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px">Top Flagged IPs</div>
+<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px">Flagged IPs <span style="font-size:9px;color:var(--red);background:rgba(239,68,68,0.1);padding:2px 6px;border-radius:4px;border:1px solid rgba(239,68,68,0.3);text-transform:none;letter-spacing:0">negative score only</span></div>
 <table style="width:100%;border-collapse:collapse">
-  <thead><tr><th style="text-align:left;padding:4px 10px;font-size:11px;color:var(--text-dim);font-weight:600">IP</th><th style="text-align:left;padding:4px 10px;font-size:11px;color:var(--text-dim);font-weight:600">Score</th></tr></thead>
+  <thead><tr>
+    <th style="text-align:left;padding:4px 8px;font-size:10px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:.08em">IP</th>
+    <th style="text-align:left;padding:4px 8px;font-size:10px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:.08em">Score</th>
+  </tr></thead>
   <tbody id="rep-score-table"></tbody>
 </table>
-<div style="margin-top:12px">
-  <button onclick="clearRepScores()" style="padding:6px 14px;background:rgba(239,68,68,0.1);color:var(--red);border:1px solid rgba(239,68,68,0.3);border-radius:6px;font-size:12px;cursor:pointer">Clear All Scores</button>
-  <button onclick="(function(){fetch('/api/authentik/reputation/status').then(function(r){return r.json();}).then(function(d){var t=document.getElementById(\'rep-score-table\');t.innerHTML=\'\';(d.scores||[]).forEach(function(s){var tr=document.createElement(\'tr\');tr.innerHTML=\'<td style="padding:4px 10px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-secondary)">\'+s.ip+\'</td><td style="padding:4px 10px;font-family:JetBrains Mono,monospace;font-size:12px;color:\'+(s.score<-3?\'var(--red)\":\'var(--yellow)\')+\'">\'  +s.score+\'</td>\';t.appendChild(tr);});});})()" style="padding:6px 14px;background:rgba(59,130,246,0.1);color:var(--accent);border:1px solid rgba(59,130,246,0.3);border-radius:6px;font-size:12px;cursor:pointer;margin-left:8px">↻ Refresh</button>
+<div style="margin-top:12px;display:flex;gap:8px">
+  <button onclick="clearRepScores()" style="padding:6px 14px;background:rgba(239,68,68,0.1);color:var(--red);border:1px solid rgba(239,68,68,0.3);border-radius:6px;font-size:12px;cursor:pointer;font-family:\'JetBrains Mono\',monospace">Clear All Scores</button>
+  <button onclick="refreshRepScores()" style="padding:6px 14px;background:rgba(59,130,246,0.1);color:var(--accent);border:1px solid rgba(59,130,246,0.3);border-radius:6px;font-size:12px;cursor:pointer;font-family:\'JetBrains Mono\',monospace">↻ Refresh</button>
 </div>
 </div>
 {% endif %}
@@ -27324,40 +27331,57 @@ document.addEventListener('DOMContentLoaded', function() {
 {% if deploying %}pollDeployLog();{% endif %}
 {% if ak.installed and ak.running %}
 (function(){
+  function _applyRepState(enabled){
+    var badge=document.getElementById('rep-badge');
+    var track=document.getElementById('rep-toggle-track');
+    var thumb=document.getElementById('rep-toggle-thumb');
+    var toggle=document.getElementById('rep-toggle');
+    if(badge){
+      badge.className=enabled?'badge badge-green':'badge badge-red';
+      badge.innerHTML=enabled?'<span class="dot dot-pulse"></span>Active':'<span class="dot"></span>Disabled';
+    }
+    if(track)track.style.background=enabled?'var(--green)':'var(--border)';
+    if(thumb)thumb.style.transform=enabled?'translateX(18px)':'';
+    if(toggle)toggle.checked=enabled;
+  }
   function _repLoad(){
     fetch('/api/authentik/reputation/status').then(function(r){return r.json();}).then(function(d){
       if(!d.ok){return;}
-      var badge=document.getElementById('rep-badge');
-      var scoreTable=document.getElementById('rep-score-table');
-      var toggle=document.getElementById('rep-toggle');
-      if(badge){badge.textContent=d.enabled?'Enabled':'Disabled';badge.style.color=d.enabled?'var(--green)':'var(--text-dim)';}
-      if(toggle){toggle.checked=d.enabled;}
+      _applyRepState(d.enabled);
       var threshEl=document.getElementById('rep-threshold');
       if(threshEl&&d.threshold!==undefined){threshEl.value=d.threshold;}
-      if(scoreTable){
-        scoreTable.innerHTML='';
-        if(d.scores&&d.scores.length>0){
-          d.scores.forEach(function(s){
-            var tr=document.createElement('tr');
-            tr.innerHTML='<td style="padding:4px 10px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-secondary)">'+s.ip+'</td><td style="padding:4px 10px;font-family:JetBrains Mono,monospace;font-size:12px;color:'+(s.score<-3?'var(--red)':'var(--yellow)')+'">'+s.score+'</td>';
-            scoreTable.appendChild(tr);
-          });
-        }else{
-          var emptyTr=document.createElement('tr');
-          emptyTr.innerHTML='<td colspan="2" style="padding:6px 10px;font-size:12px;color:var(--text-dim)">No flagged IPs</td>';
-          scoreTable.appendChild(emptyTr);
-        }
-      }
+      _renderRepScores(d.scores||[]);
     }).catch(function(){});
   }
+  function _renderRepScores(scores){
+    var scoreTable=document.getElementById('rep-score-table');
+    if(!scoreTable)return;
+    var negative=scores.filter(function(s){return s.score<0;});
+    negative.sort(function(a,b){return a.score-b.score;});
+    scoreTable.innerHTML='';
+    if(negative.length>0){
+      negative.forEach(function(s){
+        var tr=document.createElement('tr');
+        tr.style.borderBottom='1px solid var(--border)';
+        tr.innerHTML='<td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">'+s.ip+'</td>'+
+          '<td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:'+(s.score<=-3?'var(--red)':'var(--yellow)')+'">'+s.score+'</td>';
+        scoreTable.appendChild(tr);
+      });
+    }else{
+      var emptyTr=document.createElement('tr');
+      emptyTr.innerHTML='<td colspan="2" style="padding:6px 8px;font-size:12px;color:var(--text-dim)">No flagged IPs</td>';
+      scoreTable.appendChild(emptyTr);
+    }
+  }
+  window.refreshRepScores=function(){_repLoad();};
   window.toggleReputation=function(){
     var en=document.getElementById('rep-toggle').checked;
     var thr=parseInt(document.getElementById('rep-threshold').value||-5,10);
     fetch('/api/authentik/reputation/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:en,threshold:thr})})
       .then(function(r){return r.json();}).then(function(d){
-        if(d.ok){_repShowToast('Reputation policy '+(en?'enabled':'disabled')+'.','success');_repLoad();}
-        else{_repShowToast(d.error||'Failed','error');}
-      }).catch(function(){_repShowToast('Network error','error');});
+        if(d.ok){_applyRepState(en);_repShowToast('Reputation policy '+(en?'enabled':'disabled')+'.','success');_repLoad();}
+        else{_repShowToast(d.error||'Failed','error');_applyRepState(!en);}
+      }).catch(function(){_repShowToast('Network error','error');_applyRepState(!en);});
   };
   window.clearRepScores=function(){
     if(!confirm('Clear all reputation scores?'))return;
