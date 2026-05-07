@@ -117,31 +117,6 @@ def _read_priv(path):
     return proc.stdout
 
 
-def _takwerx_migration_pending():
-    """True when the console is running as root but the takwerx user exists.
-
-    The post-update migration creates the takwerx user (the safe part). The full
-    migration to running the service AS takwerx requires `sudo bash start.sh` —
-    start.sh relocates the install dir out of /root/, rebuilds the venv, and
-    rewrites the service unit. Until that's done, the console keeps running as
-    root and we surface a banner asking the operator to complete it.
-
-    The check is purely runtime — no settings flag, no manual dismiss. When the
-    operator runs start.sh and the service restarts as takwerx, os.getuid() != 0
-    and the banner stops rendering automatically.
-    """
-    if os.getuid() != 0:
-        return False
-    try:
-        import pwd as _pwd
-        _pwd.getpwnam('takwerx')
-        return True
-    except KeyError:
-        return False
-    except Exception:
-        return False
-
-
 def _client_ip():
     """Best-effort client IP for rate limiting."""
     if request.remote_addr in ('127.0.0.1', '::1'):
@@ -1760,8 +1735,7 @@ def console_page():
     resp = render_template_string(CONSOLE_TEMPLATE,
         settings=settings, modules=modules, metrics=metrics, version=VERSION,
         module_versions=module_versions, authentik_base_url=_get_authentik_base_url(settings),
-        takserver_base_url=_get_takserver_base_url(settings), uu_hosts=uu_hosts,
-        takwerx_migration_pending=_takwerx_migration_pending())
+        takserver_base_url=_get_takserver_base_url(settings), uu_hosts=uu_hosts)
     from flask import make_response
     r = make_response(resp)
     r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
@@ -33124,14 +33098,6 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div id="update-details" style="display:none;margin-top:12px;padding-top:12px;border-top:1px solid var(--border);font-size:11px;color:var(--text-dim);white-space:pre-wrap;max-height:200px;overflow-y:auto"></div>
 <div id="update-status" style="display:none;margin-top:8px;font-size:11px"></div>
 </div>
-{% if takwerx_migration_pending %}
-<div id="takwerx-migration-bar" style="background:rgba(56,189,248,0.08);border:1px solid rgba(56,189,248,0.3);border-radius:10px;padding:12px 16px;margin-bottom:16px;display:flex;align-items:center;justify-content:space-between;gap:16px">
-<div>
-  <div style="font-size:12px;font-weight:600;color:#38bdf8">⚙ Takwerx user provisioned — finish migration to non-root service</div>
-  <div style="font-size:11px;color:var(--text-dim);margin-top:2px">SSH into this host and run <code style="background:rgba(0,0,0,0.3);padding:1px 6px;border-radius:4px">sudo bash start.sh</code> from the infra-TAK directory. start.sh relocates the install out of <code style="background:rgba(0,0,0,0.3);padding:1px 4px;border-radius:4px">/root/</code>, rebuilds the venv, and switches the service to run as <code>takwerx</code>. This banner clears automatically when done.</div>
-</div>
-</div>
-{% endif %}
 {% if settings.get('console_rollback', {}).get('available') %}
 <div id="console-rollback-bar" style="background:rgba(234,179,8,0.08);border:1px solid rgba(234,179,8,0.25);border-radius:10px;padding:12px 16px;margin-bottom:16px;display:flex;align-items:center;justify-content:space-between">
 <div>
@@ -35634,54 +35600,6 @@ def _post_update_auto_deploy():
                     except Exception as e:
                         print(f"Post-update: Authentik port hardening error: {e}")
 
-            def _auto_provision_takwerx():
-                """Idempotent: create takwerx user + sudoers + groups ONLY.
-
-                Does NOT move directories or modify the service unit — those operations
-                cannot safely happen from inside the running gunicorn process (the venv
-                shebangs hardcode the install path and break on relocation). The full
-                migration to running as takwerx happens when the operator runs
-                `sudo bash start.sh` — start.sh is bash, not Python, and runs OUTSIDE
-                the service, so it can safely relocate the install + rebuild the venv.
-
-                The console UI shows a banner ("Run sudo bash start.sh to complete
-                takwerx migration") whenever this function created the user but the
-                service is still running as root."""
-                import pwd as _pwd
-                try:
-                    try:
-                        _pwd.getpwnam('takwerx')
-                        _user_existed = True
-                    except KeyError:
-                        _user_existed = False
-
-                    if not _user_existed:
-                        subprocess.run(_sudo_wrap(['useradd', '-m', '-s', '/bin/bash', 'takwerx']),
-                            capture_output=True, text=True)
-                        print("Post-update: takwerx user created")
-
-                    subprocess.run(_sudo_wrap(['usermod', '-aG', 'sudo,docker', 'takwerx']),
-                        capture_output=True, text=True)
-
-                    _sudoers_path = '/etc/sudoers.d/takwerx'
-                    _sudoers_content = 'takwerx ALL=(ALL) NOPASSWD: ALL\n'
-                    try:
-                        _existing_sudoers = _read_priv(_sudoers_path)
-                    except Exception:
-                        _existing_sudoers = ''
-                    if _existing_sudoers.strip() != _sudoers_content.strip():
-                        _write_priv(_sudoers_path, _sudoers_content)
-                        subprocess.run(_sudo_wrap(['chmod', '440', _sudoers_path]),
-                            capture_output=True, text=True)
-
-                    if not _user_existed:
-                        print("Post-update: takwerx provisioned — operator must run 'sudo bash start.sh' once to complete migration to non-root service")
-                    else:
-                        print("Post-update: takwerx user already provisioned (idempotent)")
-                except Exception as _e:
-                    print(f"Post-update: takwerx provision error (non-fatal): {_e}")
-
-            _auto_provision_takwerx()
             _auto_authentik_ports()
             _auto_nodered()
             _auto_harden_containers()
