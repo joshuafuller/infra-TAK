@@ -17789,13 +17789,20 @@ Bans IPs via UFW and sends Guard Dog email alerts.
 
 <div id="ssh-enabled-section" style="display:none">
 <div class="stat-grid" style="margin-top:20px;margin-bottom:8px">
-<div class="stat-card"><div class="stat-value red" id="ssh-stat-banned">0</div><div class="stat-label">Currently Banned</div></div>
+<div class="stat-card" id="ssh-banned-toggle" onclick="toggleSshBanPanel()" style="cursor:pointer;transition:border-color 0.2s" title="Click to see banned IPs">
+<div class="stat-value red" id="ssh-stat-banned">0</div>
+<div class="stat-label">Currently Banned <span style="font-size:10px;color:var(--text-dim)" id="ssh-banned-caret">▼ details</span></div>
+</div>
 <div class="stat-card"><div class="stat-value yellow" id="ssh-stat-failed">0</div><div class="stat-label">Currently Failed</div></div>
 <div class="stat-card"><div class="stat-value cyan" id="ssh-stat-total-banned">0</div><div class="stat-label">Total Banned (session)</div></div>
 </div>
 
-<div id="ssh-ban-list-container" style="margin-bottom:20px">
+<div id="ssh-ban-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
+<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">Banned IPs — click Unban to release</div>
+<input type="text" id="ssh-ban-search" oninput="filterSshBanList()" placeholder="Search IP…" style="width:100%;box-sizing:border-box;margin-bottom:10px;padding:6px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px;outline:none">
+<div id="ssh-ban-list-container" style="max-height:240px;overflow-y:auto">
 <div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>
+</div>
 </div>
 
 <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:16px">
@@ -18352,16 +18359,11 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
         if (cfg.bantime)  document.getElementById(\'ssh-cfg-bantime\').value  = Math.round(cfg.bantime  / 60);
         var ipEl = document.getElementById(\'ssh-cfg-ignoreip\');
         if (ipEl) { ipEl.value = (cfg.ignoreip || \'\').replace(/127\\.0\\.0\\.1\\/8\\s*::1\\s*/,\'\').trim(); renderChips(\'ssh-cfg-ignoreip\', \'ssh-cfg-ignoreip-chips\'); }
-        var ips = d.banned_ips || [];
-        var c   = document.getElementById(\'ssh-ban-list-container\');
-        if (c) {
-          if (!ips.length) {
-            c.innerHTML = \'<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>\';
-          } else {
-            var rows = ips.map(function(ip){ return \'<tr><td>\' + ip + \'</td><td><button class="btn-danger-sm" onclick="unbanSshIP(\\\'\'+ ip +\'\\\')">\' + \'Unban</button></td></tr>\'; }).join(\'\');
-            c.innerHTML = \'<table class="ban-table"><thead><tr><th>IP Address</th><th>Action</th></tr></thead><tbody>\' + rows + \'</tbody></table>\';
-          }
-        }
+        var ips = (d.banned_ips || []).slice().sort();
+        window._sshBannedIps = ips;
+        renderSshBanList(ips);
+        var caret = document.getElementById(\'ssh-banned-caret\');
+        if (caret) caret.textContent = ips.length ? \'▼ details\' : \'\';
       }
     }).catch(function(){});
   }
@@ -18392,6 +18394,39 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
         if (d.ok) { showToast(\'SSH jail \' + (d.enabled ? \'enabled and saved.\' : \'disabled.\'), \'success\'); loadSshStatus(); }
         else showToast(d.error || \'Save failed\', \'error\');
       }).catch(function(){ showToast(\'Network error\', \'error\'); });
+  };
+
+  window._sshBannedIps = [];
+
+  window.renderSshBanList = function(ips) {
+    var c = document.getElementById(\'ssh-ban-list-container\');
+    if (!c) return;
+    if (!ips.length) {
+      c.innerHTML = \'<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>\';
+      return;
+    }
+    var rows = ips.map(function(ip){
+      return \'<tr style="border-bottom:1px solid var(--border)">\'+
+        \'<td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">\'+ip+\'</td>\'+
+        \'<td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="unbanSshIP(\\\'\'+ip+\'\\\')">Unban</button></td></tr>\';
+    }).join(\'\');
+    c.innerHTML = \'<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em"><th style="padding:4px 8px;text-align:left">IP Address</th><th style="padding:4px 8px;text-align:right">Action</th></tr></thead><tbody>\'+rows+\'</tbody></table>\';
+  };
+
+  window.filterSshBanList = function() {
+    var q = (document.getElementById(\'ssh-ban-search\').value || \'\').trim().toLowerCase();
+    var filtered = q ? window._sshBannedIps.filter(function(ip){ return ip.toLowerCase().indexOf(q) !== -1; }) : window._sshBannedIps;
+    renderSshBanList(filtered);
+  };
+
+  window.toggleSshBanPanel = function() {
+    var panel = document.getElementById(\'ssh-ban-panel\');
+    var caret = document.getElementById(\'ssh-banned-caret\');
+    if (!panel) return;
+    var open = panel.style.display !== \'none\';
+    panel.style.display = open ? \'none\' : \'\';
+    if (caret) caret.textContent = open ? \'▼ details\' : \'▲ details\';
+    if (!open) { var s = document.getElementById(\'ssh-ban-search\'); if(s) s.value=\'\'; renderSshBanList(window._sshBannedIps); }
   };
 
   window.unbanSshIP = function(ip) {
