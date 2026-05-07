@@ -9392,45 +9392,58 @@ def _ensure_infratak_network_for_portal():
     _connect_container_to_infratak_network('tak-portal')
 
 
-def _patch_takportal_compose_network():
-    """Add the infratak external network to TAK Portal's docker-compose.yml.
+def _write_takportal_override():
+    """Write ~/TAK-Portal/docker-compose.override.yml with network + hardening.
 
-    This makes the network survive 'docker compose down && up' from the CLI,
-    not just console-driven restarts.
+    Uses the override file (never tracked by git) so that git pull during
+    TAK Portal updates never conflicts with our local modifications.  This
+    replaces the old approach of patching docker-compose.yml directly, which
+    caused git stash conflicts and left the repo on the old version after
+    every update.
     """
-    compose_path = os.path.expanduser('~/TAK-Portal/docker-compose.yml')
-    if not os.path.exists(compose_path):
+    portal_dir = os.path.expanduser('~/TAK-Portal')
+    override_path = os.path.join(portal_dir, 'docker-compose.override.yml')
+    if not os.path.isdir(portal_dir):
         return False
     try:
         _ensure_infratak_docker_network()
-        with open(compose_path) as f:
-            content = f.read()
-        if INFRATAK_DOCKER_NETWORK in content:
-            return False
-        networks_block = (
-            f"\nnetworks:\n"
-            f"  default:\n"
+        content = (
+            "# TAKWERX: TAK Portal runtime overrides — do not edit manually\n"
+            "services:\n"
+            "  tak-portal:\n"
+            "    networks:\n"
+            "      - default\n"
+            f"      - {INFRATAK_DOCKER_NETWORK}\n"
+            "    cap_drop:\n"
+            "      - ALL\n"
+            "    security_opt:\n"
+            "      - no-new-privileges:true\n"
+            "\n"
+            "networks:\n"
+            "  default: {}\n"
             f"  {INFRATAK_DOCKER_NETWORK}:\n"
-            f"    external: true\n"
+            "    external: true\n"
         )
-        service_network_line = f"    networks:\n      - default\n      - {INFRATAK_DOCKER_NETWORK}\n"
-        if 'restart: unless-stopped' in content:
-            content = content.replace(
-                'restart: unless-stopped',
-                'restart: unless-stopped\n' + service_network_line.rstrip('\n'),
-                1)
-        elif 'restart: always' in content:
-            content = content.replace(
-                'restart: always',
-                'restart: always\n' + service_network_line.rstrip('\n'),
-                1)
-        if not content.rstrip().endswith('external: true'):
-            content = content.rstrip() + '\n' + networks_block
-        with open(compose_path, 'w') as f:
+        existing = ''
+        if os.path.exists(override_path):
+            with open(override_path) as f:
+                existing = f.read()
+        if existing == content:
+            return False  # already current
+        with open(override_path, 'w') as f:
             f.write(content)
         return True
     except Exception:
         return False
+
+
+def _patch_takportal_compose_network():
+    """Add the infratak external network to TAK Portal compose config.
+
+    v0.9.2+: writes docker-compose.override.yml instead of modifying the
+    git-tracked docker-compose.yml, preventing stash conflicts on git pull.
+    """
+    return _write_takportal_override()
 
 
 def _patch_authentik_compose_network():
@@ -11452,10 +11465,18 @@ def takportal_control():
         running = 'Up' in (r.stdout or '')
         return jsonify({'success': True, 'running': running, 'action': action, 'message': 'Config updated and portal restarted (SSH configured).'})
     elif action == 'update':
+        # Reset any local changes to tracked files before pulling — the network
+        # and hardening patches now live in docker-compose.override.yml (not tracked
+        # by git) so it's safe to discard dirty tracked files without losing anything.
+        subprocess.run(
+            f'git -C {portal_dir} -c safe.directory={portal_dir} checkout -- .',
+            shell=True, capture_output=True, text=True, timeout=15)
         pull = subprocess.run(
-            f'cd {portal_dir} && git -c safe.directory={portal_dir} pull --rebase --autostash',
+            f'cd {portal_dir} && git -c safe.directory={portal_dir} pull --rebase',
             shell=True, capture_output=True, text=True, timeout=60)
         pull_msg = pull.stdout.strip().split('\n')[-1] if pull.stdout.strip() else ''
+        # Rewrite the override file so network + hardening survive the pull
+        _write_takportal_override()
         build = subprocess.run(f'cd {portal_dir} && docker compose up -d --build', shell=True, capture_output=True, text=True, timeout=180)
         _ensure_infratak_network_for_portal()
         _ensure_infratak_network_for_authentik()
@@ -36049,27 +36070,43 @@ def _post_update_auto_deploy():
                             print("Post-update: Authentik compose already hardened — no changes needed")
                 except Exception as _e:
                     print(f"Post-update: Authentik hardening error (non-fatal): {_e}")
-                # TAK Portal
+                # TAK Portal — write/refresh override file (network + hardening)
+                # v0.9.2+: override file instead of patching the git-tracked
+                # docker-compose.yml, which caused stash conflicts on git pull.
                 try:
-                    tp_compose = os.path.expanduser('~/TAK-Portal/docker-compose.yml')
-                    if os.path.exists(tp_compose):
-                        with open(tp_compose) as _f:
-                            _tp = _f.read()
-                        if 'cap_drop:' not in _tp and 'restart: unless-stopped' in _tp:
-                            _tp = _tp.replace(
-                                'restart: unless-stopped',
-                                'restart: unless-stopped\n    cap_drop:\n      - ALL\n    security_opt:\n      - no-new-privileges:true',
-                                1
+                    tp_dir = os.path.expanduser('~/TAK-Portal')
+                    if os.path.isdir(tp_dir):
+                        changed = _write_takportal_override()
+                        # Also strip any old cap_drop lines we injected directly into docker-compose.yml
+                        tp_compose = os.path.join(tp_dir, 'docker-compose.yml')
+                        if os.path.exists(tp_compose):
+                            with open(tp_compose) as _f:
+                                _tp = _f.read()
+                            _tp_orig = _tp
+                            for _old_injection in (
+                                '\n    cap_drop:\n      - ALL\n    security_opt:\n      - no-new-privileges:true',
+                                '\n    networks:\n      - default\n      - infratak',
+                            ):
+                                _tp = _tp.replace(_old_injection, '', 1)
+                            # Remove stale trailing networks block we may have appended
+                            import re as _re_tp
+                            _tp = _re_tp.sub(
+                                r'\nnetworks:\n  default:\n  infratak:\n    external: true\n?$',
+                                '', _tp
                             )
-                            with open(tp_compose, 'w') as _f:
-                                _f.write(_tp)
-                            print("Post-update: TAK Portal compose hardened — recreating container")
+                            if _tp != _tp_orig:
+                                with open(tp_compose, 'w') as _f:
+                                    _f.write(_tp)
+                                changed = True
+                                print("Post-update: TAK Portal docker-compose.yml cleaned (moved hardening to override)")
+                        if changed:
+                            print("Post-update: TAK Portal override written — recreating container")
                             subprocess.run(
-                                'cd ~/TAK-Portal && docker compose up -d 2>/dev/null',
+                                'cd ~/TAK-Portal && docker compose up -d --force-recreate 2>/dev/null',
                                 shell=True, capture_output=True, text=True, timeout=120
                             )
                         else:
-                            print("Post-update: TAK Portal compose already hardened — no changes needed")
+                            print("Post-update: TAK Portal override already current — no changes needed")
                 except Exception as _e:
                     print(f"Post-update: TAK Portal hardening error (non-fatal): {_e}")
 
