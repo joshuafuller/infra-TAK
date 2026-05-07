@@ -35579,7 +35579,8 @@ def _post_update_auto_deploy():
                         print(f"Post-update: Authentik port hardening error: {e}")
 
             def _auto_provision_takwerx():
-                """Idempotent: create takwerx user, migrate /root/ module dirs, update service unit.
+                """Idempotent: create takwerx user, move install dir out of /root/,
+                migrate module dirs, update service unit (User + WorkingDirectory + ExecStart).
                 Returns True if the systemd unit was modified (caller should restart)."""
                 import pwd as _pwd
                 service_updated = False
@@ -35620,14 +35621,23 @@ def _post_update_auto_deploy():
                                 capture_output=True, text=True)
                             print(f"Post-update: migrated {_src} → {_dst}")
 
-                    # chown
+                    # Move install dir out of /root/ so takwerx can use it as WorkingDirectory.
+                    # /root is mode 700 — takwerx cannot cd into it even with correct file ownership.
+                    _install_dir = os.path.dirname(os.path.abspath(__file__))
+                    _new_install_dir = _install_dir
+                    if _install_dir.startswith('/root/'):
+                        _rel = _install_dir[len('/root/'):]  # e.g. "infra-TAK"
+                        _new_install_dir = f'/home/takwerx/{_rel}'
+                        if not os.path.isdir(_new_install_dir):
+                            subprocess.run(_sudo_wrap(['mv', _install_dir, _new_install_dir]),
+                                capture_output=True, text=True)
+                            print(f"Post-update: moved install dir {_install_dir} → {_new_install_dir}")
+
+                    # chown everything under /home/takwerx
                     subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx', '/home/takwerx']),
                         capture_output=True, text=True)
-                    _install_dir = os.path.dirname(os.path.abspath(__file__))
-                    subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx', _install_dir]),
-                        capture_output=True, text=True)
 
-                    # Update service unit if still using root
+                    # Update service unit — fix User, WorkingDirectory, ExecStart, CONFIG_DIR
                     _svc_path = '/etc/systemd/system/takwerx-console.service'
                     if os.path.exists(_svc_path):
                         try:
@@ -35635,6 +35645,10 @@ def _post_update_auto_deploy():
                         except Exception:
                             _svc = ''
                         _svc_orig = _svc
+                        # Replace all old install-dir path references (ExecStart, WorkingDirectory, CONFIG_DIR)
+                        if _install_dir != _new_install_dir and _install_dir in _svc:
+                            _svc = _svc.replace(_install_dir, _new_install_dir)
+                        # Fix User
                         if 'User=root' in _svc:
                             _svc = _svc.replace('User=root', 'User=takwerx')
                         if 'User=takwerx' not in _svc and '[Service]' in _svc:
