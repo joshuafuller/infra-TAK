@@ -4781,6 +4781,66 @@ def fail2ban_ssh_unban_api():
         return jsonify({'ok': False, 'error': str(e)[:200]}), 500
 
 
+@app.route('/api/fail2ban/ssh/watching')
+@login_required
+def fail2ban_ssh_watching_api():
+    """Return IPs seen in the sshd jail (found but not currently banned)."""
+    import re as _re_watch
+    log_path = '/var/log/fail2ban.log'
+    result = []
+    try:
+        found_re = _re_watch.compile(r'\[sshd\] Found (\d[\d.:a-fA-F]+)')
+        ban_re   = _re_watch.compile(r'\[sshd\] Ban (\d[\d.:a-fA-F]+)')
+        unban_re = _re_watch.compile(r'\[sshd\] Unban (\d[\d.:a-fA-F]+)')
+        ts_re    = _re_watch.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})')
+        found_data = {}
+        banned_ips = set()
+        with open(log_path) as _lf:
+            for line in _lf:
+                m = ban_re.search(line)
+                if m: banned_ips.add(m.group(1)); continue
+                m = unban_re.search(line)
+                if m: banned_ips.discard(m.group(1)); continue
+                m = found_re.search(line)
+                if m:
+                    ip = m.group(1)
+                    ts_m = ts_re.match(line)
+                    ts = ts_m.group(1) if ts_m else ''
+                    if ip not in found_data:
+                        found_data[ip] = {'count': 0, 'last_seen': ts}
+                    found_data[ip]['count'] += 1
+                    found_data[ip]['last_seen'] = ts
+        for ip, data in found_data.items():
+            if ip not in banned_ips:
+                result.append({'ip': ip, 'attempts': data['count'], 'last_seen': data['last_seen']})
+        result.sort(key=lambda x: x['attempts'], reverse=True)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200], 'watching': []}), 500
+    return jsonify({'ok': True, 'watching': result})
+
+
+@app.route('/api/fail2ban/ssh/ban', methods=['POST'])
+@login_required
+def fail2ban_ssh_ban_api():
+    """Manually ban an IP in the SSH jail."""
+    if not _f2b_is_available():
+        return jsonify({'ok': False, 'error': 'fail2ban not installed'}), 400
+    data = request.get_json(force=True) or {}
+    ip   = str(data.get('ip', '')).strip()
+    if not ip or not _VALID_IP_RE.match(ip):
+        return jsonify({'ok': False, 'error': 'Invalid IP address'}), 400
+    try:
+        r = subprocess.run(['fail2ban-client', 'set', 'sshd', 'banip', ip],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            return jsonify({'ok': True, 'ip': ip})
+        return jsonify({'ok': False, 'error': r.stderr.strip()[:200] or 'Ban failed'}), 500
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+
 # fail2ban install status dict (tracks background install progress)
 _f2b_install_status = {'running': False, 'log': [], 'done': False, 'ok': False}
 
@@ -17714,8 +17774,8 @@ Bans IPs via UFW and sends Guard Dog email alerts.
 <div class="stat-label">Currently Banned <span style="font-size:10px;color:var(--text-dim)" id="auth-banned-caret">▼ details</span></div>
 </div>
 <div class="stat-card"><div class="stat-value yellow" id="stat-failed">0</div><div class="stat-label">Currently Failed</div></div>
-<div class="stat-card"><div class="stat-value cyan" id="stat-total-banned">0</div><div class="stat-label">Total Banned (session)</div></div>
-<div class="stat-card"><div class="stat-value" id="stat-total-failed" style="color:var(--text-dim)">0</div><div class="stat-label">Total Failed (session)</div></div>
+<div class="stat-card" title="Since the fail2ban service was last started or restarted"><div class="stat-value cyan" id="stat-total-banned">0</div><div class="stat-label">Total Banned <span style="font-size:9px;color:var(--text-dim)">(since last restart)</span></div></div>
+<div class="stat-card" title="Since the fail2ban service was last started or restarted"><div class="stat-value" id="stat-total-failed" style="color:var(--text-dim)">0</div><div class="stat-label">Total Failed <span style="font-size:9px;color:var(--text-dim)">(since last restart)</span></div></div>
 </div>
 
 <div id="auth-ban-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
@@ -17796,8 +17856,16 @@ Bans IPs via UFW and sends Guard Dog email alerts.
 <div class="stat-value red" id="ssh-stat-banned">0</div>
 <div class="stat-label">Currently Banned <span style="font-size:10px;color:var(--text-dim)" id="ssh-banned-caret">▼ details</span></div>
 </div>
-<div class="stat-card"><div class="stat-value yellow" id="ssh-stat-failed">0</div><div class="stat-label">Currently Failed</div></div>
-<div class="stat-card"><div class="stat-value cyan" id="ssh-stat-total-banned">0</div><div class="stat-label">Total Banned (session)</div></div>
+<div class="stat-card" id="ssh-watching-toggle" onclick="toggleSshWatchingPanel()" style="cursor:pointer;transition:border-color 0.2s" title="Click to see IPs being watched">
+<div class="stat-value yellow" id="ssh-stat-failed">0</div>
+<div class="stat-label">Currently Failed <span style="font-size:10px;color:var(--text-dim)" id="ssh-watching-caret">▼ details</span></div>
+</div>
+<div class="stat-card" title="Since the fail2ban service was last started or restarted"><div class="stat-value cyan" id="ssh-stat-total-banned">0</div><div class="stat-label">Total Banned <span style="font-size:9px;color:var(--text-dim)">(since last restart)</span></div></div>
+</div>
+
+<div id="ssh-watching-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
+<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">IPs Under Watch — failed attempts within find window, not yet banned</div>
+<div id="ssh-watching-list"><div style="color:var(--text-dim);font-size:13px;font-family:monospace">Loading…</div></div>
 </div>
 
 <div id="ssh-ban-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
@@ -17871,8 +17939,8 @@ TAK Server filter not yet installed — restart the console to complete setup.
 <div class="stat-value yellow" id="tak-stat-failed">0</div>
 <div class="stat-label">Currently Failed <span style="font-size:10px;color:var(--text-dim)" id="tak-watching-caret">▼ details</span></div>
 </div>
-<div class="stat-card"><div class="stat-value cyan" id="tak-stat-total-banned">0</div><div class="stat-label">Total Banned (session)</div></div>
-<div class="stat-card"><div class="stat-value" id="tak-stat-total-failed" style="color:var(--text-dim)">0</div><div class="stat-label">Total Failed (session)</div></div>
+<div class="stat-card" title="Since the fail2ban service was last started or restarted"><div class="stat-value cyan" id="tak-stat-total-banned">0</div><div class="stat-label">Total Banned <span style="font-size:9px;color:var(--text-dim)">(since last restart)</span></div></div>
+<div class="stat-card" title="Since the fail2ban service was last started or restarted"><div class="stat-value" id="tak-stat-total-failed" style="color:var(--text-dim)">0</div><div class="stat-label">Total Failed <span style="font-size:9px;color:var(--text-dim)">(since last restart)</span></div></div>
 </div>
 
 <div id="tak-ban-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
@@ -18467,6 +18535,47 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
     renderSshBanList(filtered);
   };
 
+  var _sshWatchingOpen = false;
+  window.toggleSshWatchingPanel = function() {
+    _sshWatchingOpen = !_sshWatchingOpen;
+    var panel = document.getElementById(\'ssh-watching-panel\');
+    var caret = document.getElementById(\'ssh-watching-caret\');
+    var tog   = document.getElementById(\'ssh-watching-toggle\');
+    if (!panel) return;
+    panel.style.display = _sshWatchingOpen ? \'block\' : \'none\';
+    if (caret) caret.textContent = _sshWatchingOpen ? \'▲ hide\' : \'▼ details\';
+    if (tog)   tog.style.borderColor = _sshWatchingOpen ? \'var(--yellow)\' : \'\';
+    if (_sshWatchingOpen) _loadSshWatchingList();
+  };
+  function _loadSshWatchingList() {
+    fetch(\'/api/fail2ban/ssh/watching\').then(function(r){return r.json();}).then(function(d){
+      var el = document.getElementById(\'ssh-watching-list\'); if (!el) return;
+      var list = d.watching || [];
+      if (!list.length) { el.innerHTML=\'<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently under watch.</div>\'; return; }
+      var rows = list.map(function(w){
+        return \'<tr>\'+
+          \'<td style="font-family:monospace;padding:6px 12px 6px 0;color:var(--text-primary)">\'+w.ip+\'</td>\'+
+          \'<td style="padding:6px 12px 6px 0;color:var(--yellow);font-family:monospace">\'+w.attempts+\'</td>\'+
+          \'<td style="padding:6px 12px 6px 0;color:var(--text-dim);font-family:monospace;font-size:11px">\'+w.last_seen+\'</td>\'+
+          \'<td style="padding:6px 0"><button class="btn-danger-sm" onclick="manualBanSshIP(\\\'\'+w.ip+\'\\\')">Ban Now</button></td></tr>\';
+      }).join(\'\');
+      el.innerHTML=\'<table style="width:100%;border-collapse:collapse"><thead><tr>\'+
+        \'<th style="text-align:left;font-size:11px;color:var(--text-dim);padding:0 12px 8px 0;text-transform:uppercase;letter-spacing:.06em">IP Address</th>\'+
+        \'<th style="text-align:left;font-size:11px;color:var(--text-dim);padding:0 12px 8px 0;text-transform:uppercase;letter-spacing:.06em">Attempts</th>\'+
+        \'<th style="text-align:left;font-size:11px;color:var(--text-dim);padding:0 12px 8px 0;text-transform:uppercase;letter-spacing:.06em">Last Seen</th>\'+
+        \'<th style="text-align:left;font-size:11px;color:var(--text-dim);padding:0 0 8px 0;text-transform:uppercase;letter-spacing:.06em">Action</th>\'+
+        \'</tr></thead><tbody>\'+rows+\'</tbody></table>\';
+    }).catch(function(){ var el=document.getElementById(\'ssh-watching-list\'); if(el) el.innerHTML=\'<div style="color:var(--text-dim);font-size:12px">Error loading watch list.</div>\'; });
+  }
+  window.manualBanSshIP = function(ip) {
+    if (!confirm(\'Manually ban \' + ip + \' from the SSH jail now?\')) return;
+    fetch(\'/api/fail2ban/ssh/ban\', {method:\'POST\', headers:{\'Content-Type\':\'application/json\'}, body:JSON.stringify({ip:ip})})
+      .then(function(r){return r.json();}).then(function(d){
+        if (d.ok) { showToast(ip + \' banned.\', \'success\'); loadSshStatus(); if (_sshWatchingOpen) _loadSshWatchingList(); }
+        else showToast(d.error || \'Ban failed\', \'error\');
+      }).catch(function(){ showToast(\'Network error\', \'error\'); });
+  };
+
   window.toggleSshBanPanel = function() {
     var panel = document.getElementById(\'ssh-ban-panel\');
     var caret = document.getElementById(\'ssh-banned-caret\');
@@ -18495,7 +18604,7 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
   };
 
   loadSshStatus();
-  setInterval(loadSshStatus, 30000);
+  setInterval(function(){ loadSshStatus(); if (_sshWatchingOpen) _loadSshWatchingList(); }, 30000);
 })();
 </script>
 </body></html>'''
