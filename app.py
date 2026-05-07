@@ -4841,6 +4841,123 @@ def fail2ban_ssh_ban_api():
         return jsonify({'ok': False, 'error': str(e)[:200]}), 500
 
 
+def _f2b_recidive_enabled():
+    return os.path.exists('/etc/fail2ban/jail.d/infratak-recidive.conf')
+
+def _f2b_read_recidive_config():
+    cfg = {'maxretry': 3, 'findtime': 86400}
+    path = '/etc/fail2ban/jail.d/infratak-recidive.conf'
+    if not os.path.exists(path):
+        return cfg
+    try:
+        with open(path) as _f:
+            for line in _f:
+                line = line.strip()
+                for key in ('maxretry', 'findtime'):
+                    if line.startswith(key):
+                        try: cfg[key] = int(line.split('=')[1].strip())
+                        except Exception: pass
+    except Exception:
+        pass
+    return cfg
+
+def _f2b_write_recidive_config(maxretry, findtime):
+    """Write infratak-recidive jail and ensure fail2ban persistence."""
+    os.makedirs('/etc/fail2ban/jail.d', exist_ok=True)
+    jail_conf = (
+        "[recidive]\n"
+        "enabled  = true\n"
+        "filter   = recidive\n"
+        "logpath  = /var/log/fail2ban.log\n"
+        "bantime  = -1\n"
+        f"findtime = {findtime}\n"
+        f"maxretry = {maxretry}\n"
+        "action   = ufw\n"
+    )
+    with open('/etc/fail2ban/jail.d/infratak-recidive.conf', 'w') as _f:
+        _f.write(jail_conf)
+    # Ensure fail2ban SQLite persistence so permanent bans survive restarts
+    local_path = '/etc/fail2ban/fail2ban.local'
+    db_line = 'dbfile = /var/lib/fail2ban/fail2ban.sqlite3\n'
+    purge_line = 'dbpurgeage = 0\n'
+    try:
+        existing = open(local_path).read() if os.path.exists(local_path) else ''
+        if 'dbfile' not in existing:
+            with open(local_path, 'a') as _f:
+                if not existing.strip():
+                    _f.write('[Definition]\n')
+                _f.write(db_line)
+                _f.write(purge_line)
+    except Exception:
+        pass
+
+
+@app.route('/api/fail2ban/recidive/status')
+@login_required
+def fail2ban_recidive_status_api():
+    if not _f2b_is_available():
+        return jsonify({'available': False, 'error': 'fail2ban not installed'})
+    enabled = _f2b_recidive_enabled()
+    status = {
+        'available': True,
+        'jail_enabled': enabled,
+        'jail_config': _f2b_read_recidive_config(),
+        'currently_banned': 0, 'total_banned': 0, 'banned_ips': [],
+    }
+    if enabled:
+        try:
+            r = subprocess.run(['fail2ban-client', 'status', 'recidive'],
+                               capture_output=True, text=True, timeout=10)
+            status.update(_f2b_parse_status(r.stdout))
+        except Exception as e:
+            status['error'] = str(e)[:200]
+    return jsonify(status)
+
+
+@app.route('/api/fail2ban/recidive/config', methods=['POST'])
+@login_required
+def fail2ban_recidive_config_api():
+    if not _f2b_is_available():
+        return jsonify({'ok': False, 'error': 'fail2ban not installed'}), 400
+    data = request.get_json(force=True) or {}
+    if not bool(data.get('enabled', False)):
+        path = '/etc/fail2ban/jail.d/infratak-recidive.conf'
+        if os.path.exists(path):
+            os.remove(path)
+        subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+        return jsonify({'ok': True, 'enabled': False})
+    try:
+        maxretry = max(2, min(20,  int(data.get('maxretry', 3))))
+        findtime = max(3600, min(2592000, int(data.get('findtime', 86400))))
+    except (ValueError, TypeError) as e:
+        return jsonify({'ok': False, 'error': f'Invalid value: {e}'}), 400
+    try:
+        _f2b_write_recidive_config(maxretry, findtime)
+        subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+        return jsonify({'ok': True, 'enabled': True, 'maxretry': maxretry, 'findtime': findtime})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+
+@app.route('/api/fail2ban/recidive/unban', methods=['POST'])
+@login_required
+def fail2ban_recidive_unban_api():
+    if not _f2b_is_available():
+        return jsonify({'ok': False, 'error': 'fail2ban not installed'}), 400
+    data = request.get_json(force=True) or {}
+    ip = str(data.get('ip', '')).strip()
+    if not ip or not _VALID_IP_RE.match(ip):
+        return jsonify({'ok': False, 'error': 'Invalid IP address'}), 400
+    try:
+        r = subprocess.run(['fail2ban-client', 'set', 'recidive', 'unbanip', ip],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            return jsonify({'ok': True, 'ip': ip})
+        return jsonify({'ok': False, 'error': r.stderr.strip()[:200] or 'Unban failed'}), 500
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+
 # fail2ban install status dict (tracks background install progress)
 _f2b_install_status = {'running': False, 'log': [], 'done': False, 'ok': False}
 
@@ -17989,6 +18106,65 @@ TAK Server filter not yet installed — restart the console to complete setup.
 </div>
 </div>
 
+<!-- Repeat Offender Protection -->
+<div class="card" id="recidive-card" style="margin-top:8px">
+<div class="card-title" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0">
+<div style="display:flex;align-items:center;gap:10px">
+<span>🛡 Repeat Offender Protection</span>
+<span class="badge badge-red" id="recidive-badge" style="font-size:10px;padding:2px 8px"><span class="dot"></span>Disabled</span>
+</div>
+<div style="display:flex;align-items:center;gap:16px">
+<button id="recidive-refresh-btn" onclick="manualRecidiveRefresh()" style="background:none;border:none;cursor:pointer;color:var(--text-dim);font-size:12px;font-family:\'JetBrains Mono\',monospace;display:inline-flex;align-items:center;gap:5px;padding:0"><span id="recidive-refresh-icon" style="display:inline-block;transition:transform 0.4s">↻</span> Refresh</button>
+<label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:0">
+<span style="font-size:12px;color:var(--text-dim);font-family:\'JetBrains Mono\',monospace">Enable</span>
+<div class="toggle-wrap" style="position:relative;width:40px;height:22px">
+<input type="checkbox" id="recidive-toggle" onchange="toggleRecidiveJail()" style="opacity:0;width:0;height:0;position:absolute">
+<span id="recidive-toggle-track" onclick="document.getElementById(\'recidive-toggle\').click()" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
+<span id="recidive-toggle-thumb" style="position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform .2s;pointer-events:none"></span>
+</div>
+</label>
+</div>
+</div>
+<div style="font-size:12px;color:var(--text-dim);margin-top:8px">Permanently bans repeat offenders. An IP banned by <strong>any</strong> jail N times within the watch window is blocked forever — until you manually unban them. Permanent bans survive reboots.</div>
+
+<div id="recidive-enabled-section" style="display:none">
+<div class="stat-grid" style="margin-top:20px;margin-bottom:8px">
+<div class="stat-card" id="recidive-banned-toggle" onclick="toggleRecidiveBanPanel()" style="cursor:pointer;transition:border-color 0.2s" title="Click to see permanently banned IPs">
+<div class="stat-value red" id="recidive-stat-banned">0</div>
+<div class="stat-label">Permanently Banned <span style="font-size:10px;color:var(--text-dim)" id="recidive-banned-caret">▼ details</span></div>
+</div>
+<div class="stat-card" title="Since the fail2ban service was last started or restarted">
+<div class="stat-value cyan" id="recidive-stat-total">0</div>
+<div class="stat-label">Total Caught <span style="font-size:9px;color:var(--text-dim)">(since last restart)</span></div>
+</div>
+</div>
+
+<div id="recidive-ban-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
+<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">Permanently Banned IPs <span style="font-size:9px;color:var(--red);background:rgba(239,68,68,0.1);padding:2px 6px;border-radius:4px;border:1px solid rgba(239,68,68,0.3)">∞ permanent</span></div>
+<input type="text" id="recidive-ban-search" oninput="filterRecidiveBanList()" placeholder="Search IP…" style="width:100%;box-sizing:border-box;margin-bottom:10px;padding:6px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px;outline:none">
+<div id="recidive-ban-list-container" style="max-height:240px;overflow-y:auto">
+<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs permanently banned.</div>
+</div>
+</div>
+
+<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:16px;margin-top:8px">
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Strikes before permanent ban</label>
+<input class="form-input" type="number" id="recidive-cfg-maxretry" value="3" min="2" max="20">
+<div class="form-hint">Bans in any jail that trigger a permanent block</div>
+</div>
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Watch window (hours)</label>
+<input class="form-input" type="number" id="recidive-cfg-findtime" value="24" min="1" max="720">
+<div class="form-hint">How far back to look — use 720 (30 days) for maximum strictness</div>
+</div>
+</div>
+<div style="margin-top:16px">
+<button class="btn-primary" onclick="saveRecidiveConfig()">Save &amp; Reload</button>
+</div>
+</div><!-- /recidive-enabled-section -->
+</div><!-- /Repeat Offender Protection card -->
+
 {% endif %}
 </div>
 <div class="toast" id="toast"></div>
@@ -18605,6 +18781,116 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
 
   loadSshStatus();
   setInterval(function(){ loadSshStatus(); if (_sshWatchingOpen) _loadSshWatchingList(); }, 30000);
+})();
+
+// Repeat Offender Protection
+(function(){
+  window._recidiveBannedIps=[];
+  window._recidiveSortAsc=true;
+  function _recIpToNum(ip){var p=ip.split(\'.\');return p.length===4?((+p[0]<<24)|(+p[1]<<16)|(+p[2]<<8)|+p[3])>>>0:0;}
+
+  window.renderRecidiveBanList=function(ips){
+    var c=document.getElementById(\'recidive-ban-list-container\');if(!c)return;
+    if(!ips.length){c.innerHTML=\'<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs permanently banned.</div>\';return;}
+    var sorted=ips.slice().sort(function(a,b){var d=_recIpToNum(a)-_recIpToNum(b);return window._recidiveSortAsc?d:-d;});
+    var arrow=window._recidiveSortAsc?\' ▲\':\' ▼\';
+    var rows=sorted.map(function(ip){
+      return \'<tr style="border-bottom:1px solid var(--border)">\'+
+        \'<td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">\'+ip+\'</td>\'+
+        \'<td style="padding:5px 8px;text-align:center"><span style="font-size:10px;color:var(--red);background:rgba(239,68,68,0.1);padding:1px 5px;border-radius:3px;border:1px solid rgba(239,68,68,0.3)">&#8734;</span></td>\'+
+        \'<td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="unbanRecidiveIP(\\\'\'+ip+\'\\\')">Unban</button></td></tr>\';
+    }).join(\'\');
+    c.innerHTML=\'<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em">\'+
+      \'<th style="padding:4px 8px;text-align:left;cursor:pointer;user-select:none" onclick="toggleRecidiveSort()">IP Address\'+arrow+\'</th>\'+
+      \'<th style="padding:4px 8px;text-align:center">Duration</th>\'+
+      \'<th style="padding:4px 8px;text-align:right">Action</th></tr></thead><tbody>\'+rows+\'</tbody></table>\';
+  };
+
+  window.toggleRecidiveSort=function(){window._recidiveSortAsc=!window._recidiveSortAsc;filterRecidiveBanList();};
+  window.filterRecidiveBanList=function(){var q=(document.getElementById(\'recidive-ban-search\').value||\'\').trim().toLowerCase();renderRecidiveBanList(q?window._recidiveBannedIps.filter(function(ip){return ip.toLowerCase().indexOf(q)!==-1;}):window._recidiveBannedIps);};
+  window.toggleRecidiveBanPanel=function(){
+    var panel=document.getElementById(\'recidive-ban-panel\');var caret=document.getElementById(\'recidive-banned-caret\');if(!panel)return;
+    var open=panel.style.display!==\'none\';panel.style.display=open?\'none\':\'\';
+    if(caret)caret.textContent=open?\'▼ details\':\'▲ details\';
+    if(!open){var s=document.getElementById(\'recidive-ban-search\');if(s)s.value=\'\';renderRecidiveBanList(window._recidiveBannedIps);}
+  };
+
+  function loadRecidiveStatus(){
+    fetch(\'/api/fail2ban/recidive/status\').then(function(r){return r.json();}).then(function(d){
+      if(!d.available)return;
+      var badge=document.getElementById(\'recidive-badge\');
+      var toggle=document.getElementById(\'recidive-toggle\');
+      var track=document.getElementById(\'recidive-toggle-track\');
+      var thumb=document.getElementById(\'recidive-toggle-thumb\');
+      var sec=document.getElementById(\'recidive-enabled-section\');
+      if(d.jail_enabled){
+        if(badge){badge.className=\'badge badge-green\';badge.innerHTML=\'<span class="dot dot-pulse"></span>Active\';}
+        if(track)track.style.background=\'var(--green)\';
+        if(thumb)thumb.style.transform=\'translateX(18px)\';
+      }else{
+        if(badge){badge.className=\'badge badge-red\';badge.innerHTML=\'<span class="dot"></span>Disabled\';}
+        if(track)track.style.background=\'var(--border)\';
+        if(thumb)thumb.style.transform=\'\';
+      }
+      if(toggle)toggle.checked=d.jail_enabled;
+      if(sec)sec.style.display=d.jail_enabled?\'\':\'none\';
+      if(d.jail_enabled){
+        document.getElementById(\'recidive-stat-banned\').textContent=d.currently_banned||0;
+        document.getElementById(\'recidive-stat-total\').textContent=d.total_banned||0;
+        var cfg=d.jail_config||{};
+        if(cfg.maxretry)document.getElementById(\'recidive-cfg-maxretry\').value=cfg.maxretry;
+        if(cfg.findtime)document.getElementById(\'recidive-cfg-findtime\').value=Math.round(cfg.findtime/3600);
+        var ips=d.banned_ips||[];
+        window._recidiveBannedIps=ips;
+        renderRecidiveBanList(ips);
+        var caret=document.getElementById(\'recidive-banned-caret\');
+        if(caret)caret.textContent=ips.length?\'▼ details\':\'\';
+      }
+    }).catch(function(){});
+  }
+
+  window.toggleRecidiveJail=function(){
+    var enabled=document.getElementById(\'recidive-toggle\').checked;
+    if(!enabled){
+      fetch(\'/api/fail2ban/recidive/config\',{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify({enabled:false})})
+        .then(function(r){return r.json();}).then(function(d){
+          if(d.ok){showToast(\'Repeat Offender Protection disabled.\',\'success\');loadRecidiveStatus();}
+          else{showToast(d.error||\'Failed to disable\',\'error\');loadRecidiveStatus();}
+        }).catch(function(){showToast(\'Network error\',\'error\');loadRecidiveStatus();});
+    }else{saveRecidiveConfig();}
+  };
+
+  window.saveRecidiveConfig=function(){
+    var body={
+      enabled:true,
+      maxretry:parseInt(document.getElementById(\'recidive-cfg-maxretry\').value)||3,
+      findtime:(parseInt(document.getElementById(\'recidive-cfg-findtime\').value)||24)*3600
+    };
+    fetch(\'/api/fail2ban/recidive/config\',{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify(body)})
+      .then(function(r){return r.json();}).then(function(d){
+        if(d.ok){showToast(\'Repeat Offender Protection saved.\',\'success\');loadRecidiveStatus();}
+        else showToast(d.error||\'Save failed\',\'error\');
+      }).catch(function(){showToast(\'Network error\',\'error\');});
+  };
+
+  window.unbanRecidiveIP=function(ip){
+    if(!confirm(\'Permanently unban \'+ip+\' from Repeat Offender Protection?\\n\\nThis IP will be able to attempt connections again.\'))return;
+    fetch(\'/api/fail2ban/recidive/unban\',{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify({ip:ip})})
+      .then(function(r){return r.json();}).then(function(d){
+        if(d.ok){showToast(ip+\' permanently unbanned.\',\'success\');loadRecidiveStatus();}
+        else showToast(d.error||\'Unban failed\',\'error\');
+      }).catch(function(){showToast(\'Network error\',\'error\');});
+  };
+
+  window.manualRecidiveRefresh=function(){
+    _spinIcon(\'recidive-refresh-icon\',true);
+    var btn=document.getElementById(\'recidive-refresh-btn\');if(btn)btn.disabled=true;
+    loadRecidiveStatus();
+    setTimeout(function(){_spinIcon(\'recidive-refresh-icon\',false);if(btn)btn.disabled=false;},1200);
+  };
+
+  loadRecidiveStatus();
+  setInterval(loadRecidiveStatus,30000);
 })();
 </script>
 </body></html>'''
