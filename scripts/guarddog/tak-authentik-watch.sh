@@ -20,7 +20,7 @@ UPTIME_SECS=$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0)
 [ "$UPTIME_SECS" -lt 600 ] && exit 0
 
 AK_DIR=""
-for _d in "${HOME:-/root}/authentik" /root/authentik; do
+for _d in "${HOME:-/home/takwerx}/authentik"; do
   [ -f "$_d/docker-compose.yml" ] && AK_DIR="$_d" && break
 done
 [ -z "$AK_DIR" ] && exit 0

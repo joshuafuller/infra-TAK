@@ -52,7 +52,7 @@ fi
 
 # ── 2. Start Authentik ──
 AK_DIR=""
-for _d in /root/authentik "${HOME:-/root}/authentik"; do
+for _d in "${HOME:-/home/takwerx}/authentik"; do
   [ -f "$_d/docker-compose.yml" ] && AK_DIR="$_d" && break
 done
 
@@ -128,7 +128,7 @@ fi
 # ── 4. Start CloudTAK ──
 # Stagger Docker starts to avoid iptables churn that disrupts TAK Server connections
 CT_DIR=""
-for _d in /root/CloudTAK "${HOME:-/root}/CloudTAK"; do
+for _d in "${HOME:-/home/takwerx}/CloudTAK"; do
   [ -f "$_d/docker-compose.yml" ] && CT_DIR="$_d" && break
 done
 
@@ -144,7 +144,7 @@ fi
 
 # ── 5. Start Node-RED ──
 NR_DIR=""
-for _d in /root/node-red "${HOME:-/root}/node-red"; do
+for _d in "${HOME:-/home/takwerx}/node-red"; do
   [ -f "$_d/docker-compose.yml" ] && NR_DIR="$_d" && break
 done
 

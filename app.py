@@ -86,6 +86,37 @@ _RATE_LOCK = threading.Lock()
 _RATE_HITS = defaultdict(deque)  # key -> deque[timestamps]
 
 
+def _sudo_wrap(cmd):
+    """Prepend 'sudo -n' when the process is not running as root (UID != 0).
+    No-op if sudo is already the first element or if running as root."""
+    cmd = list(cmd)
+    if os.getuid() != 0 and cmd[0] != 'sudo':
+        return ['sudo', '-n'] + cmd
+    return cmd
+
+
+def _write_priv(path, content, mode='w'):
+    """Write to a privileged path. Uses 'sudo tee' when not running as root."""
+    if os.getuid() == 0:
+        with open(path, mode) as f:
+            f.write(content)
+    else:
+        tee_cmd = ['sudo', '-n', 'tee']
+        if mode == 'a':
+            tee_cmd.append('--append')
+        tee_cmd.append(path)
+        subprocess.run(tee_cmd, input=content, capture_output=True, text=True, check=True)
+
+
+def _read_priv(path):
+    """Read a privileged path. Uses 'sudo cat' when not running as root."""
+    if os.getuid() == 0:
+        with open(path) as f:
+            return f.read()
+    proc = subprocess.run(['sudo', '-n', 'cat', path], capture_output=True, text=True, check=True)
+    return proc.stdout
+
+
 def _client_ip():
     """Best-effort client IP for rate limiting."""
     if request.remote_addr in ('127.0.0.1', '::1'):
@@ -204,7 +235,7 @@ def _ensure_gunicorn_upgrade(console_dir=None):
     content = re.sub(r'^ExecStart=.*$', f'ExecStart={exec_line}', content, flags=re.MULTILINE)
     with open(svc, 'w') as f:
         f.write(content)
-    subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=10)
+    subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
 
 
 def _request_host_is_ip():
@@ -276,7 +307,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.1-alpha"
+VERSION = "0.9.2-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -670,11 +701,11 @@ def detect_modules():
     caddy_installed = subprocess.run(['which', 'caddy'], capture_output=True).returncode == 0
     caddy_running = False
     if caddy_installed:
-        r = subprocess.run(['systemctl', 'is-active', 'caddy'], capture_output=True, text=True)
+        r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'caddy']), capture_output=True, text=True)
         caddy_running = r.stdout.strip() == 'active'
         # Leftover from uninstall-all? (binary still there but service disabled and stopped)
         if not caddy_running:
-            re = subprocess.run(['systemctl', 'is-enabled', 'caddy'], capture_output=True, text=True, timeout=5)
+            re = subprocess.run(_sudo_wrap(['systemctl', 'is-enabled', 'caddy']), capture_output=True, text=True, timeout=5)
             if (re.stdout or '').strip() == 'disabled':
                 for path in ['/usr/bin/caddy', '/usr/local/bin/caddy']:
                     if os.path.exists(path):
@@ -693,7 +724,7 @@ def detect_modules():
     tak_installed = os.path.exists('/opt/tak') and os.path.exists('/opt/tak/CoreConfig.xml')
     tak_running = False
     if tak_installed:
-        r = subprocess.run(['systemctl', 'is-active', 'takserver'], capture_output=True, text=True)
+        r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'takserver']), capture_output=True, text=True)
         tak_running = r.stdout.strip() == 'active'
     modules['takserver'] = {'name': 'TAK Server', 'installed': tak_installed, 'running': tak_running,
         'description': 'Team Awareness Kit Server', 'icon': '🗺️', 'icon_url': TAK_LOGO_URL, 'route': '/takserver', 'priority': 1}
@@ -731,7 +762,7 @@ def detect_modules():
     else:
         mtx_installed = os.path.exists('/usr/local/bin/mediamtx') and os.path.exists('/usr/local/etc/mediamtx.yml')
         if mtx_installed:
-            r = subprocess.run(['systemctl', 'is-active', 'mediamtx'], capture_output=True, text=True)
+            r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'mediamtx']), capture_output=True, text=True)
             mtx_running = r.stdout.strip() == 'active'
     modules['mediamtx'] = {'name': 'MediaMTX', 'installed': mtx_installed, 'running': mtx_running,
         'description': 'Video Streaming Server', 'icon': '📹', 'icon_url': MEDIAMTX_LOGO_URL, 'route': '/mediamtx', 'priority': 4}
@@ -739,7 +770,7 @@ def detect_modules():
     gd_installed = os.path.exists('/opt/tak-guarddog')
     gd_running = False
     if gd_installed:
-        r = subprocess.run(['systemctl', 'list-timers', '--no-pager'], capture_output=True, text=True)
+        r = subprocess.run(_sudo_wrap(['systemctl', 'list-timers', '--no-pager']), capture_output=True, text=True)
         gd_running = 'tak8089guard' in r.stdout
     modules['guarddog'] = {'name': 'Guard Dog', 'installed': gd_installed, 'running': gd_running,
         'description': 'Health monitoring and auto-recovery', 'icon': '🐕', 'route': '/guarddog', 'priority': 5}
@@ -749,7 +780,7 @@ def detect_modules():
     f2b_running = False
     f2b_version = None
     if f2b_installed:
-        r = subprocess.run(['systemctl', 'is-active', 'fail2ban'], capture_output=True, text=True)
+        r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'fail2ban']), capture_output=True, text=True)
         f2b_running = r.stdout.strip() == 'active'
         try:
             v = subprocess.run(['fail2ban-client', '--version'], capture_output=True, text=True, timeout=5)
@@ -781,7 +812,7 @@ def detect_modules():
                 nodered_running = bool(r2.stdout and 'Up' in r2.stdout)
         if not nodered_installed and (os.path.exists(os.path.expanduser('~/node-red')) or os.path.exists('/opt/nodered')):
             nodered_installed = True
-            r = subprocess.run(['systemctl', 'is-active', 'nodered'], capture_output=True, text=True)
+            r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'nodered']), capture_output=True, text=True)
             if r.stdout.strip() == 'active':
                 nodered_running = True
     modules['nodered'] = {'name': 'Node-RED', 'installed': nodered_installed, 'running': nodered_running,
@@ -823,7 +854,7 @@ def detect_modules():
     email_installed = subprocess.run(['which', 'postfix'], capture_output=True).returncode == 0
     email_running = False
     if email_installed:
-        r = subprocess.run(['systemctl', 'is-active', 'postfix'], capture_output=True, text=True)
+        r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'postfix']), capture_output=True, text=True)
         email_running = r.stdout.strip() == 'active'
     modules['emailrelay'] = {'name': 'Email Relay', 'installed': email_installed, 'running': email_running,
         'description': 'Postfix relay — notifications for TAK Portal & MediaMTX', 'icon': '📧', 'route': '/emailrelay', 'priority': 9}
@@ -1956,6 +1987,14 @@ def update_apply():
     console_dir = os.path.dirname(os.path.abspath(__file__))
     git_env = {'GIT_TERMINAL_PROMPT': '0'}
     git_cfg = ['git', '-c', f'safe.directory={console_dir}']
+    # Ensure git works on repos owned by other users (e.g. takwerx-owned
+    # ~/TAK-Portal and ~/CloudTAK when the console process HOME differs from
+    # the repo owner). --system writes to /etc/gitconfig — applies to every
+    # user on the machine, which is correct for a single-tenant server.
+    subprocess.run(
+        ['git', 'config', '--system', '--replace-all', 'safe.directory', '*'],
+        capture_output=True, timeout=5
+    )
     # Empty remote.origin.fetch: explicit refspecs are *additive* with defaults; without this,
     # `git fetch origin +refs/tags/foo:refs/tags/foo` still updates heads/tags per origin.fetch
     # and can hit "would clobber existing tag" on field installs.
@@ -1980,6 +2019,27 @@ def update_apply():
         if 'dubious ownership' in err.lower() or 'safe.directory' in err.lower():
             out['workaround'] = f'On the server run: sudo git config --global --add safe.directory {console_dir}'
         return out
+
+    # v0.9.3: Record current version for one-step rollback before updating
+    try:
+        _pre_update_version = VERSION
+        _s = load_settings()
+        # Determine the current git tag so rollback can fetch it
+        _cur_tag_r = subprocess.run(
+            ['git', f'--git-dir={os.path.join(console_dir, ".git")}',
+             f'--work-tree={console_dir}', 'describe', '--tags', '--exact-match'],
+            capture_output=True, text=True, timeout=10
+        )
+        _cur_tag = (_cur_tag_r.stdout or '').strip() if _cur_tag_r.returncode == 0 else f'v{VERSION}'
+        _s['console_rollback'] = {
+            'available':   True,
+            'version':     VERSION,
+            'tag':         _cur_tag,
+            'snapshot_at': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+        }
+        save_settings(_s)
+    except Exception:
+        pass
 
     try:
         # Never use pull --rebase in Update Now.
@@ -2031,6 +2091,48 @@ def update_apply():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)[:200]})
 
+@app.route('/api/console/rollback', methods=['POST'])
+@login_required
+def console_rollback_api():
+    """Roll back the console to the version saved before the last Update Now."""
+    console_dir = os.path.dirname(os.path.abspath(__file__))
+    s = load_settings()
+    rb = s.get('console_rollback') or {}
+    if not rb.get('available'):
+        return jsonify({'ok': False, 'error': 'No rollback available (no snapshot recorded before last update)'}), 400
+    prev_tag = rb.get('tag', '').strip()
+    if not prev_tag:
+        return jsonify({'ok': False, 'error': 'Rollback tag not recorded'}), 400
+    try:
+        git_cfg = ['git', '-c', f'safe.directory={console_dir}']
+        # Fetch the tag from origin
+        fetch_r = subprocess.run(
+            git_cfg + ['fetch', 'https://github.com/takwerx/infra-TAK.git',
+                       f'refs/tags/{prev_tag}:refs/tags/{prev_tag}'],
+            cwd=console_dir, capture_output=True, text=True, timeout=60,
+            env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'}
+        )
+        checkout_r = subprocess.run(
+            git_cfg + ['checkout', '--force', prev_tag],
+            cwd=console_dir, capture_output=True, text=True, timeout=30,
+            env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'}
+        )
+        if checkout_r.returncode != 0:
+            err = (checkout_r.stderr or '').strip() or 'git checkout failed'
+            return jsonify({'ok': False, 'error': err}), 500
+        # Clear rollback availability (one rollback per update)
+        s['console_rollback'] = {'available': False}
+        save_settings(s)
+        subprocess.Popen('sleep 2 && systemctl restart takwerx-console', shell=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return jsonify({
+            'ok': True, 'tag': prev_tag,
+            'message': f'Rolled back to {prev_tag}. Console is restarting.'
+        })
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+
 @app.route('/takserver')
 @login_required
 def takserver_page():
@@ -2063,6 +2165,7 @@ def takserver_page():
         tak_migrate_status.update({'complete': False})
     return render_template_string(TAKSERVER_TEMPLATE,
         settings=_settings, modules=modules, tak=tak, tak_version=tak_version,
+        tak_installed=tak.get('installed', False),
         show_connect_ldap=show_connect_ldap, ldap_connected=ldap_connected,
         authentik_base_url=_get_authentik_base_url(_settings),
         takserver_base_url=_get_takserver_base_url(_settings),
@@ -4219,6 +4322,52 @@ def _f2b_write_tak_jail_config(maxretry, findtime, bantime, ignoreip=''):
     with open(jail_path, 'w') as _f:
         _f.write(jail_conf)
 
+def _f2b_ssh_jail_enabled():
+    """Return True if the infratak-sshd jail config file exists."""
+    return os.path.exists('/etc/fail2ban/jail.d/infratak-sshd.conf')
+
+def _f2b_read_ssh_jail_config():
+    """Read current thresholds and ignoreip from the infratak-sshd jail config file."""
+    jail_path = '/etc/fail2ban/jail.d/infratak-sshd.conf'
+    cfg = {'maxretry': 3, 'findtime': 600, 'bantime': 3600, 'ignoreip': ''}
+    if not os.path.exists(jail_path):
+        return cfg
+    try:
+        with open(jail_path) as _f:
+            for line in _f:
+                line = line.strip()
+                for key in ('maxretry', 'findtime', 'bantime'):
+                    if line.startswith(key):
+                        try: cfg[key] = int(line.split('=')[1].strip())
+                        except Exception: pass
+                if line.startswith('ignoreip'):
+                    cfg['ignoreip'] = line.split('=', 1)[1].strip()
+    except Exception:
+        pass
+    return cfg
+
+def _f2b_write_ssh_jail_config(maxretry, findtime, bantime, ignoreip=''):
+    """Write the infratak-sshd jail config with given thresholds."""
+    jail_path = '/etc/fail2ban/jail.d/infratak-sshd.conf'
+    os.makedirs('/etc/fail2ban/jail.d', exist_ok=True)
+    guarddog_action = ""
+    if os.path.exists('/etc/fail2ban/action.d/infratak-guarddog.conf'):
+        guarddog_action = "\n         infratak-guarddog"
+    ignoreip_line = f"ignoreip = 127.0.0.1/8 ::1{' ' + ignoreip.strip() if ignoreip.strip() else ''}\n"
+    jail_conf = (
+        "[sshd]\n"
+        "enabled  = true\n"
+        "filter   = sshd\n"
+        "logpath  = /var/log/auth.log\n"
+        f"maxretry = {maxretry}\n"
+        f"findtime = {findtime}\n"
+        f"bantime  = {bantime}\n"
+        f"{ignoreip_line}"
+        f"action   = ufw{guarddog_action}\n"
+    )
+    with open(jail_path, 'w') as _f:
+        _f.write(jail_conf)
+
 def _f2b_authentik_jail_enabled():
     """Return True if the infratak-authentik jail config file exists."""
     return os.path.exists('/etc/fail2ban/jail.d/infratak-authentik.conf')
@@ -4261,8 +4410,8 @@ def fail2ban_authentik_toggle_api():
         jail_path = '/etc/fail2ban/jail.d/infratak-authentik.conf'
         if os.path.exists(jail_path):
             os.remove(jail_path)
-        subprocess.run(['systemctl', 'stop',    'authentik-log-forwarder'], capture_output=True)
-        subprocess.run(['systemctl', 'disable', 'authentik-log-forwarder'], capture_output=True)
+        subprocess.run(_sudo_wrap(['systemctl', 'stop',    'authentik-log-forwarder']), capture_output=True)
+        subprocess.run(_sudo_wrap(['systemctl', 'disable', 'authentik-log-forwarder']), capture_output=True)
         subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
         return jsonify({'ok': True, 'enabled': False})
     # Enable: write jail config (preserving existing thresholds/ignoreip if present)
@@ -4295,12 +4444,12 @@ def fail2ban_authentik_toggle_api():
             os.makedirs('/var/log/authentik', exist_ok=True)
             with open(svc_path, 'w') as _f:
                 _f.write(forwarder_service)
-            subprocess.run(['systemctl', 'daemon-reload'], capture_output=True)
+            subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True)
         # Ensure the fail2ban daemon is running before reloading jails
-        _svc = subprocess.run(['systemctl', 'is-active', 'fail2ban'],
+        _svc = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'fail2ban']),
                               capture_output=True, text=True)
         if _svc.stdout.strip() != 'active':
-            subprocess.run(['systemctl', 'enable', '--now', 'fail2ban'],
+            subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', 'fail2ban']),
                            capture_output=True)
         # Start log forwarder only if Authentik is running
         ak_running = subprocess.run(
@@ -4308,7 +4457,7 @@ def fail2ban_authentik_toggle_api():
             capture_output=True, text=True).stdout
         forwarder_msg = 'log forwarder not started (Authentik not running)'
         if 'authentik' in ak_running:
-            subprocess.run(['systemctl', 'enable', '--now', 'authentik-log-forwarder'],
+            subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', 'authentik-log-forwarder']),
                            capture_output=True)
             forwarder_msg = 'log forwarder started'
         subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
@@ -4431,10 +4580,10 @@ def fail2ban_tak_config_api():
     try:
         _f2b_write_tak_jail_config(maxretry, findtime, bantime, ignoreip)
         # Ensure the fail2ban daemon is running before reloading jails
-        _svc = subprocess.run(['systemctl', 'is-active', 'fail2ban'],
+        _svc = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'fail2ban']),
                               capture_output=True, text=True)
         if _svc.stdout.strip() != 'active':
-            subprocess.run(['systemctl', 'enable', '--now', 'fail2ban'],
+            subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', 'fail2ban']),
                            capture_output=True)
         subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
         return jsonify({'ok': True, 'enabled': True,
@@ -4563,6 +4712,260 @@ def _f2b_get_available_version():
         pass
     return None
 
+@app.route('/api/fail2ban/ssh/status')
+@login_required
+def fail2ban_ssh_status_api():
+    """Return fail2ban status for the SSH jail."""
+    if not _f2b_is_available():
+        return jsonify({'available': False, 'error': 'fail2ban not installed'})
+    try:
+        r = subprocess.run(['fail2ban-client', 'status', 'sshd'],
+                           capture_output=True, text=True, timeout=10)
+        status = _f2b_parse_status(r.stdout)
+        status['available']      = True
+        status['daemon_running'] = (subprocess.run(
+            ['systemctl', 'is-active', 'fail2ban'],
+            capture_output=True, text=True).stdout.strip() == 'active')
+        status['jail_enabled']   = _f2b_ssh_jail_enabled()
+        status['jail_config']    = _f2b_read_ssh_jail_config()
+        return jsonify(status)
+    except Exception as e:
+        return jsonify({'available': False, 'error': str(e)[:200]})
+
+
+@app.route('/api/fail2ban/ssh/config', methods=['POST'])
+@login_required
+def fail2ban_ssh_config_api():
+    """Enable/disable the SSH jail and update its thresholds."""
+    if not _f2b_is_available():
+        return jsonify({'ok': False, 'error': 'fail2ban not installed'}), 400
+    data    = request.get_json(force=True) or {}
+    enabled = bool(data.get('enabled', False))
+    if not enabled:
+        jail_path = '/etc/fail2ban/jail.d/infratak-sshd.conf'
+        if os.path.exists(jail_path):
+            os.remove(jail_path)
+        subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+        return jsonify({'ok': True, 'enabled': False})
+    try:
+        maxretry = max(1,  min(50,      int(data.get('maxretry', 3))))
+        findtime = max(60, min(86400,   int(data.get('findtime', 600))))
+        bantime  = max(60, min(2592000, int(data.get('bantime',  3600))))
+    except (ValueError, TypeError) as e:
+        return jsonify({'ok': False, 'error': f'Invalid value: {e}'}), 400
+    ignoreip = str(data.get('ignoreip', '')).strip()
+    try:
+        _f2b_write_ssh_jail_config(maxretry, findtime, bantime, ignoreip)
+        # Ensure the fail2ban daemon is running before reloading
+        _svc = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'fail2ban']),
+                              capture_output=True, text=True)
+        if _svc.stdout.strip() != 'active':
+            subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', 'fail2ban']),
+                           capture_output=True)
+        subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+        return jsonify({'ok': True, 'enabled': True,
+                        'maxretry': maxretry, 'findtime': findtime, 'bantime': bantime})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+
+@app.route('/api/fail2ban/ssh/unban', methods=['POST'])
+@login_required
+def fail2ban_ssh_unban_api():
+    """Unban a specific IP from the SSH jail."""
+    if not _f2b_is_available():
+        return jsonify({'ok': False, 'error': 'fail2ban not installed'}), 400
+    data = request.get_json(force=True) or {}
+    ip   = str(data.get('ip', '')).strip()
+    if not ip or not _VALID_IP_RE.match(ip):
+        return jsonify({'ok': False, 'error': 'Invalid IP address'}), 400
+    try:
+        r = subprocess.run(['fail2ban-client', 'set', 'sshd', 'unbanip', ip],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            return jsonify({'ok': True, 'ip': ip})
+        return jsonify({'ok': False, 'error': r.stderr.strip()[:200] or 'Unban failed'}), 500
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+
+@app.route('/api/fail2ban/ssh/watching')
+@login_required
+def fail2ban_ssh_watching_api():
+    """Return IPs seen in the sshd jail (found but not currently banned)."""
+    import re as _re_watch
+    log_path = '/var/log/fail2ban.log'
+    result = []
+    try:
+        found_re = _re_watch.compile(r'\[sshd\] Found (\d[\d.:a-fA-F]+)')
+        ban_re   = _re_watch.compile(r'\[sshd\] Ban (\d[\d.:a-fA-F]+)')
+        unban_re = _re_watch.compile(r'\[sshd\] Unban (\d[\d.:a-fA-F]+)')
+        ts_re    = _re_watch.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})')
+        found_data = {}
+        banned_ips = set()
+        with open(log_path) as _lf:
+            for line in _lf:
+                m = ban_re.search(line)
+                if m: banned_ips.add(m.group(1)); continue
+                m = unban_re.search(line)
+                if m: banned_ips.discard(m.group(1)); continue
+                m = found_re.search(line)
+                if m:
+                    ip = m.group(1)
+                    ts_m = ts_re.match(line)
+                    ts = ts_m.group(1) if ts_m else ''
+                    if ip not in found_data:
+                        found_data[ip] = {'count': 0, 'last_seen': ts}
+                    found_data[ip]['count'] += 1
+                    found_data[ip]['last_seen'] = ts
+        for ip, data in found_data.items():
+            if ip not in banned_ips:
+                result.append({'ip': ip, 'attempts': data['count'], 'last_seen': data['last_seen']})
+        result.sort(key=lambda x: x['attempts'], reverse=True)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200], 'watching': []}), 500
+    return jsonify({'ok': True, 'watching': result})
+
+
+@app.route('/api/fail2ban/ssh/ban', methods=['POST'])
+@login_required
+def fail2ban_ssh_ban_api():
+    """Manually ban an IP in the SSH jail."""
+    if not _f2b_is_available():
+        return jsonify({'ok': False, 'error': 'fail2ban not installed'}), 400
+    data = request.get_json(force=True) or {}
+    ip   = str(data.get('ip', '')).strip()
+    if not ip or not _VALID_IP_RE.match(ip):
+        return jsonify({'ok': False, 'error': 'Invalid IP address'}), 400
+    try:
+        r = subprocess.run(['fail2ban-client', 'set', 'sshd', 'banip', ip],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            return jsonify({'ok': True, 'ip': ip})
+        return jsonify({'ok': False, 'error': r.stderr.strip()[:200] or 'Ban failed'}), 500
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+
+def _f2b_recidive_enabled():
+    return os.path.exists('/etc/fail2ban/jail.d/infratak-recidive.conf')
+
+def _f2b_read_recidive_config():
+    cfg = {'maxretry': 3, 'findtime': 86400}
+    path = '/etc/fail2ban/jail.d/infratak-recidive.conf'
+    if not os.path.exists(path):
+        return cfg
+    try:
+        with open(path) as _f:
+            for line in _f:
+                line = line.strip()
+                for key in ('maxretry', 'findtime'):
+                    if line.startswith(key):
+                        try: cfg[key] = int(line.split('=')[1].strip())
+                        except Exception: pass
+    except Exception:
+        pass
+    return cfg
+
+def _f2b_write_recidive_config(maxretry, findtime):
+    """Write infratak-recidive jail and ensure fail2ban persistence."""
+    os.makedirs('/etc/fail2ban/jail.d', exist_ok=True)
+    jail_conf = (
+        "[recidive]\n"
+        "enabled  = true\n"
+        "filter   = recidive\n"
+        "logpath  = /var/log/fail2ban.log\n"
+        "bantime  = -1\n"
+        f"findtime = {findtime}\n"
+        f"maxretry = {maxretry}\n"
+        "action   = ufw\n"
+    )
+    with open('/etc/fail2ban/jail.d/infratak-recidive.conf', 'w') as _f:
+        _f.write(jail_conf)
+    # Ensure fail2ban SQLite persistence so permanent bans survive restarts
+    local_path = '/etc/fail2ban/fail2ban.local'
+    db_line = 'dbfile = /var/lib/fail2ban/fail2ban.sqlite3\n'
+    purge_line = 'dbpurgeage = 0\n'
+    try:
+        existing = open(local_path).read() if os.path.exists(local_path) else ''
+        if 'dbfile' not in existing:
+            with open(local_path, 'a') as _f:
+                if not existing.strip():
+                    _f.write('[Definition]\n')
+                _f.write(db_line)
+                _f.write(purge_line)
+    except Exception:
+        pass
+
+
+@app.route('/api/fail2ban/recidive/status')
+@login_required
+def fail2ban_recidive_status_api():
+    if not _f2b_is_available():
+        return jsonify({'available': False, 'error': 'fail2ban not installed'})
+    enabled = _f2b_recidive_enabled()
+    status = {
+        'available': True,
+        'jail_enabled': enabled,
+        'jail_config': _f2b_read_recidive_config(),
+        'currently_banned': 0, 'total_banned': 0, 'banned_ips': [],
+    }
+    if enabled:
+        try:
+            r = subprocess.run(['fail2ban-client', 'status', 'recidive'],
+                               capture_output=True, text=True, timeout=10)
+            status.update(_f2b_parse_status(r.stdout))
+        except Exception as e:
+            status['error'] = str(e)[:200]
+    return jsonify(status)
+
+
+@app.route('/api/fail2ban/recidive/config', methods=['POST'])
+@login_required
+def fail2ban_recidive_config_api():
+    if not _f2b_is_available():
+        return jsonify({'ok': False, 'error': 'fail2ban not installed'}), 400
+    data = request.get_json(force=True) or {}
+    if not bool(data.get('enabled', False)):
+        path = '/etc/fail2ban/jail.d/infratak-recidive.conf'
+        if os.path.exists(path):
+            os.remove(path)
+        subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+        return jsonify({'ok': True, 'enabled': False})
+    try:
+        maxretry = max(2, min(20,  int(data.get('maxretry', 3))))
+        findtime = max(3600, min(2592000, int(data.get('findtime', 86400))))
+    except (ValueError, TypeError) as e:
+        return jsonify({'ok': False, 'error': f'Invalid value: {e}'}), 400
+    try:
+        _f2b_write_recidive_config(maxretry, findtime)
+        subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+        return jsonify({'ok': True, 'enabled': True, 'maxretry': maxretry, 'findtime': findtime})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+
+@app.route('/api/fail2ban/recidive/unban', methods=['POST'])
+@login_required
+def fail2ban_recidive_unban_api():
+    if not _f2b_is_available():
+        return jsonify({'ok': False, 'error': 'fail2ban not installed'}), 400
+    data = request.get_json(force=True) or {}
+    ip = str(data.get('ip', '')).strip()
+    if not ip or not _VALID_IP_RE.match(ip):
+        return jsonify({'ok': False, 'error': 'Invalid IP address'}), 400
+    try:
+        r = subprocess.run(['fail2ban-client', 'set', 'recidive', 'unbanip', ip],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            return jsonify({'ok': True, 'ip': ip})
+        return jsonify({'ok': False, 'error': r.stderr.strip()[:200] or 'Unban failed'}), 500
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+
 # fail2ban install status dict (tracks background install progress)
 _f2b_install_status = {'running': False, 'log': [], 'done': False, 'ok': False}
 
@@ -4621,16 +5024,16 @@ def fail2ban_uninstall_api():
         print(f"fail2ban uninstall: {msg}", flush=True)
     try:
         # Stop and disable services
-        subprocess.run(['systemctl', 'stop', 'fail2ban'], capture_output=True)
-        subprocess.run(['systemctl', 'disable', 'fail2ban'], capture_output=True)
-        subprocess.run(['systemctl', 'stop', 'authentik-log-forwarder'], capture_output=True)
-        subprocess.run(['systemctl', 'disable', 'authentik-log-forwarder'], capture_output=True)
+        subprocess.run(_sudo_wrap(['systemctl', 'stop', 'fail2ban']), capture_output=True)
+        subprocess.run(_sudo_wrap(['systemctl', 'disable', 'fail2ban']), capture_output=True)
+        subprocess.run(_sudo_wrap(['systemctl', 'stop', 'authentik-log-forwarder']), capture_output=True)
+        subprocess.run(_sudo_wrap(['systemctl', 'disable', 'authentik-log-forwarder']), capture_output=True)
         _plog("Services stopped and disabled")
         # Remove package
         s = load_settings()
         pkg_mgr = s.get('pkg_mgr', 'apt')
         if pkg_mgr == 'apt':
-            subprocess.run(['apt-get', 'remove', '-y', 'fail2ban'], capture_output=True)
+            subprocess.run(_sudo_wrap(['apt-get', 'remove', '-y', 'fail2ban']), capture_output=True)
         else:
             subprocess.run(['yum', 'remove', '-y', 'fail2ban'], capture_output=True)
         _plog("fail2ban package removed")
@@ -4647,7 +5050,7 @@ def fail2ban_uninstall_api():
         ]:
             if os.path.exists(path):
                 os.remove(path)
-        subprocess.run(['systemctl', 'daemon-reload'], capture_output=True)
+        subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True)
         _plog("Config files and systemd unit removed")
         # Clear settings
         s2 = load_settings()
@@ -4687,7 +5090,7 @@ def _guarddog_health_check(service_id):
     """Quick health check for one service. Returns True if healthy, False otherwise. Used for UI and optional monitors."""
     try:
         if service_id == 'takserver':
-            r = subprocess.run(['systemctl', 'is-active', 'takserver'], capture_output=True, text=True, timeout=3)
+            r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'takserver']), capture_output=True, text=True, timeout=3)
             if r.returncode != 0:
                 return False
             # Optional: also check 8089
@@ -4697,8 +5100,8 @@ def _guarddog_health_check(service_id):
             settings = load_settings()
             ak_url = _get_authentik_api_url(settings)
             req = urllib.request.Request(ak_url + '/', method='GET')
-            resp = urllib.request.urlopen(req, timeout=8)
-            return resp.status in (200, 302, 301)
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                return resp.status in (200, 302, 301)
         if service_id == 'takportal':
             r = subprocess.run('docker ps --filter name=tak-portal --format "{{.Status}}"', shell=True, capture_output=True, text=True, timeout=5)
             return bool(r.stdout and 'Up' in r.stdout)
@@ -4708,7 +5111,7 @@ def _guarddog_health_check(service_id):
             if mtx_cfg.get('target_mode') == 'remote' and mtx_cfg.get('deployed') and (mtx_cfg.get('remote', {}).get('host') or '').strip():
                 ok, out = _ssh_probe(mtx_cfg.get('remote', {}), 'systemctl is-active mediamtx 2>/dev/null', timeout=8)
                 return bool(ok and out and out.strip() == 'active')
-            r = subprocess.run(['systemctl', 'is-active', 'mediamtx'], capture_output=True, text=True, timeout=3)
+            r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'mediamtx']), capture_output=True, text=True, timeout=3)
             return r.returncode == 0
         if service_id == 'nodered':
             settings = load_settings()
@@ -4718,8 +5121,8 @@ def _guarddog_health_check(service_id):
                     "curl -s -o /dev/null -w '%{http_code}' --connect-timeout 4 http://127.0.0.1:1880/ 2>/dev/null || echo 000", timeout=10)
                 return bool(ok and out and out.strip() in ('200', '301', '302'))
             req = urllib.request.Request('http://127.0.0.1:1880/', method='GET')
-            resp = urllib.request.urlopen(req, timeout=5)
-            return resp.status in (200, 302, 301)
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return resp.status in (200, 302, 301)
         if service_id == 'cloudtak':
             settings = load_settings()
             cfg = _get_cloudtak_deployment_config(settings)
@@ -4994,7 +5397,7 @@ def _monitor_health_check(monitor_id):
                     return True
             return False
         if monitor_id == 'postgresql':
-            r = subprocess.run(['systemctl', 'is-active', 'postgresql'], capture_output=True, text=True, timeout=3)
+            r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'postgresql']), capture_output=True, text=True, timeout=3)
             return r.returncode == 0
         if monitor_id == 'cotdb':
             r = subprocess.run('sudo -u postgres psql -tAc "SELECT pg_database_size(\'cot\')" 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
@@ -5057,8 +5460,8 @@ def _monitor_health_check(monitor_id):
                 return None
             try:
                 req = urllib.request.Request(f'http://{db_host}:8080/health', method='GET')
-                resp = urllib.request.urlopen(req, timeout=4)
-                return resp.status == 200
+                with urllib.request.urlopen(req, timeout=4) as resp:
+                    return resp.status == 200
             except Exception:
                 return False
         if monitor_id == 'remotedb_auth':
@@ -5091,15 +5494,15 @@ def _monitor_health_check(monitor_id):
             settings = load_settings()
             ak_url = _get_authentik_api_url(settings)
             req = urllib.request.Request(ak_url + '/', method='GET')
-            resp = urllib.request.urlopen(req, timeout=8)
-            return resp.status in (200, 302, 301)
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                return resp.status in (200, 302, 301)
         if monitor_id == 'mediamtx_svc':
             settings = load_settings()
             mtx_cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
             if mtx_cfg.get('target_mode') == 'remote' and mtx_cfg.get('deployed') and (mtx_cfg.get('remote', {}).get('host') or '').strip():
                 ok, out = _ssh_probe(mtx_cfg.get('remote', {}), 'systemctl is-active mediamtx 2>/dev/null', timeout=8)
                 return bool(ok and out and out.strip() == 'active')
-            r = subprocess.run(['systemctl', 'is-active', 'mediamtx'], capture_output=True, text=True, timeout=3)
+            r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'mediamtx']), capture_output=True, text=True, timeout=3)
             return r.returncode == 0
         if monitor_id == 'nodered_http':
             settings = load_settings()
@@ -5109,8 +5512,8 @@ def _monitor_health_check(monitor_id):
                     "curl -s -o /dev/null -w '%{http_code}' --connect-timeout 4 http://127.0.0.1:1880/ 2>/dev/null || echo 000", timeout=10)
                 return bool(ok and out and out.strip() in ('200', '301', '302'))
             req = urllib.request.Request('http://127.0.0.1:1880/', method='GET')
-            resp = urllib.request.urlopen(req, timeout=5)
-            return resp.status in (200, 302, 301)
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return resp.status in (200, 302, 301)
         if monitor_id == 'takportal_ctr':
             r = subprocess.run('docker ps --filter name=tak-portal --format "{{.Status}}"', shell=True, capture_output=True, text=True, timeout=5)
             return bool(r.stdout and 'Up' in r.stdout)
@@ -5126,7 +5529,7 @@ def _monitor_health_check(monitor_id):
             r = subprocess.run('docker ps --filter name=cloudtak-api --format "{{.Status}}"', shell=True, capture_output=True, text=True, timeout=5)
             return bool(r.stdout and 'Up' in r.stdout)
         if monitor_id == 'updates_check':
-            r = subprocess.run(['systemctl', 'is-enabled', 'takupdatesguard.timer'], capture_output=True, text=True, timeout=3)
+            r = subprocess.run(_sudo_wrap(['systemctl', 'is-enabled', 'takupdatesguard.timer']), capture_output=True, text=True, timeout=3)
             return r.returncode == 0 and (r.stdout or '').strip() == 'enabled'
         # Federation Hub monitors (all remote via SSH)
         if monitor_id.startswith('fedhub_'):
@@ -5397,15 +5800,15 @@ def _guarddog_apply_diskio_timer(settings=None):
     if settings is None:
         settings = load_settings()
     if _guarddog_diskio_monitor_enabled(settings):
-        subprocess.run(['systemctl', 'enable', '--now', GUARDDOG_DISKIO_TIMER], capture_output=True, text=True, timeout=15)
+        subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', GUARDDOG_DISKIO_TIMER]), capture_output=True, text=True, timeout=15)
     else:
-        subprocess.run(['systemctl', 'stop', GUARDDOG_DISKIO_TIMER], capture_output=True, timeout=8)
-        subprocess.run(['systemctl', 'disable', GUARDDOG_DISKIO_TIMER], capture_output=True, timeout=8)
+        subprocess.run(_sudo_wrap(['systemctl', 'stop', GUARDDOG_DISKIO_TIMER]), capture_output=True, timeout=8)
+        subprocess.run(_sudo_wrap(['systemctl', 'disable', GUARDDOG_DISKIO_TIMER]), capture_output=True, timeout=8)
 
 
 def _guarddog_is_enabled():
     """True if Guard Dog timers are enabled (at least the core 8089 timer)."""
-    r = subprocess.run(['systemctl', 'is-enabled', 'tak8089guard.timer'], capture_output=True, text=True, timeout=5)
+    r = subprocess.run(_sudo_wrap(['systemctl', 'is-enabled', 'tak8089guard.timer']), capture_output=True, text=True, timeout=5)
     return r.returncode == 0 and r.stdout.strip() == 'enabled'
 
 @app.route('/api/guarddog/disable', methods=['POST'])
@@ -5415,10 +5818,10 @@ def guarddog_disable():
     if not os.path.exists('/opt/tak-guarddog'):
         return jsonify({'error': 'Guard Dog is not installed'}), 400
     for t in _guarddog_timer_list():
-        subprocess.run(['systemctl', 'stop', t], capture_output=True, timeout=5)
-        subprocess.run(['systemctl', 'disable', t], capture_output=True, timeout=5)
-    subprocess.run(['systemctl', 'stop', 'tak-health.service'], capture_output=True, timeout=5)
-    subprocess.run(['systemctl', 'disable', 'tak-health.service'], capture_output=True, timeout=5)
+        subprocess.run(_sudo_wrap(['systemctl', 'stop', t]), capture_output=True, timeout=5)
+        subprocess.run(_sudo_wrap(['systemctl', 'disable', t]), capture_output=True, timeout=5)
+    subprocess.run(_sudo_wrap(['systemctl', 'stop', 'tak-health.service']), capture_output=True, timeout=5)
+    subprocess.run(_sudo_wrap(['systemctl', 'disable', 'tak-health.service']), capture_output=True, timeout=5)
     return jsonify({'success': True, 'enabled': False})
 
 @app.route('/api/guarddog/enable', methods=['POST'])
@@ -5427,12 +5830,12 @@ def guarddog_enable():
     """Enable and start all Guard Dog timers and health service."""
     if not os.path.exists('/opt/tak-guarddog'):
         return jsonify({'error': 'Guard Dog is not installed'}), 400
-    subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=10)
+    subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
     for t in _guarddog_timer_list():
-        subprocess.run(['systemctl', 'enable', t], capture_output=True, timeout=5)
-        subprocess.run(['systemctl', 'start', t], capture_output=True, timeout=5)
-    subprocess.run(['systemctl', 'enable', 'tak-health.service'], capture_output=True, timeout=5)
-    subprocess.run(['systemctl', 'start', 'tak-health.service'], capture_output=True, timeout=5)
+        subprocess.run(_sudo_wrap(['systemctl', 'enable', t]), capture_output=True, timeout=5)
+        subprocess.run(_sudo_wrap(['systemctl', 'start', t]), capture_output=True, timeout=5)
+    subprocess.run(_sudo_wrap(['systemctl', 'enable', 'tak-health.service']), capture_output=True, timeout=5)
+    subprocess.run(_sudo_wrap(['systemctl', 'start', 'tak-health.service']), capture_output=True, timeout=5)
     _s = load_settings()
     _guarddog_apply_diskio_timer(_s)
     _guarddog_sync_diskio_email_off_file(_s)
@@ -5573,7 +5976,7 @@ def guarddog_update():
                 f.write(f'[Unit]\nDescription=Guard Dog TAK Portal Monitor\n\n[Service]\nType=oneshot\nExecStart={tp_script}\n')
             with open(tp_tmr_path, 'w') as f:
                 f.write('[Unit]\nDescription=Run TAK Portal guard every 1 minute\n\n[Timer]\nOnBootSec=15min\nOnUnitActiveSec=1min\nUnit=taktakportalguard.service\n\n[Install]\nWantedBy=timers.target\n')
-        subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=10)
+        subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
         new_timers = ['takupdatesguard.timer']
         if os.path.isfile(av_tmr_path):
             new_timers.append('takautovacuum.timer')
@@ -5584,7 +5987,7 @@ def guarddog_update():
         if os.path.isfile(tp_tmr_path):
             new_timers.append('taktakportalguard.timer')
         for t in new_timers:
-            subprocess.run(['systemctl', 'enable', '--now', t], capture_output=True, text=True, timeout=10)
+            subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', t]), capture_output=True, text=True, timeout=10)
         # Stamp deployed version + settings so UI knows when re-deploy is needed
         try:
             _s = load_settings()
@@ -5614,10 +6017,10 @@ def guarddog_uninstall():
         return jsonify({'error': 'Invalid admin password'}), 403
     timers = _guarddog_timer_list()
     for t in timers:
-        subprocess.run(['systemctl', 'stop', t], capture_output=True, timeout=5)
-        subprocess.run(['systemctl', 'disable', t], capture_output=True, timeout=5)
-    subprocess.run(['systemctl', 'stop', 'tak-health.service'], capture_output=True, timeout=5)
-    subprocess.run(['systemctl', 'disable', 'tak-health.service'], capture_output=True, timeout=5)
+        subprocess.run(_sudo_wrap(['systemctl', 'stop', t]), capture_output=True, timeout=5)
+        subprocess.run(_sudo_wrap(['systemctl', 'disable', t]), capture_output=True, timeout=5)
+    subprocess.run(_sudo_wrap(['systemctl', 'stop', 'tak-health.service']), capture_output=True, timeout=5)
+    subprocess.run(_sudo_wrap(['systemctl', 'disable', 'tak-health.service']), capture_output=True, timeout=5)
     services_extra = ['tak8089guard.service', 'takoomguard.service', 'takdiskguard.service', 'takdiskioguard.service', 'takdbguard.service',
                       'takcotdbguard.service', 'taknetguard.service', 'takprocessguard.service', 'takcertguard.service',
                       'takintcaguard.service',
@@ -5631,7 +6034,7 @@ def guarddog_uninstall():
                 pass
     if os.path.exists('/opt/tak-guarddog'):
         shutil.rmtree('/opt/tak-guarddog', ignore_errors=True)
-    subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=10)
+    subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
     return jsonify({'success': True})
 
 def _guarddog_send_alert_email_via_relay(to_addr, subject, body):
@@ -6124,22 +6527,18 @@ def run_guarddog_deploy(alert_email):
             else:
                 if os.path.exists('/swapfile'):
                     subprocess.run(['swapon', '/swapfile'], capture_output=True, timeout=5)
-                    with open('/etc/fstab', 'r') as f:
-                        fstab = f.read()
+                    fstab = _read_priv('/etc/fstab')
                     if '/swapfile' not in fstab:
-                        with open('/etc/fstab', 'a') as f:
-                            f.write('\n/swapfile swap swap defaults 0 0\n')
+                        _write_priv('/etc/fstab', '\n/swapfile swap swap defaults 0 0\n', mode='a')
                     plog("✓ Swap file enabled")
                 else:
                     subprocess.run(['fallocate', '-l', '4G', '/swapfile'], check=True, timeout=30)
                     os.chmod('/swapfile', 0o600)
                     subprocess.run(['mkswap', '/swapfile'], check=True, capture_output=True, timeout=10)
                     subprocess.run(['swapon', '/swapfile'], check=True, timeout=10)
-                    with open('/etc/fstab', 'r') as f:
-                        fstab = f.read()
+                    fstab = _read_priv('/etc/fstab')
                     if '/swapfile' not in fstab:
-                        with open('/etc/fstab', 'a') as f:
-                            f.write('\n/swapfile swap swap defaults 0 0\n')
+                        _write_priv('/etc/fstab', '\n/swapfile swap swap defaults 0 0\n', mode='a')
                     plog("✓ 4GB swap configured (memory stability)")
         except Exception as e:
             plog(f"⚠ Swap setup skipped: {e}")
@@ -6166,7 +6565,7 @@ def run_guarddog_deploy(alert_email):
                 plog("✓ vm.swappiness already 10")
         except Exception as e:
             plog(f"⚠ Swappiness tuning skipped: {e}")
-        r = subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, text=True, timeout=60)
+        r = subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, text=True, timeout=60)
         if r.returncode != 0:
             plog(f"✗ daemon-reload failed: {r.stderr}")
             guarddog_deploy_status.update({'running': False, 'error': True})
@@ -6193,23 +6592,23 @@ def run_guarddog_deploy(alert_email):
             timers.append('takfedhubguard.timer')
         timers.append('takupdatesguard.timer')
         for t in timers:
-            re = subprocess.run(['systemctl', 'enable', t], capture_output=True, text=True, timeout=5)
+            re = subprocess.run(_sudo_wrap(['systemctl', 'enable', t]), capture_output=True, text=True, timeout=5)
             if re.returncode != 0:
                 plog(f"✗ systemctl enable {t} failed: {re.stderr or re.stdout or 'unknown'}")
                 guarddog_deploy_status.update({'running': False, 'error': True})
                 return
-            rs = subprocess.run(['systemctl', 'start', t], capture_output=True, text=True, timeout=5)
+            rs = subprocess.run(_sudo_wrap(['systemctl', 'start', t]), capture_output=True, text=True, timeout=5)
             if rs.returncode != 0:
                 plog(f"⚠ systemctl start {t} failed (continuing): {rs.stderr or rs.stdout or 'unknown'}")
         _guarddog_apply_diskio_timer(settings)
         _guarddog_sync_diskio_email_off_file(settings)
-        re = subprocess.run(['systemctl', 'enable', 'tak-health.service'], capture_output=True, text=True, timeout=5)
+        re = subprocess.run(_sudo_wrap(['systemctl', 'enable', 'tak-health.service']), capture_output=True, text=True, timeout=5)
         if re.returncode != 0:
             plog(f"✗ systemctl enable tak-health.service failed: {re.stderr or re.stdout or 'unknown'}")
             guarddog_deploy_status.update({'running': False, 'error': True})
             return
-        subprocess.run(['systemctl', 'start', 'tak-health.service'], capture_output=True, timeout=5)
-        subprocess.run(['systemctl', 'enable', 'tak-post-start.service'], capture_output=True, text=True, timeout=5)
+        subprocess.run(_sudo_wrap(['systemctl', 'start', 'tak-health.service']), capture_output=True, timeout=5)
+        subprocess.run(_sudo_wrap(['systemctl', 'enable', 'tak-post-start.service']), capture_output=True, text=True, timeout=5)
         plog("✓ Boot orchestrator enabled (staggered start: TAK → Authentik → TAK Portal → CloudTAK)")
         for f in ['process_alert_sent', 'disk_alert_sent', 'db_alert_sent', 'cotdb_alert_sent', 'network_alert_sent', 'cert_alert_sent']:
             p = os.path.join('/var/lib/takguard', f)
@@ -6534,7 +6933,7 @@ def fedhub_download_webadmin_cert():
         "python3 - <<'PY'\n"
         "import base64,sys,os\n"
         "candidates=[\n"
-        " '/root/webadmin-fed.p12',\n"
+        " os.path.expanduser('~/webadmin-fed.p12'),\n"
         " '/opt/tak/federation-hub/certs/files/webadmin-fed.p12',\n"
         "]\n"
         "for p in candidates:\n"
@@ -7061,8 +7460,8 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
                 plog('✓ webadmin-fed certificate registered')
             else:
                 plog('⚠ Admin cert registration returned non-zero — you may need to register manually')
-            # Copy webadmin-fed.p12 to /root/ for easy download
-            _ssh_probe(remote, f'sudo cp {fh_dir}/certs/files/webadmin-fed.p12 /root/ 2>/dev/null; true', timeout=15)
+            # Copy webadmin-fed.p12 to $HOME for easy download
+            _ssh_probe(remote, f'sudo cp {fh_dir}/certs/files/webadmin-fed.p12 $HOME/ 2>/dev/null; true', timeout=15)
 
         # --- Firewall ---
         # Web UI (8080 HTTP / 9100 HTTPS): must NOT be world-accessible — edge is Caddy on this console
@@ -7109,7 +7508,7 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
         plog('')
         plog('━━━ Complete ━━━')
         plog(f'Federation Hub UI: https://{remote.get("host")}:9100')
-        plog('Import webadmin-fed.p12 (in /root/ on the target) into your browser to log in.')
+        plog('Import webadmin-fed.p12 (in $HOME/ on the target) into your browser to log in.')
         plog('Password: ' + cert_pass)
         plog('Note: unattended-upgrades remains disabled after deploy/update; re-enable from Console > Unattended Upgrades when ready.')
         plog('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
@@ -7383,8 +7782,8 @@ def run_fedhub_remote_rotate_ca(new_root_ca=None, new_int_ca=None):
         else:
             plog('⚠ webadmin-fed registration returned non-zero')
 
-        _ssh_probe(remote, f'sudo cp {fh_dir}/certs/files/webadmin-fed.p12 /root/ 2>/dev/null; true', timeout=15)
-        plog('✓ webadmin-fed.p12 copied to /root/')
+        _ssh_probe(remote, f'sudo cp {fh_dir}/certs/files/webadmin-fed.p12 $HOME/ 2>/dev/null; true', timeout=15)
+        plog('✓ webadmin-fed.p12 copied to $HOME/')
 
         ok_restart, restart_out = _ssh_probe(remote, 'sudo systemctl restart federation-hub 2>&1', timeout=90)
         if restart_out:
@@ -9001,45 +9400,54 @@ def _ensure_infratak_network_for_portal():
     _connect_container_to_infratak_network('tak-portal')
 
 
-def _patch_takportal_compose_network():
-    """Add the infratak external network to TAK Portal's docker-compose.yml.
+def _write_takportal_override():
+    """Write ~/TAK-Portal/docker-compose.override.yml with network + hardening.
 
-    This makes the network survive 'docker compose down && up' from the CLI,
-    not just console-driven restarts.
+    Uses the override file (never tracked by git) so that git pull during
+    TAK Portal updates never conflicts with our local modifications.  This
+    replaces the old approach of patching docker-compose.yml directly, which
+    caused git stash conflicts and left the repo on the old version after
+    every update.
     """
-    compose_path = os.path.expanduser('~/TAK-Portal/docker-compose.yml')
-    if not os.path.exists(compose_path):
+    portal_dir = os.path.expanduser('~/TAK-Portal')
+    override_path = os.path.join(portal_dir, 'docker-compose.override.yml')
+    if not os.path.isdir(portal_dir):
         return False
     try:
         _ensure_infratak_docker_network()
-        with open(compose_path) as f:
-            content = f.read()
-        if INFRATAK_DOCKER_NETWORK in content:
-            return False
-        networks_block = (
-            f"\nnetworks:\n"
-            f"  default:\n"
+        content = (
+            "# TAKWERX: TAK Portal runtime overrides — do not edit manually\n"
+            "services:\n"
+            "  tak-portal:\n"
+            "    networks:\n"
+            "      - default\n"
+            f"      - {INFRATAK_DOCKER_NETWORK}\n"
+            "\n"
+            "networks:\n"
+            "  default: {}\n"
             f"  {INFRATAK_DOCKER_NETWORK}:\n"
-            f"    external: true\n"
+            "    external: true\n"
         )
-        service_network_line = f"    networks:\n      - default\n      - {INFRATAK_DOCKER_NETWORK}\n"
-        if 'restart: unless-stopped' in content:
-            content = content.replace(
-                'restart: unless-stopped',
-                'restart: unless-stopped\n' + service_network_line.rstrip('\n'),
-                1)
-        elif 'restart: always' in content:
-            content = content.replace(
-                'restart: always',
-                'restart: always\n' + service_network_line.rstrip('\n'),
-                1)
-        if not content.rstrip().endswith('external: true'):
-            content = content.rstrip() + '\n' + networks_block
-        with open(compose_path, 'w') as f:
+        existing = ''
+        if os.path.exists(override_path):
+            with open(override_path) as f:
+                existing = f.read()
+        if existing == content:
+            return False  # already current
+        with open(override_path, 'w') as f:
             f.write(content)
         return True
     except Exception:
         return False
+
+
+def _patch_takportal_compose_network():
+    """Add the infratak external network to TAK Portal compose config.
+
+    v0.9.2+: writes docker-compose.override.yml instead of modifying the
+    git-tracked docker-compose.yml, preventing stash conflicts on git pull.
+    """
+    return _write_takportal_override()
 
 
 def _patch_authentik_compose_network():
@@ -10151,10 +10559,8 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 '''
-    with open('/etc/systemd/system/takserver-cert-renewal.service', 'w') as f:
-        f.write(svc)
-    with open('/etc/systemd/system/takserver-cert-renewal.timer', 'w') as f:
-        f.write(timer)
+    _write_priv('/etc/systemd/system/takserver-cert-renewal.service', svc)
+    _write_priv('/etc/systemd/system/takserver-cert-renewal.timer', timer)
     subprocess.run(
         'systemctl daemon-reload && systemctl enable --now takserver-cert-renewal.timer 2>/dev/null; true',
         shell=True, capture_output=True)
@@ -11063,10 +11469,18 @@ def takportal_control():
         running = 'Up' in (r.stdout or '')
         return jsonify({'success': True, 'running': running, 'action': action, 'message': 'Config updated and portal restarted (SSH configured).'})
     elif action == 'update':
+        # Reset any local changes to tracked files before pulling — the network
+        # and hardening patches now live in docker-compose.override.yml (not tracked
+        # by git) so it's safe to discard dirty tracked files without losing anything.
+        subprocess.run(
+            f'git -c safe.directory={portal_dir} -C {portal_dir} checkout -- .',
+            shell=True, capture_output=True, text=True, timeout=15)
         pull = subprocess.run(
-            f'cd {portal_dir} && git -c safe.directory={portal_dir} pull --rebase --autostash',
+            f'cd {portal_dir} && git -c safe.directory={portal_dir} pull --rebase',
             shell=True, capture_output=True, text=True, timeout=60)
         pull_msg = pull.stdout.strip().split('\n')[-1] if pull.stdout.strip() else ''
+        # Rewrite the override file so network + hardening survive the pull
+        _write_takportal_override()
         build = subprocess.run(f'cd {portal_dir} && docker compose up -d --build', shell=True, capture_output=True, text=True, timeout=180)
         _ensure_infratak_network_for_portal()
         _ensure_infratak_network_for_authentik()
@@ -11310,6 +11724,18 @@ def run_takportal_deploy():
                     plog("  ✓ extra_hosts (host.docker.internal) added for container→host")
                 else:
                     plog("  ⚠ Could not auto-add extra_hosts (missing 'restart: unless-stopped').")
+
+            if 'cap_drop:' not in compose_content and 'restart: unless-stopped' in compose_content:
+                hardened = compose_content.replace(
+                    'restart: unless-stopped',
+                    'restart: unless-stopped\n    cap_drop:\n      - ALL\n    security_opt:\n      - no-new-privileges:true',
+                    1
+                )
+                if hardened != compose_content:
+                    compose_content = hardened
+                    with open(compose_path, 'w') as f:
+                        f.write(compose_content)
+                    plog("  ✓ cap_drop: ALL + no-new-privileges:true added to docker-compose.yml")
 
         if _patch_takportal_compose_network():
             plog("  ✓ infratak Docker network added to docker-compose.yml (Portal ↔ Authentik)")
@@ -11768,7 +12194,7 @@ def mediamtx_control():
     elif action == 'restart':
         subprocess.run('systemctl restart mediamtx mediamtx-webeditor 2>&1', shell=True, capture_output=True)
     time.sleep(2)
-    r = subprocess.run(['systemctl', 'is-active', 'mediamtx'], capture_output=True, text=True)
+    r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'mediamtx']), capture_output=True, text=True)
     running = r.stdout.strip() == 'active'
     return jsonify({'success': True, 'running': running})
 
@@ -12093,7 +12519,7 @@ paths:
     # Step 5: systemd mediamtx.service
     plog("")
     plog("━━━ Step 5/7: Creating systemd Services (remote) ━━━")
-    mediamtx_svc = "[Unit]\nDescription=MediaMTX RTSP/HLS/SRT Streaming Server\nAfter=network.target\n\n[Service]\nType=simple\nExecStart=/usr/local/bin/mediamtx /usr/local/etc/mediamtx.yml\nRestart=always\nRestartSec=5\nUser=root\n\n[Install]\nWantedBy=multi-user.target\n"
+    mediamtx_svc = "[Unit]\nDescription=MediaMTX RTSP/HLS/SRT Streaming Server\nAfter=network.target\n\n[Service]\nType=simple\nExecStart=/usr/local/bin/mediamtx /usr/local/etc/mediamtx.yml\nRestart=always\nRestartSec=5\nUser=takwerx\n\n[Install]\nWantedBy=multi-user.target\n"
     tmp_svc = '/tmp/mediamtx_remote.service'
     with open(tmp_svc, 'w') as f:
         f.write(mediamtx_svc)
@@ -12216,7 +12642,7 @@ paths:
             f'Environment=AUTHENTIK_API_URL={ak_public_url}\n'
             f'Environment=AUTHENTIK_TOKEN={ak_token_val}\n'
         )
-    editor_svc = f"[Unit]\nDescription=MediaMTX Web Configuration Editor\nAfter=network.target mediamtx.service\n\n[Service]\nType=simple\nExecStart=/usr/bin/python3 /opt/mediamtx-webeditor/mediamtx_config_editor.py\nWorkingDirectory=/opt/mediamtx-webeditor\nEnvironment=PORT=5080\nEnvironment=MEDIAMTX_API_URL=http://127.0.0.1:9898\n{ldap_env_lines}Restart=always\nRestartSec=5\nUser=root\n\n[Install]\nWantedBy=multi-user.target\n"
+    editor_svc = f"[Unit]\nDescription=MediaMTX Web Configuration Editor\nAfter=network.target mediamtx.service\n\n[Service]\nType=simple\nExecStart=/usr/bin/python3 /opt/mediamtx-webeditor/mediamtx_config_editor.py\nWorkingDirectory=/opt/mediamtx-webeditor\nEnvironment=PORT=5080\nEnvironment=MEDIAMTX_API_URL=http://127.0.0.1:9898\n{ldap_env_lines}Restart=always\nRestartSec=5\nUser=takwerx\n\n[Install]\nWantedBy=multi-user.target\n"
     with open('/tmp/mediamtx_webeditor_remote.service', 'w') as f:
         f.write(editor_svc)
     _module_copy(deploy_cfg, '/tmp/mediamtx_webeditor_remote.service', '/tmp/mediamtx-webeditor.service', log_fn=plog)
@@ -12328,10 +12754,8 @@ paths:
                 os.chmod(sync_path, 0o755)
                 svc = "[Unit]\nDescription=Sync MediaMTX SSL certs to remote host\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/mediamtx-cert-sync.sh\n"
                 timer = "[Unit]\nDescription=Sync MediaMTX certs daily\n\n[Timer]\nOnCalendar=daily\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n"
-                with open('/etc/systemd/system/mediamtx-cert-sync.service', 'w') as f:
-                    f.write(svc)
-                with open('/etc/systemd/system/mediamtx-cert-sync.timer', 'w') as f:
-                    f.write(timer)
+                _write_priv('/etc/systemd/system/mediamtx-cert-sync.service', svc)
+                _write_priv('/etc/systemd/system/mediamtx-cert-sync.timer', timer)
                 subprocess.run('systemctl daemon-reload && systemctl enable --now mediamtx-cert-sync.timer 2>/dev/null; true', shell=True, capture_output=True)
                 plog("✓ Cert renewal sync timer installed (daily)")
             else:
@@ -12562,13 +12986,12 @@ Type=simple
 ExecStart=/usr/local/bin/mediamtx /usr/local/etc/mediamtx.yml
 Restart=always
 RestartSec=5
-User=root
+User=takwerx
 
 [Install]
 WantedBy=multi-user.target
 """
-        with open('/etc/systemd/system/mediamtx.service', 'w') as f:
-            f.write(mediamtx_svc)
+        _write_priv('/etc/systemd/system/mediamtx.service', mediamtx_svc)
         plog("✓ mediamtx.service created")
 
         # Write web editor Python app — flexible: detect LDAP/Authentik and choose regular vs LDAP-enhanced source
@@ -12801,13 +13224,12 @@ Environment=PORT=5080
 Environment=MEDIAMTX_API_URL=http://127.0.0.1:9898
 {ldap_env_lines}Restart=always
 RestartSec=5
-User=root
+User=takwerx
 
 [Install]
 WantedBy=multi-user.target
 """
-            with open('/etc/systemd/system/mediamtx-webeditor.service', 'w') as f:
-                f.write(webeditor_svc)
+            _write_priv('/etc/systemd/system/mediamtx-webeditor.service', webeditor_svc)
             plog("✓ mediamtx-webeditor.service created")
         else:
             plog("  Skipping mediamtx-webeditor.service (editor file not installed)")
@@ -12844,7 +13266,7 @@ WantedBy=multi-user.target
         # Step 7: Caddy integration
         plog("")
         plog("━━━ Step 7/7: Caddy Integration ━━━")
-        caddy_running = subprocess.run(['systemctl', 'is-active', 'caddy'], capture_output=True, text=True).stdout.strip() == 'active'
+        caddy_running = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'caddy']), capture_output=True, text=True).stdout.strip() == 'active'
         if caddy_running and domain:
             # Update Caddyfile first so Caddy issues the cert
             generate_caddyfile(settings)
@@ -12892,7 +13314,7 @@ WantedBy=multi-user.target
 
         # Verify MediaMTX is up
         time.sleep(3)
-        r = subprocess.run(['systemctl', 'is-active', 'mediamtx'], capture_output=True, text=True)
+        r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'mediamtx']), capture_output=True, text=True)
         if r.stdout.strip() == 'active':
             # If Authentik is running, ensure stream visibility groups exist (video-public, video-private, video-admin)
             ak_dir = os.path.expanduser('~/authentik')
@@ -13627,6 +14049,53 @@ def cloudtak_uninstall_status_api():
         'error': cloudtak_uninstall_status.get('error')
     })
 
+@app.route('/api/cloudtak/reset-server-config', methods=['POST'])
+@login_required
+def cloudtak_reset_server_config():
+    """Clear CloudTAK's stored TAK Server auth so the bootstrap wizard runs again.
+
+    Nulls out the auth column in the servers table (cert + key) via psql inside
+    the postgis container, then restarts just the api container so it reloads
+    config from the database. Works for local and remote targets.
+    """
+    settings = load_settings()
+    cfg = _get_cloudtak_deployment_config(settings)
+    target_mode = (cfg.get('target_mode') or 'local').strip().lower()
+
+    sql_cmd = "UPDATE servers SET auth = NULL WHERE id = 1;"
+    psql_cmd = f"docker exec cloudtak-postgis-1 psql -U docker -d gis -c \"{sql_cmd}\" 2>&1"
+    restart_cmd = "cd ~/CloudTAK && docker compose restart api 2>&1"
+
+    if target_mode == 'remote':
+        rcfg = cfg.get('remote', {})
+        rhost = (rcfg.get('host') or '').strip()
+        if not rhost:
+            return jsonify({'success': False, 'error': 'Remote host not configured'}), 400
+        ok1, out1 = _ssh_probe(rcfg, psql_cmd, timeout=30)
+        if not ok1 or 'ERROR' in (out1 or '').upper():
+            return jsonify({'success': False, 'error': f'SQL reset failed on {rhost}: {(out1 or "unknown")[:200]}'}), 500
+        ok2, out2 = _ssh_probe(rcfg, restart_cmd, timeout=60)
+        if not ok2:
+            return jsonify({'success': False, 'error': f'API restart failed on {rhost}: {(out2 or "unknown")[:200]}'}), 500
+        return jsonify({'success': True, 'message': f'CloudTAK server config cleared on {rhost}. Visit map.{settings.get("fqdn","<domain>")} to re-run the bootstrap wizard.'})
+    else:
+        try:
+            r1 = subprocess.run(psql_cmd, shell=True, capture_output=True, text=True, timeout=30)
+            if r1.returncode != 0 or 'ERROR' in (r1.stdout + r1.stderr).upper():
+                return jsonify({'success': False, 'error': f'SQL reset failed: {(r1.stdout + r1.stderr)[:200]}'}), 500
+        except subprocess.TimeoutExpired:
+            return jsonify({'success': False, 'error': 'psql command timed out'}), 500
+        try:
+            cloudtak_dir = os.path.expanduser('~/CloudTAK')
+            r2 = subprocess.run('docker compose restart api 2>&1', shell=True, capture_output=True, text=True, timeout=60, cwd=cloudtak_dir)
+            if r2.returncode != 0:
+                return jsonify({'success': False, 'error': f'API restart failed: {(r2.stdout + r2.stderr)[:200]}'}), 500
+        except subprocess.TimeoutExpired:
+            return jsonify({'success': False, 'error': 'docker compose restart timed out'}), 500
+        fqdn = settings.get('fqdn', '')
+        return jsonify({'success': True, 'message': f'CloudTAK server config cleared. Visit {"map." + fqdn if fqdn else "CloudTAK"} to re-run the bootstrap wizard.'})
+
+
 def _cloudtak_build_env_content(settings, domain, signing_secret, minio_pass, remote_host=''):
     """Build CloudTAK .env content for local or remote target."""
     # Prefer explicit CloudTAK service domains when available (works even if fqdn is unset).
@@ -13704,14 +14173,28 @@ services:
   api:
     extra_hosts:
 {hosts_block}
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+    security_opt:
+      - no-new-privileges:true
   events:
     extra_hosts:
 {hosts_block}
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     environment:
       API_URL: "http://api:5000"
   media:
     extra_hosts:
 {hosts_block}
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     environment:
       API_URL: "http://api:5000"
 """
@@ -14401,7 +14884,7 @@ def run_cloudtak_update():
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
             r = subprocess.run(
-                f'cd {cloudtak_dir} && git fetch --depth 1 origin tag {release_tag} && git checkout {release_tag}',
+                f'cd {cloudtak_dir} && git -c safe.directory={cloudtak_dir} fetch --depth 1 origin tag {release_tag} && git -c safe.directory={cloudtak_dir} checkout {release_tag}',
                 shell=True, capture_output=True, text=True, timeout=120)
             if r.returncode != 0:
                 plog(f"✗ Checkout failed: {r.stderr.strip()[:200]}")
@@ -14544,16 +15027,14 @@ smtp_generic_maps = hash:/etc/postfix/generic
 
         plog(f"📧 Step 3/5 — Writing credentials...")
         sasl_line = f"[{relay_host}]:{relay_port}    {smtp_user}:{smtp_pass}"
-        with open('/etc/postfix/sasl_passwd', 'w') as f:
-            f.write(sasl_line + '\n')
+        _write_priv('/etc/postfix/sasl_passwd', sasl_line + '\n')
         subprocess.run('postmap /etc/postfix/sasl_passwd', shell=True, capture_output=True)
         subprocess.run('chmod 600 /etc/postfix/sasl_passwd /etc/postfix/sasl_passwd.db', shell=True, capture_output=True)
 
         # Generic map for from address rewriting
         hostname = subprocess.run('hostname -f', shell=True, capture_output=True, text=True).stdout.strip()
         generic_line = f"root@{hostname}    {from_addr}"
-        with open('/etc/postfix/generic', 'w') as f:
-            f.write(generic_line + '\n')
+        _write_priv('/etc/postfix/generic', generic_line + '\n')
         subprocess.run('postmap /etc/postfix/generic', shell=True, capture_output=True)
         plog("✓ Credentials written and hashed")
 
@@ -15300,8 +15781,7 @@ def _update_boot_stagger_service():
             '[Install]\n'
             'WantedBy=multi-user.target\n'
         )
-        with open('/etc/systemd/system/docker-stagger.service', 'w') as f:
-            f.write(unit)
+        _write_priv('/etc/systemd/system/docker-stagger.service', unit)
         subprocess.run('systemctl daemon-reload && systemctl enable docker-stagger 2>/dev/null',
                        shell=True, capture_output=True, timeout=10)
     except Exception:
@@ -15330,7 +15810,7 @@ def _ensure_docker_log_limits(log_fn=None):
         with open(daemon_json, 'w') as f:
             json.dump(data, f, indent=2)
             f.write('\n')
-        subprocess.run(['systemctl', 'restart', 'docker'], capture_output=True, timeout=90)
+        subprocess.run(_sudo_wrap(['systemctl', 'restart', 'docker']), capture_output=True, timeout=90)
         time.sleep(5)
         if log_fn:
             log_fn("✓ Docker log limits set (50 MB × 3 per container). Docker was restarted; other containers may need starting from their pages.")
@@ -16513,38 +16993,76 @@ def _run_nodered_deploy_remote(settings, deploy_cfg, plog):
     plog("━━━ Node-RED remote deploy ━━━")
     plog(f"  Target: {host}")
     _module_run(deploy_cfg, 'mkdir -p ~/node-red', timeout=10, log_fn=plog)
-    settings_js = """module.exports = {
-  flowFile: 'flows.json',
-  flowFilePretty: true,
-  userDir: '/data',
-  httpAdminRoot: '/',
-  httpNodeRoot: '/',
-  httpStatic: '/data/public',
-  contextStorage: {
-    default: {
-      module: 'localfilesystem',
-      config: { flushInterval: 0 }
+    # Same env-driven adminAuth + scoped settings as local deploy. See run_nodered_deploy() comments.
+    settings_js = """module.exports = (function () {
+  var conf = {
+    flowFile: 'flows.json',
+    flowFilePretty: true,
+    userDir: '/data',
+    httpAdminRoot: '/',
+    httpNodeRoot: '/',
+    httpStatic: '/data/public',
+    contextStorage: {
+      default: {
+        module: 'localfilesystem',
+        config: { flushInterval: 0 }
+      }
+    },
+    functionGlobalContext: {
+      nodeHttps: require('https'),
+      fs: require('fs')
+    },
+    editorTheme: {
+      header: {
+        title: 'infra-TAK Node-RED  —  <a href="/configurator" target="_blank" style="color:#2ec4b6;text-decoration:underline">Open Configurator</a>'
+      }
     }
-  },
-  functionGlobalContext: {
-    nodeHttps: require('https'),
-    fs: require('fs')
-  },
-  editorTheme: {
-    header: {
-      title: 'infra-TAK Node-RED  —  <a href="/configurator" target="_blank" style="color:#2ec4b6;text-decoration:underline">Open Configurator</a>'
-    }
+  };
+  if (process.env.NR_ADMIN_USER && process.env.NR_ADMIN_PASSWORD_HASH) {
+    conf.adminAuth = {
+      type: 'credentials',
+      users: [{
+        username: process.env.NR_ADMIN_USER,
+        password: process.env.NR_ADMIN_PASSWORD_HASH,
+        permissions: '*'
+      }]
+    };
   }
-};
+  if (process.env.NR_CREDENTIAL_SECRET) {
+    conf.credentialSecret = process.env.NR_CREDENTIAL_SECRET;
+  }
+  return conf;
+})();
 """
+    # Empty .env scaffold — operator opts in to adminAuth by populating it on the remote host.
+    env_template = """# infra-TAK Node-RED env file
+# Optional: enable Node-RED's built-in credentials (defense-in-depth atop Caddy+Authentik).
+# Generate the hash via: docker exec nodered npx --yes node-red-admin@latest hash-pw
+# NR_ADMIN_USER=admin
+# NR_ADMIN_PASSWORD_HASH=<bcrypt-hash>
+# NR_CREDENTIAL_SECRET=<random-hex-string-for-stable-cred-encryption>
+"""
+    # Remote compose: same hardening as local. Cert mount stays whole-tree because we cannot
+    # probe the remote host's /opt/tak/certs/files contents from here. Operator can narrow
+    # the mount by editing the remote compose post-deploy (see docs/NODERED-DEPLOY.md).
+    # Port binding is now 127.0.0.1:1880 (was 0.0.0.0:1880) — matches local deploy.
     compose_yml = """services:
   node-red:
-    image: nodered/node-red:latest
+    image: nodered/node-red:4.0
     container_name: nodered
+    restart: unless-stopped
+    user: "1000:1000"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 2g
+    env_file:
+      - .env
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
-      - "1880:1880"
+      - "127.0.0.1:1880:1880"
     volumes:
       - node_red_data:/data
       - ./settings.js:/data/settings.js
@@ -16556,11 +17074,22 @@ volumes:
         f.write(settings_js)
     with open('/tmp/nodered_docker-compose.yml', 'w') as f:
         f.write(compose_yml)
+    with open('/tmp/nodered_env', 'w') as f:
+        f.write(env_template)
     ok1, _ = _module_copy(deploy_cfg, '/tmp/nodered_settings.js', '~/node-red/settings.js', log_fn=plog)
     ok2, _ = _module_copy(deploy_cfg, '/tmp/nodered_docker-compose.yml', '~/node-red/docker-compose.yml', log_fn=plog)
+    # Only seed .env on remote if it doesn't already exist (preserves operator-provided values).
+    try:
+        _ok_check, _out_check = _module_run(deploy_cfg, 'test -f ~/node-red/.env && echo present || echo missing', timeout=5)
+        if 'missing' in (_out_check or ''):
+            _module_copy(deploy_cfg, '/tmp/nodered_env', '~/node-red/.env', log_fn=plog)
+            _module_run(deploy_cfg, 'chmod 600 ~/node-red/.env', timeout=5)
+    except Exception:
+        pass
     try:
         os.remove('/tmp/nodered_settings.js')
         os.remove('/tmp/nodered_docker-compose.yml')
+        os.remove('/tmp/nodered_env')
     except Exception:
         pass
     if not ok1 or not ok2:
@@ -16639,38 +17168,105 @@ def run_nodered_deploy():
         plog("━━━ Step 1/3: Creating Docker Compose ━━━")
         compose_yml = os.path.join(nr_dir, 'docker-compose.yml')
         settings_js = os.path.join(nr_dir, 'settings.js')
-        # Node-RED at root (/) so Caddy can proxy nodered.domain to 1880
+        env_file = os.path.join(nr_dir, '.env')
+        # settings.js — supports env-driven adminAuth (defense-in-depth on top of Caddy+Authentik).
+        # When NR_ADMIN_USER + NR_ADMIN_PASSWORD_HASH are set in ~/node-red/.env, Node-RED requires
+        # local credentials in addition to whatever Caddy is already enforcing. Default: off (Caddy only).
+        # NR_CREDENTIAL_SECRET enables stable cred encryption; otherwise Node-RED auto-generates per restart.
         with open(settings_js, 'w') as f:
-            f.write("""module.exports = {
-  flowFile: 'flows.json',
-  flowFilePretty: true,
-  userDir: '/data',
-  httpAdminRoot: '/',
-  httpNodeRoot: '/',
-  httpStatic: '/data/public',
-  contextStorage: {
-    default: {
-      module: 'localfilesystem',
-      config: { flushInterval: 0 }
+            f.write("""module.exports = (function () {
+  var conf = {
+    flowFile: 'flows.json',
+    flowFilePretty: true,
+    userDir: '/data',
+    httpAdminRoot: '/',
+    httpNodeRoot: '/',
+    httpStatic: '/data/public',
+    contextStorage: {
+      default: {
+        module: 'localfilesystem',
+        config: { flushInterval: 0 }
+      }
+    },
+    // Globally exposes 'nodeHttps' + 'fs' to function nodes. Convenience for operator-written flows;
+    // the v0.6.7+ elevation step uses 'libs:' instead and does not depend on this. Future hardening
+    // could remove this and migrate any user flows to declare 'libs:' explicitly.
+    functionGlobalContext: {
+      nodeHttps: require('https'),
+      fs: require('fs')
+    },
+    editorTheme: {
+      header: {
+        title: 'infra-TAK Node-RED  —  <a href="/configurator" target="_blank" style="color:#2ec4b6;text-decoration:underline">Open Configurator</a>'
+      }
     }
-  },
-  functionGlobalContext: {
-    nodeHttps: require('https'),
-    fs: require('fs')
-  },
-  editorTheme: {
-    header: {
-      title: 'infra-TAK Node-RED  —  <a href="/configurator" target="_blank" style="color:#2ec4b6;text-decoration:underline">Open Configurator</a>'
-    }
+  };
+  // Optional defense-in-depth: enable Node-RED's built-in credentials when env vars are set.
+  if (process.env.NR_ADMIN_USER && process.env.NR_ADMIN_PASSWORD_HASH) {
+    conf.adminAuth = {
+      type: 'credentials',
+      users: [{
+        username: process.env.NR_ADMIN_USER,
+        password: process.env.NR_ADMIN_PASSWORD_HASH,
+        permissions: '*'
+      }]
+    };
   }
-};
+  if (process.env.NR_CREDENTIAL_SECRET) {
+    conf.credentialSecret = process.env.NR_CREDENTIAL_SECRET;
+  }
+  return conf;
+})();
 """)
+        # Bootstrap an empty .env file (gitignored on operator hosts) so docker compose env_file: doesn't fail.
+        # Operators opt into adminAuth by adding NR_ADMIN_USER/NR_ADMIN_PASSWORD_HASH/NR_CREDENTIAL_SECRET here.
+        if not os.path.exists(env_file):
+            with open(env_file, 'w') as f:
+                f.write("""# infra-TAK Node-RED env file
+# Optional: enable Node-RED's built-in credentials (defense-in-depth atop Caddy+Authentik).
+# Generate the hash via: docker exec nodered npx --yes node-red-admin@latest hash-pw
+# NR_ADMIN_USER=admin
+# NR_ADMIN_PASSWORD_HASH=<bcrypt-hash>
+# NR_CREDENTIAL_SECRET=<random-hex-string-for-stable-cred-encryption>
+""")
+            os.chmod(env_file, 0o600)
+
+        # Build scoped cert mounts: per-file mounts only for cert files that actually exist on the host.
+        # This narrows blast radius from "every cert TAK has issued" to "only the certs Node-RED uses".
+        # Falls back to whole-tree mount if NONE of the expected files exist (fresh install).
+        cert_dir_host = '/opt/tak/certs/files'
+        wanted_certs = [
+            'admin.pem', 'admin.key',
+            'nodered.pem', 'nodered.key',  # Phase 1A target — only mounted if operator has generated it
+            'nodered-global-datasyncfeed.pem', 'nodered-global-datasyncfeed.key',
+        ]
+        mount_lines = []
+        for fname in wanted_certs:
+            src = os.path.join(cert_dir_host, fname)
+            if os.path.exists(src):
+                mount_lines.append(f'      - {src}:/certs/{fname}:ro')
+        if mount_lines:
+            certs_volume_block = '\n'.join(mount_lines)
+            plog(f"  Cert mount: scoped — {len(mount_lines)} files individually mounted")
+        else:
+            certs_volume_block = f'      - {cert_dir_host}:/certs:ro'
+            plog(f"  Cert mount: whole-tree fallback (no scoped certs found yet on host)")
+
         with open(compose_yml, 'w') as f:
-            f.write("""services:
+            f.write(f"""services:
   node-red:
-    image: nodered/node-red:latest
+    # Pinned to Node-RED 4.0.x (minor pin — gets patches, no major-version drift).
+    image: nodered/node-red:4.0
     container_name: nodered
     restart: unless-stopped
+    user: "1000:1000"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 2g
+    env_file:
+      - .env
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
@@ -16678,11 +17274,11 @@ def run_nodered_deploy():
     volumes:
       - node_red_data:/data
       - ./settings.js:/data/settings.js
-      - /opt/tak/certs/files:/certs:ro
+{certs_volume_block}
 volumes:
   node_red_data:
 """)
-        plog("✓ docker-compose.yml written (TAK certs → /certs, host.docker.internal for CoT)")
+        plog("✓ docker-compose.yml written (image pinned, hardening flags, scoped certs, host.docker.internal for CoT)")
         plog("")
         plog("━━━ Step 2/3: Starting Node-RED ━━━")
         r = subprocess.run(f'docker compose -f "{compose_yml}" up -d 2>&1', shell=True, capture_output=True, text=True, timeout=120, cwd=nr_dir)
@@ -17273,6 +17869,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:\'DM Sans\'
 .stat-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:0}
 @media(max-width:900px){.stat-grid{grid-template-columns:repeat(2,1fr)}}
 .stat-card{background:var(--bg-card);border:1px solid var(--border);border-radius:10px;padding:16px;text-align:center}
+.cfg-input{width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text-primary);font-size:13px;font-family:\'JetBrains Mono\',monospace;outline:none;transition:border-color .2s}.cfg-input:focus{border-color:var(--cyan)}
 .stat-value{font-family:\'JetBrains Mono\',monospace;font-size:28px;font-weight:700;margin-bottom:4px}
 .stat-label{font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em}
 .stat-value.red{color:var(--red)}.stat-value.green{color:var(--green)}.stat-value.yellow{color:var(--yellow)}.stat-value.cyan{color:var(--cyan)}
@@ -17339,6 +17936,65 @@ Bans IPs via UFW and sends Guard Dog email alerts.
 </div>
 {% else %}
 
+<!-- Repeat Offender Protection -->
+<div class="card" id="recidive-card" style="margin-bottom:8px">
+<div class="card-title" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0">
+<div style="display:flex;align-items:center;gap:10px">
+<span>🛡 Repeat Offender Protection</span>
+<span class="badge badge-red" id="recidive-badge" style="font-size:10px;padding:2px 8px"><span class="dot"></span>Disabled</span>
+</div>
+<div style="display:flex;align-items:center;gap:16px">
+<button id="recidive-refresh-btn" onclick="manualRecidiveRefresh()" style="background:none;border:none;cursor:pointer;color:var(--text-dim);font-size:12px;font-family:\'JetBrains Mono\',monospace;display:inline-flex;align-items:center;gap:5px;padding:0"><span id="recidive-refresh-icon" style="display:inline-block;transition:transform 0.4s">↻</span> Refresh</button>
+<label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:0">
+<span style="font-size:12px;color:var(--text-dim);font-family:\'JetBrains Mono\',monospace">Enable</span>
+<div class="toggle-wrap" style="position:relative;width:40px;height:22px">
+<input type="checkbox" id="recidive-toggle" onchange="toggleRecidiveJail()" style="opacity:0;width:0;height:0;position:absolute">
+<span id="recidive-toggle-track" onclick="document.getElementById(\'recidive-toggle\').click()" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
+<span id="recidive-toggle-thumb" style="position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform .2s;pointer-events:none"></span>
+</div>
+</label>
+</div>
+</div>
+<div style="font-size:12px;color:var(--text-dim);margin-top:8px">Permanently bans repeat offenders. An IP banned by <strong>any</strong> jail N times within the watch window is blocked forever — until you manually unban them. Permanent bans survive reboots.</div>
+
+<div id="recidive-enabled-section" style="display:none">
+<div class="stat-grid" style="margin-top:20px;margin-bottom:8px">
+<div class="stat-card" id="recidive-banned-toggle" onclick="toggleRecidiveBanPanel()" style="cursor:pointer;transition:border-color 0.2s" title="Click to see permanently banned IPs">
+<div class="stat-value red" id="recidive-stat-banned">0</div>
+<div class="stat-label">Permanently Banned <span style="font-size:10px;color:var(--text-dim)" id="recidive-banned-caret">▼ details</span></div>
+</div>
+<div class="stat-card" title="Since the fail2ban service was last started or restarted">
+<div class="stat-value cyan" id="recidive-stat-total">0</div>
+<div class="stat-label">Total Caught <span style="font-size:9px;color:var(--text-dim)">(since last restart)</span></div>
+</div>
+</div>
+
+<div id="recidive-ban-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
+<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">Permanently Banned IPs <span style="font-size:9px;color:var(--red);background:rgba(239,68,68,0.1);padding:2px 6px;border-radius:4px;border:1px solid rgba(239,68,68,0.3)">∞ permanent</span></div>
+<input type="text" id="recidive-ban-search" oninput="filterRecidiveBanList()" placeholder="Search IP…" style="width:100%;box-sizing:border-box;margin-bottom:10px;padding:6px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px;outline:none">
+<div id="recidive-ban-list-container" style="max-height:240px;overflow-y:auto">
+<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs permanently banned.</div>
+</div>
+</div>
+
+<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:16px;margin-top:8px">
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Strikes before permanent ban</label>
+<input class="form-input" type="number" id="recidive-cfg-maxretry" value="3" min="2" max="20">
+<div class="form-hint">Bans in any jail that trigger a permanent block</div>
+</div>
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Watch window (hours)</label>
+<input class="form-input" type="number" id="recidive-cfg-findtime" value="24" min="1" max="720">
+<div class="form-hint">How far back to look — use 720 (30 days) for maximum strictness</div>
+</div>
+</div>
+<div style="margin-top:16px">
+<button class="btn-primary" onclick="saveRecidiveConfig()">Save &amp; Reload</button>
+</div>
+</div><!-- /recidive-enabled-section -->
+</div><!-- /Repeat Offender Protection card -->
+
 <!-- Authentik Jail card -->
 <div class="card" style="margin-bottom:20px">
 <div class="card-title" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0">
@@ -17360,18 +18016,21 @@ Bans IPs via UFW and sends Guard Dog email alerts.
 </div>
 
 <div id="auth-enabled-section" style="display:none">
-<div class="stat-grid" id="stat-grid" style="margin-top:20px;margin-bottom:20px">
-<div class="stat-card"><div class="stat-value red" id="stat-banned">0</div><div class="stat-label">Currently Banned</div></div>
+<div class="stat-grid" id="stat-grid" style="margin-top:20px;margin-bottom:8px">
+<div class="stat-card" id="auth-banned-toggle" onclick="toggleAuthBanPanel()" style="cursor:pointer;transition:border-color 0.2s" title="Click to see banned IPs">
+<div class="stat-value red" id="stat-banned">0</div>
+<div class="stat-label">Currently Banned <span style="font-size:10px;color:var(--text-dim)" id="auth-banned-caret">▼ details</span></div>
+</div>
 <div class="stat-card"><div class="stat-value yellow" id="stat-failed">0</div><div class="stat-label">Currently Failed</div></div>
-<div class="stat-card"><div class="stat-value cyan" id="stat-total-banned">0</div><div class="stat-label">Total Banned (session)</div></div>
-<div class="stat-card"><div class="stat-value" id="stat-total-failed" style="color:var(--text-dim)">0</div><div class="stat-label">Total Failed (session)</div></div>
+<div class="stat-card" title="Since the fail2ban service was last started or restarted"><div class="stat-value cyan" id="stat-total-banned">0</div><div class="stat-label">Total Banned <span style="font-size:9px;color:var(--text-dim)">(since last restart)</span></div></div>
+<div class="stat-card" title="Since the fail2ban service was last started or restarted"><div class="stat-value" id="stat-total-failed" style="color:var(--text-dim)">0</div><div class="stat-label">Total Failed <span style="font-size:9px;color:var(--text-dim)">(since last restart)</span></div></div>
 </div>
 
-<!-- Banned IPs -->
-<div class="card" style="margin-top:16px">
-<div class="card-title">Currently Banned IPs</div>
-<div id="ban-list-container">
-<div style="color:var(--text-dim);font-size:13px;font-family:\'JetBrains Mono\',monospace">Loading…</div>
+<div id="auth-ban-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
+<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">Banned IPs — click Unban to release</div>
+<input type="text" id="auth-ban-search" oninput="filterAuthBanList()" placeholder="Search IP…" style="width:100%;box-sizing:border-box;margin-bottom:10px;padding:6px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px;outline:none">
+<div id="ban-list-container" style="max-height:240px;overflow-y:auto">
+<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>
 </div>
 </div>
 
@@ -17418,6 +18077,83 @@ Bans IPs via UFW and sends Guard Dog email alerts.
 </div><!-- /auth-enabled-section -->
 </div><!-- /Authentik Jail card -->
 
+<!-- SSH Jail -->
+<div class="card" id="ssh-jail-card">
+<div class="card-title" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0">
+<div style="display:flex;align-items:center;gap:10px">
+<span>SSH Jail</span>
+<span class="badge badge-red" id="ssh-jail-badge" style="font-size:10px;padding:2px 8px"><span class="dot"></span>Disabled</span>
+</div>
+<div style="display:flex;align-items:center;gap:16px">
+<button id="ssh-refresh-btn" onclick="manualSshRefresh()" style="background:none;border:none;cursor:pointer;color:var(--text-dim);font-size:12px;font-family:\'JetBrains Mono\',monospace;display:inline-flex;align-items:center;gap:5px;padding:0"><span id="ssh-refresh-icon" style="display:inline-block;transition:transform 0.4s">↻</span> Refresh</button>
+<label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:0">
+<span style="font-size:12px;color:var(--text-dim);font-family:\'JetBrains Mono\',monospace">Enable</span>
+<div class="toggle-wrap" style="position:relative;width:40px;height:22px">
+<input type="checkbox" id="ssh-toggle" onchange="toggleSshJail()" style="opacity:0;width:0;height:0;position:absolute">
+<span id="ssh-toggle-track" onclick="document.getElementById(\'ssh-toggle\').click()" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
+<span id="ssh-toggle-thumb" style="position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform .2s;pointer-events:none"></span>
+</div>
+</label>
+</div>
+</div>
+<div style="font-size:12px;color:var(--text-dim);margin-top:8px">Monitors <code>/var/log/auth.log</code> for failed SSH login attempts. Guard Dog email alert fires on ban. Default thresholds are stricter than Authentik — SSH brute-force is higher severity.</div>
+
+<div id="ssh-enabled-section" style="display:none">
+<div class="stat-grid" style="margin-top:20px;margin-bottom:8px">
+<div class="stat-card" id="ssh-banned-toggle" onclick="toggleSshBanPanel()" style="cursor:pointer;transition:border-color 0.2s" title="Click to see banned IPs">
+<div class="stat-value red" id="ssh-stat-banned">0</div>
+<div class="stat-label">Currently Banned <span style="font-size:10px;color:var(--text-dim)" id="ssh-banned-caret">▼ details</span></div>
+</div>
+<div class="stat-card" id="ssh-watching-toggle" onclick="toggleSshWatchingPanel()" style="cursor:pointer;transition:border-color 0.2s" title="Click to see IPs being watched">
+<div class="stat-value yellow" id="ssh-stat-failed">0</div>
+<div class="stat-label">Currently Failed <span style="font-size:10px;color:var(--text-dim)" id="ssh-watching-caret">▼ details</span></div>
+</div>
+<div class="stat-card" title="Since the fail2ban service was last started or restarted"><div class="stat-value cyan" id="ssh-stat-total-banned">0</div><div class="stat-label">Total Banned <span style="font-size:9px;color:var(--text-dim)">(since last restart)</span></div></div>
+</div>
+
+<div id="ssh-watching-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
+<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">IPs Under Watch — failed attempts within find window, not yet banned</div>
+<input type="text" id="ssh-watching-search" oninput="filterSshWatchingList()" placeholder="Search IP…" style="width:100%;box-sizing:border-box;margin-bottom:10px;padding:6px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px;outline:none">
+<div id="ssh-watching-list"><div style="color:var(--text-dim);font-size:13px;font-family:monospace">Loading…</div></div>
+</div>
+
+<div id="ssh-ban-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
+<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">Banned IPs — click Unban to release</div>
+<input type="text" id="ssh-ban-search" oninput="filterSshBanList()" placeholder="Search IP…" style="width:100%;box-sizing:border-box;margin-bottom:10px;padding:6px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px;outline:none">
+<div id="ssh-ban-list-container" style="max-height:240px;overflow-y:auto">
+<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>
+</div>
+</div>
+
+<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:16px">
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Max Retries</label>
+<input class="form-input" type="number" id="ssh-cfg-maxretry" value="3" min="1" max="50">
+<div class="form-hint">Attempts before ban</div>
+</div>
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Find Window (minutes)</label>
+<input class="form-input" type="number" id="ssh-cfg-findtime" value="10" min="1" max="1440">
+<div class="form-hint">Time window to count attempts</div>
+</div>
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Ban Duration (minutes)</label>
+<input class="form-input" type="number" id="ssh-cfg-bantime" value="60" min="1" max="43200">
+<div class="form-hint">How long to ban the IP</div>
+</div>
+</div>
+<div class="form-row" style="margin-top:16px;margin-bottom:0">
+<label class="form-label">Whitelist (ignoreip)</label>
+<input class="form-input" type="text" id="ssh-cfg-ignoreip" placeholder="e.g. 10.0.0.5, 192.168.1.0/24" style="font-family:monospace" oninput="renderChips(\'ssh-cfg-ignoreip\',\'ssh-cfg-ignoreip-chips\')">
+<div class="form-hint">Space-separated IPs / CIDRs — localhost is always exempt.</div>
+<div id="ssh-cfg-ignoreip-chips" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px"></div>
+</div>
+<div style="margin-top:16px">
+<button class="btn-primary" onclick="saveSshConfig()">Save &amp; Reload</button>
+</div>
+</div><!-- /ssh-enabled-section -->
+</div><!-- /SSH Jail card -->
+
 <!-- TAK Server Jail -->
 <div class="card" id="tak-jail-card" style="display:none">
 <div class="card-title" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0">
@@ -17444,26 +18180,30 @@ TAK Server filter not yet installed — restart the console to complete setup.
 
 <div id="tak-enabled-section" style="display:none">
 <div class="stat-grid" style="margin-top:20px;margin-bottom:8px">
-<div class="stat-card"><div class="stat-value red" id="tak-stat-banned">0</div><div class="stat-label">Currently Banned</div></div>
+<div class="stat-card" id="tak-banned-toggle" onclick="toggleTakBanPanel()" style="cursor:pointer;transition:border-color 0.2s" title="Click to see banned IPs">
+<div class="stat-value red" id="tak-stat-banned">0</div>
+<div class="stat-label">Currently Banned <span style="font-size:10px;color:var(--text-dim)" id="tak-banned-caret">▼ details</span></div>
+</div>
 <div class="stat-card" id="tak-watching-toggle" onclick="toggleWatchingPanel()" style="cursor:pointer;transition:border-color 0.2s" title="Click to see IPs being watched">
 <div class="stat-value yellow" id="tak-stat-failed">0</div>
 <div class="stat-label">Currently Failed <span style="font-size:10px;color:var(--text-dim)" id="tak-watching-caret">▼ details</span></div>
 </div>
-<div class="stat-card"><div class="stat-value cyan" id="tak-stat-total-banned">0</div><div class="stat-label">Total Banned (session)</div></div>
-<div class="stat-card"><div class="stat-value" id="tak-stat-total-failed" style="color:var(--text-dim)">0</div><div class="stat-label">Total Failed (session)</div></div>
+<div class="stat-card" title="Since the fail2ban service was last started or restarted"><div class="stat-value cyan" id="tak-stat-total-banned">0</div><div class="stat-label">Total Banned <span style="font-size:9px;color:var(--text-dim)">(since last restart)</span></div></div>
+<div class="stat-card" title="Since the fail2ban service was last started or restarted"><div class="stat-value" id="tak-stat-total-failed" style="color:var(--text-dim)">0</div><div class="stat-label">Total Failed <span style="font-size:9px;color:var(--text-dim)">(since last restart)</span></div></div>
+</div>
+
+<div id="tak-ban-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
+<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">Banned IPs — click Unban to release</div>
+<input type="text" id="tak-ban-search" oninput="filterTakBanList()" placeholder="Search IP…" style="width:100%;box-sizing:border-box;margin-bottom:10px;padding:6px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px;outline:none">
+<div id="tak-ban-list-container" style="max-height:240px;overflow-y:auto">
+<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>
+</div>
 </div>
 
 <div id="tak-watching-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
-<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">
-  IPs Under Watch — failed attempts within find window, not yet banned
-</div>
-<div id="tak-watching-list">
-  <div style="color:var(--text-dim);font-size:13px;font-family:monospace">Loading…</div>
-</div>
-</div>
-
-<div id="tak-ban-list-container" style="margin-bottom:20px">
-<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>
+<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">IPs Under Watch — failed attempts within find window, not yet banned</div>
+<input type="text" id="tak-watching-search" oninput="filterTakWatchingList()" placeholder="Search IP…" style="width:100%;box-sizing:border-box;margin-bottom:10px;padding:6px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px;outline:none">
+<div id="tak-watching-list"><div style="color:var(--text-dim);font-size:13px;font-family:monospace">Loading…</div></div>
 </div>
 
 <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:16px">
@@ -17666,20 +18406,32 @@ function loadStatus(cb) {
     }
 
     var ips = d.banned_ips || [];
-    var c = document.getElementById(\'ban-list-container\');
-    if (c) {
-      if (!ips.length) {
-        c.innerHTML = \'<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:8px 0">No IPs currently banned.</div>\';
-      } else {
-        var rows = ips.map(ip =>
-          \'<tr><td>\' + ip + \'</td><td><button class="btn-danger-sm" onclick="unbanIP(\\\'\'+ ip +\'\\\')">\' +
-          \'Unban</button></td></tr>\'
-        ).join(\'\');
-        c.innerHTML = \'<table class="ban-table"><thead><tr><th>IP Address</th><th>Action</th></tr></thead><tbody>\' + rows + \'</tbody></table>\';
-      }
-    }
+    window._authBannedIps = ips;
+    renderAuthBanList(ips);
+    var caret = document.getElementById(\'auth-banned-caret\');
+    if (caret) caret.textContent = ips.length ? \'▼ details\' : \'\';
     if (typeof cb === \'function\') cb();
   }).catch(()=>{ showToast(\'Failed to load status\', \'error\'); if (typeof cb === \'function\') cb(); });
+}
+
+window._authBannedIps = [];
+window._authSortAsc = true;
+function _authIpToNum(ip){var p=ip.split(\'.\');return p.length===4?((+p[0]<<24)|(+p[1]<<16)|(+p[2]<<8)|+p[3])>>>0:0;}
+function renderAuthBanList(ips){
+  var c=document.getElementById(\'ban-list-container\');if(!c)return;
+  if(!ips.length){c.innerHTML=\'<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>\';return;}
+  var sorted=ips.slice().sort(function(a,b){var d=_authIpToNum(a)-_authIpToNum(b);return window._authSortAsc?d:-d;});
+  var arrow=window._authSortAsc?\' ▲\':\' ▼\';
+  var rows=sorted.map(function(ip){return \'<tr style="border-bottom:1px solid var(--border)"><td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">\'+ip+\'</td><td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="unbanIP(\\\'\'+ip+\'\\\')">Unban</button></td></tr>\';}).join(\'\');
+  c.innerHTML=\'<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em"><th style="padding:4px 8px;text-align:left;cursor:pointer;user-select:none" onclick="toggleAuthSort()">IP Address\'+arrow+\'</th><th style="padding:4px 8px;text-align:right">Action</th></tr></thead><tbody>\'+rows+\'</tbody></table>\';
+}
+function toggleAuthSort(){window._authSortAsc=!window._authSortAsc;filterAuthBanList();}
+function filterAuthBanList(){var q=(document.getElementById(\'auth-ban-search\').value||\'\').trim().toLowerCase();renderAuthBanList(q?window._authBannedIps.filter(function(ip){return ip.toLowerCase().indexOf(q)!==-1;}):window._authBannedIps);}
+function toggleAuthBanPanel(){
+  var panel=document.getElementById(\'auth-ban-panel\');var caret=document.getElementById(\'auth-banned-caret\');if(!panel)return;
+  var open=panel.style.display!==\'none\';panel.style.display=open?\'none\':\'\';
+  if(caret)caret.textContent=open?\'▼ details\':\'▲ details\';
+  if(!open){var s=document.getElementById(\'auth-ban-search\');if(s)s.value=\'\';renderAuthBanList(window._authBannedIps);}
 }
 
 function loadLog() {
@@ -17745,30 +18497,52 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
     }
   };
 
+  window._takWatchingList = [];
+  window._takWatchingSortCol = \'ip\';
+  window._takWatchingSortAsc = true;
+
+  window.renderTakWatchingList = function(list) {
+    var el = document.getElementById(\'tak-watching-list\'); if (!el) return;
+    if (!list.length) { el.innerHTML=\'<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently under watch.</div>\'; return; }
+    var col = window._takWatchingSortCol; var asc = window._takWatchingSortAsc;
+    var sorted = list.slice().sort(function(a,b){
+      if (col===\'ip\') { var d=_takIpToNum(a.ip)-_takIpToNum(b.ip); return asc?d:-d; }
+      return asc ? a.attempts-b.attempts : b.attempts-a.attempts;
+    });
+    var ipArrow  = col===\'ip\'      ? (asc?\' ▲\':\' ▼\') : \'\';
+    var attArrow = col===\'attempts\' ? (asc?\' ▲\':\' ▼\') : \'\';
+    var rows = sorted.map(function(w){
+      return \'<tr style="border-bottom:1px solid var(--border)">\'+
+        \'<td style="font-family:monospace;padding:5px 8px;color:var(--text-primary);font-size:12px">\'+w.ip+\'</td>\'+
+        \'<td style="padding:5px 8px;color:var(--yellow);font-family:monospace;font-size:12px">\'+w.attempts+\'</td>\'+
+        \'<td style="padding:5px 8px;color:var(--text-dim);font-family:monospace;font-size:11px">\'+w.last_seen+\'</td>\'+
+        \'<td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="manualBanTakIP(\\\'\'+w.ip+\'\\\')">Ban Now</button></td></tr>\';
+    }).join(\'\');
+    el.innerHTML=\'<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em">\'+
+      \'<th style="padding:4px 8px;text-align:left;cursor:pointer;user-select:none" onclick="toggleTakWatchingSort(\\\'ip\\\')">IP Address\'+ipArrow+\'</th>\'+
+      \'<th style="padding:4px 8px;text-align:left;cursor:pointer;user-select:none" onclick="toggleTakWatchingSort(\\\'attempts\\\')">Attempts\'+attArrow+\'</th>\'+
+      \'<th style="padding:4px 8px;text-align:left">Last Seen</th>\'+
+      \'<th style="padding:4px 8px;text-align:right">Action</th>\'+
+      \'</tr></thead><tbody>\'+rows+\'</tbody></table>\';
+  };
+
+  window.toggleTakWatchingSort = function(col) {
+    if (window._takWatchingSortCol === col) window._takWatchingSortAsc = !window._takWatchingSortAsc;
+    else { window._takWatchingSortCol = col; window._takWatchingSortAsc = col===\'attempts\' ? false : true; }
+    filterTakWatchingList();
+  };
+
+  window.filterTakWatchingList = function() {
+    var q = (document.getElementById(\'tak-watching-search\').value || \'\').trim().toLowerCase();
+    renderTakWatchingList(q ? window._takWatchingList.filter(function(w){ return w.ip.indexOf(q) !== -1; }) : window._takWatchingList);
+  };
+
   function _loadWatchingList() {
     fetch(\'/api/fail2ban/takserver/watching\').then(function(r){ return r.json(); }).then(function(d){
-      var el = document.getElementById(\'tak-watching-list\');
-      if (!el) return;
-      var list = d.watching || [];
-      if (!list.length) {
-        el.innerHTML = \'<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently under watch.</div>\';
-        return;
-      }
-      var rows = list.map(function(w){
-        return \'<tr>\' +
-          \'<td style="font-family:monospace;padding:6px 12px 6px 0;color:var(--text-primary)">\' + w.ip + \'</td>\' +
-          \'<td style="padding:6px 12px 6px 0;color:var(--yellow);font-family:monospace">\' + w.attempts + \'</td>\' +
-          \'<td style="padding:6px 12px 6px 0;color:var(--text-dim);font-family:monospace;font-size:11px">\' + w.last_seen + \'</td>\' +
-          \'<td style="padding:6px 0"><button class="btn-danger-sm" onclick="manualBanTakIP(\\\'\'+ w.ip +\'\\\')" title="Manually ban this IP now">Ban Now</button></td>\' +
-          \'</tr>\';
-      }).join(\'\');
-      el.innerHTML = \'<table style="width:100%;border-collapse:collapse">\' +
-        \'<thead><tr>\' +
-        \'<th style="text-align:left;font-size:11px;color:var(--text-dim);padding:0 12px 8px 0;text-transform:uppercase;letter-spacing:.06em">IP Address</th>\' +
-        \'<th style="text-align:left;font-size:11px;color:var(--text-dim);padding:0 12px 8px 0;text-transform:uppercase;letter-spacing:.06em">Attempts</th>\' +
-        \'<th style="text-align:left;font-size:11px;color:var(--text-dim);padding:0 12px 8px 0;text-transform:uppercase;letter-spacing:.06em">Last Seen</th>\' +
-        \'<th style="text-align:left;font-size:11px;color:var(--text-dim);padding:0 0 8px 0;text-transform:uppercase;letter-spacing:.06em">Action</th>\' +
-        \'</tr></thead><tbody>\' + rows + \'</tbody></table>\';
+      window._takWatchingList = d.watching || [];
+      var s = document.getElementById(\'tak-watching-search\');
+      var q = s ? s.value.trim().toLowerCase() : \'\';
+      renderTakWatchingList(q ? window._takWatchingList.filter(function(w){ return w.ip.indexOf(q) !== -1; }) : window._takWatchingList);
     }).catch(function(){
       var el = document.getElementById(\'tak-watching-list\');
       if (el) el.innerHTML = \'<div style="color:var(--text-dim);font-size:12px">Error loading watch list.</div>\';
@@ -17853,16 +18627,10 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
           renderChips(\'tak-cfg-ignoreip\', \'tak-cfg-ignoreip-chips\');
         }
         var ips = d.banned_ips || [];
-        var c = document.getElementById(\'tak-ban-list-container\');
-        if (!ips.length) {
-          c.innerHTML = \'<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>\';
-        } else {
-          var rows = ips.map(function(ip){
-            return \'<tr><td>\' + ip + \'</td><td><button class="btn-danger-sm" onclick="unbanTakIP(\\\'\'+ ip +\'\\\')">\' +
-                   \'Unban</button></td></tr>\';
-          }).join(\'\');
-          c.innerHTML = \'<table class="ban-table"><thead><tr><th>IP Address</th><th>Action</th></tr></thead><tbody>\' + rows + \'</tbody></table>\';
-        }
+        window._takBannedIps = ips;
+        renderTakBanList(ips);
+        var caret = document.getElementById(\'tak-banned-caret\');
+        if (caret) caret.textContent = ips.length ? \'▼ details\' : \'\';
       } else {
         if (enabledSec) enabledSec.style.display = \'none\';
       }
@@ -17899,6 +18667,26 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
       }).catch(function(){ showToast(\'Network error\', \'error\'); });
   };
 
+  window._takBannedIps = [];
+  window._takSortAsc = true;
+  function _takIpToNum(ip){var p=ip.split(\'.\');return p.length===4?((+p[0]<<24)|(+p[1]<<16)|(+p[2]<<8)|+p[3])>>>0:0;}
+  window.renderTakBanList = function(ips){
+    var c=document.getElementById(\'tak-ban-list-container\');if(!c)return;
+    if(!ips.length){c.innerHTML=\'<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>\';return;}
+    var sorted=ips.slice().sort(function(a,b){var d=_takIpToNum(a)-_takIpToNum(b);return window._takSortAsc?d:-d;});
+    var arrow=window._takSortAsc?\' ▲\':\' ▼\';
+    var rows=sorted.map(function(ip){return \'<tr style="border-bottom:1px solid var(--border)"><td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">\'+ip+\'</td><td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="unbanTakIP(\\\'\'+ip+\'\\\')">Unban</button></td></tr>\';}).join(\'\');
+    c.innerHTML=\'<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em"><th style="padding:4px 8px;text-align:left;cursor:pointer;user-select:none" onclick="toggleTakSort()">IP Address\'+arrow+\'</th><th style="padding:4px 8px;text-align:right">Action</th></tr></thead><tbody>\'+rows+\'</tbody></table>\';
+  };
+  window.toggleTakSort = function(){window._takSortAsc=!window._takSortAsc;filterTakBanList();};
+  window.filterTakBanList = function(){var q=(document.getElementById(\'tak-ban-search\').value||\'\').trim().toLowerCase();renderTakBanList(q?window._takBannedIps.filter(function(ip){return ip.toLowerCase().indexOf(q)!==-1;}):window._takBannedIps);};
+  window.toggleTakBanPanel = function(){
+    var panel=document.getElementById(\'tak-ban-panel\');var caret=document.getElementById(\'tak-banned-caret\');if(!panel)return;
+    var open=panel.style.display!==\'none\';panel.style.display=open?\'none\':\'\';
+    if(caret)caret.textContent=open?\'▼ details\':\'▲ details\';
+    if(!open){var s=document.getElementById(\'tak-ban-search\');if(s)s.value=\'\';renderTakBanList(window._takBannedIps);}
+  };
+
   window.unbanTakIP = function(ip) {
     if (!confirm(\'Unban \' + ip + \' from TAK Server jail?\')) return;
     fetch(\'/api/fail2ban/takserver/unban\', {method:\'POST\', headers:{\'Content-Type\':\'application/json\'}, body:JSON.stringify({ip:ip})})
@@ -17910,6 +18698,319 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
 
   loadTakStatus();
   setInterval(function(){ loadTakStatus(); if (watchingPanelOpen) _loadWatchingList(); }, 30000);
+})();
+
+// SSH Jail
+(function(){
+  var sshCard = document.getElementById(\'ssh-jail-card\');
+  if (!sshCard) return;
+
+  function loadSshStatus() {
+    fetch(\'/api/fail2ban/ssh/status\').then(function(r){ return r.json(); }).then(function(d){
+      if (!d.available) return;
+      var badge  = document.getElementById(\'ssh-jail-badge\');
+      var toggle = document.getElementById(\'ssh-toggle\');
+      var sec    = document.getElementById(\'ssh-enabled-section\');
+      if (badge) {
+        if (d.jail_enabled) { badge.className = \'badge badge-green\'; badge.innerHTML = \'<span class="dot dot-pulse"></span>Active\'; }
+        else                { badge.className = \'badge badge-red\';   badge.innerHTML = \'<span class="dot"></span>Disabled\'; }
+      }
+      if (toggle) toggle.checked = d.jail_enabled;
+      var sshTrack = document.getElementById(\'ssh-toggle-track\');
+      var sshThumb = document.getElementById(\'ssh-toggle-thumb\');
+      if (sshTrack) sshTrack.style.background = d.jail_enabled ? \'var(--green)\' : \'var(--border)\';
+      if (sshThumb) sshThumb.style.transform  = d.jail_enabled ? \'translateX(18px)\' : \'\';
+      if (sec)    sec.style.display = d.jail_enabled ? \'\' : \'none\';
+      if (d.jail_enabled) {
+        document.getElementById(\'ssh-stat-banned\').textContent       = d.currently_banned  !== undefined ? d.currently_banned  : 0;
+        document.getElementById(\'ssh-stat-failed\').textContent       = d.currently_failed  !== undefined ? d.currently_failed  : 0;
+        document.getElementById(\'ssh-stat-total-banned\').textContent = d.total_banned       !== undefined ? d.total_banned       : 0;
+        var cfg = d.jail_config || {};
+        if (cfg.maxretry) document.getElementById(\'ssh-cfg-maxretry\').value = cfg.maxretry;
+        if (cfg.findtime) document.getElementById(\'ssh-cfg-findtime\').value = Math.round(cfg.findtime / 60);
+        if (cfg.bantime)  document.getElementById(\'ssh-cfg-bantime\').value  = Math.round(cfg.bantime  / 60);
+        var ipEl = document.getElementById(\'ssh-cfg-ignoreip\');
+        if (ipEl) { ipEl.value = (cfg.ignoreip || \'\').replace(/127\\.0\\.0\\.1\\/8\\s*::1\\s*/,\'\').trim(); renderChips(\'ssh-cfg-ignoreip\', \'ssh-cfg-ignoreip-chips\'); }
+        var ips = d.banned_ips || [];
+        window._sshBannedIps = ips;
+        renderSshBanList(ips);
+        var caret = document.getElementById(\'ssh-banned-caret\');
+        if (caret) caret.textContent = ips.length ? \'▼ details\' : \'\';
+      }
+    }).catch(function(){});
+  }
+
+  window.toggleSshJail = function() {
+    var enabled = document.getElementById(\'ssh-toggle\').checked;
+    if (!enabled) {
+      fetch(\'/api/fail2ban/ssh/config\', {method:\'POST\', headers:{\'Content-Type\':\'application/json\'}, body:JSON.stringify({enabled:false})})
+        .then(function(r){ return r.json(); }).then(function(d){
+          if (d.ok) { showToast(\'SSH jail disabled.\', \'success\'); loadSshStatus(); }
+          else { showToast(d.error || \'Failed to disable\', \'error\'); loadSshStatus(); }
+        }).catch(function(){ showToast(\'Network error\', \'error\'); loadSshStatus(); });
+    } else {
+      saveSshConfig();
+    }
+  };
+
+  window.saveSshConfig = function() {
+    var body = {
+      enabled:  true,
+      maxretry: parseInt(document.getElementById(\'ssh-cfg-maxretry\').value) || 3,
+      findtime: (parseInt(document.getElementById(\'ssh-cfg-findtime\').value) || 10) * 60,
+      bantime:  (parseInt(document.getElementById(\'ssh-cfg-bantime\').value)  || 60) * 60,
+      ignoreip: (document.getElementById(\'ssh-cfg-ignoreip\').value || \'\').trim()
+    };
+    fetch(\'/api/fail2ban/ssh/config\', {method:\'POST\', headers:{\'Content-Type\':\'application/json\'}, body:JSON.stringify(body)})
+      .then(function(r){ return r.json(); }).then(function(d){
+        if (d.ok) { showToast(\'SSH jail \' + (d.enabled ? \'enabled and saved.\' : \'disabled.\'), \'success\'); loadSshStatus(); }
+        else showToast(d.error || \'Save failed\', \'error\');
+      }).catch(function(){ showToast(\'Network error\', \'error\'); });
+  };
+
+  window._sshBannedIps = [];
+  window._sshSortAsc = true;
+
+  function _ipToNum(ip){var p=ip.split(\'.\');return p.length===4?((+p[0]<<24)|(+p[1]<<16)|(+p[2]<<8)|+p[3])>>>0:0;}
+
+  window.renderSshBanList = function(ips) {
+    var c = document.getElementById(\'ssh-ban-list-container\');
+    if (!c) return;
+    if (!ips.length) {
+      c.innerHTML = \'<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>\';
+      return;
+    }
+    var sorted = ips.slice().sort(function(a,b){ var d=_ipToNum(a)-_ipToNum(b); return window._sshSortAsc?d:-d; });
+    var arrow = window._sshSortAsc ? \' ▲\' : \' ▼\';
+    var rows = sorted.map(function(ip){
+      return \'<tr style="border-bottom:1px solid var(--border)">\'+
+        \'<td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">\'+ip+\'</td>\'+
+        \'<td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="unbanSshIP(\\\'\'+ip+\'\\\')">Unban</button></td></tr>\';
+    }).join(\'\');
+    c.innerHTML = \'<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em">\'+
+      \'<th style="padding:4px 8px;text-align:left;cursor:pointer;user-select:none" onclick="toggleSshSort()">IP Address\'+arrow+\'</th>\'+
+      \'<th style="padding:4px 8px;text-align:right">Action</th></tr></thead><tbody>\'+rows+\'</tbody></table>\';
+  };
+
+  window.toggleSshSort = function() {
+    window._sshSortAsc = !window._sshSortAsc;
+    filterSshBanList();
+  };
+
+  window.filterSshBanList = function() {
+    var q = (document.getElementById(\'ssh-ban-search\').value || \'\').trim().toLowerCase();
+    var filtered = q ? window._sshBannedIps.filter(function(ip){ return ip.toLowerCase().indexOf(q) !== -1; }) : window._sshBannedIps;
+    renderSshBanList(filtered);
+  };
+
+  var _sshWatchingOpen = false;
+  window.toggleSshWatchingPanel = function() {
+    _sshWatchingOpen = !_sshWatchingOpen;
+    var panel = document.getElementById(\'ssh-watching-panel\');
+    var caret = document.getElementById(\'ssh-watching-caret\');
+    var tog   = document.getElementById(\'ssh-watching-toggle\');
+    if (!panel) return;
+    panel.style.display = _sshWatchingOpen ? \'block\' : \'none\';
+    if (caret) caret.textContent = _sshWatchingOpen ? \'▲ hide\' : \'▼ details\';
+    if (tog)   tog.style.borderColor = _sshWatchingOpen ? \'var(--yellow)\' : \'\';
+    if (_sshWatchingOpen) _loadSshWatchingList();
+  };
+  window._sshWatchingList = [];
+  window._sshWatchingSortCol = \'ip\';
+  window._sshWatchingSortAsc = true;
+
+  window.renderSshWatchingList = function(list) {
+    var el = document.getElementById(\'ssh-watching-list\'); if (!el) return;
+    if (!list.length) { el.innerHTML=\'<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently under watch.</div>\'; return; }
+    var col = window._sshWatchingSortCol; var asc = window._sshWatchingSortAsc;
+    var sorted = list.slice().sort(function(a,b){
+      if (col===\'ip\') { var d=_ipToNum(a.ip)-_ipToNum(b.ip); return asc?d:-d; }
+      return asc ? a.attempts-b.attempts : b.attempts-a.attempts;
+    });
+    var ipArrow  = col===\'ip\'      ? (asc?\' ▲\':\' ▼\') : \'\';
+    var attArrow = col===\'attempts\' ? (asc?\' ▲\':\' ▼\') : \'\';
+    var rows = sorted.map(function(w){
+      return \'<tr style="border-bottom:1px solid var(--border)">\'+
+        \'<td style="font-family:monospace;padding:5px 8px;color:var(--text-primary);font-size:12px">\'+w.ip+\'</td>\'+
+        \'<td style="padding:5px 8px;color:var(--yellow);font-family:monospace;font-size:12px">\'+w.attempts+\'</td>\'+
+        \'<td style="padding:5px 8px;color:var(--text-dim);font-family:monospace;font-size:11px">\'+w.last_seen+\'</td>\'+
+        \'<td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="manualBanSshIP(\\\'\'+w.ip+\'\\\')">Ban Now</button></td></tr>\';
+    }).join(\'\');
+    el.innerHTML=\'<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em">\'+
+      \'<th style="padding:4px 8px;text-align:left;cursor:pointer;user-select:none" onclick="toggleSshWatchingSort(\\\'ip\\\')">IP Address\'+ipArrow+\'</th>\'+
+      \'<th style="padding:4px 8px;text-align:left;cursor:pointer;user-select:none" onclick="toggleSshWatchingSort(\\\'attempts\\\')">Attempts\'+attArrow+\'</th>\'+
+      \'<th style="padding:4px 8px;text-align:left">Last Seen</th>\'+
+      \'<th style="padding:4px 8px;text-align:right">Action</th>\'+
+      \'</tr></thead><tbody>\'+rows+\'</tbody></table>\';
+  };
+
+  window.toggleSshWatchingSort = function(col) {
+    if (window._sshWatchingSortCol === col) window._sshWatchingSortAsc = !window._sshWatchingSortAsc;
+    else { window._sshWatchingSortCol = col; window._sshWatchingSortAsc = col===\'attempts\' ? false : true; }
+    filterSshWatchingList();
+  };
+
+  window.filterSshWatchingList = function() {
+    var q = (document.getElementById(\'ssh-watching-search\').value || \'\').trim().toLowerCase();
+    renderSshWatchingList(q ? window._sshWatchingList.filter(function(w){ return w.ip.indexOf(q) !== -1; }) : window._sshWatchingList);
+  };
+
+  function _loadSshWatchingList() {
+    fetch(\'/api/fail2ban/ssh/watching\').then(function(r){return r.json();}).then(function(d){
+      window._sshWatchingList = d.watching || [];
+      var s = document.getElementById(\'ssh-watching-search\');
+      var q = s ? s.value.trim().toLowerCase() : \'\';
+      renderSshWatchingList(q ? window._sshWatchingList.filter(function(w){ return w.ip.indexOf(q) !== -1; }) : window._sshWatchingList);
+    }).catch(function(){ var el=document.getElementById(\'ssh-watching-list\'); if(el) el.innerHTML=\'<div style="color:var(--text-dim);font-size:12px">Error loading watch list.</div>\'; });
+  }
+  window.manualBanSshIP = function(ip) {
+    if (!confirm(\'Manually ban \' + ip + \' from the SSH jail now?\')) return;
+    fetch(\'/api/fail2ban/ssh/ban\', {method:\'POST\', headers:{\'Content-Type\':\'application/json\'}, body:JSON.stringify({ip:ip})})
+      .then(function(r){return r.json();}).then(function(d){
+        if (d.ok) { showToast(ip + \' banned.\', \'success\'); loadSshStatus(); if (_sshWatchingOpen) _loadSshWatchingList(); }
+        else showToast(d.error || \'Ban failed\', \'error\');
+      }).catch(function(){ showToast(\'Network error\', \'error\'); });
+  };
+
+  window.toggleSshBanPanel = function() {
+    var panel = document.getElementById(\'ssh-ban-panel\');
+    var caret = document.getElementById(\'ssh-banned-caret\');
+    if (!panel) return;
+    var open = panel.style.display !== \'none\';
+    panel.style.display = open ? \'none\' : \'\';
+    if (caret) caret.textContent = open ? \'▼ details\' : \'▲ details\';
+    if (!open) { var s = document.getElementById(\'ssh-ban-search\'); if(s) s.value=\'\'; renderSshBanList(window._sshBannedIps); }
+  };
+
+  window.unbanSshIP = function(ip) {
+    if (!confirm(\'Unban \' + ip + \' from SSH jail?\')) return;
+    fetch(\'/api/fail2ban/ssh/unban\', {method:\'POST\', headers:{\'Content-Type\':\'application/json\'}, body:JSON.stringify({ip:ip})})
+      .then(function(r){ return r.json(); }).then(function(d){
+        if (d.ok) { showToast(ip + \' unbanned.\', \'success\'); loadSshStatus(); }
+        else showToast(d.error || \'Unban failed\', \'error\');
+      }).catch(function(){ showToast(\'Network error\', \'error\'); });
+  };
+
+  window.manualSshRefresh = function() {
+    _spinIcon(\'ssh-refresh-icon\', true);
+    var btn = document.getElementById(\'ssh-refresh-btn\');
+    if (btn) btn.disabled = true;
+    loadSshStatus();
+    setTimeout(function(){ _spinIcon(\'ssh-refresh-icon\', false); if (btn) btn.disabled = false; }, 1200);
+  };
+
+  loadSshStatus();
+  setInterval(function(){ loadSshStatus(); if (_sshWatchingOpen) _loadSshWatchingList(); }, 30000);
+})();
+
+// Repeat Offender Protection
+(function(){
+  window._recidiveBannedIps=[];
+  window._recidiveSortAsc=true;
+  function _recIpToNum(ip){var p=ip.split(\'.\');return p.length===4?((+p[0]<<24)|(+p[1]<<16)|(+p[2]<<8)|+p[3])>>>0:0;}
+
+  window.renderRecidiveBanList=function(ips){
+    var c=document.getElementById(\'recidive-ban-list-container\');if(!c)return;
+    if(!ips.length){c.innerHTML=\'<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs permanently banned.</div>\';return;}
+    var sorted=ips.slice().sort(function(a,b){var d=_recIpToNum(a)-_recIpToNum(b);return window._recidiveSortAsc?d:-d;});
+    var arrow=window._recidiveSortAsc?\' ▲\':\' ▼\';
+    var rows=sorted.map(function(ip){
+      return \'<tr style="border-bottom:1px solid var(--border)">\'+
+        \'<td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">\'+ip+\'</td>\'+
+        \'<td style="padding:5px 8px;text-align:center"><span style="font-size:10px;color:var(--red);background:rgba(239,68,68,0.1);padding:1px 5px;border-radius:3px;border:1px solid rgba(239,68,68,0.3)">&#8734;</span></td>\'+
+        \'<td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="unbanRecidiveIP(\\\'\'+ip+\'\\\')">Unban</button></td></tr>\';
+    }).join(\'\');
+    c.innerHTML=\'<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em">\'+
+      \'<th style="padding:4px 8px;text-align:left;cursor:pointer;user-select:none" onclick="toggleRecidiveSort()">IP Address\'+arrow+\'</th>\'+
+      \'<th style="padding:4px 8px;text-align:center">Duration</th>\'+
+      \'<th style="padding:4px 8px;text-align:right">Action</th></tr></thead><tbody>\'+rows+\'</tbody></table>\';
+  };
+
+  window.toggleRecidiveSort=function(){window._recidiveSortAsc=!window._recidiveSortAsc;filterRecidiveBanList();};
+  window.filterRecidiveBanList=function(){var q=(document.getElementById(\'recidive-ban-search\').value||\'\').trim().toLowerCase();renderRecidiveBanList(q?window._recidiveBannedIps.filter(function(ip){return ip.toLowerCase().indexOf(q)!==-1;}):window._recidiveBannedIps);};
+  window.toggleRecidiveBanPanel=function(){
+    var panel=document.getElementById(\'recidive-ban-panel\');var caret=document.getElementById(\'recidive-banned-caret\');if(!panel)return;
+    var open=panel.style.display!==\'none\';panel.style.display=open?\'none\':\'\';
+    if(caret)caret.textContent=open?\'▼ details\':\'▲ details\';
+    if(!open){var s=document.getElementById(\'recidive-ban-search\');if(s)s.value=\'\';renderRecidiveBanList(window._recidiveBannedIps);}
+  };
+
+  function loadRecidiveStatus(){
+    fetch(\'/api/fail2ban/recidive/status\').then(function(r){return r.json();}).then(function(d){
+      if(!d.available)return;
+      var badge=document.getElementById(\'recidive-badge\');
+      var toggle=document.getElementById(\'recidive-toggle\');
+      var track=document.getElementById(\'recidive-toggle-track\');
+      var thumb=document.getElementById(\'recidive-toggle-thumb\');
+      var sec=document.getElementById(\'recidive-enabled-section\');
+      if(d.jail_enabled){
+        if(badge){badge.className=\'badge badge-green\';badge.innerHTML=\'<span class="dot dot-pulse"></span>Active\';}
+        if(track)track.style.background=\'var(--green)\';
+        if(thumb)thumb.style.transform=\'translateX(18px)\';
+      }else{
+        if(badge){badge.className=\'badge badge-red\';badge.innerHTML=\'<span class="dot"></span>Disabled\';}
+        if(track)track.style.background=\'var(--border)\';
+        if(thumb)thumb.style.transform=\'\';
+      }
+      if(toggle)toggle.checked=d.jail_enabled;
+      if(sec)sec.style.display=d.jail_enabled?\'\':\'none\';
+      if(d.jail_enabled){
+        document.getElementById(\'recidive-stat-banned\').textContent=d.currently_banned||0;
+        document.getElementById(\'recidive-stat-total\').textContent=d.total_banned||0;
+        var cfg=d.jail_config||{};
+        if(cfg.maxretry)document.getElementById(\'recidive-cfg-maxretry\').value=cfg.maxretry;
+        if(cfg.findtime)document.getElementById(\'recidive-cfg-findtime\').value=Math.round(cfg.findtime/3600);
+        var ips=d.banned_ips||[];
+        window._recidiveBannedIps=ips;
+        renderRecidiveBanList(ips);
+        var caret=document.getElementById(\'recidive-banned-caret\');
+        if(caret)caret.textContent=ips.length?\'▼ details\':\'\';
+      }
+    }).catch(function(){});
+  }
+
+  window.toggleRecidiveJail=function(){
+    var enabled=document.getElementById(\'recidive-toggle\').checked;
+    if(!enabled){
+      fetch(\'/api/fail2ban/recidive/config\',{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify({enabled:false})})
+        .then(function(r){return r.json();}).then(function(d){
+          if(d.ok){showToast(\'Repeat Offender Protection disabled.\',\'success\');loadRecidiveStatus();}
+          else{showToast(d.error||\'Failed to disable\',\'error\');loadRecidiveStatus();}
+        }).catch(function(){showToast(\'Network error\',\'error\');loadRecidiveStatus();});
+    }else{saveRecidiveConfig();}
+  };
+
+  window.saveRecidiveConfig=function(){
+    var body={
+      enabled:true,
+      maxretry:parseInt(document.getElementById(\'recidive-cfg-maxretry\').value)||3,
+      findtime:(parseInt(document.getElementById(\'recidive-cfg-findtime\').value)||24)*3600
+    };
+    fetch(\'/api/fail2ban/recidive/config\',{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify(body)})
+      .then(function(r){return r.json();}).then(function(d){
+        if(d.ok){showToast(\'Repeat Offender Protection saved.\',\'success\');loadRecidiveStatus();}
+        else showToast(d.error||\'Save failed\',\'error\');
+      }).catch(function(){showToast(\'Network error\',\'error\');});
+  };
+
+  window.unbanRecidiveIP=function(ip){
+    if(!confirm(\'Permanently unban \'+ip+\' from Repeat Offender Protection?\\n\\nThis IP will be able to attempt connections again.\'))return;
+    fetch(\'/api/fail2ban/recidive/unban\',{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify({ip:ip})})
+      .then(function(r){return r.json();}).then(function(d){
+        if(d.ok){showToast(ip+\' permanently unbanned.\',\'success\');loadRecidiveStatus();}
+        else showToast(d.error||\'Unban failed\',\'error\');
+      }).catch(function(){showToast(\'Network error\',\'error\');});
+  };
+
+  window.manualRecidiveRefresh=function(){
+    _spinIcon(\'recidive-refresh-icon\',true);
+    var btn=document.getElementById(\'recidive-refresh-btn\');if(btn)btn.disabled=true;
+    loadRecidiveStatus();
+    setTimeout(function(){_spinIcon(\'recidive-refresh-icon\',false);if(btn)btn.disabled=false;},1200);
+  };
+
+  loadRecidiveStatus();
+  setInterval(loadRecidiveStatus,30000);
 })();
 </script>
 </body></html>'''
@@ -18131,7 +19232,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     <summary><span>Certificates &amp; CA rotation</span><span class="chev">&#9662;</span></summary>
     <div class="fh-section-body">
       <div id="fedhub-cert-expiry-section" style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim);margin-bottom:14px;line-height:1.5;min-height:1.2em"></div>
-      <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:10px"><strong>Browser admin cert:</strong> Import <code style="font-size:11px">webadmin-fed.p12</code> (from deploy or CA rotation, also under <code style="font-size:11px">/root/</code> on the Fed Hub host). Keystore / P12 password (effective): <code style="font-size:11px;font-family:'JetBrains Mono',monospace">{{ fh_cert_password_effective }}</code> — set under <strong>Certificate metadata</strong> below (or inherits TAK console cert password). Or use <strong>Authentik SSO</strong> below.</p>
+      <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:10px"><strong>Browser admin cert:</strong> Import <code style="font-size:11px">webadmin-fed.p12</code> (from deploy or CA rotation, also under <code style="font-size:11px">$HOME/</code> on the Fed Hub host). Keystore / P12 password (effective): <code style="font-size:11px;font-family:'JetBrains Mono',monospace">{{ fh_cert_password_effective }}</code> — set under <strong>Certificate metadata</strong> below (or inherits TAK console cert password). Or use <strong>Authentik SSO</strong> below.</p>
       <div class="controls" style="align-items:center;flex-wrap:wrap;gap:12px;margin-bottom:16px">
         <button class="btn btn-ghost" type="button" onclick="fedhubDownloadWebadminCert()">⬇ Download webadmin-fed.p12</button>
         <span id="fedhub-cert-download-msg" style="font-size:12px;color:var(--text-dim)"></span>
@@ -19865,6 +20966,29 @@ window.doUninstall = function() {
     cancelBtn.disabled = false;
   });
 };
+
+window.doCloudtakResetConfig = function() {
+  var msgEl = document.getElementById("ct-reset-msg");
+  var btn = document.getElementById("ct-reset-confirm-btn");
+  if (msgEl) { msgEl.textContent = "Resetting..."; msgEl.style.color = "var(--text-dim)"; }
+  if (btn) btn.disabled = true;
+  fetch("/api/cloudtak/reset-server-config", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    credentials: "same-origin"
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.success) {
+      if (msgEl) { msgEl.textContent = "\u2713 " + (d.message || "Config cleared. Re-run the bootstrap wizard."); msgEl.style.color = "var(--green)"; }
+      setTimeout(function() { document.getElementById("ct-reset-modal").classList.remove("open"); if (msgEl) msgEl.textContent = ""; if (btn) btn.disabled = false; }, 3500);
+    } else {
+      if (msgEl) { msgEl.textContent = "\u2717 " + (d.error || "Reset failed"); msgEl.style.color = "var(--red)"; }
+      if (btn) btn.disabled = false;
+    }
+  }).catch(function(err) {
+    if (msgEl) { msgEl.textContent = "Request failed: " + (err && err.message ? err.message : "network error"); msgEl.style.color = "var(--red)"; }
+    if (btn) btn.disabled = false;
+  });
+};
 '''
 
 CLOUDTAK_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
@@ -19959,7 +21083,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <div class="section-title" style="margin-top:20px">Controls</div>
   <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:24px">
   <div class="controls" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
-  {% if cloudtak.running %}<button class="control-btn" onclick="control('restart')">↻ Restart</button><button class="control-btn" onclick="startRedeploy()" id="redeploy-btn">🔄 Update config</button><button class="control-btn btn-update" onclick="startCloudtakUpdate()" id="cloudtak-update-btn"{% if cloudtak_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if cloudtak_update_available %} <span style="color:var(--cyan)" title="Update available: v{{ cloudtak_latest }}">●</span>{% endif %}</button><button class="control-btn btn-stop" onclick="control('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="control('start')">▶ Start</button><button class="control-btn" onclick="startRedeploy()" id="redeploy-btn">🔄 Update config</button><button class="control-btn btn-update" onclick="startCloudtakUpdate()" id="cloudtak-update-btn"{% if cloudtak_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if cloudtak_update_available %} <span style="color:var(--cyan)" title="Update available: v{{ cloudtak_latest }}">●</span>{% endif %}</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% endif %}
+  {% if cloudtak.running %}<button class="control-btn" onclick="control('restart')">↻ Restart</button><button class="control-btn" onclick="startRedeploy()" id="redeploy-btn">🔄 Update config</button><button class="control-btn btn-update" onclick="startCloudtakUpdate()" id="cloudtak-update-btn"{% if cloudtak_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if cloudtak_update_available %} <span style="color:var(--cyan)" title="Update available: v{{ cloudtak_latest }}">●</span>{% endif %}</button><button class="control-btn" onclick="document.getElementById('ct-reset-modal').classList.add('open')" style="color:var(--yellow);border-color:rgba(234,179,8,0.4)">🔑 Reset Config</button><button class="control-btn btn-stop" onclick="control('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="control('start')">▶ Start</button><button class="control-btn" onclick="startRedeploy()" id="redeploy-btn">🔄 Update config</button><button class="control-btn btn-update" onclick="startCloudtakUpdate()" id="cloudtak-update-btn"{% if cloudtak_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if cloudtak_update_available %} <span style="color:var(--cyan)" title="Update available: v{{ cloudtak_latest }}">●</span>{% endif %}</button><button class="control-btn" onclick="document.getElementById('ct-reset-modal').classList.add('open')" style="color:var(--yellow);border-color:rgba(234,179,8,0.4)">🔑 Reset Config</button><button class="control-btn btn-remove" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Remove</button>{% endif %}
   </div>
   <div id="control-status" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
   </div>
@@ -20101,6 +21225,19 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 </div>
 
 <!-- Uninstall modal -->
+<div class="modal-overlay" id="ct-reset-modal">
+  <div class="modal">
+    <h3>🔑 Reset CloudTAK Server Config?</h3>
+    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:8px">This clears the stored TAK Server connection (URL, cert, and admin account) from CloudTAK's database so you can re-run the bootstrap wizard with new TAK Server details.</p>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:4px">Your map data and tile layers remain intact. Only the TAK Server connection is cleared.</p>
+    <div class="modal-actions" style="margin-top:16px">
+      <button class="btn btn-ghost" onclick="document.getElementById('ct-reset-modal').classList.remove('open')">Cancel</button>
+      <button class="btn" id="ct-reset-confirm-btn" onclick="doCloudtakResetConfig()" style="background:linear-gradient(135deg,#92400e,#b45309);color:#fff;border:none">Reset Config</button>
+    </div>
+    <div id="ct-reset-msg" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
+  </div>
+</div>
+
 <div class="modal-overlay" id="uninstall-modal">
   <div class="modal">
     <h3>&#x26a0; Uninstall CloudTAK?</h3>
@@ -21663,6 +22800,135 @@ def authentik_uninstall():
     return jsonify({'success': True, 'steps': steps})
 
 
+@app.route('/api/authentik/reputation/status')
+@login_required
+def authentik_reputation_status_api():
+    """Return current Authentik Reputation Policy status and top flagged IPs."""
+    import urllib.request as _req
+    settings = load_settings()
+    ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or \
+               _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
+    if not ak_token:
+        return jsonify({'ok': False, 'error': 'Authentik token not found'})
+    url     = _get_authentik_api_url(settings)
+    headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+    try:
+        rep_cfg = settings.get('authentik_reputation_policy') or {}
+        req = _req.Request(
+            f'{url}/api/v3/policies/reputation/?search=infratak-brute-force',
+            headers=headers
+        )
+        resp    = json.loads(_req.urlopen(req, timeout=8).read().decode())
+        policy  = next((p for p in resp.get('results', [])
+                        if p.get('name') == 'infratak-brute-force'), None)
+        enabled = policy is not None
+        threshold = (policy or {}).get('threshold', rep_cfg.get('threshold', -5))
+        # Fetch current scores (top offenders)
+        scores = []
+        try:
+            req2   = _req.Request(f'{url}/api/v3/policies/reputation/scores/?page_size=20', headers=headers)
+            s_resp = json.loads(_req.urlopen(req2, timeout=8).read().decode())
+            scores = [{'ip': e.get('ip'), 'score': e.get('score', 0)}
+                      for e in s_resp.get('results', []) if e.get('ip')]
+            scores.sort(key=lambda x: x['score'])
+        except Exception:
+            pass
+        return jsonify({
+            'ok': True, 'enabled': enabled,
+            'policy_pk': (policy or {}).get('pk'),
+            'threshold': threshold,
+            'scores': scores,
+            'last_applied': rep_cfg.get('applied_at'),
+        })
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]})
+
+
+@app.route('/api/authentik/reputation/config', methods=['POST'])
+@login_required
+def authentik_reputation_config_api():
+    """Enable or disable the reputation policy, and update threshold."""
+    import urllib.request as _req
+    settings = load_settings()
+    ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or \
+               _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
+    if not ak_token:
+        return jsonify({'ok': False, 'error': 'Authentik token not found'}), 400
+    url     = _get_authentik_api_url(settings)
+    headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+    data      = request.get_json(force=True) or {}
+    enabled   = bool(data.get('enabled', True))
+    threshold = int(data.get('threshold', -5))
+    try:
+        req  = _req.Request(
+            f'{url}/api/v3/policies/reputation/?search=infratak-brute-force',
+            headers=headers
+        )
+        resp = json.loads(_req.urlopen(req, timeout=8).read().decode())
+        policy = next((p for p in resp.get('results', [])
+                       if p.get('name') == 'infratak-brute-force'), None)
+        if not enabled:
+            if policy:
+                del_req = _req.Request(
+                    f'{url}/api/v3/policies/reputation/{policy["pk"]}/',
+                    headers=headers, method='DELETE'
+                )
+                try:
+                    _req.urlopen(del_req, timeout=8)
+                except Exception:
+                    pass
+            s = load_settings()
+            rc = s.get('authentik_reputation_policy') or {}
+            rc['last_outcome'] = 'disabled'
+            rc['threshold']    = threshold
+            s['authentik_reputation_policy'] = rc
+            save_settings(s)
+            return jsonify({'ok': True, 'enabled': False})
+        # Enable: create or update policy + (re)bind
+        s = load_settings()
+        rc = s.get('authentik_reputation_policy') or {}
+        rc['last_outcome'] = ''  # reset so _authentik_setup_reputation_policy re-applies
+        rc['threshold']    = threshold
+        s['authentik_reputation_policy'] = rc
+        save_settings(s)
+        applied = _authentik_setup_reputation_policy(lambda m: None)
+        return jsonify({'ok': True, 'enabled': True, 'applied': applied, 'threshold': threshold})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+
+@app.route('/api/authentik/reputation/scores/clear', methods=['POST'])
+@login_required
+def authentik_reputation_clear_scores_api():
+    """Clear all reputation scores (bulk delete)."""
+    import urllib.request as _req
+    settings = load_settings()
+    ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or \
+               _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
+    if not ak_token:
+        return jsonify({'ok': False, 'error': 'Authentik token not found'}), 400
+    url     = _get_authentik_api_url(settings)
+    headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+    try:
+        # Fetch all score PKs and delete them
+        req    = _req.Request(f'{url}/api/v3/policies/reputation/scores/?page_size=100', headers=headers)
+        scores = json.loads(_req.urlopen(req, timeout=8).read().decode()).get('results', [])
+        deleted = 0
+        for sc in scores:
+            try:
+                del_req = _req.Request(
+                    f'{url}/api/v3/policies/reputation/scores/{sc["pk"]}/',
+                    headers=headers, method='DELETE'
+                )
+                _req.urlopen(del_req, timeout=8)
+                deleted += 1
+            except Exception:
+                pass
+        return jsonify({'ok': True, 'deleted': deleted})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+
 def _run_authentik_deploy_remote(settings, deploy_cfg, plog):
     """Deploy Authentik on a remote host via SSH (Docker Compose)."""
     import secrets as _sec
@@ -21985,6 +23251,10 @@ entries:
   server:
     image: ${AUTHENTIK_IMAGE:-ghcr.io/goauthentik/server}:${AUTHENTIK_TAG:-2026.2.0}
     restart: unless-stopped
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     command: server
     networks:
       - default
@@ -22027,7 +23297,6 @@ entries:
       AUTHENTIK_POSTGRESQL__PASSWORD: ${PG_PASS}
     user: root
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
       - ./media:/media
       - ./certs:/certs
       - ./custom-templates:/templates
@@ -22055,6 +23324,10 @@ entries:
       AUTHENTIK_INSECURE: "true"
       AUTHENTIK_TOKEN: placeholder
     restart: unless-stopped
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:9300/outpost.goauthentik.io/ping"]
       start_period: 30s
@@ -23124,6 +24397,8 @@ def _authentik_apply_official_tunings(plog):
 
     target_settings = [
         ('AUTHENTIK_WEB__WORKERS', '4', '4 web workers (vs default 2)'),
+        ('AUTHENTIK_WEB__MAX_REQUESTS', '0', 'disable gunicorn worker recycling — eliminates periodic LDAP websocket drops'),
+        ('AUTHENTIK_WEB__MAX_REQUESTS_JITTER', '0', 'disable max_requests jitter (pair with MAX_REQUESTS=0)'),
         ('AUTHENTIK_CACHE__TIMEOUT_FLOWS', '600', 'flows cache 600s (vs default 300s) — reduces DB pressure'),
         ('AUTHENTIK_CACHE__TIMEOUT_POLICIES', '600', 'policies cache 600s (vs default 300s) — reduces DB pressure'),
         ('AUTHENTIK_LOG_LEVEL', 'warning', 'log level warning (vs default info) — reduces log overhead'),
@@ -23558,6 +24833,159 @@ def _authentik_fix_ldap_flow_recursion(plog):
         pass
 
     return True
+
+
+def _authentik_setup_reputation_policy(plog):
+    """v0.9.2: Create and bind an Authentik ReputationPolicy on the ldap-authentication-flow.
+
+    This adds a flow-level brute-force check that runs *inside* Authentik before
+    the password stage. Every failed login decrements the source-IP score by 1.
+    When the score drops below the threshold the policy denies the flow immediately.
+    Scores recover over time. This is complementary to Fail2ban (which blocks at
+    the host firewall level) — reputation policy trips first (faster, lower threshold).
+
+    Idempotency key: settings.authentik_reputation_policy.last_outcome in
+    {applied, idempotent-noop}.
+
+    Returns True if applied (first run), False if no-op or skipped.
+    """
+    import urllib.request as _req
+    import urllib.error
+
+    ak_env = os.path.expanduser('~/authentik/.env')
+    if not os.path.exists(ak_env):
+        plog("  reputation policy: ~/authentik/.env not found — skipping (Authentik not installed)")
+        return False
+
+    settings = load_settings()
+    ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or \
+               _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
+    if not ak_token:
+        plog("  reputation policy: no Authentik token found — skipping")
+        return False
+
+    url     = _get_authentik_api_url(settings)
+    headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+
+    # Check if Authentik server is reachable
+    try:
+        _req.urlopen(_req.Request(f'{url}/api/v3/core/users/?page_size=1', headers=headers), timeout=8)
+    except Exception as e:
+        plog(f"  reputation policy: Authentik API unreachable ({e}) — skipping")
+        return False
+
+    # Check idempotency
+    rep_cfg = settings.get('authentik_reputation_policy') or {}
+    if rep_cfg.get('last_outcome') in ('applied', 'idempotent-noop'):
+        # Still record the check time
+        try:
+            s = load_settings()
+            rc = s.get('authentik_reputation_policy') or {}
+            rc['last_check_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+            rc['last_outcome'] = 'idempotent-noop'
+            s['authentik_reputation_policy'] = rc
+            save_settings(s)
+        except Exception:
+            pass
+        plog("  reputation policy: already applied (idempotent — skipping)")
+        return False
+
+    plog("  reputation policy: applying for the first time…")
+    threshold = rep_cfg.get('threshold', -5)
+
+    try:
+        # 1. Check if a reputation policy named 'infratak-brute-force' already exists
+        req = _req.Request(f'{url}/api/v3/policies/reputation/?search=infratak-brute-force', headers=headers)
+        resp = json.loads(_req.urlopen(req, timeout=10).read().decode())
+        policy_obj = next((p for p in resp.get('results', [])
+                           if p.get('name') == 'infratak-brute-force'), None)
+
+        if not policy_obj:
+            plog("  reputation policy: creating ReputationPolicy…")
+            policy_data = {
+                'name':             'infratak-brute-force',
+                'threshold':        threshold,
+                'check_ip':         True,
+                'check_username':   True,
+            }
+            req = _req.Request(
+                f'{url}/api/v3/policies/reputation/',
+                data=json.dumps(policy_data).encode(),
+                headers=headers, method='POST'
+            )
+            policy_obj = json.loads(_req.urlopen(req, timeout=10).read().decode())
+            plog(f"  reputation policy: created policy pk={policy_obj['pk']}")
+        else:
+            plog(f"  reputation policy: policy exists pk={policy_obj['pk']}")
+
+        policy_pk = policy_obj['pk']
+
+        # 2. Find the ldap-authentication-flow pk
+        req = _req.Request(
+            f'{url}/api/v3/flows/instances/?slug=ldap-authentication-flow',
+            headers=headers
+        )
+        flows = json.loads(_req.urlopen(req, timeout=10).read().decode())['results']
+        ldap_flow = next((f for f in flows if f.get('slug') == 'ldap-authentication-flow'), None)
+        if not ldap_flow:
+            plog("  reputation policy: ldap-authentication-flow not found — skipping bind")
+        else:
+            flow_pk = ldap_flow['pk']
+            # 3. Check if binding already exists
+            req = _req.Request(
+                f'{url}/api/v3/policies/bindings/?policy={policy_pk}&target={flow_pk}',
+                headers=headers
+            )
+            bindings = json.loads(_req.urlopen(req, timeout=10).read().decode())['results']
+            if not bindings:
+                plog("  reputation policy: binding policy to ldap-authentication-flow…")
+                bind_data = {
+                    'policy':          policy_pk,
+                    'target':          flow_pk,
+                    'order':           0,
+                    'enabled':         True,
+                    'negate':          False,
+                    'timeout':         30,
+                    'failure_result':  False,
+                }
+                req = _req.Request(
+                    f'{url}/api/v3/policies/bindings/',
+                    data=json.dumps(bind_data).encode(),
+                    headers=headers, method='POST'
+                )
+                _req.urlopen(req, timeout=10)
+                plog("  reputation policy: bound to ldap-authentication-flow")
+            else:
+                plog("  reputation policy: binding already exists")
+
+        # 4. Persist outcome
+        try:
+            s = load_settings()
+            rc = s.get('authentik_reputation_policy') or {}
+            rc['last_outcome']  = 'applied'
+            rc['applied_at']    = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+            rc['policy_pk']     = policy_pk
+            rc['threshold']     = threshold
+            s['authentik_reputation_policy'] = rc
+            save_settings(s)
+        except Exception:
+            pass
+
+        plog("  ✓ reputation policy: applied successfully")
+        return True
+
+    except Exception as e:
+        plog(f"  reputation policy: error — {e}")
+        try:
+            s = load_settings()
+            rc = s.get('authentik_reputation_policy') or {}
+            rc['last_outcome'] = 'error'
+            rc['last_error']   = str(e)[:200]
+            s['authentik_reputation_policy'] = rc
+            save_settings(s)
+        except Exception:
+            pass
+        return False
 
 
 def _authentik_fix_pg_idle_timeout(plog):
@@ -24405,22 +25833,18 @@ entries:
             else:
                 if os.path.exists('/swapfile'):
                     subprocess.run(['swapon', '/swapfile'], capture_output=True, timeout=5)
-                    with open('/etc/fstab', 'r') as f:
-                        fstab = f.read()
+                    fstab = _read_priv('/etc/fstab')
                     if '/swapfile' not in fstab:
-                        with open('/etc/fstab', 'a') as f:
-                            f.write('\n/swapfile swap swap defaults 0 0\n')
+                        _write_priv('/etc/fstab', '\n/swapfile swap swap defaults 0 0\n', mode='a')
                     plog("  Swap file enabled")
                 else:
                     subprocess.run(['fallocate', '-l', '4G', '/swapfile'], check=True, timeout=30)
                     os.chmod('/swapfile', 0o600)
                     subprocess.run(['mkswap', '/swapfile'], check=True, capture_output=True, timeout=10)
                     subprocess.run(['swapon', '/swapfile'], check=True, timeout=10)
-                    with open('/etc/fstab', 'r') as f:
-                        fstab = f.read()
+                    fstab = _read_priv('/etc/fstab')
                     if '/swapfile' not in fstab:
-                        with open('/etc/fstab', 'a') as f:
-                            f.write('\n/swapfile swap swap defaults 0 0\n')
+                        _write_priv('/etc/fstab', '\n/swapfile swap swap defaults 0 0\n', mode='a')
                     plog("  4GB swap configured (reduces Authentik OOM on small VPS)")
         except Exception as e:
             plog(f"  \u26a0 Swap setup skipped: {e}")
@@ -25391,6 +26815,13 @@ AUTHENTIK_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-
 .btn-back{color:var(--text-dim);text-decoration:none;font-size:13px;padding:6px 14px;border:1px solid var(--border);border-radius:6px;transition:all 0.2s}.btn-back:hover{color:var(--text-secondary);border-color:var(--border-hover)}
 .btn-logout{color:var(--text-dim);text-decoration:none;font-size:13px;padding:6px 14px;border:1px solid var(--border);border-radius:6px;transition:all 0.2s}.btn-logout:hover{color:var(--red);border-color:rgba(239,68,68,0.3)}
 .os-badge{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);padding:4px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:4px}
+.badge{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:20px;font-size:11px;font-family:'JetBrains Mono',monospace;font-weight:600}
+.badge-green{background:rgba(16,185,129,.1);color:var(--green);border:1px solid rgba(16,185,129,.25)}
+.badge-red{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.25)}
+.badge-yellow{background:rgba(234,179,8,.1);color:var(--yellow);border:1px solid rgba(234,179,8,.25)}
+.dot{width:7px;height:7px;border-radius:50%;background:currentColor;display:inline-block}
+.dot-pulse{animation:ak-pulse 2s infinite}
+@keyframes ak-pulse{0%,100%{opacity:1}50%{opacity:.3}}
 .main{flex:1;min-width:0;overflow-y:auto;padding:32px}
 .section-title{font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;color:var(--text-dim);letter-spacing:2px;text-transform:uppercase;margin-bottom:16px;margin-top:24px}
 .status-banner{background:var(--bg-card);border:1px solid var(--border);border-top:none;border-radius:12px;padding:24px;margin-bottom:24px;display:flex;align-items:center;justify-content:space-between}
@@ -25419,11 +26850,11 @@ AUTHENTIK_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-
 .form-input{width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px;color:var(--text-primary);font-size:13px;font-family:'DM Sans',sans-serif;transition:border-color .15s;outline:none}
 .form-input:focus{border-color:var(--accent)}
 .form-hint{font-size:11px;color:var(--text-dim);margin-top:4px}
-.btn{display:inline-flex;align-items:center;gap:8px;padding:10px 20px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:none;transition:all .15s}
-.btn-primary{background:var(--accent);color:#fff}.btn-primary:hover{background:#2563eb}
-.btn-danger{background:var(--red);color:#fff}.btn-danger:hover{background:#dc2626}
-.btn-ghost{background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border)}.btn-ghost:hover{color:var(--text-primary);border-color:var(--border-hover)}
-.btn:disabled{opacity:.5;cursor:not-allowed}
+ .btn{display:inline-flex;align-items:center;gap:8px;padding:10px 20px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:none;transition:all .15s}
+ .btn-primary{background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;padding:10px 22px;border-radius:8px;cursor:pointer;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;transition:opacity .2s}.btn-primary:hover{opacity:.85}
+ .btn-danger{background:var(--red);color:#fff}.btn-danger:hover{background:#dc2626}
+ .btn-ghost{background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border)}.btn-ghost:hover{color:var(--text-primary);border-color:var(--border-hover)}
+ .btn:disabled{opacity:.5;cursor:not-allowed}
 .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
 .log-box{background:#070a12;border:1px solid var(--border);border-radius:8px;padding:16px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:340px;overflow-y:auto;line-height:1.7;white-space:pre-wrap}
 .deploy-log{background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:400px;overflow-y:auto;line-height:1.6;white-space:pre-wrap;margin-top:16px}
@@ -25666,6 +27097,47 @@ Additional admins: Authentik → Groups → authentik Admins → Users.
 <button onclick="window.location.href='/authentik'" style="padding:10px 24px;background:rgba(30,64,175,0.2);color:var(--cyan);border:1px solid var(--border);border-radius:8px;font-size:14px;font-weight:600;cursor:pointer">Refresh Page</button>
 </div>
 {% endif %}
+{% if ak.installed and ak.running %}
+<div class="section-title" style="margin-top:24px">Reputation Policy <span style="font-size:11px;color:var(--text-dim);font-weight:400;text-transform:none;letter-spacing:0">Flow-level brute-force blocking</span></div>
+<div class="card">
+<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+  <div>
+    <div style="font-size:13px;font-weight:600;color:var(--text-primary)">Authentik Reputation Policy</div>
+    <div style="font-size:12px;color:var(--text-dim);margin-top:4px">Blocks logins at the flow level when a source IP exceeds the failure threshold. Complementary to Fail2ban — trips first, lower overhead.</div>
+  </div>
+  <div style="display:flex;align-items:center;gap:16px">
+    <span class="badge badge-red" id="rep-badge"><span class="dot"></span>Disabled</span>
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:0">
+      <span style="font-size:12px;color:var(--text-dim);font-family:\'JetBrains Mono\',monospace">Enable</span>
+      <div class="toggle-wrap" style="position:relative;width:40px;height:22px">
+        <input type="checkbox" id="rep-toggle" onchange="toggleReputation()" style="opacity:0;width:0;height:0;position:absolute">
+        <span id="rep-toggle-track" onclick="document.getElementById(\'rep-toggle\').click()" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
+        <span id="rep-toggle-thumb" style="position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform .2s;pointer-events:none"></span>
+      </div>
+    </label>
+  </div>
+</div>
+<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">
+  <label style="font-size:12px;color:var(--text-dim);white-space:nowrap;font-family:\'JetBrains Mono\',monospace">Score threshold:</label>
+  <input class="form-input" type="number" id="rep-threshold" value="-5" min="-100" max="-1" style="width:80px">
+  <span style="font-size:11px;color:var(--text-dim)">Failed login = −1. Success = +1. Block when score ≤ threshold. Only IPs with negative scores are shown below.</span>
+  <button class="btn-primary" onclick="toggleReputation()" style="white-space:nowrap">Save</button>
+</div>
+<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px">Flagged IPs <span style="font-size:9px;color:var(--red);background:rgba(239,68,68,0.1);padding:2px 6px;border-radius:4px;border:1px solid rgba(239,68,68,0.3);text-transform:none;letter-spacing:0">negative score only</span></div>
+<table style="width:100%;border-collapse:collapse">
+  <thead><tr>
+    <th style="text-align:left;padding:4px 8px;font-size:10px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:.08em">IP</th>
+    <th style="text-align:left;padding:4px 8px;font-size:10px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:.08em">Score</th>
+  </tr></thead>
+  <tbody id="rep-score-table"></tbody>
+</table>
+<div style="margin-top:12px;display:flex;gap:8px">
+  <button onclick="clearRepScores()" style="padding:6px 14px;background:rgba(239,68,68,0.1);color:var(--red);border:1px solid rgba(239,68,68,0.3);border-radius:6px;font-size:12px;cursor:pointer;font-family:\'JetBrains Mono\',monospace">Clear All Scores</button>
+  <button onclick="refreshRepScores()" style="padding:6px 14px;background:rgba(59,130,246,0.1);color:var(--accent);border:1px solid rgba(59,130,246,0.3);border-radius:6px;font-size:12px;cursor:pointer;font-family:\'JetBrains Mono\',monospace">↻ Refresh</button>
+</div>
+</div>
+{% endif %}
+
 </div>
 <div class="modal-overlay" id="ak-uninstall-modal">
 <div class="modal">
@@ -25970,6 +27442,77 @@ document.addEventListener('DOMContentLoaded', function() {
 });
 
 {% if deploying %}pollDeployLog();{% endif %}
+{% if ak.installed and ak.running %}
+(function(){
+  function _applyRepState(enabled){
+    var badge=document.getElementById('rep-badge');
+    var track=document.getElementById('rep-toggle-track');
+    var thumb=document.getElementById('rep-toggle-thumb');
+    var toggle=document.getElementById('rep-toggle');
+    if(badge){
+      badge.className=enabled?'badge badge-green':'badge badge-red';
+      badge.innerHTML=enabled?'<span class="dot dot-pulse"></span>Active':'<span class="dot"></span>Disabled';
+    }
+    if(track)track.style.background=enabled?'var(--green)':'var(--border)';
+    if(thumb)thumb.style.transform=enabled?'translateX(18px)':'';
+    if(toggle)toggle.checked=enabled;
+  }
+  function _repLoad(){
+    fetch('/api/authentik/reputation/status').then(function(r){return r.json();}).then(function(d){
+      if(!d.ok){return;}
+      _applyRepState(d.enabled);
+      var threshEl=document.getElementById('rep-threshold');
+      if(threshEl&&d.threshold!==undefined){threshEl.value=d.threshold;}
+      _renderRepScores(d.scores||[]);
+    }).catch(function(){});
+  }
+  function _renderRepScores(scores){
+    var scoreTable=document.getElementById('rep-score-table');
+    if(!scoreTable)return;
+    var negative=scores.filter(function(s){return s.score<0;});
+    negative.sort(function(a,b){return a.score-b.score;});
+    scoreTable.innerHTML='';
+    if(negative.length>0){
+      negative.forEach(function(s){
+        var tr=document.createElement('tr');
+        tr.style.borderBottom='1px solid var(--border)';
+        tr.innerHTML='<td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">'+s.ip+'</td>'+
+          '<td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:'+(s.score<=-3?'var(--red)':'var(--yellow)')+'">'+s.score+'</td>';
+        scoreTable.appendChild(tr);
+      });
+    }else{
+      var emptyTr=document.createElement('tr');
+      emptyTr.innerHTML='<td colspan="2" style="padding:6px 8px;font-size:12px;color:var(--text-dim)">No flagged IPs</td>';
+      scoreTable.appendChild(emptyTr);
+    }
+  }
+  window.refreshRepScores=function(){_repLoad();};
+  window.toggleReputation=function(){
+    var en=document.getElementById('rep-toggle').checked;
+    var thr=parseInt(document.getElementById('rep-threshold').value||-5,10);
+    fetch('/api/authentik/reputation/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:en,threshold:thr})})
+      .then(function(r){return r.json();}).then(function(d){
+        if(d.ok){_applyRepState(en);_repShowToast('Reputation policy '+(en?'enabled':'disabled')+'.','success');_repLoad();}
+        else{_repShowToast(d.error||'Failed','error');_applyRepState(!en);}
+      }).catch(function(){_repShowToast('Network error','error');_applyRepState(!en);});
+  };
+  window.clearRepScores=function(){
+    if(!confirm('Clear all reputation scores?'))return;
+    fetch('/api/authentik/reputation/scores/clear',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})
+      .then(function(r){return r.json();}).then(function(d){
+        if(d.ok){_repShowToast('Cleared '+d.deleted+' score(s).','success');_repLoad();}
+        else{_repShowToast(d.error||'Failed','error');}
+      }).catch(function(){_repShowToast('Network error','error');});
+  };
+  function _repShowToast(msg,type){
+    var t=document.getElementById('rep-toast');
+    if(!t){t=document.createElement('div');t.id='rep-toast';t.style.cssText='position:fixed;bottom:24px;right:24px;padding:12px 20px;border-radius:8px;font-size:13px;z-index:9999;transition:opacity 0.3s';document.body.appendChild(t);}
+    t.textContent=msg;t.style.background=type==='success'?'rgba(16,185,129,0.15)':'rgba(239,68,68,0.15)';t.style.border='1px solid '+(type==='success'?'rgba(16,185,129,0.4)':'rgba(239,68,68,0.4)');t.style.color=type==='success'?'var(--green)':'var(--red)';t.style.opacity='1';setTimeout(function(){t.style.opacity='0';},3500);
+  }
+  _repLoad();
+  setInterval(_repLoad,30000);
+})();
+{% endif %}
 </script>
 </body></html>'''
 
@@ -28445,7 +29988,7 @@ def _run_takserver_update_config():
             def _log(msg):
                 print(msg, flush=True)
             install_le_cert_on_8446(takserver_host, _log, wait_for_cert=False)
-    subprocess.run(['systemctl', 'restart', 'takserver'], capture_output=True, text=True, timeout=60)
+    subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takserver']), capture_output=True, text=True, timeout=60)
     takserver_update_config_status.update({'running': False, 'complete': True, 'error': False})
 
 takserver_update_config_status = {'running': False, 'complete': False, 'error': False}
@@ -28506,9 +30049,9 @@ def takserver_control():
             changed, msg = _resync_ldap_credential_to_coreconfig()
             if changed:
                 results['ldap_resync'] = msg
-        subprocess.run(['systemctl', action, 'takserver'], capture_output=True, text=True, timeout=60)
+        subprocess.run(_sudo_wrap(['systemctl', action, 'takserver']), capture_output=True, text=True, timeout=60)
         time.sleep(3)
-        s = subprocess.run(['systemctl', 'is-active', 'takserver'], capture_output=True, text=True)
+        s = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'takserver']), capture_output=True, text=True)
         results['core'] = {'success': True, 'running': s.stdout.strip() == 'active'}
     return jsonify({'success': True, 'results': results, 'action': action, 'target': target,
                     'running': results.get('core', {}).get('running', None)})
@@ -28647,8 +30190,8 @@ def takserver_uninstall():
         return jsonify({'error': 'Invalid admin password'}), 403
     steps = []
     # Stop service
-    subprocess.run(['systemctl', 'stop', 'takserver'], capture_output=True, timeout=90)
-    subprocess.run(['systemctl', 'disable', 'takserver'], capture_output=True, timeout=90)
+    subprocess.run(_sudo_wrap(['systemctl', 'stop', 'takserver']), capture_output=True, timeout=90)
+    subprocess.run(_sudo_wrap(['systemctl', 'disable', 'takserver']), capture_output=True, timeout=90)
     steps.append('Stopped TAK Server')
     # Kill any remaining processes
     subprocess.run('pkill -9 -f takserver 2>/dev/null; true', shell=True, capture_output=True)
@@ -28810,6 +30353,195 @@ upgrade_status = {'running': False, 'complete': False, 'error': False}
 
 tak_migrate_log = []
 tak_migrate_status = {'running': False, 'complete': False, 'error': False}
+
+plugin_install_log = []
+plugin_install_status = {'running': False, 'complete': False, 'error': False}
+
+TAK_LIB_DIR = '/opt/tak/lib'
+TAK_PLUGINS_CONF_DIR = '/opt/tak/conf/plugins'
+
+
+@app.route('/api/takserver/plugins/list')
+@login_required
+def takserver_plugins_list():
+    """List installed plugins: union of JARs in /opt/tak/lib/ and YAMLs in /opt/tak/conf/plugins/."""
+    plugins = {}
+    if os.path.isdir(TAK_LIB_DIR):
+        r = subprocess.run(['sudo', 'ls', TAK_LIB_DIR], capture_output=True, text=True, timeout=5)
+        for fn in (r.stdout.splitlines() if r.returncode == 0 else []):
+            if fn.endswith('.jar'):
+                stem = fn[:-4]
+                plugins[stem] = {'jar': fn, 'classname': None, 'has_config': False}
+    if os.path.isdir(TAK_PLUGINS_CONF_DIR):
+        r2 = subprocess.run(['sudo', 'ls', TAK_PLUGINS_CONF_DIR], capture_output=True, text=True, timeout=5)
+        for fn in (r2.stdout.splitlines() if r2.returncode == 0 else []):
+            if fn.endswith('.yaml'):
+                classname = fn[:-5]
+                matched = False
+                for stem, entry in plugins.items():
+                    if stem.lower().replace('-', '').replace('_', '') in classname.lower().replace('.', '').replace('-', '').replace('_', ''):
+                        entry['classname'] = classname
+                        entry['has_config'] = True
+                        matched = True
+                        break
+                if not matched:
+                    plugins[classname] = {'jar': None, 'classname': classname, 'has_config': True}
+    result = sorted(plugins.values(), key=lambda x: (x['jar'] is None, x.get('jar') or x.get('classname', '')))
+    return jsonify({'plugins': result})
+
+
+@app.route('/api/upload/takserver-plugin', methods=['POST'])
+@login_required
+def upload_takserver_plugin():
+    """Accept .jar or .yaml plugin file, save to UPLOAD_DIR."""
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file uploaded'}), 400
+    f = request.files['file']
+    raw_name = f.filename or ''
+    fn = secure_filename(raw_name)
+    if not fn:
+        return jsonify({'error': 'Invalid filename'}), 400
+    if not fn.endswith('.jar') and not fn.endswith('.yaml'):
+        return jsonify({'error': 'Only .jar and .yaml files are accepted'}), 400
+    fp = os.path.join(UPLOAD_DIR, fn)
+    f.save(fp)
+    sz = round(os.path.getsize(fp) / (1024 * 1024), 2)
+    return jsonify({'success': True, 'filename': fn, 'size_mb': sz, 'type': 'jar' if fn.endswith('.jar') else 'yaml'})
+
+
+@app.route('/api/takserver/plugins/install-jar', methods=['POST'])
+@login_required
+def takserver_plugin_install_jar():
+    """Copy an uploaded .jar to /opt/tak/lib/."""
+    import re as _re
+    data = request.get_json() or {}
+    fn = data.get('filename', '')
+    if not fn or not fn.endswith('.jar'):
+        return jsonify({'error': 'No .jar filename provided'}), 400
+    if not _re.match(r'^[a-zA-Z0-9._-]+\.jar$', fn):
+        return jsonify({'error': 'Invalid filename'}), 400
+    src = os.path.join(UPLOAD_DIR, fn)
+    if not os.path.exists(src):
+        return jsonify({'error': f'File not found in uploads: {fn}'}), 404
+    dest = os.path.join(TAK_LIB_DIR, fn)
+    plugin_install_log.clear()
+    plugin_install_status.update({'running': True, 'complete': False, 'error': False})
+    def _do_install(src=src, dest=dest, fn=fn):
+        try:
+            plugin_install_log.append(f'Copying {fn} to {TAK_LIB_DIR}...')
+            r = subprocess.run(['sudo', 'mkdir', '-p', TAK_LIB_DIR], capture_output=True, text=True, timeout=10)
+            r2 = subprocess.run(['sudo', 'cp', src, dest], capture_output=True, text=True, timeout=30)
+            if r2.returncode != 0:
+                plugin_install_log.append(f'Error: {r2.stderr.strip() or "copy failed"}')
+                plugin_install_status.update({'running': False, 'error': True})
+                return
+            subprocess.run(['sudo', 'chmod', '644', dest], capture_output=True, text=True, timeout=10)
+            plugin_install_log.append(f'\u2713 {fn} installed to {TAK_LIB_DIR}')
+            plugin_install_log.append('Restart TAK Server to load the plugin.')
+            plugin_install_status.update({'running': False, 'complete': True})
+        except Exception as e:
+            plugin_install_log.append(f'Error: {str(e)[:200]}')
+            plugin_install_status.update({'running': False, 'error': True})
+    threading.Thread(target=_do_install, daemon=True).start()
+    return jsonify({'success': True})
+
+
+@app.route('/api/takserver/plugins/install-yaml', methods=['POST'])
+@login_required
+def takserver_plugin_install_yaml():
+    """Copy an uploaded plugin .yaml config to /opt/tak/conf/plugins/. Validates tak.server.plugins.* naming."""
+    import re as _re
+    data = request.get_json() or {}
+    fn = data.get('filename', '')
+    if not fn or not fn.endswith('.yaml'):
+        return jsonify({'error': 'No .yaml filename provided'}), 400
+    if not _re.match(r'^tak\.server\.plugins\.[a-zA-Z0-9._-]+\.yaml$', fn):
+        return jsonify({'error': 'Plugin config filename must be named tak.server.plugins.<ClassName>.yaml'}), 400
+    src = os.path.join(UPLOAD_DIR, fn)
+    if not os.path.exists(src):
+        return jsonify({'error': f'File not found in uploads: {fn}'}), 404
+    dest = os.path.join(TAK_PLUGINS_CONF_DIR, fn)
+    try:
+        subprocess.run(['sudo', 'mkdir', '-p', TAK_PLUGINS_CONF_DIR], capture_output=True, text=True, timeout=10)
+        r = subprocess.run(['sudo', 'cp', src, dest], capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            return jsonify({'error': r.stderr.strip() or 'Copy failed'}), 500
+        subprocess.run(['sudo', 'chmod', '644', dest], capture_output=True, text=True, timeout=10)
+        return jsonify({'success': True, 'filename': fn})
+    except Exception as e:
+        return jsonify({'error': str(e)[:200]}), 500
+
+
+@app.route('/api/takserver/plugins/config/<classname>')
+@login_required
+def takserver_plugin_config_get(classname):
+    """Read a plugin YAML config from /opt/tak/conf/plugins/."""
+    import re as _re
+    if not _re.match(r'^[a-zA-Z0-9._-]+$', classname):
+        return jsonify({'error': 'Invalid classname'}), 400
+    fn = classname if classname.endswith('.yaml') else classname + '.yaml'
+    path = os.path.join(TAK_PLUGINS_CONF_DIR, fn)
+    r = subprocess.run(['sudo', 'cat', path], capture_output=True, text=True, timeout=5)
+    if r.returncode != 0:
+        return jsonify({'exists': False, 'content': ''})
+    return jsonify({'exists': True, 'content': r.stdout})
+
+
+@app.route('/api/takserver/plugins/config/<classname>', methods=['POST'])
+@login_required
+def takserver_plugin_config_save(classname):
+    """Write a plugin YAML config back to /opt/tak/conf/plugins/."""
+    import re as _re
+    if not _re.match(r'^[a-zA-Z0-9._-]+$', classname):
+        return jsonify({'error': 'Invalid classname'}), 400
+    data = request.get_json() or {}
+    content = data.get('content', '')
+    fn = classname if classname.endswith('.yaml') else classname + '.yaml'
+    path = os.path.join(TAK_PLUGINS_CONF_DIR, fn)
+    try:
+        subprocess.run(['sudo', 'mkdir', '-p', TAK_PLUGINS_CONF_DIR], capture_output=True, text=True, timeout=10)
+        proc = subprocess.run(['sudo', 'tee', path], input=content, capture_output=True, text=True, timeout=10)
+        if proc.returncode != 0:
+            return jsonify({'error': proc.stderr.strip() or 'Write failed'}), 500
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)[:200]}), 500
+
+
+@app.route('/api/takserver/plugins/remove/<jarname>', methods=['POST'])
+@login_required
+def takserver_plugin_remove(jarname):
+    """Remove a plugin JAR from /opt/tak/lib/ and its matching YAML from /opt/tak/conf/plugins/."""
+    import re as _re
+    if not _re.match(r'^[a-zA-Z0-9._-]+\.jar$', jarname):
+        return jsonify({'error': 'Invalid jar filename'}), 400
+    jar_path = os.path.join(TAK_LIB_DIR, jarname)
+    r = subprocess.run(['sudo', 'test', '-f', jar_path], capture_output=True, timeout=5)
+    if r.returncode != 0:
+        return jsonify({'error': f'{jarname} not found in {TAK_LIB_DIR}'}), 404
+    try:
+        subprocess.run(['sudo', 'rm', jar_path], capture_output=True, text=True, timeout=10)
+        removed_yaml = []
+        if os.path.isdir(TAK_PLUGINS_CONF_DIR):
+            r2 = subprocess.run(['sudo', 'ls', TAK_PLUGINS_CONF_DIR], capture_output=True, text=True, timeout=5)
+            stem = jarname[:-4].lower().replace('-', '').replace('_', '')
+            for fn in (r2.stdout.splitlines() if r2.returncode == 0 else []):
+                if fn.endswith('.yaml') and stem in fn.lower().replace('.', '').replace('-', '').replace('_', ''):
+                    subprocess.run(['sudo', 'rm', os.path.join(TAK_PLUGINS_CONF_DIR, fn)],
+                                   capture_output=True, text=True, timeout=10)
+                    removed_yaml.append(fn)
+        return jsonify({'success': True, 'jar_removed': jarname, 'yaml_removed': removed_yaml})
+    except Exception as e:
+        return jsonify({'error': str(e)[:200]}), 500
+
+
+@app.route('/api/takserver/plugins/install/log')
+@login_required
+def takserver_plugin_install_log_api():
+    idx = int(request.args.get('index', 0))
+    return jsonify({'entries': plugin_install_log[idx:], 'total': len(plugin_install_log),
+        'running': plugin_install_status['running'], 'complete': plugin_install_status['complete'],
+        'error': plugin_install_status['error']})
 
 
 @app.route('/api/takserver/cert-password')
@@ -29209,6 +30941,571 @@ def _tak_upgrade_apt_install_streamed(cmd, cwd, upgrade_log, timeout_sec=600):
     return proc.returncode if proc.returncode is not None else 1
 
 
+SNAPSHOT_DIR = '/opt/tak/snapshots'
+
+def _tak_snapshot(label, plog=None):
+    """Create a TAK Server snapshot at /opt/tak/snapshots/<label>/.
+
+    Captures: installed TAK version, CoreConfig.xml, UserAuthenticationFile.xml,
+    /etc/default/takserver, PostgreSQL cot dump, and /opt/tak/certs/files/.
+
+    Returns (True, metadata_dict) on success, (False, error_str) on failure.
+    Idempotent — if the label already exists it is overwritten.
+    """
+    import shutil as _shutil
+    if plog is None:
+        plog = lambda m: print(m, flush=True)
+
+    snap_path = os.path.join(SNAPSHOT_DIR, label)
+    plog(f"  snapshot [{label}]: creating at {snap_path}")
+
+    try:
+        os.makedirs(snap_path, exist_ok=True)
+    except Exception as e:
+        return False, f"Could not create snapshot dir: {e}"
+
+    meta = {
+        'label':      label,
+        'taken_at':   datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'source':     'manual',
+        'tak_version': None,
+        'size_mb':    0,
+    }
+
+    # 1. TAK version
+    try:
+        r = subprocess.run(['dpkg', '-l', 'takserver'], capture_output=True, text=True, timeout=10)
+        for line in r.stdout.splitlines():
+            if line.startswith('ii') and 'takserver' in line:
+                parts = line.split()
+                meta['tak_version'] = parts[2] if len(parts) > 2 else None
+                break
+    except Exception as e:
+        plog(f"  snapshot: version probe failed: {e}")
+
+    # 2. CoreConfig.xml
+    cc_src = '/opt/tak/CoreConfig.xml'
+    if os.path.exists(cc_src):
+        try:
+            _shutil.copy2(cc_src, os.path.join(snap_path, 'CoreConfig.xml'))
+            plog("  snapshot: CoreConfig.xml copied")
+        except Exception as e:
+            plog(f"  snapshot: CoreConfig copy failed: {e}")
+    else:
+        plog("  snapshot: CoreConfig.xml not found — skipping")
+
+    # 2b. UserAuthenticationFile.xml — flat-file users (admin, webadmin, optional Phase 1A nodered).
+    # Without this, restoring a snapshot loses any flat-file users added since the snapshot,
+    # which breaks Phase 1A's nodered cert auth even though the cert files survive in certs/.
+    uaf_src = '/opt/tak/UserAuthenticationFile.xml'
+    if os.path.exists(uaf_src):
+        try:
+            _shutil.copy2(uaf_src, os.path.join(snap_path, 'UserAuthenticationFile.xml'))
+            plog("  snapshot: UserAuthenticationFile.xml copied")
+        except Exception as e:
+            plog(f"  snapshot: UserAuthenticationFile.xml copy failed: {e}")
+    else:
+        plog("  snapshot: UserAuthenticationFile.xml not found — skipping (flat-file auth not configured)")
+
+    # 3. /etc/default/takserver (JVM heap)
+    heap_src = '/etc/default/takserver'
+    if os.path.exists(heap_src):
+        try:
+            _shutil.copy2(heap_src, os.path.join(snap_path, 'takserver.default'))
+            plog("  snapshot: takserver.default copied")
+        except Exception as e:
+            plog(f"  snapshot: takserver.default copy failed: {e}")
+
+    # 4. PostgreSQL cot dump (native host postgres — not a container)
+    pg_dump_path = os.path.join(snap_path, 'cot.pgdump')
+    plog("  snapshot: pg_dump starting — cot database (may take 30–90s for large databases)…")
+    try:
+        with open(pg_dump_path, 'wb') as _f:
+            r2 = subprocess.run(
+                'sudo -u postgres pg_dump -Fc cot',
+                shell=True, stdout=_f, stderr=subprocess.PIPE, timeout=300
+            )
+        if r2.returncode == 0 and os.path.getsize(pg_dump_path) > 0:
+            plog(f"  snapshot: cot pg_dump written ({os.path.getsize(pg_dump_path) // 1024} KB)")
+        else:
+            plog(f"  snapshot: pg_dump failed: {(r2.stderr or b'').decode()[:200]}")
+            try: os.remove(pg_dump_path)
+            except Exception: pass
+    except Exception as e:
+        plog(f"  snapshot: pg_dump exception: {e}")
+
+    # 5. Certificates
+    certs_src = '/opt/tak/certs/files'
+    certs_dst = os.path.join(snap_path, 'certs')
+    if os.path.isdir(certs_src):
+        try:
+            if os.path.exists(certs_dst):
+                _shutil.rmtree(certs_dst)
+            _shutil.copytree(certs_src, certs_dst)
+            plog("  snapshot: certs/ copied")
+        except Exception as e:
+            plog(f"  snapshot: certs copy failed: {e}")
+    else:
+        plog("  snapshot: /opt/tak/certs/files not found — skipping")
+
+    # Compute total size
+    try:
+        total = 0
+        for dirpath, _, filenames in os.walk(snap_path):
+            for fn in filenames:
+                try: total += os.path.getsize(os.path.join(dirpath, fn))
+                except Exception: pass
+        meta['size_mb'] = round(total / (1024 * 1024), 1)
+    except Exception:
+        pass
+
+    # Persist to settings
+    try:
+        s = load_settings()
+        snaps = s.get('tak_snapshots') or []
+        # Remove any existing entry with same label
+        snaps = [sn for sn in snaps if sn.get('label') != label]
+        snaps.append(meta)
+        # Keep most recent 50
+        snaps.sort(key=lambda x: x.get('taken_at', ''), reverse=True)
+        s['tak_snapshots'] = snaps[:50]
+        save_settings(s)
+    except Exception as e:
+        plog(f"  snapshot: settings save failed: {e}")
+
+    plog(f"  ✓ snapshot [{label}]: done ({meta['size_mb']} MB, version={meta['tak_version']})")
+    return True, meta
+
+
+def _tak_rollback(label, plog=None):
+    """Restore TAK Server from snapshot at /opt/tak/snapshots/<label>/.
+
+    Steps:
+      1. Validate snapshot exists and has a pg_dump
+      2. systemctl stop takserver
+      3. Restore CoreConfig.xml, UserAuthenticationFile.xml, takserver.default, certs/
+      4. pg_restore --clean -d cot from snapshot
+      5. systemctl start takserver
+
+    Returns (True, None) on success, (False, error_str) on failure.
+    """
+    import shutil as _shutil
+    if plog is None:
+        plog = lambda m: print(m, flush=True)
+
+    snap_path = os.path.join(SNAPSHOT_DIR, label)
+    if not os.path.isdir(snap_path):
+        return False, f"Snapshot '{label}' not found at {snap_path}"
+
+    plog(f"  rollback [{label}]: starting")
+
+    # 1. Validate
+    pg_dump_path = os.path.join(snap_path, 'cot.pgdump')
+    if not os.path.exists(pg_dump_path):
+        return False, f"Snapshot '{label}' has no cot.pgdump — cannot restore database"
+
+    # 2. Stop TAK Server
+    plog("  rollback: stopping takserver…")
+    subprocess.run(_sudo_wrap(['systemctl', 'stop', 'takserver']), capture_output=True, timeout=60)
+
+    # 3. Restore CoreConfig.xml
+    cc_src = os.path.join(snap_path, 'CoreConfig.xml')
+    if os.path.exists(cc_src):
+        try:
+            _shutil.copy2(cc_src, '/opt/tak/CoreConfig.xml')
+            plog("  rollback: CoreConfig.xml restored")
+        except Exception as e:
+            plog(f"  rollback: CoreConfig restore failed: {e}")
+
+    # 3b. Restore UserAuthenticationFile.xml (flat-file users incl. optional Phase 1A nodered).
+    uaf_src = os.path.join(snap_path, 'UserAuthenticationFile.xml')
+    uaf_dst = '/opt/tak/UserAuthenticationFile.xml'
+    if os.path.exists(uaf_src):
+        try:
+            _shutil.copy2(uaf_src, uaf_dst)
+            # Match the ownership convention used elsewhere for /opt/tak files.
+            subprocess.run(
+                'chown tak:tak /opt/tak/UserAuthenticationFile.xml 2>/dev/null; true',
+                shell=True, capture_output=True, timeout=10
+            )
+            plog("  rollback: UserAuthenticationFile.xml restored")
+        except Exception as e:
+            plog(f"  rollback: UserAuthenticationFile.xml restore failed: {e}")
+    else:
+        plog("  rollback: snapshot has no UserAuthenticationFile.xml — leaving current file in place")
+
+    # 4. Restore JVM heap settings
+    heap_src = os.path.join(snap_path, 'takserver.default')
+    if os.path.exists(heap_src):
+        try:
+            _shutil.copy2(heap_src, '/etc/default/takserver')
+            plog("  rollback: takserver.default restored")
+        except Exception as e:
+            plog(f"  rollback: takserver.default restore failed: {e}")
+
+    # 5. Restore certs
+    certs_src = os.path.join(snap_path, 'certs')
+    certs_dst = '/opt/tak/certs/files'
+    if os.path.isdir(certs_src):
+        try:
+            if os.path.exists(certs_dst):
+                _shutil.rmtree(certs_dst)
+            _shutil.copytree(certs_src, certs_dst)
+            # Restore ownership (tak:tak) on certs
+            subprocess.run(
+                'chown -R tak:tak /opt/tak/certs/files 2>/dev/null; true',
+                shell=True, capture_output=True, timeout=15
+            )
+            plog("  rollback: certs/ restored")
+        except Exception as e:
+            plog(f"  rollback: certs restore failed: {e}")
+
+    # 6. pg_restore
+    pg_container = 'takserver-db'
+    plog("  rollback: restoring PostgreSQL cot database…")
+    try:
+        r = subprocess.run(
+            f'docker ps -q --filter name={pg_container}',
+            shell=True, capture_output=True, text=True, timeout=10
+        )
+        if (r.stdout or '').strip():
+            r2 = subprocess.run(
+                f'docker exec -i {pg_container} pg_restore -U postgres --clean -d cot',
+                shell=True,
+                stdin=open(pg_dump_path, 'rb'),
+                capture_output=True,
+                timeout=300
+            )
+            if r2.returncode == 0:
+                plog("  rollback: pg_restore successful")
+            else:
+                stderr = (r2.stderr or b'').decode()[:400]
+                # pg_restore may emit warnings but still succeed
+                if r2.returncode in (0, 1):
+                    plog(f"  rollback: pg_restore warnings (non-fatal): {stderr[:200]}")
+                else:
+                    plog(f"  rollback: pg_restore failed (exit {r2.returncode}): {stderr[:200]}")
+        else:
+            plog(f"  rollback: {pg_container} not running — skipping pg_restore")
+    except Exception as e:
+        plog(f"  rollback: pg_restore exception: {e}")
+
+    # 7. Start TAK Server
+    plog("  rollback: starting takserver…")
+    subprocess.run(_sudo_wrap(['systemctl', 'start', 'takserver']), capture_output=True, timeout=90)
+
+    # 8. Restart Node-RED so it resyncs mission state from the restored DB.
+    # Without this, Node-RED keeps trying to manage missions that were wiped by
+    # the rollback, causing NPEs in TAK Server's mission API on the next poll.
+    try:
+        r_nr = subprocess.run(
+            'docker restart nodered 2>/dev/null',
+            shell=True, capture_output=True, text=True, timeout=30
+        )
+        if r_nr.returncode == 0:
+            plog("  rollback: Node-RED restarted (mission state resynced)")
+        else:
+            plog("  rollback: Node-RED not running or restart skipped (non-fatal)")
+    except Exception as _e_nr:
+        plog(f"  rollback: Node-RED restart error (non-fatal): {_e_nr}")
+
+    plog(f"  ✓ rollback [{label}]: complete")
+    return True, None
+
+
+# Snapshot/rollback log stream
+_snapshot_log   = []
+_snapshot_status = {'running': False, 'complete': False, 'error': False}
+
+def _tak_setup_snapshot_schedule(plog=None):
+    """v0.9.3: Write/update a systemd timer for scheduled TAK Server snapshots.
+
+    The timer calls POST /api/takserver/snapshot/run with source='scheduled'.
+    Schedule defaults to daily at 02:00 local time; operator can change via UI.
+    Idempotent — rewrites unit files each time so schedule changes take effect.
+    """
+    if plog is None:
+        plog = lambda m: print(m, flush=True)
+
+    settings  = load_settings()
+    snap_cfg  = settings.get('tak_snapshot_schedule') or {}
+    enabled   = snap_cfg.get('enabled', False)
+    frequency = snap_cfg.get('frequency', 'daily')   # 'daily' | 'weekly'
+    hour      = int(snap_cfg.get('hour', 2))
+    minute    = int(snap_cfg.get('minute', 0))
+    retention = int(snap_cfg.get('retention', 7))
+
+    # Read the console port from environment or default
+    try:
+        _port_r = subprocess.run(
+            "systemctl show takwerx-console --property=ExecStart 2>/dev/null | grep -o '\\-p [0-9]*' | awk '{print $2}'",
+            shell=True, capture_output=True, text=True, timeout=5
+        )
+        _port = (_port_r.stdout or '').strip() or '2121'
+    except Exception:
+        _port = '2121'
+
+    service_unit = f"""[Unit]
+Description=infra-TAK Scheduled TAK Server Snapshot
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/curl -s -X POST -H "Content-Type: application/json" \\
+    -b /opt/tak-console-session.cookie \\
+    http://127.0.0.1:{_port}/api/takserver/snapshot/run \\
+    -d '{{"source":"scheduled"}}'
+User=takwerx
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+    if frequency == 'weekly':
+        on_calendar = f"Sat *-*-* {hour:02d}:{minute:02d}:00"
+    else:
+        on_calendar = f"*-*-* {hour:02d}:{minute:02d}:00"
+
+    timer_unit = f"""[Unit]
+Description=infra-TAK Scheduled TAK Server Snapshot Timer
+Requires=takserver-snapshot.service
+
+[Timer]
+OnCalendar={on_calendar}
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+"""
+
+    svc_path   = '/etc/systemd/system/takserver-snapshot.service'
+    timer_path = '/etc/systemd/system/takserver-snapshot.timer'
+
+    try:
+        with open(svc_path,   'w') as _f: _f.write(service_unit)
+        with open(timer_path, 'w') as _f: _f.write(timer_unit)
+        subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
+
+        if enabled:
+            subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', 'takserver-snapshot.timer']),
+                           capture_output=True, timeout=10)
+            plog(f"  snapshot schedule: enabled ({frequency} at {hour:02d}:{minute:02d}, retention={retention})")
+        else:
+            subprocess.run(_sudo_wrap(['systemctl', 'disable', '--now', 'takserver-snapshot.timer']),
+                           capture_output=True, timeout=10)
+            plog("  snapshot schedule: disabled")
+        return True
+    except Exception as e:
+        plog(f"  snapshot schedule: error — {e}")
+        return False
+
+
+@app.route('/api/takserver/snapshot/schedule', methods=['GET'])
+@login_required
+def takserver_snapshot_schedule_get_api():
+    """Return current scheduled snapshot configuration."""
+    s   = load_settings()
+    cfg = s.get('tak_snapshot_schedule') or {
+        'enabled': False, 'frequency': 'daily', 'hour': 2, 'minute': 0, 'retention': 7
+    }
+    # Check if timer is actually active
+    r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'takserver-snapshot.timer']),
+                       capture_output=True, text=True)
+    cfg['timer_active'] = (r.stdout.strip() == 'active')
+    return jsonify(cfg)
+
+
+@app.route('/api/takserver/snapshot/schedule', methods=['POST'])
+@login_required
+def takserver_snapshot_schedule_post_api():
+    """Update scheduled snapshot configuration and rewrite the systemd timer."""
+    data = request.get_json(force=True) or {}
+    s    = load_settings()
+    cfg  = s.get('tak_snapshot_schedule') or {}
+    cfg['enabled']   = bool(data.get('enabled', False))
+    cfg['frequency'] = str(data.get('frequency', 'daily'))
+    cfg['hour']      = max(0, min(23, int(data.get('hour', 2))))
+    cfg['minute']    = max(0, min(59, int(data.get('minute', 0))))
+    cfg['retention'] = max(1, min(90, int(data.get('retention', 7))))
+    s['tak_snapshot_schedule'] = cfg
+    save_settings(s)
+    ok = _tak_setup_snapshot_schedule(lambda m: print(m, flush=True))
+    return jsonify({'ok': ok, 'config': cfg})
+
+
+@app.route('/api/takserver/snapshots')
+@login_required
+def takserver_snapshots_api():
+    """List all TAK Server snapshots from settings."""
+    s     = load_settings()
+    snaps = s.get('tak_snapshots') or []
+    snaps.sort(key=lambda x: x.get('taken_at', ''), reverse=True)
+    return jsonify({'snapshots': snaps})
+
+
+@app.route('/api/takserver/snapshot/run', methods=['POST'])
+@login_required
+def takserver_snapshot_run_api():
+    """Trigger a manual snapshot in the background."""
+    global _snapshot_status, _snapshot_log
+    if _snapshot_status.get('running'):
+        return jsonify({'ok': False, 'error': 'Snapshot already running'}), 409
+    data   = request.get_json(force=True) or {}
+    source = data.get('source', 'manual')
+    label  = data.get('label') or f"{source}-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
+    _snapshot_log = []
+    _snapshot_status = {'running': True, 'complete': False, 'error': False}
+
+    def _run():
+        global _snapshot_status
+        def plog(m):
+            entry = f"[{datetime.now().strftime('%H:%M:%S')}] {m}"
+            _snapshot_log.append(entry)
+            print(entry, flush=True)
+        ok, result = _tak_snapshot(label, plog)
+        if ok:
+            _snapshot_status = {'running': False, 'complete': True, 'error': False}
+            # Tag metadata with source
+            try:
+                s  = load_settings()
+                sn = s.get('tak_snapshots') or []
+                for snap in sn:
+                    if snap.get('label') == label:
+                        snap['source'] = source
+                s['tak_snapshots'] = sn
+                save_settings(s)
+            except Exception:
+                pass
+        else:
+            plog(f"Snapshot failed: {result}")
+            _snapshot_status = {'running': False, 'complete': False, 'error': True}
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({'ok': True, 'label': label})
+
+
+@app.route('/api/takserver/snapshot/status')
+@login_required
+def takserver_snapshot_status_api():
+    """Poll snapshot progress."""
+    return jsonify({
+        'running':  _snapshot_status.get('running', False),
+        'complete': _snapshot_status.get('complete', False),
+        'error':    _snapshot_status.get('error', False),
+        'log':      _snapshot_log[-100:],
+    })
+
+
+@app.route('/api/takserver/snapshot/<label>/download')
+@login_required
+def takserver_snapshot_download_api(label):
+    """Stream a .tar.gz of the snapshot directory directly to the client."""
+    import subprocess
+    snap_path = os.path.join(SNAPSHOT_DIR, label)
+    if not os.path.isdir(snap_path):
+        return jsonify({'error': 'Snapshot not found'}), 404
+
+    # Sanitise label so it never escapes the shell command
+    safe_label = os.path.basename(label)
+    if not safe_label or safe_label != label:
+        return jsonify({'error': 'Invalid label'}), 400
+
+    def _stream():
+        # Stream tar directly from disk — no in-memory buffering
+        proc = subprocess.Popen(
+            ['tar', '-czf', '-', '-C', SNAPSHOT_DIR, safe_label],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            while True:
+                chunk = proc.stdout.read(65536)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            proc.stdout.close()
+            proc.wait()
+
+    from flask import Response
+    return Response(
+        _stream(),
+        headers={
+            'Content-Disposition': f'attachment; filename="{safe_label}.tar.gz"',
+            'Content-Type': 'application/gzip',
+        }
+    )
+
+
+@app.route('/api/takserver/snapshot/<label>', methods=['DELETE'])
+@login_required
+def takserver_snapshot_delete_api(label):
+    """Delete a snapshot directory and its settings entry."""
+    import shutil as _shutil
+    snap_path = os.path.join(SNAPSHOT_DIR, label)
+    if os.path.isdir(snap_path):
+        try:
+            _shutil.rmtree(snap_path)
+        except Exception as e:
+            return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+    try:
+        s     = load_settings()
+        snaps = [sn for sn in (s.get('tak_snapshots') or []) if sn.get('label') != label]
+        s['tak_snapshots'] = snaps
+        save_settings(s)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+    return jsonify({'ok': True})
+
+
+# Rollback log stream
+_rollback_log    = []
+_rollback_status = {'running': False, 'complete': False, 'error': False}
+
+@app.route('/api/takserver/rollback', methods=['POST'])
+@login_required
+def takserver_rollback_api():
+    """Restore TAK Server from a named snapshot. Streams log via /api/takserver/rollback/log."""
+    global _rollback_status, _rollback_log
+    if _rollback_status.get('running'):
+        return jsonify({'ok': False, 'error': 'Rollback already running'}), 409
+    data  = request.get_json(force=True) or {}
+    label = (data.get('label') or '').strip()
+    if not label:
+        return jsonify({'ok': False, 'error': 'label is required'}), 400
+
+    _rollback_log    = []
+    _rollback_status = {'running': True, 'complete': False, 'error': False}
+
+    def _run():
+        global _rollback_status
+        def plog(m):
+            entry = f"[{datetime.now().strftime('%H:%M:%S')}] {m}"
+            _rollback_log.append(entry)
+            print(entry, flush=True)
+        ok, err = _tak_rollback(label, plog)
+        if ok:
+            _rollback_status = {'running': False, 'complete': True, 'error': False}
+        else:
+            plog(f"Rollback failed: {err}")
+            _rollback_status = {'running': False, 'complete': False, 'error': True}
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({'ok': True, 'label': label})
+
+
+@app.route('/api/takserver/rollback/log')
+@login_required
+def takserver_rollback_log_api():
+    """Stream rollback progress log."""
+    return jsonify({
+        'running':  _rollback_status.get('running', False),
+        'complete': _rollback_status.get('complete', False),
+        'error':    _rollback_status.get('error', False),
+        'log':      _rollback_log[-200:],
+    })
+
+
 def run_takserver_upgrade(pkg_path):
     def ulog(msg):
         entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
@@ -29229,6 +31526,28 @@ def run_takserver_upgrade(pkg_path):
                     ulog("✓ JVM heap settings backed up")
             except Exception:
                 heap_backup = None
+
+        # v0.9.3: Pre-upgrade snapshot — abort upgrade if snapshot fails
+        snap_label = f"pre-upgrade-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
+        ulog(f"Taking pre-upgrade snapshot [{snap_label}]…")
+        snap_ok, snap_result = _tak_snapshot(snap_label, ulog)
+        if snap_ok:
+            ulog(f"✓ Pre-upgrade snapshot saved — rollback available via Snapshots & Recovery")
+            # Tag source in settings
+            try:
+                _s = load_settings()
+                for sn in (_s.get('tak_snapshots') or []):
+                    if sn.get('label') == snap_label:
+                        sn['source'] = 'pre-upgrade'
+                save_settings(_s)
+            except Exception:
+                pass
+        else:
+            ulog(f"✗ Pre-upgrade snapshot failed — aborting upgrade to protect current data")
+            ulog(f"  Detail: {snap_result}")
+            upgrade_status.update({'running': False, 'complete': False, 'error': True})
+            return
+
         wait_for_unattended_upgrade_worker(ulog, upgrade_log)
         wait_for_apt_lock(ulog, upgrade_log)
         dpkg_result = _tak_upgrade_dpkg_configure_a(ulog, upgrade_log, pkg_path=pkg_path)
@@ -30241,12 +32560,12 @@ def run_takserver_deploy(config):
             elif os.path.exists('/opt/tak-guarddog') and not _guarddog_is_enabled():
                 # Partial install (e.g. enable failed): ensure timers are enabled so Guard Dog runs
                 log_step("Enabling Guard Dog timers…")
-                subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=10)
+                subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
                 for t in _guarddog_timer_list():
-                    subprocess.run(['systemctl', 'enable', t], capture_output=True, timeout=5)
-                    subprocess.run(['systemctl', 'start', t], capture_output=True, timeout=5)
-                subprocess.run(['systemctl', 'enable', 'tak-health.service'], capture_output=True, timeout=5)
-                subprocess.run(['systemctl', 'start', 'tak-health.service'], capture_output=True, timeout=5)
+                    subprocess.run(_sudo_wrap(['systemctl', 'enable', t]), capture_output=True, timeout=5)
+                    subprocess.run(_sudo_wrap(['systemctl', 'start', t]), capture_output=True, timeout=5)
+                subprocess.run(_sudo_wrap(['systemctl', 'enable', 'tak-health.service']), capture_output=True, timeout=5)
+                subprocess.run(_sudo_wrap(['systemctl', 'start', 'tak-health.service']), capture_output=True, timeout=5)
                 if _guarddog_is_enabled():
                     log_step("✓ Guard Dog enabled. Configure notifications on the Guard Dog page.")
     except Exception as e:
@@ -30532,6 +32851,8 @@ def api_metrics():
         }]
     return jsonify(metrics)
 
+
+
 def _run_unattended_upgrades_remote(remote_cfg, action):
     """Run enable/disable unattended-upgrades on remote host via SSH. Returns (success, result_dict)."""
     if action == 'disable':
@@ -30713,8 +33034,8 @@ def run_full_uninstall():
 
         # 5. TAK Server
         plog("━━━ TAK Server ━━━")
-        subprocess.run(['systemctl', 'stop', 'takserver'], capture_output=True, timeout=90)
-        subprocess.run(['systemctl', 'disable', 'takserver'], capture_output=True, timeout=90)
+        subprocess.run(_sudo_wrap(['systemctl', 'stop', 'takserver']), capture_output=True, timeout=90)
+        subprocess.run(_sudo_wrap(['systemctl', 'disable', 'takserver']), capture_output=True, timeout=90)
         subprocess.run('pkill -9 -f takserver 2>/dev/null; true', shell=True, capture_output=True)
         pkg_result = subprocess.run('dpkg -l | grep takserver', shell=True, capture_output=True, text=True)
         if 'takserver' in (pkg_result.stdout or ''):
@@ -30861,15 +33182,14 @@ def console_password_reset():
 def _get_current_ssh_port():
     """Read SSH port from /etc/ssh/sshd_config. Default 22 if not set or unreadable."""
     try:
-        with open('/etc/ssh/sshd_config', 'r') as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith('#'):
-                    parts = line.split(None, 1)
-                    if len(parts) >= 2 and parts[0].lower() == 'port':
-                        p = int(parts[1].strip())
-                        if 1 <= p <= 65535:
-                            return p
+        for line in _read_priv('/etc/ssh/sshd_config').splitlines():
+            line = line.strip()
+            if line and not line.startswith('#'):
+                parts = line.split(None, 1)
+                if len(parts) >= 2 and parts[0].lower() == 'port':
+                    p = int(parts[1].strip())
+                    if 1 <= p <= 65535:
+                        return p
     except Exception:
         pass
     return 22
@@ -30934,12 +33254,12 @@ def api_hardening_ssh_port_post():
     # Allow new port in firewall (ufw)
     r = subprocess.run(['which', 'ufw'], capture_output=True)
     if r.returncode == 0:
-        subprocess.run(['ufw', 'allow', f'{port}/tcp'], capture_output=True, timeout=10)
-        subprocess.run(['ufw', 'reload'], capture_output=True, timeout=10)
+        subprocess.run(_sudo_wrap(['ufw', 'allow', f'{port}/tcp']), capture_output=True, timeout=10)
+        subprocess.run(_sudo_wrap(['ufw', 'reload']), capture_output=True, timeout=10)
 
     # Restart SSH (ssh.service on Debian/Ubuntu, sshd on some others)
     for svc in ('ssh', 'sshd'):
-        r = subprocess.run(['systemctl', 'restart', svc], capture_output=True, text=True, timeout=15)
+        r = subprocess.run(_sudo_wrap(['systemctl', 'restart', svc]), capture_output=True, text=True, timeout=15)
         if r.returncode == 0:
             break
 
@@ -31489,6 +33809,15 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div id="update-details" style="display:none;margin-top:12px;padding-top:12px;border-top:1px solid var(--border);font-size:11px;color:var(--text-dim);white-space:pre-wrap;max-height:200px;overflow-y:auto"></div>
 <div id="update-status" style="display:none;margin-top:8px;font-size:11px"></div>
 </div>
+{% if settings.get('console_rollback', {}).get('available') %}
+<div id="console-rollback-bar" style="background:rgba(234,179,8,0.08);border:1px solid rgba(234,179,8,0.25);border-radius:10px;padding:12px 16px;margin-bottom:16px;display:flex;align-items:center;justify-content:space-between">
+<div>
+  <div style="font-size:12px;font-weight:600;color:var(--yellow)">↩ Rollback available — {{ settings.get('console_rollback', {}).get('tag', '') }}</div>
+  <div style="font-size:11px;color:var(--text-dim);margin-top:2px">Snapshot taken {{ settings.get('console_rollback', {}).get('snapshot_at', '') }} before last update</div>
+</div>
+<button onclick="doConsoleRollback()" style="padding:6px 14px;background:rgba(234,179,8,0.1);color:var(--yellow);border:1px solid rgba(234,179,8,0.3);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">Roll Back</button>
+</div>
+{% endif %}
 <div class="metrics-bar" id="metrics-bar">
 <div class="metric-card"><div class="metric-label">CPU</div><div class="metric-value" id="cpu-value">{{ metrics.cpu_percent }}%</div></div>
 <div class="metric-card"><div class="metric-label">Memory</div><div class="metric-value" id="ram-value">{{ metrics.ram_percent }}%</div><div class="metric-detail">{{ metrics.ram_used_gb }}GB / {{ metrics.ram_total_gb }}GB</div></div>
@@ -31512,8 +33841,8 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <span class="uu-spinner" data-target="{{ host.id }}" style="display:none"></span>
 <span class="uu-label" id="uu-label-{{ host.id }}" data-target="{{ host.id }}" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:{% if host.enabled %}var(--green){% else %}var(--text-dim){% endif %}">{% if host.enabled and host.running %}Running...{% elif host.enabled %}Enabled{% else %}Disabled{% endif %}</span>
 </div>
-<button type="button" onclick="event.stopPropagation();toggleResourceBreakdown('{{ host.id }}')" style="margin-top:8px;padding:4px 10px;background:rgba(59,130,246,0.15);color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">What's using CPU/RAM?</button>
-<div id="resource-breakdown-{{ host.id }}" style="display:none;margin-top:8px;padding-top:8px;border-top:1px solid var(--border);font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);max-height:200px;overflow-y:auto"></div>
+<button type="button" onclick="event.stopPropagation();toggleResourceBreakdown('{{ host.id }}')" style="margin-top:8px;padding:4px 10px;background:rgba(59,130,246,0.15);color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">What&#39;s using CPU/RAM?</button>
+<div id="resource-breakdown-{{ host.id }}" style="display:none;margin-top:8px;padding-top:8px;border-top:1px solid var(--border);background:var(--bg-card);font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim)"></div>
 </div>
 {% endfor %}
 </div>
@@ -31570,19 +33899,20 @@ async function toggleUU(cb){
         else{cb.checked=!cb.checked;if(lb){lb.textContent=(action==='disable'?'Disable failed: ':'Enable failed: ')+(d.error||'unknown');lb.style.color='var(--red)';}}
     }catch(e){if(sp)sp.style.display='none';cb.checked=!cb.checked;if(lb){lb.textContent='Error';lb.style.color='var(--red)';}}
 }
+function escapeHtml(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML;}
 function formatRamGb(memPct,totalRamGb){if(totalRamGb==null)return '';var gb=(Number(memPct||0)/100)*totalRamGb;return gb.toFixed(2)+' GB';}
 function cpuColor(pct){var n=Number(pct||0);if(n>=90)return 'var(--red)';if(n>=70)return '#eab308';return 'var(--green)';}
 function diskIoColor(mbs){var m=Number(mbs||0);if(m>=200)return 'var(--green)';if(m>=80)return '#eab308';return 'var(--red)';}
 function renderResourceBreakdown(div,data,hostId){
-    var err=data.error,cpuTop=data.cpu_top,memTop=data.mem_top,totalRamGb=data.total_ram_gb,processor=data.processor,vcpuCount=data.vcpu_count,diskRead=data.disk_io_read_mbs,diskWrite=data.disk_io_write_mbs,diskSrc=data.disk_io_source,speedRead=data.disk_speed_test_read_mbs,speedWrite=data.disk_speed_test_write_mbs,speedErr=data.disk_speed_test_error;
-    if(err){div.innerHTML='<span style="color:var(--red)">'+escapeHtml(err)+'</span>'+(hostId?' <button type="button" onclick="refreshResourceBreakdown(\\''+hostId+'\\')" style="margin-left:8px;padding:2px 8px;font-size:10px;background:rgba(59,130,246,0.2);color:var(--cyan);border:1px solid var(--border);border-radius:4px;cursor:pointer">Refresh</button>':'');return;}
-    var tbl='width:100%;border-collapse:collapse;font-size:10px;text-align:left', th='padding:2px 8px 2px 0;color:var(--cyan);font-weight:600;border-bottom:1px solid var(--border)', td='padding:2px 8px 2px 0;border-bottom:1px solid rgba(255,255,255,0.06)', r='text-align:right';
+    var err=data.error,cpuTop=data.cpu_top,memTop=data.mem_top,totalRamGb=data.total_ram_gb,processor=data.processor,vcpuCount=data.vcpu_count,diskWrite=data.disk_io_write_mbs,diskSrc=data.disk_io_source,speedWrite=data.disk_speed_test_write_mbs,speedErr=data.disk_speed_test_error;
+    if(err){div.innerHTML='<span style="color:var(--red)">'+escapeHtml(err)+'</span>';return;}
+    var tbl='width:100%;border-collapse:collapse;font-size:10px;text-align:left',th='padding:2px 8px 2px 0;color:var(--cyan);font-weight:600;border-bottom:1px solid var(--border)',td='padding:2px 8px 2px 0;border-bottom:1px solid rgba(255,255,255,0.06)',r='text-align:right';
     var html='';
-    if(processor){html+='<div style="margin-bottom:2px;color:var(--text-dim);font-size:10px">Processor: '+escapeHtml(processor)+'</div>';if(vcpuCount)html+='<div style="margin-bottom:4px;padding-left:8px;color:var(--cyan);font-size:10px;font-weight:600">'+vcpuCount+' vCPUs</div>';}
+    if(processor){html+='<div style="margin-bottom:2px;color:var(--text-dim)">Processor: '+escapeHtml(processor)+'</div>';if(vcpuCount)html+='<div style="margin-bottom:4px;padding-left:8px;color:var(--cyan);font-weight:600">'+vcpuCount+' vCPUs</div>';}
     if(totalRamGb!=null)html+='<div style="margin-bottom:4px;color:var(--text-dim)">Total RAM: '+totalRamGb+' GB</div>';
-    if(diskWrite!=null&&diskSrc==='sync'){var dw=Number(diskWrite),cwColor=diskIoColor(dw);html+='<div style="margin-bottom:4px;font-size:10px">Disk write speed (Guard Dog): <span style="color:'+cwColor+'">'+dw.toFixed(0)+' MB/s</span></div>';}
-    if(speedWrite!=null){var sw=Number(speedWrite),swColor=diskIoColor(sw);html+='<div style="margin-bottom:6px;font-size:10px">Disk speed test (256 MiB): <span style="color:'+swColor+'">'+sw.toFixed(0)+' MB/s</span></div>';}
-    else if(speedErr)html+='<div style="margin-bottom:6px;color:var(--text-dim);font-size:10px">Disk speed test: <span style="color:var(--red)">'+escapeHtml(speedErr)+'</span></div>';
+    if(diskWrite!=null&&diskSrc==='sync'){var dw=Number(diskWrite),cwColor=diskIoColor(dw);html+='<div style="margin-bottom:4px">Disk write speed (Guard Dog): <span style="color:'+cwColor+'">'+dw.toFixed(0)+' MB/s</span></div>';}
+    if(speedWrite!=null){var sw=Number(speedWrite),swColor=diskIoColor(sw);html+='<div style="margin-bottom:6px">Disk speed test (256 MiB): <span style="color:'+swColor+'">'+sw.toFixed(0)+' MB/s</span></div>';}
+    else if(speedErr)html+='<div style="margin-bottom:6px;color:var(--red)">Disk speed test: '+escapeHtml(speedErr)+'</div>';
     var ramCell='padding:2px 8px 2px 0;border-bottom:1px solid rgba(255,255,255,0.06);text-align:right;color:var(--text-dim);white-space:nowrap';
     if(cpuTop&&cpuTop.length){
         html+='<div style="margin-bottom:10px"><strong style="color:var(--cyan)">Top by CPU</strong><table style="'+tbl+';margin-top:4px"><thead><tr><th style="'+th+'">Process</th><th style="'+th+';'+r+'">CPU %</th><th style="'+th+';'+r+'">RAM %</th>'+(totalRamGb!=null?'<th style="'+th+';'+r+'">RAM</th>':'')+'</tr></thead><tbody>';
@@ -31595,24 +33925,21 @@ function renderResourceBreakdown(div,data,hostId){
         html+='</tbody></table></div>';
     }
     if(!html)html='No process data.';
-    if(hostId)html+='<div style="margin-top:8px"><button type="button" onclick="refreshResourceBreakdown(\\''+hostId+'\\')" style="padding:4px 10px;font-size:10px;background:rgba(59,130,246,0.15);color:var(--cyan);border:1px solid var(--border);border-radius:6px;cursor:pointer">Refresh</button></div>';
     div.innerHTML=html;
 }
 async function refreshResourceBreakdown(hostId){
     var div=document.getElementById('resource-breakdown-'+hostId);if(!div)return;
-    div.removeAttribute('data-loaded');div.style.display='block';div.textContent='Loading… (disk speed test ~5–30s)';
-    try{var r=await fetch('/api/host-resource-usage?target='+encodeURIComponent(hostId));var d=await r.json();renderResourceBreakdown(div,d,hostId);div.setAttribute('data-loaded','1');}catch(e){div.innerHTML='<span style="color:var(--red)">Request failed</span>';div.setAttribute('data-loaded','1');}
+    div.removeAttribute('data-loaded');div.style.display='block';div.textContent='Loading\u2026';
+    try{var r=await fetch('/api/host-resource-usage?target='+encodeURIComponent(hostId));var d=await r.json();renderResourceBreakdown(div,d,hostId);div.setAttribute('data-loaded','1');}
+    catch(e){div.innerHTML='<span style="color:var(--red)">Request failed</span>';div.setAttribute('data-loaded','1');}
 }
-function escapeHtml(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML;}
 async function toggleResourceBreakdown(hostId){
     var div=document.getElementById('resource-breakdown-'+hostId);if(!div)return;
     if(div.style.display==='block'){div.style.display='none';return;}
     if(!div.getAttribute('data-loaded')){
-        div.style.display='block';div.textContent='Loading… (disk speed test ~5–30s)';
-        try{
-            var r=await fetch('/api/host-resource-usage?target='+encodeURIComponent(hostId));var d=await r.json();
-            renderResourceBreakdown(div,d,hostId);div.setAttribute('data-loaded','1');
-        }catch(e){div.innerHTML='<span style="color:var(--red)">Request failed</span>';div.setAttribute('data-loaded','1');}
+        div.style.display='block';div.textContent='Loading\u2026';
+        try{var r=await fetch('/api/host-resource-usage?target='+encodeURIComponent(hostId));var d=await r.json();renderResourceBreakdown(div,d,hostId);div.setAttribute('data-loaded','1');}
+        catch(e){div.innerHTML='<span style="color:var(--red)">Request failed</span>';div.setAttribute('data-loaded','1');}
         return;
     }
     div.style.display='block';
@@ -31775,6 +34102,20 @@ async function applyUpdate(){
     }catch(e){status.style.color='var(--red)';status.textContent='Error: '+e.message;btn.disabled=false;btn.textContent='Update Now';btn.style.opacity='1'}
 }
 checkUpdate();
+async function doConsoleRollback(){
+    if(!confirm('Roll back console to the previous version?\\n\\nThe console will restart. You may see 502 briefly.'))return;
+    var bar=document.getElementById('console-rollback-bar');
+    if(bar)bar.innerHTML='<div style="font-size:12px;color:var(--yellow)">Rolling back…</div>';
+    try{
+        var r=await fetch('/api/console/rollback',{method:'POST'});var d=await r.json();
+        if(d.ok){
+            if(bar)bar.innerHTML='<div style="font-size:12px;color:var(--green)">✓ '+d.message+'</div>';
+            setTimeout(function(){window.location.reload()},10000);
+        }else{
+            if(bar)bar.innerHTML='<div style="font-size:12px;color:var(--red)">✗ Error: '+(d.error||'failed')+'</div>';
+        }
+    }catch(e){if(bar)bar.innerHTML='<div style="font-size:12px;color:var(--red)">Network error: '+e.message+'</div>';}
+}
 </script></body></html>'''
 
 # === Marketplace Template (all services, deploy from here) ===
@@ -31869,6 +34210,7 @@ setInterval(async()=>{try{const r=await fetch('/api/metrics');const d=await r.js
 TAKSERVER_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>TAK Server — infra-TAK</title>
 <style>
 ''' + BASE_CSS + '''
+@keyframes spin{to{transform:rotate(360deg)}}
 .upload-area{border:2px dashed var(--border);border-radius:12px;padding:40px;text-align:center;cursor:pointer;transition:all 0.3s;background:rgba(15,23,42,0.3);margin-bottom:20px}
 .upload-area:hover,.upload-area.dragover{border-color:var(--accent);background:var(--accent-glow)}
 .upload-icon{font-size:40px;margin-bottom:12px}.upload-text{font-size:16px;color:var(--text-secondary);margin-bottom:8px}.upload-hint{font-size:13px;color:var(--text-dim);line-height:1.6}
@@ -31924,6 +34266,12 @@ body{display:flex;flex-direction:row;min-height:100vh}
 .metric-label{font-family:'JetBrains Mono',monospace;font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--text-dim);margin-bottom:6px}
 .metric-value{font-family:'JetBrains Mono',monospace;font-size:24px;font-weight:700;color:var(--text-primary)}
 .metric-detail{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:4px}
+.badge{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:500;font-family:'JetBrains Mono',monospace}
+.badge-green{background:rgba(16,185,129,.1);color:var(--green);border:1px solid rgba(16,185,129,.25)}
+.badge-red{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.25)}
+.dot{width:7px;height:7px;border-radius:50%;background:currentColor;display:inline-block;flex-shrink:0}
+.dot-pulse{animation:tak-badge-pulse 2s infinite}
+@keyframes tak-badge-pulse{0%,100%{opacity:1}50%{opacity:.4}}
 </style></head><body data-tak-deploying="{{ 'true' if deploying or deploy_done or deploy_error else 'false' }}" data-tak-upgrading="{{ 'true' if upgrading else 'false' }}" data-tak-migrating="{{ 'true' if migrating else 'false' }}">
 {{ sidebar_html }}
 <div class="main">
@@ -32103,6 +34451,39 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div class="section-title">Update log</div>
 <div id="upgrade-log" style="background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary);max-height:400px;overflow-y:auto;line-height:1.7;white-space:pre-wrap;margin-top:8px">{% if upgrading %}Connecting...{% else %}{% if upgrade_done %}Done.{% elif upgrade_error %}Update failed.{% endif %}{% endif %}</div>
 {% if upgrade_done %}<p style="margin-top:12px;font-size:13px;color:var(--text-secondary)">Update complete. <button type="button" onclick="window.location.reload()" style="padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer">Refresh page</button> to see the new version.</p>{% endif %}
+</div>
+</div>
+</div>
+{% endif %}
+{% if tak.installed %}
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:24px">
+<div style="display:flex;align-items:center;justify-content:space-between;padding:16px 24px;cursor:pointer" onclick="takTogglePlugins()" id="tak-plugins-header">
+<span class="section-title" style="margin-bottom:0">TAK Server Plugins</span>
+<span id="tak-plugins-toggle-icon" style="font-size:18px;color:var(--text-dim);transition:transform 0.2s ease">&#9662;</span>
+</div>
+<div id="tak-plugins-body" style="display:none;padding:0 24px 24px 24px;border-top:1px solid var(--border)">
+<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">Plugin JARs are loaded from <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">/opt/tak/lib/</span>. Upload a <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">.jar</span> to install a plugin, or a <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">tak.server.plugins.ClassName.yaml</span> to install a config file. TAK Server must be restarted after any change.</p>
+<div id="tak-plugins-restart-banner" style="display:none;background:rgba(234,179,8,0.08);border:1px solid rgba(234,179,8,0.35);border-radius:10px;padding:12px 16px;margin-bottom:16px;display:none;align-items:center;justify-content:space-between;gap:12px">
+<span style="font-size:13px;color:var(--yellow)">&#9888; Restart TAK Server to apply plugin changes.</span>
+<button type="button" id="tak-plugin-restart-btn" onclick="takPluginRestartNow(this)" style="padding:7px 16px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap">&#8635; Restart Now</button>
+</div>
+<div style="margin-bottom:20px">
+<div class="section-title" style="margin-bottom:10px">Installed Plugins</div>
+<div id="tak-plugins-list" style="font-size:13px;color:var(--text-dim)">Loading...</div>
+</div>
+<div class="section-title" style="margin-bottom:10px">Install Plugin</div>
+<div class="upload-area" id="tak-plugin-upload-area" style="padding:24px;margin-bottom:12px" onclick="document.getElementById('tak-plugin-file-input').click()" ondrop="takPluginDrop(event)" ondragover="event.preventDefault();this.classList.add('dragover')" ondragleave="event.preventDefault();this.classList.remove('dragover')">
+<input type="file" id="tak-plugin-file-input" style="display:none" accept=".jar,.yaml" multiple onchange="takPluginFileChange(event)">
+<div id="tak-plugin-upload-text" style="color:var(--text-dim);font-size:13px">Click or drag to upload a <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">.jar</span> and/or <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">tak.server.plugins.ClassName.yaml</span> — you can drop both at once</div>
+<div id="tak-plugin-upload-filelist" style="display:none;margin-top:10px;display:none;flex-direction:column;gap:4px"></div>
+</div>
+<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px">
+<button type="button" id="tak-plugin-install-btn" onclick="takPluginInstall()" style="padding:10px 22px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:14px;font-weight:600;cursor:pointer" disabled>Install Plugin</button>
+<span id="tak-plugin-install-msg" style="font-size:12px;color:var(--text-dim)"></span>
+</div>
+<div id="tak-plugin-log-wrap" style="display:none;margin-top:4px">
+<div class="section-title">Install log</div>
+<div id="tak-plugin-log" style="background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary);max-height:300px;overflow-y:auto;line-height:1.7;white-space:pre-wrap;margin-top:8px"></div>
 </div>
 </div>
 </div>
@@ -32319,6 +34700,64 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <button onclick="showDeployConfig()" style="padding:12px 32px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:15px;font-weight:600;cursor:pointer">Configure &amp; Deploy →</button>
 </div></div></div>
 {% endif %}
+
+<!-- Snapshots & Recovery -->
+{% if tak_installed %}
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:24px">
+<div style="display:flex;align-items:center;justify-content:space-between;padding:16px 24px;cursor:pointer" onclick="takToggleSection('snapshots-recovery')">
+<span class="section-title" style="margin-bottom:0">Snapshots &amp; Recovery</span>
+<span id="snapshots-recovery-toggle-icon" style="font-size:18px;color:var(--text-dim);transition:transform 0.2s ease">&#9662;</span>
+</div>
+<div id="snapshots-recovery-body" style="display:none;padding:0 24px 24px 24px;border-top:1px solid var(--border)">
+<div style="padding-top:16px">
+<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+  <div>
+    <div style="font-size:13px;font-weight:600;color:var(--text-primary)">TAK Server Snapshots</div>
+    <div style="font-size:12px;color:var(--text-dim);margin-top:4px">Pre-upgrade snapshots are created automatically. Restore any snapshot with one click. Download for off-box backup.</div>
+  </div>
+  <div style="display:flex;gap:8px">
+    <button onclick="takeSnapshot()" id="snap-now-btn" style="padding:8px 16px;background:rgba(6,182,212,0.1);color:var(--cyan);border:1px solid rgba(6,182,212,0.3);border-radius:8px;font-size:12px;font-family:JetBrains Mono,monospace;cursor:pointer">📸 Take Snapshot Now</button>
+    <button id="snap-refresh-btn" onclick="loadSnapshots(true)" style="padding:8px 16px;background:transparent;color:var(--text-dim);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer;transition:opacity .2s">↻ Refresh</button>
+  </div>
+</div>
+<div id="snap-progress" style="display:none;font-family:JetBrains Mono,monospace;font-size:11px;color:var(--cyan);padding:8px 0;margin-bottom:12px"></div>
+<div id="snap-table-container">
+  <div style="color:var(--text-dim);font-size:13px">Loading snapshots…</div>
+</div>
+</div>
+
+<div style="margin-top:20px;padding-top:20px;border-top:1px solid var(--border)">
+<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+  <div style="display:flex;align-items:center;gap:10px">
+    <span style="font-size:13px;font-weight:600;color:var(--text-primary)">Scheduled Snapshots</span>
+    <span class="badge badge-red" id="sched-badge"><span class="dot"></span>Disabled</span>
+  </div>
+  <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:0">
+    <span style="font-size:12px;color:var(--text-dim);font-family:\'JetBrains Mono\',monospace">Enable</span>
+    <div style="position:relative;width:40px;height:22px">
+      <input type="checkbox" id="sched-enabled" onchange="saveSchedule()" style="opacity:0;width:0;height:0;position:absolute">
+      <span id="sched-toggle-track" onclick="document.getElementById(\'sched-enabled\').click()" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
+      <span id="sched-toggle-thumb" style="position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform .2s;pointer-events:none"></span>
+    </div>
+  </label>
+</div>
+<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+  <select id="sched-freq" onchange="saveSchedule()" style="background:#0a0e1a;border:1px solid var(--border);color:var(--text-primary);border-radius:6px;padding:5px 10px;font-size:12px;font-family:\'JetBrains Mono\',monospace">
+    <option value="daily">Daily</option>
+    <option value="weekly">Weekly (Saturday)</option>
+  </select>
+  <span style="font-size:12px;color:var(--text-dim)">at</span>
+  <input type="number" id="sched-hour" value="2" min="0" max="23" style="width:55px;background:#0a0e1a;border:1px solid var(--border);color:var(--text-primary);border-radius:6px;padding:5px 8px;font-size:12px;font-family:JetBrains Mono,monospace" oninput="saveSchedule()">
+  <span style="font-size:12px;color:var(--text-dim)">:00 local · keep last</span>
+  <input type="number" id="sched-retention" value="7" min="1" max="90" style="width:55px;background:#0a0e1a;border:1px solid var(--border);color:var(--text-primary);border-radius:6px;padding:5px 8px;font-size:12px;font-family:JetBrains Mono,monospace" oninput="saveSchedule()">
+  <span style="font-size:12px;color:var(--text-dim)">snapshots</span>
+  <span id="sched-status" style="font-size:11px;color:var(--text-dim)"></span>
+</div>
+</div>
+</div>
+</div>
+{% endif %}
+
 </div>
 <div class="modal-overlay" id="tak-uninstall-modal">
 <div class="modal">
@@ -32336,6 +34775,185 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 <footer class="footer"></footer>
 <script src="/log-tools.js?v={{ version }}"></script>
+<script>
+// Generic collapsible toggle for TAK Server page sections.
+// Section structure: header div with onclick="takToggleSection('<id>')" +
+// body div with id="<id>-body" + arrow span with id="<id>-toggle-icon".
+window.takToggleSection = function(id) {
+  var body = document.getElementById(id + '-body');
+  var icon = document.getElementById(id + '-toggle-icon');
+  if (!body) return;
+  var show = body.style.display === 'none';
+  body.style.display = show ? 'block' : 'none';
+  if (icon) icon.style.transform = show ? 'rotate(180deg)' : '';
+  // Lazy-load snapshot table on first open
+  if (show && id === 'snapshots-recovery' && typeof loadSnapshots === 'function') {
+    loadSnapshots();
+    if (typeof loadSchedule === 'function') loadSchedule();
+  }
+};
+
+// Snapshots & Recovery
+var _snapPollTimer = null;
+function loadSnapshots(fromBtn){
+  var c=document.getElementById('snap-table-container');
+  if(!c)return;
+  var btn=document.getElementById('snap-refresh-btn');
+  if(btn){btn.disabled=true;btn.style.opacity='0.5';btn.textContent='↻ Loading…';}
+  c.innerHTML='<div style="color:var(--text-dim);font-size:13px;display:flex;align-items:center;gap:8px"><span style="display:inline-block;width:14px;height:14px;border:2px solid var(--cyan);border-top-color:transparent;border-radius:50%;animation:spin 0.7s linear infinite"></span>Loading snapshots…</div>';
+  fetch('/api/takserver/snapshots',{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.json();}).then(function(d){
+    if(btn){btn.disabled=false;btn.style.opacity='1';btn.textContent='↻ Refresh';}
+    var snaps=d.snapshots||[];
+    if(!snaps.length){c.innerHTML='<div style="color:var(--text-dim);font-size:13px">No snapshots yet. Use "Take Snapshot Now" to create one.</div>';return;}
+    var rows=snaps.map(function(s){
+      var src=s.source||'manual';
+      var srcColor=src==='pre-upgrade'?'var(--cyan)':src==='scheduled'?'var(--green)':'var(--text-dim)';
+      return '<tr style="border-bottom:1px solid var(--border)">'
+        +'<td style="padding:6px 8px;font-size:11px;font-family:JetBrains Mono,monospace;color:var(--text-secondary)">'+s.label+'</td>'
+        +'<td style="padding:6px 8px;font-size:11px;color:var(--text-dim)">'+( s.taken_at||'' ).replace('T',' ').replace('Z','')+'</td>'
+        +'<td style="padding:6px 8px;font-size:11px;color:'+srcColor+'">'+src+'</td>'
+        +'<td style="padding:6px 8px;font-size:11px;color:var(--text-dim)">'+(s.tak_version||'?')+'</td>'
+        +'<td style="padding:6px 8px;font-size:11px;color:var(--text-dim)">'+(s.size_mb||0)+' MB</td>'
+        +'<td style="padding:6px 8px;white-space:nowrap">'
++'<button onclick="restoreSnapshot(\\''+s.label+'\\')" style="padding:4px 10px;background:rgba(16,185,129,0.1);color:var(--green);border:1px solid rgba(16,185,129,0.4);border-radius:5px;font-size:11px;cursor:pointer;margin-right:4px">↩ Restore</button>'
++'<a href="/api/takserver/snapshot/'+encodeURIComponent(s.label)+'/download" style="padding:4px 10px;background:rgba(6,182,212,0.08);color:var(--cyan);border:1px solid rgba(6,182,212,0.3);border-radius:5px;font-size:11px;text-decoration:none;display:inline-block;margin-right:4px">⬇ Download</a>'
++'<button onclick="deleteSnapshot(\\''+s.label+'\\')" style="padding:4px 10px;background:rgba(239,68,68,0.1);color:var(--red);border:1px solid rgba(239,68,68,0.4);border-radius:5px;font-size:11px;cursor:pointer">Delete</button>'
+        +'</td></tr>';
+    }).join('');
+    c.innerHTML='<table style="width:100%;border-collapse:collapse">'
+      +'<thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em">'
+      +'<th style="padding:4px 8px;text-align:left">Label</th>'
+      +'<th style="padding:4px 8px;text-align:left">Taken</th>'
+      +'<th style="padding:4px 8px;text-align:left">Source</th>'
+      +'<th style="padding:4px 8px;text-align:left">TAK Version</th>'
+      +'<th style="padding:4px 8px;text-align:left">Size</th>'
+      +'<th style="padding:4px 8px;text-align:left">Actions</th>'
+      +'</tr></thead><tbody>'+rows+'</tbody></table>';
+  }).catch(function(e){
+    var btn2=document.getElementById('snap-refresh-btn');
+    if(btn2){btn2.disabled=false;btn2.style.opacity='1';btn2.textContent='↻ Refresh';}
+    c.innerHTML='<div style="color:var(--red);font-size:12px">Failed to load snapshots — '+((e&&e.message)||'network error')+'</div>';
+  });
+}
+
+function takeSnapshot(){
+  var btn=document.getElementById('snap-now-btn');
+  var prog=document.getElementById('snap-progress');
+  if(btn)btn.disabled=true;
+  if(prog){prog.style.display='';prog.textContent='Starting snapshot…';}
+  fetch('/api/takserver/snapshot/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:'manual'})})
+    .then(function(r){return r.json();}).then(function(d){
+      if(d.ok){
+        _snapPollTimer=setInterval(function(){
+          fetch('/api/takserver/snapshot/status').then(function(r){return r.json();}).then(function(s){
+            var msg=s.log&&s.log.length?s.log[s.log.length-1]:'Running\u2026';
+            if(prog){
+              if(s.running){
+                prog.innerHTML='<span style="display:inline-block;width:12px;height:12px;border:2px solid var(--cyan);border-top-color:transparent;border-radius:50%;animation:spin 0.7s linear infinite;vertical-align:middle;margin-right:6px"></span><span style="vertical-align:middle">'+msg+'</span>';
+              }else{
+                prog.textContent=msg;
+              }
+            }
+            if(!s.running){
+              clearInterval(_snapPollTimer);
+              if(btn)btn.disabled=false;
+              if(prog)setTimeout(function(){prog.style.display='none';},4000);
+              loadSnapshots();
+            }
+          });
+        },1500);
+      }else{
+        if(prog){prog.textContent='Error: '+(d.error||'failed');prog.style.color='var(--red)';}
+        if(btn)btn.disabled=false;
+      }
+    }).catch(function(){if(btn)btn.disabled=false;if(prog)prog.textContent='Network error';});
+}
+
+function restoreSnapshot(label){
+  if(!confirm('Restore TAK Server from snapshot "'+label+'"?\\n\\nThis will:\\n• Stop TAK Server\\n• Restore CoreConfig.xml, UserAuthenticationFile.xml, certs, and database\\n• Restart TAK Server\\n\\nCurrent data will be overwritten.'))return;
+  var prog=document.getElementById('snap-progress');
+  if(prog){prog.style.display='';prog.style.color='var(--yellow)';prog.textContent='Restoring snapshot…';}
+  fetch('/api/takserver/rollback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:label})})
+    .then(function(r){return r.json();}).then(function(d){
+      if(d.ok){
+        var poll=setInterval(function(){
+          fetch('/api/takserver/rollback/log').then(function(r){return r.json();}).then(function(s){
+            if(prog)prog.textContent=s.log&&s.log.length?s.log[s.log.length-1]:'Running…';
+            if(!s.running){
+              clearInterval(poll);
+              if(prog)prog.style.color=s.error?'var(--red)':'var(--green)';
+              loadSnapshots();
+            }
+          });
+        },1500);
+      }else{
+        if(prog){prog.style.color='var(--red)';prog.textContent='Error: '+(d.error||'failed');}
+      }
+    }).catch(function(){if(prog){prog.style.color='var(--red)';prog.textContent='Network error';}});
+}
+
+function deleteSnapshot(label){
+  if(!confirm('Delete snapshot "'+label+'"?'))return;
+  fetch('/api/takserver/snapshot/'+encodeURIComponent(label),{method:'DELETE'})
+    .then(function(r){return r.json();}).then(function(d){
+      if(d.ok)loadSnapshots();
+      else alert('Delete failed: '+(d.error||'unknown'));
+    });
+}
+
+function _applySchedState(enabled){
+  var badge=document.getElementById('sched-badge');
+  var track=document.getElementById('sched-toggle-track');
+  var thumb=document.getElementById('sched-toggle-thumb');
+  var cb=document.getElementById('sched-enabled');
+  if(cb)cb.checked=!!enabled;
+  if(track)track.style.background=enabled?'var(--green)':'var(--border)';
+  if(thumb)thumb.style.transform=enabled?'translateX(18px)':'translateX(0)';
+  if(badge){
+    badge.className=enabled?'badge badge-green':'badge badge-red';
+    badge.innerHTML=enabled?'<span class="dot dot-pulse"></span>Active':'<span class="dot"></span>Disabled';
+  }
+}
+
+function loadSchedule(){
+  fetch('/api/takserver/snapshot/schedule').then(function(r){return r.json();}).then(function(d){
+    var freq=document.getElementById('sched-freq');
+    var hour=document.getElementById('sched-hour');
+    var ret=document.getElementById('sched-retention');
+    var stat=document.getElementById('sched-status');
+    _applySchedState(!!d.enabled);
+    if(freq)freq.value=d.frequency||'daily';
+    if(hour)hour.value=d.hour!==undefined?d.hour:2;
+    if(ret)ret.value=d.retention||7;
+    if(stat)stat.textContent=d.timer_active?'● Timer active':'';
+  }).catch(function(){});
+}
+
+var _schedSaveTimer=null;
+function saveSchedule(){
+  clearTimeout(_schedSaveTimer);
+  _schedSaveTimer=setTimeout(function(){
+    var enabled=!!(document.getElementById('sched-enabled')&&document.getElementById('sched-enabled').checked);
+    var body={
+      enabled:enabled,
+      frequency:(document.getElementById('sched-freq')||{}).value||'daily',
+      hour:parseInt((document.getElementById('sched-hour')||{}).value||2,10),
+      minute:0,
+      retention:parseInt((document.getElementById('sched-retention')||{}).value||7,10)
+    };
+    _applySchedState(enabled);
+    fetch('/api/takserver/snapshot/schedule',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+      .then(function(r){return r.json();}).then(function(d){
+        var stat=document.getElementById('sched-status');
+        if(d.ok){_applySchedState(d.config.enabled);if(stat)stat.textContent=d.config.enabled?'● Timer active':'';}
+        else{if(stat)stat.textContent='✗ Save failed';}
+      });
+  },600);
+}
+
+loadSnapshots();
+loadSchedule();
+</script>
 <script src="/takserver.js"></script></body></html>'''
 
 # === Startup Banner (prints for both gunicorn and direct invocation) ===
@@ -32481,7 +35099,7 @@ def _fail2ban_install_and_configure(plog):
     # Step 1: Install fail2ban
     plog("fail2ban migration: installing fail2ban")
     if pkg_mgr == 'apt':
-        result = subprocess.run(['apt-get', 'install', '-y', 'fail2ban'],
+        result = subprocess.run(_sudo_wrap(['apt-get', 'install', '-y', 'fail2ban']),
                                 capture_output=True, text=True)
     else:
         result = subprocess.run(['yum', 'install', '-y', 'fail2ban'],
@@ -32551,7 +35169,7 @@ def _fail2ban_install_and_configure(plog):
     plog(f"fail2ban migration: wrote {jail_path}")
 
     # Step 6: Reload systemd and enable/start services
-    subprocess.run(['systemctl', 'daemon-reload'], capture_output=True)
+    subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True)
     # Only start the log forwarder if Authentik containers are actually running.
     # If Authentik isn't deployed yet, the forwarder would crash-loop trying to
     # tail a non-existent container. It will be started automatically when the
@@ -32560,18 +35178,18 @@ def _fail2ban_install_and_configure(plog):
         ['docker', 'ps', '--format', '{{.Names}}'],
         capture_output=True, text=True).stdout
     if 'authentik' in ak_running:
-        subprocess.run(['systemctl', 'enable', '--now', 'authentik-log-forwarder'],
+        subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', 'authentik-log-forwarder']),
                        capture_output=True)
         plog("fail2ban migration: Authentik detected — log forwarder enabled and started")
     else:
         plog("fail2ban migration: Authentik not running — log forwarder will start when Authentik jail is enabled")
-    subprocess.run(['systemctl', 'enable', '--now', 'fail2ban'],
+    subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', 'fail2ban']),
                    capture_output=True)
     # Verify the daemon actually came up — apt installs it disabled on some images
     import time as _time
     for _attempt in range(3):
         _time.sleep(2)
-        _r = subprocess.run(['systemctl', 'is-active', 'fail2ban'],
+        _r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'fail2ban']),
                             capture_output=True, text=True)
         if _r.stdout.strip() == 'active':
             plog("fail2ban migration: fail2ban service is active")
@@ -32647,8 +35265,8 @@ def _find_settings():
                 return p
     except Exception:
         pass
-    for d in ['/opt/infra-TAK', '/root/infra-TAK', '/home/ubuntu/infra-TAK',
-              '/home/admin/infra-TAK']:
+    for d in ['/opt/infra-TAK', '/home/takwerx/infra-TAK', '/root/infra-TAK',
+              '/home/ubuntu/infra-TAK', '/home/admin/infra-TAK']:
         p = os.path.join(d, '.config', 'settings.json')
         if os.path.exists(p):
             return p
@@ -32979,6 +35597,22 @@ def _startup_migrations():
             _fail2ban_takserver_filter(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _f2b_tak_err:
             print(f"Startup migration: fail2ban takserver filter error (non-fatal): {_f2b_tak_err}")
+
+        # v0.9.2: Create Authentik ReputationPolicy and bind to ldap-authentication-flow.
+        # Idempotent — only runs the API calls on first startup per box.
+        try:
+            if os.path.exists(os.path.expanduser('~/authentik/.env')):
+                _authentik_setup_reputation_policy(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _ak_rep_err:
+            print(f"Startup migration: authentik reputation policy error (non-fatal): {_ak_rep_err}")
+
+        # v0.9.3: Ensure TAK Server snapshot timer matches settings (idempotent rewrite).
+        try:
+            _s = load_settings()
+            if (_s.get('tak_snapshot_schedule') or {}).get('enabled'):
+                _tak_setup_snapshot_schedule(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _snap_err:
+            print(f"Startup migration: snapshot schedule error (non-fatal): {_snap_err}")
     except Exception as e:
         print(f"Startup migration error: {e}")
         import traceback; traceback.print_exc()
@@ -33193,6 +35827,13 @@ def _post_update_auto_deploy():
             except Exception as _f2b_tak_err:
                 print(f"Post-update: fail2ban takserver filter error (non-fatal): {_f2b_tak_err}")
 
+            # v0.9.2: Set up Authentik ReputationPolicy on ldap-authentication-flow.
+            try:
+                if os.path.exists(os.path.expanduser('~/authentik/.env')):
+                    _authentik_setup_reputation_policy(lambda m: print(f"Post-update: {m}", flush=True))
+            except Exception as _ak_rep_err:
+                print(f"Post-update: authentik reputation policy error (non-fatal): {_ak_rep_err}")
+
             # Re-deploy Guard Dog (updated scripts + timers)
             if os.path.exists('/opt/tak-guarddog') and os.path.exists('/opt/tak'):
                 if not guarddog_deploy_status.get('running'):
@@ -33330,10 +35971,53 @@ def _post_update_auto_deploy():
                                 1
                             )
                             print("Post-update: Node-RED compose — adding host.docker.internal")
+                        # Phase 2 hardening — pin image (drop :latest), add cap_drop / no-new-privileges /
+                        # mem_limit / user / restart / env_file. Idempotent string-level patches that
+                        # respect any operator overrides already in place.
+                        if 'image: nodered/node-red:latest' in content:
+                            content = content.replace('image: nodered/node-red:latest', 'image: nodered/node-red:4.0')
+                            print("Post-update: Node-RED image pinned to 4.0 (was :latest)")
+                        if 'restart:' not in content and 'container_name: nodered' in content:
+                            content = content.replace(
+                                'container_name: nodered\n',
+                                'container_name: nodered\n    restart: unless-stopped\n',
+                                1
+                            )
+                            print("Post-update: Node-RED compose — adding restart: unless-stopped")
+                        if 'cap_drop:' not in content and 'container_name: nodered' in content:
+                            content = content.replace(
+                                'container_name: nodered\n',
+                                'container_name: nodered\n    user: "1000:1000"\n    cap_drop:\n      - ALL\n    security_opt:\n      - no-new-privileges:true\n    mem_limit: 2g\n',
+                                1
+                            )
+                            print("Post-update: Node-RED compose — adding hardening flags (user, cap_drop, no-new-privileges, mem_limit)")
+                        if 'env_file:' not in content and 'container_name: nodered' in content:
+                            content = content.replace(
+                                'container_name: nodered\n',
+                                'container_name: nodered\n    env_file:\n      - .env\n',
+                                1
+                            )
+                            print("Post-update: Node-RED compose — adding env_file: .env (for optional adminAuth env vars)")
                         if content != orig:
                             _auto_deploy_active['nodered'] = True
                             with open(compose_path, 'w') as f:
                                 f.write(content)
+                            # Ensure .env exists so docker compose --env-file doesn't fail.
+                            env_path = os.path.join(nr_dir, '.env')
+                            if not os.path.exists(env_path):
+                                try:
+                                    with open(env_path, 'w') as ef:
+                                        ef.write("""# infra-TAK Node-RED env file
+# Optional: enable Node-RED's built-in credentials (defense-in-depth atop Caddy+Authentik).
+# Generate the hash via: docker exec nodered npx --yes node-red-admin@latest hash-pw
+# NR_ADMIN_USER=admin
+# NR_ADMIN_PASSWORD_HASH=<bcrypt-hash>
+# NR_CREDENTIAL_SECRET=<random-hex-string-for-stable-cred-encryption>
+""")
+                                    os.chmod(env_path, 0o600)
+                                    print("Post-update: Node-RED .env file created (empty scaffold)")
+                                except Exception as ee:
+                                    print(f"Post-update: Node-RED .env create warning: {ee}")
                             subprocess.run(f'cd {shlex.quote(nr_dir)} && docker compose up -d 2>/dev/null',
                                 shell=True, capture_output=True, text=True, timeout=120)
                             print("Post-update: Node-RED recreated (compose patch)")
@@ -33344,6 +36028,108 @@ def _post_update_auto_deploy():
                         print(f"Post-update: Node-RED port hardening error: {e}")
                     finally:
                         _auto_deploy_active.pop('nodered', None)
+
+            def _auto_harden_containers():
+                """CVE-2026-31431 (Copy Fail) hardening for Authentik and TAK Portal.
+
+                Idempotent — safe to run every Update Now.  Removes the Docker socket
+                from the Authentik worker and adds cap_drop/no-new-privileges to
+                Authentik (server/worker/ldap) and TAK Portal compose files, then
+                recreates only the affected containers.
+                """
+                # Authentik
+                try:
+                    ak_compose = os.path.expanduser('~/authentik/docker-compose.yml')
+                    if os.path.exists(ak_compose):
+                        with open(ak_compose) as _f:
+                            _ak = _f.read()
+                        _ak_orig = _ak
+                        if '/var/run/docker.sock' in _ak:
+                            # Line-filter removal — handles any indentation level
+                            _ak = ''.join(
+                                l for l in _ak.splitlines(keepends=True)
+                                if '/var/run/docker.sock' not in l
+                            )
+                            print("Post-update: Authentik — removed docker.sock from worker")
+                        for _old, _new in (
+                            ('command: server\n', 'cap_drop:\n      - ALL\n    security_opt:\n      - no-new-privileges:true\n    command: server\n'),
+                        ):
+                            if _old in _ak and _new not in _ak:
+                                _ak = _ak.replace(_old, _new, 1)
+                        # Remove any previous worker hardening — worker must run as root (upstream design)
+                        for _bad in (
+                            'cap_drop:\n      - ALL\n    cap_add:\n      - CHOWN\n      - SETUID\n      - SETGID\n    security_opt:\n      - no-new-privileges:true\n    command: worker\n',
+                            'cap_drop:\n      - ALL\n    security_opt:\n      - no-new-privileges:true\n    command: worker\n',
+                        ):
+                            if _bad in _ak:
+                                _ak = _ak.replace(_bad, 'command: worker\n', 1)
+                        # LDAP cap_drop — section-based (anchor: ldap image line, not the token value)
+                        _ldap_start = _ak.find('\n  ldap:\n')
+                        if _ldap_start != -1:
+                            import re as _re_harden
+                            _ldap_end_m = _re_harden.search(r'\n(volumes:|networks:)', _ak[_ldap_start + 1:])
+                            _ldap_end = _ldap_start + 1 + (_ldap_end_m.start() if _ldap_end_m else len(_ak))
+                            _ldap_block = _ak[_ldap_start:_ldap_end]
+                            if 'cap_drop:' not in _ldap_block and 'restart: unless-stopped' in _ldap_block:
+                                _ldap_new = _ldap_block.replace(
+                                    '    restart: unless-stopped\n',
+                                    '    restart: unless-stopped\n    cap_drop:\n      - ALL\n    security_opt:\n      - no-new-privileges:true\n',
+                                    1
+                                )
+                                _ak = _ak[:_ldap_start] + _ldap_new + _ak[_ldap_end:]
+                        if _ak != _ak_orig:
+                            with open(ak_compose, 'w') as _f:
+                                _f.write(_ak)
+                            print("Post-update: Authentik compose hardened — recreating worker/server/ldap")
+                            subprocess.run(
+                                'cd ~/authentik && docker compose up -d --force-recreate worker server ldap 2>/dev/null',
+                                shell=True, capture_output=True, text=True, timeout=120
+                            )
+                        else:
+                            print("Post-update: Authentik compose already hardened — no changes needed")
+                except Exception as _e:
+                    print(f"Post-update: Authentik hardening error (non-fatal): {_e}")
+                # TAK Portal — write/refresh override file (infratak network only)
+                # v0.9.2+: override file instead of patching the git-tracked
+                # docker-compose.yml, which caused stash conflicts on git pull.
+                # No cap_drop — TAK Portal reads cert files owned by uid 889;
+                # cap_drop:ALL removes CAP_DAC_OVERRIDE and breaks cert access.
+                try:
+                    tp_dir = os.path.expanduser('~/TAK-Portal')
+                    if os.path.isdir(tp_dir):
+                        changed = _write_takportal_override()
+                        # Also strip any old cap_drop lines we injected directly into docker-compose.yml
+                        tp_compose = os.path.join(tp_dir, 'docker-compose.yml')
+                        if os.path.exists(tp_compose):
+                            with open(tp_compose) as _f:
+                                _tp = _f.read()
+                            _tp_orig = _tp
+                            for _old_injection in (
+                                '\n    cap_drop:\n      - ALL\n    security_opt:\n      - no-new-privileges:true',
+                                '\n    networks:\n      - default\n      - infratak',
+                            ):
+                                _tp = _tp.replace(_old_injection, '', 1)
+                            # Remove stale trailing networks block we may have appended
+                            import re as _re_tp
+                            _tp = _re_tp.sub(
+                                r'\nnetworks:\n  default:\n  infratak:\n    external: true\n?$',
+                                '', _tp
+                            )
+                            if _tp != _tp_orig:
+                                with open(tp_compose, 'w') as _f:
+                                    _f.write(_tp)
+                                changed = True
+                                print("Post-update: TAK Portal docker-compose.yml cleaned (moved hardening to override)")
+                        if changed:
+                            print("Post-update: TAK Portal override written — recreating container")
+                            subprocess.run(
+                                'cd ~/TAK-Portal && docker compose up -d --force-recreate 2>/dev/null',
+                                shell=True, capture_output=True, text=True, timeout=120
+                            )
+                        else:
+                            print("Post-update: TAK Portal override already current — no changes needed")
+                except Exception as _e:
+                    print(f"Post-update: TAK Portal hardening error (non-fatal): {_e}")
 
             def _auto_nodered_settings(nr_dir):
                 """Ensure Node-RED settings.js has required keys (editorTheme, httpStatic, functionGlobalContext, contextStorage)."""
@@ -33599,6 +36385,7 @@ def _post_update_auto_deploy():
 
             _auto_authentik_ports()
             _auto_nodered()
+            _auto_harden_containers()
 
             # CloudTAK is independent (talks to TAK Server, not Authentik) — start it early
             cloudtak_t = threading.Thread(target=_auto_cloudtak, daemon=True)

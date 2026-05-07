@@ -396,7 +396,6 @@ ExecStart=$GUNICORN_BIN $GUNICORN_ARGS app:app
 WorkingDirectory=$USE_DIR
 Restart=always
 RestartSec=5
-User=root
 Environment=PYTHONUNBUFFERED=1
 Environment=CONFIG_DIR=$USE_DIR/.config
 
@@ -414,6 +413,7 @@ EOF
 detect_os
 check_disk_io
 wait_for_upgrades
+
 install_dependencies
 
 # First-time setup if no auth file exists

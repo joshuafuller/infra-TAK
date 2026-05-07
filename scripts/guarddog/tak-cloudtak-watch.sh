@@ -14,8 +14,7 @@ mkdir -p "$STATE_DIR"
 UPTIME_SECS=$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0)
 [ "$UPTIME_SECS" -lt 900 ] && exit 0
 
-CT_DIR="${HOME:-/root}/CloudTAK"
-[ -z "$CT_DIR" ] && CT_DIR="/root/CloudTAK"
+CT_DIR="${HOME:-/home/takwerx}/CloudTAK"
 [ ! -f "$CT_DIR/docker-compose.yml" ] && exit 0
 
 # Health: cloudtak-api container running

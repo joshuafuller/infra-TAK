@@ -474,8 +474,28 @@ docker exec "$CONTAINER" node -e "
 "
 
 CERT_HOST_DIR="/opt/tak/certs/files"
-# If tls_tak still has no cert paths but host has standard TAK admin files, wire /certs/... (expects volume mount host:files -> container:/certs)
-if [ -f "$CERT_HOST_DIR/admin.pem" ] && [ -f "$CERT_HOST_DIR/admin.key" ]; then
+# Cert auto-fill priority (Phase 1A migration):
+#   1. nodered.pem/key   — least-privilege flat-file user. Generated when operator completes
+#                          the Phase 0 spike (see docs/SPIKE-flatfile-nodered.md). When present,
+#                          tls_tak picks this up automatically. nodered owns DataSync missions
+#                          it creates, so no role-elevation hack is needed.
+#   2. admin.pem/key     — fallback. Pre-Phase-1A behavior. Status quo for installs that have
+#                          not run the spike or that chose to stay on admin.
+# Only writes to tls_tak.cert/key if the field is currently empty (preserves operator overrides).
+if [ -f "$CERT_HOST_DIR/nodered.pem" ] && [ -f "$CERT_HOST_DIR/nodered.key" ]; then
+  docker exec "$CONTAINER" node -e "
+    var fs = require('fs');
+    var p = '/tmp/flows_merged.json';
+    var f = JSON.parse(fs.readFileSync(p, 'utf8'));
+    var tls = f.find(function(n) { return n.id === 'tls_tak'; });
+    if (tls && (!tls.cert || tls.cert === '')) {
+      tls.cert = '/certs/nodered.pem';
+      tls.key = '/certs/nodered.key';
+      fs.writeFileSync(p, JSON.stringify(f, null, 2));
+      console.log('    TLS: auto-filled /certs/nodered.pem (Phase 1A: flat-file nodered cert detected)');
+    }
+  "
+elif [ -f "$CERT_HOST_DIR/admin.pem" ] && [ -f "$CERT_HOST_DIR/admin.key" ]; then
   docker exec "$CONTAINER" node -e "
     var fs = require('fs');
     var p = '/tmp/flows_merged.json';
@@ -485,7 +505,7 @@ if [ -f "$CERT_HOST_DIR/admin.pem" ] && [ -f "$CERT_HOST_DIR/admin.key" ]; then
       tls.cert = '/certs/admin.pem';
       tls.key = '/certs/admin.key';
       fs.writeFileSync(p, JSON.stringify(f, null, 2));
-      console.log('    TLS: auto-filled /certs/admin.pem (host has admin certs)');
+      console.log('    TLS: auto-filled /certs/admin.pem (host has admin certs; nodered.pem not present)');
     }
   "
 fi

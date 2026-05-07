@@ -14,8 +14,7 @@ mkdir -p "$STATE_DIR"
 UPTIME_SECS=$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0)
 [ "$UPTIME_SECS" -lt 900 ] && exit 0
 
-NR_DIR="${HOME:-/root}/node-red"
-[ -z "$NR_DIR" ] && NR_DIR="/root/node-red"
+NR_DIR="${HOME:-/home/takwerx}/node-red"
 [ ! -f "$NR_DIR/docker-compose.yml" ] && exit 0
 
 # Health: HTTP to Node-RED (1880)
