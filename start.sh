@@ -59,6 +59,60 @@ provision_takwerx() {
         fi
     done
 
+    # ----------------------------------------------------------------------
+    # Relocate the install directory out of /root/ if needed.
+    #
+    # WHY: /root/ is mode 0700 — takwerx cannot cd into it as WorkingDirectory
+    # even if file ownership is correct. We must physically move the install
+    # tree under /home/takwerx/.
+    #
+    # WHY HERE (not in app.py): a Python venv bakes absolute path shebangs into
+    # every script in .venv/bin. Moving a venv breaks every shebang. We must
+    # delete and rebuild the venv at the new location. This cannot safely
+    # happen from inside the running gunicorn process — we'd be sawing off
+    # the branch we're sitting on. start.sh is bash, runs OUTSIDE the service,
+    # and stops the service before doing anything destructive.
+    # ----------------------------------------------------------------------
+    if [[ "$INSTALL_DIR" == /root/* ]]; then
+        local NEW_INSTALL_DIR="/home/takwerx/${INSTALL_DIR#/root/}"
+        echo ""
+        echo -e "  ${YELLOW}Detected install at $INSTALL_DIR — relocating to $NEW_INSTALL_DIR${NC}"
+        echo -e "  ${YELLOW}(takwerx cannot use /root/ paths as systemd WorkingDirectory)${NC}"
+
+        # Stop the service if running so we don't move files out from under it
+        systemctl stop takwerx-console 2>/dev/null || true
+
+        # If a previous broken attempt left a symlink at NEW_INSTALL_DIR, remove it
+        if [ -L "$NEW_INSTALL_DIR" ]; then
+            rm -f "$NEW_INSTALL_DIR"
+        fi
+        if [ -d "$NEW_INSTALL_DIR" ]; then
+            echo -e "  ${YELLOW}$NEW_INSTALL_DIR already exists as a directory — refusing to overwrite. Aborting relocation.${NC}"
+            return 1
+        fi
+
+        mv "$INSTALL_DIR" "$NEW_INSTALL_DIR"
+
+        # Clean up any leftover symlink at the old /root/infra-TAK location from a prior
+        # failed attempt. Bare /root path is now empty/symlinked — fine.
+        if [ -L "$INSTALL_DIR" ] || [ -d "$INSTALL_DIR" ]; then
+            rm -rf "$INSTALL_DIR" 2>/dev/null || true
+        fi
+
+        INSTALL_DIR="$NEW_INSTALL_DIR"
+        CONFIG_DIR="$INSTALL_DIR/.config"
+        AUTH_FILE="$CONFIG_DIR/auth.json"
+        SETTINGS_FILE="$CONFIG_DIR/settings.json"
+        echo -e "  ${GREEN}✓ Install dir moved to $INSTALL_DIR${NC}"
+
+        # Rebuild the venv — old shebangs all point to /root/.../python3 which is gone
+        if [ -d "$INSTALL_DIR/.venv" ]; then
+            echo -e "  Rebuilding Python venv at new location..."
+            rm -rf "$INSTALL_DIR/.venv"
+        fi
+        # The venv will be recreated by install_dependencies() later in start.sh.
+    fi
+
     chown -R takwerx:takwerx /home/takwerx
     chown -R takwerx:takwerx "$INSTALL_DIR"
 
@@ -445,6 +499,12 @@ EOF
 detect_os
 check_disk_io
 wait_for_upgrades
+
+# Provision dedicated service user FIRST — may relocate $INSTALL_DIR out of /root/.
+# Doing this before install_dependencies ensures the venv gets built at the final
+# location with correct shebangs.
+provision_takwerx
+
 install_dependencies
 
 # First-time setup if no auth file exists
@@ -454,9 +514,6 @@ fi
 
 # Always use self-signed cert for console (Caddy handles FQDN SSL)
 generate_self_signed_cert
-
-# Provision dedicated service user
-provision_takwerx
 
 # Create and start systemd service
 create_service

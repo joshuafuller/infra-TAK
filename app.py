@@ -117,6 +117,31 @@ def _read_priv(path):
     return proc.stdout
 
 
+def _takwerx_migration_pending():
+    """True when the console is running as root but the takwerx user exists.
+
+    The post-update migration creates the takwerx user (the safe part). The full
+    migration to running the service AS takwerx requires `sudo bash start.sh` —
+    start.sh relocates the install dir out of /root/, rebuilds the venv, and
+    rewrites the service unit. Until that's done, the console keeps running as
+    root and we surface a banner asking the operator to complete it.
+
+    The check is purely runtime — no settings flag, no manual dismiss. When the
+    operator runs start.sh and the service restarts as takwerx, os.getuid() != 0
+    and the banner stops rendering automatically.
+    """
+    if os.getuid() != 0:
+        return False
+    try:
+        import pwd as _pwd
+        _pwd.getpwnam('takwerx')
+        return True
+    except KeyError:
+        return False
+    except Exception:
+        return False
+
+
 def _client_ip():
     """Best-effort client IP for rate limiting."""
     if request.remote_addr in ('127.0.0.1', '::1'):
@@ -1735,7 +1760,8 @@ def console_page():
     resp = render_template_string(CONSOLE_TEMPLATE,
         settings=settings, modules=modules, metrics=metrics, version=VERSION,
         module_versions=module_versions, authentik_base_url=_get_authentik_base_url(settings),
-        takserver_base_url=_get_takserver_base_url(settings), uu_hosts=uu_hosts)
+        takserver_base_url=_get_takserver_base_url(settings), uu_hosts=uu_hosts,
+        takwerx_migration_pending=_takwerx_migration_pending())
     from flask import make_response
     r = make_response(resp)
     r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
@@ -33098,6 +33124,14 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div id="update-details" style="display:none;margin-top:12px;padding-top:12px;border-top:1px solid var(--border);font-size:11px;color:var(--text-dim);white-space:pre-wrap;max-height:200px;overflow-y:auto"></div>
 <div id="update-status" style="display:none;margin-top:8px;font-size:11px"></div>
 </div>
+{% if takwerx_migration_pending %}
+<div id="takwerx-migration-bar" style="background:rgba(56,189,248,0.08);border:1px solid rgba(56,189,248,0.3);border-radius:10px;padding:12px 16px;margin-bottom:16px;display:flex;align-items:center;justify-content:space-between;gap:16px">
+<div>
+  <div style="font-size:12px;font-weight:600;color:#38bdf8">⚙ Takwerx user provisioned — finish migration to non-root service</div>
+  <div style="font-size:11px;color:var(--text-dim);margin-top:2px">SSH into this host and run <code style="background:rgba(0,0,0,0.3);padding:1px 6px;border-radius:4px">sudo bash start.sh</code> from the infra-TAK directory. start.sh relocates the install out of <code style="background:rgba(0,0,0,0.3);padding:1px 4px;border-radius:4px">/root/</code>, rebuilds the venv, and switches the service to run as <code>takwerx</code>. This banner clears automatically when done.</div>
+</div>
+</div>
+{% endif %}
 {% if settings.get('console_rollback', {}).get('available') %}
 <div id="console-rollback-bar" style="background:rgba(234,179,8,0.08);border:1px solid rgba(234,179,8,0.25);border-radius:10px;padding:12px 16px;margin-bottom:16px;display:flex;align-items:center;justify-content:space-between">
 <div>
@@ -35579,11 +35613,19 @@ def _post_update_auto_deploy():
                         print(f"Post-update: Authentik port hardening error: {e}")
 
             def _auto_provision_takwerx():
-                """Idempotent: create takwerx user, move install dir out of /root/,
-                migrate module dirs, update service unit (User + WorkingDirectory + ExecStart).
-                Returns True if the systemd unit was modified (caller should restart)."""
+                """Idempotent: create takwerx user + sudoers + groups ONLY.
+
+                Does NOT move directories or modify the service unit — those operations
+                cannot safely happen from inside the running gunicorn process (the venv
+                shebangs hardcode the install path and break on relocation). The full
+                migration to running as takwerx happens when the operator runs
+                `sudo bash start.sh` — start.sh is bash, not Python, and runs OUTSIDE
+                the service, so it can safely relocate the install + rebuild the venv.
+
+                The console UI shows a banner ("Run sudo bash start.sh to complete
+                takwerx migration") whenever this function created the user but the
+                service is still running as root."""
                 import pwd as _pwd
-                service_updated = False
                 try:
                     try:
                         _pwd.getpwnam('takwerx')
@@ -35596,11 +35638,9 @@ def _post_update_auto_deploy():
                             capture_output=True, text=True)
                         print("Post-update: takwerx user created")
 
-                    # Groups — idempotent
                     subprocess.run(_sudo_wrap(['usermod', '-aG', 'sudo,docker', 'takwerx']),
                         capture_output=True, text=True)
 
-                    # Sudoers
                     _sudoers_path = '/etc/sudoers.d/takwerx'
                     _sudoers_content = 'takwerx ALL=(ALL) NOPASSWD: ALL\n'
                     try:
@@ -35612,64 +35652,14 @@ def _post_update_auto_deploy():
                         subprocess.run(_sudo_wrap(['chmod', '440', _sudoers_path]),
                             capture_output=True, text=True)
 
-                    # Migrate module dirs /root/ → /home/takwerx/
-                    for _mod in ('authentik', 'CloudTAK', 'node-red', 'TAK-Portal'):
-                        _src = f'/root/{_mod}'
-                        _dst = f'/home/takwerx/{_mod}'
-                        if os.path.isdir(_src) and not os.path.isdir(_dst):
-                            subprocess.run(_sudo_wrap(['mv', _src, _dst]),
-                                capture_output=True, text=True)
-                            print(f"Post-update: migrated {_src} → {_dst}")
-
-                    # Move install dir out of /root/ so takwerx can use it as WorkingDirectory.
-                    # /root is mode 700 — takwerx cannot cd into it even with correct file ownership.
-                    _install_dir = os.path.dirname(os.path.abspath(__file__))
-                    _new_install_dir = _install_dir
-                    if _install_dir.startswith('/root/'):
-                        _rel = _install_dir[len('/root/'):]  # e.g. "infra-TAK"
-                        _new_install_dir = f'/home/takwerx/{_rel}'
-                        if not os.path.isdir(_new_install_dir):
-                            subprocess.run(_sudo_wrap(['mv', _install_dir, _new_install_dir]),
-                                capture_output=True, text=True)
-                            print(f"Post-update: moved install dir {_install_dir} → {_new_install_dir}")
-
-                    # chown everything under /home/takwerx
-                    subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx', '/home/takwerx']),
-                        capture_output=True, text=True)
-
-                    # Update service unit — fix User, WorkingDirectory, ExecStart, CONFIG_DIR
-                    _svc_path = '/etc/systemd/system/takwerx-console.service'
-                    if os.path.exists(_svc_path):
-                        try:
-                            _svc = _read_priv(_svc_path)
-                        except Exception:
-                            _svc = ''
-                        _svc_orig = _svc
-                        # Replace all old install-dir path references (ExecStart, WorkingDirectory, CONFIG_DIR)
-                        if _install_dir != _new_install_dir and _install_dir in _svc:
-                            _svc = _svc.replace(_install_dir, _new_install_dir)
-                        # Fix User
-                        if 'User=root' in _svc:
-                            _svc = _svc.replace('User=root', 'User=takwerx')
-                        if 'User=takwerx' not in _svc and '[Service]' in _svc:
-                            _svc = _svc.replace('[Service]\n', '[Service]\nUser=takwerx\n')
-                        if 'HOME=/home/takwerx' not in _svc and '[Service]' in _svc:
-                            _svc = _svc.replace('[Service]\n', '[Service]\nEnvironment=HOME=/home/takwerx\n')
-                        if _svc != _svc_orig:
-                            _write_priv(_svc_path, _svc)
-                            subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']),
-                                capture_output=True, text=True)
-                            service_updated = True
-                            print("Post-update: takwerx service unit updated — restarting as takwerx after deploy")
-                        elif not _user_existed:
-                            print("Post-update: takwerx user provisioned (service unit already correct)")
-                        else:
-                            print("Post-update: takwerx user already provisioned (idempotent)")
+                    if not _user_existed:
+                        print("Post-update: takwerx provisioned — operator must run 'sudo bash start.sh' once to complete migration to non-root service")
+                    else:
+                        print("Post-update: takwerx user already provisioned (idempotent)")
                 except Exception as _e:
                     print(f"Post-update: takwerx provision error (non-fatal): {_e}")
-                return service_updated
 
-            _takwerx_needs_restart = _auto_provision_takwerx()
+            _auto_provision_takwerx()
             _auto_authentik_ports()
             _auto_nodered()
             _auto_harden_containers()
@@ -35696,11 +35686,6 @@ def _post_update_auto_deploy():
             cloudtak_t.join(timeout=600)
 
             print("Post-update: auto-deploy complete")
-
-            if _takwerx_needs_restart:
-                print("Post-update: restarting console service as takwerx user")
-                subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takwerx-console']),
-                    capture_output=True, text=True)
 
         def _run_post_update_guarded():
             try:
