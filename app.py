@@ -23180,14 +23180,6 @@ entries:
   worker:
     image: ${AUTHENTIK_IMAGE:-ghcr.io/goauthentik/server}:${AUTHENTIK_TAG:-2026.2.0}
     restart: unless-stopped
-    cap_drop:
-      - ALL
-    cap_add:
-      - CHOWN
-      - SETUID
-      - SETGID
-    security_opt:
-      - no-new-privileges:true
     command: worker
     environment:
       AUTHENTIK_REDIS__HOST: redis
@@ -35882,21 +35874,16 @@ def _post_update_auto_deploy():
                             print("Post-update: Authentik — removed docker.sock from worker")
                         for _old, _new in (
                             ('command: server\n', 'cap_drop:\n      - ALL\n    security_opt:\n      - no-new-privileges:true\n    command: server\n'),
-                            ('command: worker\n', 'cap_drop:\n      - ALL\n    cap_add:\n      - CHOWN\n      - SETUID\n      - SETGID\n    security_opt:\n      - no-new-privileges:true\n    command: worker\n'),
                         ):
                             if _old in _ak and _new not in _ak:
                                 _ak = _ak.replace(_old, _new, 1)
-                        # Fixup: worker already has cap_drop but is missing cap_add (previous hardening pass)
-                        _missing_cap_add = (
-                            'cap_drop:\n      - ALL\n    security_opt:\n      - no-new-privileges:true\n    command: worker\n' in _ak
-                            and 'cap_add:\n      - CHOWN' not in _ak
-                        )
-                        if _missing_cap_add:
-                            _ak = _ak.replace(
-                                'cap_drop:\n      - ALL\n    security_opt:\n      - no-new-privileges:true\n    command: worker\n',
-                                'cap_drop:\n      - ALL\n    cap_add:\n      - CHOWN\n      - SETUID\n      - SETGID\n    security_opt:\n      - no-new-privileges:true\n    command: worker\n',
-                                1
-                            )
+                        # Remove any previous worker hardening — worker must run as root (upstream design)
+                        for _bad in (
+                            'cap_drop:\n      - ALL\n    cap_add:\n      - CHOWN\n      - SETUID\n      - SETGID\n    security_opt:\n      - no-new-privileges:true\n    command: worker\n',
+                            'cap_drop:\n      - ALL\n    security_opt:\n      - no-new-privileges:true\n    command: worker\n',
+                        ):
+                            if _bad in _ak:
+                                _ak = _ak.replace(_bad, 'command: worker\n', 1)
                         # LDAP cap_drop — section-based (anchor: ldap image line, not the token value)
                         _ldap_start = _ak.find('\n  ldap:\n')
                         if _ldap_start != -1:
