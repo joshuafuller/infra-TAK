@@ -34021,9 +34021,13 @@ body{display:flex;flex-direction:row;min-height:100vh}
 
 <!-- Snapshots & Recovery -->
 {% if tak_installed %}
-<div style="margin-top:24px">
-<div class="section-title">Snapshots &amp; Recovery</div>
-<div class="card" style="margin-bottom:16px">
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:24px">
+<div style="display:flex;align-items:center;justify-content:space-between;padding:16px 24px;cursor:pointer" onclick="takToggleSection('snapshots-recovery')">
+<span class="section-title" style="margin-bottom:0">Snapshots &amp; Recovery</span>
+<span id="snapshots-recovery-toggle-icon" style="font-size:18px;color:var(--text-dim);transition:transform 0.2s ease">&#9662;</span>
+</div>
+<div id="snapshots-recovery-body" style="display:none;padding:0 24px 24px 24px;border-top:1px solid var(--border)">
+<div style="padding-top:16px">
 <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
   <div>
     <div style="font-size:13px;font-weight:600;color:var(--text-primary)">TAK Server Snapshots</div>
@@ -34040,7 +34044,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 </div>
 
-<div class="card" style="margin-bottom:16px">
+<div style="margin-top:20px;padding-top:20px;border-top:1px solid var(--border)">
 <div style="font-size:13px;font-weight:600;color:var(--text-primary);margin-bottom:12px">Scheduled Snapshots</div>
 <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
   <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-secondary)">
@@ -34056,6 +34060,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
   <input type="number" id="sched-retention" value="7" min="1" max="90" style="width:55px;background:#0a0e1a;border:1px solid var(--border);color:var(--text-primary);border-radius:6px;padding:5px 8px;font-size:12px;font-family:JetBrains Mono,monospace" oninput="saveSchedule()">
   <span style="font-size:12px;color:var(--text-dim)">snapshots</span>
   <span id="sched-status" style="font-size:11px;color:var(--text-dim)"></span>
+</div>
 </div>
 </div>
 </div>
@@ -34079,6 +34084,23 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <footer class="footer"></footer>
 <script src="/log-tools.js?v={{ version }}"></script>
 <script>
+// Generic collapsible toggle for TAK Server page sections.
+// Section structure: header div with onclick="takToggleSection('<id>')" +
+// body div with id="<id>-body" + arrow span with id="<id>-toggle-icon".
+window.takToggleSection = function(id) {
+  var body = document.getElementById(id + '-body');
+  var icon = document.getElementById(id + '-toggle-icon');
+  if (!body) return;
+  var show = body.style.display === 'none';
+  body.style.display = show ? 'block' : 'none';
+  if (icon) icon.style.transform = show ? 'rotate(180deg)' : '';
+  // Lazy-load snapshot table on first open
+  if (show && id === 'snapshots-recovery' && typeof loadSnapshots === 'function') {
+    loadSnapshots();
+    if (typeof loadSchedule === 'function') loadSchedule();
+  }
+};
+
 // Snapshots & Recovery
 var _snapPollTimer = null;
 function loadSnapshots(){
