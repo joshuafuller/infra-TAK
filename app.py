@@ -307,7 +307,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.2-alpha"
+VERSION = "0.9.3-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -4849,6 +4849,147 @@ def fail2ban_ssh_ban_api():
         return jsonify({'ok': False, 'error': str(e)[:200]}), 500
 
 
+def _f2b_mediamtx_jail_enabled():
+    """Return True if the infratak-mediamtx-rtsp jail config file exists."""
+    return os.path.exists('/etc/fail2ban/jail.d/infratak-mediamtx-rtsp.conf')
+
+def _f2b_read_mediamtx_jail_config():
+    """Read current thresholds from the infratak-mediamtx-rtsp jail config file."""
+    cfg = {'maxretry': 10, 'findtime': 30, 'bantime': 3600}
+    jail_path = '/etc/fail2ban/jail.d/infratak-mediamtx-rtsp.conf'
+    if not os.path.exists(jail_path):
+        return cfg
+    try:
+        with open(jail_path) as _f:
+            for line in _f:
+                line = line.strip()
+                for key in ('maxretry', 'findtime', 'bantime'):
+                    if line.startswith(key):
+                        try: cfg[key] = int(line.split('=')[1].strip())
+                        except Exception: pass
+    except Exception:
+        pass
+    return cfg
+
+def _f2b_write_mediamtx_jail(maxretry, findtime, bantime):
+    """Write the mediamtx-rtsp filter file and infratak-mediamtx-rtsp jail config."""
+    os.makedirs('/etc/fail2ban/filter.d', exist_ok=True)
+    os.makedirs('/etc/fail2ban/jail.d', exist_ok=True)
+
+    filter_path = '/etc/fail2ban/filter.d/mediamtx-rtsp.conf'
+    filter_conf = (
+        "[Definition]\n"
+        "# Match RTSP connection opens per source IP.\n"
+        "# Counts 'opened' events — catches scanners before their probe cycle completes;\n"
+        "# legitimate ATAK clients reconnect occasionally but never at scanner rates.\n"
+        "failregex = \\[RTSP\\] \\[conn <HOST>:\\d+\\] opened\n"
+        "ignoreregex =\n"
+    )
+    with open(filter_path, 'w') as _f:
+        _f.write(filter_conf)
+
+    guarddog_action = ""
+    if os.path.exists('/etc/fail2ban/action.d/infratak-guarddog.conf'):
+        guarddog_action = "\n         infratak-guarddog"
+    jail_conf = (
+        "[mediamtx-rtsp]\n"
+        "enabled  = true\n"
+        "filter   = mediamtx-rtsp\n"
+        "backend  = systemd\n"
+        "journalmatch = _SYSTEMD_UNIT=mediamtx.service\n"
+        f"maxretry = {maxretry}\n"
+        f"findtime = {findtime}\n"
+        f"bantime  = {bantime}\n"
+        "ignoreip = 127.0.0.1/8 ::1\n"
+        f"action   = ufw{guarddog_action}\n"
+    )
+    jail_path = '/etc/fail2ban/jail.d/infratak-mediamtx-rtsp.conf'
+    with open(jail_path, 'w') as _f:
+        _f.write(jail_conf)
+
+
+@app.route('/api/fail2ban/mediamtx/status')
+@login_required
+def fail2ban_mediamtx_status_api():
+    """Return fail2ban status for the mediamtx-rtsp jail."""
+    if not _f2b_is_available():
+        return jsonify({'available': False, 'error': 'fail2ban not installed'})
+    try:
+        r = subprocess.run(['fail2ban-client', 'status', 'mediamtx-rtsp'],
+                           capture_output=True, text=True, timeout=10)
+        status = _f2b_parse_status(r.stdout)
+        status['available']      = True
+        status['daemon_running'] = (subprocess.run(
+            ['systemctl', 'is-active', 'fail2ban'],
+            capture_output=True, text=True).stdout.strip() == 'active')
+        status['jail_enabled']  = _f2b_mediamtx_jail_enabled()
+        status['jail_config']   = _f2b_read_mediamtx_jail_config()
+        # mediamtx is a systemd unit — confirm it is installed
+        mtx_active = subprocess.run(
+            ['systemctl', 'is-active', 'mediamtx'],
+            capture_output=True, text=True).stdout.strip()
+        status['mediamtx_installed'] = (mtx_active != 'inactive' or
+            os.path.exists('/etc/systemd/system/mediamtx.service') or
+            os.path.exists('/usr/local/bin/mediamtx'))
+        return jsonify(status)
+    except Exception as e:
+        return jsonify({'available': False, 'error': str(e)[:200]})
+
+
+@app.route('/api/fail2ban/mediamtx/config', methods=['POST'])
+@login_required
+def fail2ban_mediamtx_config_api():
+    """Enable/disable the mediamtx-rtsp jail and update its thresholds."""
+    if not _f2b_is_available():
+        return jsonify({'ok': False, 'error': 'fail2ban not installed'}), 400
+    data    = request.get_json(force=True) or {}
+    enabled = bool(data.get('enabled', False))
+    if not enabled:
+        jail_path = '/etc/fail2ban/jail.d/infratak-mediamtx-rtsp.conf'
+        if os.path.exists(jail_path):
+            os.remove(jail_path)
+        subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+        return jsonify({'ok': True, 'enabled': False})
+    try:
+        maxretry = max(1,  min(100,     int(data.get('maxretry', 10))))
+        findtime = max(10, min(86400,   int(data.get('findtime', 30))))
+        bantime  = max(60, min(2592000, int(data.get('bantime',  3600))))
+    except (ValueError, TypeError) as e:
+        return jsonify({'ok': False, 'error': f'Invalid value: {e}'}), 400
+    try:
+        _f2b_write_mediamtx_jail(maxretry, findtime, bantime)
+        _svc = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'fail2ban']),
+                              capture_output=True, text=True)
+        if _svc.stdout.strip() != 'active':
+            subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', 'fail2ban']),
+                           capture_output=True)
+        subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+        return jsonify({'ok': True, 'enabled': True,
+                        'maxretry': maxretry, 'findtime': findtime, 'bantime': bantime})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+
+@app.route('/api/fail2ban/mediamtx/unban', methods=['POST'])
+@login_required
+def fail2ban_mediamtx_unban_api():
+    """Unban a specific IP from the mediamtx-rtsp jail."""
+    if not _f2b_is_available():
+        return jsonify({'ok': False, 'error': 'fail2ban not installed'}), 400
+    data = request.get_json(force=True) or {}
+    ip   = str(data.get('ip', '')).strip()
+    if not ip or not _VALID_IP_RE.match(ip):
+        return jsonify({'ok': False, 'error': 'Invalid IP address'}), 400
+    try:
+        r = subprocess.run(['fail2ban-client', 'set', 'mediamtx-rtsp', 'unbanip', ip],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            return jsonify({'ok': True, 'ip': ip})
+        return jsonify({'ok': False, 'error': r.stderr.strip()[:200] or 'Unban failed'}), 500
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+
 def _f2b_recidive_enabled():
     return os.path.exists('/etc/fail2ban/jail.d/infratak-recidive.conf')
 
@@ -8040,6 +8181,322 @@ def caddy_log():
         'running': caddy_deploy_status['running'], 'complete': caddy_deploy_status['complete'],
         'error': caddy_deploy_status['error'], 'entries': list(caddy_deploy_log)})
 
+def _authentik_sync_all_domain_refs(fqdn, settings, plog=None):
+    """Comprehensive domain sync for Authentik — covers all 7 locations missed by the v0.9.1 flow.
+
+    1. ~/authentik/.env — AUTHENTIK_HOST and AUTHENTIK_COOKIE_DOMAIN
+    2. ~/authentik/docker-compose.yml — LDAP outpost AUTHENTIK_HOST → internal URL
+    3. Authentik API — brand: domain, cookie_domain, branding_custom_css, branding_default_flow_background
+    4. Authentik API — embedded outpost: config.authentik_host
+    5. Authentik API — all proxy providers: external_host, cookie_domain, redirect_uris
+    6. docker compose down && up -d (only if env was changed, to pick up env changes)
+    """
+    import urllib.request as _req
+    import urllib.error
+    _log = plog or (lambda m: print(f"[domain-sync] {m}", flush=True))
+
+    if not fqdn:
+        _log("⚠ No FQDN — skipping Authentik domain sync")
+        return
+
+    ak_dir = os.path.expanduser('~/authentik')
+    env_path = os.path.join(ak_dir, '.env')
+    compose_path = os.path.join(ak_dir, 'docker-compose.yml')
+    if not os.path.isdir(ak_dir):
+        return
+
+    ak_host = _get_authentik_host(settings) or f'tak.{fqdn}'
+    cookie_domain = f'.{fqdn.split(":")[0]}'
+    env_changed = False
+
+    # 1. Update .env: AUTHENTIK_HOST and AUTHENTIK_COOKIE_DOMAIN
+    if os.path.exists(env_path):
+        try:
+            with open(env_path) as _f:
+                env_lines = _f.readlines()
+            new_lines = []
+            found_host = found_cookie = False
+            for line in env_lines:
+                k = line.split('=', 1)[0].strip()
+                if k == 'AUTHENTIK_HOST':
+                    new_val = f'https://{ak_host}/\n'
+                    if line.rstrip('\n') != f'AUTHENTIK_HOST=https://{ak_host}/':
+                        env_changed = True
+                    new_lines.append(f'AUTHENTIK_HOST=https://{ak_host}/\n')
+                    found_host = True
+                elif k == 'AUTHENTIK_COOKIE_DOMAIN':
+                    if line.rstrip('\n') != f'AUTHENTIK_COOKIE_DOMAIN={cookie_domain}':
+                        env_changed = True
+                    new_lines.append(f'AUTHENTIK_COOKIE_DOMAIN={cookie_domain}\n')
+                    found_cookie = True
+                else:
+                    new_lines.append(line)
+            if not found_host:
+                new_lines.append(f'AUTHENTIK_HOST=https://{ak_host}/\n')
+                env_changed = True
+            if not found_cookie:
+                new_lines.append(f'AUTHENTIK_COOKIE_DOMAIN={cookie_domain}\n')
+                env_changed = True
+            with open(env_path, 'w') as _f:
+                _f.writelines(new_lines)
+            _log(f"✓ .env: AUTHENTIK_HOST=https://{ak_host}/ AUTHENTIK_COOKIE_DOMAIN={cookie_domain}")
+        except Exception as e:
+            _log(f"⚠ .env update: {e}")
+
+    # 2. Fix LDAP outpost AUTHENTIK_HOST in docker-compose.yml → internal URL (survives all domain changes)
+    _ldap_internal = 'http://authentik-server-1:9000/'
+    if os.path.exists(compose_path):
+        try:
+            with open(compose_path) as _f:
+                comp = _f.read()
+            comp_orig = comp
+            import re as _re_ds
+            # Replace any AUTHENTIK_HOST value in the ldap service block with the internal URL
+            comp = _re_ds.sub(
+                r'(AUTHENTIK_HOST:\s*)https?://[^\s\n]+',
+                r'\g<1>' + _ldap_internal,
+                comp
+            )
+            if comp != comp_orig:
+                with open(compose_path, 'w') as _f:
+                    _f.write(comp)
+                _log(f"✓ docker-compose.yml: LDAP AUTHENTIK_HOST → {_ldap_internal} (internal)")
+                subprocess.run(
+                    f'cd {ak_dir} && docker compose up -d --force-recreate ldap 2>/dev/null',
+                    shell=True, capture_output=True, text=True, timeout=60
+                )
+                _log("✓ LDAP container recreated with internal host")
+            else:
+                _log(f"✓ docker-compose.yml: LDAP AUTHENTIK_HOST already internal — no change")
+        except Exception as e:
+            _log(f"⚠ compose LDAP host: {e}")
+
+    # Get API token
+    ak_token = (_get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or
+                _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN') or '')
+    if not ak_token:
+        _log("⚠ No Authentik token — skipping API updates")
+    else:
+        ak_url = _get_authentik_api_url(settings)
+        ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+        _ak_pub_url = f'https://{ak_host}'
+
+        # 3. PATCH default brand
+        try:
+            r = _req.Request(f'{ak_url}/api/v3/core/brands/', headers=ak_headers)
+            brands = json.loads(_req.urlopen(r, timeout=10).read().decode()).get('results', [])
+            if brands:
+                brand = brands[0]
+                brand_id = brand.get('brand_uuid') or brand.get('pk')
+                patch = {'domain': ak_host, 'cookie_domain': cookie_domain}
+                # Scan branding_custom_css for old domain string and replace
+                css = brand.get('branding_custom_css') or ''
+                old_fqdn_guess = None
+                for candidate in [brand.get('domain', ''), css]:
+                    # heuristic: if css contains an old domain, replace it
+                    pass
+                if css and fqdn not in css:
+                    # May contain old domain — try to replace any https://.../ pattern
+                    import re as _re_css
+                    new_css = _re_css.sub(r'https://[^/"\'\s]+\.', f'https://{ak_host.split(".")[0]}.', css)
+                    if new_css != css:
+                        patch['branding_custom_css'] = new_css
+                # Reset default flow background if it references an old domain
+                bg = brand.get('branding_default_flow_background') or ''
+                if bg and fqdn not in bg and ('http' in bg):
+                    patch['branding_default_flow_background'] = '/static/dist/assets/images/flow_background.jpg'
+                _req.urlopen(_req.Request(f'{ak_url}/api/v3/core/brands/{brand_id}/',
+                    data=json.dumps(patch).encode(), headers=ak_headers, method='PATCH'), timeout=10)
+                _log(f"✓ Brand: domain={ak_host}, cookie_domain={cookie_domain}")
+        except Exception as e:
+            _log(f"⚠ Brand update: {str(e)[:120]}")
+
+        # 4. PATCH embedded outpost config.authentik_host → internal URL
+        try:
+            r = _req.Request(f'{ak_url}/api/v3/outposts/instances/?search=embedded', headers=ak_headers)
+            outposts = json.loads(_req.urlopen(r, timeout=10).read().decode()).get('results', [])
+            embedded = next((o for o in outposts if 'embed' in (o.get('name') or '').lower() or o.get('type') == 'proxy'), None)
+            if embedded:
+                op_pk = embedded.get('pk')
+                full = json.loads(_req.urlopen(_req.Request(f'{ak_url}/api/v3/outposts/instances/{op_pk}/', headers=ak_headers), timeout=10).read().decode())
+                cfg = full.get('config') or {}
+                cfg['authentik_host'] = _ldap_internal
+                cfg['authentik_host_insecure'] = True
+                _req.urlopen(_req.Request(f'{ak_url}/api/v3/outposts/instances/{op_pk}/',
+                    data=json.dumps({'config': cfg}).encode(), headers=ak_headers, method='PATCH'), timeout=10)
+                _log(f"✓ Embedded outpost: config.authentik_host → {_ldap_internal}")
+        except Exception as e:
+            _log(f"⚠ Embedded outpost: {str(e)[:120]}")
+
+        # 5. PATCH all proxy providers: external_host, cookie_domain, redirect_uris
+        try:
+            r = _req.Request(f'{ak_url}/api/v3/providers/proxy/?page_size=100', headers=ak_headers)
+            providers = json.loads(_req.urlopen(r, timeout=15).read().decode()).get('results', [])
+            for prov in providers:
+                pk = prov.get('pk')
+                if not pk:
+                    continue
+                try:
+                    # Fetch full provider to get all required fields for PATCH
+                    full_prov = json.loads(_req.urlopen(
+                        _req.Request(f'{ak_url}/api/v3/providers/proxy/{pk}/', headers=ak_headers), timeout=10
+                    ).read().decode())
+                    # Build updated external_host — replace old domain in existing URL
+                    ext_host = full_prov.get('external_host') or ''
+                    if ext_host:
+                        import re as _re_prov
+                        ext_host = _re_prov.sub(r'https?://([^/]+)', lambda m: f'https://{m.group(1).rsplit(".", 2)[-2] + "." + fqdn if "." in m.group(1) else m.group(1)}', ext_host)
+                    # Update redirect_uris — replace old domain in all URL entries
+                    uris = full_prov.get('redirect_uris') or []
+                    new_uris = []
+                    for uri in uris:
+                        url = uri.get('url') or ''
+                        if url and 'http' in url:
+                            import re as _re_uri
+                            # Replace the domain portion while keeping the path
+                            parts = url.split('://', 1)
+                            if len(parts) == 2:
+                                rest = parts[1]
+                                old_host_part = rest.split('/')[0]
+                                # Derive new host: keep subdomain prefix, replace base domain
+                                subdomain = old_host_part.split('.')[0] if '.' in old_host_part else old_host_part
+                                new_host = f'{subdomain}.{fqdn}'
+                                url = 'https://' + new_host + ('/' + '/'.join(rest.split('/')[1:]) if '/' in rest else '')
+                        new_uris.append({'url': url, 'matching_mode': uri.get('matching_mode', 'strict')})
+                    patch = {
+                        'external_host': ext_host,
+                        'cookie_domain': cookie_domain,
+                        'redirect_uris': new_uris,
+                        # Required fields to pass cross-field validators
+                        'name': full_prov.get('name', ''),
+                        'authorization_flow': full_prov.get('authorization_flow'),
+                        'mode': full_prov.get('mode', 'proxy'),
+                        'internal_host': full_prov.get('internal_host') or '',
+                        'internal_host_ssl_validation': full_prov.get('internal_host_ssl_validation', False),
+                    }
+                    _req.urlopen(_req.Request(f'{ak_url}/api/v3/providers/proxy/{pk}/',
+                        data=json.dumps(patch).encode(), headers=ak_headers, method='PATCH'), timeout=10)
+                except Exception as ep:
+                    _log(f"  ⚠ Provider {pk}: {str(ep)[:80]}")
+            _log(f"✓ Proxy providers updated ({len(providers)} total)")
+        except Exception as e:
+            _log(f"⚠ Proxy providers: {str(e)[:120]}")
+
+    # 6. Restart Authentik if env changed (env changes require full down/up, not just restart)
+    if env_changed:
+        _log("Env changed — running docker compose down && up -d to apply (this takes ~30s)…")
+        try:
+            subprocess.run(
+                f'cd {ak_dir} && docker compose down --timeout 20 && docker compose up -d 2>/dev/null',
+                shell=True, capture_output=True, text=True, timeout=120
+            )
+            _log("✓ Authentik restarted with new env")
+        except Exception as e:
+            _log(f"⚠ Authentik restart: {e}")
+    else:
+        _log("Env unchanged — no container restart needed")
+
+
+@app.route('/api/authentik/domain-audit')
+@login_required
+def authentik_domain_audit_api():
+    """Sweep for stale domain references across Authentik config files and database.
+
+    Checks: ~/authentik/.env, ~/authentik/docker-compose.yml, and all Authentik API
+    objects (brand, outposts, proxy providers) for any value that does not match the
+    current FQDN. Returns a list of {location, field, current_value} stale entries.
+    """
+    import urllib.request as _req
+    settings = load_settings()
+    fqdn = (settings.get('fqdn') or '').strip()
+    if not fqdn:
+        return jsonify({'ok': False, 'error': 'No FQDN configured'}), 400
+
+    ak_host = _get_authentik_host(settings) or f'tak.{fqdn}'
+    ak_dir = os.path.expanduser('~/authentik')
+    stale = []
+
+    # Check .env
+    env_path = os.path.join(ak_dir, '.env')
+    if os.path.exists(env_path):
+        try:
+            with open(env_path) as _f:
+                for line in _f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    k, _, v = line.partition('=')
+                    k = k.strip(); v = v.strip()
+                    if k == 'AUTHENTIK_HOST' and fqdn not in v:
+                        stale.append({'location': '~/authentik/.env', 'field': 'AUTHENTIK_HOST', 'current_value': v})
+                    if k == 'AUTHENTIK_COOKIE_DOMAIN' and fqdn not in v:
+                        stale.append({'location': '~/authentik/.env', 'field': 'AUTHENTIK_COOKIE_DOMAIN', 'current_value': v})
+        except Exception as e:
+            stale.append({'location': '~/authentik/.env', 'field': '(read error)', 'current_value': str(e)[:80]})
+
+    # Check docker-compose.yml LDAP AUTHENTIK_HOST
+    compose_path = os.path.join(ak_dir, 'docker-compose.yml')
+    if os.path.exists(compose_path):
+        try:
+            with open(compose_path) as _f:
+                comp = _f.read()
+            import re as _re_audit
+            for m in _re_audit.finditer(r'AUTHENTIK_HOST:\s*(\S+)', comp):
+                val = m.group(1).strip()
+                if val and val != 'http://authentik-server-1:9000/' and fqdn not in val:
+                    stale.append({'location': '~/authentik/docker-compose.yml', 'field': 'AUTHENTIK_HOST (LDAP)', 'current_value': val})
+        except Exception as e:
+            stale.append({'location': '~/authentik/docker-compose.yml', 'field': '(read error)', 'current_value': str(e)[:80]})
+
+    # Check Authentik API
+    ak_token = (_get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or
+                _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN') or '')
+    if ak_token:
+        ak_url = _get_authentik_api_url(settings)
+        ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+        try:
+            brands = json.loads(_req.urlopen(_req.Request(f'{ak_url}/api/v3/core/brands/', headers=ak_headers), timeout=10).read().decode()).get('results', [])
+            for b in brands:
+                if fqdn not in (b.get('domain') or ''):
+                    stale.append({'location': 'Authentik brand', 'field': 'domain', 'current_value': b.get('domain') or ''})
+                if fqdn not in (b.get('cookie_domain') or ''):
+                    stale.append({'location': 'Authentik brand', 'field': 'cookie_domain', 'current_value': b.get('cookie_domain') or ''})
+                css = b.get('branding_custom_css') or ''
+                if css and fqdn not in css and 'http' in css:
+                    stale.append({'location': 'Authentik brand', 'field': 'branding_custom_css', 'current_value': css[:120]})
+                bg = b.get('branding_default_flow_background') or ''
+                if bg and fqdn not in bg and 'http' in bg:
+                    stale.append({'location': 'Authentik brand', 'field': 'branding_default_flow_background', 'current_value': bg[:120]})
+        except Exception as e:
+            stale.append({'location': 'Authentik brand API', 'field': '(error)', 'current_value': str(e)[:80]})
+        try:
+            outposts = json.loads(_req.urlopen(_req.Request(f'{ak_url}/api/v3/outposts/instances/?search=embedded', headers=ak_headers), timeout=10).read().decode()).get('results', [])
+            for o in outposts:
+                cfg = o.get('config') or {}
+                h = cfg.get('authentik_host') or ''
+                if h and 'authentik-server-1' not in h and fqdn not in h:
+                    stale.append({'location': f'Outpost: {o.get("name")}', 'field': 'config.authentik_host', 'current_value': h})
+        except Exception as e:
+            stale.append({'location': 'Authentik outpost API', 'field': '(error)', 'current_value': str(e)[:80]})
+        try:
+            providers = json.loads(_req.urlopen(_req.Request(f'{ak_url}/api/v3/providers/proxy/?page_size=100', headers=ak_headers), timeout=15).read().decode()).get('results', [])
+            for p in providers:
+                eh = p.get('external_host') or ''
+                if eh and fqdn not in eh:
+                    stale.append({'location': f'Proxy provider: {p.get("name")}', 'field': 'external_host', 'current_value': eh})
+                cd = p.get('cookie_domain') or ''
+                if cd and fqdn not in cd:
+                    stale.append({'location': f'Proxy provider: {p.get("name")}', 'field': 'cookie_domain', 'current_value': cd})
+                for uri in (p.get('redirect_uris') or []):
+                    url = uri.get('url') or ''
+                    if url and 'http' in url and fqdn not in url:
+                        stale.append({'location': f'Proxy provider: {p.get("name")}', 'field': 'redirect_uri', 'current_value': url})
+        except Exception as e:
+            stale.append({'location': 'Authentik proxy providers API', 'field': '(error)', 'current_value': str(e)[:80]})
+
+    return jsonify({'ok': True, 'fqdn': fqdn, 'stale': stale, 'clean': len(stale) == 0})
+
+
 @app.route('/api/caddy/domain', methods=['POST'])
 @login_required
 def caddy_update_domain():
@@ -8051,30 +8508,29 @@ def caddy_update_domain():
     if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]$', domain):
         return jsonify({'success': False, 'error': 'Invalid domain/FQDN format'})
     settings = load_settings()
+    old_fqdn = settings.get('fqdn', '')
     settings['fqdn'] = domain
     save_settings(settings)
     generate_caddyfile(settings)
-    # If Authentik is installed (local or remote), ensure infra-TAK + TAK Portal apps exist so "Applications" at tak.<fqdn> work
     modules = detect_modules()
     if modules.get('authentik', {}).get('installed'):
-        def _ensure_ak_apps_after_domain():
-            time.sleep(2)
+        def _sync_ak_after_domain():
+            time.sleep(3)
             try:
                 s = load_settings()
+                _authentik_sync_all_domain_refs(domain, s)
                 ak_token = _get_authentik_env_value(s, 'AUTHENTIK_TOKEN') or _get_authentik_env_value(s, 'AUTHENTIK_BOOTSTRAP_TOKEN')
-                if not ak_token:
-                    return
-                _ensure_authentik_console_app(domain, ak_token)
-                s = load_settings()
-                ak_url = _get_authentik_api_url(s)
-                ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
-                _repair_embedded_outpost_all_apps(ak_url, ak_headers, s)
+                if ak_token:
+                    _ensure_authentik_console_app(domain, ak_token)
+                    ak_url = _get_authentik_api_url(s)
+                    ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+                    _repair_embedded_outpost_all_apps(ak_url, ak_headers, s)
                 if _is_module_deployed(s, 'takportal'):
                     _sync_authentik_takportal_provider_url(s)
-            except Exception:
-                pass
-        threading.Thread(target=_ensure_ak_apps_after_domain, daemon=True).start()
-    # Restart in background so response reaches client before Caddy restarts (console is behind Caddy)
+            except Exception as _e:
+                print(f"[domain-sync] post-domain-change sync error: {_e}", flush=True)
+        threading.Thread(target=_sync_ak_after_domain, daemon=True).start()
+    # Restart Caddy in background
     def _restart():
         time.sleep(2)
         try:
@@ -8082,7 +8538,7 @@ def caddy_update_domain():
         except Exception:
             pass
     threading.Thread(target=_restart, daemon=True).start()
-    return jsonify({'success': True, 'domain': domain, 'output': 'Caddy restart scheduled.'})
+    return jsonify({'success': True, 'domain': domain, 'output': 'Caddy restart scheduled. Authentik domain sync running in background.'})
 
 @app.route('/api/caddy/caddyfile')
 @login_required
@@ -14054,15 +14510,16 @@ def cloudtak_uninstall_status_api():
 def cloudtak_reset_server_config():
     """Clear CloudTAK's stored TAK Server auth so the bootstrap wizard runs again.
 
-    Nulls out the auth column in the servers table (cert + key) via psql inside
-    the postgis container, then restarts just the api container so it reloads
+    Resets auth to empty jsonb ({}) in the server table via psql inside the
+    postgis container, then restarts just the api container so it reloads
     config from the database. Works for local and remote targets.
     """
     settings = load_settings()
     cfg = _get_cloudtak_deployment_config(settings)
     target_mode = (cfg.get('target_mode') or 'local').strip().lower()
 
-    sql_cmd = "UPDATE servers SET auth = NULL WHERE id = 1;"
+    # Table is "server" (singular) and auth is NOT NULL jsonb — reset to empty object, not NULL
+    sql_cmd = "UPDATE server SET auth = '{}'::jsonb WHERE id = 1;"
     psql_cmd = f"docker exec cloudtak-postgis-1 psql -U docker -d gis -c \"{sql_cmd}\" 2>&1"
     restart_cmd = "cd ~/CloudTAK && docker compose restart api 2>&1"
 
@@ -18154,6 +18611,68 @@ Bans IPs via UFW and sends Guard Dog email alerts.
 </div><!-- /ssh-enabled-section -->
 </div><!-- /SSH Jail card -->
 
+<!-- MediaMTX RTSP Jail -->
+<div class="card" id="mediamtx-jail-card" style="display:none">
+<div class="card-title" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0">
+<div style="display:flex;align-items:center;gap:10px">
+<span>MediaMTX RTSP Jail</span>
+<span class="badge badge-red" id="mediamtx-jail-badge" style="font-size:10px;padding:2px 8px"><span class="dot"></span>Disabled</span>
+</div>
+<div style="display:flex;align-items:center;gap:16px">
+<button id="mediamtx-refresh-btn" onclick="manualMtxRefresh()" style="background:none;border:none;cursor:pointer;color:var(--text-dim);font-size:12px;font-family:\'JetBrains Mono\',monospace;display:inline-flex;align-items:center;gap:5px;padding:0"><span id="mediamtx-refresh-icon" style="display:inline-block;transition:transform 0.4s">↻</span> Refresh</button>
+<label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:0">
+<span style="font-size:12px;color:var(--text-dim);font-family:\'JetBrains Mono\',monospace">Enable</span>
+<div class="toggle-wrap" style="position:relative;width:40px;height:22px">
+<input type="checkbox" id="mediamtx-toggle" onchange="toggleMtxJail()" style="opacity:0;width:0;height:0;position:absolute">
+<span id="mediamtx-toggle-track" onclick="document.getElementById(\'mediamtx-toggle\').click()" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
+<span id="mediamtx-toggle-thumb" style="position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform .2s;pointer-events:none"></span>
+</div>
+</label>
+</div>
+</div>
+<div style="font-size:12px;color:var(--text-dim);margin-top:8px">Monitors the <code>mediamtx</code> systemd service log for aggressive RTSP scanner traffic. Triggered by <em>opened</em> events — catches scanners before their probe cycle completes. Guard Dog email alert fires on ban. Default thresholds match the tak-10 scanner profile (20 probes in 10 s).</div>
+
+<div id="mediamtx-enabled-section" style="display:none">
+<div class="stat-grid" style="margin-top:20px;margin-bottom:8px">
+<div class="stat-card" id="mediamtx-banned-toggle" onclick="toggleMtxBanPanel()" style="cursor:pointer;transition:border-color 0.2s" title="Click to see banned IPs">
+<div class="stat-value red" id="mediamtx-stat-banned">0</div>
+<div class="stat-label">Currently Banned <span style="font-size:10px;color:var(--text-dim)" id="mediamtx-banned-caret">▼ details</span></div>
+</div>
+<div class="stat-card"><div class="stat-value yellow" id="mediamtx-stat-failed">0</div><div class="stat-label">Currently Watching</div></div>
+<div class="stat-card" title="Since the fail2ban service was last started or restarted"><div class="stat-value cyan" id="mediamtx-stat-total-banned">0</div><div class="stat-label">Total Banned <span style="font-size:9px;color:var(--text-dim)">(since last restart)</span></div></div>
+</div>
+
+<div id="mediamtx-ban-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
+<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">Banned IPs — click Unban to release</div>
+<input type="text" id="mediamtx-ban-search" oninput="filterMtxBanList()" placeholder="Search IP…" style="width:100%;box-sizing:border-box;margin-bottom:10px;padding:6px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px;outline:none">
+<div id="mediamtx-ban-list-container" style="max-height:240px;overflow-y:auto">
+<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>
+</div>
+</div>
+
+<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:16px">
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Max Retries</label>
+<input class="form-input" type="number" id="mediamtx-cfg-maxretry" value="10" min="1" max="100">
+<div class="form-hint">Opens before ban</div>
+</div>
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Find Window (seconds)</label>
+<input class="form-input" type="number" id="mediamtx-cfg-findtime" value="30" min="10" max="3600">
+<div class="form-hint">Time window to count opens</div>
+</div>
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Ban Duration (minutes)</label>
+<input class="form-input" type="number" id="mediamtx-cfg-bantime" value="60" min="1" max="43200">
+<div class="form-hint">How long to ban the IP</div>
+</div>
+</div>
+<div style="margin-top:16px">
+<button class="btn-primary" onclick="saveMtxConfig()">Save &amp; Reload</button>
+</div>
+</div><!-- /mediamtx-enabled-section -->
+</div><!-- /MediaMTX RTSP Jail card -->
+
 <!-- TAK Server Jail -->
 <div class="card" id="tak-jail-card" style="display:none">
 <div class="card-title" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0">
@@ -18901,6 +19420,122 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
 
   loadSshStatus();
   setInterval(function(){ loadSshStatus(); if (_sshWatchingOpen) _loadSshWatchingList(); }, 30000);
+})();
+
+// MediaMTX RTSP Jail
+(function(){
+  var card = document.getElementById(\'mediamtx-jail-card\');
+  if (!card) return;
+
+  function loadMtxStatus() {
+    fetch(\'/api/fail2ban/mediamtx/status\').then(function(r){ return r.json(); }).then(function(d){
+      if (!d.available) return;
+      // Show card only when mediamtx is installed
+      if (d.mediamtx_installed) card.style.display = \'\';
+      var badge  = document.getElementById(\'mediamtx-jail-badge\');
+      var toggle = document.getElementById(\'mediamtx-toggle\');
+      var sec    = document.getElementById(\'mediamtx-enabled-section\');
+      if (badge) {
+        if (d.jail_enabled) { badge.className=\'badge badge-green\'; badge.innerHTML=\'<span class="dot dot-pulse"></span>Active\'; }
+        else                { badge.className=\'badge badge-red\';   badge.innerHTML=\'<span class="dot"></span>Disabled\'; }
+      }
+      if (toggle) toggle.checked = d.jail_enabled;
+      var trk = document.getElementById(\'mediamtx-toggle-track\');
+      var thb = document.getElementById(\'mediamtx-toggle-thumb\');
+      if (trk) trk.style.background = d.jail_enabled ? \'var(--green)\' : \'var(--border)\';
+      if (thb) thb.style.transform  = d.jail_enabled ? \'translateX(18px)\' : \'\';
+      if (sec) sec.style.display = d.jail_enabled ? \'\' : \'none\';
+      if (d.jail_enabled) {
+        document.getElementById(\'mediamtx-stat-banned\').textContent       = d.currently_banned !== undefined ? d.currently_banned : 0;
+        document.getElementById(\'mediamtx-stat-failed\').textContent       = d.currently_failed !== undefined ? d.currently_failed : 0;
+        document.getElementById(\'mediamtx-stat-total-banned\').textContent = d.total_banned      !== undefined ? d.total_banned      : 0;
+        var cfg = d.jail_config || {};
+        if (cfg.maxretry) document.getElementById(\'mediamtx-cfg-maxretry\').value = cfg.maxretry;
+        // findtime stored in seconds for mediamtx (not minutes like SSH)
+        if (cfg.findtime) document.getElementById(\'mediamtx-cfg-findtime\').value = cfg.findtime;
+        if (cfg.bantime)  document.getElementById(\'mediamtx-cfg-bantime\').value  = Math.round(cfg.bantime / 60);
+        var ips = d.banned_ips || [];
+        window._mtxBannedIps = ips;
+        renderMtxBanList(ips);
+        var caret = document.getElementById(\'mediamtx-banned-caret\');
+        if (caret) caret.textContent = ips.length ? \'▼ details\' : \'\';
+      }
+    }).catch(function(){});
+  }
+
+  window.toggleMtxJail = function() {
+    var enabled = document.getElementById(\'mediamtx-toggle\').checked;
+    if (!enabled) {
+      fetch(\'/api/fail2ban/mediamtx/config\', {method:\'POST\', headers:{\'Content-Type\':\'application/json\'}, body:JSON.stringify({enabled:false})})
+        .then(function(r){ return r.json(); }).then(function(d){
+          if (d.ok) { showToast(\'MediaMTX RTSP jail disabled.\', \'success\'); loadMtxStatus(); }
+          else { showToast(d.error || \'Failed to disable\', \'error\'); loadMtxStatus(); }
+        }).catch(function(){ showToast(\'Network error\', \'error\'); loadMtxStatus(); });
+    } else {
+      saveMtxConfig();
+    }
+  };
+
+  window.saveMtxConfig = function() {
+    var body = {
+      enabled:  true,
+      maxretry: parseInt(document.getElementById(\'mediamtx-cfg-maxretry\').value) || 10,
+      findtime: parseInt(document.getElementById(\'mediamtx-cfg-findtime\').value)  || 30,
+      bantime:  (parseInt(document.getElementById(\'mediamtx-cfg-bantime\').value)  || 60) * 60
+    };
+    fetch(\'/api/fail2ban/mediamtx/config\', {method:\'POST\', headers:{\'Content-Type\':\'application/json\'}, body:JSON.stringify(body)})
+      .then(function(r){ return r.json(); }).then(function(d){
+        if (d.ok) { showToast(\'MediaMTX RTSP jail \' + (d.enabled ? \'enabled and saved.\' : \'disabled.\'), \'success\'); loadMtxStatus(); }
+        else showToast(d.error || \'Save failed\', \'error\');
+      }).catch(function(){ showToast(\'Network error\', \'error\'); });
+  };
+
+  window._mtxBannedIps = [];
+  window.renderMtxBanList = function(ips) {
+    var c = document.getElementById(\'mediamtx-ban-list-container\'); if (!c) return;
+    if (!ips.length) { c.innerHTML=\'<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>\'; return; }
+    var rows = ips.map(function(ip){
+      return \'<tr style="border-bottom:1px solid var(--border)"><td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">\'+ip+\'</td>\'+
+        \'<td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="unbanMtxIP(\\\'\'+ip+\'\\\')">Unban</button></td></tr>\';
+    }).join(\'\');
+    c.innerHTML = \'<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em"><th style="padding:4px 8px;text-align:left">IP Address</th><th style="padding:4px 8px;text-align:right">Action</th></tr></thead><tbody>\'+rows+\'</tbody></table>\';
+  };
+
+  window.filterMtxBanList = function() {
+    var q = (document.getElementById(\'mediamtx-ban-search\').value || \'\').trim().toLowerCase();
+    var filtered = q ? window._mtxBannedIps.filter(function(ip){ return ip.toLowerCase().indexOf(q) !== -1; }) : window._mtxBannedIps;
+    renderMtxBanList(filtered);
+  };
+
+  window.toggleMtxBanPanel = function() {
+    var panel = document.getElementById(\'mediamtx-ban-panel\');
+    var caret = document.getElementById(\'mediamtx-banned-caret\');
+    if (!panel) return;
+    var open = panel.style.display !== \'none\';
+    panel.style.display = open ? \'none\' : \'\';
+    if (caret) caret.textContent = open ? \'▼ details\' : \'▲ details\';
+    if (!open) { var s = document.getElementById(\'mediamtx-ban-search\'); if(s) s.value=\'\'; renderMtxBanList(window._mtxBannedIps); }
+  };
+
+  window.unbanMtxIP = function(ip) {
+    if (!confirm(\'Unban \' + ip + \' from MediaMTX RTSP jail?\')) return;
+    fetch(\'/api/fail2ban/mediamtx/unban\', {method:\'POST\', headers:{\'Content-Type\':\'application/json\'}, body:JSON.stringify({ip:ip})})
+      .then(function(r){ return r.json(); }).then(function(d){
+        if (d.ok) { showToast(ip + \' unbanned.\', \'success\'); loadMtxStatus(); }
+        else showToast(d.error || \'Unban failed\', \'error\');
+      }).catch(function(){ showToast(\'Network error\', \'error\'); });
+  };
+
+  window.manualMtxRefresh = function() {
+    _spinIcon(\'mediamtx-refresh-icon\', true);
+    var btn = document.getElementById(\'mediamtx-refresh-btn\');
+    if (btn) btn.disabled = true;
+    loadMtxStatus();
+    setTimeout(function(){ _spinIcon(\'mediamtx-refresh-icon\', false); if (btn) btn.disabled = false; }, 1200);
+  };
+
+  loadMtxStatus();
+  setInterval(loadMtxStatus, 30000);
 })();
 
 // Repeat Offender Protection
@@ -21718,6 +22353,9 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% endif %}
 <div class="section-title">Caddyfile</div>
 <div style="background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:400px;overflow-y:auto;line-height:1.6;white-space:pre-wrap">{{ caddyfile }}</div>
+<div style="margin-top:10px;padding:12px 16px;background:rgba(59,130,246,0.05);border:1px solid rgba(59,130,246,0.15);border-radius:8px;font-size:12px;color:var(--text-dim);line-height:1.5">
+<span style="font-weight:600;color:var(--text-secondary)">Custom vhosts / rules</span> — add them <em>below</em> the line <code style="background:rgba(255,255,255,.05);padding:1px 6px;border-radius:3px"># --- User-added blocks (do not remove) ---</code> at the bottom of this file. Everything below that line is preserved automatically on every domain change, deploy, and "Update Now". Do not remove the marker itself. See <a href="https://github.com/takwerx/infra-TAK/blob/main/docs/COMMANDS.md" target="_blank" rel="noopener noreferrer" style="color:var(--cyan)">COMMANDS.md</a> for an example.
+</div>
 {% elif not caddy.installed %}
 <div class="section-title">Set Up Your Domain</div>
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:32px;margin-bottom:24px">
@@ -21801,8 +22439,19 @@ async function caddyControl(action){
 async function updateDomain(){
     var domain=document.getElementById('domain-input').value.trim();
     if(!domain){alert('Please enter a domain name');return}
+    var currentDomain = '{{ settings.get("fqdn","") }}';
+    if (currentDomain && currentDomain !== domain) {
+        var ok = confirm(
+            'Domain change detected:\n\n' +
+            '  Old: ' + currentDomain + '\n' +
+            '  New: ' + domain + '\n\n' +
+            'This will update Caddy AND trigger a full Authentik domain sync (brand, outpost, all proxy providers, .env, docker-compose.yml).\n\n' +
+            'Authentik will restart — SSO will be unavailable for ~30s.\n\nProceed?'
+        );
+        if (!ok) return;
+    }
     try{var r=await fetch('/api/caddy/domain',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({domain:domain})});
-    var d=await r.json();if(d.success){alert('Domain updated and Caddy reloaded');location.reload()}else{alert('Error: '+d.error)}}catch(e){alert('Error: '+e.message)}
+    var d=await r.json();if(d.success){alert('Domain updated and Caddy reload scheduled.\n\nAuthentik domain sync is running in the background — check the Authentik page → Domain Migration Audit in ~60s to verify.');location.reload()}else{alert('Error: '+d.error)}}catch(e){alert('Error: '+e.message)}
 }
 async function caddyUninstall(){
     if(!confirm('Remove Caddy and clear domain configuration?'))return;
@@ -26956,6 +27605,16 @@ body{display:flex;min-height:100vh}
   <div class="card-title">Update config &amp; reconnect — Log</div>
   <div class="deploy-log" id="deploy-log" data-authentik-url="{{ authentik_base_url }}">Waiting...</div>
 </div>
+
+<div class="card" id="domain-audit-card">
+  <div class="card-title" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0">
+    <span>Domain Migration Audit</span>
+    <button onclick="runDomainAudit()" id="domain-audit-btn" style="padding:6px 14px;background:rgba(59,130,246,0.15);color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-family:\'JetBrains Mono\',monospace;font-size:11px;cursor:pointer">Run Audit</button>
+  </div>
+  <div style="font-size:12px;color:var(--text-dim);margin-top:8px;margin-bottom:12px">Scans .env, docker-compose.yml, and all Authentik API objects (brand, outpost, proxy providers) for stale domain references after a domain change.</div>
+  <div id="domain-audit-result" style="display:none"></div>
+</div>
+
 {% if container_info.get('containers') %}
 <div class="section-title">Services</div>
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
@@ -27206,6 +27865,39 @@ async function reconfigureAk(){
         }
         else alert('Error: '+(d.error||'Reconfigure failed'));
     }catch(e){alert('Error: '+e.message)}
+}
+
+async function runDomainAudit(){
+    var btn = document.getElementById('domain-audit-btn');
+    var res = document.getElementById('domain-audit-result');
+    if (!res) return;
+    if (btn) { btn.disabled=true; btn.textContent='Scanning…'; }
+    res.style.display='none';
+    try {
+        var r = await fetch('/api/authentik/domain-audit');
+        var d = await r.json();
+        if (!d.ok) { res.innerHTML='<div style="color:var(--red);font-size:12px;font-family:\'JetBrains Mono\',monospace">'+escapeHtml(d.error||'Audit failed')+'</div>'; res.style.display='block'; return; }
+        if (d.clean) {
+            res.innerHTML='<div style="display:flex;align-items:center;gap:8px;padding:10px 14px;background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.2);border-radius:8px;font-size:12px;color:var(--green);font-family:\'JetBrains Mono\',monospace"><span>✓</span><span>All domain references match <strong>'+escapeHtml(d.fqdn)+'</strong> — no stale config found.</span></div>';
+        } else {
+            var rows = d.stale.map(function(s){ return '<tr style="border-bottom:1px solid var(--border)"><td style="padding:5px 10px;font-size:11px;color:var(--text-dim)">'+escapeHtml(s.location)+'</td><td style="padding:5px 10px;font-size:11px;color:var(--yellow)">'+escapeHtml(s.field)+'</td><td style="padding:5px 10px;font-size:11px;font-family:\'JetBrains Mono\',monospace;color:var(--red)">'+escapeHtml(s.current_value)+'</td></tr>'; }).join('');
+            res.innerHTML='<div style="color:var(--yellow);font-size:12px;font-family:\'JetBrains Mono\',monospace;margin-bottom:8px">⚠ '+d.stale.length+' stale reference'+(d.stale.length>1?'s':'')+' found — use <em>Update config &amp; reconnect</em> or the Domain Sync button to fix</div>'+
+                '<button onclick="triggerDomainSync()" style="margin-bottom:12px;padding:6px 14px;background:rgba(234,179,8,0.15);color:var(--yellow);border:1px solid rgba(234,179,8,0.3);border-radius:6px;font-size:11px;font-family:\'JetBrains Mono\',monospace;cursor:pointer">↻ Sync Domain Now</button>'+
+                '<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em"><th style="padding:4px 10px;text-align:left">Location</th><th style="padding:4px 10px;text-align:left">Field</th><th style="padding:4px 10px;text-align:left">Current (stale) Value</th></tr></thead><tbody>'+rows+'</tbody></table>';
+        }
+        res.style.display='block';
+    } catch(e) {
+        res.innerHTML='<div style="color:var(--red);font-size:12px;font-family:\'JetBrains Mono\',monospace">Network error: '+escapeHtml(e.message)+'</div>';
+        res.style.display='block';
+    } finally {
+        if (btn) { btn.disabled=false; btn.textContent='Run Audit'; }
+    }
+}
+
+async function triggerDomainSync(){
+    var res = document.getElementById('domain-audit-result');
+    if (res) res.innerHTML='<div style="color:var(--text-dim);font-size:12px;font-family:\'JetBrains Mono\',monospace">Triggering domain sync — this calls Update config &amp; reconnect…</div>';
+    await reconfigureAk();
 }
 async function fixAkLdapToken(btn){
     if(!btn)return;
@@ -32836,6 +33528,38 @@ def api_host_resource_usage():
     return jsonify(_top_processes_local())
 
 
+_kernel_patch_cache = {'ts': 0, 'data': None}
+
+@app.route('/api/system/kernel-patch-status')
+@login_required
+def kernel_patch_status_api():
+    """Return running kernel version and whether a linux-image update is available via apt.
+    Result is cached for 60 seconds to avoid hitting apt on every page load."""
+    import time as _kpt
+    now = _kpt.time()
+    if _kernel_patch_cache['data'] and now - _kernel_patch_cache['ts'] < 60:
+        return jsonify(_kernel_patch_cache['data'])
+    try:
+        running_kernel = subprocess.run(['uname', '-r'], capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:
+        running_kernel = 'unknown'
+    try:
+        upgradable_out = subprocess.run(
+            'apt list --upgradable 2>/dev/null | grep linux-image | wc -l',
+            shell=True, capture_output=True, text=True, timeout=20
+        ).stdout.strip()
+        upgradable_count = int(upgradable_out) if upgradable_out.isdigit() else 0
+    except Exception:
+        upgradable_count = 0
+    data = {
+        'running_kernel': running_kernel,
+        'upgradable': upgradable_count > 0,
+        'patched': upgradable_count == 0,
+    }
+    _kernel_patch_cache.update({'ts': now, 'data': data})
+    return jsonify(data)
+
+
 @app.route('/api/metrics')
 @login_required
 def api_metrics():
@@ -33818,6 +34542,12 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <button onclick="doConsoleRollback()" style="padding:6px 14px;background:rgba(234,179,8,0.1);color:var(--yellow);border:1px solid rgba(234,179,8,0.3);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">Roll Back</button>
 </div>
 {% endif %}
+<div id="kernel-patch-banner" style="display:none;background:linear-gradient(135deg,rgba(234,179,8,0.1),rgba(234,179,8,0.05));border:1px solid rgba(234,179,8,0.3);border-radius:12px;padding:14px 20px;margin-bottom:16px;font-family:'JetBrains Mono',monospace">
+<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
+<div><div style="font-size:13px;font-weight:600;color:var(--yellow)">&#9888; Kernel update available &mdash; patch now to fix CVE-2026-31431 (Copy Fail)</div>
+<div style="font-size:11px;color:var(--text-dim);margin-top:4px">Run: <code style="background:rgba(255,255,255,.05);padding:1px 6px;border-radius:3px">apt update &amp;&amp; apt full-upgrade &amp;&amp; reboot</code></div></div>
+<button onclick="dismissKernelBanner()" style="padding:5px 12px;background:none;border:1px solid rgba(234,179,8,0.3);color:var(--text-dim);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">Dismiss</button>
+</div></div>
 <div class="metrics-bar" id="metrics-bar">
 <div class="metric-card"><div class="metric-label">CPU</div><div class="metric-value" id="cpu-value">{{ metrics.cpu_percent }}%</div></div>
 <div class="metric-card"><div class="metric-label">Memory</div><div class="metric-value" id="ram-value">{{ metrics.ram_percent }}%</div><div class="metric-detail">{{ metrics.ram_used_gb }}GB / {{ metrics.ram_total_gb }}GB</div></div>
@@ -33905,9 +34635,10 @@ function cpuColor(pct){var n=Number(pct||0);if(n>=90)return 'var(--red)';if(n>=7
 function diskIoColor(mbs){var m=Number(mbs||0);if(m>=200)return 'var(--green)';if(m>=80)return '#eab308';return 'var(--red)';}
 function renderResourceBreakdown(div,data,hostId){
     var err=data.error,cpuTop=data.cpu_top,memTop=data.mem_top,totalRamGb=data.total_ram_gb,processor=data.processor,vcpuCount=data.vcpu_count,diskWrite=data.disk_io_write_mbs,diskSrc=data.disk_io_source,speedWrite=data.disk_speed_test_write_mbs,speedErr=data.disk_speed_test_error;
-    if(err){div.innerHTML='<span style="color:var(--red)">'+escapeHtml(err)+'</span>';return;}
+    var refreshBtn='<button onclick="refreshResourceBreakdown(\''+hostId+'\')" style="margin-bottom:8px;padding:3px 10px;background:rgba(59,130,246,0.15);color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-family:\'JetBrains Mono\',monospace;font-size:10px;cursor:pointer">&#8635; Refresh</button>';
+    if(err){div.innerHTML=refreshBtn+'<br><span style="color:var(--red)">'+escapeHtml(err)+'</span>';return;}
     var tbl='width:100%;border-collapse:collapse;font-size:10px;text-align:left',th='padding:2px 8px 2px 0;color:var(--cyan);font-weight:600;border-bottom:1px solid var(--border)',td='padding:2px 8px 2px 0;border-bottom:1px solid rgba(255,255,255,0.06)',r='text-align:right';
-    var html='';
+    var html=refreshBtn;
     if(processor){html+='<div style="margin-bottom:2px;color:var(--text-dim)">Processor: '+escapeHtml(processor)+'</div>';if(vcpuCount)html+='<div style="margin-bottom:4px;padding-left:8px;color:var(--cyan);font-weight:600">'+vcpuCount+' vCPUs</div>';}
     if(totalRamGb!=null)html+='<div style="margin-bottom:4px;color:var(--text-dim)">Total RAM: '+totalRamGb+' GB</div>';
     if(diskWrite!=null&&diskSrc==='sync'){var dw=Number(diskWrite),cwColor=diskIoColor(dw);html+='<div style="margin-bottom:4px">Disk write speed (Guard Dog): <span style="color:'+cwColor+'">'+dw.toFixed(0)+' MB/s</span></div>';}
@@ -34061,6 +34792,21 @@ if(document.getElementById('fedhub-card-cert-expiry')){
   setInterval(loadFedHubCardCertExpiry,60000);
 }
 loadCaddyCertDays();
+async function checkKernelPatch(){
+    var banner=document.getElementById('kernel-patch-banner');if(!banner)return;
+    var dismissed=localStorage.getItem('kernel-patch-dismissed');
+    try{
+        var r=await fetch('/api/system/kernel-patch-status',{credentials:'same-origin',cache:'no-store'});
+        var d=await r.json();
+        if(d.patched){localStorage.removeItem('kernel-patch-dismissed');return;}
+        if(!dismissed){banner.style.display='block';}
+    }catch(e){}
+}
+function dismissKernelBanner(){
+    var b=document.getElementById('kernel-patch-banner');if(b)b.style.display='none';
+    localStorage.setItem('kernel-patch-dismissed','1');
+}
+checkKernelPatch();
 var updateBody='';
 async function checkUpdate(forceRefresh){
     var btn=document.getElementById('check-release-btn');
@@ -35677,7 +36423,9 @@ def _post_update_auto_deploy():
             import time
             time.sleep(10)
 
-            # Fix cert-metadata.sh ownership (v0.5.8 — servers upgraded from 5.6→5.7 left it as root:root)
+            # Fix cert-metadata.sh ownership and mode (v0.5.8+; v0.9.3 adds mode check + source-test)
+            # Must be tak:tak 600 — makeCert.sh sources it as user 'tak'; root:root 600 breaks
+            # TAK Portal integration cert download with "cert-metadata.sh: Permission denied".
             _cm = '/opt/tak/certs/cert-metadata.sh'
             if os.path.exists(_cm):
                 try:
@@ -35685,10 +36433,28 @@ def _post_update_auto_deploy():
                     st = os.stat(_cm)
                     tak_uid = pwd.getpwnam('tak').pw_uid
                     tak_gid = grp.getgrnam('tak').gr_gid
+                    _want_mode = stat.S_IRUSR | stat.S_IWUSR  # 0o600
+                    _fixed = []
                     if st.st_uid != tak_uid or st.st_gid != tak_gid:
                         os.chown(_cm, tak_uid, tak_gid)
-                        os.chmod(_cm, stat.S_IRUSR | stat.S_IXUSR)
-                        print(f"Post-update: fixed cert-metadata.sh ownership to tak:tak")
+                        _fixed.append('ownership→tak:tak')
+                    if (st.st_mode & 0o777) != _want_mode:
+                        os.chmod(_cm, _want_mode)
+                        _fixed.append('mode→600')
+                    if _fixed:
+                        print(f"Post-update: cert-metadata.sh fixed: {', '.join(_fixed)}")
+                    # Validate: source the file as 'tak' and confirm $DIR is populated
+                    _src_test = subprocess.run(
+                        ['sudo', '-u', 'tak', 'bash', '-c',
+                         'cd /opt/tak/certs && . ./cert-metadata.sh && test -n "$DIR"'],
+                        capture_output=True, timeout=10
+                    )
+                    if _src_test.returncode != 0:
+                        print("Post-update: WARNING cert-metadata.sh source-test-as-tak FAILED — "
+                              "TAK Portal integration cert download may not work. "
+                              "Check /opt/tak/certs/cert-metadata.sh ownership and content.")
+                    else:
+                        print("Post-update: cert-metadata.sh source-test-as-tak OK")
                 except Exception as e:
                     print(f"Post-update: cert-metadata.sh fixup skipped: {e}")
 
@@ -36085,6 +36851,22 @@ def _post_update_auto_deploy():
                                 'cd ~/authentik && docker compose up -d --force-recreate worker server ldap 2>/dev/null',
                                 shell=True, capture_output=True, text=True, timeout=120
                             )
+                            # Verify CapDrop was applied to server and ldap (worker is intentionally excluded)
+                            import time as _harden_t
+                            _harden_t.sleep(3)
+                            for _svc_name in ('authentik-server-1', 'authentik-ldap-1'):
+                                try:
+                                    _ins = subprocess.run(
+                                        ['docker', 'inspect', '--format', '{{.HostConfig.CapDrop}}', _svc_name],
+                                        capture_output=True, text=True, timeout=10
+                                    )
+                                    _cap = _ins.stdout.strip()
+                                    if 'ALL' in _cap:
+                                        print(f"Post-update: {_svc_name} CapDrop verified: ALL")
+                                    else:
+                                        print(f"Post-update: WARNING {_svc_name} CapDrop={_cap!r} — hardening may not have applied")
+                                except Exception as _ie:
+                                    print(f"Post-update: {_svc_name} inspect error: {_ie}")
                         else:
                             print("Post-update: Authentik compose already hardened — no changes needed")
                 except Exception as _e:
@@ -36386,6 +37168,18 @@ def _post_update_auto_deploy():
             _auto_authentik_ports()
             _auto_nodered()
             _auto_harden_containers()
+
+            # MediaMTX RTSP Fail2ban jail — auto-install if mediamtx + fail2ban present
+            try:
+                _mtx_svc = os.path.exists('/etc/systemd/system/mediamtx.service') or os.path.exists('/usr/local/bin/mediamtx')
+                if _mtx_svc and _f2b_is_available() and not _f2b_mediamtx_jail_enabled():
+                    _f2b_write_mediamtx_jail(maxretry=10, findtime=30, bantime=3600)
+                    subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+                    print("Post-update: MediaMTX RTSP Fail2ban jail installed (10 conns/30s → 1h ban)")
+                elif _mtx_svc and _f2b_mediamtx_jail_enabled():
+                    print("Post-update: MediaMTX RTSP Fail2ban jail already present — no change")
+            except Exception as _mtx_f2b_err:
+                print(f"Post-update: MediaMTX Fail2ban setup skipped: {_mtx_f2b_err}")
 
             # CloudTAK is independent (talks to TAK Server, not Authentik) — start it early
             cloudtak_t = threading.Thread(target=_auto_cloudtak, daemon=True)
