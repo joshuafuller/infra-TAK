@@ -5024,6 +5024,26 @@ def fail2ban_mediamtx_watching_api():
     return jsonify({'ok': True, 'watching': result})
 
 
+@app.route('/api/fail2ban/mediamtx/ban', methods=['POST'])
+@login_required
+def fail2ban_mediamtx_ban_api():
+    """Manually ban an IP in the mediamtx-rtsp jail."""
+    if not _f2b_is_available():
+        return jsonify({'ok': False, 'error': 'fail2ban not installed'}), 400
+    data = request.get_json(force=True) or {}
+    ip = (data.get('ip') or '').strip()
+    if not ip or not _VALID_IP_RE.match(ip):
+        return jsonify({'ok': False, 'error': 'Invalid IP address'}), 400
+    try:
+        r = subprocess.run(['fail2ban-client', 'set', 'mediamtx-rtsp', 'banip', ip],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            return jsonify({'ok': True, 'ip': ip})
+        return jsonify({'ok': False, 'error': r.stderr.strip()[:200] or 'Ban failed'}), 500
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+
 @app.route('/api/fail2ban/mediamtx/unban', methods=['POST'])
 @login_required
 def fail2ban_mediamtx_unban_api():
@@ -18721,12 +18741,10 @@ Bans IPs via UFW and sends Guard Dog email alerts.
 <div class="stat-value red" id="mediamtx-stat-banned">0</div>
 <div class="stat-label">Currently Banned <span style="font-size:10px;color:var(--text-dim)" id="mediamtx-banned-caret">▼ details</span></div>
 </div>
-<div id="mediamtx-watching-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
-<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">IPs Under Watch — opens within find window, not yet banned</div>
-<input type="text" id="mediamtx-watching-search" oninput="filterMtxWatchingList()" placeholder="Search IP…" style="width:100%;box-sizing:border-box;margin-bottom:10px;padding:6px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px;outline:none">
-<div id="mediamtx-watching-list"><div style="color:var(--text-dim);font-size:13px;font-family:monospace">Loading…</div></div>
+<div class="stat-card" id="mediamtx-watching-toggle" onclick="toggleMtxWatchingPanel()" style="cursor:pointer;transition:border-color 0.2s" title="Click to see IPs being watched">
+<div class="stat-value yellow" id="mediamtx-stat-failed">0</div>
+<div class="stat-label">Currently Watching <span style="font-size:10px;color:var(--text-dim)" id="mediamtx-watching-caret">▼ details</span></div>
 </div>
-<div class="stat-card" id="mediamtx-watching-toggle" onclick="toggleMtxWatchingPanel()" style="cursor:pointer;transition:border-color 0.2s" title="Click to see IPs being watched"><div class="stat-value yellow" id="mediamtx-stat-failed">0</div><div class="stat-label">Currently Watching <span style="font-size:10px;color:var(--text-dim)" id="mediamtx-watching-caret">▼ details</span></div></div>
 <div class="stat-card" title="Since the fail2ban service was last started or restarted"><div class="stat-value cyan" id="mediamtx-stat-total-banned">0</div><div class="stat-label">Total Banned <span style="font-size:9px;color:var(--text-dim)">(since last restart)</span></div></div>
 </div>
 
@@ -18736,6 +18754,12 @@ Bans IPs via UFW and sends Guard Dog email alerts.
 <div id="mediamtx-ban-list-container" style="max-height:240px;overflow-y:auto">
 <div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>
 </div>
+</div>
+
+<div id="mediamtx-watching-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
+<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">IPs Under Watch — opens within find window, not yet banned</div>
+<input type="text" id="mediamtx-watching-search" oninput="filterMtxWatchingList()" placeholder="Search IP…" style="width:100%;box-sizing:border-box;margin-bottom:10px;padding:6px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px;outline:none">
+<div id="mediamtx-watching-list"><div style="color:var(--text-dim);font-size:13px;font-family:monospace">Loading…</div></div>
 </div>
 
 <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:16px">
@@ -19605,9 +19629,10 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
       return \'<tr style="border-bottom:1px solid var(--border)">\'+
         \'<td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">\'+w.ip+\'</td>\'+
         \'<td style="padding:5px 8px;text-align:right;font-size:12px;color:var(--yellow)">\'+w.attempts+\'</td>\'+
-        \'<td style="padding:5px 8px;text-align:right;font-size:11px;color:var(--text-dim)">\'+w.last_seen+\'</td></tr>\';
+        \'<td style="padding:5px 8px;font-size:11px;color:var(--text-dim)">\'+w.last_seen+\'</td>\'+
+        \'<td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="banMtxIP(\\\'\'+w.ip+\'\\\')">Ban Now</button></td></tr>\';
     }).join(\'\');
-    c.innerHTML = \'<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em"><th style="padding:4px 8px;text-align:left">IP Address</th><th style="padding:4px 8px;text-align:right">Opens</th><th style="padding:4px 8px;text-align:right">Last Seen</th></tr></thead><tbody>\'+rows+\'</tbody></table>\';
+    c.innerHTML = \'<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em"><th style="padding:4px 8px;text-align:left">IP Address</th><th style="padding:4px 8px;text-align:right">Attempts</th><th style="padding:4px 8px">Last Seen</th><th style="padding:4px 8px;text-align:right">Action</th></tr></thead><tbody>\'+rows+\'</tbody></table>\';
   };
 
   window.filterMtxWatchingList = function() {
@@ -19660,6 +19685,15 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
       .then(function(r){ return r.json(); }).then(function(d){
         if (d.ok) { showToast(ip + \' unbanned.\', \'success\'); loadMtxStatus(); }
         else showToast(d.error || \'Unban failed\', \'error\');
+      }).catch(function(){ showToast(\'Network error\', \'error\'); });
+  };
+
+  window.banMtxIP = function(ip) {
+    if (!confirm(\'Manually ban \' + ip + \' from MediaMTX RTSP jail now?\')) return;
+    fetch(\'/api/fail2ban/mediamtx/ban\', {method:\'POST\', headers:{\'Content-Type\':\'application/json\'}, body:JSON.stringify({ip:ip})})
+      .then(function(r){ return r.json(); }).then(function(d){
+        if (d.ok) { showToast(ip + \' banned.\', \'success\'); loadMtxStatus(); if (_mtxWatchingPanelOpen) _loadMtxWatchingList(); }
+        else showToast(d.error || \'Ban failed\', \'error\');
       }).catch(function(){ showToast(\'Network error\', \'error\'); });
   };
 
