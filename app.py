@@ -22624,7 +22624,7 @@ async function updateDomain(){
         if (!ok) return;
     }
     try{var r=await fetch('/api/caddy/domain',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({domain:domain})});
-    var d=await r.json();if(d.success){alert('Domain updated and Caddy reload scheduled.\n\nAuthentik domain sync is running in the background — check the Authentik page → Domain Migration Audit in ~60s to verify.');location.reload()}else{alert('Error: '+d.error)}}catch(e){alert('Error: '+e.message)}
+    var d=await r.json();if(d.success){alert('Domain updated and Caddy reload scheduled.\\n\\nAuthentik domain sync is running in the background — check the Authentik page → Domain Migration Audit in ~60s to verify.');location.reload()}else{alert('Error: '+d.error)}}catch(e){alert('Error: '+e.message)}
 }
 async function caddyUninstall(){
     if(!confirm('Remove Caddy and clear domain configuration?'))return;
