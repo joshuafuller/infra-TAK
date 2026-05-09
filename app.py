@@ -1914,16 +1914,30 @@ def update_check():
             'body': update_cache.get('body') or '',
             'update_available': cached_newer})
     try:
+        gh_headers = {'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'infra-TAK'}
         req = urllib.request.Request(
             f'https://api.github.com/repos/{GITHUB_REPO}/tags',
-            headers={'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'infra-TAK'}
+            headers=gh_headers
         )
         resp = urllib.request.urlopen(req, timeout=5)
         data = json.loads(resp.read().decode())
         if not data:
             return _update_check_response({'current': VERSION, 'latest': None, 'error': 'No tags found', 'body': '', 'update_available': False})
+        # Only surface tags that are actually on the main branch so that tags
+        # pushed on dev before a merge-to-main don't show as "update available".
+        try:
+            main_req = urllib.request.Request(
+                f'https://api.github.com/repos/{GITHUB_REPO}/commits?sha=main&per_page=100',
+                headers=gh_headers
+            )
+            main_resp = urllib.request.urlopen(main_req, timeout=5)
+            main_commits = {c['sha'] for c in json.loads(main_resp.read().decode())}
+        except Exception:
+            main_commits = None  # fall back: don't filter if we can't reach main
         versions = []
         for tag in data:
+            if main_commits is not None and tag.get('commit', {}).get('sha') not in main_commits:
+                continue
             name = tag.get('name', '').lstrip('v').replace('-alpha','').replace('-beta','')
             parts = name.split('.')
             try:
@@ -34664,7 +34678,7 @@ function cpuColor(pct){var n=Number(pct||0);if(n>=90)return 'var(--red)';if(n>=7
 function diskIoColor(mbs){var m=Number(mbs||0);if(m>=200)return 'var(--green)';if(m>=80)return '#eab308';return 'var(--red)';}
 function renderResourceBreakdown(div,data,hostId){
     var err=data.error,cpuTop=data.cpu_top,memTop=data.mem_top,totalRamGb=data.total_ram_gb,processor=data.processor,vcpuCount=data.vcpu_count,diskWrite=data.disk_io_write_mbs,diskSrc=data.disk_io_source,speedWrite=data.disk_speed_test_write_mbs,speedErr=data.disk_speed_test_error;
-    var refreshBtn='<button onclick="refreshResourceBreakdown(\''+hostId+'\')" style="margin-bottom:8px;padding:3px 10px;background:rgba(59,130,246,0.15);color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-size:10px;cursor:pointer">&#8635; Refresh</button>';
+    var refreshBtn=`<button onclick="refreshResourceBreakdown('${hostId}')" style="margin-bottom:8px;padding:3px 10px;background:rgba(59,130,246,0.15);color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-size:10px;cursor:pointer">&#8635; Refresh</button>`;
     if(err){div.innerHTML=refreshBtn+'<br><span style="color:var(--red)">'+escapeHtml(err)+'</span>';return;}
     var tbl='width:100%;border-collapse:collapse;font-size:10px;text-align:left',th='padding:2px 8px 2px 0;color:var(--cyan);font-weight:600;border-bottom:1px solid var(--border)',td='padding:2px 8px 2px 0;border-bottom:1px solid rgba(255,255,255,0.06)',r='text-align:right';
     var html=refreshBtn;
