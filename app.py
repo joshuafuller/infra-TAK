@@ -32061,14 +32061,24 @@ def _tak_snapshot(label, plog=None):
         'size_mb':    0,
     }
 
-    # 1. TAK version
+    # 1. TAK version — try dpkg (multiple package names) then rpm
     try:
-        r = subprocess.run(['dpkg', '-l', 'takserver'], capture_output=True, text=True, timeout=10)
-        for line in r.stdout.splitlines():
-            if line.startswith('ii') and 'takserver' in line:
-                parts = line.split()
-                meta['tak_version'] = parts[2] if len(parts) > 2 else None
+        for _pkg in ('takserver', 'takserver-core', 'takserver-database'):
+            _r = subprocess.run(
+                f"dpkg -s {_pkg} 2>/dev/null | grep ^Version:",
+                shell=True, capture_output=True, text=True, timeout=5)
+            if _r.returncode == 0 and _r.stdout.strip():
+                meta['tak_version'] = _r.stdout.strip().replace('Version:', '').strip()
                 break
+        if meta['tak_version'] is None:
+            _r = subprocess.run("rpm -q takserver 2>/dev/null", shell=True, capture_output=True, text=True, timeout=5)
+            if _r.returncode == 0 and _r.stdout.strip():
+                _ver = _r.stdout.strip()
+                if _ver.startswith('takserver-'):
+                    _ver = _ver.split('-', 1)[1]
+                _ver = _ver.replace('.noarch', '')
+                if _ver:
+                    meta['tak_version'] = _ver
     except Exception as e:
         plog(f"  snapshot: version probe failed: {e}")
 
@@ -32656,11 +32666,33 @@ def takserver_snapshot_upload_api():
                 except Exception: pass
         size_mb = round(total / (1024 * 1024), 1)
 
+        # Probe installed TAK version (dpkg then rpm) for the upload metadata
+        _upload_ver = None
+        try:
+            for _pkg in ('takserver', 'takserver-core', 'takserver-database'):
+                _r = subprocess.run(
+                    f"dpkg -s {_pkg} 2>/dev/null | grep ^Version:",
+                    shell=True, capture_output=True, text=True, timeout=5)
+                if _r.returncode == 0 and _r.stdout.strip():
+                    _upload_ver = _r.stdout.strip().replace('Version:', '').strip()
+                    break
+            if _upload_ver is None:
+                _r = subprocess.run("rpm -q takserver 2>/dev/null", shell=True, capture_output=True, text=True, timeout=5)
+                if _r.returncode == 0 and _r.stdout.strip():
+                    _ver = _r.stdout.strip()
+                    if _ver.startswith('takserver-'):
+                        _ver = _ver.split('-', 1)[1]
+                    _ver = _ver.replace('.noarch', '')
+                    if _ver:
+                        _upload_ver = _ver
+        except Exception:
+            pass
+
         meta = {
             'label':      extracted_label,
             'taken_at':   datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
             'source':     'uploaded',
-            'tak_version': None,
+            'tak_version': _upload_ver,
             'size_mb':    size_mb,
         }
 
