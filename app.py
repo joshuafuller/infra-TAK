@@ -14381,6 +14381,8 @@ def cloudtak_control():
         else:
             return jsonify({'error': 'Invalid action'}), 400
         time.sleep(3)
+        if action in ('start', 'restart'):
+            _cloudtak_fix_nginx_user()
         r = subprocess.run('docker ps --filter name=cloudtak-api --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
         running = 'Up' in r.stdout
     return jsonify({'success': True, 'running': running})
@@ -14518,8 +14520,9 @@ def cloudtak_reset_server_config():
     cfg = _get_cloudtak_deployment_config(settings)
     target_mode = (cfg.get('target_mode') or 'local').strip().lower()
 
-    # Table is "server" (singular) and auth is NOT NULL jsonb — reset to empty object, not NULL
-    sql_cmd = "UPDATE server SET auth = '{}'::jsonb WHERE id = 1;"
+    # Table is "server" (singular). Clear all connection fields so the API doesn't try to
+    # connect to a stale TAK Server on startup (which blocks the Node event loop).
+    sql_cmd = "UPDATE server SET auth = '{}'::jsonb, url = '', api = '', webtak = '' WHERE id = 1;"
     psql_cmd = f"docker exec cloudtak-postgis-1 psql -U docker -d gis -c \"{sql_cmd}\" 2>&1"
     restart_cmd = "cd ~/CloudTAK && docker compose restart api 2>&1"
 
@@ -14534,6 +14537,8 @@ def cloudtak_reset_server_config():
         ok2, out2 = _ssh_probe(rcfg, restart_cmd, timeout=60)
         if not ok2:
             return jsonify({'success': False, 'error': f'API restart failed on {rhost}: {(out2 or "unknown")[:200]}'}), 500
+        nginx_fix = 'docker exec cloudtak-api-1 sed -i "s/^user nginx;/user root;/" /etc/nginx/nginx.conf 2>/dev/null && docker exec cloudtak-api-1 nginx -s reload 2>/dev/null; true'
+        _ssh_probe(rcfg, nginx_fix, timeout=15)
         return jsonify({'success': True, 'message': f'CloudTAK server config cleared on {rhost}. Visit map.{settings.get("fqdn","<domain>")} to re-run the bootstrap wizard.'})
     else:
         try:
@@ -14549,6 +14554,7 @@ def cloudtak_reset_server_config():
                 return jsonify({'success': False, 'error': f'API restart failed: {(r2.stdout + r2.stderr)[:200]}'}), 500
         except subprocess.TimeoutExpired:
             return jsonify({'success': False, 'error': 'docker compose restart timed out'}), 500
+        _cloudtak_fix_nginx_user()
         fqdn = settings.get('fqdn', '')
         return jsonify({'success': True, 'message': f'CloudTAK server config cleared. Visit {"map." + fqdn if fqdn else "CloudTAK"} to re-run the bootstrap wizard.'})
 
@@ -14655,6 +14661,24 @@ services:
     environment:
       API_URL: "http://api:5000"
 """
+
+
+def _cloudtak_fix_nginx_user(container_name='cloudtak-api-1', timeout=10):
+    """Patch nginx.conf user directive from 'nginx' to 'root' and reload workers.
+
+    The CloudTAK container image generates 'user nginx;' in nginx.conf via nginx.conf.js,
+    but workers crash immediately with exit code 2 because /dev/stdout and /dev/stderr
+    are not writable after dropping root privileges. Patching to 'user root;' and
+    reloading causes workers to spawn correctly. Called after every API container start.
+    """
+    try:
+        subprocess.run(
+            f'docker exec {container_name} sed -i "s/^user nginx;/user root;/" /etc/nginx/nginx.conf 2>/dev/null'
+            f' && docker exec {container_name} nginx -s reload 2>/dev/null',
+            shell=True, capture_output=True, text=True, timeout=timeout
+        )
+    except Exception:
+        pass
 
 
 def run_cloudtak_deploy(cfg=None):
@@ -15265,8 +15289,9 @@ def run_cloudtak_redeploy(cfg=None):
         if api_container:
             for nf in ['/etc/nginx/nginx.conf', '/etc/nginx/conf.d/default.conf']:
                 subprocess.run(f'docker exec {api_container} sed -i "s|proxy_pass http://[^;]*:5001|proxy_pass http://127.0.0.1:5001|g" {nf} 2>/dev/null', shell=True, capture_output=True, timeout=5)
+                subprocess.run(f'docker exec {api_container} sed -i "s/^user nginx;/user root;/" {nf} 2>/dev/null', shell=True, capture_output=True, timeout=5)
             subprocess.run(f'docker exec {api_container} nginx -s reload 2>/dev/null', shell=True, capture_output=True, timeout=5)
-            plog("  Nginx /api proxy pointed at CloudTAK API (127.0.0.1:5001)")
+            plog("  Nginx proxy and user directive patched, workers reloaded")
         plog("  Waiting for CloudTAK API to respond...")
         import urllib.request as _urlreq
         for attempt in range(45):
@@ -15372,6 +15397,10 @@ def run_cloudtak_update():
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
         plog("✓ Containers rebuilt and restarted")
+        if not is_remote:
+            time.sleep(5)
+            _cloudtak_fix_nginx_user()
+            plog("  Nginx user directive patched, workers reloaded")
         plog("")
         plog(f"✓ CloudTAK updated to {release_tag}")
         plog("Update finished — CloudTAK is running.")
