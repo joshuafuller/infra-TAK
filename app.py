@@ -4984,6 +4984,46 @@ def fail2ban_mediamtx_config_api():
         return jsonify({'ok': False, 'error': str(e)[:200]}), 500
 
 
+@app.route('/api/fail2ban/mediamtx/watching')
+@login_required
+def fail2ban_mediamtx_watching_api():
+    """Return IPs seen in the mediamtx-rtsp jail (found but not currently banned)."""
+    import re as _re_watch
+    log_path = '/var/log/fail2ban.log'
+    result = []
+    try:
+        found_re = _re_watch.compile(r'\[mediamtx-rtsp\] Found (\d[\d.:a-fA-F]+)')
+        ban_re   = _re_watch.compile(r'\[mediamtx-rtsp\] Ban (\d[\d.:a-fA-F]+)')
+        unban_re = _re_watch.compile(r'\[mediamtx-rtsp\] Unban (\d[\d.:a-fA-F]+)')
+        ts_re    = _re_watch.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})')
+        found_data = {}
+        banned_ips = set()
+        with open(log_path) as _lf:
+            for line in _lf:
+                m = ban_re.search(line)
+                if m: banned_ips.add(m.group(1)); continue
+                m = unban_re.search(line)
+                if m: banned_ips.discard(m.group(1)); continue
+                m = found_re.search(line)
+                if m:
+                    ip = m.group(1)
+                    ts_m = ts_re.match(line)
+                    ts = ts_m.group(1) if ts_m else ''
+                    if ip not in found_data:
+                        found_data[ip] = {'count': 0, 'last_seen': ts}
+                    found_data[ip]['count'] += 1
+                    found_data[ip]['last_seen'] = ts
+        for ip, data in found_data.items():
+            if ip not in banned_ips:
+                result.append({'ip': ip, 'attempts': data['count'], 'last_seen': data['last_seen']})
+        result.sort(key=lambda x: x['attempts'], reverse=True)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200], 'watching': []}), 500
+    return jsonify({'ok': True, 'watching': result})
+
+
 @app.route('/api/fail2ban/mediamtx/unban', methods=['POST'])
 @login_required
 def fail2ban_mediamtx_unban_api():
@@ -18681,7 +18721,12 @@ Bans IPs via UFW and sends Guard Dog email alerts.
 <div class="stat-value red" id="mediamtx-stat-banned">0</div>
 <div class="stat-label">Currently Banned <span style="font-size:10px;color:var(--text-dim)" id="mediamtx-banned-caret">▼ details</span></div>
 </div>
-<div class="stat-card"><div class="stat-value yellow" id="mediamtx-stat-failed">0</div><div class="stat-label">Currently Watching</div></div>
+<div id="mediamtx-watching-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
+<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">IPs Under Watch — opens within find window, not yet banned</div>
+<input type="text" id="mediamtx-watching-search" oninput="filterMtxWatchingList()" placeholder="Search IP…" style="width:100%;box-sizing:border-box;margin-bottom:10px;padding:6px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px;outline:none">
+<div id="mediamtx-watching-list"><div style="color:var(--text-dim);font-size:13px;font-family:monospace">Loading…</div></div>
+</div>
+<div class="stat-card" id="mediamtx-watching-toggle" onclick="toggleMtxWatchingPanel()" style="cursor:pointer;transition:border-color 0.2s" title="Click to see IPs being watched"><div class="stat-value yellow" id="mediamtx-stat-failed">0</div><div class="stat-label">Currently Watching <span style="font-size:10px;color:var(--text-dim)" id="mediamtx-watching-caret">▼ details</span></div></div>
 <div class="stat-card" title="Since the fail2ban service was last started or restarted"><div class="stat-value cyan" id="mediamtx-stat-total-banned">0</div><div class="stat-label">Total Banned <span style="font-size:9px;color:var(--text-dim)">(since last restart)</span></div></div>
 </div>
 
@@ -19501,7 +19546,7 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
         window._mtxBannedIps = ips;
         renderMtxBanList(ips);
         var caret = document.getElementById(\'mediamtx-banned-caret\');
-        if (caret) caret.textContent = ips.length ? \'▼ details\' : \'\';
+        if (caret && caret.textContent === \'\') caret.textContent = \'▼ details\';
       }
     }).catch(function(){});
   }
@@ -19550,6 +19595,55 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
     renderMtxBanList(filtered);
   };
 
+  var _mtxWatchingPanelOpen = false;
+  window._mtxWatchingList = [];
+
+  window.renderMtxWatchingList = function(list) {
+    var c = document.getElementById(\'mediamtx-watching-list\'); if (!c) return;
+    if (!list.length) { c.innerHTML=\'<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently being watched.</div>\'; return; }
+    var rows = list.map(function(w){
+      return \'<tr style="border-bottom:1px solid var(--border)">\'+
+        \'<td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">\'+w.ip+\'</td>\'+
+        \'<td style="padding:5px 8px;text-align:right;font-size:12px;color:var(--yellow)">\'+w.attempts+\'</td>\'+
+        \'<td style="padding:5px 8px;text-align:right;font-size:11px;color:var(--text-dim)">\'+w.last_seen+\'</td></tr>\';
+    }).join(\'\');
+    c.innerHTML = \'<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em"><th style="padding:4px 8px;text-align:left">IP Address</th><th style="padding:4px 8px;text-align:right">Opens</th><th style="padding:4px 8px;text-align:right">Last Seen</th></tr></thead><tbody>\'+rows+\'</tbody></table>\';
+  };
+
+  window.filterMtxWatchingList = function() {
+    var q = (document.getElementById(\'mediamtx-watching-search\').value || \'\').trim().toLowerCase();
+    window.renderMtxWatchingList(q ? window._mtxWatchingList.filter(function(w){ return w.ip.indexOf(q) !== -1; }) : window._mtxWatchingList);
+  };
+
+  function _loadMtxWatchingList() {
+    fetch(\'/api/fail2ban/mediamtx/watching\').then(function(r){ return r.json(); }).then(function(d){
+      window._mtxWatchingList = d.watching || [];
+      var s = document.getElementById(\'mediamtx-watching-search\');
+      var q = s ? s.value.trim().toLowerCase() : \'\';
+      window.renderMtxWatchingList(q ? window._mtxWatchingList.filter(function(w){ return w.ip.indexOf(q) !== -1; }) : window._mtxWatchingList);
+    }).catch(function(){
+      var el = document.getElementById(\'mediamtx-watching-list\');
+      if (el) el.innerHTML = \'<div style="color:var(--text-dim);font-size:12px">Error loading watch list.</div>\';
+    });
+  }
+
+  window.toggleMtxWatchingPanel = function() {
+    _mtxWatchingPanelOpen = !_mtxWatchingPanelOpen;
+    var panel  = document.getElementById(\'mediamtx-watching-panel\');
+    var caret  = document.getElementById(\'mediamtx-watching-caret\');
+    var toggle = document.getElementById(\'mediamtx-watching-toggle\');
+    if (_mtxWatchingPanelOpen) {
+      if (panel)  panel.style.display = \'block\';
+      if (caret)  caret.textContent = \'▲ hide\';
+      if (toggle) toggle.style.borderColor = \'var(--yellow)\';
+      _loadMtxWatchingList();
+    } else {
+      if (panel)  panel.style.display = \'none\';
+      if (caret)  caret.textContent = \'▼ details\';
+      if (toggle) toggle.style.borderColor = \'\';
+    }
+  };
+
   window.toggleMtxBanPanel = function() {
     var panel = document.getElementById(\'mediamtx-ban-panel\');
     var caret = document.getElementById(\'mediamtx-banned-caret\');
@@ -19574,11 +19668,12 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
     var btn = document.getElementById(\'mediamtx-refresh-btn\');
     if (btn) btn.disabled = true;
     loadMtxStatus();
+    if (_mtxWatchingPanelOpen) _loadMtxWatchingList();
     setTimeout(function(){ _spinIcon(\'mediamtx-refresh-icon\', false); if (btn) btn.disabled = false; }, 1200);
   };
 
   loadMtxStatus();
-  setInterval(loadMtxStatus, 30000);
+  setInterval(function(){ loadMtxStatus(); if (_mtxWatchingPanelOpen) _loadMtxWatchingList(); }, 30000);
 })();
 
 // Repeat Offender Protection
