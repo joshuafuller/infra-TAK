@@ -28039,6 +28039,7 @@ async function reconfigureAk(){
     }catch(e){alert('Error: '+e.message)}
 }
 
+function escapeHtml(s){var d=document.createElement('div');d.textContent=s==null?'':String(s);return d.innerHTML;}
 async function runDomainAudit(){
     var btn = document.getElementById('domain-audit-btn');
     var res = document.getElementById('domain-audit-result');
