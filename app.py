@@ -22525,10 +22525,10 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 {% endif %}
 <div class="section-title">Caddyfile</div>
-<div style="background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:400px;overflow-y:auto;line-height:1.6;white-space:pre-wrap">{{ caddyfile }}</div>
-<div style="margin-top:10px;padding:12px 16px;background:rgba(59,130,246,0.05);border:1px solid rgba(59,130,246,0.15);border-radius:8px;font-size:12px;color:var(--text-dim);line-height:1.5">
+<div style="margin-bottom:10px;padding:12px 16px;background:rgba(59,130,246,0.05);border:1px solid rgba(59,130,246,0.15);border-radius:8px;font-size:12px;color:var(--text-dim);line-height:1.5">
 <span style="font-weight:600;color:var(--text-secondary)">Custom vhosts / rules</span> — add them <em>below</em> the line <code style="background:rgba(255,255,255,.05);padding:1px 6px;border-radius:3px"># --- User-added blocks (do not remove) ---</code> at the bottom of this file. Everything below that line is preserved automatically on every domain change, deploy, and "Update Now". Do not remove the marker itself. See <a href="https://github.com/takwerx/infra-TAK/blob/main/docs/COMMANDS.md" target="_blank" rel="noopener noreferrer" style="color:var(--cyan)">COMMANDS.md</a> for an example.
 </div>
+<div style="background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:400px;overflow-y:auto;line-height:1.6;white-space:pre-wrap">{{ caddyfile }}</div>
 {% elif not caddy.installed %}
 <div class="section-title">Set Up Your Domain</div>
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:32px;margin-bottom:24px">
