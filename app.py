@@ -6980,10 +6980,6 @@ def federation_hub_page():
     modules = detect_modules()
     fh = modules.get('fedhub', {})
     fedhub_deploy_cfg = _get_fedhub_deployment_config(settings)
-    if (fedhub_deploy_cfg.get('target_mode') or 'local') != 'remote':
-        fedhub_deploy_cfg = _normalize_module_deployment_config({
-            **fedhub_deploy_cfg, 'target_mode': 'remote'})
-        fedhub_deploy_cfg = _get_fedhub_deployment_config({'fedhub_deployment': fedhub_deploy_cfg})
     _fpkg_fn, fpkg_fp = _find_fedhub_deb_in_uploads()
     fpkg_size = round(os.path.getsize(fpkg_fp) / (1024 * 1024), 1) if fpkg_fp else None
     _fedhub_upgrade_done = fedhub_upgrade_status.get('complete', False)
@@ -7038,16 +7034,17 @@ def federation_hub_page():
 def fedhub_mark_deployed_api():
     settings = load_settings()
     cfg = _get_fedhub_deployment_config(settings)
-    if cfg.get('target_mode') != 'remote' or not (cfg.get('remote', {}).get('host') or '').strip():
+    is_remote = cfg.get('target_mode') == 'remote'
+    if is_remote and not (cfg.get('remote', {}).get('host') or '').strip():
         return jsonify({'success': False, 'error': 'Set remote host and save SSH settings first.'}), 400
-    ok, out = _ssh_probe(cfg['remote'], 'test -d /opt/tak/federation-hub && echo OK', timeout=20)
+    ok, out = _module_run(cfg, 'test -d /opt/tak/federation-hub && echo OK', timeout=20)
     if not ok or 'OK' not in (out or ''):
         return jsonify({
             'success': False,
             'error': 'Could not find /opt/tak/federation-hub on the target. Install the Federation Hub .deb on Ubuntu per TAK.gov first.',
             'detail': (out or '')[:400],
         }), 400
-    cfg = {**cfg, 'deployed': True, 'target_mode': 'remote'}
+    cfg = {**cfg, 'deployed': True}
     settings['fedhub_deployment'] = _normalize_module_deployment_config(cfg)
     save_settings(settings)
     _caddy_regenerate_if_fqdn()
@@ -7082,11 +7079,13 @@ def fedhub_clear_registration_api():
 def fedhub_status_api():
     settings = load_settings()
     cfg = _get_fedhub_deployment_config(settings)
-    if not cfg.get('deployed') or not (cfg.get('remote', {}).get('host') or '').strip():
+    if not cfg.get('deployed'):
         return jsonify({'registered': False})
-    r = cfg.get('remote', {})
-    ok_d, out_d = _ssh_probe(r, 'test -d /opt/tak/federation-hub && echo OK', timeout=15)
-    ok_s, out_s = _ssh_probe(r, 'systemctl is-active federation-hub 2>/dev/null', timeout=15)
+    is_remote = cfg.get('target_mode') == 'remote'
+    if is_remote and not (cfg.get('remote', {}).get('host') or '').strip():
+        return jsonify({'registered': False})
+    ok_d, out_d = _module_run(cfg, 'test -d /opt/tak/federation-hub && echo OK', timeout=15)
+    ok_s, out_s = _module_run(cfg, 'systemctl is-active federation-hub 2>/dev/null', timeout=15)
     st = (out_s or '').strip()
     return jsonify({
         'registered': True,
@@ -7105,8 +7104,6 @@ def fedhub_control_api():
     cfg = _get_fedhub_deployment_config(settings)
     if not cfg.get('deployed'):
         return jsonify({'success': False, 'error': 'Federation Hub is not registered for this console.'}), 400
-    if cfg.get('target_mode') != 'remote':
-        return jsonify({'success': False, 'error': 'Remote target only.'}), 400
     if action == 'restart':
         cmd = 'sudo systemctl restart federation-hub'
     elif action == 'start':
@@ -7136,14 +7133,34 @@ def fedhub_remote_metrics():
 @app.route('/api/fedhub/download-webadmin-cert')
 @login_required
 def fedhub_download_webadmin_cert():
-    """Download webadmin-fed.p12 from Federation Hub target host."""
+    """Download webadmin-fed.p12 from Federation Hub target host (local or remote)."""
     settings = load_settings()
     cfg = _get_fedhub_deployment_config(settings)
-    if not cfg.get('deployed') or cfg.get('target_mode') != 'remote':
-        return jsonify({'success': False, 'error': 'Federation Hub must be deployed to a remote host first.'}), 400
-    remote = cfg.get('remote', {})
-    if not (remote.get('host') or '').strip():
+    if not cfg.get('deployed'):
+        return jsonify({'success': False, 'error': 'Federation Hub must be deployed first.'}), 400
+    is_remote = cfg.get('target_mode') == 'remote'
+    if is_remote and not (cfg.get('remote', {}).get('host') or '').strip():
         return jsonify({'success': False, 'error': 'Remote host not configured.'}), 400
+    if not is_remote:
+        # Local: read directly
+        import base64 as _b64
+        candidates = [
+            os.path.expanduser('~/webadmin-fed.p12'),
+            '/opt/tak/federation-hub/certs/files/webadmin-fed.p12',
+        ]
+        for p in candidates:
+            if os.path.exists(p):
+                try:
+                    data = open(p, 'rb').read()
+                    resp = make_response(data)
+                    resp.headers['Content-Type'] = 'application/x-pkcs12'
+                    resp.headers['Content-Disposition'] = 'attachment; filename=webadmin-fed.p12'
+                    resp.headers['Content-Length'] = str(len(data))
+                    return resp
+                except Exception as e:
+                    return jsonify({'success': False, 'error': f'Could not read cert: {str(e)[:200]}'}), 500
+        return jsonify({'success': False, 'error': 'webadmin-fed.p12 not found locally'}), 404
+    # Remote: fetch via SSH
     cmd = (
         "python3 - <<'PY'\n"
         "import base64,sys,os\n"
@@ -7164,7 +7181,7 @@ def fedhub_download_webadmin_cert():
         "sys.exit(1)\n"
         "PY"
     )
-    ok, out = _ssh_probe(remote, cmd, timeout=25)
+    ok, out = _ssh_probe(cfg['remote'], cmd, timeout=25)
     if not ok or not (out or '').strip():
         return jsonify({'success': False, 'error': (out or 'Could not read remote certificate file')[:260]}), 404
     try:
@@ -7188,10 +7205,11 @@ def fedhub_enable_authentik_api():
     Opening Fed Hub from Authentik after tak.<fqdn> login uses forward_auth so the edge session matches — often no Fed Hub ‘Keycloak’ step."""
     settings = load_settings()
     cfg = _get_fedhub_deployment_config(settings)
-    if not cfg.get('deployed') or cfg.get('target_mode') != 'remote':
+    if not cfg.get('deployed'):
         return jsonify({'success': False, 'error': 'Federation Hub must be deployed first.'}), 400
+    is_remote = cfg.get('target_mode') == 'remote'
     remote = cfg.get('remote', {})
-    if not (remote.get('host') or '').strip():
+    if is_remote and not (remote.get('host') or '').strip():
         return jsonify({'success': False, 'error': 'Remote host not configured.'}), 400
     fqdn = (settings.get('fqdn') or '').strip()
     if not fqdn:
@@ -7209,7 +7227,7 @@ def fedhub_enable_authentik_api():
     # 2) Fed Hub built-in OIDC → Authentik (direct visits / callbacks); Caddy forward_auth handles Authentik-first flow
     client_id, client_secret, auth_url, token_url = _ensure_authentik_fedhub_oauth_app(settings, plog=lambda m: steps.append(m))
     fh_domain = _get_service_domain(settings, 'fedhub')
-    fh_host = fh_domain or (remote.get('host') or '').strip()
+    fh_host = fh_domain or (remote.get('host') or '').strip() or 'localhost'
     # Fed Hub OAuth callback is handled by backend API endpoint, not SPA route.
     redirect_uri = f'https://{fh_host}/api/oauth/login/redirect' if fh_domain else f'https://{fh_host}:9100/api/oauth/login/redirect'
 
@@ -7226,7 +7244,7 @@ def fedhub_enable_authentik_api():
         f'chmod 644 /opt/tak/certs/keycloak.der && '
         f'ls -la /opt/tak/certs/keycloak.der'
     )
-    ok_der, out_der = _ssh_probe(remote, der_cmd, timeout=30)
+    ok_der, out_der = _module_run(cfg, der_cmd, timeout=30)
     if ok_der:
         steps.append(f'  ✓ keycloak.der generated from {ak_host}')
     else:
@@ -7262,14 +7280,14 @@ def fedhub_enable_authentik_api():
             f'grep -q "^keycloakrRedirectUri:" federation-hub-ui.yml || echo "keycloakrRedirectUri: {redirect_uri}" | sudo tee -a federation-hub-ui.yml > /dev/null && '
             f'grep -q "^keycloakConfigurationEndpoint:" federation-hub-ui.yml || echo "keycloakConfigurationEndpoint: {oidc_config_url}" | sudo tee -a federation-hub-ui.yml > /dev/null'
         )
-        ok_patch, _ = _ssh_probe(remote, patch_cmd, timeout=30)
+        ok_patch, _ = _module_run(cfg, patch_cmd, timeout=30)
         if ok_patch:
             steps.append('  ✓ federation-hub-ui.yml patched with OAuth settings')
         else:
             steps.append('  ⚠ OAuth config patch warning — Fed Hub UI login may be incomplete until fixed')
 
     # 3) Restart federation-hub to pick up OAuth changes
-    ok_restart, _ = _ssh_probe(remote, 'sudo systemctl restart federation-hub 2>&1', timeout=90)
+    ok_restart, _ = _module_run(cfg, 'sudo systemctl restart federation-hub 2>&1', timeout=90)
     steps.append('  ✓ federation-hub restarted' if ok_restart else '  ⚠ Restart returned non-zero')
 
     # 4) Authentik Proxy provider + app for Caddy forward_auth (same pattern as Node-RED)
@@ -7298,8 +7316,20 @@ def fedhub_enable_authentik_api():
     })
 
 
+def _fedhub_copy_file(cfg, src, dst_dir, timeout=300):
+    """Copy src to dst_dir on the FedHub target (local or remote). Returns (ok, output)."""
+    if cfg.get('target_mode') == 'remote':
+        return _scp_to_host(cfg['remote'], src, dst_dir, timeout=timeout)
+    try:
+        dst = os.path.join(dst_dir, os.path.basename(src))
+        r = subprocess.run(['sudo', 'cp', src, dst], capture_output=True, text=True, timeout=60)
+        return r.returncode == 0, (r.stdout + r.stderr).strip() or f'Copied to {dst}'
+    except Exception as e:
+        return False, str(e)
+
+
 def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deploy'):
-    """SCP Federation Hub .deb from UPLOAD_DIR to remote, apt install, restart service; register console when successful."""
+    """Install/update Federation Hub .deb on local or remote target; register console when successful."""
     def plog(msg):
         entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
         log_list.append(entry)
@@ -7308,30 +7338,31 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
         plog(f'━━━ Federation Hub — {phase_label} ━━━')
         settings = load_settings()
         cfg = _get_fedhub_deployment_config(settings)
-        if cfg.get('target_mode') != 'remote' or not (cfg.get('remote', {}).get('host') or '').strip():
+        is_remote = cfg.get('target_mode') == 'remote'
+        if is_remote and not (cfg.get('remote', {}).get('host') or '').strip():
             plog('✗ Remote host not configured — save the SSH target on this page first.')
             status_dict.update({'running': False, 'complete': True, 'error': True})
             return
-        remote = cfg['remote']
-        # On fresh VPS images, unattended-upgrades frequently grabs apt locks.
-        # Disable it up-front so deploy/update doesn't stall for long lock waits.
-        try:
-            uu_before = _get_unattended_upgrades_status_remote(remote) or {}
-            if uu_before.get('error'):
-                plog(f"⚠ Could not read unattended-upgrades status: {uu_before.get('error')}")
-            else:
-                plog(f"Unattended upgrades (before): enabled={uu_before.get('enabled')} running={uu_before.get('running')}")
-            if uu_before.get('enabled') or uu_before.get('running'):
-                plog('Disabling unattended-upgrades temporarily for package install...')
-                ok_uu, uu_res = _run_unattended_upgrades_remote(remote, 'disable')
-                if ok_uu:
-                    plog(f"✓ Unattended upgrades disabled on target (enabled={uu_res.get('enabled')}, running={uu_res.get('running')})")
+        remote = cfg.get('remote', {})
+        # On fresh remote VPS images, unattended-upgrades frequently grabs apt locks.
+        if is_remote:
+            try:
+                uu_before = _get_unattended_upgrades_status_remote(remote) or {}
+                if uu_before.get('error'):
+                    plog(f"⚠ Could not read unattended-upgrades status: {uu_before.get('error')}")
                 else:
-                    plog(f"⚠ Could not disable unattended-upgrades cleanly: {(uu_res or {}).get('error', 'unknown')}")
-            else:
-                plog('Unattended upgrades already inactive on target.')
-        except Exception as e:
-            plog(f'⚠ Unattended-upgrades pre-check failed: {str(e)[:220]}')
+                    plog(f"Unattended upgrades (before): enabled={uu_before.get('enabled')} running={uu_before.get('running')}")
+                if uu_before.get('enabled') or uu_before.get('running'):
+                    plog('Disabling unattended-upgrades temporarily for package install...')
+                    ok_uu, uu_res = _run_unattended_upgrades_remote(remote, 'disable')
+                    if ok_uu:
+                        plog(f"✓ Unattended upgrades disabled on target (enabled={uu_res.get('enabled')}, running={uu_res.get('running')})")
+                    else:
+                        plog(f"⚠ Could not disable unattended-upgrades cleanly: {(uu_res or {}).get('error', 'unknown')}")
+                else:
+                    plog('Unattended upgrades already inactive on target.')
+            except Exception as e:
+                plog(f'⚠ Unattended-upgrades pre-check failed: {str(e)[:220]}')
 
         deb_fn, deb_path = _find_fedhub_deb_in_uploads()
         if not deb_path:
@@ -7339,17 +7370,18 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
             status_dict.update({'running': False, 'complete': True, 'error': True})
             return
         plog(f'Package: {deb_fn}')
-        plog('━━━ Apt lock cleanup on target ━━━')
-        _ok_u, out_u = _ssh_probe(remote, _fedhub_remote_apt_unlock_cmd(), timeout=90)
-        if out_u:
-            plog(out_u[:2000])
-        plog('━━━ SCP to /tmp/ ━━━')
-        ok_scp, scp_out = _scp_to_host(remote, deb_path, '/tmp/', timeout=300)
+        if is_remote:
+            plog('━━━ Apt lock cleanup on target ━━━')
+            _ok_u, out_u = _module_run(cfg, _fedhub_remote_apt_unlock_cmd(), timeout=90)
+            if out_u:
+                plog(out_u[:2000])
+        plog('━━━ Copy .deb to /tmp/ ━━━')
+        ok_scp, scp_out = _fedhub_copy_file(cfg, deb_path, '/tmp/', timeout=300)
         if not ok_scp:
-            plog(f'✗ SCP failed: {scp_out or "unknown"}')
+            plog(f'✗ Copy failed: {scp_out or "unknown"}')
             status_dict.update({'running': False, 'complete': True, 'error': True})
             return
-        plog('✓ Copied to target /tmp/')
+        plog('✓ Copied .deb to /tmp/')
         # takserver-fed-hub preinst backs up policies/*; missing dir or empty glob makes cp fail (first install).
         plog('━━━ Prepare /opt/tak/federation-hub/policies (vendor preinst) ━━━')
         prep_policies = (
@@ -7357,9 +7389,9 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
             'if [ -z "$(ls /opt/tak/federation-hub/policies 2>/dev/null)" ]; then '
             'sudo touch /opt/tak/federation-hub/policies/fedhub-install-placeholder; fi'
         )
-        ok_prep, prep_out = _ssh_probe(remote, prep_policies, timeout=30)
+        ok_prep, prep_out = _module_run(cfg, prep_policies, timeout=30)
         if not ok_prep:
-            plog(f'✗ Could not prepare policies dir: {prep_out or "ssh failed"}')
+            plog(f'✗ Could not prepare policies dir: {prep_out or "failed"}')
             status_dict.update({'running': False, 'complete': True, 'error': True})
             return
         # Local .deb must be ./name.deb or apt treats the name as a repository package (and fails to locate it).
@@ -7369,21 +7401,23 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
             f'sudo DEBIAN_FRONTEND=noninteractive apt-get install -y {fnq}'
         )
         plog('━━━ apt-get install ━━━')
-        plog('This step installs Federation Hub on the remote host.')
-        plog('If unattended-upgrades or apt lock cleanup is active, this can take 5-20+ minutes.')
-        lock_diag_cmd = (
-            "sudo bash -lc '"
-            "if systemctl is-active --quiet unattended-upgrades; then echo \"unattended-upgrades: active\"; "
-            "else echo \"unattended-upgrades: inactive\"; fi; "
-            "if command -v fuser >/dev/null 2>&1; then "
-            "fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock 2>/dev/null || true; "
-            "fi'"
-        )
-        _ok_lock, out_lock = _ssh_probe(remote, lock_diag_cmd, timeout=20)
-        if out_lock:
-            plog(('APT lock status:\n' + out_lock.strip())[:1200])
+        target_label = 'remote host' if is_remote else 'this machine'
+        plog(f'This step installs Federation Hub on the {target_label}.')
+        plog('This can take 5-20+ minutes depending on apt lock activity.')
+        if is_remote:
+            lock_diag_cmd = (
+                "sudo bash -lc '"
+                "if systemctl is-active --quiet unattended-upgrades; then echo \"unattended-upgrades: active\"; "
+                "else echo \"unattended-upgrades: inactive\"; fi; "
+                "if command -v fuser >/dev/null 2>&1; then "
+                "fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock 2>/dev/null || true; "
+                "fi'"
+            )
+            _ok_lock, out_lock = _module_run(cfg, lock_diag_cmd, timeout=20)
+            if out_lock:
+                plog(('APT lock status:\n' + out_lock.strip())[:1200])
         plog('Running apt-get now...')
-        ok_inst, out_inst = _ssh_probe(remote, install_cmd, timeout=600)
+        ok_inst, out_inst = _module_run(cfg, install_cmd, timeout=600)
         if out_inst:
             tail = out_inst[-4500:] if len(out_inst) > 4500 else out_inst
             plog(tail)
@@ -7392,7 +7426,7 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
             status_dict.update({'running': False, 'complete': True, 'error': True})
             return
         fh_dir = '/opt/tak/federation-hub'
-        ok_d, _dout = _ssh_probe(remote, f'test -d {fh_dir} && echo OK', timeout=15)
+        ok_d, _dout = _module_run(cfg, f'test -d {fh_dir} && echo OK', timeout=15)
         if not (ok_d and 'OK' in (_dout or '')):
             plog(f'✗ {fh_dir} not found after install — package may be broken')
             status_dict.update({'running': False, 'complete': True, 'error': True})
@@ -7420,7 +7454,7 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
             'systemctl daemon-reload && systemctl enable mongod && systemctl start mongod && '
             'sleep 2 && systemctl is-active mongod'
         )
-        ok_mg, mg_out = _ssh_probe(remote, f'sudo bash -c {shlex.quote(mongo_cmds)}', timeout=300)
+        ok_mg, mg_out = _module_run(cfg, f'sudo bash -c {shlex.quote(mongo_cmds)}', timeout=300)
         if mg_out:
             plog(mg_out[-2000:] if len(mg_out) > 2000 else mg_out)
         if not ok_mg or 'active' not in (mg_out or ''):
@@ -7439,7 +7473,7 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
             '  echo "SET:${DBPW}"; '
             'else echo "EXISTS"; fi'
         )
-        ok_dbpw, dbpw_out = _ssh_probe(remote, f'sudo bash -c {shlex.quote(mongo_pass_cmd)}', timeout=30)
+        ok_dbpw, dbpw_out = _module_run(cfg, f'sudo bash -c {shlex.quote(mongo_pass_cmd)}', timeout=30)
         if not ok_dbpw:
             plog(f'⚠ MongoDB password patch warning: {dbpw_out}')
         else:
@@ -7447,7 +7481,7 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
 
         # --- Run vendor DB configure script ---
         db_script = f'{fh_dir}/scripts/db/configure.sh'
-        ok_dbcfg, dbcfg_out = _ssh_probe(remote, f'test -x {db_script} && sudo {db_script} 2>&1 || echo SKIP', timeout=60)
+        ok_dbcfg, dbcfg_out = _module_run(cfg, f'test -x {db_script} && sudo {db_script} 2>&1 || echo SKIP', timeout=60)
         if dbcfg_out and 'SKIP' not in dbcfg_out:
             plog(dbcfg_out[-1500:] if len(dbcfg_out) > 1500 else dbcfg_out)
         plog('✓ MongoDB configured')
@@ -7461,8 +7495,8 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
         int_ca = (settings.get('fedhub_intermediate_ca') or settings.get('intermediate_ca_name') or 'FEDHUB-INT-CA').strip()
         plog(f'  Root CA: {root_ca} | Intermediate CA: {int_ca}')
 
-        hostname_ok, hostname_out = _ssh_probe(remote, 'hostname', timeout=10)
-        remote_hostname = (hostname_out or 'fedhub').strip() or 'fedhub'
+        _hn_ok, _hn_out = _module_run(cfg, 'hostname', timeout=10)
+        remote_hostname = (_hn_out or 'fedhub').strip().split()[0] or 'fedhub'
 
         # Patch cert-metadata.sh (same as TAK Server deploy does for /opt/tak/certs/cert-metadata.sh)
         meta_subs = [
@@ -7480,16 +7514,17 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
             meta_cmds += f" && sudo sed -i 's/^CAPASS=.*/CAPASS={shlex.quote(cert_pass)}/' cert-metadata.sh"
             meta_cmds += f" && sudo sed -i 's/^PASS=.*/PASS={shlex.quote(cert_pass)}/' cert-metadata.sh"
         # Pre-flight: passwordless sudo required — SSH sessions have no TTY for password prompts
-        ok_sudo, sudo_out = _ssh_probe(remote, 'sudo -n true 2>&1', timeout=10)
-        if not ok_sudo or 'password' in (sudo_out or '').lower():
-            plog('✗ Certificate generation failed — SSH user requires a sudo password')
-            plog('  Fix on the Federation Hub host:')
-            plog('    echo "$(whoami) ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/infra-tak-nopasswd')
-            plog('  Or SSH as root. Then retry.')
-            status_dict.update({'running': False, 'complete': True, 'error': True})
-            return
+        if is_remote:
+            ok_sudo, sudo_out = _module_run(cfg, 'sudo -n true 2>&1', timeout=10)
+            if not ok_sudo or 'password' in (sudo_out or '').lower():
+                plog('✗ Certificate generation failed — SSH user requires a sudo password')
+                plog('  Fix on the Federation Hub host:')
+                plog('    echo "$(whoami) ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/infra-tak-nopasswd')
+                plog('  Or SSH as root. Then retry.')
+                status_dict.update({'running': False, 'complete': True, 'error': True})
+                return
 
-        ok_meta, meta_out = _ssh_probe(remote, meta_cmds, timeout=30)
+        ok_meta, meta_out = _module_run(cfg, meta_cmds, timeout=30)
         if not ok_meta:
             plog(f'⚠ cert-metadata.sh patch warning: {meta_out}')
         else:
@@ -7504,7 +7539,7 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
             f'sudo -u tak ./makeCert.sh server {shlex.quote(remote_hostname)} 2>&1 && '
             f'echo y | sudo -u tak ./makeCert.sh client webadmin-fed 2>&1'
         )
-        ok_cert, cert_out = _ssh_probe(remote, cert_cmds, timeout=120)
+        ok_cert, cert_out = _module_run(cfg, cert_cmds, timeout=120)
         if cert_out:
             plog(cert_out[-3000:] if len(cert_out) > 3000 else cert_out)
         if not ok_cert:
@@ -7526,7 +7561,7 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
                 f'sudo sed -i "s/takserver\\.jks/{shlex.quote(remote_hostname)}.jks/g" federation-hub-broker.yml && '
                 f'sudo sed -i "s/takserver\\.jks/{shlex.quote(remote_hostname)}.jks/g" federation-hub-ui.yml'
             )
-            ok_patch, patch_out = _ssh_probe(remote, patch_cmds, timeout=30)
+            ok_patch, patch_out = _module_run(cfg, patch_cmds, timeout=30)
             if not ok_patch:
                 plog(f'⚠ Config patch warning: {patch_out}')
             else:
@@ -7539,23 +7574,23 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
                     f'sudo sed -i "s/atakatak/{shlex.quote(cert_pass)}/g" federation-hub-broker.yml && '
                     f'sudo sed -i "s/atakatak/{shlex.quote(cert_pass)}/g" federation-hub-ui.yml'
                 )
-                _ssh_probe(remote, pw_cmd, timeout=20)
+                _module_run(cfg, pw_cmd, timeout=20)
                 plog('✓ Certificate password applied to config files')
 
         # --- chown + systemd ---
         plog('━━━ Start Federation Hub services ━━━')
-        _ssh_probe(remote, f'sudo chown -R tak:tak {fh_dir}', timeout=30)
-        _ssh_probe(remote, 'sudo systemctl daemon-reload', timeout=90)
-        _ssh_probe(remote, 'sudo systemctl enable federation-hub 2>/dev/null; true', timeout=90)
-        _ssh_probe(remote, f'sudo touch {fh_dir}/logs/federation-hub-ui.log && sudo chown tak:tak {fh_dir}/logs/federation-hub-ui.log', timeout=15)
-        _ssh_probe(remote, 'sudo systemctl restart federation-hub 2>&1', timeout=90)
+        _module_run(cfg, f'sudo chown -R tak:tak {fh_dir}', timeout=30)
+        _module_run(cfg, 'sudo systemctl daemon-reload', timeout=90)
+        _module_run(cfg, 'sudo systemctl enable federation-hub 2>/dev/null; true', timeout=90)
+        _module_run(cfg, f'sudo touch {fh_dir}/logs/federation-hub-ui.log && sudo chown tak:tak {fh_dir}/logs/federation-hub-ui.log', timeout=15)
+        _module_run(cfg, 'sudo systemctl restart federation-hub 2>&1', timeout=90)
 
         # Wait for UI to start (up to ~90s, checking log for "Started FederationHubUIServer")
         plog('Waiting for Federation Hub UI to start…')
         ui_started = False
         for attempt in range(18):
             time.sleep(5)
-            ok_log, log_out = _ssh_probe(remote, f'tail -20 {fh_dir}/logs/federation-hub-ui.log 2>/dev/null', timeout=15)
+            ok_log, log_out = _module_run(cfg, f'tail -20 {fh_dir}/logs/federation-hub-ui.log 2>/dev/null', timeout=15)
             if log_out and 'Started FederationHubUIServer' in log_out:
                 ui_started = True
                 break
@@ -7564,7 +7599,7 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
                 status_dict.update({'running': False, 'complete': True, 'error': True})
                 return
         if not ui_started:
-            ok_st2, st2_out = _ssh_probe(remote, 'systemctl is-active federation-hub 2>/dev/null', timeout=15)
+            ok_st2, st2_out = _module_run(cfg, 'systemctl is-active federation-hub 2>/dev/null', timeout=15)
             if (st2_out or '').strip() == 'active':
                 plog('⚠ federation-hub active but UI startup message not yet seen — may still be loading')
             else:
@@ -7589,7 +7624,7 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
                         settings, plog=plog
                     )
                     fh_domain = _get_service_domain(settings, 'fedhub')
-                    fh_host = fh_domain or (remote.get('host') or '').strip()
+                    fh_host = fh_domain or (remote.get('host') or '').strip() or 'localhost'
                     redirect_uri = (
                         f'https://{fh_host}/api/oauth/login/redirect'
                         if fh_domain else f'https://{fh_host}:9100/api/oauth/login/redirect'
@@ -7608,7 +7643,7 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
                         f'chown tak:tak /opt/tak/certs/keycloak.der && '
                         f'chmod 644 /opt/tak/certs/keycloak.der'
                     )
-                    ok_der, _ = _ssh_probe(remote, der_cmd, timeout=30)
+                    ok_der, _ = _module_run(cfg, der_cmd, timeout=30)
                     if ok_der:
                         plog(f'✓ keycloak.der generated from {ak_host}')
                     else:
@@ -7638,10 +7673,10 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
                             f'grep -q "^keycloakrRedirectUri:" federation-hub-ui.yml || echo "keycloakrRedirectUri: {redirect_uri}" | sudo tee -a federation-hub-ui.yml > /dev/null && '
                             f'grep -q "^keycloakConfigurationEndpoint:" federation-hub-ui.yml || echo "keycloakConfigurationEndpoint: {oidc_config_url}" | sudo tee -a federation-hub-ui.yml > /dev/null'
                         )
-                        ok_patch, _ = _ssh_probe(remote, patch_cmd, timeout=30)
+                        ok_patch, _ = _module_run(cfg, patch_cmd, timeout=30)
                         if ok_patch:
                             plog('✓ federation-hub-ui.yml patched for Authentik OAuth')
-                            _ssh_probe(remote, 'sudo systemctl restart federation-hub 2>&1', timeout=90)
+                            _module_run(cfg, 'sudo systemctl restart federation-hub 2>&1', timeout=90)
                             plog('✓ federation-hub restarted after OAuth patch')
                         else:
                             plog('⚠ Auto OAuth patch failed — use "Enable Authentik login" button')
@@ -7668,7 +7703,7 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
                 f'sudo -u tak java -jar {fh_dir}/jars/federation-hub-manager.jar '
                 f'{fh_dir}/certs/files/webadmin-fed.pem 2>&1'
             )
-            ok_adm, adm_out = _ssh_probe(remote, mgr_cmd, timeout=60)
+            ok_adm, adm_out = _module_run(cfg, mgr_cmd, timeout=60)
             if adm_out:
                 plog(adm_out[-1000:] if len(adm_out) > 1000 else adm_out)
             if ok_adm:
@@ -7676,56 +7711,71 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
             else:
                 plog('⚠ Admin cert registration returned non-zero — you may need to register manually')
             # Copy webadmin-fed.p12 to $HOME for easy download
-            _ssh_probe(remote, f'sudo cp {fh_dir}/certs/files/webadmin-fed.p12 $HOME/ 2>/dev/null; true', timeout=15)
+            _module_run(cfg, f'sudo cp {fh_dir}/certs/files/webadmin-fed.p12 $HOME/ 2>/dev/null; true', timeout=15)
 
         # --- Firewall ---
-        # Web UI (8080 HTTP / 9100 HTTPS): must NOT be world-accessible — edge is Caddy on this console
-        # (https://fedhub.<fqdn> + Authentik). Scope to console public IP when Settings → Server IP is set.
+        # Web UI (8080 HTTP / 9100 HTTPS): for remote hosts, scope to console IP.
+        # For local installs, Caddy proxies via 127.0.0.1 — no external access needed.
         # Federation protocol (9101-9103): remain open for peer TAK servers on the internet.
         plog('━━━ Firewall (UFW) ━━━')
-        _ssh_probe(remote, 'sudo ufw allow 22/tcp > /dev/null 2>&1; true', timeout=15)
-        caddy_src = _fedhub_caddy_source_ip(settings)
-        if caddy_src:
-            plog(f'Fed Hub web UI: allowing 8080, 9100 only from Caddy host {caddy_src} (Settings → Server IP)')
-            for port in (8080, 9100):
-                _ssh_probe(
-                    remote,
-                    f'sudo ufw allow from {caddy_src} to any port {port} proto tcp > /dev/null 2>&1; true',
-                    timeout=15,
+        if is_remote:
+            _module_run(cfg, 'sudo ufw allow 22/tcp > /dev/null 2>&1; true', timeout=15)
+            caddy_src = _fedhub_caddy_source_ip(settings)
+            if caddy_src:
+                plog(f'Fed Hub web UI: allowing 8080, 9100 only from Caddy host {caddy_src} (Settings → Server IP)')
+                for port in (8080, 9100):
+                    _module_run(
+                        cfg,
+                        f'sudo ufw allow from {caddy_src} to any port {port} proto tcp > /dev/null 2>&1; true',
+                        timeout=15,
+                    )
+            else:
+                plog(
+                    '⚠ Server IP unset or not IPv4 — opening 8080/9100 to everyone (insecure). '
+                    'Set Settings → Server IP to this console\'s public IP and re-run Update Federation Hub to restrict.'
                 )
+                for p in ('8080/tcp', '9100/tcp'):
+                    _module_run(cfg, f'sudo ufw allow {p} > /dev/null 2>&1; true', timeout=15)
+            for p in ('9101/tcp', '9102/tcp', '9103/tcp'):
+                _module_run(cfg, f'sudo ufw allow {p} > /dev/null 2>&1; true', timeout=15)
+            _module_run(cfg, 'sudo ufw --force enable > /dev/null 2>&1; true', timeout=15)
+            if caddy_src:
+                plog('✓ Firewall: SSH; 8080/9100 from Caddy host only; 9101-9103 public (federation peers)')
+            else:
+                plog('✓ Firewall configured (22, 8080, 9100-9103) — set Server IP + re-run deploy to harden UI ports')
         else:
-            plog(
-                '⚠ Server IP unset or not IPv4 — opening 8080/9100 to everyone (insecure). '
-                'Set Settings → Server IP to this console\'s public IP and re-run Update Federation Hub to restrict.'
-            )
-            for p in ('8080/tcp', '9100/tcp'):
-                _ssh_probe(remote, f'sudo ufw allow {p} > /dev/null 2>&1; true', timeout=15)
-        for p in ('9101/tcp', '9102/tcp', '9103/tcp'):
-            _ssh_probe(remote, f'sudo ufw allow {p} > /dev/null 2>&1; true', timeout=15)
-        _ssh_probe(remote, 'sudo ufw --force enable > /dev/null 2>&1; true', timeout=15)
-        if caddy_src:
-            plog('✓ Firewall: SSH; 8080/9100 from Caddy host only; 9101-9103 public (federation peers)')
-        else:
-            plog('✓ Firewall configured (22, 8080, 9100-9103) — set Server IP + re-run deploy to harden UI ports')
+            # Local: open federation protocol ports; Caddy handles 8080/9100 via localhost
+            for p in ('9101/tcp', '9102/tcp', '9103/tcp'):
+                _module_run(cfg, f'sudo ufw allow {p} > /dev/null 2>&1; true', timeout=15)
+            _module_run(cfg, 'sudo ufw --force enable > /dev/null 2>&1; true', timeout=15)
+            plog('✓ Firewall: 9101-9103 open for federation peers (8080/9100 not exposed — Caddy proxies locally)')
 
         plog('━━━ Verify ━━━')
-        ok_9100, out_9100 = _ssh_probe(remote, 'ss -tlnp | grep :9100 || true', timeout=15)
+        ok_9100, out_9100 = _module_run(cfg, 'ss -tlnp | grep :9100 || true', timeout=15)
         if out_9100 and '9100' in out_9100:
             plog('✓ Port 9100 is listening (Federation Hub UI)')
         else:
             plog('⚠ Port 9100 not yet listening — UI may still be starting')
 
-        cfg2 = {**cfg, 'deployed': True, 'target_mode': 'remote'}
+        cfg2 = {**cfg, 'deployed': True}
         settings = load_settings()
         settings['fedhub_deployment'] = _normalize_module_deployment_config(cfg2)
         save_settings(settings)
         plog('✓ Console registration updated (deployed)')
         plog('')
         plog('━━━ Complete ━━━')
-        plog(f'Federation Hub UI: https://{remote.get("host")}:9100')
-        plog('Import webadmin-fed.p12 (in $HOME/ on the target) into your browser to log in.')
+        if is_remote:
+            plog(f'Federation Hub UI: https://{remote.get("host")}:9100')
+        else:
+            fh_domain = _get_service_domain(settings, 'fedhub')
+            if fh_domain:
+                plog(f'Federation Hub UI: https://{fh_domain}  (via Caddy on this console)')
+            else:
+                plog('Federation Hub UI: https://localhost:9100 (set FQDN + Caddy SSL for a public URL)')
+        plog('Import webadmin-fed.p12 (in $HOME/ on this host) into your browser to log in.')
         plog('Password: ' + cert_pass)
-        plog('Note: unattended-upgrades remains disabled after deploy/update; re-enable from Console > Unattended Upgrades when ready.')
+        if is_remote:
+            plog('Note: unattended-upgrades remains disabled after deploy/update; re-enable from Console > Unattended Upgrades when ready.')
         plog('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
         status_dict.update({'running': False, 'complete': True, 'error': False})
         _caddy_regenerate_if_fqdn()
@@ -7865,18 +7915,15 @@ def run_fedhub_remote_rotate_ca(new_root_ca=None, new_int_ca=None):
             plog('✗ Federation Hub is not registered. Deploy first.')
             fedhub_rotate_status.update({'running': False, 'complete': True, 'error': True})
             return
-        if cfg.get('target_mode') != 'remote':
-            plog('✗ Rotate CA is only supported for remote Federation Hub targets.')
-            fedhub_rotate_status.update({'running': False, 'complete': True, 'error': True})
-            return
+        is_remote = cfg.get('target_mode') == 'remote'
         remote = cfg.get('remote', {})
-        if not (remote.get('host') or '').strip():
+        if is_remote and not (remote.get('host') or '').strip():
             plog('✗ Remote host is not configured.')
             fedhub_rotate_status.update({'running': False, 'complete': True, 'error': True})
             return
 
         fh_dir = '/opt/tak/federation-hub'
-        ok_dir, out_dir = _ssh_probe(remote, f'test -d {fh_dir} && echo OK', timeout=20)
+        ok_dir, out_dir = _module_run(cfg, f'test -d {fh_dir} && echo OK', timeout=20)
         if not ok_dir or 'OK' not in (out_dir or ''):
             plog(f'✗ {fh_dir} not found on target host')
             fedhub_rotate_status.update({'running': False, 'complete': True, 'error': True})
@@ -7902,11 +7949,11 @@ def run_fedhub_remote_rotate_ca(new_root_ca=None, new_int_ca=None):
         cert_pass = _get_fedhub_cert_password(settings)
         dn = _fedhub_cert_dn(settings)
 
-        ok_host, host_out = _ssh_probe(remote, 'hostname', timeout=10)
-        remote_hostname = (host_out or 'fedhub').strip() or 'fedhub'
+        _hn_ok, _hn_out = _module_run(cfg, 'hostname', timeout=10)
+        remote_hostname = (_hn_out or 'fedhub').strip().split()[0] or 'fedhub'
 
         plog('━━━ Rotate Federation Hub CA ━━━')
-        plog(f'  Host: {remote.get("host")}')
+        plog(f'  Host: {remote.get("host") or "local"}')
         plog(f'  New Root CA: {safe_root}')
         plog(f'  New Intermediate CA: {safe_int}')
 
@@ -7915,7 +7962,7 @@ def run_fedhub_remote_rotate_ca(new_root_ca=None, new_int_ca=None):
             f'sudo mkdir -p backups && '
             f'sudo tar -czf backups/pre-rotate-{ts}.tgz files 2>/dev/null || true'
         )
-        _ssh_probe(remote, backup_cmd, timeout=45)
+        _module_run(cfg, backup_cmd, timeout=45)
         plog(f'✓ Backup created: {fh_dir}/certs/backups/pre-rotate-{ts}.tgz')
 
         meta_subs = [
@@ -7932,16 +7979,17 @@ def run_fedhub_remote_rotate_ca(new_root_ca=None, new_int_ca=None):
             meta_cmds += f" && sudo sed -i 's/^CAPASS=.*/CAPASS={shlex.quote(cert_pass)}/' cert-metadata.sh"
             meta_cmds += f" && sudo sed -i 's/^PASS=.*/PASS={shlex.quote(cert_pass)}/' cert-metadata.sh"
         # Pre-flight: passwordless sudo required — SSH sessions have no TTY for password prompts
-        ok_sudo, sudo_out = _ssh_probe(remote, 'sudo -n true 2>&1', timeout=10)
-        if not ok_sudo or 'password' in (sudo_out or '').lower():
-            plog('✗ Certificate rotation failed — SSH user requires a sudo password')
-            plog('  Fix on the Federation Hub host:')
-            plog('    echo "$(whoami) ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/infra-tak-nopasswd')
-            plog('  Or SSH as root. Then retry.')
-            fedhub_rotate_status.update({'running': False, 'complete': True, 'error': True})
-            return
+        if is_remote:
+            ok_sudo, sudo_out = _module_run(cfg, 'sudo -n true 2>&1', timeout=10)
+            if not ok_sudo or 'password' in (sudo_out or '').lower():
+                plog('✗ Certificate rotation failed — SSH user requires a sudo password')
+                plog('  Fix on the Federation Hub host:')
+                plog('    echo "$(whoami) ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/infra-tak-nopasswd')
+                plog('  Or SSH as root. Then retry.')
+                fedhub_rotate_status.update({'running': False, 'complete': True, 'error': True})
+                return
 
-        ok_meta, meta_out = _ssh_probe(remote, meta_cmds, timeout=30)
+        ok_meta, meta_out = _module_run(cfg, meta_cmds, timeout=30)
         if not ok_meta:
             plog(f'⚠ cert-metadata patch warning: {(meta_out or "")[:240]}')
         else:
@@ -7955,7 +8003,7 @@ def run_fedhub_remote_rotate_ca(new_root_ca=None, new_int_ca=None):
             f'sudo -u tak ./makeCert.sh server {shlex.quote(remote_hostname)} 2>&1 && '
             f'echo y | sudo -u tak ./makeCert.sh client webadmin-fed 2>&1'
         )
-        ok_cert, cert_out = _ssh_probe(remote, cert_cmds, timeout=180)
+        ok_cert, cert_out = _module_run(cfg, cert_cmds, timeout=180)
         if cert_out:
             plog(cert_out[-3000:] if len(cert_out) > 3000 else cert_out)
         if not ok_cert:
@@ -7970,7 +8018,7 @@ def run_fedhub_remote_rotate_ca(new_root_ca=None, new_int_ca=None):
             f'sudo sed -i "s/takserver\\.jks/{shlex.quote(remote_hostname)}.jks/g" federation-hub-broker.yml && '
             f'sudo sed -i "s/takserver\\.jks/{shlex.quote(remote_hostname)}.jks/g" federation-hub-ui.yml'
         )
-        ok_cfg, cfg_out = _ssh_probe(remote, patch_cfg_cmd, timeout=30)
+        ok_cfg, cfg_out = _module_run(cfg, patch_cfg_cmd, timeout=30)
         if not ok_cfg:
             plog(f'⚠ Config patch warning: {(cfg_out or "")[:240]}')
         else:
@@ -7982,14 +8030,14 @@ def run_fedhub_remote_rotate_ca(new_root_ca=None, new_int_ca=None):
                 f'sudo sed -i "s/atakatak/{shlex.quote(cert_pass)}/g" federation-hub-broker.yml && '
                 f'sudo sed -i "s/atakatak/{shlex.quote(cert_pass)}/g" federation-hub-ui.yml'
             )
-            _ssh_probe(remote, pw_cmd, timeout=20)
+            _module_run(cfg, pw_cmd, timeout=20)
             plog('✓ Certificate password re-applied to config files')
 
         mgr_cmd = (
             f'sudo -u tak java -jar {fh_dir}/jars/federation-hub-manager.jar '
             f'{fh_dir}/certs/files/webadmin-fed.pem 2>&1'
         )
-        ok_mgr, mgr_out = _ssh_probe(remote, mgr_cmd, timeout=60)
+        ok_mgr, mgr_out = _module_run(cfg, mgr_cmd, timeout=60)
         if mgr_out:
             plog(mgr_out[-1000:] if len(mgr_out) > 1000 else mgr_out)
         if ok_mgr:
@@ -7997,10 +8045,10 @@ def run_fedhub_remote_rotate_ca(new_root_ca=None, new_int_ca=None):
         else:
             plog('⚠ webadmin-fed registration returned non-zero')
 
-        _ssh_probe(remote, f'sudo cp {fh_dir}/certs/files/webadmin-fed.p12 $HOME/ 2>/dev/null; true', timeout=15)
+        _module_run(cfg, f'sudo cp {fh_dir}/certs/files/webadmin-fed.p12 $HOME/ 2>/dev/null; true', timeout=15)
         plog('✓ webadmin-fed.p12 copied to $HOME/')
 
-        ok_restart, restart_out = _ssh_probe(remote, 'sudo systemctl restart federation-hub 2>&1', timeout=90)
+        ok_restart, restart_out = _module_run(cfg, 'sudo systemctl restart federation-hub 2>&1', timeout=90)
         if restart_out:
             plog(restart_out[-800:] if len(restart_out) > 800 else restart_out)
         if not ok_restart:
@@ -8008,7 +8056,7 @@ def run_fedhub_remote_rotate_ca(new_root_ca=None, new_int_ca=None):
             fedhub_rotate_status.update({'running': False, 'complete': True, 'error': True})
             return
 
-        ok_state, state_out = _ssh_probe(remote, 'systemctl is-active federation-hub 2>/dev/null', timeout=20)
+        ok_state, state_out = _module_run(cfg, 'systemctl is-active federation-hub 2>/dev/null', timeout=20)
         state = (state_out or '').strip()
         if state != 'active':
             plog(f'✗ federation-hub state is {state or "unknown"} after restart')
@@ -19998,7 +20046,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   {% elif fh.installed %}
   <div class="status-banner stopped"><div class="dot"></div>Registered on {{ fedhub_deploy_cfg.remote.host }}{% if fedhub_version %} · {{ fedhub_version }}{% endif %} — service not active (check target)</div>
   {% else %}
-  <div class="status-banner not-installed"><div class="dot"></div>Not registered — upload the .deb, set SSH below, then <strong>Deploy to remote host</strong> (or confirm manually)</div>
+  <div class="status-banner not-installed"><div class="dot"></div>Not registered — upload the .deb, choose target (local or remote) below, then <strong>Deploy</strong> (or confirm manually)</div>
   {% endif %}
 
   {% if fh.installed %}
@@ -20020,7 +20068,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 
   {% if fh.installed %}
   <div class="card">
-    <div class="card-title">Controls (remote)</div>
+    <div class="card-title">Controls</div>
     <div class="controls">
       {% if fh.running %}<button class="control-btn" onclick="fedhubControl('restart')">↻ Restart</button><button class="control-btn btn-stop" onclick="fedhubControl('stop')">■ Stop</button>{% else %}<button class="control-btn btn-start" onclick="fedhubControl('start')">▶ Start</button><button class="control-btn" onclick="fedhubControl('restart')">↻ Restart</button>{% endif %}
       <button class="btn btn-ghost" type="button" onclick="fedhubRefreshStatus()">Refresh status</button>
@@ -20060,9 +20108,9 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 
   {% if not fh.installed %}
   <details class="fh-section">
-    <summary><span>Package upload &amp; remote install</span><span class="chev">&#9662;</span></summary>
+    <summary><span>Package upload &amp; install</span><span class="chev">&#9662;</span></summary>
     <div class="fh-section-body">
-    <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:14px">Same idea as <strong>split-mode</strong> TAK database deploy: upload <code style="font-size:12px">takserver-fed-hub</code> .deb on this console, then infra-TAK <strong>SCP</strong>s it to the target and runs <code style="font-size:12px">apt-get install</code> there.</p>
+    <p style="font-size:12px;color:var(--text-secondary);line-height:1.55;margin-bottom:14px">Upload <code style="font-size:12px">takserver-fed-hub</code> .deb here. For <strong>local</strong> mode it installs directly on this machine; for <strong>remote</strong> mode infra-TAK SCPs it to the target and runs <code style="font-size:12px">apt-get install</code> there.</p>
     <div id="fedhub-upload-area" class="upload-area" onclick="var i=document.getElementById('fedhub-file-input');if(i){i.value='';i.click();}" ondrop="fedhubDrop(event)" ondragover="event.preventDefault();this.classList.add('dragover')" ondragleave="event.preventDefault();this.classList.remove('dragover')">
       <div style="font-size:28px;margin-bottom:8px">📦</div>
       <div style="font-size:14px;color:var(--text-secondary)">Drop .deb here or click to upload</div>
@@ -20072,7 +20120,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     <div id="fedhub-progress-area" style="margin-bottom:12px" aria-live="polite"></div>
     <p id="fedhub-upload-hint-empty" class="form-hint" style="margin-bottom:10px{% if fedhub_pkg_filename %};display:none{% endif %}">No package uploaded yet — progress appears below when you select a file.</p>
     <div class="controls">
-      <button class="btn btn-primary" type="button" id="fedhub-deploy-btn" onclick="fedhubStartDeploy()">Deploy to remote host</button>
+      <button class="btn btn-primary" type="button" id="fedhub-deploy-btn" onclick="fedhubStartDeploy()">Deploy Federation Hub</button>
     </div>
     <div id="fedhub-deploy-log-card" style="display:{% if fedhub_deploying or (fedhub_deploy_done and fedhub_deploy_error) %}block{% else %}none{% endif %};margin-top:18px;padding-top:18px;border-top:1px solid var(--border)">
       <div class="card-title" style="margin-bottom:10px">Deploy log</div>
@@ -20129,10 +20177,28 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   </details>
 
   <details class="fh-section">
-    <summary><span>Deployment target (SSH)</span><span class="chev">&#9662;</span></summary>
+    <summary><span>Deployment target</span><span class="chev">&#9662;</span></summary>
     <div class="fh-section-body">
-    <p style="font-size:12px;color:var(--text-dim);margin-bottom:16px">This module is built for a <strong>separate</strong> machine from this console. Use the same SSH patterns as MediaMTX/Authentik remote deploy.</p>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:16px">Deploy Federation Hub on <strong>this machine</strong> (same server as the console) or on a <strong>separate remote host</strong> via SSH — same pattern as TAK Server split-mode.</p>
     <input type="hidden" id="fedhub-deployed-flag" value="{% if fedhub_deploy_cfg.deployed %}1{% else %}0{% endif %}">
+    <div style="display:flex;gap:24px;margin-bottom:16px;align-items:center">
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
+        <input type="radio" name="fedhub-target-mode" id="fedhub-mode-local" value="local"
+          {% if (fedhub_deploy_cfg.target_mode or 'local') != 'remote' %}checked{% endif %}
+          onchange="fedhubToggleTargetMode()">
+        <span>This machine (local)</span>
+      </label>
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
+        <input type="radio" name="fedhub-target-mode" id="fedhub-mode-remote" value="remote"
+          {% if fedhub_deploy_cfg.target_mode == 'remote' %}checked{% endif %}
+          onchange="fedhubToggleTargetMode()">
+        <span>Remote host (SSH)</span>
+      </label>
+    </div>
+    <div id="fedhub-local-note" style="{% if fedhub_deploy_cfg.target_mode == 'remote' %}display:none;{% endif %}font-size:12px;color:var(--text-dim);padding:10px 12px;background:rgba(16,185,129,.06);border:1px solid rgba(16,185,129,.15);border-radius:6px;margin-bottom:14px;line-height:1.5">
+      Federation Hub will be installed directly on this machine. Upload the .deb below and click <strong>Deploy</strong>.
+    </div>
+    <div id="fedhub-ssh-fields" style="{% if (fedhub_deploy_cfg.target_mode or 'local') != 'remote' %}display:none;{% endif %}">
     <div class="grid-2">
       <div class="form-group">
         <label class="form-label">Remote host / IP</label>
@@ -20162,12 +20228,15 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
       <button class="btn btn-ghost" type="button" onclick="fedhubEnsureKey()">Generate SSH key</button>
       <button class="btn btn-ghost" type="button" onclick="fedhubInstallKey()">Install SSH key</button>
       <button class="btn btn-ghost" type="button" onclick="fedhubTestSsh()">Test SSH</button>
-      <button class="btn btn-ghost" type="button" onclick="fedhubSaveTarget()">Save target</button>
     </div>
     <div id="fedhub-ssh-status" style="margin-top:10px;font-size:12px;color:var(--text-dim)"></div>
     <div class="form-group" style="margin-top:12px">
       <label class="form-label">Public key (manual fallback)</label>
       <textarea id="fedhub-public-key" class="form-input" rows="3" readonly placeholder="Generate SSH key"></textarea>
+    </div>
+    </div>
+    <div class="controls" style="margin-top:12px">
+      <button class="btn btn-ghost" type="button" onclick="fedhubSaveTarget()">Save target</button>
     </div>
     </div>
   </details>
@@ -20222,7 +20291,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <details class="fh-section"{% if fedhub_upgrading or fedhub_upgrade_done or fedhub_upgrade_error %} open{% endif %}>
     <summary><span>Update Federation Hub</span><span class="chev">&#9662;</span></summary>
     <div class="fh-section-body">
-      <p class="form-hint" style="margin:14px 0 12px;line-height:1.45">Upload a newer <code style="font-size:11px">takserver-fed-hub</code> .deb and push it to the same remote host (same pattern as <strong>Update TAK Server</strong>).</p>
+      <p class="form-hint" style="margin:14px 0 12px;line-height:1.45">Upload a newer <code style="font-size:11px">takserver-fed-hub</code> .deb and install it on the same target (same pattern as <strong>Update TAK Server</strong>).</p>
     <div id="fedhub-update-body">
       <div id="fedhub-upgrade-upload-area" class="upload-area" style="margin-top:16px" onclick="var i=document.getElementById('fedhub-upgrade-file-input');if(i){i.value='';i.click();}" ondrop="fedhubDropUpgrade(event)" ondragover="event.preventDefault();this.classList.add('dragover')" ondragleave="event.preventDefault();this.classList.remove('dragover')">
         <div style="font-size:22px;margin-bottom:6px">⬆</div>
@@ -20645,6 +20714,17 @@ function fedhubPollUpgradeLog(){
     });
   },800);
 }
+function fedhubGetTargetMode(){
+  var r=document.getElementById('fedhub-mode-remote');
+  return(r&&r.checked)?'remote':'local';
+}
+function fedhubToggleTargetMode(){
+  var isRemote=fedhubGetTargetMode()==='remote';
+  var sf=document.getElementById('fedhub-ssh-fields');
+  var ln=document.getElementById('fedhub-local-note');
+  if(sf)sf.style.display=isRemote?'':'none';
+  if(ln)ln.style.display=isRemote?'none':'';
+}
 function collectFedhubDeployConfig(){
   var host=(document.getElementById('fedhub-remote-host')||{}).value||'';
   var user=(document.getElementById('fedhub-remote-user')||{}).value||'root';
@@ -20654,7 +20734,8 @@ function collectFedhubDeployConfig(){
   var wup=(document.getElementById('fedhub-web-ui-port')||{}).value;
   var wp=parseInt(wup,10);
   var dep=document.getElementById('fedhub-deployed-flag');
-  return{target_mode:'remote',deployed:dep&&dep.value==='1',web_ui_port:isNaN(wp)?8080:wp,remote:{host:host.trim(),ssh_user:(user||'root').trim(),ssh_port:isNaN(p)?22:p,ssh_key_path:key.trim()}};
+  var mode=fedhubGetTargetMode();
+  return{target_mode:mode,deployed:dep&&dep.value==='1',web_ui_port:isNaN(wp)?8080:wp,remote:{host:host.trim(),ssh_user:(user||'root').trim(),ssh_port:isNaN(p)?22:p,ssh_key_path:key.trim()}};
 }
 function _fedhubSshMsg(msg,err,ok){
   var el=document.getElementById('fedhub-ssh-status');
@@ -29865,20 +29946,21 @@ def takserver_cert_expiry():
 @app.route('/api/fedhub/cert-expiry')
 @login_required
 def fedhub_cert_expiry():
-    """Return Federation Hub Root CA and Intermediate CA expiry (remote host via SSH). Same shape as /api/takserver/cert-expiry."""
+    """Return Federation Hub Root CA and Intermediate CA expiry (local or remote). Same shape as /api/takserver/cert-expiry."""
     settings = load_settings()
     cfg = _get_fedhub_deployment_config(settings)
-    if not cfg.get('deployed') or cfg.get('target_mode') != 'remote':
+    if not cfg.get('deployed'):
         return jsonify({'root_ca': {'error': 'Not deployed'}, 'intermediate_ca': {'error': 'Not deployed'}})
+    is_remote = cfg.get('target_mode') == 'remote'
     remote = cfg.get('remote', {})
-    if not (remote.get('host') or '').strip():
+    if is_remote and not (remote.get('host') or '').strip():
         return jsonify({'root_ca': {'error': 'No host'}, 'intermediate_ca': {'error': 'No host'}})
     fh_dir = '/opt/tak/federation-hub/certs/files'
     results = {}
     for label, filename in [('root_ca', 'root-ca.pem'), ('intermediate_ca', 'ca.pem')]:
         path = f'{fh_dir}/{filename}'
         cmd = f'openssl x509 -enddate -noout -in {shlex.quote(path)} 2>/dev/null'
-        ok, out = _ssh_probe(remote, cmd, timeout=15)
+        ok, out = _module_run(cfg, cmd, timeout=15)
         if not ok or not (out or '').strip() or 'notAfter' not in out:
             results[label] = {'error': 'Not found', 'file': filename}
             continue
