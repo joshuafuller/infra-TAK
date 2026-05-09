@@ -36211,29 +36211,64 @@ function uploadSnapshot(input){
   var lbl=document.getElementById('snap-upload-label');
   if(!file){return;}
   if(!file.name.endsWith('.tar.gz')){
-    if(msg){msg.textContent='File must be a .tar.gz archive';msg.style.color='var(--red)';}
+    if(msg){msg.style.color='var(--red)';msg.textContent='File must be a .tar.gz archive';}
     input.value='';return;
   }
-  if(msg){msg.style.color='var(--yellow)';msg.textContent='Uploading…';}
+  function _fmtBytes(b){
+    if(b>=1073741824)return (b/1073741824).toFixed(1)+' GB';
+    if(b>=1048576)return (b/1048576).toFixed(1)+' MB';
+    if(b>=1024)return (b/1024).toFixed(0)+' KB';
+    return b+' B';
+  }
+  var totalSize=file.size;
+  // Build inline progress bar inside the msg span
+  if(msg){
+    msg.innerHTML='<span style="display:inline-flex;align-items:center;gap:8px;font-family:\'JetBrains Mono\',monospace;font-size:11px;color:var(--yellow)">'
+      +'<span id="snap-ul-text">Uploading… 0%</span>'
+      +'<span style="display:inline-block;width:120px;height:6px;background:rgba(255,255,255,0.08);border-radius:3px;overflow:hidden;vertical-align:middle">'
+      +'<span id="snap-ul-bar" style="display:block;height:100%;width:0%;background:var(--cyan);border-radius:3px;transition:width .1s linear"></span>'
+      +'</span>'
+      +'<span id="snap-ul-bytes" style="color:var(--text-dim)">0 B / '+_fmtBytes(totalSize)+'</span>'
+      +'</span>';
+  }
   if(lbl)lbl.style.opacity='0.5';
   var fd=new FormData();
   fd.append('file',file);
-  fetch('/api/takserver/snapshot/upload',{method:'POST',credentials:'same-origin',body:fd})
-    .then(function(r){return r.json();}).then(function(d){
-      if(lbl)lbl.style.opacity='1';
-      input.value='';
+  var xhr=new XMLHttpRequest();
+  xhr.open('POST','/api/takserver/snapshot/upload',true);
+  xhr.withCredentials=true;
+  xhr.upload.onprogress=function(e){
+    if(!e.lengthComputable)return;
+    var pct=Math.round(e.loaded/e.total*100);
+    var barEl=document.getElementById('snap-ul-bar');
+    var txtEl=document.getElementById('snap-ul-text');
+    var byteEl=document.getElementById('snap-ul-bytes');
+    if(barEl)barEl.style.width=pct+'%';
+    if(txtEl)txtEl.textContent='Uploading… '+pct+'%';
+    if(byteEl)byteEl.textContent=_fmtBytes(e.loaded)+' / '+_fmtBytes(e.total);
+  };
+  xhr.onload=function(){
+    if(lbl)lbl.style.opacity='1';
+    input.value='';
+    try{
+      var d=JSON.parse(xhr.responseText);
       if(d.ok){
-        if(msg){msg.style.color='var(--green)';msg.textContent='✓ Uploaded ('+d.label+', '+d.size_mb+' MB)';}
+        if(msg){msg.innerHTML='';msg.style.color='var(--green)';msg.textContent='✓ Uploaded ('+d.label+', '+d.size_mb+' MB)';}
         loadSnapshots();
         setTimeout(function(){if(msg)msg.textContent='';},8000);
       }else{
-        if(msg){msg.style.color='var(--red)';msg.textContent='Upload failed: '+(d.error||'unknown');}
+        if(msg){msg.innerHTML='';msg.style.color='var(--red)';msg.textContent='Upload failed: '+(d.error||'unknown');}
       }
-    }).catch(function(e){
-      if(lbl)lbl.style.opacity='1';
-      input.value='';
-      if(msg){msg.style.color='var(--red)';msg.textContent='Network error';}
-    });
+    }catch(e){
+      if(msg){msg.innerHTML='';msg.style.color='var(--red)';msg.textContent='Server error (bad response)';}
+    }
+  };
+  xhr.onerror=function(){
+    if(lbl)lbl.style.opacity='1';
+    input.value='';
+    if(msg){msg.innerHTML='';msg.style.color='var(--red)';msg.textContent='Network error';}
+  };
+  xhr.send(fd);
 }
 
 function _applySchedState(enabled){
