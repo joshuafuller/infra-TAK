@@ -8533,8 +8533,9 @@ def authentik_domain_audit_api():
             for b in brands:
                 if fqdn not in (b.get('domain') or ''):
                     stale.append({'location': 'Authentik brand', 'field': 'domain', 'current_value': b.get('domain') or ''})
-                if fqdn not in (b.get('cookie_domain') or ''):
-                    stale.append({'location': 'Authentik brand', 'field': 'cookie_domain', 'current_value': b.get('cookie_domain') or ''})
+                cd = (b.get('cookie_domain') or '').strip()
+                if cd and fqdn not in cd:
+                    stale.append({'location': 'Authentik brand', 'field': 'cookie_domain', 'current_value': cd})
                 css = b.get('branding_custom_css') or ''
                 if css and fqdn not in css and 'http' in css:
                     stale.append({'location': 'Authentik brand', 'field': 'branding_custom_css', 'current_value': css[:120]})
