@@ -22615,11 +22615,11 @@ async function updateDomain(){
     var currentDomain = '{{ settings.get("fqdn","") }}';
     if (currentDomain && currentDomain !== domain) {
         var ok = confirm(
-            'Domain change detected:\n\n' +
-            '  Old: ' + currentDomain + '\n' +
-            '  New: ' + domain + '\n\n' +
-            'This will update Caddy AND trigger a full Authentik domain sync (brand, outpost, all proxy providers, .env, docker-compose.yml).\n\n' +
-            'Authentik will restart — SSO will be unavailable for ~30s.\n\nProceed?'
+            'Domain change detected:\\n\\n' +
+            '  Old: ' + currentDomain + '\\n' +
+            '  New: ' + domain + '\\n\\n' +
+            'This will update Caddy AND trigger a full Authentik domain sync (brand, outpost, all proxy providers, .env, docker-compose.yml).\\n\\n' +
+            'Authentik will restart — SSO will be unavailable for ~30s.\\n\\nProceed?'
         );
         if (!ok) return;
     }
