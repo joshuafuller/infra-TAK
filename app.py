@@ -3826,6 +3826,22 @@ def guarddog_page():
             _gd_dep_nick != _gd_cur_nick
         )
     )
+    # Last-run timestamps for scheduled maintenance timers
+    def _timer_last_run(stamp_file):
+        """Read last-run UTC timestamp written by the script itself, or fall back to systemd."""
+        try:
+            with open(stamp_file) as _f:
+                ts = _f.read().strip()
+                if ts:
+                    return ts
+        except Exception:
+            pass
+        return None
+
+    _autovacuum_last    = _timer_last_run('/var/log/takguard/autovacuum_last.txt')
+    _ak_tasklog_installed = os.path.isfile('/opt/tak-guarddog/tak-authentik-tasklog-purge.sh')
+    _ak_tasklog_last      = _timer_last_run('/opt/tak-guarddog/authentik_tasklog_purge_last.txt')
+
     return render_template_string(GUARDDOG_TEMPLATE,
         settings=settings, gd=gd, tak=tak, version=VERSION,
         gd_needs_update=gd_needs_update, gd_deployed_version=_gd_dep_ver,
@@ -3840,7 +3856,10 @@ def guarddog_page():
         email_relay_configured=email_relay_configured,
         health_url=_guarddog_health_url(settings),
         deploying=guarddog_deploy_status.get('running', False),
-        deploy_done=guarddog_deploy_status.get('complete', False))
+        deploy_done=guarddog_deploy_status.get('complete', False),
+        autovacuum_last=_autovacuum_last,
+        ak_tasklog_installed=_ak_tasklog_installed,
+        ak_tasklog_last=_ak_tasklog_last)
 
 @app.route('/api/guarddog/deploy', methods=['POST'])
 @login_required
@@ -5960,7 +5979,8 @@ def _guarddog_timer_list():
     return ['tak8089guard.timer', 'takoomguard.timer', 'takdiskguard.timer', 'takdiskioguard.timer',
             'takdbguard.timer', 'takcotdbguard.timer', 'taknetguard.timer', 'takprocessguard.timer',
             'takcertguard.timer', 'takintcaguard.timer',
-            'takauthentikguard.timer', 'takmediamtxguard.timer', 'taknoderedguard.timer', 'takcloudtakguard.timer',
+            'takauthentikguard.timer', 'takauthentiktasklogpurge.timer',
+            'takmediamtxguard.timer', 'taknoderedguard.timer', 'takcloudtakguard.timer',
             'taktakportalguard.timer', 'takfedhubguard.timer']
 
 GUARDDOG_DISKIO_TIMER = 'takdiskioguard.timer'
@@ -6191,6 +6211,47 @@ def guarddog_update():
                 f.write(f'[Unit]\nDescription=Guard Dog TAK Portal Monitor\n\n[Service]\nType=oneshot\nExecStart={tp_script}\n')
             with open(tp_tmr_path, 'w') as f:
                 f.write('[Unit]\nDescription=Run TAK Portal guard every 1 minute\n\n[Timer]\nOnBootSec=15min\nOnUnitActiveSec=1min\nUnit=taktakportalguard.service\n\n[Install]\nWantedBy=timers.target\n')
+        # Authentik task log purge timer — install if Authentik is present but timer doesn't exist yet
+        _ak_tl_svc_path = '/etc/systemd/system/takauthentiktasklogpurge.service'
+        _ak_tl_tmr_path = '/etc/systemd/system/takauthentiktasklogpurge.timer'
+        _ak_tl_script   = '/opt/tak-guarddog/tak-authentik-tasklog-purge.sh'
+        _ak_compose_path = os.path.expanduser('~/authentik/docker-compose.yml')
+        if os.path.exists(_ak_compose_path) and not os.path.isfile(_ak_tl_tmr_path):
+            _ak_tl_script_content = (
+                '#!/bin/bash\n'
+                '# Guard Dog: Authentik task log purge — removes task/tasklog rows older than 30 days.\n'
+                '# Runs weekly (Sunday 03:00). Tables are never auto-purged by Authentik and can grow\n'
+                '# to 500–900 MB after ~1 month of normal operation, causing autovacuum lag and CPU spikes.\n'
+                'set -euo pipefail\n'
+                'LOG=/var/log/takguard/authentik-tasklog-purge.log\n'
+                'STAMP_FILE=/opt/tak-guarddog/authentik_tasklog_purge_last.txt\n'
+                'TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")\n'
+                'mkdir -p /var/log/takguard\n'
+                'echo "[$TS] Starting Authentik task log purge" >> "$LOG"\n'
+                'if ! docker ps -q --filter name=authentik-postgresql-1 | grep -q .; then\n'
+                '  echo "[$TS] authentik-postgresql-1 not running — skipping" >> "$LOG"\n'
+                '  exit 0\n'
+                'fi\n'
+                'docker exec authentik-postgresql-1 psql -U authentik -d authentik -c "\n'
+                'DELETE FROM authentik_tasks_tasklog\n'
+                'WHERE task_id IN (\n'
+                '  SELECT pk FROM authentik_tasks_task\n'
+                "  WHERE finish_timestamp < NOW() - INTERVAL '30 days'\n"
+                ');\n'
+                'DELETE FROM authentik_tasks_task\n'
+                "WHERE finish_timestamp < NOW() - INTERVAL '30 days';\n"
+                'VACUUM ANALYZE authentik_tasks_task, authentik_tasks_tasklog;\n'
+                '" >> "$LOG" 2>&1\n'
+                'echo "$TS" > "$STAMP_FILE"\n'
+                'echo "[$TS] Authentik task log purge complete" >> "$LOG"\n'
+            )
+            with open(_ak_tl_script, 'w') as _f:
+                _f.write(_ak_tl_script_content)
+            os.chmod(_ak_tl_script, 0o755)
+            with open(_ak_tl_svc_path, 'w') as _f:
+                _f.write('[Unit]\nDescription=Guard Dog Authentik Task Log Purge\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-authentik-tasklog-purge.sh\n')
+            with open(_ak_tl_tmr_path, 'w') as _f:
+                _f.write('[Unit]\nDescription=Purge Authentik task logs weekly (Sunday 03:00)\n\n[Timer]\nOnCalendar=Sun *-*-* 03:00:00\nPersistent=true\nUnit=takauthentiktasklogpurge.service\n\n[Install]\nWantedBy=timers.target\n')
         subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
         new_timers = ['takupdatesguard.timer']
         if os.path.isfile(av_tmr_path):
@@ -6201,6 +6262,8 @@ def guarddog_update():
             new_timers.append('takdbrepack.timer')
         if os.path.isfile(tp_tmr_path):
             new_timers.append('taktakportalguard.timer')
+        if os.path.isfile(_ak_tl_tmr_path):
+            new_timers.append('takauthentiktasklogpurge.timer')
         for t in new_timers:
             subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', t]), capture_output=True, text=True, timeout=10)
         # Stamp deployed version + settings so UI knows when re-deploy is needed
@@ -6692,6 +6755,43 @@ def run_guarddog_deploy(alert_email):
                 ('takauthentikguard.service', '[Unit]\nDescription=Guard Dog Authentik Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-authentik-watch.sh\n'),
                 ('takauthentikguard.timer', '[Unit]\nDescription=Run Authentik guard every 1 minute\n\n[Timer]\nOnBootSec=15min\nOnUnitActiveSec=1min\nUnit=takauthentikguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ])
+            # Authentik task log purge — weekly cleanup of authentik_tasks_task/tasklog tables
+            _ak_purge_script = (
+                '#!/bin/bash\n'
+                '# Guard Dog: Authentik task log purge — removes task/tasklog rows older than 30 days.\n'
+                '# Runs weekly (Sunday 03:00). Tables are never auto-purged by Authentik and can grow\n'
+                '# to 500–900 MB after ~1 month of normal operation, causing autovacuum lag and CPU spikes.\n'
+                'set -euo pipefail\n'
+                'LOG=/var/log/takguard/authentik-tasklog-purge.log\n'
+                'STAMP_FILE=/opt/tak-guarddog/authentik_tasklog_purge_last.txt\n'
+                'TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")\n'
+                'mkdir -p /var/log/takguard\n'
+                'echo "[$TS] Starting Authentik task log purge" >> "$LOG"\n'
+                'if ! docker ps -q --filter name=authentik-postgresql-1 | grep -q .; then\n'
+                '  echo "[$TS] authentik-postgresql-1 not running — skipping" >> "$LOG"\n'
+                '  exit 0\n'
+                'fi\n'
+                'docker exec authentik-postgresql-1 psql -U authentik -d authentik -c "\n'
+                'DELETE FROM authentik_tasks_tasklog\n'
+                'WHERE task_id IN (\n'
+                '  SELECT pk FROM authentik_tasks_task\n'
+                "  WHERE finish_timestamp < NOW() - INTERVAL '30 days'\n"
+                ');\n'
+                'DELETE FROM authentik_tasks_task\n'
+                "WHERE finish_timestamp < NOW() - INTERVAL '30 days';\n"
+                'VACUUM ANALYZE authentik_tasks_task, authentik_tasks_tasklog;\n'
+                '" >> "$LOG" 2>&1\n'
+                'echo "$TS" > "$STAMP_FILE"\n'
+                'echo "[$TS] Authentik task log purge complete" >> "$LOG"\n'
+            )
+            _ak_purge_path = '/opt/tak-guarddog/tak-authentik-tasklog-purge.sh'
+            with open(_ak_purge_path, 'w') as _f:
+                _f.write(_ak_purge_script)
+            os.chmod(_ak_purge_path, 0o755)
+            units.extend([
+                ('takauthentiktasklogpurge.service', '[Unit]\nDescription=Guard Dog Authentik Task Log Purge\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-authentik-tasklog-purge.sh\n'),
+                ('takauthentiktasklogpurge.timer', '[Unit]\nDescription=Purge Authentik task logs weekly (Sunday 03:00)\n\n[Timer]\nOnCalendar=Sun *-*-* 03:00:00\nPersistent=true\nUnit=takauthentiktasklogpurge.service\n\n[Install]\nWantedBy=timers.target\n'),
+            ])
         if 'tak-mediamtx-watch.sh' in script_files:
             units.extend([
                 ('takmediamtxguard.service', '[Unit]\nDescription=Guard Dog MediaMTX Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-mediamtx-watch.sh\n'),
@@ -6795,6 +6895,7 @@ def run_guarddog_deploy(alert_email):
         timers.append('takautovacuum.timer')
         if 'tak-authentik-watch.sh' in script_files:
             timers.append('takauthentikguard.timer')
+            timers.append('takauthentiktasklogpurge.timer')
         if 'tak-mediamtx-watch.sh' in script_files:
             timers.append('takmediamtxguard.timer')
         if 'tak-nodered-watch.sh' in script_files:
@@ -15160,6 +15261,10 @@ def run_cloudtak_deploy(cfg=None):
             return
         plog("✓ Containers started")
         plog("✓ Restart complete.")
+        # Patch nginx user directive so workers can write to /dev/stdout with cap_drop: ALL
+        time.sleep(5)
+        _cloudtak_fix_nginx_user()
+        plog("  Nginx user directive patched, workers reloaded")
 
         # Open port 5000 (and 5002 for tiles) so http://ip:5000 works when no domain or before Caddy is used
         for port in ['5000/tcp', '5002/tcp']:
@@ -18412,6 +18517,25 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     </div>
     <div id="gd-vacuum-output" style="display:none;margin-top:14px;padding:12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);white-space:pre-wrap;max-height:200px;overflow-y:auto"></div>
     <div id="gd-vacuum-msg" style="margin-top:8px;font-size:13px"></div>
+    {% if autovacuum_last %}<div style="margin-top:10px;font-size:11px;color:var(--text-dim)">Auto-VACUUM last run: <span style="color:var(--cyan)">{{ autovacuum_last }}</span></div>{% endif %}
+    </div>
+  </div>
+  {% endif %}
+
+  {% if ak_tasklog_installed %}
+  <div class="card">
+    <div class="gd-collapse-header" onclick="gdSectionToggle(this)"><span style="margin:0">Database maintenance (Authentik)</span><span class="gd-collapse-toggle">&#9662;</span></div>
+    <div class="gd-collapse-body">
+    <p style="font-size:12px;color:var(--text-secondary);line-height:1.5;margin-bottom:12px">Authentik writes a record to <code>authentik_tasks_task</code> and <code>authentik_tasks_tasklog</code> on every background task. These tables are never automatically purged — after ~1 month of normal operation they can grow to 500–900 MB (88%+ of the Authentik DB), causing autovacuum lag and background writer CPU spikes. Guard Dog runs a weekly cleanup (Sunday 03:00) that deletes rows older than 30 days and runs <code>VACUUM ANALYZE</code>.</p>
+    <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap">
+      <div style="font-size:12px;color:var(--text-dim)">Schedule: <span style="color:var(--cyan)">Weekly — Sunday 03:00</span></div>
+      {% if ak_tasklog_last %}
+      <div style="font-size:12px;color:var(--text-dim)">Last run: <span style="color:var(--green)">{{ ak_tasklog_last }}</span></div>
+      {% else %}
+      <div style="font-size:12px;color:var(--text-dim)">Last run: <span style="color:var(--text-dim)">Not yet run</span></div>
+      {% endif %}
+    </div>
+    <div style="margin-top:12px;font-size:11px;color:var(--text-dim)">Log: <code>/var/log/takguard/authentik-tasklog-purge.log</code></div>
     </div>
   </div>
   {% endif %}
@@ -18441,6 +18565,22 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     <div style="display:flex;gap:10px;justify-content:flex-end"><button class="btn btn-ghost" onclick="document.getElementById('gd-uninstall-modal').classList.remove('open')">Cancel</button><button class="btn" style="background:var(--red);color:#fff" onclick="gdUninstall()">Uninstall</button></div>
     <div id="gd-uninstall-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
   </div></div>
+  <div class="card">
+    <div class="card-title">Console Rollback</div>
+    {% if settings.get('console_rollback', {}).get('available') %}
+    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:16px">A snapshot was taken before the last update. You can roll back the console to the previous version if the update caused issues.</p>
+    <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:12px">
+      <div>
+        <div style="font-size:13px;font-weight:600;color:var(--yellow)">↩ {{ settings.get('console_rollback', {}).get('tag', '') }}</div>
+        <div style="font-size:11px;color:var(--text-dim);margin-top:2px">Snapshot taken {{ settings.get('console_rollback', {}).get('snapshot_at', '') }} before last update</div>
+      </div>
+      <button onclick="doConsoleRollback()" style="padding:7px 16px;background:rgba(234,179,8,0.1);color:var(--yellow);border:1px solid rgba(234,179,8,0.3);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:12px;cursor:pointer">↩ Roll Back to {{ settings.get('console_rollback', {}).get('tag', '') }}</button>
+    </div>
+    {% else %}
+    <p style="font-size:13px;color:var(--text-dim)">No previous version available — fresh install or settings cleared.</p>
+    {% endif %}
+  </div>
+
   {% else %}
   <div class="card"><div class="card-title">Deploy Guard Dog</div>
     <p style="font-size:13px;color:var(--text-secondary);margin-bottom:16px">Guard Dog usually installs automatically when you deploy TAK Server. If you skipped that or need to reinstall, use this. Installs monitors (port 8089, processes, PostgreSQL, CoT DB size, OOM, disk, network, certificate expiry) and a health endpoint. Alert email is optional — set it in Notifications above to receive alerts (or add it later).</p>
@@ -24126,6 +24266,7 @@ entries:
   postgresql:
     image: docker.io/library/postgres:16-alpine
     restart: unless-stopped
+    shm_size: 256m
     command: postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
@@ -31964,21 +32105,50 @@ def _tak_snapshot(label, plog=None):
         except Exception as e:
             plog(f"  snapshot: takserver.default copy failed: {e}")
 
-    # 4. PostgreSQL cot dump (native host postgres — not a container)
+    # 4. PostgreSQL cot dump
+    # In a two-server deployment the database lives on Server One — stream via SSH.
+    # In a single-server deployment it runs locally as the postgres OS user.
     pg_dump_path = os.path.join(snap_path, 'cot.pgdump')
     plog("  snapshot: pg_dump starting — cot database (may take 30–90s for large databases)…")
     try:
-        with open(pg_dump_path, 'wb') as _f:
-            r2 = subprocess.run(
-                'sudo -u postgres pg_dump -Fc cot',
-                shell=True, stdout=_f, stderr=subprocess.PIPE, timeout=300
-            )
-        if r2.returncode == 0 and os.path.getsize(pg_dump_path) > 0:
-            plog(f"  snapshot: cot pg_dump written ({os.path.getsize(pg_dump_path) // 1024} KB)")
+        _snap_settings = load_settings()
+        _snap_tak_cfg = _get_tak_deployment_config(_snap_settings)
+        _snap_two_server = _snap_tak_cfg.get('mode') == 'two_server'
+        _snap_s1 = _snap_tak_cfg.get('server_one', {})
+        if _snap_two_server and _snap_s1.get('host'):
+            plog("  snapshot: two-server mode — streaming pg_dump from Server One via SSH")
+            _ssh_dump_cmd = 'sudo -u postgres pg_dump -Fc cot'
+            _host = (_snap_s1.get('host') or '').strip()
+            _user = (_snap_s1.get('ssh_user') or 'root').strip() or 'root'
+            _port = int(_snap_s1.get('ssh_port') or 22)
+            _key  = (_snap_s1.get('ssh_key_path') or '').strip() or None
+            _ssh_parts = [
+                'ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'BatchMode=yes',
+                '-p', str(_port),
+            ]
+            if _key:
+                _ssh_parts += ['-i', _key]
+            _ssh_parts += [f'{_user}@{_host}', _ssh_dump_cmd]
+            with open(pg_dump_path, 'wb') as _f:
+                r2 = subprocess.run(_ssh_parts, stdout=_f, stderr=subprocess.PIPE, timeout=300)
+            if r2.returncode == 0 and os.path.getsize(pg_dump_path) > 0:
+                plog(f"  snapshot: cot pg_dump (remote) written ({os.path.getsize(pg_dump_path) // 1024} KB)")
+            else:
+                plog(f"  snapshot: remote pg_dump failed: {(r2.stderr or b'').decode()[:200]}")
+                try: os.remove(pg_dump_path)
+                except Exception: pass
         else:
-            plog(f"  snapshot: pg_dump failed: {(r2.stderr or b'').decode()[:200]}")
-            try: os.remove(pg_dump_path)
-            except Exception: pass
+            with open(pg_dump_path, 'wb') as _f:
+                r2 = subprocess.run(
+                    'sudo -u postgres pg_dump -Fc cot',
+                    shell=True, stdout=_f, stderr=subprocess.PIPE, timeout=300
+                )
+            if r2.returncode == 0 and os.path.getsize(pg_dump_path) > 0:
+                plog(f"  snapshot: cot pg_dump written ({os.path.getsize(pg_dump_path) // 1024} KB)")
+            else:
+                plog(f"  snapshot: pg_dump failed: {(r2.stderr or b'').decode()[:200]}")
+                try: os.remove(pg_dump_path)
+                except Exception: pass
     except Exception as e:
         plog(f"  snapshot: pg_dump exception: {e}")
 
@@ -32109,32 +32279,60 @@ def _tak_rollback(label, plog=None):
             plog(f"  rollback: certs restore failed: {e}")
 
     # 6. pg_restore
-    pg_container = 'takserver-db'
+    # In two-server mode stream the dump to Server One and restore there.
+    # In single-server mode restore into the local takserver-db container.
     plog("  rollback: restoring PostgreSQL cot database…")
     try:
-        r = subprocess.run(
-            f'docker ps -q --filter name={pg_container}',
-            shell=True, capture_output=True, text=True, timeout=10
-        )
-        if (r.stdout or '').strip():
-            r2 = subprocess.run(
-                f'docker exec -i {pg_container} pg_restore -U postgres --clean -d cot',
-                shell=True,
-                stdin=open(pg_dump_path, 'rb'),
-                capture_output=True,
-                timeout=300
-            )
-            if r2.returncode == 0:
-                plog("  rollback: pg_restore successful")
-            else:
-                stderr = (r2.stderr or b'').decode()[:400]
-                # pg_restore may emit warnings but still succeed
-                if r2.returncode in (0, 1):
-                    plog(f"  rollback: pg_restore warnings (non-fatal): {stderr[:200]}")
+        _rb_settings = load_settings()
+        _rb_tak_cfg  = _get_tak_deployment_config(_rb_settings)
+        _rb_two_server = _rb_tak_cfg.get('mode') == 'two_server'
+        _rb_s1 = _rb_tak_cfg.get('server_one', {})
+        if _rb_two_server and _rb_s1.get('host'):
+            plog("  rollback: two-server mode — streaming pg_restore to Server One via SSH")
+            _rb_host = (_rb_s1.get('host') or '').strip()
+            _rb_user = (_rb_s1.get('ssh_user') or 'root').strip() or 'root'
+            _rb_port = int(_rb_s1.get('ssh_port') or 22)
+            _rb_key  = (_rb_s1.get('ssh_key_path') or '').strip() or None
+            _rb_ssh  = ['ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'BatchMode=yes',
+                        '-p', str(_rb_port)]
+            if _rb_key:
+                _rb_ssh += ['-i', _rb_key]
+            _rb_remote_cmd = 'sudo -u postgres pg_restore --clean -d cot'
+            _rb_ssh += [f'{_rb_user}@{_rb_host}', _rb_remote_cmd]
+            with open(pg_dump_path, 'rb') as _f:
+                r2 = subprocess.run(_rb_ssh, stdin=_f, capture_output=True, timeout=300)
+            if r2.returncode in (0, 1):
+                stderr = (r2.stderr or b'').decode()[:200]
+                if stderr:
+                    plog(f"  rollback: pg_restore (remote) warnings (non-fatal): {stderr}")
                 else:
-                    plog(f"  rollback: pg_restore failed (exit {r2.returncode}): {stderr[:200]}")
+                    plog("  rollback: pg_restore (remote) successful")
+            else:
+                plog(f"  rollback: remote pg_restore failed (exit {r2.returncode}): {(r2.stderr or b'').decode()[:200]}")
         else:
-            plog(f"  rollback: {pg_container} not running — skipping pg_restore")
+            pg_container = 'takserver-db'
+            r = subprocess.run(
+                f'docker ps -q --filter name={pg_container}',
+                shell=True, capture_output=True, text=True, timeout=10
+            )
+            if (r.stdout or '').strip():
+                r2 = subprocess.run(
+                    f'docker exec -i {pg_container} pg_restore -U postgres --clean -d cot',
+                    shell=True,
+                    stdin=open(pg_dump_path, 'rb'),
+                    capture_output=True,
+                    timeout=300
+                )
+                if r2.returncode in (0, 1):
+                    stderr = (r2.stderr or b'').decode()[:400]
+                    if stderr:
+                        plog(f"  rollback: pg_restore warnings (non-fatal): {stderr[:200]}")
+                    else:
+                        plog("  rollback: pg_restore successful")
+                else:
+                    plog(f"  rollback: pg_restore failed (exit {r2.returncode}): {(r2.stderr or b'').decode()[:200]}")
+            else:
+                plog(f"  rollback: {pg_container} not running — skipping pg_restore")
     except Exception as e:
         plog(f"  rollback: pg_restore exception: {e}")
 
@@ -32383,6 +32581,102 @@ def takserver_snapshot_download_api(label):
             'Content-Type': 'application/gzip',
         }
     )
+
+
+@app.route('/api/takserver/snapshot/upload', methods=['POST'])
+@login_required
+def takserver_snapshot_upload_api():
+    """Accept a snapshot .tar.gz, validate its structure, extract to SNAPSHOT_DIR, and register it."""
+    import shutil as _shutil
+    import tarfile as _tarfile
+
+    uploaded = request.files.get('file')
+    if not uploaded or not uploaded.filename:
+        return jsonify({'ok': False, 'error': 'No file provided'}), 400
+
+    filename = uploaded.filename
+    if not filename.endswith('.tar.gz'):
+        return jsonify({'ok': False, 'error': 'File must be a .tar.gz archive'}), 400
+
+    # Derive label from filename (strip .tar.gz)
+    raw_label = filename[:-7]
+    # Sanitise — only allow chars valid in a directory name
+    import re as _re_ul
+    safe_label = _re_ul.sub(r'[^A-Za-z0-9._-]', '_', raw_label)
+    if not safe_label:
+        safe_label = 'uploaded'
+
+    # Ensure the label doesn't collide; append a suffix if needed
+    dest_path = os.path.join(SNAPSHOT_DIR, safe_label)
+    if os.path.exists(dest_path):
+        import time as _t_ul
+        safe_label = safe_label + '_' + str(int(_t_ul.time()))[-6:]
+        dest_path = os.path.join(SNAPSHOT_DIR, safe_label)
+
+    tmp_path = dest_path + '.tmp.tar.gz'
+    try:
+        os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+        uploaded.save(tmp_path)
+
+        # Validate: must be a valid tar.gz and contain at least CoreConfig.xml or cot.pgdump
+        try:
+            with _tarfile.open(tmp_path, 'r:gz') as tf:
+                names = tf.getnames()
+        except Exception as e:
+            return jsonify({'ok': False, 'error': f'Invalid tar.gz archive: {e}'}), 400
+
+        has_core   = any('CoreConfig.xml'  in n for n in names)
+        has_pgdump = any('cot.pgdump'      in n for n in names)
+        if not has_core and not has_pgdump:
+            return jsonify({'ok': False, 'error': 'Archive does not appear to be a TAK Server snapshot (missing CoreConfig.xml and cot.pgdump)'}), 400
+
+        # Extract — honour the top-level directory inside the archive (tar -C SNAPSHOT_DIR)
+        result = subprocess.run(
+            ['tar', '-xzf', tmp_path, '-C', SNAPSHOT_DIR],
+            capture_output=True, timeout=120
+        )
+        if result.returncode != 0:
+            return jsonify({'ok': False, 'error': f'Extraction failed: {(result.stderr or b"").decode()[:200]}'}), 500
+
+        # The archive may have a different top-level name than safe_label; find it
+        # (tar extracts the directory that was originally tarred)
+        extracted_label = safe_label
+        for n in names:
+            parts = n.split('/')
+            if parts[0]:
+                extracted_label = parts[0]
+                break
+        extracted_path = os.path.join(SNAPSHOT_DIR, extracted_label)
+
+        # Compute size and build metadata
+        total = 0
+        for dirpath, _, filenames in os.walk(extracted_path):
+            for fn in filenames:
+                try: total += os.path.getsize(os.path.join(dirpath, fn))
+                except Exception: pass
+        size_mb = round(total / (1024 * 1024), 1)
+
+        meta = {
+            'label':      extracted_label,
+            'taken_at':   datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'source':     'uploaded',
+            'tak_version': None,
+            'size_mb':    size_mb,
+        }
+
+        s = load_settings()
+        snaps = [sn for sn in (s.get('tak_snapshots') or []) if sn.get('label') != extracted_label]
+        snaps.append(meta)
+        snaps.sort(key=lambda x: x.get('taken_at', ''), reverse=True)
+        s['tak_snapshots'] = snaps[:50]
+        save_settings(s)
+
+        return jsonify({'ok': True, 'label': extracted_label, 'size_mb': size_mb})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:300]}), 500
+    finally:
+        try: os.remove(tmp_path)
+        except Exception: pass
 
 
 @app.route('/api/takserver/snapshot/<label>', methods=['DELETE'])
@@ -34392,6 +34686,21 @@ async function doApplySshPort(){
         else{msg.style.color='var(--red)';msg.textContent=d.error||'Failed';}
     }catch(e){msg.style.color='var(--red)';msg.textContent=e.message||'Request failed';}
 }
+async function doConsoleRollback(){
+    if(!confirm('Roll back console to the previous version?\\n\\nThe console will restart. You may see 502 briefly.'))return;
+    var btn=document.querySelector('[onclick="doConsoleRollback()"]');
+    if(btn){btn.disabled=true;btn.textContent='Rolling back…';}
+    try{
+        var r=await fetch('/api/console/rollback',{method:'POST'});var d=await r.json();
+        if(d.ok){
+            if(btn)btn.textContent='✓ '+d.message;
+            setTimeout(function(){window.location.reload();},10000);
+        }else{
+            if(btn){btn.disabled=false;btn.textContent='↩ Roll Back';}
+            alert('Rollback failed: '+(d.error||'unknown error'));
+        }
+    }catch(e){if(btn){btn.disabled=false;btn.textContent='↩ Roll Back';}alert('Network error: '+e.message);}
+}
 </script></body></html>'''
 
 # === Console Template (installed services only) ===
@@ -34789,15 +35098,6 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div id="update-details" style="display:none;margin-top:12px;padding-top:12px;border-top:1px solid var(--border);font-size:11px;color:var(--text-dim);white-space:pre-wrap;max-height:200px;overflow-y:auto"></div>
 <div id="update-status" style="display:none;margin-top:8px;font-size:11px"></div>
 </div>
-{% if settings.get('console_rollback', {}).get('available') %}
-<div id="console-rollback-bar" style="background:rgba(234,179,8,0.08);border:1px solid rgba(234,179,8,0.25);border-radius:10px;padding:12px 16px;margin-bottom:16px;display:flex;align-items:center;justify-content:space-between">
-<div>
-  <div style="font-size:12px;font-weight:600;color:var(--yellow)">↩ Rollback available — {{ settings.get('console_rollback', {}).get('tag', '') }}</div>
-  <div style="font-size:11px;color:var(--text-dim);margin-top:2px">Snapshot taken {{ settings.get('console_rollback', {}).get('snapshot_at', '') }} before last update</div>
-</div>
-<button onclick="doConsoleRollback()" style="padding:6px 14px;background:rgba(234,179,8,0.1);color:var(--yellow);border:1px solid rgba(234,179,8,0.3);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">Roll Back</button>
-</div>
-{% endif %}
 <div id="kernel-patch-banner" style="display:none;background:linear-gradient(135deg,rgba(234,179,8,0.1),rgba(234,179,8,0.05));border:1px solid rgba(234,179,8,0.3);border-radius:12px;padding:14px 20px;margin-bottom:16px;font-family:'JetBrains Mono',monospace">
 <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
 <div><div style="font-size:13px;font-weight:600;color:var(--yellow)">&#9888; Kernel update available &mdash; patch now to fix CVE-2026-31431 (Copy Fail)</div>
@@ -35720,6 +36020,8 @@ body{display:flex;flex-direction:row;min-height:100vh}
   <div style="display:flex;gap:8px">
     <button onclick="takeSnapshot()" id="snap-now-btn" style="padding:8px 16px;background:rgba(6,182,212,0.1);color:var(--cyan);border:1px solid rgba(6,182,212,0.3);border-radius:8px;font-size:12px;font-family:JetBrains Mono,monospace;cursor:pointer">📸 Take Snapshot Now</button>
     <button id="snap-refresh-btn" onclick="loadSnapshots(true)" style="padding:8px 16px;background:transparent;color:var(--text-dim);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer;transition:opacity .2s">↻ Refresh</button>
+    <label id="snap-upload-label" style="padding:8px 16px;background:rgba(234,179,8,0.08);color:var(--yellow);border:1px solid rgba(234,179,8,0.3);border-radius:8px;font-size:12px;font-family:JetBrains Mono,monospace;cursor:pointer;user-select:none" title="Upload a previously downloaded .tar.gz snapshot to restore from it">⬆ Upload Snapshot<input type="file" id="snap-upload-input" accept=".tar.gz" style="display:none" onchange="uploadSnapshot(this)"></label>
+    <span id="snap-upload-msg" style="font-size:11px;color:var(--text-dim)"></span>
   </div>
 </div>
 <div id="snap-progress" style="display:none;font-family:JetBrains Mono,monospace;font-size:11px;color:var(--cyan);padding:8px 0;margin-bottom:12px"></div>
@@ -35900,6 +36202,37 @@ function deleteSnapshot(label){
     .then(function(r){return r.json();}).then(function(d){
       if(d.ok)loadSnapshots();
       else alert('Delete failed: '+(d.error||'unknown'));
+    });
+}
+
+function uploadSnapshot(input){
+  var file=input&&input.files&&input.files[0];
+  var msg=document.getElementById('snap-upload-msg');
+  var lbl=document.getElementById('snap-upload-label');
+  if(!file){return;}
+  if(!file.name.endsWith('.tar.gz')){
+    if(msg){msg.textContent='File must be a .tar.gz archive';msg.style.color='var(--red)';}
+    input.value='';return;
+  }
+  if(msg){msg.style.color='var(--yellow)';msg.textContent='Uploading…';}
+  if(lbl)lbl.style.opacity='0.5';
+  var fd=new FormData();
+  fd.append('file',file);
+  fetch('/api/takserver/snapshot/upload',{method:'POST',credentials:'same-origin',body:fd})
+    .then(function(r){return r.json();}).then(function(d){
+      if(lbl)lbl.style.opacity='1';
+      input.value='';
+      if(d.ok){
+        if(msg){msg.style.color='var(--green)';msg.textContent='✓ Uploaded ('+d.label+', '+d.size_mb+' MB)';}
+        loadSnapshots();
+        setTimeout(function(){if(msg)msg.textContent='';},8000);
+      }else{
+        if(msg){msg.style.color='var(--red)';msg.textContent='Upload failed: '+(d.error||'unknown');}
+      }
+    }).catch(function(e){
+      if(lbl)lbl.style.opacity='1';
+      input.value='';
+      if(msg){msg.style.color='var(--red)';msg.textContent='Network error';}
     });
 }
 
@@ -37073,6 +37406,15 @@ def _post_update_auto_deploy():
                                 if '/var/run/docker.sock' not in l
                             )
                             print("Post-update: Authentik — removed docker.sock from worker")
+                        # shm_size: 256m — postgres needs > 64 MB for VACUUM ANALYZE with parallel workers
+                        if 'shm_size:' not in _ak:
+                            import re as _re_shm
+                            _ak = _re_shm.sub(
+                                r'(\s+restart: unless-stopped\n)(\s+command: postgres)',
+                                r'\1    shm_size: 256m\n\2',
+                                _ak, count=1
+                            )
+                            print("Post-update: Authentik — added shm_size: 256m to postgresql service")
                         for _old, _new in (
                             ('command: server\n', 'cap_drop:\n      - ALL\n    security_opt:\n      - no-new-privileges:true\n    command: server\n'),
                         ):
