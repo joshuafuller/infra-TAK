@@ -28048,18 +28048,18 @@ async function runDomainAudit(){
     try {
         var r = await fetch('/api/authentik/domain-audit');
         var d = await r.json();
-        if (!d.ok) { res.innerHTML='<div style="color:var(--red);font-size:12px;font-family:\'JetBrains Mono\',monospace">'+escapeHtml(d.error||'Audit failed')+'</div>'; res.style.display='block'; return; }
+        if (!d.ok) { res.innerHTML='<div style="color:var(--red);font-size:12px;font-family:"JetBrains Mono",monospace">'+escapeHtml(d.error||'Audit failed')+'</div>'; res.style.display='block'; return; }
         if (d.clean) {
-            res.innerHTML='<div style="display:flex;align-items:center;gap:8px;padding:10px 14px;background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.2);border-radius:8px;font-size:12px;color:var(--green);font-family:\'JetBrains Mono\',monospace"><span>✓</span><span>All domain references match <strong>'+escapeHtml(d.fqdn)+'</strong> — no stale config found.</span></div>';
+            res.innerHTML='<div style="display:flex;align-items:center;gap:8px;padding:10px 14px;background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.2);border-radius:8px;font-size:12px;color:var(--green);font-family:"JetBrains Mono",monospace"><span>✓</span><span>All domain references match <strong>'+escapeHtml(d.fqdn)+'</strong> — no stale config found.</span></div>';
         } else {
-            var rows = d.stale.map(function(s){ return '<tr style="border-bottom:1px solid var(--border)"><td style="padding:5px 10px;font-size:11px;color:var(--text-dim)">'+escapeHtml(s.location)+'</td><td style="padding:5px 10px;font-size:11px;color:var(--yellow)">'+escapeHtml(s.field)+'</td><td style="padding:5px 10px;font-size:11px;font-family:\'JetBrains Mono\',monospace;color:var(--red)">'+escapeHtml(s.current_value)+'</td></tr>'; }).join('');
-            res.innerHTML='<div style="color:var(--yellow);font-size:12px;font-family:\'JetBrains Mono\',monospace;margin-bottom:8px">⚠ '+d.stale.length+' stale reference'+(d.stale.length>1?'s':'')+' found — use <em>Update config &amp; reconnect</em> or the Domain Sync button to fix</div>'+
-                '<button onclick="triggerDomainSync()" style="margin-bottom:12px;padding:6px 14px;background:rgba(234,179,8,0.15);color:var(--yellow);border:1px solid rgba(234,179,8,0.3);border-radius:6px;font-size:11px;font-family:\'JetBrains Mono\',monospace;cursor:pointer">↻ Sync Domain Now</button>'+
+            var rows = d.stale.map(function(s){ return '<tr style="border-bottom:1px solid var(--border)"><td style="padding:5px 10px;font-size:11px;color:var(--text-dim)">'+escapeHtml(s.location)+'</td><td style="padding:5px 10px;font-size:11px;color:var(--yellow)">'+escapeHtml(s.field)+'</td><td style="padding:5px 10px;font-size:11px;font-family:"JetBrains Mono",monospace;color:var(--red)">'+escapeHtml(s.current_value)+'</td></tr>'; }).join('');
+            res.innerHTML='<div style="color:var(--yellow);font-size:12px;font-family:"JetBrains Mono",monospace;margin-bottom:8px">⚠ '+d.stale.length+' stale reference'+(d.stale.length>1?'s':'')+' found — use <em>Update config &amp; reconnect</em> or the Domain Sync button to fix</div>'+
+                '<button onclick="triggerDomainSync()" style="margin-bottom:12px;padding:6px 14px;background:rgba(234,179,8,0.15);color:var(--yellow);border:1px solid rgba(234,179,8,0.3);border-radius:6px;font-size:11px;font-family:"JetBrains Mono",monospace;cursor:pointer">↻ Sync Domain Now</button>'+
                 '<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em"><th style="padding:4px 10px;text-align:left">Location</th><th style="padding:4px 10px;text-align:left">Field</th><th style="padding:4px 10px;text-align:left">Current (stale) Value</th></tr></thead><tbody>'+rows+'</tbody></table>';
         }
         res.style.display='block';
     } catch(e) {
-        res.innerHTML='<div style="color:var(--red);font-size:12px;font-family:\'JetBrains Mono\',monospace">Network error: '+escapeHtml(e.message)+'</div>';
+        res.innerHTML='<div style="color:var(--red);font-size:12px;font-family:"JetBrains Mono",monospace">Network error: '+escapeHtml(e.message)+'</div>';
         res.style.display='block';
     } finally {
         if (btn) { btn.disabled=false; btn.textContent='Run Audit'; }
@@ -28068,7 +28068,7 @@ async function runDomainAudit(){
 
 async function triggerDomainSync(){
     var res = document.getElementById('domain-audit-result');
-    if (res) res.innerHTML='<div style="color:var(--text-dim);font-size:12px;font-family:\'JetBrains Mono\',monospace">Triggering domain sync — this calls Update config &amp; reconnect…</div>';
+    if (res) res.innerHTML='<div style="color:var(--text-dim);font-size:12px;font-family:"JetBrains Mono",monospace">Triggering domain sync — this calls Update config &amp; reconnect…</div>';
     await reconfigureAk();
 }
 async function fixAkLdapToken(btn){
