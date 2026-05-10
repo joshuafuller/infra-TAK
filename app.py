@@ -18772,7 +18772,7 @@ Bans IPs via UFW and sends Guard Dog email alerts.
 <span style="font-size:12px;color:var(--text-dim);font-family:\'JetBrains Mono\',monospace">Enable</span>
 <div class="toggle-wrap" style="position:relative;width:40px;height:22px">
 <input type="checkbox" id="recidive-toggle" onchange="toggleRecidiveJail()" style="opacity:0;width:0;height:0;position:absolute">
-<span id="recidive-toggle-track" onclick="document.getElementById(\'recidive-toggle\').click()" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
+<span id="recidive-toggle-track" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
 <span id="recidive-toggle-thumb" style="position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform .2s;pointer-events:none"></span>
 </div>
 </label>
@@ -18831,7 +18831,7 @@ Bans IPs via UFW and sends Guard Dog email alerts.
 <span style="font-size:12px;color:var(--text-dim);font-family:\'JetBrains Mono\',monospace">Enable</span>
 <div class="toggle-wrap" style="position:relative;width:40px;height:22px">
 <input type="checkbox" id="auth-toggle" onchange="toggleAuthentikJail()" style="opacity:0;width:0;height:0;position:absolute">
-<span id="auth-toggle-track" onclick="document.getElementById(\'auth-toggle\').click()" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
+<span id="auth-toggle-track" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
 <span id="auth-toggle-thumb" style="position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform .2s;pointer-events:none"></span>
 </div>
 </label>
@@ -18913,7 +18913,7 @@ Bans IPs via UFW and sends Guard Dog email alerts.
 <span style="font-size:12px;color:var(--text-dim);font-family:\'JetBrains Mono\',monospace">Enable</span>
 <div class="toggle-wrap" style="position:relative;width:40px;height:22px">
 <input type="checkbox" id="ssh-toggle" onchange="toggleSshJail()" style="opacity:0;width:0;height:0;position:absolute">
-<span id="ssh-toggle-track" onclick="document.getElementById(\'ssh-toggle\').click()" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
+<span id="ssh-toggle-track" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
 <span id="ssh-toggle-thumb" style="position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform .2s;pointer-events:none"></span>
 </div>
 </label>
@@ -18990,7 +18990,7 @@ Bans IPs via UFW and sends Guard Dog email alerts.
 <span style="font-size:12px;color:var(--text-dim);font-family:\'JetBrains Mono\',monospace">Enable</span>
 <div class="toggle-wrap" style="position:relative;width:40px;height:22px">
 <input type="checkbox" id="mediamtx-toggle" onchange="toggleMtxJail()" style="opacity:0;width:0;height:0;position:absolute">
-<span id="mediamtx-toggle-track" onclick="document.getElementById(\'mediamtx-toggle\').click()" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
+<span id="mediamtx-toggle-track" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
 <span id="mediamtx-toggle-thumb" style="position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform .2s;pointer-events:none"></span>
 </div>
 </label>
@@ -19061,7 +19061,7 @@ Bans IPs via UFW and sends Guard Dog email alerts.
 <span style="font-size:12px;color:var(--text-dim);font-family:\'JetBrains Mono\',monospace">Enable</span>
 <div class="toggle-wrap" style="position:relative;width:40px;height:22px">
 <input type="checkbox" id="tak-toggle" onchange="toggleTakJail()" style="opacity:0;width:0;height:0;position:absolute">
-<span id="tak-toggle-track" onclick="document.getElementById(\'tak-toggle\').click()" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
+<span id="tak-toggle-track" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
 <span id="tak-toggle-thumb" style="position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform .2s;pointer-events:none"></span>
 </div>
 </label>
@@ -28239,7 +28239,7 @@ Additional admins: Authentik → Groups → authentik Admins → Users.
       <span style="font-size:12px;color:var(--text-dim);font-family:\'JetBrains Mono\',monospace">Enable</span>
       <div class="toggle-wrap" style="position:relative;width:40px;height:22px">
         <input type="checkbox" id="rep-toggle" onchange="toggleReputation()" style="opacity:0;width:0;height:0;position:absolute">
-        <span id="rep-toggle-track" onclick="document.getElementById(\'rep-toggle\').click()" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
+        <span id="rep-toggle-track" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
         <span id="rep-toggle-thumb" style="position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform .2s;pointer-events:none"></span>
       </div>
     </label>
@@ -36146,7 +36146,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
     <span style="font-size:12px;color:var(--text-dim);font-family:\'JetBrains Mono\',monospace">Enable</span>
     <div style="position:relative;width:40px;height:22px">
       <input type="checkbox" id="sched-enabled" onchange="saveSchedule()" style="opacity:0;width:0;height:0;position:absolute">
-      <span id="sched-toggle-track" onclick="document.getElementById(\'sched-enabled\').click()" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
+      <span id="sched-toggle-track" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
       <span id="sched-toggle-thumb" style="position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform .2s;pointer-events:none"></span>
     </div>
   </label>
