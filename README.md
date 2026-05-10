@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Latest release: v0.9.4-alpha** — See **[docs/RELEASE-v0.9.4-alpha.md](docs/RELEASE-v0.9.4-alpha.md)** for full details. Prior releases: [v0.9.3](docs/RELEASE-v0.9.3-alpha.md), [v0.9.2](docs/RELEASE-v0.9.2-alpha.md), [v0.9.1](docs/RELEASE-v0.9.1-alpha.md), [v0.9.0](docs/RELEASE-v0.9.0-alpha.md) — older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases).
+**Latest release: v0.9.5-alpha** — See **[docs/RELEASE-v0.9.5-alpha.md](docs/RELEASE-v0.9.5-alpha.md)** for full details. Prior releases: [v0.9.4](docs/RELEASE-v0.9.4-alpha.md), [v0.9.3](docs/RELEASE-v0.9.3-alpha.md), [v0.9.2](docs/RELEASE-v0.9.2-alpha.md), [v0.9.1](docs/RELEASE-v0.9.1-alpha.md), [v0.9.0](docs/RELEASE-v0.9.0-alpha.md) — older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases).
 
 **Something broken?** Wrong sidebar version, **Update Now** error, merge/rebase/tag-clobber messages, or you are not sure the VPS ever pulled the real repo → go to **[Universal recovery (SSH)](#universal-recovery-ssh)** and run the one block there. **Point people at that section**; it is the single source of truth.
 
@@ -299,6 +299,26 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v0.9.5-alpha — 2026-05-10
+
+**Headline: Snapshot upload & restore, two-server snapshot support, Authentik DB health, CloudTAK stability, and six bug fixes from field testing.**
+
+- **Snapshot Upload & Restore (B)** — New **⬆ Upload Snapshot** button. Upload a previously downloaded `.tar.gz` back to the server; it appears in the table like a local snapshot and the existing **↩ Restore** button works without changes. Real-time progress bar shows MB transferred and percent. Use case: disaster recovery on a fresh VPS, migration between hosts, restoring a snapshot pruned by the retention policy.
+- **Two-server snapshot support (A)** — On split deployments, `_tak_snapshot()` now streams `pg_dump` from Server One via SSH instead of running locally (where the DB doesn't live). `_tak_rollback()` streams the restore back. Config files and certs are unchanged — they already live on Server Two.
+- **Authentik Postgres `shm_size` (C)** — Added `shm_size: 256m` to the Authentik `postgresql` service (fresh installs and "Update Now" on existing installs). Prevents `ERROR: could not resize shared memory segment` on `VACUUM ANALYZE` with parallel workers.
+- **Authentik task log purge — weekly Guard Dog timer (D)** — New `takauthentiktasklogpurge.timer` (Sundays 03:00). Deletes `authentik_tasks_task` and `authentik_tasks_tasklog` rows older than 30 days, then `VACUUM ANALYZE`. Without this, these tables grow to 500–900 MB after ~1 month (88%+ of the Authentik DB), causing autovacuum lag and CPU spikes. Guard Dog page shows last-run timestamp.
+- **Console Rollback → Guard Dog page (E)** — Removed the yellow rollback banner from the Console (home) page. New **Console Rollback** card on the Guard Dog page shows the previous version and "Roll Back" button. If no previous version exists, shows a greyed-out "No previous version available" state.
+- **Fix: CloudTAK deploy hanging / "failed to deploy"** — Three overlapping bugs: (1) `cap_drop: ALL` in the CloudTAK override silently broke nginx workers; (2) a Caddy exception in Step 7 marked the entire deploy failed; (3) the JS polling loop stopped permanently on fetch errors, so users saw failure even when the deploy succeeded.
+- **Fix: TAK Portal `cap_drop` on fresh deploy** — Fresh TAK Portal deploys were still injecting `cap_drop: ALL`, preventing Node.js from reading `tak-client.p12` (dashboard showed `--` for all stats).
+- **Fix: CloudTAK Reset Config** — "Key (username)=(…) already exists" error on reconfiguration. Now uses `TRUNCATE profile CASCADE` to clear all FK-dependent tables before restarting the API container.
+- **Fix: Fail2ban / Scheduler toggles double-fire (issue #21)** — Removed redundant `onclick` from all 7 `*-toggle-track` spans; disabling jails now works correctly.
+- **Fix: Snapshot TAK Server version shown as `?`** — Version detection now runs in the upload endpoint and the two-server SSH path, not only in the local snapshot path.
+- **Fix: TAK Server page JS syntax error** — `font-family:'JetBrains Mono'` in a JS string caused `Uncaught SyntaxError: Unexpected identifier 'JetBrains'`, breaking all card expand/collapse on the TAK Server page.
+
+Full notes: [docs/RELEASE-v0.9.5-alpha.md](docs/RELEASE-v0.9.5-alpha.md).
+
+---
 
 ### v0.8.9-alpha — 2026-05-01
 

@@ -307,7 +307,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.4-alpha"
+VERSION = "0.9.5-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -3826,6 +3826,22 @@ def guarddog_page():
             _gd_dep_nick != _gd_cur_nick
         )
     )
+    # Last-run timestamps for scheduled maintenance timers
+    def _timer_last_run(stamp_file):
+        """Read last-run UTC timestamp written by the script itself, or fall back to systemd."""
+        try:
+            with open(stamp_file) as _f:
+                ts = _f.read().strip()
+                if ts:
+                    return ts
+        except Exception:
+            pass
+        return None
+
+    _autovacuum_last    = _timer_last_run('/var/log/takguard/autovacuum_last.txt')
+    _ak_tasklog_installed = os.path.isfile('/opt/tak-guarddog/tak-authentik-tasklog-purge.sh')
+    _ak_tasklog_last      = _timer_last_run('/opt/tak-guarddog/authentik_tasklog_purge_last.txt')
+
     return render_template_string(GUARDDOG_TEMPLATE,
         settings=settings, gd=gd, tak=tak, version=VERSION,
         gd_needs_update=gd_needs_update, gd_deployed_version=_gd_dep_ver,
@@ -3840,7 +3856,10 @@ def guarddog_page():
         email_relay_configured=email_relay_configured,
         health_url=_guarddog_health_url(settings),
         deploying=guarddog_deploy_status.get('running', False),
-        deploy_done=guarddog_deploy_status.get('complete', False))
+        deploy_done=guarddog_deploy_status.get('complete', False),
+        autovacuum_last=_autovacuum_last,
+        ak_tasklog_installed=_ak_tasklog_installed,
+        ak_tasklog_last=_ak_tasklog_last)
 
 @app.route('/api/guarddog/deploy', methods=['POST'])
 @login_required
@@ -5960,7 +5979,8 @@ def _guarddog_timer_list():
     return ['tak8089guard.timer', 'takoomguard.timer', 'takdiskguard.timer', 'takdiskioguard.timer',
             'takdbguard.timer', 'takcotdbguard.timer', 'taknetguard.timer', 'takprocessguard.timer',
             'takcertguard.timer', 'takintcaguard.timer',
-            'takauthentikguard.timer', 'takmediamtxguard.timer', 'taknoderedguard.timer', 'takcloudtakguard.timer',
+            'takauthentikguard.timer', 'takauthentiktasklogpurge.timer',
+            'takmediamtxguard.timer', 'taknoderedguard.timer', 'takcloudtakguard.timer',
             'taktakportalguard.timer', 'takfedhubguard.timer']
 
 GUARDDOG_DISKIO_TIMER = 'takdiskioguard.timer'
@@ -6191,6 +6211,47 @@ def guarddog_update():
                 f.write(f'[Unit]\nDescription=Guard Dog TAK Portal Monitor\n\n[Service]\nType=oneshot\nExecStart={tp_script}\n')
             with open(tp_tmr_path, 'w') as f:
                 f.write('[Unit]\nDescription=Run TAK Portal guard every 1 minute\n\n[Timer]\nOnBootSec=15min\nOnUnitActiveSec=1min\nUnit=taktakportalguard.service\n\n[Install]\nWantedBy=timers.target\n')
+        # Authentik task log purge timer — install if Authentik is present but timer doesn't exist yet
+        _ak_tl_svc_path = '/etc/systemd/system/takauthentiktasklogpurge.service'
+        _ak_tl_tmr_path = '/etc/systemd/system/takauthentiktasklogpurge.timer'
+        _ak_tl_script   = '/opt/tak-guarddog/tak-authentik-tasklog-purge.sh'
+        _ak_compose_path = os.path.expanduser('~/authentik/docker-compose.yml')
+        if os.path.exists(_ak_compose_path) and not os.path.isfile(_ak_tl_tmr_path):
+            _ak_tl_script_content = (
+                '#!/bin/bash\n'
+                '# Guard Dog: Authentik task log purge — removes task/tasklog rows older than 30 days.\n'
+                '# Runs weekly (Sunday 03:00). Tables are never auto-purged by Authentik and can grow\n'
+                '# to 500–900 MB after ~1 month of normal operation, causing autovacuum lag and CPU spikes.\n'
+                'set -euo pipefail\n'
+                'LOG=/var/log/takguard/authentik-tasklog-purge.log\n'
+                'STAMP_FILE=/opt/tak-guarddog/authentik_tasklog_purge_last.txt\n'
+                'TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")\n'
+                'mkdir -p /var/log/takguard\n'
+                'echo "[$TS] Starting Authentik task log purge" >> "$LOG"\n'
+                'if ! docker ps -q --filter name=authentik-postgresql-1 | grep -q .; then\n'
+                '  echo "[$TS] authentik-postgresql-1 not running — skipping" >> "$LOG"\n'
+                '  exit 0\n'
+                'fi\n'
+                'docker exec authentik-postgresql-1 psql -U authentik -d authentik -c "\n'
+                'DELETE FROM authentik_tasks_tasklog\n'
+                'WHERE task_id IN (\n'
+                '  SELECT pk FROM authentik_tasks_task\n'
+                "  WHERE finish_timestamp < NOW() - INTERVAL '30 days'\n"
+                ');\n'
+                'DELETE FROM authentik_tasks_task\n'
+                "WHERE finish_timestamp < NOW() - INTERVAL '30 days';\n"
+                'VACUUM ANALYZE authentik_tasks_task, authentik_tasks_tasklog;\n'
+                '" >> "$LOG" 2>&1\n'
+                'echo "$TS" > "$STAMP_FILE"\n'
+                'echo "[$TS] Authentik task log purge complete" >> "$LOG"\n'
+            )
+            with open(_ak_tl_script, 'w') as _f:
+                _f.write(_ak_tl_script_content)
+            os.chmod(_ak_tl_script, 0o755)
+            with open(_ak_tl_svc_path, 'w') as _f:
+                _f.write('[Unit]\nDescription=Guard Dog Authentik Task Log Purge\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-authentik-tasklog-purge.sh\n')
+            with open(_ak_tl_tmr_path, 'w') as _f:
+                _f.write('[Unit]\nDescription=Purge Authentik task logs weekly (Sunday 03:00)\n\n[Timer]\nOnCalendar=Sun *-*-* 03:00:00\nPersistent=true\nUnit=takauthentiktasklogpurge.service\n\n[Install]\nWantedBy=timers.target\n')
         subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
         new_timers = ['takupdatesguard.timer']
         if os.path.isfile(av_tmr_path):
@@ -6201,6 +6262,8 @@ def guarddog_update():
             new_timers.append('takdbrepack.timer')
         if os.path.isfile(tp_tmr_path):
             new_timers.append('taktakportalguard.timer')
+        if os.path.isfile(_ak_tl_tmr_path):
+            new_timers.append('takauthentiktasklogpurge.timer')
         for t in new_timers:
             subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', t]), capture_output=True, text=True, timeout=10)
         # Stamp deployed version + settings so UI knows when re-deploy is needed
@@ -6692,6 +6755,43 @@ def run_guarddog_deploy(alert_email):
                 ('takauthentikguard.service', '[Unit]\nDescription=Guard Dog Authentik Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-authentik-watch.sh\n'),
                 ('takauthentikguard.timer', '[Unit]\nDescription=Run Authentik guard every 1 minute\n\n[Timer]\nOnBootSec=15min\nOnUnitActiveSec=1min\nUnit=takauthentikguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ])
+            # Authentik task log purge — weekly cleanup of authentik_tasks_task/tasklog tables
+            _ak_purge_script = (
+                '#!/bin/bash\n'
+                '# Guard Dog: Authentik task log purge — removes task/tasklog rows older than 30 days.\n'
+                '# Runs weekly (Sunday 03:00). Tables are never auto-purged by Authentik and can grow\n'
+                '# to 500–900 MB after ~1 month of normal operation, causing autovacuum lag and CPU spikes.\n'
+                'set -euo pipefail\n'
+                'LOG=/var/log/takguard/authentik-tasklog-purge.log\n'
+                'STAMP_FILE=/opt/tak-guarddog/authentik_tasklog_purge_last.txt\n'
+                'TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")\n'
+                'mkdir -p /var/log/takguard\n'
+                'echo "[$TS] Starting Authentik task log purge" >> "$LOG"\n'
+                'if ! docker ps -q --filter name=authentik-postgresql-1 | grep -q .; then\n'
+                '  echo "[$TS] authentik-postgresql-1 not running — skipping" >> "$LOG"\n'
+                '  exit 0\n'
+                'fi\n'
+                'docker exec authentik-postgresql-1 psql -U authentik -d authentik -c "\n'
+                'DELETE FROM authentik_tasks_tasklog\n'
+                'WHERE task_id IN (\n'
+                '  SELECT pk FROM authentik_tasks_task\n'
+                "  WHERE finish_timestamp < NOW() - INTERVAL '30 days'\n"
+                ');\n'
+                'DELETE FROM authentik_tasks_task\n'
+                "WHERE finish_timestamp < NOW() - INTERVAL '30 days';\n"
+                'VACUUM ANALYZE authentik_tasks_task, authentik_tasks_tasklog;\n'
+                '" >> "$LOG" 2>&1\n'
+                'echo "$TS" > "$STAMP_FILE"\n'
+                'echo "[$TS] Authentik task log purge complete" >> "$LOG"\n'
+            )
+            _ak_purge_path = '/opt/tak-guarddog/tak-authentik-tasklog-purge.sh'
+            with open(_ak_purge_path, 'w') as _f:
+                _f.write(_ak_purge_script)
+            os.chmod(_ak_purge_path, 0o755)
+            units.extend([
+                ('takauthentiktasklogpurge.service', '[Unit]\nDescription=Guard Dog Authentik Task Log Purge\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-authentik-tasklog-purge.sh\n'),
+                ('takauthentiktasklogpurge.timer', '[Unit]\nDescription=Purge Authentik task logs weekly (Sunday 03:00)\n\n[Timer]\nOnCalendar=Sun *-*-* 03:00:00\nPersistent=true\nUnit=takauthentiktasklogpurge.service\n\n[Install]\nWantedBy=timers.target\n'),
+            ])
         if 'tak-mediamtx-watch.sh' in script_files:
             units.extend([
                 ('takmediamtxguard.service', '[Unit]\nDescription=Guard Dog MediaMTX Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-mediamtx-watch.sh\n'),
@@ -6795,6 +6895,7 @@ def run_guarddog_deploy(alert_email):
         timers.append('takautovacuum.timer')
         if 'tak-authentik-watch.sh' in script_files:
             timers.append('takauthentikguard.timer')
+            timers.append('takauthentiktasklogpurge.timer')
         if 'tak-mediamtx-watch.sh' in script_files:
             timers.append('takmediamtxguard.timer')
         if 'tak-nodered-watch.sh' in script_files:
@@ -12304,17 +12405,27 @@ def run_takportal_deploy():
                 else:
                     plog("  ⚠ Could not auto-add extra_hosts (missing 'restart: unless-stopped').")
 
-            if 'cap_drop:' not in compose_content and 'restart: unless-stopped' in compose_content:
-                hardened = compose_content.replace(
-                    'restart: unless-stopped',
-                    'restart: unless-stopped\n    cap_drop:\n      - ALL\n    security_opt:\n      - no-new-privileges:true',
-                    1
-                )
-                if hardened != compose_content:
-                    compose_content = hardened
-                    with open(compose_path, 'w') as f:
-                        f.write(compose_content)
-                    plog("  ✓ cap_drop: ALL + no-new-privileges:true added to docker-compose.yml")
+            # NOTE: We deliberately do NOT inject cap_drop:ALL / no-new-privileges
+            # into TAK Portal's docker-compose.yml. cap_drop:ALL removes
+            # CAP_DAC_OVERRIDE which is required for the Node.js process to read
+            # tak-client.p12 (owned by uid 889 with mode 600) — the dashboard
+            # silently shows -- for all stats. Same lesson learned in commit
+            # 7fe8191 for the override path; this code path was missed in that
+            # commit and re-applied the broken hardening on every fresh deploy.
+            # If a previous deploy injected cap_drop, strip it now so the next
+            # `docker compose up` runs with default capabilities.
+            _had_capdrop = False
+            for _bad in (
+                '\n    cap_drop:\n      - ALL\n    security_opt:\n      - no-new-privileges:true',
+                '    cap_drop:\n      - ALL\n    security_opt:\n      - no-new-privileges:true\n',
+            ):
+                if _bad in compose_content:
+                    compose_content = compose_content.replace(_bad, '', 1)
+                    _had_capdrop = True
+            if _had_capdrop:
+                with open(compose_path, 'w') as f:
+                    f.write(compose_content)
+                plog("  ✓ Removed legacy cap_drop:ALL from docker-compose.yml (breaks cert reads)")
 
         if _patch_takportal_compose_network():
             plog("  ✓ infratak Docker network added to docker-compose.yml (Portal ↔ Authentik)")
@@ -14504,8 +14615,6 @@ def cloudtak_control():
         else:
             return jsonify({'error': 'Invalid action'}), 400
         time.sleep(3)
-        if action in ('start', 'restart'):
-            _cloudtak_fix_nginx_user()
         r = subprocess.run('docker ps --filter name=cloudtak-api --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
         running = 'Up' in r.stdout
     return jsonify({'success': True, 'running': running})
@@ -14643,9 +14752,23 @@ def cloudtak_reset_server_config():
     cfg = _get_cloudtak_deployment_config(settings)
     target_mode = (cfg.get('target_mode') or 'local').strip().lower()
 
-    # Table is "server" (singular). Clear all connection fields so the API doesn't try to
-    # connect to a stale TAK Server on startup (which blocks the Node event loop).
-    sql_cmd = "UPDATE server SET auth = '{}'::jsonb, url = '', api = '', webtak = '' WHERE id = 1;"
+    # Two-step reset (confirmed from CloudTAK source api/routes/server.ts):
+    #
+    # 1. Clear the server connection fields so /api/server returns status:unconfigured
+    #    and the configure wizard shows again.
+    #
+    # 2. TRUNCATE profile CASCADE. CloudTAK's PATCH /server handler calls
+    #    profileControl.generate() which does a plain INSERT (not upsert). If the
+    #    admin user's profile row still exists, the wizard fails with
+    #    "Key (username)=(...) already exists". We use TRUNCATE CASCADE (not DELETE)
+    #    because multiple tables (profile_overlays, profile_config, etc.) have FK
+    #    references to profile.username — a plain DELETE hits FK violations.
+    #    Truncating all profiles is correct for a reset: all profile rows are tied to
+    #    the old TAK Server's user accounts which won't exist on the new server.
+    sql_cmd = (
+        "UPDATE server SET auth = '{}'::jsonb, url = '', api = '', webtak = '' WHERE id = 1;"
+        " TRUNCATE profile CASCADE;"
+    )
     psql_cmd = f"docker exec cloudtak-postgis-1 psql -U docker -d gis -c \"{sql_cmd}\" 2>&1"
     restart_cmd = "cd ~/CloudTAK && docker compose restart api 2>&1"
 
@@ -14655,19 +14778,17 @@ def cloudtak_reset_server_config():
         if not rhost:
             return jsonify({'success': False, 'error': 'Remote host not configured'}), 400
         ok1, out1 = _ssh_probe(rcfg, psql_cmd, timeout=30)
-        if not ok1 or 'ERROR' in (out1 or '').upper():
-            return jsonify({'success': False, 'error': f'SQL reset failed on {rhost}: {(out1 or "unknown")[:200]}'}), 500
+        if not ok1:
+            return jsonify({'success': False, 'error': f'SQL reset failed on {rhost}: {(out1 or "unknown")[:400]}'}), 500
         ok2, out2 = _ssh_probe(rcfg, restart_cmd, timeout=60)
         if not ok2:
             return jsonify({'success': False, 'error': f'API restart failed on {rhost}: {(out2 or "unknown")[:200]}'}), 500
-        nginx_fix = 'docker exec cloudtak-api-1 sed -i "s/^user nginx;/user root;/" /etc/nginx/nginx.conf 2>/dev/null && docker exec cloudtak-api-1 nginx -s reload 2>/dev/null; true'
-        _ssh_probe(rcfg, nginx_fix, timeout=15)
         return jsonify({'success': True, 'message': f'CloudTAK server config cleared on {rhost}. Visit map.{settings.get("fqdn","<domain>")} to re-run the bootstrap wizard.'})
     else:
         try:
             r1 = subprocess.run(psql_cmd, shell=True, capture_output=True, text=True, timeout=30)
-            if r1.returncode != 0 or 'ERROR' in (r1.stdout + r1.stderr).upper():
-                return jsonify({'success': False, 'error': f'SQL reset failed: {(r1.stdout + r1.stderr)[:200]}'}), 500
+            if r1.returncode != 0:
+                return jsonify({'success': False, 'error': f'SQL reset failed: {(r1.stdout + r1.stderr)[:400]}'}), 500
         except subprocess.TimeoutExpired:
             return jsonify({'success': False, 'error': 'psql command timed out'}), 500
         try:
@@ -14677,7 +14798,6 @@ def cloudtak_reset_server_config():
                 return jsonify({'success': False, 'error': f'API restart failed: {(r2.stdout + r2.stderr)[:200]}'}), 500
         except subprocess.TimeoutExpired:
             return jsonify({'success': False, 'error': 'docker compose restart timed out'}), 500
-        _cloudtak_fix_nginx_user()
         fqdn = settings.get('fqdn', '')
         return jsonify({'success': True, 'message': f'CloudTAK server config cleared. Visit {"map." + fqdn if fqdn else "CloudTAK"} to re-run the bootstrap wizard.'})
 
@@ -14754,54 +14874,82 @@ def _cloudtak_build_override_yml(settings):
             if server_ip:
                 extra_hosts.append(f'{tak_fqdn}:{server_ip}')
     hosts_block = '\n'.join(f'      - "{h}"' for h in extra_hosts)
+    # NOTE: We deliberately do NOT add cap_drop / no-new-privileges here.
+    # CloudTAK's api container runs both nginx and Node in the same image;
+    # cap_drop:ALL silently breaks nginx workers (can't write /dev/stdout)
+    # and breaks the nginx→Node loopback proxy in subtle ways that produce
+    # nothing in the logs. Same lesson learned earlier on Authentik worker
+    # (commit c908179) and TAK Portal (commit 7fe8191) — these containers
+    # legitimately need a default capability set; capability hardening at
+    # this level is not appropriate for them.
     return f"""# TAKWERX: CloudTAK container overrides
 services:
   api:
     extra_hosts:
 {hosts_block}
-    cap_drop:
-      - ALL
-    cap_add:
-      - CHOWN
-    security_opt:
-      - no-new-privileges:true
   events:
     extra_hosts:
 {hosts_block}
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
     environment:
       API_URL: "http://api:5000"
   media:
     extra_hosts:
 {hosts_block}
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
     environment:
       API_URL: "http://api:5000"
 """
 
 
-def _cloudtak_fix_nginx_user(container_name='cloudtak-api-1', timeout=10):
+def _cloudtak_fix_nginx_user(container_name='cloudtak-api-1', total_timeout=180, ssh_cfg=None):
     """Patch nginx.conf user directive from 'nginx' to 'root' and reload workers.
 
     The CloudTAK container image generates 'user nginx;' in nginx.conf via nginx.conf.js,
     but workers crash immediately with exit code 2 because /dev/stdout and /dev/stderr
     are not writable after dropping root privileges. Patching to 'user root;' and
-    reloading causes workers to spawn correctly. Called after every API container start.
+    reloading causes workers to spawn correctly.
+
+    The container takes a variable amount of time to write nginx.conf via the
+    entrypoint (nginx.conf.js generates it), so we poll until the file exists,
+    apply the patch, reload, and verify a worker process has spawned. If
+    `ssh_cfg` is provided, runs against a remote host via SSH; otherwise
+    operates against local Docker.
     """
-    try:
-        subprocess.run(
-            f'docker exec {container_name} sed -i "s/^user nginx;/user root;/" /etc/nginx/nginx.conf 2>/dev/null'
-            f' && docker exec {container_name} nginx -s reload 2>/dev/null',
-            shell=True, capture_output=True, text=True, timeout=timeout
-        )
-    except Exception:
-        pass
+    def _exec(cmd):
+        if ssh_cfg:
+            return _ssh_probe(ssh_cfg, cmd, timeout=20)
+        try:
+            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=20)
+            return (r.returncode == 0), (r.stdout or '') + (r.stderr or '')
+        except Exception as e:
+            return False, str(e)
+
+    deadline = time.time() + total_timeout
+    sleep_s = 2
+    patched = False
+    while time.time() < deadline:
+        ok, out = _exec(f'docker exec {container_name} test -f /etc/nginx/nginx.conf && echo READY')
+        if ok and 'READY' in (out or ''):
+            ok2, out2 = _exec(
+                f'docker exec {container_name} sh -c "grep -q \\"^user root;\\" /etc/nginx/nginx.conf || sed -i \\"s/^user nginx;/user root;/\\" /etc/nginx/nginx.conf"'
+            )
+            _exec(f'docker exec {container_name} nginx -s reload 2>/dev/null || true')
+            patched = True
+            break
+        time.sleep(sleep_s)
+    if not patched:
+        return False
+    worker_deadline = time.time() + 30
+    while time.time() < worker_deadline:
+        ok, out = _exec(f'docker exec {container_name} sh -c "ps -o pid,user,args -A 2>/dev/null | grep \\"nginx: worker\\" | grep -v grep | wc -l"')
+        try:
+            n = int((out or '').strip().splitlines()[-1].strip()) if (out or '').strip() else 0
+        except Exception:
+            n = 0
+        if n > 0:
+            return True
+        _exec(f'docker exec {container_name} nginx -s reload 2>/dev/null || true')
+        time.sleep(2)
+    return False
 
 
 def run_cloudtak_deploy(cfg=None):
@@ -14938,14 +15086,18 @@ def run_cloudtak_deploy(cfg=None):
                 "command -v firewall-cmd >/dev/null 2>&1 && (sudo firewall-cmd --reload >/dev/null 2>&1 || true)"
             )
             _ssh_probe(remote_cfg, fw_cmd, timeout=40)
+            # Probe /api/server (returns 200 even on unconfigured installs — see Step 6 comment).
+            # /api/connections is auth-gated and not a reliable readiness signal on a fresh install.
             ready_cmd = (
                 "python3 - <<'PY'\n"
                 "import urllib.request,sys,time\n"
                 "ok=False\n"
                 "for _ in range(120):\n"
                 "  try:\n"
-                "    r=urllib.request.urlopen('http://127.0.0.1:5000/api/connections', timeout=4)\n"
-                "    if r.getcode() in (200,401,403,404): ok=True; break\n"
+                "    r=urllib.request.urlopen('http://127.0.0.1:5000/api/server', timeout=15)\n"
+                "    if r.getcode() < 500: ok=True; break\n"
+                "  except urllib.error.HTTPError as e:\n"
+                "    if e.code < 500: ok=True; break\n"
                 "  except Exception:\n"
                 "    pass\n"
                 "  time.sleep(2)\n"
@@ -14957,7 +15109,7 @@ def run_cloudtak_deploy(cfg=None):
             if ok and 'READY' in (out or ''):
                 plog("✓ Remote CloudTAK API is responding")
             else:
-                plog("⚠ Remote CloudTAK API did not confirm readiness in time; continuing")
+                plog("⚠ Remote CloudTAK API did not confirm readiness in time; continuing — Caddy is wired so URL will work as soon as Node finishes warming up")
 
             plog("")
             plog("━━━ Step 6/6: Updating Caddy ━━━")
@@ -15174,117 +15326,148 @@ def run_cloudtak_deploy(cfg=None):
         # CloudTAK nginx proxies /api to 127.0.0.1:5001 (Node app in same container). Do NOT
         # replace that with host:5001 or /api would hit TAKWERX Console and the app would stay on "Loading CloudTAK".
 
-        # Step 6: Wait for API to be ready (Node backend can take 10+ min after containers start on slow VPS)
+        # Update Caddyfile NOW (before waiting for API) so the public URL is reachable
+        # the moment CloudTAK comes up. Persist deployed=True first so detect_modules()
+        # picks up cloudtak as installed even on retries.
+        try:
+            cfg['deployed'] = True
+            settings['cloudtak_deployment'] = _normalize_cloudtak_deployment_config(cfg)
+            save_settings(settings)
+        except Exception as _e:
+            plog(f"  ⚠ Could not persist deployment flag: {_e}")
+        if domain:
+            try:
+                generate_caddyfile(settings)
+                r_cd = subprocess.run('systemctl reload caddy 2>&1', shell=True, capture_output=True, text=True, timeout=15)
+                if r_cd.returncode == 0:
+                    plog(f"✓ Caddy updated early — map.{domain} routed (will work as soon as API responds)")
+                else:
+                    plog(f"⚠ Caddy reload: {r_cd.stdout.strip()[:100]}")
+            except Exception as _e:
+                plog(f"⚠ Caddy update skipped: {_e}")
+
+        # Step 6: Wait for API to be ready.
+        #
+        # On a fresh deploy the Node app inside cloudtak-api-1 has to:
+        #   1. wait for postgis to accept connections,
+        #   2. run Drizzle migrations against the gis db,
+        #   3. seed iconsets/basemaps from /home/etl/api/dist/data,
+        #   4. start serving on 127.0.0.1:5001 (which nginx proxies to :5000).
+        #
+        # On slow VPSes this takes 20–30 minutes the first time. We probe /api/server
+        # because it returns 200 with no auth even when CloudTAK is in the
+        # "unconfigured" state (verified empirically on 2026-05-10 — the response
+        # is `{"status":"unconfigured", ...}`). /api/connections is auth-gated and
+        # not a reliable readiness signal on a fresh install.
+        #
+        # Important: every loop iteration can take up to ~12s wall clock when
+        # nginx returns 502 from a stuck upstream, so we MUST track real wall
+        # clock — not `attempt * poll_interval` which lies by 5–6×.
         plog("")
         plog("━━━ Step 6/7: Waiting for CloudTAK API ━━━")
-        plog("  Waiting for /api/connections (or GET /) — only 200/401/403/404 from /api counts as ready")
+        plog("  Probing /api/server (returns 200 even on unconfigured installs)")
         import urllib.request as _urlreq
         import urllib.error as _urlerr
         api_ready = False
-        max_wait_sec = 900  # 15 minutes — backend first start is slow after heavy build
+        max_wait_sec = 1800  # 30 minutes wall-clock — fresh-boot Postgres + Drizzle migrations on slow VPS can take 25 min
         poll_interval = 2
-        attempts = max_wait_sec // poll_interval
-        _step6_logged_exc = [False]
-        _step6_logged_502 = [False]
+        start_ts = time.time()
+        _last_diag_ts = [0.0]
+        _last_status_ts = [0.0]
+        diag_throttle = 60  # repeat a diagnostic line at most once per minute so we keep heartbeat
         def _check_url(url, name):
+            # 15s per-request timeout: during Drizzle migrations Node can be
+            # bound but slow to respond. 5s was too aggressive and produced
+            # false TimeoutErrors against a healthy-but-warming backend.
             try:
                 r = _urlreq.Request(url, method='GET')
-                resp = _urlreq.urlopen(r, timeout=5)
-                return resp.getcode()
+                resp = _urlreq.urlopen(r, timeout=15)
+                return resp.getcode(), None
             except _urlerr.HTTPError as e:
-                return e.code
+                return e.code, None
             except Exception as e:
-                if not _step6_logged_exc[0]:
-                    _step6_logged_exc[0] = True
-                    plog(f"  (diagnostic: {name} → {type(e).__name__}: {str(e)[:80]})")
-                return None
-        for attempt in range(attempts):
-            code = _check_url('http://127.0.0.1:5000/api/connections', 'api/connections')
-            if code is not None:
-                if code in (200, 401, 403):
-                    plog("✓ CloudTAK API is responding (backend ready)")
-                    api_ready = True
-                    break
-                if code == 404:
-                    plog("✓ CloudTAK backend is up (GET /api/connections returned 404 — path may vary by version)")
-                    api_ready = True
-                    break
-                if code in (502, 503) and not _step6_logged_502[0]:
-                    _step6_logged_502[0] = True
-                    plog(f"  Backend returned {code} (Node app may still be starting — we'll keep trying)")
-            if not api_ready:
-                code_root = _check_url('http://127.0.0.1:5000/', 'root')
-                if code_root == 200 and attempt > 0 and (attempt * poll_interval) % 60 == 0:
-                    plog("  (GET / returns 200 but /api not ready yet — waiting for Node app)")
-                if code_root in (502, 503) and not _step6_logged_502[0]:
-                    _step6_logged_502[0] = True
-                    plog(f"  Backend returned {code_root} (Node app may still be starting — we'll keep trying)")
-            if api_ready:
+                return None, f"{type(e).__name__}: {str(e)[:80]}"
+        while True:
+            elapsed = int(time.time() - start_ts)
+            if elapsed >= max_wait_sec:
                 break
-            elapsed = attempt * poll_interval
-            if elapsed > 0 and elapsed % 30 == 0:
-                plog(f"  ⏳ Waiting for backend... ({elapsed}s)")
+            code, err = _check_url('http://127.0.0.1:5000/api/server', 'api/server')
+            # Anything 2xx/3xx/4xx means Node is alive and responding (even 401/403/404 are fine —
+            # nginx is up and Node returned a real HTTP response). Only 5xx and connection errors mean
+            # not ready.
+            if code is not None and code < 500:
+                plog(f"✓ CloudTAK API is responding (GET /api/server → {code}) after {elapsed}s")
+                api_ready = True
+                break
+            now_ts = time.time()
+            if now_ts - _last_diag_ts[0] >= diag_throttle:
+                _last_diag_ts[0] = now_ts
+                if code is not None:
+                    plog(f"  Backend returned {code} (Node app still starting at {elapsed}s) — we'll keep trying")
+                elif err:
+                    plog(f"  /api/server → {err} at {elapsed}s — Node not yet bound, waiting")
+            elif elapsed > 0 and now_ts - _last_status_ts[0] >= 30:
+                _last_status_ts[0] = now_ts
+                plog(f"  ⏳ Waiting for backend... ({elapsed}s elapsed, max {max_wait_sec}s)")
             time.sleep(poll_interval)
+
         if not api_ready:
-            plog("✗ CloudTAK API did not respond in time — deploy failed.")
-            plog("  Check: docker logs cloudtak-api-1. If you see 404 for /api/connections, the backend is up — ensure you have pulled latest infra-TAK and restarted the console (sudo systemctl restart takwerx-console), then redeploy.")
-            plog("  Otherwise wait and open the CloudTAK URL manually once it responds.")
-            cloudtak_deploy_status.update({'running': False, 'error': True})
-            return
-
-        # Settling: require multiple consecutive OK responses so we don't declare done while the app is still warming up.
-        settle_wait = 105  # ~1m45s before first check — backend often needs extra time on second/fresh deploy
-        needed_ok = 3
-        check_interval = 15
-        plog(f"  Waiting {settle_wait}s then checking backend {needed_ok} times ({check_interval}s apart)...")
-        time.sleep(settle_wait)
-        ok_count = 0
-        for round_ in range(5):
-            code_again = _check_url('http://127.0.0.1:5000/api/connections', 'api/connections')
-            if code_again in (200, 401, 403, 404):
-                ok_count += 1
-                plog(f"  Check {ok_count}/{needed_ok} OK")
-                if ok_count >= needed_ok:
-                    plog("✓ Backend settled — ready for traffic")
-                    break
-            else:
-                ok_count = 0
-                if round_ < 4:
-                    plog("  Backend not ready, waiting 20s before retry...")
-                    time.sleep(20)
-            if ok_count < needed_ok and round_ < 4:
-                time.sleep(check_interval)
-        if ok_count < needed_ok:
-            plog("  Backend not fully stable — if the map stays on 'Loading CloudTAK', wait a minute and try a hard refresh (Ctrl+Shift+R / Cmd+Shift+R).")
-
-        # Step 7: Update Caddyfile
-        plog("")
-        plog("━━━ Step 7/7: Updating Caddy ━━━")
-        if domain:
-            generate_caddyfile(settings)
-            r = subprocess.run('systemctl reload caddy 2>&1', shell=True, capture_output=True, text=True, timeout=15)
-            if r.returncode == 0:
-                plog(f"✓ Caddy updated — map.{domain} and tiles.map.{domain} live")
-            else:
-                plog(f"⚠ Caddy reload: {r.stdout.strip()[:100]}")
+            # Caddy is already wired (Step 5 did it before this wait), so the public URL will
+            # work the instant Node finishes its first-boot migration — even if that's after
+            # we exit. Don't fail the deploy: the operator can hit the URL and it'll come up.
+            plog("")
+            plog(f"⚠ CloudTAK API did not respond within {max_wait_sec}s — but containers are running.")
+            plog("  Postgres + Drizzle migrations on first boot can take 25+ min on slow VPS.")
+            plog("  Caddy is already configured. The site will work as soon as Node finishes warming up.")
+            plog("  Watch progress: docker logs -f cloudtak-api-1")
+            if domain:
+                plog(f"  Try: https://map.{domain}/ in a few minutes (hard-refresh: Cmd/Ctrl+Shift+R)")
+            # Fall through — do not return, do not mark error. Step 7 will reconfirm Caddy.
         else:
-            plog("  No domain configured — skipping Caddy (access via port 5000)")
+            plog("✓ CloudTAK API responded — proceeding to Caddy confirmation")
+
+        # Step 7: Re-confirm Caddy (it was already updated earlier; this is a safety net).
+        # Wrapped in its own try/except — a Caddyfile error must never flip error:True
+        # on an otherwise successful deploy (CloudTAK containers are already running).
+        plog("")
+        plog("━━━ Step 7/7: Confirming Caddy ━━━")
+        try:
+            if domain:
+                generate_caddyfile(settings)
+                r = subprocess.run('systemctl reload caddy 2>&1', shell=True, capture_output=True, text=True, timeout=30)
+                if r.returncode == 0:
+                    plog(f"✓ Caddy confirmed — map.{domain} and tiles.map.{domain} live")
+                else:
+                    plog(f"⚠ Caddy reload: {r.stdout.strip()[:100]}")
+            else:
+                plog("  No domain configured — skipping Caddy (access via port 5000)")
+        except Exception as _caddy_e:
+            plog(f"⚠ Caddy confirm skipped: {_caddy_e} (CloudTAK is still running)")
 
         plog("")
         plog("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        if api_ready:
+            ready_emoji = "🎉"
+            ready_verb = "deployed"
+        else:
+            ready_emoji = "⏳"
+            ready_verb = "deployed (still warming up — first-boot migrations in progress)"
         if domain:
-            plog(f"🎉 CloudTAK deployed! Open https://map.{domain} in your browser")
+            plog(f"{ready_emoji} CloudTAK {ready_verb}! Open https://map.{domain} in your browser")
             plog(f"   Tiles: https://tiles.map.{domain}")
             plog(f"   Video: https://video.{domain} (via standalone MediaMTX)")
         else:
             server_ip = settings.get('server_ip', 'your-server-ip')
-            plog(f"🎉 CloudTAK deployed! Open http://{server_ip}:5000 in your browser")
+            plog(f"{ready_emoji} CloudTAK {ready_verb}! Open http://{server_ip}:5000 in your browser")
         plog(f"   Log in and go to Admin → Connections to configure your TAK Server")
         plog("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        plog("Deploy finished — CloudTAK is running and ready.")
-        cfg['deployed'] = True
-        settings['cloudtak_deployment'] = _normalize_cloudtak_deployment_config(cfg)
-        save_settings(settings)
+        if api_ready:
+            plog("Deploy finished — CloudTAK is running and ready.")
+        else:
+            plog("Deploy finished — containers up. Node app may still be running first-boot migrations.")
+            plog("  Watch progress: docker logs -f cloudtak-api-1")
+            plog("  Once you see 'ok - http://localhost:5000' the URL above will work.")
+        # cfg['deployed']=True already saved in early-Caddy step; keep settings consistent.
         _update_boot_stagger_service()
         cloudtak_deploy_status.update({'running': False, 'complete': True, 'error': False})
 
@@ -15520,10 +15703,6 @@ def run_cloudtak_update():
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
         plog("✓ Containers rebuilt and restarted")
-        if not is_remote:
-            time.sleep(5)
-            _cloudtak_fix_nginx_user()
-            plog("  Nginx user directive patched, workers reloaded")
         plog("")
         plog(f"✓ CloudTAK updated to {release_tag}")
         plog("Update finished — CloudTAK is running.")
@@ -18412,6 +18591,25 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     </div>
     <div id="gd-vacuum-output" style="display:none;margin-top:14px;padding:12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);white-space:pre-wrap;max-height:200px;overflow-y:auto"></div>
     <div id="gd-vacuum-msg" style="margin-top:8px;font-size:13px"></div>
+    {% if autovacuum_last %}<div style="margin-top:10px;font-size:11px;color:var(--text-dim)">Auto-VACUUM last run: <span style="color:var(--cyan)">{{ autovacuum_last }}</span></div>{% endif %}
+    </div>
+  </div>
+  {% endif %}
+
+  {% if ak_tasklog_installed %}
+  <div class="card">
+    <div class="gd-collapse-header" onclick="gdSectionToggle(this)"><span style="margin:0">Database maintenance (Authentik)</span><span class="gd-collapse-toggle">&#9662;</span></div>
+    <div class="gd-collapse-body">
+    <p style="font-size:12px;color:var(--text-secondary);line-height:1.5;margin-bottom:12px">Authentik writes a record to <code>authentik_tasks_task</code> and <code>authentik_tasks_tasklog</code> on every background task. These tables are never automatically purged — after ~1 month of normal operation they can grow to 500–900 MB (88%+ of the Authentik DB), causing autovacuum lag and background writer CPU spikes. Guard Dog runs a weekly cleanup (Sunday 03:00) that deletes rows older than 30 days and runs <code>VACUUM ANALYZE</code>.</p>
+    <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap">
+      <div style="font-size:12px;color:var(--text-dim)">Schedule: <span style="color:var(--cyan)">Weekly — Sunday 03:00</span></div>
+      {% if ak_tasklog_last %}
+      <div style="font-size:12px;color:var(--text-dim)">Last run: <span style="color:var(--green)">{{ ak_tasklog_last }}</span></div>
+      {% else %}
+      <div style="font-size:12px;color:var(--text-dim)">Last run: <span style="color:var(--text-dim)">Not yet run</span></div>
+      {% endif %}
+    </div>
+    <div style="margin-top:12px;font-size:11px;color:var(--text-dim)">Log: <code>/var/log/takguard/authentik-tasklog-purge.log</code></div>
     </div>
   </div>
   {% endif %}
@@ -18441,6 +18639,22 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     <div style="display:flex;gap:10px;justify-content:flex-end"><button class="btn btn-ghost" onclick="document.getElementById('gd-uninstall-modal').classList.remove('open')">Cancel</button><button class="btn" style="background:var(--red);color:#fff" onclick="gdUninstall()">Uninstall</button></div>
     <div id="gd-uninstall-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
   </div></div>
+  <div class="card">
+    <div class="card-title">Console Rollback</div>
+    {% if settings.get('console_rollback', {}).get('available') %}
+    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:16px">A snapshot was taken before the last update. You can roll back the console to the previous version if the update caused issues.</p>
+    <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:12px">
+      <div>
+        <div style="font-size:13px;font-weight:600;color:var(--yellow)">↩ {{ settings.get('console_rollback', {}).get('tag', '') }}</div>
+        <div style="font-size:11px;color:var(--text-dim);margin-top:2px">Snapshot taken {{ settings.get('console_rollback', {}).get('snapshot_at', '') }} before last update</div>
+      </div>
+      <button onclick="doConsoleRollback()" style="padding:7px 16px;background:rgba(234,179,8,0.1);color:var(--yellow);border:1px solid rgba(234,179,8,0.3);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:12px;cursor:pointer">↩ Roll Back to {{ settings.get('console_rollback', {}).get('tag', '') }}</button>
+    </div>
+    {% else %}
+    <p style="font-size:13px;color:var(--text-dim)">No previous version available — fresh install or settings cleared.</p>
+    {% endif %}
+  </div>
+
   {% else %}
   <div class="card"><div class="card-title">Deploy Guard Dog</div>
     <p style="font-size:13px;color:var(--text-secondary);margin-bottom:16px">Guard Dog usually installs automatically when you deploy TAK Server. If you skipped that or need to reinstall, use this. Installs monitors (port 8089, processes, PostgreSQL, CoT DB size, OOM, disk, network, certificate expiry) and a health endpoint. Alert email is optional — set it in Notifications above to receive alerts (or add it later).</p>
@@ -18558,7 +18772,7 @@ Bans IPs via UFW and sends Guard Dog email alerts.
 <span style="font-size:12px;color:var(--text-dim);font-family:\'JetBrains Mono\',monospace">Enable</span>
 <div class="toggle-wrap" style="position:relative;width:40px;height:22px">
 <input type="checkbox" id="recidive-toggle" onchange="toggleRecidiveJail()" style="opacity:0;width:0;height:0;position:absolute">
-<span id="recidive-toggle-track" onclick="document.getElementById(\'recidive-toggle\').click()" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
+<span id="recidive-toggle-track" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
 <span id="recidive-toggle-thumb" style="position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform .2s;pointer-events:none"></span>
 </div>
 </label>
@@ -18617,7 +18831,7 @@ Bans IPs via UFW and sends Guard Dog email alerts.
 <span style="font-size:12px;color:var(--text-dim);font-family:\'JetBrains Mono\',monospace">Enable</span>
 <div class="toggle-wrap" style="position:relative;width:40px;height:22px">
 <input type="checkbox" id="auth-toggle" onchange="toggleAuthentikJail()" style="opacity:0;width:0;height:0;position:absolute">
-<span id="auth-toggle-track" onclick="document.getElementById(\'auth-toggle\').click()" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
+<span id="auth-toggle-track" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
 <span id="auth-toggle-thumb" style="position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform .2s;pointer-events:none"></span>
 </div>
 </label>
@@ -18699,7 +18913,7 @@ Bans IPs via UFW and sends Guard Dog email alerts.
 <span style="font-size:12px;color:var(--text-dim);font-family:\'JetBrains Mono\',monospace">Enable</span>
 <div class="toggle-wrap" style="position:relative;width:40px;height:22px">
 <input type="checkbox" id="ssh-toggle" onchange="toggleSshJail()" style="opacity:0;width:0;height:0;position:absolute">
-<span id="ssh-toggle-track" onclick="document.getElementById(\'ssh-toggle\').click()" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
+<span id="ssh-toggle-track" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
 <span id="ssh-toggle-thumb" style="position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform .2s;pointer-events:none"></span>
 </div>
 </label>
@@ -18776,7 +18990,7 @@ Bans IPs via UFW and sends Guard Dog email alerts.
 <span style="font-size:12px;color:var(--text-dim);font-family:\'JetBrains Mono\',monospace">Enable</span>
 <div class="toggle-wrap" style="position:relative;width:40px;height:22px">
 <input type="checkbox" id="mediamtx-toggle" onchange="toggleMtxJail()" style="opacity:0;width:0;height:0;position:absolute">
-<span id="mediamtx-toggle-track" onclick="document.getElementById(\'mediamtx-toggle\').click()" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
+<span id="mediamtx-toggle-track" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
 <span id="mediamtx-toggle-thumb" style="position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform .2s;pointer-events:none"></span>
 </div>
 </label>
@@ -18847,7 +19061,7 @@ Bans IPs via UFW and sends Guard Dog email alerts.
 <span style="font-size:12px;color:var(--text-dim);font-family:\'JetBrains Mono\',monospace">Enable</span>
 <div class="toggle-wrap" style="position:relative;width:40px;height:22px">
 <input type="checkbox" id="tak-toggle" onchange="toggleTakJail()" style="opacity:0;width:0;height:0;position:absolute">
-<span id="tak-toggle-track" onclick="document.getElementById(\'tak-toggle\').click()" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
+<span id="tak-toggle-track" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
 <span id="tak-toggle-thumb" style="position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform .2s;pointer-events:none"></span>
 </div>
 </label>
@@ -21737,11 +21951,11 @@ window.pollLog = function(redeployBtn) {
           if (dyn) dyn.textContent = (dyn.textContent || "") + msg;
           if (stat) stat.textContent = (stat.textContent || "") + msg;
         }
-        if (window.cloudtakPollFails >= 10) {
-          clearInterval(window.logInterval);
-          window.logInterval = null;
-          if (redeployBtn) redeployBtn.disabled = false;
-          var failMsg = "\n\nRequest failed: " + (err && err.message ? err.message : String(err)) + " Deploy may still be running on the server \u2014 refresh the page to check.";
+        // Do NOT clear the interval on transient failures — the deploy can take 30 min
+        // and Flask may be briefly under load. Keep retrying; we'll hear back when the
+        // server recovers. Only show the "still trying" note after prolonged failures.
+        if (window.cloudtakPollFails === 30) {
+          var failMsg = "\n[Still trying to reach server — deploy may still be running...]";
           if (dyn) dyn.textContent = (dyn.textContent || "") + failMsg;
           if (stat) stat.textContent = (stat.textContent || "") + failMsg;
         }
@@ -24126,6 +24340,7 @@ entries:
   postgresql:
     image: docker.io/library/postgres:16-alpine
     restart: unless-stopped
+    shm_size: 256m
     command: postgres -c max_connections=300 -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
@@ -28024,7 +28239,7 @@ Additional admins: Authentik → Groups → authentik Admins → Users.
       <span style="font-size:12px;color:var(--text-dim);font-family:\'JetBrains Mono\',monospace">Enable</span>
       <div class="toggle-wrap" style="position:relative;width:40px;height:22px">
         <input type="checkbox" id="rep-toggle" onchange="toggleReputation()" style="opacity:0;width:0;height:0;position:absolute">
-        <span id="rep-toggle-track" onclick="document.getElementById(\'rep-toggle\').click()" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
+        <span id="rep-toggle-track" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
         <span id="rep-toggle-thumb" style="position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform .2s;pointer-events:none"></span>
       </div>
     </label>
@@ -31920,14 +32135,24 @@ def _tak_snapshot(label, plog=None):
         'size_mb':    0,
     }
 
-    # 1. TAK version
+    # 1. TAK version — try dpkg (multiple package names) then rpm
     try:
-        r = subprocess.run(['dpkg', '-l', 'takserver'], capture_output=True, text=True, timeout=10)
-        for line in r.stdout.splitlines():
-            if line.startswith('ii') and 'takserver' in line:
-                parts = line.split()
-                meta['tak_version'] = parts[2] if len(parts) > 2 else None
+        for _pkg in ('takserver', 'takserver-core', 'takserver-database'):
+            _r = subprocess.run(
+                f"dpkg -s {_pkg} 2>/dev/null | grep ^Version:",
+                shell=True, capture_output=True, text=True, timeout=5)
+            if _r.returncode == 0 and _r.stdout.strip():
+                meta['tak_version'] = _r.stdout.strip().replace('Version:', '').strip()
                 break
+        if meta['tak_version'] is None:
+            _r = subprocess.run("rpm -q takserver 2>/dev/null", shell=True, capture_output=True, text=True, timeout=5)
+            if _r.returncode == 0 and _r.stdout.strip():
+                _ver = _r.stdout.strip()
+                if _ver.startswith('takserver-'):
+                    _ver = _ver.split('-', 1)[1]
+                _ver = _ver.replace('.noarch', '')
+                if _ver:
+                    meta['tak_version'] = _ver
     except Exception as e:
         plog(f"  snapshot: version probe failed: {e}")
 
@@ -31964,21 +32189,50 @@ def _tak_snapshot(label, plog=None):
         except Exception as e:
             plog(f"  snapshot: takserver.default copy failed: {e}")
 
-    # 4. PostgreSQL cot dump (native host postgres — not a container)
+    # 4. PostgreSQL cot dump
+    # In a two-server deployment the database lives on Server One — stream via SSH.
+    # In a single-server deployment it runs locally as the postgres OS user.
     pg_dump_path = os.path.join(snap_path, 'cot.pgdump')
     plog("  snapshot: pg_dump starting — cot database (may take 30–90s for large databases)…")
     try:
-        with open(pg_dump_path, 'wb') as _f:
-            r2 = subprocess.run(
-                'sudo -u postgres pg_dump -Fc cot',
-                shell=True, stdout=_f, stderr=subprocess.PIPE, timeout=300
-            )
-        if r2.returncode == 0 and os.path.getsize(pg_dump_path) > 0:
-            plog(f"  snapshot: cot pg_dump written ({os.path.getsize(pg_dump_path) // 1024} KB)")
+        _snap_settings = load_settings()
+        _snap_tak_cfg = _get_tak_deployment_config(_snap_settings)
+        _snap_two_server = _snap_tak_cfg.get('mode') == 'two_server'
+        _snap_s1 = _snap_tak_cfg.get('server_one', {})
+        if _snap_two_server and _snap_s1.get('host'):
+            plog("  snapshot: two-server mode — streaming pg_dump from Server One via SSH")
+            _ssh_dump_cmd = 'sudo -u postgres pg_dump -Fc cot'
+            _host = (_snap_s1.get('host') or '').strip()
+            _user = (_snap_s1.get('ssh_user') or 'root').strip() or 'root'
+            _port = int(_snap_s1.get('ssh_port') or 22)
+            _key  = (_snap_s1.get('ssh_key_path') or '').strip() or None
+            _ssh_parts = [
+                'ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'BatchMode=yes',
+                '-p', str(_port),
+            ]
+            if _key:
+                _ssh_parts += ['-i', _key]
+            _ssh_parts += [f'{_user}@{_host}', _ssh_dump_cmd]
+            with open(pg_dump_path, 'wb') as _f:
+                r2 = subprocess.run(_ssh_parts, stdout=_f, stderr=subprocess.PIPE, timeout=300)
+            if r2.returncode == 0 and os.path.getsize(pg_dump_path) > 0:
+                plog(f"  snapshot: cot pg_dump (remote) written ({os.path.getsize(pg_dump_path) // 1024} KB)")
+            else:
+                plog(f"  snapshot: remote pg_dump failed: {(r2.stderr or b'').decode()[:200]}")
+                try: os.remove(pg_dump_path)
+                except Exception: pass
         else:
-            plog(f"  snapshot: pg_dump failed: {(r2.stderr or b'').decode()[:200]}")
-            try: os.remove(pg_dump_path)
-            except Exception: pass
+            with open(pg_dump_path, 'wb') as _f:
+                r2 = subprocess.run(
+                    'sudo -u postgres pg_dump -Fc cot',
+                    shell=True, stdout=_f, stderr=subprocess.PIPE, timeout=300
+                )
+            if r2.returncode == 0 and os.path.getsize(pg_dump_path) > 0:
+                plog(f"  snapshot: cot pg_dump written ({os.path.getsize(pg_dump_path) // 1024} KB)")
+            else:
+                plog(f"  snapshot: pg_dump failed: {(r2.stderr or b'').decode()[:200]}")
+                try: os.remove(pg_dump_path)
+                except Exception: pass
     except Exception as e:
         plog(f"  snapshot: pg_dump exception: {e}")
 
@@ -32109,32 +32363,60 @@ def _tak_rollback(label, plog=None):
             plog(f"  rollback: certs restore failed: {e}")
 
     # 6. pg_restore
-    pg_container = 'takserver-db'
+    # In two-server mode stream the dump to Server One and restore there.
+    # In single-server mode restore into the local takserver-db container.
     plog("  rollback: restoring PostgreSQL cot database…")
     try:
-        r = subprocess.run(
-            f'docker ps -q --filter name={pg_container}',
-            shell=True, capture_output=True, text=True, timeout=10
-        )
-        if (r.stdout or '').strip():
-            r2 = subprocess.run(
-                f'docker exec -i {pg_container} pg_restore -U postgres --clean -d cot',
-                shell=True,
-                stdin=open(pg_dump_path, 'rb'),
-                capture_output=True,
-                timeout=300
-            )
-            if r2.returncode == 0:
-                plog("  rollback: pg_restore successful")
-            else:
-                stderr = (r2.stderr or b'').decode()[:400]
-                # pg_restore may emit warnings but still succeed
-                if r2.returncode in (0, 1):
-                    plog(f"  rollback: pg_restore warnings (non-fatal): {stderr[:200]}")
+        _rb_settings = load_settings()
+        _rb_tak_cfg  = _get_tak_deployment_config(_rb_settings)
+        _rb_two_server = _rb_tak_cfg.get('mode') == 'two_server'
+        _rb_s1 = _rb_tak_cfg.get('server_one', {})
+        if _rb_two_server and _rb_s1.get('host'):
+            plog("  rollback: two-server mode — streaming pg_restore to Server One via SSH")
+            _rb_host = (_rb_s1.get('host') or '').strip()
+            _rb_user = (_rb_s1.get('ssh_user') or 'root').strip() or 'root'
+            _rb_port = int(_rb_s1.get('ssh_port') or 22)
+            _rb_key  = (_rb_s1.get('ssh_key_path') or '').strip() or None
+            _rb_ssh  = ['ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'BatchMode=yes',
+                        '-p', str(_rb_port)]
+            if _rb_key:
+                _rb_ssh += ['-i', _rb_key]
+            _rb_remote_cmd = 'sudo -u postgres pg_restore --clean -d cot'
+            _rb_ssh += [f'{_rb_user}@{_rb_host}', _rb_remote_cmd]
+            with open(pg_dump_path, 'rb') as _f:
+                r2 = subprocess.run(_rb_ssh, stdin=_f, capture_output=True, timeout=300)
+            if r2.returncode in (0, 1):
+                stderr = (r2.stderr or b'').decode()[:200]
+                if stderr:
+                    plog(f"  rollback: pg_restore (remote) warnings (non-fatal): {stderr}")
                 else:
-                    plog(f"  rollback: pg_restore failed (exit {r2.returncode}): {stderr[:200]}")
+                    plog("  rollback: pg_restore (remote) successful")
+            else:
+                plog(f"  rollback: remote pg_restore failed (exit {r2.returncode}): {(r2.stderr or b'').decode()[:200]}")
         else:
-            plog(f"  rollback: {pg_container} not running — skipping pg_restore")
+            pg_container = 'takserver-db'
+            r = subprocess.run(
+                f'docker ps -q --filter name={pg_container}',
+                shell=True, capture_output=True, text=True, timeout=10
+            )
+            if (r.stdout or '').strip():
+                r2 = subprocess.run(
+                    f'docker exec -i {pg_container} pg_restore -U postgres --clean -d cot',
+                    shell=True,
+                    stdin=open(pg_dump_path, 'rb'),
+                    capture_output=True,
+                    timeout=300
+                )
+                if r2.returncode in (0, 1):
+                    stderr = (r2.stderr or b'').decode()[:400]
+                    if stderr:
+                        plog(f"  rollback: pg_restore warnings (non-fatal): {stderr[:200]}")
+                    else:
+                        plog("  rollback: pg_restore successful")
+                else:
+                    plog(f"  rollback: pg_restore failed (exit {r2.returncode}): {(r2.stderr or b'').decode()[:200]}")
+            else:
+                plog(f"  rollback: {pg_container} not running — skipping pg_restore")
     except Exception as e:
         plog(f"  rollback: pg_restore exception: {e}")
 
@@ -32383,6 +32665,124 @@ def takserver_snapshot_download_api(label):
             'Content-Type': 'application/gzip',
         }
     )
+
+
+@app.route('/api/takserver/snapshot/upload', methods=['POST'])
+@login_required
+def takserver_snapshot_upload_api():
+    """Accept a snapshot .tar.gz, validate its structure, extract to SNAPSHOT_DIR, and register it."""
+    import shutil as _shutil
+    import tarfile as _tarfile
+
+    uploaded = request.files.get('file')
+    if not uploaded or not uploaded.filename:
+        return jsonify({'ok': False, 'error': 'No file provided'}), 400
+
+    filename = uploaded.filename
+    if not filename.endswith('.tar.gz'):
+        return jsonify({'ok': False, 'error': 'File must be a .tar.gz archive'}), 400
+
+    # Derive label from filename (strip .tar.gz)
+    raw_label = filename[:-7]
+    # Sanitise — only allow chars valid in a directory name
+    import re as _re_ul
+    safe_label = _re_ul.sub(r'[^A-Za-z0-9._-]', '_', raw_label)
+    if not safe_label:
+        safe_label = 'uploaded'
+
+    # Ensure the label doesn't collide; append a suffix if needed
+    dest_path = os.path.join(SNAPSHOT_DIR, safe_label)
+    if os.path.exists(dest_path):
+        import time as _t_ul
+        safe_label = safe_label + '_' + str(int(_t_ul.time()))[-6:]
+        dest_path = os.path.join(SNAPSHOT_DIR, safe_label)
+
+    tmp_path = dest_path + '.tmp.tar.gz'
+    try:
+        os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+        uploaded.save(tmp_path)
+
+        # Validate: must be a valid tar.gz and contain at least CoreConfig.xml or cot.pgdump
+        try:
+            with _tarfile.open(tmp_path, 'r:gz') as tf:
+                names = tf.getnames()
+        except Exception as e:
+            return jsonify({'ok': False, 'error': f'Invalid tar.gz archive: {e}'}), 400
+
+        has_core   = any('CoreConfig.xml'  in n for n in names)
+        has_pgdump = any('cot.pgdump'      in n for n in names)
+        if not has_core and not has_pgdump:
+            return jsonify({'ok': False, 'error': 'Archive does not appear to be a TAK Server snapshot (missing CoreConfig.xml and cot.pgdump)'}), 400
+
+        # Extract — honour the top-level directory inside the archive (tar -C SNAPSHOT_DIR)
+        result = subprocess.run(
+            ['tar', '-xzf', tmp_path, '-C', SNAPSHOT_DIR],
+            capture_output=True, timeout=120
+        )
+        if result.returncode != 0:
+            return jsonify({'ok': False, 'error': f'Extraction failed: {(result.stderr or b"").decode()[:200]}'}), 500
+
+        # The archive may have a different top-level name than safe_label; find it
+        # (tar extracts the directory that was originally tarred)
+        extracted_label = safe_label
+        for n in names:
+            parts = n.split('/')
+            if parts[0]:
+                extracted_label = parts[0]
+                break
+        extracted_path = os.path.join(SNAPSHOT_DIR, extracted_label)
+
+        # Compute size and build metadata
+        total = 0
+        for dirpath, _, filenames in os.walk(extracted_path):
+            for fn in filenames:
+                try: total += os.path.getsize(os.path.join(dirpath, fn))
+                except Exception: pass
+        size_mb = round(total / (1024 * 1024), 1)
+
+        # Probe installed TAK version (dpkg then rpm) for the upload metadata
+        _upload_ver = None
+        try:
+            for _pkg in ('takserver', 'takserver-core', 'takserver-database'):
+                _r = subprocess.run(
+                    f"dpkg -s {_pkg} 2>/dev/null | grep ^Version:",
+                    shell=True, capture_output=True, text=True, timeout=5)
+                if _r.returncode == 0 and _r.stdout.strip():
+                    _upload_ver = _r.stdout.strip().replace('Version:', '').strip()
+                    break
+            if _upload_ver is None:
+                _r = subprocess.run("rpm -q takserver 2>/dev/null", shell=True, capture_output=True, text=True, timeout=5)
+                if _r.returncode == 0 and _r.stdout.strip():
+                    _ver = _r.stdout.strip()
+                    if _ver.startswith('takserver-'):
+                        _ver = _ver.split('-', 1)[1]
+                    _ver = _ver.replace('.noarch', '')
+                    if _ver:
+                        _upload_ver = _ver
+        except Exception:
+            pass
+
+        meta = {
+            'label':      extracted_label,
+            'taken_at':   datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'source':     'uploaded',
+            'tak_version': _upload_ver,
+            'size_mb':    size_mb,
+        }
+
+        s = load_settings()
+        snaps = [sn for sn in (s.get('tak_snapshots') or []) if sn.get('label') != extracted_label]
+        snaps.append(meta)
+        snaps.sort(key=lambda x: x.get('taken_at', ''), reverse=True)
+        s['tak_snapshots'] = snaps[:50]
+        save_settings(s)
+
+        return jsonify({'ok': True, 'label': extracted_label, 'size_mb': size_mb})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:300]}), 500
+    finally:
+        try: os.remove(tmp_path)
+        except Exception: pass
 
 
 @app.route('/api/takserver/snapshot/<label>', methods=['DELETE'])
@@ -34392,6 +34792,21 @@ async function doApplySshPort(){
         else{msg.style.color='var(--red)';msg.textContent=d.error||'Failed';}
     }catch(e){msg.style.color='var(--red)';msg.textContent=e.message||'Request failed';}
 }
+async function doConsoleRollback(){
+    if(!confirm('Roll back console to the previous version?\\n\\nThe console will restart. You may see 502 briefly.'))return;
+    var btn=document.querySelector('[onclick="doConsoleRollback()"]');
+    if(btn){btn.disabled=true;btn.textContent='Rolling back…';}
+    try{
+        var r=await fetch('/api/console/rollback',{method:'POST'});var d=await r.json();
+        if(d.ok){
+            if(btn)btn.textContent='✓ '+d.message;
+            setTimeout(function(){window.location.reload();},10000);
+        }else{
+            if(btn){btn.disabled=false;btn.textContent='↩ Roll Back';}
+            alert('Rollback failed: '+(d.error||'unknown error'));
+        }
+    }catch(e){if(btn){btn.disabled=false;btn.textContent='↩ Roll Back';}alert('Network error: '+e.message);}
+}
 </script></body></html>'''
 
 # === Console Template (installed services only) ===
@@ -34789,15 +35204,6 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div id="update-details" style="display:none;margin-top:12px;padding-top:12px;border-top:1px solid var(--border);font-size:11px;color:var(--text-dim);white-space:pre-wrap;max-height:200px;overflow-y:auto"></div>
 <div id="update-status" style="display:none;margin-top:8px;font-size:11px"></div>
 </div>
-{% if settings.get('console_rollback', {}).get('available') %}
-<div id="console-rollback-bar" style="background:rgba(234,179,8,0.08);border:1px solid rgba(234,179,8,0.25);border-radius:10px;padding:12px 16px;margin-bottom:16px;display:flex;align-items:center;justify-content:space-between">
-<div>
-  <div style="font-size:12px;font-weight:600;color:var(--yellow)">↩ Rollback available — {{ settings.get('console_rollback', {}).get('tag', '') }}</div>
-  <div style="font-size:11px;color:var(--text-dim);margin-top:2px">Snapshot taken {{ settings.get('console_rollback', {}).get('snapshot_at', '') }} before last update</div>
-</div>
-<button onclick="doConsoleRollback()" style="padding:6px 14px;background:rgba(234,179,8,0.1);color:var(--yellow);border:1px solid rgba(234,179,8,0.3);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">Roll Back</button>
-</div>
-{% endif %}
 <div id="kernel-patch-banner" style="display:none;background:linear-gradient(135deg,rgba(234,179,8,0.1),rgba(234,179,8,0.05));border:1px solid rgba(234,179,8,0.3);border-radius:12px;padding:14px 20px;margin-bottom:16px;font-family:'JetBrains Mono',monospace">
 <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
 <div><div style="font-size:13px;font-weight:600;color:var(--yellow)">&#9888; Kernel update available &mdash; patch now to fix CVE-2026-31431 (Copy Fail)</div>
@@ -35720,6 +36126,8 @@ body{display:flex;flex-direction:row;min-height:100vh}
   <div style="display:flex;gap:8px">
     <button onclick="takeSnapshot()" id="snap-now-btn" style="padding:8px 16px;background:rgba(6,182,212,0.1);color:var(--cyan);border:1px solid rgba(6,182,212,0.3);border-radius:8px;font-size:12px;font-family:JetBrains Mono,monospace;cursor:pointer">📸 Take Snapshot Now</button>
     <button id="snap-refresh-btn" onclick="loadSnapshots(true)" style="padding:8px 16px;background:transparent;color:var(--text-dim);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer;transition:opacity .2s">↻ Refresh</button>
+    <label id="snap-upload-label" style="padding:8px 16px;background:rgba(234,179,8,0.08);color:var(--yellow);border:1px solid rgba(234,179,8,0.3);border-radius:8px;font-size:12px;font-family:JetBrains Mono,monospace;cursor:pointer;user-select:none" title="Upload a previously downloaded .tar.gz snapshot to restore from it">⬆ Upload Snapshot<input type="file" id="snap-upload-input" accept=".tar.gz" style="display:none" onchange="uploadSnapshot(this)"></label>
+    <span id="snap-upload-msg" style="font-size:11px;color:var(--text-dim)"></span>
   </div>
 </div>
 <div id="snap-progress" style="display:none;font-family:JetBrains Mono,monospace;font-size:11px;color:var(--cyan);padding:8px 0;margin-bottom:12px"></div>
@@ -35738,7 +36146,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
     <span style="font-size:12px;color:var(--text-dim);font-family:\'JetBrains Mono\',monospace">Enable</span>
     <div style="position:relative;width:40px;height:22px">
       <input type="checkbox" id="sched-enabled" onchange="saveSchedule()" style="opacity:0;width:0;height:0;position:absolute">
-      <span id="sched-toggle-track" onclick="document.getElementById(\'sched-enabled\').click()" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
+      <span id="sched-toggle-track" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
       <span id="sched-toggle-thumb" style="position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform .2s;pointer-events:none"></span>
     </div>
   </label>
@@ -35901,6 +36309,72 @@ function deleteSnapshot(label){
       if(d.ok)loadSnapshots();
       else alert('Delete failed: '+(d.error||'unknown'));
     });
+}
+
+function uploadSnapshot(input){
+  var file=input&&input.files&&input.files[0];
+  var msg=document.getElementById('snap-upload-msg');
+  var lbl=document.getElementById('snap-upload-label');
+  if(!file){return;}
+  if(!file.name.endsWith('.tar.gz')){
+    if(msg){msg.style.color='var(--red)';msg.textContent='File must be a .tar.gz archive';}
+    input.value='';return;
+  }
+  function _fmtBytes(b){
+    if(b>=1073741824)return (b/1073741824).toFixed(1)+' GB';
+    if(b>=1048576)return (b/1048576).toFixed(1)+' MB';
+    if(b>=1024)return (b/1024).toFixed(0)+' KB';
+    return b+' B';
+  }
+  var totalSize=file.size;
+  // Build inline progress bar inside the msg span
+  if(msg){
+    msg.innerHTML='<span style="display:inline-flex;align-items:center;gap:8px;font-family:JetBrains Mono,monospace;font-size:11px;color:var(--yellow)">'
+      +'<span id="snap-ul-text">Uploading… 0%</span>'
+      +'<span style="display:inline-block;width:120px;height:6px;background:rgba(255,255,255,0.08);border-radius:3px;overflow:hidden;vertical-align:middle">'
+      +'<span id="snap-ul-bar" style="display:block;height:100%;width:0%;background:var(--cyan);border-radius:3px;transition:width .1s linear"></span>'
+      +'</span>'
+      +'<span id="snap-ul-bytes" style="color:var(--text-dim)">0 B / '+_fmtBytes(totalSize)+'</span>'
+      +'</span>';
+  }
+  if(lbl)lbl.style.opacity='0.5';
+  var fd=new FormData();
+  fd.append('file',file);
+  var xhr=new XMLHttpRequest();
+  xhr.open('POST','/api/takserver/snapshot/upload',true);
+  xhr.withCredentials=true;
+  xhr.upload.onprogress=function(e){
+    if(!e.lengthComputable)return;
+    var pct=Math.round(e.loaded/e.total*100);
+    var barEl=document.getElementById('snap-ul-bar');
+    var txtEl=document.getElementById('snap-ul-text');
+    var byteEl=document.getElementById('snap-ul-bytes');
+    if(barEl)barEl.style.width=pct+'%';
+    if(txtEl)txtEl.textContent='Uploading… '+pct+'%';
+    if(byteEl)byteEl.textContent=_fmtBytes(e.loaded)+' / '+_fmtBytes(e.total);
+  };
+  xhr.onload=function(){
+    if(lbl)lbl.style.opacity='1';
+    input.value='';
+    try{
+      var d=JSON.parse(xhr.responseText);
+      if(d.ok){
+        if(msg){msg.innerHTML='';msg.style.color='var(--green)';msg.textContent='✓ Uploaded ('+d.label+', '+d.size_mb+' MB)';}
+        loadSnapshots();
+        setTimeout(function(){if(msg)msg.textContent='';},8000);
+      }else{
+        if(msg){msg.innerHTML='';msg.style.color='var(--red)';msg.textContent='Upload failed: '+(d.error||'unknown');}
+      }
+    }catch(e){
+      if(msg){msg.innerHTML='';msg.style.color='var(--red)';msg.textContent='Server error (bad response)';}
+    }
+  };
+  xhr.onerror=function(){
+    if(lbl)lbl.style.opacity='1';
+    input.value='';
+    if(msg){msg.innerHTML='';msg.style.color='var(--red)';msg.textContent='Network error';}
+  };
+  xhr.send(fd);
 }
 
 function _applySchedState(enabled){
@@ -37073,6 +37547,15 @@ def _post_update_auto_deploy():
                                 if '/var/run/docker.sock' not in l
                             )
                             print("Post-update: Authentik — removed docker.sock from worker")
+                        # shm_size: 256m — postgres needs > 64 MB for VACUUM ANALYZE with parallel workers
+                        if 'shm_size:' not in _ak:
+                            import re as _re_shm
+                            _ak = _re_shm.sub(
+                                r'(\s+restart: unless-stopped\n)(\s+command: postgres)',
+                                r'\1    shm_size: 256m\n\2',
+                                _ak, count=1
+                            )
+                            print("Post-update: Authentik — added shm_size: 256m to postgresql service")
                         for _old, _new in (
                             ('command: server\n', 'cap_drop:\n      - ALL\n    security_opt:\n      - no-new-privileges:true\n    command: server\n'),
                         ):
