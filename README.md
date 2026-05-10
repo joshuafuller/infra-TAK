@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Latest release: v0.9.6-alpha** — See **[docs/RELEASE-v0.9.6-alpha.md](docs/RELEASE-v0.9.6-alpha.md)** for full details. Prior releases: [v0.9.5](docs/RELEASE-v0.9.5-alpha.md), [v0.9.4](docs/RELEASE-v0.9.4-alpha.md), [v0.9.3](docs/RELEASE-v0.9.3-alpha.md), [v0.9.2](docs/RELEASE-v0.9.2-alpha.md), [v0.9.1](docs/RELEASE-v0.9.1-alpha.md), [v0.9.0](docs/RELEASE-v0.9.0-alpha.md) — older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases).
+**Latest release: v0.9.7-alpha** — See **[docs/RELEASE-v0.9.7-alpha.md](docs/RELEASE-v0.9.7-alpha.md)** for full details. Prior releases: [v0.9.6](docs/RELEASE-v0.9.6-alpha.md), [v0.9.5](docs/RELEASE-v0.9.5-alpha.md), [v0.9.4](docs/RELEASE-v0.9.4-alpha.md), [v0.9.3](docs/RELEASE-v0.9.3-alpha.md), [v0.9.2](docs/RELEASE-v0.9.2-alpha.md), [v0.9.1](docs/RELEASE-v0.9.1-alpha.md), [v0.9.0](docs/RELEASE-v0.9.0-alpha.md) — older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases).
 
 **Something broken?** Wrong sidebar version, **Update Now** error, merge/rebase/tag-clobber messages, or you are not sure the VPS ever pulled the real repo → go to **[Universal recovery (SSH)](#universal-recovery-ssh)** and run the one block there. **Point people at that section**; it is the single source of truth.
 
@@ -299,6 +299,17 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v0.9.7-alpha — 2026-05-10
+
+**Headline: Hotfix — three bugs in v0.9.5/v0.9.6 Authentik Postgres cleanup left all servers still broken.**
+
+- **Fix: `shm_size` detection anchored to postgresql service block** — v0.9.6 checked `'shm_size:' not in whole_file` which false-positives when other services (server/worker) have their own `shm_size` values. Fix: scan only the postgresql service block by anchoring on `image: docker.io/library/postgres:16-alpine`. Also decoupled the docker inspect ShmSize check from compose content — now always checks the running container regardless of what the file says.
+- **Fix: DELETE SQL wrong column names** — Authentik 2026.x task table schema has `message_id` (PK) and `mtime` (timestamp), not `pk` and `finish_timestamp`. All three SQL locations fixed: `_authentik_tasklog_cleanup()`, the weekly Guard Dog timer script written to disk, and `docs/AUTHENTIK-TASK-BLOAT-FIX.md`.
+
+Full notes: [docs/RELEASE-v0.9.7-alpha.md](docs/RELEASE-v0.9.7-alpha.md).
+
+---
 
 ### v0.9.6-alpha — 2026-05-10
 
