@@ -14887,22 +14887,56 @@ services:
 """
 
 
-def _cloudtak_fix_nginx_user(container_name='cloudtak-api-1', timeout=10):
+def _cloudtak_fix_nginx_user(container_name='cloudtak-api-1', total_timeout=180, ssh_cfg=None):
     """Patch nginx.conf user directive from 'nginx' to 'root' and reload workers.
 
     The CloudTAK container image generates 'user nginx;' in nginx.conf via nginx.conf.js,
     but workers crash immediately with exit code 2 because /dev/stdout and /dev/stderr
     are not writable after dropping root privileges. Patching to 'user root;' and
-    reloading causes workers to spawn correctly. Called after every API container start.
+    reloading causes workers to spawn correctly.
+
+    The container takes a variable amount of time to write nginx.conf via the
+    entrypoint (nginx.conf.js generates it), so we poll until the file exists,
+    apply the patch, reload, and verify a worker process has spawned. If
+    `ssh_cfg` is provided, runs against a remote host via SSH; otherwise
+    operates against local Docker.
     """
-    try:
-        subprocess.run(
-            f'docker exec {container_name} sed -i "s/^user nginx;/user root;/" /etc/nginx/nginx.conf 2>/dev/null'
-            f' && docker exec {container_name} nginx -s reload 2>/dev/null',
-            shell=True, capture_output=True, text=True, timeout=timeout
-        )
-    except Exception:
-        pass
+    def _exec(cmd):
+        if ssh_cfg:
+            return _ssh_probe(ssh_cfg, cmd, timeout=20)
+        try:
+            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=20)
+            return (r.returncode == 0), (r.stdout or '') + (r.stderr or '')
+        except Exception as e:
+            return False, str(e)
+
+    deadline = time.time() + total_timeout
+    sleep_s = 2
+    patched = False
+    while time.time() < deadline:
+        ok, out = _exec(f'docker exec {container_name} test -f /etc/nginx/nginx.conf && echo READY')
+        if ok and 'READY' in (out or ''):
+            ok2, out2 = _exec(
+                f'docker exec {container_name} sh -c "grep -q \\"^user root;\\" /etc/nginx/nginx.conf || sed -i \\"s/^user nginx;/user root;/\\" /etc/nginx/nginx.conf"'
+            )
+            _exec(f'docker exec {container_name} nginx -s reload 2>/dev/null || true')
+            patched = True
+            break
+        time.sleep(sleep_s)
+    if not patched:
+        return False
+    worker_deadline = time.time() + 30
+    while time.time() < worker_deadline:
+        ok, out = _exec(f'docker exec {container_name} sh -c "ps -o pid,user,args -A 2>/dev/null | grep \\"nginx: worker\\" | grep -v grep | wc -l"')
+        try:
+            n = int((out or '').strip().splitlines()[-1].strip()) if (out or '').strip() else 0
+        except Exception:
+            n = 0
+        if n > 0:
+            return True
+        _exec(f'docker exec {container_name} nginx -s reload 2>/dev/null || true')
+        time.sleep(2)
+    return False
 
 
 def run_cloudtak_deploy(cfg=None):
@@ -15261,10 +15295,14 @@ def run_cloudtak_deploy(cfg=None):
             return
         plog("✓ Containers started")
         plog("✓ Restart complete.")
-        # Patch nginx user directive so workers can write to /dev/stdout with cap_drop: ALL
-        time.sleep(5)
-        _cloudtak_fix_nginx_user()
-        plog("  Nginx user directive patched, workers reloaded")
+        # Patch nginx user directive so workers can write to /dev/stdout with cap_drop: ALL.
+        # Polls until /etc/nginx/nginx.conf exists then verifies workers spawn (the
+        # entrypoint takes a variable amount of time to write nginx.conf).
+        nginx_ok = _cloudtak_fix_nginx_user()
+        if nginx_ok:
+            plog("  ✓ Nginx user directive patched and workers running")
+        else:
+            plog("  ⚠ Nginx user patch could not be verified — API may not respond until rerun")
 
         # Open port 5000 (and 5002 for tiles) so http://ip:5000 works when no domain or before Caddy is used
         for port in ['5000/tcp', '5002/tcp']:
@@ -15278,6 +15316,26 @@ def run_cloudtak_deploy(cfg=None):
 
         # CloudTAK nginx proxies /api to 127.0.0.1:5001 (Node app in same container). Do NOT
         # replace that with host:5001 or /api would hit TAKWERX Console and the app would stay on "Loading CloudTAK".
+
+        # Update Caddyfile NOW (before waiting for API) so the public URL is reachable
+        # the moment CloudTAK comes up. Persist deployed=True first so detect_modules()
+        # picks up cloudtak as installed even on retries.
+        try:
+            cfg['deployed'] = True
+            settings['cloudtak_deployment'] = _normalize_cloudtak_deployment_config(cfg)
+            save_settings(settings)
+        except Exception as _e:
+            plog(f"  ⚠ Could not persist deployment flag: {_e}")
+        if domain:
+            try:
+                generate_caddyfile(settings)
+                r_cd = subprocess.run('systemctl reload caddy 2>&1', shell=True, capture_output=True, text=True, timeout=15)
+                if r_cd.returncode == 0:
+                    plog(f"✓ Caddy updated early — map.{domain} routed (will work as soon as API responds)")
+                else:
+                    plog(f"⚠ Caddy reload: {r_cd.stdout.strip()[:100]}")
+            except Exception as _e:
+                plog(f"⚠ Caddy update skipped: {_e}")
 
         # Step 6: Wait for API to be ready (Node backend can take 10+ min after containers start on slow VPS)
         plog("")
@@ -15362,14 +15420,14 @@ def run_cloudtak_deploy(cfg=None):
         if ok_count < needed_ok:
             plog("  Backend not fully stable — if the map stays on 'Loading CloudTAK', wait a minute and try a hard refresh (Ctrl+Shift+R / Cmd+Shift+R).")
 
-        # Step 7: Update Caddyfile
+        # Step 7: Re-confirm Caddy (it was already updated earlier; this is a safety net)
         plog("")
-        plog("━━━ Step 7/7: Updating Caddy ━━━")
+        plog("━━━ Step 7/7: Confirming Caddy ━━━")
         if domain:
             generate_caddyfile(settings)
             r = subprocess.run('systemctl reload caddy 2>&1', shell=True, capture_output=True, text=True, timeout=15)
             if r.returncode == 0:
-                plog(f"✓ Caddy updated — map.{domain} and tiles.map.{domain} live")
+                plog(f"✓ Caddy confirmed — map.{domain} and tiles.map.{domain} live")
             else:
                 plog(f"⚠ Caddy reload: {r.stdout.strip()[:100]}")
         else:
@@ -15387,9 +15445,7 @@ def run_cloudtak_deploy(cfg=None):
         plog(f"   Log in and go to Admin → Connections to configure your TAK Server")
         plog("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         plog("Deploy finished — CloudTAK is running and ready.")
-        cfg['deployed'] = True
-        settings['cloudtak_deployment'] = _normalize_cloudtak_deployment_config(cfg)
-        save_settings(settings)
+        # cfg['deployed']=True already saved in early-Caddy step; keep settings consistent.
         _update_boot_stagger_service()
         cloudtak_deploy_status.update({'running': False, 'complete': True, 'error': False})
 
