@@ -14757,14 +14757,17 @@ def cloudtak_reset_server_config():
     # 1. Clear the server connection fields so /api/server returns status:unconfigured
     #    and the configure wizard shows again.
     #
-    # 2. DELETE the system_admin profile(s). CloudTAK's PATCH /server handler calls
+    # 2. TRUNCATE profile CASCADE. CloudTAK's PATCH /server handler calls
     #    profileControl.generate() which does a plain INSERT (not upsert). If the
-    #    admin user's profile row still exists from the previous config, the wizard
-    #    fails with "Key (username)=(...) already exists". Deleting only system_admin
-    #    profiles leaves regular user profiles/data intact.
+    #    admin user's profile row still exists, the wizard fails with
+    #    "Key (username)=(...) already exists". We use TRUNCATE CASCADE (not DELETE)
+    #    because multiple tables (profile_overlays, profile_config, etc.) have FK
+    #    references to profile.username — a plain DELETE hits FK violations.
+    #    Truncating all profiles is correct for a reset: all profile rows are tied to
+    #    the old TAK Server's user accounts which won't exist on the new server.
     sql_cmd = (
         "UPDATE server SET auth = '{}'::jsonb, url = '', api = '', webtak = '' WHERE id = 1;"
-        " DELETE FROM profile WHERE system_admin = true;"
+        " TRUNCATE profile CASCADE;"
     )
     psql_cmd = f"docker exec cloudtak-postgis-1 psql -U docker -d gis -c \"{sql_cmd}\" 2>&1"
     restart_cmd = "cd ~/CloudTAK && docker compose restart api 2>&1"
