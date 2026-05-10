@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Latest release: v0.9.5-alpha** — See **[docs/RELEASE-v0.9.5-alpha.md](docs/RELEASE-v0.9.5-alpha.md)** for full details. Prior releases: [v0.9.4](docs/RELEASE-v0.9.4-alpha.md), [v0.9.3](docs/RELEASE-v0.9.3-alpha.md), [v0.9.2](docs/RELEASE-v0.9.2-alpha.md), [v0.9.1](docs/RELEASE-v0.9.1-alpha.md), [v0.9.0](docs/RELEASE-v0.9.0-alpha.md) — older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases).
+**Latest release: v0.9.6-alpha** — See **[docs/RELEASE-v0.9.6-alpha.md](docs/RELEASE-v0.9.6-alpha.md)** for full details. Prior releases: [v0.9.5](docs/RELEASE-v0.9.5-alpha.md), [v0.9.4](docs/RELEASE-v0.9.4-alpha.md), [v0.9.3](docs/RELEASE-v0.9.3-alpha.md), [v0.9.2](docs/RELEASE-v0.9.2-alpha.md), [v0.9.1](docs/RELEASE-v0.9.1-alpha.md), [v0.9.0](docs/RELEASE-v0.9.0-alpha.md) — older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases).
 
 **Something broken?** Wrong sidebar version, **Update Now** error, merge/rebase/tag-clobber messages, or you are not sure the VPS ever pulled the real repo → go to **[Universal recovery (SSH)](#universal-recovery-ssh)** and run the one block there. **Point people at that section**; it is the single source of truth.
 
@@ -299,6 +299,17 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v0.9.6-alpha — 2026-05-10
+
+**Headline: Hotfix — Authentik Postgres `shm_size: 256m` was patched to compose file in v0.9.5 but the container was never recreated with it.**
+
+- **Fix: Authentik `shm_size` not applied to running container** — `_auto_harden_containers()` wrote `shm_size: 256m` to `~/authentik/docker-compose.yml` but only ran `--force-recreate worker server ldap` — `postgresql` was never in the list. All v0.9.5 installs had `ShmSize: 67108864` (64 MB) in `docker inspect` regardless of the compose file. Fix: the code now inspects the running container's `HostConfig.ShmSize` at update time; if it reads 64 MB it recreates `postgresql` first (with a 5 s settle), then `worker server ldap`. Fires automatically for all v0.9.5 operators.
+- **Fix: Authentik task log backlog cleared on "Update Now"** — New `_authentik_tasklog_cleanup()` runs on every update. If `authentik_tasks_tasklog` exceeds 100 MB it runs the same DELETE + `VACUUM ANALYZE` as the weekly Guard Dog timer, clearing the accumulated backlog immediately. No-op on subsequent runs once tables are small. Operators experiencing Authentik Postgres CPU spikes from bloated task tables no longer need to follow the manual runbook.
+
+Full notes: [docs/RELEASE-v0.9.6-alpha.md](docs/RELEASE-v0.9.6-alpha.md).
+
+---
 
 ### v0.9.5-alpha — 2026-05-10
 

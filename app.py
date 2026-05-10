@@ -307,7 +307,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.5-alpha"
+VERSION = "0.9.6-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -37548,6 +37548,7 @@ def _post_update_auto_deploy():
                             )
                             print("Post-update: Authentik — removed docker.sock from worker")
                         # shm_size: 256m — postgres needs > 64 MB for VACUUM ANALYZE with parallel workers
+                        _shm_added = False
                         if 'shm_size:' not in _ak:
                             import re as _re_shm
                             _ak = _re_shm.sub(
@@ -37555,6 +37556,7 @@ def _post_update_auto_deploy():
                                 r'\1    shm_size: 256m\n\2',
                                 _ak, count=1
                             )
+                            _shm_added = True
                             print("Post-update: Authentik — added shm_size: 256m to postgresql service")
                         for _old, _new in (
                             ('command: server\n', 'cap_drop:\n      - ALL\n    security_opt:\n      - no-new-privileges:true\n    command: server\n'),
@@ -37582,9 +37584,31 @@ def _post_update_auto_deploy():
                                     1
                                 )
                                 _ak = _ak[:_ldap_start] + _ldap_new + _ak[_ldap_end:]
+                        # Detect if the running postgresql container still has the old 64 MB shm_size
+                        # even though the compose file already has shm_size: 256m (v0.9.5 regression:
+                        # the file was patched but postgresql was never in the --force-recreate list).
+                        _shm_needs_pg_recreate = _shm_added
+                        if not _shm_needs_pg_recreate and 'shm_size: 256m' in _ak:
+                            _pg_insp = subprocess.run(
+                                ['docker', 'inspect', '--format', '{{.HostConfig.ShmSize}}', 'authentik-postgresql-1'],
+                                capture_output=True, text=True, timeout=10
+                            )
+                            if _pg_insp.returncode == 0 and _pg_insp.stdout.strip() == '67108864':
+                                _shm_needs_pg_recreate = True
+                                print("Post-update: Authentik postgresql ShmSize is still 64 MB — recreating to apply shm_size: 256m")
                         if _ak != _ak_orig:
                             with open(ak_compose, 'w') as _f:
                                 _f.write(_ak)
+                        if _shm_needs_pg_recreate:
+                            # postgresql must be recreated first so the new shm_size takes effect
+                            # before worker/server restart and reconnect to it
+                            subprocess.run(
+                                'cd ~/authentik && docker compose up -d --force-recreate postgresql 2>/dev/null',
+                                shell=True, capture_output=True, text=True, timeout=60
+                            )
+                            import time as _shm_t
+                            _shm_t.sleep(5)
+                        if _ak != _ak_orig:
                             print("Post-update: Authentik compose hardened — recreating worker/server/ldap")
                             subprocess.run(
                                 'cd ~/authentik && docker compose up -d --force-recreate worker server ldap 2>/dev/null',
@@ -37606,7 +37630,7 @@ def _post_update_auto_deploy():
                                         print(f"Post-update: WARNING {_svc_name} CapDrop={_cap!r} — hardening may not have applied")
                                 except Exception as _ie:
                                     print(f"Post-update: {_svc_name} inspect error: {_ie}")
-                        else:
+                        elif not _shm_needs_pg_recreate:
                             print("Post-update: Authentik compose already hardened — no changes needed")
                 except Exception as _e:
                     print(f"Post-update: Authentik hardening error (non-fatal): {_e}")
@@ -37907,6 +37931,68 @@ def _post_update_auto_deploy():
             _auto_authentik_ports()
             _auto_nodered()
             _auto_harden_containers()
+
+            def _authentik_tasklog_cleanup():
+                """One-time migration: purge bloated Authentik task log tables on update.
+
+                Authentik writes to authentik_tasks_task and authentik_tasks_tasklog on every
+                background task run and never purges them automatically (until the weekly
+                Guard Dog timer from v0.9.5). On installs older than ~1 month the tables can
+                reach 500-900 MB and cause sustained autovacuum checkpoint CPU spikes.
+
+                This runs on every Update Now but is effectively a no-op once the tables are
+                small — the DELETE matches nothing and returns instantly. The weekly timer
+                (takauthentiktasklogpurge.timer) keeps them clean going forward.
+                """
+                try:
+                    # Only run if Authentik postgres container is up
+                    _pg_up = subprocess.run(
+                        ['docker', 'inspect', '--format', '{{.State.Running}}', 'authentik-postgresql-1'],
+                        capture_output=True, text=True, timeout=10
+                    )
+                    if _pg_up.returncode != 0 or _pg_up.stdout.strip() != 'true':
+                        return
+                    # Check table size — skip if already small
+                    _size_r = subprocess.run(
+                        ['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik', '-t', '-A', '-c',
+                         "SELECT pg_total_relation_size('authentik_tasks_tasklog')"],
+                        capture_output=True, text=True, timeout=15
+                    )
+                    if _size_r.returncode != 0:
+                        return
+                    _tl_bytes = int(_size_r.stdout.strip() or '0')
+                    _threshold = 100 * 1024 * 1024  # 100 MB
+                    if _tl_bytes < _threshold:
+                        print(f"Post-update: Authentik task log {_tl_bytes // (1024*1024)} MB — no cleanup needed")
+                        return
+                    print(f"Post-update: Authentik task log {_tl_bytes // (1024*1024)} MB — purging records > 30 days")
+                    _del_sql = (
+                        "DELETE FROM authentik_tasks_tasklog "
+                        "WHERE task_id IN ("
+                        "  SELECT pk FROM authentik_tasks_task "
+                        "  WHERE finish_timestamp < NOW() - INTERVAL '30 days'"
+                        "); "
+                        "DELETE FROM authentik_tasks_task "
+                        "WHERE finish_timestamp < NOW() - INTERVAL '30 days';"
+                    )
+                    _del_r = subprocess.run(
+                        ['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik', '-c', _del_sql],
+                        capture_output=True, text=True, timeout=300
+                    )
+                    if _del_r.returncode != 0:
+                        print(f"Post-update: Authentik task log DELETE failed: {_del_r.stderr[:200]}")
+                        return
+                    print(f"Post-update: Authentik task log DELETE complete — running VACUUM ANALYZE")
+                    subprocess.run(
+                        ['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik', '-c',
+                         'VACUUM ANALYZE authentik_tasks_task, authentik_tasks_tasklog;'],
+                        capture_output=True, text=True, timeout=600
+                    )
+                    print("Post-update: Authentik task log VACUUM ANALYZE complete")
+                except Exception as _tl_e:
+                    print(f"Post-update: Authentik task log cleanup error (non-fatal): {_tl_e}")
+
+            _authentik_tasklog_cleanup()
 
             # MediaMTX RTSP Fail2ban jail — auto-install if mediamtx + fail2ban present
             try:
