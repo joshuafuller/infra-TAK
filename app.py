@@ -307,7 +307,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.9-alpha"
+VERSION = "0.9.10-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -37662,16 +37662,19 @@ def _post_update_auto_deploy():
                                     print(f"Post-update: {_svc_name} inspect error: {_ie}")
                         elif not _shm_needs_pg_recreate:
                             print("Post-update: Authentik compose already hardened — no changes needed")
-                        # Kill any UID-70 postgres processes not belonging to the current container.
-                        # Runs unconditionally — catches orphans left by this update's recreate AND
-                        # orphans from prior bad updates (e.g. v0.9.7 force-recreate with 10s timeout).
+                        # Kill any UID-70 postgres processes whose cgroup doesn't match ANY currently
+                        # running container — those are true orphans (the container that owned them
+                        # is gone). Critical: do NOT kill processes belonging to *other* running
+                        # postgres containers (e.g. cloudtak-postgis-1) — they share UID 70 with
+                        # authentik-postgresql-1 but live in their own container, and killing them
+                        # restarts CloudTAK on every update.
                         try:
-                            _cid_r = subprocess.run(
-                                ['docker', 'inspect', '--format', '{{.Id}}', 'authentik-postgresql-1'],
+                            _running_r = subprocess.run(
+                                ['docker', 'ps', '-q', '--no-trunc'],
                                 capture_output=True, text=True, timeout=10
                             )
-                            if _cid_r.returncode == 0 and _cid_r.stdout.strip():
-                                _cur_cid = _cid_r.stdout.strip()[:12]
+                            _running_ids = {c[:12] for c in _running_r.stdout.split() if c}
+                            if _running_ids:
                                 _all_pg_r = subprocess.run(
                                     "ps -eo uid,pid,comm | awk '$1==70 && $3~/postgres/ {print $2}'",
                                     shell=True, capture_output=True, text=True, timeout=5
@@ -37679,9 +37682,9 @@ def _post_update_auto_deploy():
                                 for _pid in _all_pg_r.stdout.split():
                                     try:
                                         _cg = open(f'/proc/{_pid}/cgroup').read()
-                                        if _cur_cid not in _cg:
+                                        if not any(_rid in _cg for _rid in _running_ids):
                                             subprocess.run(['kill', '-9', _pid], capture_output=True, timeout=5)
-                                            print(f"Post-update: killed orphaned postgres PID {_pid} (not in container {_cur_cid})")
+                                            print(f"Post-update: killed orphaned postgres PID {_pid} (cgroup matches no running container)")
                                     except Exception:
                                         pass
                         except Exception as _orp_e:
@@ -38087,13 +38090,16 @@ def _post_update_auto_deploy():
             # Final orphan postgres kill — _auto_authentik() runs run_authentik_deploy()
             # which recreates containers AGAIN after _auto_harden_containers() already ran,
             # potentially leaving fresh orphans that the first kill couldn't see.
+            # v0.9.10: kill only processes whose cgroup matches NO running container — never
+            # killed by previously broken "not in authentik-postgresql-1" check that took down
+            # cloudtak-postgis-1 processes on every update.
             try:
-                _final_cid_r = subprocess.run(
-                    ['docker', 'inspect', '--format', '{{.Id}}', 'authentik-postgresql-1'],
+                _final_running_r = subprocess.run(
+                    ['docker', 'ps', '-q', '--no-trunc'],
                     capture_output=True, text=True, timeout=10
                 )
-                if _final_cid_r.returncode == 0 and _final_cid_r.stdout.strip():
-                    _final_cur_cid = _final_cid_r.stdout.strip()[:12]
+                _final_running_ids = {c[:12] for c in _final_running_r.stdout.split() if c}
+                if _final_running_ids:
                     _final_pg_r = subprocess.run(
                         "ps -eo uid,pid,comm | awk '$1==70 && $3~/postgres/ {print $2}'",
                         shell=True, capture_output=True, text=True, timeout=5
@@ -38101,9 +38107,9 @@ def _post_update_auto_deploy():
                     for _final_pid in _final_pg_r.stdout.split():
                         try:
                             _final_cg = open(f'/proc/{_final_pid}/cgroup').read()
-                            if _final_cur_cid not in _final_cg:
+                            if not any(_rid in _final_cg for _rid in _final_running_ids):
                                 subprocess.run(['kill', '-9', _final_pid], capture_output=True, timeout=5)
-                                print(f"Post-update: final pass — killed orphaned postgres PID {_final_pid} (not in container {_final_cur_cid})")
+                                print(f"Post-update: final pass — killed orphaned postgres PID {_final_pid} (cgroup matches no running container)")
                         except Exception:
                             pass
             except Exception as _final_orp_e:

@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Latest release: v0.9.9-alpha** — See **[docs/RELEASE-v0.9.9-alpha.md](docs/RELEASE-v0.9.9-alpha.md)** for full details. Prior releases: [v0.9.8](docs/RELEASE-v0.9.8-alpha.md), [v0.9.7](docs/RELEASE-v0.9.7-alpha.md), [v0.9.6](docs/RELEASE-v0.9.6-alpha.md), [v0.9.5](docs/RELEASE-v0.9.5-alpha.md), [v0.9.4](docs/RELEASE-v0.9.4-alpha.md), [v0.9.3](docs/RELEASE-v0.9.3-alpha.md), [v0.9.2](docs/RELEASE-v0.9.2-alpha.md), [v0.9.1](docs/RELEASE-v0.9.1-alpha.md), [v0.9.0](docs/RELEASE-v0.9.0-alpha.md) — older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases).
+**Latest release: v0.9.10-alpha** — See **[docs/RELEASE-v0.9.10-alpha.md](docs/RELEASE-v0.9.10-alpha.md)** for full details. Prior releases: [v0.9.9](docs/RELEASE-v0.9.9-alpha.md), [v0.9.8](docs/RELEASE-v0.9.8-alpha.md), [v0.9.7](docs/RELEASE-v0.9.7-alpha.md), [v0.9.6](docs/RELEASE-v0.9.6-alpha.md), [v0.9.5](docs/RELEASE-v0.9.5-alpha.md), [v0.9.4](docs/RELEASE-v0.9.4-alpha.md), [v0.9.3](docs/RELEASE-v0.9.3-alpha.md), [v0.9.2](docs/RELEASE-v0.9.2-alpha.md), [v0.9.1](docs/RELEASE-v0.9.1-alpha.md), [v0.9.0](docs/RELEASE-v0.9.0-alpha.md) — older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases).
 
 **Something broken?** Wrong sidebar version, **Update Now** error, merge/rebase/tag-clobber messages, or you are not sure the VPS ever pulled the real repo → go to **[Universal recovery (SSH)](#universal-recovery-ssh)** and run the one block there. **Point people at that section**; it is the single source of truth.
 
@@ -299,6 +299,16 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v0.9.10-alpha — 2026-05-10
+
+**Headline: Critical hotfix — orphan-postgres killer was murdering CloudTAK PostGIS on every update.**
+
+- **Fix: cgroup check now compares against ALL running containers, not just `authentik-postgresql-1`** — v0.9.8/v0.9.9 used `kill if cgroup doesn't contain authentik-postgresql-1 ID`, which incorrectly classified `cloudtak-postgis-1` UID-70 processes as orphans and SIGKILLed them on every update. Verified on responder and tak-10. Fix: get the set of all running container IDs via `docker ps -q --no-trunc`, kill UID-70 postgres only when its cgroup matches NO running container.
+
+Full notes: [docs/RELEASE-v0.9.10-alpha.md](docs/RELEASE-v0.9.10-alpha.md).
+
+---
 
 ### v0.9.9-alpha — 2026-05-10
 
