@@ -15073,14 +15073,18 @@ def run_cloudtak_deploy(cfg=None):
                 "command -v firewall-cmd >/dev/null 2>&1 && (sudo firewall-cmd --reload >/dev/null 2>&1 || true)"
             )
             _ssh_probe(remote_cfg, fw_cmd, timeout=40)
+            # Probe /api/server (returns 200 even on unconfigured installs — see Step 6 comment).
+            # /api/connections is auth-gated and not a reliable readiness signal on a fresh install.
             ready_cmd = (
                 "python3 - <<'PY'\n"
                 "import urllib.request,sys,time\n"
                 "ok=False\n"
                 "for _ in range(120):\n"
                 "  try:\n"
-                "    r=urllib.request.urlopen('http://127.0.0.1:5000/api/connections', timeout=4)\n"
-                "    if r.getcode() in (200,401,403,404): ok=True; break\n"
+                "    r=urllib.request.urlopen('http://127.0.0.1:5000/api/server', timeout=4)\n"
+                "    if r.getcode() < 500: ok=True; break\n"
+                "  except urllib.error.HTTPError as e:\n"
+                "    if e.code < 500: ok=True; break\n"
                 "  except Exception:\n"
                 "    pass\n"
                 "  time.sleep(2)\n"
@@ -15092,7 +15096,7 @@ def run_cloudtak_deploy(cfg=None):
             if ok and 'READY' in (out or ''):
                 plog("✓ Remote CloudTAK API is responding")
             else:
-                plog("⚠ Remote CloudTAK API did not confirm readiness in time; continuing")
+                plog("⚠ Remote CloudTAK API did not confirm readiness in time; continuing — Caddy is wired so URL will work as soon as Node finishes warming up")
 
             plog("")
             plog("━━━ Step 6/6: Updating Caddy ━━━")
@@ -15337,88 +15341,105 @@ def run_cloudtak_deploy(cfg=None):
             except Exception as _e:
                 plog(f"⚠ Caddy update skipped: {_e}")
 
-        # Step 6: Wait for API to be ready (Node backend can take 10+ min after containers start on slow VPS)
+        # Step 6: Wait for API to be ready.
+        #
+        # On a fresh deploy the Node app inside cloudtak-api-1 has to:
+        #   1. wait for postgis to accept connections,
+        #   2. run Drizzle migrations against the gis db,
+        #   3. seed iconsets/basemaps from /home/etl/api/dist/data,
+        #   4. start serving on 127.0.0.1:5001 (which nginx proxies to :5000).
+        #
+        # On slow VPSes this takes 20–30 minutes the first time. We probe /api/server
+        # because it returns 200 with no auth even when CloudTAK is in the
+        # "unconfigured" state (verified empirically on 2026-05-10 — the response
+        # is `{"status":"unconfigured", ...}`). /api/connections is auth-gated and
+        # not a reliable readiness signal on a fresh install.
+        #
+        # Important: every loop iteration can take up to ~12s wall clock when
+        # nginx returns 502 from a stuck upstream, so we MUST track real wall
+        # clock — not `attempt * poll_interval` which lies by 5–6×.
         plog("")
         plog("━━━ Step 6/7: Waiting for CloudTAK API ━━━")
-        plog("  Waiting for /api/connections (or GET /) — only 200/401/403/404 from /api counts as ready")
+        plog("  Probing /api/server (returns 200 even on unconfigured installs)")
         import urllib.request as _urlreq
         import urllib.error as _urlerr
         api_ready = False
-        max_wait_sec = 900  # 15 minutes — backend first start is slow after heavy build
+        max_wait_sec = 1800  # 30 minutes wall-clock — fresh-boot Postgres + Drizzle migrations on slow VPS can take 25 min
         poll_interval = 2
-        attempts = max_wait_sec // poll_interval
-        _step6_logged_exc = [False]
-        _step6_logged_502 = [False]
+        start_ts = time.time()
+        _last_diag_ts = [0.0]
+        _last_status_ts = [0.0]
+        diag_throttle = 60  # repeat a diagnostic line at most once per minute so we keep heartbeat
         def _check_url(url, name):
             try:
                 r = _urlreq.Request(url, method='GET')
                 resp = _urlreq.urlopen(r, timeout=5)
-                return resp.getcode()
+                return resp.getcode(), None
             except _urlerr.HTTPError as e:
-                return e.code
+                return e.code, None
             except Exception as e:
-                if not _step6_logged_exc[0]:
-                    _step6_logged_exc[0] = True
-                    plog(f"  (diagnostic: {name} → {type(e).__name__}: {str(e)[:80]})")
-                return None
-        for attempt in range(attempts):
-            code = _check_url('http://127.0.0.1:5000/api/connections', 'api/connections')
-            if code is not None:
-                if code in (200, 401, 403):
-                    plog("✓ CloudTAK API is responding (backend ready)")
-                    api_ready = True
-                    break
-                if code == 404:
-                    plog("✓ CloudTAK backend is up (GET /api/connections returned 404 — path may vary by version)")
-                    api_ready = True
-                    break
-                if code in (502, 503) and not _step6_logged_502[0]:
-                    _step6_logged_502[0] = True
-                    plog(f"  Backend returned {code} (Node app may still be starting — we'll keep trying)")
-            if not api_ready:
-                code_root = _check_url('http://127.0.0.1:5000/', 'root')
-                if code_root == 200 and attempt > 0 and (attempt * poll_interval) % 60 == 0:
-                    plog("  (GET / returns 200 but /api not ready yet — waiting for Node app)")
-                if code_root in (502, 503) and not _step6_logged_502[0]:
-                    _step6_logged_502[0] = True
-                    plog(f"  Backend returned {code_root} (Node app may still be starting — we'll keep trying)")
-            if api_ready:
+                return None, f"{type(e).__name__}: {str(e)[:80]}"
+        while True:
+            elapsed = int(time.time() - start_ts)
+            if elapsed >= max_wait_sec:
                 break
-            elapsed = attempt * poll_interval
-            if elapsed > 0 and elapsed % 30 == 0:
-                plog(f"  ⏳ Waiting for backend... ({elapsed}s)")
+            code, err = _check_url('http://127.0.0.1:5000/api/server', 'api/server')
+            # Anything 2xx/3xx/4xx means Node is alive and responding (even 401/403/404 are fine —
+            # nginx is up and Node returned a real HTTP response). Only 5xx and connection errors mean
+            # not ready.
+            if code is not None and code < 500:
+                plog(f"✓ CloudTAK API is responding (GET /api/server → {code}) after {elapsed}s")
+                api_ready = True
+                break
+            now_ts = time.time()
+            if now_ts - _last_diag_ts[0] >= diag_throttle:
+                _last_diag_ts[0] = now_ts
+                if code is not None:
+                    plog(f"  Backend returned {code} (Node app still starting at {elapsed}s) — we'll keep trying")
+                elif err:
+                    plog(f"  /api/server → {err} at {elapsed}s — Node not yet bound, waiting")
+            elif elapsed > 0 and now_ts - _last_status_ts[0] >= 30:
+                _last_status_ts[0] = now_ts
+                plog(f"  ⏳ Waiting for backend... ({elapsed}s elapsed, max {max_wait_sec}s)")
             time.sleep(poll_interval)
-        if not api_ready:
-            plog("✗ CloudTAK API did not respond in time — deploy failed.")
-            plog("  Check: docker logs cloudtak-api-1. If you see 404 for /api/connections, the backend is up — ensure you have pulled latest infra-TAK and restarted the console (sudo systemctl restart takwerx-console), then redeploy.")
-            plog("  Otherwise wait and open the CloudTAK URL manually once it responds.")
-            cloudtak_deploy_status.update({'running': False, 'error': True})
-            return
 
-        # Settling: require multiple consecutive OK responses so we don't declare done while the app is still warming up.
-        settle_wait = 105  # ~1m45s before first check — backend often needs extra time on second/fresh deploy
-        needed_ok = 3
-        check_interval = 15
-        plog(f"  Waiting {settle_wait}s then checking backend {needed_ok} times ({check_interval}s apart)...")
-        time.sleep(settle_wait)
-        ok_count = 0
-        for round_ in range(5):
-            code_again = _check_url('http://127.0.0.1:5000/api/connections', 'api/connections')
-            if code_again in (200, 401, 403, 404):
-                ok_count += 1
-                plog(f"  Check {ok_count}/{needed_ok} OK")
-                if ok_count >= needed_ok:
-                    plog("✓ Backend settled — ready for traffic")
-                    break
-            else:
-                ok_count = 0
-                if round_ < 4:
-                    plog("  Backend not ready, waiting 20s before retry...")
-                    time.sleep(20)
-            if ok_count < needed_ok and round_ < 4:
-                time.sleep(check_interval)
-        if ok_count < needed_ok:
-            plog("  Backend not fully stable — if the map stays on 'Loading CloudTAK', wait a minute and try a hard refresh (Ctrl+Shift+R / Cmd+Shift+R).")
+        if not api_ready:
+            # Caddy is already wired (Step 5 did it before this wait), so the public URL will
+            # work the instant Node finishes its first-boot migration — even if that's after
+            # we exit. Don't fail the deploy: the operator can hit the URL and it'll come up.
+            plog("")
+            plog(f"⚠ CloudTAK API did not respond within {max_wait_sec}s — but containers are running.")
+            plog("  Postgres + Drizzle migrations on first boot can take 25+ min on slow VPS.")
+            plog("  Caddy is already configured. The site will work as soon as Node finishes warming up.")
+            plog("  Watch progress: docker logs -f cloudtak-api-1")
+            if domain:
+                plog(f"  Try: https://map.{domain}/ in a few minutes (hard-refresh: Cmd/Ctrl+Shift+R)")
+            # Fall through — do not return, do not mark error. Step 7 will reconfirm Caddy.
+        else:
+            # Settling: require multiple consecutive OK responses so we don't declare done while the app is still warming up.
+            settle_wait = 30
+            needed_ok = 3
+            check_interval = 10
+            plog(f"  Waiting {settle_wait}s then checking backend {needed_ok} times ({check_interval}s apart)...")
+            time.sleep(settle_wait)
+            ok_count = 0
+            for round_ in range(5):
+                code_again, _err_again = _check_url('http://127.0.0.1:5000/api/server', 'api/server')
+                if code_again is not None and code_again < 500:
+                    ok_count += 1
+                    plog(f"  Check {ok_count}/{needed_ok} OK ({code_again})")
+                    if ok_count >= needed_ok:
+                        plog("✓ Backend settled — ready for traffic")
+                        break
+                else:
+                    ok_count = 0
+                    if round_ < 4:
+                        plog("  Backend not ready, waiting 20s before retry...")
+                        time.sleep(20)
+                if ok_count < needed_ok and round_ < 4:
+                    time.sleep(check_interval)
+            if ok_count < needed_ok:
+                plog("  Backend not fully stable — if the map stays on 'Loading CloudTAK', wait a minute and try a hard refresh (Ctrl+Shift+R / Cmd+Shift+R).")
 
         # Step 7: Re-confirm Caddy (it was already updated earlier; this is a safety net)
         plog("")
@@ -15435,16 +15456,27 @@ def run_cloudtak_deploy(cfg=None):
 
         plog("")
         plog("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        if api_ready:
+            ready_emoji = "🎉"
+            ready_verb = "deployed"
+        else:
+            ready_emoji = "⏳"
+            ready_verb = "deployed (still warming up — first-boot migrations in progress)"
         if domain:
-            plog(f"🎉 CloudTAK deployed! Open https://map.{domain} in your browser")
+            plog(f"{ready_emoji} CloudTAK {ready_verb}! Open https://map.{domain} in your browser")
             plog(f"   Tiles: https://tiles.map.{domain}")
             plog(f"   Video: https://video.{domain} (via standalone MediaMTX)")
         else:
             server_ip = settings.get('server_ip', 'your-server-ip')
-            plog(f"🎉 CloudTAK deployed! Open http://{server_ip}:5000 in your browser")
+            plog(f"{ready_emoji} CloudTAK {ready_verb}! Open http://{server_ip}:5000 in your browser")
         plog(f"   Log in and go to Admin → Connections to configure your TAK Server")
         plog("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        plog("Deploy finished — CloudTAK is running and ready.")
+        if api_ready:
+            plog("Deploy finished — CloudTAK is running and ready.")
+        else:
+            plog("Deploy finished — containers up. Node app may still be running first-boot migrations.")
+            plog("  Watch progress: docker logs -f cloudtak-api-1")
+            plog("  Once you see 'ok - http://localhost:5000' the URL above will work.")
         # cfg['deployed']=True already saved in early-Caddy step; keep settings consistent.
         _update_boot_stagger_service()
         cloudtak_deploy_status.update({'running': False, 'complete': True, 'error': False})
