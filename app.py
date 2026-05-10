@@ -14752,9 +14752,20 @@ def cloudtak_reset_server_config():
     cfg = _get_cloudtak_deployment_config(settings)
     target_mode = (cfg.get('target_mode') or 'local').strip().lower()
 
-    # Table is "server" (singular). Clear all connection fields so the API doesn't try to
-    # connect to a stale TAK Server on startup (which blocks the Node event loop).
-    sql_cmd = "UPDATE server SET auth = '{}'::jsonb, url = '', api = '', webtak = '' WHERE id = 1;"
+    # Two-step reset (confirmed from CloudTAK source api/routes/server.ts):
+    #
+    # 1. Clear the server connection fields so /api/server returns status:unconfigured
+    #    and the configure wizard shows again.
+    #
+    # 2. DELETE the system_admin profile(s). CloudTAK's PATCH /server handler calls
+    #    profileControl.generate() which does a plain INSERT (not upsert). If the
+    #    admin user's profile row still exists from the previous config, the wizard
+    #    fails with "Key (username)=(...) already exists". Deleting only system_admin
+    #    profiles leaves regular user profiles/data intact.
+    sql_cmd = (
+        "UPDATE server SET auth = '{}'::jsonb, url = '', api = '', webtak = '' WHERE id = 1;"
+        " DELETE FROM profile WHERE system_admin = true;"
+    )
     psql_cmd = f"docker exec cloudtak-postgis-1 psql -U docker -d gis -c \"{sql_cmd}\" 2>&1"
     restart_cmd = "cd ~/CloudTAK && docker compose restart api 2>&1"
 
@@ -14769,8 +14780,6 @@ def cloudtak_reset_server_config():
         ok2, out2 = _ssh_probe(rcfg, restart_cmd, timeout=60)
         if not ok2:
             return jsonify({'success': False, 'error': f'API restart failed on {rhost}: {(out2 or "unknown")[:200]}'}), 500
-        nginx_fix = 'docker exec cloudtak-api-1 sed -i "s/^user nginx;/user root;/" /etc/nginx/nginx.conf 2>/dev/null && docker exec cloudtak-api-1 nginx -s reload 2>/dev/null; true'
-        _ssh_probe(rcfg, nginx_fix, timeout=15)
         return jsonify({'success': True, 'message': f'CloudTAK server config cleared on {rhost}. Visit map.{settings.get("fqdn","<domain>")} to re-run the bootstrap wizard.'})
     else:
         try:
