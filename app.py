@@ -307,7 +307,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.6-alpha"
+VERSION = "0.9.7-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -6235,11 +6235,11 @@ def guarddog_update():
                 'docker exec authentik-postgresql-1 psql -U authentik -d authentik -c "\n'
                 'DELETE FROM authentik_tasks_tasklog\n'
                 'WHERE task_id IN (\n'
-                '  SELECT pk FROM authentik_tasks_task\n'
-                "  WHERE finish_timestamp < NOW() - INTERVAL '30 days'\n"
+                '  SELECT message_id FROM authentik_tasks_task\n'
+                "  WHERE mtime < NOW() - INTERVAL '30 days'\n"
                 ');\n'
                 'DELETE FROM authentik_tasks_task\n'
-                "WHERE finish_timestamp < NOW() - INTERVAL '30 days';\n"
+                "WHERE mtime < NOW() - INTERVAL '30 days';\n"
                 'VACUUM ANALYZE authentik_tasks_task, authentik_tasks_tasklog;\n'
                 '" >> "$LOG" 2>&1\n'
                 'echo "$TS" > "$STAMP_FILE"\n'
@@ -6774,11 +6774,11 @@ def run_guarddog_deploy(alert_email):
                 'docker exec authentik-postgresql-1 psql -U authentik -d authentik -c "\n'
                 'DELETE FROM authentik_tasks_tasklog\n'
                 'WHERE task_id IN (\n'
-                '  SELECT pk FROM authentik_tasks_task\n'
-                "  WHERE finish_timestamp < NOW() - INTERVAL '30 days'\n"
+                '  SELECT message_id FROM authentik_tasks_task\n'
+                "  WHERE mtime < NOW() - INTERVAL '30 days'\n"
                 ');\n'
                 'DELETE FROM authentik_tasks_task\n'
-                "WHERE finish_timestamp < NOW() - INTERVAL '30 days';\n"
+                "WHERE mtime < NOW() - INTERVAL '30 days';\n"
                 'VACUUM ANALYZE authentik_tasks_task, authentik_tasks_tasklog;\n'
                 '" >> "$LOG" 2>&1\n'
                 'echo "$TS" > "$STAMP_FILE"\n'
@@ -37547,17 +37547,23 @@ def _post_update_auto_deploy():
                                 if '/var/run/docker.sock' not in l
                             )
                             print("Post-update: Authentik — removed docker.sock from worker")
-                        # shm_size: 256m — postgres needs > 64 MB for VACUUM ANALYZE with parallel workers
+                        # shm_size: 256m for the postgresql service specifically.
+                        # Anchor on the postgres image line (not the whole file — other services
+                        # such as server/worker may already have their own shm_size values, which
+                        # would cause a whole-file 'shm_size:' check to false-positive).
                         _shm_added = False
-                        if 'shm_size:' not in _ak:
+                        _pg_img_token = '    image: docker.io/library/postgres:16-alpine\n'
+                        if _pg_img_token in _ak:
+                            _pg_img_pos = _ak.index(_pg_img_token)
+                            # Find the end of the postgresql service block (next top-level service key)
                             import re as _re_shm
-                            _ak = _re_shm.sub(
-                                r'(\s+restart: unless-stopped\n)(\s+command: postgres)',
-                                r'\1    shm_size: 256m\n\2',
-                                _ak, count=1
-                            )
-                            _shm_added = True
-                            print("Post-update: Authentik — added shm_size: 256m to postgresql service")
+                            _pg_svc_end_m = _re_shm.search(r'\n  \w', _ak[_pg_img_pos + 1:])
+                            _pg_svc_end = _pg_img_pos + 1 + (_pg_svc_end_m.start() if _pg_svc_end_m else len(_ak))
+                            _pg_block = _ak[_pg_img_pos:_pg_svc_end]
+                            if 'shm_size:' not in _pg_block:
+                                _ak = _ak[:_pg_img_pos] + _pg_img_token + '    shm_size: 256m\n' + _ak[_pg_img_pos + len(_pg_img_token):]
+                                _shm_added = True
+                                print("Post-update: Authentik — added shm_size: 256m to postgresql service")
                         for _old, _new in (
                             ('command: server\n', 'cap_drop:\n      - ALL\n    security_opt:\n      - no-new-privileges:true\n    command: server\n'),
                         ):
@@ -37584,18 +37590,20 @@ def _post_update_auto_deploy():
                                     1
                                 )
                                 _ak = _ak[:_ldap_start] + _ldap_new + _ak[_ldap_end:]
-                        # Detect if the running postgresql container still has the old 64 MB shm_size
-                        # even though the compose file already has shm_size: 256m (v0.9.5 regression:
-                        # the file was patched but postgresql was never in the --force-recreate list).
+                        # Detect if the running postgresql container needs a recreate to pick up
+                        # shm_size: 256m. Check the running container directly — do not rely on
+                        # compose file content, which may have been patched in a prior run without
+                        # the container being recreated (v0.9.5/v0.9.6 regression).
                         _shm_needs_pg_recreate = _shm_added
-                        if not _shm_needs_pg_recreate and 'shm_size: 256m' in _ak:
+                        if not _shm_needs_pg_recreate:
                             _pg_insp = subprocess.run(
                                 ['docker', 'inspect', '--format', '{{.HostConfig.ShmSize}}', 'authentik-postgresql-1'],
                                 capture_output=True, text=True, timeout=10
                             )
-                            if _pg_insp.returncode == 0 and _pg_insp.stdout.strip() == '67108864':
+                            _pg_shm_val = int(_pg_insp.stdout.strip() or '0')
+                            if _pg_insp.returncode == 0 and _pg_shm_val != 268435456:
                                 _shm_needs_pg_recreate = True
-                                print("Post-update: Authentik postgresql ShmSize is still 64 MB — recreating to apply shm_size: 256m")
+                                print(f"Post-update: Authentik postgresql ShmSize is {_pg_shm_val // (1024*1024)} MB — recreating to apply shm_size: 256m")
                         if _ak != _ak_orig:
                             with open(ak_compose, 'w') as _f:
                                 _f.write(_ak)
@@ -37955,7 +37963,7 @@ def _post_update_auto_deploy():
                     # Check table size — skip if already small
                     _size_r = subprocess.run(
                         ['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik', '-t', '-A', '-c',
-                         "SELECT pg_total_relation_size('authentik_tasks_tasklog')"],
+                         "SELECT pg_total_relation_size('authentik_tasks_tasklog') + pg_total_relation_size('authentik_tasks_task')"],
                         capture_output=True, text=True, timeout=15
                     )
                     if _size_r.returncode != 0:
@@ -37966,14 +37974,17 @@ def _post_update_auto_deploy():
                         print(f"Post-update: Authentik task log {_tl_bytes // (1024*1024)} MB — no cleanup needed")
                         return
                     print(f"Post-update: Authentik task log {_tl_bytes // (1024*1024)} MB — purging records > 30 days")
+                    # Schema (Authentik 2026.x): PK is message_id (uuid), timestamp is mtime.
+                    # The old column names (pk, finish_timestamp) were from a different Authentik
+                    # version and do not exist in the current schema.
                     _del_sql = (
                         "DELETE FROM authentik_tasks_tasklog "
                         "WHERE task_id IN ("
-                        "  SELECT pk FROM authentik_tasks_task "
-                        "  WHERE finish_timestamp < NOW() - INTERVAL '30 days'"
+                        "  SELECT message_id FROM authentik_tasks_task "
+                        "  WHERE mtime < NOW() - INTERVAL '30 days'"
                         "); "
                         "DELETE FROM authentik_tasks_task "
-                        "WHERE finish_timestamp < NOW() - INTERVAL '30 days';"
+                        "WHERE mtime < NOW() - INTERVAL '30 days';"
                     )
                     _del_r = subprocess.run(
                         ['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik', '-c', _del_sql],
