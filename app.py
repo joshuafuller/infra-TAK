@@ -307,7 +307,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.8-alpha"
+VERSION = "0.9.9-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -38083,6 +38083,31 @@ def _post_update_auto_deploy():
 
             _auto_takportal()
             cloudtak_t.join(timeout=600)
+
+            # Final orphan postgres kill — _auto_authentik() runs run_authentik_deploy()
+            # which recreates containers AGAIN after _auto_harden_containers() already ran,
+            # potentially leaving fresh orphans that the first kill couldn't see.
+            try:
+                _final_cid_r = subprocess.run(
+                    ['docker', 'inspect', '--format', '{{.Id}}', 'authentik-postgresql-1'],
+                    capture_output=True, text=True, timeout=10
+                )
+                if _final_cid_r.returncode == 0 and _final_cid_r.stdout.strip():
+                    _final_cur_cid = _final_cid_r.stdout.strip()[:12]
+                    _final_pg_r = subprocess.run(
+                        "ps -eo uid,pid,comm | awk '$1==70 && $3~/postgres/ {print $2}'",
+                        shell=True, capture_output=True, text=True, timeout=5
+                    )
+                    for _final_pid in _final_pg_r.stdout.split():
+                        try:
+                            _final_cg = open(f'/proc/{_final_pid}/cgroup').read()
+                            if _final_cur_cid not in _final_cg:
+                                subprocess.run(['kill', '-9', _final_pid], capture_output=True, timeout=5)
+                                print(f"Post-update: final pass — killed orphaned postgres PID {_final_pid} (not in container {_final_cur_cid})")
+                        except Exception:
+                            pass
+            except Exception as _final_orp_e:
+                print(f"Post-update: final orphan check error (non-fatal): {_final_orp_e}")
 
             print("Post-update: auto-deploy complete")
 

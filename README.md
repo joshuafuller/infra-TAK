@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Latest release: v0.9.8-alpha** — See **[docs/RELEASE-v0.9.8-alpha.md](docs/RELEASE-v0.9.8-alpha.md)** for full details. Prior releases: [v0.9.7](docs/RELEASE-v0.9.7-alpha.md), [v0.9.6](docs/RELEASE-v0.9.6-alpha.md), [v0.9.5](docs/RELEASE-v0.9.5-alpha.md), [v0.9.4](docs/RELEASE-v0.9.4-alpha.md), [v0.9.3](docs/RELEASE-v0.9.3-alpha.md), [v0.9.2](docs/RELEASE-v0.9.2-alpha.md), [v0.9.1](docs/RELEASE-v0.9.1-alpha.md), [v0.9.0](docs/RELEASE-v0.9.0-alpha.md) — older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases).
+**Latest release: v0.9.9-alpha** — See **[docs/RELEASE-v0.9.9-alpha.md](docs/RELEASE-v0.9.9-alpha.md)** for full details. Prior releases: [v0.9.8](docs/RELEASE-v0.9.8-alpha.md), [v0.9.7](docs/RELEASE-v0.9.7-alpha.md), [v0.9.6](docs/RELEASE-v0.9.6-alpha.md), [v0.9.5](docs/RELEASE-v0.9.5-alpha.md), [v0.9.4](docs/RELEASE-v0.9.4-alpha.md), [v0.9.3](docs/RELEASE-v0.9.3-alpha.md), [v0.9.2](docs/RELEASE-v0.9.2-alpha.md), [v0.9.1](docs/RELEASE-v0.9.1-alpha.md), [v0.9.0](docs/RELEASE-v0.9.0-alpha.md) — older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases).
 
 **Something broken?** Wrong sidebar version, **Update Now** error, merge/rebase/tag-clobber messages, or you are not sure the VPS ever pulled the real repo → go to **[Universal recovery (SSH)](#universal-recovery-ssh)** and run the one block there. **Point people at that section**; it is the single source of truth.
 
@@ -299,6 +299,16 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v0.9.9-alpha — 2026-05-10
+
+**Headline: Hotfix — v0.9.8's orphan kill ran too early; second pass added after Authentik reconfigure.**
+
+- **Fix: final orphan postgres kill after `_auto_authentik()`** — v0.9.8's orphan check ran at the end of `_auto_harden_containers()`, but `_auto_authentik()` runs LATER in post-update and recreates Authentik containers a second time, creating fresh orphans the first check couldn't see. Second cgroup-based kill now runs right before `auto-deploy complete` to catch these.
+
+Full notes: [docs/RELEASE-v0.9.9-alpha.md](docs/RELEASE-v0.9.9-alpha.md).
+
+---
 
 ### v0.9.8-alpha — 2026-05-10
 
