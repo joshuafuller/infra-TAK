@@ -14605,8 +14605,6 @@ def cloudtak_control():
         else:
             return jsonify({'error': 'Invalid action'}), 400
         time.sleep(3)
-        if action in ('start', 'restart'):
-            _cloudtak_fix_nginx_user()
         r = subprocess.run('docker ps --filter name=cloudtak-api --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
         running = 'Up' in r.stdout
     return jsonify({'success': True, 'running': running})
@@ -14778,7 +14776,6 @@ def cloudtak_reset_server_config():
                 return jsonify({'success': False, 'error': f'API restart failed: {(r2.stdout + r2.stderr)[:200]}'}), 500
         except subprocess.TimeoutExpired:
             return jsonify({'success': False, 'error': 'docker compose restart timed out'}), 500
-        _cloudtak_fix_nginx_user()
         fqdn = settings.get('fqdn', '')
         return jsonify({'success': True, 'message': f'CloudTAK server config cleared. Visit {"map." + fqdn if fqdn else "CloudTAK"} to re-run the bootstrap wizard.'})
 
@@ -14855,33 +14852,27 @@ def _cloudtak_build_override_yml(settings):
             if server_ip:
                 extra_hosts.append(f'{tak_fqdn}:{server_ip}')
     hosts_block = '\n'.join(f'      - "{h}"' for h in extra_hosts)
+    # NOTE: We deliberately do NOT add cap_drop / no-new-privileges here.
+    # CloudTAK's api container runs both nginx and Node in the same image;
+    # cap_drop:ALL silently breaks nginx workers (can't write /dev/stdout)
+    # and breaks the nginx→Node loopback proxy in subtle ways that produce
+    # nothing in the logs. Same lesson learned earlier on Authentik worker
+    # (commit c908179) and TAK Portal (commit 7fe8191) — these containers
+    # legitimately need a default capability set; capability hardening at
+    # this level is not appropriate for them.
     return f"""# TAKWERX: CloudTAK container overrides
 services:
   api:
     extra_hosts:
 {hosts_block}
-    cap_drop:
-      - ALL
-    cap_add:
-      - CHOWN
-    security_opt:
-      - no-new-privileges:true
   events:
     extra_hosts:
 {hosts_block}
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
     environment:
       API_URL: "http://api:5000"
   media:
     extra_hosts:
 {hosts_block}
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
     environment:
       API_URL: "http://api:5000"
 """
@@ -15081,7 +15072,7 @@ def run_cloudtak_deploy(cfg=None):
                 "ok=False\n"
                 "for _ in range(120):\n"
                 "  try:\n"
-                "    r=urllib.request.urlopen('http://127.0.0.1:5000/api/server', timeout=4)\n"
+                "    r=urllib.request.urlopen('http://127.0.0.1:5000/api/server', timeout=15)\n"
                 "    if r.getcode() < 500: ok=True; break\n"
                 "  except urllib.error.HTTPError as e:\n"
                 "    if e.code < 500: ok=True; break\n"
@@ -15299,14 +15290,6 @@ def run_cloudtak_deploy(cfg=None):
             return
         plog("✓ Containers started")
         plog("✓ Restart complete.")
-        # Patch nginx user directive so workers can write to /dev/stdout with cap_drop: ALL.
-        # Polls until /etc/nginx/nginx.conf exists then verifies workers spawn (the
-        # entrypoint takes a variable amount of time to write nginx.conf).
-        nginx_ok = _cloudtak_fix_nginx_user()
-        if nginx_ok:
-            plog("  ✓ Nginx user directive patched and workers running")
-        else:
-            plog("  ⚠ Nginx user patch could not be verified — API may not respond until rerun")
 
         # Open port 5000 (and 5002 for tiles) so http://ip:5000 works when no domain or before Caddy is used
         for port in ['5000/tcp', '5002/tcp']:
@@ -15371,9 +15354,12 @@ def run_cloudtak_deploy(cfg=None):
         _last_status_ts = [0.0]
         diag_throttle = 60  # repeat a diagnostic line at most once per minute so we keep heartbeat
         def _check_url(url, name):
+            # 15s per-request timeout: during Drizzle migrations Node can be
+            # bound but slow to respond. 5s was too aggressive and produced
+            # false TimeoutErrors against a healthy-but-warming backend.
             try:
                 r = _urlreq.Request(url, method='GET')
-                resp = _urlreq.urlopen(r, timeout=5)
+                resp = _urlreq.urlopen(r, timeout=15)
                 return resp.getcode(), None
             except _urlerr.HTTPError as e:
                 return e.code, None
@@ -15713,10 +15699,6 @@ def run_cloudtak_update():
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
         plog("✓ Containers rebuilt and restarted")
-        if not is_remote:
-            time.sleep(5)
-            _cloudtak_fix_nginx_user()
-            plog("  Nginx user directive patched, workers reloaded")
         plog("")
         plog(f"✓ CloudTAK updated to {release_tag}")
         plog("Update finished — CloudTAK is running.")
