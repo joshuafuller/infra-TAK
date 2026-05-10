@@ -12405,17 +12405,27 @@ def run_takportal_deploy():
                 else:
                     plog("  ⚠ Could not auto-add extra_hosts (missing 'restart: unless-stopped').")
 
-            if 'cap_drop:' not in compose_content and 'restart: unless-stopped' in compose_content:
-                hardened = compose_content.replace(
-                    'restart: unless-stopped',
-                    'restart: unless-stopped\n    cap_drop:\n      - ALL\n    security_opt:\n      - no-new-privileges:true',
-                    1
-                )
-                if hardened != compose_content:
-                    compose_content = hardened
-                    with open(compose_path, 'w') as f:
-                        f.write(compose_content)
-                    plog("  ✓ cap_drop: ALL + no-new-privileges:true added to docker-compose.yml")
+            # NOTE: We deliberately do NOT inject cap_drop:ALL / no-new-privileges
+            # into TAK Portal's docker-compose.yml. cap_drop:ALL removes
+            # CAP_DAC_OVERRIDE which is required for the Node.js process to read
+            # tak-client.p12 (owned by uid 889 with mode 600) — the dashboard
+            # silently shows -- for all stats. Same lesson learned in commit
+            # 7fe8191 for the override path; this code path was missed in that
+            # commit and re-applied the broken hardening on every fresh deploy.
+            # If a previous deploy injected cap_drop, strip it now so the next
+            # `docker compose up` runs with default capabilities.
+            _had_capdrop = False
+            for _bad in (
+                '\n    cap_drop:\n      - ALL\n    security_opt:\n      - no-new-privileges:true',
+                '    cap_drop:\n      - ALL\n    security_opt:\n      - no-new-privileges:true\n',
+            ):
+                if _bad in compose_content:
+                    compose_content = compose_content.replace(_bad, '', 1)
+                    _had_capdrop = True
+            if _had_capdrop:
+                with open(compose_path, 'w') as f:
+                    f.write(compose_content)
+                plog("  ✓ Removed legacy cap_drop:ALL from docker-compose.yml (breaks cert reads)")
 
         if _patch_takportal_compose_network():
             plog("  ✓ infratak Docker network added to docker-compose.yml (Portal ↔ Authentik)")
