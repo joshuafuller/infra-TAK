@@ -15412,43 +15412,25 @@ def run_cloudtak_deploy(cfg=None):
                 plog(f"  Try: https://map.{domain}/ in a few minutes (hard-refresh: Cmd/Ctrl+Shift+R)")
             # Fall through — do not return, do not mark error. Step 7 will reconfirm Caddy.
         else:
-            # Settling: require multiple consecutive OK responses so we don't declare done while the app is still warming up.
-            settle_wait = 30
-            needed_ok = 3
-            check_interval = 10
-            plog(f"  Waiting {settle_wait}s then checking backend {needed_ok} times ({check_interval}s apart)...")
-            time.sleep(settle_wait)
-            ok_count = 0
-            for round_ in range(5):
-                code_again, _err_again = _check_url('http://127.0.0.1:5000/api/server', 'api/server')
-                if code_again is not None and code_again < 500:
-                    ok_count += 1
-                    plog(f"  Check {ok_count}/{needed_ok} OK ({code_again})")
-                    if ok_count >= needed_ok:
-                        plog("✓ Backend settled — ready for traffic")
-                        break
-                else:
-                    ok_count = 0
-                    if round_ < 4:
-                        plog("  Backend not ready, waiting 20s before retry...")
-                        time.sleep(20)
-                if ok_count < needed_ok and round_ < 4:
-                    time.sleep(check_interval)
-            if ok_count < needed_ok:
-                plog("  Backend not fully stable — if the map stays on 'Loading CloudTAK', wait a minute and try a hard refresh (Ctrl+Shift+R / Cmd+Shift+R).")
+            plog("✓ CloudTAK API responded — proceeding to Caddy confirmation")
 
-        # Step 7: Re-confirm Caddy (it was already updated earlier; this is a safety net)
+        # Step 7: Re-confirm Caddy (it was already updated earlier; this is a safety net).
+        # Wrapped in its own try/except — a Caddyfile error must never flip error:True
+        # on an otherwise successful deploy (CloudTAK containers are already running).
         plog("")
         plog("━━━ Step 7/7: Confirming Caddy ━━━")
-        if domain:
-            generate_caddyfile(settings)
-            r = subprocess.run('systemctl reload caddy 2>&1', shell=True, capture_output=True, text=True, timeout=15)
-            if r.returncode == 0:
-                plog(f"✓ Caddy confirmed — map.{domain} and tiles.map.{domain} live")
+        try:
+            if domain:
+                generate_caddyfile(settings)
+                r = subprocess.run('systemctl reload caddy 2>&1', shell=True, capture_output=True, text=True, timeout=30)
+                if r.returncode == 0:
+                    plog(f"✓ Caddy confirmed — map.{domain} and tiles.map.{domain} live")
+                else:
+                    plog(f"⚠ Caddy reload: {r.stdout.strip()[:100]}")
             else:
-                plog(f"⚠ Caddy reload: {r.stdout.strip()[:100]}")
-        else:
-            plog("  No domain configured — skipping Caddy (access via port 5000)")
+                plog("  No domain configured — skipping Caddy (access via port 5000)")
+        except Exception as _caddy_e:
+            plog(f"⚠ Caddy confirm skipped: {_caddy_e} (CloudTAK is still running)")
 
         plog("")
         plog("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -21957,11 +21939,11 @@ window.pollLog = function(redeployBtn) {
           if (dyn) dyn.textContent = (dyn.textContent || "") + msg;
           if (stat) stat.textContent = (stat.textContent || "") + msg;
         }
-        if (window.cloudtakPollFails >= 10) {
-          clearInterval(window.logInterval);
-          window.logInterval = null;
-          if (redeployBtn) redeployBtn.disabled = false;
-          var failMsg = "\n\nRequest failed: " + (err && err.message ? err.message : String(err)) + " Deploy may still be running on the server \u2014 refresh the page to check.";
+        // Do NOT clear the interval on transient failures — the deploy can take 30 min
+        // and Flask may be briefly under load. Keep retrying; we'll hear back when the
+        // server recovers. Only show the "still trying" note after prolonged failures.
+        if (window.cloudtakPollFails === 30) {
+          var failMsg = "\n[Still trying to reach server — deploy may still be running...]";
           if (dyn) dyn.textContent = (dyn.textContent || "") + failMsg;
           if (stat) stat.textContent = (stat.textContent || "") + failMsg;
         }
