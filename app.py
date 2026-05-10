@@ -36255,7 +36255,7 @@ function uploadSnapshot(input){
   var totalSize=file.size;
   // Build inline progress bar inside the msg span
   if(msg){
-    msg.innerHTML='<span style="display:inline-flex;align-items:center;gap:8px;font-family:\'JetBrains Mono\',monospace;font-size:11px;color:var(--yellow)">'
+    msg.innerHTML='<span style="display:inline-flex;align-items:center;gap:8px;font-family:JetBrains Mono,monospace;font-size:11px;color:var(--yellow)">'
       +'<span id="snap-ul-text">Uploading… 0%</span>'
       +'<span style="display:inline-block;width:120px;height:6px;background:rgba(255,255,255,0.08);border-radius:3px;overflow:hidden;vertical-align:middle">'
       +'<span id="snap-ul-bar" style="display:block;height:100%;width:0%;background:var(--cyan);border-radius:3px;transition:width .1s linear"></span>'
