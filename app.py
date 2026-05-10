@@ -37662,6 +37662,30 @@ def _post_update_auto_deploy():
                                     print(f"Post-update: {_svc_name} inspect error: {_ie}")
                         elif not _shm_needs_pg_recreate:
                             print("Post-update: Authentik compose already hardened — no changes needed")
+                        # Kill any UID-70 postgres processes not belonging to the current container.
+                        # Runs unconditionally — catches orphans left by this update's recreate AND
+                        # orphans from prior bad updates (e.g. v0.9.7 force-recreate with 10s timeout).
+                        try:
+                            _cid_r = subprocess.run(
+                                ['docker', 'inspect', '--format', '{{.Id}}', 'authentik-postgresql-1'],
+                                capture_output=True, text=True, timeout=10
+                            )
+                            if _cid_r.returncode == 0 and _cid_r.stdout.strip():
+                                _cur_cid = _cid_r.stdout.strip()[:12]
+                                _all_pg_r = subprocess.run(
+                                    "ps -eo uid,pid,comm | awk '$1==70 && $3~/postgres/ {print $2}'",
+                                    shell=True, capture_output=True, text=True, timeout=5
+                                )
+                                for _pid in _all_pg_r.stdout.split():
+                                    try:
+                                        _cg = open(f'/proc/{_pid}/cgroup').read()
+                                        if _cur_cid not in _cg:
+                                            subprocess.run(['kill', '-9', _pid], capture_output=True, timeout=5)
+                                            print(f"Post-update: killed orphaned postgres PID {_pid} (not in container {_cur_cid})")
+                                    except Exception:
+                                        pass
+                        except Exception as _orp_e:
+                            print(f"Post-update: orphan postgres check error (non-fatal): {_orp_e}")
                 except Exception as _e:
                     print(f"Post-update: Authentik hardening error (non-fatal): {_e}")
                 # TAK Portal — write/refresh override file (infratak network only)
