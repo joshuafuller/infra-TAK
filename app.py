@@ -307,7 +307,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.7-alpha"
+VERSION = "0.9.8-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -37608,14 +37608,36 @@ def _post_update_auto_deploy():
                             with open(ak_compose, 'w') as _f:
                                 _f.write(_ak)
                         if _shm_needs_pg_recreate:
-                            # postgresql must be recreated first so the new shm_size takes effect
-                            # before worker/server restart and reconnect to it
+                            # Record all UID-70 postgres PIDs before stopping so we can kill
+                            # any that survive the container recreate (docker's default 10s stop
+                            # timeout is too short for a loaded postgres checkpoint — the process
+                            # can outlive the container and continue pegging CPU as an orphan).
+                            _old_pg_pids_r = subprocess.run(
+                                "ps -eo uid,pid,comm | awk '$1==70 && $3~/postgres/ {print $2}'",
+                                shell=True, capture_output=True, text=True, timeout=5
+                            )
+                            _old_pg_pids = set(_old_pg_pids_r.stdout.split()) if _old_pg_pids_r.returncode == 0 else set()
+                            # Stop with a longer timeout so postgres can finish its checkpoint cleanly
                             subprocess.run(
-                                'cd ~/authentik && docker compose up -d --force-recreate postgresql 2>/dev/null',
+                                'docker stop -t 30 authentik-postgresql-1 2>/dev/null',
+                                shell=True, capture_output=True, text=True, timeout=35
+                            )
+                            subprocess.run(
+                                'cd ~/authentik && docker compose up -d postgresql 2>/dev/null',
                                 shell=True, capture_output=True, text=True, timeout=60
                             )
                             import time as _shm_t
                             _shm_t.sleep(5)
+                            # Kill any postgres processes that survived the container stop
+                            if _old_pg_pids:
+                                _surviving_r = subprocess.run(
+                                    "ps -eo uid,pid,comm | awk '$1==70 && $3~/postgres/ {print $2}'",
+                                    shell=True, capture_output=True, text=True, timeout=5
+                                )
+                                _surviving = set(_surviving_r.stdout.split()) if _surviving_r.returncode == 0 else set()
+                                for _orphan_pid in (_old_pg_pids & _surviving):
+                                    subprocess.run(['kill', '-9', _orphan_pid], capture_output=True, timeout=5)
+                                    print(f"Post-update: killed orphaned postgres process PID {_orphan_pid}")
                         if _ak != _ak_orig:
                             print("Post-update: Authentik compose hardened — recreating worker/server/ldap")
                             subprocess.run(
