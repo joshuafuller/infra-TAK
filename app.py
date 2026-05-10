@@ -14778,8 +14778,8 @@ def cloudtak_reset_server_config():
         if not rhost:
             return jsonify({'success': False, 'error': 'Remote host not configured'}), 400
         ok1, out1 = _ssh_probe(rcfg, psql_cmd, timeout=30)
-        if not ok1 or 'ERROR' in (out1 or '').upper():
-            return jsonify({'success': False, 'error': f'SQL reset failed on {rhost}: {(out1 or "unknown")[:200]}'}), 500
+        if not ok1:
+            return jsonify({'success': False, 'error': f'SQL reset failed on {rhost}: {(out1 or "unknown")[:400]}'}), 500
         ok2, out2 = _ssh_probe(rcfg, restart_cmd, timeout=60)
         if not ok2:
             return jsonify({'success': False, 'error': f'API restart failed on {rhost}: {(out2 or "unknown")[:200]}'}), 500
@@ -14787,8 +14787,8 @@ def cloudtak_reset_server_config():
     else:
         try:
             r1 = subprocess.run(psql_cmd, shell=True, capture_output=True, text=True, timeout=30)
-            if r1.returncode != 0 or 'ERROR' in (r1.stdout + r1.stderr).upper():
-                return jsonify({'success': False, 'error': f'SQL reset failed: {(r1.stdout + r1.stderr)[:200]}'}), 500
+            if r1.returncode != 0:
+                return jsonify({'success': False, 'error': f'SQL reset failed: {(r1.stdout + r1.stderr)[:400]}'}), 500
         except subprocess.TimeoutExpired:
             return jsonify({'success': False, 'error': 'psql command timed out'}), 500
         try:
