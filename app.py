@@ -1894,6 +1894,25 @@ def _github_release_notes_for_tag(tag_name: str) -> str:
     return fallback
 
 
+@app.route('/api/update/channel', methods=['POST'])
+@login_required
+def set_update_channel():
+    """Toggle the update channel between 'main' (stable releases) and 'dev' (dev branch head).
+
+    Persisted in settings.json as update_channel. The update check and apply routes
+    both respect this setting so the operator never has to SSH to switch tracks.
+    """
+    data = request.get_json(force=True) or {}
+    channel = (data.get('channel') or 'main').strip().lower()
+    if channel not in ('main', 'dev'):
+        return jsonify({'ok': False, 'error': 'channel must be "main" or "dev"'}), 400
+    s = load_settings()
+    s['update_channel'] = channel
+    save_settings(s)
+    update_cache.update({'latest': None, 'checked': 0, 'notes': '', 'body': ''})
+    return jsonify({'ok': True, 'channel': channel})
+
+
 @app.route('/api/update/check')
 @login_required
 def update_check():
@@ -1901,7 +1920,51 @@ def update_check():
     now = time.time()
     def _parse_version_tuple(v):
         return tuple(int(p) for p in v.replace('-alpha','').replace('-beta','').split('.'))
-    # Cache 10 min so even old builds (no button) see new releases soon; button forces immediate check
+
+    _settings = load_settings()
+    _channel = (_settings.get('update_channel') or 'main').strip().lower()
+    _on_dev = (_channel == 'dev')
+
+    # Dev channel: compare current VERSION against the HEAD commit message on dev.
+    # We report update_available when the dev branch HEAD SHA differs from the
+    # currently running commit (i.e. there are new commits on dev we haven't pulled).
+    if _on_dev:
+        try:
+            gh_headers = {'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'infra-TAK'}
+            dev_req = urllib.request.Request(
+                f'https://api.github.com/repos/{GITHUB_REPO}/commits?sha=dev&per_page=1',
+                headers=gh_headers
+            )
+            dev_resp = urllib.request.urlopen(dev_req, timeout=5)
+            dev_data = json.loads(dev_resp.read().decode())
+            if not dev_data:
+                return _update_check_response({'current': VERSION, 'latest': None, 'channel': 'dev',
+                    'error': 'No commits on dev', 'body': '', 'update_available': False})
+            head = dev_data[0]
+            head_sha = head.get('sha', '')[:7]
+            head_msg = (head.get('commit', {}).get('message', '') or '').splitlines()[0][:80]
+            # Check local git HEAD to see if we're already at this commit
+            try:
+                _local_sha = subprocess.run(
+                    ['git', f'--git-dir={os.path.join(os.path.dirname(os.path.abspath(__file__)), ".git")}',
+                     'rev-parse', '--short', 'HEAD'],
+                    capture_output=True, text=True, timeout=5
+                ).stdout.strip()
+            except Exception:
+                _local_sha = ''
+            _remote_full_sha = head.get('sha', '')
+            _is_ahead = bool(_remote_full_sha) and not _remote_full_sha.startswith(_local_sha or 'XXXXXXXX')
+            latest_label = f'dev@{head_sha}'
+            notes = f'dev branch — {head_msg}'
+            body = f'Latest commit on dev:\n{head_sha} — {head_msg}\n\nClick "Pull dev" to update to this commit.'
+            update_cache.update({'latest': latest_label, 'checked': now, 'notes': notes, 'body': body})
+            return _update_check_response({'current': VERSION, 'latest': latest_label, 'notes': notes,
+                'body': body, 'channel': 'dev', 'update_available': _is_ahead})
+        except Exception as e:
+            return _update_check_response({'current': VERSION, 'latest': None, 'channel': 'dev',
+                'error': str(e)[:200], 'body': '', 'update_available': False})
+
+    # Main channel: existing tag-based check.
     force = request.args.get('refresh') == '1'
     if not force and update_cache['latest'] and (now - update_cache['checked']) < 600:
         try:
@@ -1911,7 +1974,7 @@ def update_check():
         except (ValueError, IndexError):
             cached_newer = False
         return _update_check_response({'current': VERSION, 'latest': update_cache['latest'], 'notes': update_cache['notes'],
-            'body': update_cache.get('body') or '',
+            'body': update_cache.get('body') or '', 'channel': 'main',
             'update_available': cached_newer})
     try:
         gh_headers = {'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'infra-TAK'}
@@ -1922,7 +1985,7 @@ def update_check():
         resp = urllib.request.urlopen(req, timeout=5)
         data = json.loads(resp.read().decode())
         if not data:
-            return _update_check_response({'current': VERSION, 'latest': None, 'error': 'No tags found', 'body': '', 'update_available': False})
+            return _update_check_response({'current': VERSION, 'latest': None, 'channel': 'main', 'error': 'No tags found', 'body': '', 'update_available': False})
         # Only surface tags that are actually on the main branch so that tags
         # pushed on dev before a merge-to-main don't show as "update available".
         try:
@@ -1945,7 +2008,7 @@ def update_check():
             except (ValueError, IndexError):
                 continue
         if not versions:
-            return _update_check_response({'current': VERSION, 'latest': None, 'error': 'No version tags', 'body': '', 'update_available': False})
+            return _update_check_response({'current': VERSION, 'latest': None, 'channel': 'main', 'error': 'No version tags', 'body': '', 'update_available': False})
         versions.sort(key=lambda x: x[0], reverse=True)
         latest_tag = versions[0][1]
         latest = latest_tag.get('name', '').lstrip('v')
@@ -1963,9 +2026,9 @@ def update_check():
         body = _github_release_notes_for_tag(tag_full) if is_newer else ''
         update_cache.update({'latest': latest, 'checked': now, 'notes': notes, 'body': body})
         return _update_check_response({'current': VERSION, 'latest': latest, 'notes': notes, 'body': body,
-            'update_available': is_newer})
+            'channel': 'main', 'update_available': is_newer})
     except Exception as e:
-        return _update_check_response({'current': VERSION, 'latest': None, 'error': str(e)[:200], 'body': '', 'update_available': False})
+        return _update_check_response({'current': VERSION, 'latest': None, 'channel': 'main', 'error': str(e)[:200], 'body': '', 'update_available': False})
 
 def _fetch_latest_tag_name():
     """Return the latest release tag name (e.g. 'v0.2.3-alpha') from GitHub, or None on error."""
@@ -2055,6 +2118,10 @@ def update_apply():
     except Exception:
         pass
 
+    _apply_settings = load_settings()
+    _apply_channel = (_apply_settings.get('update_channel') or 'main').strip().lower()
+    _apply_dev = (_apply_channel == 'dev')
+
     try:
         # Never use pull --rebase in Update Now.
         # Field installs can be detached/tagged or have stale rebase metadata; rebase causes customer-facing conflicts.
@@ -2064,29 +2131,40 @@ def update_apply():
             except Exception:
                 pass
 
-        # Resolve latest tag from GitHub API first, then fetch ONLY that tag (+ = update local tag if
-        # it moved). Bulk `git fetch --tags` fails on many field installs: local v0.3.8-alpha etc.
-        # can differ from origin ("would clobber existing tag") even when the operator only wants
-        # the newest release.
-        tag_name = _fetch_latest_tag_name()
-        target_ref = None
-        if tag_name:
-            refspec = f'+refs/tags/{tag_name}:refs/tags/{tag_name}'
-            fetch_tag = _git(['fetch', 'origin', refspec], timeout=120, isolated_fetch=True)
-            if fetch_tag.returncode != 0:
-                return jsonify(_error_payload(_git_err(fetch_tag)))
-            verify_tag = _git(['rev-parse', '-q', '--verify', f'refs/tags/{tag_name}'], timeout=15)
-            if verify_tag.returncode == 0:
-                target_ref = f'refs/tags/{tag_name}'
-
-        # Fallback: track origin/main if tag lookup fails.
-        if not target_ref:
-            fetch_main = _git(
-                ['fetch', 'origin', 'main:refs/remotes/origin/main'], timeout=30, isolated_fetch=True
+        if _apply_dev:
+            # Dev channel: fetch origin/dev HEAD and check it out directly.
+            fetch_dev = _git(
+                ['fetch', 'origin', 'dev:refs/remotes/origin/dev'], timeout=60, isolated_fetch=True
             )
-            if fetch_main.returncode != 0:
-                return jsonify(_error_payload(_git_err(fetch_main)))
-            target_ref = 'refs/remotes/origin/main'
+            if fetch_dev.returncode != 0:
+                return jsonify(_error_payload(_git_err(fetch_dev)))
+            target_ref = 'refs/remotes/origin/dev'
+            target_label = 'origin/dev'
+        else:
+            # Main channel: resolve latest tag from GitHub API, then fetch ONLY that tag (+ = update
+            # local tag if it moved). Bulk `git fetch --tags` fails on many field installs: local
+            # v0.3.8-alpha etc. can differ from origin ("would clobber existing tag") even when the
+            # operator only wants the newest release.
+            tag_name = _fetch_latest_tag_name()
+            target_ref = None
+            if tag_name:
+                refspec = f'+refs/tags/{tag_name}:refs/tags/{tag_name}'
+                fetch_tag = _git(['fetch', 'origin', refspec], timeout=120, isolated_fetch=True)
+                if fetch_tag.returncode != 0:
+                    return jsonify(_error_payload(_git_err(fetch_tag)))
+                verify_tag = _git(['rev-parse', '-q', '--verify', f'refs/tags/{tag_name}'], timeout=15)
+                if verify_tag.returncode == 0:
+                    target_ref = f'refs/tags/{tag_name}'
+
+            # Fallback: track origin/main if tag lookup fails.
+            if not target_ref:
+                fetch_main = _git(
+                    ['fetch', 'origin', 'main:refs/remotes/origin/main'], timeout=30, isolated_fetch=True
+                )
+                if fetch_main.returncode != 0:
+                    return jsonify(_error_payload(_git_err(fetch_main)))
+                target_ref = 'refs/remotes/origin/main'
+            target_label = tag_name or 'origin/main'
 
         checkout = _git(['checkout', '--force', target_ref], timeout=30)
         if checkout.returncode != 0:
@@ -2098,7 +2176,7 @@ def update_apply():
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return jsonify({
             'success': True,
-            'output': f'Updated to {tag_name or "origin/main"}',
+            'output': f'Updated to {target_label}',
             'restart_required': True,
             'restart_message': 'Console is restarting. You may see 502 briefly — wait 10–15 seconds then refresh the page.'
         })
@@ -35652,6 +35730,14 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 <div class="section-title">Console</div>
 <div class="meta-line" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">v{{ version }} | {{ settings.get('os_name', 'Unknown OS') }} | {{ settings.get('server_ip', 'N/A') }}{% if settings.get('fqdn') %} | {{ settings.get('fqdn') }}{% endif %}<button type="button" id="check-release-btn" onclick="checkUpdate(true)" style="padding:4px 10px;background:rgba(59,130,246,0.15);color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">Check for new release</button></div>
+<div style="display:flex;align-items:center;gap:8px;margin-top:6px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim)">
+  <span>Update channel:</span>
+  <div style="display:inline-flex;border:1px solid var(--border);border-radius:6px;overflow:hidden">
+    <button id="ch-main-btn" onclick="setUpdateChannel('main')" style="padding:3px 10px;font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:600;border:none;cursor:pointer;transition:background .15s,color .15s" title="Track stable releases on main">main</button>
+    <button id="ch-dev-btn"  onclick="setUpdateChannel('dev')"  style="padding:3px 10px;font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:600;border:none;border-left:1px solid var(--border);cursor:pointer;transition:background .15s,color .15s" title="Track dev branch (testers only)">dev</button>
+  </div>
+  <span id="ch-status" style="font-size:10px;opacity:0.7"></span>
+</div>
 <div class="modules-grid">
 {% if not modules %}
 <div style="grid-column:1/-1;background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:48px;text-align:center">
@@ -35920,6 +36006,33 @@ async function applyUpdate(){
             btn.disabled=false;btn.textContent='Update Now';btn.style.opacity='1';
         }
     }catch(e){status.style.color='var(--red)';status.textContent='Error: '+e.message;btn.disabled=false;btn.textContent='Update Now';btn.style.opacity='1'}
+}
+// --- Update channel toggle ---
+var _currentChannel = '{{ settings.get("update_channel", "main") }}';
+function _renderChannelButtons(ch){
+    var mb=document.getElementById('ch-main-btn');
+    var db=document.getElementById('ch-dev-btn');
+    if(!mb||!db)return;
+    var activeStyle='background:var(--cyan);color:#0f172a;';
+    var idleStyle='background:transparent;color:var(--text-dim);';
+    if(ch==='dev'){mb.style.cssText+=idleStyle;db.style.cssText+=activeStyle;}
+    else{mb.style.cssText+=activeStyle;db.style.cssText+=idleStyle;}
+}
+_renderChannelButtons(_currentChannel);
+async function setUpdateChannel(ch){
+    var st=document.getElementById('ch-status');
+    if(st)st.textContent='Saving…';
+    try{
+        var r=await fetch('/api/update/channel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:ch}),credentials:'same-origin'});
+        var d=await r.json();
+        if(d.ok){
+            _currentChannel=ch;
+            _renderChannelButtons(ch);
+            if(st)st.textContent='Switched to '+ch+' — checking…';
+            checkUpdate(true);
+            setTimeout(function(){if(st)st.textContent='';},3000);
+        }else{if(st)st.textContent='Error: '+(d.error||'unknown');}
+    }catch(e){if(st)st.textContent='Error: '+e.message;}
 }
 checkUpdate();
 async function doConsoleRollback(){
