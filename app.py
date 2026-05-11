@@ -1901,11 +1901,22 @@ def set_update_channel():
 
     Persisted in settings.json as update_channel. The update check and apply routes
     both respect this setting so the operator never has to SSH to switch tracks.
+
+    Switching TO 'dev' requires the console password to be supplied in the request
+    body as 'password' — prevents accidental channel changes by an operator who
+    clicked the wrong button. Switching back to 'main' requires no password.
     """
     data = request.get_json(force=True) or {}
     channel = (data.get('channel') or 'main').strip().lower()
     if channel not in ('main', 'dev'):
         return jsonify({'ok': False, 'error': 'channel must be "main" or "dev"'}), 400
+    if channel == 'dev':
+        pw = (data.get('password') or '').strip()
+        if not pw:
+            return jsonify({'ok': False, 'error': 'password required to switch to dev channel', 'need_password': True}), 403
+        auth = load_auth()
+        if not auth.get('password_hash') or not check_password_hash(auth['password_hash'], pw):
+            return jsonify({'ok': False, 'error': 'incorrect password', 'need_password': True}), 403
     s = load_settings()
     s['update_channel'] = channel
     save_settings(s)
@@ -35729,14 +35740,19 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% endfor %}
 </div>
 <div class="section-title">Console</div>
-<div class="meta-line" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">v{{ version }} | {{ settings.get('os_name', 'Unknown OS') }} | {{ settings.get('server_ip', 'N/A') }}{% if settings.get('fqdn') %} | {{ settings.get('fqdn') }}{% endif %}<button type="button" id="check-release-btn" onclick="checkUpdate(true)" style="padding:4px 10px;background:rgba(59,130,246,0.15);color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">Check for new release</button></div>
-<div style="display:flex;align-items:center;gap:8px;margin-top:6px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim)">
-  <span>Update channel:</span>
-  <div style="display:inline-flex;border:1px solid var(--border);border-radius:6px;overflow:hidden">
-    <button id="ch-main-btn" onclick="setUpdateChannel('main')" style="padding:3px 10px;font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:600;border:none;cursor:pointer;transition:background .15s,color .15s" title="Track stable releases on main">main</button>
-    <button id="ch-dev-btn"  onclick="setUpdateChannel('dev')"  style="padding:3px 10px;font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:600;border:none;border-left:1px solid var(--border);cursor:pointer;transition:background .15s,color .15s" title="Track dev branch (testers only)">dev</button>
+<div class="meta-line" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">v{{ version }} | {{ settings.get('os_name', 'Unknown OS') }} | {{ settings.get('server_ip', 'N/A') }}{% if settings.get('fqdn') %} | {{ settings.get('fqdn') }}{% endif %}<div style="display:inline-flex;border:1px solid var(--border);border-radius:6px;overflow:hidden;margin-left:2px" title="Update channel"><button id="ch-main-btn" onclick="setUpdateChannel('main')" style="padding:3px 10px;font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:600;border:none;cursor:pointer;transition:background .15s,color .15s">main</button><button id="ch-dev-btn" onclick="promptDevChannel()" style="padding:3px 10px;font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:600;border:none;border-left:1px solid var(--border);cursor:pointer;transition:background .15s,color .15s">dev</button></div><span id="ch-status" style="font-size:10px;opacity:0.7"></span><button type="button" id="check-release-btn" onclick="checkUpdate(true)" style="padding:4px 10px;background:rgba(59,130,246,0.15);color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">Check for new release</button></div>
+<div id="dev-pw-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;align-items:center;justify-content:center">
+  <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:320px;max-width:90vw;font-family:'JetBrains Mono',monospace">
+    <div style="font-size:13px;font-weight:700;color:var(--yellow);margin-bottom:6px">⚠ Switch to dev channel</div>
+    <div style="font-size:11px;color:var(--text-dim);margin-bottom:16px;line-height:1.5">Dev tracks unreleased builds. Enter your console password to confirm.</div>
+    <label style="display:block;font-size:11px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">Console password</label>
+    <input id="dev-pw-input" type="password" style="width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text-primary);font-size:13px;font-family:'JetBrains Mono',monospace;box-sizing:border-box" placeholder="password" onkeydown="if(event.key==='Enter')confirmDevChannel()">
+    <div id="dev-pw-err" style="font-size:11px;color:var(--red);margin-top:6px;min-height:16px"></div>
+    <div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">
+      <button onclick="closeDevModal()" style="padding:7px 16px;background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border);border-radius:8px;cursor:pointer;font-family:inherit;font-size:12px">Cancel</button>
+      <button onclick="confirmDevChannel()" style="padding:7px 16px;background:var(--yellow);color:#0f172a;border:none;border-radius:8px;cursor:pointer;font-family:inherit;font-size:12px;font-weight:700">Switch to dev</button>
+    </div>
   </div>
-  <span id="ch-status" style="font-size:10px;opacity:0.7"></span>
 </div>
 <div class="modules-grid">
 {% if not modules %}
@@ -36013,12 +36029,46 @@ function _renderChannelButtons(ch){
     var mb=document.getElementById('ch-main-btn');
     var db=document.getElementById('ch-dev-btn');
     if(!mb||!db)return;
-    var activeStyle='background:var(--cyan);color:#0f172a;';
-    var idleStyle='background:transparent;color:var(--text-dim);';
-    if(ch==='dev'){mb.style.cssText+=idleStyle;db.style.cssText+=activeStyle;}
-    else{mb.style.cssText+=activeStyle;db.style.cssText+=idleStyle;}
+    var mainActive='background:var(--green);color:#0f172a;border:none;';
+    var devActive='background:var(--yellow);color:#0f172a;border:none;';
+    var idle='background:transparent;color:var(--text-dim);border:none;';
+    if(ch==='dev'){mb.setAttribute('style',mb.getAttribute('style').replace(/background:[^;]+;/,'')+idle);db.setAttribute('style',db.getAttribute('style').replace(/background:[^;]+;/,'')+devActive);}
+    else{mb.setAttribute('style',mb.getAttribute('style').replace(/background:[^;]+;/,'')+mainActive);db.setAttribute('style',db.getAttribute('style').replace(/background:[^;]+;/,'')+idle);}
 }
 _renderChannelButtons(_currentChannel);
+function promptDevChannel(){
+    if(_currentChannel==='dev'){setUpdateChannel('main');return;}
+    var m=document.getElementById('dev-pw-modal');
+    var inp=document.getElementById('dev-pw-input');
+    var err=document.getElementById('dev-pw-err');
+    if(err)err.textContent='';
+    if(inp)inp.value='';
+    if(m){m.style.display='flex';setTimeout(function(){if(inp)inp.focus();},80);}
+}
+function closeDevModal(){
+    var m=document.getElementById('dev-pw-modal');
+    if(m)m.style.display='none';
+}
+async function confirmDevChannel(){
+    var inp=document.getElementById('dev-pw-input');
+    var err=document.getElementById('dev-pw-err');
+    var pw=(inp?inp.value:'').trim();
+    if(!pw){if(err)err.textContent='Password required';return;}
+    if(err)err.textContent='';
+    try{
+        var r=await fetch('/api/update/channel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:'dev',password:pw}),credentials:'same-origin'});
+        var d=await r.json();
+        if(d.ok){
+            closeDevModal();
+            _currentChannel='dev';
+            _renderChannelButtons('dev');
+            var st=document.getElementById('ch-status');
+            if(st)st.textContent='Switched to dev — checking…';
+            checkUpdate(true);
+            setTimeout(function(){var s=document.getElementById('ch-status');if(s)s.textContent='';},3000);
+        }else{if(err)err.textContent=d.error||'Incorrect password';}
+    }catch(e){if(err)err.textContent='Error: '+e.message;}
+}
 async function setUpdateChannel(ch){
     var st=document.getElementById('ch-status');
     if(st)st.textContent='Saving…';
