@@ -26507,8 +26507,27 @@ def _authentik_setup_reputation_policy(plog):
                     data=json.dumps(bind_data).encode(),
                     headers=headers, method='POST'
                 )
-                _req.urlopen(req, timeout=10)
-                plog("  reputation policy: bound to ldap-authentication-flow")
+                try:
+                    _req.urlopen(req, timeout=10)
+                    plog("  reputation policy: bound to ldap-authentication-flow")
+                except urllib.error.HTTPError as _bind_err:
+                    _body = _bind_err.read().decode('utf-8', errors='replace')[:500]
+                    plog(f"  reputation policy: binding POST returned {_bind_err.code} — {_body}")
+                    # Re-query: binding may already exist (race condition / prior partial run)
+                    _recheck = _req.Request(
+                        f'{url}/api/v3/policies/bindings/?policy={policy_pk}&target={flow_pk}',
+                        headers=headers
+                    )
+                    try:
+                        _existing = json.loads(_req.urlopen(_recheck, timeout=10).read().decode())['results']
+                    except Exception:
+                        _existing = []
+                    if _existing:
+                        plog("  reputation policy: binding confirmed via re-check — treating as bound")
+                    else:
+                        raise RuntimeError(
+                            f"HTTP {_bind_err.code} creating policy binding: {_body}"
+                        ) from _bind_err
             else:
                 plog("  reputation policy: binding already exists")
 
@@ -26529,7 +26548,14 @@ def _authentik_setup_reputation_policy(plog):
         return True
 
     except Exception as e:
-        plog(f"  reputation policy: error — {e}")
+        if isinstance(e, urllib.error.HTTPError):
+            try:
+                _err_body = e.read().decode('utf-8', errors='replace')[:500]
+            except Exception:
+                _err_body = '(body already read)'
+            plog(f"  reputation policy: error — {e} — response: {_err_body}")
+        else:
+            plog(f"  reputation policy: error — {e}")
         try:
             s = load_settings()
             rc = s.get('authentik_reputation_policy') or {}
