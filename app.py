@@ -37467,6 +37467,66 @@ def _startup_harden_cloudtak_ports():
 
 _startup_harden_cloudtak_ports()
 
+
+# v0.9.12: self-heal LDAP service account password drift on every startup.
+# Triggered originally by the v0.9.12 hardening recreate of Authentik containers,
+# which caused some installs to end up with an `adm_ldapservice` password in
+# Authentik that no longer matched ~/authentik/.env (despite the .env being
+# unchanged). When the bind fails, all LDAP-backed login flows break —
+# WebTAK, TAK Portal, CloudTAK login modal, ATAK certificate enrollment, etc.
+#
+# Idempotent: skips entirely if Authentik isn't installed or CoreConfig
+# doesn't have LDAP configured. If LDAP IS configured, attempts a probe bind
+# with the .env password; only triggers the full resync flow (set Authentik
+# user password from .env + force-recreate LDAP outpost) when the probe fails.
+def _startup_resync_ldap_service_account():
+    try:
+        if not os.path.isdir(os.path.expanduser('~/authentik')):
+            return
+        if not _coreconfig_has_ldap():
+            return
+        settings = load_settings()
+        env_pass = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')
+        if not env_pass:
+            return
+        # Probe: does the bind work today? If yes, idempotent no-op.
+        try:
+            verdict = _test_ldap_bind_dn_verdict('cn=adm_ldapservice,ou=users,dc=takldap', env_pass)
+        except Exception:
+            verdict = 'inconclusive'
+        if verdict == 'ok':
+            print("Startup migration: LDAP service account bind verified (idempotent — no-op)")
+            return
+        if verdict == 'inconclusive':
+            # Don't touch a system where we can't confirm the bind state — could be
+            # outpost not ready yet (boot race). The next startup or operator's
+            # explicit Resync click handles it.
+            print("Startup migration: LDAP service account bind inconclusive — leaving alone (outpost may still be starting)")
+            return
+        # Confirmed fail — trigger the same flow as the Resync LDAP button.
+        print("Startup migration: LDAP service account bind FAILED — auto-resyncing (post-v0.9.12 hardening drift)")
+        try:
+            ok, msg = _ensure_authentik_ldap_service_account()
+            if ok:
+                print(f"Startup migration: LDAP service account resync OK ({msg})")
+            else:
+                print(f"Startup migration: LDAP service account resync incomplete — {msg}")
+        except Exception as _re:
+            print(f"Startup migration: LDAP service account resync error (non-fatal): {_re}")
+        # Belt and braces: also resync the CoreConfig credential so any drift on
+        # that side gets fixed in the same startup pass.
+        try:
+            changed, resync_msg = _resync_ldap_credential_to_coreconfig()
+            if changed:
+                print(f"Startup migration: CoreConfig.xml LDAP credential resynced ({resync_msg})")
+        except Exception:
+            pass
+    except Exception as _e:
+        print(f"Startup migration: LDAP service account resync skipped: {_e}")
+
+_startup_resync_ldap_service_account()
+
+
 def _fail2ban_install_and_configure(plog):
     """Install and configure fail2ban for Authentik brute-force protection (v0.9.0).
 
@@ -38299,6 +38359,29 @@ def _post_update_auto_deploy():
                             print(f"Post-update: Authentik reconfigure error: {e}")
                         finally:
                             _auto_deploy_active.pop('authentik', None)
+                        # v0.9.12: self-heal LDAP service account password drift.
+                        # The reconfigure flow fixes the LDAP flow + provider but does
+                        # NOT re-PATCH the adm_ldapservice user's password to match
+                        # .env. Some installs ended up with drifted passwords after the
+                        # Authentik container recreate triggered by other v0.9.12
+                        # hardening steps. Probe the bind and only re-sync on failure.
+                        try:
+                            if _coreconfig_has_ldap():
+                                _s = load_settings()
+                                _env_pass = _get_authentik_env_value(_s, 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')
+                                if _env_pass:
+                                    _verdict = _test_ldap_bind_dn_verdict(
+                                        'cn=adm_ldapservice,ou=users,dc=takldap', _env_pass)
+                                    if _verdict == 'fail':
+                                        print("Post-update: LDAP service account bind FAILED — auto-resyncing")
+                                        _ok, _msg = _ensure_authentik_ldap_service_account()
+                                        print(f"Post-update: LDAP service account resync {'OK' if _ok else 'incomplete'} ({_msg})")
+                                    elif _verdict == 'ok':
+                                        print("Post-update: LDAP service account bind verified (no resync needed)")
+                                    else:
+                                        print("Post-update: LDAP service account bind inconclusive — leaving alone")
+                        except Exception as _lae:
+                            print(f"Post-update: LDAP service account probe error (non-fatal): {_lae}")
                     else:
                         print("Post-update: Authentik deploy already running, skipped")
 
