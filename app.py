@@ -37325,6 +37325,83 @@ def _auto_update_guarddog():
 _auto_update_guarddog()
 _auto_harden_guarddog_8080()   # v0.9.12 A6: source-scope UFW for port 8080
 
+# v0.9.12 A7: startup migration — patch base compose port bindings to loopback
+# and force-recreate containers if the loopback binding is absent.
+# Runs on every console startup so restarts self-heal without needing Update Now.
+# The same patching also runs in post-update (_auto_harden_takportal/cloudtak).
+def _startup_harden_tak_portal_ports():
+    try:
+        _tp_dir = os.path.expanduser('~/TAK-Portal')
+        if not os.path.isdir(_tp_dir):
+            return
+        _changed = _patch_takportal_compose_ports(_tp_dir)
+        if _changed:
+            print("Startup migration: TAK Portal base compose patched (WEB_UI_PORT → 127.0.0.1)")
+        # Check if the running container is missing the loopback binding
+        _needs_recreate = _changed
+        if not _needs_recreate:
+            try:
+                _ins = subprocess.run(
+                    "docker inspect tak-portal --format '{{json .HostConfig.PortBindings}}'",
+                    shell=True, capture_output=True, text=True, timeout=5
+                )
+                _bindings = json.loads(_ins.stdout.strip() or '{}')
+                if not _bindings.get('3000/tcp'):
+                    _needs_recreate = True
+                    print("Startup migration: TAK Portal 127.0.0.1:3000 binding absent — recreating")
+            except Exception:
+                pass
+        if _needs_recreate:
+            r = subprocess.run(
+                f'cd {shlex.quote(_tp_dir)} && docker compose up -d --force-recreate 2>&1',
+                shell=True, capture_output=True, text=True, timeout=180
+            )
+            if r.returncode == 0:
+                print("Startup migration: TAK Portal recreated with 127.0.0.1:3000 binding")
+            else:
+                print(f"Startup migration: TAK Portal recreate warning: {(r.stdout or '')[:200]}")
+    except Exception as _e:
+        print(f"Startup migration: TAK Portal port harden error (non-fatal): {_e}")
+
+_startup_harden_tak_portal_ports()
+
+
+def _startup_harden_cloudtak_ports():
+    try:
+        _ct_dir = os.path.expanduser('~/CloudTAK')
+        if not os.path.isdir(_ct_dir):
+            return
+        _changed = _patch_cloudtak_compose_ports(_ct_dir)
+        if _changed:
+            print("Startup migration: CloudTAK base compose patched (port bindings → loopback/removed)")
+        # Check if the api container is missing the loopback binding
+        _needs_recreate = _changed
+        if not _needs_recreate:
+            try:
+                _ins = subprocess.run(
+                    "docker inspect cloudtak-api-1 --format '{{json .HostConfig.PortBindings}}'",
+                    shell=True, capture_output=True, text=True, timeout=5
+                )
+                _bindings = json.loads(_ins.stdout.strip() or '{}')
+                if not _bindings.get('5000/tcp'):
+                    _needs_recreate = True
+                    print("Startup migration: CloudTAK 127.0.0.1:5000 binding absent — recreating")
+            except Exception:
+                pass
+        if _needs_recreate:
+            r = subprocess.run(
+                f'cd {shlex.quote(_ct_dir)} && docker compose up -d --force-recreate 2>&1',
+                shell=True, capture_output=True, text=True, timeout=240
+            )
+            if r.returncode == 0:
+                print("Startup migration: CloudTAK recreated with hardened port bindings")
+            else:
+                print(f"Startup migration: CloudTAK recreate warning: {(r.stdout or '')[:200]}")
+    except Exception as _e:
+        print(f"Startup migration: CloudTAK port harden error (non-fatal): {_e}")
+
+_startup_harden_cloudtak_ports()
+
 def _fail2ban_install_and_configure(plog):
     """Install and configure fail2ban for Authentik brute-force protection (v0.9.0).
 
