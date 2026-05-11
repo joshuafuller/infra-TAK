@@ -307,7 +307,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.10-alpha"
+VERSION = "0.9.11-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -7049,6 +7049,22 @@ def cloudtak_page():
     ct_version = ct_vinfo.get('version', '')
     ct_update_available = ct_vinfo.get('update_available', False)
     ct_latest = ct_vinfo.get('latest', '')
+    # v0.9.11 security advisory state — drives the in-UI banner.
+    # compromise_detected: ~/CloudTAK/COMPROMISE-DETECTED.txt was written by
+    #   _auto_harden_cloudtak() because malware persistence (.so + shared_preload_libraries)
+    #   was found in the postgis data volume during the last Update Now.
+    # legacy_install: the install pre-dates v0.9.11 (no .postgres-password file). Postgis
+    #   still has the upstream 'docker' password baked into pg_authid — Remove + Reinstall
+    #   is required to rotate to the strong random value, even though network is locked.
+    sec_compromised = False
+    sec_legacy_install = False
+    try:
+        _ct_dir = os.path.expanduser('~/CloudTAK')
+        if cloudtak.get('installed') and cloudtak_cfg.get('target_mode') != 'remote':
+            sec_compromised = os.path.exists(os.path.join(_ct_dir, 'COMPROMISE-DETECTED.txt'))
+            sec_legacy_install = not os.path.exists(os.path.join(_ct_dir, '.postgres-password'))
+    except Exception:
+        pass
     return render_template_string(CLOUDTAK_TEMPLATE,
         settings=settings, cloudtak=cloudtak,
         version=VERSION,
@@ -7062,6 +7078,8 @@ def cloudtak_page():
         cloudtak_bootstrap_pass=ct_bootstrap_pass,
         cloudtak_cert_password=ct_cert_pass,
         container_info=container_info,
+        sec_compromised=sec_compromised,
+        sec_legacy_install=sec_legacy_install,
         deploying=cloudtak_deploy_status.get('running', False),
         deploy_done=cloudtak_deploy_status.get('complete', False),
         deploy_error=cloudtak_deploy_status.get('error', False))
@@ -14802,8 +14820,17 @@ def cloudtak_reset_server_config():
         return jsonify({'success': True, 'message': f'CloudTAK server config cleared. Visit {"map." + fqdn if fqdn else "CloudTAK"} to re-run the bootstrap wizard.'})
 
 
-def _cloudtak_build_env_content(settings, domain, signing_secret, minio_pass, remote_host=''):
-    """Build CloudTAK .env content for local or remote target."""
+def _cloudtak_build_env_content(settings, domain, signing_secret, minio_pass, postgres_pass='docker', remote_host=''):
+    """Build CloudTAK .env content for local or remote target.
+
+    postgres_pass: strong random password for the postgis DB. Defaults to
+    'docker' for backwards compatibility with pre-v0.9.11 call sites; new
+    installs (v0.9.11+) should always pass a `secrets.token_hex(24)` value.
+    The value is substituted into the override file's postgis service via
+    Compose variable expansion (${POSTGRES_PASSWORD}) so postgis initdb
+    bakes the strong password into pg_authid on first boot of a fresh
+    data volume.
+    """
     # Prefer explicit CloudTAK service domains when available (works even if fqdn is unset).
     ct_map_host = (_get_service_domain(settings, 'cloudtak_map') or '').strip()
     ct_tiles_host = (_get_service_domain(settings, 'cloudtak_tiles') or '').strip()
@@ -14837,7 +14864,12 @@ AWS_S3_SecretAccessKey={minio_pass}
 MINIO_ROOT_USER=cloudtakminioadmin
 MINIO_ROOT_PASSWORD={minio_pass}
 
-POSTGRES=postgres://docker:docker@postgis:5432/gis
+# POSTGRES_PASSWORD: substituted into postgis service via docker-compose.override.yml.
+# Postgres reads POSTGRES_PASSWORD env on initdb (first boot of empty volume) and bakes it
+# into pg_authid. On subsequent boots the value is ignored — the password in the DB persists.
+# v0.9.11+ generates a random 48-char hex value; pre-v0.9.11 installs used 'docker' (weak).
+POSTGRES_PASSWORD={postgres_pass}
+POSTGRES=postgres://docker:{postgres_pass}@postgis:5432/gis
 
 # API_URL must be reachable by the browser (for tile URLs in TileJSON). We set it to the public
 # map URL when domain is set so the map and basemaps render.
@@ -14882,7 +14914,29 @@ def _cloudtak_build_override_yml(settings):
     # (commit c908179) and TAK Portal (commit 7fe8191) — these containers
     # legitimately need a default capability set; capability hardening at
     # this level is not appropriate for them.
-    return f"""# TAKWERX: CloudTAK container overrides
+    # v0.9.11 security hardening: lock down postgis + MinIO host port mappings.
+    # Upstream dfpc-coe/CloudTAK ships postgis bound to 0.0.0.0:5433 with hardcoded
+    # docker:docker creds, which was actively exploited in the wild by PG_MEM/PGMiner
+    # cryptominer family (live compromise on infra-TAK May 8-10, 2026).
+    #
+    # postgis ports !reset []: removes the upstream 5433:5432 host mapping entirely.
+    #   CloudTAK app reaches postgis via the internal Docker network (postgis:5432),
+    #   never needed a host port. Operators who want psql access: use
+    #   `docker exec -it cloudtak-postgis-1 psql -U docker gis` from the host.
+    #
+    # store (MinIO) ports !reset to 127.0.0.1:9002:9002: removes the public 9000
+    #   (S3 API — only needed by internal containers) and binds the 9002 web console
+    #   to loopback only (operators can SSH-tunnel to access for bucket management).
+    #
+    # postgis POSTGRES_PASSWORD: "${{POSTGRES_PASSWORD}}": Compose substitutes the
+    #   value from .env. On a fresh volume initdb bakes this into pg_authid; on an
+    #   existing volume the env var is ignored and the previously-baked password
+    #   stays in force (so update-only flows don't break running installs).
+    #
+    # Defense-in-depth: _auto_harden_cloudtak() also installs UFW deny rules for
+    # 5433/9000/9002 so a regressed override or disabled UFW alone can't reopen
+    # the attack surface.
+    return f"""# TAKWERX: CloudTAK container overrides — v0.9.11 security hardening
 services:
   api:
     extra_hosts:
@@ -14897,6 +14951,13 @@ services:
 {hosts_block}
     environment:
       API_URL: "http://api:5000"
+  postgis:
+    ports: !reset []
+    environment:
+      POSTGRES_PASSWORD: "${{POSTGRES_PASSWORD:-docker}}"
+  store:
+    ports: !reset
+      - "127.0.0.1:9002:9002"
 """
 
 
@@ -15034,7 +15095,8 @@ def run_cloudtak_deploy(cfg=None):
             import secrets as _secrets
             signing_secret = _secrets.token_hex(32)
             minio_pass = _secrets.token_hex(16)
-            env_content = _cloudtak_build_env_content(settings, domain, signing_secret, minio_pass, remote_host=remote_host)
+            postgres_pass = _secrets.token_hex(24)
+            env_content = _cloudtak_build_env_content(settings, domain, signing_secret, minio_pass, postgres_pass=postgres_pass, remote_host=remote_host)
             override_yml = _cloudtak_build_override_yml(settings)
             tmp_dir = tempfile.mkdtemp(prefix='cloudtak-remote-')
             try:
@@ -15240,10 +15302,19 @@ def run_cloudtak_deploy(cfg=None):
         import secrets as _secrets
         signing_secret = _secrets.token_hex(32)
         minio_pass = _secrets.token_hex(16)
+        postgres_pass = _secrets.token_hex(24)
 
-        env_content = _cloudtak_build_env_content(settings, domain, signing_secret, minio_pass)
+        env_content = _cloudtak_build_env_content(settings, domain, signing_secret, minio_pass, postgres_pass=postgres_pass)
         with open(env_path, 'w') as f:
             f.write(env_content)
+        try:
+            _pwfile = os.path.join(cloudtak_dir, '.postgres-password')
+            with open(_pwfile, 'w') as _pf:
+                _pf.write(postgres_pass + '\n')
+            os.chmod(_pwfile, 0o600)
+            plog(f"  postgis password saved to {_pwfile} (chmod 600)")
+        except Exception as _pwe:
+            plog(f"  WARNING: could not save .postgres-password: {_pwe}")
 
         # So the API container can reach the host (e.g. TAKWERX Console / Marti at :5001)
         override_path = os.path.join(cloudtak_dir, 'docker-compose.override.yml')
@@ -15496,7 +15567,23 @@ def run_cloudtak_redeploy(cfg=None):
             import secrets as _secrets
             signing_secret = _secrets.token_hex(32)
             minio_pass = _secrets.token_hex(16)
-            env_content = _cloudtak_build_env_content(settings, domain, signing_secret, minio_pass, remote_host=remote_host)
+            # Preserve existing postgres password from remote .env so we don't break the
+            # DB connection on an existing install. If the remote .env doesn't have one
+            # (pre-v0.9.11), fall back to 'docker' (the upstream literal). New strong
+            # passwords are only generated on first install or full Remove+Reinstall.
+            postgres_pass = 'docker'
+            try:
+                _ok_pw, _pw_out = _ssh_probe(
+                    remote_cfg,
+                    "grep -E '^POSTGRES_PASSWORD=' ~/CloudTAK/.env 2>/dev/null | head -1 | cut -d= -f2-",
+                    timeout=15
+                )
+                if _ok_pw and (_pw_out or '').strip():
+                    postgres_pass = (_pw_out or '').strip()
+                    plog("  Preserving existing postgis password from remote .env")
+            except Exception:
+                pass
+            env_content = _cloudtak_build_env_content(settings, domain, signing_secret, minio_pass, postgres_pass=postgres_pass, remote_host=remote_host)
             override_yml = _cloudtak_build_override_yml(settings)
             tmp_dir = tempfile.mkdtemp(prefix='cloudtak-reremote-')
             try:
@@ -15546,6 +15633,7 @@ def run_cloudtak_redeploy(cfg=None):
         env_path = os.path.join(cloudtak_dir, '.env')
         signing_secret = None
         minio_pass = None
+        postgres_pass = None
         if os.path.exists(env_path):
             with open(env_path) as f:
                 for line in f:
@@ -15554,12 +15642,20 @@ def run_cloudtak_redeploy(cfg=None):
                         signing_secret = line.split('=', 1)[1].strip()
                     elif line.startswith('MINIO_ROOT_PASSWORD='):
                         minio_pass = line.split('=', 1)[1].strip()
+                    elif line.startswith('POSTGRES_PASSWORD='):
+                        postgres_pass = line.split('=', 1)[1].strip()
         import secrets as _secrets
         if not signing_secret:
             signing_secret = _secrets.token_hex(32)
         if not minio_pass:
             minio_pass = _secrets.token_hex(16)
-        env_content = _cloudtak_build_env_content(settings, domain, signing_secret, minio_pass)
+        # Preserve existing postgis password on reconfig so the DB connection keeps
+        # working. Pre-v0.9.11 installs don't have POSTGRES_PASSWORD in .env — fall
+        # back to 'docker' (the upstream literal that postgres already initialized
+        # the volume with). Strong passwords only land on Remove + Reinstall.
+        if not postgres_pass:
+            postgres_pass = 'docker'
+        env_content = _cloudtak_build_env_content(settings, domain, signing_secret, minio_pass, postgres_pass=postgres_pass)
         with open(env_path, 'w') as f:
             f.write(env_content)
         override_path = os.path.join(cloudtak_dir, 'docker-compose.override.yml')
@@ -22173,6 +22269,38 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     <h1><img src="{{ cloudtak_icon }}" alt="" style="height:28px;vertical-align:middle;margin-right:8px">CloudTAK{% if cloudtak_version %} <span style="font-weight:500;color:var(--text-dim);font-size:16px">· v{{ cloudtak_version }}</span>{% endif %}{% if cloudtak_update_available %} <span style="font-size:12px;color:var(--cyan);font-weight:600;margin-left:8px">v{{ cloudtak_latest }} available</span>{% endif %}</h1>
     <p>Browser-based TAK client — in-browser map and situational awareness via TAK Server</p>
   </div>
+
+  {% if sec_compromised %}
+  <div style="background:rgba(239,68,68,0.10);border:2px solid var(--red);border-radius:12px;padding:18px 22px;margin-bottom:20px;color:var(--red)">
+    <div style="display:flex;align-items:flex-start;gap:12px">
+      <span class="material-symbols-outlined" style="font-size:28px;flex-shrink:0">warning</span>
+      <div style="flex:1">
+        <div style="font-weight:700;font-size:15px;margin-bottom:6px;color:var(--red)">CRITICAL: CloudTAK PostGIS compromise detected on this host</div>
+        <div style="color:var(--text-secondary);font-size:13px;line-height:1.6">
+          The v0.9.11 security update found malware persistence (PG_MEM / PGMiner cryptominer) in your CloudTAK postgis data volume.
+          The malware has been quarantined and CloudTAK has been stopped. <strong style="color:var(--text-primary)">Attacker artifacts may still exist in the DB itself (additional postgres roles, pg_cron jobs, event triggers) — they cannot be reliably cleaned in place.</strong>
+          <br><br>
+          <strong style="color:var(--text-primary)">Required action:</strong> Click <strong style="color:var(--red)">Remove</strong> below (wipes the data volume), then <strong style="color:var(--green)">Install</strong> (fresh DB with strong random password and locked-down ports). Forensic details: <code>~/CloudTAK/COMPROMISE-DETECTED.txt</code> on the server, and <a href="https://github.com/takwerx/infra-TAK/blob/main/docs/SECURITY-INCIDENT-2026-05-10-PGMINER.md" target="_blank" rel="noopener" style="color:var(--cyan)">docs/SECURITY-INCIDENT-2026-05-10-PGMINER.md</a>.
+        </div>
+      </div>
+    </div>
+  </div>
+  {% elif sec_legacy_install and cloudtak.installed %}
+  <div style="background:rgba(234,179,8,0.08);border:1px solid rgba(234,179,8,0.4);border-radius:12px;padding:16px 20px;margin-bottom:20px">
+    <div style="display:flex;align-items:flex-start;gap:12px">
+      <span class="material-symbols-outlined" style="font-size:24px;color:var(--yellow);flex-shrink:0">shield_locked</span>
+      <div style="flex:1">
+        <div style="font-weight:600;font-size:14px;margin-bottom:4px;color:var(--yellow)">Action recommended: Remove + Reinstall CloudTAK to complete v0.9.11 security hardening</div>
+        <div style="color:var(--text-secondary);font-size:12.5px;line-height:1.6">
+          v0.9.11 already locked down your network exposure (postgis host port removed, MinIO console on 127.0.0.1 only, UFW deny rules in place), but your existing postgis database still uses the upstream default password.
+          PostgreSQL only honors <code>POSTGRES_PASSWORD</code> on first <code>initdb</code>, so the rotation requires a fresh data volume.
+          <br><br>
+          <strong style="color:var(--text-primary)">To finish hardening:</strong> click <strong style="color:var(--red)">Remove</strong> then <strong style="color:var(--green)">Install</strong> when it's convenient. Your TAK Server, Authentik, and TAK Portal data are unaffected — only the CloudTAK gis database is rebuilt. Details: <a href="https://github.com/takwerx/infra-TAK/blob/main/docs/RELEASE-v0.9.11-alpha.md" target="_blank" rel="noopener" style="color:var(--cyan)">docs/RELEASE-v0.9.11-alpha.md</a>.
+        </div>
+      </div>
+    </div>
+  </div>
+  {% endif %}
 
   {% if cloudtak.running %}
   <div class="status-banner running"><div class="dot"></div>CloudTAK is running</div>
@@ -38086,6 +38214,205 @@ def _post_update_auto_deploy():
 
             _auto_takportal()
             cloudtak_t.join(timeout=600)
+
+            def _auto_harden_cloudtak():
+                """v0.9.11 security hardening for CloudTAK.
+
+                Three jobs, in order:
+                  1. Detect PG_MEM/PGMiner compromise in the postgis data volume
+                     (gcmanager-1.so or any .so + uncommented shared_preload_libraries).
+                  2. If compromised: stop CloudTAK, quarantine the .so into a dated
+                     subdir, comment out the shared_preload_libraries line, leave
+                     CloudTAK STOPPED. Operator must Remove + Reinstall to remediate.
+                  3. Always: write the v0.9.11 override (postgis ports !reset; store
+                     bound to 127.0.0.1:9002 only; postgis POSTGRES_PASSWORD from env)
+                     and install UFW deny rules for 5433/9000/9002. Recreate the
+                     stack only if NOT compromised — compromised installs stay down.
+
+                Background: dfpc-coe/CloudTAK upstream ships postgis bound to
+                0.0.0.0:5433 with hardcoded docker:docker superuser creds; the
+                PG_MEM/PGMiner cryptominer family actively exploits this in the
+                wild (live compromise observed on infra-TAK responder, May 8-10
+                2026 — see docs/RELEASE-v0.9.11-alpha.md and
+                docs/SECURITY-INCIDENT-2026-05-10-PGMINER.md).
+                """
+                try:
+                    _cloudtak_dir = os.path.expanduser('~/CloudTAK')
+                    _compose_yml = os.path.join(_cloudtak_dir, 'docker-compose.yml')
+                    _compose_yaml = os.path.join(_cloudtak_dir, 'compose.yaml')
+                    if not (os.path.exists(_compose_yml) or os.path.exists(_compose_yaml)):
+                        return
+                    print("Post-update: CloudTAK security hardening (v0.9.11)...")
+
+                    # 1. Locate postgis data volume host path (works for running OR
+                    #    stopped container as long as the container still exists).
+                    _pg_data_path = None
+                    try:
+                        _ins = subprocess.run(
+                            ['docker', 'inspect', 'cloudtak-postgis-1', '-f',
+                             '{{ range .Mounts }}{{ if eq .Destination "/var/lib/postgresql/data" }}{{ .Source }}{{ end }}{{ end }}'],
+                            capture_output=True, text=True, timeout=10
+                        )
+                        if _ins.returncode == 0 and _ins.stdout.strip():
+                            _pg_data_path = _ins.stdout.strip()
+                    except Exception:
+                        pass
+
+                    # 2. Detection
+                    _compromised = False
+                    _quarantined = []
+                    _pgconf_disabled = False
+                    if _pg_data_path and os.path.isdir(_pg_data_path):
+                        try:
+                            _so_files = [f for f in os.listdir(_pg_data_path)
+                                         if f.lower().endswith('.so')]
+                            if _so_files:
+                                _compromised = True
+                                _ts = time.strftime('%Y%m%d-%H%M%S')
+                                _quar_dir = os.path.join(_pg_data_path, f'quarantine-{_ts}')
+                                try:
+                                    os.makedirs(_quar_dir, exist_ok=True)
+                                    for _f in _so_files:
+                                        try:
+                                            os.rename(os.path.join(_pg_data_path, _f),
+                                                      os.path.join(_quar_dir, _f))
+                                            _quarantined.append(_f)
+                                        except Exception as _qfe:
+                                            print(f"  WARNING: failed to quarantine {_f}: {_qfe}")
+                                    if _quarantined:
+                                        print(f"  Quarantined {len(_quarantined)} .so file(s) → {_quar_dir}")
+                                except Exception as _qde:
+                                    print(f"  WARNING: quarantine dir creation failed: {_qde}")
+                        except Exception:
+                            pass
+
+                        _pgconf = os.path.join(_pg_data_path, 'postgresql.conf')
+                        if os.path.exists(_pgconf):
+                            try:
+                                with open(_pgconf, 'r') as _cf:
+                                    _conf = _cf.read()
+                                _pat = re.compile(
+                                    r"^([ \t]*shared_preload_libraries[ \t]*=[ \t]*['\"](.*?)['\"])",
+                                    re.MULTILINE
+                                )
+                                _m = _pat.search(_conf)
+                                if _m and _m.group(2).strip():
+                                    _compromised = True
+                                    _new_conf = _pat.sub(
+                                        lambda mm: f"#INFRATAK_DISABLED# {mm.group(1)}",
+                                        _conf
+                                    )
+                                    with open(_pgconf, 'w') as _cf:
+                                        _cf.write(_new_conf)
+                                    _pgconf_disabled = True
+                                    print(f"  Disabled malicious shared_preload_libraries → '{_m.group(2)}'")
+                            except Exception as _ce:
+                                print(f"  WARNING: postgresql.conf scan failed: {_ce}")
+
+                    # 3. If compromised: stop everything, write a banner file, do
+                    #    NOT recreate. Operator must do Remove + Reinstall.
+                    if _compromised:
+                        try:
+                            subprocess.run(
+                                ['docker', 'stop', '-t', '15',
+                                 'cloudtak-postgis-1', 'cloudtak-api-1',
+                                 'cloudtak-events-1', 'cloudtak-retention-1',
+                                 'cloudtak-media-1', 'cloudtak-tiles-1',
+                                 'cloudtak-store-1'],
+                                capture_output=True, timeout=60
+                            )
+                        except Exception:
+                            pass
+                        _banner = (
+                            "==============================================================\n"
+                            "CRITICAL: CloudTAK PostGIS compromise detected on this host\n"
+                            "==============================================================\n"
+                            f"Detected at:      {time.strftime('%Y-%m-%d %H:%M:%S %Z')}\n"
+                            f"Malware family:   PG_MEM / PGMiner (Monero cryptominer)\n"
+                            f"Quarantined .so:  {', '.join(_quarantined) if _quarantined else '(none found in data dir)'}\n"
+                            f"Persistence:      shared_preload_libraries {'DISABLED' if _pgconf_disabled else 'not found in postgresql.conf'}\n"
+                            "\n"
+                            "WHAT INFRA-TAK HAS DONE:\n"
+                            "  * Stopped all CloudTAK containers\n"
+                            "  * Moved malicious .so files to quarantine-* subdir\n"
+                            "    (kept for forensics, NOT deleted)\n"
+                            "  * Disabled malware load hook in postgresql.conf\n"
+                            "  * Installed UFW deny rules for 5433, 9000, 9002\n"
+                            "  * Wrote v0.9.11 override (host ports locked down)\n"
+                            "\n"
+                            "WHAT INFRA-TAK HAS NOT DONE:\n"
+                            "  * Cleaned attacker-created DB artifacts (postgres\n"
+                            "    roles, pg_cron jobs, event triggers). The data\n"
+                            "    volume may still contain backdoors.\n"
+                            "\n"
+                            "REQUIRED OPERATOR ACTION:\n"
+                            "  1. Console -> CloudTAK -> Remove (wipes data volume)\n"
+                            "  2. Console -> CloudTAK -> Install (fresh DB with\n"
+                            "     v0.9.11 strong password and port lockdown)\n"
+                            "\n"
+                            "CloudTAK will remain OFFLINE until you Remove + Reinstall.\n"
+                            "Full advisory: docs/RELEASE-v0.9.11-alpha.md\n"
+                            "==============================================================\n"
+                        )
+                        print(_banner)
+                        try:
+                            with open(os.path.join(_cloudtak_dir, 'COMPROMISE-DETECTED.txt'), 'w') as _bf:
+                                _bf.write(_banner)
+                        except Exception:
+                            pass
+
+                    # 4. Write hardened override (always, idempotent)
+                    try:
+                        _override_path = os.path.join(_cloudtak_dir, 'docker-compose.override.yml')
+                        _settings = load_settings()
+                        _new_override = _cloudtak_build_override_yml(_settings)
+                        _existing = ''
+                        if os.path.exists(_override_path):
+                            try:
+                                with open(_override_path, 'r') as _of:
+                                    _existing = _of.read()
+                            except Exception:
+                                pass
+                        if _existing.strip() != _new_override.strip():
+                            with open(_override_path, 'w') as _of:
+                                _of.write(_new_override)
+                            print("  CloudTAK override updated (postgis/store host ports locked down)")
+                    except Exception as _ove:
+                        print(f"  WARNING: override write failed: {_ove}")
+
+                    # 5. UFW deny rules (defense in depth — survives override regressions)
+                    try:
+                        for _port in ('5433/tcp', '9000/tcp', '9002/tcp'):
+                            subprocess.run(
+                                f'(sudo ufw deny {_port} || ufw deny {_port}) >/dev/null 2>&1 || true',
+                                shell=True, capture_output=True, timeout=10
+                            )
+                        print("  CloudTAK UFW deny rules applied (5433, 9000, 9002)")
+                    except Exception as _ue:
+                        print(f"  WARNING: UFW rules failed: {_ue}")
+
+                    # 6. Recreate the stack only if clean. Compromised installs
+                    #    stay STOPPED until operator does Remove + Reinstall.
+                    if not _compromised:
+                        try:
+                            _rec = subprocess.run(
+                                f'cd {shlex.quote(_cloudtak_dir)} && docker compose up -d --force-recreate 2>&1',
+                                shell=True, capture_output=True, text=True, timeout=240
+                            )
+                            if _rec.returncode == 0:
+                                print("  CloudTAK recreated with hardened port bindings")
+                            else:
+                                print(f"  WARNING: CloudTAK recreate returned {_rec.returncode}: {(_rec.stdout or '')[:200]}")
+                        except Exception as _re:
+                            print(f"  WARNING: CloudTAK recreate failed: {_re}")
+                    else:
+                        print("  CloudTAK left STOPPED pending operator Remove + Reinstall")
+
+                    print("Post-update: CloudTAK security hardening complete")
+                except Exception as _che:
+                    print(f"Post-update: CloudTAK hardening error (non-fatal): {_che}")
+
+            _auto_harden_cloudtak()
 
             # Final orphan postgres kill — _auto_authentik() runs run_authentik_deploy()
             # which recreates containers AGAIN after _auto_harden_containers() already ran,
