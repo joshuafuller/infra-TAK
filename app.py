@@ -39076,6 +39076,21 @@ def _post_update_auto_deploy():
                                 print("  TAK Portal: override clean but container still on 0.0.0.0:3000 — recreating")
                         except Exception:
                             pass
+                    if not _needs_recreate:
+                        # Also recreate if the expected loopback binding is simply absent
+                        # (e.g. container was created before the override existed, or was
+                        # restarted with `docker restart` rather than `docker compose up`).
+                        try:
+                            _ins = subprocess.run(
+                                "docker inspect tak-portal --format '{{json .HostConfig.PortBindings}}'",
+                                shell=True, capture_output=True, text=True, timeout=5
+                            )
+                            _bindings = json.loads(_ins.stdout.strip() or '{}')
+                            if not _bindings.get('3000/tcp'):
+                                _needs_recreate = True
+                                print("  TAK Portal: 127.0.0.1:3000 binding absent from running container — recreating")
+                        except Exception:
+                            pass
 
                     if _needs_recreate:
                         try:
