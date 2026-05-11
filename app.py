@@ -36042,8 +36042,8 @@ function _renderChannelButtons(ch){
     var mb=document.getElementById('ch-main-btn');
     var db=document.getElementById('ch-dev-btn');
     if(!mb||!db)return;
-    var base='padding:3px 10px;font-family:\'JetBrains Mono\',monospace;font-size:10px;font-weight:600;border:none;cursor:pointer;transition:background .15s,color .15s;';
-    var devBorder='border-left:1px solid var(--border);';
+    var base="padding:3px 10px;font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:600;border:none;cursor:pointer;transition:background .15s,color .15s;";
+    var devBorder="border-left:1px solid var(--border);";
     if(ch==='dev'){
         mb.style.cssText=base+'background:transparent;color:var(--text-dim);';
         db.style.cssText=base+devBorder+'background:var(--yellow);color:#0f172a;';
