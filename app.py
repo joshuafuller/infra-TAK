@@ -307,7 +307,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.11-alpha"
+VERSION = "0.9.12-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -2281,12 +2281,26 @@ def takserver_two_server_preflight():
         }
     })
 
+_PG_IDENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]{0,62}$')
+
+
 @app.route('/api/takserver/external-db/provision', methods=['POST'])
 @login_required
 def takserver_external_db_provision():
     """Provision the TAK Server database user on an external/managed PostgreSQL instance.
     Installs postgresql-client if needed, connects as the admin user, creates the app user
     (martiuser by default), grants required privileges, and returns a log of what was done.
+
+    v0.9.12 hardening — defence against SQL injection:
+      * All identifiers (db_user, db_name, admin_user, app_user) are
+        regex-validated against the Postgres identifier grammar
+        (^[A-Za-z_][A-Za-z0-9_]{0,62}$) before any psql call. Postgres
+        does NOT support parameter substitution for identifiers, so this
+        is the only safe path.
+      * Passwords (app_pass) go through `psql -v` substitution and
+        :'name' quoting, NEVER f-strings.
+      * db_host is validated via _safe_migration_db_host (IP or simple
+        DNS name only).
     """
     import secrets, string
     data = request.get_json() or {}
@@ -2308,6 +2322,19 @@ def takserver_external_db_provision():
         return jsonify({'success': False, 'error': 'No database host provided', 'log': []}), 400
     if not admin_pass:
         return jsonify({'success': False, 'error': 'Admin password is required to provision the database', 'log': []}), 400
+
+    # v0.9.12 — input validation BEFORE any psql call.
+    if not _safe_migration_db_host(db_host):
+        return jsonify({'success': False, 'error': 'Invalid db_host (must be IP or simple DNS name)', 'log': []}), 400
+    if not (1 <= db_port <= 65535):
+        return jsonify({'success': False, 'error': 'Invalid db_port', 'log': []}), 400
+    for _ident_name, _ident_val in (('app_user', app_user), ('db_name', db_name), ('admin_user', admin_user)):
+        if not _PG_IDENT_RE.fullmatch(_ident_val):
+            return jsonify({
+                'success': False,
+                'error': f'Invalid {_ident_name}: must match Postgres identifier grammar ^[A-Za-z_][A-Za-z0-9_]{{0,62}}$',
+                'log': []
+            }), 400
 
     log = []
 
@@ -2341,16 +2368,22 @@ def takserver_external_db_provision():
         plog(f'  ✗ Error checking psql: {e}')
         return jsonify({'success': False, 'log': log, 'error': str(e)}), 500
 
-    def run_sql(sql, label, use_db=None):
-        """Run a SQL statement as the admin user. Returns (ok, output)."""
+    def run_sql(sql, label, use_db=None, pw_var=None):
+        """Run a SQL statement as the admin user. Returns (ok, output).
+
+        v0.9.12: optional pw_var={'name': value} passes a password to psql via
+        `-v name=value` so the SQL can reference it as `:'name'` (psql will
+        quote and escape correctly). NEVER f-string passwords into SQL.
+        """
         try:
             target_db = use_db or db_name
             env = dict(os.environ, PGPASSWORD=admin_pass)
-            r = subprocess.run(
-                ['psql', '-h', db_host, '-p', str(db_port), '-U', admin_user, '-d', target_db,
-                 '-c', sql, '--no-password', '-t', '-A'],
-                capture_output=True, text=True, timeout=20, env=env
-            )
+            argv = ['psql', '-h', db_host, '-p', str(db_port), '-U', admin_user, '-d', target_db]
+            if pw_var:
+                for _k, _v in pw_var.items():
+                    argv.extend(['-v', f'{_k}={_v}'])
+            argv.extend(['-c', sql, '--no-password', '-t', '-A'])
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=20, env=env)
             ok = r.returncode == 0
             out = (r.stdout or r.stderr or '').strip()[:300]
             return ok, out
@@ -2365,20 +2398,22 @@ def takserver_external_db_provision():
         return jsonify({'success': False, 'log': log, 'error': f'Cannot connect as {admin_user}: {out}'}), 400
     plog(f'  ✓ Connected as {admin_user}')
 
-    # Step 2: Create app user if it doesn't exist
+    # Step 2: Create app user if it doesn't exist.
+    # Identifier (app_user) was regex-validated upfront — safe to inline.
+    # Password goes through psql -v substitution and :'pw' quoting.
     plog(f'  Checking if user {app_user} exists...')
     ok, out = run_sql(f"SELECT 1 FROM pg_roles WHERE rolname='{app_user}';", 'check user')
     user_exists = ok and '1' in out
     if user_exists:
         plog(f'  User {app_user} already exists — updating password...')
-        ok, out = run_sql(f"ALTER USER {app_user} WITH PASSWORD '{app_pass}';", 'alter user')
+        ok, out = run_sql(f"ALTER USER {app_user} WITH PASSWORD :'pw';", 'alter user', pw_var={'pw': app_pass})
         if not ok:
             plog(f'  ✗ Failed to update password: {out}')
         else:
             plog(f'  ✓ Password updated for {app_user}')
     else:
         plog(f'  Creating user {app_user}...')
-        ok, out = run_sql(f"CREATE USER {app_user} WITH PASSWORD '{app_pass}';", 'create user')
+        ok, out = run_sql(f"CREATE USER {app_user} WITH PASSWORD :'pw';", 'create user', pw_var={'pw': app_pass})
         if not ok:
             plog(f'  ✗ Failed to create user: {out}')
             return jsonify({'success': False, 'log': log, 'error': f'Could not create user {app_user}: {out}'}), 500
@@ -2453,20 +2488,28 @@ def takserver_external_db_test_connection():
     if not db_host:
         return jsonify({'success': False, 'error': 'No database host configured', 'checks': []}), 400
 
+    # v0.9.12 — input validation. Catches command-injection vectors before
+    # any shell-out below. Previous code piped `db_host` through `bash -c`.
+    if not _safe_migration_db_host(db_host):
+        return jsonify({'success': False, 'error': 'Invalid db_host (must be IP or simple DNS name)', 'checks': []}), 400
+    if not (1 <= db_port <= 65535):
+        return jsonify({'success': False, 'error': 'Invalid db_port', 'checks': []}), 400
+
     checks = []
 
     def add_check(name, ok, detail=''):
         checks.append({'name': name, 'ok': bool(ok), 'detail': (detail or '')[:400]})
 
-    # Check 1: TCP reachability
+    # Check 1: TCP reachability — v0.9.12: socket.create_connection instead of
+    # `bash -c "</dev/tcp/HOST/PORT"`. No shell, no injection vector.
     tcp_ok = False
     try:
-        r = subprocess.run(
-            ['bash', '-c', f'timeout 8 bash -c "</dev/tcp/{db_host}/{db_port}" && echo OPEN || echo CLOSED'],
-            capture_output=True, text=True, timeout=12
-        )
-        tcp_ok = 'OPEN' in (r.stdout or '')
-        add_check(f'TCP {db_host}:{db_port}', tcp_ok, r.stdout.strip() if not tcp_ok else f'Connected to {db_host}:{db_port}')
+        import socket as _sock_tc
+        with _sock_tc.create_connection((db_host, db_port), timeout=8):
+            tcp_ok = True
+            add_check(f'TCP {db_host}:{db_port}', True, f'Connected to {db_host}:{db_port}')
+    except (_sock_tc.timeout, OSError) as _tc_err:
+        add_check(f'TCP {db_host}:{db_port}', False, str(_tc_err)[:200])
     except Exception as e:
         add_check(f'TCP {db_host}:{db_port}', False, str(e)[:200])
 
@@ -2765,19 +2808,26 @@ def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
         return False, log, ''
     log.append('PostgreSQL configured: listen_addresses=* and pg_hba entry for ' + core_ip)
 
-    # Step 3: UFW
+    # Step 3: UFW — v0.9.12 hardening: drop unconditional `allow {db_port}/tcp`
+    # (defeated the source-scoped allow above and exposed Postgres to the public
+    # internet). Postgres only needs to be reachable from Server Two's IP. Same
+    # class of bug as the v0.9.11 CloudTAK 5433 incident — except UFW is
+    # actually effective here (native Postgres, not Docker-published).
+    # Also add an explicit `deny {db_port}/tcp` belt-and-braces so a future
+    # `ufw allow` of that port (e.g. by an operator script) doesn't reopen the
+    # surface unless the source-scope rule is matched first.
     ufw_cmd = (
         f'sudo ufw allow 22/tcp && '
         f'sudo ufw allow from {core_ip} to any port 22 proto tcp && '
         f'sudo ufw allow from {core_ip} to any port {db_port} proto tcp && '
-        f'sudo ufw allow {db_port}/tcp && '
+        f'sudo ufw deny {db_port}/tcp && '
         'sudo ufw --force enable && sudo ufw reload'
     )
     ok, out = _ssh_probe(s1, ufw_cmd, timeout=25)
     if not ok:
         log.append('UFW config failed: ' + (out or ''))
         return False, log, ''
-    log.append(f'UFW: allowed {core_ip} → port {db_port}')
+    log.append(f'UFW: allowed {core_ip} → port {db_port}, denied all other sources (v0.9.12 hardening)')
 
     # Step 4: Read auto-generated DB password from Server One (try multiple sources)
     db_password, _ = _fetch_db_password_from_server_one(s1)
@@ -2937,8 +2987,11 @@ def takserver_two_server_runbook():
         'echo "deb [signed-by=/etc/apt/keyrings/postgresql.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/postgresql.list >/dev/null',
         'sudo apt update',
         f'sudo apt install -y ./{db_pkg}' if db_pkg else 'sudo apt install -y ./takserver-database_x.x-RELEASExx_all.deb',
+        # v0.9.12 hardening: source-scope only, deny everything else on db_port.
+        # The pre-v0.9.12 unconditional `ufw allow {db_port}/tcp` defeated the
+        # source-scope rule above and left Postgres reachable from the internet.
         f'sudo ufw allow from {core_host_for_db_acl} to any port {db_port} proto tcp',
-        f'sudo ufw allow {db_port}/tcp',
+        f'sudo ufw deny {db_port}/tcp',
         'sudo ufw --force enable',
     ]
     server_two_steps = [
@@ -3882,7 +3935,13 @@ def guarddog_deploy_api():
     return jsonify({'success': True})
 
 def _deploy_health_agent_to_server_one(s1_cfg):
-    """Deploy Guard Dog health agent to Server One (SCP + systemd + 8080). Returns (ok, message)."""
+    """Deploy Guard Dog health agent to Server One (SCP + systemd + 8080). Returns (ok, message).
+
+    v0.9.12 hardening: UFW for port 8080 is source-scoped to the console's
+    public IP (settings.server_ip) and explicitly denied otherwise. The health
+    endpoint exposes Postgres state — it was publicly reachable pre-v0.9.12.
+    Falls back to public-allow only when no source IP is configured.
+    """
     scripts_dir = os.path.join(BASE_DIR, 'scripts', 'guarddog')
     agent_src = os.path.join(scripts_dir, 'tak-db-health-agent.py')
     if not os.path.isfile(agent_src):
@@ -3890,6 +3949,14 @@ def _deploy_health_agent_to_server_one(s1_cfg):
     scp_ok, scp_out = _scp_to_host(s1_cfg, agent_src, '/opt/', timeout=30)
     if not scp_ok:
         return False, f'SCP failed: {(scp_out or "")[:150]}'
+    _src_ip = _fedhub_caddy_source_ip(load_settings())
+    if _src_ip:
+        _ufw_step = (
+            f'sudo ufw allow from {_src_ip} to any port 8080 proto tcp >/dev/null 2>&1; '
+            'sudo ufw deny 8080/tcp >/dev/null 2>&1; '
+        )
+    else:
+        _ufw_step = 'sudo ufw allow 8080/tcp >/dev/null 2>&1; '
     setup_cmd = (
         'sudo mkdir -p /opt/tak-guarddog && '
         'sudo mv /opt/tak-db-health-agent.py /opt/tak-guarddog/tak-db-health-agent.py && '
@@ -3910,7 +3977,7 @@ def _deploy_health_agent_to_server_one(s1_cfg):
         'sudo systemctl daemon-reload && '
         'sudo systemctl enable tak-db-health.service && '
         'sudo systemctl restart tak-db-health.service && '
-        'sudo ufw allow 8080/tcp >/dev/null 2>&1; '
+        + _ufw_step +
         'echo AGENT_OK'
     )
     ok, out = _ssh_probe(s1_cfg, setup_cmd, timeout=30)
@@ -6944,7 +7011,17 @@ def run_guarddog_deploy(alert_email):
             if os.path.isfile(agent_src):
                 scp_ok, scp_out = _scp_to_host(s1_cfg, agent_src, '/opt/', timeout=30)
                 if scp_ok:
-                    # Create systemd service and open port 8080 on Server One
+                    # Create systemd service and open port 8080 on Server One.
+                    # v0.9.12: UFW source-scoped to console IP (settings.server_ip);
+                    # falls back to public-allow only when no source IP set.
+                    _gd_src_ip = _fedhub_caddy_source_ip(settings)
+                    if _gd_src_ip:
+                        _gd_ufw_step = (
+                            f'sudo ufw allow from {_gd_src_ip} to any port 8080 proto tcp >/dev/null 2>&1; '
+                            'sudo ufw deny 8080/tcp >/dev/null 2>&1; '
+                        )
+                    else:
+                        _gd_ufw_step = 'sudo ufw allow 8080/tcp >/dev/null 2>&1; '
                     setup_cmd = (
                         'sudo mkdir -p /opt/tak-guarddog && '
                         'sudo mv /opt/tak-db-health-agent.py /opt/tak-guarddog/tak-db-health-agent.py && '
@@ -6965,7 +7042,7 @@ def run_guarddog_deploy(alert_email):
                         'sudo systemctl daemon-reload && '
                         'sudo systemctl enable tak-db-health.service && '
                         'sudo systemctl restart tak-db-health.service && '
-                        'sudo ufw allow 8080/tcp >/dev/null 2>&1; '
+                        + _gd_ufw_step +
                         'echo AGENT_OK'
                     )
                     ok, out = _ssh_probe(s1_cfg, setup_cmd, timeout=30)
@@ -10099,13 +10176,25 @@ def _ensure_infratak_network_for_portal():
 
 
 def _write_takportal_override():
-    """Write ~/TAK-Portal/docker-compose.override.yml with network + hardening.
+    """Write ~/TAK-Portal/docker-compose.override.yml with network + port hardening.
 
     Uses the override file (never tracked by git) so that git pull during
     TAK Portal updates never conflicts with our local modifications.  This
     replaces the old approach of patching docker-compose.yml directly, which
     caused git stash conflicts and left the repo on the old version after
     every update.
+
+    v0.9.12 — port hardening (Tier 3, Caddy-loopback):
+      Upstream `AdventureSeeker423/TAK-Portal`'s docker-compose.yml binds
+      `${WEB_UI_PORT:-3000}:${WEB_UI_PORT:-3000}` which defaults to
+      `0.0.0.0:3000:3000`. Authentication is delegated to Authentik via
+      Caddy forward_auth, so anyone hitting port 3000 directly bypasses
+      that auth boundary entirely. Same class of issue as the CloudTAK
+      `5433` bug (Tier 3 service published publicly when only Caddy
+      legitimately consumes it).
+      Fix: `!reset` the port list to bind 3000 to loopback only. Browsers
+      reach the portal via `https://portal.example.com` → Caddy on 443 →
+      forward_auth → upstream `127.0.0.1:3000`.
     """
     portal_dir = os.path.expanduser('~/TAK-Portal')
     override_path = os.path.join(portal_dir, 'docker-compose.override.yml')
@@ -10115,8 +10204,11 @@ def _write_takportal_override():
         _ensure_infratak_docker_network()
         content = (
             "# TAKWERX: TAK Portal runtime overrides — do not edit manually\n"
+            "# v0.9.12 — port hardening: bind WEB_UI_PORT to 127.0.0.1 only.\n"
             "services:\n"
             "  tak-portal:\n"
+            "    ports: !reset\n"
+            "      - \"127.0.0.1:${WEB_UI_PORT:-3000}:${WEB_UI_PORT:-3000}\"\n"
             "    networks:\n"
             "      - default\n"
             f"      - {INFRATAK_DOCKER_NETWORK}\n"
@@ -10411,6 +10503,33 @@ def _normalize_tak_deployment_config(cfg):
 def _get_tak_deployment_config(settings):
     return _normalize_tak_deployment_config(settings.get('tak_deployment', {}))
 
+_SSH_USER_RE = re.compile(r'^[a-z_][a-z0-9_-]{0,31}\$?$')
+
+
+def _validate_ssh_target(host, user, port):
+    """v0.9.12 — validate SSH host/user/port before invoking ssh.
+
+    Defends against operator/API-supplied values that contain SSH option
+    flags (e.g. host = '-oProxyCommand=touch /tmp/x') or shell metacharacters
+    via the `user@host` argument. Without this guard a remote-host setting
+    would have allowed a logged-in console user (or any compromised settings
+    file) to execute arbitrary commands locally.
+    """
+    if not host or len(host) > 253:
+        return False, 'host empty or too long'
+    if not _safe_migration_db_host(host):
+        return False, f'host {host!r} fails IP/DNS validation'
+    if not user or not _SSH_USER_RE.fullmatch(user):
+        return False, f'ssh_user {user!r} fails POSIX username validation'
+    try:
+        p = int(port)
+        if not (1 <= p <= 65535):
+            return False, 'ssh_port out of range'
+    except Exception:
+        return False, 'ssh_port not an integer'
+    return True, ''
+
+
 def _ssh_probe(host_cfg, cmd='echo ok', timeout=15):
     """Run a non-interactive SSH probe command. Returns (ok, output)."""
     host = (host_cfg.get('host') or '').strip()
@@ -10419,6 +10538,10 @@ def _ssh_probe(host_cfg, cmd='echo ok', timeout=15):
     if not host:
         return False, 'host not set'
     is_local = bool(host_cfg.get('use_localhost')) or host in ('127.0.0.1', 'localhost', '::1')
+    if not is_local:
+        _ok, _err = _validate_ssh_target(host, user, port)
+        if not _ok:
+            return False, f'SSH target validation failed: {_err}'
     if is_local:
         try:
             r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
@@ -10575,6 +10698,10 @@ def _scp_to_host(host_cfg, local_path, remote_path, timeout=120):
     if not host or not os.path.isfile(local_path):
         return False, 'host not set or file not found'
     is_local = bool(host_cfg.get('use_localhost')) or host in ('127.0.0.1', 'localhost', '::1')
+    if not is_local:
+        _ok, _err = _validate_ssh_target(host, user, port)
+        if not _ok:
+            return False, f'SSH target validation failed: {_err}'
     if is_local:
         try:
             shutil.copy2(local_path, remote_path.rstrip('/') if not remote_path.endswith('/') else os.path.join(remote_path, os.path.basename(local_path)))
@@ -12928,9 +13055,13 @@ def mediamtx_recovery():
                 "mkdir -p /opt/mediamtx-webeditor && curl -sL '" + MEDIAMTX_EDITOR_RAW_URL + "' -o /opt/mediamtx-webeditor/mediamtx_config_editor.py",
                 timeout=90,
             )
+            # v0.9.12: also bind webedit Flask app to 127.0.0.1 (Tier 3 — Caddy
+            # is the only legitimate consumer; upstream defaults to 0.0.0.0).
             _module_run(
                 deploy_cfg,
-                "sed -i 's/port=5000/port=5080/' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null; sed -i 's/9997/9898/g' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null",
+                "sed -i 's/port=5000/port=5080/' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null; "
+                "sed -i 's/9997/9898/g' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null; "
+                "sed -i \"s/host='0\\.0\\.0\\.0'/host='127.0.0.1'/\" /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null",
                 timeout=10,
             )
         else:
@@ -12940,7 +13071,9 @@ def mediamtx_recovery():
                 with open(editor_path, 'w') as f:
                     f.write(content)
                 subprocess.run(
-                    f"sed -i 's/port=5000/port=5080/' {editor_path} 2>/dev/null; sed -i 's/9997/9898/g' {editor_path} 2>/dev/null",
+                    f"sed -i 's/port=5000/port=5080/' {editor_path} 2>/dev/null; "
+                    f"sed -i 's/9997/9898/g' {editor_path} 2>/dev/null; "
+                    f"sed -i \"s/host='0\\.0\\.0\\.0'/host='127.0.0.1'/\" {editor_path} 2>/dev/null",
                     shell=True,
                     capture_output=True,
                     timeout=10,
@@ -13133,13 +13266,15 @@ def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
     plog("")
     plog("━━━ Step 4/7: Writing Configuration (remote) ━━━")
     hls_pass = _sec.token_hex(8)
+    # v0.9.12: Tier 3 endpoints (apiAddress, hlsAddress) bound to 127.0.0.1.
+    # Tier 1 (public streaming): rtsp/rtsps/srt/rtp/rtcp left on all interfaces.
     mediamtx_yml = f"""# MediaMTX - infra-TAK remote
 logLevel: info
 logDestinations: [stdout]
 readTimeout: 10s
 writeTimeout: 10s
 api: yes
-apiAddress: :9898
+apiAddress: 127.0.0.1:9898
 apiEncryption: no
 apiAllowOrigins: ['*']
 rtsp: yes
@@ -13151,7 +13286,7 @@ rtcpAddress: :8001
 rtmp: no
 rtmpAddress: :1935
 hls: yes
-hlsAddress: :8888
+hlsAddress: 127.0.0.1:8888
 hlsAllowOrigins: ['*']
 hlsTrustedProxies: ['127.0.0.1']
 webrtc: no
@@ -13246,7 +13381,8 @@ paths:
     ok, _ = _module_run(deploy_cfg, f'rm -rf /tmp/mediamtx_editor_clone && git clone --depth 1 --branch "{MEDIAMTX_EDITOR_REF}" "{MEDIAMTX_EDITOR_REPO}" /tmp/mediamtx_editor_clone', timeout=90)
     if ok:
         _module_run(deploy_cfg, 'cp /tmp/mediamtx_editor_clone/config-editor/mediamtx_config_editor.py /opt/mediamtx-webeditor/ 2>/dev/null; rm -rf /tmp/mediamtx_editor_clone', timeout=15)
-        _module_run(deploy_cfg, "sed -i 's/port=5000/port=5080/' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null; sed -i 's/9997/9898/g' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null", timeout=10)
+        # v0.9.12: bind Flask webedit to 127.0.0.1 (Caddy-loopback Tier 3).
+        _module_run(deploy_cfg, "sed -i 's/port=5000/port=5080/' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null; sed -i 's/9997/9898/g' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null; sed -i \"s/host='0\\.0\\.0\\.0'/host='127.0.0.1'/\" /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null", timeout=10)
         # Patch HLS URLs to go through Caddy /hls-proxy/ instead of direct port 8888 (avoids mixed content)
         hls_patch_script = (
             "import re, sys\n"
@@ -13375,8 +13511,15 @@ paths:
     # Step 6: Firewall
     plog("")
     plog("━━━ Step 6/8: Firewall (remote) ━━━")
-    _module_run(deploy_cfg, "ufw allow 8554/tcp 2>/dev/null; ufw allow 8322/tcp 2>/dev/null; ufw allow 8888/tcp 2>/dev/null; ufw allow 5080/tcp 2>/dev/null; ufw allow 9898/tcp 2>/dev/null; true", timeout=15)
-    plog("✓ Ports opened")
+    # v0.9.12 — Tier 1 (public streaming) only: rtsp 8554, rtsps 8322, srt 8890.
+    # Webedit 5080 / API 9898 / HLS 8888 are Tier 3 (Caddy-loopback) — explicitly
+    # DENIED here so a regressed bind can't leak the admin surface. Browsers
+    # reach the webedit + HLS through Caddy on 443.
+    _module_run(deploy_cfg,
+        "ufw allow 8554/tcp 2>/dev/null; ufw allow 8322/tcp 2>/dev/null; ufw allow 8890/tcp 2>/dev/null; "
+        "ufw deny 8888/tcp 2>/dev/null; ufw deny 5080/tcp 2>/dev/null; ufw deny 9898/tcp 2>/dev/null; true",
+        timeout=15)
+    plog("✓ Ports opened (RTSP/RTSPS/SRT public; webedit/API/HLS loopback only)")
 
     # Step 7: Caddy on infra-TAK (point stream.* to remote)
     plog("")
@@ -13615,7 +13758,10 @@ authHTTPExclude:
 - action: pprof
 
 api: yes
-apiAddress: :9898  # moved from 9997 — CloudTAK media container owns port 9997 (hardcoded in video-service.ts)
+# v0.9.12: bound to 127.0.0.1 — admin API never needs public-internet exposure.
+# Webedit (also loopback) and Caddy (HLS proxy) are the only legitimate consumers.
+# moved from 9997 — CloudTAK media container owns port 9997 (hardcoded in video-service.ts).
+apiAddress: 127.0.0.1:9898
 apiEncryption: no
 apiAllowOrigins: ['*']
 apiTrustedProxies: []
@@ -13646,7 +13792,9 @@ rtmpServerKey:
 rtmpServerCert:
 
 hls: yes
-hlsAddress: :8888
+# v0.9.12: HLS bound to 127.0.0.1 — browsers reach it through Caddy `/hls-proxy/`
+# reverse proxy on 443 (mixed-content safe + only path that has Authentik auth).
+hlsAddress: 127.0.0.1:8888
 hlsEncryption: no
 hlsServerKey:
 hlsServerCert:
@@ -13965,11 +14113,17 @@ WantedBy=multi-user.target
         plog("✓ Services enabled and started")
 
         # Step 6: Firewall
+        # v0.9.12 — Tier 1 (public streaming) only: rtsp 8554, rtsps 8322, srt 8890,
+        # rtp 8000, rtcp 8001. Webedit 5080 / API 9898 / HLS 8888 are Tier 3
+        # (Caddy-loopback) — explicitly DENIED here so a regressed bind can't
+        # leak the admin surface. Browsers reach the webedit + HLS through Caddy.
         plog("")
         plog("━━━ Step 6/7: Configuring Firewall ━━━")
-        for port_proto in ['8554/tcp', '8322/tcp', '8888/tcp', '8890/udp', '8000/udp', '8001/udp', '5080/tcp', '9898/tcp']:
+        for port_proto in ['8554/tcp', '8322/tcp', '8890/udp', '8000/udp', '8001/udp']:
             subprocess.run(f'ufw allow {port_proto} 2>/dev/null; true', shell=True, capture_output=True)
-        plog("✓ Ports opened: 8554 (RTSP), 8322 (RTSPS), 8888 (HLS), 8890 (SRT), 5080 (Web Editor), 9898 (API)")
+        for port_proto in ['8888/tcp', '5080/tcp', '9898/tcp']:
+            subprocess.run(f'ufw deny {port_proto} 2>/dev/null; true', shell=True, capture_output=True)
+        plog("✓ Ports opened: 8554 (RTSP), 8322 (RTSPS), 8890 (SRT), 8000/8001 (RTP/RTCP); 8888/5080/9898 loopback-only (Caddy)")
 
         # Step 7: Caddy integration
         plog("")
@@ -14914,19 +15068,27 @@ def _cloudtak_build_override_yml(settings):
     # (commit c908179) and TAK Portal (commit 7fe8191) — these containers
     # legitimately need a default capability set; capability hardening at
     # this level is not appropriate for them.
-    # v0.9.11 security hardening: lock down postgis + MinIO host port mappings.
+    # v0.9.11 / v0.9.12 security hardening — lock down every host port that
+    # doesn't actually need public-internet exposure.
+    #
     # Upstream dfpc-coe/CloudTAK ships postgis bound to 0.0.0.0:5433 with hardcoded
     # docker:docker creds, which was actively exploited in the wild by PG_MEM/PGMiner
-    # cryptominer family (live compromise on infra-TAK May 8-10, 2026).
+    # cryptominer family (live compromise on infra-TAK May 8-10, 2026). The audit
+    # that followed found the same class of issue across nearly every CloudTAK
+    # container — host ports bound to 0.0.0.0 for app/admin endpoints that are
+    # only meant to be reached by Caddy (loopback) or by sibling containers via
+    # Docker DNS (no host port needed at all).
     #
-    # postgis ports !reset []: removes the upstream 5433:5432 host mapping entirely.
-    #   CloudTAK app reaches postgis via the internal Docker network (postgis:5432),
-    #   never needed a host port. Operators who want psql access: use
-    #   `docker exec -it cloudtak-postgis-1 psql -U docker gis` from the host.
-    #
-    # store (MinIO) ports !reset to 127.0.0.1:9002:9002: removes the public 9000
-    #   (S3 API — only needed by internal containers) and binds the 9002 web console
-    #   to loopback only (operators can SSH-tunnel to access for bucket management).
+    # Tier classification (see docs/PORT-EXPOSURE-POLICY.md):
+    #   - api 5000        → Tier 3 (Caddy-loopback)  — browser → cloudtak.fqdn → Caddy → 127.0.0.1:5000
+    #   - tiles 5002      → Tier 3 (Caddy-loopback)  — same path, used for tile URLs
+    #   - events 5003     → Tier 4 (Docker-internal) — only api/store talk to it; no host port needed
+    #   - media 9997      → Tier 3 (Caddy-loopback)  — admin API; api container talks via Docker DNS
+    #   - media 18888 HLS → Tier 3 (Caddy-loopback)  — HTTP HLS playback through Caddy
+    #   - media 18554 RTSP, 11935 RTMP, 18890 SRT    → Tier 1 (public) — direct streaming clients
+    #   - postgis 5433    → Tier 4 (Docker-internal) — gone entirely (v0.9.11)
+    #   - store 9000 S3   → Tier 4 (Docker-internal) — gone entirely (v0.9.11)
+    #   - store 9002 web  → Tier 3 (Caddy-loopback)  — operator SSH-tunnels for MinIO console
     #
     # postgis POSTGRES_PASSWORD: "${{POSTGRES_PASSWORD}}": Compose substitutes the
     #   value from .env. On a fresh volume initdb bakes this into pg_authid; on an
@@ -14934,23 +15096,35 @@ def _cloudtak_build_override_yml(settings):
     #   stays in force (so update-only flows don't break running installs).
     #
     # Defense-in-depth: _auto_harden_cloudtak() also installs UFW deny rules for
-    # 5433/9000/9002 so a regressed override or disabled UFW alone can't reopen
-    # the attack surface.
-    return f"""# TAKWERX: CloudTAK container overrides — v0.9.11 security hardening
+    # every Tier 3/4 port so a regressed override or disabled UFW alone can't
+    # reopen the attack surface.
+    return f"""# TAKWERX: CloudTAK container overrides — v0.9.11+v0.9.12 security hardening
 services:
   api:
     extra_hosts:
 {hosts_block}
+    ports: !reset
+      - "127.0.0.1:5000:5000"
+  tiles:
+    ports: !reset
+      - "127.0.0.1:5002:5002"
   events:
     extra_hosts:
 {hosts_block}
     environment:
       API_URL: "http://api:5000"
+    ports: !reset []
   media:
     extra_hosts:
 {hosts_block}
     environment:
       API_URL: "http://api:5000"
+    ports: !reset
+      - "127.0.0.1:${{MEDIA_PORT_API:-9997}}:9997"
+      - "${{MEDIA_PORT_RTSP:-18554}}:8554"
+      - "${{MEDIA_PORT_RTMP:-11935}}:1935"
+      - "127.0.0.1:${{MEDIA_PORT_HLS:-18888}}:8888"
+      - "${{MEDIA_PORT_SRT:-18890}}:8890"
   postgis:
     ports: !reset []
     environment:
@@ -24517,9 +24691,11 @@ entries:
       - ./blueprints:/blueprints/custom
     env_file:
       - .env
+    # v0.9.12: bound to 127.0.0.1 (Tier 3 — Caddy on 443 is the only legitimate
+    # consumer). Was 0.0.0.0 prior to v0.9.12 on remote installs.
     ports:
-      - "${COMPOSE_PORT_HTTP:-9000}:9000"
-      - "${COMPOSE_PORT_HTTPS:-9443}:9443"
+      - "127.0.0.1:${COMPOSE_PORT_HTTP:-9000}:9000"
+      - "127.0.0.1:${COMPOSE_PORT_HTTPS:-9443}:9443"
     healthcheck:
       test: ["CMD", "ak", "healthcheck"]
       start_period: 600s
@@ -24562,6 +24738,10 @@ entries:
         condition: service_healthy
   ldap:
     image: ghcr.io/goauthentik/ldap:${AUTHENTIK_TAG:-2026.2.0}
+    # v0.9.12: LDAP outpost stays on 0.0.0.0 for REMOTE Authentik installs —
+    # TAK Server on the console host has to reach this at remote_host:389.
+    # Tier 5 (source-scoped): the deploy step source-scopes UFW to the console
+    # IP only, so 389/636 are NOT reachable from the general internet.
     ports:
       - 389:3389
       - 636:6636
@@ -24760,19 +24940,45 @@ networks:
     subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True)
     plog("✓ Caddyfile updated")
 
-    # Open Authentik ports on remote so console can reach API (9090) and LDAP (389/636); enable UFW/firewalld so rules apply
-    _module_run(deploy_cfg, (
-        'command -v ufw >/dev/null 2>&1 && (sudo ufw allow 22/tcp 2>/dev/null; '
-        'sudo ufw allow 9090/tcp 2>/dev/null; sudo ufw allow 9443/tcp 2>/dev/null; '
-        'sudo ufw allow 389/tcp 2>/dev/null; sudo ufw allow 636/tcp 2>/dev/null; '
-        'sudo ufw --force enable 2>/dev/null; sudo ufw reload 2>/dev/null); '
-        'command -v firewall-cmd >/dev/null 2>&1 && (sudo firewall-cmd --permanent --add-port=9090/tcp 2>/dev/null; '
-        'sudo firewall-cmd --permanent --add-port=9443/tcp 2>/dev/null; '
-        'sudo firewall-cmd --permanent --add-port=389/tcp 2>/dev/null; '
-        'sudo firewall-cmd --permanent --add-port=636/tcp 2>/dev/null; '
-        'sudo firewall-cmd --reload 2>/dev/null); true'
-    ), timeout=20)
-    plog("✓ Firewall ports opened (9090 API, 9443 HTTPS, 389/636 LDAP) — console can reach Authentik")
+    # v0.9.12 — remote Authentik firewall (security-hardened):
+    #   * 9090/9443 (Authentik HTTP/HTTPS): NOT opened publicly. Compose
+    #     binds these to 127.0.0.1 on the remote; Caddy on the remote
+    #     proxies them via the public FQDN (Authentik admin UI is reachable
+    #     at https://authentik.example.com → Caddy → loopback 9000).
+    #   * 389/636 (LDAP outpost): SOURCE-SCOPED to the console source IP
+    #     only. TAK Server on the console host queries the LDAP outpost
+    #     directly via `ldap://{remote_host}:389`, so we keep these reachable
+    #     from exactly that one IP — not from the general internet.
+    #   * Fallback (no source IP detected): legacy public-open behaviour,
+    #     so existing installs that don't have settings.server_ip filled
+    #     in keep working until the operator sets it.
+    _console_src_ip = _fedhub_caddy_source_ip(settings)
+    if _console_src_ip:
+        _ufw_block = (
+            'command -v ufw >/dev/null 2>&1 && (sudo ufw allow 22/tcp 2>/dev/null; '
+            f'sudo ufw allow from {_console_src_ip} to any port 389 proto tcp 2>/dev/null; '
+            f'sudo ufw allow from {_console_src_ip} to any port 636 proto tcp 2>/dev/null; '
+            'sudo ufw deny 389/tcp 2>/dev/null; sudo ufw deny 636/tcp 2>/dev/null; '
+            'sudo ufw deny 9090/tcp 2>/dev/null; sudo ufw deny 9443/tcp 2>/dev/null; '
+            'sudo ufw --force enable 2>/dev/null; sudo ufw reload 2>/dev/null); '
+            'command -v firewall-cmd >/dev/null 2>&1 && ('
+            f'sudo firewall-cmd --permanent --add-rich-rule="rule family=ipv4 source address={_console_src_ip} port port=389 protocol=tcp accept" 2>/dev/null; '
+            f'sudo firewall-cmd --permanent --add-rich-rule="rule family=ipv4 source address={_console_src_ip} port port=636 protocol=tcp accept" 2>/dev/null; '
+            'sudo firewall-cmd --reload 2>/dev/null); true'
+        )
+        plog(f"✓ Firewall hardened: 389/636 LDAP source-scoped to console IP {_console_src_ip}; 9090/9443 loopback only (Caddy proxies)")
+    else:
+        _ufw_block = (
+            'command -v ufw >/dev/null 2>&1 && (sudo ufw allow 22/tcp 2>/dev/null; '
+            'sudo ufw allow 389/tcp 2>/dev/null; sudo ufw allow 636/tcp 2>/dev/null; '
+            'sudo ufw deny 9090/tcp 2>/dev/null; sudo ufw deny 9443/tcp 2>/dev/null; '
+            'sudo ufw --force enable 2>/dev/null; sudo ufw reload 2>/dev/null); '
+            'command -v firewall-cmd >/dev/null 2>&1 && (sudo firewall-cmd --permanent --add-port=389/tcp 2>/dev/null; '
+            'sudo firewall-cmd --permanent --add-port=636/tcp 2>/dev/null; '
+            'sudo firewall-cmd --reload 2>/dev/null); true'
+        )
+        plog("⚠ No console source IP set (Settings → Server IP) — 389/636 left public; 9090/9443 denied. Fill Server IP to enable source-scoping.")
+    _module_run(deploy_cfg, _ufw_block, timeout=20)
 
     plog("")
     plog("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -27366,13 +27572,30 @@ entries:
                                 plog(f"  ⚠ Could not set webadmin password: {str(e)[:100]}")
     
                     # Set adm_ldapservice password — ALWAYS RUN regardless of TAK Server install state
+                    # v0.9.12 — defence against shared-credential reuse:
+                    # The previous fallback was a literal 32-char string baked into
+                    # the Python source. Every install hitting this branch ended up
+                    # with the SAME LDAP service password, viewable by anyone with
+                    # git blame access. v0.9.12 generates a fresh token, writes it
+                    # back to ~/authentik/.env so the next run reads the persisted
+                    # value, and never reuses across installs.
                     ldap_svc_password = ''
                     with open(env_path) as f:
                         for line in f:
                             if line.strip().startswith('AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD='):
                                 ldap_svc_password = line.strip().split('=', 1)[1].strip()
                     if not ldap_svc_password:
-                        ldap_svc_password = 'B9wobRV8wlFJmnlEWB71gJjD3aoKOBBW'
+                        import secrets as _ldap_secrets
+                        ldap_svc_password = _ldap_secrets.token_urlsafe(24)
+                        try:
+                            with open(env_path, 'a') as _env_f:
+                                _env_f.write(
+                                    '\n# Auto-generated by infra-TAK v0.9.12 (was previously a shared hardcoded fallback).\n'
+                                    f'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD={ldap_svc_password}\n'
+                                )
+                            plog("  ⚠ AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD was missing — generated and saved a new value to ~/authentik/.env")
+                        except Exception as _ldap_pe:
+                            plog(f"  ⚠ Could not persist new LDAP service password to .env: {_ldap_pe} (using ephemerally for this run)")
     
                     ldap_pk = None
                     try:
@@ -29821,11 +30044,25 @@ def takserver_webadmin_password():
 @app.route('/api/takserver/webadmin-password', methods=['POST'])
 @login_required
 def takserver_set_webadmin_password():
-    """Set webadmin password in settings and update flat-file (8446 auth source). Optionally sync to Authentik afterward."""
+    """Set webadmin password in settings and update flat-file (8446 auth source). Optionally sync to Authentik afterward.
+
+    v0.9.12 — defence against shell injection:
+      * Password is validated by _validate_cert_password (rejects shell
+        metacharacters like $, `, ;, &, |, etc.) before any subprocess use.
+      * subprocess.run uses argv (not shell=True) so the password is passed
+        as a single literal argument — quoting/escaping does not apply.
+      * The pre-v0.9.12 path used f-string interpolation inside `bash -c`
+        which would execute `pw="x'; touch /tmp/owned; #"` as shell commands.
+    """
     data = request.get_json() or {}
     pw = (data.get('password') or '').strip()
     if not pw:
         return jsonify({'success': False, 'error': 'Password required'}), 400
+    if not _validate_cert_password(pw):
+        return jsonify({
+            'success': False,
+            'error': 'Password contains characters not allowed for safe processing — use alphanumerics and -_.@!#%^*+=:'
+        }), 400
     settings = load_settings()
     settings['webadmin_password'] = pw
     save_settings(settings)
@@ -29839,8 +30076,9 @@ def takserver_set_webadmin_password():
     if os.path.exists('/opt/tak/utils/UserManager.jar'):
         try:
             r = subprocess.run(
-                f"java -jar /opt/tak/utils/UserManager.jar usermod -A -p '{pw}' webadmin 2>&1",
-                shell=True, capture_output=True, text=True, timeout=30)
+                ['java', '-jar', '/opt/tak/utils/UserManager.jar',
+                 'usermod', '-A', '-p', pw, 'webadmin'],
+                capture_output=True, text=True, timeout=30)
             flatfile_ok = r.returncode == 0
         except Exception:
             pass
@@ -32234,6 +32472,41 @@ def _tak_upgrade_apt_install_streamed(cmd, cwd, upgrade_log, timeout_sec=600):
 
 SNAPSHOT_DIR = '/opt/tak/snapshots'
 
+_SNAPSHOT_LABEL_RE = re.compile(r'^[A-Za-z0-9._-]+$')
+
+
+def _validate_snapshot_label(label):
+    """v0.9.12: defence against path traversal in snapshot routes.
+
+    Reject anything that could escape SNAPSHOT_DIR. Returns (ok, safe_label_or_error).
+
+    Defence in depth:
+      1. Reject empty / non-str inputs.
+      2. Reject reserved names ('.', '..').
+      3. Whitelist regex — only [A-Za-z0-9._-]+. Forbids '/', '\\', whitespace,
+         null bytes, and every shell metacharacter.
+      4. realpath check — after joining, the resolved path must live strictly
+         inside the resolved SNAPSHOT_DIR. Catches edge cases where a clever
+         attacker bypasses the regex (e.g. symlink games on disk).
+    """
+    if not label or not isinstance(label, str):
+        return False, 'label is required'
+    if label in ('.', '..'):
+        return False, 'invalid label'
+    if not _SNAPSHOT_LABEL_RE.fullmatch(label):
+        return False, 'label must match [A-Za-z0-9._-]+'
+    try:
+        snap_real = os.path.realpath(os.path.join(SNAPSHOT_DIR, label))
+        base_real = os.path.realpath(SNAPSHOT_DIR)
+    except Exception:
+        return False, 'label resolves to invalid path'
+    if not snap_real.startswith(base_real + os.sep) and snap_real != base_real:
+        return False, 'label resolves outside SNAPSHOT_DIR'
+    if snap_real == base_real:
+        return False, 'invalid label'
+    return True, label
+
+
 def _tak_snapshot(label, plog=None):
     """Create a TAK Server snapshot at /opt/tak/snapshots/<label>/.
 
@@ -32423,6 +32696,10 @@ def _tak_rollback(label, plog=None):
     if plog is None:
         plog = lambda m: print(m, flush=True)
 
+    ok, label_or_err = _validate_snapshot_label(label)
+    if not ok:
+        return False, f"Invalid snapshot label: {label_or_err}"
+    label = label_or_err
     snap_path = os.path.join(SNAPSHOT_DIR, label)
     if not os.path.isdir(snap_path):
         return False, f"Snapshot '{label}' not found at {snap_path}"
@@ -32759,14 +33036,12 @@ def takserver_snapshot_status_api():
 def takserver_snapshot_download_api(label):
     """Stream a .tar.gz of the snapshot directory directly to the client."""
     import subprocess
-    snap_path = os.path.join(SNAPSHOT_DIR, label)
+    ok, safe_label = _validate_snapshot_label(label)
+    if not ok:
+        return jsonify({'error': safe_label}), 400
+    snap_path = os.path.join(SNAPSHOT_DIR, safe_label)
     if not os.path.isdir(snap_path):
         return jsonify({'error': 'Snapshot not found'}), 404
-
-    # Sanitise label so it never escapes the shell command
-    safe_label = os.path.basename(label)
-    if not safe_label or safe_label != label:
-        return jsonify({'error': 'Invalid label'}), 400
 
     def _stream():
         # Stream tar directly from disk — no in-memory buffering
@@ -32918,7 +33193,10 @@ def takserver_snapshot_upload_api():
 def takserver_snapshot_delete_api(label):
     """Delete a snapshot directory and its settings entry."""
     import shutil as _shutil
-    snap_path = os.path.join(SNAPSHOT_DIR, label)
+    ok, safe_label = _validate_snapshot_label(label)
+    if not ok:
+        return jsonify({'ok': False, 'error': safe_label}), 400
+    snap_path = os.path.join(SNAPSHOT_DIR, safe_label)
     if os.path.isdir(snap_path):
         try:
             _shutil.rmtree(snap_path)
@@ -32926,7 +33204,7 @@ def takserver_snapshot_delete_api(label):
             return jsonify({'ok': False, 'error': str(e)[:200]}), 500
     try:
         s     = load_settings()
-        snaps = [sn for sn in (s.get('tak_snapshots') or []) if sn.get('label') != label]
+        snaps = [sn for sn in (s.get('tak_snapshots') or []) if sn.get('label') != safe_label]
         s['tak_snapshots'] = snaps
         save_settings(s)
     except Exception as e:
@@ -32947,8 +33225,10 @@ def takserver_rollback_api():
         return jsonify({'ok': False, 'error': 'Rollback already running'}), 409
     data  = request.get_json(force=True) or {}
     label = (data.get('label') or '').strip()
-    if not label:
-        return jsonify({'ok': False, 'error': 'label is required'}), 400
+    ok, label_or_err = _validate_snapshot_label(label)
+    if not ok:
+        return jsonify({'ok': False, 'error': label_or_err}), 400
+    label = label_or_err
 
     _rollback_log    = []
     _rollback_status = {'running': True, 'complete': False, 'error': False}
@@ -33945,8 +34225,12 @@ def run_takserver_deploy(config):
                 log_step("Authentik detected — webadmin will live in Authentik/LDAP only (skipping flat-file UserManager; avoids 8446 shadowing).")
                 _remove_webadmin_from_userauth()
             else:
+                # v0.9.12: shlex.quote the password so any future operator-supplied
+                # value with shell metacharacters is safely literalized instead of
+                # being interpreted by bash. webadmin_pass should already pass
+                # _validate_cert_password upstream, but defense-in-depth.
                 log_step("Creating webadmin user (flat-file)...")
-                run_cmd(f"java -jar /opt/tak/utils/UserManager.jar usermod -A -p '{webadmin_pass}' webadmin 2>&1", check=False)
+                run_cmd(f"java -jar /opt/tak/utils/UserManager.jar usermod -A -p {shlex.quote(webadmin_pass)} webadmin 2>&1", check=False)
                 log_step("✓ webadmin user created")
         ne_changed, ne_msg = _sanitize_coreconfig_name_entries()
         if ne_changed:
@@ -38113,7 +38397,73 @@ def _post_update_auto_deploy():
                     except Exception as e:
                         print(f"Post-update: Authentik port hardening error: {e}")
 
+            def _auto_authentik_ports_remote():
+                """v0.9.12 — apply the same Authentik port hardening over SSH for
+                remote Authentik installs. Idempotent: no-op when Authentik is
+                deployed locally or not at all.
+
+                Patches `~/authentik/docker-compose.yml` on the remote so:
+                  * 9000/9443 (Authentik HTTP/HTTPS) → bound to 127.0.0.1 (Caddy
+                    proxies via the public FQDN; raw ports never need external).
+                  * 389/636 (LDAP outpost) → STAY on 0.0.0.0 (TAK Server on
+                    console host reaches them at remote_host:389).
+                Then source-scopes UFW 389/636 to the console source IP and
+                denies 9090/9443 publicly.
+                """
+                try:
+                    _settings = load_settings()
+                    _ak_cfg = _get_module_deployment_config(_settings, 'authentik_deployment')
+                    if not _ak_cfg or _ak_cfg.get('target_mode') != 'remote':
+                        return
+                    _rhost = (_ak_cfg.get('remote', {}).get('host') or '').strip()
+                    if not _rhost:
+                        return
+                    print("Post-update: hardening remote Authentik port bindings...")
+
+                    # Patch the remote compose. We sed-replace the server's
+                    # 9000/9443 mappings to 127.0.0.1 in-place, then docker
+                    # compose up -d to apply. LDAP outpost is intentionally
+                    # left on 0.0.0.0 (Tier 5 — see compose-template comment).
+                    _ssh_cmd = (
+                        'cd ~/authentik && '
+                        'cp -n docker-compose.yml docker-compose.yml.pre-v0912.bak 2>/dev/null; '
+                        # 9000 server HTTP
+                        'sed -i \'s|^\\(\\s\\+-\\s\\+\\)"${COMPOSE_PORT_HTTP:-9000}:9000"|\\1"127.0.0.1:${COMPOSE_PORT_HTTP:-9000}:9000"|\' docker-compose.yml 2>/dev/null; '
+                        'sed -i \'s|^\\(\\s\\+-\\s\\+\\)"9000:9000"|\\1"127.0.0.1:9000:9000"|\' docker-compose.yml 2>/dev/null; '
+                        # 9443 server HTTPS
+                        'sed -i \'s|^\\(\\s\\+-\\s\\+\\)"${COMPOSE_PORT_HTTPS:-9443}:9443"|\\1"127.0.0.1:${COMPOSE_PORT_HTTPS:-9443}:9443"|\' docker-compose.yml 2>/dev/null; '
+                        'sed -i \'s|^\\(\\s\\+-\\s\\+\\)"9443:9443"|\\1"127.0.0.1:9443:9443"|\' docker-compose.yml 2>/dev/null; '
+                        # Detect 0.0.0.0:9000/9443 publish state for recreate decision
+                        'CHANGED=0; '
+                        'ss -tln 2>/dev/null | grep -qE "0\\.0\\.0\\.0:(9000|9443) " && CHANGED=1; '
+                        'if [ $CHANGED -eq 1 ]; then docker compose up -d --force-recreate 2>&1 | tail -5; '
+                        'else echo "[remote-ak] ports already secure — no recreate needed"; fi'
+                    )
+                    _ok, _out = _ssh_probe(_ak_cfg, _ssh_cmd, timeout=180)
+                    for _line in (_out or '').strip().splitlines()[:20]:
+                        print(f"  remote-ak: {_line}")
+
+                    # UFW source-scope for 389/636 + deny 9090/9443 publicly
+                    _csrc = _fedhub_caddy_source_ip(_settings)
+                    if _csrc:
+                        _ufw_cmd = (
+                            'command -v ufw >/dev/null 2>&1 && ('
+                            f'sudo ufw allow from {_csrc} to any port 389 proto tcp 2>/dev/null; '
+                            f'sudo ufw allow from {_csrc} to any port 636 proto tcp 2>/dev/null; '
+                            'sudo ufw deny 389/tcp 2>/dev/null; sudo ufw deny 636/tcp 2>/dev/null; '
+                            'sudo ufw deny 9090/tcp 2>/dev/null; sudo ufw deny 9443/tcp 2>/dev/null; '
+                            'sudo ufw reload 2>/dev/null); true'
+                        )
+                        _ssh_probe(_ak_cfg, _ufw_cmd, timeout=20)
+                        print(f"  remote-ak UFW: 389/636 → console {_csrc} only; 9090/9443 denied")
+                    else:
+                        print("  remote-ak UFW skipped — Settings → Server IP not set")
+                    print("Post-update: remote Authentik port hardening complete")
+                except Exception as _rake:
+                    print(f"Post-update: remote Authentik hardening error (non-fatal): {_rake}")
+
             _auto_authentik_ports()
+            _auto_authentik_ports_remote()
             _auto_nodered()
             _auto_harden_containers()
 
@@ -38381,13 +38731,21 @@ def _post_update_auto_deploy():
                         print(f"  WARNING: override write failed: {_ove}")
 
                     # 5. UFW deny rules (defense in depth — survives override regressions)
+                    # v0.9.11 covered postgis 5433 + minio 9000/9002. v0.9.12 extends
+                    # to every other CloudTAK service host port that should never be
+                    # publicly reachable: api 5000, tiles 5002, events 5003 (just in
+                    # case), media admin 9997, media HLS 18888.
+                    # RTSP 18554 / RTMP 11935 / SRT 18890 are NOT denied — those are
+                    # legitimate public streaming endpoints (Tier 1).
                     try:
-                        for _port in ('5433/tcp', '9000/tcp', '9002/tcp'):
+                        for _port in ('5000/tcp', '5002/tcp', '5003/tcp',
+                                      '5433/tcp', '9000/tcp', '9002/tcp',
+                                      '9997/tcp', '18888/tcp'):
                             subprocess.run(
                                 f'(sudo ufw deny {_port} || ufw deny {_port}) >/dev/null 2>&1 || true',
                                 shell=True, capture_output=True, timeout=10
                             )
-                        print("  CloudTAK UFW deny rules applied (5433, 9000, 9002)")
+                        print("  CloudTAK UFW deny rules applied (5000,5002,5003,5433,9000,9002,9997,18888)")
                     except Exception as _ue:
                         print(f"  WARNING: UFW rules failed: {_ue}")
 
@@ -38413,6 +38771,157 @@ def _post_update_auto_deploy():
                     print(f"Post-update: CloudTAK hardening error (non-fatal): {_che}")
 
             _auto_harden_cloudtak()
+
+            def _auto_harden_takportal():
+                """v0.9.12 — TAK Portal port hardening.
+
+                Mirrors _auto_harden_cloudtak() for upstream AdventureSeeker423/TAK-Portal:
+                upstream binds WEB_UI_PORT to 0.0.0.0; we override to 127.0.0.1 and add
+                UFW deny on 3000/tcp belt-and-braces. Browsers reach the portal via
+                Caddy on 443 → forward_auth → loopback 3000.
+
+                Idempotent — only force-recreates the tak-portal container if the
+                override changed or the port is currently published on 0.0.0.0.
+                """
+                try:
+                    _portal_dir = os.path.expanduser('~/TAK-Portal')
+                    if not os.path.isdir(_portal_dir):
+                        return
+                    if not os.path.exists(os.path.join(_portal_dir, 'docker-compose.yml')):
+                        return
+                    print("Post-update: TAK Portal security hardening (v0.9.12)...")
+
+                    _override_changed = _write_takportal_override()
+
+                    try:
+                        subprocess.run(
+                            '(sudo ufw deny 3000/tcp || ufw deny 3000/tcp) >/dev/null 2>&1 || true',
+                            shell=True, capture_output=True, timeout=10
+                        )
+                    except Exception:
+                        pass
+
+                    _needs_recreate = _override_changed
+                    if not _needs_recreate:
+                        try:
+                            _ss = subprocess.run(
+                                "ss -tlnp 2>/dev/null | grep -E '0\\.0\\.0\\.0:3000' | wc -l",
+                                shell=True, capture_output=True, text=True, timeout=5
+                            )
+                            if (_ss.stdout or '').strip() not in ('', '0'):
+                                _needs_recreate = True
+                                print("  TAK Portal: override clean but container still on 0.0.0.0:3000 — recreating")
+                        except Exception:
+                            pass
+
+                    if _needs_recreate:
+                        try:
+                            _r = subprocess.run(
+                                f'cd {shlex.quote(_portal_dir)} && docker compose up -d --force-recreate 2>&1',
+                                shell=True, capture_output=True, text=True, timeout=180
+                            )
+                            if _r.returncode == 0:
+                                print("  TAK Portal recreated with 127.0.0.1:3000 binding")
+                            else:
+                                print(f"  WARNING: TAK Portal recreate returned {_r.returncode}: {(_r.stdout or '')[:200]}")
+                        except Exception as _re:
+                            print(f"  WARNING: TAK Portal recreate failed: {_re}")
+                    else:
+                        print("  TAK Portal already hardened — no recreate needed")
+
+                    print("Post-update: TAK Portal security hardening complete")
+                except Exception as _tphe:
+                    print(f"Post-update: TAK Portal hardening error (non-fatal): {_tphe}")
+
+            _auto_harden_takportal()
+
+            def _auto_harden_mediamtx():
+                """v0.9.12 — MediaMTX port hardening for existing local installs.
+
+                Three jobs, all idempotent:
+                  1. Patch /usr/local/etc/mediamtx.yml so apiAddress and hlsAddress
+                     bind to 127.0.0.1 (was :PORT i.e. 0.0.0.0).
+                  2. Patch /opt/mediamtx-webeditor/mediamtx_config_editor.py so
+                     Flask binds to 127.0.0.1 (was 0.0.0.0).
+                  3. Apply UFW: allow streaming ports (8554/8322/8890/8000/8001),
+                     DENY Tier 3 ports (8888/5080/9898). Restart mediamtx +
+                     mediamtx-webeditor systemd units only if anything changed.
+
+                Tier 1 (public): 8554 RTSP, 8322 RTSPS, 8890 SRT, 8000 RTP, 8001 RTCP.
+                Tier 3 (Caddy-loopback): 8888 HLS, 5080 webedit, 9898 API.
+
+                No-ops when MediaMTX isn't installed (no /usr/local/etc/mediamtx.yml).
+                """
+                try:
+                    _mtx_yml = '/usr/local/etc/mediamtx.yml'
+                    _webedit_py = '/opt/mediamtx-webeditor/mediamtx_config_editor.py'
+                    if not os.path.exists(_mtx_yml):
+                        return
+                    print("Post-update: MediaMTX security hardening (v0.9.12)...")
+
+                    _yml_changed = False
+                    try:
+                        with open(_mtx_yml, 'r') as _f:
+                            _yml = _f.read()
+                        _new_yml = _yml
+                        # apiAddress :PORT  → 127.0.0.1:PORT  (only when not already loopback)
+                        _new_yml = re.sub(
+                            r'^(apiAddress:\s+)(?!127\.0\.0\.1):(\d+)',
+                            r'\g<1>127.0.0.1:\g<2>', _new_yml, flags=re.MULTILINE)
+                        _new_yml = re.sub(
+                            r'^(hlsAddress:\s+)(?!127\.0\.0\.1):(\d+)',
+                            r'\g<1>127.0.0.1:\g<2>', _new_yml, flags=re.MULTILINE)
+                        if _new_yml != _yml:
+                            _yml_changed = True
+                            with open(_mtx_yml, 'w') as _f:
+                                _f.write(_new_yml)
+                            print("  MediaMTX mediamtx.yml: apiAddress/hlsAddress bound to 127.0.0.1")
+                    except Exception as _ye:
+                        print(f"  WARNING: mediamtx.yml patch failed: {_ye}")
+
+                    _webedit_changed = False
+                    if os.path.exists(_webedit_py):
+                        try:
+                            with open(_webedit_py, 'r') as _f:
+                                _wp = _f.read()
+                            _new_wp = _wp.replace("host='0.0.0.0'", "host='127.0.0.1'")
+                            _new_wp = _new_wp.replace('host="0.0.0.0"', 'host="127.0.0.1"')
+                            if _new_wp != _wp:
+                                _webedit_changed = True
+                                with open(_webedit_py, 'w') as _f:
+                                    _f.write(_new_wp)
+                                print("  MediaMTX webedit: Flask host bound to 127.0.0.1")
+                        except Exception as _we:
+                            print(f"  WARNING: mediamtx_config_editor.py patch failed: {_we}")
+
+                    try:
+                        for _port_proto in ('8554/tcp', '8322/tcp', '8890/udp',
+                                            '8000/udp', '8001/udp'):
+                            subprocess.run(
+                                f'(sudo ufw allow {_port_proto} || ufw allow {_port_proto}) >/dev/null 2>&1 || true',
+                                shell=True, capture_output=True, timeout=10)
+                        for _port_proto in ('8888/tcp', '5080/tcp', '9898/tcp'):
+                            subprocess.run(
+                                f'(sudo ufw deny {_port_proto} || ufw deny {_port_proto}) >/dev/null 2>&1 || true',
+                                shell=True, capture_output=True, timeout=10)
+                        print("  MediaMTX UFW: streaming public; webedit/API/HLS denied")
+                    except Exception as _ue:
+                        print(f"  WARNING: MediaMTX UFW rules failed: {_ue}")
+
+                    if _yml_changed:
+                        subprocess.run('systemctl restart mediamtx 2>/dev/null; true',
+                            shell=True, capture_output=True, timeout=30)
+                        print("  MediaMTX restarted")
+                    if _webedit_changed:
+                        subprocess.run('systemctl restart mediamtx-webeditor 2>/dev/null; true',
+                            shell=True, capture_output=True, timeout=30)
+                        print("  MediaMTX webedit restarted")
+
+                    print("Post-update: MediaMTX security hardening complete")
+                except Exception as _mhe:
+                    print(f"Post-update: MediaMTX hardening error (non-fatal): {_mhe}")
+
+            _auto_harden_mediamtx()
 
             # Final orphan postgres kill — _auto_authentik() runs run_authentik_deploy()
             # which recreates containers AGAIN after _auto_harden_containers() already ran,
