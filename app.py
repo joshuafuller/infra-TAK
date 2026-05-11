@@ -10357,11 +10357,19 @@ def _patch_takportal_compose_ports(portal_dir=None):
     Idempotent — already-patched files are not re-patched.
     Returns True if the file was modified.
 
+    Corruption recovery: if the file contains the corruption signature from
+    a prior bad patch (`ports:J7.0.0.1`), restore from git first, then patch.
+
     Note: `ports: !reset` in the override is NOT used for this because Docker
     Compose v5.x (shipped with Docker Engine 27+) does not support the !reset
     YAML tag; the tagged sequence resolves to null, silently dropping ALL port
     bindings (both base and override). Direct base-file patching is
     version-agnostic and reliable.
+
+    IMPORTANT: backrefs use \\g<N> syntax (NOT \\N) because the previous
+    `r'\\1127.0.0.1:\\2"'` form was parsed by Python's re engine as octal
+    \\112 (= ASCII 'J') + literal '7.0.0.1:' + group2, corrupting every file
+    it touched. `\\g<1>127.0.0.1` is unambiguous and safe.
     """
     import re as _re
     if portal_dir is None:
@@ -10370,6 +10378,19 @@ def _patch_takportal_compose_ports(portal_dir=None):
     if not os.path.exists(compose_path):
         return False
     try:
+        # Corruption recovery from the v0.9.12 bad-backref bug
+        with open(compose_path) as f:
+            _pre = f.read()
+        if 'ports:J' in _pre or 'J7.0.0.1' in _pre:
+            try:
+                subprocess.run(
+                    f'cd {shlex.quote(portal_dir)} && '
+                    f'git -c safe.directory={shlex.quote(portal_dir)} checkout -- docker-compose.yml',
+                    shell=True, capture_output=True, timeout=10
+                )
+            except Exception:
+                pass
+
         with open(compose_path) as f:
             content = f.read()
         orig = content
@@ -10377,7 +10398,7 @@ def _patch_takportal_compose_ports(portal_dir=None):
         # Idempotent: pattern won't match if 127.0.0.1: prefix is already present
         content = _re.sub(
             r'(\s+- ")(\$\{WEB_UI_PORT:-3000\}:\$\{WEB_UI_PORT:-3000\})"',
-            r'\1127.0.0.1:\2"',
+            r'\g<1>127.0.0.1:\g<2>"',
             content
         )
         if content != orig:
@@ -15290,6 +15311,13 @@ def _patch_cloudtak_compose_ports(cloudtak_dir=None):
     Idempotent — patterns already containing '127.0.0.1:' are not re-matched.
     Returns True if the file was modified.
 
+    Corruption recovery: if the file contains the v0.9.12 bad-backref
+    signature (`ports:J7.0.0.1`), restore from git first, then patch.
+
+    IMPORTANT: backrefs use \\g<N> syntax (NOT \\N) because `r'\\1127.0.0.1...'`
+    is parsed by Python's re engine as octal \\112 (= 'J') + '7.0.0.1...',
+    corrupting every file it touched. `\\g<1>127.0.0.1` is unambiguous.
+
     Port policy (matches docs/PORT-EXPOSURE-POLICY.md):
       api 5000        Tier 3 → 127.0.0.1:5000:5000
       tiles 5002      Tier 3 → 127.0.0.1:5002:5002
@@ -15310,15 +15338,28 @@ def _patch_cloudtak_compose_ports(cloudtak_dir=None):
         if not os.path.exists(_path):
             continue
         try:
+            # Corruption recovery from the v0.9.12 bad-backref bug
+            with open(_path) as f:
+                _pre = f.read()
+            if 'ports:J' in _pre or 'J7.0.0.1' in _pre:
+                try:
+                    subprocess.run(
+                        f'cd {shlex.quote(cloudtak_dir)} && '
+                        f'git -c safe.directory={shlex.quote(cloudtak_dir)} checkout -- {shlex.quote(_fname)}',
+                        shell=True, capture_output=True, timeout=10
+                    )
+                except Exception:
+                    pass
+
             with open(_path) as f:
                 _ct = f.read()
             _orig = _ct
 
             # Tier 3: api 5000 → loopback (idempotent: won't match 127.0.0.1:5000)
-            _ct = _re.sub(r'(\s+- )"?5000:5000"?', r'\1"127.0.0.1:5000:5000"', _ct)
+            _ct = _re.sub(r'(\s+- )"?5000:5000"?', r'\g<1>"127.0.0.1:5000:5000"', _ct)
 
             # Tier 3: tiles 5002 → loopback
-            _ct = _re.sub(r'(\s+- )"?5002:5002"?', r'\1"127.0.0.1:5002:5002"', _ct)
+            _ct = _re.sub(r'(\s+- )"?5002:5002"?', r'\g<1>"127.0.0.1:5002:5002"', _ct)
 
             # Tier 4: events 5003 — remove the ports block entirely
             _ct = _re.sub(
@@ -15329,14 +15370,14 @@ def _patch_cloudtak_compose_ports(cloudtak_dir=None):
             # Tier 3: media API port (${MEDIA_PORT_API:-9997}:9997) → loopback
             _ct = _re.sub(
                 r'(\s+- ")(\$\{MEDIA_PORT_API:-\d+\}:9997")',
-                r'\1127.0.0.1:\2',
+                r'\g<1>127.0.0.1:\g<2>',
                 _ct
             )
 
             # Tier 3: media HLS port (*:8888) → loopback (update default to 18888)
             _ct = _re.sub(
                 r'(\s+- ")(\$\{MEDIA_PORT_HLS:-)\d+(\}:8888")',
-                r'\g<1>127.0.0.1:\g<2>18888\3',
+                r'\g<1>127.0.0.1:\g<2>18888\g<3>',
                 _ct
             )
 
@@ -15350,7 +15391,7 @@ def _patch_cloudtak_compose_ports(cloudtak_dir=None):
             _ct = _re.sub(r'\n[ \t]+- "?9000:9000"?', '', _ct)
 
             # Tier 3: store 9002 → loopback
-            _ct = _re.sub(r'(\s+- )"?9002:9002"?', r'\1"127.0.0.1:9002:9002"', _ct)
+            _ct = _re.sub(r'(\s+- )"?9002:9002"?', r'\g<1>"127.0.0.1:9002:9002"', _ct)
 
             if _ct != _orig:
                 with open(_path, 'w') as f:
@@ -37334,11 +37375,18 @@ def _startup_harden_tak_portal_ports():
         _tp_dir = os.path.expanduser('~/TAK-Portal')
         if not os.path.isdir(_tp_dir):
             return
+        # Refresh the override file (clears stale `ports: !reset` content
+        # from v0.9.12 pre-fix installs, keeps network hardening current).
+        try:
+            _override_changed = _write_takportal_override()
+            if _override_changed:
+                print("Startup migration: TAK Portal override refreshed")
+        except Exception:
+            _override_changed = False
         _changed = _patch_takportal_compose_ports(_tp_dir)
         if _changed:
             print("Startup migration: TAK Portal base compose patched (WEB_UI_PORT → 127.0.0.1)")
-        # Check if the running container is missing the loopback binding
-        _needs_recreate = _changed
+        _needs_recreate = _changed or _override_changed
         if not _needs_recreate:
             try:
                 _ins = subprocess.run(
@@ -37371,11 +37419,28 @@ def _startup_harden_cloudtak_ports():
         _ct_dir = os.path.expanduser('~/CloudTAK')
         if not os.path.isdir(_ct_dir):
             return
+        # Refresh the override file (clears stale `ports: !reset` content
+        # from v0.9.12 pre-fix installs, keeps extra_hosts/env current).
+        _override_changed = False
+        try:
+            _override_path = os.path.join(_ct_dir, 'docker-compose.override.yml')
+            _settings = load_settings()
+            _new_override = _cloudtak_build_override_yml(_settings)
+            _existing = ''
+            if os.path.exists(_override_path):
+                with open(_override_path) as _of:
+                    _existing = _of.read()
+            if _existing.strip() != _new_override.strip():
+                with open(_override_path, 'w') as _of:
+                    _of.write(_new_override)
+                _override_changed = True
+                print("Startup migration: CloudTAK override refreshed (removed stale ports: !reset)")
+        except Exception:
+            pass
         _changed = _patch_cloudtak_compose_ports(_ct_dir)
         if _changed:
             print("Startup migration: CloudTAK base compose patched (port bindings → loopback/removed)")
-        # Check if the api container is missing the loopback binding
-        _needs_recreate = _changed
+        _needs_recreate = _changed or _override_changed
         if not _needs_recreate:
             try:
                 _ins = subprocess.run(
