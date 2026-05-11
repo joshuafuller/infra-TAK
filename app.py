@@ -26594,24 +26594,19 @@ def _authentik_setup_reputation_policy(plog):
         plog(f"  reputation policy: Authentik API unreachable ({e}) — skipping")
         return False
 
-    # Check idempotency
+    # v0.9.12: idempotency gate removed at the function top so the retro-fix
+    # (PATCH check_ip=True → False, PATCH failure_result=False → True) runs on
+    # already-applied installs that shipped with the broken v0.9.2 defaults.
+    # The find-or-create logic below is naturally idempotent (search before
+    # create; PATCH only on drift), so re-running is cheap and safe.
     rep_cfg = settings.get('authentik_reputation_policy') or {}
-    if rep_cfg.get('last_outcome') in ('applied', 'idempotent-noop'):
-        # Still record the check time
-        try:
-            s = load_settings()
-            rc = s.get('authentik_reputation_policy') or {}
-            rc['last_check_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
-            rc['last_outcome'] = 'idempotent-noop'
-            s['authentik_reputation_policy'] = rc
-            save_settings(s)
-        except Exception:
-            pass
-        plog("  reputation policy: already applied (idempotent — skipping)")
-        return False
-
-    plog("  reputation policy: applying for the first time…")
     threshold = rep_cfg.get('threshold', -5)
+    _first_run = rep_cfg.get('last_outcome') not in ('applied', 'idempotent-noop')
+
+    if _first_run:
+        plog("  reputation policy: applying for the first time…")
+    else:
+        plog("  reputation policy: already applied — checking for v0.9.12 retro-fix drift")
 
     try:
         # 1. Check if a reputation policy named 'infratak-brute-force' already exists
@@ -26622,10 +26617,17 @@ def _authentik_setup_reputation_policy(plog):
 
         if not policy_obj:
             plog("  reputation policy: creating ReputationPolicy…")
+            # v0.9.12 fix: check_ip=False because the LDAP outpost executes the
+            # flow without an HTTP client-IP context. With check_ip=True, the
+            # policy can't score the request and the binding's failure_result
+            # then denies the flow — FlowNonApplicableException on EVERY bind,
+            # blocking all LDAP auth even with correct credentials.
+            # Fail2ban already handles IP-layer brute force at the host level;
+            # check_username is the reliable signal in LDAP context.
             policy_data = {
                 'name':             'infratak-brute-force',
                 'threshold':        threshold,
-                'check_ip':         True,
+                'check_ip':         False,
                 'check_username':   True,
             }
             req = _req.Request(
@@ -26637,6 +26639,20 @@ def _authentik_setup_reputation_policy(plog):
             plog(f"  reputation policy: created policy pk={policy_obj['pk']}")
         else:
             plog(f"  reputation policy: policy exists pk={policy_obj['pk']}")
+            # v0.9.12 retro-fix: PATCH legacy installs that shipped with
+            # check_ip=True (which blocks all LDAP binds — see comment above).
+            if policy_obj.get('check_ip') is not False or policy_obj.get('check_username') is not True:
+                plog(f"  reputation policy: drift — check_ip={policy_obj.get('check_ip')}, check_username={policy_obj.get('check_username')} → PATCHing to safe values")
+                try:
+                    _patch_req = _req.Request(
+                        f"{url}/api/v3/policies/reputation/{policy_obj['pk']}/",
+                        data=json.dumps({'check_ip': False, 'check_username': True}).encode(),
+                        headers=headers, method='PATCH'
+                    )
+                    _req.urlopen(_patch_req, timeout=10)
+                    plog("  reputation policy: PATCHed (check_ip=False, check_username=True)")
+                except Exception as _pe:
+                    plog(f"  reputation policy: PATCH error (non-fatal): {_pe}")
 
         policy_pk = policy_obj['pk']
 
@@ -26664,6 +26680,9 @@ def _authentik_setup_reputation_policy(plog):
             bindings = json.loads(_req.urlopen(req, timeout=10).read().decode())['results']
             if not bindings:
                 plog("  reputation policy: binding policy to ldap-authentication-flow…")
+                # v0.9.12 fix: failure_result=True (fail-open). Combined with the
+                # check_ip=False policy fix above, this means any future policy
+                # evaluation hiccup leaves LDAP auth working instead of denied.
                 bind_data = {
                     'policy':          policy_pk,
                     'target':          flow_target_pk,
@@ -26671,7 +26690,7 @@ def _authentik_setup_reputation_policy(plog):
                     'enabled':         True,
                     'negate':          False,
                     'timeout':         30,
-                    'failure_result':  False,
+                    'failure_result':  True,
                 }
                 req = _req.Request(
                     f'{url}/api/v3/policies/bindings/',
@@ -26701,6 +26720,23 @@ def _authentik_setup_reputation_policy(plog):
                         ) from _bind_err
             else:
                 plog("  reputation policy: binding already exists")
+                # v0.9.12 retro-fix: PATCH legacy bindings shipped with
+                # failure_result=False, which makes any policy eval failure
+                # deny the flow. Fail-open is the right posture for an internal
+                # LDAP control plane.
+                for _b in bindings:
+                    if _b.get('failure_result') is not True:
+                        plog(f"  reputation policy: binding {_b.get('pk')} drift — failure_result={_b.get('failure_result')} → PATCHing to True (fail-open)")
+                        try:
+                            _patch_req = _req.Request(
+                                f"{url}/api/v3/policies/bindings/{_b['pk']}/",
+                                data=json.dumps({'failure_result': True}).encode(),
+                                headers=headers, method='PATCH'
+                            )
+                            _req.urlopen(_patch_req, timeout=10)
+                            plog(f"  reputation policy: binding {_b.get('pk')} PATCHed (failure_result=True)")
+                        except Exception as _pe:
+                            plog(f"  reputation policy: binding PATCH error (non-fatal): {_pe}")
 
         # 4. Persist outcome
         try:
@@ -29947,17 +29983,35 @@ def _ensure_authentik_ldap_service_account():
                 shell=True, capture_output=True, timeout=60)
         # 6. Ensure ldapsearch is available (install ldap-utils / openldap-clients if missing)
         _ensure_ldapsearch()
-        # 7. Wait for LDAP outpost to be ready, then VERIFY via outpost logs (ldapsearch exit code is unreliable)
+        # 7. Wait for LDAP outpost ready, then VERIFY with authoritative ldapsearch
+        # exit code. Old _test_ldap_bind (log-only) false-positives on outpost SA
+        # session-renewal events — `"authenticated from session"` fires constantly
+        # for any cached SA whether or not the current bind succeeded. Use the
+        # tri-state verdict from v0.8.5 (ldapsearch exit code as truth, log
+        # markers only as fallback when ldapsearch isn't installed).
         ready, ready_status = _wait_ldap_outpost_ready(timeout_secs=180)
         if not ready:
             return False, f'LDAP outpost not ready (status: {ready_status})'
+        last_verdict = 'inconclusive'
         for attempt in range(10):
             time.sleep(6)
-            if _test_ldap_bind(ldap_pass):
+            v = _test_ldap_bind_dn_verdict('cn=adm_ldapservice,ou=users,dc=takldap', ldap_pass)
+            if v == 'ok':
                 return True, f'LDAP bind verified (attempt {attempt + 1})'
-        # Verification failed — outpost may not log service account binds, or format differs.
-        # Proceed anyway; service account exists and password is set. User can test with a TAK client.
-        return True, 'LDAP service account configured (bind verification inconclusive — outpost may not log service-account binds). Proceeding.'
+            last_verdict = v
+        if last_verdict == 'fail':
+            # Confirmed failure after the API set_password — almost always means
+            # the reputation policy on ldap-authentication-flow is still denying
+            # the flow (FlowNonApplicableException). The v0.9.12 startup migration
+            # _startup_fix_reputation_policy_drift handles this; this call site
+            # may be running before that migration completed (e.g. during the
+            # console's first deploy on a fresh box). Operator next action:
+            # re-run deploy or trigger Update Now.
+            return False, 'LDAP bind confirmed failing after API password set — check ldap-authentication-flow policy bindings'
+        # Inconclusive across all attempts — likely ldapsearch not installable on
+        # this distro. Keep prior permissive behavior: assume API success means
+        # password was written; let downstream operator workflow catch any issue.
+        return True, 'LDAP service account configured (bind verification inconclusive — ldapsearch unavailable). Proceeding.'
     except urllib.error.HTTPError as e:
         body = ''
         try:
@@ -37468,6 +37522,115 @@ def _startup_harden_cloudtak_ports():
 _startup_harden_cloudtak_ports()
 
 
+# v0.9.12: self-heal the v0.9.2 reputation-policy misconfiguration that blocks
+# ALL LDAP authentication. The original v0.9.2 shipped:
+#   ReputationPolicy(check_ip=True, check_username=True)
+#   PolicyBinding(failure_result=False) on ldap-authentication-flow
+# Problem: the LDAP outpost executes the flow without an HTTP client-IP
+# context (binds come from a docker bridge, not a browser session). With
+# check_ip=True the policy can't score → returns a failure verdict →
+# failure_result=False denies the flow → FlowNonApplicableException on
+# EVERY bind, regardless of whether the password is right.
+#
+# This bug was masked for months by the outpost's bind_mode=cached: once a
+# successful SA session was hot in the outpost cache, subsequent binds for
+# the same DN were served from cache and never hit the flow. Any container
+# recreate / docker restart / host reboot that wipes the outpost cache
+# exposes the bug — and that's exactly what the v0.9.12 hardening recreates
+# triggered on tak-10.
+#
+# Fix: PATCH the live policy to check_ip=False (fail2ban handles IP-layer
+# brute force at the host level; check_username remains the reliable LDAP
+# signal) and the binding to failure_result=True (fail-open for any future
+# evaluation hiccup). Must run BEFORE _startup_resync_ldap_service_account
+# so the bind probe doesn't false-fail on the broken flow.
+#
+# Idempotent: no-op once both fields are at safe values.
+def _startup_fix_reputation_policy_drift():
+    try:
+        if not os.path.isdir(os.path.expanduser('~/authentik')):
+            return False
+        settings = load_settings()
+        ak_token = (_get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+                    or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN'))
+        if not ak_token:
+            return False
+        import urllib.request as _req2
+        url = _get_authentik_api_url(settings)
+        headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+
+        # Locate the policy. Not present = first deploy hasn't run yet — let
+        # _authentik_setup_reputation_policy create it with safe defaults.
+        try:
+            req = _req2.Request(
+                f'{url}/api/v3/policies/reputation/?search=infratak-brute-force',
+                headers=headers)
+            resp = json.loads(_req2.urlopen(req, timeout=8).read().decode())
+        except Exception:
+            return False
+        policy_obj = next((p for p in resp.get('results', [])
+                           if p.get('name') == 'infratak-brute-force'), None)
+        if not policy_obj:
+            return False
+
+        any_patched = False
+        policy_pk = policy_obj['pk']
+
+        # 1. Policy itself: enforce check_ip=False, check_username=True.
+        if policy_obj.get('check_ip') is not False or policy_obj.get('check_username') is not True:
+            print(f"Startup migration: reputation policy drift — "
+                  f"check_ip={policy_obj.get('check_ip')} → False, "
+                  f"check_username={policy_obj.get('check_username')} → True "
+                  f"(v0.9.12 fix for FlowNonApplicable on LDAP binds)")
+            try:
+                req = _req2.Request(
+                    f'{url}/api/v3/policies/reputation/{policy_pk}/',
+                    data=json.dumps({'check_ip': False, 'check_username': True}).encode(),
+                    headers=headers, method='PATCH')
+                _req2.urlopen(req, timeout=10)
+                print("Startup migration: reputation policy PATCHed (check_ip=False, check_username=True)")
+                any_patched = True
+            except Exception as _pe:
+                print(f"Startup migration: reputation policy PATCH error (non-fatal): {_pe}")
+
+        # 2. Bindings: enforce failure_result=True (fail-open).
+        try:
+            req = _req2.Request(
+                f'{url}/api/v3/policies/bindings/?policy={policy_pk}',
+                headers=headers)
+            br = json.loads(_req2.urlopen(req, timeout=8).read().decode())
+        except Exception:
+            return any_patched
+        for binding in br.get('results', []):
+            if binding.get('failure_result') is not True:
+                bpk = binding.get('pk')
+                print(f"Startup migration: reputation binding {bpk} drift — "
+                      f"failure_result={binding.get('failure_result')} → True (fail-open)")
+                try:
+                    req = _req2.Request(
+                        f'{url}/api/v3/policies/bindings/{bpk}/',
+                        data=json.dumps({'failure_result': True}).encode(),
+                        headers=headers, method='PATCH')
+                    _req2.urlopen(req, timeout=10)
+                    print(f"Startup migration: reputation binding {bpk} PATCHed (failure_result=True)")
+                    any_patched = True
+                except Exception as _pe:
+                    print(f"Startup migration: reputation binding PATCH error (non-fatal): {_pe}")
+
+        if not any_patched:
+            # Quiet idempotent path — no log line on every reboot.
+            pass
+        return any_patched
+    except Exception as _e:
+        print(f"Startup migration: reputation policy drift fix error (non-fatal): {_e}")
+        return False
+
+# Expose result to the LDAP resync migration so it can decide whether to
+# restart takserver (broken flow means TAK Server has been hitting denials,
+# might be holding a degraded internal state).
+_v0_9_12_rep_patched = _startup_fix_reputation_policy_drift()
+
+
 # v0.9.12: self-heal LDAP service account password drift on every startup.
 # Triggered originally by the v0.9.12 hardening recreate of Authentik containers,
 # which caused some installs to end up with an `adm_ldapservice` password in
@@ -37489,38 +37652,80 @@ def _startup_resync_ldap_service_account():
         env_pass = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')
         if not env_pass:
             return
-        # Probe: does the bind work today? If yes, idempotent no-op.
+
+        # Probe: does the bind work today? If yes, idempotent no-op (unless the
+        # reputation policy was just patched — in that case TAK Server has been
+        # hitting denials and a restart clears any degraded JVM state).
         try:
             verdict = _test_ldap_bind_dn_verdict('cn=adm_ldapservice,ou=users,dc=takldap', env_pass)
         except Exception:
             verdict = 'inconclusive'
-        if verdict == 'ok':
+
+        healing_performed = bool(globals().get('_v0_9_12_rep_patched', False))
+
+        if verdict == 'ok' and not healing_performed:
             print("Startup migration: LDAP service account bind verified (idempotent — no-op)")
             return
+
         if verdict == 'inconclusive':
-            # Don't touch a system where we can't confirm the bind state — could be
-            # outpost not ready yet (boot race). The next startup or operator's
-            # explicit Resync click handles it.
             print("Startup migration: LDAP service account bind inconclusive — leaving alone (outpost may still be starting)")
             return
-        # Confirmed fail — trigger the same flow as the Resync LDAP button.
-        print("Startup migration: LDAP service account bind FAILED — auto-resyncing (post-v0.9.12 hardening drift)")
+
+        if verdict == 'fail':
+            print("Startup migration: LDAP service account bind FAILED — auto-resyncing")
+            try:
+                ok, msg = _ensure_authentik_ldap_service_account()
+                if ok:
+                    print(f"Startup migration: LDAP service account resync OK ({msg})")
+                    healing_performed = True
+                else:
+                    print(f"Startup migration: LDAP service account resync incomplete — {msg}")
+            except Exception as _re:
+                print(f"Startup migration: LDAP service account resync error (non-fatal): {_re}")
+
+        # Belt and braces: resync CoreConfig.xml credential against .env so drift
+        # on the TAK Server side gets fixed in the same startup pass.
+        coreconfig_changed = False
         try:
-            ok, msg = _ensure_authentik_ldap_service_account()
-            if ok:
-                print(f"Startup migration: LDAP service account resync OK ({msg})")
-            else:
-                print(f"Startup migration: LDAP service account resync incomplete — {msg}")
-        except Exception as _re:
-            print(f"Startup migration: LDAP service account resync error (non-fatal): {_re}")
-        # Belt and braces: also resync the CoreConfig credential so any drift on
-        # that side gets fixed in the same startup pass.
-        try:
-            changed, resync_msg = _resync_ldap_credential_to_coreconfig()
-            if changed:
+            coreconfig_changed, resync_msg = _resync_ldap_credential_to_coreconfig()
+            if coreconfig_changed:
                 print(f"Startup migration: CoreConfig.xml LDAP credential resynced ({resync_msg})")
+                healing_performed = True
         except Exception:
             pass
+
+        # Final probe to confirm we actually fixed things.
+        try:
+            final_verdict = _test_ldap_bind_dn_verdict(
+                'cn=adm_ldapservice,ou=users,dc=takldap', env_pass)
+        except Exception:
+            final_verdict = 'inconclusive'
+
+        # If healing happened AND the bind now works AND TAK Server is installed,
+        # restart takserver so it picks up:
+        #   - any new CoreConfig credential (Java reads CoreConfig once at boot)
+        #   - a healthy flow state (clears any retry-backoff / degraded internals
+        #     accumulated while binds were being denied by the broken policy)
+        # Gate strictly on final_verdict='ok' so we never restart into a still-
+        # broken state.
+        if (healing_performed
+                and final_verdict == 'ok'
+                and os.path.exists('/opt/tak/CoreConfig.xml')):
+            print("Startup migration: LDAP healed — restarting takserver to flush cached state")
+            try:
+                r = subprocess.run(
+                    'sudo systemctl restart takserver 2>&1',
+                    shell=True, capture_output=True, text=True, timeout=120)
+                if r.returncode == 0:
+                    print("Startup migration: takserver restart sent")
+                else:
+                    print(f"Startup migration: takserver restart warning: "
+                          f"{(r.stdout or '')[:200]}{(r.stderr or '')[:200]}")
+            except Exception as _re:
+                print(f"Startup migration: takserver restart error (non-fatal): {_re}")
+        elif healing_performed and final_verdict != 'ok':
+            print(f"Startup migration: healing applied but final bind verdict = {final_verdict} — "
+                  f"NOT restarting takserver (would restart into broken state)")
     except Exception as _e:
         print(f"Startup migration: LDAP service account resync skipped: {_e}")
 
