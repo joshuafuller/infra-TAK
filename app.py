@@ -36029,11 +36029,15 @@ function _renderChannelButtons(ch){
     var mb=document.getElementById('ch-main-btn');
     var db=document.getElementById('ch-dev-btn');
     if(!mb||!db)return;
-    var mainActive='background:var(--green);color:#0f172a;border:none;';
-    var devActive='background:var(--yellow);color:#0f172a;border:none;';
-    var idle='background:transparent;color:var(--text-dim);border:none;';
-    if(ch==='dev'){mb.setAttribute('style',mb.getAttribute('style').replace(/background:[^;]+;/,'')+idle);db.setAttribute('style',db.getAttribute('style').replace(/background:[^;]+;/,'')+devActive);}
-    else{mb.setAttribute('style',mb.getAttribute('style').replace(/background:[^;]+;/,'')+mainActive);db.setAttribute('style',db.getAttribute('style').replace(/background:[^;]+;/,'')+idle);}
+    var base='padding:3px 10px;font-family:\'JetBrains Mono\',monospace;font-size:10px;font-weight:600;border:none;cursor:pointer;transition:background .15s,color .15s;';
+    var devBorder='border-left:1px solid var(--border);';
+    if(ch==='dev'){
+        mb.style.cssText=base+'background:transparent;color:var(--text-dim);';
+        db.style.cssText=base+devBorder+'background:var(--yellow);color:#0f172a;';
+    }else{
+        mb.style.cssText=base+'background:var(--green);color:#0f172a;';
+        db.style.cssText=base+devBorder+'background:transparent;color:var(--text-dim);';
+    }
 }
 _renderChannelButtons(_currentChannel);
 function promptDevChannel(){
