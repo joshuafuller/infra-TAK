@@ -10309,11 +10309,10 @@ def _write_takportal_override():
         _ensure_infratak_docker_network()
         content = (
             "# TAKWERX: TAK Portal runtime overrides — do not edit manually\n"
-            "# v0.9.12 — port hardening: bind WEB_UI_PORT to 127.0.0.1 only.\n"
+            "# Port hardening is applied directly to docker-compose.yml by\n"
+            "# _patch_takportal_compose_ports() (compose-version-agnostic).\n"
             "services:\n"
             "  tak-portal:\n"
-            "    ports: !reset\n"
-            "      - \"127.0.0.1:${WEB_UI_PORT:-3000}:${WEB_UI_PORT:-3000}\"\n"
             "    networks:\n"
             "      - default\n"
             f"      - {INFRATAK_DOCKER_NETWORK}\n"
@@ -10343,6 +10342,51 @@ def _patch_takportal_compose_network():
     git-tracked docker-compose.yml, preventing stash conflicts on git pull.
     """
     return _write_takportal_override()
+
+
+def _patch_takportal_compose_ports(portal_dir=None):
+    """Patch ~/TAK-Portal/docker-compose.yml to bind WEB_UI_PORT to loopback only.
+
+    Upstream AdventureSeeker423/TAK-Portal binds
+    `${WEB_UI_PORT:-3000}:${WEB_UI_PORT:-3000}` (0.0.0.0). We rewrite it to
+    `127.0.0.1:${WEB_UI_PORT:-3000}:${WEB_UI_PORT:-3000}`.
+
+    Must be called after every `git pull` and before `docker compose up`, so
+    that git resets don't leave the container exposed on 0.0.0.0.
+
+    Idempotent — already-patched files are not re-patched.
+    Returns True if the file was modified.
+
+    Note: `ports: !reset` in the override is NOT used for this because Docker
+    Compose v5.x (shipped with Docker Engine 27+) does not support the !reset
+    YAML tag; the tagged sequence resolves to null, silently dropping ALL port
+    bindings (both base and override). Direct base-file patching is
+    version-agnostic and reliable.
+    """
+    import re as _re
+    if portal_dir is None:
+        portal_dir = os.path.expanduser('~/TAK-Portal')
+    compose_path = os.path.join(portal_dir, 'docker-compose.yml')
+    if not os.path.exists(compose_path):
+        return False
+    try:
+        with open(compose_path) as f:
+            content = f.read()
+        orig = content
+        # Change bare `PORT:PORT` → `127.0.0.1:PORT:PORT`
+        # Idempotent: pattern won't match if 127.0.0.1: prefix is already present
+        content = _re.sub(
+            r'(\s+- ")(\$\{WEB_UI_PORT:-3000\}:\$\{WEB_UI_PORT:-3000\})"',
+            r'\1127.0.0.1:\2"',
+            content
+        )
+        if content != orig:
+            with open(compose_path, 'w') as f:
+                f.write(content)
+            return True
+        return False
+    except Exception:
+        return False
 
 
 def _patch_authentik_compose_network():
@@ -12361,6 +12405,7 @@ def takportal_control():
     portal_dir = os.path.expanduser('~/TAK-Portal')
     if action == 'start':
         _patch_takportal_compose_network()
+        _patch_takportal_compose_ports(portal_dir)
         subprocess.run(f'cd {portal_dir} && docker compose up -d --build', shell=True, capture_output=True, text=True, timeout=120)
         _ensure_infratak_network_for_portal()
         _ensure_infratak_network_for_authentik()
@@ -12368,6 +12413,7 @@ def takportal_control():
         subprocess.run(f'cd {portal_dir} && docker compose down', shell=True, capture_output=True, text=True, timeout=60)
     elif action == 'restart':
         _patch_takportal_compose_network()
+        _patch_takportal_compose_ports(portal_dir)
         subprocess.run(f'cd {portal_dir} && docker compose down && docker compose up -d', shell=True, capture_output=True, text=True, timeout=120)
         _ensure_infratak_network_for_portal()
         _ensure_infratak_network_for_authentik()
@@ -12409,8 +12455,11 @@ def takportal_control():
             f'cd {portal_dir} && git -c safe.directory={portal_dir} pull --rebase',
             shell=True, capture_output=True, text=True, timeout=60)
         pull_msg = pull.stdout.strip().split('\n')[-1] if pull.stdout.strip() else ''
-        # Rewrite the override file so network + hardening survive the pull
+        # Rewrite the override file so network hardening survives the pull.
+        # Also patch the base compose so port binding is loopback-only
+        # (git pull resets the upstream 0.0.0.0 binding on every update).
         _write_takportal_override()
+        _patch_takportal_compose_ports(portal_dir)
         build = subprocess.run(f'cd {portal_dir} && docker compose up -d --build', shell=True, capture_output=True, text=True, timeout=180)
         _ensure_infratak_network_for_portal()
         _ensure_infratak_network_for_authentik()
@@ -15203,41 +15252,114 @@ def _cloudtak_build_override_yml(settings):
     # Defense-in-depth: _auto_harden_cloudtak() also installs UFW deny rules for
     # every Tier 3/4 port so a regressed override or disabled UFW alone can't
     # reopen the attack surface.
+    # Note: port hardening is applied directly to compose.yaml via
+    # _patch_cloudtak_compose_ports() (compose-version-agnostic).
+    # `ports: !reset` is NOT used here because Docker Compose v5.x (shipped
+    # with Docker Engine 27+) does not support the !reset YAML tag — it
+    # resolves to null, silently dropping ALL port bindings.
     return f"""# TAKWERX: CloudTAK container overrides — v0.9.11+v0.9.12 security hardening
+# Port hardening applied directly to compose.yaml by _patch_cloudtak_compose_ports().
 services:
   api:
     extra_hosts:
 {hosts_block}
-    ports: !reset
-      - "127.0.0.1:5000:5000"
-  tiles:
-    ports: !reset
-      - "127.0.0.1:5002:5002"
   events:
     extra_hosts:
 {hosts_block}
     environment:
       API_URL: "http://api:5000"
-    ports: !reset []
   media:
     extra_hosts:
 {hosts_block}
     environment:
       API_URL: "http://api:5000"
-    ports: !reset
-      - "127.0.0.1:${{MEDIA_PORT_API:-9997}}:9997"
-      - "${{MEDIA_PORT_RTSP:-18554}}:8554"
-      - "${{MEDIA_PORT_RTMP:-11935}}:1935"
-      - "127.0.0.1:${{MEDIA_PORT_HLS:-18888}}:8888"
-      - "${{MEDIA_PORT_SRT:-18890}}:8890"
   postgis:
-    ports: !reset []
     environment:
       POSTGRES_PASSWORD: "${{POSTGRES_PASSWORD:-docker}}"
-  store:
-    ports: !reset
-      - "127.0.0.1:9002:9002"
 """
+
+
+def _patch_cloudtak_compose_ports(cloudtak_dir=None):
+    """Patch port bindings in CloudTAK compose.yaml / docker-compose.yml.
+
+    Applies loopback-only restrictions to Tier-3 (Caddy-facing) services and
+    removes host-port bindings for Tier-4 (Docker-internal-only) services.
+    Must be called after every deployment or git pull that may reset upstream
+    0.0.0.0 bindings.
+
+    Idempotent — patterns already containing '127.0.0.1:' are not re-matched.
+    Returns True if the file was modified.
+
+    Port policy (matches docs/PORT-EXPOSURE-POLICY.md):
+      api 5000        Tier 3 → 127.0.0.1:5000:5000
+      tiles 5002      Tier 3 → 127.0.0.1:5002:5002
+      events 5003     Tier 4 → removed (Docker-internal only)
+      media 9997      Tier 3 → 127.0.0.1:9997:9997 (HLS admin)
+      media 8888 HLS  Tier 3 → 127.0.0.1:PORT:8888 (via MEDIA_PORT_HLS)
+      media RTSP/RTMP/SRT  Tier 1 → untouched (public streaming)
+      postgis 5433    Tier 4 → removed
+      store 9000      Tier 4 → removed
+      store 9002      Tier 3 → 127.0.0.1:9002:9002
+    """
+    import re as _re
+    if cloudtak_dir is None:
+        cloudtak_dir = os.path.expanduser('~/CloudTAK')
+    changed = False
+    for _fname in ('compose.yaml', 'docker-compose.yml'):
+        _path = os.path.join(cloudtak_dir, _fname)
+        if not os.path.exists(_path):
+            continue
+        try:
+            with open(_path) as f:
+                _ct = f.read()
+            _orig = _ct
+
+            # Tier 3: api 5000 → loopback (idempotent: won't match 127.0.0.1:5000)
+            _ct = _re.sub(r'(\s+- )"?5000:5000"?', r'\1"127.0.0.1:5000:5000"', _ct)
+
+            # Tier 3: tiles 5002 → loopback
+            _ct = _re.sub(r'(\s+- )"?5002:5002"?', r'\1"127.0.0.1:5002:5002"', _ct)
+
+            # Tier 4: events 5003 — remove the ports block entirely
+            _ct = _re.sub(
+                r'\n([ \t]+)ports:[ \t]*\n\1[ \t]+- "?5003:5003"?',
+                '', _ct
+            )
+
+            # Tier 3: media API port (${MEDIA_PORT_API:-9997}:9997) → loopback
+            _ct = _re.sub(
+                r'(\s+- ")(\$\{MEDIA_PORT_API:-\d+\}:9997")',
+                r'\1127.0.0.1:\2',
+                _ct
+            )
+
+            # Tier 3: media HLS port (*:8888) → loopback (update default to 18888)
+            _ct = _re.sub(
+                r'(\s+- ")(\$\{MEDIA_PORT_HLS:-)\d+(\}:8888")',
+                r'\g<1>127.0.0.1:\g<2>18888\3',
+                _ct
+            )
+
+            # Tier 4: postgis 5433 — remove the ports block entirely
+            _ct = _re.sub(
+                r'\n([ \t]+)ports:[ \t]*\n\1[ \t]+- "?5433:5432"?',
+                '', _ct
+            )
+
+            # Tier 4: store 9000 — remove the line only (9002 stays in the block)
+            _ct = _re.sub(r'\n[ \t]+- "?9000:9000"?', '', _ct)
+
+            # Tier 3: store 9002 → loopback
+            _ct = _re.sub(r'(\s+- )"?9002:9002"?', r'\1"127.0.0.1:9002:9002"', _ct)
+
+            if _ct != _orig:
+                with open(_path, 'w') as f:
+                    f.write(_ct)
+                changed = True
+        except Exception:
+            pass
+        break  # only patch the first matching file
+    return changed
 
 
 def _cloudtak_fix_nginx_user(container_name='cloudtak-api-1', total_timeout=180, ssh_cfg=None):
@@ -38993,7 +39115,18 @@ def _post_update_auto_deploy():
                     except Exception as _ove:
                         print(f"  WARNING: override write failed: {_ove}")
 
-                    # 5. UFW deny rules (defense in depth — survives override regressions)
+                    # 5. Patch the base compose file so port bindings are loopback-only.
+                    # `ports: !reset` in the override is NOT used because Docker
+                    # Compose v5.x (shipped with Docker Engine 27+) resolves that
+                    # YAML tag to null, dropping ALL port bindings silently.
+                    try:
+                        _base_patched = _patch_cloudtak_compose_ports(_cloudtak_dir)
+                        if _base_patched:
+                            print("  CloudTAK base compose: port bindings patched (loopback/removed)")
+                    except Exception as _bpe:
+                        print(f"  WARNING: CloudTAK base compose patch failed: {_bpe}")
+
+                    # 6. UFW deny rules (defense in depth — survives any compose regression)
                     # v0.9.11 covered postgis 5433 + minio 9000/9002. v0.9.12 extends
                     # to every other CloudTAK service host port that should never be
                     # publicly reachable: api 5000, tiles 5002, events 5003 (just in
@@ -39012,7 +39145,7 @@ def _post_update_auto_deploy():
                     except Exception as _ue:
                         print(f"  WARNING: UFW rules failed: {_ue}")
 
-                    # 6. Recreate the stack only if clean. Compromised installs
+                    # 7. Recreate the stack only if clean. Compromised installs
                     #    stay STOPPED until operator does Remove + Reinstall.
                     if not _compromised:
                         try:
@@ -39064,7 +39197,16 @@ def _post_update_auto_deploy():
                     except Exception:
                         pass
 
-                    _needs_recreate = _override_changed
+                    # Patch the base docker-compose.yml to bind WEB_UI_PORT to
+                    # loopback. Must run after every git pull that resets the
+                    # upstream port binding to 0.0.0.0. The override alone cannot
+                    # fix this because `ports: !reset` is not supported by Docker
+                    # Compose v5.x (resolves to null, drops all port bindings).
+                    _base_patched = _patch_takportal_compose_ports(_portal_dir)
+                    if _base_patched:
+                        print("  TAK Portal base compose: WEB_UI_PORT binding → 127.0.0.1")
+
+                    _needs_recreate = _override_changed or _base_patched
                     if not _needs_recreate:
                         try:
                             _ss = subprocess.run(
@@ -39073,13 +39215,10 @@ def _post_update_auto_deploy():
                             )
                             if (_ss.stdout or '').strip() not in ('', '0'):
                                 _needs_recreate = True
-                                print("  TAK Portal: override clean but container still on 0.0.0.0:3000 — recreating")
+                                print("  TAK Portal: container still on 0.0.0.0:3000 — recreating")
                         except Exception:
                             pass
                     if not _needs_recreate:
-                        # Also recreate if the expected loopback binding is simply absent
-                        # (e.g. container was created before the override existed, or was
-                        # restarted with `docker restart` rather than `docker compose up`).
                         try:
                             _ins = subprocess.run(
                                 "docker inspect tak-portal --format '{{json .HostConfig.PortBindings}}'",
@@ -39088,7 +39227,7 @@ def _post_update_auto_deploy():
                             _bindings = json.loads(_ins.stdout.strip() or '{}')
                             if not _bindings.get('3000/tcp'):
                                 _needs_recreate = True
-                                print("  TAK Portal: 127.0.0.1:3000 binding absent from running container — recreating")
+                                print("  TAK Portal: 127.0.0.1:3000 binding absent — recreating")
                         except Exception:
                             pass
 
