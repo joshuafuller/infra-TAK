@@ -26720,23 +26720,44 @@ def _authentik_setup_reputation_policy(plog):
                         ) from _bind_err
             else:
                 plog("  reputation policy: binding already exists")
-                # v0.9.12 retro-fix: PATCH legacy bindings shipped with
-                # failure_result=False, which makes any policy eval failure
-                # deny the flow. Fail-open is the right posture for an internal
-                # LDAP control plane.
+                # v0.9.12 retro-fix: legacy bindings shipped with failure_result=False
+                # which makes any policy eval failure deny the flow (the FlowNonApplicable
+                # cascade documented in v0.9.12 release notes). Fail-open is the right
+                # posture for an internal LDAP control plane.
+                #
+                # Implementation: PATCH /api/v3/policies/bindings/{pk}/ returns HTTP 405
+                # Method Not Allowed on Authentik 2026.x — observed empirically on tak-10
+                # (May 2026). PUT may or may not work; DELETE + POST always works and is
+                # idempotent at the API layer. Use that.
                 for _b in bindings:
                     if _b.get('failure_result') is not True:
-                        plog(f"  reputation policy: binding {_b.get('pk')} drift — failure_result={_b.get('failure_result')} → PATCHing to True (fail-open)")
+                        plog(f"  reputation policy: binding {_b.get('pk')} drift — failure_result={_b.get('failure_result')} → DELETE+POST recreate (PATCH returns 405 on Authentik 2026.x)")
                         try:
-                            _patch_req = _req.Request(
+                            # Capture full record so the recreate preserves all fields.
+                            _orig = dict(_b)
+                            _del_req = _req.Request(
                                 f"{url}/api/v3/policies/bindings/{_b['pk']}/",
-                                data=json.dumps({'failure_result': True}).encode(),
-                                headers=headers, method='PATCH'
+                                headers=headers, method='DELETE'
                             )
-                            _req.urlopen(_patch_req, timeout=10)
-                            plog(f"  reputation policy: binding {_b.get('pk')} PATCHed (failure_result=True)")
+                            _req.urlopen(_del_req, timeout=10)
+                            _new = {
+                                'policy':          _orig.get('policy') or policy_pk,
+                                'target':          _orig.get('target') or flow_target_pk,
+                                'order':           _orig.get('order', 0),
+                                'enabled':         _orig.get('enabled', True),
+                                'negate':          _orig.get('negate', False),
+                                'timeout':         _orig.get('timeout', 30),
+                                'failure_result':  True,
+                            }
+                            _post_req = _req.Request(
+                                f'{url}/api/v3/policies/bindings/',
+                                data=json.dumps(_new).encode(),
+                                headers=headers, method='POST'
+                            )
+                            _new_resp = json.loads(_req.urlopen(_post_req, timeout=10).read().decode())
+                            plog(f"  reputation policy: binding recreated as {_new_resp.get('pk')} (failure_result=True, fail-open)")
                         except Exception as _pe:
-                            plog(f"  reputation policy: binding PATCH error (non-fatal): {_pe}")
+                            plog(f"  reputation policy: binding recreate error (non-fatal): {_pe}")
 
         # 4. Persist outcome
         try:
@@ -37594,6 +37615,9 @@ def _startup_fix_reputation_policy_drift():
                 print(f"Startup migration: reputation policy PATCH error (non-fatal): {_pe}")
 
         # 2. Bindings: enforce failure_result=True (fail-open).
+        #    Authentik 2026.x returns HTTP 405 Method Not Allowed for PATCH on
+        #    /api/v3/policies/bindings/{pk}/ (observed empirically on tak-10 May
+        #    2026). DELETE + POST always works. Idempotent at the API layer.
         try:
             req = _req2.Request(
                 f'{url}/api/v3/policies/bindings/?policy={policy_pk}',
@@ -37605,17 +37629,33 @@ def _startup_fix_reputation_policy_drift():
             if binding.get('failure_result') is not True:
                 bpk = binding.get('pk')
                 print(f"Startup migration: reputation binding {bpk} drift — "
-                      f"failure_result={binding.get('failure_result')} → True (fail-open)")
+                      f"failure_result={binding.get('failure_result')} → "
+                      f"DELETE+POST recreate (PATCH 405 on Authentik 2026.x)")
                 try:
+                    _orig = dict(binding)
                     req = _req2.Request(
                         f'{url}/api/v3/policies/bindings/{bpk}/',
-                        data=json.dumps({'failure_result': True}).encode(),
-                        headers=headers, method='PATCH')
+                        headers=headers, method='DELETE')
                     _req2.urlopen(req, timeout=10)
-                    print(f"Startup migration: reputation binding {bpk} PATCHed (failure_result=True)")
+                    new_data = {
+                        'policy':          _orig.get('policy') or policy_pk,
+                        'target':          _orig.get('target'),
+                        'order':           _orig.get('order', 0),
+                        'enabled':         _orig.get('enabled', True),
+                        'negate':          _orig.get('negate', False),
+                        'timeout':         _orig.get('timeout', 30),
+                        'failure_result':  True,
+                    }
+                    req = _req2.Request(
+                        f'{url}/api/v3/policies/bindings/',
+                        data=json.dumps(new_data).encode(),
+                        headers=headers, method='POST')
+                    new_resp = json.loads(_req2.urlopen(req, timeout=10).read().decode())
+                    print(f"Startup migration: reputation binding recreated as "
+                          f"{new_resp.get('pk')} (failure_result=True)")
                     any_patched = True
                 except Exception as _pe:
-                    print(f"Startup migration: reputation binding PATCH error (non-fatal): {_pe}")
+                    print(f"Startup migration: reputation binding recreate error (non-fatal): {_pe}")
 
         if not any_patched:
             # Quiet idempotent path — no log line on every reboot.
