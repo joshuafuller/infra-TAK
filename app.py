@@ -26485,9 +26485,14 @@ def _authentik_setup_reputation_policy(plog):
             plog("  reputation policy: ldap-authentication-flow not found — skipping bind")
         else:
             flow_pk = ldap_flow['pk']
+            # Authentik stores PolicyBinding.target using the flow's policybindingmodel_ptr_id,
+            # not the flow's own pk.  Using the flow pk in both the duplicate-check query and
+            # the POST body causes the query to miss an existing binding (different UUID stored
+            # in the DB) and then the POST to fail with "Select a valid choice" 400.
+            flow_target_pk = ldap_flow.get('policybindingmodel_ptr_id') or flow_pk
             # 3. Check if binding already exists
             req = _req.Request(
-                f'{url}/api/v3/policies/bindings/?policy={policy_pk}&target={flow_pk}',
+                f'{url}/api/v3/policies/bindings/?policy={policy_pk}&target={flow_target_pk}',
                 headers=headers
             )
             bindings = json.loads(_req.urlopen(req, timeout=10).read().decode())['results']
@@ -26495,7 +26500,7 @@ def _authentik_setup_reputation_policy(plog):
                 plog("  reputation policy: binding policy to ldap-authentication-flow…")
                 bind_data = {
                     'policy':          policy_pk,
-                    'target':          flow_pk,
+                    'target':          flow_target_pk,
                     'order':           0,
                     'enabled':         True,
                     'negate':          False,
@@ -26515,7 +26520,7 @@ def _authentik_setup_reputation_policy(plog):
                     plog(f"  reputation policy: binding POST returned {_bind_err.code} — {_body}")
                     # Re-query: binding may already exist (race condition / prior partial run)
                     _recheck = _req.Request(
-                        f'{url}/api/v3/policies/bindings/?policy={policy_pk}&target={flow_pk}',
+                        f'{url}/api/v3/policies/bindings/?policy={policy_pk}&target={flow_target_pk}',
                         headers=headers
                     )
                     try:
