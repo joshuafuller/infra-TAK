@@ -65,7 +65,20 @@ from datetime import datetime, timedelta
 from collections import defaultdict, deque
 
 app = Flask(__name__)
-app.secret_key = secrets.token_hex(32)
+# Persist the secret key so session cookies survive console restarts.
+_SECRET_KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.config', 'secret_key')
+try:
+    os.makedirs(os.path.dirname(_SECRET_KEY_FILE), exist_ok=True)
+    if os.path.exists(_SECRET_KEY_FILE):
+        app.secret_key = open(_SECRET_KEY_FILE).read().strip()
+    else:
+        _new_key = secrets.token_hex(32)
+        with open(_SECRET_KEY_FILE, 'w') as _f:
+            _f.write(_new_key)
+        os.chmod(_SECRET_KEY_FILE, 0o600)
+        app.secret_key = _new_key
+except Exception:
+    app.secret_key = secrets.token_hex(32)
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024 * 1024
