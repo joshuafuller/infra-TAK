@@ -6241,6 +6241,7 @@ def guarddog_enable():
     subprocess.run(_sudo_wrap(['systemctl', 'enable', 'tak-health.service']), capture_output=True, timeout=5)
     subprocess.run(_sudo_wrap(['systemctl', 'start', 'tak-health.service']), capture_output=True, timeout=5)
     _s = load_settings()
+    _auto_harden_guarddog_8080(_s)   # v0.9.12 A6
     _guarddog_apply_diskio_timer(_s)
     _guarddog_sync_diskio_email_off_file(_s)
     return jsonify({'success': True, 'enabled': True})
@@ -7093,6 +7094,8 @@ def run_guarddog_deploy(alert_email):
             guarddog_deploy_status.update({'running': False, 'error': True})
             return
         subprocess.run(_sudo_wrap(['systemctl', 'start', 'tak-health.service']), capture_output=True, timeout=5)
+        # v0.9.12 A6: source-scope UFW for Guard Dog health endpoint
+        _auto_harden_guarddog_8080(settings, plog=plog)
         subprocess.run(_sudo_wrap(['systemctl', 'enable', 'tak-post-start.service']), capture_output=True, text=True, timeout=5)
         plog("✓ Boot orchestrator enabled (staggered start: TAK → Authentik → TAK Portal → CloudTAK)")
         for f in ['process_alert_sent', 'disk_alert_sent', 'db_alert_sent', 'cotdb_alert_sent', 'network_alert_sent', 'cert_alert_sent']:
@@ -37070,6 +37073,54 @@ if _fqdn:
 print(f"Port: {_port}")
 print("=" * 50)
 
+# === A6 hardening: source-scope UFW for local Guard Dog health endpoint ===
+def _auto_harden_guarddog_8080(settings=None, plog=None):
+    """v0.9.12 A6: apply UFW source-scope + deny for the local Guard Dog health
+    endpoint (tak-health.service, port 8080).
+
+    Idempotent — skips if `ufw deny 8080/tcp` already present.
+    For single-server installs (console IP == this box) the deny rule blocks all
+    external traffic; UFW's default loopback policy still allows localhost access.
+    For two-server the source-scope allows only the console's public IP.
+    Falls back to no-op if Guard Dog is not installed or UFW is unavailable.
+    """
+    _log = plog or (lambda m: print(m, flush=True))
+    if not os.path.exists('/opt/tak-guarddog'):
+        return False
+    # Only harden if tak-health.service is actually installed
+    r = subprocess.run(
+        _sudo_wrap(['systemctl', 'is-enabled', 'tak-health.service']),
+        capture_output=True, text=True, timeout=5
+    )
+    if r.returncode not in (0,) and 'enabled' not in (r.stdout or '').lower() and 'static' not in (r.stdout or '').lower():
+        return False
+    # UFW available?
+    if subprocess.run('command -v ufw >/dev/null 2>&1', shell=True, timeout=5).returncode != 0:
+        return False
+    # Idempotency: already denied?
+    chk = subprocess.run(
+        'ufw status 2>/dev/null | grep -E "8080.*DENY" >/dev/null 2>&1',
+        shell=True, timeout=5
+    )
+    if chk.returncode == 0:
+        _log("Startup migration: guarddog 8080: UFW deny already set (idempotent — skipping)")
+        return False
+    s = settings or load_settings()
+    src_ip = _fedhub_caddy_source_ip(s)
+    if src_ip:
+        subprocess.run(
+            f'ufw allow from {src_ip} to any port 8080 proto tcp >/dev/null 2>&1 || true',
+            shell=True, timeout=5
+        )
+        _log(f"Startup migration: guarddog 8080: UFW source-scoped ALLOW from {src_ip}")
+    else:
+        _log("Startup migration: guarddog 8080: Settings → Server IP not set — skipping source-scope (set server_ip to harden)")
+        return False
+    subprocess.run('ufw deny 8080/tcp >/dev/null 2>&1 || true', shell=True, timeout=5)
+    _log("Startup migration: guarddog 8080: UFW deny 8080/tcp applied")
+    return True
+
+
 # === Auto-update Guard Dog scripts on console startup ===
 def _auto_update_guarddog():
     """If Guard Dog is installed, re-copy scripts and reload timers so updates take effect on console restart."""
@@ -37150,6 +37201,7 @@ def _auto_update_guarddog():
         print(f"Guard Dog auto-update skipped: {e}")
 
 _auto_update_guarddog()
+_auto_harden_guarddog_8080()   # v0.9.12 A6: source-scope UFW for port 8080
 
 def _fail2ban_install_and_configure(plog):
     """Install and configure fail2ban for Authentik brute-force protection (v0.9.0).
