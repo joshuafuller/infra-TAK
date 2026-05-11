@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Latest release: v0.9.10-alpha** — See **[docs/RELEASE-v0.9.10-alpha.md](docs/RELEASE-v0.9.10-alpha.md)** for full details. Prior releases: [v0.9.9](docs/RELEASE-v0.9.9-alpha.md), [v0.9.8](docs/RELEASE-v0.9.8-alpha.md), [v0.9.7](docs/RELEASE-v0.9.7-alpha.md), [v0.9.6](docs/RELEASE-v0.9.6-alpha.md), [v0.9.5](docs/RELEASE-v0.9.5-alpha.md), [v0.9.4](docs/RELEASE-v0.9.4-alpha.md), [v0.9.3](docs/RELEASE-v0.9.3-alpha.md), [v0.9.2](docs/RELEASE-v0.9.2-alpha.md), [v0.9.1](docs/RELEASE-v0.9.1-alpha.md), [v0.9.0](docs/RELEASE-v0.9.0-alpha.md) — older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases).
+**Latest release: v0.9.11-alpha** — **SECURITY HOTFIX.** CloudTAK PostgreSQL exposure (upstream `dfpc-coe/CloudTAK` ships postgis on `0.0.0.0:5433` with `docker:docker` default credentials) was actively exploited in the wild (PG_MEM/PGMiner cryptominer). v0.9.11 locks down the host port mappings, generates strong random postgis passwords on new installs, installs UFW deny rules, and adds compromise detection + quarantine on Update Now. **All operators with CloudTAK enabled should update immediately and then Remove + Reinstall CloudTAK from the console to wipe any potentially compromised data volume.** See **[docs/RELEASE-v0.9.11-alpha.md](docs/RELEASE-v0.9.11-alpha.md)** and **[docs/SECURITY-INCIDENT-2026-05-10-PGMINER.md](docs/SECURITY-INCIDENT-2026-05-10-PGMINER.md)** for full advisory. Prior releases: [v0.9.10](docs/RELEASE-v0.9.10-alpha.md), [v0.9.9](docs/RELEASE-v0.9.9-alpha.md), [v0.9.8](docs/RELEASE-v0.9.8-alpha.md), [v0.9.7](docs/RELEASE-v0.9.7-alpha.md), [v0.9.6](docs/RELEASE-v0.9.6-alpha.md), [v0.9.5](docs/RELEASE-v0.9.5-alpha.md), [v0.9.4](docs/RELEASE-v0.9.4-alpha.md), [v0.9.3](docs/RELEASE-v0.9.3-alpha.md), [v0.9.2](docs/RELEASE-v0.9.2-alpha.md), [v0.9.1](docs/RELEASE-v0.9.1-alpha.md), [v0.9.0](docs/RELEASE-v0.9.0-alpha.md) — older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases).
 
 **Something broken?** Wrong sidebar version, **Update Now** error, merge/rebase/tag-clobber messages, or you are not sure the VPS ever pulled the real repo → go to **[Universal recovery (SSH)](#universal-recovery-ssh)** and run the one block there. **Point people at that section**; it is the single source of truth.
 
@@ -299,6 +299,21 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v0.9.11-alpha — 2026-05-10 — SECURITY HOTFIX
+
+**Headline: CloudTAK upstream PostgreSQL public-exposure + default-credentials RCE — active cryptominer infection observed.**
+
+- **Background.** `dfpc-coe/CloudTAK`'s `docker-compose.yml` (main branch) ships postgis with `5433:5432` (host `0.0.0.0:5433`) and a hardcoded `POSTGRES_PASSWORD=docker` literal, plus MinIO on `9000`/`9002`. Any public-IP CloudTAK install = open Postgres with `docker:docker` superuser creds reachable from the internet. Brute-force scanners find it within hours.
+- **Live compromise observed May 8–10 2026** on infra-TAK `responder`. Attacker chain: scan → `docker:docker` succeeds → `COPY FROM PROGRAM` drops `gcmanager-1.so` into the postgis data volume → modify `postgresql.conf` `shared_preload_libraries` → reload → Monero miner runs at 1000%+ CPU. Malware family: PG_MEM / PGMiner (Aqua Nautilus, Palo Alto Unit 42). C2 over Tor SOCKS5. See [docs/SECURITY-INCIDENT-2026-05-10-PGMINER.md](docs/SECURITY-INCIDENT-2026-05-10-PGMINER.md).
+- **Fix in `_cloudtak_build_override_yml()`.** Override now uses `ports: !reset []` on postgis (removes the upstream `5433:5432` mapping entirely — CloudTAK app reaches postgis over the internal Docker network, host port was never needed) and `ports: !reset` on store binding only `127.0.0.1:9002:9002` (operators can still SSH-tunnel for MinIO console access; the public `9000` S3 API mapping is removed). Postgis `POSTGRES_PASSWORD` is now substituted from `.env` via `${POSTGRES_PASSWORD:-docker}` so fresh installs init with a strong value.
+- **Fix in `_cloudtak_build_env_content()`.** Accepts `postgres_pass` parameter; emits `POSTGRES_PASSWORD=<value>` + `POSTGRES=postgres://docker:<value>@postgis:5432/gis`. Fresh-install call sites generate `secrets.token_hex(24)` and save to `~/CloudTAK/.postgres-password` (chmod 600). Reconfig call sites read the existing value from `.env` (and from remote `.env` via SSH for remote deploys) so a reconfig never breaks the DB connection.
+- **New: `_auto_harden_cloudtak()`** runs every Update Now after `_auto_takportal()` and `cloudtak_t.join()`. Detects compromise (`*.so` files in postgis data root + uncommented `shared_preload_libraries` in `postgresql.conf`), quarantines `.so` files to a dated subdir (preserves forensics, does not delete), comments out the malicious `shared_preload_libraries` line with `#INFRATAK_DISABLED# ` prefix. If compromised: stops all CloudTAK containers, writes `~/CloudTAK/COMPROMISE-DETECTED.txt`, prints loud red banner, leaves CloudTAK OFFLINE pending operator Remove + Reinstall. If clean: writes the hardened override, applies UFW deny rules for `5433/tcp`/`9000/tcp`/`9002/tcp` (defense in depth), force-recreates the stack.
+- **Operator action required.** After updating, go to console → CloudTAK → **Remove** (wipes the data volume + any potentially compromised artifacts), then → **Install** (clean install with strong password + hardened port bindings). Reinstall is the only way to get a fresh DB; the Update Now hardening alone leaves the existing weak password in place (but locks the network so it's unreachable). See [docs/RELEASE-v0.9.11-alpha.md](docs/RELEASE-v0.9.11-alpha.md).
+
+Full notes: [docs/RELEASE-v0.9.11-alpha.md](docs/RELEASE-v0.9.11-alpha.md).
+
+---
 
 ### v0.9.10-alpha — 2026-05-10
 
