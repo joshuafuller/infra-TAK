@@ -335,7 +335,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.12-alpha"
+VERSION = "0.9.13-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -28811,6 +28811,15 @@ body{display:flex;min-height:100vh}
 <a href="{{ takserver_base_url }}" target="_blank" class="cert-btn cert-btn-secondary" style="text-decoration:none;white-space:nowrap;font-size:12px;padding:8px 14px">🔑 WebGUI (password)</a>
 </div>
 <div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:12px">Admin user: <span style="color:var(--cyan)">akadmin</span> · <button type="button" onclick="showAkPassword()" id="ak-pw-btn" style="background:none;border:1px solid var(--border);color:var(--cyan);padding:2px 10px;border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">🔑 Show Password</button> <span id="ak-pw-display" style="color:var(--green);user-select:all;display:none"></span></div>
+<div id="admin-accounts-status" style="margin-top:14px;padding-top:14px;border-top:1px solid var(--border)">
+<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px">
+<span style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em">Protected admin accounts</span>
+<button type="button" onclick="refreshAdminAccounts()" id="admin-accounts-refresh" title="Re-check is_active in Authentik" style="background:none;border:1px solid var(--border);color:var(--text-dim);padding:2px 10px;border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">↻ Refresh</button>
+</div>
+<div id="admin-accounts-rows" style="display:flex;flex-direction:column;gap:6px;font-family:'JetBrains Mono',monospace;font-size:11px"><div style="color:var(--text-dim)">Loading…</div></div>
+<div id="admin-accounts-msg" style="margin-top:8px;font-family:'JetBrains Mono',monospace;font-size:11px;display:none"></div>
+<div style="margin-top:6px;font-size:10px;color:var(--text-dim);line-height:1.5">If <strong>akadmin</strong> or <strong>webadmin</strong> shows <span style="color:var(--red)">DEACTIVATED</span> (e.g. someone clicked Deactivate in TAK Portal or the Authentik UI), click Reactivate to restore login. Tries Authentik API first, falls back to <code style="color:var(--cyan)">docker exec authentik-server-1 ak shell</code>.</div>
+</div>
 </div>
 <div class="section-title">LDAP Configuration</div>
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
@@ -29047,6 +29056,71 @@ async function showAkPassword(){
         else{display.textContent='Not found';display.style.display='inline'}
     }catch(e){display.textContent='Error';display.style.display='inline'}
 }
+
+async function refreshAdminAccounts(){
+    var container = document.getElementById('admin-accounts-rows');
+    if (!container) return;
+    var refreshBtn = document.getElementById('admin-accounts-refresh');
+    if (refreshBtn) { refreshBtn.disabled = true; }
+    try {
+        var r = await fetch('/api/authentik/admin-accounts');
+        var d = await r.json();
+        if (!d || d.available === false) {
+            container.innerHTML = '<div style="color:var(--text-dim)">' + escapeHtml((d && d.error) || 'Status unavailable') + '</div>';
+            return;
+        }
+        var rows = '';
+        (d.accounts || []).forEach(function(a){
+            var pill, btnHtml = '';
+            if (a.error) {
+                pill = '<span style="color:var(--text-dim)">? ' + escapeHtml(a.error) + '</span>';
+            } else if (!a.exists) {
+                pill = '<span style="color:var(--text-dim)">— not present in Authentik</span>';
+            } else if (a.is_active) {
+                var su = a.is_superuser ? ' · <span style="color:var(--text-dim)">superuser</span>' : '';
+                pill = '<span style="color:var(--green)">✓ Active</span>' + su;
+            } else {
+                pill = '<span style="color:var(--red);font-weight:600">⚠ DEACTIVATED</span>';
+                btnHtml = ' <button type="button" id="reactivate-' + escapeHtml(a.username) + '-btn" onclick="reactivateAdmin(\'' + escapeHtml(a.username) + '\')" style="margin-left:10px;background:rgba(16,185,129,.15);border:1px solid var(--green);color:var(--green);padding:2px 14px;border-radius:4px;font-family:\'JetBrains Mono\',monospace;font-size:11px;font-weight:600;cursor:pointer">Reactivate</button>';
+            }
+            rows += '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"><span style="color:var(--cyan);min-width:110px">' + escapeHtml(a.username) + '</span>' + pill + btnHtml + '</div>';
+        });
+        container.innerHTML = rows || '<div style="color:var(--text-dim)">No accounts reported</div>';
+    } catch(e) {
+        container.innerHTML = '<div style="color:var(--red)">Error: ' + escapeHtml(e.message) + '</div>';
+    } finally {
+        if (refreshBtn) { refreshBtn.disabled = false; }
+    }
+}
+
+async function reactivateAdmin(username){
+    var btn = document.getElementById('reactivate-' + username + '-btn');
+    var msg = document.getElementById('admin-accounts-msg');
+    if (btn) { btn.disabled = true; btn.textContent = 'Reactivating…'; btn.style.opacity = '0.6'; btn.style.cursor = 'wait'; }
+    if (msg) { msg.style.display = 'block'; msg.style.color = 'var(--text-dim)'; msg.textContent = 'Reactivating ' + username + '…'; }
+    try {
+        var r = await fetch('/api/authentik/recover-admin', {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({user: username})
+        });
+        var d = await r.json();
+        if (msg) {
+            msg.style.color = d.success ? 'var(--green)' : 'var(--red)';
+            var methodSuffix = d.method ? ' [via ' + d.method + ']' : '';
+            msg.textContent = (d.success ? '✓ ' : '✗ ') + (d.message || (d.success ? 'Done.' : 'Failed.')) + methodSuffix;
+        }
+    } catch(e) {
+        if (msg) { msg.style.color = 'var(--red)'; msg.textContent = 'Error: ' + e.message; }
+    } finally {
+        setTimeout(refreshAdminAccounts, 600);
+    }
+}
+
+document.addEventListener('DOMContentLoaded', function(){
+    if (document.getElementById('admin-accounts-status')) { refreshAdminAccounts(); }
+});
+
 async function akControl(action){
     var btns=document.querySelectorAll('.control-btn');
     btns.forEach(function(b){b.disabled=true;b.style.opacity='0.5'});
@@ -30276,6 +30350,11 @@ def _ensure_authentik_webadmin(skip_bind_verify=False):
             user_obj = _create_webadmin_user()
         webadmin_pk = user_obj['pk']
         patch_fields = {}
+        # v0.9.13: recover a webadmin that was Deactivated via TAK Portal / Authentik UI.
+        # Without this, Sync webadmin silently fails to restore 8446 login because
+        # is_active=false blocks the LDAP bind even after the password is reset.
+        if user_obj.get('is_active') is not True:
+            patch_fields['is_active'] = True
         if user_obj.get('is_superuser') is not True:
             patch_fields['is_superuser'] = True
         if user_obj.get('path', '') != 'users':
@@ -30446,6 +30525,188 @@ def _get_authentik_webadmin_status():
         return {'available': False, 'exists': False, 'is_superuser': False, 'error': f'Authentik API {e.code}: {body}'}
     except Exception as e:
         return {'available': False, 'exists': False, 'is_superuser': False, 'error': str(e)[:160]}
+
+
+# v0.9.13 — Authentik admin recovery
+#
+# Operators (typically via TAK Portal user management, or accidentally in
+# Authentik's own UI) can hit a yellow "Deactivate" button on akadmin or
+# webadmin. Authentik's "Deactivate" is just `PATCH /api/v3/core/users/{pk}/`
+# with `{"is_active": false}` — the user record is preserved, but login and
+# LDAP bind both stop working. If both admin accounts get Deactivated the
+# operator is locked out of the Authentik UI entirely.
+#
+# infra-TAK can always recover because it owns the bootstrap token in
+# ~/authentik/.env, and it has shell access to the authentik-server-1
+# container. The status panel on /authentik surfaces is_active for both
+# accounts; the Reactivate button flips it back via API, falling back to
+# `ak shell` (Django ORM) if the API path fails.
+#
+# Whitelist is enforced server-side: only akadmin / webadmin are recoverable
+# through this endpoint, so it cannot be used to re-enable arbitrary accounts.
+
+_AUTHENTIK_RECOVERABLE_USERS = ('akadmin', 'webadmin')
+
+
+def _get_authentik_admin_accounts_status():
+    """Return is_active/is_superuser for the protected admin accounts (akadmin, webadmin).
+
+    Used by /api/authentik/admin-accounts to drive the status panel on the
+    Authentik page. Missing users come back as exists=False (e.g. webadmin
+    before TAK Server is deployed) so the UI can render a quiet "not present"
+    instead of a red banner.
+    """
+    import urllib.request as _req
+    import urllib.error as _err
+
+    settings = load_settings()
+    ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
+    if not ak_token:
+        return {'available': False, 'error': 'Authentik bootstrap token not found in ~/authentik/.env', 'accounts': []}
+    url = _get_authentik_api_url(settings)
+    headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+    accounts = []
+    for username in _AUTHENTIK_RECOVERABLE_USERS:
+        entry = {'username': username, 'exists': False, 'is_active': None, 'is_superuser': None, 'error': None}
+        try:
+            req = _req.Request(f'{url}/api/v3/core/users/?search={username}', headers=headers)
+            resp = _req.urlopen(req, timeout=8)
+            results = json.loads(resp.read().decode()).get('results', [])
+            user_obj = next((u for u in results if u.get('username') == username), None)
+            if user_obj:
+                entry['exists'] = True
+                entry['is_active'] = bool(user_obj.get('is_active'))
+                entry['is_superuser'] = bool(user_obj.get('is_superuser'))
+        except _err.HTTPError as e:
+            entry['error'] = f'Authentik API {e.code}'
+        except Exception as e:
+            entry['error'] = str(e)[:120]
+        accounts.append(entry)
+    return {'available': True, 'accounts': accounts}
+
+
+def _recover_authentik_user(username):
+    """Re-activate a protected Authentik admin user (akadmin or webadmin).
+
+    Layered recovery — first path that works wins:
+      1. PATCH /api/v3/core/users/{pk}/ with the bootstrap token (normal case).
+      2. `ak shell` in authentik-server-1 → direct Django ORM update.
+         Bypasses API auth, broken flows, broken policies — anything short of
+         the container being down.
+
+    Returns (success: bool, message: str, method: str|None).
+
+    Whitelist (_AUTHENTIK_RECOVERABLE_USERS) is enforced so this can't be used
+    as a generic privilege-escalation primitive. Whitelist enforcement also
+    means the f-string interpolation into the ak-shell Python snippet below
+    can't be abused — the only values that ever reach it are the literal
+    strings 'akadmin' or 'webadmin'.
+    """
+    import urllib.request as _req
+    import urllib.error as _err
+    import base64 as _b64
+
+    if username not in _AUTHENTIK_RECOVERABLE_USERS:
+        return False, f"Recovery not permitted for '{username}' (allowed: {', '.join(_AUTHENTIK_RECOVERABLE_USERS)})", None
+
+    settings = load_settings()
+    ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+    ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
+    url = _get_authentik_api_url(settings)
+
+    api_err = None
+    # Layer 1: API with bootstrap token
+    if ak_token:
+        try:
+            req = _req.Request(f'{url}/api/v3/core/users/?search={username}',
+                headers={'Authorization': f'Bearer {ak_token}'})
+            resp = _req.urlopen(req, timeout=10)
+            results = json.loads(resp.read().decode()).get('results', [])
+            user_obj = next((u for u in results if u.get('username') == username), None)
+            if user_obj is None:
+                api_err = f"user '{username}' not found via API"
+            else:
+                if user_obj.get('is_active') is True and user_obj.get('is_superuser') is True:
+                    return True, f"{username} is already active and superuser.", 'noop'
+                patch = {}
+                if user_obj.get('is_active') is not True:
+                    patch['is_active'] = True
+                if user_obj.get('is_superuser') is not True:
+                    patch['is_superuser'] = True
+                req = _req.Request(f'{url}/api/v3/core/users/{user_obj["pk"]}/',
+                    data=json.dumps(patch).encode(),
+                    headers={'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'},
+                    method='PATCH')
+                _req.urlopen(req, timeout=10)
+                return True, f"Reactivated {username} via Authentik API.", 'api'
+        except _err.HTTPError as e:
+            try:
+                body = e.read().decode()[:160]
+            except Exception:
+                body = ''
+            api_err = f'API {e.code}: {body}'
+        except Exception as e:
+            api_err = f'API error: {str(e)[:160]}'
+    else:
+        api_err = 'AUTHENTIK_BOOTSTRAP_TOKEN missing'
+
+    # Layer 2: ak shell (Django ORM inside authentik-server-1)
+    # Username is whitelisted above so f-string interpolation is safe.
+    py = (
+        "from authentik.core.models import User\n"
+        f"u = User.objects.filter(username='{username}').first()\n"
+        "if u is None:\n"
+        "    print('AK-SHELL-NOTFOUND')\n"
+        "else:\n"
+        "    u.is_active = True\n"
+        "    if hasattr(u, 'is_superuser') and not u.is_superuser:\n"
+        "        u.is_superuser = True\n"
+        "    u.save()\n"
+        "    print('AK-SHELL-OK')\n"
+    )
+    b64 = _b64.b64encode(py.encode()).decode()
+    # Use sh -c inside the container so the pipe is evaluated there, not on the
+    # host. base64 avoids every layer of quoting/escaping (shell, ssh, docker).
+    cmd = f"docker exec authentik-server-1 sh -c 'echo {b64} | base64 -d | ak shell' 2>&1"
+    ok, out = _module_run(ak_cfg, cmd, timeout=45)
+    out_s = (out or '').strip()
+    if ok and 'AK-SHELL-OK' in out_s:
+        return True, f"Reactivated {username} via ak shell (API path: {api_err}).", 'ak-shell'
+    if 'AK-SHELL-NOTFOUND' in out_s:
+        return False, f"User '{username}' does not exist in Authentik DB.", None
+    return False, f"All recovery paths failed. API: {api_err}. ak shell: {out_s[:240] or 'no output'}", None
+
+
+@app.route('/api/authentik/admin-accounts')
+@login_required
+def authentik_admin_accounts_api():
+    """Return is_active / is_superuser status for akadmin and webadmin.
+
+    Powers the Protected Admin Accounts panel on /authentik. The panel
+    surfaces a red banner + one-click Reactivate button when either account
+    has been deactivated (typically via TAK Portal user management).
+    """
+    return jsonify(_get_authentik_admin_accounts_status())
+
+
+@app.route('/api/authentik/recover-admin', methods=['POST'])
+@login_required
+def authentik_recover_admin_api():
+    """Reactivate a protected Authentik admin user. Whitelist: akadmin, webadmin.
+
+    Tries the API first (bootstrap token from ~/authentik/.env), falls back to
+    `docker exec authentik-server-1 ak shell` running Django ORM. The ak-shell
+    path works even when the bootstrap token has been revoked or the
+    authentication flow is broken — only requirement is that the
+    authentik-server-1 container is running.
+    """
+    data = request.get_json() or {}
+    username = (data.get('user') or '').strip()
+    if not username:
+        return jsonify({'success': False, 'message': 'user field required'}), 400
+    ok, msg, method = _recover_authentik_user(username)
+    status = 200 if ok else 400
+    return jsonify({'success': ok, 'message': msg, 'method': method}), status
 
 
 @app.route('/api/takserver/webadmin-password')
