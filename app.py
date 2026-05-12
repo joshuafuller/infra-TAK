@@ -29081,7 +29081,7 @@ async function refreshAdminAccounts(){
                 pill = '<span style="color:var(--green)">✓ Active</span>' + su;
             } else {
                 pill = '<span style="color:var(--red);font-weight:600">⚠ DEACTIVATED</span>';
-                btnHtml = ' <button type="button" id="reactivate-' + escapeHtml(a.username) + '-btn" onclick="reactivateAdmin(\'' + escapeHtml(a.username) + '\')" style="margin-left:10px;background:rgba(16,185,129,.15);border:1px solid var(--green);color:var(--green);padding:2px 14px;border-radius:4px;font-family:\'JetBrains Mono\',monospace;font-size:11px;font-weight:600;cursor:pointer">Reactivate</button>';
+                btnHtml = ` <button type="button" id="reactivate-${escapeHtml(a.username)}-btn" onclick="reactivateAdmin('${escapeHtml(a.username)}')" style="margin-left:10px;background:rgba(16,185,129,.15);border:1px solid var(--green);color:var(--green);padding:2px 14px;border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Reactivate</button>`;
             }
             rows += '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"><span style="color:var(--cyan);min-width:110px">' + escapeHtml(a.username) + '</span>' + pill + btnHtml + '</div>';
         });
