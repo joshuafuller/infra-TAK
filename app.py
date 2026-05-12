@@ -26695,15 +26695,42 @@ def _authentik_setup_reputation_policy(plog):
             bindings = json.loads(_req.urlopen(req, timeout=10).read().decode())['results']
             if not bindings:
                 plog("  reputation policy: binding policy to ldap-authentication-flow…")
-                # v0.9.12 fix: failure_result=True (fail-open). Combined with the
-                # check_ip=False policy fix above, this means any future policy
-                # evaluation hiccup leaves LDAP auth working instead of denied.
+                # v0.9.12-late-cycle fix: negate=True is REQUIRED for ReputationPolicy.
+                #
+                # Upstream Authentik 2026.2.2 source — verified via
+                #   docker exec authentik-server-1 ak shell -c \
+                #     "import inspect; from authentik.policies.reputation.models import ReputationPolicy; \
+                #      print(inspect.getsource(ReputationPolicy.passes))"
+                # on tak-10 (2026-05-11):
+                #
+                #     def passes(self, request: PolicyRequest) -> PolicyResult:
+                #         ...
+                #         score = Reputation.objects.filter(query).aggregate(
+                #             total_score=Sum("score"))["total_score"] or 0
+                #         passing = score <= self.threshold
+                #         return PolicyResult(bool(passing))
+                #
+                # ReputationPolicy.passes() returns True ONLY when the user is bad
+                # enough to act on (score <= threshold). A "good" user with score=0
+                # or positive returns False. With negate=False on the binding, the
+                # binding result for a normal user is False → policy_engine_mode='any'
+                # with this as the only binding → flow non-applicable → every LDAP
+                # bind returns 49 even when the password is correct. We shipped
+                # negate=False v0.9.2 → v0.9.12-rc; this masked behind the LDAP
+                # outpost bind cache until v0.9.12 force-recreates wiped it.
+                #
+                # negate=True inverts the boolean: normal users pass, brute-forcers
+                # (score <= -5) are blocked. This is exactly the Authentik-documented
+                # usage of ReputationPolicy as a brute-force gate.
+                #
+                # failure_result=True (fail-open) is kept as defence-in-depth for any
+                # future policy-evaluation exception.
                 bind_data = {
                     'policy':          policy_pk,
                     'target':          flow_target_pk,
                     'order':           0,
                     'enabled':         True,
-                    'negate':          False,
+                    'negate':          True,
                     'timeout':         30,
                     'failure_result':  True,
                 }
@@ -26735,18 +26762,20 @@ def _authentik_setup_reputation_policy(plog):
                         ) from _bind_err
             else:
                 plog("  reputation policy: binding already exists")
-                # v0.9.12 retro-fix: legacy bindings shipped with failure_result=False
-                # which makes any policy eval failure deny the flow (the FlowNonApplicable
-                # cascade documented in v0.9.12 release notes). Fail-open is the right
-                # posture for an internal LDAP control plane.
+                # v0.9.12 retro-fix on the BINDING (not the policy):
+                #   failure_result MUST be True (fail-open on policy exception)
+                #   negate          MUST be True (see upstream-source comment above)
+                # Either field drifted means the v0.9.12 binding contract isn't met.
                 #
                 # Implementation: PATCH /api/v3/policies/bindings/{pk}/ returns HTTP 405
                 # Method Not Allowed on Authentik 2026.x — observed empirically on tak-10
                 # (May 2026). PUT may or may not work; DELETE + POST always works and is
                 # idempotent at the API layer. Use that.
                 for _b in bindings:
-                    if _b.get('failure_result') is not True:
-                        plog(f"  reputation policy: binding {_b.get('pk')} drift — failure_result={_b.get('failure_result')} → DELETE+POST recreate (PATCH returns 405 on Authentik 2026.x)")
+                    _drift_fail = _b.get('failure_result') is not True
+                    _drift_neg  = _b.get('negate')         is not True
+                    if _drift_fail or _drift_neg:
+                        plog(f"  reputation policy: binding {_b.get('pk')} drift — failure_result={_b.get('failure_result')} negate={_b.get('negate')} → DELETE+POST recreate (PATCH returns 405 on Authentik 2026.x)")
                         try:
                             # Capture full record so the recreate preserves all fields.
                             _orig = dict(_b)
@@ -26760,7 +26789,7 @@ def _authentik_setup_reputation_policy(plog):
                                 'target':          _orig.get('target') or flow_target_pk,
                                 'order':           _orig.get('order', 0),
                                 'enabled':         _orig.get('enabled', True),
-                                'negate':          _orig.get('negate', False),
+                                'negate':          True,
                                 'timeout':         _orig.get('timeout', 30),
                                 'failure_result':  True,
                             }
@@ -26770,7 +26799,7 @@ def _authentik_setup_reputation_policy(plog):
                                 headers=headers, method='POST'
                             )
                             _new_resp = json.loads(_req.urlopen(_post_req, timeout=10).read().decode())
-                            plog(f"  reputation policy: binding recreated as {_new_resp.get('pk')} (failure_result=True, fail-open)")
+                            plog(f"  reputation policy: binding recreated as {_new_resp.get('pk')} (negate=True, failure_result=True)")
                         except Exception as _pe:
                             plog(f"  reputation policy: binding recreate error (non-fatal): {_pe}")
 
@@ -37682,7 +37711,16 @@ def _startup_fix_reputation_policy_drift():
             except Exception as _pe:
                 print(f"Startup migration: reputation policy PATCH error (non-fatal): {_pe}")
 
-        # 2. Bindings: enforce failure_result=True (fail-open).
+        # 2. Bindings: enforce failure_result=True (fail-open) AND negate=True.
+        #    Authentik 2026.x ReputationPolicy.passes() returns True ONLY when
+        #    score <= threshold (i.e. user is BAD enough to act on). We use it
+        #    as a brute-force gate, so the binding must invert that with
+        #    negate=True — otherwise every normal-reputation user gets denied
+        #    and the flow becomes non-applicable (the v0.9.2 → v0.9.12-rc bug).
+        #    Source: inspect.getsource(ReputationPolicy.passes) on the deployed
+        #    authentik-server-1 container; verified on tak-10 2026-05-11.
+        #    See docs/RELEASE-v0.9.12-alpha.md § B7 and docs/HANDOFF-LDAP-AUTHENTIK.md.
+        #
         #    Authentik 2026.x returns HTTP 405 Method Not Allowed for PATCH on
         #    /api/v3/policies/bindings/{pk}/ (observed empirically on tak-10 May
         #    2026). DELETE + POST always works. Idempotent at the API layer.
@@ -37694,10 +37732,12 @@ def _startup_fix_reputation_policy_drift():
         except Exception:
             return any_patched
         for binding in br.get('results', []):
-            if binding.get('failure_result') is not True:
+            _drift_fail = binding.get('failure_result') is not True
+            _drift_neg  = binding.get('negate')         is not True
+            if _drift_fail or _drift_neg:
                 bpk = binding.get('pk')
                 print(f"Startup migration: reputation binding {bpk} drift — "
-                      f"failure_result={binding.get('failure_result')} → "
+                      f"failure_result={binding.get('failure_result')} negate={binding.get('negate')} → "
                       f"DELETE+POST recreate (PATCH 405 on Authentik 2026.x)")
                 try:
                     _orig = dict(binding)
@@ -37710,7 +37750,7 @@ def _startup_fix_reputation_policy_drift():
                         'target':          _orig.get('target'),
                         'order':           _orig.get('order', 0),
                         'enabled':         _orig.get('enabled', True),
-                        'negate':          _orig.get('negate', False),
+                        'negate':          True,
                         'timeout':         _orig.get('timeout', 30),
                         'failure_result':  True,
                     }
@@ -37720,7 +37760,7 @@ def _startup_fix_reputation_policy_drift():
                         headers=headers, method='POST')
                     new_resp = json.loads(_req2.urlopen(req, timeout=10).read().decode())
                     print(f"Startup migration: reputation binding recreated as "
-                          f"{new_resp.get('pk')} (failure_result=True)")
+                          f"{new_resp.get('pk')} (negate=True, failure_result=True)")
                     any_patched = True
                 except Exception as _pe:
                     print(f"Startup migration: reputation binding recreate error (non-fatal): {_pe}")
