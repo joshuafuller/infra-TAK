@@ -64,6 +64,21 @@ import urllib.parse
 from datetime import datetime, timedelta
 from collections import defaultdict, deque
 
+# v0.9.12: ensure $HOME is set so child shells can expand ~/ in
+# subprocess.run('cd ~/authentik ...', shell=True). systemd does NOT inherit
+# HOME from login env, and takwerx-console.service historically did not pin
+# Environment=HOME=... (the v0.2.7 fix added it for takupdatesguard but not
+# the console unit). Without this, /bin/sh -c 'cd ~/authentik' fails with
+# `cd: can't cd to ~/authentik` even though /root/authentik exists. See
+# docs/RELEASE-v0.9.2-alpha.md (same HOME-unset bug for git config), and
+# docs/RELEASE-v0.2.7-alpha.md (HOME pinning for the Guard Dog timer).
+if not os.environ.get('HOME'):
+    try:
+        import pwd as _pwd
+        os.environ['HOME'] = _pwd.getpwuid(os.getuid()).pw_dir or '/root'
+    except Exception:
+        os.environ['HOME'] = '/root'
+
 app = Flask(__name__)
 # Persist the secret key so session cookies survive console restarts.
 _SECRET_KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.config', 'secret_key')
@@ -37440,6 +37455,59 @@ def _auto_update_guarddog():
 
 _auto_update_guarddog()
 _auto_harden_guarddog_8080()   # v0.9.12 A6: source-scope UFW for port 8080
+
+
+# v0.9.12: pin HOME in the console systemd unit so child shells can expand ~/.
+# The runtime guard at the top of app.py (HOME=pwd-entry fallback) fixes the
+# CURRENT gunicorn process, but a subsequent `systemctl restart takwerx-console`
+# (e.g. from Update Now) would lose it because takwerx-console.service has never
+# carried `Environment=HOME=...`. v0.2.7-alpha applied the same pattern to
+# takupdatesguard.service; v0.9.12 extends it to the console unit so the fix
+# survives restarts on already-installed boxes without re-running start.sh.
+# Symptom this prevents: `cd: can't cd to ~/authentik` from
+# `subprocess.run('cd ~/authentik && docker compose ...', shell=True)` call sites
+# (takserver_sync_webadmin, _ensure_authentik_ldap_service_account, etc.).
+def _startup_pin_console_service_home():
+    try:
+        svc = '/etc/systemd/system/takwerx-console.service'
+        if not os.path.exists(svc):
+            return
+        with open(svc) as f:
+            content = f.read()
+        if re.search(r'^Environment=HOME=', content, flags=re.MULTILINE):
+            return
+        home = os.environ.get('HOME') or '/root'
+        # Insert HOME after the first existing Environment= line in [Service],
+        # or after the [Service] header if none exists.
+        if re.search(r'^Environment=', content, flags=re.MULTILINE):
+            new = re.sub(
+                r'(^Environment=[^\n]*\n)(?!Environment=)',
+                lambda m: m.group(1) + f'Environment=HOME={home}\n',
+                content, count=1, flags=re.MULTILINE
+            )
+        else:
+            new = re.sub(
+                r'(^\[Service\]\n)',
+                lambda m: m.group(1) + f'Environment=HOME={home}\n',
+                content, count=1, flags=re.MULTILINE
+            )
+        if new == content:
+            return
+        with open(svc, 'w') as f:
+            f.write(new)
+        subprocess.run(['systemctl', 'daemon-reload'],
+                       capture_output=True, timeout=15)
+        print(f'Startup migration: pinned Environment=HOME={home} in takwerx-console.service (v0.9.12)')
+    except PermissionError:
+        # Console not running as root (v1.0.0 takwerx migration) — operator
+        # will need to apply the unit-file edit out of band. Runtime HOME guard
+        # at top of app.py keeps the current process working regardless.
+        pass
+    except Exception as _e:
+        print(f'Startup migration: pin HOME in console unit warning (non-fatal): {_e}')
+
+_startup_pin_console_service_home()
+
 
 # v0.9.12 A7: startup migration — patch base compose port bindings to loopback
 # and force-recreate containers if the loopback binding is absent.
