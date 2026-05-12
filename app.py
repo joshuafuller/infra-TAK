@@ -335,7 +335,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.13-alpha"
+VERSION = "0.9.14-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -29072,8 +29072,10 @@ async function refreshAdminAccounts(){
         var rows = '';
         (d.accounts || []).forEach(function(a){
             var pill, btnHtml = '';
+            var reactivateBtn = ` <button type="button" id="reactivate-${escapeHtml(a.username)}-btn" onclick="reactivateAdmin('${escapeHtml(a.username)}')" style="margin-left:10px;background:rgba(16,185,129,.15);border:1px solid var(--green);color:var(--green);padding:2px 14px;border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Reactivate</button>`;
             if (a.error) {
                 pill = '<span style="color:var(--text-dim)">? ' + escapeHtml(a.error) + '</span>';
+                btnHtml = reactivateBtn;
             } else if (!a.exists) {
                 pill = '<span style="color:var(--text-dim)">— not present in Authentik</span>';
             } else if (a.is_active) {
@@ -29081,11 +29083,12 @@ async function refreshAdminAccounts(){
                 pill = '<span style="color:var(--green)">✓ Active</span>' + su;
             } else {
                 pill = '<span style="color:var(--red);font-weight:600">⚠ DEACTIVATED</span>';
-                btnHtml = ` <button type="button" id="reactivate-${escapeHtml(a.username)}-btn" onclick="reactivateAdmin('${escapeHtml(a.username)}')" style="margin-left:10px;background:rgba(16,185,129,.15);border:1px solid var(--green);color:var(--green);padding:2px 14px;border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Reactivate</button>`;
+                btnHtml = reactivateBtn;
             }
             rows += '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"><span style="color:var(--cyan);min-width:110px">' + escapeHtml(a.username) + '</span>' + pill + btnHtml + '</div>';
         });
-        container.innerHTML = rows || '<div style="color:var(--text-dim)">No accounts reported</div>';
+        var sourceTag = d.source === 'ak-shell' ? '<div style="margin-top:6px;color:var(--text-dim);font-size:10px">status read via <code>ak shell</code> (Authentik API unavailable)</div>' : '';
+        container.innerHTML = (rows || '<div style="color:var(--text-dim)">No accounts reported</div>') + sourceTag;
     } catch(e) {
         container.innerHTML = '<div style="color:var(--red)">Error: ' + escapeHtml(e.message) + '</div>';
     } finally {
@@ -30548,6 +30551,72 @@ def _get_authentik_webadmin_status():
 _AUTHENTIK_RECOVERABLE_USERS = ('akadmin', 'webadmin')
 
 
+def _read_authentik_admin_accounts_via_ak_shell():
+    """Read is_active/is_superuser for protected admin accounts via `ak shell`.
+
+    Used as a fallback when the Authentik REST API is unreachable or returning
+    401/403. The bootstrap token in ~/authentik/.env is owned by `akadmin`;
+    if akadmin itself has been deactivated (the exact scenario this panel
+    exists to recover from), Authentik authenticates the token but denies
+    every API call because the token's *owner* has no permissions — so the
+    API read path can't see the very state that requires recovery.
+
+    Bypass: shell into authentik-server-1 and read User.objects directly
+    via Django ORM. Bypasses API auth, broken flows, broken policies — works
+    as long as the container is running.
+
+    Returns (accounts: list[dict] | None, error: str | None). On success,
+    accounts has the same shape as the API path; on failure, None + a short
+    error string. Only the whitelisted usernames are ever interpolated into
+    the snippet, so f-string injection is not a concern.
+    """
+    import base64 as _b64
+
+    settings = load_settings()
+    ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+    py_lines = [
+        "from authentik.core.models import User",
+        f"for _n in {tuple(_AUTHENTIK_RECOVERABLE_USERS)!r}:",
+        "    _u = User.objects.filter(username=_n).first()",
+        "    if _u is None:",
+        "        print(f'AK-STATUS|{_n}|MISSING|0|0')",
+        "    else:",
+        "        print(f'AK-STATUS|{_n}|EXISTS|{int(bool(_u.is_active))}|{int(bool(_u.is_superuser))}')",
+    ]
+    py = "\n".join(py_lines) + "\n"
+    b64 = _b64.b64encode(py.encode()).decode()
+    cmd = f"docker exec authentik-server-1 sh -c 'echo {b64} | base64 -d | ak shell' 2>&1"
+    ok, out = _module_run(ak_cfg, cmd, timeout=30)
+    out_s = (out or '').strip()
+    if not ok or 'AK-STATUS|' not in out_s:
+        return None, (out_s[:240] or 'ak shell produced no parseable output')
+    by_username = {}
+    for line in out_s.splitlines():
+        line = line.strip()
+        if not line.startswith('AK-STATUS|'):
+            continue
+        parts = line.split('|')
+        if len(parts) < 5:
+            continue
+        _, uname, state, active, superuser = parts[:5]
+        exists = (state == 'EXISTS')
+        by_username[uname] = {
+            'username': uname,
+            'exists': exists,
+            'is_active': bool(int(active)) if exists else None,
+            'is_superuser': bool(int(superuser)) if exists else None,
+            'error': None,
+        }
+    accounts = []
+    for username in _AUTHENTIK_RECOVERABLE_USERS:
+        if username in by_username:
+            accounts.append(by_username[username])
+        else:
+            accounts.append({'username': username, 'exists': False, 'is_active': None,
+                             'is_superuser': None, 'error': 'ak shell did not report this user'})
+    return accounts, None
+
+
 def _get_authentik_admin_accounts_status():
     """Return is_active/is_superuser for the protected admin accounts (akadmin, webadmin).
 
@@ -30555,34 +30624,68 @@ def _get_authentik_admin_accounts_status():
     Authentik page. Missing users come back as exists=False (e.g. webadmin
     before TAK Server is deployed) so the UI can render a quiet "not present"
     instead of a red banner.
+
+    Layered read (mirrors _recover_authentik_user):
+      1. Authentik REST API using the bootstrap token (normal case, fastest).
+      2. `ak shell` Django ORM inside authentik-server-1 (fallback for the
+         very scenario the panel exists to fix: when akadmin itself is
+         deactivated, the bootstrap token's owner has no permissions and
+         every API call returns 403, so the read needs a no-API path).
+
+    Returns {'available': True, 'source': 'api'|'ak-shell'|'mixed', 'accounts': [...]}
+    or {'available': False, 'error': '...'} if even the ak-shell fallback
+    fails (container down, etc.).
     """
     import urllib.request as _req
     import urllib.error as _err
 
     settings = load_settings()
     ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
-    if not ak_token:
-        return {'available': False, 'error': 'Authentik bootstrap token not found in ~/authentik/.env', 'accounts': []}
     url = _get_authentik_api_url(settings)
-    headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
-    accounts = []
-    for username in _AUTHENTIK_RECOVERABLE_USERS:
-        entry = {'username': username, 'exists': False, 'is_active': None, 'is_superuser': None, 'error': None}
-        try:
-            req = _req.Request(f'{url}/api/v3/core/users/?search={username}', headers=headers)
-            resp = _req.urlopen(req, timeout=8)
-            results = json.loads(resp.read().decode()).get('results', [])
-            user_obj = next((u for u in results if u.get('username') == username), None)
-            if user_obj:
-                entry['exists'] = True
-                entry['is_active'] = bool(user_obj.get('is_active'))
-                entry['is_superuser'] = bool(user_obj.get('is_superuser'))
-        except _err.HTTPError as e:
-            entry['error'] = f'Authentik API {e.code}'
-        except Exception as e:
-            entry['error'] = str(e)[:120]
-        accounts.append(entry)
-    return {'available': True, 'accounts': accounts}
+    api_accounts = []
+    api_had_auth_error = False
+    api_attempted = bool(ak_token)
+    if api_attempted:
+        headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+        for username in _AUTHENTIK_RECOVERABLE_USERS:
+            entry = {'username': username, 'exists': False, 'is_active': None, 'is_superuser': None, 'error': None}
+            try:
+                req = _req.Request(f'{url}/api/v3/core/users/?search={username}', headers=headers)
+                resp = _req.urlopen(req, timeout=8)
+                results = json.loads(resp.read().decode()).get('results', [])
+                user_obj = next((u for u in results if u.get('username') == username), None)
+                if user_obj:
+                    entry['exists'] = True
+                    entry['is_active'] = bool(user_obj.get('is_active'))
+                    entry['is_superuser'] = bool(user_obj.get('is_superuser'))
+            except _err.HTTPError as e:
+                entry['error'] = f'Authentik API {e.code}'
+                if e.code in (401, 403):
+                    api_had_auth_error = True
+            except Exception as e:
+                entry['error'] = str(e)[:120]
+                api_had_auth_error = True
+            api_accounts.append(entry)
+
+    # If every API result is clean (no error), trust it.
+    if api_attempted and not any(a.get('error') for a in api_accounts):
+        return {'available': True, 'source': 'api', 'accounts': api_accounts}
+
+    # API failed (or token missing). Try ak shell fallback. This is the path
+    # that recovers the panel when akadmin is deactivated.
+    shell_accounts, shell_err = _read_authentik_admin_accounts_via_ak_shell()
+    if shell_accounts is not None:
+        return {'available': True, 'source': 'ak-shell', 'accounts': shell_accounts}
+
+    # Both paths failed. Surface whatever we got from the API attempt so the
+    # UI can still show *something*; if there was no token at all, return a
+    # top-level error.
+    if not api_attempted:
+        return {'available': False,
+                'error': f'AUTHENTIK_BOOTSTRAP_TOKEN missing and ak shell fallback failed: {shell_err}',
+                'accounts': []}
+    return {'available': True, 'source': 'api-failed', 'accounts': api_accounts,
+            'fallback_error': shell_err}
 
 
 def _recover_authentik_user(username):
