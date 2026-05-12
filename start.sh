@@ -384,6 +384,14 @@ except Exception:
         GUNICORN_ARGS="$GUNICORN_ARGS --certfile=$CERT_DIR/console.crt --keyfile=$CERT_DIR/console.key"
     fi
 
+    # v0.9.12: pin HOME so shell commands like `cd ~/authentik` work under systemd.
+    # systemd does NOT inherit HOME from login env; without this, /bin/sh can't
+    # expand ~/. Same documented pattern as v0.2.7-alpha takupdatesguard.service.
+    SERVICE_HOME="${HOME:-/root}"
+    if [ -z "$SERVICE_HOME" ] || [ "$SERVICE_HOME" = "/" ]; then
+        SERVICE_HOME="/root"
+    fi
+
     cat > "$SERVICE_FILE" << EOF
 [Unit]
 Description=infra-TAK - Team Awareness Kit Infrastructure Platform
@@ -398,6 +406,7 @@ Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
 Environment=CONFIG_DIR=$USE_DIR/.config
+Environment=HOME=$SERVICE_HOME
 
 [Install]
 WantedBy=multi-user.target

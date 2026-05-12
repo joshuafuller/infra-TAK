@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Latest release: v0.9.11-alpha** — **SECURITY HOTFIX.** CloudTAK PostgreSQL exposure (upstream `dfpc-coe/CloudTAK` ships postgis on `0.0.0.0:5433` with `docker:docker` default credentials) was actively exploited in the wild (PG_MEM/PGMiner cryptominer). v0.9.11 locks down the host port mappings, generates strong random postgis passwords on new installs, installs UFW deny rules, and adds compromise detection + quarantine on Update Now. **All operators with CloudTAK enabled should update immediately and then Remove + Reinstall CloudTAK from the console to wipe any potentially compromised data volume.** See **[docs/RELEASE-v0.9.11-alpha.md](docs/RELEASE-v0.9.11-alpha.md)** and **[docs/SECURITY-INCIDENT-2026-05-10-PGMINER.md](docs/SECURITY-INCIDENT-2026-05-10-PGMINER.md)** for full advisory. Prior releases: [v0.9.10](docs/RELEASE-v0.9.10-alpha.md), [v0.9.9](docs/RELEASE-v0.9.9-alpha.md), [v0.9.8](docs/RELEASE-v0.9.8-alpha.md), [v0.9.7](docs/RELEASE-v0.9.7-alpha.md), [v0.9.6](docs/RELEASE-v0.9.6-alpha.md), [v0.9.5](docs/RELEASE-v0.9.5-alpha.md), [v0.9.4](docs/RELEASE-v0.9.4-alpha.md), [v0.9.3](docs/RELEASE-v0.9.3-alpha.md), [v0.9.2](docs/RELEASE-v0.9.2-alpha.md), [v0.9.1](docs/RELEASE-v0.9.1-alpha.md), [v0.9.0](docs/RELEASE-v0.9.0-alpha.md) — older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases).
+**Latest release: v0.9.12-alpha** — **CYBER SECURITY HARDENING.** Follow-up to the v0.9.11 CloudTAK incident. Comprehensive port-exposure lockdown across every service we deploy (CloudTAK API/tiles/media-admin/HLS, TAK Portal, MediaMTX admin/HLS/webedit, remote Authentik, Server One Postgres + Guard Dog health agent) plus post-auth route fixes (snapshot path traversal, external-DB SQL injection, webadmin shell injection, hardcoded LDAP service password fallback, SSH host/user validation). Also ships: a new `main`/`dev` **update-channel toggle** on the Console page (operators stay on `main` for tagged releases; maintainers can switch to `dev` for in-development testing), self-healing startup migrations for the port hardening + Authentik LDAP service account + ReputationPolicy binding (`negate=True` — required for the brute-force gate to work correctly), and `Environment=HOME=` pinned in the console systemd unit so `cd ~/authentik` works under gunicorn. New `docs/PORT-EXPOSURE-POLICY.md` is the canonical Tier 1/3/4/5 reference. **Before clicking Update Now**, confirm the channel toggle on the Console page is set to `main` (green) — see `docs/RELEASE-v0.9.12-alpha.md` for the operator pre-flight. See **[docs/RELEASE-v0.9.12-alpha.md](docs/RELEASE-v0.9.12-alpha.md)** for the full advisory. Prior releases: [v0.9.11](docs/RELEASE-v0.9.11-alpha.md) (security hotfix — CloudTAK PG_MEM/PGMiner; **read this if you haven't updated past v0.9.10 yet**), [v0.9.10](docs/RELEASE-v0.9.10-alpha.md), [v0.9.9](docs/RELEASE-v0.9.9-alpha.md), [v0.9.8](docs/RELEASE-v0.9.8-alpha.md), [v0.9.7](docs/RELEASE-v0.9.7-alpha.md), [v0.9.6](docs/RELEASE-v0.9.6-alpha.md), [v0.9.5](docs/RELEASE-v0.9.5-alpha.md), [v0.9.4](docs/RELEASE-v0.9.4-alpha.md), [v0.9.3](docs/RELEASE-v0.9.3-alpha.md), [v0.9.2](docs/RELEASE-v0.9.2-alpha.md), [v0.9.1](docs/RELEASE-v0.9.1-alpha.md), [v0.9.0](docs/RELEASE-v0.9.0-alpha.md) — older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases).
 
 **Something broken?** Wrong sidebar version, **Update Now** error, merge/rebase/tag-clobber messages, or you are not sure the VPS ever pulled the real repo → go to **[Universal recovery (SSH)](#universal-recovery-ssh)** and run the one block there. **Point people at that section**; it is the single source of truth.
 
@@ -200,6 +200,10 @@ start.sh                    ← One CLI command to launch everything
 
 ## Ports
 
+> **v0.9.12 hardening:** Every host port is classified by exposure tier. **Tier 1 (Public)** is reachable from the internet, **Tier 3 (Caddy-loopback)** binds to `127.0.0.1` and is reached only via Caddy on 443, **Tier 4 (Docker-internal)** has no host port at all, **Tier 5 (Source-scoped)** is allowed only from a specific peer IP. Full policy: [docs/PORT-EXPOSURE-POLICY.md](docs/PORT-EXPOSURE-POLICY.md).
+
+### Tier 1 — Public (open in UFW)
+
 | Service | Port | Protocol | Description |
 |---------|------|----------|-------------|
 | infra-TAK Console | 5001 | HTTPS | Management web UI (backdoor: direct IP access) |
@@ -208,19 +212,50 @@ start.sh                    ← One CLI command to launch everything
 | TAK Server | 8089 | TLS | TAK client connections (ATAK, iTAK, WinTAK) |
 | TAK Server | 8443 | HTTPS | Admin WebGUI (client certificate auth) |
 | TAK Server | 8446 | HTTPS | Admin WebGUI (Let's Encrypt, password/LDAP auth) |
-| TAK Server | 8087 | TCP | Disabled by default (plaintext, replaced by 8089) |
-| PostgreSQL | 5432 | TCP | TAK Server database (localhost or remote for two-server) |
-| Authentik | 9090 | HTTP | Identity provider API + admin UI (proxied via Caddy) |
-| Authentik | 9443 | HTTPS | Authentik HTTPS (direct, rarely needed) |
-| LDAP Outpost | 389 | TCP | LDAP auth for TAK Server (Authentik outpost) |
-| LDAP Outpost | 636 | TCP | LDAPS (TLS-wrapped LDAP) |
-| TAK Portal | 3000 | HTTP | User/cert management portal (proxied via Caddy) |
-| Email Relay | 25 | SMTP | Local Postfix relay (localhost only, apps send here) |
-| Node-RED | 1880 | HTTP | Flow editor (proxied via Caddy) |
-| MediaMTX | 8554 | RTSP | Video streaming (RTSP) |
-| MediaMTX | 8889 | HTTP | WebRTC / HLS playback |
-| MediaMTX | 5080 | HTTP | MediaMTX web editor |
-| CloudTAK | 5000 | HTTP | Browser-based TAK client (proxied via Caddy) |
+| MediaMTX | 8554 | RTSP | Video streaming clients (publish + play) |
+| MediaMTX | 8322 | RTSPS | TLS-wrapped RTSP |
+| MediaMTX | 8890 | SRT | SRT streaming clients |
+| MediaMTX | 8000/8001 | UDP | RTP/RTCP companion ports for RTSP |
+| CloudTAK Media | 18554 | RTSP | CloudTAK video tab — RTSP clients |
+| CloudTAK Media | 11935 | RTMP | CloudTAK video tab — RTMP publishers |
+| CloudTAK Media | 18890 | SRT | CloudTAK video tab — SRT clients |
+
+### Tier 3 — Caddy-loopback (bound to `127.0.0.1`, **deny in UFW**)
+
+Reached only through Caddy on 443 via the public FQDN. Raw ports are NOT reachable from the internet. v0.9.12 enforces this via `!reset` Docker port overrides plus UFW deny rules.
+
+| Service | Port | Description |
+|---------|------|-------------|
+| Authentik | 9090/9443 | Identity provider HTTP/HTTPS (Caddy proxies `https://authentik.example.com`) |
+| TAK Portal | 3000 | User/cert management portal (Caddy proxies `https://portal.example.com`) |
+| Node-RED | 1880 | Flow editor (Caddy proxies `https://nodered.example.com` with forward_auth) |
+| MediaMTX | 8888 | HLS playback (Caddy proxies `/hls-proxy/` on the MediaMTX FQDN) |
+| MediaMTX | 5080 | MediaMTX webedit (Caddy proxies the MediaMTX FQDN) |
+| MediaMTX | 9898 | MediaMTX admin API (consumed by webedit on loopback) |
+| CloudTAK | 5000 | CloudTAK API (Caddy proxies `https://cloudtak.example.com`) |
+| CloudTAK | 5002 | CloudTAK tiles |
+| CloudTAK | 18888 | CloudTAK media HLS |
+| CloudTAK | 9997 | CloudTAK media admin API |
+| CloudTAK | 9002 | MinIO web console (operator SSH-tunnels for bucket management) |
+
+### Tier 4 — Docker-internal (no host port, **service reachable only on the Docker network**)
+
+| Service | Internal endpoint | Description |
+|---------|-------------------|-------------|
+| Authentik PostgreSQL | `postgresql:5432` | Authentik DB |
+| Authentik Redis | `redis:6379` | Authentik task queue |
+| CloudTAK PostGIS | `postgis:5432` | CloudTAK DB (was Tier 1 + default creds pre-v0.9.11 — root cause of the PG_MEM incident) |
+| CloudTAK MinIO S3 | `store:9000` | CloudTAK S3 storage |
+| CloudTAK events | `events:5003` | CloudTAK background worker |
+
+### Tier 5 — Source-scoped (UFW allow from specific peer IP only)
+
+| Service | Port | Source | Description |
+|---------|------|--------|-------------|
+| Server One PostgreSQL | 5432 (default) | Server Two IP | Two-server TAK Server DB (was unconditional `allow 5432/tcp` pre-v0.9.12) |
+| Guard Dog health agent | 8080 | Console IP (`settings.server_ip`) | Two-server DB health endpoint on Server One |
+| LDAP Outpost | 389/636 | Console IP | Reachable only when Authentik is deployed remotely; consumed by TAK Server's LDAP auth block |
+| Email Relay | 25 | localhost | Local Postfix relay (apps send here) |
 
 ## Actions Reference (Sync, Update Config, Resync)
 
@@ -299,6 +334,36 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v0.9.12-alpha — 2026-05-11 — CYBER SECURITY HARDENING
+
+**Headline: Comprehensive port-exposure lockdown + post-auth route fixes + self-healing migrations — follow-up to v0.9.11 audit.**
+
+- **Operator pre-flight.** v0.9.12 introduces a `main`/`dev` **update-channel toggle** on the Console page. Before clicking **Update Now**, confirm the toggle is on **`main`** (green). Operators on the `dev` channel during the rc cycle should click `main` first; otherwise Update Now will keep tracking the moving `dev` HEAD instead of the tagged `v0.9.12-alpha` release. Full pre-flight in [docs/RELEASE-v0.9.12-alpha.md](docs/RELEASE-v0.9.12-alpha.md).
+- **Background.** The v0.9.11 CloudTAK fix patched ONE upstream credential / port-exposure vulnerability. A post-incident audit found the same class of issue (publicly-bound services + lax auth boundaries) elsewhere in the stack, plus a small cluster of post-auth code bugs (SQL injection, command injection, path traversal, a hardcoded LDAP fallback password). None were live-exploited — this release is a planned hardening pass, not a fire drill. New canonical reference: [docs/PORT-EXPOSURE-POLICY.md](docs/PORT-EXPOSURE-POLICY.md).
+- **Port hardening — Part A.** Generalises the v0.9.11 `!reset` override pattern to every service:
+  - **CloudTAK** — `api 5000`, `tiles 5002`, `media-admin 9997`, `media HLS 18888` bound to `127.0.0.1`; `events 5003` removed entirely (Docker-internal, no host port). RTSP/RTMP/SRT streaming ports kept public. UFW denies the loopback ports belt-and-braces.
+  - **TAK Portal** — `WEB_UI_PORT` (default 3000) bound to `127.0.0.1`. New `_auto_harden_takportal()` post-update step force-recreates the container if it's still on `0.0.0.0`.
+  - **MediaMTX** — admin API `9898`, HLS `8888`, webedit Flask `5080` bound to `127.0.0.1` (both local and remote installs). Patches existing installs on every Update Now via new `_auto_harden_mediamtx()`. Streaming ports (RTSP 8554, RTSPS 8322, SRT 8890, RTP 8000/8001) kept public.
+  - **Remote Authentik** — `9000`/`9443` bound to `127.0.0.1` (Caddy proxies). LDAP outpost `389`/`636` source-scoped to the console source IP via `settings.server_ip`. Existing remote installs patched on Update Now via new `_auto_authentik_ports_remote()`.
+  - **Server One PostgreSQL** — removed the unconditional `ufw allow {db_port}/tcp` that silently overrode the source-scope rule above it; UFW now explicitly denies the port to everyone except Server Two.
+  - **Server One Guard Dog health agent** — `8080/tcp` source-scoped to the console IP instead of public.
+- **Route fixes — Part B.**
+  - **Snapshot path traversal.** New `_validate_snapshot_label` validator wired into `/api/takserver/snapshot/<label>/download`, `/api/takserver/snapshot/<label>` DELETE, `/api/takserver/rollback`, and the underlying `_tak_rollback` helper. Was vulnerable to `..%2F..%2Fetc` payloads.
+  - **External-DB SQL injection.** `/api/takserver/external-db/provision` now regex-validates identifiers (`app_user`, `db_name`, `admin_user`) against the Postgres identifier grammar and passes the password via `psql -v` substitution + `:'pw'` quoting instead of f-string concatenation.
+  - **External-DB test-connection RCE.** Replaced `bash -c "</dev/tcp/HOST/PORT"` shell-out with `socket.create_connection((host, port))` and added IP/DNS validation on `db_host`.
+  - **Webadmin password shell injection.** `/api/takserver/webadmin-password` POST now validates the password with `_validate_cert_password` and passes it to `UserManager.jar` via `argv` instead of `bash -c "... -p '{pw}' ..."`. Secondary call site uses `shlex.quote` for defence-in-depth.
+  - **Hardcoded LDAP service password fallback.** The literal 32-char `adm_ldapservice` fallback baked into `app.py` since v0.7.x is gone. Missing `AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD` now generates a fresh `secrets.token_urlsafe(24)` and persists it to `~/authentik/.env` for future runs.
+  - **SSH host/user injection.** New `_validate_ssh_target` regex-checks `host`/`ssh_user`/`ssh_port` before `_ssh_probe` and `_scp_to_host` build the ssh argv, defending against operator/API inputs that contain SSH option flags (e.g. `-oProxyCommand=...`).
+- **Operator action.** Confirm the channel toggle is `main`, then click **Update Now** — the new `_auto_harden_*` post-update steps patch existing installs automatically. For installs that have been running TAK Portal or MediaMTX for a while, a one-time container recreate happens during the post-update; expect a brief downtime on those services. The remote-Authentik hardening requires `Settings → Server IP` to be filled in for LDAP source-scoping; without it the install logs a warning and leaves 389/636 publicly open (current behaviour).
+- **Late-cycle fixes (B7, B8) — discovered during the test cycle on `tak-10` and `responder`, shipped in the same release.** These are documented as separate sections in the release notes:
+  - **B7. `~/authentik` tilde expansion under gunicorn.** Clicking **Sync webadmin to Authentik** (and any other code path that shelled out to `cd ~/authentik …`) failed with `/bin/sh: 1: cd: can't cd to ~/authentik` because `takwerx-console.service` never pinned `Environment=HOME=`. systemd does not inherit `HOME` from login env, so `/bin/sh` couldn't expand `~`. Three-layer fix: runtime guard in `app.py` (sets `os.environ['HOME']` if unset), `start.sh create_service()` writes `Environment=HOME=$SERVICE_HOME` for fresh installs, and a new `_startup_pin_console_service_home()` migration patches existing v0.9.11 unit files on Update Now. Same class of bug fixed for `takupdatesguard.service` in v0.2.7-alpha and for `git config --global` in v0.9.2-alpha — finally closed end-to-end for the console unit.
+  - **B8. Authentik ReputationPolicy binding was inverted — `negate=True` required.** Every LDAP bind for `webadmin` (and `adm_ldapservice` once its cache rebuilt) returned `Invalid credentials (49)` after the v0.9.12 `_startup_resync_ldap_service_account` migration wiped the LDAP outpost's bind cache. Authentik server log filled with `FlowNonApplicableException`. Root cause verified via `inspect.getsource(ReputationPolicy.passes)` directly inside the running `authentik-server-1` container: `passes()` returns `True` only when `score <= threshold` (i.e. only when the user has accumulated bad reputation), so with `negate=False` the binding denied **all normal users** instead of just brute-force abusers. Fix: `_authentik_setup_reputation_policy()` now POSTs new bindings with `negate=True, failure_result=True`, and a new `_startup_fix_reputation_policy_drift()` migration DELETE+POST-recreates existing bindings whose `negate` or `failure_result` fields are wrong (PATCH on `policies/bindings/` returns 405 on Authentik 2026.x — DELETE+POST is the documented workaround). This bug hid for ten releases (v0.9.2 → v0.9.12-rc) because the LDAP outpost's `bind_mode: cached` masked the misconfig — only after v0.9.12's resync cleared the cache did it surface. [`docs/HANDOFF-LDAP-AUTHENTIK.md`](docs/HANDOFF-LDAP-AUTHENTIK.md) carries the new `negate=True` rule so it can't be re-introduced without a doc trigger.
+- **Self-healing startup migrations (run on every console boot, all idempotent).** `_startup_pin_console_service_home` (B7), `_auto_harden_takportal_compose_ports` / `_auto_harden_cloudtak_compose_ports` (Part A self-heal — patches existing `docker-compose.yml` files in place and force-recreates if `0.0.0.0` still in port mappings), `_startup_resync_ldap_service_account` (heals LDAP SA bind drift end-to-end including TAK Server restart on healing), `_startup_fix_reputation_policy_drift` (B8). All persist their outcome to `settings.json` so the operator can audit what ran via `journalctl -u takwerx-console`.
+
+Full notes: [docs/RELEASE-v0.9.12-alpha.md](docs/RELEASE-v0.9.12-alpha.md).
+
+---
 
 ### v0.9.11-alpha — 2026-05-10 — SECURITY HOTFIX
 
