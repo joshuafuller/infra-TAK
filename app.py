@@ -335,7 +335,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.14-alpha"
+VERSION = "0.9.15-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -12284,9 +12284,19 @@ def _takportal_build_settings_dict(settings):
     return {
         "AUTHENTIK_URL": f"http://{auth_url_host}:{auth_url_port}",
         "AUTHENTIK_TOKEN": ak_token or "",
-        "USERS_HIDDEN_PREFIXES": "ak-,adm_,nodered-,ma-",
+        # v0.9.15 — akadmin and webadmin are both HIDDEN and ACTION-LOCKED in
+        # TAK Portal so an operator cannot click Disable / Delete on either
+        # protected admin account from the user-management UI. infra-TAK is
+        # authoritative for both fields: every "Update config & reconnect"
+        # and every post-update `_auto_harden_takportal_settings` push these
+        # defaults back. The v0.9.13/v0.9.14 Protected Admin Accounts panel
+        # on /authentik stays as the last-resort recovery if this guardrail
+        # is ever bypassed (e.g. operator clears the lists in TAK Portal's
+        # UI, future TAK Portal release exposes a way past the lock, or the
+        # accounts are disabled directly through Authentik's native admin).
+        "USERS_HIDDEN_PREFIXES": "akadmin,webadmin,ak-,adm_,nodered-,ma-",
         "GROUPS_HIDDEN_PREFIXES": "authentik, MA -, vid_, tak_ROLE_",
-        "USERS_ACTIONS_HIDDEN_PREFIXES": "",
+        "USERS_ACTIONS_HIDDEN_PREFIXES": "akadmin,webadmin",
         "GROUPS_ACTIONS_HIDDEN_PREFIXES": "",
         "DASHBOARD_AUTHENTIK_STATS_REFRESH_SECONDS": "300",
         "PORTAL_AUTH_ENABLED": "true" if settings.get('fqdn') else "false",
@@ -40193,6 +40203,89 @@ def _post_update_auto_deploy():
                     print(f"Post-update: TAK Portal hardening error (non-fatal): {_tphe}")
 
             _auto_harden_takportal()
+
+            def _auto_harden_takportal_settings():
+                """v0.9.15 — TAK Portal admin-account guardrail.
+
+                Ensures `akadmin` and `webadmin` are in both
+                USERS_HIDDEN_PREFIXES (hidden from the user list) and
+                USERS_ACTIONS_HIDDEN_PREFIXES (action-locked — cannot be
+                modified from TAK Portal's UI). Prevents the v0.9.13 incident
+                class where an operator accidentally clicked Disable on
+                `akadmin` from TAK Portal's user-management UI and locked
+                themselves out of Authentik entirely.
+
+                Idempotent — no-op if both prefixes are already present in
+                both fields. Otherwise pushes merged settings (preserves
+                BRAND_LOGO_URL / SSH onboarding flags via PRESERVE_TAKPORTAL_KEYS)
+                and restarts the tak-portal container to apply.
+
+                Skipped when TAK Portal isn't deployed locally (~/TAK-Portal
+                missing); remote-Portal installs apply the new defaults on
+                next "Update config & reconnect" click in the UI.
+
+                The /authentik Protected Admin Accounts panel (v0.9.13 +
+                v0.9.14 layered API → ak shell recovery) stays as the
+                last-resort recovery if this guardrail is ever bypassed.
+                """
+                try:
+                    _portal_dir = os.path.expanduser('~/TAK-Portal')
+                    if not os.path.isdir(_portal_dir):
+                        return
+                    _ps = subprocess.run(
+                        'docker ps --filter name=^tak-portal$ --format "{{.Names}}"',
+                        shell=True, capture_output=True, text=True, timeout=10
+                    )
+                    if 'tak-portal' not in (_ps.stdout or ''):
+                        return
+                    print("Post-update: TAK Portal admin-account guardrail (v0.9.15)...")
+
+                    _existing = _takportal_get_existing_settings()
+                    _hidden = (_existing.get('USERS_HIDDEN_PREFIXES') or '') if isinstance(_existing, dict) else ''
+                    _locked = (_existing.get('USERS_ACTIONS_HIDDEN_PREFIXES') or '') if isinstance(_existing, dict) else ''
+                    _hidden_parts = {p.strip() for p in _hidden.split(',') if p.strip()}
+                    _locked_parts = {p.strip() for p in _locked.split(',') if p.strip()}
+                    _need_keys = {'akadmin', 'webadmin'}
+                    _hidden_ok = _need_keys.issubset(_hidden_parts)
+                    _locked_ok = _need_keys.issubset(_locked_parts)
+                    if _hidden_ok and _locked_ok:
+                        print("  TAK Portal already guarded — akadmin/webadmin hidden + action-locked")
+                        return
+
+                    print(f"  TAK Portal current: hidden={_hidden!r} actions_hidden={_locked!r}")
+                    print("  TAK Portal pushing merged settings (preserves operator brand/SSH keys)")
+                    _settings = load_settings()
+                    _settings_json = _takportal_merged_settings_json(_settings)
+                    _fd, _tmp = tempfile.mkstemp(suffix='.json', prefix='tak-portal-guard-')
+                    try:
+                        with os.fdopen(_fd, 'w') as _tf:
+                            _tf.write(_settings_json)
+                        _cp = subprocess.run(
+                            f'docker cp {shlex.quote(_tmp)} tak-portal:/usr/src/app/data/settings.json',
+                            shell=True, capture_output=True, text=True, timeout=20
+                        )
+                    finally:
+                        try:
+                            os.remove(_tmp)
+                        except OSError:
+                            pass
+                    if _cp.returncode != 0:
+                        print(f"  WARNING: docker cp failed: {((_cp.stderr or _cp.stdout) or '').strip()[:200]}")
+                        return
+                    _rs = subprocess.run(
+                        'docker restart tak-portal',
+                        shell=True, capture_output=True, text=True, timeout=30
+                    )
+                    if _rs.returncode == 0:
+                        print("  TAK Portal restarted — akadmin/webadmin now hidden + action-locked")
+                    else:
+                        print(f"  WARNING: TAK Portal restart returned {_rs.returncode}")
+
+                    print("Post-update: TAK Portal admin-account guardrail complete")
+                except Exception as _tge:
+                    print(f"Post-update: TAK Portal guardrail error (non-fatal): {_tge}")
+
+            _auto_harden_takportal_settings()
 
             def _auto_harden_mediamtx():
                 """v0.9.12 — MediaMTX port hardening for existing local installs.
