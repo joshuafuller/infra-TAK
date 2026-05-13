@@ -29200,7 +29200,7 @@ document.addEventListener('DOMContentLoaded', function(){
 async function akUpdate(){
     var btn=document.getElementById('ak-update-btn');
     var status=document.getElementById('ak-update-status');
-    if(!confirm('Pull the latest Authentik image and restart containers?\n\nThis may take 2–5 minutes. The page will reload when done.'))return;
+    if(!confirm('Pull the latest Authentik image and restart containers?\\n\\nThis may take 2-5 minutes. The page will reload when done.'))return;
     btn.disabled=true;btn.innerHTML='<span style="display:inline-block;animation:uninstall-spin 1s linear infinite;font-size:14px">↻</span> Updating...';
     document.querySelectorAll('.control-btn').forEach(function(b){if(b!==btn){b.disabled=true;b.style.opacity='0.5'}});
     status.style.display='block';status.style.color='var(--text-secondary)';status.textContent='Pulling latest Authentik image and restarting… (may take 2–5 min)';
