@@ -39912,7 +39912,7 @@ def _post_update_auto_deploy():
                     # Check Authentik is reachable before attempting API calls
                     try:
                         _probe = _req.Request(
-                            f'{_dsc_url}/api/v3/core/service_connections/docker/',
+                            f'{_dsc_url}/api/v3/outposts/service_connections/docker/',
                             headers=_dsc_headers
                         )
                         with _req.urlopen(_probe, timeout=10) as _resp:
@@ -39932,7 +39932,7 @@ def _post_update_auto_deploy():
                             _pk = _conn.get('pk', '')
                             _name = _conn.get('name', _pk)
                             _del_req = _req.Request(
-                                f'{_dsc_url}/api/v3/core/service_connections/docker/{_pk}/',
+                                f'{_dsc_url}/api/v3/outposts/service_connections/docker/{_pk}/',
                                 headers=_dsc_headers,
                                 method='DELETE'
                             )
