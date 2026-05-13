@@ -8570,11 +8570,14 @@ def caddy_page():
     cert_days = _caddy_letsencrypt_days_left(settings)
     cert_days_color = _caddy_cert_days_color(cert_days)
     cert_days_fmt, _ = _fmt_caddy_cert_days(cert_days)  # same format as dashboard card
+    caddy_ver_info = _get_caddy_version_info() if caddy.get('installed') else {}
+    caddy_update_available = caddy_ver_info.get('update_available', False)
     return render_template_string(CADDY_TEMPLATE,
         settings=settings, caddy=caddy, caddyfile=caddyfile_content,
         configured_urls=configured_urls,
         cert_days_left=cert_days, cert_days_color=cert_days_color,
         cert_days_fmt=cert_days_fmt,
+        caddy_update_available=caddy_update_available,
         version=VERSION, deploying=caddy_deploy_status.get('running', False),
         deploy_done=caddy_deploy_status.get('complete', False))
 
@@ -9019,6 +9022,34 @@ def caddy_control():
         return jsonify({'success': True, 'output': 'Caddy restart scheduled; connection may drop briefly.'})
     else:
         return jsonify({'success': False, 'error': 'Unknown action'})
+
+@app.route('/api/caddy/update', methods=['POST'])
+@login_required
+def caddy_update():
+    """Upgrade Caddy to the latest apt package version and reload."""
+    try:
+        settings = load_settings()
+        pkg_mgr = settings.get('pkg_mgr', 'apt')
+        if pkg_mgr == 'apt':
+            r = subprocess.run(
+                'DEBIAN_FRONTEND=noninteractive apt-get update -qq && '
+                'apt-get install --only-upgrade -y caddy 2>&1',
+                shell=True, capture_output=True, text=True, timeout=120)
+        else:
+            r = subprocess.run(
+                'dnf upgrade -y caddy 2>&1',
+                shell=True, capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            return jsonify({'success': False, 'error': (r.stdout or r.stderr or 'Package upgrade failed').strip()})
+        # Reload so the new binary takes effect without dropping connections for long
+        reload_r = subprocess.run(
+            'systemctl reload caddy 2>&1 || systemctl restart caddy 2>&1',
+            shell=True, capture_output=True, text=True, timeout=30)
+        return jsonify({'success': True, 'output': (r.stdout or '').strip()})
+    except subprocess.TimeoutExpired:
+        return jsonify({'success': False, 'error': 'apt-get timed out'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/api/caddy/uninstall', methods=['POST'])
 @login_required
@@ -23323,6 +23354,7 @@ CADDY_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><
 .control-btn.btn-stop{border-color:rgba(239,68,68,0.3)}.control-btn.btn-stop:hover{background:rgba(239,68,68,0.1);color:var(--red)}
 .control-btn.btn-start{border-color:rgba(16,185,129,0.3)}.control-btn.btn-start:hover{background:rgba(16,185,129,0.1);color:var(--green)}
 .control-btn.btn-remove{border-color:rgba(239,68,68,0.2)}.control-btn.btn-remove:hover{background:rgba(239,68,68,0.1);color:var(--red)}
+.control-btn.btn-update{border-color:rgba(59,130,246,0.3)}.control-btn.btn-update:hover{background:rgba(59,130,246,0.1);color:var(--accent)}
 .deploy-log{background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:400px;overflow-y:auto;line-height:1.6;white-space:pre-wrap;margin-top:16px}
 .input-field{width:100%;padding:12px 16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:14px;outline:none;transition:border-color 0.2s}
 .input-field:focus{border-color:var(--accent)}
@@ -23364,8 +23396,10 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div class="section-title" style="margin-top:20px">Controls</div>
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:24px">
 <div class="controls" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
-{% if caddy.running %}<button class="control-btn" onclick="caddyControl('reload')">↻ Reload</button><button class="control-btn" onclick="caddyControl('restart')">↻ Restart</button><button class="control-btn btn-stop" onclick="caddyControl('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="caddyUninstall()">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="caddyControl('start')">▶ Start</button><button class="control-btn btn-remove" onclick="caddyUninstall()">🗑 Remove</button>{% endif %}
-</div></div>
+{% if caddy.running %}<button class="control-btn" onclick="caddyControl('reload')">↻ Reload</button><button class="control-btn" onclick="caddyControl('restart')">↻ Restart</button><button class="control-btn btn-stop" onclick="caddyControl('stop')">■ Stop</button><button class="control-btn btn-update" id="caddy-update-btn" onclick="caddyUpdate()"{% if caddy_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if caddy_update_available %} <span style="color:var(--cyan)" title="Update available">●</span>{% endif %}</button><button class="control-btn btn-remove" onclick="caddyUninstall()">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="caddyControl('start')">▶ Start</button><button class="control-btn btn-update" id="caddy-update-btn" onclick="caddyUpdate()"{% if caddy_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if caddy_update_available %} <span style="color:var(--cyan)" title="Update available">●</span>{% endif %}</button><button class="control-btn btn-remove" onclick="caddyUninstall()">🗑 Remove</button>{% endif %}
+</div>
+<div id="caddy-update-status" style="display:none;margin-top:10px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary)"></div>
+</div>
 {% endif %}
 
 {% if deploying %}
@@ -23519,6 +23553,30 @@ async function updateDomain(){
 async function caddyUninstall(){
     if(!confirm('Remove Caddy and clear domain configuration?'))return;
     try{var r=await fetch('/api/caddy/uninstall',{method:'POST'});var d=await r.json();if(d.success)location.reload()}catch(e){alert('Error: '+e.message)}
+}
+async function caddyUpdate(){
+    var btn=document.getElementById('caddy-update-btn');
+    var status=document.getElementById('caddy-update-status');
+    if(!confirm('Upgrade Caddy to the latest version via apt?\n\nCaddy will be reloaded automatically after the upgrade.'))return;
+    btn.disabled=true;btn.innerHTML='<span style="display:inline-block;animation:spin 1s linear infinite">↻</span> Updating...';
+    document.querySelectorAll('.control-btn').forEach(function(b){if(b!==btn){b.disabled=true;b.style.opacity='0.5'}});
+    status.style.display='block';status.style.color='var(--text-secondary)';status.textContent='Running apt-get update && apt-get install --only-upgrade caddy…';
+    try{
+        var r=await fetch('/api/caddy/update',{method:'POST',headers:{'Content-Type':'application/json'}});
+        var d=await r.json();
+        if(d.success){
+            status.style.color='var(--green)';status.textContent='✓ Caddy updated successfully. Reloading…';
+            setTimeout(()=>location.reload(),2500);
+        }else{
+            status.style.color='var(--red)';status.textContent='✗ Update failed: '+(d.error||'unknown error');
+            btn.disabled=false;btn.innerHTML='⬆ Update';
+            document.querySelectorAll('.control-btn').forEach(function(b){b.disabled=false;b.style.opacity=''});
+        }
+    }catch(e){
+        status.style.color='var(--red)';status.textContent='✗ Error: '+e.message;
+        btn.disabled=false;btn.innerHTML='⬆ Update';
+        document.querySelectorAll('.control-btn').forEach(function(b){b.disabled=false;b.style.opacity=''});
+    }
 }
 async function loadServiceDomains(){
     try{
