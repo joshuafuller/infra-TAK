@@ -39918,7 +39918,11 @@ def _post_update_auto_deploy():
                         with _req.urlopen(_probe, timeout=10) as _resp:
                             _data = _json.loads(_resp.read())
                     except urllib.error.HTTPError as _he:
-                        print(f"Post-update: Authentik Docker SC cleanup — API returned {_he.code}, skipping")
+                        try:
+                            _he_body = _he.read().decode('utf-8', errors='replace')[:200]
+                        except Exception:
+                            _he_body = '(unreadable)'
+                        print(f"Post-update: Authentik Docker SC cleanup — API returned {_he.code}: {_he_body}")
                         return
                     except Exception as _re:
                         print(f"Post-update: Authentik Docker SC cleanup — API unreachable ({_re}), skipping")
@@ -39950,8 +39954,6 @@ def _post_update_auto_deploy():
                 except Exception as _dsc_e:
                     print(f"Post-update: Authentik Docker SC cleanup error (non-fatal): {_dsc_e}")
 
-            _auto_remove_stale_docker_service_connections()
-
             # MediaMTX RTSP Fail2ban jail — auto-install if mediamtx + fail2ban present
             try:
                 _mtx_svc = os.path.exists('/etc/systemd/system/mediamtx.service') or os.path.exists('/usr/local/bin/mediamtx')
@@ -39981,6 +39983,9 @@ def _post_update_auto_deploy():
                     time.sleep(5)
                 else:
                     print("Post-update: Authentik not healthy after 5 min, proceeding anyway")
+
+            # Run after Authentik is confirmed healthy — outposts API requires a fully-loaded server
+            _auto_remove_stale_docker_service_connections()
 
             _auto_takportal()
             cloudtak_t.join(timeout=600)
