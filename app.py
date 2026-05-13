@@ -23355,6 +23355,7 @@ CADDY_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><
 .control-btn.btn-start{border-color:rgba(16,185,129,0.3)}.control-btn.btn-start:hover{background:rgba(16,185,129,0.1);color:var(--green)}
 .control-btn.btn-remove{border-color:rgba(239,68,68,0.2)}.control-btn.btn-remove:hover{background:rgba(239,68,68,0.1);color:var(--red)}
 .control-btn.btn-update{border-color:rgba(59,130,246,0.3)}.control-btn.btn-update:hover{background:rgba(59,130,246,0.1);color:var(--accent)}
+@keyframes caddy-spin{to{transform:rotate(360deg)}}
 .deploy-log{background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:400px;overflow-y:auto;line-height:1.6;white-space:pre-wrap;margin-top:16px}
 .input-field{width:100%;padding:12px 16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:14px;outline:none;transition:border-color 0.2s}
 .input-field:focus{border-color:var(--accent)}
@@ -23557,8 +23558,8 @@ async function caddyUninstall(){
 async function caddyUpdate(){
     var btn=document.getElementById('caddy-update-btn');
     var status=document.getElementById('caddy-update-status');
-    if(!confirm('Upgrade Caddy to the latest version via apt?\n\nCaddy will be reloaded automatically after the upgrade.'))return;
-    btn.disabled=true;btn.innerHTML='<span style="display:inline-block;animation:spin 1s linear infinite">↻</span> Updating...';
+    if(!confirm('Upgrade Caddy to the latest version via apt?\\n\\nCaddy will be reloaded automatically after the upgrade.'))return;
+    btn.disabled=true;btn.innerHTML='<span style="display:inline-block;animation:caddy-spin 1s linear infinite;font-size:14px">↻</span> Updating...';
     document.querySelectorAll('.control-btn').forEach(function(b){if(b!==btn){b.disabled=true;b.style.opacity='0.5'}});
     status.style.display='block';status.style.color='var(--text-secondary)';status.textContent='Running apt-get update && apt-get install --only-upgrade caddy…';
     try{
