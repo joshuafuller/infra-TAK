@@ -335,7 +335,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.15-alpha"
+VERSION = "0.9.16-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -8570,11 +8570,16 @@ def caddy_page():
     cert_days = _caddy_letsencrypt_days_left(settings)
     cert_days_color = _caddy_cert_days_color(cert_days)
     cert_days_fmt, _ = _fmt_caddy_cert_days(cert_days)  # same format as dashboard card
+    caddy_ver_info = _get_caddy_version_info() if caddy.get('installed') else {}
+    caddy_update_available = caddy_ver_info.get('update_available', False)
+    caddy_version = caddy_ver_info.get('version', '')
     return render_template_string(CADDY_TEMPLATE,
         settings=settings, caddy=caddy, caddyfile=caddyfile_content,
         configured_urls=configured_urls,
         cert_days_left=cert_days, cert_days_color=cert_days_color,
         cert_days_fmt=cert_days_fmt,
+        caddy_update_available=caddy_update_available,
+        caddy_version=caddy_version,
         version=VERSION, deploying=caddy_deploy_status.get('running', False),
         deploy_done=caddy_deploy_status.get('complete', False))
 
@@ -9019,6 +9024,34 @@ def caddy_control():
         return jsonify({'success': True, 'output': 'Caddy restart scheduled; connection may drop briefly.'})
     else:
         return jsonify({'success': False, 'error': 'Unknown action'})
+
+@app.route('/api/caddy/update', methods=['POST'])
+@login_required
+def caddy_update():
+    """Upgrade Caddy to the latest apt package version and reload."""
+    try:
+        settings = load_settings()
+        pkg_mgr = settings.get('pkg_mgr', 'apt')
+        if pkg_mgr == 'apt':
+            r = subprocess.run(
+                'DEBIAN_FRONTEND=noninteractive apt-get update -qq && '
+                'apt-get install --only-upgrade -y caddy 2>&1',
+                shell=True, capture_output=True, text=True, timeout=120)
+        else:
+            r = subprocess.run(
+                'dnf upgrade -y caddy 2>&1',
+                shell=True, capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            return jsonify({'success': False, 'error': (r.stdout or r.stderr or 'Package upgrade failed').strip()})
+        # Reload so the new binary takes effect without dropping connections for long
+        reload_r = subprocess.run(
+            'systemctl reload caddy 2>&1 || systemctl restart caddy 2>&1',
+            shell=True, capture_output=True, text=True, timeout=30)
+        return jsonify({'success': True, 'output': (r.stdout or '').strip()})
+    except subprocess.TimeoutExpired:
+        return jsonify({'success': False, 'error': 'apt-get timed out'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/api/caddy/uninstall', methods=['POST'])
 @login_required
@@ -23323,6 +23356,8 @@ CADDY_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><
 .control-btn.btn-stop{border-color:rgba(239,68,68,0.3)}.control-btn.btn-stop:hover{background:rgba(239,68,68,0.1);color:var(--red)}
 .control-btn.btn-start{border-color:rgba(16,185,129,0.3)}.control-btn.btn-start:hover{background:rgba(16,185,129,0.1);color:var(--green)}
 .control-btn.btn-remove{border-color:rgba(239,68,68,0.2)}.control-btn.btn-remove:hover{background:rgba(239,68,68,0.1);color:var(--red)}
+.control-btn.btn-update{border-color:rgba(59,130,246,0.3)}.control-btn.btn-update:hover{background:rgba(59,130,246,0.1);color:var(--accent)}
+@keyframes caddy-spin{to{transform:rotate(360deg)}}
 .deploy-log{background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:400px;overflow-y:auto;line-height:1.6;white-space:pre-wrap;margin-top:16px}
 .input-field{width:100%;padding:12px 16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:14px;outline:none;transition:border-color 0.2s}
 .input-field:focus{border-color:var(--accent)}
@@ -23352,9 +23387,9 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div class="main">
 <div class="status-banner">
 {% if caddy.installed and caddy.running %}
-<div class="status-info"><div class="status-logo-wrap"><img src="{{ caddy_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--green)">Running</div><div class="status-detail">Caddy is active{% if settings.get('fqdn') %} · {{ settings.get('fqdn') }}{% endif %}</div><div style="font-family:'JetBrains Mono',monospace;font-size:10px;margin-top:4px;color:{% if cert_days_fmt %}{% if cert_days_color == 'green' %}var(--green){% elif cert_days_color == 'yellow' %}var(--yellow){% elif cert_days_color == 'red' %}var(--red){% else %}var(--text-dim){% endif %}{% else %}var(--text-dim){% endif %}">Cert: {% if cert_days_fmt %}{{ cert_days_fmt }}{% else %}—{% endif %}</div></div></div>
+<div class="status-info"><div class="status-logo-wrap"><img src="{{ caddy_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--green)">Running</div><div class="status-detail">Caddy is active{% if settings.get('fqdn') %} · {{ settings.get('fqdn') }}{% endif %}{% if caddy_version %} · {{ caddy_version }}{% endif %}{% if caddy_update_available %} · <span style="color:var(--cyan)">update available</span>{% endif %}</div><div style="font-family:'JetBrains Mono',monospace;font-size:10px;margin-top:4px;color:{% if cert_days_fmt %}{% if cert_days_color == 'green' %}var(--green){% elif cert_days_color == 'yellow' %}var(--yellow){% elif cert_days_color == 'red' %}var(--red){% else %}var(--text-dim){% endif %}{% else %}var(--text-dim){% endif %}">Cert: {% if cert_days_fmt %}{{ cert_days_fmt }}{% else %}—{% endif %}</div></div></div>
 {% elif caddy.installed %}
-<div class="status-info"><div class="status-logo-wrap"><img src="{{ caddy_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--red)">Stopped</div><div class="status-detail">Caddy is installed but not running</div><div style="font-family:'JetBrains Mono',monospace;font-size:10px;margin-top:4px;color:var(--text-dim)">Cert: {% if cert_days_fmt %}{{ cert_days_fmt }}{% else %}—{% endif %}</div></div></div>
+<div class="status-info"><div class="status-logo-wrap"><img src="{{ caddy_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--red)">Stopped</div><div class="status-detail">Caddy is installed but not running{% if caddy_version %} · {{ caddy_version }}{% endif %}{% if caddy_update_available %} · <span style="color:var(--cyan)">update available</span>{% endif %}</div><div style="font-family:'JetBrains Mono',monospace;font-size:10px;margin-top:4px;color:var(--text-dim)">Cert: {% if cert_days_fmt %}{{ cert_days_fmt }}{% else %}—{% endif %}</div></div></div>
 {% else %}
 <div class="status-info"><div class="status-logo-wrap"><img src="{{ caddy_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--text-dim)">Not Installed</div><div class="status-detail">Set up a domain for full functionality</div></div></div>
 {% endif %}
@@ -23364,8 +23399,10 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div class="section-title" style="margin-top:20px">Controls</div>
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:24px">
 <div class="controls" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
-{% if caddy.running %}<button class="control-btn" onclick="caddyControl('reload')">↻ Reload</button><button class="control-btn" onclick="caddyControl('restart')">↻ Restart</button><button class="control-btn btn-stop" onclick="caddyControl('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="caddyUninstall()">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="caddyControl('start')">▶ Start</button><button class="control-btn btn-remove" onclick="caddyUninstall()">🗑 Remove</button>{% endif %}
-</div></div>
+{% if caddy.running %}<button class="control-btn" onclick="caddyControl('reload')">↻ Reload</button><button class="control-btn" onclick="caddyControl('restart')">↻ Restart</button><button class="control-btn btn-stop" onclick="caddyControl('stop')">■ Stop</button><button class="control-btn btn-update" id="caddy-update-btn" onclick="caddyUpdate()"{% if caddy_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if caddy_update_available %} <span style="color:var(--cyan)" title="Update available">●</span>{% endif %}</button><button class="control-btn btn-remove" onclick="caddyUninstall()">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="caddyControl('start')">▶ Start</button><button class="control-btn btn-update" id="caddy-update-btn" onclick="caddyUpdate()"{% if caddy_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if caddy_update_available %} <span style="color:var(--cyan)" title="Update available">●</span>{% endif %}</button><button class="control-btn btn-remove" onclick="caddyUninstall()">🗑 Remove</button>{% endif %}
+</div>
+<div id="caddy-update-status" style="display:none;margin-top:10px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary)"></div>
+</div>
 {% endif %}
 
 {% if deploying %}
@@ -23519,6 +23556,30 @@ async function updateDomain(){
 async function caddyUninstall(){
     if(!confirm('Remove Caddy and clear domain configuration?'))return;
     try{var r=await fetch('/api/caddy/uninstall',{method:'POST'});var d=await r.json();if(d.success)location.reload()}catch(e){alert('Error: '+e.message)}
+}
+async function caddyUpdate(){
+    var btn=document.getElementById('caddy-update-btn');
+    var status=document.getElementById('caddy-update-status');
+    if(!confirm('Upgrade Caddy to the latest version via apt?\\n\\nCaddy will be reloaded automatically after the upgrade.'))return;
+    btn.disabled=true;btn.innerHTML='<span style="display:inline-block;animation:caddy-spin 1s linear infinite;font-size:14px">↻</span> Updating...';
+    document.querySelectorAll('.control-btn').forEach(function(b){if(b!==btn){b.disabled=true;b.style.opacity='0.5'}});
+    status.style.display='block';status.style.color='var(--text-secondary)';status.textContent='Running apt-get update && apt-get install --only-upgrade caddy…';
+    try{
+        var r=await fetch('/api/caddy/update',{method:'POST',headers:{'Content-Type':'application/json'}});
+        var d=await r.json();
+        if(d.success){
+            status.style.color='var(--green)';status.textContent='✓ Caddy updated successfully. Reloading…';
+            setTimeout(()=>location.reload(),2500);
+        }else{
+            status.style.color='var(--red)';status.textContent='✗ Update failed: '+(d.error||'unknown error');
+            btn.disabled=false;btn.innerHTML='⬆ Update';
+            document.querySelectorAll('.control-btn').forEach(function(b){b.disabled=false;b.style.opacity=''});
+        }
+    }catch(e){
+        status.style.color='var(--red)';status.textContent='✗ Error: '+e.message;
+        btn.disabled=false;btn.innerHTML='⬆ Update';
+        document.querySelectorAll('.control-btn').forEach(function(b){b.disabled=false;b.style.opacity=''});
+    }
 }
 async function loadServiceDomains(){
     try{
@@ -28786,8 +28847,10 @@ body{display:flex;min-height:100vh}
 <div class="section-title" style="margin-top:20px">Controls</div>
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:24px">
 <div class="controls" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
-{% if ak.running %}<button class="control-btn" onclick="akControl('restart')">↻ Restart</button><button class="control-btn" onclick="reconfigureAk()">🔄 Update config</button><button class="control-btn btn-update" onclick="akControl('update')"{% if ak_version_info and ak_version_info.update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if ak_version_info and ak_version_info.update_available %} <span style="color:var(--cyan)" title="Update available: v{{ ak_version_info.latest }}">●</span>{% endif %}</button>{% if authentik_deploy_cfg.target_mode == 'remote' %}<button class="control-btn" onclick="fixAkLdapToken(this)" title="Emergency: inject LDAP outpost token and recreate LDAP container">🔑 Fix LDAP token</button>{% endif %}<button class="control-btn btn-stop" onclick="akControl('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('ak-uninstall-modal').classList.add('open')">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="akControl('start')">▶ Start</button><button class="control-btn" onclick="reconfigureAk()">🔄 Update config</button><button class="control-btn btn-update" onclick="akControl('update')"{% if ak_version_info and ak_version_info.update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if ak_version_info and ak_version_info.update_available %} <span style="color:var(--cyan)" title="Update available: v{{ ak_version_info.latest }}">●</span>{% endif %}</button>{% if authentik_deploy_cfg.target_mode == 'remote' %}<button class="control-btn" onclick="fixAkLdapToken(this)" title="Emergency: inject LDAP outpost token and recreate LDAP container">🔑 Fix LDAP token</button>{% endif %}<button class="control-btn btn-remove" onclick="document.getElementById('ak-uninstall-modal').classList.add('open')">🗑 Remove</button>{% endif %}
-</div></div>
+{% if ak.running %}<button class="control-btn" onclick="akControl('restart')">↻ Restart</button><button class="control-btn" onclick="reconfigureAk()">🔄 Update config</button><button class="control-btn btn-update" id="ak-update-btn" onclick="akUpdate()"{% if ak_version_info and ak_version_info.update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if ak_version_info and ak_version_info.update_available %} <span style="color:var(--cyan)" title="Update available: v{{ ak_version_info.latest }}">●</span>{% endif %}</button>{% if authentik_deploy_cfg.target_mode == 'remote' %}<button class="control-btn" onclick="fixAkLdapToken(this)" title="Emergency: inject LDAP outpost token and recreate LDAP container">🔑 Fix LDAP token</button>{% endif %}<button class="control-btn btn-stop" onclick="akControl('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('ak-uninstall-modal').classList.add('open')">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="akControl('start')">▶ Start</button><button class="control-btn" onclick="reconfigureAk()">🔄 Update config</button><button class="control-btn btn-update" id="ak-update-btn" onclick="akUpdate()"{% if ak_version_info and ak_version_info.update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if ak_version_info and ak_version_info.update_available %} <span style="color:var(--cyan)" title="Update available: v{{ ak_version_info.latest }}">●</span>{% endif %}</button>{% if authentik_deploy_cfg.target_mode == 'remote' %}<button class="control-btn" onclick="fixAkLdapToken(this)" title="Emergency: inject LDAP outpost token and recreate LDAP container">🔑 Fix LDAP token</button>{% endif %}<button class="control-btn btn-remove" onclick="document.getElementById('ak-uninstall-modal').classList.add('open')">🗑 Remove</button>{% endif %}
+</div>
+<div id="ak-update-status" style="display:none;margin-top:10px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary)"></div>
+</div>
 {% endif %}
 
 {% if deploying %}
@@ -29134,6 +29197,30 @@ document.addEventListener('DOMContentLoaded', function(){
     if (document.getElementById('admin-accounts-status')) { refreshAdminAccounts(); }
 });
 
+async function akUpdate(){
+    var btn=document.getElementById('ak-update-btn');
+    var status=document.getElementById('ak-update-status');
+    if(!confirm('Pull the latest Authentik image and restart containers?\\n\\nThis may take 2-5 minutes. The page will reload when done.'))return;
+    btn.disabled=true;btn.innerHTML='<span style="display:inline-block;animation:uninstall-spin 1s linear infinite;font-size:14px">↻</span> Updating...';
+    document.querySelectorAll('.control-btn').forEach(function(b){if(b!==btn){b.disabled=true;b.style.opacity='0.5'}});
+    status.style.display='block';status.style.color='var(--text-secondary)';status.textContent='Pulling latest Authentik image and restarting… (may take 2–5 min)';
+    try{
+        var r=await fetch('/api/authentik/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'update'})});
+        var d=await r.json();
+        if(d.success){
+            status.style.color='var(--green)';status.textContent='✓ Authentik updated successfully. Reloading…';
+            setTimeout(()=>location.reload(),2500);
+        }else{
+            status.style.color='var(--red)';status.textContent='✗ Update failed: '+(d.error||'unknown error');
+            btn.disabled=false;btn.innerHTML='⬆ Update';
+            document.querySelectorAll('.control-btn').forEach(function(b){b.disabled=false;b.style.opacity=''});
+        }
+    }catch(e){
+        status.style.color='var(--red)';status.textContent='✗ Error: '+e.message;
+        btn.disabled=false;btn.innerHTML='⬆ Update';
+        document.querySelectorAll('.control-btn').forEach(function(b){b.disabled=false;b.style.opacity=''});
+    }
+}
 async function akControl(action){
     var btns=document.querySelectorAll('.control-btn');
     btns.forEach(function(b){b.disabled=true;b.style.opacity='0.5'});
@@ -39869,6 +39956,91 @@ def _post_update_auto_deploy():
 
             _authentik_tasklog_cleanup()
 
+            def _auto_remove_stale_docker_service_connections():
+                """v0.9.16: Delete the local Docker service connection that Authentik's upstream
+                quickstart creates by default.
+
+                infra-TAK stripped /var/run/docker.sock from the Authentik worker in v0.9.2
+                (CVE-2026-31431 hardening) but did not remove the corresponding service
+                connection from Authentik's database.  The worker's
+                outpost_service_connection_monitor task retries the dead socket connection
+                every 30 seconds, causing ~26% sustained CPU on the worker container.
+
+                This function calls the Authentik API to list all Docker service connections
+                with local=True (local socket) and deletes them.  infra-TAK uses a standalone
+                authentik-ldap-1 container managed by docker compose — not Docker-managed
+                outposts — so no local Docker service connection is needed or safe.
+
+                Idempotent: if no local Docker service connections exist, logs a one-liner
+                and returns.  Safe to run on every Update Now.
+                """
+                import urllib.request as _req
+                import urllib.error
+                import json as _json
+
+                try:
+                    _ak_env = os.path.expanduser('~/authentik/.env')
+                    if not os.path.exists(_ak_env):
+                        return  # Authentik not installed locally
+                    _dsc_settings = load_settings()
+                    _dsc_token = (
+                        _get_authentik_env_value(_dsc_settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or
+                        _get_authentik_env_value(_dsc_settings, 'AUTHENTIK_TOKEN')
+                    )
+                    if not _dsc_token:
+                        print("Post-update: Authentik Docker SC cleanup — no token found, skipping")
+                        return
+                    _dsc_url = _get_authentik_api_url(_dsc_settings)
+                    _dsc_headers = {
+                        'Authorization': f'Bearer {_dsc_token}',
+                        'Content-Type': 'application/json',
+                    }
+
+                    # Check Authentik is reachable before attempting API calls
+                    try:
+                        _probe = _req.Request(
+                            f'{_dsc_url}/api/v3/outposts/service_connections/docker/',
+                            headers=_dsc_headers
+                        )
+                        with _req.urlopen(_probe, timeout=10) as _resp:
+                            _data = _json.loads(_resp.read())
+                    except urllib.error.HTTPError as _he:
+                        try:
+                            _he_body = _he.read().decode('utf-8', errors='replace')[:200]
+                        except Exception:
+                            _he_body = '(unreadable)'
+                        print(f"Post-update: Authentik Docker SC cleanup — API returned {_he.code}: {_he_body}")
+                        return
+                    except Exception as _re:
+                        print(f"Post-update: Authentik Docker SC cleanup — API unreachable ({_re}), skipping")
+                        return
+
+                    _deleted = 0
+                    for _conn in _data.get('results', []):
+                        # local=True means "connect to /var/run/docker.sock on the worker host"
+                        # That socket is intentionally not mounted in the worker (CVE-2026-31431).
+                        if _conn.get('local'):
+                            _pk = _conn.get('pk', '')
+                            _name = _conn.get('name', _pk)
+                            _del_req = _req.Request(
+                                f'{_dsc_url}/api/v3/outposts/service_connections/docker/{_pk}/',
+                                headers=_dsc_headers,
+                                method='DELETE'
+                            )
+                            try:
+                                _req.urlopen(_del_req, timeout=10)
+                                print(f"Post-update: Authentik — deleted stale local Docker service connection '{_name}' ({_pk})")
+                                _deleted += 1
+                            except urllib.error.HTTPError as _de:
+                                print(f"Post-update: Authentik Docker SC — failed to delete '{_name}': HTTP {_de.code}")
+                            except Exception as _de2:
+                                print(f"Post-update: Authentik Docker SC — failed to delete '{_name}': {_de2}")
+
+                    if _deleted == 0:
+                        print("Post-update: Authentik Docker SC cleanup — no local connections found, nothing to do")
+                except Exception as _dsc_e:
+                    print(f"Post-update: Authentik Docker SC cleanup error (non-fatal): {_dsc_e}")
+
             # MediaMTX RTSP Fail2ban jail — auto-install if mediamtx + fail2ban present
             try:
                 _mtx_svc = os.path.exists('/etc/systemd/system/mediamtx.service') or os.path.exists('/usr/local/bin/mediamtx')
@@ -39898,6 +40070,9 @@ def _post_update_auto_deploy():
                     time.sleep(5)
                 else:
                     print("Post-update: Authentik not healthy after 5 min, proceeding anyway")
+
+            # Run after Authentik is confirmed healthy — outposts API requires a fully-loaded server
+            _auto_remove_stale_docker_service_connections()
 
             _auto_takportal()
             cloudtak_t.join(timeout=600)

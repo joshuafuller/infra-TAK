@@ -66,8 +66,7 @@ fi
 
 # 3) Ensure systemd has LDAP_ENABLED and Authentik env
 if ! grep -q 'Environment=LDAP_ENABLED' "$SVC_FILE" 2>/dev/null; then
-  AUTH_DIR="${AUTH_DIR:-$HOME/authentik}"
-  [ -d "$AUTH_DIR" ] || AUTH_DIR="/root/authentik"
+  AUTH_DIR="${AUTH_DIR:-${HOME:-/home/takwerx}/authentik}"
   TOKEN=""
   if [ -f "${AUTH_DIR}/.env" ]; then
     TOKEN=$(grep -E '^AUTHENTIK_BOOTSTRAP_TOKEN=|^AUTHENTIK_TOKEN=' "${AUTH_DIR}/.env" | head -1 | cut -d= -f2- | tr -d '\r')
