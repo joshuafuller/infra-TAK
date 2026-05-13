@@ -8572,12 +8572,14 @@ def caddy_page():
     cert_days_fmt, _ = _fmt_caddy_cert_days(cert_days)  # same format as dashboard card
     caddy_ver_info = _get_caddy_version_info() if caddy.get('installed') else {}
     caddy_update_available = caddy_ver_info.get('update_available', False)
+    caddy_version = caddy_ver_info.get('version', '')
     return render_template_string(CADDY_TEMPLATE,
         settings=settings, caddy=caddy, caddyfile=caddyfile_content,
         configured_urls=configured_urls,
         cert_days_left=cert_days, cert_days_color=cert_days_color,
         cert_days_fmt=cert_days_fmt,
         caddy_update_available=caddy_update_available,
+        caddy_version=caddy_version,
         version=VERSION, deploying=caddy_deploy_status.get('running', False),
         deploy_done=caddy_deploy_status.get('complete', False))
 
@@ -23385,9 +23387,9 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div class="main">
 <div class="status-banner">
 {% if caddy.installed and caddy.running %}
-<div class="status-info"><div class="status-logo-wrap"><img src="{{ caddy_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--green)">Running</div><div class="status-detail">Caddy is active{% if settings.get('fqdn') %} · {{ settings.get('fqdn') }}{% endif %}</div><div style="font-family:'JetBrains Mono',monospace;font-size:10px;margin-top:4px;color:{% if cert_days_fmt %}{% if cert_days_color == 'green' %}var(--green){% elif cert_days_color == 'yellow' %}var(--yellow){% elif cert_days_color == 'red' %}var(--red){% else %}var(--text-dim){% endif %}{% else %}var(--text-dim){% endif %}">Cert: {% if cert_days_fmt %}{{ cert_days_fmt }}{% else %}—{% endif %}</div></div></div>
+<div class="status-info"><div class="status-logo-wrap"><img src="{{ caddy_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--green)">Running</div><div class="status-detail">Caddy is active{% if settings.get('fqdn') %} · {{ settings.get('fqdn') }}{% endif %}{% if caddy_version %} · {{ caddy_version }}{% endif %}{% if caddy_update_available %} · <span style="color:var(--cyan)">update available</span>{% endif %}</div><div style="font-family:'JetBrains Mono',monospace;font-size:10px;margin-top:4px;color:{% if cert_days_fmt %}{% if cert_days_color == 'green' %}var(--green){% elif cert_days_color == 'yellow' %}var(--yellow){% elif cert_days_color == 'red' %}var(--red){% else %}var(--text-dim){% endif %}{% else %}var(--text-dim){% endif %}">Cert: {% if cert_days_fmt %}{{ cert_days_fmt }}{% else %}—{% endif %}</div></div></div>
 {% elif caddy.installed %}
-<div class="status-info"><div class="status-logo-wrap"><img src="{{ caddy_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--red)">Stopped</div><div class="status-detail">Caddy is installed but not running</div><div style="font-family:'JetBrains Mono',monospace;font-size:10px;margin-top:4px;color:var(--text-dim)">Cert: {% if cert_days_fmt %}{{ cert_days_fmt }}{% else %}—{% endif %}</div></div></div>
+<div class="status-info"><div class="status-logo-wrap"><img src="{{ caddy_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--red)">Stopped</div><div class="status-detail">Caddy is installed but not running{% if caddy_version %} · {{ caddy_version }}{% endif %}{% if caddy_update_available %} · <span style="color:var(--cyan)">update available</span>{% endif %}</div><div style="font-family:'JetBrains Mono',monospace;font-size:10px;margin-top:4px;color:var(--text-dim)">Cert: {% if cert_days_fmt %}{{ cert_days_fmt }}{% else %}—{% endif %}</div></div></div>
 {% else %}
 <div class="status-info"><div class="status-logo-wrap"><img src="{{ caddy_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--text-dim)">Not Installed</div><div class="status-detail">Set up a domain for full functionality</div></div></div>
 {% endif %}
