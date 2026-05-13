@@ -335,7 +335,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.15-alpha"
+VERSION = "0.9.16-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -39868,6 +39868,89 @@ def _post_update_auto_deploy():
                     print(f"Post-update: Authentik task log cleanup error (non-fatal): {_tl_e}")
 
             _authentik_tasklog_cleanup()
+
+            def _auto_remove_stale_docker_service_connections():
+                """v0.9.16: Delete the local Docker service connection that Authentik's upstream
+                quickstart creates by default.
+
+                infra-TAK stripped /var/run/docker.sock from the Authentik worker in v0.9.2
+                (CVE-2026-31431 hardening) but did not remove the corresponding service
+                connection from Authentik's database.  The worker's
+                outpost_service_connection_monitor task retries the dead socket connection
+                every 30 seconds, causing ~26% sustained CPU on the worker container.
+
+                This function calls the Authentik API to list all Docker service connections
+                with local=True (local socket) and deletes them.  infra-TAK uses a standalone
+                authentik-ldap-1 container managed by docker compose — not Docker-managed
+                outposts — so no local Docker service connection is needed or safe.
+
+                Idempotent: if no local Docker service connections exist, logs a one-liner
+                and returns.  Safe to run on every Update Now.
+                """
+                import urllib.request as _req
+                import urllib.error
+                import json as _json
+
+                try:
+                    _ak_env = os.path.expanduser('~/authentik/.env')
+                    if not os.path.exists(_ak_env):
+                        return  # Authentik not installed locally
+                    _dsc_settings = load_settings()
+                    _dsc_token = (
+                        _get_authentik_env_value(_dsc_settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or
+                        _get_authentik_env_value(_dsc_settings, 'AUTHENTIK_TOKEN')
+                    )
+                    if not _dsc_token:
+                        print("Post-update: Authentik Docker SC cleanup — no token found, skipping")
+                        return
+                    _dsc_url = _get_authentik_api_url(_dsc_settings)
+                    _dsc_headers = {
+                        'Authorization': f'Bearer {_dsc_token}',
+                        'Content-Type': 'application/json',
+                    }
+
+                    # Check Authentik is reachable before attempting API calls
+                    try:
+                        _probe = _req.Request(
+                            f'{_dsc_url}/api/v3/core/service_connections/docker/',
+                            headers=_dsc_headers
+                        )
+                        with _req.urlopen(_probe, timeout=10) as _resp:
+                            _data = _json.loads(_resp.read())
+                    except urllib.error.HTTPError as _he:
+                        print(f"Post-update: Authentik Docker SC cleanup — API returned {_he.code}, skipping")
+                        return
+                    except Exception as _re:
+                        print(f"Post-update: Authentik Docker SC cleanup — API unreachable ({_re}), skipping")
+                        return
+
+                    _deleted = 0
+                    for _conn in _data.get('results', []):
+                        # local=True means "connect to /var/run/docker.sock on the worker host"
+                        # That socket is intentionally not mounted in the worker (CVE-2026-31431).
+                        if _conn.get('local'):
+                            _pk = _conn.get('pk', '')
+                            _name = _conn.get('name', _pk)
+                            _del_req = _req.Request(
+                                f'{_dsc_url}/api/v3/core/service_connections/docker/{_pk}/',
+                                headers=_dsc_headers,
+                                method='DELETE'
+                            )
+                            try:
+                                _req.urlopen(_del_req, timeout=10)
+                                print(f"Post-update: Authentik — deleted stale local Docker service connection '{_name}' ({_pk})")
+                                _deleted += 1
+                            except urllib.error.HTTPError as _de:
+                                print(f"Post-update: Authentik Docker SC — failed to delete '{_name}': HTTP {_de.code}")
+                            except Exception as _de2:
+                                print(f"Post-update: Authentik Docker SC — failed to delete '{_name}': {_de2}")
+
+                    if _deleted == 0:
+                        print("Post-update: Authentik Docker SC cleanup — no local connections found, nothing to do")
+                except Exception as _dsc_e:
+                    print(f"Post-update: Authentik Docker SC cleanup error (non-fatal): {_dsc_e}")
+
+            _auto_remove_stale_docker_service_connections()
 
             # MediaMTX RTSP Fail2ban jail — auto-install if mediamtx + fail2ban present
             try:
