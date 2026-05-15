@@ -335,7 +335,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.21-alpha"
+VERSION = "0.9.22-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -25001,7 +25001,7 @@ entries:
     image: docker.io/library/postgres:16-alpine
     restart: unless-stopped
     shm_size: 256m
-    command: postgres -c max_connections=500 -c statement_timeout=120s -c idle_session_timeout=30s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6
+    command: postgres -c max_connections=500 -c statement_timeout=120s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
       start_period: 20s
@@ -25468,10 +25468,10 @@ def _ensure_authentik_compose_patches_legacy(compose_path, plog=None):
             lines = f.readlines()
         changed = False
 
-        # v0.9.21: removed idle_session_timeout=300s; added statement_timeout=120s.
-        # v0.9.21 (rev): re-added idle_session_timeout=30s — server-side cleanup for
-        # abandoned async-thread connections that Django never closes (CONN_MAX_AGE ignored).
-        pg_cmd = 'postgres -c max_connections=500 -c statement_timeout=120s -c idle_session_timeout=30s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
+        # v0.9.22 hotfix: keep statement_timeout=120s but REMOVE idle_session_timeout.
+        # Real-world validation on tak-10 showed idle_session_timeout kills
+        # django_channels_postgres LISTEN sockets, causing reconnect storms/CPU spikes.
+        pg_cmd = 'postgres -c max_connections=500 -c statement_timeout=120s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
         _pg_full = ''.join(lines)
         has_pg_cmd = bool(re.search(r'command:\s*postgres\b.*max_connections=', _pg_full))
         _pg_it_match = re.search(r'idle_in_transaction_session_timeout=(\d+)s', _pg_full)
@@ -25480,8 +25480,8 @@ def _ensure_authentik_compose_patches_legacy(compose_path, plog=None):
         _it_needs = not _pg_it_match or _pg_it_match.group(1) != '300'
         _mc_needs = not _pg_mc_match or (_pg_mc_match.group(1).isdigit() and int(_pg_mc_match.group(1)) < 500)
         _st_needs = not _pg_st_match or _pg_st_match.group(1) != '120'
-        _ist_correct = bool(re.search(r'idle_session_timeout=30s', _pg_full))
-        needs_pg_update = has_pg_cmd and (_it_needs or _mc_needs or _st_needs or not _ist_correct)
+        _ist_present = bool(re.search(r'idle_session_timeout=\d+', _pg_full))
+        needs_pg_update = has_pg_cmd and (_it_needs or _mc_needs or _st_needs or _ist_present)
         if not has_pg_cmd:
             patched = []
             for line in lines:
@@ -25502,7 +25502,7 @@ def _ensure_authentik_compose_patches_legacy(compose_path, plog=None):
                     changed = True
                     if plog:
                         _old_mc = _pg_mc_match.group(1) if _pg_mc_match else '?'
-                        plog(f"  ✓ Updated PostgreSQL tuning (max_connections={_old_mc}→500, idle_session_timeout=30s, statement_timeout=120s) [legacy patcher]")
+                        plog(f"  ✓ Updated PostgreSQL tuning (max_connections={_old_mc}→500, removed idle_session_timeout, statement_timeout=120s) [legacy patcher]")
                     break
 
         if not any('ak healthcheck' in l or 'ak", "healthcheck' in l for l in lines):
@@ -25648,14 +25648,11 @@ def _ensure_authentik_compose_patches(compose_path, plog=None):
     services = data.setdefault('services', {})
 
     # ── PostgreSQL command-line tuning ────────────────────────────────────────
-    # v0.9.21: removed idle_session_timeout=300s (too-long interval caused burst CPU spike
-    # when many connections expired simultaneously). Added statement_timeout=120s.
-    # v0.9.21 (rev): re-added idle_session_timeout=30s — shorter interval distributes
-    # expirations evenly; required for server-side cleanup of abandoned async-thread
-    # connections that Django CONN_MAX_AGE never closes (thread pool abandonment pattern).
+    # v0.9.22 hotfix: REMOVE idle_session_timeout after real-world validation showed
+    # it kills django_channels_postgres LISTEN sockets and causes reconnect storms.
+    # Keep statement_timeout=120s and idle_in_transaction_session_timeout=300s.
     _pg_target_cmd = (
         'postgres -c max_connections=500 -c statement_timeout=120s'
-        ' -c idle_session_timeout=30s'
         ' -c idle_in_transaction_session_timeout=300s'
         ' -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
     )
@@ -25670,7 +25667,7 @@ def _ensure_authentik_compose_patches(compose_path, plog=None):
         pg['command'] = _pg_target_cmd
         changed = True
         if plog:
-            plog(f"  ✓ Set PostgreSQL command-line tuning (max_connections=500, statement_timeout=120s, idle_session_timeout=30s)")
+            plog(f"  ✓ Set PostgreSQL command-line tuning (max_connections=500, statement_timeout=120s, no idle_session_timeout)")
 
     # ── Server healthcheck ────────────────────────────────────────────────────
     _target_hc = {
@@ -25773,12 +25770,12 @@ def _apply_authentik_pg_tuning(ak_dir, plog):
         )
         if compose_changed:
             # Command-line args changed — must recreate the container for them to take effect
-            plog("  PostgreSQL tuning args changed — recreating container to apply new settings (statement_timeout=120s, idle_session_timeout=30s)")
+            plog("  PostgreSQL tuning args changed — recreating container to apply new settings (statement_timeout=120s, no idle_session_timeout)")
             subprocess.run(
                 f'cd {ak_dir} && docker compose up -d --force-recreate postgresql 2>&1',
                 shell=True, capture_output=True, text=True, timeout=120
             )
-            plog("  ✓ PostgreSQL recreated with updated tuning (max_connections=500, statement_timeout=120s, idle_session_timeout=30s, idle_in_transaction_session_timeout=300s)")
+            plog("  ✓ PostgreSQL recreated with updated tuning (max_connections=500, statement_timeout=120s, idle_in_transaction_session_timeout=300s)")
         else:
             subprocess.run(
                 f'cd {ak_dir} && docker compose exec -T postgresql psql -U authentik -d authentik -c "SELECT pg_reload_conf();" 2>&1',
@@ -26787,7 +26784,7 @@ def _ensure_embedded_outpost_authentik_host(plog):
         plog(f"  Embedded outpost host check error (non-fatal): {_e}")
 
 
-def _ensure_authentik_proxy_external_hosts_canonical(plog):
+def _ensure_authentik_proxy_external_hosts_canonical(plog, max_attempts=1, retry_delay_s=5):
     """v0.9.21: For each known infra-TAK proxy provider, assert external_host matches
     https://<service-prefix>.<fqdn>.
 
@@ -26805,6 +26802,7 @@ def _ensure_authentik_proxy_external_hosts_canonical(plog):
     import urllib.request as _req
     import urllib.error
     import json as _json
+    import base64 as _b64
 
     try:
         _ak_env = os.path.expanduser('~/authentik/.env')
@@ -26841,59 +26839,179 @@ def _ensure_authentik_proxy_external_hosts_canonical(plog):
             'Content-Type': 'application/json',
         }
 
-        # GET all proxy providers
+        # v0.9.22 follow-up: startup may race Authentik API readiness. Retry the
+        # full canonicalization pass so Update Now converges without operator CLI.
+        # Also persist outcome in settings for support diagnostics.
+        _last_err = ''
+        _fixed_total = 0
+        _final_state = 'no-op'
+        _providers_seen = 0
+        _api_patch_failures_total = 0
+
+        def _apply_via_ak_shell():
+            """Fallback patch path when Authentik REST API is unavailable or PATCH fails.
+            Returns (ok: bool, fixed_count: int, err: str)."""
+            try:
+                _cookie = f'.{base}'
+                _py_lines = [
+                    "from authentik.providers.proxy.models import ProxyProvider",
+                    f"targets = {canonical!r}",
+                    f"cookie = {_cookie!r}",
+                    "fixed = 0",
+                    "for name, want in targets.items():",
+                    "    p = ProxyProvider.objects.filter(name=name).first()",
+                    "    if not p:",
+                    "        print(f'AK-PROXY|{name}|MISSING')",
+                    "        continue",
+                    "    cur = (p.external_host or '').rstrip('/')",
+                    "    want_clean = (want or '').rstrip('/')",
+                    "    cur_cookie = (p.cookie_domain or '')",
+                    "    if cur != want_clean or cur_cookie != cookie:",
+                    "        p.external_host = want_clean + '/'",
+                    "        p.cookie_domain = cookie",
+                    "        p.save(update_fields=['external_host', 'cookie_domain'])",
+                    "        fixed += 1",
+                    "        print(f'AK-PROXY|{name}|FIXED|{cur}|{p.external_host}|{cur_cookie}|{p.cookie_domain}')",
+                    "    else:",
+                    "        print(f'AK-PROXY|{name}|OK|{cur}|{cur_cookie}')",
+                    "print(f'AK-PROXY-SUMMARY|{fixed}')",
+                ]
+                _py = "\n".join(_py_lines) + "\n"
+                _b64_text = _b64.b64encode(_py.encode()).decode()
+                _cmd = f"docker exec authentik-server-1 sh -c 'echo {_b64_text} | base64 -d | ak shell' 2>&1"
+                _r = subprocess.run(_cmd, shell=True, capture_output=True, text=True, timeout=45)
+                _out = ((_r.stdout or '') + (_r.stderr or '')).strip()
+                if _r.returncode != 0 or 'AK-PROXY-SUMMARY|' not in _out:
+                    return False, 0, (_out[:240] or f"ak shell rc={_r.returncode}")
+                _fixed = 0
+                for _line in _out.splitlines():
+                    _line = _line.strip()
+                    if _line.startswith('AK-PROXY-SUMMARY|'):
+                        try:
+                            _fixed = int((_line.split('|', 1)[1] or '0').strip())
+                        except Exception:
+                            _fixed = 0
+                return True, _fixed, ''
+            except Exception as _e_sh:
+                return False, 0, str(_e_sh)[:240]
+
+        for _attempt in range(max(1, int(max_attempts))):
+            if _attempt > 0:
+                try:
+                    plog(f"  proxy external_hosts: retry {_attempt + 1}/{max_attempts} after API warmup delay")
+                except Exception:
+                    pass
+                time.sleep(max(1, int(retry_delay_s)))
+
+            # GET all proxy providers
+            try:
+                _r = _req.Request(f'{_api_url}/api/v3/providers/proxy/?page_size=100', headers=_headers)
+                _providers = _json.loads(_req.urlopen(_r, timeout=15).read().decode()).get('results', [])
+                _providers_seen = len(_providers or [])
+            except Exception as _ge:
+                _last_err = str(_ge)
+                if _attempt >= max(1, int(max_attempts)) - 1:
+                    plog(f"  proxy external_hosts: API unreachable ({_ge}) — skip")
+                    _final_state = 'api-unreachable'
+                    break
+                continue
+
+            _fixed = 0
+            _patch_failures = 0
+            for _prov in _providers:
+                _name = (_prov.get('name') or '').strip()
+                if _name not in canonical:
+                    continue
+                _want = canonical[_name]
+                _pk = _prov.get('pk')
+                if not _pk:
+                    continue
+                # Fetch full provider record (list endpoint omits some required PATCH fields)
+                try:
+                    _full = _json.loads(_req.urlopen(
+                        _req.Request(f'{_api_url}/api/v3/providers/proxy/{_pk}/', headers=_headers), timeout=10
+                    ).read().decode())
+                except Exception as _fe:
+                    plog(f"  proxy external_hosts: failed to fetch provider {_name!r}: {_fe}")
+                    _patch_failures += 1
+                    continue
+                _current = (_full.get('external_host') or '').rstrip('/')
+                _want_clean = _want.rstrip('/')
+                if _current == _want_clean:
+                    continue  # already canonical
+
+                # Derive correct cookie_domain from fqdn
+                _cookie_domain = base
+                _patch = {
+                    'external_host': _want_clean + '/',
+                    'cookie_domain': _cookie_domain,
+                }
+                try:
+                    _req.urlopen(
+                        _req.Request(f'{_api_url}/api/v3/providers/proxy/{_pk}/',
+                                     data=_json.dumps(_patch).encode(), headers=_headers, method='PATCH'),
+                        timeout=10
+                    )
+                    plog(f"  ✓ Proxy external_host fixed: {_name!r}: {_current!r} → {_want_clean + '/'!r}")
+                    _fixed += 1
+                except urllib.error.HTTPError as _pe:
+                    plog(f"  ✗ Proxy external_host PATCH failed for {_name!r}: HTTP {_pe.code}")
+                    _patch_failures += 1
+                except Exception as _pe2:
+                    plog(f"  ✗ Proxy external_host PATCH failed for {_name!r}: {_pe2}")
+                    _patch_failures += 1
+
+            _fixed_total += _fixed
+            _api_patch_failures_total += _patch_failures
+            if _patch_failures == 0:
+                if _fixed == 0:
+                    plog("  proxy external_hosts: all canonical — no-op")
+                    _final_state = 'no-op'
+                else:
+                    plog(f"  proxy external_hosts: fixed {_fixed} provider(s)")
+                    _final_state = 'fixed'
+                break
+            if _attempt >= max(1, int(max_attempts)) - 1:
+                _final_state = 'partial-failure'
+                break
+
+        # v0.9.22 follow-up: if API path couldn't converge, fall back to ak shell so
+        # Update Now can self-heal in-field without manual CLI intervention.
+        _needs_shell_fallback = (
+            _final_state in ('api-unreachable', 'partial-failure') or
+            (_providers_seen == 0 and _fixed_total == 0) or
+            (_api_patch_failures_total > 0)
+        )
+        if _needs_shell_fallback:
+            _ok_sh, _fixed_sh, _err_sh = _apply_via_ak_shell()
+            if _ok_sh:
+                _fixed_total += int(_fixed_sh)
+                if _fixed_sh > 0:
+                    plog(f"  ✓ proxy external_hosts: ak-shell fallback fixed {_fixed_sh} provider(s)")
+                    _final_state = 'fixed-via-ak-shell'
+                elif _final_state in ('api-unreachable', 'partial-failure'):
+                    # Shell path succeeded and found nothing to change.
+                    plog("  proxy external_hosts: ak-shell fallback confirms all canonical")
+                    _final_state = 'no-op'
+            else:
+                plog(f"  ✗ proxy external_hosts: ak-shell fallback failed: {_err_sh}")
+                _last_err = _err_sh or _last_err
+
         try:
-            _r = _req.Request(f'{_api_url}/api/v3/providers/proxy/?page_size=100', headers=_headers)
-            _providers = _json.loads(_req.urlopen(_r, timeout=15).read().decode()).get('results', [])
-        except Exception as _ge:
-            plog(f"  proxy external_hosts: API unreachable ({_ge}) — skip")
-            return
-
-        _fixed = 0
-        for _prov in _providers:
-            _name = (_prov.get('name') or '').strip()
-            if _name not in canonical:
-                continue
-            _want = canonical[_name]
-            _pk = _prov.get('pk')
-            if not _pk:
-                continue
-            # Fetch full provider record (list endpoint omits some required PATCH fields)
-            try:
-                _full = _json.loads(_req.urlopen(
-                    _req.Request(f'{_api_url}/api/v3/providers/proxy/{_pk}/', headers=_headers), timeout=10
-                ).read().decode())
-            except Exception as _fe:
-                plog(f"  proxy external_hosts: failed to fetch provider {_name!r}: {_fe}")
-                continue
-            _current = (_full.get('external_host') or '').rstrip('/')
-            _want_clean = _want.rstrip('/')
-            if _current == _want_clean:
-                continue  # already canonical
-
-            # Derive correct cookie_domain from fqdn
-            _cookie_domain = base
-            _patch = {
-                'external_host': _want_clean + '/',
-                'cookie_domain': _cookie_domain,
-            }
-            try:
-                _req.urlopen(
-                    _req.Request(f'{_api_url}/api/v3/providers/proxy/{_pk}/',
-                                 data=_json.dumps(_patch).encode(), headers=_headers, method='PATCH'),
-                    timeout=10
-                )
-                plog(f"  ✓ Proxy external_host fixed: {_name!r}: {_current!r} → {_want_clean + '/'!r}")
-                _fixed += 1
-            except urllib.error.HTTPError as _pe:
-                plog(f"  ✗ Proxy external_host PATCH failed for {_name!r}: HTTP {_pe.code}")
-            except Exception as _pe2:
-                plog(f"  ✗ Proxy external_host PATCH failed for {_name!r}: {_pe2}")
-
-        if _fixed == 0:
-            plog("  proxy external_hosts: all canonical — no-op")
-        else:
-            plog(f"  proxy external_hosts: fixed {_fixed} provider(s)")
+            _s = load_settings()
+            _cfg = _s.get('authentik_proxy_external_hosts_canonicalization') or {}
+            _cfg['last_check_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+            _cfg['last_outcome'] = _final_state
+            _cfg['fixed_count'] = int(_fixed_total)
+            _cfg['providers_seen'] = int(_providers_seen)
+            if _last_err:
+                _cfg['last_error'] = _last_err[:200]
+            elif 'last_error' in _cfg:
+                del _cfg['last_error']
+            _s['authentik_proxy_external_hosts_canonicalization'] = _cfg
+            save_settings(_s)
+        except Exception:
+            pass
     except Exception as _e:
         plog(f"  Proxy external_hosts check error (non-fatal): {_e}")
 
@@ -27806,15 +27924,16 @@ def _authentik_fix_pg_idle_timeout(plog):
         return False
     current = int(m.group(1))
     # v0.9.20: also check max_connections drift (<500).
-    # v0.9.21: also check statement_timeout=120s absent, and idle_session_timeout=30s present.
+    # v0.9.22 hotfix: also check statement_timeout=120s absent, and ensure
+    # idle_session_timeout is NOT present (LISTEN-socket reconnect storm regression).
     _mc = re.search(r'max_connections=(\d+)', compose_content)
     _mc_current = int(_mc.group(1)) if _mc and _mc.group(1).isdigit() else None
     _mc_drift = _mc_current is not None and _mc_current < 500
     _st = re.search(r'statement_timeout=(\d+)s', compose_content)
     _st_ok = _st and _st.group(1) == '120'
-    _ist_correct = bool(re.search(r'idle_session_timeout=30s', compose_content))
-    if current == 300 and not _mc_drift and _st_ok and _ist_correct:
-        plog("  pg idle timeout: already idle_in_transaction=300s + max_connections=500 + statement_timeout=120s + idle_session_timeout=30s (idempotent — no-op)")
+    _ist_still_present = bool(re.search(r'idle_session_timeout=\d+', compose_content))
+    if current == 300 and not _mc_drift and _st_ok and not _ist_still_present:
+        plog("  pg idle timeout: already idle_in_transaction=300s + max_connections=500 + statement_timeout=120s + no idle_session_timeout (idempotent — no-op)")
         try:
             s = load_settings()
             cfg = s.get('authentik_pg_idle_timeout_fix') or {}
@@ -27835,8 +27954,8 @@ def _authentik_fix_pg_idle_timeout(plog):
         _drift_parts.append(f"max_connections={_mc_current}→500")
     if not _st_ok:
         _drift_parts.append("statement_timeout missing→120s")
-    if not _ist_correct:
-        _drift_parts.append("idle_session_timeout missing→30s (server-side cleanup for abandoned async-thread connections)")
+    if _ist_still_present:
+        _drift_parts.append("removing idle_session_timeout (kills channels LISTEN sockets / causes reconnect storm)")
     plog(f"  pg tuning: drift detected ({', '.join(_drift_parts)}) — applying v0.9.21 target config")
 
     try:
@@ -27906,13 +28025,38 @@ def _authentik_fix_pg_idle_timeout(plog):
             plog(f"  ✗ pg idle timeout: {cn} restart exception: {e}")
             restart_ok = False
 
+    # v0.9.22 follow-up: verify runtime idle_session_timeout after recreate/restart so
+    # operators do not need manual CLI checks.
+    runtime_idle = ''
+    verify_ok = False
+    for _verify_attempt in range(6):
+        time.sleep(5)
+        try:
+            _v = subprocess.run(
+                "docker exec authentik-postgresql-1 psql -U authentik -d authentik -tA -c \"SHOW idle_session_timeout\"",
+                shell=True, capture_output=True, text=True, timeout=12
+            )
+            if _v.returncode == 0:
+                runtime_idle = (_v.stdout or '').strip()
+                if runtime_idle in ('0', '0s'):
+                    verify_ok = True
+                    break
+        except Exception:
+            pass
+    if verify_ok:
+        plog("  ✓ pg idle timeout: runtime verified (SHOW idle_session_timeout=0)")
+    else:
+        _idle_dbg = runtime_idle or 'unknown'
+        plog(f"  ⚠ pg idle timeout: runtime verification did not confirm 0 (SHOW idle_session_timeout={_idle_dbg})")
+
     try:
         s = load_settings()
         cfg = s.get('authentik_pg_idle_timeout_fix') or {}
         cfg['last_check_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
-        cfg['last_outcome'] = 'fixed' if restart_ok else 'fixed-restart-failed'
+        cfg['last_outcome'] = 'fixed' if (restart_ok and verify_ok) else ('fixed-restart-failed' if not restart_ok else 'fixed-verify-failed')
         cfg['last_previous_value'] = f'{current}s'
-        cfg['last_new_value'] = '300s'
+        cfg['last_new_value'] = '300s + no idle_session_timeout'
+        cfg['last_runtime_idle_session_timeout'] = runtime_idle or 'unknown'
         s['authentik_pg_idle_timeout_fix'] = cfg
         save_settings(s)
     except Exception:
@@ -39845,7 +39989,11 @@ def _startup_migrations():
         # v0.9.21: Ensure proxy provider external_hosts are canonical (e.g. nodered.<fqdn>,
         # not taktical.<fqdn>). Closes tak-10 brand-prefix drift and generalizes to all boxes.
         try:
-            _ensure_authentik_proxy_external_hosts_canonical(lambda m: print(f"Startup migration: {m}", flush=True))
+            _ensure_authentik_proxy_external_hosts_canonical(
+                lambda m: print(f"Startup migration: {m}", flush=True),
+                max_attempts=12,
+                retry_delay_s=5
+            )
         except Exception as ak_ph_err:
             print(f"Startup migration: proxy external_hosts canonical check error (non-fatal): {ak_ph_err}")
 
@@ -40170,6 +40318,25 @@ def _post_update_auto_deploy():
                             print(f"Post-update: Authentik reconfigure error: {e}")
                         finally:
                             _auto_deploy_active.pop('authentik', None)
+                        # v0.9.22 follow-up: re-run proxy external_host canonicalization
+                        # after reconfigure, with retries. Startup pass can race API warmup.
+                        try:
+                            _s_ak = load_settings()
+                            _token_ak = (
+                                _get_authentik_env_value(_s_ak, 'AUTHENTIK_BOOTSTRAP_TOKEN') or
+                                _get_authentik_env_value(_s_ak, 'AUTHENTIK_TOKEN')
+                            )
+                            _ak_url = _get_authentik_api_url(_s_ak)
+                            if _token_ak and _ak_url:
+                                _headers_ak = {'Authorization': f'Bearer {_token_ak}', 'Content-Type': 'application/json'}
+                                if _wait_for_authentik_api(_ak_url, _headers_ak, max_attempts=60, plog=lambda m: print(f"Post-update: {m}", flush=True)):
+                                    _ensure_authentik_proxy_external_hosts_canonical(
+                                        lambda m: print(f"Post-update: {m}", flush=True),
+                                        max_attempts=12,
+                                        retry_delay_s=5
+                                    )
+                        except Exception as _akph_e:
+                            print(f"Post-update: proxy external_hosts canonicalization skipped: {_akph_e}")
                         # v0.9.12: self-heal LDAP service account password drift.
                         # The reconfigure flow fixes the LDAP flow + provider but does
                         # NOT re-PATCH the adm_ldapservice user's password to match
