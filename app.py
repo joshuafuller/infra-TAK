@@ -232,10 +232,24 @@ UPLOAD_DIR = os.path.join(BASE_DIR, 'uploads')
 
 
 def _ensure_gunicorn_upgrade(console_dir=None):
-    """Install gunicorn and upgrade systemd service if still using Flask dev server.
+    """Ensure the venv has gunicorn + PyYAML + any other deps required by the
+    post-update boot, and upgrade systemd service if still using Flask dev server.
 
-    Called automatically by the in-app update flow so users clicking
-    'Update Now' get gunicorn without any manual steps.
+    Called automatically by the in-app Update Now flow (`/api/update/apply`)
+    BEFORE the systemctl restart fires, so the venv is in the right shape by
+    the time the new code's `_startup_migrations` runs.
+
+    Deps managed here:
+      - `gunicorn` — added in v0.4.x; some legacy installs still use Flask dev server.
+      - `pyyaml`  — added in v0.9.23 Phase 6. The PgBouncer migration parses
+        and mutates ~/authentik/docker-compose.yml via PyYAML; on field
+        installs whose venv was built before PyYAML was needed
+        (tak-10, May 2026), the migration would skip with
+        "PyYAML not available". Installing it here as part of Update Now
+        means Phase 6 fires cleanly on the very first click.
+
+    Idempotent: `pip install --quiet` is a fast no-op when the package is
+    already satisfied (~1s on a hot pip cache).
     """
     console_dir = console_dir or BASE_DIR
     venv_pip = os.path.join(console_dir, '.venv', 'bin', 'pip')
@@ -245,6 +259,20 @@ def _ensure_gunicorn_upgrade(console_dir=None):
     if not os.path.exists(venv_gunicorn):
         subprocess.run([venv_pip, 'install', '--quiet', 'gunicorn'],
                        capture_output=True, timeout=60)
+
+    # v0.9.23 Phase 6: ensure PyYAML is in the venv before the PgBouncer
+    # migration runs in the post-restart startup chain. `pip show` first
+    # to keep the common-path (already-installed) cost near zero.
+    try:
+        _show = subprocess.run([venv_pip, 'show', 'pyyaml'],
+                               capture_output=True, text=True, timeout=10)
+        if _show.returncode != 0:
+            subprocess.run([venv_pip, 'install', '--quiet',
+                            '--disable-pip-version-check', 'pyyaml'],
+                           capture_output=True, timeout=120)
+    except Exception:
+        pass
+
     svc = '/etc/systemd/system/takwerx-console.service'
     if not os.path.exists(svc) or not os.path.exists(venv_gunicorn):
         return
@@ -335,7 +363,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.22-alpha"
+VERSION = "0.9.23-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -24826,6 +24854,7 @@ entries:
       name: LDAP Service account
       type: service_account
       path: users
+      password: !Context password
   - attrs:
       authentication: none
       denied_action: message_continue
@@ -25001,7 +25030,7 @@ entries:
     image: docker.io/library/postgres:16-alpine
     restart: unless-stopped
     shm_size: 256m
-    command: postgres -c max_connections=500 -c statement_timeout=120s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6
+    command: postgres -c max_connections=500 -c statement_timeout=120s -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
       start_period: 20s
@@ -25468,20 +25497,28 @@ def _ensure_authentik_compose_patches_legacy(compose_path, plog=None):
             lines = f.readlines()
         changed = False
 
-        # v0.9.22 hotfix: keep statement_timeout=120s but REMOVE idle_session_timeout.
-        # Real-world validation on tak-10 showed idle_session_timeout kills
-        # django_channels_postgres LISTEN sockets, causing reconnect storms/CPU spikes.
-        pg_cmd = 'postgres -c max_connections=500 -c statement_timeout=120s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
+        # v0.9.23: bring back idle_session_timeout AT 300s (Christian Elsen's
+        # production-proven value, confirmed by AJ's last-month notes; matches
+        # TAK-NZ/auth-infra-style PG config). The v0.9.22 hotfix removed the
+        # value entirely after v0.9.21's 30s was killing django_channels_postgres
+        # LISTEN sockets and storming reconnects. 300s is conservative enough
+        # that long-LISTEN connections survive (tcp_keepalives_idle=60s emits
+        # protocol-level activity well within the window), but short enough to
+        # reap the leaked async-thread connections that CONN_MAX_AGE never
+        # closes — the actual root cause of the ak-pg-watchdog 5-minute restart
+        # cycle we've been observing on tak-10.
+        pg_cmd = 'postgres -c max_connections=500 -c statement_timeout=120s -c idle_session_timeout=300s -c idle_in_transaction_session_timeout=300s -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
         _pg_full = ''.join(lines)
         has_pg_cmd = bool(re.search(r'command:\s*postgres\b.*max_connections=', _pg_full))
         _pg_it_match = re.search(r'idle_in_transaction_session_timeout=(\d+)s', _pg_full)
         _pg_mc_match = re.search(r'max_connections=(\d+)', _pg_full)
         _pg_st_match = re.search(r'statement_timeout=(\d+)s', _pg_full)
+        _pg_is_match = re.search(r'idle_session_timeout=(\d+)s', _pg_full)
         _it_needs = not _pg_it_match or _pg_it_match.group(1) != '300'
         _mc_needs = not _pg_mc_match or (_pg_mc_match.group(1).isdigit() and int(_pg_mc_match.group(1)) < 500)
         _st_needs = not _pg_st_match or _pg_st_match.group(1) != '120'
-        _ist_present = bool(re.search(r'idle_session_timeout=\d+', _pg_full))
-        needs_pg_update = has_pg_cmd and (_it_needs or _mc_needs or _st_needs or _ist_present)
+        _is_needs = not _pg_is_match or _pg_is_match.group(1) != '300'  # v0.9.23: enforce 300, not absent
+        needs_pg_update = has_pg_cmd and (_it_needs or _mc_needs or _st_needs or _is_needs)
         if not has_pg_cmd:
             patched = []
             for line in lines:
@@ -25502,7 +25539,8 @@ def _ensure_authentik_compose_patches_legacy(compose_path, plog=None):
                     changed = True
                     if plog:
                         _old_mc = _pg_mc_match.group(1) if _pg_mc_match else '?'
-                        plog(f"  ✓ Updated PostgreSQL tuning (max_connections={_old_mc}→500, removed idle_session_timeout, statement_timeout=120s) [legacy patcher]")
+                        _old_is = _pg_is_match.group(1) if _pg_is_match else '(absent)'
+                        plog(f"  ✓ Updated PostgreSQL tuning (max_connections={_old_mc}→500, idle_session_timeout={_old_is}s→300s, statement_timeout=120s) [legacy patcher]")
                     break
 
         if not any('ak healthcheck' in l or 'ak", "healthcheck' in l for l in lines):
@@ -25648,11 +25686,16 @@ def _ensure_authentik_compose_patches(compose_path, plog=None):
     services = data.setdefault('services', {})
 
     # ── PostgreSQL command-line tuning ────────────────────────────────────────
-    # v0.9.22 hotfix: REMOVE idle_session_timeout after real-world validation showed
-    # it kills django_channels_postgres LISTEN sockets and causes reconnect storms.
-    # Keep statement_timeout=120s and idle_in_transaction_session_timeout=300s.
+    # v0.9.23: bring back idle_session_timeout AT 300s. v0.9.21 set it to 30s
+    # which killed django_channels_postgres LISTEN sockets (reconnect storms).
+    # v0.9.22 reverted to "absent" entirely, but absent means async-thread
+    # connections leaked by CONN_MAX_AGE never get reaped server-side, causing
+    # the ak-pg-watchdog to restart authentik-server-1 every ~5 minutes on
+    # tak-10. 300s is Christian Elsen's production value and matches
+    # TAK-NZ/auth-infra; tcp_keepalives_idle=60s keeps LISTEN sockets alive.
     _pg_target_cmd = (
         'postgres -c max_connections=500 -c statement_timeout=120s'
+        ' -c idle_session_timeout=300s'
         ' -c idle_in_transaction_session_timeout=300s'
         ' -c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6'
     )
@@ -25667,7 +25710,7 @@ def _ensure_authentik_compose_patches(compose_path, plog=None):
         pg['command'] = _pg_target_cmd
         changed = True
         if plog:
-            plog(f"  ✓ Set PostgreSQL command-line tuning (max_connections=500, statement_timeout=120s, no idle_session_timeout)")
+            plog(f"  ✓ Set PostgreSQL command-line tuning (max_connections=500, statement_timeout=120s, idle_session_timeout=300s)")
 
     # ── Server healthcheck ────────────────────────────────────────────────────
     _target_hc = {
@@ -25770,7 +25813,7 @@ def _apply_authentik_pg_tuning(ak_dir, plog):
         )
         if compose_changed:
             # Command-line args changed — must recreate the container for them to take effect
-            plog("  PostgreSQL tuning args changed — recreating container to apply new settings (statement_timeout=120s, no idle_session_timeout)")
+            plog("  PostgreSQL tuning args changed — recreating container to apply new settings (statement_timeout=120s, idle_session_timeout=300s)")
             subprocess.run(
                 f'cd {ak_dir} && docker compose up -d --force-recreate postgresql 2>&1',
                 shell=True, capture_output=True, text=True, timeout=120
@@ -26472,21 +26515,47 @@ def _patch_authentik_conn_max_age_60_to_10(plog=None):
     """v0.9.21 migration: lower AUTHENTIK_POSTGRESQL__CONN_MAX_AGE from 60 → 10 on
     installs deployed under v0.9.20.
 
-    Root cause (identified in field analysis of tak-10 and tak-12, May 2026):
+    HISTORICAL NOTE (post-v0.9.23, after Tom Andersen's anchortak analysis):
+      This migration is RETAINED for defense-in-depth but is NOT actually the
+      primary fix for the upstream Authentik 2026.2.x PG connection leak.
+
+      The original v0.9.21 hypothesis was that CONN_MAX_AGE=60 was holding
+      enterprise/license cache-miss connections open for 60s each, and that
+      lowering it to 10 would bound steady-state at ~5 idle connections.
+
+      Tom's May 2026 forensic capture (91-min, 1056 samples, anctakserver2)
+      proved that hypothesis incomplete: the leak is in django_postgres_cache,
+      which has its OWN connection pool that does NOT honor CONN_MAX_AGE.
+      Direct evidence from his data: 79.6% of leaked connections aged >60s
+      and 37.8% aged >5min, despite CONN_MAX_AGE=10 being set. Django's
+      `close_old_connections()` signal fires at request end on the ORM pool
+      only — the cache backend's connections are detached from that lifecycle.
+
+      The actual fix is `AUTHENTIK_WEB__MAX_REQUESTS=1000` (gunicorn worker
+      recycling), which closes ALL of a worker's connections on graceful
+      shutdown including the cache pool's. See
+      `_patch_authentik_web_max_requests_to_1000` and
+      `docs/UPSTREAM-AUTHENTIK-PG-LEAK-20714.md` for the full analysis.
+
+      CONN_MAX_AGE=10 still does useful work on the ORM pool (smaller TCP
+      handshake amortisation), so we keep this migration as belt-and-braces
+      and continue defaulting new installs to 10 in
+      `_ensure_authentik_pg_persistent_connections`. We just don't claim
+      anymore that it stops the cache-pool leak.
+
+    Original v0.9.21 reasoning preserved below for historical context:
+
       Community Authentik has no enterprise license. The Django cache backend
       (django_postgres_cache) stores the enterprise license at cache key
-      'public::1:goauthentik.io/enterprise/license'. Since the key is never written,
-      every gunicorn/daphne worker checks the cache and gets a DB miss on every
-      request. With CONN_MAX_AGE=60, each miss's connection stays idle for 60 s.
-      At ~0.5 new DB connections/second (from worker thread pool growth under
-      async-to-sync dispatch), steady-state idle count = 0.5 × 60 = 30/s → 500 in
-      ~20 min → FATAL: sorry, too many clients.
-
-      At CONN_MAX_AGE=10: steady-state = 0.5 × 10 = 5 connections. Safe.
-
-    _ensure_authentik_pg_persistent_connections now defaults to max_age=10 for new
-    installs, but it's idempotent (won't overwrite an already-set value). This
-    function handles the downgrade migration for existing =60 installs.
+      'public::1:goauthentik.io/enterprise/license'. Since the key is never
+      written, every gunicorn/daphne worker checks the cache and gets a DB
+      miss on every request. With CONN_MAX_AGE=60 (the v0.9.20 default), we
+      assumed each miss's connection stayed idle for 60 s; under that
+      assumption, at ~0.5 new DB connections/second steady-state idle =
+      0.5 × 60 = 30 → exhausts max_connections=500 in ~20 min. Tom's data
+      later showed the cache pool ignores CONN_MAX_AGE entirely and the
+      leak ran regardless — but lowering 60→10 still reduces ORM-pool
+      retention so we keep the migration.
 
     Idempotent: no-ops if CONN_MAX_AGE is absent, already ≤10, or not =60.
     """
@@ -26528,6 +26597,139 @@ def _patch_authentik_conn_max_age_60_to_10(plog=None):
         return True
     except Exception as e:
         plog(f"  ⚠ conn_max_age 60→10 patch error (non-fatal): {e}")
+        return False
+
+
+def _patch_authentik_web_max_requests_to_1000(plog=None):
+    """v0.9.23 migration: re-enable gunicorn worker recycling on installs that
+    deployed under v0.8.7+ with AUTHENTIK_WEB__MAX_REQUESTS=0.
+
+    Reverses the v0.8.7 decision in light of upstream Authentik 2026.2.x
+    regression #20714 (https://github.com/goauthentik/authentik/issues/20714).
+
+    Why this is the right call now:
+
+      v0.8.7 set MAX_REQUESTS=0 to "eliminate periodic LDAP websocket drops"
+      caused by gunicorn workers cycling and breaking the embedded outpost
+      websocket. That was correct at the time — no leak, no watchdog, so
+      worker recycling was pure cost with no benefit.
+
+      Authentik 2026.2 (after the Redis→PostgreSQL migration documented at
+      https://goauthentik.io/blog/2025-11-13-we-removed-redis/) introduced
+      an idle PG connection leak in the enterprise/license cache-miss code
+      path. The leak accumulates inside long-lived gunicorn worker processes
+      at ~0.17 idle conns/sec aggregate (Tom Andersen, anctakserver2,
+      May 15 2026, 91-min × 1056-sample anchortak capture — see
+      docs/UPSTREAM-AUTHENTIK-PG-LEAK-20714.md for the full forensic
+      analysis).
+
+      Important context Tom's analysis surfaced: the leaked connections
+      are NOT in Django's standard ORM pool (which CONN_MAX_AGE governs).
+      They're in the django_postgres_cache backend's pool, which has its
+      own lifecycle and is NOT cleaned up by Django's close_old_connections()
+      signal at request end. CONN_MAX_AGE=10 (our v0.9.21 value) doesn't
+      reach this code path — Tom's data shows 79.6% of idle connections
+      aged >60s, proving the 10-second TTL isn't being honored on the
+      leaking class. Trying CONN_MAX_AGE=0 would not fix this either.
+
+      What DOES fix it: gunicorn's MAX_REQUESTS mechanism. When a worker
+      hits MAX_REQUESTS, gunicorn gracefully shuts it down and forks a
+      replacement. The shutdown closes all the worker's open file
+      descriptors — including the cache-backend's stuck PG connections.
+      Leak resets to zero on every worker recycle. Per-worker, not
+      whole-container.
+
+      Without MAX_REQUESTS: workers never reset → leak grows unbounded →
+      channels_pool_watchdog catches at idle≥150 and restarts the WHOLE
+      authentik-server-1 container every 5-10 min on busy boxes, dropping
+      the LDAP outpost websocket for 10-30s and losing TAK CoT channel
+      state for connected operators in the field.
+
+      With MAX_REQUESTS=1000 + JITTER=50: gunicorn recycles ONE worker
+      gracefully (1-5s) every ~15-30 min on typical traffic. Same LDAP
+      drop class as the watchdog, less frequent, much shorter, and only
+      affects 1/N of the worker pool at a time (others keep serving).
+
+    Upstream-supported pattern per Authentik config docs:
+    https://docs.goauthentik.io/install-config/configuration/#authentik_web__max_requests
+
+    Same env-var migration shape as _patch_authentik_conn_max_age_60_to_10:
+    only runs on existing operator-set values that are KNOWN-BAD (=0).
+    Idempotent: no-op if MAX_REQUESTS is absent (new-install path is handled
+    by _authentik_apply_official_tunings, which now defaults to 1000) or
+    already set to anything other than 0.
+
+    Triggers _recreate_authentik_server_worker on apply so gunicorn picks
+    up the new env. Returns True if any value was changed.
+    """
+    if plog is None:
+        plog = lambda m: None
+    ak_env = os.path.expanduser('~/authentik/.env')
+    if not os.path.exists(ak_env):
+        return False
+    try:
+        with open(ak_env) as _f:
+            env_text = _f.read()
+
+        # Only migrate the legacy v0.8.7 "=0" value. Don't touch operator-set
+        # values (e.g. 500, 2000) — those are intentional.
+        _max_req_zero = bool(re.search(r'^AUTHENTIK_WEB__MAX_REQUESTS=0\s*$',
+                                       env_text, re.MULTILINE))
+        _jitter_zero = bool(re.search(r'^AUTHENTIK_WEB__MAX_REQUESTS_JITTER=0\s*$',
+                                      env_text, re.MULTILINE))
+        if not _max_req_zero and not _jitter_zero:
+            return False  # Either absent (new-install path will handle) or operator-set
+
+        import time as _t
+        backup_path = f'{ak_env}.bak.max-requests-1000.{int(_t.time())}'
+        with open(backup_path, 'w') as _f:
+            _f.write(env_text)
+
+        new_text = env_text
+        _changes = []
+        if _max_req_zero:
+            new_text = re.sub(
+                r'^AUTHENTIK_WEB__MAX_REQUESTS=0\s*$',
+                'AUTHENTIK_WEB__MAX_REQUESTS=1000',
+                new_text, flags=re.MULTILINE
+            )
+            _changes.append("MAX_REQUESTS=0→1000")
+        if _jitter_zero:
+            new_text = re.sub(
+                r'^AUTHENTIK_WEB__MAX_REQUESTS_JITTER=0\s*$',
+                'AUTHENTIK_WEB__MAX_REQUESTS_JITTER=50',
+                new_text, flags=re.MULTILINE
+            )
+            _changes.append("MAX_REQUESTS_JITTER=0→50")
+
+        with open(ak_env, 'w') as _f:
+            _f.write(new_text)
+
+        plog(f"  ✓ max_requests: re-enabled gunicorn worker recycling ({', '.join(_changes)})")
+        plog("    Reason: upstream Authentik 2026.2.x enterprise/license cache-miss leak (#20714)")
+        plog("    Effect: leak now bounded by per-worker request count instead of by watchdog restart")
+        plog(f"    Backup: {os.path.basename(backup_path)}")
+        plog("  max_requests: recreating Authentik server + worker to apply new env vars...")
+        ok = _recreate_authentik_server_worker(plog, reason='max-requests-to-1000')
+        if ok:
+            plog("  ✓ max_requests: server + worker recreated with MAX_REQUESTS=1000")
+            try:
+                _s = load_settings()
+                _s['authentik_max_requests_to_1000_migration'] = {
+                    'ts': int(_t.time()),
+                    'outcome': 'success',
+                    'changes': _changes,
+                    'rationale': 'upstream Authentik 2026.2.x PG connection leak (#20714) mitigation',
+                    'reference_analysis': 'docs/UPSTREAM-AUTHENTIK-PG-LEAK-20714.md',
+                }
+                save_settings(_s)
+            except Exception:
+                pass
+        else:
+            plog("  ⚠ max_requests: recreate reported failure — .env updated but restart manually if needed")
+        return True
+    except Exception as e:
+        plog(f"  ⚠ max_requests v0.9.23 patch error (non-fatal): {e}")
         return False
 
 
@@ -26646,8 +26848,29 @@ def _authentik_apply_official_tunings(plog):
 
     target_settings = [
         ('AUTHENTIK_WEB__WORKERS', '4', '4 web workers (vs default 2)'),
-        ('AUTHENTIK_WEB__MAX_REQUESTS', '0', 'disable gunicorn worker recycling — eliminates periodic LDAP websocket drops'),
-        ('AUTHENTIK_WEB__MAX_REQUESTS_JITTER', '0', 'disable max_requests jitter (pair with MAX_REQUESTS=0)'),
+        # v0.9.23: re-enabled MAX_REQUESTS after upstream Authentik 2026.2.x regression
+        # made it necessary. Background:
+        #   - v0.8.7 set MAX_REQUESTS=0 to eliminate "periodic LDAP websocket drops"
+        #     caused by gunicorn workers cycling and breaking the embedded outpost ws.
+        #     Correct decision at the time (no leak, no watchdog yet).
+        #   - Authentik 2026.2 (after the Redis→Postgres migration) leaks ~0.17
+        #     idle PG conns/sec via the enterprise/license cache-miss code path
+        #     (upstream #20714, confirmed/open, assigned to rissson). The leak
+        #     accumulates inside long-lived gunicorn worker processes.
+        #   - Our channels_pool watchdog catches the leak at idle≥150 and fully
+        #     restarts authentik-server-1 every 5-10 min on busy boxes, which
+        #     drops the LDAP outpost websocket for 10-30s per restart.
+        #   - Enabling MAX_REQUESTS=1000 makes gunicorn recycle ONE worker
+        #     gracefully (1-5s) every ~15-30 min instead of restarting the whole
+        #     container every 5-10 min. Same LDAP drop class, less frequent,
+        #     much shorter, and only one worker at a time (the others keep
+        #     handling traffic). Confirmed via Tom Andersen's anchortak diagnostic
+        #     (anctakserver2, 91-min × 1056-sample run, 2026-05-15):
+        #     docs/UPSTREAM-AUTHENTIK-PG-LEAK-20714.md.
+        #   - Upstream-supported pattern per Authentik config docs:
+        #     https://docs.goauthentik.io/install-config/configuration/#authentik_web__max_requests
+        ('AUTHENTIK_WEB__MAX_REQUESTS', '1000', 'recycle each gunicorn worker every 1000 requests — bounds enterprise/license cache-miss connection accumulation (upstream Authentik #20714 mitigation)'),
+        ('AUTHENTIK_WEB__MAX_REQUESTS_JITTER', '50', 'jitter ±50 so workers do not recycle in lockstep'),
         ('AUTHENTIK_CACHE__TIMEOUT_FLOWS', '600', 'flows cache 600s (vs default 300s) — reduces DB pressure'),
         ('AUTHENTIK_CACHE__TIMEOUT_POLICIES', '600', 'policies cache 600s (vs default 300s) — reduces DB pressure'),
         ('AUTHENTIK_LOG_LEVEL', 'warning', 'log level warning (vs default info) — reduces log overhead'),
@@ -26696,6 +26919,716 @@ def _authentik_apply_official_tunings(plog):
     except Exception:
         pass
 
+    return True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.9.23 Phase 6: PgBouncer connection pooler installation
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Image pin: edoburu/pgbouncer ships a tiny Alpine-based PgBouncer that supports
+# scram-sha-256 auth and auto-generates userlist.txt from DB_USER/DB_PASSWORD
+# env vars. v1.25.1-p0 is the latest stable release as of Dec 2025 — pinning
+# rather than :latest avoids surprise version bumps on `docker compose pull`
+# during Update Now. Image is ~15MB so the pull cost is negligible.
+#
+# Note on tag format: edoburu/pgbouncer used unprefixed `1.22.0-p0` style tags
+# through early 2024, then switched to `v1.23.0-p0` style (with `v` prefix)
+# from July 2024 onward. The `-pN` suffix is the image build (patch level)
+# for that pgbouncer version. Tags MUST be the exact DockerHub tag —
+# `edoburu/pgbouncer:1.25.1` (no `v`, no `-p0`) returns 404. Verified against
+# `https://hub.docker.com/v2/repositories/edoburu/pgbouncer/tags`.
+_AUTHENTIK_PGBOUNCER_IMAGE = 'edoburu/pgbouncer:v1.25.1-p0'
+
+
+def _authentik_pgbouncer_pg_activity_breakdown(timeout_s=6):
+    """Return a robust pg_stat_activity breakdown for the Authentik database.
+
+    Background: the original post-install probe (v0.9.23 Phase 6 first cut)
+    filtered by `application_name='pgbouncer'` to count "via PgBouncer" vs
+    "direct" connections. This was wrong — PgBouncer does NOT set
+    `application_name` by default (it propagates the client's
+    `application_name`, which for Authentik 2026.2.x is empty). As observed
+    on tak-10 (2026-05-15, 16:14 UTC):
+
+        client_addr | application_name | state  | count
+        ------------+------------------+--------+------
+         172.19.0.4 |                  | idle   |     6
+         172.19.0.3 |                  | idle   |     4
+                    | psql             | active |     1
+
+    Both 172.19.0.4 and 172.19.0.3 are container-internal Docker bridge IPs
+    (the second is the worker which keeps a persistent connection too) —
+    they're all going THROUGH pgbouncer. The empty `application_name` made
+    the original probe count zero connections via pgbouncer and warn
+    incorrectly.
+
+    Correct check: look up the pgbouncer container's IP via `docker inspect`,
+    then count rows in pg_stat_activity where client_addr matches. Treat
+    anything else with a non-null client_addr (i.e. another Docker container
+    bypassing pgbouncer) as "direct". Unix-socket / null client_addr is the
+    psql probe itself and is ignored.
+
+    Returns: dict with keys:
+      pgbouncer_ip      — str or None (resolution failed)
+      via_pgbouncer     — int (count of idle+active conns from pgbouncer IP)
+      direct            — int (count from any other non-null client_addr)
+      by_addr           — list of (client_addr, count) tuples, all rows
+      total             — int (sum of via_pgbouncer + direct)
+      error             — str or None
+    """
+    out = {
+        'pgbouncer_ip': None,
+        'via_pgbouncer': 0,
+        'direct': 0,
+        'by_addr': [],
+        'total': 0,
+        'error': None,
+    }
+    try:
+        ip_r = subprocess.run(
+            "docker inspect "
+            "--format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{println}}{{end}}' "
+            "authentik-pgbouncer-1 2>/dev/null",
+            shell=True, capture_output=True, text=True, timeout=5
+        )
+        ips = [ln.strip() for ln in (ip_r.stdout or '').splitlines() if ln.strip()]
+        out['pgbouncer_ip'] = ips[0] if ips else None
+    except Exception as _ie:
+        out['error'] = f'docker inspect failed: {_ie}'
+
+    try:
+        r = subprocess.run(
+            "docker exec authentik-postgresql-1 psql -U authentik -d authentik -tAF, -c "
+            "\"SELECT COALESCE(host(client_addr),''), count(*) FROM pg_stat_activity "
+            "WHERE datname='authentik' AND client_addr IS NOT NULL "
+            "GROUP BY client_addr ORDER BY count(*) DESC;\"",
+            shell=True, capture_output=True, text=True, timeout=timeout_s
+        )
+        if r.returncode != 0:
+            err = ((r.stderr or '') + (r.stdout or ''))[:160].strip()
+            out['error'] = (out['error'] or '') + f' | psql failed: {err}'
+            return out
+        for ln in (r.stdout or '').strip().splitlines():
+            if ',' not in ln:
+                continue
+            addr, cnt_str = ln.rsplit(',', 1)
+            addr = addr.strip()
+            try:
+                cnt = int(cnt_str.strip())
+            except ValueError:
+                continue
+            out['by_addr'].append((addr, cnt))
+            if out['pgbouncer_ip'] and addr == out['pgbouncer_ip']:
+                out['via_pgbouncer'] += cnt
+            else:
+                out['direct'] += cnt
+        out['total'] = out['via_pgbouncer'] + out['direct']
+    except Exception as _e:
+        out['error'] = (out['error'] or '') + f' | probe error: {_e}'
+    return out
+
+# Pool sizing knobs. These are conservative defaults chosen for the typical
+# infra-TAK fleet box (2-4 vCPU, ~50 concurrent ATAK + iTAK + WebTAK + portal
+# users + LDAP outpost binds). Operators can override via .env if needed but
+# the defaults should comfortably absorb 99% of traffic.
+#   - DEFAULT_POOL_SIZE=25: real PG server connections per (db, user) pair.
+#     With Authentik's leak, the previous setting was ~500 (max_connections),
+#     hit by exhaustion every ~30 min on busy boxes. 25 is what
+#     TAK-NZ/auth-infra runs in production on managed RDS (Christian Elsen,
+#     PR #102) and is well below Authentik's natural concurrency.
+#   - MAX_CLIENT_CONN=1000: client-side virtual connection slots. Authentik
+#     workers + outposts can each "hold" idle connections without consuming
+#     real PG server slots — PgBouncer only checks out a server connection
+#     for the duration of each transaction (POOL_MODE=transaction).
+#   - RESERVE_POOL_SIZE=5: extra connections opened when DEFAULT_POOL_SIZE
+#     is saturated AND a client has been waiting >reserve_pool_timeout (5s).
+#     Provides headroom during traffic spikes without permanently inflating
+#     the steady-state connection count.
+#   - SERVER_IDLE_TIMEOUT=300s: PgBouncer-side idle reaper. Matches our
+#     Postgres idle_session_timeout=300s. Real PG connections close after
+#     5 min idle so we don't keep them open longer than the upstream.
+#   - SERVER_RESET_QUERY=DISCARD ALL: clears prepared statements, temp tables,
+#     and session state between checkouts. Required for transaction mode
+#     and recommended by both PgBouncer upstream and Authentik docs.
+_AUTHENTIK_PGBOUNCER_DEFAULT_POOL_SIZE = 25
+_AUTHENTIK_PGBOUNCER_MAX_CLIENT_CONN = 1000
+_AUTHENTIK_PGBOUNCER_RESERVE_POOL_SIZE = 5
+_AUTHENTIK_PGBOUNCER_SERVER_IDLE_TIMEOUT_S = 300
+
+
+def _ensure_authentik_pgbouncer(plog):
+    """v0.9.23 Phase 6: Install PgBouncer between Authentik and Postgres.
+
+    BACKGROUND (Tom Andersen's 2026-05-15 anchortak forensics + observed
+    overnight behavior on tak-10):
+
+    The v0.9.23 stack already lands three mitigations against the upstream
+    Authentik 2026.2.x PostgreSQL connection leak (#20714):
+      1. MAX_REQUESTS=1000 (gunicorn worker recycling)
+      2. MAX_REQUESTS autotune (asymmetric cooldowns, fast tune-down)
+      3. ak-pg-watchdog circuit-breaker at idle≥150
+
+    On tak-10's leak rate (~2.0 conn/sec, 12x Tom's box) the autotune
+    converged to MAX_REQUESTS=100 (the floor) but the watchdog still fired
+    ~4x/hour. Each fire produced a ~30-60s window where TAK Server's user
+    lookups via the LDAP outpost would fail, creating "zombie subscriptions"
+    in TAK Server's DistributedSubscriptionManager (51 zombies observed on
+    Tom's v0.9.22 box: phantom tls:N entries with Last Report 1969-12-31).
+    TAK Server cannot self-heal these — they accumulate until JVM restart.
+
+    THE ARCHITECTURAL FIX (THIS FUNCTION):
+
+    Insert PgBouncer in transaction-pool mode between Authentik and Postgres.
+    PgBouncer maintains a small server-side pool of real PG connections
+    (DEFAULT_POOL_SIZE=25, RESERVE=5 → ~30 real connections steady-state)
+    regardless of how leaky Authentik's client-side psycopg pools become.
+    Authentik workers can "hold" thousands of client-side idle connections
+    but only borrow a real PG connection for the duration of each
+    transaction. Postgres `idle` count in pg_stat_activity drops from
+    ~150-300 (watchdog-firing territory) to ~30 (steady-state).
+
+    DOWNSTREAM EFFECTS:
+      - ak-pg-watchdog will essentially never fire again (defense-in-depth
+        only). The watchdog log goes quiet.
+      - MAX_REQUESTS autotune drifts back up to baseline=1000 over ~15h
+        of stable behavior (asymmetric cooldown: 30min tune-up). We
+        accelerate this by explicitly resetting to baseline on successful
+        install — see end of this function.
+      - LDAP outpost websocket no longer drops in waves of 10-30s every
+        5-10 min. TAK Server user lookups succeed consistently.
+      - Existing 51 zombies on tak-10 require a one-time `docker restart
+        takserver-takserver-1` to clear (TAK Server has no self-heal
+        path for them). Future zombies should not accumulate.
+
+    REFERENCES (consulted before implementing):
+      - https://docs.goauthentik.io/install-config/configuration/#using-a-postgresql-connection-pooler
+        (DISABLE_SERVER_SIDE_CURSORS=true REQUIRED for transaction mode;
+         USE_PGBOUNCER is deprecated)
+      - goauthentik/authentik#14148 + #14149 (April 2025 doc fix:
+        DISABLE_SERVER_SIDE_CURSORS=true, not false, is the correct value)
+      - https://github.com/edoburu/docker-pgbouncer (image we're pinning)
+      - https://github.com/TAK-NZ/auth-infra/pull/102 (Christian Elsen,
+        TAK-NZ running PgBouncer with Authentik 2026.2.0 on managed RDS)
+      - https://github.com/pounde/FastTAK/issues/31 (Erick Pound,
+        diagnosing this same class of leak in FastTAK)
+      - docs/UPSTREAM-AUTHENTIK-PG-LEAK-20714.md (Tom's full writeup)
+
+    IMPLEMENTATION CONTRACT:
+      - Idempotent: if `pgbouncer` service already exists in compose AND
+        `AUTHENTIK_POSTGRESQL__HOST=pgbouncer` in .env, no-op.
+      - Atomic: backs up compose + .env to .bak.before-pgbouncer.<ts>
+        BEFORE any mutation. On any failure (compose write, pgbouncer
+        won't start, server+worker recreate fails, post-install probe
+        fails) the function restores both files and returns None.
+      - Skips installations where AUTHENTIK_POSTGRESQL__HOST is set to a
+        non-default value (e.g. external managed PG) — we only patch the
+        bundled in-compose Postgres path.
+      - Records outcome to settings.authentik_pgbouncer for operator audit.
+
+    Returns:
+      True  — installed (compose + .env modified, pgbouncer running,
+              server+worker recreated, post-install probe passed)
+      False — already installed, OR ~/authentik not present (no-op)
+      None  — failed (logged via plog, files rolled back where possible)
+    """
+    ak_dir = os.path.expanduser('~/authentik')
+    compose_path = os.path.join(ak_dir, 'docker-compose.yml')
+    env_path = os.path.join(ak_dir, '.env')
+
+    if not os.path.exists(compose_path) or not os.path.exists(env_path):
+        plog("  pgbouncer install: ~/authentik not installed — skip")
+        return False
+
+    # PyYAML bootstrap. On tak-10 (May 2026) the takwerx-console venv was
+    # missing PyYAML — `_ensure_authentik_compose_patches` falls back to a
+    # legacy text patcher in that case, but adding a whole new compose
+    # service via text-mangling is too fragile, so we install PyYAML on
+    # the fly. One-time cost (~3s for a ~280KB wheel). Locate the venv
+    # pip via BASE_DIR — matches the existing `_ensure_gunicorn_upgrade`
+    # pattern and avoids needing `sys` at module scope (it isn't).
+    try:
+        import yaml as _yaml
+    except ImportError:
+        plog("  pgbouncer install: PyYAML missing from venv — installing now (one-time bootstrap)")
+        _venv_pip = os.path.join(BASE_DIR, '.venv', 'bin', 'pip')
+        if not os.path.exists(_venv_pip):
+            plog(f"  ✗ pgbouncer install: venv pip not found at {_venv_pip} — manual investigation required")
+            return None
+        try:
+            _pip_r = subprocess.run(
+                [_venv_pip, 'install', '--quiet', '--disable-pip-version-check', 'pyyaml'],
+                capture_output=True, text=True, timeout=180
+            )
+            if _pip_r.returncode != 0:
+                _err = ((_pip_r.stderr or '') + (_pip_r.stdout or ''))[:300]
+                plog(f"  ✗ pgbouncer install: `pip install pyyaml` failed (rc={_pip_r.returncode}): {_err}")
+                plog(f"  ✗ pgbouncer install: install manually with `sudo -u takwerx {_venv_pip} install pyyaml` and restart takwerx-console")
+                return None
+            import yaml as _yaml
+            plog(f"  ✓ pgbouncer install: PyYAML {getattr(_yaml, '__version__', '?')} installed + imported")
+        except ImportError:
+            plog("  ✗ pgbouncer install: PyYAML still unimportable after pip install — manual investigation required")
+            return None
+        except Exception as _be:
+            plog(f"  ✗ pgbouncer install: PyYAML bootstrap error: {_be}")
+            return None
+
+    try:
+        with open(compose_path, 'r') as f:
+            raw_compose = f.read()
+        data = _yaml.safe_load(raw_compose)
+        if not isinstance(data, dict):
+            plog("  pgbouncer install: compose did not parse as a dict — skip")
+            return None
+    except _yaml.YAMLError as e:
+        plog(f"  pgbouncer install: compose is not valid YAML ({str(e)[:80]}) — skip")
+        return None
+    except Exception as e:
+        plog(f"  pgbouncer install: compose read error: {e}")
+        return None
+
+    services = data.get('services') or {}
+    if 'postgresql' not in services:
+        plog("  pgbouncer install: compose has no `postgresql` service — skip (likely external PG, not our scenario)")
+        return False
+
+    try:
+        with open(env_path) as f:
+            env_content = f.read()
+    except Exception as e:
+        plog(f"  pgbouncer install: .env read error: {e}")
+        return None
+
+    env_lines = env_content.splitlines()
+    current_host = None
+    for ln in env_lines:
+        m = re.match(r'^\s*AUTHENTIK_POSTGRESQL__HOST\s*=\s*(.+?)\s*$', ln)
+        if m:
+            current_host = m.group(1).strip().strip('"').strip("'")
+            break
+
+    pgbouncer_in_compose = 'pgbouncer' in services
+    pgbouncer_in_env = (current_host == 'pgbouncer')
+
+    def _read_svc_pg_host(svc_dict):
+        """Return services.<svc>.environment.AUTHENTIK_POSTGRESQL__HOST as a string,
+        or None if absent/unsettable. Handles both dict and list forms of `environment:`.
+        """
+        if not isinstance(svc_dict, dict):
+            return None
+        env = svc_dict.get('environment')
+        if isinstance(env, dict):
+            v = env.get('AUTHENTIK_POSTGRESQL__HOST')
+            return None if v is None else str(v).strip().strip('"').strip("'")
+        if isinstance(env, list):
+            for item in env:
+                if isinstance(item, str) and item.startswith('AUTHENTIK_POSTGRESQL__HOST='):
+                    return item.split('=', 1)[1].strip().strip('"').strip("'")
+        return None
+
+    server_compose_host = _read_svc_pg_host(services.get('server'))
+    worker_compose_host = _read_svc_pg_host(services.get('worker'))
+    compose_env_wired = (server_compose_host == 'pgbouncer' and worker_compose_host == 'pgbouncer')
+
+    # v2.2 (2026-05-15 PM): the v1 install was silently incomplete. The Authentik
+    # compose template hardcodes `AUTHENTIK_POSTGRESQL__HOST: postgresql` in
+    # `services.{server,worker}.environment` — and per Docker Compose semantics
+    # `environment:` takes PRECEDENCE over `env_file:`. So rewriting `.env`
+    # alone (which the v1 install did) is overridden every time those containers
+    # are (re)created. Field-observed on tak-10 2026-05-15 PM: `.env` correctly
+    # said `pgbouncer`, but live `docker exec authentik-server-1 env` showed
+    # `postgresql`, and pg_stat_activity confirmed 15 direct conns + 0 via
+    # PgBouncer. The fix: also patch services.{server,worker}.environment.
+    if pgbouncer_in_compose and pgbouncer_in_env and compose_env_wired:
+        plog("  pgbouncer install: already installed (compose + .env + "
+             "server/worker compose env all wired to pgbouncer) — idempotent no-op")
+        return False
+    if pgbouncer_in_compose and pgbouncer_in_env and not compose_env_wired:
+        plog(f"  pgbouncer install: PARTIAL INSTALL DETECTED (v0.9.23-alpha v1 bug). "
+             f"pgbouncer container is present and .env is wired, but "
+             f"services.server.environment.AUTHENTIK_POSTGRESQL__HOST={server_compose_host!r} "
+             f"and services.worker.environment.AUTHENTIK_POSTGRESQL__HOST={worker_compose_host!r} "
+             f"(both should be 'pgbouncer'). Compose `environment:` overrides `env_file:` per "
+             f"Docker Compose semantics — Authentik is bypassing PgBouncer. Applying v2.2 "
+             f"compose env fixup + force-recreate now.")
+
+    if current_host is not None and current_host not in ('', 'postgresql', 'pgbouncer', 'authentik-postgresql-1'):
+        plog(f"  pgbouncer install: AUTHENTIK_POSTGRESQL__HOST={current_host!r} is operator-customized "
+             "(likely external PG) — skipping to avoid clobbering operator config")
+        return False
+    if server_compose_host is not None and server_compose_host not in ('', 'postgresql', 'pgbouncer', 'authentik-postgresql-1'):
+        plog(f"  pgbouncer install: services.server.environment.AUTHENTIK_POSTGRESQL__HOST="
+             f"{server_compose_host!r} is operator-customized — skipping to avoid clobbering")
+        return False
+
+    ts = datetime.utcnow().strftime('%Y%m%d-%H%M%S')
+    compose_bak = f"{compose_path}.bak.before-pgbouncer.{ts}"
+    env_bak = f"{env_path}.bak.before-pgbouncer.{ts}"
+    try:
+        with open(compose_bak, 'w') as f:
+            f.write(raw_compose)
+        with open(env_bak, 'w') as f:
+            f.write(env_content)
+        plog(f"  pgbouncer install: backups written ({compose_bak}, {env_bak})")
+    except Exception as e:
+        plog(f"  pgbouncer install: backup error (aborting before any mutation): {e}")
+        return None
+
+    services_root = data.setdefault('services', {})
+    if 'pgbouncer' not in services_root:
+        services_root['pgbouncer'] = {
+            'image': _AUTHENTIK_PGBOUNCER_IMAGE,
+            'restart': 'unless-stopped',
+            'depends_on': {
+                'postgresql': {'condition': 'service_healthy'},
+            },
+            'environment': {
+                'DB_USER': '${PG_USER:-authentik}',
+                'DB_PASSWORD': '${PG_PASS}',
+                'DB_HOST': 'postgresql',
+                'DB_NAME': '${PG_DB:-authentik}',
+                'AUTH_TYPE': 'scram-sha-256',
+                'POOL_MODE': 'transaction',
+                'ADMIN_USERS': '${PG_USER:-authentik}',
+                'MAX_CLIENT_CONN': _AUTHENTIK_PGBOUNCER_MAX_CLIENT_CONN,
+                'DEFAULT_POOL_SIZE': _AUTHENTIK_PGBOUNCER_DEFAULT_POOL_SIZE,
+                'RESERVE_POOL_SIZE': _AUTHENTIK_PGBOUNCER_RESERVE_POOL_SIZE,
+                'SERVER_RESET_QUERY': 'DISCARD ALL',
+                'SERVER_IDLE_TIMEOUT': _AUTHENTIK_PGBOUNCER_SERVER_IDLE_TIMEOUT_S,
+            },
+            'healthcheck': {
+                'test': ['CMD', 'pg_isready', '-h', 'localhost', '-p', '5432'],
+                'interval': '30s',
+                'timeout': '5s',
+                'retries': 5,
+                'start_period': '20s',
+            },
+        }
+        plog("  pgbouncer install: added `pgbouncer` service to docker-compose.yml "
+             f"(image={_AUTHENTIK_PGBOUNCER_IMAGE}, pool=transaction, "
+             f"default_pool_size={_AUTHENTIK_PGBOUNCER_DEFAULT_POOL_SIZE})")
+
+    for svc_name in ('server', 'worker'):
+        svc = services_root.get(svc_name)
+        if not isinstance(svc, dict):
+            continue
+        dep = svc.get('depends_on')
+        if isinstance(dep, dict):
+            if 'pgbouncer' not in dep:
+                dep['pgbouncer'] = {'condition': 'service_healthy'}
+                plog(f"  pgbouncer install: added pgbouncer to {svc_name}.depends_on")
+        elif isinstance(dep, list):
+            if 'pgbouncer' not in dep:
+                dep.append('pgbouncer')
+                plog(f"  pgbouncer install: added pgbouncer to {svc_name}.depends_on (list form)")
+        else:
+            svc['depends_on'] = {'pgbouncer': {'condition': 'service_healthy'}}
+            plog(f"  pgbouncer install: created {svc_name}.depends_on with pgbouncer")
+
+        # v2.2 fix: also rewrite services.{server,worker}.environment.AUTHENTIK_POSTGRESQL__HOST
+        # from 'postgresql' → 'pgbouncer'. The compose template hardcodes this in
+        # `environment:` which takes PRECEDENCE over `env_file:` — so rewriting .env
+        # alone is silently ignored. See idempotency gate comment above for the full
+        # forensic trace. This change is what makes the install actually take effect.
+        env = svc.setdefault('environment', {})
+        if isinstance(env, dict):
+            prev = env.get('AUTHENTIK_POSTGRESQL__HOST')
+            if prev != 'pgbouncer':
+                env['AUTHENTIK_POSTGRESQL__HOST'] = 'pgbouncer'
+                plog(f"  pgbouncer install: patched {svc_name}.environment."
+                     f"AUTHENTIK_POSTGRESQL__HOST {prev!r} → 'pgbouncer'")
+        elif isinstance(env, list):
+            new_env_list = []
+            replaced = False
+            for item in env:
+                if isinstance(item, str) and item.startswith('AUTHENTIK_POSTGRESQL__HOST='):
+                    new_env_list.append('AUTHENTIK_POSTGRESQL__HOST=pgbouncer')
+                    replaced = True
+                else:
+                    new_env_list.append(item)
+            if not replaced:
+                new_env_list.append('AUTHENTIK_POSTGRESQL__HOST=pgbouncer')
+            svc['environment'] = new_env_list
+            plog(f"  pgbouncer install: patched {svc_name}.environment (list form) "
+                 f"AUTHENTIK_POSTGRESQL__HOST → 'pgbouncer'")
+
+    try:
+        with open(compose_path, 'w') as f:
+            _yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False, allow_unicode=True, width=200)
+    except Exception as e:
+        plog(f"  ✗ pgbouncer install: compose write error (rolling back): {e}")
+        try:
+            with open(compose_path, 'w') as f:
+                f.write(raw_compose)
+        except Exception:
+            pass
+        return None
+
+    targets = [
+        ('AUTHENTIK_POSTGRESQL__HOST', 'pgbouncer',
+         'route Authentik PG traffic through PgBouncer'),
+        ('AUTHENTIK_POSTGRESQL__PORT', '5432',
+         'PgBouncer listens on standard PG port'),
+        ('AUTHENTIK_POSTGRESQL__DISABLE_SERVER_SIDE_CURSORS', 'true',
+         'REQUIRED for PgBouncer transaction-pool mode — '
+         'server-side cursors maintain state across queries which '
+         'transaction-mode pooling breaks (Django/Authentik would throw '
+         'query_wait_timeout otherwise). See Authentik docs.'),
+        ('AUTHENTIK_POSTGRESQL__CONN_HEALTH_CHECKS', 'true',
+         'Django connection health check before reuse — recovers cleanly '
+         'when PgBouncer recycles a backend on the upstream side'),
+        ('AUTHENTIK_POSTGRESQL__CONN_MAX_AGE', '0',
+         'close-after-each-request on the client side; PgBouncer handles '
+         'real PG persistence'),
+    ]
+
+    new_env_lines = []
+    seen_keys = set()
+    for ln in env_lines:
+        replaced = False
+        for k, v, _desc in targets:
+            if re.match(rf'^\s*{re.escape(k)}\s*=', ln):
+                new_env_lines.append(f'{k}={v}')
+                seen_keys.add(k)
+                replaced = True
+                break
+        if not replaced:
+            new_env_lines.append(ln)
+
+    if new_env_lines and new_env_lines[-1].strip():
+        new_env_lines.append('')
+    if not any(ln.startswith('# ── v0.9.23 PgBouncer pooler') for ln in new_env_lines):
+        new_env_lines.append('# ── v0.9.23 PgBouncer pooler ─────────────────────────────────────────')
+        new_env_lines.append('# Authentik now connects to PgBouncer (transaction pool mode) instead of')
+        new_env_lines.append('# Postgres directly. PgBouncer caps real PG server connections at ~30')
+        new_env_lines.append('# (DEFAULT_POOL_SIZE=25 + RESERVE_POOL_SIZE=5) regardless of upstream')
+        new_env_lines.append('# Authentik 2026.2.x cache-pool leaks. This eliminates the')
+        new_env_lines.append('# ak-pg-watchdog firefighting class and the downstream TAK Server')
+        new_env_lines.append('# "User lookup failed" / phantom-subscription class.')
+        new_env_lines.append('#')
+        new_env_lines.append('# Upstream guidance:')
+        new_env_lines.append('#   docs.goauthentik.io/install-config/configuration/#using-a-postgresql-connection-pooler')
+        new_env_lines.append('#')
+        new_env_lines.append('# DO NOT change AUTHENTIK_POSTGRESQL__HOST unless you also remove the')
+        new_env_lines.append('# pgbouncer service from docker-compose.yml — Authentik will fail to')
+        new_env_lines.append('# resolve the host otherwise.')
+        new_env_lines.append('# ─────────────────────────────────────────────────────────────────────')
+    for k, v, _desc in targets:
+        if k not in seen_keys:
+            new_env_lines.append(f'{k}={v}')
+
+    new_env_content = '\n'.join(new_env_lines).rstrip('\n') + '\n'
+
+    try:
+        with open(env_path, 'w') as f:
+            f.write(new_env_content)
+        plog("  pgbouncer install: .env updated (5 keys: HOST→pgbouncer, PORT, "
+             "DISABLE_SERVER_SIDE_CURSORS=true, CONN_HEALTH_CHECKS=true, CONN_MAX_AGE=0)")
+    except Exception as e:
+        plog(f"  ✗ pgbouncer install: .env write error (rolling back compose + .env): {e}")
+        try:
+            with open(compose_path, 'w') as f:
+                f.write(raw_compose)
+            with open(env_path, 'w') as f:
+                f.write(env_content)
+        except Exception:
+            pass
+        return None
+
+    def _dump_proc_output(label, proc):
+        """Helper: log up to 30 lines of stdout+stderr from a failed subprocess."""
+        _so = (proc.stdout or '').strip()
+        _se = (proc.stderr or '').strip()
+        plog(f"  ✗ pgbouncer install: {label} (rc={proc.returncode})")
+        if _so:
+            plog(f"  ✗ pgbouncer install: --- stdout ({len(_so)} chars) ---")
+            for _ln in _so.splitlines()[-20:]:
+                plog(f"  ✗   {_ln}")
+        if _se:
+            plog(f"  ✗ pgbouncer install: --- stderr ({len(_se)} chars) ---")
+            for _ln in _se.splitlines()[-20:]:
+                plog(f"  ✗   {_ln}")
+        if not _so and not _se:
+            plog("  ✗ pgbouncer install: (subprocess produced no output)")
+
+    def _rollback_compose_env(reason):
+        plog(f"  pgbouncer install: rolling back compose + .env ({reason}), leaving Authentik on direct PG")
+        try:
+            with open(compose_path, 'w') as f:
+                f.write(raw_compose)
+            with open(env_path, 'w') as f:
+                f.write(env_content)
+            subprocess.run(
+                f'cd {ak_dir} && docker compose rm -sf pgbouncer 2>&1',
+                shell=True, capture_output=True, text=True, timeout=60
+            )
+        except Exception:
+            pass
+
+    # Pull the image FIRST as a separate step. This makes the failure mode
+    # diagnosable: pull issues (DockerHub rate limits, slow network, bad image
+    # tag) get distinct errors from container-start issues (compose YAML
+    # errors, depends_on chain breaks, port conflicts). Without this split,
+    # `docker compose up -d pgbouncer` returns non-zero in ~1s on certain
+    # docker compose versions while only printing "Image edoburu/pgbouncer:v1.25.1-p0 Pulling"
+    # to stdout — the actual error gets buried (tak-10, May 2026).
+    # Note: stderr captured SEPARATELY (no shell-level 2>&1) so failure diagnosis
+    # can show both streams distinctly.
+    plog(f"  pgbouncer install: pulling {_AUTHENTIK_PGBOUNCER_IMAGE} (may take ~60s on first run)...")
+    _pull_r = subprocess.run(
+        ['docker', 'compose', 'pull', 'pgbouncer'],
+        cwd=ak_dir, capture_output=True, text=True, timeout=300
+    )
+    if _pull_r.returncode != 0:
+        _dump_proc_output(f"`docker compose pull pgbouncer` failed", _pull_r)
+        _rollback_compose_env('pull-failed')
+        return None
+    plog(f"  ✓ pgbouncer install: image pulled")
+
+    plog("  pgbouncer install: starting pgbouncer container...")
+    r = subprocess.run(
+        ['docker', 'compose', 'up', '-d', '--no-deps', 'pgbouncer'],
+        cwd=ak_dir, capture_output=True, text=True, timeout=180
+    )
+    if r.returncode != 0:
+        _dump_proc_output("`docker compose up -d pgbouncer` failed", r)
+        _rollback_compose_env('up-failed')
+        return None
+
+    pgbouncer_healthy = False
+    for _ in range(24):
+        time.sleep(5)
+        h = subprocess.run(
+            "docker inspect --format '{{.State.Health.Status}}' authentik-pgbouncer-1 2>/dev/null",
+            shell=True, capture_output=True, text=True, timeout=5
+        )
+        status = (h.stdout or '').strip()
+        if status == 'healthy':
+            pgbouncer_healthy = True
+            plog("  ✓ pgbouncer container healthy")
+            break
+    if not pgbouncer_healthy:
+        plog("  ⚠ pgbouncer install: container did not reach healthy within 120s — continuing anyway "
+             "(may stabilize once server+worker reconnect)")
+
+    ok = _recreate_authentik_server_worker(plog, reason='pgbouncer-install')
+    if not ok:
+        plog("  ✗ pgbouncer install: server+worker recreate failed — Authentik may be in a degraded state")
+        plog("  pgbouncer install: NOT rolling back .env+compose automatically — manual diagnosis required")
+        plog(f"  pgbouncer install: backups are at {compose_bak} and {env_bak}")
+        try:
+            s = load_settings()
+            cfg = s.get('authentik_pgbouncer') or {}
+            cfg['installed'] = False
+            cfg['last_attempt_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+            cfg['last_outcome'] = 'recreate-failed'
+            cfg['version'] = VERSION
+            s['authentik_pgbouncer'] = cfg
+            save_settings(s)
+        except Exception:
+            pass
+        return None
+
+    time.sleep(15)
+
+    # Use the robust client_addr-based probe. PgBouncer doesn't set
+    # application_name by default (the field-observed bug on tak-10's
+    # first install — see _authentik_pgbouncer_pg_activity_breakdown
+    # docstring for the forensic trace).
+    _probe = _authentik_pgbouncer_pg_activity_breakdown(timeout_s=10)
+    via_bouncer = _probe['via_pgbouncer']
+    direct = _probe['direct']
+    pgb_ip = _probe['pgbouncer_ip']
+    if _probe.get('error'):
+        plog(f"  pgbouncer install: post-install probe partial: {_probe['error']}")
+
+    plog(f"  pgbouncer install: pg_stat_activity → via_pgbouncer={via_bouncer} "
+         f"(from {pgb_ip or 'unknown-ip'}), direct={direct}")
+    if _probe.get('by_addr'):
+        for _addr, _cnt in _probe['by_addr']:
+            _tag = '←pgbouncer' if pgb_ip and _addr == pgb_ip else ''
+            plog(f"  pgbouncer install:   client_addr={_addr or '(null)'}: {_cnt} {_tag}")
+
+    post_install_outcome = 'ok'
+    if pgb_ip is None:
+        plog("  ⚠ pgbouncer install: could not resolve pgbouncer container IP via docker "
+             "inspect — probe degraded but install otherwise succeeded.")
+        post_install_outcome = 'probe-degraded'
+    elif via_bouncer == 0 and direct == 0:
+        plog("  ⚠ pgbouncer install: pg_stat_activity shows 0 connections — Authentik may "
+             "still be initializing. Re-check in 60s with: docker exec authentik-postgresql-1 "
+             "psql -U authentik -d authentik -c \"SELECT client_addr, count(*) FROM "
+             "pg_stat_activity WHERE datname='authentik' GROUP BY 1;\"")
+        post_install_outcome = 'probe-too-early'
+    elif via_bouncer == 0 and direct > 0:
+        # v2.2: this is the silent-broken state the v1 install left tak-10 in.
+        # We log it as ✗ now (was ⚠) and record `last_outcome=bypassed` so the
+        # dashboard surfaces it and the next migration retry will detect+fix.
+        plog(f"  ✗ pgbouncer install: BYPASSED — {direct} conn(s) going direct to postgresql, "
+             f"0 via PgBouncer ({pgb_ip}). Most likely cause: compose `environment:` block "
+             f"overrides `.env` for AUTHENTIK_POSTGRESQL__HOST.")
+        plog("  ✗ pgbouncer install: Inspect with: "
+             "docker exec authentik-server-1 env | grep AUTHENTIK_POSTGRESQL__HOST")
+        plog("  ✗ pgbouncer install: If that shows 'postgresql' instead of 'pgbouncer', "
+             "the v2.2 compose env patch did not take effect — try `cd ~/authentik && "
+             "docker compose up -d --force-recreate --no-deps server worker` and re-probe.")
+        post_install_outcome = 'bypassed'
+
+    try:
+        try:
+            with open(env_path) as f:
+                _cur = f.read()
+            _new = []
+            for ln in _cur.splitlines():
+                if re.match(r'^\s*AUTHENTIK_WEB__MAX_REQUESTS\s*=', ln):
+                    _new.append('AUTHENTIK_WEB__MAX_REQUESTS=1000')
+                elif re.match(r'^\s*AUTHENTIK_WEB__MAX_REQUESTS_JITTER\s*=', ln):
+                    _new.append('AUTHENTIK_WEB__MAX_REQUESTS_JITTER=50')
+                else:
+                    _new.append(ln)
+            with open(env_path, 'w') as f:
+                f.write('\n'.join(_new).rstrip('\n') + '\n')
+            plog("  pgbouncer install: reset MAX_REQUESTS to baseline=1000, JITTER=50 "
+                 "(autotune floor=100 is no longer load-bearing with PgBouncer in place)")
+        except Exception as _re:
+            plog(f"  pgbouncer install: MAX_REQUESTS reset skipped: {_re}")
+
+        s = load_settings()
+        s['authentik_max_requests_last_tune_ts'] = int(time.time())
+        s['authentik_max_requests_fire_history'] = []
+        save_settings(s)
+    except Exception:
+        pass
+
+    try:
+        s = load_settings()
+        cfg = s.get('authentik_pgbouncer') or {}
+        cfg['installed'] = True
+        cfg['installed_at_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+        cfg['version'] = VERSION
+        cfg['image'] = _AUTHENTIK_PGBOUNCER_IMAGE
+        cfg['pool_mode'] = 'transaction'
+        cfg['default_pool_size'] = _AUTHENTIK_PGBOUNCER_DEFAULT_POOL_SIZE
+        cfg['reserve_pool_size'] = _AUTHENTIK_PGBOUNCER_RESERVE_POOL_SIZE
+        cfg['max_client_conn'] = _AUTHENTIK_PGBOUNCER_MAX_CLIENT_CONN
+        cfg['server_idle_timeout_s'] = _AUTHENTIK_PGBOUNCER_SERVER_IDLE_TIMEOUT_S
+        cfg['compose_backup'] = compose_bak
+        cfg['env_backup'] = env_bak
+        cfg['last_outcome'] = post_install_outcome
+        cfg['post_install_via_pgbouncer'] = via_bouncer
+        cfg['post_install_direct'] = direct
+        cfg['post_install_pgbouncer_ip'] = pgb_ip
+        s['authentik_pgbouncer'] = cfg
+        save_settings(s)
+    except Exception:
+        pass
+
+    if post_install_outcome == 'bypassed':
+        plog("  ✗ pgbouncer install: completed with BYPASSED state — see logs above for fix steps")
+    else:
+        plog("  ✓ pgbouncer install: COMPLETE — Authentik now connects through PgBouncer "
+             "(transaction pool, ≤30 real PG conns)")
     return True
 
 
@@ -27019,27 +27952,401 @@ def _ensure_authentik_proxy_external_hosts_canonical(plog, max_attempts=1, retry
 _channels_watchdog_started = False
 
 
+# ---------------------------------------------------------------------------
+# v0.9.23: MAX_REQUESTS auto-tune
+# ---------------------------------------------------------------------------
+# Self-tuning of AUTHENTIK_WEB__MAX_REQUESTS based on observed watchdog
+# behaviour. Different boxes have wildly different traffic profiles and the
+# leak rate (which scales with request volume) varies 2-3x between them
+# (Tom's anctakserver2: 0.17 conn/sec; tak-10: 0.37 conn/sec). One static
+# default cannot satisfy both ends of the fleet:
+#
+#   - Too HIGH (e.g. 1000) on busy boxes → workers don't recycle fast enough
+#     to flush the leak before idle hits 150 → watchdog fires → LDAP drops.
+#   - Too LOW (e.g. 100) on idle boxes → workers churn unnecessarily →
+#     more frequent LDAP outpost websocket reconnects for no benefit.
+#
+# Auto-tune watches `ak-pg-watchdog` fire events and adjusts MAX_REQUESTS
+# automatically:
+#
+#   - On fire: halve MAX_REQUESTS (toward floor of 100). More aggressive
+#     worker recycling on this box.
+#   - After 6 hours with no fire AND we're below ceiling: nudge up 25%.
+#     Slowly returns to a less-churny value as load drops or upstream fixes
+#     the leak.
+#
+# Rate-limited at 1 change per 30 min so we don't oscillate on transient
+# load spikes. Operator can disable via settings.authentik_max_requests_autotune_disabled.
+#
+# References:
+#   - docs/UPSTREAM-AUTHENTIK-PG-LEAK-20714.md
+#   - https://github.com/goauthentik/authentik/issues/20714
+
+_AUTHENTIK_MAX_REQUESTS_FLOOR_DEFAULT = 100
+_AUTHENTIK_MAX_REQUESTS_CEILING_DEFAULT = 2000
+# Asymmetric cooldowns: converge FAST under fire (every watchdog tick can tune
+# down), and slowly back UP after a long no-fire window. Tak-10 dev box
+# (May 2026) showed the original symmetric 30-min cooldown was too slow to
+# converge — we'd eat 5-10 watchdog fires in one cooldown window while the
+# leak rate doubled what Tom's box measured. Pattern preferred everywhere:
+# escalate-fast-deescalate-slow.
+_AUTHENTIK_MAX_REQUESTS_TUNE_DOWN_COOLDOWN_S = 120   # 2 min — fast convergence under fire
+_AUTHENTIK_MAX_REQUESTS_TUNE_UP_COOLDOWN_S = 1800    # 30 min — avoid oscillation on quiet → noisy transitions
+_AUTHENTIK_MAX_REQUESTS_FIRE_LOOKBACK_S = 1800  # 30 min: "recent fire" window
+_AUTHENTIK_MAX_REQUESTS_QUIET_WINDOW_S = 21600  # 6h: "no fire for a long time"
+_AUTHENTIK_MAX_REQUESTS_FIRE_HISTORY_MAX = 50
+_AUTHENTIK_MAX_REQUESTS_TUNE_HISTORY_MAX = 50
+
+# Auto-tune dedicated log file. Operator can `tail -F` this to watch
+# convergence on a single screen without grepping journalctl. Format is
+# one event per line: '<ISO timestamp UTC> | <event type> | <detail>'.
+_AUTOTUNE_LOG_PATH = '/var/log/takguard/ak-mr-autotune.log'
+_AUTOTUNE_LOG_MAX_BYTES = 5 * 1024 * 1024   # 5 MB rollover ceiling
+_AUTOTUNE_LOG_KEEP_LINES = 5000             # On rollover, keep this many most-recent lines
+
+
+def _autotune_log(msg):
+    """Append a single line to the auto-tune log file. Self-rolling at 5 MB.
+    Resilient — never raises. Used by the watchdog, fire recorder, evaluator
+    and applier so the whole story for a box is in one tailable file.
+    """
+    try:
+        os.makedirs(os.path.dirname(_AUTOTUNE_LOG_PATH), exist_ok=True)
+        import datetime as _dt
+        _ts = _dt.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+        _line = f"{_ts} | {msg}\n"
+        # Lazy rollover: if file is over the cap, keep the last N lines and
+        # rewrite. Cheap because it only happens once per ~5 MB.
+        try:
+            if (os.path.exists(_AUTOTUNE_LOG_PATH)
+                    and os.path.getsize(_AUTOTUNE_LOG_PATH) > _AUTOTUNE_LOG_MAX_BYTES):
+                with open(_AUTOTUNE_LOG_PATH, 'r', errors='replace') as _f:
+                    _tail = _f.readlines()[-_AUTOTUNE_LOG_KEEP_LINES:]
+                with open(_AUTOTUNE_LOG_PATH, 'w') as _f:
+                    _f.writelines(_tail)
+        except Exception:
+            pass
+        with open(_AUTOTUNE_LOG_PATH, 'a') as _f:
+            _f.write(_line)
+    except Exception:
+        pass
+
+
+def _authentik_max_requests_get_current():
+    """Read current AUTHENTIK_WEB__MAX_REQUESTS from ~/authentik/.env.
+
+    Returns (max_requests:int, jitter:int) or (None, None) if either is
+    missing/unparseable. Used by both the auto-tune and the dashboard.
+    """
+    ak_env = os.path.expanduser('~/authentik/.env')
+    if not os.path.exists(ak_env):
+        return None, None
+    try:
+        with open(ak_env) as _f:
+            _txt = _f.read()
+        _m = re.search(r'^AUTHENTIK_WEB__MAX_REQUESTS=(\d+)\s*$', _txt, re.MULTILINE)
+        _j = re.search(r'^AUTHENTIK_WEB__MAX_REQUESTS_JITTER=(\d+)\s*$', _txt, re.MULTILINE)
+        return (int(_m.group(1)) if _m else None,
+                int(_j.group(1)) if _j else None)
+    except Exception:
+        return None, None
+
+
+def _authentik_max_requests_autotune_record_fire(idle_count=None, threshold=None, current_max=None):
+    """Record a watchdog-fire event.
+
+    Two side effects:
+      1. Appends timestamp to settings.authentik_max_requests_fire_history
+         (last 50). Used by autotune evaluate() to decide tune-down.
+      2. Writes a human-readable line to the auto-tune log so an operator
+         can review history without grepping journalctl.
+
+    Called by the watchdog loop every time it issues an ALERT/restart.
+    """
+    try:
+        import time as _t
+        _now = int(_t.time())
+        _s = load_settings()
+        _hist = list(_s.get('authentik_max_requests_fire_history') or [])
+        _hist.append(_now)
+        _hist = _hist[-_AUTHENTIK_MAX_REQUESTS_FIRE_HISTORY_MAX:]
+        _s['authentik_max_requests_fire_history'] = _hist
+        save_settings(_s)
+    except Exception:
+        pass
+    try:
+        _ic = idle_count if idle_count is not None else '?'
+        _th = threshold if threshold is not None else '?'
+        _mr = current_max if current_max is not None else '?'
+        _autotune_log(
+            f"WATCHDOG_FIRE | idle={_ic} threshold={_th} MAX_REQUESTS={_mr}"
+        )
+    except Exception:
+        pass
+
+
+def _authentik_max_requests_autotune_evaluate(plog=None):
+    """Inspect fire history + current MAX_REQUESTS and decide if a tune is needed.
+
+    Returns (new_max_requests, new_jitter, reason) or (None, None, None) if no change.
+
+    Decision matrix with ASYMMETRIC cooldowns (fast-down, slow-up):
+      - autotune disabled in settings                    → no change
+      - fire in last 30 min AND current > floor          → tune DOWN (halve,
+        clamped to floor). Cooldown: 2 min between down-tunes — converge
+        fast under fire.
+      - no fire in 6h AND current < min(baseline, ceiling) → tune UP (+25%,
+        clamped). Cooldown: 30 min between up-tunes — avoid oscillation.
+      - otherwise                                        → no change
+
+    The cooldown asymmetry matters: tak-10 (May 2026) showed the original
+    symmetric 30-min cooldown was too slow to converge — the box took 5+
+    fires inside a single cooldown window. With down-cooldown=2 min, the
+    box halves on every other watchdog tick under sustained pressure
+    (1000 → 500 → 250 → 125 → 100 floor in ~8 min).
+
+    The starting value baseline for "bump up" is min(starting_value, ceiling).
+    Starting value defaults to 1000 (the v0.9.23 migration default) but can
+    be overridden via settings.authentik_max_requests_baseline.
+    """
+    if plog is None:
+        plog = lambda m: None
+    try:
+        import time as _t
+        _now = int(_t.time())
+        _s = load_settings()
+        if _s.get('authentik_max_requests_autotune_disabled'):
+            return (None, None, None)
+
+        _current, _jitter_now = _authentik_max_requests_get_current()
+        if _current is None:
+            return (None, None, None)  # nothing to tune
+
+        _floor = int(_s.get('authentik_max_requests_floor') or _AUTHENTIK_MAX_REQUESTS_FLOOR_DEFAULT)
+        _ceiling = int(_s.get('authentik_max_requests_ceiling') or _AUTHENTIK_MAX_REQUESTS_CEILING_DEFAULT)
+        _baseline = int(_s.get('authentik_max_requests_baseline') or 1000)
+
+        _last_tune_ts = int(_s.get('authentik_max_requests_last_tune_ts') or 0)
+        _since_tune = _now - _last_tune_ts
+
+        _fires = list(_s.get('authentik_max_requests_fire_history') or [])
+        _last_fire_ts = max(_fires) if _fires else 0
+        _recent_fire = (_now - _last_fire_ts) < _AUTHENTIK_MAX_REQUESTS_FIRE_LOOKBACK_S if _last_fire_ts else False
+        _quiet = (_now - _last_fire_ts) > _AUTHENTIK_MAX_REQUESTS_QUIET_WINDOW_S if _last_fire_ts else True
+
+        # ── Tune DOWN path ──
+        if _recent_fire and _current > _floor:
+            if _since_tune < _AUTHENTIK_MAX_REQUESTS_TUNE_DOWN_COOLDOWN_S:
+                return (None, None, None)  # tune-down cooldown still in effect
+            _new = max(_floor, _current // 2)
+            _new_jitter = max(5, _new // 20)
+            _fires_30min = len([_f for _f in _fires if _now - _f < _AUTHENTIK_MAX_REQUESTS_FIRE_LOOKBACK_S])
+            _reason = (
+                f"DOWN: watchdog fired {_fires_30min}x in last 30min "
+                f"(last fire {_now - _last_fire_ts}s ago) — MAX_REQUESTS too high"
+            )
+            try:
+                _autotune_log(
+                    f"DECISION_DOWN | from={_current} to={_new} jitter={_new_jitter} "
+                    f"fires_30min={_fires_30min} last_fire_age_s={_now - _last_fire_ts}"
+                )
+            except Exception:
+                pass
+            return (_new, _new_jitter, _reason)
+
+        # ── Tune UP path ──
+        if _quiet and _current < min(_baseline, _ceiling):
+            if _since_tune < _AUTHENTIK_MAX_REQUESTS_TUNE_UP_COOLDOWN_S:
+                return (None, None, None)  # tune-up cooldown still in effect
+            _new = min(_ceiling, _baseline, int(_current * 1.25))
+            if _new <= _current:
+                return (None, None, None)  # rounding edge — no actual change
+            _new_jitter = max(5, _new // 20)
+            _qmin = (_now - _last_fire_ts) // 60 if _last_fire_ts else 9999
+            _reason = (
+                f"UP: no watchdog fire for {_qmin}min — easing back toward baseline {_baseline}"
+            )
+            try:
+                _autotune_log(
+                    f"DECISION_UP | from={_current} to={_new} jitter={_new_jitter} "
+                    f"quiet_min={_qmin} baseline={_baseline}"
+                )
+            except Exception:
+                pass
+            return (_new, _new_jitter, _reason)
+
+        return (None, None, None)
+    except Exception as _e:
+        plog(f"[ak-mr-autotune] evaluate error: {_e}")
+        try:
+            _autotune_log(f"EVAL_ERROR | {_e}")
+        except Exception:
+            pass
+        return (None, None, None)
+
+
+def _authentik_max_requests_autotune_apply(plog, new_max, new_jitter, reason):
+    """Update ~/authentik/.env to the new MAX_REQUESTS + JITTER values and
+    recreate the server+worker containers so gunicorn picks them up.
+
+    Records the tune event to settings.authentik_max_requests_tune_history
+    and updates settings.authentik_max_requests_last_tune_ts. Returns True
+    on success.
+
+    NOTE: this triggers a server container recreate, which drops the LDAP
+    outpost websocket for ~1-5s. Acceptable trade because the alternative
+    is a sustained watchdog-fire cycle, each of which drops the websocket
+    for longer (full restart) AND keeps the underlying problem unsolved.
+    """
+    ak_env = os.path.expanduser('~/authentik/.env')
+    if not os.path.exists(ak_env):
+        plog("[ak-mr-autotune] ~/authentik/.env not found — skipping apply")
+        return False
+    try:
+        import time as _t
+        _now = int(_t.time())
+        with open(ak_env) as _f:
+            _txt = _f.read()
+        _old_max, _old_jitter = _authentik_max_requests_get_current()
+        if _old_max is None:
+            plog("[ak-mr-autotune] MAX_REQUESTS not in .env — skipping apply")
+            return False
+
+        _backup = f"{ak_env}.bak.autotune.{_now}"
+        with open(_backup, 'w') as _f:
+            _f.write(_txt)
+
+        _new_txt = re.sub(
+            r'^AUTHENTIK_WEB__MAX_REQUESTS=\d+\s*$',
+            f'AUTHENTIK_WEB__MAX_REQUESTS={new_max}',
+            _txt, flags=re.MULTILINE
+        )
+        _new_txt = re.sub(
+            r'^AUTHENTIK_WEB__MAX_REQUESTS_JITTER=\d+\s*$',
+            f'AUTHENTIK_WEB__MAX_REQUESTS_JITTER={new_jitter}',
+            _new_txt, flags=re.MULTILINE
+        )
+        with open(ak_env, 'w') as _f:
+            _f.write(_new_txt)
+
+        plog(
+            f"[ak-mr-autotune] MAX_REQUESTS {_old_max}→{new_max}, "
+            f"JITTER {_old_jitter}→{new_jitter} | reason: {reason}"
+        )
+        plog(f"[ak-mr-autotune] backup: {os.path.basename(_backup)}")
+        plog("[ak-mr-autotune] recreating server+worker to apply new values...")
+        try:
+            _autotune_log(
+                f"APPLY_START | from={_old_max} to={new_max} "
+                f"jitter_from={_old_jitter} jitter_to={new_jitter} | {reason}"
+            )
+        except Exception:
+            pass
+
+        ok = _recreate_authentik_server_worker(plog, reason='max-requests-autotune')
+        if not ok:
+            plog("[ak-mr-autotune] WARN: recreate reported failure — .env updated, "
+                 "values will apply on next restart")
+        try:
+            _autotune_log(
+                f"APPLY_{'OK' if ok else 'WARN_NO_RECREATE'} | "
+                f"MAX_REQUESTS={new_max} JITTER={new_jitter}"
+            )
+        except Exception:
+            pass
+
+        try:
+            _s = load_settings()
+            _s['authentik_max_requests_last_tune_ts'] = _now
+            _hist = list(_s.get('authentik_max_requests_tune_history') or [])
+            _hist.append({
+                'ts': _now,
+                'from_max': _old_max,
+                'to_max': new_max,
+                'from_jitter': _old_jitter,
+                'to_jitter': new_jitter,
+                'reason': reason,
+                'recreate_ok': bool(ok),
+            })
+            _hist = _hist[-_AUTHENTIK_MAX_REQUESTS_TUNE_HISTORY_MAX:]
+            _s['authentik_max_requests_tune_history'] = _hist
+            save_settings(_s)
+        except Exception:
+            pass
+        return True
+    except Exception as _e:
+        plog(f"[ak-mr-autotune] apply error (non-fatal): {_e}")
+        return False
+
+
 def _authentik_channels_pool_watchdog_loop():
     """v0.9.21: Background daemon — auto-restart authentik-server-1 when total idle
     PostgreSQL connections from the authentik database exceed a threshold.
 
-    Root cause (confirmed field analysis, May 2026 — tak-10, tak-12, Authentik 2026.2.3):
-      Community Authentik has no enterprise license. Every gunicorn/daphne worker
-      checks django_postgres_cache_cacheentry for key
-      'public::1:goauthentik.io/enterprise/license' on every request. The key is
-      never written (no license), so every check is a DB miss. Under CONN_MAX_AGE>0,
-      each worker thread retains its connection after the miss. Thread pool growth
-      under async-to-sync dispatch opens new connections faster than they are
-      reclaimed, accumulating ~1 idle connection per 1-3 seconds.
-      At this rate max_connections=500 is exhausted in ~15-20 min.
+    STATUS as of v0.9.23 Phase 6 (PgBouncer): DEEP DEFENSE-IN-DEPTH only.
+    PgBouncer (transaction-pool, DEFAULT_POOL_SIZE=25 + RESERVE=5) caps the real
+    PG server-side idle count at ~30 regardless of how leaky Authentik's
+    cache-pool is, so this watchdog should essentially never fire on a v0.9.23+
+    box. If it DOES fire post-PgBouncer, it means either:
+      1. PgBouncer is mis-configured (e.g. POOL_MODE flipped to `session`),
+      2. The leak class has changed (new upstream code path), or
+      3. Some other workload is consuming PG connections directly
+         (not through PgBouncer) — possibly a manual `docker exec ... psql`
+         left dangling, or a custom integration.
 
-      NOTE: django_channels_postgres LISTEN connection (1 persistent) is normal and
-      NOT the source of the leak. Primary mitigation is CONN_MAX_AGE=10 (v0.9.21,
-      down from 60) which bounds steady-state accumulation to ~5 connections.
-      This watchdog is the secondary safety net.
+    Operator action when this fires post-PgBouncer:
+      - Inspect `settings.authentik_pgbouncer` (was PgBouncer install OK?)
+      - Check `docker logs authentik-pgbouncer-1` for backend errors
+      - Run `docker exec authentik-pgbouncer-1 psql -U authentik
+        -d pgbouncer -c 'SHOW POOLS;'` to see live pool state.
+
+    Primary mitigations preceding this safety net (in order of effectiveness):
+      1. **PgBouncer transaction-pool** (v0.9.23 Phase 6) — caps real PG
+         conns at ~30 regardless of upstream leaks. THE architectural fix.
+      2. **AUTHENTIK_WEB__MAX_REQUESTS=1000** (v0.9.23 Phase 4) — gunicorn
+         worker recycle bounds in-process leak accumulation. Now mostly
+         redundant with PgBouncer but kept as defense-in-depth for memory.
+      3. **CONN_MAX_AGE=0** (v0.9.23 Phase 6) — Django closes connections
+         after each request; PgBouncer recycles them.
+
+    See:
+      - _ensure_authentik_pgbouncer (Phase 6 installer — THE fix)
+      - _authentik_apply_official_tunings (sets the values on new installs)
+      - _patch_authentik_web_max_requests_to_1000 (migrates existing installs)
+      - docs/UPSTREAM-AUTHENTIK-PG-LEAK-20714.md (Tom Andersen's forensic
+        analysis showing CONN_MAX_AGE never reached the leaking pool, but
+        worker recycling does)
+
+    Root cause (Authentik 2026.2.x, confirmed upstream — goauthentik/authentik#20714):
+      The 2025.10 release of Authentik [removed Redis entirely]
+      (https://goauthentik.io/blog/2025-11-13-we-removed-redis/) and routed
+      cache + channels + sessions + outpost store through PostgreSQL. Each
+      subsystem uses its own connection pool with its own lifecycle:
+        - `django.db.backends.postgresql` (ORM) → bound by CONN_MAX_AGE ✓
+        - `django_postgres_cache` (was Redis) → SEPARATE pool, NOT bound by
+          CONN_MAX_AGE — this is where the leak lives.
+        - `django_channels_postgres` (was Redis pub/sub) → persistent LISTEN
+          sockets (only 2-3, not the leak).
+        - `django_dramatiq_postgres` (was Celery+Redis) → persistent (worker
+          container only, also not the leak).
+
+      Community Authentik has no enterprise license, so EVERY HTTP request
+      (including the /-/health/live/ healthcheck) triggers a cache lookup
+      for `public::1:goauthentik.io/enterprise/license` via
+      `django_postgres_cache`. The lookup misses (key is never written
+      because no license), the misses' connections leak in the cache pool,
+      and accumulate at ~0.17 idle conn/sec aggregate steady-state on a
+      typical box (Tom Andersen's anchortak forensic, anctakserver2,
+      May 2026 — 91 min × 1056 samples, label `bug/confirmed`).
+
+      Without MAX_REQUESTS, accumulation is unbounded until something
+      triggers a worker reset. That's what this watchdog is for: catch
+      the runaway when MAX_REQUESTS isn't enabled (legacy installs) or
+      isn't keeping up (unexpected traffic spike).
 
     Threshold: 150 connections (~30% of max_connections=500). Checks every 2 min.
-    After restart, idle count resets to ~28 connections.
+    After restart, idle count resets to ~28 connections. With MAX_REQUESTS=1000
+    enabled, this watchdog should fire rarely or never.
 
     Override: set channels_pool_watchdog_threshold=N in settings to change the
     threshold, or channels_pool_watchdog_disabled=true to disable entirely.
@@ -27082,11 +28389,26 @@ def _authentik_channels_pool_watchdog_loop():
             _consecutive_failures = 0
 
             if _count > _threshold:
+                _mr_cur, _ = _authentik_max_requests_get_current()
+                _mr_str = f"MAX_REQUESTS={_mr_cur}" if _mr_cur is not None else "MAX_REQUESTS=unset"
+                _pgb_installed = bool((_settings.get('authentik_pgbouncer') or {}).get('installed'))
+                _pgb_note = (
+                    "PgBouncer is INSTALLED — this should not fire unless PgBouncer itself is "
+                    "mis-configured, broken, or being bypassed. Check `docker logs "
+                    "authentik-pgbouncer-1` and `docker exec authentik-pgbouncer-1 psql -U authentik "
+                    "-d pgbouncer -c 'SHOW POOLS;'`."
+                ) if _pgb_installed else (
+                    "PgBouncer is NOT installed — the upstream Authentik #20714 cache-pool leak is "
+                    "unbounded on this box. Consider running the v0.9.23 PgBouncer migration."
+                )
                 print(
                     f"[ak-pg-watchdog] ALERT: {_count} idle PG connections "
-                    f"(threshold={_threshold}) — restarting authentik-server-1 "
-                    f"(enterprise license cache-miss accumulation workaround)",
+                    f"(threshold={_threshold}, {_mr_str}) — restarting authentik-server-1. "
+                    f"SAFETY NET firing. {_pgb_note}",
                     flush=True
+                )
+                _authentik_max_requests_autotune_record_fire(
+                    idle_count=_count, threshold=_threshold, current_max=_mr_cur
                 )
                 _restart = subprocess.run(
                     ['docker', 'restart', 'authentik-server-1'],
@@ -27094,16 +28416,55 @@ def _authentik_channels_pool_watchdog_loop():
                 )
                 if _restart.returncode == 0:
                     print(f"[ak-pg-watchdog] authentik-server-1 restarted — idle connections reset", flush=True)
+                    try:
+                        _autotune_log("WATCHDOG_RESTART_OK | idle reset")
+                    except Exception:
+                        pass
                 else:
                     print(f"[ak-pg-watchdog] restart failed: {(_restart.stderr or '')[:120]}", flush=True)
+                    try:
+                        _autotune_log(f"WATCHDOG_RESTART_FAIL | {(_restart.stderr or '')[:160]}")
+                    except Exception:
+                        pass
                 # Sleep longer after restart to let server recover before next check
                 _wt.sleep(180)
             elif _count > 80:
+                _mr_cur, _ = _authentik_max_requests_get_current()
                 print(
                     f"[ak-pg-watchdog] {_count} idle PG connections "
                     f"(threshold={_threshold}) — accumulation in progress, monitoring",
                     flush=True
                 )
+                try:
+                    _autotune_log(
+                        f"ACCUMULATING | idle={_count} threshold={_threshold} "
+                        f"MAX_REQUESTS={_mr_cur if _mr_cur is not None else '?'}"
+                    )
+                except Exception:
+                    pass
+
+            # v0.9.23: auto-tune MAX_REQUESTS based on fire history. Runs every
+            # tick (cheap — just settings read + math). Rate-limited internally
+            # to one actual change per 30 min. We do this AFTER the alert/
+            # restart path so the freshly-recorded fire timestamp is visible.
+            try:
+                _new_max, _new_jit, _reason = _authentik_max_requests_autotune_evaluate(
+                    plog=lambda m: print(m, flush=True)
+                )
+                if _new_max is not None:
+                    print(
+                        f"[ak-mr-autotune] decision: tune MAX_REQUESTS → {_new_max} "
+                        f"(jitter {_new_jit}) | {_reason}",
+                        flush=True
+                    )
+                    _authentik_max_requests_autotune_apply(
+                        lambda m: print(m, flush=True),
+                        _new_max, _new_jit, _reason
+                    )
+                    # After a tune, give the new workers a moment to ramp up
+                    _wt.sleep(60)
+            except Exception as _tune_e:
+                print(f"[ak-mr-autotune] tick error (non-fatal): {_tune_e}", flush=True)
         except Exception:
             pass  # Never crash the console process
         _wt.sleep(120)
@@ -27122,6 +28483,525 @@ def _start_channels_pool_watchdog():
         name='channels-pool-watchdog'
     )
     _t.start()
+
+
+# ---------------------------------------------------------------------------
+# v0.9.23: LDAP SA bind + webadmin admin-role continuous watchdog
+# ---------------------------------------------------------------------------
+# Closes the recovery gap between the boot-time _startup_resync_ldap_service_account
+# (one-shot at console start) and operator intervention. Field-observed drift recurs
+# mid-session (every ~hour or two) under bind_mode: cached because the cache masks
+# the underlying mutator until the 120s outpost cache expires. See:
+#   - docs/HANDOFF-LDAP-AUTHENTIK.md  (why bind_mode: cached is the correct arch)
+#   - docs/PLAN-v0.9.23-alpha.md       (this work)
+#
+# Two periodic invariants checked every 5 minutes:
+#
+#   Item 1 — adm_ldapservice fresh bind via ldapsearch tri-state verdict.
+#            Heal: _ensure_authentik_ldap_service_account (set_password + outpost recreate).
+#
+#   Item 2 — webadmin admin-role drift:
+#              (a) is_active = True
+#              (b) member of tak_ROLE_ADMIN
+#              (c) member of authentik Admins
+#              (d) CoreConfig.xml has adminGroup="ROLE_ADMIN"
+#            Heal: _ensure_authentik_webadmin(skip_bind_verify=True) +
+#                  _resync_ldap_credential_to_coreconfig().
+#
+# All checks are idempotent — no log spam on healthy ticks (one "ok" line every
+# ~50 minutes for liveness). Each heal records timestamp + counter in settings.json
+# so operators can spot a writer that's burning down the bind on a tight cadence.
+
+_ldap_sa_watchdog_started = False
+
+
+def _authentik_webadmin_role_check_and_heal(plog_fn=None):
+    """v0.9.23 (Item 2 of PLAN-v0.9.23-alpha.md). Verify webadmin admin-role
+    invariants in Authentik + CoreConfig; heal on drift.
+
+    Returns True if any heal was performed this tick, False if everything was
+    already in the expected shape. Never raises — exceptions are swallowed and
+    logged via plog_fn so callers (watchdog loop, startup migrations) can keep
+    running.
+    """
+    _log = plog_fn or (lambda m: print(m, flush=True))
+    _healed = False
+
+    if not os.path.exists('/opt/tak'):
+        return False  # No TAK Server on this box — webadmin admin role is N/A
+
+    try:
+        import urllib.request as _req
+        _settings = load_settings()
+        _token = (_get_authentik_env_value(_settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+                  or _get_authentik_env_value(_settings, 'AUTHENTIK_TOKEN'))
+        if not _token:
+            return False
+        _url = _get_authentik_api_url(_settings)
+        _headers = {'Authorization': f'Bearer {_token}', 'Content-Type': 'application/json'}
+
+        try:
+            _r = _req.Request(f'{_url}/api/v3/core/users/?search=webadmin', headers=_headers)
+            _users = json.loads(_req.urlopen(_r, timeout=10).read().decode()).get('results', [])
+            _wa = next((u for u in _users if u.get('username') == 'webadmin'), None)
+        except Exception as _e:
+            _log(f"webadmin role check: lookup error: {str(_e)[:120]}")
+            return False
+
+        if not _wa:
+            _log("webadmin role check: webadmin MISSING in Authentik — calling _ensure_authentik_webadmin")
+            try:
+                _ok, _msg = _ensure_authentik_webadmin(skip_bind_verify=True)
+                if _ok:
+                    _healed = True
+                else:
+                    _log(f"webadmin recreate incomplete: {_msg}")
+            except Exception as _e:
+                _log(f"webadmin recreate error: {str(_e)[:120]}")
+            # Fall through to CoreConfig check below
+
+        _need_role_heal = False
+        _reasons = []
+
+        if _wa is not None:
+            if _wa.get('is_active') is not True:
+                _need_role_heal = True
+                _reasons.append('is_active=False')
+
+            # Group membership — Authentik returns groups_obj with name+pk on user lookup.
+            _groups = _wa.get('groups_obj') or []
+            if not _groups:
+                try:
+                    _r2 = _req.Request(f'{_url}/api/v3/core/users/{_wa["pk"]}/', headers=_headers)
+                    _full = json.loads(_req.urlopen(_r2, timeout=10).read().decode())
+                    _groups = _full.get('groups_obj') or []
+                except Exception:
+                    _groups = []
+            _gnames = {(g.get('name') or '') for g in _groups if isinstance(g, dict)}
+            if 'tak_ROLE_ADMIN' not in _gnames:
+                _need_role_heal = True
+                _reasons.append('not in tak_ROLE_ADMIN')
+            if 'authentik Admins' not in _gnames:
+                _need_role_heal = True
+                _reasons.append('not in authentik Admins')
+
+            if _need_role_heal:
+                _log(f"webadmin role drift detected ({', '.join(_reasons)}) — auto-healing")
+                try:
+                    _ok, _msg = _ensure_authentik_webadmin(skip_bind_verify=True)
+                    if _ok:
+                        _log("webadmin role healed via _ensure_authentik_webadmin")
+                        _healed = True
+                    else:
+                        _log(f"webadmin role heal incomplete: {_msg}")
+                except Exception as _e:
+                    _log(f"webadmin role heal error: {str(_e)[:120]}")
+
+        # CoreConfig adminGroup invariant — even when Authentik says webadmin is
+        # in tak_ROLE_ADMIN, TAK Server 8446 only treats the bind as admin when
+        # CoreConfig <ldap groupBaseRDN ... adminGroup="ROLE_ADMIN"/> is present.
+        try:
+            _cc_path = '/opt/tak/CoreConfig.xml'
+            if os.path.exists(_cc_path):
+                with open(_cc_path, 'r', encoding='utf-8') as _f:
+                    _cc = _f.read()
+                if 'adm_ldapservice' in _cc and 'adminGroup="ROLE_ADMIN"' not in _cc:
+                    _log("CoreConfig.xml adminGroup attribute MISSING — calling _resync_ldap_credential_to_coreconfig")
+                    try:
+                        _changed, _msg = _resync_ldap_credential_to_coreconfig()
+                        if _changed:
+                            _log(f"CoreConfig adminGroup restored ({_msg})")
+                            _healed = True
+                        else:
+                            _log(f"CoreConfig adminGroup resync no-op: {_msg}")
+                    except Exception as _e:
+                        _log(f"CoreConfig adminGroup heal error: {str(_e)[:120]}")
+        except Exception:
+            pass
+
+        if _healed:
+            try:
+                _s2 = load_settings()
+                from datetime import datetime as _dt_now
+                _s2['authentik_webadmin_role_last_repair'] = _dt_now.utcnow().isoformat() + 'Z'
+                _s2['authentik_webadmin_role_repair_count'] = int(_s2.get('authentik_webadmin_role_repair_count') or 0) + 1
+                save_settings(_s2)
+            except Exception:
+                pass
+
+        return _healed
+    except Exception as _e:
+        _log(f"webadmin role check exception (non-fatal): {str(_e)[:120]}")
+        return False
+
+
+def _takportal_admin_guardrail(plog_fn=None):
+    """v0.9.23 (Item 3 of PLAN-v0.9.23-alpha.md). Module-level extraction of the
+    v0.9.15 _auto_harden_takportal_settings hook that previously only ran inside
+    the version-gated post-update block. Promoted so it also fires on every
+    console startup and (optionally) under the SA-bind watchdog, bounding
+    recovery for USERS_HIDDEN_PREFIXES / USERS_ACTIONS_HIDDEN_PREFIXES drift
+    between Update Now clicks.
+
+    Idempotent — no-op when both 'akadmin' and 'webadmin' are already present
+    in both fields. See v0.9.15 release notes for the original "accidental
+    Disable on akadmin" incident motivation.
+    """
+    _log = plog_fn or (lambda m: print(m, flush=True))
+    try:
+        _portal_dir = os.path.expanduser('~/TAK-Portal')
+        if not os.path.isdir(_portal_dir):
+            return
+        _ps = subprocess.run(
+            'docker ps --filter name=^tak-portal$ --format "{{.Names}}"',
+            shell=True, capture_output=True, text=True, timeout=10
+        )
+        if 'tak-portal' not in (_ps.stdout or ''):
+            return
+
+        _existing = _takportal_get_existing_settings()
+        _hidden = (_existing.get('USERS_HIDDEN_PREFIXES') or '') if isinstance(_existing, dict) else ''
+        _locked = (_existing.get('USERS_ACTIONS_HIDDEN_PREFIXES') or '') if isinstance(_existing, dict) else ''
+        _hidden_parts = {p.strip() for p in _hidden.split(',') if p.strip()}
+        _locked_parts = {p.strip() for p in _locked.split(',') if p.strip()}
+        _need_keys = {'akadmin', 'webadmin'}
+        if _need_keys.issubset(_hidden_parts) and _need_keys.issubset(_locked_parts):
+            return  # Idempotent — no log spam on healthy boot
+
+        _log(f"takportal admin guardrail: current hidden={_hidden!r} actions_hidden={_locked!r} — re-asserting")
+        _settings = load_settings()
+        _settings_json = _takportal_merged_settings_json(_settings)
+        _fd, _tmp = tempfile.mkstemp(suffix='.json', prefix='tak-portal-guard-')
+        try:
+            with os.fdopen(_fd, 'w') as _tf:
+                _tf.write(_settings_json)
+            _cp = subprocess.run(
+                f'docker cp {shlex.quote(_tmp)} tak-portal:/usr/src/app/data/settings.json',
+                shell=True, capture_output=True, text=True, timeout=20
+            )
+        finally:
+            try:
+                os.remove(_tmp)
+            except OSError:
+                pass
+        if _cp.returncode != 0:
+            _log(f"takportal admin guardrail: docker cp failed: {((_cp.stderr or _cp.stdout) or '').strip()[:200]}")
+            return
+        _rs = subprocess.run(
+            'docker restart tak-portal',
+            shell=True, capture_output=True, text=True, timeout=30
+        )
+        if _rs.returncode == 0:
+            _log("takportal admin guardrail: restarted — akadmin/webadmin hidden + action-locked")
+        else:
+            _log(f"takportal admin guardrail: restart returned {_rs.returncode}")
+    except Exception as _e:
+        _log(f"takportal admin guardrail error (non-fatal): {_e}")
+
+
+def _authentik_ldap_sa_bind_watchdog_loop():
+    """v0.9.23 (Item 1+2 of PLAN-v0.9.23-alpha.md). Background daemon — periodic
+    LDAP SA bind verification + webadmin admin-role drift heal.
+
+    Tick = 300s (5 minutes). Per tick:
+      1. Tri-state bind probe of cn=adm_ldapservice,ou=users,dc=takldap against
+         AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD from ~/authentik/.env. On
+         verdict='fail', call _ensure_authentik_ldap_service_account() (re-sets
+         the password in Authentik DB and force-recreates the LDAP outpost).
+      2. _authentik_webadmin_role_check_and_heal() (Item 2).
+
+    Liveness: one "ok" line every ~50 minutes (10 quiet ticks) so log readers
+    can confirm the daemon is alive without spam. Each heal records timestamp
+    + monotonically-increasing counter in settings.json
+    (authentik_ldap_sa_last_repair / authentik_ldap_sa_repair_count /
+    authentik_webadmin_role_last_repair / authentik_webadmin_role_repair_count)
+    so operators can grep for repeated-repair patterns (would indicate the
+    writer that's mutating these values mid-session is still active).
+
+    Override: ldap_sa_watchdog_disabled=true in infra-TAK settings disables.
+    """
+    import time as _wt
+    _wt.sleep(120)  # Let console finish _startup_migrations before first tick
+
+    _ok_log_interval = 10  # ~50 minutes between liveness lines
+    _ok_counter = 0
+
+    while True:
+        try:
+            _settings = load_settings()
+            if _settings.get('ldap_sa_watchdog_disabled'):
+                _wt.sleep(300)
+                continue
+            if not os.path.exists(os.path.expanduser('~/authentik/.env')):
+                _wt.sleep(300)
+                continue
+            if not _coreconfig_has_ldap():
+                _wt.sleep(300)
+                continue
+
+            _env_pass = _get_authentik_env_value(_settings, 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')
+            if not _env_pass:
+                _wt.sleep(300)
+                continue
+
+            try:
+                _verdict = _test_ldap_bind_dn_verdict(
+                    'cn=adm_ldapservice,ou=users,dc=takldap', _env_pass)
+            except Exception:
+                _verdict = 'inconclusive'
+
+            _sa_healed = False
+            _role_healed = False
+
+            if _verdict == 'fail':
+                print("[ldap-sa-watchdog] adm_ldapservice bind drift DETECTED — auto-resyncing", flush=True)
+                try:
+                    _ok, _msg = _ensure_authentik_ldap_service_account()
+                    if _ok:
+                        print(f"[ldap-sa-watchdog] adm_ldapservice bind healed ({_msg})", flush=True)
+                        _sa_healed = True
+                        try:
+                            _s2 = load_settings()
+                            from datetime import datetime as _dt_now
+                            _s2['authentik_ldap_sa_last_repair'] = _dt_now.utcnow().isoformat() + 'Z'
+                            _s2['authentik_ldap_sa_repair_count'] = int(_s2.get('authentik_ldap_sa_repair_count') or 0) + 1
+                            save_settings(_s2)
+                        except Exception:
+                            pass
+                        # Belt + braces — also resync CoreConfig credential while we
+                        # know the env_pass is authoritative.
+                        try:
+                            _cc_changed, _cc_msg = _resync_ldap_credential_to_coreconfig()
+                            if _cc_changed:
+                                print(f"[ldap-sa-watchdog] CoreConfig credential resynced ({_cc_msg})", flush=True)
+                        except Exception:
+                            pass
+                    else:
+                        print(f"[ldap-sa-watchdog] adm_ldapservice heal INCOMPLETE: {_msg}", flush=True)
+                except Exception as _se:
+                    print(f"[ldap-sa-watchdog] adm_ldapservice heal error: {str(_se)[:120]}", flush=True)
+            elif _verdict == 'inconclusive':
+                # Don't take action — could be transient (outpost restarting after
+                # operator-driven sync). The next tick will reassess.
+                pass
+
+            try:
+                _role_healed = _authentik_webadmin_role_check_and_heal(
+                    plog_fn=lambda m: print(f"[ldap-sa-watchdog] {m}", flush=True)
+                )
+            except Exception as _re:
+                print(f"[ldap-sa-watchdog] webadmin role check error: {str(_re)[:120]}", flush=True)
+
+            # v0.9.23 Phase 1: forensic audit-log scrape AFTER any heal. This
+            # captures both (a) external writers that triggered the heal AND
+            # (b) our own password_set from _ensure_authentik_ldap_service_account
+            # so the high-water mark advances past our writes and we don't
+            # mistake them for the mystery mutator on the next tick.
+            try:
+                _new_events = _authentik_audit_scrape_recent(plog_fn=lambda m: print(m, flush=True))
+                if _new_events:
+                    _ok_counter = 0  # Activity on this tick — reset liveness
+            except Exception as _ae:
+                print(f"[ldap-sa-watchdog] audit scrape error: {str(_ae)[:120]}", flush=True)
+
+            if _verdict == 'ok' and not _sa_healed and not _role_healed:
+                _ok_counter += 1
+                if _ok_counter >= _ok_log_interval:
+                    print("[ldap-sa-watchdog] ok (SA bind verified, webadmin roles intact)", flush=True)
+                    _ok_counter = 0
+            else:
+                _ok_counter = 0
+        except Exception as _le:
+            print(f"[ldap-sa-watchdog] tick error (non-fatal): {str(_le)[:120]}", flush=True)
+
+        _wt.sleep(300)
+
+
+def _start_ldap_sa_bind_watchdog():
+    """Start the LDAP SA bind + webadmin role watchdog daemon thread
+    (idempotent — only starts once per process)."""
+    global _ldap_sa_watchdog_started
+    if _ldap_sa_watchdog_started:
+        return
+    _ldap_sa_watchdog_started = True
+    import threading as _thr
+    _t = _thr.Thread(
+        target=_authentik_ldap_sa_bind_watchdog_loop,
+        daemon=True,
+        name='ldap-sa-bind-watchdog'
+    )
+    _t.start()
+
+
+# ---------------------------------------------------------------------------
+# v0.9.23 Phase 1 (FORENSIC): Authentik audit-log scraper
+# ---------------------------------------------------------------------------
+# Stop healing what we don't understand. The boot+watchdog self-healers (above)
+# silently re-set the adm_ldapservice password and re-add webadmin to groups
+# every time drift is detected, but they never tell us WHO is mutating the
+# state mid-session. As long as we don't know, every release is another
+# band-aid on top of a writer we haven't identified.
+#
+# Authentik already records every credential change, group update, and user
+# state change in its events API (/api/v3/events/events/) with the actor's
+# username, client IP, user agent, and context. We just have never queried it.
+#
+# This helper pulls events that mention the protected admin usernames
+# (adm_ldapservice, webadmin) since the last-seen high-water mark, logs each
+# new event as a single structured line, and stores the last 20 per user in
+# settings.json (authentik_audit_recent_<username>) so the operator can grep
+# `journalctl -u infra-tak-console -e | grep "\[audit:"` or read settings.json
+# from /authentik to see exactly who wrote what, when, from where.
+#
+# Called at:
+#   - _startup_migrations (sets initial high-water mark, no spam on first boot)
+#   - _authentik_ldap_sa_bind_watchdog_loop (end of every 5-min tick)
+#
+# Identifying the mutator: events from our own self-healer will show
+# actor=akadmin client_ip=<docker bridge>. Mystery writers will show some
+# other actor / IP / user_agent. ONE drift cycle and we will know.
+
+def _authentik_audit_scrape_recent(usernames=('adm_ldapservice', 'webadmin'),
+                                   max_per_user=20, plog_fn=None):
+    """v0.9.23 Phase 1 forensic scraper. Read Authentik /api/v3/events/events/
+    filtered by username, log new events since last-seen PK, persist rolling
+    list to settings.json for UI surfacing.
+
+    Returns count of new events seen across all usernames. Never raises;
+    callers (watchdog tick, startup migrations) must keep running on any
+    failure here.
+
+    First-call-per-username behavior: if no last-seen PK exists yet, scans the
+    current top of the event list, records the newest PK as high-water mark,
+    and does NOT log the historical events (otherwise we'd dump 50 entries on
+    every console restart). One quiet line is logged confirming initialization.
+    """
+    _log = plog_fn or (lambda m: print(m, flush=True))
+    _total_new = 0
+    try:
+        import urllib.request as _req
+        import urllib.parse as _up
+        _settings = load_settings()
+        _token = (_get_authentik_env_value(_settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+                  or _get_authentik_env_value(_settings, 'AUTHENTIK_TOKEN'))
+        if not _token:
+            return 0
+        _url = _get_authentik_api_url(_settings)
+        _headers = {'Authorization': f'Bearer {_token}'}
+
+        _settings_dirty = False
+        for _username in usernames:
+            try:
+                _last_seen_key = f'authentik_audit_last_seen_{_username}'
+                _last_seen = (_settings.get(_last_seen_key) or '').strip()
+                _q = _up.urlencode({
+                    'search': _username,
+                    'ordering': '-created',
+                    'page_size': 50,
+                })
+                _r = _req.Request(f'{_url}/api/v3/events/events/?{_q}', headers=_headers)
+                _resp = json.loads(_req.urlopen(_r, timeout=15).read().decode())
+                _events = _resp.get('results', []) or []
+                if not _events:
+                    continue
+
+                _newest_pk = str(_events[0].get('pk') or '')
+
+                if not _last_seen:
+                    # First run for this username — set high-water mark, don't spam.
+                    if _newest_pk:
+                        _settings[_last_seen_key] = _newest_pk
+                        _settings_dirty = True
+                    _log(f"[audit:{_username}] scraper initialized (high-water pk={_newest_pk[:8]}, "
+                         f"{len(_events)} historical events skipped)")
+                    continue
+
+                # v0.9.23 hotfix: filter to MUTATING actions only. The LDAP
+                # outpost generates a `login` event for every successful bind
+                # against adm_ldapservice (cached or not) — dozens per minute
+                # on a busy box. Logging those tells us nothing about who is
+                # mutating the user; they just fill the journal. Keep events
+                # that change state (password_set, model_updated/created/deleted,
+                # user_write, configuration_error), drop everything else.
+                _MUTATING_ACTIONS = {
+                    'password_set', 'model_created', 'model_updated',
+                    'model_deleted', 'user_write', 'configuration_error',
+                    'permission_denied', 'suspicious_request',
+                }
+                _new_events = []
+                for _ev in _events:
+                    _pk = str(_ev.get('pk') or '')
+                    if not _pk:
+                        continue
+                    if _pk == _last_seen:
+                        break  # Reached previous high-water mark
+                    _action = (_ev.get('action') or '').strip()
+                    if _action not in _MUTATING_ACTIONS:
+                        continue  # noise (e.g. action=login from outpost binds)
+                    _new_events.append(_ev)
+
+                if not _new_events:
+                    # No mutating events this tick — still advance the high-water
+                    # mark past whatever noise was returned, so the next scrape
+                    # doesn't re-walk + re-filter the same login spam.
+                    if _newest_pk and _newest_pk != _last_seen:
+                        _settings[_last_seen_key] = _newest_pk
+                        _settings_dirty = True
+                    continue
+
+                # Log chronologically (oldest new event first)
+                for _ev in reversed(_new_events):
+                    _action = _ev.get('action') or '?'
+                    _created = _ev.get('created') or ''
+                    _user_obj = _ev.get('user') or {}
+                    _actor = (_user_obj.get('username')
+                              if isinstance(_user_obj, dict) else str(_user_obj))
+                    _client_ip = _ev.get('client_ip') or ''
+                    _ctx = _ev.get('context') or {}
+                    _ctx_bits = []
+                    if isinstance(_ctx, dict):
+                        for _k in ('model', 'http_request', 'auth_method', 'flow', 'message'):
+                            _v = _ctx.get(_k)
+                            if _v:
+                                _ctx_bits.append(f"{_k}={str(_v)[:80]}")
+                    _ctx_summary = ' '.join(_ctx_bits)[:240]
+                    _log(f"[audit:{_username}] {_created} action={_action} "
+                         f"actor={_actor!r} ip={_client_ip} {_ctx_summary}")
+
+                _total_new += len(_new_events)
+                if _newest_pk:
+                    _settings[_last_seen_key] = _newest_pk
+                    _settings_dirty = True
+
+                # Rolling list for UI surfacing (newest first)
+                _key = f'authentik_audit_recent_{_username}'
+                _rolling = _settings.get(_key) or []
+                if not isinstance(_rolling, list):
+                    _rolling = []
+                for _ev in _new_events:
+                    _user_obj = _ev.get('user') or {}
+                    _rolling.insert(0, {
+                        'pk': str(_ev.get('pk') or ''),
+                        'created': _ev.get('created') or '',
+                        'action': _ev.get('action') or '',
+                        'actor': (_user_obj.get('username')
+                                  if isinstance(_user_obj, dict) else str(_user_obj)),
+                        'client_ip': _ev.get('client_ip') or '',
+                        'user_agent': _ev.get('user_agent') or '',
+                        'context': _ev.get('context') or {},
+                    })
+                _settings[_key] = _rolling[:max_per_user]
+                _settings_dirty = True
+            except Exception as _e:
+                _log(f"[audit:{_username}] scrape error (non-fatal): {str(_e)[:160]}")
+                continue
+
+        if _settings_dirty:
+            save_settings(_settings)
+        return _total_new
+    except Exception as _e:
+        _log(f"audit scrape exception (non-fatal): {str(_e)[:160]}")
+        return 0
 
 
 def _auto_remove_stale_docker_service_connections(label='Post-update'):
@@ -27924,16 +29804,19 @@ def _authentik_fix_pg_idle_timeout(plog):
         return False
     current = int(m.group(1))
     # v0.9.20: also check max_connections drift (<500).
-    # v0.9.22 hotfix: also check statement_timeout=120s absent, and ensure
-    # idle_session_timeout is NOT present (LISTEN-socket reconnect storm regression).
+    # v0.9.22 hotfix: also check statement_timeout=120s absent.
+    # v0.9.23: enforce idle_session_timeout=300s (was: ensure absent). 300s reaps
+    # leaked async-thread connections without killing LISTEN sockets.
     _mc = re.search(r'max_connections=(\d+)', compose_content)
     _mc_current = int(_mc.group(1)) if _mc and _mc.group(1).isdigit() else None
     _mc_drift = _mc_current is not None and _mc_current < 500
     _st = re.search(r'statement_timeout=(\d+)s', compose_content)
     _st_ok = _st and _st.group(1) == '120'
-    _ist_still_present = bool(re.search(r'idle_session_timeout=\d+', compose_content))
-    if current == 300 and not _mc_drift and _st_ok and not _ist_still_present:
-        plog("  pg idle timeout: already idle_in_transaction=300s + max_connections=500 + statement_timeout=120s + no idle_session_timeout (idempotent — no-op)")
+    _is_match = re.search(r'idle_session_timeout=(\d+)s', compose_content)
+    _is_current = int(_is_match.group(1)) if _is_match else None
+    _is_ok = _is_current == 300
+    if current == 300 and not _mc_drift and _st_ok and _is_ok:
+        plog("  pg idle timeout: already idle_in_transaction=300s + max_connections=500 + statement_timeout=120s + idle_session_timeout=300s (idempotent — no-op)")
         try:
             s = load_settings()
             cfg = s.get('authentik_pg_idle_timeout_fix') or {}
@@ -27954,9 +29837,12 @@ def _authentik_fix_pg_idle_timeout(plog):
         _drift_parts.append(f"max_connections={_mc_current}→500")
     if not _st_ok:
         _drift_parts.append("statement_timeout missing→120s")
-    if _ist_still_present:
-        _drift_parts.append("removing idle_session_timeout (kills channels LISTEN sockets / causes reconnect storm)")
-    plog(f"  pg tuning: drift detected ({', '.join(_drift_parts)}) — applying v0.9.21 target config")
+    if not _is_ok:
+        _drift_parts.append(
+            f"idle_session_timeout={'absent' if _is_current is None else str(_is_current)+'s'}→300s "
+            f"(reaps leaked async-thread connections; v0.9.21's 30s caused LISTEN-socket storms — 300s is safe)"
+        )
+    plog(f"  pg tuning: drift detected ({', '.join(_drift_parts)}) — applying v0.9.23 target config")
 
     try:
         changed = _ensure_authentik_compose_patches(compose_path, plog)
@@ -28010,6 +29896,31 @@ def _authentik_fix_pg_idle_timeout(plog):
     else:
         plog("  ⚠ pg idle timeout: Postgres pg_isready did not confirm ready in 60s — proceeding anyway")
 
+    # v0.9.23: ALTER SYSTEM RESET ALL defensively — if a past run (or extension,
+    # or stray manual command) wrote anything to postgresql.auto.conf, those
+    # entries OUTRANK the command-line args we just set. Wipe them, reload, so
+    # the command-line config wins. No-op on a clean box.
+    plog("  pg idle timeout: ALTER SYSTEM RESET ALL → pg_reload_conf (defensive — kills stale postgresql.auto.conf overrides)")
+    # NOTE: ALTER SYSTEM cannot run inside a transaction block. psql -c
+    # "stmt1; stmt2" wraps both statements in an implicit transaction, which
+    # makes ALTER SYSTEM fail with:
+    #   ERROR: ALTER SYSTEM cannot run inside a transaction block
+    # Workaround: use two separate -c flags. psql runs each in its own
+    # autocommit txn. This was the v0.9.23 phase-3 bug seen on tak-10 prod
+    # logs — it caused this whole defensive block to silently fail.
+    try:
+        _alter = subprocess.run(
+            "docker exec authentik-postgresql-1 psql -U authentik -d authentik "
+            "-c \"ALTER SYSTEM RESET ALL\" -c \"SELECT pg_reload_conf()\"",
+            shell=True, capture_output=True, text=True, timeout=15
+        )
+        if _alter.returncode == 0:
+            plog("  ✓ pg idle timeout: ALTER SYSTEM RESET ALL applied + config reloaded")
+        else:
+            plog(f"  ⚠ pg idle timeout: ALTER SYSTEM RESET failed: {(_alter.stderr or '')[:200]}")
+    except Exception as e:
+        plog(f"  ⚠ pg idle timeout: ALTER SYSTEM RESET exception: {e}")
+
     plog("  pg idle timeout: restarting authentik-server-1 and authentik-worker-1 (clears any crash-loop state — LDAP outpost untouched)")
     restart_ok = True
     for cn in ('authentik-server-1', 'authentik-worker-1'):
@@ -28025,8 +29936,8 @@ def _authentik_fix_pg_idle_timeout(plog):
             plog(f"  ✗ pg idle timeout: {cn} restart exception: {e}")
             restart_ok = False
 
-    # v0.9.22 follow-up: verify runtime idle_session_timeout after recreate/restart so
-    # operators do not need manual CLI checks.
+    # v0.9.23 verifier: after recreate, runtime SHOW idle_session_timeout should
+    # be '5min' (PG normalises 300s as '5min'). Accept any 300-equivalent.
     runtime_idle = ''
     verify_ok = False
     for _verify_attempt in range(6):
@@ -28038,16 +29949,17 @@ def _authentik_fix_pg_idle_timeout(plog):
             )
             if _v.returncode == 0:
                 runtime_idle = (_v.stdout or '').strip()
-                if runtime_idle in ('0', '0s'):
+                # PG prints 300s as '5min'; accept either form.
+                if runtime_idle in ('5min', '300000', '300s', '300'):
                     verify_ok = True
                     break
         except Exception:
             pass
     if verify_ok:
-        plog("  ✓ pg idle timeout: runtime verified (SHOW idle_session_timeout=0)")
+        plog(f"  ✓ pg idle timeout: runtime verified (SHOW idle_session_timeout={runtime_idle})")
     else:
         _idle_dbg = runtime_idle or 'unknown'
-        plog(f"  ⚠ pg idle timeout: runtime verification did not confirm 0 (SHOW idle_session_timeout={_idle_dbg})")
+        plog(f"  ⚠ pg idle timeout: runtime verification did not confirm 300s (SHOW idle_session_timeout={_idle_dbg})")
 
     try:
         s = load_settings()
@@ -28055,7 +29967,7 @@ def _authentik_fix_pg_idle_timeout(plog):
         cfg['last_check_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
         cfg['last_outcome'] = 'fixed' if (restart_ok and verify_ok) else ('fixed-restart-failed' if not restart_ok else 'fixed-verify-failed')
         cfg['last_previous_value'] = f'{current}s'
-        cfg['last_new_value'] = '300s + no idle_session_timeout'
+        cfg['last_new_value'] = '300s + idle_session_timeout=300s'
         cfg['last_runtime_idle_session_timeout'] = runtime_idle or 'unknown'
         s['authentik_pg_idle_timeout_fix'] = cfg
         save_settings(s)
@@ -28463,6 +30375,7 @@ entries:
       name: LDAP Service account
       type: service_account
       path: users
+      password: !Context password
   - attrs:
       authentication: none
       denied_action: message_continue
@@ -29053,16 +30966,19 @@ entries:
                         else:
                             plog(f"  ⚠ Could not create adm_ldapservice: {e.code}")
     
-                    if ldap_pk:
-                        try:
-                            req = urllib.request.Request(f'{ak_url}/api/v3/core/users/{ldap_pk}/set_password/',
-                                data=json.dumps({'password': ldap_svc_password}).encode(),
-                                headers=ak_headers, method='POST')
-                            urllib.request.urlopen(req, timeout=10)
-                            plog(f"  ✓ Set adm_ldapservice password")
-                        except Exception as e:
-                            plog(f"  ⚠ Could not set adm_ldapservice password: {str(e)[:100]}")
-    
+                    # v0.9.23: REMOVED imperative set_password on adm_ldapservice.
+                    # The LDAP blueprint (tak-ldap-setup.yaml) now declares
+                    # `password: !Context password` on the user entry, which
+                    # resolves to AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD from
+                    # .env at blueprint apply time. .env is the single source of
+                    # truth; Authentik's blueprint engine owns the create.
+                    #
+                    # Matches TAK-NZ/auth-infra (Christian Elsen) — declarative
+                    # over imperative kills the mid-session SA password drift class.
+                    # Heal-on-fail fallback remains in
+                    # _ensure_authentik_ldap_service_account() (only fires when
+                    # ldapsearch tri-state verdict says 'fail').
+
                     # Create LDAP provider + outpost + inject token — ALWAYS RUN (required for MediaMTX, TAK Server, standalone)
                     try:
                         # Get default invalidation flow
@@ -29266,50 +31182,44 @@ entries:
                 else:
                     plog(f"  ✗ LDAP start failed: {(r.stderr or r.stdout or '').strip()[:300]}")
 
-        # Verify LDAP flow + service account bind after outpost is up
-        # Prevents "Invalid Credentials" drift after Update & Config
+        # Verify LDAP flow + service account bind after outpost is up.
+        # v0.9.23: REMOVED the imperative re-set_password call that previously
+        # lived here. The LDAP blueprint now declares the password via
+        # `password: !Context password` (resolved from
+        # AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD in .env at apply time), so
+        # the imperative POST was racing the blueprint engine and was the
+        # source of mid-session SA bind drift. This block is now READ-ONLY —
+        # it ldapsearches to confirm the blueprint applied cleanly and logs
+        # the verdict. Heal-on-fail is the watchdog's job, not deploy's.
         if os.path.exists(os.path.join(ak_dir, '.env')):
             plog("")
-            plog("  Verifying LDAP service account...")
+            plog("  Verifying LDAP service account bind (read-only check)...")
             try:
                 ok, err = _ensure_ldap_flow_authentication_none()
                 if ok:
                     plog("  ✓ LDAP flow authentication: none")
                 else:
                     plog(f"  ⚠ LDAP flow fix: {err}")
-                # Re-set password and verify bind
                 _ldap_pass = ''
                 with open(os.path.join(ak_dir, '.env')) as _f:
                     for _line in _f:
                         if _line.strip().startswith('AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD='):
                             _ldap_pass = _line.strip().split('=', 1)[1].strip()
+                            break
                 if _ldap_pass:
-                    _ak_token = ''
-                    with open(os.path.join(ak_dir, '.env')) as _f:
-                        for _line in _f:
-                            if _line.strip().startswith('AUTHENTIK_BOOTSTRAP_TOKEN='):
-                                _ak_token = _line.strip().split('=', 1)[1].strip()
-                    if _ak_token:
-                        _ak_headers = {'Authorization': f'Bearer {_ak_token}', 'Content-Type': 'application/json'}
-                        try:
-                            req = urllib.request.Request(f'http://127.0.0.1:9090/api/v3/core/users/?search=adm_ldapservice', headers=_ak_headers)
-                            resp = urllib.request.urlopen(req, timeout=10)
-                            _results = json.loads(resp.read().decode()).get('results', [])
-                            _ldap_pk = next((u['pk'] for u in _results if u['username'] == 'adm_ldapservice'), None)
-                            if _ldap_pk:
-                                req = urllib.request.Request(f'http://127.0.0.1:9090/api/v3/core/users/{_ldap_pk}/set_password/',
-                                    data=json.dumps({'password': _ldap_pass}).encode(), headers=_ak_headers, method='POST')
-                                urllib.request.urlopen(req, timeout=10)
-                                time.sleep(3)
-                                r = subprocess.run(
-                                    f'ldapsearch -x -H ldap://127.0.0.1:389 -D "cn=adm_ldapservice,ou=users,dc=takldap" -w "{_ldap_pass}" -b "dc=takldap" -s base "(objectClass=*)" 2>&1',
-                                    shell=True, capture_output=True, text=True, timeout=15)
-                                if 'dn:' in (r.stdout or '').lower() or 'result: 0' in (r.stdout or '').lower():
-                                    plog("  ✓ LDAP bind verified")
-                                else:
-                                    plog(f"  ⚠ LDAP bind check inconclusive (service may still be starting)")
-                        except Exception as e:
-                            plog(f"  ⚠ LDAP verify: {str(e)[:100]}")
+                    # Give the blueprint engine a beat to apply on first deploy.
+                    time.sleep(3)
+                    r = subprocess.run(
+                        f'ldapsearch -x -H ldap://127.0.0.1:389 -D "cn=adm_ldapservice,ou=users,dc=takldap" -w "{_ldap_pass}" -b "dc=takldap" -s base "(objectClass=*)" 2>&1',
+                        shell=True, capture_output=True, text=True, timeout=15)
+                    _out = (r.stdout or '').lower()
+                    if 'dn:' in _out or 'result: 0' in _out:
+                        plog("  ✓ LDAP bind verified (blueprint applied — password from .env in DB)")
+                    elif 'invalid credentials' in _out:
+                        plog("  ⚠ LDAP bind INVALID — blueprint may not have applied yet or .env diverged from DB")
+                        plog("    Watchdog will retry within 5 min; or manually: cd ~/authentik && docker compose restart worker")
+                    else:
+                        plog("  ⚠ LDAP bind check inconclusive (outpost still starting)")
             except Exception as e:
                 plog(f"  ⚠ LDAP verify skipped: {str(e)[:80]}")
 
@@ -31652,6 +33562,430 @@ def takserver_sync_webadmin():
     return jsonify({'success': False, 'message': err or 'Sync failed'}), 400
 
 
+@app.route('/api/authentik/pgbouncer')
+@login_required
+def authentik_pgbouncer_api():
+    """v0.9.23 endpoint. Return PgBouncer install status + live pool state.
+
+    Sources:
+      - settings.authentik_pgbouncer (set by `_ensure_authentik_pgbouncer`)
+      - `docker exec authentik-pgbouncer-1 psql -U authentik -d pgbouncer
+        -c 'SHOW POOLS; SHOW STATS;'` for live counters when container is
+        running.
+      - `docker exec authentik-postgresql-1 psql ... pg_stat_activity` to
+        report how many real PG sessions are currently checked out by
+        PgBouncer vs anything else.
+
+    Read-only. Returns JSON. Designed to power a dashboard tile on the
+    Authentik admin page.
+    """
+    s = load_settings()
+    cfg = dict(s.get('authentik_pgbouncer') or {})
+
+    container_state = 'absent'
+    try:
+        r = subprocess.run(
+            "docker inspect --format '{{.State.Status}}|{{.State.Health.Status}}' "
+            "authentik-pgbouncer-1 2>/dev/null",
+            shell=True, capture_output=True, text=True, timeout=5
+        )
+        out = (r.stdout or '').strip()
+        if out:
+            parts = out.split('|')
+            container_state = parts[0] or 'unknown'
+            if len(parts) > 1 and parts[1]:
+                container_state = f"{parts[0]} ({parts[1]})"
+    except Exception:
+        pass
+
+    pools_raw = None
+    stats_raw = None
+    if 'absent' not in container_state and 'unknown' not in container_state:
+        try:
+            r = subprocess.run(
+                "docker exec authentik-pgbouncer-1 psql -h 127.0.0.1 -U authentik "
+                "-d pgbouncer -tA -c 'SHOW POOLS;' 2>/dev/null",
+                shell=True, capture_output=True, text=True, timeout=8
+            )
+            pools_raw = (r.stdout or '').strip() if r.returncode == 0 else None
+        except Exception:
+            pools_raw = None
+        try:
+            r2 = subprocess.run(
+                "docker exec authentik-pgbouncer-1 psql -h 127.0.0.1 -U authentik "
+                "-d pgbouncer -tA -c 'SHOW STATS;' 2>/dev/null",
+                shell=True, capture_output=True, text=True, timeout=8
+            )
+            stats_raw = (r2.stdout or '').strip() if r2.returncode == 0 else None
+        except Exception:
+            stats_raw = None
+
+    # Robust pg_stat_activity probe (client_addr-based, not application_name
+    # which PgBouncer doesn't set by default). See helper docstring for the
+    # field-observed reason this matters.
+    _probe = _authentik_pgbouncer_pg_activity_breakdown(timeout_s=6)
+    via_bouncer = _probe['via_pgbouncer'] if _probe.get('total', 0) > 0 or _probe.get('pgbouncer_ip') else None
+    direct = _probe['direct'] if _probe.get('total', 0) > 0 or _probe.get('pgbouncer_ip') else None
+
+    return jsonify({
+        'installed': bool(cfg.get('installed')),
+        'installed_at_utc': cfg.get('installed_at_utc'),
+        'install_version': cfg.get('version'),
+        'image': cfg.get('image'),
+        'pool_mode': cfg.get('pool_mode'),
+        'default_pool_size': cfg.get('default_pool_size'),
+        'reserve_pool_size': cfg.get('reserve_pool_size'),
+        'max_client_conn': cfg.get('max_client_conn'),
+        'server_idle_timeout_s': cfg.get('server_idle_timeout_s'),
+        'compose_backup': cfg.get('compose_backup'),
+        'env_backup': cfg.get('env_backup'),
+        'container_state': container_state,
+        'pgbouncer_container_ip': _probe.get('pgbouncer_ip'),
+        'pg_stat_activity_via_pgbouncer': via_bouncer,
+        'pg_stat_activity_direct': direct,
+        'pg_stat_activity_by_addr': [{'addr': a, 'count': c} for (a, c) in (_probe.get('by_addr') or [])],
+        'pg_stat_activity_probe_error': _probe.get('error'),
+        'live_pools_raw': pools_raw,
+        'live_stats_raw': stats_raw,
+        'last_outcome': cfg.get('last_outcome'),
+    })
+
+
+# ---------------------------------------------------------------------------
+# v0.9.23 Phase 6b — TAK Server connection-state diagnostic (corrected v2)
+# ---------------------------------------------------------------------------
+# CORRECTED MODEL — the original Phase 6b "zombie subscription" framing was
+# based on a misunderstanding of TAK Server's data model. Forensic
+# investigation on tak-10 (2026-05-15 afternoon) revealed:
+#
+# 1. `client_endpoint` in the cot DB is an IMMORTAL audit log (intentional —
+#    ON DELETE RESTRICT FK from client_endpoint_event), NOT a runtime
+#    subscription pool. Rows persist across JVM restarts forever.
+#
+# 2. `client_endpoint_event` records Connected/Disconnected events with
+#    `created_ts`. Only TWO event types: id=1 Connected, id=2 Disconnected.
+#
+# 3. Marti's `/api/clientEndPoints` API field `lastEventTime: null` does
+#    NOT mean "zombie" or "no events" — it means **the client is currently
+#    in the Disconnected state**. Proof: device `D8985041-...` was reported
+#    as `lastEventTime: null` at 13:31 PT, then connected 60 seconds later
+#    (reflected in client_endpoint_event with type=1). The same device had
+#    7+ connect/disconnect cycles earlier that day.
+#
+# 4. Tak-10's `client_endpoint_event` has 1,801 events across 35 days for
+#    47 unique identities — a healthy, active audit log. The "30 zombies"
+#    that the original Phase 6b code reported were just identities ever
+#    seen, NOT operational problems.
+#
+# 5. `sudo systemctl restart takserver` does NOT clear the persisted
+#    client_endpoint rows — we proved this on tak-10 (27 pre-restart,
+#    27 post-restart, same UIDs, just bumped timestamps from new events).
+#    So the original `jvm_restart` sweep strategy was a no-op.
+#
+# What this means for v0.9.23:
+#
+#   - The PgBouncer fix (Phase 6) is GOOD and stays. Authentik leak ⇒ PG
+#     conn exhaustion ⇒ ak-pg-watchdog restarts ⇒ LDAP-outpost outages is
+#     a real upstream class that PgBouncer architecturally closes.
+#
+#   - The "downstream zombie accumulation" framing was wrong. PgBouncer
+#     stability protects against new auth-disruption-during-connect events
+#     (which were never showing up as "zombies" anyway — see point 3).
+#
+#   - The diagnostic must report ACTUAL connection state, not bucket the
+#     Marti API's misleading `lastEventTime` field. Source of truth:
+#     `client_endpoint_event.created_ts` joined to the latest event per
+#     identity (Connected vs Disconnected).
+#
+# infra-TAK access pattern: cot DB is local PostgreSQL on every TAK Server
+# host (the `takserver` systemd unit + the `postgresql` systemd unit run on
+# the same box). Console queries via `sudo -u postgres psql cot -tAF$'\t' -c ...`
+# — same pattern as `_authentik_pgbouncer_pg_activity_breakdown`.
+#
+# Endpoint: GET /api/takserver/zombies — kept as a URL alias since it was
+# shipped earlier today; returns the new accurate v2 response shape.
+# Endpoint: POST /api/takserver/zombies/sweep — kept for back-compat but
+# returns 410 GONE because there's nothing to sweep under the corrected
+# model.
+
+def _takserver_connection_state(timeout_s=10, sample_size=10):
+    """Query the cot DB directly for actual TAK Server connection state.
+
+    Replaces the broken Marti-API-based bucket logic (see v2 module header
+    for forensic detail). Returns ACTUAL signals:
+
+      total_identities       — row count of client_endpoint (all-time)
+      currently_connected    — identities whose most recent event is type=1
+      currently_disconnected — identities whose most recent event is type=2
+      total_events           — row count of client_endpoint_event
+      events_last_5min       — events created in the last 5 minutes
+      events_last_1h         — events created in the last hour
+      events_last_24h        — events created in the last day
+      earliest_event_utc     — oldest audit row
+      latest_event_utc       — newest audit row (== "is anything happening?")
+      sample_connected       — top N currently-connected clients (callsign,
+                               uid, username, since_utc)
+      advisory               — human-readable verdict
+      taken_at_utc           — when this snapshot was taken
+      error                  — string if probe failed, else None
+
+    Probe: `sudo -u postgres psql cot -tAF$'\\t' -c <sql>` — same access
+    pattern as the rest of app.py's local-DB integrations. The takwerx
+    console process runs unprivileged and reaches `postgres` via the
+    standard `sudo -u postgres psql ...` peer-auth path. The `cot` DB and
+    its tables are created by TAK Server deploy and remain stable across
+    TAK Server versions on infra-TAK boxes; if the table layout ever
+    changes we degrade gracefully via the `error` field.
+    """
+    out = {
+        'model': 'v2',
+        'total_identities': 0,
+        'currently_connected': 0,
+        'currently_disconnected': 0,
+        'total_events': 0,
+        'events_last_5min': 0,
+        'events_last_1h': 0,
+        'events_last_24h': 0,
+        'earliest_event_utc': None,
+        'latest_event_utc': None,
+        'sample_connected': [],
+        'advisory': None,
+        'taken_at_utc': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'error': None,
+    }
+
+    if not os.path.isdir('/opt/tak'):
+        out['error'] = (
+            "TAK Server not installed on this host (/opt/tak missing). "
+            "Connection-state diagnostic is only applicable on hosts running takserver.service."
+        )
+        return out
+
+    sql_stats = (
+        "WITH last_event_per_id AS ("
+        "  SELECT DISTINCT ON (client_endpoint_id) "
+        "    client_endpoint_id, connection_event_type_id, created_ts "
+        "  FROM client_endpoint_event "
+        "  ORDER BY client_endpoint_id, created_ts DESC"
+        ") "
+        "SELECT "
+        "  (SELECT COUNT(*) FROM client_endpoint) AS total_identities, "
+        "  COUNT(*) FILTER (WHERE connection_event_type_id = 1) AS connected, "
+        "  COUNT(*) FILTER (WHERE connection_event_type_id = 2) AS disconnected, "
+        "  (SELECT COUNT(*) FROM client_endpoint_event) AS total_events, "
+        "  (SELECT COUNT(*) FROM client_endpoint_event WHERE created_ts > NOW() - INTERVAL '5 minutes') AS events_5min, "
+        "  (SELECT COUNT(*) FROM client_endpoint_event WHERE created_ts > NOW() - INTERVAL '1 hour') AS events_1h, "
+        "  (SELECT COUNT(*) FROM client_endpoint_event WHERE created_ts > NOW() - INTERVAL '24 hours') AS events_24h, "
+        "  (SELECT MIN(created_ts) FROM client_endpoint_event) AS earliest, "
+        "  (SELECT MAX(created_ts) FROM client_endpoint_event) AS latest "
+        "FROM last_event_per_id"
+    )
+
+    try:
+        r = subprocess.run(
+            _sudo_wrap(['sudo', '-u', 'postgres', 'psql', 'cot',
+                        '-tAF', '\t', '-c', sql_stats]),
+            capture_output=True, text=True, timeout=timeout_s
+        )
+    except subprocess.TimeoutExpired:
+        out['error'] = 'cot DB query timed out — postgresql.service may be unresponsive'
+        return out
+    except Exception as e:
+        out['error'] = f'cot DB probe error: {e}'
+        return out
+
+    if r.returncode != 0:
+        err = ((r.stderr or '') + (r.stdout or ''))[:240]
+        if 'does not exist' in err.lower() and ('client_endpoint' in err.lower() or 'cot' in err.lower()):
+            out['error'] = (
+                "cot DB or client_endpoint table not found. TAK Server may not be deployed "
+                "on this host, or the schema differs from the standard TAK Server layout."
+            )
+        else:
+            out['error'] = f'psql failed (rc={r.returncode}): {err}'
+        return out
+
+    line = (r.stdout or '').strip().splitlines()
+    if not line:
+        out['error'] = 'cot DB returned no rows from stats query'
+        return out
+    parts = line[0].split('\t')
+    if len(parts) < 9:
+        out['error'] = f'cot DB stats output malformed (got {len(parts)} fields): {line[0][:120]!r}'
+        return out
+
+    def _int(s):
+        try:
+            return int((s or '0').strip() or '0')
+        except ValueError:
+            return 0
+
+    out['total_identities']     = _int(parts[0])
+    out['currently_connected']  = _int(parts[1])
+    out['currently_disconnected'] = _int(parts[2])
+    out['total_events']         = _int(parts[3])
+    out['events_last_5min']     = _int(parts[4])
+    out['events_last_1h']       = _int(parts[5])
+    out['events_last_24h']      = _int(parts[6])
+    out['earliest_event_utc']   = (parts[7] or '').strip() or None
+    out['latest_event_utc']     = (parts[8] or '').strip() or None
+
+    if sample_size > 0 and out['currently_connected'] > 0:
+        sql_sample = (
+            "WITH last_event_per_id AS ("
+            "  SELECT DISTINCT ON (client_endpoint_id) "
+            "    client_endpoint_id, connection_event_type_id, created_ts "
+            "  FROM client_endpoint_event "
+            "  ORDER BY client_endpoint_id, created_ts DESC"
+            ") "
+            "SELECT ce.callsign, ce.uid, COALESCE(ce.username, ''), le.created_ts "
+            "FROM last_event_per_id le "
+            "JOIN client_endpoint ce ON ce.id = le.client_endpoint_id "
+            f"WHERE le.connection_event_type_id = 1 "
+            "ORDER BY le.created_ts DESC "
+            f"LIMIT {int(sample_size)}"
+        )
+        try:
+            sr = subprocess.run(
+                _sudo_wrap(['sudo', '-u', 'postgres', 'psql', 'cot',
+                            '-tAF', '\t', '-c', sql_sample]),
+                capture_output=True, text=True, timeout=timeout_s
+            )
+            if sr.returncode == 0:
+                for ln in (sr.stdout or '').strip().splitlines():
+                    sp = ln.split('\t')
+                    if len(sp) >= 4:
+                        out['sample_connected'].append({
+                            'callsign': sp[0],
+                            'uid': sp[1],
+                            'username': sp[2],
+                            'connected_since_utc': sp[3].strip() or None,
+                        })
+        except Exception:
+            pass
+
+    connected = out['currently_connected']
+    disconnected = out['currently_disconnected']
+    e1h = out['events_last_1h']
+    e24h = out['events_last_24h']
+    total_ev = out['total_events']
+
+    # Advisory v2.1 (2026-05-15 PM): the original v2 advisory was over-eager
+    # because it interpreted `events_last_5min == 0 AND connected > 0` as a
+    # routing-impairment signal. That's wrong — `client_endpoint_event` only
+    # records STATE TRANSITIONS (Connect=1, Disconnect=2), not CoT traffic
+    # or heartbeats. A stably-connected client generates ZERO audit rows
+    # for the entire duration of its session (potentially hours or days).
+    # So "no transitions in the last N minutes" is the normal steady state
+    # for any well-behaved client, not a CoT outage.
+    #
+    # We don't try to alarm on "audit pipeline stalled" via these tables
+    # because (a) connected > 0 already proves the pipeline can write
+    # (each connect WAS an event) and (b) genuine routing problems show
+    # up in takserver-messaging.log, not here.
+    if total_ev == 0:
+        out['advisory'] = (
+            'INACTIVE: no events recorded. TAK Server may be freshly installed '
+            'or has never had a client connect.'
+        )
+    elif connected > 0:
+        out['advisory'] = (
+            f'HEALTHY: {connected} client(s) currently connected. '
+            f'{e1h} state-transition event(s) in last hour, {e24h} in last 24h. '
+            f'Audit log: {total_ev} events across {out["total_identities"]} identities.'
+        )
+    elif connected == 0 and e1h > 0:
+        out['advisory'] = (
+            f'IDLE: no clients currently connected, but {e1h} event(s) in last hour. '
+            'Recently active — normal between sessions.'
+        )
+    elif connected == 0 and e24h > 0:
+        out['advisory'] = (
+            f'QUIET: no clients connected, {e24h} event(s) in last 24h. '
+            'Normal for test/standby boxes.'
+        )
+    else:
+        out['advisory'] = (
+            f'DORMANT: no events in last 24h, {disconnected} identities currently disconnected. '
+            'Test/idle box, or no clients have connected lately. Verify takserver.service '
+            'is healthy if this is a production box.'
+        )
+
+    return out
+
+
+def _takserver_subscriptions_breakdown(timeout_s=10, sample_size=10):
+    """Back-compat shim: now delegates to the corrected v2 connection-state probe.
+
+    The original Marti-API-based implementation reported `lastEventTime: null` as
+    "zombie" when it actually means "currently disconnected" — see v2 module
+    header for the forensic trace. Kept as a name alias because earlier code in
+    this release wired the symbol into the (now retired) sweep endpoint and the
+    `/api/takserver/zombies` endpoint.
+    """
+    return _takserver_connection_state(timeout_s=timeout_s, sample_size=sample_size)
+
+
+@app.route('/api/takserver/zombies')
+@app.route('/api/takserver/connection-state')
+@login_required
+def takserver_zombies_api():
+    """v0.9.23 Phase 6b (v2 corrected model). TAK Server connection-state diagnostic.
+
+    URL `/api/takserver/zombies` is kept as a back-compat alias (the route
+    was published earlier in v0.9.23 development under the old "zombie"
+    framing); `/api/takserver/connection-state` is the canonical name now
+    that the underlying model has been corrected.
+
+    Queries the local cot PostgreSQL DB directly (the source of truth for
+    TAK Server's audit log + current connection state) instead of the
+    Marti REST API's `clientEndPoints` endpoint, which reports
+    `lastEventTime: null` for currently-disconnected clients in a way
+    that misled the original "zombie bucket" logic.
+
+    Read-only. Returns 200 JSON even when the probe fails (with `error`
+    set to the diagnostic string) so dashboards can render the failure
+    state cleanly. See v2 module header for the corrected mental model.
+    """
+    return jsonify(_takserver_connection_state(timeout_s=12, sample_size=10))
+
+
+@app.route('/api/takserver/zombies/sweep', methods=['POST'])
+@login_required
+def takserver_zombies_sweep_api():
+    """v0.9.23 Phase 6b — RETIRED. Returns 410 Gone.
+
+    The original `jvm_restart` strategy assumed `sudo systemctl restart takserver`
+    would clear leaked subscription state from TAK Server's in-memory pool. Field
+    forensic on tak-10 (2026-05-15 afternoon) proved this assumption wrong:
+    `client_endpoint` rows are persisted to the cot DB by TAK Server's normal
+    audit-log mechanism and survive every JVM restart (we ran one and counted
+    27 rows pre-restart, 27 rows post-restart, same UIDs, just bumped
+    timestamps). The "zombies" the original endpoint reported are not a runtime
+    leak — they're durable audit log entries.
+
+    No replacement strategy is offered because there is nothing to sweep under
+    the corrected model. Operators wanting a clean dashboard view should use
+    GET /api/takserver/zombies (alias /api/takserver/connection-state) which
+    now reports actual connection state instead of misclassified audit rows.
+
+    Optional audit-log pruning (delete client_endpoint_event rows older than N
+    days) may be added in a future release if operators report needing it.
+    """
+    return jsonify({
+        'success': False,
+        'gone': True,
+        'message': (
+            'This endpoint is retired. The original "jvm_restart" sweep was a no-op '
+            'under the corrected model — TAK Server\'s client_endpoint rows are '
+            'persistent audit-log entries, not leaked subscriptions, and survive '
+            'every systemctl restart. Use GET /api/takserver/zombies (or its '
+            'canonical alias /api/takserver/connection-state) to see real connection '
+            'state. See docs/PLAN-v0.9.23-alpha.md Item 7 for the forensic detail.'
+        ),
+    }), 410
+
+
 def _get_authentik_webadmin_status():
     """Return webadmin presence/superuser status from Authentik API."""
     import urllib.request as _req
@@ -31947,6 +34281,166 @@ def authentik_admin_accounts_api():
     has been deactivated (typically via TAK Portal user management).
     """
     return jsonify(_get_authentik_admin_accounts_status())
+
+
+@app.route('/api/authentik/audit-log')
+@login_required
+def authentik_audit_log_api():
+    """v0.9.23 Phase 1 forensic endpoint. Return the rolling audit events the
+    watchdog has scraped from Authentik for the protected admin accounts.
+
+    Useful for identifying mid-session mutators without SSH'ing to the box:
+        curl -s -H "Cookie: $C" https://<host>/api/authentik/audit-log | jq
+
+    Read-only. No mutations. Returns last 20 events per username plus repair
+    counters and last-repair timestamps so operators can correlate the audit
+    events (who/when/from-where) to our self-healer's writes.
+    """
+    s = load_settings()
+    out = {
+        'usernames': ['adm_ldapservice', 'webadmin'],
+        'repair_counters': {
+            'authentik_ldap_sa_repair_count': int(s.get('authentik_ldap_sa_repair_count') or 0),
+            'authentik_ldap_sa_last_repair': s.get('authentik_ldap_sa_last_repair') or '',
+            'authentik_webadmin_role_repair_count': int(s.get('authentik_webadmin_role_repair_count') or 0),
+            'authentik_webadmin_role_last_repair': s.get('authentik_webadmin_role_last_repair') or '',
+        },
+        'events': {
+            'adm_ldapservice': s.get('authentik_audit_recent_adm_ldapservice') or [],
+            'webadmin': s.get('authentik_audit_recent_webadmin') or [],
+        },
+        'high_water': {
+            'adm_ldapservice': s.get('authentik_audit_last_seen_adm_ldapservice') or '',
+            'webadmin': s.get('authentik_audit_last_seen_webadmin') or '',
+        },
+    }
+    return jsonify(out)
+
+
+@app.route('/api/authentik/audit-log/scrape-now', methods=['POST'])
+@login_required
+def authentik_audit_log_scrape_now_api():
+    """v0.9.23 Phase 1. Force an immediate audit-log scrape (don't wait for the
+    next 5-min watchdog tick). Useful when an operator just witnessed a drift
+    event and wants to see who wrote to the user RIGHT NOW.
+    """
+    try:
+        n = _authentik_audit_scrape_recent(plog_fn=lambda m: print(m, flush=True))
+        return jsonify({'success': True, 'new_events': n})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)[:200]}), 500
+
+
+@app.route('/api/authentik/max-requests')
+@login_required
+def authentik_max_requests_api():
+    """v0.9.23 endpoint. Return the current MAX_REQUESTS value + auto-tune
+    state so the dashboard can surface 'Authentik worker recycle: every N
+    requests, auto-tuned 2h ago after watchdog fired' to operators.
+
+    Read-only.
+    """
+    s = load_settings()
+    cur_max, cur_jitter = _authentik_max_requests_get_current()
+    fires = list(s.get('authentik_max_requests_fire_history') or [])
+    tunes = list(s.get('authentik_max_requests_tune_history') or [])
+    import time as _t
+    _now = int(_t.time())
+    fires_last_24h = [f for f in fires if _now - f < 86400]
+    out = {
+        'current_max_requests': cur_max,
+        'current_jitter': cur_jitter,
+        'autotune_disabled': bool(s.get('authentik_max_requests_autotune_disabled')),
+        'floor': int(s.get('authentik_max_requests_floor') or _AUTHENTIK_MAX_REQUESTS_FLOOR_DEFAULT),
+        'ceiling': int(s.get('authentik_max_requests_ceiling') or _AUTHENTIK_MAX_REQUESTS_CEILING_DEFAULT),
+        'baseline': int(s.get('authentik_max_requests_baseline') or 1000),
+        'last_tune_ts': int(s.get('authentik_max_requests_last_tune_ts') or 0),
+        'tune_history': tunes[-10:],
+        'fire_history_last_24h_count': len(fires_last_24h),
+        'last_fire_ts': max(fires) if fires else 0,
+    }
+    return jsonify(out)
+
+
+@app.route('/api/authentik/max-requests/log')
+@login_required
+def authentik_max_requests_log_api():
+    """v0.9.23 endpoint. Tail the auto-tune log file.
+
+    Query params:
+      - lines (int, default 200, max 5000): number of trailing lines to return
+
+    Returns plain text (Content-Type: text/plain) so it can be `curl`'d into
+    less / piped through grep without JSON parsing overhead.
+
+    The log file is /var/log/takguard/ak-mr-autotune.log; tail it directly
+    with `tail -F` on the VPS for live monitoring.
+    """
+    try:
+        n = int(request.args.get('lines') or 200)
+    except (TypeError, ValueError):
+        n = 200
+    n = max(1, min(n, 5000))
+    try:
+        if not os.path.exists(_AUTOTUNE_LOG_PATH):
+            return ("(no events yet — auto-tune log file does not exist; "
+                    "will be created when the watchdog records its first event)\n"),  200, {
+                'Content-Type': 'text/plain; charset=utf-8'
+            }
+        with open(_AUTOTUNE_LOG_PATH, 'r', errors='replace') as f:
+            tail = f.readlines()[-n:]
+        body = ''.join(tail) or '(log file is empty)\n'
+        return body, 200, {'Content-Type': 'text/plain; charset=utf-8'}
+    except Exception as e:
+        return f"(error reading log: {e})\n", 500, {
+            'Content-Type': 'text/plain; charset=utf-8'
+        }
+
+
+@app.route('/api/authentik/max-requests/autotune', methods=['POST'])
+@login_required
+def authentik_max_requests_autotune_api():
+    """v0.9.23 endpoint. Operator controls for the MAX_REQUESTS auto-tuner.
+
+    Accepts JSON body with optional keys:
+      - `disabled` (bool): set settings.authentik_max_requests_autotune_disabled
+      - `floor` (int): clamp the minimum the auto-tuner will set
+      - `ceiling` (int): clamp the maximum the auto-tuner will set
+      - `baseline` (int): the "happy path" value the auto-tuner returns to
+        after a long no-fire period
+
+    No body or missing keys = no-op for that field (read current settings only).
+
+    Returns the updated state. Read-only-style query is also supported via
+    GET on /api/authentik/max-requests.
+    """
+    data = request.get_json() or {}
+    s = load_settings()
+    if 'disabled' in data:
+        s['authentik_max_requests_autotune_disabled'] = bool(data['disabled'])
+    if 'floor' in data:
+        try:
+            s['authentik_max_requests_floor'] = max(50, int(data['floor']))
+        except (TypeError, ValueError):
+            pass
+    if 'ceiling' in data:
+        try:
+            s['authentik_max_requests_ceiling'] = min(10000, int(data['ceiling']))
+        except (TypeError, ValueError):
+            pass
+    if 'baseline' in data:
+        try:
+            s['authentik_max_requests_baseline'] = int(data['baseline'])
+        except (TypeError, ValueError):
+            pass
+    save_settings(s)
+    return jsonify({
+        'success': True,
+        'autotune_disabled': bool(s.get('authentik_max_requests_autotune_disabled')),
+        'floor': int(s.get('authentik_max_requests_floor') or _AUTHENTIK_MAX_REQUESTS_FLOOR_DEFAULT),
+        'ceiling': int(s.get('authentik_max_requests_ceiling') or _AUTHENTIK_MAX_REQUESTS_CEILING_DEFAULT),
+        'baseline': int(s.get('authentik_max_requests_baseline') or 1000),
+    })
 
 
 @app.route('/api/authentik/recover-admin', methods=['POST'])
@@ -39932,10 +42426,51 @@ def _startup_migrations():
         # v0.9.21: Downgrade CONN_MAX_AGE 60→10 on boxes deployed under v0.9.20.
         # Root cause: enterprise license cache miss (~1 DB hit/req) + CONN_MAX_AGE=60
         # → ~30 idle connections steady-state → exhausts max_connections=500 in ~20 min.
+        # NOTE (v0.9.23, after Tom Andersen's anchortak analysis): this migration
+        # is RETAINED as defense-in-depth (it covers the Django ORM pool which
+        # CONN_MAX_AGE does govern), but the actual upstream Authentik 2026.2.x
+        # leak is in django_postgres_cache's separate pool which bypasses
+        # CONN_MAX_AGE entirely. The real fix is below
+        # (_patch_authentik_web_max_requests_to_1000). See
+        # docs/UPSTREAM-AUTHENTIK-PG-LEAK-20714.md.
         try:
             _patch_authentik_conn_max_age_60_to_10(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as ak_cma_err:
             print(f"Startup migration: conn_max_age 60→10 patch error (non-fatal): {ak_cma_err}")
+        # v0.9.23: Re-enable gunicorn worker recycling (MAX_REQUESTS 0→1000) on
+        # boxes deployed under v0.8.7+ that explicitly disabled it. The disable
+        # was correct at the time (pre-leak era), but upstream Authentik 2026.2.x
+        # introduced the enterprise/license cache-miss leak (#20714) which makes
+        # worker recycling the right shape of mitigation again. With MAX_REQUESTS=1000
+        # the channels_pool_watchdog should rarely or never fire — see Tom
+        # Andersen's 91-min × 1056-sample anchortak forensic analysis at
+        # docs/UPSTREAM-AUTHENTIK-PG-LEAK-20714.md.
+        try:
+            _patch_authentik_web_max_requests_to_1000(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as ak_mr_err:
+            print(f"Startup migration: max_requests 0→1000 patch error (non-fatal): {ak_mr_err}")
+
+        # v0.9.23 Phase 6: Install PgBouncer between Authentik and Postgres.
+        # Architectural fix for the upstream Authentik 2026.2.x cache-pool
+        # leak (#20714). Even with MAX_REQUESTS=1000 + autotune + watchdog
+        # all working as designed, tak-10's overnight log (2026-05-15) showed
+        # the watchdog still firing ~4x/hour at the autotune floor, and Tom
+        # Andersen's TAK Server forensics showed those windows create zombie
+        # subscriptions in DistributedSubscriptionManager that TAK Server
+        # cannot self-heal. PgBouncer caps real PG connections at ~30
+        # regardless of upstream leaks → watchdog never fires → user lookups
+        # never fail → no zombies. Idempotent — re-running on a box that
+        # already has pgbouncer in compose AND .env is a fast no-op.
+        # Reference: docs.goauthentik.io/install-config/configuration/#using-a-postgresql-connection-pooler
+        try:
+            _pgb_changed = _ensure_authentik_pgbouncer(lambda m: print(f"Startup migration: {m}", flush=True))
+            if _pgb_changed is True:
+                # The pgbouncer install function already recreated server+worker
+                # so .env changes are live. Re-run runtime verify to record
+                # current state with PgBouncer in the loop.
+                _authentik_verify_runtime_config(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as ak_pgb_err:
+            print(f"Startup migration: pgbouncer install error (non-fatal): {ak_pgb_err}")
 
         # v0.8.8: Fix LDAP flow stage-binding recursion (evaluate_on_plan=true + re_evaluate_policies=true).
         # Idempotent — only fires the SQL UPDATE + server restart on boxes where the bug
@@ -40008,6 +42543,63 @@ def _startup_migrations():
                 print("Startup: PG connection watchdog started (threshold=150, interval=2min)", flush=True)
         except Exception as _wde:
             print(f"Startup: channels pool watchdog start failed (non-fatal): {_wde}", flush=True)
+
+        # v0.9.23: TAK Portal admin-account guardrail re-assertion at every boot.
+        # Was version-gated post-update only (v0.9.15). Promoted to startup migration
+        # so USERS_HIDDEN_PREFIXES / USERS_ACTIONS_HIDDEN_PREFIXES drift between Update
+        # Now clicks gets bounded recovery on the next console restart. Idempotent —
+        # no-op on already-hardened boxes. See PLAN-v0.9.23-alpha.md (Item 3).
+        try:
+            _takportal_admin_guardrail(plog_fn=lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _tge:
+            print(f"Startup migration: takportal admin guardrail error (non-fatal): {_tge}", flush=True)
+
+        # v0.9.23: webadmin admin-role drift guardrail (boot-time check).
+        # Catches webadmin missing from tak_ROLE_ADMIN / authentik Admins, deactivated,
+        # or CoreConfig adminGroup attribute stripped — the class of drift that lands
+        # an operator on the WebTAK landing page when they meant the TAK Server admin
+        # UI at :8446. Heals via _ensure_authentik_webadmin (skip_bind_verify=True for
+        # speed; the LDAP outpost already gets reloaded by Item 1 on the same tick).
+        # See PLAN-v0.9.23-alpha.md (Item 2).
+        try:
+            _authentik_webadmin_role_check_and_heal(
+                plog_fn=lambda m: print(f"Startup migration: {m}", flush=True)
+            )
+        except Exception as _wae:
+            print(f"Startup migration: webadmin role check error (non-fatal): {_wae}", flush=True)
+
+        # v0.9.23: Continuous LDAP SA bind + webadmin role watchdog.
+        # Boot-time _startup_resync_ldap_service_account() and the two checks above
+        # only run once per console restart. Field-observed drift recurs mid-session
+        # every ~1–2 hours under bind_mode: cached (cache masks the underlying
+        # mutator). This daemon re-runs both checks every 5 min so recovery time
+        # is bounded under one tick instead of "until the next reboot". See
+        # PLAN-v0.9.23-alpha.md (Item 1).
+        try:
+            if (os.path.exists(os.path.expanduser('~/authentik/.env'))
+                    and _coreconfig_has_ldap()):
+                _start_ldap_sa_bind_watchdog()
+                print("Startup: LDAP SA bind watchdog started (interval=5min, checks SA bind + webadmin roles)", flush=True)
+        except Exception as _lwe:
+            print(f"Startup: LDAP SA bind watchdog start failed (non-fatal): {_lwe}", flush=True)
+
+        # v0.9.23 Phase 1 (FORENSIC): seed the Authentik audit-log scraper. On
+        # first-ever run per box this sets the high-water mark silently (no log
+        # spam for historical events). On subsequent boots it logs any events
+        # that landed while the console was down — so an overnight reboot will
+        # show us any password_set / model_updated on adm_ldapservice or webadmin
+        # that happened during the outage. After this, the 5-min watchdog tick
+        # re-scrapes continuously. See PLAN-v0.9.23-alpha.md Phase 1.
+        try:
+            if os.path.exists(os.path.expanduser('~/authentik/.env')):
+                _new_at_boot = _authentik_audit_scrape_recent(
+                    plog_fn=lambda m: print(f"Startup migration: {m}", flush=True)
+                )
+                if _new_at_boot:
+                    print(f"Startup migration: audit scraper logged {_new_at_boot} new events "
+                          f"since last console run (grep '[audit:' for details)", flush=True)
+        except Exception as _ase:
+            print(f"Startup migration: audit scraper seed error (non-fatal): {_ase}", flush=True)
 
         # v0.9.0: fail2ban post-install config migrations (only run if fail2ban is already installed
         # by the operator via the Marketplace — _fail2ban_install_and_configure is NOT auto-run).
@@ -41461,88 +44053,12 @@ def _post_update_auto_deploy():
 
             _auto_harden_takportal()
 
-            def _auto_harden_takportal_settings():
-                """v0.9.15 — TAK Portal admin-account guardrail.
-
-                Ensures `akadmin` and `webadmin` are in both
-                USERS_HIDDEN_PREFIXES (hidden from the user list) and
-                USERS_ACTIONS_HIDDEN_PREFIXES (action-locked — cannot be
-                modified from TAK Portal's UI). Prevents the v0.9.13 incident
-                class where an operator accidentally clicked Disable on
-                `akadmin` from TAK Portal's user-management UI and locked
-                themselves out of Authentik entirely.
-
-                Idempotent — no-op if both prefixes are already present in
-                both fields. Otherwise pushes merged settings (preserves
-                BRAND_LOGO_URL / SSH onboarding flags via PRESERVE_TAKPORTAL_KEYS)
-                and restarts the tak-portal container to apply.
-
-                Skipped when TAK Portal isn't deployed locally (~/TAK-Portal
-                missing); remote-Portal installs apply the new defaults on
-                next "Update config & reconnect" click in the UI.
-
-                The /authentik Protected Admin Accounts panel (v0.9.13 +
-                v0.9.14 layered API → ak shell recovery) stays as the
-                last-resort recovery if this guardrail is ever bypassed.
-                """
-                try:
-                    _portal_dir = os.path.expanduser('~/TAK-Portal')
-                    if not os.path.isdir(_portal_dir):
-                        return
-                    _ps = subprocess.run(
-                        'docker ps --filter name=^tak-portal$ --format "{{.Names}}"',
-                        shell=True, capture_output=True, text=True, timeout=10
-                    )
-                    if 'tak-portal' not in (_ps.stdout or ''):
-                        return
-                    print("Post-update: TAK Portal admin-account guardrail (v0.9.15)...")
-
-                    _existing = _takportal_get_existing_settings()
-                    _hidden = (_existing.get('USERS_HIDDEN_PREFIXES') or '') if isinstance(_existing, dict) else ''
-                    _locked = (_existing.get('USERS_ACTIONS_HIDDEN_PREFIXES') or '') if isinstance(_existing, dict) else ''
-                    _hidden_parts = {p.strip() for p in _hidden.split(',') if p.strip()}
-                    _locked_parts = {p.strip() for p in _locked.split(',') if p.strip()}
-                    _need_keys = {'akadmin', 'webadmin'}
-                    _hidden_ok = _need_keys.issubset(_hidden_parts)
-                    _locked_ok = _need_keys.issubset(_locked_parts)
-                    if _hidden_ok and _locked_ok:
-                        print("  TAK Portal already guarded — akadmin/webadmin hidden + action-locked")
-                        return
-
-                    print(f"  TAK Portal current: hidden={_hidden!r} actions_hidden={_locked!r}")
-                    print("  TAK Portal pushing merged settings (preserves operator brand/SSH keys)")
-                    _settings = load_settings()
-                    _settings_json = _takportal_merged_settings_json(_settings)
-                    _fd, _tmp = tempfile.mkstemp(suffix='.json', prefix='tak-portal-guard-')
-                    try:
-                        with os.fdopen(_fd, 'w') as _tf:
-                            _tf.write(_settings_json)
-                        _cp = subprocess.run(
-                            f'docker cp {shlex.quote(_tmp)} tak-portal:/usr/src/app/data/settings.json',
-                            shell=True, capture_output=True, text=True, timeout=20
-                        )
-                    finally:
-                        try:
-                            os.remove(_tmp)
-                        except OSError:
-                            pass
-                    if _cp.returncode != 0:
-                        print(f"  WARNING: docker cp failed: {((_cp.stderr or _cp.stdout) or '').strip()[:200]}")
-                        return
-                    _rs = subprocess.run(
-                        'docker restart tak-portal',
-                        shell=True, capture_output=True, text=True, timeout=30
-                    )
-                    if _rs.returncode == 0:
-                        print("  TAK Portal restarted — akadmin/webadmin now hidden + action-locked")
-                    else:
-                        print(f"  WARNING: TAK Portal restart returned {_rs.returncode}")
-
-                    print("Post-update: TAK Portal admin-account guardrail complete")
-                except Exception as _tge:
-                    print(f"Post-update: TAK Portal guardrail error (non-fatal): {_tge}")
-
-            _auto_harden_takportal_settings()
+            # v0.9.23: nested _auto_harden_takportal_settings (v0.9.15) extracted
+            # to module-level _takportal_admin_guardrail so the same logic also
+            # runs in _startup_migrations (every console boot) — see PLAN-v0.9.23-alpha.md Item 3.
+            print("Post-update: TAK Portal admin-account guardrail (v0.9.15)...")
+            _takportal_admin_guardrail(plog_fn=lambda m: print(f"Post-update: {m}", flush=True))
+            print("Post-update: TAK Portal admin-account guardrail complete")
 
             def _auto_harden_mediamtx():
                 """v0.9.12 — MediaMTX port hardening for existing local installs.
