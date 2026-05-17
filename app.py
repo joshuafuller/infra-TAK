@@ -363,7 +363,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.25-alpha"
+VERSION = "0.9.26-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -6487,36 +6487,11 @@ def guarddog_update():
         _ak_tl_script   = '/opt/tak-guarddog/tak-authentik-tasklog-purge.sh'
         _ak_compose_path = os.path.expanduser('~/authentik/docker-compose.yml')
         if os.path.exists(_ak_compose_path) and not os.path.isfile(_ak_tl_tmr_path):
-            _ak_tl_script_content = (
-                '#!/bin/bash\n'
-                '# Guard Dog: Authentik task log purge — removes task/tasklog rows older than 30 days.\n'
-                '# Runs weekly (Sunday 03:00). Tables are never auto-purged by Authentik and can grow\n'
-                '# to 500–900 MB after ~1 month of normal operation, causing autovacuum lag and CPU spikes.\n'
-                'set -euo pipefail\n'
-                'LOG=/var/log/takguard/authentik-tasklog-purge.log\n'
-                'STAMP_FILE=/opt/tak-guarddog/authentik_tasklog_purge_last.txt\n'
-                'TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")\n'
-                'mkdir -p /var/log/takguard\n'
-                'echo "[$TS] Starting Authentik task log purge" >> "$LOG"\n'
-                'if ! docker ps -q --filter name=authentik-postgresql-1 | grep -q .; then\n'
-                '  echo "[$TS] authentik-postgresql-1 not running — skipping" >> "$LOG"\n'
-                '  exit 0\n'
-                'fi\n'
-                'docker exec authentik-postgresql-1 psql -U authentik -d authentik -c "\n'
-                'DELETE FROM authentik_tasks_tasklog\n'
-                'WHERE task_id IN (\n'
-                '  SELECT message_id FROM authentik_tasks_task\n'
-                "  WHERE mtime < NOW() - INTERVAL '30 days'\n"
-                ');\n'
-                'DELETE FROM authentik_tasks_task\n'
-                "WHERE mtime < NOW() - INTERVAL '30 days';\n"
-                'VACUUM ANALYZE authentik_tasks_task, authentik_tasks_tasklog;\n'
-                '" >> "$LOG" 2>&1\n'
-                'echo "$TS" > "$STAMP_FILE"\n'
-                'echo "[$TS] Authentik task log purge complete" >> "$LOG"\n'
-            )
+            # v0.9.26: script body comes from the canonical _AUTHENTIK_TASKLOG_PURGE_SCRIPT
+            # constant (see app.py around line 33985). Fixed the v0.9.5 VACUUM-in-transaction
+            # bug + replaced the 30-day-only window with a 7d → 24h → 1h tier ladder.
             with open(_ak_tl_script, 'w') as _f:
-                _f.write(_ak_tl_script_content)
+                _f.write(_AUTHENTIK_TASKLOG_PURGE_SCRIPT)
             os.chmod(_ak_tl_script, 0o755)
             with open(_ak_tl_svc_path, 'w') as _f:
                 _f.write('[Unit]\nDescription=Guard Dog Authentik Task Log Purge\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-authentik-tasklog-purge.sh\n')
@@ -7026,37 +7001,12 @@ def run_guarddog_deploy(alert_email):
                 ('takauthentikguard.timer', '[Unit]\nDescription=Run Authentik guard every 1 minute\n\n[Timer]\nOnBootSec=15min\nOnUnitActiveSec=1min\nUnit=takauthentikguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ])
             # Authentik task log purge — weekly cleanup of authentik_tasks_task/tasklog tables
-            _ak_purge_script = (
-                '#!/bin/bash\n'
-                '# Guard Dog: Authentik task log purge — removes task/tasklog rows older than 30 days.\n'
-                '# Runs weekly (Sunday 03:00). Tables are never auto-purged by Authentik and can grow\n'
-                '# to 500–900 MB after ~1 month of normal operation, causing autovacuum lag and CPU spikes.\n'
-                'set -euo pipefail\n'
-                'LOG=/var/log/takguard/authentik-tasklog-purge.log\n'
-                'STAMP_FILE=/opt/tak-guarddog/authentik_tasklog_purge_last.txt\n'
-                'TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")\n'
-                'mkdir -p /var/log/takguard\n'
-                'echo "[$TS] Starting Authentik task log purge" >> "$LOG"\n'
-                'if ! docker ps -q --filter name=authentik-postgresql-1 | grep -q .; then\n'
-                '  echo "[$TS] authentik-postgresql-1 not running — skipping" >> "$LOG"\n'
-                '  exit 0\n'
-                'fi\n'
-                'docker exec authentik-postgresql-1 psql -U authentik -d authentik -c "\n'
-                'DELETE FROM authentik_tasks_tasklog\n'
-                'WHERE task_id IN (\n'
-                '  SELECT message_id FROM authentik_tasks_task\n'
-                "  WHERE mtime < NOW() - INTERVAL '30 days'\n"
-                ');\n'
-                'DELETE FROM authentik_tasks_task\n'
-                "WHERE mtime < NOW() - INTERVAL '30 days';\n"
-                'VACUUM ANALYZE authentik_tasks_task, authentik_tasks_tasklog;\n'
-                '" >> "$LOG" 2>&1\n'
-                'echo "$TS" > "$STAMP_FILE"\n'
-                'echo "[$TS] Authentik task log purge complete" >> "$LOG"\n'
-            )
+            # v0.9.26: script body comes from the canonical _AUTHENTIK_TASKLOG_PURGE_SCRIPT
+            # constant (see app.py around line 33985). Fixed the v0.9.5 VACUUM-in-transaction
+            # bug + replaced the 30-day-only window with a 7d → 24h → 1h tier ladder.
             _ak_purge_path = '/opt/tak-guarddog/tak-authentik-tasklog-purge.sh'
             with open(_ak_purge_path, 'w') as _f:
-                _f.write(_ak_purge_script)
+                _f.write(_AUTHENTIK_TASKLOG_PURGE_SCRIPT)
             os.chmod(_ak_purge_path, 0o755)
             units.extend([
                 ('takauthentiktasklogpurge.service', '[Unit]\nDescription=Guard Dog Authentik Task Log Purge\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-authentik-tasklog-purge.sh\n'),
@@ -27192,32 +27142,45 @@ def _authentik_pgbouncer_pg_activity_breakdown(timeout_s=6):
 # infra-TAK fleet box (2-4 vCPU, ~50 concurrent ATAK + iTAK + WebTAK + portal
 # users + LDAP outpost binds). Operators can override via .env if needed but
 # the defaults should comfortably absorb 99% of traffic.
-#   - DEFAULT_POOL_SIZE=35: real PG server connections per (db, user) pair.
+#   - DEFAULT_POOL_SIZE=75: real PG server connections per (db, user) pair.
 #     With Authentik's leak, the previous setting was ~500 (max_connections),
 #     hit by exhaustion every ~30 min on busy boxes. v0.9.23 shipped =25
 #     (matching TAK-NZ/auth-infra on managed RDS, Christian Elsen PR #102).
-#     v0.9.24 bumps to 35 after tak-10 field validation (2026-05-16) showed
-#     `SHOW POOLS` running steady-state at sv_active=29/sv_idle=1 under modest
-#     concurrent load — saturated with zero headroom for spike absorption.
-#     35 + RESERVE=5 → 40-connection ceiling, still well below Postgres
-#     max_connections=500 and gives ~33% headroom for traffic bursts.
+#     v0.9.24 bumped to 35 after the steady-state pool saturated at sv_active=29.
+#     v0.9.26-alpha hotfix #3 bumps to 75 after tak-10 field validation
+#     (2026-05-17, post-bloat-cleanup): even with healthy task tables and 4
+#     gunicorn workers, the server hit `ProtocolViolation: query_wait_timeout`
+#     within ~10 min of every recreate. Root cause: Django Channels uses
+#     PG-backed `django_channels_postgres_groupchannel` long-polling SELECTs
+#     for the channels layer — `pg_stat_activity` showed 17 idle conns held
+#     by `SELECT DISTINCT FROM ... groupchannel` (one per active channel),
+#     leaving only ~18 of the 35-slot pool for HTTP requests. Under modest
+#     concurrent load (outpost API polls, healthchecks, OAuth flows) the
+#     pool exhausted, requests piled in PgBouncer's queue past query_wait
+#     timeout, gunicorn workers got stuck on `pg_advisory_lock(...)`, and
+#     LDAP searches started returning empty results → TAK Server 8446 login
+#     landed on WebTAK instead of admin page. 75 + RESERVE=15 → 90-connection
+#     ceiling gives ~57 slots after Channels overhead, comfortably absorbing
+#     spike load. Still well below Postgres max_connections=500.
 #   - MAX_CLIENT_CONN=1000: client-side virtual connection slots. Authentik
 #     workers + outposts can each "hold" idle connections without consuming
 #     real PG server slots — PgBouncer only checks out a server connection
 #     for the duration of each transaction (POOL_MODE=transaction).
-#   - RESERVE_POOL_SIZE=5: extra connections opened when DEFAULT_POOL_SIZE
+#   - RESERVE_POOL_SIZE=15: extra connections opened when DEFAULT_POOL_SIZE
 #     is saturated AND a client has been waiting >reserve_pool_timeout (5s).
-#     Provides headroom during traffic spikes without permanently inflating
-#     the steady-state connection count.
+#     Provides headroom during traffic spikes (OAuth-flow bursts, post-restart
+#     reconnect storms, blueprint reloads) without permanently inflating the
+#     steady-state connection count. Bumped 5 → 15 in v0.9.26-alpha hotfix #3
+#     alongside DEFAULT_POOL_SIZE.
 #   - SERVER_IDLE_TIMEOUT=300s: PgBouncer-side idle reaper. Matches our
 #     Postgres idle_session_timeout=300s. Real PG connections close after
 #     5 min idle so we don't keep them open longer than the upstream.
 #   - SERVER_RESET_QUERY=DISCARD ALL: clears prepared statements, temp tables,
 #     and session state between checkouts. Required for transaction mode
 #     and recommended by both PgBouncer upstream and Authentik docs.
-_AUTHENTIK_PGBOUNCER_DEFAULT_POOL_SIZE = 35
+_AUTHENTIK_PGBOUNCER_DEFAULT_POOL_SIZE = 75
 _AUTHENTIK_PGBOUNCER_MAX_CLIENT_CONN = 1000
-_AUTHENTIK_PGBOUNCER_RESERVE_POOL_SIZE = 5
+_AUTHENTIK_PGBOUNCER_RESERVE_POOL_SIZE = 15
 _AUTHENTIK_PGBOUNCER_SERVER_IDLE_TIMEOUT_S = 300
 
 
@@ -27245,7 +27208,8 @@ def _ensure_authentik_pgbouncer(plog):
 
     Insert PgBouncer in transaction-pool mode between Authentik and Postgres.
     PgBouncer maintains a small server-side pool of real PG connections
-    (DEFAULT_POOL_SIZE=35, RESERVE=5 → 40-connection ceiling, v0.9.24)
+    (DEFAULT_POOL_SIZE=75, RESERVE=15 → 90-connection ceiling, v0.9.26-alpha
+    hotfix #3 — see _AUTHENTIK_PGBOUNCER_* constants for sizing rationale)
     regardless of how leaky Authentik's client-side psycopg pools become.
     Authentik workers can "hold" thousands of client-side idle connections
     but only borrow a real PG connection for the duration of each
@@ -27565,8 +27529,8 @@ def _ensure_authentik_pgbouncer(plog):
     if not any(ln.startswith('# ── v0.9.23 PgBouncer pooler') for ln in new_env_lines):
         new_env_lines.append('# ── v0.9.23 PgBouncer pooler ─────────────────────────────────────────')
         new_env_lines.append('# Authentik now connects to PgBouncer (transaction pool mode) instead of')
-        new_env_lines.append('# Postgres directly. PgBouncer caps real PG server connections at ~30')
-        new_env_lines.append('# (DEFAULT_POOL_SIZE=35 + RESERVE_POOL_SIZE=5) regardless of upstream')
+        new_env_lines.append('# Postgres directly. PgBouncer caps real PG server connections at ~90')
+        new_env_lines.append('# (DEFAULT_POOL_SIZE=75 + RESERVE_POOL_SIZE=15) regardless of upstream')
         new_env_lines.append('# Authentik 2026.2.x cache-pool leaks. This eliminates the')
         new_env_lines.append('# ak-pg-watchdog firefighting class and the downstream TAK Server')
         new_env_lines.append('# "User lookup failed" / phantom-subscription class.')
@@ -27792,28 +27756,40 @@ def _ensure_authentik_pgbouncer(plog):
         plog("  ✗ pgbouncer install: completed with BYPASSED state — see logs above for fix steps")
     else:
         plog("  ✓ pgbouncer install: COMPLETE — Authentik now connects through PgBouncer "
-             "(transaction pool, ≤40 real PG conns)")
+             "(transaction pool, ≤90 real PG conns)")
     return True
 
 
-def _ensure_authentik_pgbouncer_pool_size(plog, target=None):
-    """v0.9.24 Item 3: Bump PgBouncer DEFAULT_POOL_SIZE on existing installs.
+def _ensure_authentik_pgbouncer_pool_size(plog, target=None, target_reserve=None):
+    """v0.9.24 Item 3 + v0.9.26-alpha hotfix #3: Bump PgBouncer pool sizing on
+    existing installs.
 
-    v0.9.23 shipped the PgBouncer install with DEFAULT_POOL_SIZE=25, RESERVE_POOL_SIZE=5
-    (30-connection ceiling). Field validation on tak-10 (2026-05-16, single-day post-
-    install) showed `SHOW POOLS` running steady-state at sv_active=29 / sv_idle=1 under
-    modest concurrent load — fully saturated with zero headroom for traffic spikes,
-    OAuth-flow bursts, or LDAP outpost reconnect storms. Bumping to 35 + RESERVE=5 →
-    40-connection ceiling, restoring ~33% spike headroom while staying well below
-    Postgres max_connections=500.
+    v0.9.23 shipped DEFAULT_POOL_SIZE=25, RESERVE_POOL_SIZE=5 (30-conn ceiling).
+    v0.9.24 bumped to 35/5 (40-conn ceiling) after tak-10 field validation
+    (2026-05-16) showed `SHOW POOLS` saturated at sv_active=29/sv_idle=1.
+
+    v0.9.26-alpha hotfix #3 (2026-05-17): bumps DEFAULT_POOL_SIZE 35 → 75 and
+    RESERVE_POOL_SIZE 5 → 15 (90-conn ceiling). After the v0.9.26 inline
+    tasklog purge cleaned the database, tak-10 STILL saturated the pool within
+    ~10 min of every recreate. Root cause was Django Channels' PG-backed channel
+    layer: `pg_stat_activity` showed 17 idle connections held by
+    `SELECT DISTINCT FROM ...django_channels_postgres_groupchannel`
+    (one per active channel, long-polling). That consumed almost half the
+    35-slot pool, leaving only ~18 slots for HTTP requests, outpost API polls,
+    OAuth flows, and healthchecks → `ProtocolViolation: query_wait_timeout` →
+    gunicorn workers stuck on `pg_advisory_lock` → LDAP searches returning
+    empty results → TAK Server 8446 login landing on WebTAK instead of admin.
+    See `_AUTHENTIK_PGBOUNCER_DEFAULT_POOL_SIZE` for the full forensic trace.
 
     Idempotency / safety:
-      - On fresh v0.9.24 installs, `_ensure_authentik_pgbouncer` already writes
-        DEFAULT_POOL_SIZE=35 (the bumped constant). This migration sees it and no-ops.
-      - On v0.9.23 installs (DEFAULT_POOL_SIZE=25 in compose), patches the YAML in
-        place and force-recreates the pgbouncer container only (server+worker keep
-        their existing connections; PgBouncer healthcheck cycling pools them).
-      - On boxes where an operator has manually raised it (e.g. DEFAULT_POOL_SIZE=50),
+      - On fresh installs, `_ensure_authentik_pgbouncer` already writes the
+        current target values. This migration sees them and no-ops.
+      - On v0.9.23 (25/5) or v0.9.24-v0.9.26 initial (35/5) installs, patches
+        BOTH DEFAULT_POOL_SIZE and RESERVE_POOL_SIZE in the YAML and recreates
+        the pgbouncer container (server+worker keep their existing client-side
+        connections — PgBouncer's transaction-pool semantics re-pool within
+        seconds).
+      - On boxes where an operator manually raised either value (e.g. 100/20),
         idempotent no-op — we never lower an operator override.
       - On boxes without PgBouncer installed (very old, or external PG), no-op.
       - Backs up the compose file before mutation and rolls back on write failure.
@@ -27824,6 +27800,10 @@ def _ensure_authentik_pgbouncer_pool_size(plog, target=None):
       None  — failure (logged via plog, compose rolled back on write error)
     """
     target = target if target is not None else _AUTHENTIK_PGBOUNCER_DEFAULT_POOL_SIZE
+    target_reserve = (
+        target_reserve if target_reserve is not None
+        else _AUTHENTIK_PGBOUNCER_RESERVE_POOL_SIZE
+    )
     ak_dir = os.path.expanduser('~/authentik')
     compose_path = os.path.join(ak_dir, 'docker-compose.yml')
     if not os.path.exists(compose_path):
@@ -27858,15 +27838,53 @@ def _ensure_authentik_pgbouncer_pool_size(plog, target=None):
              "skip (operator override or unusual compose layout)")
         return False
 
-    cur = env.get('DEFAULT_POOL_SIZE')
-    try:
-        cur_int = int(cur) if cur is not None else None
-    except (TypeError, ValueError):
-        plog(f"  pgbouncer pool-size: DEFAULT_POOL_SIZE has non-integer value {cur!r} "
-             "— skip (operator override)")
+    def _int_or_none(name):
+        v = env.get(name)
+        if v is None:
+            return None
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            plog(f"  pgbouncer pool-size: {name} has non-integer value {v!r} "
+                 "— treating as operator override (will not modify)")
+            return 'override'
+
+    cur_default = _int_or_none('DEFAULT_POOL_SIZE')
+    cur_reserve = _int_or_none('RESERVE_POOL_SIZE')
+
+    if cur_default == 'override' or cur_reserve == 'override':
         return False
 
-    if cur_int is not None and cur_int >= target:
+    # v0.9.26-alpha hotfix #4: regardless of whether we're bumping the pool
+    # in this call, ensure the ak-pg-watchdog threshold is above the current
+    # pool ceiling. This handles operator overrides above the codebase target
+    # (e.g., tak-10's manual 150/30 = 180 ceiling, where the default
+    # threshold of 150 would mis-fire on every pre-warmed pool). See the
+    # forensic comment in the pool-bump block below for full rationale.
+    def _reconcile_watchdog_threshold(default_val, reserve_val):
+        try:
+            if default_val is None or reserve_val is None:
+                return
+            ceiling = default_val + reserve_val
+            computed = ceiling + 50
+            s = load_settings()
+            cur_thresh = s.get('channels_pool_watchdog_threshold')
+            if not isinstance(cur_thresh, int) or cur_thresh < computed:
+                s['channels_pool_watchdog_threshold'] = computed
+                save_settings(s)
+                plog(f"  ✓ watchdog threshold: {cur_thresh or 'unset (default 150)'} → "
+                     f"{computed} (pool ceiling {ceiling} + 50 margin)")
+        except Exception:
+            pass
+
+    needs_default = cur_default is not None and cur_default < target
+    needs_reserve = cur_reserve is not None and cur_reserve < target_reserve
+
+    if not needs_default and not needs_reserve:
+        # Pool is already at/above target. Still reconcile watchdog threshold —
+        # critical for boxes with operator-overridden pool (e.g., tak-10 at
+        # 150/30) where the codebase default 150 threshold mis-fires.
+        _reconcile_watchdog_threshold(cur_default, cur_reserve)
         return False
 
     backup_path = compose_path + f'.poolsize-bak-{int(time.time())}'
@@ -27877,12 +27895,18 @@ def _ensure_authentik_pgbouncer_pool_size(plog, target=None):
         plog(f"  pgbouncer pool-size: backup failed (refusing to mutate): {e}")
         return None
 
-    env['DEFAULT_POOL_SIZE'] = target
+    new_default = max(cur_default or 0, target)
+    new_reserve = max(cur_reserve or 0, target_reserve)
+    env['DEFAULT_POOL_SIZE'] = new_default
+    env['RESERVE_POOL_SIZE'] = new_reserve
+
     try:
         with open(compose_path, 'w') as f:
             _yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)
         plog(f"  pgbouncer pool-size: patched docker-compose.yml "
-             f"DEFAULT_POOL_SIZE {cur_int} → {target} (backup at {backup_path})")
+             f"DEFAULT_POOL_SIZE {cur_default} → {new_default}, "
+             f"RESERVE_POOL_SIZE {cur_reserve} → {new_reserve} "
+             f"(backup at {backup_path})")
     except Exception as e:
         plog(f"  pgbouncer pool-size: compose write failed: {e} — rolling back")
         try:
@@ -27916,7 +27940,8 @@ def _ensure_authentik_pgbouncer_pool_size(plog, target=None):
             break
     if healthy:
         plog(f"  ✓ pgbouncer pool-size: pgbouncer recreated and healthy "
-             f"(DEFAULT_POOL_SIZE={target}, ceiling=40 with RESERVE=5)")
+             f"(DEFAULT_POOL_SIZE={new_default}, RESERVE_POOL_SIZE={new_reserve}, "
+             f"ceiling={new_default + new_reserve})")
     else:
         plog(f"  ⚠ pgbouncer pool-size: pgbouncer recreated but not healthy within 24s "
              f"— server+worker may briefly degrade; will stabilize as transactions cycle")
@@ -27924,16 +27949,194 @@ def _ensure_authentik_pgbouncer_pool_size(plog, target=None):
     try:
         s = load_settings()
         cfg = s.get('authentik_pgbouncer') or {}
-        cfg['default_pool_size'] = target
+        cfg['default_pool_size'] = new_default
+        cfg['reserve_pool_size'] = new_reserve
         cfg['last_pool_size_migration_utc'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
-        cfg['last_pool_size_migration_from'] = cur_int
-        cfg['last_pool_size_migration_to'] = target
+        cfg['last_pool_size_migration_from'] = {
+            'default': cur_default, 'reserve': cur_reserve,
+        }
+        cfg['last_pool_size_migration_to'] = {
+            'default': new_default, 'reserve': new_reserve,
+        }
         cfg['last_pool_size_migration_version'] = VERSION
         s['authentik_pgbouncer'] = cfg
         save_settings(s)
     except Exception:
         pass
 
+    # v0.9.26-alpha hotfix #4 (forensic discovery 2026-05-17 16:41 UTC on
+    # tak-10): the ak-pg-watchdog threshold (default 150) is compared against
+    # TOTAL idle PG connections, which includes PgBouncer's pre-warmed sv_idle
+    # pool. If pool ceiling (DEFAULT + RESERVE) ever exceeds the watchdog
+    # threshold, the watchdog mis-fires on NORMAL pre-warmed state — it sees
+    # ~178 idle conns (PgBouncer warming) and concludes the upstream
+    # license-cache leak is happening, restarting authentik-server-1 every
+    # 8-10 min. tak-10's manual operator override to pool 150/30 (180 ceiling)
+    # triggered this: watchdog at 150 thresh ALWAYS fired on warmed pool →
+    # constant server-1 restart cycle → MAX_REQUESTS autotuned to floor (100)
+    # → operator-visible 8446 + Sync webadmin outage every ~10 min during
+    # the restart window.
+    #
+    # Reconcile the watchdog threshold to sit ABOVE the pool ceiling (the
+    # watchdog should detect REAL leaks where conns grow past PgBouncer's
+    # configured maximum, NOT the prewarmed pool itself).
+    # Formula: threshold = ceiling + 50 (50-conn alert headroom above
+    # pre-warmed state). 50 is conservative — license-cache class leaks
+    # grew at ~2 conn/sec, so 50-conn headroom gives ~25 sec to detect
+    # before the watchdog fires.
+    # Operator overrides above the computed value are preserved.
+    _reconcile_watchdog_threshold(new_default, new_reserve)
+
+    return True
+
+
+def _ensure_vm_overcommit_memory(plog):
+    """v0.9.26-alpha hotfix #4: Persist `vm.overcommit_memory = 1` on the host.
+
+    BACKGROUND (Tom Endress's 2026-05-17 anchortak forensic report):
+
+    Authentik's Redis container logs this warning on every cold boot:
+
+        WARNING Memory overcommit must be enabled! Without it, a background
+        save or replication may fail under low memory condition.
+
+    When Redis forks for a BGSAVE (snapshot to disk) or replication, the Linux
+    kernel does a full virtual-memory accounting check at fork time. On hosts
+    with default `vm.overcommit_memory = 0` (heuristic), the kernel refuses
+    the fork unless 100% of the parent's RSS fits in free RAM. On busy hosts
+    that's almost never true — so the fork fails with ENOMEM. Redis then logs
+    "Background save failed" and (depending on tuning) STOPS ACCEPTING WRITES
+    via the `stop-writes-on-bgsave-error yes` default.
+
+    Authentik uses Redis for:
+      - session cache, OAuth token cache, license cache
+      - dramatiq middleware state, rate-limit counters
+      - Outpost websocket state mirrors
+
+    When Redis stops accepting writes, the Authentik server hangs on every
+    cache.set() call — gunicorn workers tie up backend connections waiting
+    for a Redis write that will never complete. That stacks with the
+    Channels-PG / dramatiq lock-race patterns from hotfixes #2 and #3, but
+    is a SEPARATE failure mode that we'd been masking with restarts.
+
+    THE FIX (Tom's universal remediation, applied to anchortak 2026-05-17):
+
+        echo 'vm.overcommit_memory = 1' >> /etc/sysctl.conf
+        sysctl vm.overcommit_memory=1
+
+    Setting `1` tells the kernel: "always allow allocation, sort it out at
+    page-fault time." This is the upstream Redis recommendation since 2011
+    (https://redis.io/docs/management/admin/#additional-information). It is
+    safe on Linux servers because the kernel still kills processes that
+    actually exhaust memory (via the OOM killer), it just doesn't refuse
+    the fork preemptively.
+
+    Why not in compose / Redis container:
+      - `vm.overcommit_memory` is a HOST kernel parameter. Containers cannot
+        set it (the sysctl is read-only from inside an unprivileged container,
+        and Redis runs unprivileged). Must be set on the host kernel.
+
+    Idempotent / safe:
+      - Reads /proc/sys/vm/overcommit_memory first. If already `1`, no-op.
+      - Writes to /etc/sysctl.conf only if the line isn't already there
+        (matches both `vm.overcommit_memory = 1` and `vm.overcommit_memory=1`).
+      - Runs `sysctl -w` to apply live (no reboot required).
+      - All errors logged but never raised — startup_migrations is best-effort.
+
+    Returns:
+      True   — value was changed (now persistently 1)
+      False  — already at 1 (idempotent no-op)
+      None   — error (logged; sysctl read or write failed)
+    """
+    proc_path = '/proc/sys/vm/overcommit_memory'
+    sysctl_conf = '/etc/sysctl.conf'
+
+    # Step 1: read current value (kernel runtime, source of truth)
+    try:
+        with open(proc_path, 'r') as f:
+            current = (f.read() or '').strip()
+    except Exception as e:
+        plog(f"  vm.overcommit_memory: cannot read {proc_path}: {e} — skip "
+             "(non-Linux host, container, or unreadable proc)")
+        return None
+
+    # Step 2: apply runtime change if needed
+    runtime_changed = False
+    if current != '1':
+        r = subprocess.run(
+            ['sysctl', '-w', 'vm.overcommit_memory=1'],
+            capture_output=True, text=True, timeout=10
+        )
+        if r.returncode != 0:
+            plog(f"  vm.overcommit_memory: sysctl -w failed (rc={r.returncode}): "
+                 f"{((r.stderr or '') + (r.stdout or ''))[:200]}")
+            return None
+        runtime_changed = True
+        # Verify the kernel actually applied it
+        try:
+            with open(proc_path, 'r') as f:
+                verify = (f.read() or '').strip()
+            if verify != '1':
+                plog(f"  vm.overcommit_memory: sysctl -w succeeded but kernel still reports {verify!r}")
+                return None
+        except Exception:
+            pass
+
+    # Step 3: ensure /etc/sysctl.conf has the line so the setting survives reboot
+    sysctl_persisted = False
+    try:
+        if os.path.exists(sysctl_conf):
+            with open(sysctl_conf, 'r') as f:
+                conf = f.read()
+        else:
+            conf = ''
+        # Tolerate either spaced or unspaced variants
+        has_line = any(
+            ln.strip().replace(' ', '') == 'vm.overcommit_memory=1'
+            for ln in conf.splitlines()
+            if ln.strip() and not ln.strip().startswith('#')
+        )
+        if not has_line:
+            # Comment out any existing non-`1` declarations so this is the active value
+            patched = []
+            for ln in conf.splitlines():
+                stripped = ln.strip()
+                if (stripped and not stripped.startswith('#')
+                        and stripped.replace(' ', '').startswith('vm.overcommit_memory=')):
+                    patched.append(f'# {ln}  # superseded by infra-TAK v0.9.26 hotfix #4')
+                else:
+                    patched.append(ln)
+            if patched and not patched[-1].endswith('\n') and patched[-1] != '':
+                patched.append('')
+            patched.append('# infra-TAK v0.9.26-alpha hotfix #4: Redis BGSAVE fork (Tom Endress 2026-05-17)')
+            patched.append('vm.overcommit_memory = 1')
+            patched.append('')
+            new_conf = '\n'.join(patched)
+            # Atomic write via tempfile + rename
+            tmp_path = sysctl_conf + '.infratak-tmp'
+            with open(tmp_path, 'w') as f:
+                f.write(new_conf)
+            os.rename(tmp_path, sysctl_conf)
+            sysctl_persisted = True
+    except Exception as e:
+        plog(f"  vm.overcommit_memory: /etc/sysctl.conf update failed: {e} "
+             "(runtime value is still set, but won't survive reboot)")
+
+    if runtime_changed and sysctl_persisted:
+        plog(f"  ✓ vm.overcommit_memory: {current} → 1 (runtime + persistent) "
+             "— Redis BGSAVE fork now safe")
+        return True
+    if runtime_changed and not sysctl_persisted:
+        plog(f"  ⚠ vm.overcommit_memory: {current} → 1 (runtime only — "
+             "/etc/sysctl.conf write skipped; will revert on reboot)")
+        return True
+    if not runtime_changed and not sysctl_persisted:
+        # Already at 1 and sysctl.conf already has the line — perfect steady state
+        return False
+    # not runtime_changed but sysctl_persisted: kernel was already 1, we just
+    # added the persistence line for safety
+    plog(f"  ✓ vm.overcommit_memory: kernel already 1; persisted to "
+         f"/etc/sysctl.conf so it survives reboot")
     return True
 
 
@@ -28588,10 +28791,11 @@ def _authentik_channels_pool_watchdog_loop():
     """v0.9.21: Background daemon — auto-restart authentik-server-1 when total idle
     PostgreSQL connections from the authentik database exceed a threshold.
 
-    STATUS as of v0.9.24 (PgBouncer pool bump): DEEP DEFENSE-IN-DEPTH only.
-    PgBouncer (transaction-pool, DEFAULT_POOL_SIZE=35 + RESERVE=5) caps the real
-    PG server-side idle count at ~40 regardless of how leaky Authentik's
-    cache-pool is, so this watchdog should essentially never fire on a v0.9.23+
+    STATUS as of v0.9.26-alpha hotfix #3 (PgBouncer pool re-bump 35→75): DEEP
+    DEFENSE-IN-DEPTH only. PgBouncer (transaction-pool, DEFAULT_POOL_SIZE=75 +
+    RESERVE=15) caps the real PG server-side idle count at ~90 regardless of
+    how leaky Authentik's cache-pool is or how many Django Channels long-polls
+    are open, so this watchdog should essentially never fire on a v0.9.23+
     box. If it DOES fire post-PgBouncer, it means either:
       1. PgBouncer is mis-configured (e.g. POOL_MODE flipped to `session`),
       2. The leak class has changed (new upstream code path), or
@@ -28693,6 +28897,38 @@ def _authentik_channels_pool_watchdog_loop():
             _count = int(_count_str)
             _consecutive_failures = 0
 
+            # v0.9.26-alpha hotfix #4: when the watchdog is about to fire or
+            # already accumulating, query the dominant idle-conn pattern so
+            # the operator can tell at a glance whether saturation is:
+            #   - Channels-class (django_channels_postgres_groupchannel SELECTs)
+            #   - dramatiq-class (django_dramatiq_postgres SELECT FOR UPDATE)
+            #   - cache-class (django_postgres_cache_cacheentry)
+            #   - "other" / generic ORM
+            # Only runs on the alert/accumulation paths to keep the hot loop cheap.
+            def _classify_idle_load():
+                try:
+                    _rb = subprocess.run(
+                        ['docker', 'exec', 'authentik-postgresql-1', 'psql',
+                         '-U', 'authentik', '-d', 'authentik', '-tA', '-F', '|', '-c',
+                         "SELECT "
+                         "  COUNT(*) FILTER (WHERE query LIKE '%groupchannel%'), "
+                         "  COUNT(*) FILTER (WHERE query LIKE '%dramatiq%' OR query LIKE '%FOR UPDATE%'), "
+                         "  COUNT(*) FILTER (WHERE query LIKE '%postgres_cache_cacheentry%'), "
+                         "  COUNT(*) FILTER (WHERE query LIKE '%pg_advisory_lock%') "
+                         "FROM pg_stat_activity "
+                         "WHERE datname='authentik' AND state='idle'"],
+                        capture_output=True, text=True, timeout=8
+                    )
+                    if _rb.returncode == 0:
+                        _parts = (_rb.stdout or '').strip().split('|')
+                        if len(_parts) == 4 and all(p.isdigit() for p in _parts):
+                            _ch, _dr, _ca, _adv = (int(p) for p in _parts)
+                            _other = max(0, _count - _ch - _dr - _ca)
+                            return (_ch, _dr, _ca, _adv, _other)
+                except Exception:
+                    pass
+                return None
+
             if _count > _threshold:
                 _mr_cur, _ = _authentik_max_requests_get_current()
                 _mr_str = f"MAX_REQUESTS={_mr_cur}" if _mr_cur is not None else "MAX_REQUESTS=unset"
@@ -28706,10 +28942,26 @@ def _authentik_channels_pool_watchdog_loop():
                     "PgBouncer is NOT installed — the upstream Authentik #20714 cache-pool leak is "
                     "unbounded on this box. Consider running the v0.9.23 PgBouncer migration."
                 )
+                _cls = _classify_idle_load()
+                _cls_str = ""
+                if _cls is not None:
+                    _ch, _dr, _ca, _adv, _other = _cls
+                    _dom = max(
+                        ('Channels', _ch),
+                        ('dramatiq', _dr),
+                        ('cache', _ca),
+                        ('other', _other),
+                        key=lambda x: x[1],
+                    )[0]
+                    _cls_str = (
+                        f" idle-by-class: Channels={_ch} dramatiq={_dr} "
+                        f"cache={_ca} advisory_lock={_adv} other={_other} "
+                        f"(dominant={_dom})"
+                    )
                 print(
                     f"[ak-pg-watchdog] ALERT: {_count} idle PG connections "
                     f"(threshold={_threshold}, {_mr_str}) — restarting authentik-server-1. "
-                    f"SAFETY NET firing. {_pgb_note}",
+                    f"SAFETY NET firing.{_cls_str} {_pgb_note}",
                     flush=True
                 )
                 _authentik_max_requests_autotune_record_fire(
@@ -28735,15 +28987,27 @@ def _authentik_channels_pool_watchdog_loop():
                 _wt.sleep(180)
             elif _count > 80:
                 _mr_cur, _ = _authentik_max_requests_get_current()
+                _cls = _classify_idle_load()
+                _cls_str = ""
+                if _cls is not None:
+                    _ch, _dr, _ca, _adv, _other = _cls
+                    _cls_str = (
+                        f" [Channels={_ch} dramatiq={_dr} cache={_ca} "
+                        f"advisory_lock={_adv} other={_other}]"
+                    )
                 print(
                     f"[ak-pg-watchdog] {_count} idle PG connections "
-                    f"(threshold={_threshold}) — accumulation in progress, monitoring",
+                    f"(threshold={_threshold}) — accumulation in progress, monitoring{_cls_str}",
                     flush=True
                 )
                 try:
                     _autotune_log(
                         f"ACCUMULATING | idle={_count} threshold={_threshold} "
                         f"MAX_REQUESTS={_mr_cur if _mr_cur is not None else '?'}"
+                        + (
+                            f" classes:Channels={_ch}/dramatiq={_dr}/cache={_ca}/adv={_adv}/other={_other}"
+                            if _cls is not None else ""
+                        )
                     )
                 except Exception:
                     pass
@@ -33980,6 +34244,395 @@ def _read_compose_heal_stamp():
                 f"result='{_res}')")
     except Exception as _e:
         return f"compose self-heal STAMP: read error ({_e})"
+
+
+# v0.9.26: Canonical content of the Authentik task-log purge script.
+# Shared by both embedded-write sites (lines ~6490 and ~7029 in app.py) AND
+# by `_ensure_authentik_tasklog_purge_script` which overwrites broken copies
+# on every console boot.
+#
+# v0.9.5 → v0.9.25 BUG: original script used `psql -c "DELETE;DELETE;VACUUM"`.
+# psql wraps multi-statement `-c` arguments in an IMPLICIT transaction, and
+# `VACUUM cannot run inside a transaction block`. Every Sunday 03:00 timer
+# fire on every install ended with exit code 1, silently. tak-10 evidence
+# (2026-05-17): script ran today at 03:00:06 UTC, log shows
+# `DELETE 0 / DELETE 0 / ERROR: VACUUM cannot run inside a transaction block`.
+#
+# v0.9.5 → v0.9.25 SECOND BUG: threshold was `mtime < NOW() - INTERVAL '30 days'`.
+# Console-restart churn (e.g. release day with 6+ Update Now cycles) can stuff
+# the tables with 2M rows that are all < 1 day old. Even when the VACUUM
+# transaction bug was avoided manually, the time window matched nothing.
+# tak-10 grew to 2,025,958 tasklog rows / 516 MB + 640,596 task rows / 442 MB
+# in under 24h. Three-tier escalation (7d → 24h → 1h) handles both the slow
+# steady-state growth case and the runaway-churn case.
+_AUTHENTIK_TASKLOG_PURGE_SCRIPT = (
+    '#!/bin/bash\n'
+    '# Guard Dog: Authentik task log purge (v0.9.26 — fixed VACUUM-in-transaction).\n'
+    '# Removes authentik_tasks_task + authentik_tasks_tasklog rows in tiers:\n'
+    '#   Tier 1: rows older than 7 days (gentle, keeps weekly audit trail)\n'
+    '#   Tier 2: rows older than 24h (if size still ≥ 100 MB after Tier 1)\n'
+    '#   Tier 3: rows older than 1h  (if size still ≥ 100 MB after Tier 2)\n'
+    '# Each tier runs in its own `psql -c` invocation; the final VACUUM ANALYZE\n'
+    '# also runs in a SEPARATE psql -c so it is NOT wrapped in a transaction.\n'
+    '# Old v0.9.5 single-call script failed every Sunday with\n'
+    '#   ERROR: VACUUM cannot run inside a transaction block\n'
+    '# v0.9.26 fix lives both here AND inline in app.py\n'
+    '# (_auto_authentik_tasklog_purge); the inline helper runs on every console\n'
+    '# boot regardless of the timer, so even if THIS script is broken the\n'
+    '# console boot path keeps the tables healthy.\n'
+    'set -u\n'
+    'LOG=/var/log/takguard/authentik-tasklog-purge.log\n'
+    'STAMP_FILE=/opt/tak-guarddog/authentik_tasklog_purge_last.txt\n'
+    'TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")\n'
+    'mkdir -p /var/log/takguard\n'
+    'echo "[$TS] Starting Authentik task log purge (v0.9.26 multi-tier)" >> "$LOG"\n'
+    '\n'
+    'if [ -z "$(docker ps -q --filter name=authentik-postgresql-1 2>/dev/null)" ]; then\n'
+    '  echo "[$TS] authentik-postgresql-1 not running — skipping" >> "$LOG"\n'
+    '  echo "$TS" > "$STAMP_FILE" 2>/dev/null || true\n'
+    '  exit 0\n'
+    'fi\n'
+    '\n'
+    'size_mb() {\n'
+    '  docker exec authentik-postgresql-1 psql -U authentik -d authentik -t -A -c \\\n'
+    '    "SELECT (pg_total_relation_size(\'authentik_tasks_tasklog\') + pg_total_relation_size(\'authentik_tasks_task\')) / 1024 / 1024" 2>/dev/null \\\n'
+    '    | tr -dc "0-9" || echo 0\n'
+    '}\n'
+    '\n'
+    'row_counts() {\n'
+    '  docker exec authentik-postgresql-1 psql -U authentik -d authentik -t -A -c \\\n'
+    '    "SELECT (SELECT count(*) FROM authentik_tasks_task) || \'/\' || (SELECT count(*) FROM authentik_tasks_tasklog)" 2>/dev/null || echo "?/?"\n'
+    '}\n'
+    '\n'
+    'delete_older_than() {\n'
+    '  local interval="$1"\n'
+    '  docker exec authentik-postgresql-1 psql -U authentik -d authentik -c "\n'
+    'DELETE FROM authentik_tasks_tasklog WHERE task_id IN (\n'
+    '  SELECT message_id FROM authentik_tasks_task WHERE mtime < NOW() - INTERVAL \'$interval\'\n'
+    ');\n'
+    'DELETE FROM authentik_tasks_task WHERE mtime < NOW() - INTERVAL \'$interval\';\n'
+    '" >> "$LOG" 2>&1\n'
+    '}\n'
+    '\n'
+    'INITIAL=$(size_mb)\n'
+    'INITIAL=${INITIAL:-0}\n'
+    'INITIAL_ROWS=$(row_counts)\n'
+    'THRESHOLD=100\n'
+    'echo "[$TS] Initial size: ${INITIAL} MB (task/tasklog rows: ${INITIAL_ROWS}), threshold ${THRESHOLD} MB" >> "$LOG"\n'
+    '\n'
+    'if [ "$INITIAL" -lt "$THRESHOLD" ] 2>/dev/null; then\n'
+    '  echo "[$TS] No cleanup needed — already healthy" >> "$LOG"\n'
+    '  echo "$TS" > "$STAMP_FILE" 2>/dev/null || true\n'
+    '  exit 0\n'
+    'fi\n'
+    '\n'
+    'echo "[$TS] Tier 1 — DELETE rows older than 7 days" >> "$LOG"\n'
+    'delete_older_than "7 days" || echo "[$TS] Tier 1 returned non-zero (continuing)" >> "$LOG"\n'
+    'AFTER_7D=$(size_mb); AFTER_7D=${AFTER_7D:-$INITIAL}\n'
+    'echo "[$TS] After 7-day pass: ${AFTER_7D} MB" >> "$LOG"\n'
+    '\n'
+    'if [ "$AFTER_7D" -ge "$THRESHOLD" ] 2>/dev/null; then\n'
+    '  echo "[$TS] Tier 2 — DELETE rows older than 24 hours" >> "$LOG"\n'
+    '  delete_older_than "24 hours" || echo "[$TS] Tier 2 returned non-zero (continuing)" >> "$LOG"\n'
+    'fi\n'
+    'AFTER_24H=$(size_mb); AFTER_24H=${AFTER_24H:-$AFTER_7D}\n'
+    'echo "[$TS] After 24h pass: ${AFTER_24H} MB" >> "$LOG"\n'
+    '\n'
+    'if [ "$AFTER_24H" -ge "$THRESHOLD" ] 2>/dev/null; then\n'
+    '  echo "[$TS] Tier 3 (nuclear) — DELETE rows older than 1 hour" >> "$LOG"\n'
+    '  delete_older_than "1 hour" || echo "[$TS] Tier 3 returned non-zero (continuing)" >> "$LOG"\n'
+    'fi\n'
+    '\n'
+    'echo "[$TS] VACUUM ANALYZE (separate invocation — NOT in transaction)" >> "$LOG"\n'
+    'docker exec authentik-postgresql-1 psql -U authentik -d authentik -c \\\n'
+    '  "VACUUM ANALYZE authentik_tasks_task, authentik_tasks_tasklog;" >> "$LOG" 2>&1 || \\\n'
+    '  echo "[$TS] VACUUM returned non-zero (table sizes still updated)" >> "$LOG"\n'
+    '\n'
+    'FINAL=$(size_mb); FINAL=${FINAL:-0}\n'
+    'FINAL_ROWS=$(row_counts)\n'
+    'echo "[$TS] Final size: ${FINAL} MB (task/tasklog rows: ${FINAL_ROWS}), freed $(( INITIAL - FINAL )) MB" >> "$LOG"\n'
+    'echo "$TS" > "$STAMP_FILE" 2>/dev/null || true\n'
+    'echo "[$TS] Authentik task log purge complete" >> "$LOG"\n'
+    'exit 0\n'
+)
+
+
+def _ensure_authentik_tasklog_purge_script(plog=None):
+    """v0.9.26: overwrite /opt/tak-guarddog/tak-authentik-tasklog-purge.sh with
+    the canonical (fixed) script content if it has drifted or is missing.
+
+    The original v0.9.5 script content was emitted ONCE at install time and
+    never updated — boxes deployed before v0.9.26 ship with a broken script
+    (VACUUM-in-transaction → silent weekly failure). This migration replaces
+    the on-disk script with the fixed canonical content on every console boot.
+
+    Idempotent: only writes when content differs. Silent no-op when the script
+    path doesn't exist (Authentik not installed, or Guard Dog directory absent).
+    """
+    def _log(m):
+        if plog:
+            plog(m)
+        else:
+            print(m, flush=True)
+
+    _path = '/opt/tak-guarddog/tak-authentik-tasklog-purge.sh'
+    if not os.path.isdir('/opt/tak-guarddog'):
+        return
+    try:
+        _current = ''
+        if os.path.isfile(_path):
+            with open(_path) as _f:
+                _current = _f.read()
+        if _current == _AUTHENTIK_TASKLOG_PURGE_SCRIPT:
+            return  # Already canonical
+        with open(_path, 'w') as _f:
+            _f.write(_AUTHENTIK_TASKLOG_PURGE_SCRIPT)
+        os.chmod(_path, 0o755)
+        _log("Authentik tasklog purge script updated to v0.9.26 canonical version (fixes VACUUM-in-transaction bug)")
+    except Exception as _e:
+        _log(f"Authentik tasklog purge script update error (non-fatal): {_e}")
+
+
+def _auto_authentik_tasklog_purge(plog=None):
+    """v0.9.26: inline multi-tier cleanup of authentik_tasks_task + authentik_tasks_tasklog.
+
+    Runs on every console boot via `_startup_migrations` (no version gate,
+    no Update Now gate). Mirrors the on-disk weekly script's logic but is
+    executed by the Python console process so:
+      1. it runs MORE OFTEN than the weekly timer (every console restart),
+      2. it doesn't depend on the on-disk script being correct (the v0.9.5
+         script silently failed every Sunday for months until v0.9.26),
+      3. errors are surfaced into the console log alongside other migrations.
+
+    Threshold ladder (combined size of both tables):
+      < 100 MB → no-op (already healthy, silent).
+      ≥ 100 MB after Tier 1 (7 days)  → escalate to Tier 2.
+      ≥ 100 MB after Tier 2 (24 hours)→ escalate to Tier 3 (1 hour).
+
+    Each DELETE runs in its own `psql -c`. VACUUM ANALYZE runs in a SEPARATE
+    `psql -c`. NEVER use a single multi-statement -c arg because psql wraps
+    multi-statement `-c` in an implicit transaction and `VACUUM cannot run
+    inside a transaction block` — this is the bug that silently broke the
+    v0.9.5 weekly timer on every install for 6+ months.
+
+    Idempotent. Non-raising — exceptions are logged and swallowed.
+    """
+    def _log(m):
+        if plog:
+            plog(m)
+        else:
+            print(m, flush=True)
+
+    if not os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
+        return  # Authentik not installed on this host
+
+    try:
+        _up = subprocess.run(
+            ['docker', 'inspect', '--format', '{{.State.Running}}', 'authentik-postgresql-1'],
+            capture_output=True, text=True, timeout=10
+        )
+        if _up.returncode != 0 or _up.stdout.strip() != 'true':
+            return
+
+        def _size_bytes():
+            r = subprocess.run(
+                ['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik',
+                 '-d', 'authentik', '-t', '-A', '-c',
+                 "SELECT pg_total_relation_size('authentik_tasks_tasklog') + pg_total_relation_size('authentik_tasks_task')"],
+                capture_output=True, text=True, timeout=20
+            )
+            if r.returncode != 0:
+                return None
+            try:
+                return int((r.stdout or '0').strip())
+            except ValueError:
+                return None
+
+        def _row_counts():
+            r = subprocess.run(
+                ['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik',
+                 '-d', 'authentik', '-t', '-A', '-c',
+                 "SELECT (SELECT count(*) FROM authentik_tasks_task) || '|' || (SELECT count(*) FROM authentik_tasks_tasklog)"],
+                capture_output=True, text=True, timeout=30
+            )
+            if r.returncode != 0:
+                return None, None
+            try:
+                parts = (r.stdout or '').strip().split('|')
+                return int(parts[0]), int(parts[1])
+            except (ValueError, IndexError):
+                return None, None
+
+        _initial = _size_bytes()
+        if _initial is None:
+            return
+        _initial_mb = _initial // (1024 * 1024)
+        _threshold_mb = 100
+
+        if _initial_mb < _threshold_mb:
+            return  # Healthy — silent no-op
+
+        _row_t0, _row_tl0 = _row_counts()
+        _log(
+            f"Authentik tasklog: {_initial_mb} MB "
+            f"(task={_row_t0} rows, tasklog={_row_tl0} rows) — running v0.9.26 cleanup"
+        )
+
+        def _delete_older_than(interval, tier_label):
+            sql = (
+                "DELETE FROM authentik_tasks_tasklog "
+                "WHERE task_id IN ("
+                "  SELECT message_id FROM authentik_tasks_task "
+                f"  WHERE mtime < NOW() - INTERVAL '{interval}'"
+                "); "
+                "DELETE FROM authentik_tasks_task "
+                f"WHERE mtime < NOW() - INTERVAL '{interval}';"
+            )
+            r = subprocess.run(
+                ['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik',
+                 '-d', 'authentik', '-c', sql],
+                capture_output=True, text=True, timeout=600
+            )
+            if r.returncode != 0:
+                _log(f"Authentik tasklog: {tier_label} DELETE returned non-zero: {(r.stderr or '')[:200]}")
+            return r
+
+        _delete_older_than('7 days', 'Tier 1 (7-day)')
+        _after_7d = _size_bytes() or _initial
+        if (_after_7d // (1024 * 1024)) >= _threshold_mb:
+            _delete_older_than('24 hours', 'Tier 2 (24-hour)')
+        _after_24h = _size_bytes() or _after_7d
+        if (_after_24h // (1024 * 1024)) >= _threshold_mb:
+            _delete_older_than('1 hour', 'Tier 3 (1-hour, nuclear)')
+
+        # VACUUM ANALYZE in its own psql -c so it's NOT inside an implicit transaction.
+        # See the v0.9.5 weekly-timer-script bug history in the comment above.
+        _vac = subprocess.run(
+            ['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik',
+             '-d', 'authentik', '-c',
+             'VACUUM ANALYZE authentik_tasks_task, authentik_tasks_tasklog;'],
+            capture_output=True, text=True, timeout=900
+        )
+        if _vac.returncode != 0:
+            _log(f"Authentik tasklog: VACUUM ANALYZE returned non-zero: {(_vac.stderr or '')[:200]}")
+
+        _final = _size_bytes() or _initial
+        _final_mb = _final // (1024 * 1024)
+        _row_t1, _row_tl1 = _row_counts()
+        _freed_mb = max(0, _initial_mb - _final_mb)
+        _log(
+            f"Authentik tasklog: cleanup complete — "
+            f"{_initial_mb} MB → {_final_mb} MB (freed {_freed_mb} MB), "
+            f"task rows {_row_t0}→{_row_t1}, tasklog rows {_row_tl0}→{_row_tl1}"
+        )
+
+        # v0.9.26 hotfix #2 (2026-05-17, after tak-10 surfaced post-purge worker
+        # thrashing the SAME morning v0.9.26 shipped):
+        #
+        # `DELETE` + `VACUUM ANALYZE` clears live rows but does NOT shrink the
+        # heap file or rebuild bloated indexes. On a long-bloated box (tak-10
+        # at 13:00 UTC: 940 MB heap + 444 MB indexes for only ~1000 live rows
+        # post-DELETE), every INSERT/UPDATE traverses 50 MB indexes per write.
+        # PgBouncer kills those queries with `query_wait_timeout` (default 120s),
+        # which cascades to `OperationalError: the connection is closed` in the
+        # dramatiq broker, which pegs `authentik-worker-1` at ~46% CPU thrashing
+        # on PG retries, and ultimately leaves `authentik-server-1` `(unhealthy)`
+        # with the LDAP outpost getting 502 Bad Gateway → 228-second bind times
+        # → 8446 login + Sync webadmin operator-visible timeouts.
+        #
+        # Fix (one-shot per-install): detect "tiny live rows in a huge file"
+        # (bytes/live_row > 100 KB AND total > 50 MB) and escalate to
+        #   1. REINDEX TABLE CONCURRENTLY  (no lock — PG 12+)
+        #   2. VACUUM FULL                  (brief lock — sub-second on tiny tables)
+        #   3. _recreate_authentik_server_worker — flush stuck PG connections from
+        #      the cancellation storm. Required because gunicorn's MAX_REQUESTS=1000
+        #      recycling doesn't catch workers deadlocked on dead PG sockets, and
+        #      Authentik's healthcheck stays `unhealthy` until the process restarts.
+        #
+        # Safety: skipped when `live_rows > 100k` (the table is actively busy,
+        # don't take the VACUUM FULL lock) — those installs are healthy enough
+        # already that the time-based DELETE tiers will catch them next boot.
+        try:
+            _post_cleanup_size = _size_bytes() or _final
+            _live_rows = (_row_t1 or 0) + (_row_tl1 or 0)
+            _bytes_per_row = _post_cleanup_size // max(_live_rows, 1)
+            _bloat_size_min = 50 * 1024 * 1024       # 50 MB
+            _bloat_bpr_threshold = 100 * 1024        # 100 KB/row
+            _bloat_live_rows_max = 100_000           # safety: skip when tables are busy
+
+            if (_post_cleanup_size > _bloat_size_min
+                    and _bytes_per_row > _bloat_bpr_threshold
+                    and _live_rows < _bloat_live_rows_max):
+                _log(
+                    f"Authentik tasklog: post-DELETE bloat detected "
+                    f"({_post_cleanup_size // (1024*1024)} MB / {_live_rows} live rows "
+                    f"= {_bytes_per_row // 1024} KB/row) — running REINDEX CONCURRENTLY + VACUUM FULL"
+                )
+                _compact_t0 = time.time()
+                for _tbl in ('authentik_tasks_tasklog', 'authentik_tasks_task'):
+                    _r_idx = subprocess.run(
+                        ['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik',
+                         '-d', 'authentik', '-c', f'REINDEX TABLE CONCURRENTLY {_tbl};'],
+                        capture_output=True, text=True, timeout=1800
+                    )
+                    if _r_idx.returncode != 0:
+                        _log(
+                            f"Authentik tasklog: REINDEX {_tbl} returned non-zero "
+                            f"(continuing): {(_r_idx.stderr or '')[:200]}"
+                        )
+                    _r_vf = subprocess.run(
+                        ['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik',
+                         '-d', 'authentik', '-c', f'VACUUM FULL {_tbl};'],
+                        capture_output=True, text=True, timeout=600
+                    )
+                    if _r_vf.returncode != 0:
+                        _log(
+                            f"Authentik tasklog: VACUUM FULL {_tbl} returned non-zero "
+                            f"(continuing): {(_r_vf.stderr or '')[:200]}"
+                        )
+
+                _post_compact_size = _size_bytes() or _post_cleanup_size
+                _compact_freed_mb = max(0, (_post_cleanup_size - _post_compact_size) // (1024 * 1024))
+                _log(
+                    f"Authentik tasklog: deep compaction complete in "
+                    f"{int(time.time() - _compact_t0)}s — "
+                    f"{_post_cleanup_size // (1024*1024)} MB → "
+                    f"{_post_compact_size // (1024*1024)} MB "
+                    f"(freed {_compact_freed_mb} MB on disk)"
+                )
+
+                # Recreate server + worker to flush stuck PG connections from the
+                # cancellation storm. LDAP outpost is preserved (it'll auto-reconnect
+                # to the new server via websocket — fresh state, no operator action).
+                _log("Authentik tasklog: recreating server+worker to flush stuck PG connections (LDAP preserved)")
+                try:
+                    _recreate_authentik_server_worker(
+                        plog=lambda m: _log(f"  {m}"),
+                        reason='post-tasklog-deep-compact'
+                    )
+                except Exception as _rec_err:
+                    _log(f"Authentik tasklog: post-compact server+worker recreate error (non-fatal): {_rec_err}")
+            else:
+                if _post_cleanup_size > _bloat_size_min:
+                    _log(
+                        f"Authentik tasklog: post-cleanup state "
+                        f"{_post_cleanup_size // (1024*1024)} MB / {_live_rows} live rows "
+                        f"= {_bytes_per_row // 1024} KB/row — within healthy bounds, "
+                        f"skipping deep compaction"
+                    )
+        except Exception as _bloat_err:
+            _log(f"Authentik tasklog: bloat-ratio check error (non-fatal): {_bloat_err}")
+
+        # Update the Guard Dog stamp file so the dashboard's "last run" tile is current.
+        try:
+            _ts = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+            os.makedirs('/opt/tak-guarddog', exist_ok=True)
+            with open('/opt/tak-guarddog/authentik_tasklog_purge_last.txt', 'w') as _f:
+                _f.write(_ts + '\n')
+        except Exception:
+            pass
+    except Exception as _e:
+        _log(f"Authentik tasklog purge error (non-fatal): {_e}")
 
 
 def _ensure_authentik_webadmin(skip_bind_verify=False):
@@ -43131,6 +43784,40 @@ def _startup_migrations():
         except Exception as _shc_err:
             print(f"Startup migration: compose self-heal error (non-fatal): {_shc_err}", flush=True)
 
+        # v0.9.26 (2026-05-17, after tak-10 surfaced sustained ~80% Authentik
+        # server CPU with the symptom traced to the v0.9.5 weekly tasklog
+        # purge timer silently failing every Sunday for months):
+        #
+        #   - takauthentiktasklogpurge.service ran 03:00:06 UTC and exited 1
+        #     with `ERROR: VACUUM cannot run inside a transaction block`.
+        #     The script's single `psql -c "DELETE;DELETE;VACUUM"` got wrapped
+        #     in an implicit transaction by psql; VACUUM is forbidden inside
+        #     transactions. The DELETEs returned 0 rows anyway because the
+        #     hardcoded 30-day threshold didn't match recent restart-churn
+        #     bloat. authentik_tasks_tasklog grew to 2,025,958 rows / 516 MB
+        #     + authentik_tasks_task to 640,596 rows / 442 MB in <24h.
+        #     Every license-cache request through Django's middleware stack
+        #     timed out → asgiref CancelledError → authentik-server-1
+        #     pinned at ~80% CPU, exactly the pattern v0.9.21 already
+        #     documented for the upstream license cache leak — but caused
+        #     by THIS bloat, not the leak itself.
+        #
+        # Two-part fix on every console boot, both unconditional:
+        #   1. _ensure_authentik_tasklog_purge_script — overwrite the broken
+        #      v0.9.5 script on disk with the fixed multi-tier version. The
+        #      Sunday 03:00 timer will work correctly from then on.
+        #   2. _auto_authentik_tasklog_purge — inline purge from Python.
+        #      Runs immediately on every console boot, doesn't depend on
+        #      the on-disk script. Idempotent + silent if size < 100 MB.
+        try:
+            _ensure_authentik_tasklog_purge_script(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _atl_s_err:
+            print(f"Startup migration: tasklog script update error (non-fatal): {_atl_s_err}", flush=True)
+        try:
+            _auto_authentik_tasklog_purge(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _atl_e:
+            print(f"Startup migration: tasklog purge error (non-fatal): {_atl_e}", flush=True)
+
         # v0.8.7: Apply Authentik official tunings (env var name fix + cache + log level).
         # The function is idempotent: returns False if no changes needed (every startup
         # after the first), so the recreate only fires once per box. Migrates the v0.8.2
@@ -43236,15 +43923,38 @@ def _startup_migrations():
         except Exception as ak_pgb_err:
             print(f"Startup migration: pgbouncer install error (non-fatal): {ak_pgb_err}")
 
-        # v0.9.24 Item 3: Bump PgBouncer DEFAULT_POOL_SIZE on existing v0.9.23
-        # installs from 25 → 35. Field validation on tak-10 (2026-05-16, the
-        # day after v0.9.23 install) showed `SHOW POOLS` saturated at
-        # sv_active=29/sv_idle=1 under modest concurrent load — zero spike
-        # headroom. Bump to 35 + RESERVE=5 → 40-conn ceiling. Idempotent:
-        # fresh v0.9.24 installs already write 35 above (no-op here); existing
-        # v0.9.23 installs get patched + pgbouncer container recreated (server+
-        # worker keep their connections). Operator overrides (>35) are
-        # preserved. See `_ensure_authentik_pgbouncer_pool_size` docstring.
+        # v0.9.26-alpha hotfix #4 (2026-05-17, Tom Endress's anchortak incident
+        # report): set `vm.overcommit_memory = 1` on the host kernel so Redis
+        # BGSAVE forks don't fail with ENOMEM and trigger
+        # `stop-writes-on-bgsave-error`. This is the upstream Redis
+        # recommendation and Tom confirmed it as a contributing factor to
+        # the 2026-05-17 anchortak full outage. Independent of pool sizing —
+        # applies to ALL infra-TAK boxes regardless of load.
+        # Idempotent: no-op when already 1 + persisted.
+        try:
+            _ensure_vm_overcommit_memory(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as vm_oc_err:
+            print(f"Startup migration: vm.overcommit_memory error (non-fatal): {vm_oc_err}")
+
+        # v0.9.24 Item 3 + v0.9.26-alpha hotfix #3: Bump PgBouncer pool sizing
+        # on existing installs. v0.9.23 shipped 25/5 (30-conn ceiling); v0.9.24
+        # bumped to 35/5 (40-conn) after sv_active=29/sv_idle=1 saturation.
+        # v0.9.26-alpha hotfix #3 bumps to 75/15 (90-conn) after tak-10 forensics
+        # (2026-05-17) showed Django Channels' PG-backed groupchannel SELECTs
+        # eating 17 of 35 slots, triggering query_wait_timeout under modest
+        # load. Idempotent: fresh installs write the new constants above (no-op
+        # here); existing installs at 25/5 or 35/5 get both values patched +
+        # pgbouncer container recreated (server+worker keep their connections).
+        # Operator overrides are preserved. See `_ensure_authentik_pgbouncer_pool_size`.
+        #
+        # Hotfix #4 corroborating evidence (Tom Endress anchortak 2026-05-17):
+        # His box's dramatiq lock-race class of failure (36 consumer threads
+        # racing on `_fetch_pending_messages` SELECT FOR UPDATE without
+        # SKIP LOCKED) saturates pool=35+5 instantly. tak-10's class is
+        # different (Channels-PG long-poll) but the prescription is the
+        # same: more pool headroom. We ship 75/15 (90-ceiling) which
+        # exceeds Tom's 80/5 recommendation; operator overrides above
+        # this (e.g. tak-10's 150/30) are preserved.
         try:
             _ensure_authentik_pgbouncer_pool_size(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as ak_pgb_pool_err:
