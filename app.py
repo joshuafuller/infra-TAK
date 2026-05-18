@@ -221,8 +221,9 @@ def inject_cloudtak_icon():
     if not request.path.startswith('/api') and not request.path.startswith('/cloudtak/page.js'):
         _settings = load_settings()
         _banner = render_custom_banner(_settings)
+        _cert_pw_nag = render_default_cert_password_warning(_settings)
         _sidebar = render_sidebar(detect_modules(), request.path.strip('/') or 'console', takwerx_logo_url=_login_logo_url())
-        d['sidebar_html'] = Markup(_banner + _sidebar)
+        d['sidebar_html'] = Markup(_banner + _cert_pw_nag + _sidebar)
     return d
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -345,10 +346,12 @@ def apply_security_headers(response):
     response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
     response.headers['Permissions-Policy'] = 'geolocation=(), microphone=(), camera=()'
     # Keep CSP compatible with existing templates (inline script/style, CDN assets, data URLs).
-    # We can tighten this later by removing inline JS/CSS and adding nonces.
+    # v0.9.29 (security audit LOW): dropped 'unsafe-eval' — codebase has no
+    # eval()/new Function()/string-form setTimeout. Inline scripts still
+    # require 'unsafe-inline' (template surgery deferred to nonces).
     csp = (
         "default-src 'self' https: data: blob:; "
-        "script-src 'self' 'unsafe-inline' 'unsafe-eval' https:; "
+        "script-src 'self' 'unsafe-inline' https:; "
         "style-src 'self' 'unsafe-inline' https:; "
         "img-src 'self' data: https:; "
         "font-src 'self' data: https:; "
@@ -363,7 +366,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.28-alpha"
+VERSION = "0.9.29-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -1008,6 +1011,58 @@ def render_custom_banner(settings):
         f'<span class="custom-banner-text">{text}{identity_html}</span>'
         f'{logo_img}'
         '</div>'
+    )
+
+
+def render_default_cert_password_warning(settings):
+    """v0.9.29 (security audit MED): show a dismissable banner while the TAK
+    cert export password is still the upstream default `atakatak`.
+
+    Renders only when:
+      - TAK Server is installed (avoid noise on bare consoles),
+      - `tak_cert_password` is unset or equals 'atakatak',
+      - operator has not dismissed it (`cert_pw_warning_dismissed`).
+    """
+    try:
+        if not (settings and os.path.exists('/opt/tak/CoreConfig.xml')):
+            return ''
+        if settings.get('cert_pw_warning_dismissed'):
+            return ''
+        pw = (settings.get('tak_cert_password') or '').strip()
+        if pw and pw != 'atakatak':
+            return ''
+    except Exception:
+        return ''
+    return (
+        '<style>'
+        '.cert-pw-nag{position:fixed;top:0;left:0;right:0;z-index:9998;'
+        'background:linear-gradient(90deg,#7c2d12,#9a3412);color:#fef3c7;'
+        'font-family:"JetBrains Mono",monospace;font-size:13px;'
+        'padding:10px 16px;display:flex;align-items:center;justify-content:center;'
+        'gap:14px;border-bottom:1px solid #fbbf24;flex-wrap:wrap}'
+        '.cert-pw-nag a{color:#fde68a;text-decoration:underline;font-weight:600}'
+        '.cert-pw-nag button{background:transparent;border:1px solid #fde68a;'
+        'color:#fde68a;padding:4px 10px;border-radius:6px;cursor:pointer;'
+        'font-family:inherit;font-size:12px}'
+        '.cert-pw-nag button:hover{background:#fde68a;color:#7c2d12}'
+        'body.has-cert-pw-nag{padding-top:44px}'
+        '</style>'
+        '<div class="cert-pw-nag" role="alert">'
+        '<span>'
+        '<strong>Security:</strong> TAK certificate password is still the '
+        'upstream default <code>atakatak</code>. '
+        '<a href="/takserver#cert-section">Change it on the TAK Server page</a>.'
+        '</span>'
+        '<button type="button" onclick="(function(){'
+        "fetch('/api/security/dismiss-cert-pw-warning',{method:'POST',"
+        "headers:{'Content-Type':'application/json'},body:'{}'})"
+        ".then(function(){document.querySelector('.cert-pw-nag').remove();"
+        "document.body.classList.remove('has-cert-pw-nag');});"
+        '})()">Dismiss</button>'
+        '</div>'
+        '<script>document.body && document.body.classList.add("has-cert-pw-nag");'
+        'document.addEventListener("DOMContentLoaded",function(){'
+        'document.body.classList.add("has-cert-pw-nag");});</script>'
     )
 
 
@@ -1858,6 +1913,18 @@ def customization_settings_post():
     cust['banner_font'] = banner_font
     cust['banner_color'] = banner_color
     cust['banner_size'] = banner_size
+    save_settings(s)
+    return jsonify({'ok': True})
+
+@app.route('/api/security/dismiss-cert-pw-warning', methods=['POST'])
+@login_required
+def security_dismiss_cert_pw_warning():
+    """v0.9.29 (security audit MED): persist that the operator has acknowledged
+    the default `atakatak` cert password nag. Auto-clears when the password is
+    changed away from the default (handled at render time in
+    render_default_cert_password_warning)."""
+    s = load_settings()
+    s['cert_pw_warning_dismissed'] = True
     save_settings(s)
     return jsonify({'ok': True})
 
@@ -4253,6 +4320,24 @@ def _sync_guarddog_remote_db_from_settings(settings=None):
             json.dump(gd_conf, f)
     except Exception as e:
         return False, f'guarddog.conf: {e}'
+
+    # v0.9.29 CRIT-08 fix: provision a pinned SSH known_hosts file for the
+    # watchdog scripts. Watchdog SSH calls use StrictHostKeyChecking=accept-new
+    # against this file, so first contact pins the DB host's key and any later
+    # MITM attempt fails. Empty file on first install — scripts append on first
+    # successful connect. Operators rotating the DB host key can clear this
+    # with `: > /opt/tak-guarddog/known_hosts`.
+    try:
+        kh_path = os.path.join(gd_dir, 'known_hosts')
+        if not os.path.exists(kh_path):
+            open(kh_path, 'a').close()
+        os.chmod(kh_path, 0o600)
+        try:
+            os.chown(kh_path, 0, 0)
+        except PermissionError:
+            pass
+    except Exception as e:
+        return False, f'known_hosts: {e}'
 
     cert_pass = _get_tak_cert_password(settings)
     external_db_flag = 'true' if is_external else ''
@@ -6855,6 +6940,19 @@ def run_guarddog_deploy(alert_email):
             return
         for d in ['/opt/tak-guarddog', '/var/lib/takguard', '/var/log/takguard']:
             os.makedirs(d, exist_ok=True)
+        # v0.9.29 CRIT-08 fix: provision pinned SSH known_hosts for watchdog
+        # scripts (used when StrictHostKeyChecking=accept-new is in effect).
+        try:
+            _kh = '/opt/tak-guarddog/known_hosts'
+            if not os.path.exists(_kh):
+                open(_kh, 'a').close()
+            os.chmod(_kh, 0o600)
+            try:
+                os.chown(_kh, 0, 0)
+            except PermissionError:
+                pass
+        except Exception:
+            pass
         plog("✓ Directories created")
         # Detect two-server mode
         settings = load_settings()
@@ -11547,19 +11645,59 @@ def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
         with open(core_config, 'r') as f:
             content = f.read()
         shutil.copy(core_config, core_config + '.bak-le')
+        # v0.9.29 — defense-in-depth: if CoreConfig has ns0: prefixes (leftover from a
+        # prior buggy _apply_coreconfig_ldap_auth_et run on an older release), strip
+        # them BEFORE patching the connector. The original regex below only matched
+        # `<connector ...>` and silently no-op'd on `<ns0:connector ...>`, leaving the
+        # LE cert install incomplete. We also fix the regex to be namespace-tolerant
+        # as a second layer of defense.
+        if '<ns0:' in content or 'xmlns:ns0=' in content:
+            log_fn("  ⚠ CoreConfig.xml has legacy ns0: prefixes — stripping before patch")
+            content = re.sub(r'<ns0:', '<', content)
+            content = re.sub(r'</ns0:', '</', content)
+            content = re.sub(r'\s+xmlns:ns0="[^"]+"', '', content)
+            if 'xmlns=' not in content:
+                content = re.sub(
+                    r'(<Configuration\b)',
+                    '\\1 xmlns="http://bbn.com/marti/xml/config"',
+                    content, count=1
+                )
         new_connector = (
             '<connector port="8446" clientAuth="false" _name="LetsEncrypt" '
             'keystore="JKS" keystoreFile="certs/files/takserver-le.jks" '
             f'keystorePass="{cert_pass}" enableAdminUI="true" enableWebtak="true" '
             'enableNonAdminUI="false"/>'
         )
-        patched = re.sub(r'<connector port="8446"[^/]*/>', new_connector, content)
+        # Namespace-tolerant regex: matches `<connector ...>` AND `<ns0:connector ...>`
+        # (or any other prefix). The (?:[A-Za-z][\w-]*:)? group accepts an optional
+        # XML namespace prefix before the element name. Also accept `/ >` (with space)
+        # which ElementTree emits with short_empty_elements=True on some Python versions.
+        patched = re.sub(
+            r'<(?:[A-Za-z][\w-]*:)?connector\s+port="8446"[^/]*/\s*>',
+            new_connector, content, count=1
+        )
         if patched != content:
             with open(core_config, 'w') as f:
                 f.write(patched)
             log_fn("  ✓ CoreConfig.xml 8446 connector patched to use LE cert")
+            # v0.9.29 — verify the patch actually landed by reading back. Critical
+            # because subtle whitespace differences or a stale file lock could leave
+            # the patch unwritten, and a silent no-op here means 8446 serves the
+            # cert_https default keystore instead of LE — making mobile/ATAK clients
+            # show cert warnings on enrollment.
+            try:
+                with open(core_config, 'r') as f:
+                    _verify = f.read()
+                if '_name="LetsEncrypt"' not in _verify or 'takserver-le.jks' not in _verify:
+                    log_fn("  ⚠ Post-patch verify FAILED — 8446 connector did not pick up LE attrs")
+                    log_fn("  ⚠ Restoring from .bak-le and aborting LE wire-up")
+                    shutil.copy(core_config + '.bak-le', core_config)
+                    return False
+            except Exception as _ve:
+                log_fn(f"  ⚠ Post-patch verify error: {_ve} (continuing — may need manual check)")
         else:
             log_fn("  ⚠ 8446 connector pattern not matched in CoreConfig.xml — check manually")
+            log_fn(f"  ⚠ First 200 chars: {content[:200]!r}")
     except Exception as ce:
         log_fn(f"  ⚠ CoreConfig patch error: {ce}")
 
@@ -14105,6 +14243,9 @@ paths:
         # Step 5: Create mediamtx systemd service
         plog("")
         plog("━━━ Step 5/7: Creating systemd Services ━━━")
+        # SupplementaryGroups=caddy lets takwerx read Caddy's LE cert/key files
+        # (Caddy writes 0600 caddy:caddy in /var/lib/caddy/.local/share/caddy/...).
+        # Without this, MediaMTX fails to start with "permission denied" on the cert.
         mediamtx_svc = """[Unit]
 Description=MediaMTX RTSP/HLS/SRT Streaming Server
 After=network.target
@@ -14115,6 +14256,7 @@ ExecStart=/usr/local/bin/mediamtx /usr/local/etc/mediamtx.yml
 Restart=always
 RestartSec=5
 User=takwerx
+SupplementaryGroups=caddy
 
 [Install]
 WantedBy=multi-user.target
@@ -14379,6 +14521,36 @@ WantedBy=multi-user.target
         subprocess.run('systemctl enable mediamtx', shell=True, capture_output=True)
         if os.path.exists(editor_file):
             subprocess.run('systemctl enable mediamtx-webeditor', shell=True, capture_output=True)
+
+        # v0.9.29 — Pre-create writable dirs + chown for the takwerx-run web editor.
+        # The upstream mediamtx_config_editor.py (from mediamtx-installer) hardcodes:
+        #   BACKUP_DIR  = '/usr/local/etc/mediamtx_backups'
+        #   CONFIG_FILE = '/usr/local/etc/mediamtx.yml'
+        # and at IMPORT time (line ~93) calls `os.makedirs(BACKUP_DIR, exist_ok=True)`.
+        # If `/usr/local/etc/` is root-owned (default after `mkdir -p` for the .yml)
+        # AND the BACKUP_DIR doesn't exist, the import fails with PermissionError
+        # since the service runs as `User=takwerx`. Symptom seen on tak-test-4
+        # 2026-05-18: mediamtx-webeditor.service in fail-loop (264 restarts) with
+        #   `PermissionError: [Errno 13] Permission denied: '/usr/local/etc/mediamtx_backups'`
+        # Downstream: Caddy's stream.* vhost reverse-proxies to :5080 → nothing
+        # listening → Caddy returns 502 → browser sees authentik's "Not Found"
+        # page (because the forward_auth flow falls back to authentik on error).
+        # Same problem class as the LE-cert read-access fix earlier in this release.
+        if os.path.exists(editor_file):
+            try:
+                subprocess.run('mkdir -p /usr/local/etc/mediamtx_backups', shell=True, capture_output=True, timeout=5)
+                subprocess.run('chown -R takwerx:takwerx /usr/local/etc/mediamtx_backups', shell=True, capture_output=True, timeout=5)
+                # Editor writes theme_config.json, email_config.json, users_file,
+                # share_links, group_metadata, srt_passphrase_backup, pending_reg,
+                # reset_tokens, etc. into /opt/mediamtx-webeditor/. All as takwerx.
+                subprocess.run('chown -R takwerx:takwerx /opt/mediamtx-webeditor', shell=True, capture_output=True, timeout=10)
+                # mediamtx.yml is read by `mediamtx` (User=takwerx) and written by
+                # the editor's Save-Config UI. takwerx ownership lets both work.
+                subprocess.run('chown takwerx:takwerx /usr/local/etc/mediamtx.yml', shell=True, capture_output=True, timeout=5)
+                plog("  ✓ Web editor writable paths chowned to takwerx (backups + /opt/mediamtx-webeditor + mediamtx.yml)")
+            except Exception as _pe:
+                plog(f"  ⚠ Could not chown web editor paths: {_pe}")
+
         subprocess.run('systemctl start mediamtx', shell=True, capture_output=True)
         if os.path.exists(editor_file):
             subprocess.run('systemctl start mediamtx-webeditor', shell=True, capture_output=True)
@@ -14436,6 +14608,29 @@ WantedBy=multi-user.target
                 subprocess.run(f"sed -i 's|^hlsEncryption:.*|hlsEncryption: yes|' {yml}", shell=True)
                 plog(f"✓ SSL certificates wired — RTSPS and HTTPS HLS enabled")
                 plog(f"  Cert: {cert_file}")
+
+                # Grant MediaMTX (running as takwerx) read access to Caddy's LE cert files.
+                # Caddy stores certs as 0600 caddy:caddy under /var/lib/caddy/.local/share/caddy/...
+                # We add takwerx to the caddy group (via SupplementaryGroups=caddy in the unit) and
+                # make the directory chain group-traversable + the cert/key files group-readable.
+                # Without this, mediamtx fails on startup with "permission denied" on the cert path.
+                try:
+                    subprocess.run('usermod -aG caddy takwerx 2>/dev/null', shell=True, capture_output=True)
+                    for d in ('/var/lib/caddy',
+                              '/var/lib/caddy/.local',
+                              '/var/lib/caddy/.local/share',
+                              '/var/lib/caddy/.local/share/caddy',
+                              '/var/lib/caddy/.local/share/caddy/certificates',
+                              cert_base,
+                              f'{cert_base}/{mtx_domain}'):
+                        subprocess.run(f'chmod g+rx "{d}" 2>/dev/null', shell=True, capture_output=True)
+                    subprocess.run(f'chmod g+r "{cert_file}" "{key_file}" 2>/dev/null', shell=True, capture_output=True)
+                    # daemon-reload so the SupplementaryGroups=caddy in the unit (written in Step 5) takes effect
+                    subprocess.run('systemctl daemon-reload', shell=True, capture_output=True)
+                    plog("  ✓ Cert read-access granted to MediaMTX (takwerx in caddy group)")
+                except Exception as _e:
+                    plog(f"  ⚠ Could not grant cert read-access: {_e}")
+
                 subprocess.run('systemctl restart mediamtx', shell=True, capture_output=True)
                 time.sleep(2)
             else:
@@ -26845,6 +27040,523 @@ def _patch_authentik_web_max_requests_to_1000(plog=None):
         return False
 
 
+def _patch_authentik_max_requests_snap_to_baseline_if_pgbouncer(plog=None):
+    """v0.9.29: short-circuit the v0.9.23 autotune tune-UP cascade for boxes
+    that were stuck at the floor before PgBouncer landed.
+
+    BACKGROUND (test12 / tak-10, 2026-05-18):
+      The v0.9.23 MAX_REQUESTS autotuner uses asymmetric cooldowns: halve
+      on watchdog fire (down to floor=100, every 2 min) and +25% on quiet
+      (up to baseline=1000, every 30 min). On a box that hit the floor
+      during a real leak burst, the tune-UP cascade after pressure resolves
+      takes ~7 hours and produces 10 server+worker recreates (100 → 125 →
+      156 → 195 → 243 → 303 → 378 → 472 → 590 → 737 → 921 → 1000). Each
+      recreate drops the LDAP outpost websocket for 1-5s (visible as Caddy
+      502s on /api/v3/flows/executor/ldap-authentication-flow). Field
+      forensic on test12 2026-05-18 caught this in soak.
+
+      The v0.9.23 PgBouncer install function (line 28467-28491) already
+      RESETS MAX_REQUESTS to baseline as part of its post-install path
+      ("autotune floor=100 is no longer load-bearing with PgBouncer in
+      place"). But that path only fires on FRESH PgBouncer installs.
+      Boxes upgraded to PgBouncer while already-stuck-at-floor never
+      saw the reset — they took the 7-hour cascade instead.
+
+      This migration closes that gap. It runs every startup, but is
+      effectively a one-shot per box because it short-circuits once
+      MAX_REQUESTS == baseline.
+
+    Gating (all must be true to apply):
+      - ~/authentik/.env exists
+      - PgBouncer is installed in compose AND wired in .env (the
+        architectural protection that makes MAX_REQUESTS autotune
+        non-load-bearing)
+      - current MAX_REQUESTS < baseline (default 1000; settings override
+        via authentik_max_requests_baseline)
+      - no SAFETY NET firing in the last _AUTHENTIK_MAX_REQUESTS_QUIET_WINDOW_S
+        (default 6h) — if pressure is currently active we let the autotuner
+        do its job
+      - no autotune apply in the last _AUTHENTIK_MAX_REQUESTS_TUNE_UP_COOLDOWN_S
+        (default 30 min) — avoid colliding with an in-flight autotune cycle
+
+    On apply: write .env MAX_REQUESTS=baseline / JITTER=baseline//20, single
+    server+worker recreate, clear authentik_max_requests_fire_history,
+    record the snap in authentik_max_requests_tune_history with
+    reason='snap-to-baseline-pgbouncer-installed-quiet', set
+    authentik_max_requests_last_tune_ts=now.
+
+    Returns True if applied (cascade was short-circuited), False if
+    no-op (already at baseline, or gate condition not met), None on error.
+    """
+    if plog is None:
+        plog = lambda m: None
+    ak_dir = os.path.expanduser('~/authentik')
+    ak_env = os.path.join(ak_dir, '.env')
+    ak_compose = os.path.join(ak_dir, 'docker-compose.yml')
+    if not os.path.exists(ak_env) or not os.path.exists(ak_compose):
+        return False
+    try:
+        import time as _t
+
+        _cur_max, _cur_jitter = _authentik_max_requests_get_current()
+        if _cur_max is None:
+            return False  # MAX_REQUESTS not in .env — nothing to do
+
+        _s = load_settings()
+        _baseline = int(_s.get('authentik_max_requests_baseline') or 1000)
+        _ceiling = int(_s.get('authentik_max_requests_ceiling') or _AUTHENTIK_MAX_REQUESTS_CEILING_DEFAULT)
+        if _cur_max >= _baseline:
+            return False  # at or above baseline — no cascade to short-circuit
+        if _baseline > _ceiling:
+            _baseline = _ceiling  # safety clamp
+
+        try:
+            with open(ak_env) as _f:
+                _env_text = _f.read()
+        except Exception as _re:
+            plog(f"  ⚠ snap-to-baseline: .env read error: {_re}")
+            return None
+
+        _has_pgbouncer_in_env = bool(
+            re.search(r'^\s*AUTHENTIK_POSTGRESQL__HOST\s*=\s*pgbouncer\s*$',
+                      _env_text, re.MULTILINE)
+        )
+        try:
+            with open(ak_compose) as _f:
+                _compose_text = _f.read()
+        except Exception:
+            _compose_text = ''
+        _has_pgbouncer_in_compose = bool(
+            re.search(r'^\s*pgbouncer\s*:\s*$', _compose_text, re.MULTILINE)
+        )
+        if not (_has_pgbouncer_in_env and _has_pgbouncer_in_compose):
+            return False  # No PgBouncer installed — let the autotuner cascade
+
+        _now = int(_t.time())
+        _fires = list(_s.get('authentik_max_requests_fire_history') or [])
+        _last_fire_ts = max(_fires) if _fires else 0
+        if _last_fire_ts and (_now - _last_fire_ts) < _AUTHENTIK_MAX_REQUESTS_QUIET_WINDOW_S:
+            _qmin = (_now - _last_fire_ts) // 60
+            plog(f"  snap-to-baseline: SAFETY NET fired {_qmin}min ago "
+                 f"(< {_AUTHENTIK_MAX_REQUESTS_QUIET_WINDOW_S//60}min quiet window) "
+                 f"— deferring to autotuner")
+            return False
+
+        _last_tune_ts = int(_s.get('authentik_max_requests_last_tune_ts') or 0)
+        if _last_tune_ts and (_now - _last_tune_ts) < _AUTHENTIK_MAX_REQUESTS_TUNE_UP_COOLDOWN_S:
+            _tmin = (_now - _last_tune_ts) // 60
+            plog(f"  snap-to-baseline: autotune ran {_tmin}min ago "
+                 f"(< {_AUTHENTIK_MAX_REQUESTS_TUNE_UP_COOLDOWN_S//60}min cooldown) "
+                 f"— deferring to avoid collision")
+            return False
+
+        _new_jitter = max(5, _baseline // 20)
+        _backup = f'{ak_env}.bak.snap-to-baseline.{_now}'
+        with open(_backup, 'w') as _f:
+            _f.write(_env_text)
+
+        _new_text = re.sub(
+            r'^AUTHENTIK_WEB__MAX_REQUESTS=\d+\s*$',
+            f'AUTHENTIK_WEB__MAX_REQUESTS={_baseline}',
+            _env_text, flags=re.MULTILINE
+        )
+        _new_text = re.sub(
+            r'^AUTHENTIK_WEB__MAX_REQUESTS_JITTER=\d+\s*$',
+            f'AUTHENTIK_WEB__MAX_REQUESTS_JITTER={_new_jitter}',
+            _new_text, flags=re.MULTILINE
+        )
+        if _new_text == _env_text:
+            plog("  snap-to-baseline: regex did not match (.env shape unexpected) — skip")
+            try:
+                os.remove(_backup)
+            except Exception:
+                pass
+            return False
+
+        with open(ak_env, 'w') as _f:
+            _f.write(_new_text)
+
+        _saved_recreates = max(0, _estimate_cascade_recreates(_cur_max, _baseline))
+        plog(f"  ✓ snap-to-baseline: MAX_REQUESTS {_cur_max}→{_baseline}, "
+             f"JITTER {_cur_jitter}→{_new_jitter} "
+             f"(short-circuited ~{_saved_recreates} +25%/30min tune-UP recreates)")
+        plog(f"    Reason: PgBouncer installed, quiet for "
+             f"{(_now - _last_fire_ts) // 60 if _last_fire_ts else 9999}min — "
+             f"v0.9.23 cascade no longer needed")
+        plog(f"    Backup: {os.path.basename(_backup)}")
+        plog("  snap-to-baseline: recreating server+worker (single recreate) to apply new env...")
+
+        ok = _recreate_authentik_server_worker(plog, reason='snap-to-baseline-pgbouncer-installed')
+        if not ok:
+            plog("  ⚠ snap-to-baseline: recreate reported failure — .env updated, "
+                 "values will apply on next manual restart")
+
+        try:
+            _s = load_settings()
+            _s['authentik_max_requests_last_tune_ts'] = _now
+            _s['authentik_max_requests_fire_history'] = []  # post-PgBouncer, old fires irrelevant
+            _hist = list(_s.get('authentik_max_requests_tune_history') or [])
+            _hist.append({
+                'ts': _now,
+                'from_max': _cur_max,
+                'to_max': _baseline,
+                'from_jitter': _cur_jitter,
+                'to_jitter': _new_jitter,
+                'reason': 'snap-to-baseline-pgbouncer-installed-quiet',
+                'recreate_ok': bool(ok),
+                'saved_recreates_estimate': _saved_recreates,
+            })
+            _hist = _hist[-_AUTHENTIK_MAX_REQUESTS_TUNE_HISTORY_MAX:]
+            _s['authentik_max_requests_tune_history'] = _hist
+            _s['authentik_max_requests_snap_migration'] = {
+                'ts': _now,
+                'outcome': 'success' if ok else 'partial',
+                'from_max': _cur_max,
+                'to_max': _baseline,
+                'saved_recreates_estimate': _saved_recreates,
+                'rationale': 'v0.9.29: short-circuit v0.9.23 tune-UP cascade now that '
+                             'PgBouncer headroom makes the floor-state irrelevant',
+            }
+            save_settings(_s)
+        except Exception:
+            pass
+        return True
+    except Exception as _e:
+        plog(f"  ⚠ snap-to-baseline migration error (non-fatal): {_e}")
+        return None
+
+
+def _estimate_cascade_recreates(cur_max, baseline):
+    """How many +25%/30min tune-UP recreates would have been needed to climb
+    from cur_max to baseline? Used for reporting the cost-avoided in the
+    snap-to-baseline migration log line. Pure function — no side effects.
+    """
+    try:
+        _n = 0
+        _v = int(cur_max)
+        _b = int(baseline)
+        if _v >= _b or _v <= 0:
+            return 0
+        # Same arithmetic as _authentik_max_requests_autotune_evaluate tune-UP:
+        # _new = min(_baseline, int(_current * 1.25))
+        while _v < _b and _n < 30:
+            _v = min(_b, int(_v * 1.25))
+            _n += 1
+        return _n
+    except Exception:
+        return 0
+
+
+def _ip_is_rfc1918_private(ip):
+    """True if ip is in RFC 1918 private ranges (10/8, 172.16/12, 192.168/16).
+    Also rejects loopback / link-local / invalid. Pure function — no side effects.
+    """
+    try:
+        if not ip:
+            return False
+        parts = ip.strip().split('.')
+        if len(parts) != 4:
+            return False
+        octets = [int(p) for p in parts]
+        if any(o < 0 or o > 255 for o in octets):
+            return False
+        a, b = octets[0], octets[1]
+        if a == 10:
+            return True
+        if a == 172 and 16 <= b <= 31:
+            return True
+        if a == 192 and b == 168:
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def _detect_cloud_environment():
+    """Return 'azure', 'aws', or None based on IMDS reachability.
+
+    IMDS at link-local 169.254.169.254 is the strongest "I am running on a
+    cloud VM" signal we can get without operator input. On bare-metal /
+    laptops / corp LANs, the link-local address either isn't routed or
+    times out within 2 s. On Azure / AWS the metadata service responds in
+    sub-100ms.
+
+    Field-discovered necessity (tak-test-4, 2026-05-18): some Azure VMs
+    have NO public IP attached to the NIC — they're reached via an Azure
+    Load Balancer or NAT Gateway. IMDS correctly reports
+    ``publicIpAddress: ""`` on those, so `_detect_cloud_public_ip()` needs
+    a separate "are we on a cloud VM?" signal to know it's safe to fall
+    through to ifconfig.me / api.ipify.org (which would otherwise be too
+    permissive on CGNAT bare-metal hosts).
+    """
+    import urllib.request as _ur
+    # Azure: requires `Metadata: true` header and api-version
+    try:
+        _req = _ur.Request(
+            'http://169.254.169.254/metadata/instance?api-version=2021-02-01',
+            headers={'Metadata': 'true'},
+        )
+        with _ur.urlopen(_req, timeout=2) as r:
+            if r.status == 200:
+                return 'azure'
+    except Exception:
+        pass
+    # AWS IMDSv1 (token-less); IMDSv2 on newer AMIs would still respond to
+    # this endpoint with 401, which urllib raises — we accept "responded at
+    # all" via the explicit HTTPError check.
+    try:
+        with _ur.urlopen('http://169.254.169.254/latest/meta-data/', timeout=2) as r:
+            if r.status == 200:
+                return 'aws'
+    except Exception as _e:
+        # IMDSv2 returns 401 Unauthorized without a token → still proves
+        # "we're on AWS" for our purposes.
+        try:
+            if getattr(_e, 'code', None) in (401, 403):
+                return 'aws'
+        except Exception:
+            pass
+    return None
+
+
+def _detect_cloud_public_ip():
+    """Return (public_ip, source) on cloud VMs only.
+
+    Detection logic (v0.9.29):
+      1. Determine the cloud environment via IMDS reachability
+         (_detect_cloud_environment). If we're not on a cloud VM, return
+         (None, None) — we will NOT touch bare-metal / laptop / CGNAT
+         operator settings.
+      2. On Azure / AWS, first ask IMDS for a public IP directly attached
+         to the NIC. If present, that's the highest-confidence answer.
+      3. If IMDS reports no direct-attached public IP (which is the
+         tak-test-4 case — Azure VM behind Load Balancer / NAT Gateway),
+         fall through to public-IP echo services. This is safe BECAUSE we
+         already proved (step 1) we're on a cloud VM. Echo services would
+         be too permissive on bare-metal alone, but the cloud-VM
+         precondition rules that case out.
+
+    Source values:
+      'azure-imds-direct' — Azure IMDS returned a public IP attached to interface 0
+      'aws-imds-direct'   — AWS IMDS returned a public IP attached to the NIC
+      'azure-nat'         — Azure VM (IMDS responded) but no direct public IP;
+                            ifconfig.me / api.ipify.org returned a public IP
+                            (e.g. via Azure Load Balancer or NAT Gateway)
+      'aws-nat'           — Same pattern on AWS (e.g. via NAT Gateway)
+
+    Returns (None, None) if not on a cloud VM, or if all probes time out.
+    """
+    import urllib.request as _ur
+    _ipv4 = re.compile(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$')
+
+    cloud = _detect_cloud_environment()
+    if not cloud:
+        return None, None
+
+    # Step 2: try direct-attached public IP via IMDS first (highest confidence)
+    if cloud == 'azure':
+        try:
+            _req = _ur.Request(
+                'http://169.254.169.254/metadata/instance/network/interface/0/ipv4/ipAddress/0/publicIpAddress'
+                '?api-version=2021-02-01&format=text',
+                headers={'Metadata': 'true'},
+            )
+            with _ur.urlopen(_req, timeout=2) as r:
+                _body = (r.read() or b'').decode('utf-8', 'replace').strip()
+            if _body and _ipv4.match(_body):
+                return _body, 'azure-imds-direct'
+        except Exception:
+            pass
+    elif cloud == 'aws':
+        try:
+            with _ur.urlopen('http://169.254.169.254/latest/meta-data/public-ipv4', timeout=2) as r:
+                _body = (r.read() or b'').decode('utf-8', 'replace').strip()
+            if _body and _ipv4.match(_body):
+                return _body, 'aws-imds-direct'
+        except Exception:
+            pass
+
+    # Step 3: cloud VM with no direct public IP — fall through to echo services
+    # (safe because the cloud-VM precondition has already been established).
+    for _url in ('https://api.ipify.org', 'https://ifconfig.me'):
+        try:
+            with _ur.urlopen(_url, timeout=3) as r:
+                _body = (r.read() or b'').decode('utf-8', 'replace').strip()
+            if _body and _ipv4.match(_body):
+                return _body, f'{cloud}-nat'
+        except Exception:
+            continue
+
+    return None, None
+
+
+def _patch_settings_server_ip_prefer_cloud_public(plog=None):
+    """v0.9.29: auto-correct settings.server_ip when a cloud VM has a private
+    IP stored but the cloud-metadata service definitively reports a public IP.
+
+    BACKGROUND (tak-test-4, fresh Azure deploy on v0.9.28 main, 2026-05-18):
+      start.sh used `hostname -I | awk '{print $1}'` at fresh-install time,
+      which on Azure/AWS/GCP returns the *private* interface IP (e.g.
+      10.0.0.x), not the public IP operators browse to. v0.9.29 fixed
+      start.sh for new installs, but Update Now doesn't re-run start.sh
+      — existing installs keep the private IP forever unless the operator
+      knows to paste in the public one via Settings → Server IP.
+
+      This migration closes that gap. It runs at startup with TIGHT gating
+      so it can never wrongly rewrite a deliberately-private deployment.
+
+    Gating (all must be true to apply):
+      - current settings.server_ip is in RFC 1918 private ranges
+        (10/8, 172.16/12, 192.168/16) — the symptom we're fixing
+      - _detect_cloud_public_ip() returns a public IP. The function
+        proves cloud-VM environment via IMDS reachability first, then
+        tries direct-attached public IP via IMDS, then falls through to
+        ifconfig.me / api.ipify.org if the VM is on a cloud but has no
+        direct public IP (e.g. behind Azure Load Balancer / NAT Gateway —
+        tak-test-4's case). On bare-metal / laptop / CGNAT operator
+        installs, IMDS doesn't respond, so this function returns
+        (None, None) and the migration is a no-op.
+      - detected public IP differs from current settings.server_ip
+      - migration not previously applied on this box (settings key
+        `server_ip_auto_corrected_migration`)
+
+    On apply: rewrites settings.server_ip in-place, records audit blob in
+    settings.json with `from`, `to`, `source` (azure|aws), `applied_at`.
+    Logs loudly so operators can see it in journalctl. If they wanted the
+    private IP, they paste it back in Settings → Server IP and Save —
+    the migration won't re-run because the audit blob is recorded.
+
+    Idempotent: no-op on every subsequent startup once applied.
+    Safe to call on every console boot from `_startup_migrations`.
+    """
+    if not plog:
+        plog = lambda m: None
+    try:
+        s = load_settings()
+        cur_ip = (s.get('server_ip') or '').strip()
+        if not cur_ip:
+            return False
+        # Idempotency: if we already auto-corrected this box, never touch again.
+        prev = s.get('server_ip_auto_corrected_migration')
+        if isinstance(prev, dict) and prev.get('applied'):
+            return False
+        if not _ip_is_rfc1918_private(cur_ip):
+            return False
+        public_ip, source = _detect_cloud_public_ip()
+        if not public_ip:
+            return False
+        if public_ip == cur_ip:
+            return False
+        plog(
+            f"  server_ip auto-correct: detected {source} public IP {public_ip}, "
+            f"current settings.server_ip is private ({cur_ip}) — updating"
+        )
+        s['server_ip'] = public_ip
+        s['server_ip_auto_corrected_migration'] = {
+            'applied': True,
+            'applied_at': datetime.utcnow().isoformat() + 'Z',
+            'from': cur_ip,
+            'to': public_ip,
+            'source': source,
+            'version': VERSION,
+        }
+        save_settings(s)
+        plog(
+            f"  server_ip auto-correct: applied. {cur_ip} → {public_ip} "
+            f"(source={source}). If you actually wanted the private IP, "
+            f"paste it back in Settings → Server IP — migration is one-shot."
+        )
+        return True
+    except Exception as e:
+        try:
+            plog(f"  server_ip auto-correct: error (non-fatal): {e}")
+        except Exception:
+            pass
+        return False
+
+
+def _heal_mediamtx_webeditor_writable_paths(plog=None):
+    """v0.9.29: self-heal `mediamtx-webeditor.service` fail-loop caused by
+    PermissionError on `/usr/local/etc/mediamtx_backups`.
+
+    BACKGROUND (tak-test-4, fresh Azure deploy on v0.9.28 main, 2026-05-18):
+      The upstream mediamtx_config_editor.py (from mediamtx-installer) hard-codes
+        BACKUP_DIR  = '/usr/local/etc/mediamtx_backups'
+        CONFIG_FILE = '/usr/local/etc/mediamtx.yml'
+      and at IMPORT time calls `os.makedirs(BACKUP_DIR, exist_ok=True)`. The
+      systemd unit runs the editor as `User=takwerx`, but `/usr/local/etc/` is
+      `root:root 0755` and the BACKUP_DIR doesn't exist → PermissionError at
+      module import → service exits 1 → systemd Restart=always re-launches →
+      tight fail-loop (264 restarts seen on tak-test-4 before discovery).
+      Downstream: Caddy stream.* vhost reverse-proxies `/` to :5080 → nothing
+      listening → browser sees the Authentik "Not Found" page (forward_auth
+      falls back to the auth/caddy endpoint response on upstream-unreachable).
+      Same problem class as the LE-cert read-access bug fixed earlier in v0.9.29.
+
+      v0.9.29 fixes the deploy path (`deploy_mediamtx()`), but Update Now does
+      NOT re-run that flow. Operators on broken boxes would have to redeploy
+      MediaMTX from the console (a heavy step). This migration closes the gap:
+      on every console boot, if MediaMTX is installed AND the editor service is
+      NOT active, re-apply the chowns so the next service restart succeeds.
+
+    Gating (all must be true to apply):
+      - /opt/mediamtx-webeditor exists (MediaMTX installed)
+      - mediamtx-webeditor.service is loaded but not active (broken state)
+
+    On apply: chown /usr/local/etc/mediamtx_backups (mkdir if absent),
+      /opt/mediamtx-webeditor recursively, and /usr/local/etc/mediamtx.yml to
+      takwerx:takwerx, then `systemctl restart mediamtx-webeditor`. Idempotent
+      on healthy boxes (skips entirely if service is active).
+    """
+    if not plog:
+        plog = lambda m: None
+    try:
+        if not os.path.exists('/opt/mediamtx-webeditor'):
+            return False
+        # Don't disturb healthy boxes
+        r_active = subprocess.run(
+            ['systemctl', 'is-active', 'mediamtx-webeditor'],
+            capture_output=True, text=True, timeout=5
+        )
+        if r_active.stdout.strip() == 'active':
+            return False
+        # Confirm the unit file is actually installed (not just a stale heal target)
+        r_loaded = subprocess.run(
+            ['systemctl', 'list-unit-files', 'mediamtx-webeditor.service', '--no-legend'],
+            capture_output=True, text=True, timeout=5
+        )
+        if 'mediamtx-webeditor' not in (r_loaded.stdout or ''):
+            return False
+        plog("  mediamtx-webeditor: not active — applying perm-heal (v0.9.29)")
+        subprocess.run('mkdir -p /usr/local/etc/mediamtx_backups',
+                       shell=True, capture_output=True, timeout=5)
+        subprocess.run('chown -R takwerx:takwerx /usr/local/etc/mediamtx_backups',
+                       shell=True, capture_output=True, timeout=5)
+        subprocess.run('chown -R takwerx:takwerx /opt/mediamtx-webeditor',
+                       shell=True, capture_output=True, timeout=10)
+        if os.path.exists('/usr/local/etc/mediamtx.yml'):
+            subprocess.run('chown takwerx:takwerx /usr/local/etc/mediamtx.yml',
+                           shell=True, capture_output=True, timeout=5)
+        subprocess.run(['systemctl', 'restart', 'mediamtx-webeditor'],
+                       capture_output=True, timeout=15)
+        # Give it a moment and re-check
+        time.sleep(3)
+        r2 = subprocess.run(['systemctl', 'is-active', 'mediamtx-webeditor'],
+                            capture_output=True, text=True, timeout=5)
+        if r2.stdout.strip() == 'active':
+            plog("  mediamtx-webeditor: perm-heal applied and service is now active")
+            return True
+        plog(f"  mediamtx-webeditor: perm-heal applied but service still {r2.stdout.strip()!r} "
+             f"— check journalctl -u mediamtx-webeditor")
+        return False
+    except Exception as e:
+        try:
+            plog(f"  mediamtx-webeditor: perm-heal error (non-fatal): {e}")
+        except Exception:
+            pass
+        return False
+
+
 def _recreate_authentik_server_worker(plog, reason):
     """v0.8.7: Force-recreate Authentik server + worker containers (NEVER ldap).
 
@@ -34009,8 +34721,55 @@ def _apply_coreconfig_ldap_auth_et(coreconfig_path, ldap_host, ldap_pass, plog=N
         'x509useGroupCacheRequiresExtKeyUsage': 'false',
     }
 
+    # v0.9.29 — CRITICAL FIX: properly register the TAK Server config namespace so
+    # tree.write() emits `<Configuration xmlns="...">` (clean) instead of
+    # `<ns0:Configuration xmlns:ns0="...">` (namespace-prefixed on every element).
+    #
+    # The previous `ET.register_namespace('', '')` was a no-op (maps empty URI to
+    # empty prefix). TAK Server's CoreConfig has `xmlns="http://bbn.com/marti/xml/config"`
+    # — without proper registration of that URI, ET.write() assigns a synthetic `ns0:`
+    # prefix to every element. The resulting `<ns0:auth>` / `<ns0:ldap>` elements are
+    # not recognized by TAK Server's Spring Security LDAP wiring (silent fail → 8446
+    # login returns 401 even with correct webadmin password). Symptom on fresh
+    # Azure/SSDNodes installs: "TAK webadmin login fails after deploy".
+    #
+    # Defense-in-depth: ALSO detect & strip any pre-existing `ns0:` prefixes from
+    # the file BEFORE parsing, so a CoreConfig left mangled by a prior buggy run
+    # self-heals on the next LDAP sync (Update Now path on existing installs).
+    import re as _re_ns
     try:
-        ET.register_namespace('', '')  # suppress spurious ns0: prefix on default namespace
+        with open(coreconfig_path, 'r', encoding='utf-8') as _f:
+            _cc_raw = _f.read()
+        # Detect the TAK config namespace URI from the root xmlns declaration
+        _m_ns = _re_ns.search(r'<[A-Za-z][\w-]*[^>]*?\bxmlns(?::[\w-]+)?="([^"]+)"', _cc_raw)
+        _ns_uri = _m_ns.group(1) if _m_ns else 'http://bbn.com/marti/xml/config'
+        # Strip any ns0: (or similar synthetic) prefixes left over from prior buggy runs
+        _had_ns0 = bool(_re_ns.search(r'<ns0:', _cc_raw))
+        if _had_ns0:
+            _cc_clean = _re_ns.sub(r'<ns0:', '<', _cc_raw)
+            _cc_clean = _re_ns.sub(r'</ns0:', '</', _cc_clean)
+            _cc_clean = _re_ns.sub(r'\s+xmlns:ns0="[^"]+"', '', _cc_clean)
+            if 'xmlns=' not in _cc_clean:
+                _cc_clean = _re_ns.sub(
+                    r'(<Configuration\b)',
+                    f'\\1 xmlns="{_ns_uri}"',
+                    _cc_clean, count=1
+                )
+            try:
+                with open(coreconfig_path, 'w', encoding='utf-8') as _f:
+                    _f.write(_cc_clean)
+            except PermissionError:
+                _clean_tmp = coreconfig_path + '.ns0-strip.xml'
+                with open(_clean_tmp, 'w', encoding='utf-8') as _f:
+                    _f.write(_cc_clean)
+                subprocess.run(
+                    ['sudo', 'cp', os.path.abspath(_clean_tmp), coreconfig_path],
+                    capture_output=True, text=True, timeout=10
+                )
+            if plog:
+                plog("  ✓ CoreConfig.xml: stripped legacy ns0: prefixes (was breaking LDAP auth)")
+        # Register the namespace URI to the empty prefix so ET.write() emits clean XML
+        ET.register_namespace('', _ns_uri)
         tree = ET.parse(coreconfig_path)
         root = tree.getroot()
     except ET.ParseError as e:
@@ -34038,7 +34797,12 @@ def _apply_coreconfig_ldap_auth_et(coreconfig_path, ldap_host, ldap_pass, plog=N
     _auth_existed = auth is not None
 
     if auth is None:
-        auth = ET.SubElement(root, 'auth')
+        # v0.9.29 — when creating new elements, use the SAME namespace-qualified tag
+        # as the parent root so ET.write() serializes them into the same default
+        # namespace. ET.SubElement(root, 'auth') would create an element WITHOUT the
+        # namespace, which would then be emitted with an extra `xmlns=""` declaration
+        # (breaking the document). Use `{ns}auth` to inherit the parent namespace.
+        auth = ET.SubElement(root, auth_tag)
         if plog:
             plog("  CoreConfig.xml: created <auth> element")
 
@@ -34054,7 +34818,8 @@ def _apply_coreconfig_ldap_auth_et(coreconfig_path, ldap_host, ldap_pass, plog=N
     _ldap_existed = ldap is not None
 
     if ldap is None:
-        ldap = ET.SubElement(auth, 'ldap')
+        # v0.9.29 — preserve the same namespace as the parent (see <auth> comment above).
+        ldap = ET.SubElement(auth, ldap_tag)
         if plog:
             plog("  CoreConfig.xml: created <ldap> element")
 
@@ -34088,12 +34853,31 @@ def _apply_coreconfig_ldap_auth_et(coreconfig_path, ldap_host, ldap_pass, plog=N
             _check = f.read()
         if 'adm_ldapservice' not in _check:
             return False, 'BUG: ElementTree-patched CoreConfig.xml missing adm_ldapservice — aborting'
+        # v0.9.29 — verify the namespace fix is working. If ns0: prefixes leaked into
+        # the output, ABORT before touching /opt/tak/CoreConfig.xml (better to fail
+        # loud here than to silently break TAK Server's LDAP auth). The ns0: prefix
+        # comes from broken namespace handling and breaks Spring Security's auth
+        # bean wiring — login returns 401 even when LDAP itself is healthy.
+        if '<ns0:' in _check or 'xmlns:ns0=' in _check:
+            return False, ('BUG: ElementTree emitted ns0: prefixes (TAK Server LDAP auth would break). '
+                           'Falling back to text-based patcher.')
         r = subprocess.run(
             ['sudo', 'cp', os.path.abspath(_patch_path), coreconfig_path],
             capture_output=True, text=True, timeout=10
         )
         if r.returncode != 0:
             return False, f'sudo cp failed: {r.stderr.strip()[:200]}'
+        # v0.9.29 — final post-cp verification: read /opt/tak/CoreConfig.xml back
+        # and confirm it has no ns0: prefixes. If it does (e.g. cp got partial write),
+        # log a loud warning so the operator can investigate.
+        try:
+            r2 = subprocess.run(['sudo', 'cat', coreconfig_path], capture_output=True, text=True, timeout=5)
+            if r2.returncode == 0 and ('<ns0:' in r2.stdout or 'xmlns:ns0=' in r2.stdout):
+                if plog:
+                    plog("  ⚠ /opt/tak/CoreConfig.xml STILL has ns0: prefixes after write — investigate")
+                return False, 'CoreConfig.xml has ns0: prefixes after write — TAK Server LDAP will fail'
+        except Exception:
+            pass
         return True, f'CoreConfig.xml updated with LDAP auth (ldap://{ldap_host}:389)'
     except Exception as e:
         return False, f'CoreConfig.xml write error: {e}'
@@ -34101,7 +34885,15 @@ def _apply_coreconfig_ldap_auth_et(coreconfig_path, ldap_host, ldap_pass, plog=N
 
 def _apply_coreconfig_ldap_auth_text(coreconfig_path, ldap_host, ldap_pass, plog=None):
     """Legacy text-based LDAP auth writer for CoreConfig.xml — used as fallback by
-    _apply_coreconfig_ldap_auth_et when ElementTree parsing fails."""
+    _apply_coreconfig_ldap_auth_et when ElementTree parsing fails.
+
+    v0.9.29: namespace-prefix tolerant. The substitution regex previously
+    matched only ``<auth ...>...</auth>`` and silently no-op'd on namespace-
+    prefixed canonical form ``<ns0:auth ...>...</ns0:auth>`` written by TAK
+    Server 5.7-RELEASE-32+. If ET parsing failed AND the existing file was
+    namespace-prefixed, the legacy fallback would return "format not recognized"
+    instead of patching. Same fix class as the v0.9.29 verifier fix.
+    """
     import re as _re
     auth_block = (
         '    <auth default="ldap" x509groups="true" x509addAnonymous="false" x509useGroupCache="true"'
@@ -34116,7 +34908,10 @@ def _apply_coreconfig_ldap_auth_text(coreconfig_path, ldap_host, ldap_pass, plog
     try:
         with open(coreconfig_path, 'r') as f:
             content = f.read()
-        new_content = _re.sub(r'<auth[^>]*>.*?</auth>', auth_block, content, flags=_re.DOTALL)
+        new_content = _re.sub(
+            r'<(?:[A-Za-z][\w-]*:)?auth[^>]*>.*?</(?:[A-Za-z][\w-]*:)?auth\s*>',
+            auth_block, content, flags=_re.DOTALL | _re.IGNORECASE,
+        )
         if new_content == content:
             return False, 'CoreConfig <auth> block not found or format not recognized (text patcher)'
         _patch_path = coreconfig_path + '.ldap-patch.xml'
@@ -34132,21 +34927,37 @@ def _apply_coreconfig_ldap_auth_text(coreconfig_path, ldap_host, ldap_pass, plog
 
 
 def _coreconfig_has_ldap():
-    """True only when CoreConfig auth block is actually LDAP-default."""
+    """True only when CoreConfig auth block is actually LDAP-default.
+
+    v0.9.29: namespace-prefix tolerant. TAK Server 5.7-RELEASE-32+ canonicalizes
+    CoreConfig.xml on restart and writes elements with the ``ns0:`` XML namespace
+    prefix (``<ns0:auth ...>``). The previous naive ``<auth`` substring lookup
+    failed on those installs even though the LDAP wiring itself was correct,
+    producing a misleading ``coreconfig=FAIL`` in the LDAP sync banner on every
+    fresh deploy. Discovered on tak-test-4 (Azure, 2026-05-18).
+    """
     path = '/opt/tak/CoreConfig.xml'
     if not os.path.exists(path):
         return False
     try:
         with open(path, 'r') as f:
             content = f.read()
-        lower = content.lower()
-        start = lower.find('<auth')
-        end = lower.find('</auth>', start) if start >= 0 else -1
-        if start < 0 or end < 0:
+        m_start = re.search(r'<(?:[A-Za-z][\w-]*:)?auth\b', content, re.IGNORECASE)
+        if not m_start:
             return False
-        block = content[start:end + len('</auth>')]
-        has_ldap_provider = bool(re.search(r'<ldap\b', block, re.IGNORECASE)) and ('adm_ldapservice' in block.lower())
-        m = re.search(r'<auth[^>]*\bdefault="([^"]+)"', block, re.IGNORECASE)
+        rest = content[m_start.start():]
+        m_end = re.search(r'</(?:[A-Za-z][\w-]*:)?auth\s*>', rest, re.IGNORECASE)
+        if not m_end:
+            return False
+        block = rest[:m_end.end()]
+        has_ldap_provider = (
+            bool(re.search(r'<(?:[A-Za-z][\w-]*:)?ldap\b', block, re.IGNORECASE))
+            and ('adm_ldapservice' in block.lower())
+        )
+        m = re.search(
+            r'<(?:[A-Za-z][\w-]*:)?auth[^>]*\bdefault="([^"]+)"',
+            block, re.IGNORECASE,
+        )
         default_auth = (m.group(1).strip().lower() if m else '')
         return bool(has_ldap_provider and default_auth == 'ldap')
     except Exception:
@@ -36810,6 +37621,10 @@ def takserver_set_cert_password():
         return jsonify({'success': False, 'error': 'Password contains unsupported characters (avoid $, `, ;, &, |, quotes, spaces, etc.)'}), 400
     settings = load_settings()
     settings['tak_cert_password'] = pw
+    # v0.9.29: if operator picks a non-default password, clear the dismiss flag
+    # so the nag can re-appear correctly if the password ever resets to default.
+    if pw != 'atakatak' and settings.get('cert_pw_warning_dismissed'):
+        settings.pop('cert_pw_warning_dismissed', None)
     save_settings(settings)
     return jsonify({'success': True, 'password': pw})
 
@@ -39307,7 +40122,7 @@ def _tak_snapshot(label, plog=None):
             _port = int(_snap_s1.get('ssh_port') or 22)
             _key  = (_snap_s1.get('ssh_key_path') or '').strip() or None
             _ssh_parts = [
-                'ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'BatchMode=yes',
+                'ssh', '-o', 'StrictHostKeyChecking=accept-new', '-o', 'BatchMode=yes',
                 '-p', str(_port),
             ]
             if _key:
@@ -39481,7 +40296,7 @@ def _tak_rollback(label, plog=None):
             _rb_user = (_rb_s1.get('ssh_user') or 'root').strip() or 'root'
             _rb_port = int(_rb_s1.get('ssh_port') or 22)
             _rb_key  = (_rb_s1.get('ssh_key_path') or '').strip() or None
-            _rb_ssh  = ['ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'BatchMode=yes',
+            _rb_ssh  = ['ssh', '-o', 'StrictHostKeyChecking=accept-new', '-o', 'BatchMode=yes',
                         '-p', str(_rb_port)]
             if _rb_key:
                 _rb_ssh += ['-i', _rb_key]
@@ -44881,6 +45696,52 @@ def _startup_migrations():
             _ensure_authentik_pgbouncer_pool_size(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as ak_pgb_pool_err:
             print(f"Startup migration: pgbouncer pool-size bump error (non-fatal): {ak_pgb_pool_err}")
+
+        # v0.9.29: short-circuit the v0.9.23 MAX_REQUESTS tune-UP cascade for
+        # boxes that were stuck at the autotune floor (100) before PgBouncer
+        # absorbed the leak pressure. Without this migration, those boxes
+        # take a 7-hour, 10-recreate climb back to baseline=1000 (each
+        # recreate dropping the LDAP outpost websocket for 1-5s). Field
+        # forensic on test12 2026-05-18 caught this in soak. Idempotent:
+        # no-op on boxes already at baseline. Only fires when PgBouncer is
+        # installed AND no fires in last 6h AND no autotune in last 30min.
+        # See `_patch_authentik_max_requests_snap_to_baseline_if_pgbouncer`.
+        try:
+            _patch_authentik_max_requests_snap_to_baseline_if_pgbouncer(
+                lambda m: print(f"Startup migration: {m}", flush=True)
+            )
+        except Exception as ak_snap_err:
+            print(f"Startup migration: max-requests snap-to-baseline error (non-fatal): {ak_snap_err}")
+
+        # v0.9.29: auto-correct settings.server_ip on cloud VMs where start.sh
+        # had previously written the private interface IP (hostname -I) at
+        # fresh-install time. Tight gates: only fires if current server_ip is
+        # in RFC 1918 ranges AND cloud IMDS (Azure or AWS) definitively
+        # returns a different public IP. Idempotent — records the correction
+        # and never re-fires. If the operator actually wanted the private IP,
+        # they paste it back in Settings → Server IP and save. Field-
+        # discovered on tak-test-4 2026-05-18.
+        # See `_patch_settings_server_ip_prefer_cloud_public`.
+        try:
+            _patch_settings_server_ip_prefer_cloud_public(
+                lambda m: print(f"Startup migration: {m}", flush=True)
+            )
+        except Exception as ip_fix_err:
+            print(f"Startup migration: server_ip auto-correct error (non-fatal): {ip_fix_err}")
+
+        # v0.9.29 — self-heal mediamtx-webeditor writable paths on existing installs
+        # that pre-date the deploy-time chown. The upstream mediamtx_config_editor.py
+        # hard-codes BACKUP_DIR=/usr/local/etc/mediamtx_backups and call os.makedirs()
+        # at module-import time. Running as User=takwerx with root-owned /usr/local/etc
+        # → PermissionError → fail-loop. Field discovered on tak-test-4 2026-05-18.
+        # Idempotent: only runs if MediaMTX is installed AND the editor service is
+        # NOT active (don't disturb healthy boxes).
+        try:
+            _heal_mediamtx_webeditor_writable_paths(
+                lambda m: print(f"Startup migration: {m}", flush=True)
+            )
+        except Exception as mtx_perm_err:
+            print(f"Startup migration: mediamtx-webeditor perm-heal error (non-fatal): {mtx_perm_err}")
 
         # v0.9.27-alpha hotfix #4: reap ghost Channels backends left over
         # from prior server-1 restarts. Critical on the v0.9.26 → v0.9.27
