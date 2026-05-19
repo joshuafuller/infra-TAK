@@ -366,7 +366,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.30-alpha"
+VERSION = "0.9.31-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -12694,12 +12694,39 @@ def takportal_control():
             subprocess.run('docker restart tak-portal', shell=True, capture_output=True, text=True, timeout=30)
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)[:300]}), 500
-        # Fix Authentik TAK Portal Proxy URL only (external_host + cookie_domain), do not touch outpost
-        _sync_authentik_takportal_provider_url(settings)
+        # v0.9.31: run the full Authentik proxy chain heal for all deployed
+        # services, not just TAK Portal. Catches the "deploy timed out, provider
+        # never registered" class of bug fleet-wide. Uses 30s timeouts + retries
+        # + verify-via-re-GET so silent failures actually surface in the log.
+        chain_summary = {}
+        try:
+            chain_summary = _heal_authentik_proxy_chain_all_services(settings=settings)
+        except Exception:
+            pass
+        # Back-compat: keep the legacy single-service call as a defensive second
+        # pass (idempotent; no-op when chain healer already converged).
+        try:
+            _sync_authentik_takportal_provider_url(settings)
+        except Exception:
+            pass
         time.sleep(2)
         r = subprocess.run('docker ps --filter name=tak-portal --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
         running = 'Up' in (r.stdout or '')
-        return jsonify({'success': True, 'running': running, 'action': action, 'message': 'Config updated and portal restarted (SSH configured).'})
+        tp_state = (chain_summary or {}).get('takportal', {})
+        ok = (tp_state.get('provider') in ('ok', 'created', 'fixed', 'adopted')
+              and tp_state.get('app') in ('ok', 'created', 'fixed'))
+        msg = 'Config updated and portal restarted.'
+        if not chain_summary:
+            # Healer didn't run (Authentik not installed, no token, etc.) — just report container state
+            msg = 'Config updated and portal restarted (SSH configured).'
+        elif ok:
+            msg = 'Config updated, portal restarted, and Authentik proxy chain reconciled.'
+        elif tp_state:
+            msg = (f'Config updated and portal restarted, but Authentik proxy chain heal reported: '
+                   f"provider={tp_state.get('provider')}, app={tp_state.get('app')}, outpost={tp_state.get('outpost')}. "
+                   f"Check console logs and Authentik admin UI.")
+        return jsonify({'success': True, 'running': running, 'action': action,
+                        'message': msg, 'chain_summary': chain_summary})
     elif action == 'update':
         # Reset any local changes to tracked files before pulling — the network
         # and hardening patches now live in docker-compose.override.yml (not tracked
@@ -12817,6 +12844,18 @@ def takportal_uninstall():
         steps.append('Removed ~/TAK-Portal')
     takportal_deploy_log.clear()
     takportal_deploy_status.update({'running': False, 'complete': False, 'error': False})
+    # v0.9.31: regenerate Caddyfile so the takportal.<fqdn> vhost is removed.
+    # Without this the stale vhost remained, Caddy reverse-proxied to a dead
+    # upstream (or fell through to Authentik's forward-auth), and the operator
+    # saw the Authentik "Not Found" page on takportal.<fqdn> after Remove.
+    # Matches mediamtx_uninstall() which has done this correctly since v0.9.x.
+    try:
+        settings = load_settings()
+        generate_caddyfile(settings)
+        subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
+        steps.append('Regenerated Caddyfile + reloaded Caddy')
+    except Exception as caddy_err:
+        steps.append(f'Caddy regen warning (non-fatal): {caddy_err}')
     _update_boot_stagger_service()
     return jsonify({'success': True, 'steps': steps})
 
@@ -13644,6 +13683,14 @@ def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
         _module_run(deploy_cfg, 'pip3 install Flask ruamel.yaml requests psutil 2>&1', timeout=120)
     plog("✓ Python packages installed")
 
+    # v0.9.31: ensure `takwerx` system user exists on the remote host before
+    # any chown / unit install happens. See `_ensure_takwerx_system_user`
+    # docstring for the full backstory. Idempotent.
+    plog("  Ensuring takwerx system user on remote host...")
+    created = _ensure_takwerx_system_user_remote(deploy_cfg, plog=plog)
+    if not created:
+        plog("  ✓ takwerx system user already present on remote host")
+
     # Step 2: Version + arch on remote
     plog("")
     plog("━━━ Step 2/7: Detecting MediaMTX Version ━━━")
@@ -14089,6 +14136,15 @@ def run_mediamtx_deploy():
             subprocess.run('pip3 install Flask ruamel.yaml requests psutil 2>&1',
                 shell=True, capture_output=True, text=True, timeout=120)
         plog("✓ Python packages installed")
+
+        # v0.9.31: ensure `takwerx` system user exists before any chown / unit
+        # install happens. mediamtx.service + mediamtx-webeditor.service both
+        # run as `User=takwerx` (v0.9.29 hardening); missing user → 217/USER
+        # tight-loop on Restart=always. Idempotent.
+        plog("  Ensuring takwerx system user...")
+        created = _ensure_takwerx_system_user(plog=plog)
+        if not created:
+            plog("  ✓ takwerx system user already present")
 
         # Step 2: Detect architecture and latest version
         plog("")
@@ -17848,15 +17904,23 @@ def _ensure_authentik_console_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
                 pk = _existing[name]
                 provider_pks.append(pk)
                 try:
-                    # GET current provider so we can send a valid full-object PATCH
-                    _get_req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/{pk}/', headers=_ak_headers)
-                    _current = json.loads(_urlreq.urlopen(_get_req, timeout=10).read().decode())
+                    # v0.9.31: use _ak_api_call (3 retries with backoff, 30s
+                    # timeout) instead of bare urlopen(timeout=10). Closes the
+                    # SSDNodes-fresh-install class of bug where deploy-time
+                    # 10s PUT silently timed out and the proxy provider stayed
+                    # with whatever external_host it had at creation.
+                    _get_resp = _ak_api_call(
+                        f'{_ak_url}/api/v3/providers/proxy/{pk}/',
+                        method='GET', headers=_ak_headers, max_retries=3, timeout=30
+                    )
+                    _current = json.loads(_get_resp.read().decode())
                     _current['external_host'] = host
                     _current['cookie_domain'] = cookie_domain
-                    req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/{pk}/',
+                    _ak_api_call(
+                        f'{_ak_url}/api/v3/providers/proxy/{pk}/',
                         data=json.dumps(_current).encode(),
-                        headers=_ak_headers, method='PUT')
-                    _urlreq.urlopen(req, timeout=10)
+                        method='PUT', headers=_ak_headers, max_retries=3, timeout=30
+                    )
                     log(f"  ✓ Proxy provider updated: {name} → {host}")
                 except Exception as e:
                     _err_body = ''
@@ -17864,27 +17928,30 @@ def _ensure_authentik_console_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
                         _err_body = e.read().decode()[:200]
                     except Exception:
                         pass
-                    log(f"  ⚠ Proxy provider update failed: {name}: {str(e)[:80]} {_err_body}")
+                    # Don't surrender — chain healer will catch this at next
+                    # startup / Update Now. Surface the failure clearly.
+                    log(f"  ⚠ Proxy provider update failed: {name}: {str(e)[:80]} {_err_body} (chain healer will retry)")
             else:
                 try:
-                    req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/',
+                    pk = json.loads(_ak_api_call(
+                        f'{_ak_url}/api/v3/providers/proxy/',
                         data=json.dumps({'name': name, 'authorization_flow': flow_pk,
                             'invalidation_flow': inv_flow_pk,
                             'external_host': host, 'mode': 'forward_single',
                             'token_validity': 'hours=24', 'cookie_domain': cookie_domain}).encode(),
-                        headers=_ak_headers, method='POST')
-                    resp = _urlreq.urlopen(req, timeout=10)
-                    pk = json.loads(resp.read().decode())['pk']
+                        method='POST', headers=_ak_headers, max_retries=3, timeout=30
+                    ).read().decode())['pk']
                     provider_pks.append(pk)
                     log(f"  ✓ Proxy provider created: {name} → {host}")
                 except Exception as e:
-                    log(f"  ⚠ Proxy provider create failed: {name}: {str(e)[:80]}")
+                    log(f"  ⚠ Proxy provider create failed: {name}: {str(e)[:80]} (chain healer will retry)")
             if pk:
                 try:
-                    req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/',
+                    _ak_api_call(
+                        f'{_ak_url}/api/v3/core/applications/',
                         data=json.dumps({'name': name, 'slug': slug, 'provider': pk, 'open_in_new_tab': True}).encode(),
-                        headers=_ak_headers, method='POST')
-                    _urlreq.urlopen(req, timeout=10)
+                        method='POST', headers=_ak_headers, max_retries=3, timeout=30
+                    )
                     log(f"  ✓ Application created: {name}")
                 except Exception as e:
                     if hasattr(e, 'code') and e.code == 400:
@@ -24904,6 +24971,17 @@ def authentik_uninstall():
             steps.append('Removed ~/authentik')
         else:
             steps.append('~/authentik not found (already removed)')
+        # v0.9.31: also regenerate Caddyfile on local Authentik uninstall.
+        # The remote branch above already did this; the local branch did not,
+        # which left stale auth.<fqdn> + forward_auth proxy directives
+        # pointing at a dead upstream. Symptom matched the takportal bug.
+        try:
+            settings_now = load_settings()
+            generate_caddyfile(settings_now)
+            subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
+            steps.append('Regenerated Caddyfile + reloaded Caddy')
+        except Exception as caddy_err:
+            steps.append(f'Caddy regen warning (non-fatal): {caddy_err}')
     authentik_deploy_log.clear()
     authentik_deploy_status.update({'running': False, 'complete': False, 'error': False})
     _update_boot_stagger_service()
@@ -27486,6 +27564,173 @@ def _patch_settings_server_ip_prefer_cloud_public(plog=None):
         return False
 
 
+def _ensure_takwerx_system_user(plog=None):
+    """v0.9.31: ensure the `takwerx` Linux system user exists.
+
+    BACKGROUND: v0.9.29 added `User=takwerx` + `SupplementaryGroups=caddy` to
+    both `mediamtx.service` and `mediamtx-webeditor.service` as part of the
+    Project Shakespear MediaMTX hardening — MediaMTX no longer runs as root.
+    But the corresponding user-creation step (originally in start.sh as
+    `provision_takwerx()` and in app.py as `_auto_provision_takwerx()`) was
+    reverted in v0.9.2-alpha commit `a6a7422` with the note 'defer to v0.9.3'
+    and never came back. Result: on any box where `takwerx` doesn't already
+    exist for unrelated reasons, both MediaMTX systemd units fail with
+    `status=217/USER` ("Failed to determine user credentials: No such
+    process") and tight-loop on `Restart=always` (636 restarts observed in
+    field on a SSDNodes fresh install 2026-05-18 before discovery).
+
+    This helper closes the gap. Called from:
+      - `run_mediamtx_deploy()` Step 1 (local) — fresh deploys
+      - `_run_mediamtx_deploy_remote()` Step 1 — fresh remote deploys
+      - `_heal_takwerx_user_missing_for_mediamtx()` startup migration —
+        existing broken boxes self-heal on next Update Now / console restart
+
+    Idempotent: `getent` guards both calls. Returns True if the user was
+    created in this call, False if it already existed.
+    """
+    def _log(m):
+        if plog:
+            try:
+                plog(m)
+            except Exception:
+                pass
+    try:
+        r = subprocess.run(['getent', 'passwd', 'takwerx'], capture_output=True, text=True, timeout=5)
+        if r.stdout.strip():
+            return False
+        # Create as a locked-down system user — no shell, no home directory
+        # creation, no password. Matches Debian/Ubuntu conventions for service
+        # accounts (e.g. www-data, postgres). System UID/GID auto-assigned.
+        subprocess.run(
+            'getent group  takwerx >/dev/null || groupadd --system takwerx',
+            shell=True, capture_output=True, timeout=10
+        )
+        subprocess.run(
+            'getent passwd takwerx >/dev/null || useradd  --system -g takwerx '
+            '-d /nonexistent -s /usr/sbin/nologin takwerx',
+            shell=True, capture_output=True, timeout=10
+        )
+        # Confirm
+        r2 = subprocess.run(['getent', 'passwd', 'takwerx'], capture_output=True, text=True, timeout=5)
+        if r2.stdout.strip():
+            _log("✓ takwerx system user created (--system -s /usr/sbin/nologin -d /nonexistent)")
+            return True
+        _log("⚠ takwerx user creation reported success but getent still empty")
+        return False
+    except Exception as e:
+        _log(f"⚠ takwerx user creation error (non-fatal): {e}")
+        return False
+
+
+def _ensure_takwerx_system_user_remote(deploy_cfg, plog=None):
+    """v0.9.31: same as `_ensure_takwerx_system_user` but for remote MediaMTX
+    deploys (over SSH). Idempotent — `getent` guards make repeat calls safe.
+    Returns True if created in this call, False if already present.
+    """
+    def _log(m):
+        if plog:
+            try:
+                plog(m)
+            except Exception:
+                pass
+    try:
+        ok_check, out_check = _module_run(deploy_cfg, 'getent passwd takwerx 2>/dev/null', timeout=10)
+        if ok_check and (out_check or '').strip():
+            return False
+        cmd = (
+            'getent group  takwerx >/dev/null || groupadd --system takwerx; '
+            'getent passwd takwerx >/dev/null || useradd  --system -g takwerx '
+            '-d /nonexistent -s /usr/sbin/nologin takwerx'
+        )
+        _module_run(deploy_cfg, cmd, timeout=15)
+        ok2, out2 = _module_run(deploy_cfg, 'getent passwd takwerx 2>/dev/null', timeout=10)
+        if ok2 and (out2 or '').strip():
+            _log("✓ takwerx system user created on remote host")
+            return True
+        _log("⚠ takwerx user creation on remote host reported success but getent still empty")
+        return False
+    except Exception as e:
+        _log(f"⚠ takwerx user creation on remote host error (non-fatal): {e}")
+        return False
+
+
+def _heal_takwerx_user_missing_for_mediamtx(plog=None):
+    """v0.9.31: self-heal MediaMTX fail-loop caused by missing `takwerx` user.
+
+    Gating (all must be true to apply):
+      - /etc/systemd/system/mediamtx.service exists (MediaMTX installed)
+      - getent passwd takwerx returns empty (user doesn't exist)
+
+    On apply: create the takwerx system user, re-apply the v0.9.29 chowns
+    (which were silently no-ops when the user didn't exist), re-apply
+    usermod -aG caddy takwerx, daemon-reload, restart mediamtx +
+    mediamtx-webeditor. Idempotent on healthy boxes (skips if user exists).
+
+    Closes the gap left by v0.9.29 Item 9 + Item 12 on existing-broken
+    boxes: those fixes assumed `takwerx` existed already. On a clean install
+    where it doesn't, the systemd units crash-loop with status=217/USER
+    before either heal can run. This migration creates the user first, then
+    the chowns actually take effect on the next service restart.
+    """
+    def _log(m):
+        if plog:
+            try:
+                plog(m)
+            except Exception:
+                pass
+    try:
+        if not os.path.exists('/etc/systemd/system/mediamtx.service'):
+            return False
+        r = subprocess.run(['getent', 'passwd', 'takwerx'], capture_output=True, text=True, timeout=5)
+        if r.stdout.strip():
+            return False  # user exists — nothing to do
+        _log("  mediamtx: takwerx user missing — creating + re-applying chowns + restarting services")
+        created = _ensure_takwerx_system_user(plog=plog)
+        if not created:
+            return False
+        # Re-apply the v0.9.29 chowns now that the user exists. They were
+        # silent no-ops on previous runs (chown to a non-existent user
+        # silently does nothing on most filesystems).
+        for path in (
+            '/opt/mediamtx-webeditor',
+            '/usr/local/etc/mediamtx_backups',
+            '/usr/local/etc/mediamtx.yml',
+        ):
+            if os.path.exists(path):
+                subprocess.run(f'chown -R takwerx:takwerx "{path}" 2>/dev/null; true',
+                               shell=True, capture_output=True, timeout=10)
+        # v0.9.29 item 9 LE-cert read-access (also silent no-op when user
+        # was missing) — re-apply.
+        subprocess.run('usermod -aG caddy takwerx 2>/dev/null; true',
+                       shell=True, capture_output=True, timeout=5)
+        for d in ('/var/lib/caddy',
+                  '/var/lib/caddy/.local',
+                  '/var/lib/caddy/.local/share',
+                  '/var/lib/caddy/.local/share/caddy',
+                  '/var/lib/caddy/.local/share/caddy/certificates'):
+            if os.path.exists(d):
+                subprocess.run(f'chmod g+rx "{d}" 2>/dev/null; true',
+                               shell=True, capture_output=True, timeout=5)
+        subprocess.run('systemctl daemon-reload 2>/dev/null; true',
+                       shell=True, capture_output=True, timeout=5)
+        subprocess.run(['systemctl', 'restart', 'mediamtx', 'mediamtx-webeditor'],
+                       capture_output=True, timeout=20)
+        # Verify
+        time.sleep(3)
+        r_mtx = subprocess.run(['systemctl', 'is-active', 'mediamtx'],
+                               capture_output=True, text=True, timeout=5)
+        r_ed = subprocess.run(['systemctl', 'is-active', 'mediamtx-webeditor'],
+                              capture_output=True, text=True, timeout=5)
+        if r_mtx.stdout.strip() == 'active' and r_ed.stdout.strip() == 'active':
+            _log("  ✓ takwerx heal complete: mediamtx + mediamtx-webeditor both active")
+            return True
+        _log(f"  ⚠ takwerx heal applied but services still mediamtx={r_mtx.stdout.strip()!r} editor={r_ed.stdout.strip()!r}")
+        return False
+    except Exception as e:
+        _log(f"  mediamtx: takwerx heal error (non-fatal): {e}")
+        return False
+
+
 def _heal_mediamtx_webeditor_writable_paths(plog=None):
     """v0.9.29: self-heal `mediamtx-webeditor.service` fail-loop caused by
     PermissionError on `/usr/local/etc/mediamtx_backups`.
@@ -29657,6 +29902,407 @@ def _ensure_embedded_outpost_authentik_host(plog):
         plog(f"  Embedded outpost host check error (non-fatal): {_e}")
 
 
+# v0.9.31: Canonical service catalog for Authentik forward_auth chain healing.
+# Single source of truth for every infra-TAK service that sits behind Authentik.
+# Used by `_heal_authentik_proxy_chain_all_services` to assert provider + app +
+# outpost membership idempotently on every console boot. Adding a new
+# forward_auth service requires ONE entry here, not changes scattered across
+# 6 functions.
+#
+# Tuple shape: (module_key, provider_name, app_slug, app_name, service_domain_key, open_in_new_tab)
+#   - module_key       — passed to `_is_module_deployed()` ('infratak' = always True)
+#   - provider_name    — exact Authentik proxy-provider name (UI-visible label)
+#   - app_slug         — Authentik application slug (URL path component)
+#   - app_name         — UI-visible application name
+#   - service_domain_key — key for `_get_service_domain()` → produces external_host
+#   - open_in_new_tab  — Authentik Application.open_in_new_tab field
+_AUTHENTIK_PROXY_CHAIN_SERVICES = [
+    ('infratak',  'infra-TAK',            'infratak',       'infra-TAK',      'infratak',  False),
+    ('takportal', 'TAK Portal Proxy',     'tak-portal',     'TAK Portal',     'takportal', True),
+    ('nodered',   'Node-RED Proxy',       'node-red',       'Node-RED',       'nodered',   True),
+    ('mediamtx',  'MediaMTX',             'stream',         'MediaMTX',       'mediamtx',  True),
+    ('fedhub',    'Federation Hub Proxy', 'federation-hub', 'Federation Hub', 'fedhub',    True),
+]
+
+
+def _heal_authentik_proxy_chain_all_services(plog=None, settings=None):
+    """v0.9.31: fleet-uniform self-heal of the full Authentik forward_auth chain
+    for every deployed infra-TAK service. Replaces the band-aid era of per-service
+    `_sync_authentik_*_provider_url` functions that each silently swallowed
+    Authentik API timeouts (the class of bug that left `takportal.<fqdn>` showing
+    Authentik's "Not Found" page on slower hosts — a deploy-time 10s PATCH that
+    timed out, was silently caught, and never retried by anything).
+
+    For each known service (see `_AUTHENTIK_PROXY_CHAIN_SERVICES`) that has its
+    docker-compose / systemd unit deployed, this function asserts:
+
+      1. Proxy provider exists with:
+         - correct name
+         - mode = forward_single
+         - external_host = https://<service-domain>
+         - cookie_domain = .<base-fqdn>
+         - valid authorization_flow + invalidation_flow
+      2. Application exists with:
+         - correct slug + name
+         - provider link to the above
+         - open_in_new_tab per the catalog entry
+      3. Provider is in the embedded outpost's providers[] list
+
+    Uses `_ak_api_call` (3 retries with 5s/10s/15s backoff, 30s timeout) instead
+    of bare urlopen(timeout=10). Verifies every PATCH/POST by re-GETing and
+    confirming the desired state, so silent failures stop being silent.
+
+    Idempotent: on healthy boxes, every GET returns the correct state, no
+    PATCH is attempted, and the function logs `chain: all canonical — no-op`
+    per service then exits in <1s.
+
+    Returns a summary dict: `{service_module_key: {'provider': 'ok'|'created'|'fixed'|'failed:<reason>',
+                                                    'app':      ...,
+                                                    'outpost':  ...}}`
+    """
+    import urllib.request as _req
+    import urllib.error
+    _log = plog if plog else (lambda _m: None)
+
+    summary = {}
+    try:
+        if settings is None:
+            settings = load_settings()
+
+        ak_env_path = os.path.expanduser('~/authentik/.env')
+        if not os.path.exists(ak_env_path):
+            _log("  proxy chain: Authentik not installed locally — skip")
+            return summary
+
+        fqdn = (settings.get('fqdn') or '').strip()
+        if not fqdn:
+            _log("  proxy chain: no FQDN configured — skip")
+            return summary
+
+        ak_token = (
+            _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or
+            _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
+        )
+        if not ak_token:
+            _log("  proxy chain: no Authentik API token — skip")
+            return summary
+
+        ak_url = _get_authentik_api_url(settings)
+        ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+        base_fqdn = fqdn.split(':')[0].split('/')[0]
+        desired_cookie = f'.{base_fqdn}'
+
+        # Discover flows once (shared across all services). Use _ak_api_call's
+        # retry/backoff so transient 502/timeout doesn't abort the entire heal.
+        flow_pk = None
+        inv_flow_pk = None
+        try:
+            resp = _ak_api_call(
+                f'{ak_url}/api/v3/flows/instances/?designation=authorization&ordering=slug',
+                method='GET', headers=ak_headers, max_retries=3, timeout=30
+            )
+            flows = json.loads(resp.read().decode()).get('results', [])
+            flow_pk = next((f['pk'] for f in flows if 'implicit' in f.get('slug', '')),
+                           flows[0]['pk'] if flows else None)
+        except Exception as fe:
+            _log(f"  proxy chain: could not fetch authorization flow ({str(fe)[:120]}) — skip")
+            return summary
+        try:
+            resp = _ak_api_call(
+                f'{ak_url}/api/v3/flows/instances/?designation=invalidation',
+                method='GET', headers=ak_headers, max_retries=3, timeout=30
+            )
+            inv_flows = json.loads(resp.read().decode()).get('results', [])
+            inv_flow_pk = next((f['pk'] for f in inv_flows if 'provider' not in f.get('slug', '')),
+                               inv_flows[0]['pk'] if inv_flows else None)
+        except Exception as ife:
+            _log(f"  proxy chain: could not fetch invalidation flow ({str(ife)[:120]}) — skip")
+            return summary
+
+        if not flow_pk or not inv_flow_pk:
+            _log("  proxy chain: required flows missing in Authentik — skip (will retry next boot)")
+            return summary
+
+        # Single LIST of all proxy providers — avoids N round-trips per service.
+        try:
+            resp = _ak_api_call(
+                f'{ak_url}/api/v3/providers/proxy/?page_size=200',
+                method='GET', headers=ak_headers, max_retries=3, timeout=30
+            )
+            all_providers = json.loads(resp.read().decode()).get('results', []) or []
+        except Exception as le:
+            _log(f"  proxy chain: could not list proxy providers ({str(le)[:120]}) — skip")
+            return summary
+        providers_by_name = {}
+        for p in all_providers:
+            n = (p.get('name') or '').strip()
+            if n and n not in providers_by_name:  # first wins on duplicates
+                providers_by_name[n] = p
+
+        outpost_provider_pks = []
+
+        for module_key, prov_name, app_slug, app_name, dom_key, open_new_tab in _AUTHENTIK_PROXY_CHAIN_SERVICES:
+            # Skip services that aren't deployed (Federation Hub deployed flag
+            # lives in cloudtak_deployment? No — _is_module_deployed only knows
+            # infratak/takportal/nodered/mediamtx. For fedhub use deployment config.)
+            try:
+                if module_key == 'fedhub':
+                    fh_cfg = _get_fedhub_deployment_config(settings)
+                    deployed = bool(
+                        fh_cfg.get('deployed') and
+                        fh_cfg.get('target_mode') == 'remote' and
+                        (fh_cfg.get('remote', {}).get('host') or '').strip()
+                    )
+                else:
+                    deployed = _is_module_deployed(settings, module_key)
+            except Exception:
+                deployed = (module_key == 'infratak')
+
+            if not deployed:
+                continue
+
+            service_domain = _get_service_domain(settings, dom_key)
+            if not service_domain:
+                summary[module_key] = {'provider': 'failed:no-domain', 'app': '-', 'outpost': '-'}
+                _log(f"  ⚠ {prov_name}: cannot resolve service domain — skip")
+                continue
+            desired_host = f'https://{service_domain}'
+
+            result = {'provider': 'ok', 'app': 'ok', 'outpost': 'ok'}
+
+            # ---------- (1) Proxy provider ----------
+            existing = providers_by_name.get(prov_name)
+            provider_pk = None
+            if existing is None:
+                # Create
+                body = {
+                    'name': prov_name,
+                    'authorization_flow': flow_pk,
+                    'invalidation_flow': inv_flow_pk,
+                    'external_host': desired_host,
+                    'mode': 'forward_single',
+                    'token_validity': 'hours=24',
+                    'cookie_domain': desired_cookie,
+                }
+                try:
+                    resp = _ak_api_call(
+                        f'{ak_url}/api/v3/providers/proxy/',
+                        data=json.dumps(body).encode(),
+                        method='POST', headers=ak_headers, max_retries=3, timeout=30
+                    )
+                    provider_pk = json.loads(resp.read().decode()).get('pk')
+                    result['provider'] = 'created'
+                    _log(f"  ✓ {prov_name}: provider created → {desired_host}")
+                except urllib.error.HTTPError as he:
+                    # 400 often means name collision — search and adopt
+                    if he.code == 400:
+                        try:
+                            resp = _ak_api_call(
+                                f'{ak_url}/api/v3/providers/proxy/?search={_req.quote(prov_name)}',
+                                method='GET', headers=ak_headers, max_retries=3, timeout=30
+                            )
+                            results = json.loads(resp.read().decode()).get('results', [])
+                            for r in results:
+                                if (r.get('name') or '').strip() == prov_name:
+                                    provider_pk = r.get('pk')
+                                    result['provider'] = 'adopted'
+                                    break
+                        except Exception:
+                            pass
+                    if not provider_pk:
+                        err_body = ''
+                        try:
+                            err_body = he.read().decode()[:200]
+                        except Exception:
+                            pass
+                        result['provider'] = f'failed:create-{he.code}'
+                        _log(f"  ✗ {prov_name}: create failed HTTP {he.code} {err_body}")
+                except Exception as ce:
+                    result['provider'] = 'failed:create-timeout'
+                    _log(f"  ✗ {prov_name}: create failed ({str(ce)[:120]})")
+            else:
+                provider_pk = existing.get('pk')
+                # v0.9.31 (post-field-debug 2026-05-18): compare EXACT strings.
+                # Previously rstrip('/') made `https://takportal.lutak.net/` and
+                # `https://takportal.lutak.net` look equal, but Authentik's
+                # strict-match redirect_uris list bakes in the exact form
+                # (with-slash vs without-slash) — so the OAuth flow's
+                # redirect_uri lookup mismatched, producing "Redirect URI Error".
+                # Trailing-slash drift is the bug we have to actively fix, not
+                # something to normalize away in the comparison.
+                cur_host = (existing.get('external_host') or '')
+                cur_cookie = (existing.get('cookie_domain') or '').strip()
+                if cur_host != desired_host or cur_cookie != desired_cookie:
+                    # v0.9.31 (post-field-debug): use PUT with the full provider
+                    # body, NOT PATCH. Authentik validates the entire object
+                    # even on PATCH and rejects partial bodies with
+                    #   400 internal_host: "Internal host cannot be empty when
+                    #   forward auth is disabled."
+                    # Observed live on tak-portal proxy provider pk=3 on the
+                    # SSDNodes box (alexliveussdtakman). PUT with full body
+                    # round-trips cleanly.
+                    full_body = {
+                        'name': prov_name,
+                        'authorization_flow': flow_pk,
+                        'invalidation_flow': inv_flow_pk,
+                        'external_host': desired_host,
+                        'mode': 'forward_single',
+                        'token_validity': 'hours=24',
+                        'cookie_domain': desired_cookie,
+                        # Preserve operator-meaningful fields from the existing
+                        # record (Authentik only validates internal_host when
+                        # mode != forward_*, so empty string is fine here).
+                        'internal_host': existing.get('internal_host') or '',
+                        'internal_host_ssl_validation': existing.get(
+                            'internal_host_ssl_validation', True),
+                        'skip_path_regex': existing.get('skip_path_regex') or '',
+                        'basic_auth_enabled': existing.get('basic_auth_enabled', False),
+                        'basic_auth_password_attribute': existing.get(
+                            'basic_auth_password_attribute') or '',
+                        'basic_auth_user_attribute': existing.get(
+                            'basic_auth_user_attribute') or '',
+                        'intercept_header_auth': existing.get('intercept_header_auth', True),
+                    }
+                    try:
+                        _ak_api_call(
+                            f'{ak_url}/api/v3/providers/proxy/{provider_pk}/',
+                            data=json.dumps(full_body).encode(),
+                            method='PUT', headers=ak_headers, max_retries=3, timeout=30
+                        )
+                        # Verify by re-GET
+                        try:
+                            v = _ak_api_call(
+                                f'{ak_url}/api/v3/providers/proxy/{provider_pk}/',
+                                method='GET', headers=ak_headers, max_retries=2, timeout=20
+                            )
+                            v_data = json.loads(v.read().decode())
+                            v_host = (v_data.get('external_host') or '')
+                            v_cookie = (v_data.get('cookie_domain') or '').strip()
+                            v_mode = (v_data.get('mode') or '').strip()
+                            if v_host == desired_host and v_cookie == desired_cookie and v_mode == 'forward_single':
+                                result['provider'] = 'fixed'
+                                _log(f"  ✓ {prov_name}: PUT fixed {cur_host!r} → {desired_host!r} (verified, mode={v_mode})")
+                            else:
+                                result['provider'] = 'failed:verify-mismatch'
+                                _log(f"  ✗ {prov_name}: PUT returned but verify shows host={v_host!r} cookie={v_cookie!r} mode={v_mode!r}")
+                        except Exception as ve:
+                            result['provider'] = 'failed:verify-error'
+                            _log(f"  ✗ {prov_name}: PUT returned but verify failed ({str(ve)[:120]})")
+                    except urllib.error.HTTPError as he:
+                        err_body = ''
+                        try:
+                            err_body = he.read().decode()[:240]
+                        except Exception:
+                            pass
+                        result['provider'] = f'failed:put-{he.code}'
+                        _log(f"  ✗ {prov_name}: PUT failed HTTP {he.code} {err_body}")
+                    except Exception as pe:
+                        result['provider'] = 'failed:put-timeout'
+                        _log(f"  ✗ {prov_name}: PUT failed ({str(pe)[:120]}) — will retry next boot")
+
+            if not provider_pk:
+                # Can't proceed to app or outpost without a provider PK
+                result['app'] = 'skipped:no-provider'
+                result['outpost'] = 'skipped:no-provider'
+                summary[module_key] = result
+                continue
+
+            # ---------- (2) Application ----------
+            existing_app = None
+            try:
+                resp = _ak_api_call(
+                    f'{ak_url}/api/v3/core/applications/{app_slug}/',
+                    method='GET', headers=ak_headers, max_retries=2, timeout=20
+                )
+                existing_app = json.loads(resp.read().decode())
+            except urllib.error.HTTPError as he:
+                if he.code != 404:
+                    _log(f"  ⚠ {app_name}: GET app HTTP {he.code} (will try to create)")
+            except Exception:
+                pass
+
+            if existing_app is None:
+                # Create application
+                body = {'name': app_name, 'slug': app_slug, 'provider': provider_pk,
+                        'open_in_new_tab': bool(open_new_tab)}
+                try:
+                    _ak_api_call(
+                        f'{ak_url}/api/v3/core/applications/',
+                        data=json.dumps(body).encode(),
+                        method='POST', headers=ak_headers, max_retries=3, timeout=30
+                    )
+                    result['app'] = 'created'
+                    _log(f"  ✓ {app_name}: application created (slug={app_slug}, provider={provider_pk})")
+                except urllib.error.HTTPError as he:
+                    if he.code == 400:
+                        # likely already exists by slug — PATCH instead
+                        try:
+                            _ak_api_call(
+                                f'{ak_url}/api/v3/core/applications/{app_slug}/',
+                                data=json.dumps({'provider': provider_pk, 'open_in_new_tab': bool(open_new_tab)}).encode(),
+                                method='PATCH', headers=ak_headers, max_retries=3, timeout=30
+                            )
+                            result['app'] = 'fixed'
+                            _log(f"  ✓ {app_name}: application existed by slug — PATCHed to point at provider {provider_pk}")
+                        except Exception as pae:
+                            result['app'] = 'failed:patch-after-409'
+                            _log(f"  ✗ {app_name}: app PATCH after 400 failed ({str(pae)[:120]})")
+                    else:
+                        result['app'] = f'failed:create-{he.code}'
+                        _log(f"  ✗ {app_name}: app create failed HTTP {he.code}")
+                except Exception as ae:
+                    result['app'] = 'failed:create-timeout'
+                    _log(f"  ✗ {app_name}: app create failed ({str(ae)[:120]})")
+            else:
+                cur_prov = existing_app.get('provider')
+                cur_otb = bool(existing_app.get('open_in_new_tab'))
+                if cur_prov != provider_pk or cur_otb != bool(open_new_tab):
+                    try:
+                        _ak_api_call(
+                            f'{ak_url}/api/v3/core/applications/{app_slug}/',
+                            data=json.dumps({'provider': provider_pk, 'open_in_new_tab': bool(open_new_tab)}).encode(),
+                            method='PATCH', headers=ak_headers, max_retries=3, timeout=30
+                        )
+                        result['app'] = 'fixed'
+                        _log(f"  ✓ {app_name}: app PATCHed (provider {cur_prov} → {provider_pk}, open_in_new_tab {cur_otb} → {bool(open_new_tab)})")
+                    except Exception as pe2:
+                        result['app'] = 'failed:patch-timeout'
+                        _log(f"  ✗ {app_name}: app PATCH failed ({str(pe2)[:120]})")
+
+            # ---------- (3) Outpost membership ----------
+            outpost_provider_pks.append(provider_pk)
+            summary[module_key] = result
+
+        # ---------- (3b) One outpost PATCH covers all services ----------
+        if outpost_provider_pks:
+            try:
+                added = _outpost_add_providers_safe(ak_url, ak_headers, outpost_provider_pks, plog=_log)
+                if added:
+                    _log(f"  ✓ embedded outpost: added missing providers ({len(outpost_provider_pks)} considered)")
+                else:
+                    _log(f"  ✓ embedded outpost: all {len(outpost_provider_pks)} provider(s) already attached")
+            except Exception as oe:
+                _log(f"  ⚠ embedded outpost update failed: {str(oe)[:120]}")
+                for k in summary:
+                    if summary[k].get('outpost') == 'ok':
+                        summary[k]['outpost'] = 'failed:outpost-error'
+
+        # Summary line
+        ok_count = sum(1 for v in summary.values()
+                       if v.get('provider') in ('ok', 'created', 'fixed', 'adopted')
+                       and v.get('app') in ('ok', 'created', 'fixed'))
+        if summary:
+            _log(f"  proxy chain: {ok_count}/{len(summary)} service(s) fully reconciled "
+                 f"({', '.join(sorted(summary.keys()))})")
+        else:
+            _log("  proxy chain: no deployed services to reconcile")
+
+        return summary
+    except Exception as e:
+        _log(f"  ⚠ proxy chain heal error (non-fatal): {str(e)[:200]}")
+        return summary
+
+
 def _ensure_authentik_proxy_external_hosts_canonical(plog, max_attempts=1, retry_delay_s=5):
     """v0.9.21: For each known infra-TAK proxy provider, assert external_host matches
     https://<service-prefix>.<fqdn>.
@@ -29726,6 +30372,17 @@ def _ensure_authentik_proxy_external_hosts_canonical(plog, max_attempts=1, retry
             Returns (ok: bool, fixed_count: int, err: str)."""
             try:
                 _cookie = f'.{base}'
+                # v0.9.31 (post-field-debug 2026-05-18): write WITHOUT trailing
+                # slash. Previously `want_clean + '/'` produced
+                # `external_host = 'https://takportal.lutak.net/'`, which made
+                # Authentik bake the with-slash form into the proxy provider's
+                # strict-match redirect_uris list. When Caddy/outpost later
+                # forward_auth'd the user, the OAuth flow's redirect_uri
+                # mismatched the strict-match entry and Authentik returned
+                # "Redirect URI Error" instead of the login page. Observed live
+                # on takportal.lutak.net (provider pk=3). Compare exact strings
+                # too — no rstrip on cur — so a stale with-slash row is fixed
+                # instead of silently treated as equal to the no-slash target.
                 _py_lines = [
                     "from authentik.providers.proxy.models import ProxyProvider",
                     f"targets = {canonical!r}",
@@ -29736,11 +30393,11 @@ def _ensure_authentik_proxy_external_hosts_canonical(plog, max_attempts=1, retry
                     "    if not p:",
                     "        print(f'AK-PROXY|{name}|MISSING')",
                     "        continue",
-                    "    cur = (p.external_host or '').rstrip('/')",
+                    "    cur = (p.external_host or '')",
                     "    want_clean = (want or '').rstrip('/')",
                     "    cur_cookie = (p.cookie_domain or '')",
                     "    if cur != want_clean or cur_cookie != cookie:",
-                    "        p.external_host = want_clean + '/'",
+                    "        p.external_host = want_clean",  # no trailing slash
                     "        p.cookie_domain = cookie",
                     "        p.save(update_fields=['external_host', 'cookie_domain'])",
                     "        fixed += 1",
@@ -29808,30 +30465,60 @@ def _ensure_authentik_proxy_external_hosts_canonical(plog, max_attempts=1, retry
                     plog(f"  proxy external_hosts: failed to fetch provider {_name!r}: {_fe}")
                     _patch_failures += 1
                     continue
-                _current = (_full.get('external_host') or '').rstrip('/')
+                # v0.9.31 (post-field-debug 2026-05-18): compare EXACT strings
+                # and write WITHOUT trailing slash. See ak-shell fallback above
+                # for the full story (Authentik bakes the with/without-slash
+                # form into the strict-match redirect_uris list; mixing them
+                # produces "Redirect URI Error" instead of the login page).
+                _current = (_full.get('external_host') or '')
                 _want_clean = _want.rstrip('/')
-                if _current == _want_clean:
+                _full_cookie = (_full.get('cookie_domain') or '').strip()
+                _cookie_domain = f'.{base}'
+                if _current == _want_clean and _full_cookie == _cookie_domain:
                     continue  # already canonical
 
-                # Derive correct cookie_domain from fqdn
-                _cookie_domain = base
-                _patch = {
-                    'external_host': _want_clean + '/',
+                # v0.9.31 (post-field-debug): PUT with the FULL provider body.
+                # Authentik validates the whole object even on PATCH and
+                # rejects partial bodies with "internal_host: Internal host
+                # cannot be empty when forward auth is disabled." (HTTP 400).
+                # Observed live on takportal proxy provider pk=3 (SSDNodes).
+                _put_body = {
+                    'name': _name,
+                    'authorization_flow': _full.get('authorization_flow'),
+                    'invalidation_flow': _full.get('invalidation_flow'),
+                    'external_host': _want_clean,
+                    'mode': _full.get('mode') or 'forward_single',
+                    'token_validity': _full.get('token_validity') or 'hours=24',
                     'cookie_domain': _cookie_domain,
+                    'internal_host': _full.get('internal_host') or '',
+                    'internal_host_ssl_validation': _full.get(
+                        'internal_host_ssl_validation', True),
+                    'skip_path_regex': _full.get('skip_path_regex') or '',
+                    'basic_auth_enabled': _full.get('basic_auth_enabled', False),
+                    'basic_auth_password_attribute': _full.get(
+                        'basic_auth_password_attribute') or '',
+                    'basic_auth_user_attribute': _full.get(
+                        'basic_auth_user_attribute') or '',
+                    'intercept_header_auth': _full.get('intercept_header_auth', True),
                 }
                 try:
                     _req.urlopen(
                         _req.Request(f'{_api_url}/api/v3/providers/proxy/{_pk}/',
-                                     data=_json.dumps(_patch).encode(), headers=_headers, method='PATCH'),
-                        timeout=10
+                                     data=_json.dumps(_put_body).encode(), headers=_headers, method='PUT'),
+                        timeout=30
                     )
-                    plog(f"  ✓ Proxy external_host fixed: {_name!r}: {_current!r} → {_want_clean + '/'!r}")
+                    plog(f"  ✓ Proxy external_host fixed: {_name!r}: {_current!r} → {_want_clean!r}")
                     _fixed += 1
                 except urllib.error.HTTPError as _pe:
-                    plog(f"  ✗ Proxy external_host PATCH failed for {_name!r}: HTTP {_pe.code}")
+                    _err_body = ''
+                    try:
+                        _err_body = _pe.read().decode()[:200]
+                    except Exception:
+                        pass
+                    plog(f"  ✗ Proxy external_host PUT failed for {_name!r}: HTTP {_pe.code} {_err_body}")
                     _patch_failures += 1
                 except Exception as _pe2:
-                    plog(f"  ✗ Proxy external_host PATCH failed for {_name!r}: {_pe2}")
+                    plog(f"  ✗ Proxy external_host PUT failed for {_name!r}: {_pe2}")
                     _patch_failures += 1
 
             _fixed_total += _fixed
@@ -36392,6 +37079,87 @@ def _auto_authentik_tasklog_purge(plog=None):
         _log(f"Authentik tasklog purge error (non-fatal): {_e}")
 
 
+def _heal_takauthentik_tasklog_purge_stale_failed_state(plog=None):
+    """v0.9.31: clear stale `failed` state on `takauthentiktasklogpurge.service`
+    when the on-disk script is already the v0.9.26+ fixed version.
+
+    BACKGROUND (test6 + test8, validated 2026-05-18):
+      The v0.9.5 weekly purge script hit `VACUUM cannot run inside a transaction
+      block` every Sunday 03:00 UTC until v0.9.26 fixed it (separate `psql -c`
+      for the VACUUM step). On boxes deployed before v0.9.26, the Sunday timer
+      fired the OLD script — systemd marked the unit `failed` (exit 1) — then
+      a later Update Now dropped the FIXED canonical script on disk via
+      `_ensure_authentik_tasklog_purge_script`. The failed-state accounting is
+      now stale: the underlying bug is fixed, but `systemctl --failed` still
+      shows the unit until either (a) the next Sunday timer fires successfully
+      or (b) someone manually `reset-failed`s it.
+
+      Data hygiene is NOT affected — `_auto_authentik_tasklog_purge` (inline,
+      Python) runs on every console boot regardless of the timer/unit and
+      keeps the tables compact. This migration is purely about clearing the
+      cosmetic systemd accounting so `systemctl --failed` stops lying.
+
+    Gating (all must be true to apply):
+      - /etc/systemd/system/takauthentiktasklogpurge.service exists (unit installed)
+      - `systemctl is-failed` reports `failed` (don't disturb non-failed states)
+      - On-disk script at /opt/tak-guarddog/tak-authentik-tasklog-purge.sh
+        contains the `v0.9.26 multi-tier` marker (i.e. the fix is actually on disk)
+
+    On apply: `systemctl reset-failed takauthentiktasklogpurge.service`. Idempotent
+    — once cleared, future runs are no-ops (is-failed != failed). If a future
+    failure recurs with the fixed script on disk, this heal will catch and clear
+    it too — but since the v0.9.26 fix has been field-validated, that should
+    not happen. If it does, the recurrence itself is real signal worth investigating.
+
+    Never raises. All errors logged + swallowed.
+    """
+    def _log(m):
+        if plog:
+            try:
+                plog(m)
+            except Exception:
+                pass
+    try:
+        _unit_path = '/etc/systemd/system/takauthentiktasklogpurge.service'
+        if not os.path.exists(_unit_path):
+            return False
+        r_failed = subprocess.run(
+            ['systemctl', 'is-failed', 'takauthentiktasklogpurge.service'],
+            capture_output=True, text=True, timeout=5
+        )
+        if (r_failed.stdout or '').strip() != 'failed':
+            return False
+        _script_path = '/opt/tak-guarddog/tak-authentik-tasklog-purge.sh'
+        if not os.path.isfile(_script_path):
+            _log("  tasklog-purge: failed-state present but on-disk script missing — leaving alone (re-deploy needed)")
+            return False
+        try:
+            with open(_script_path) as _f:
+                _content = _f.read()
+        except Exception as _re:
+            _log(f"  tasklog-purge: failed-state heal — script read error (non-fatal): {_re}")
+            return False
+        if 'v0.9.26 multi-tier' not in _content:
+            _log("  tasklog-purge: failed-state present and on-disk script is NOT the v0.9.26 fixed version — leaving alone (script will be re-emitted on next deploy)")
+            return False
+        subprocess.run(
+            ['systemctl', 'reset-failed', 'takauthentiktasklogpurge.service'],
+            capture_output=True, timeout=5
+        )
+        r_verify = subprocess.run(
+            ['systemctl', 'is-failed', 'takauthentiktasklogpurge.service'],
+            capture_output=True, text=True, timeout=5
+        )
+        if (r_verify.stdout or '').strip() != 'failed':
+            _log("  ✓ tasklog-purge: stale failed-state cleared (script on disk is v0.9.26+ fix; next Sunday timer will re-validate)")
+            return True
+        _log(f"  ⚠ tasklog-purge: reset-failed didn't take, state={r_verify.stdout.strip()!r}")
+        return False
+    except Exception as _e:
+        _log(f"  tasklog-purge stale-failed heal error (non-fatal): {_e}")
+        return False
+
+
 def _ensure_authentik_webadmin(skip_bind_verify=False):
     """Ensure webadmin exists in Authentik with password from settings; 8446 uses LDAP when CoreConfig has <ldap/>.
     skip_bind_verify=True skips LDAP outpost recreate and bind verification (default False — TAK deploy and Sync webadmin use full verify).
@@ -39263,11 +40031,36 @@ def takserver_uninstall():
     # Kill any remaining processes
     subprocess.run('pkill -9 -f takserver 2>/dev/null; true', shell=True, capture_output=True)
     steps.append('Killed remaining processes')
-    # Remove package
-    pkg_result = subprocess.run('dpkg -l | grep takserver', shell=True, capture_output=True, text=True)
-    if 'takserver' in pkg_result.stdout:
-        subprocess.run('DEBIAN_FRONTEND=noninteractive apt-get remove -y takserver 2>/dev/null; true', shell=True, capture_output=True, timeout=120)
-        steps.append('Removed TAK Server package')
+    # Purge package — must complete BEFORE removing /opt/tak, otherwise the
+    # package can remain in 'ii' state with files gone, and the next
+    # `apt-get install` becomes a no-op ("already newest version") that leaves
+    # a half-installed system. See deploy Step 4 self-heal for the matching
+    # recovery path.
+    pkg_status = subprocess.run(
+        "dpkg-query -W -f='${Status}' takserver 2>/dev/null",
+        shell=True, capture_output=True, text=True
+    ).stdout.strip()
+    if pkg_status:
+        # Try purge (apt first, then dpkg, then dpkg --force-all). Capture
+        # stderr so silent failures don't pretend success.
+        purge_ok = False
+        for cmd in (
+            'DEBIAN_FRONTEND=noninteractive apt-get purge -y takserver',
+            'DEBIAN_FRONTEND=noninteractive dpkg --purge takserver',
+            'DEBIAN_FRONTEND=noninteractive dpkg --purge --force-all takserver',
+        ):
+            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=180)
+            after = subprocess.run(
+                "dpkg-query -W -f='${Status}' takserver 2>/dev/null",
+                shell=True, capture_output=True, text=True
+            ).stdout.strip()
+            if not after or 'not-installed' in after:
+                purge_ok = True
+                break
+        if purge_ok:
+            steps.append('Purged TAK Server package')
+        else:
+            steps.append('⚠ Could not purge takserver package (still registered with dpkg) — manual cleanup required')
     # Clean up /opt/tak
     if os.path.exists('/opt/tak'):
         subprocess.run('rm -rf /opt/tak', shell=True, capture_output=True)
@@ -39286,6 +40079,16 @@ def takserver_uninstall():
     # Reset deploy status
     deploy_log.clear()
     deploy_status.update({'running': False, 'complete': False, 'error': False})
+    # v0.9.31: regenerate Caddyfile so the webtak.<fqdn> vhost is removed.
+    # Same gap as takportal/authentik uninstall — without this the vhost
+    # remained and Caddy fell through to Authentik's "Not Found" page.
+    try:
+        settings = load_settings()
+        generate_caddyfile(settings)
+        subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
+        steps.append('Regenerated Caddyfile + reloaded Caddy')
+    except Exception as caddy_err:
+        steps.append(f'Caddy regen warning (non-fatal): {caddy_err}')
     return jsonify({'success': True, 'steps': steps})
 
 @app.route('/api/upload/takserver', methods=['POST'])
@@ -41505,6 +42308,29 @@ def run_takserver_deploy(config):
             if settings.get('pkg_mgr', 'apt') == 'apt':
                 wait_for_apt_lock(log_step, deploy_log)
             log_step(f"Installing {pkg_name}...")
+            # Pre-flight: if a prior Remove button run left the package marked
+            # installed (dpkg `ii`) but /opt/tak gone, `apt-get install` becomes
+            # a no-op ("already newest version") and we'd FATAL below. Detect
+            # that state and purge first so the install actually extracts.
+            _pre_status = subprocess.run(
+                "dpkg-query -W -f='${Status}' takserver 2>/dev/null",
+                shell=True, capture_output=True, text=True
+            ).stdout.strip()
+            if _pre_status and 'installed' in _pre_status and not os.path.exists('/opt/tak'):
+                log_step("  Detected half-removed takserver (package marked installed, /opt/tak missing) — purging before reinstall...")
+                for _cmd in (
+                    'DEBIAN_FRONTEND=noninteractive apt-get purge -y takserver',
+                    'DEBIAN_FRONTEND=noninteractive dpkg --purge takserver',
+                    'DEBIAN_FRONTEND=noninteractive dpkg --purge --force-all takserver',
+                ):
+                    subprocess.run(_cmd, shell=True, capture_output=True, text=True, timeout=180)
+                    _after = subprocess.run(
+                        "dpkg-query -W -f='${Status}' takserver 2>/dev/null",
+                        shell=True, capture_output=True, text=True
+                    ).stdout.strip()
+                    if not _after or 'not-installed' in _after:
+                        break
+                log_step("  ✓ Purge complete — proceeding with fresh install")
             r1 = run_cmd(f'DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y {pkg} 2>&1', check=False)
             if not r1:
                 log_step("  apt-get failed, trying dpkg + dependency fix...")
@@ -41515,8 +42341,16 @@ def run_takserver_deploy(config):
                 log_step("  Creating PostgreSQL 15 cluster...")
                 run_cmd('pg_createcluster 15 main --start 2>&1', check=False)
             run_cmd('dpkg --configure -a 2>&1', check=False, quiet=True)
+            # Last-resort self-heal: if /opt/tak is still missing (e.g. apt
+            # decided the package was already installed and skipped extraction
+            # despite our pre-flight purge), force a reinstall from the .deb.
             if not os.path.exists('/opt/tak'):
-                log_step("✗ FATAL: /opt/tak not found after install"); deploy_status.update({'error': True, 'running': False}); return
+                log_step("  /opt/tak missing after install — forcing reinstall from .deb...")
+                run_cmd(f'DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install --reinstall -y {pkg} 2>&1', check=False)
+                run_cmd('dpkg --configure -a 2>&1', check=False, quiet=True)
+            if not os.path.exists('/opt/tak'):
+                log_step("✗ FATAL: /opt/tak not found after install (even after forced reinstall) — run `dpkg --purge --force-all takserver && rm -rf /opt/tak` on the host and retry")
+                deploy_status.update({'error': True, 'running': False}); return
             log_step("✓ TAK Server installed")
 
         # For external_db: patch CoreConfig JDBC URL NOW, before first start,
@@ -42170,6 +43004,270 @@ def kernel_patch_status_api():
     return jsonify(data)
 
 
+# v0.9.31 — one-click "Patch now" background-detached kernel/apt upgrade.
+#
+# WHY THIS EXISTS
+# ---------------
+# The kernel-update banner used to instruct operators to run
+# `apt update && apt full-upgrade && reboot`. Locally this is fine. Over SSH
+# it's a foot-gun: `apt full-upgrade` replaces systemd, networking, and
+# (often) openssh-server, which can drop the SSH session mid-transaction.
+# The chained command never reaches `reboot`; apt leaves an interrupted
+# transaction (Start-Date but no End-Date in /var/log/apt/history.log);
+# the box reboots later on the OLD kernel because the new one's initramfs
+# never finalized. Field-hit on the SSDNodes box 2026-05-18 — operator
+# followed the banner's instructions to the letter, ended up with the box
+# still on 5.15.0-177 and the banner still firing.
+#
+# WHAT IT DOES
+# ------------
+# The "Patch now" button POSTs to /api/system/kernel-patch/start. The server
+# fires `apt-get update && apt-get full-upgrade` as a TRANSIENT SYSTEMD UNIT
+# via `systemd-run --no-block`. This is critical because:
+#
+#   apt full-upgrade with NEEDRESTART_MODE=a auto-restarts services whose
+#   libraries got upgraded. takwerx-console.service is a Python gunicorn
+#   process linked against libpython3.x / libssl / libc — almost any apt
+#   full-upgrade will cause needrestart to `systemctl restart
+#   takwerx-console.service`. If our apt subprocess shared takwerx-console's
+#   cgroup, that restart would kill the apt job mid-flight — same disaster
+#   as the original SSH-drop scenario, just from a different cause.
+#
+# `systemd-run --no-block --unit=infratak-kernel-patch` creates a transient
+# .service unit in its OWN cgroup, completely decoupled from
+# takwerx-console.service. When needrestart restarts the console, our apt
+# job sails on. Bonus: full journalctl integration + clean systemctl
+# status query for done/error/running state.
+#
+# Reboot is a SEPARATE explicit operator click — we never auto-reboot.
+# Banner clears naturally within 60s of post-reboot once
+# `apt list --upgradable | grep linux-image` returns 0.
+#
+# FLEET-UNIFORM COMPLIANCE
+# ------------------------
+# Same code path on every box. No per-customer state. systemd-run is part
+# of systemd itself — always present on every box we deploy on (Ubuntu
+# 22.04+). dpkg force-conf flags + DEBIAN_FRONTEND=noninteractive +
+# NEEDRESTART_MODE=a are CONSTANTS baked into the unit definition — no
+# operator override knob. If a box hits a class of upgrade that needs
+# different flags, that's a code change pushed to the fleet.
+_KERNEL_PATCH_UNIT = 'infratak-kernel-patch.service'
+_KERNEL_PATCH_LOGFILE = '/var/log/takguard/kernel-patch.log'
+
+
+def _kernel_patch_unit_state():
+    """Return (active_state, sub_state, result, main_pid).
+      active_state: 'active' | 'inactive' | 'activating' | 'deactivating' | 'failed' | ''
+      sub_state:    'running' | 'exited' | 'dead' | 'failed' | ...
+      result:       'success' | 'exit-code' | 'signal' | '' (only meaningful when inactive/failed)
+      main_pid:     int or 0 (0 = no main PID)
+    Empty strings on any error.
+    """
+    try:
+        r = subprocess.run(
+            ['systemctl', 'show', '-p', 'ActiveState,SubState,Result,MainPID',
+             _KERNEL_PATCH_UNIT],
+            capture_output=True, text=True, timeout=5
+        )
+        out = r.stdout or ''
+        active = sub = result = ''
+        pid = 0
+        for line in out.splitlines():
+            if line.startswith('ActiveState='):
+                active = line.split('=', 1)[1].strip()
+            elif line.startswith('SubState='):
+                sub = line.split('=', 1)[1].strip()
+            elif line.startswith('Result='):
+                result = line.split('=', 1)[1].strip()
+            elif line.startswith('MainPID='):
+                try:
+                    pid = int(line.split('=', 1)[1].strip())
+                except ValueError:
+                    pid = 0
+        return (active, sub, result, pid)
+    except Exception:
+        return ('', '', '', 0)
+
+
+def _kernel_patch_start_job():
+    """Fire `apt-get update && apt-get full-upgrade` as a transient systemd
+    unit. Returns (ok, message, pid_or_None).
+
+    Why systemd-run vs subprocess.Popen: needrestart inside the apt run will
+    almost certainly restart takwerx-console.service (any libpython/libssl/
+    libc upgrade triggers it with NEEDRESTART_MODE=a). A plain Popen child
+    shares the parent's cgroup and would get killed. systemd-run creates a
+    transient unit in a separate cgroup that survives takwerx-console's
+    restart, daemon-reexec, etc.
+
+    Idempotent: if the transient unit is already active, refuses to spawn
+    another and returns the existing pid. If the unit is failed or
+    inactive, accepts the new request (and resets failed-state first so
+    systemd allows the re-start).
+    """
+    if not (os.path.exists('/usr/bin/systemd-run') or os.path.exists('/bin/systemd-run')):
+        return (False, "systemd-run not found — cannot detach safely", None)
+    active, sub, result, pid = _kernel_patch_unit_state()
+    if active in ('active', 'activating') and pid:
+        return (False, f"kernel patch already running (pid {pid})", pid)
+    # If unit is in a failed state from a previous run, reset so systemd
+    # accepts a fresh start request with the same unit name.
+    if active == 'failed':
+        try:
+            subprocess.run(['systemctl', 'reset-failed', _KERNEL_PATCH_UNIT],
+                           capture_output=True, timeout=5)
+        except Exception:
+            pass
+    try:
+        os.makedirs(os.path.dirname(_KERNEL_PATCH_LOGFILE), exist_ok=True)
+    except Exception:
+        pass
+    # Bash script body. Written to a tmp file rather than inlined into the
+    # systemd-run argv to keep the unit definition compact.
+    script = (
+        '#!/bin/bash\n'
+        'set -o pipefail\n'
+        'export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a\n'
+        'TS() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }\n'
+        'echo "[$(TS)] === infra-TAK kernel patch job starting (pid $$) ==="\n'
+        'echo "[$(TS)] apt-get update"\n'
+        'apt-get update 2>&1 || { rc=$?; echo "[$(TS)] FATAL: apt-get update failed (exit $rc)"; exit $rc; }\n'
+        'echo "[$(TS)] apt-get full-upgrade -y"\n'
+        'apt-get -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" full-upgrade 2>&1 \\\n'
+        '  || { rc=$?; echo "[$(TS)] FATAL: apt-get full-upgrade failed (exit $rc)"; exit $rc; }\n'
+        'echo "[$(TS)] === DONE — safe to reboot ==="\n'
+    )
+    _script_path = '/var/lib/infratak-kernel-patch.sh'
+    try:
+        with open(_script_path, 'w') as _sf:
+            _sf.write(script)
+        os.chmod(_script_path, 0o755)
+    except Exception as _we:
+        return (False, f"could not write script to {_script_path}: {_we}", None)
+    cmd = [
+        'systemd-run',
+        '--unit=' + _KERNEL_PATCH_UNIT.replace('.service', ''),
+        '--description=infra-TAK Kernel Patch Job (detached)',
+        '--property=StandardOutput=append:' + _KERNEL_PATCH_LOGFILE,
+        '--property=StandardError=append:' + _KERNEL_PATCH_LOGFILE,
+        '--setenv=DEBIAN_FRONTEND=noninteractive',
+        '--setenv=NEEDRESTART_MODE=a',
+        '--setenv=PATH=/usr/sbin:/usr/bin:/sbin:/bin',
+        '--no-block',
+        '/bin/bash', _script_path,
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    except Exception as _se:
+        return (False, f"systemd-run spawn failed: {_se}", None)
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout or '').strip()[:300]
+        return (False, f"systemd-run returned {r.returncode}: {err}", None)
+    # Poll briefly for the unit to enter active state and have a MainPID
+    import time as _ktime
+    new_pid = 0
+    for _ in range(20):  # up to ~2 sec
+        a, s, _res, p = _kernel_patch_unit_state()
+        if a in ('active', 'activating') and p:
+            new_pid = p
+            break
+        _ktime.sleep(0.1)
+    # Bust the kernel-patch status cache so the banner reflects fresh state
+    _kernel_patch_cache.update({'ts': 0, 'data': None})
+    return (True, f"started (unit {_KERNEL_PATCH_UNIT}, pid {new_pid or 'pending'})", new_pid or None)
+
+
+def _kernel_patch_job_state():
+    """Return current state of the background kernel-patch transient unit.
+    Returns a dict suitable for jsonify:
+      {
+        'running': bool,
+        'pid': int|None,
+        'done': bool,
+        'error': bool,
+        'log_tail': str (last ~4 KB),
+        'log_present': bool,
+        'unit_state': str (e.g. 'active/running', 'inactive/dead', 'failed/failed')
+      }
+    """
+    active, sub, result, pid = _kernel_patch_unit_state()
+    running = (active in ('active', 'activating'))
+    log_tail = ''
+    log_present = False
+    if os.path.exists(_KERNEL_PATCH_LOGFILE):
+        log_present = True
+        try:
+            r = subprocess.run(
+                ['tail', '-c', '4096', _KERNEL_PATCH_LOGFILE],
+                capture_output=True, text=True, timeout=5
+            )
+            log_tail = (r.stdout or '')[-4000:]
+        except Exception:
+            log_tail = ''
+    # Use systemd's own Result= field as the authoritative success/fail
+    # signal — don't depend on log_tail content (log may be rotated, wiped,
+    # or empty if the unit died before writing anything). The log-tail
+    # banner string is just operator-visible confirmation.
+    done = (not running) and (result == 'success')
+    err = (not running) and (active == 'failed' or (result not in ('', 'success')))
+    # If the job clearly completed (success or failure), bust the kernel
+    # patch status cache so the post-reboot banner check picks up reality.
+    if (done or err) and _kernel_patch_cache.get('ts'):
+        _kernel_patch_cache.update({'ts': 0, 'data': None})
+    return {
+        'running': running,
+        'pid': (pid or None) if running else None,
+        'done': done,
+        'error': err,
+        'log_tail': log_tail,
+        'log_present': log_present,
+        'unit_state': f"{active or 'unknown'}/{sub or 'unknown'}" + (f" ({result})" if result else ''),
+    }
+
+
+@app.route('/api/system/kernel-patch/start', methods=['POST'])
+@login_required
+def kernel_patch_start_api():
+    """Start the detached kernel-patch background job. Idempotent — if a
+    job is already running, returns the existing pid + a 200."""
+    try:
+        ok, msg, pid = _kernel_patch_start_job()
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'start error: {e}'}), 500
+    return jsonify({'ok': ok, 'message': msg, 'pid': pid})
+
+
+@app.route('/api/system/kernel-patch/job-status')
+@login_required
+def kernel_patch_job_status_api():
+    """Return live state of the kernel-patch background job (running/done/
+    error/log_tail). Distinct from /api/system/kernel-patch-status which
+    reports whether ANY apt linux-image upgrade is available — this one
+    reports the job spawned by THIS console session."""
+    try:
+        return jsonify(_kernel_patch_job_state())
+    except Exception as e:
+        return jsonify({'running': False, 'error': True, 'log_tail': f'job-status error: {e}', 'pid': None, 'done': False, 'log_present': False}), 500
+
+
+@app.route('/api/system/kernel-patch/reboot', methods=['POST'])
+@login_required
+def kernel_patch_reboot_api():
+    """Schedule a system reboot. Detached so the response can still complete
+    before the box goes down. Operator MUST have explicitly clicked the
+    'Reboot now' button — this endpoint is intentionally unguarded beyond
+    login_required; the UI confirm dialog is the only gate."""
+    try:
+        subprocess.Popen(
+            ['systemctl', 'reboot'],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True, close_fds=True
+        )
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'reboot spawn failed: {e}'}), 500
+    return jsonify({'ok': True, 'message': 'reboot scheduled'})
+
+
 @app.route('/api/metrics')
 @login_required
 def api_metrics():
@@ -42371,9 +43469,25 @@ def run_full_uninstall():
         subprocess.run(_sudo_wrap(['systemctl', 'stop', 'takserver']), capture_output=True, timeout=90)
         subprocess.run(_sudo_wrap(['systemctl', 'disable', 'takserver']), capture_output=True, timeout=90)
         subprocess.run('pkill -9 -f takserver 2>/dev/null; true', shell=True, capture_output=True)
-        pkg_result = subprocess.run('dpkg -l | grep takserver', shell=True, capture_output=True, text=True)
-        if 'takserver' in (pkg_result.stdout or ''):
-            subprocess.run('DEBIAN_FRONTEND=noninteractive apt-get remove -y takserver 2>/dev/null; true', shell=True, capture_output=True, timeout=120)
+        # Purge BEFORE removing /opt/tak — see takserver_uninstall() for why
+        # `apt-get remove` (no purge) + `rm -rf /opt/tak` is a footgun.
+        pkg_status = subprocess.run(
+            "dpkg-query -W -f='${Status}' takserver 2>/dev/null",
+            shell=True, capture_output=True, text=True
+        ).stdout.strip()
+        if pkg_status:
+            for _cmd in (
+                'DEBIAN_FRONTEND=noninteractive apt-get purge -y takserver',
+                'DEBIAN_FRONTEND=noninteractive dpkg --purge takserver',
+                'DEBIAN_FRONTEND=noninteractive dpkg --purge --force-all takserver',
+            ):
+                subprocess.run(_cmd, shell=True, capture_output=True, text=True, timeout=180)
+                _after = subprocess.run(
+                    "dpkg-query -W -f='${Status}' takserver 2>/dev/null",
+                    shell=True, capture_output=True, text=True
+                ).stdout.strip()
+                if not _after or 'not-installed' in _after:
+                    break
         if os.path.exists('/opt/tak'):
             subprocess.run('rm -rf /opt/tak', shell=True, capture_output=True)
         subprocess.run("sudo -u postgres psql -c \"DROP DATABASE IF EXISTS cot;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
@@ -43159,11 +44273,41 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div id="update-status" style="display:none;margin-top:8px;font-size:11px"></div>
 </div>
 <div id="kernel-patch-banner" style="display:none;background:linear-gradient(135deg,rgba(234,179,8,0.1),rgba(234,179,8,0.05));border:1px solid rgba(234,179,8,0.3);border-radius:12px;padding:14px 20px;margin-bottom:16px;font-family:'JetBrains Mono',monospace">
-<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
+<div id="kpatch-idle" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
 <div><div style="font-size:13px;font-weight:600;color:var(--yellow)">&#9888; Kernel update available &mdash; patch now to fix CVE-2026-31431 (Copy Fail)</div>
-<div style="font-size:11px;color:var(--text-dim);margin-top:4px">Run: <code style="background:rgba(255,255,255,.05);padding:1px 6px;border-radius:3px">apt update &amp;&amp; apt full-upgrade &amp;&amp; reboot</code></div></div>
+<div style="font-size:11px;color:var(--text-dim);margin-top:4px">Runs <code style="background:rgba(255,255,255,.05);padding:1px 6px;border-radius:3px">apt-get full-upgrade</code> in a detached background process &mdash; safe over SSH, survives session drops. Reboot is a separate explicit click.</div></div>
+<div style="display:flex;gap:8px">
+<button onclick="startKernelPatch()" style="padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Patch now</button>
 <button onclick="dismissKernelBanner()" style="padding:5px 12px;background:none;border:1px solid rgba(234,179,8,0.3);color:var(--text-dim);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">Dismiss</button>
 </div></div>
+<div id="kpatch-running" style="display:none">
+<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
+<div><div style="font-size:13px;font-weight:600;color:var(--cyan)">&#9881; Kernel patch in progress &mdash; <span id="kpatch-pid"></span></div>
+<div style="font-size:11px;color:var(--text-dim);margin-top:4px">Detached from console &mdash; safe to close this tab. Job runs to completion regardless. Typical time: 2-5 min.</div></div>
+</div>
+<pre id="kpatch-log" style="margin-top:10px;background:#0a0e1a;border:1px solid rgba(59,130,246,0.15);border-radius:6px;padding:10px;font-size:10px;color:var(--text-secondary);max-height:180px;overflow-y:auto;white-space:pre-wrap;word-break:break-word;font-family:'JetBrains Mono',monospace"></pre>
+</div>
+<div id="kpatch-done" style="display:none">
+<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
+<div><div style="font-size:13px;font-weight:600;color:var(--green)">&#10003; Kernel patch complete &mdash; reboot required to boot the new kernel</div>
+<div style="font-size:11px;color:var(--text-dim);margin-top:4px">apt-get full-upgrade finished cleanly. The new kernel is staged but the running system is still on the old one. Reboot when ready.</div></div>
+<div style="display:flex;gap:8px">
+<button onclick="rebootForKernelPatch()" style="padding:6px 14px;background:linear-gradient(135deg,#dc2626,#b91c1c);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Reboot now</button>
+<button onclick="dismissKernelBanner()" style="padding:5px 12px;background:none;border:1px solid rgba(234,179,8,0.3);color:var(--text-dim);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">I&#39;ll reboot later</button>
+</div></div>
+<pre id="kpatch-log-done" style="margin-top:10px;background:#0a0e1a;border:1px solid rgba(16,185,129,0.2);border-radius:6px;padding:10px;font-size:10px;color:var(--text-dim);max-height:140px;overflow-y:auto;white-space:pre-wrap;word-break:break-word;font-family:'JetBrains Mono',monospace"></pre>
+</div>
+<div id="kpatch-error" style="display:none">
+<div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px">
+<div><div style="font-size:13px;font-weight:600;color:var(--red)">&#10007; Kernel patch FAILED &mdash; see log below</div>
+<div style="font-size:11px;color:var(--text-dim);margin-top:4px">apt-get exited non-zero. No reboot will run. Investigate the log and either retry or fix manually over SSH.</div></div>
+<div style="display:flex;gap:8px">
+<button onclick="startKernelPatch()" style="padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Retry</button>
+<button onclick="dismissKernelBanner()" style="padding:5px 12px;background:none;border:1px solid rgba(234,179,8,0.3);color:var(--text-dim);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">Dismiss</button>
+</div></div>
+<pre id="kpatch-log-error" style="margin-top:10px;background:#0a0e1a;border:1px solid rgba(239,68,68,0.25);border-radius:6px;padding:10px;font-size:10px;color:var(--text-secondary);max-height:200px;overflow-y:auto;white-space:pre-wrap;word-break:break-word;font-family:'JetBrains Mono',monospace"></pre>
+</div>
+</div>
 <div class="metrics-bar" id="metrics-bar">
 <div class="metric-card"><div class="metric-label">CPU</div><div class="metric-value" id="cpu-value">{{ metrics.cpu_percent }}%</div></div>
 <div class="metric-card"><div class="metric-label">Memory</div><div class="metric-value" id="ram-value">{{ metrics.ram_percent }}%</div><div class="metric-detail">{{ metrics.ram_used_gb }}GB / {{ metrics.ram_total_gb }}GB</div></div>
@@ -43421,19 +44565,127 @@ if(document.getElementById('fedhub-card-cert-expiry')){
   setInterval(loadFedHubCardCertExpiry,60000);
 }
 loadCaddyCertDays();
+var _kpatchPollTimer=null;
+function _kpatchShowState(state){
+    ['kpatch-idle','kpatch-running','kpatch-done','kpatch-error'].forEach(function(id){
+        var el=document.getElementById(id);if(el)el.style.display=(id==='kpatch-'+state)?'block':'none';
+    });
+}
 async function checkKernelPatch(){
     var banner=document.getElementById('kernel-patch-banner');if(!banner)return;
     var dismissed=localStorage.getItem('kernel-patch-dismissed');
+    // First: check if a background patch job is in flight (started in a prior
+    // session — UI reload, browser refresh, etc.). If so, jump straight into
+    // the live polling state instead of showing the idle banner.
+    try{
+        var jr=await fetch('/api/system/kernel-patch/job-status',{credentials:'same-origin',cache:'no-store'});
+        var jd=await jr.json();
+        if(jd && jd.running){
+            banner.style.display='block';
+            _kpatchShowState('running');
+            document.getElementById('kpatch-pid').textContent='pid '+(jd.pid||'?');
+            document.getElementById('kpatch-log').textContent=jd.log_tail||'(no output yet)';
+            _kpatchStartPolling();
+            return;
+        }
+        if(jd && jd.done){
+            banner.style.display='block';
+            _kpatchShowState('done');
+            document.getElementById('kpatch-log-done').textContent=jd.log_tail||'';
+            return;
+        }
+        if(jd && jd.error){
+            banner.style.display='block';
+            _kpatchShowState('error');
+            document.getElementById('kpatch-log-error').textContent=jd.log_tail||'';
+            return;
+        }
+    }catch(e){}
+    // No in-flight job — fall back to the "is there a kernel update available?" check
     try{
         var r=await fetch('/api/system/kernel-patch-status',{credentials:'same-origin',cache:'no-store'});
         var d=await r.json();
-        if(d.patched){localStorage.removeItem('kernel-patch-dismissed');return;}
-        if(!dismissed){banner.style.display='block';}
+        if(d.patched){localStorage.removeItem('kernel-patch-dismissed');banner.style.display='none';return;}
+        if(!dismissed){banner.style.display='block';_kpatchShowState('idle');}
     }catch(e){}
 }
 function dismissKernelBanner(){
     var b=document.getElementById('kernel-patch-banner');if(b)b.style.display='none';
     localStorage.setItem('kernel-patch-dismissed','1');
+    // Don't kill the polling timer if a job is running in the background —
+    // we just hide the UI. The job continues to run regardless.
+}
+async function startKernelPatch(){
+    if(!confirm('Start kernel patch?\n\nThis will run apt-get full-upgrade in a detached background process. It typically takes 2-5 minutes. Safe over SSH (the job survives session drops). The box will need a reboot after — that\'s a separate explicit click.\n\nContinue?'))return;
+    var banner=document.getElementById('kernel-patch-banner');
+    _kpatchShowState('running');
+    document.getElementById('kpatch-pid').textContent='starting...';
+    document.getElementById('kpatch-log').textContent='Spawning detached background job...';
+    try{
+        var r=await fetch('/api/system/kernel-patch/start',{method:'POST',credentials:'same-origin'});
+        var d=await r.json();
+        if(!d.ok && !d.message){
+            _kpatchShowState('error');
+            document.getElementById('kpatch-log-error').textContent='start failed: '+(d.error||'unknown error');
+            return;
+        }
+        document.getElementById('kpatch-pid').textContent='pid '+(d.pid||'?')+(d.ok?'':' (already running)');
+        _kpatchStartPolling();
+    }catch(e){
+        _kpatchShowState('error');
+        document.getElementById('kpatch-log-error').textContent='start failed: network error - '+e;
+    }
+}
+function _kpatchStartPolling(){
+    if(_kpatchPollTimer)return;
+    _kpatchPollTimer=setInterval(_kpatchPollOnce,3000);
+    _kpatchPollOnce();
+}
+async function _kpatchPollOnce(){
+    try{
+        var r=await fetch('/api/system/kernel-patch/job-status',{credentials:'same-origin',cache:'no-store'});
+        var d=await r.json();
+        var logEl=document.getElementById('kpatch-log');
+        if(logEl && d.log_tail){
+            var atBottom=(logEl.scrollHeight-logEl.scrollTop-logEl.clientHeight)<10;
+            logEl.textContent=d.log_tail;
+            if(atBottom)logEl.scrollTop=logEl.scrollHeight;
+        }
+        if(d.done){
+            clearInterval(_kpatchPollTimer);_kpatchPollTimer=null;
+            _kpatchShowState('done');
+            document.getElementById('kpatch-log-done').textContent=d.log_tail||'';
+            return;
+        }
+        if(d.error){
+            clearInterval(_kpatchPollTimer);_kpatchPollTimer=null;
+            _kpatchShowState('error');
+            document.getElementById('kpatch-log-error').textContent=d.log_tail||'';
+            return;
+        }
+        if(!d.running && !d.done && !d.error){
+            // Job is no longer running, log doesn't show DONE or FATAL — could
+            // be the apt subprocess got killed by the OS, an unexpected exit,
+            // or we polled in the tiny window between Popen returning and the
+            // log getting its first line. Wait one more cycle before deciding.
+            // The next poll will either flip to done/error (apt actually
+            // finished while we were polling) or stay in this limbo state,
+            // in which case we treat it as error.
+            // For now: leave the UI in 'running' state, the next poll resolves.
+        }
+    }catch(e){}
+}
+async function rebootForKernelPatch(){
+    if(!confirm('Reboot now?\n\nThis will reboot the server immediately. The console will be unavailable until the box comes back (usually 1-3 min).\n\nContinue?'))return;
+    var logEl=document.getElementById('kpatch-log-done');
+    if(logEl)logEl.textContent+='\n[browser] reboot requested...';
+    try{
+        await fetch('/api/system/kernel-patch/reboot',{method:'POST',credentials:'same-origin'});
+    }catch(e){}
+    // Either way the box is going down; show a friendly message
+    var bn=document.getElementById('kpatch-done');
+    if(bn)bn.innerHTML='<div style="font-size:13px;font-weight:600;color:var(--cyan)">&#9881; Reboot in progress &mdash; the console will reload automatically when the box is back up...</div>';
+    setTimeout(function(){location.reload();},45000);
 }
 checkKernelPatch();
 var updateBody='';
@@ -45579,6 +46831,25 @@ def _startup_migrations():
         except Exception as _atl_e:
             print(f"Startup migration: tasklog purge error (non-fatal): {_atl_e}", flush=True)
 
+        # v0.9.31: Clear stale `failed` state on takauthentiktasklogpurge.service
+        # when the on-disk script is already the v0.9.26+ fixed version.
+        # Field-found on test6 + test8 (2026-05-18 soak validation) — the May 17
+        # 03:00 UTC weekly timer fired the OLD script, hit VACUUM-in-transaction,
+        # exited 1. v0.9.26 then dropped the fixed script via the migration above,
+        # but `systemctl --failed` still shows the unit stale-failed until either
+        # the next Sunday timer fires successfully or someone manually
+        # reset-failed it. Data hygiene is unaffected (the inline purge above
+        # runs on every boot); this is purely about clearing cosmetic systemd
+        # accounting so audits / dashboards stop showing a spurious failure.
+        # Idempotent: only acts if state IS currently failed AND the on-disk
+        # script contains the `v0.9.26 multi-tier` marker.
+        try:
+            _heal_takauthentik_tasklog_purge_stale_failed_state(
+                lambda m: print(f"Startup migration: {m}", flush=True)
+            )
+        except Exception as _atl_h_err:
+            print(f"Startup migration: tasklog stale-failed heal error (non-fatal): {_atl_h_err}", flush=True)
+
         # v0.8.7: Apply Authentik official tunings (env var name fix + cache + log level).
         # The function is idempotent: returns False if no changes needed (every startup
         # after the first), so the recreate only fires once per box. Migrates the v0.8.2
@@ -45753,6 +47024,23 @@ def _startup_migrations():
         except Exception as ip_fix_err:
             print(f"Startup migration: server_ip auto-correct error (non-fatal): {ip_fix_err}")
 
+        # v0.9.31 — self-heal mediamtx fail-loop on boxes where the takwerx
+        # system user is missing entirely. v0.9.29 hardening added
+        # `User=takwerx` to both mediamtx.service + mediamtx-webeditor.service
+        # but never re-added the corresponding `useradd` (reverted in v0.9.2
+        # and never restored). On any box where the user doesn't already
+        # exist for unrelated reasons, both units fail with status=217/USER
+        # and tight-loop on Restart=always. MUST run BEFORE the
+        # mediamtx-webeditor perm-heal below — that heal does chowns to
+        # takwerx, which silently no-op when the user doesn't exist yet.
+        # Idempotent: skips if user already exists OR mediamtx not installed.
+        try:
+            _heal_takwerx_user_missing_for_mediamtx(
+                lambda m: print(f"Startup migration: {m}", flush=True)
+            )
+        except Exception as wx_err:
+            print(f"Startup migration: takwerx user heal error (non-fatal): {wx_err}")
+
         # v0.9.29 — self-heal mediamtx-webeditor writable paths on existing installs
         # that pre-date the deploy-time chown. The upstream mediamtx_config_editor.py
         # hard-codes BACKUP_DIR=/usr/local/etc/mediamtx_backups and call os.makedirs()
@@ -45841,6 +47129,26 @@ def _startup_migrations():
             )
         except Exception as ak_ph_err:
             print(f"Startup migration: proxy external_hosts canonical check error (non-fatal): {ak_ph_err}")
+
+        # v0.9.31: Fleet-uniform self-heal for the FULL Authentik forward_auth chain
+        # (proxy provider + application + embedded-outpost membership) for every
+        # deployed service. Supersedes the per-service band-aid era — closes the
+        # SSDNodes-fresh-install "takportal.<fqdn> shows Authentik Not Found" class
+        # of bug, where deploy-time 10s PATCH/POST timeouts silently left the chain
+        # half-built. Uses `_ak_api_call` (3 retries with backoff, 30s timeout) and
+        # verifies every PATCH by re-GET, so silent failures stop being silent.
+        #
+        # Runs AFTER the v0.9.21 canonicalizer because:
+        #   - canonicalizer only PATCHes external_host on providers that already exist
+        #   - chain healer creates missing providers + apps + outpost membership
+        # On a healthy box both are no-ops; on a half-built box, canonicalizer fixes
+        # what it can and chain healer fills in everything else.
+        try:
+            _heal_authentik_proxy_chain_all_services(
+                plog=lambda m: print(f"Startup migration: {m}", flush=True)
+            )
+        except Exception as ak_chain_err:
+            print(f"Startup migration: proxy chain heal error (non-fatal): {ak_chain_err}")
 
         # v0.9.21: Start PG connection watchdog — auto-restart authentik-server-1 when
         # total idle connections exceed threshold (default 150).
@@ -46451,6 +47759,16 @@ def _post_update_auto_deploy():
                                         max_attempts=12,
                                         retry_delay_s=5
                                     )
+                                    # v0.9.31: After canonicalizer, run the chain healer to
+                                    # cover provider creation + app + outpost membership for
+                                    # any service whose deploy-time PATCH timed out silently.
+                                    try:
+                                        _heal_authentik_proxy_chain_all_services(
+                                            plog=lambda m: print(f"Post-update: {m}", flush=True),
+                                            settings=load_settings()
+                                        )
+                                    except Exception as _chain_e:
+                                        print(f"Post-update: proxy chain heal skipped: {_chain_e}")
                         except Exception as _akph_e:
                             print(f"Post-update: proxy external_hosts canonicalization skipped: {_akph_e}")
                         # v0.9.12: self-heal LDAP service account password drift.
