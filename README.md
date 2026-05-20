@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v0.9.32-alpha](docs/RELEASE-v0.9.32-alpha.md)**
+**Current release: [v0.9.35-alpha](docs/RELEASE-v0.9.35-alpha.md)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) (or browse [`docs/RELEASE-*.md`](docs/) for inline release notes).
 
@@ -338,6 +338,18 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v0.9.35-alpha — 2026-05-20 — Seven bugfixes: Node-RED backup restore CORS fix + CloudTAK update checkout + CloudTAK spinner + server-side update banner + atakatak nag removed + Help CLI recovery + TAK Server corrupted .deb self-healing — RELEASED 2026-05-20 to `main`
+
+**Headline: seven independent fixes across three subsystems.** (1) Node-RED Emergency Config Restore "Failed to fetch": `loadBackupList()` and `restoreBackup()` now use `_fetchT()` with `redirect: 'manual'` — Authentik's session-expiry 302 produces an opaqueredirect (status 0) instead of a CORS-blocked network error; shows amber "Session expired — reload the page to re-authenticate." (2) CloudTAK update checkout failure: `git checkout -- .` added before fetch+checkout in both local and remote update paths — prevents "local changes would be overwritten" errors on dirty working trees. (3) CloudTAK update button spinner: button now shows a spinning indicator and "Updating…" during `docker compose build --no-cache`; restores original label on completion or error. (4) Server-side update banner: daemon thread warms the GitHub release cache 8 seconds after startup; Console page renders `#srv-update-banner` directly in HTML if an update is available — visible even with completely broken JS (as in v0.9.31). JS hides the server-side banner once running to avoid duplication. (5) atakatak default-cert-password nag removed: `render_default_cert_password_warning()` now always returns `''` — the banner was too alarmist for operators who know what they're doing. (6) Help page "Force update via CLI": new collapsible section with a copyable block of CLI commands to manually update the console when Update Now isn't responding. (7) TAK Server corrupted .deb self-healing: `dpkg-deb --info` validation before install fails fast on corrupted uploads; new `POST /api/takserver/purge-failed-install` endpoint runs `dpkg --purge --force-all takserver` + `rm -rf /opt/tak` + deletes bad uploads + resets deploy status; TAKSERVER_TEMPLATE shows a "Clean up & retry" button in the error state so operators recover from a bad upload without SSH.
+
+- **Fleet validation:** test6 / test8 / test12 pulled `2bb8137`, ran 3h13m with zero `query_wait_timeout`, zero watchdog ALERTs, all containers `(healthy)`. test12 has a pre-existing `docker compose ps` latency spike (2.4s normal, occasionally >5s → timeout in `detect_modules`) that predates this release and is unrelated to any of the seven fixes.
+
+Full notes: [docs/RELEASE-v0.9.35-alpha.md](docs/RELEASE-v0.9.35-alpha.md).
+
+### v0.9.34-alpha — 2026-05-19 — Node-RED KML multipart polygon / polyline support + dedup multi-ring fix — RELEASED 2026-05-19 to `main`
+
+Full notes: [docs/RELEASE-v0.9.34-alpha.md](docs/RELEASE-v0.9.34-alpha.md).
 
 ### v0.9.32-alpha — 2026-05-19 — Two-bug hotfix on v0.9.31: dashboard JS parse-abort (every onclick broken on Console page) + kernel-patch "Reboot now" banner re-fires forever after every reboot — RELEASED 2026-05-19 to `main`
 

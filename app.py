@@ -366,7 +366,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.34-alpha"
+VERSION = "0.9.35-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
@@ -686,6 +686,53 @@ TAK_LOGO_URL = "https://tak.gov/assets/logos/brand-06b80939.svg"
 LOGIN_LOGO_FILENAME = "takwerx-logo.png"
 update_cache = {'latest': None, 'checked': 0, 'notes': '', 'body': ''}
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+def _warm_update_cache_bg():
+    """Populate update_cache once at startup so the server-side update banner
+    shows on the very first console page load — even if the JS <script> block
+    is broken (e.g. the v0.9.31 SyntaxError that stranded users who couldn't
+    see the banner or click Update Now).  Runs in a daemon thread; any network
+    error is silently swallowed."""
+    import urllib.request as _ur
+    try:
+        import time as _t
+        _t.sleep(8)   # let gunicorn finish startup before hitting GitHub
+        _gh = {'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'infra-TAK'}
+        _req = _ur.Request(
+            f'https://api.github.com/repos/{GITHUB_REPO}/tags',
+            headers=_gh
+        )
+        _data = json.loads(_ur.urlopen(_req, timeout=6).read().decode())
+        if not _data:
+            return
+        _main_req = _ur.Request(
+            f'https://api.github.com/repos/{GITHUB_REPO}/commits?sha=main&per_page=100',
+            headers=_gh
+        )
+        try:
+            _main_commits = {c['sha'] for c in json.loads(_ur.urlopen(_main_req, timeout=6).read().decode())}
+        except Exception:
+            _main_commits = None
+        _versions = []
+        for _tag in _data:
+            if _main_commits is not None and _tag.get('commit', {}).get('sha') not in _main_commits:
+                continue
+            _n = _tag.get('name', '').lstrip('v').replace('-alpha', '').replace('-beta', '')
+            _parts = _n.split('.')
+            try:
+                _versions.append((tuple(int(p) for p in _parts), _tag))
+            except (ValueError, IndexError):
+                continue
+        if not _versions:
+            return
+        _versions.sort(key=lambda x: x[0], reverse=True)
+        _latest_tag = _versions[0][1]
+        _latest = _latest_tag.get('name', '').lstrip('v')
+        update_cache.update({'latest': _latest, 'checked': time.time(), 'notes': f"Version {_latest_tag.get('name', '')}", 'body': ''})
+    except Exception:
+        pass
+
+threading.Thread(target=_warm_update_cache_bg, daemon=True).start()
 
 def load_settings():
     p = os.path.join(CONFIG_DIR, 'settings.json')
@@ -1015,55 +1062,8 @@ def render_custom_banner(settings):
 
 
 def render_default_cert_password_warning(settings):
-    """v0.9.29 (security audit MED): show a dismissable banner while the TAK
-    cert export password is still the upstream default `atakatak`.
-
-    Renders only when:
-      - TAK Server is installed (avoid noise on bare consoles),
-      - `tak_cert_password` is unset or equals 'atakatak',
-      - operator has not dismissed it (`cert_pw_warning_dismissed`).
-    """
-    try:
-        if not (settings and os.path.exists('/opt/tak/CoreConfig.xml')):
-            return ''
-        if settings.get('cert_pw_warning_dismissed'):
-            return ''
-        pw = (settings.get('tak_cert_password') or '').strip()
-        if pw and pw != 'atakatak':
-            return ''
-    except Exception:
-        return ''
-    return (
-        '<style>'
-        '.cert-pw-nag{position:fixed;top:0;left:0;right:0;z-index:9998;'
-        'background:linear-gradient(90deg,#7c2d12,#9a3412);color:#fef3c7;'
-        'font-family:"JetBrains Mono",monospace;font-size:13px;'
-        'padding:10px 16px;display:flex;align-items:center;justify-content:center;'
-        'gap:14px;border-bottom:1px solid #fbbf24;flex-wrap:wrap}'
-        '.cert-pw-nag a{color:#fde68a;text-decoration:underline;font-weight:600}'
-        '.cert-pw-nag button{background:transparent;border:1px solid #fde68a;'
-        'color:#fde68a;padding:4px 10px;border-radius:6px;cursor:pointer;'
-        'font-family:inherit;font-size:12px}'
-        '.cert-pw-nag button:hover{background:#fde68a;color:#7c2d12}'
-        'body.has-cert-pw-nag{padding-top:44px}'
-        '</style>'
-        '<div class="cert-pw-nag" role="alert">'
-        '<span>'
-        '<strong>Security:</strong> TAK certificate password is still the '
-        'upstream default <code>atakatak</code>. '
-        '<a href="/takserver#cert-section">Change it on the TAK Server page</a>.'
-        '</span>'
-        '<button type="button" onclick="(function(){'
-        "fetch('/api/security/dismiss-cert-pw-warning',{method:'POST',"
-        "headers:{'Content-Type':'application/json'},body:'{}'})"
-        ".then(function(){document.querySelector('.cert-pw-nag').remove();"
-        "document.body.classList.remove('has-cert-pw-nag');});"
-        '})()">Dismiss</button>'
-        '</div>'
-        '<script>document.body && document.body.classList.add("has-cert-pw-nag");'
-        'document.addEventListener("DOMContentLoaded",function(){'
-        'document.body.classList.add("has-cert-pw-nag");});</script>'
-    )
+    """Removed in v0.9.35 — the atakatak default-password nag was too alarmist for operators who know what they're doing."""
+    return ''
 
 
 def render_sidebar(modules, active_path, takwerx_logo_url=None):
@@ -1843,10 +1843,25 @@ def console_page():
         module_versions = {}
     metrics = get_system_metrics()
     uu_hosts = _build_uu_hosts(metrics, settings)
+    # Server-side update state — used to render a no-JS-required banner so broken
+    # JS (e.g. the v0.9.31 SyntaxError) can't strand users who can't see the banner.
+    _srv_update = False
+    _srv_latest = ''
+    try:
+        _cached = update_cache.get('latest')
+        if _cached and (time.time() - update_cache.get('checked', 0)) < 7200:
+            _cv = tuple(int(p) for p in VERSION.replace('-alpha','').replace('-beta','').split('.'))
+            _lv = tuple(int(p) for p in _cached.replace('-alpha','').replace('-beta','').split('.'))
+            _srv_update = _lv > _cv
+            if _srv_update:
+                _srv_latest = _cached
+    except Exception:
+        pass
     resp = render_template_string(CONSOLE_TEMPLATE,
         settings=settings, modules=modules, metrics=metrics, version=VERSION,
         module_versions=module_versions, authentik_base_url=_get_authentik_base_url(settings),
-        takserver_base_url=_get_takserver_base_url(settings), uu_hosts=uu_hosts)
+        takserver_base_url=_get_takserver_base_url(settings), uu_hosts=uu_hosts,
+        srv_update_available=_srv_update, srv_latest=_srv_latest)
     from flask import make_response
     r = make_response(resp)
     r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
@@ -16563,6 +16578,7 @@ def run_cloudtak_update():
                 return
             checkout_cmd = (
                 f"cd ~/CloudTAK && "
+                f"git checkout -- . && "
                 f"git fetch --depth 1 origin tag {release_tag} && "
                 f"git checkout {release_tag}"
             )
@@ -16577,6 +16593,12 @@ def run_cloudtak_update():
                 plog("✗ ~/CloudTAK not found — use Deploy instead")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
+            # Reset local modifications before tag checkout — patches (nginx, port
+            # bindings) live in docker-compose.override.yml which is untracked, so
+            # discarding tracked-file dirt is safe and mirrors the TAK Portal update path.
+            subprocess.run(
+                f'git -c safe.directory={cloudtak_dir} -C {cloudtak_dir} checkout -- .',
+                shell=True, capture_output=True, text=True, timeout=15)
             r = subprocess.run(
                 f'cd {cloudtak_dir} && git -c safe.directory={cloudtak_dir} fetch --depth 1 origin tag {release_tag} && git -c safe.directory={cloudtak_dir} checkout {release_tag}',
                 shell=True, capture_output=True, text=True, timeout=120)
@@ -22752,18 +22774,31 @@ window.startCloudtakUpdate = function() {
   var logCard = document.getElementById("log-card");
   var dyn = document.getElementById("deploy-log-dyn");
   var stat = document.getElementById("deploy-log");
+  var origBtnHTML = btn ? btn.innerHTML : "";
+  function restoreBtn() {
+    if (btn) { btn.disabled = false; btn.innerHTML = origBtnHTML; btn.style.opacity = "1"; }
+  }
   function showErr(s) {
     if (dyn) dyn.textContent = s;
     if (stat) stat.textContent = s;
-    if (btn) btn.disabled = false;
+    restoreBtn();
     alert(s);
   }
-  if (btn) btn.disabled = true;
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="ct-btn-spinner"></span>Updating\u2026';
+    btn.style.opacity = "0.75";
+  }
   if (logCard) { logCard.style.display = "block"; logCard.scrollIntoView({ behavior: "smooth", block: "nearest" }); }
   var initMsg = "Updating CloudTAK to latest stable release...";
   if (dyn) dyn.textContent = initMsg;
   if (stat) stat.textContent = initMsg;
   window.logIndex = 0;
+  // Proxy so pollLog re-enables the button AND restores its original label on completion.
+  var btnProxy = btn ? {
+    get disabled() { return btn.disabled; },
+    set disabled(v) { if (!v) restoreBtn(); else btn.disabled = true; }
+  } : null;
   fetch("/api/cloudtak/update", {
     method: "POST",
     headers: {"Content-Type": "application/json"},
@@ -22777,7 +22812,7 @@ window.startCloudtakUpdate = function() {
     if (d && d.error) {
       showErr("Error: " + d.error);
     } else {
-      window.pollLog(btn);
+      window.pollLog(btnProxy);
     }
   }).catch(function(e) {
     showErr("Failed: " + (e && e.message ? e.message : String(e)));
@@ -23076,6 +23111,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 .tab.active{background:var(--bg-card);color:var(--text-primary)}
 .tab-panel{display:none}.tab-panel.active{display:block}
 .uninstall-spinner{display:inline-block;width:18px;height:18px;border:2px solid var(--border);border-top-color:var(--cyan);border-radius:50%;animation:uninstall-spin .7s linear infinite;vertical-align:middle;margin-right:8px}
+.ct-btn-spinner{display:inline-block;width:11px;height:11px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:uninstall-spin .7s linear infinite;vertical-align:middle;margin-right:6px}
 @keyframes uninstall-spin{to{transform:rotate(360deg)}}
 .uninstall-progress-row{display:flex;align-items:center;gap:8px;margin-top:10px;font-size:13px;color:var(--text-secondary)}
 .svc-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;margin-top:8px}
@@ -42351,6 +42387,18 @@ def run_takserver_deploy(config):
                     if not _after or 'not-installed' in _after:
                         break
                 log_step("  ✓ Purge complete — proceeding with fresh install")
+            # Validate the .deb before attempting install — fail fast on corrupted uploads
+            # rather than burning through three install attempts and leaving a broken dpkg state.
+            _deb_ok = subprocess.run(
+                f'dpkg-deb --info {pkg} > /dev/null 2>&1',
+                shell=True, capture_output=True, timeout=30
+            )
+            if _deb_ok.returncode != 0:
+                log_step("✗ FATAL: The uploaded package is corrupted or incomplete (dpkg-deb --info failed).")
+                log_step("  On this page: delete the current upload, download a fresh copy from tak.gov, re-upload, then click")
+                log_step("  'Clean up & retry' to purge the broken state before trying again.")
+                deploy_status.update({'error': True, 'running': False})
+                return
             r1 = run_cmd(f'DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y {pkg} 2>&1', check=False)
             if not r1:
                 log_step("  apt-get failed, trying dpkg + dependency fix...")
@@ -42894,6 +42942,38 @@ def deploy_log_stream():
     last = int(request.args.get('after', 0))
     return jsonify({'entries': deploy_log[last:], 'total': len(deploy_log),
         'running': deploy_status['running'], 'complete': deploy_status['complete'], 'error': deploy_status['error']})
+
+
+@app.route('/api/takserver/purge-failed-install', methods=['POST'])
+@login_required
+def takserver_purge_failed_install():
+    """Purge a broken takserver dpkg state after a FATAL install failure so the operator can re-upload and retry."""
+    if deploy_status.get('running'):
+        return jsonify({'error': 'Deployment is running — wait for it to complete first.'}), 400
+    log = []
+    for cmd in [
+        'DEBIAN_FRONTEND=noninteractive dpkg --purge --force-all takserver 2>&1',
+        'rm -rf /opt/tak',
+        'apt-get autoremove -y 2>/dev/null; true',
+    ]:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
+        log.append(r.stdout.strip() or r.stderr.strip() or '(ok)')
+    # Delete any .deb uploads that fail dpkg-deb --info (corrupted files)
+    cleaned_debs = []
+    for fn in os.listdir(UPLOAD_DIR):
+        if 'takserver' in fn.lower() and fn.endswith('.deb'):
+            fp = os.path.join(UPLOAD_DIR, fn)
+            r = subprocess.run(f'dpkg-deb --info {fp} > /dev/null 2>&1', shell=True, capture_output=True, timeout=15)
+            if r.returncode != 0:
+                try:
+                    os.remove(fp)
+                    cleaned_debs.append(fn)
+                except OSError:
+                    pass
+    deploy_status.update({'running': False, 'complete': False, 'error': False, 'cancelled': False})
+    deploy_log.clear()
+    return jsonify({'success': True, 'cleaned_debs': cleaned_debs, 'log': log})
+
 
 # === Shared CSS ===
 BASE_CSS = """
@@ -43868,6 +43948,18 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <p>Accept the self-signed cert and log in with your <strong>console password</strong>. <strong>Full lockout?</strong> If you can't log in at all, you have to get on the CLI: the <strong>README on the GitHub repo</strong> has the exact commands to run on the server to reset the password (e.g. <code style="background:var(--bg-surface);padding:2px 6px;border-radius:4px">./reset-console-password.sh</code>).</p>
 </div></div>
 <div class="help-card">
+<div class="help-card-header" onclick="helpToggle(this)"><h2>Force update via CLI</h2><span class="help-card-toggle">&#9662;</span></div>
+<div class="help-card-body">
+<p>If the <strong>Update Available</strong> banner isn&#39;t showing, or the <strong>Update Now</strong> button isn&#39;t responding, you can force-update the console directly from the server CLI. SSH in and run:</p>
+<pre style="background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:14px 16px;font-family:\'JetBrains Mono\',monospace;font-size:12px;color:var(--cyan);overflow-x:auto;white-space:pre;margin-bottom:12px;position:relative" id="force-update-block">cd $(grep -oP \'WorkingDirectory=\K.*\' /etc/systemd/system/takwerx-console.service)
+git fetch https://github.com/takwerx/infra-TAK.git main
+git checkout --force -B main FETCH_HEAD
+grep \'^VERSION\' app.py
+sudo systemctl restart takwerx-console</pre>
+<button type="button" onclick="(function(){var el=document.getElementById(\'force-update-block\');navigator.clipboard.writeText(el.innerText).then(function(){var b=event.target;b.textContent=\'Copied!\';setTimeout(function(){b.textContent=\'Copy\'},1500)});})()" style="margin-bottom:12px;padding:5px 14px;background:rgba(6,182,212,0.15);color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-family:\'JetBrains Mono\',monospace;font-size:11px;cursor:pointer">Copy</button>
+<p>The <code style="background:var(--bg-surface);padding:2px 6px;border-radius:4px">grep \'&#94;VERSION\'</code> line confirms the new version is on disk before the restart. After <code style="background:var(--bg-surface);padding:2px 6px;border-radius:4px">systemctl restart</code> the console will be back in 10&#8211;15 seconds.</p>
+</div></div>
+<div class="help-card">
 <div class="help-card-header" onclick="helpToggle(this)"><h2>Console password</h2><span class="help-card-toggle">&#9662;</span></div>
 <div class="help-card-body">
 <p>This is the password you set when you ran <code style="background:var(--bg-surface);padding:2px 6px;border-radius:4px">start.sh</code>. The <strong>same password</strong> is used to log in at the backdoor (above) and for <strong>Uninstall all services</strong> on the Console page. We don't store the plaintext, so it can't be shown here. Forgot it? Use the form below if you're logged in; for a full lockout you need the CLI — see the README on the GitHub repo.</p>
@@ -44361,6 +44453,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 </div>
 {% endif %}
+{% if srv_update_available %}<div id="srv-update-banner" style="background:linear-gradient(135deg,rgba(30,64,175,0.15),rgba(14,116,144,0.15));border:1px solid rgba(59,130,246,0.3);border-radius:12px;padding:16px 24px;margin-bottom:24px;font-family:'JetBrains Mono',monospace"><div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px"><div><div style="font-size:13px;font-weight:600;color:var(--cyan)">&#x26A1; Update Available</div><div style="font-size:12px;color:var(--text-secondary);margin-top:4px">v{{ version }} &#x2192; v{{ srv_latest }}</div></div><form action="/api/update/apply" method="POST" style="display:inline"><button type="submit" style="padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Update Now</button></form></div></div>{% endif %}
 <div id="update-banner" style="display:none;background:linear-gradient(135deg,rgba(30,64,175,0.15),rgba(14,116,144,0.15));border:1px solid rgba(59,130,246,0.3);border-radius:12px;padding:16px 24px;margin-bottom:24px;font-family:'JetBrains Mono',monospace">
 <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
 <div>
@@ -44907,6 +45000,8 @@ async function setUpdateChannel(ch){
     }catch(e){if(st)st.textContent='Error: '+e.message;}
 }
 checkUpdate();
+// Hide the server-side fallback banner once JS is running — JS banner takes over.
+(function(){var b=document.getElementById('srv-update-banner');if(b)b.style.display='none';})();
 async function doConsoleRollback(){
     if(!confirm('Roll back console to the previous version?\\n\\nThe console will restart. You may see 502 briefly.'))return;
     var bar=document.getElementById('console-rollback-bar');
@@ -45126,7 +45221,36 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div class="section-title">Deployment Log</div>
 <div id="deploy-log" style="background:#0c0f1a;border:1px solid var(--border);border-radius:12px;padding:20px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary);max-height:500px;overflow-y:auto;line-height:1.7;white-space:pre-wrap">Reconnecting to deployment log...</div>
 <div id="deploy-log-area" style="display:block"></div>
-{% if deploy_done %}
+{% if deploy_error %}
+<div style="margin-top:16px;padding:16px 20px;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.3);border-radius:10px">
+<div style="font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--red);font-weight:600;margin-bottom:8px">✗ Deployment failed</div>
+<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:12px">The install left a broken package state on disk. Click <strong>Clean up &amp; retry</strong> to purge it — any corrupted uploads will be deleted automatically. Then re-upload a fresh copy from <a href="https://tak.gov/products/tak-server" target="_blank" style="color:var(--cyan)">tak.gov</a> and deploy again.</p>
+<button type="button" id="tak-purge-btn" onclick="takPurgeFailed()" style="padding:10px 22px;background:linear-gradient(135deg,#7f1d1d,#b91c1c);color:#fff;border:none;border-radius:8px;font-family:\'DM Sans\',sans-serif;font-size:14px;font-weight:600;cursor:pointer">🧹 Clean up &amp; retry</button>
+<span id="tak-purge-msg" style="margin-left:12px;font-size:13px;color:var(--text-dim)"></span>
+</div>
+<script>
+function takPurgeFailed(){
+  var btn=document.getElementById('tak-purge-btn');
+  var msg=document.getElementById('tak-purge-msg');
+  if(btn){btn.disabled=true;btn.textContent='Cleaning up\u2026';}
+  fetch('/api/takserver/purge-failed-install',{method:'POST',headers:{'Content-Type':'application/json'}})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      if(d.success){
+        if(msg) msg.textContent='Done — page reloading\u2026';
+        setTimeout(function(){window.location.reload();},1200);
+      } else {
+        if(btn){btn.disabled=false;btn.textContent='\uD83E\uDDF9 Clean up & retry';}
+        if(msg) msg.textContent=d.error||'Cleanup failed.';
+      }
+    })
+    .catch(function(){
+      if(btn){btn.disabled=false;btn.textContent='\uD83E\uDDF9 Clean up & retry';}
+      if(msg) msg.textContent='Request failed.';
+    });
+}
+</script>
+{% elif deploy_done %}
 <div id="cert-download-area" style="margin-top:20px"><div class="section-title">Download Certificates</div><div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px"><div class="cert-downloads"><a href="/api/download/admin-cert" class="cert-btn cert-btn-secondary">⬇ admin.p12</a><a href="/api/download/user-cert" class="cert-btn cert-btn-secondary">⬇ user.p12</a><a href="/api/download/truststore" class="cert-btn cert-btn-secondary">⬇ truststore.p12</a></div><div style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim);margin-top:12px">Certificate password: <span style="color:var(--cyan)">{{ settings.get('tak_cert_password','atakatak') }}</span></div></div></div>
 {% endif %}
 {% elif tak.installed %}
