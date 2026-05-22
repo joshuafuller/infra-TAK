@@ -366,8 +366,16 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.36-alpha"
+VERSION = "0.9.37-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
+# Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
+# the full T&E validation on the new Authentik version across ≥3 dev boxes.
+# Main-channel boxes will never be offered a version above AUTHENTIK_VETTED_RELEASE.
+# Dev-channel boxes (update_channel = 'dev' in settings.json) use AUTHENTIK_DEV_RELEASE —
+# the version currently under validation.  When vetting passes, promote DEV → VETTED and
+# bump VERSION to a new infra-TAK release.
+AUTHENTIK_VETTED_RELEASE = "2026.2.3"   # fleet-validated — safe for all customers
+AUTHENTIK_DEV_RELEASE    = "2026.5.0"   # under validation on dev channel (2026-05-22)
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
 CADDYFILE_USER_BLOCKS_MARKER = "# --- User-added blocks (do not remove) ---"
@@ -12096,6 +12104,22 @@ def _get_authentik_latest_release_tag(use_cache=True):
         return _authentik_release_cache.get('tag')
 
 
+def _get_authentik_target_release(settings=None):
+    """Return the operator-approved Authentik version for this box's channel.
+
+    Dev channel (update_channel='dev' in settings.json): AUTHENTIK_DEV_RELEASE — the
+    version currently under validation by the operator.
+
+    Main channel (default): AUTHENTIK_VETTED_RELEASE — the last fleet-validated release.
+    Customers on main are never offered an Authentik version that hasn't been explicitly
+    vetted and promoted by bumping AUTHENTIK_VETTED_RELEASE in a new infra-TAK release.
+    """
+    if settings is None:
+        settings = load_settings()
+    channel = (settings.get('update_channel') or 'main').strip().lower()
+    return AUTHENTIK_DEV_RELEASE if channel == 'dev' else AUTHENTIK_VETTED_RELEASE
+
+
 def _get_authentik_version_info():
     """Return {version: str, update_available: bool, latest: str|None} for Authentik."""
     out = {'version': '', 'update_available': False, 'latest': None}
@@ -12140,15 +12164,28 @@ def _get_authentik_version_info():
                             out['version'] = m.group(1).strip()
         except Exception:
             pass
-    # Compare against latest release
-    latest = _get_authentik_latest_release_tag()
-    if latest:
-        out['latest'] = latest
-        if out['version']:
-            installed = re.sub(r'^[vV\$\{AUTHENTIK_TAG:-]*', '', out['version']).rstrip('}').strip()
-            if installed and installed != latest:
+    # Compare against channel-appropriate vetted target (not raw GitHub latest).
+    # Main channel → AUTHENTIK_VETTED_RELEASE; dev channel → AUTHENTIK_DEV_RELEASE.
+    # update_available is only True when target > installed (never show a downgrade badge).
+    _s = load_settings()
+    _channel = (_s.get('update_channel') or 'main').strip().lower()
+    target = _get_authentik_target_release(_s)
+    out['latest'] = target
+    out['vetted_release'] = AUTHENTIK_VETTED_RELEASE
+    out['dev_release'] = AUTHENTIK_DEV_RELEASE
+    out['channel'] = _channel
+    if out['version']:
+        installed = re.sub(r'^[vV\$\{AUTHENTIK_TAG:-]*', '', out['version']).rstrip('}').strip()
+        out['version'] = installed
+        if installed and installed != target:
+            # Only flag as update_available if target is strictly newer (no downgrade badge)
+            try:
+                _t = tuple(int(x) for x in re.findall(r'\d+', target))
+                _i = tuple(int(x) for x in re.findall(r'\d+', installed))
+                if _t > _i:
+                    out['update_available'] = True
+            except Exception:
                 out['update_available'] = True
-            out['version'] = installed
     return out
 
 
@@ -24527,7 +24564,48 @@ def authentik_page():
             if line.strip():
                 parts = line.split('|||')
                 containers.append({'name': parts[0], 'status': parts[1] if len(parts) > 1 else ''})
+        # Fetch per-container CPU/RAM for the service cards (non-blocking; ignore errors)
+        _stats_cmd = 'docker stats --no-stream --format "{{.Name}}|||{{.CPUPerc}}|||{{.MemUsage}}" 2>/dev/null'
+        _stats_by_name = {}
+        try:
+            if ak_deploy.get('target_mode') == 'remote' and (ak_deploy.get('remote', {}).get('host') or '').strip():
+                _ok_s, _stats_raw = _ssh_probe(ak_deploy['remote'], _stats_cmd, timeout=20)
+                _stats_raw = (_stats_raw or '') if _ok_s else ''
+            else:
+                _sr = subprocess.run(_stats_cmd, shell=True, capture_output=True, text=True, timeout=15)
+                _stats_raw = _sr.stdout or ''
+            for _sl in _stats_raw.strip().split('\n'):
+                if not _sl.strip():
+                    continue
+                _sp = _sl.split('|||')
+                if len(_sp) >= 3:
+                    _cn = _sp[0].strip().lstrip('/')
+                    _cpu_s = _sp[1].strip().rstrip('%')
+                    _mem_s = _sp[2].strip().split('/')[0].strip()
+                    try:
+                        _stats_by_name[_cn] = {'cpu_raw': round(float(_cpu_s), 1), 'mem': _mem_s}
+                    except ValueError:
+                        pass
+        except Exception:
+            pass
+        _vcpu = None
+        try:
+            if ak_deploy.get('target_mode') == 'remote' and (ak_deploy.get('remote', {}).get('host') or '').strip():
+                _vcpu = _get_vcpu_count_remote(ak_deploy.get('remote', {}))
+            else:
+                _vcpu = _get_vcpu_count_local()
+        except Exception:
+            pass
+        for _c in containers:
+            _s = _stats_by_name.get(_c['name'], {})
+            if _s:
+                _raw = _s['cpu_raw']
+                _sys = round(_raw / _vcpu, 1) if (_vcpu and _vcpu > 1) else _raw
+                _c['cpu_raw'] = _raw
+                _c['cpu_sys'] = _sys
+                _c['mem'] = _s['mem']
         container_info['containers'] = containers
+        container_info['vcpu_count'] = _vcpu
     modules = detect_modules()
     portal_installed = modules.get('takportal', {}).get('installed', False)
     portal_running = modules.get('takportal', {}).get('running', False)
@@ -24551,7 +24629,8 @@ def authentik_page():
         portal_installed=portal_installed,
         portal_running=portal_running,
         authentik_deploy_cfg=authentik_deploy_cfg,
-        remote_host=remote_host)
+        remote_host=remote_host,
+        vcpu_count=container_info.get('vcpu_count'))
 
 @app.route('/api/authentik/control', methods=['POST'])
 @login_required
@@ -24572,9 +24651,8 @@ def authentik_control():
         elif action == 'restart':
             _ssh_probe(remote, f'cd {ak_dir} && docker compose down --timeout 30 2>&1 && docker compose up -d 2>&1', timeout=180)
         elif action == 'update':
-            latest = _get_authentik_latest_release_tag(use_cache=False)
-            if latest:
-                _ssh_probe(remote, f"cd {ak_dir} && sed -i 's/AUTHENTIK_TAG:-[^}}]*/AUTHENTIK_TAG:-{latest}/g' docker-compose.yml 2>/dev/null", timeout=10)
+            latest = _get_authentik_target_release(settings)
+            _ssh_probe(remote, f"cd {ak_dir} && sed -i 's/AUTHENTIK_TAG:-[^}}]*/AUTHENTIK_TAG:-{latest}/g' docker-compose.yml 2>/dev/null", timeout=10)
             _ssh_probe(remote, f'cd {ak_dir} && docker compose pull 2>&1 && docker compose up -d 2>&1', timeout=300)
         else:
             return jsonify({'error': 'Invalid action'}), 400
@@ -24592,16 +24670,15 @@ def authentik_control():
         subprocess.run(f'cd {ak_dir} && docker compose down && docker compose up -d', shell=True, capture_output=True, text=True, timeout=120)
     elif action == 'update':
         import re as _re
-        latest = _get_authentik_latest_release_tag(use_cache=False)
+        latest = _get_authentik_target_release(settings)
         cp = os.path.join(ak_dir, 'docker-compose.yml')
-        if latest:
-            if os.path.isfile(cp):
-                with open(cp) as _f:
-                    _cc = _f.read()
-                _new = _re.sub(r'AUTHENTIK_TAG:-[^}]+', f'AUTHENTIK_TAG:-{latest}', _cc)
-                if _new != _cc:
-                    with open(cp, 'w') as _f:
-                        _f.write(_new)
+        if os.path.isfile(cp):
+            with open(cp) as _f:
+                _cc = _f.read()
+            _new = _re.sub(r'AUTHENTIK_TAG:-[^}]+', f'AUTHENTIK_TAG:-{latest}', _cc)
+            if _new != _cc:
+                with open(cp, 'w') as _f:
+                    _f.write(_new)
         _ensure_authentik_compose_patches(cp)
         subprocess.run(f'cd {ak_dir} && docker compose pull && docker compose up -d && docker image prune -f', shell=True, capture_output=True, text=True, timeout=300)
     else:
@@ -24651,6 +24728,50 @@ def _authentik_installed_for_reconfigure():
     except Exception:
         pass
     return False
+
+
+@app.route('/api/authentik/container-stats')
+@login_required
+def authentik_container_stats():
+    """Return per-container CPU (system-normalized %) + RAM for the Authentik service cards."""
+    settings = load_settings()
+    deploy_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+    _stats_cmd = 'docker stats --no-stream --format "{{.Name}}|||{{.CPUPerc}}|||{{.MemUsage}}" 2>/dev/null'
+    _stats_raw = ''
+    _is_remote = deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip()
+    try:
+        if _is_remote:
+            _ok, _stats_raw = _ssh_probe(deploy_cfg['remote'], _stats_cmd, timeout=20)
+            if not _ok:
+                _stats_raw = ''
+        else:
+            _r = subprocess.run(_stats_cmd, shell=True, capture_output=True, text=True, timeout=15)
+            _stats_raw = _r.stdout or ''
+    except Exception:
+        pass
+    _vcpu = None
+    try:
+        _vcpu = _get_vcpu_count_remote(deploy_cfg['remote']) if _is_remote else _get_vcpu_count_local()
+    except Exception:
+        pass
+    result = {}
+    for _sl in (_stats_raw or '').strip().split('\n'):
+        if not _sl.strip():
+            continue
+        _sp = _sl.split('|||')
+        if len(_sp) >= 3:
+            _cn = _sp[0].strip().lstrip('/')
+            _cpu_s = _sp[1].strip().rstrip('%')
+            _mem_s = _sp[2].strip().split('/')[0].strip()
+            if not _cn.startswith('authentik'):
+                continue
+            try:
+                _raw = round(float(_cpu_s), 1)
+                _sys = round(_raw / _vcpu, 1) if (_vcpu and _vcpu > 1) else _raw
+                result[_cn] = {'cpu_raw': _raw, 'cpu_sys': _sys, 'mem': _mem_s, 'vcpu_count': _vcpu}
+            except ValueError:
+                pass
+    return jsonify(result)
 
 
 @app.route('/api/authentik/reconfigure', methods=['POST'])
@@ -25463,8 +25584,8 @@ entries:
     # Step 5: Generate docker-compose.yml and copy
     plog("")
     plog("━━━ Step 5/8: Creating Docker Compose ━━━")
-    _ak_latest = _get_authentik_latest_release_tag(use_cache=False) or '2026.2.1'
-    plog(f"  Authentik version: {_ak_latest}")
+    _ak_latest = _get_authentik_target_release()
+    plog(f"  Authentik version: {_ak_latest} (channel: {(load_settings().get('update_channel') or 'main')})")
     compose_content = """services:
   postgresql:
     image: docker.io/library/postgres:16-alpine
@@ -33636,14 +33757,24 @@ entries:
             # The inline text-based pg_cmd injection has been removed to avoid duplicate-key emissions.
             # _ensure_authentik_compose_patches is called after the file is written (see below).
 
-        # Pin AUTHENTIK_TAG to latest stable release
-        ak_tag = _get_authentik_latest_release_tag(use_cache=False) or '2026.2.1'
-        plog(f"  Authentik version: {ak_tag}")
+        # Pin AUTHENTIK_TAG to the channel-appropriate vetted release.
+        # Only upgrade (target > current); never silently downgrade an operator-upgraded install.
+        ak_tag = _get_authentik_target_release()
+        plog(f"  Authentik version target: {ak_tag}")
         for i, l in enumerate(lines):
             m = re.search(r'AUTHENTIK_TAG:-([^}]+)', l)
-            if m and m.group(1).strip() != ak_tag:
-                lines[i] = l.replace(f'AUTHENTIK_TAG:-{m.group(1)}', f'AUTHENTIK_TAG:-{ak_tag}')
-                needs_write = True
+            if m:
+                cur_tag = m.group(1).strip()
+                if cur_tag != ak_tag:
+                    try:
+                        _ct = tuple(int(x) for x in re.findall(r'\d+', cur_tag))
+                        _tt = tuple(int(x) for x in re.findall(r'\d+', ak_tag))
+                        if _tt > _ct:
+                            lines[i] = l.replace(f'AUTHENTIK_TAG:-{m.group(1)}', f'AUTHENTIK_TAG:-{ak_tag}')
+                            needs_write = True
+                    except Exception:
+                        lines[i] = l.replace(f'AUTHENTIK_TAG:-{m.group(1)}', f'AUTHENTIK_TAG:-{ak_tag}')
+                        needs_write = True
         # Inject healthchecks for server and worker if missing (upstream compose may not have them)
         if not any('ak healthcheck' in l or 'ak", "healthcheck' in l for l in lines):
             _hc_block = '    healthcheck:\n      test: ["CMD", "ak", "healthcheck"]\n      start_period: 600s\n      interval: 30s\n      timeout: 10s\n      retries: 5\n'
@@ -34788,9 +34919,9 @@ body{display:flex;min-height:100vh}
 {% if deploying %}
 <div class="status-info"><div class="status-icon running" style="background:rgba(59,130,246,0.1)">🔄</div><div><div class="status-text" style="color:var(--accent)">Deploying...</div><div class="status-detail">Authentik installation in progress</div></div></div>
 {% elif ak.installed and ak.running %}
-<div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--green)">Running</div><div class="status-detail">Identity provider active{% if ak_version_info and ak_version_info.version %} · <span class="os-badge" style="margin-left:4px">v{{ ak_version_info.version }}</span>{% if ak_version_info.update_available and ak_version_info.latest %} · <span style="color:var(--cyan);font-size:11px">v{{ ak_version_info.latest }} available</span>{% endif %}{% endif %}</div></div></div>
+<div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--green)">Running</div><div class="status-detail">Identity provider active{% if ak_version_info and ak_version_info.version %} · <span class="os-badge" style="margin-left:4px">v{{ ak_version_info.version }}</span>{% if ak_version_info.update_available and ak_version_info.latest %} · <span style="color:var(--cyan);font-size:11px">v{{ ak_version_info.latest }} available</span>{% elif ak_version_info.channel == 'dev' %} · <span style="color:#f59e0b;font-size:10px" title="Dev channel — testing v{{ ak_version_info.dev_release }}">dev: v{{ ak_version_info.dev_release }}</span>{% elif not ak_version_info.update_available %} · <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% endif %}</div></div></div>
 {% elif ak.installed %}
-<div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--red)">Stopped</div><div class="status-detail">Docker containers not running{% if ak_version_info and ak_version_info.version %} · <span class="os-badge" style="margin-left:4px">v{{ ak_version_info.version }}</span>{% if ak_version_info.update_available and ak_version_info.latest %} · <span style="color:var(--cyan);font-size:11px">v{{ ak_version_info.latest }} available</span>{% endif %}{% endif %}</div></div></div>
+<div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--red)">Stopped</div><div class="status-detail">Docker containers not running{% if ak_version_info and ak_version_info.version %} · <span class="os-badge" style="margin-left:4px">v{{ ak_version_info.version }}</span>{% if ak_version_info.update_available and ak_version_info.latest %} · <span style="color:var(--cyan);font-size:11px">v{{ ak_version_info.latest }} available</span>{% elif ak_version_info.channel == 'dev' %} · <span style="color:#f59e0b;font-size:10px" title="Dev channel — testing v{{ ak_version_info.dev_release }}">dev: v{{ ak_version_info.dev_release }}</span>{% elif not ak_version_info.update_available %} · <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% endif %}</div></div></div>
 {% else %}
 <div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--text-dim)">Not Installed</div><div class="status-detail">Deploy Authentik for identity management & SSO</div></div></div>
 {% endif %}
@@ -34800,7 +34931,7 @@ body{display:flex;min-height:100vh}
 <div class="section-title" style="margin-top:20px">Controls</div>
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:24px">
 <div class="controls" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
-{% if ak.running %}<button class="control-btn" onclick="akControl('restart')">↻ Restart</button><button class="control-btn" onclick="reconfigureAk()">🔄 Update config</button><button class="control-btn btn-update" id="ak-update-btn" onclick="akUpdate()"{% if ak_version_info and ak_version_info.update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if ak_version_info and ak_version_info.update_available %} <span style="color:var(--cyan)" title="Update available: v{{ ak_version_info.latest }}">●</span>{% endif %}</button>{% if authentik_deploy_cfg.target_mode == 'remote' %}<button class="control-btn" onclick="fixAkLdapToken(this)" title="Emergency: inject LDAP outpost token and recreate LDAP container">🔑 Fix LDAP token</button>{% endif %}<button class="control-btn btn-stop" onclick="akControl('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('ak-uninstall-modal').classList.add('open')">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="akControl('start')">▶ Start</button><button class="control-btn" onclick="reconfigureAk()">🔄 Update config</button><button class="control-btn btn-update" id="ak-update-btn" onclick="akUpdate()"{% if ak_version_info and ak_version_info.update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if ak_version_info and ak_version_info.update_available %} <span style="color:var(--cyan)" title="Update available: v{{ ak_version_info.latest }}">●</span>{% endif %}</button>{% if authentik_deploy_cfg.target_mode == 'remote' %}<button class="control-btn" onclick="fixAkLdapToken(this)" title="Emergency: inject LDAP outpost token and recreate LDAP container">🔑 Fix LDAP token</button>{% endif %}<button class="control-btn btn-remove" onclick="document.getElementById('ak-uninstall-modal').classList.add('open')">🗑 Remove</button>{% endif %}
+{% if ak.running %}<button class="control-btn" onclick="akControl('restart')">↻ Restart</button><button class="control-btn" onclick="reconfigureAk()">🔄 Update config</button><button class="control-btn btn-update" id="ak-update-btn" onclick="akUpdate()"{% if ak_version_info and ak_version_info.update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if ak_version_info and ak_version_info.update_available %} <span style="color:var(--cyan)" title="Update to v{{ ak_version_info.latest }}{% if ak_version_info.channel == 'dev' %} (dev channel){% else %} (fleet-vetted){% endif %}">●</span>{% endif %}</button>{% if authentik_deploy_cfg.target_mode == 'remote' %}<button class="control-btn" onclick="fixAkLdapToken(this)" title="Emergency: inject LDAP outpost token and recreate LDAP container">🔑 Fix LDAP token</button>{% endif %}<button class="control-btn btn-stop" onclick="akControl('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('ak-uninstall-modal').classList.add('open')">🗑 Remove</button>{% else %}<button class="control-btn btn-start" onclick="akControl('start')">▶ Start</button><button class="control-btn" onclick="reconfigureAk()">🔄 Update config</button><button class="control-btn btn-update" id="ak-update-btn" onclick="akUpdate()"{% if ak_version_info and ak_version_info.update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if ak_version_info and ak_version_info.update_available %} <span style="color:var(--cyan)" title="Update to v{{ ak_version_info.latest }}{% if ak_version_info.channel == 'dev' %} (dev channel){% else %} (fleet-vetted){% endif %}">●</span>{% endif %}</button>{% if authentik_deploy_cfg.target_mode == 'remote' %}<button class="control-btn" onclick="fixAkLdapToken(this)" title="Emergency: inject LDAP outpost token and recreate LDAP container">🔑 Fix LDAP token</button>{% endif %}<button class="control-btn btn-remove" onclick="document.getElementById('ak-uninstall-modal').classList.add('open')">🗑 Remove</button>{% endif %}
 </div>
 <div id="ak-update-status" style="display:none;margin-top:10px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary)"></div>
 </div>
@@ -34875,7 +35006,7 @@ body{display:flex;min-height:100vh}
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
 <div class="svc-grid">
 {% for c in container_info.containers %}
-<div class="svc-card" onclick="filterLogs('{{ c.name }}')" style="cursor:pointer;border-color:{{ 'var(--red)' if 'unhealthy' in c.status else 'var(--green)' if 'healthy' in c.status else 'var(--border)' }}" id="svc-{{ c.name }}"><div class="svc-name">{{ c.name }}</div><div class="svc-status" style="color:{{ 'var(--red)' if 'unhealthy' in c.status else 'var(--green)' }}">● {{ c.status }}</div></div>
+<div class="svc-card" onclick="filterLogs('{{ c.name }}')" style="cursor:pointer;border-color:{{ 'var(--red)' if 'unhealthy' in c.status else 'var(--green)' if 'healthy' in c.status else 'var(--border)' }}" id="svc-{{ c.name }}"><div class="svc-name">{{ c.name }}</div><div class="svc-status" style="color:{{ 'var(--red)' if 'unhealthy' in c.status else 'var(--green)' }}">● {{ c.status }}</div>{% if 'cpu_sys' in c %}<div id="svc-metrics-{{ c.name }}" style="font-size:10px;margin-top:4px;line-height:1.5"><span class="svc-cpu" style="color:{{ 'var(--red)' if c.cpu_sys >= 50 else 'var(--text-dim)' }}" title="{{ c.cpu_raw }}% per-core{{ ' · investigate if sustained' if c.cpu_sys >= 50 else '' }}">{{ c.cpu_sys }}% sys</span><span class="svc-mem" style="color:var(--text-dim);margin-left:6px">{{ c.mem }}</span></div>{% endif %}</div>
 {% endfor %}
 <div class="svc-card" onclick="filterLogs('')" style="cursor:pointer" id="svc-all"><div class="svc-name">all containers</div><div class="svc-status" style="color:var(--text-dim)">● combined</div></div>
 </div>
@@ -35347,6 +35478,29 @@ async function loadContainerLogs(){
     }catch(e){el.textContent='Failed to load logs';}
 }
 if(document.getElementById('container-log')){loadContainerLogs();setInterval(loadContainerLogs,10000)}
+
+async function refreshContainerStats(){
+    try{
+        var r=await fetch('/api/authentik/container-stats');
+        if(!r.ok)return;
+        var data=await r.json();
+        for(var name in data){
+            var el=document.getElementById('svc-metrics-'+name);
+            if(!el)continue;
+            var d=data[name];
+            var cpuSys=Number(d.cpu_sys||0);
+            var cpuEl=el.querySelector('.svc-cpu');
+            var memEl=el.querySelector('.svc-mem');
+            if(cpuEl){
+                cpuEl.textContent=cpuSys.toFixed(1)+'% sys';
+                cpuEl.style.color=cpuSys>=50?'var(--red)':'var(--text-dim)';
+                cpuEl.title=Number(d.cpu_raw||0).toFixed(1)+'% per-core'+(cpuSys>=50?' · investigate if sustained':'');
+            }
+            if(memEl)memEl.textContent=d.mem||'';
+        }
+    }catch(e){}
+}
+if(document.querySelector('[id^="svc-metrics-"]')){refreshContainerStats();setInterval(refreshContainerStats,15000);}
 
 async function loadRemoteMetrics(){
     var bar=document.getElementById('remote-metrics-bar');
@@ -44665,7 +44819,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% if not mod.get('icon_url') or key in ('takportal', 'fedhub', 'emailrelay', 'fail2ban') %}<div class="module-name">{{ mod.name }}</div>{% endif %}
 </div>
 <div class="module-desc">{{ mod.description }}</div>
-{% if module_versions.get(key) %}{% set v = module_versions.get(key) %}{% if v.version or v.update_available %}<div class="meta-line module-version-line" id="module-version-{{ key }}" style="margin-bottom:4px">{% if v.version %}{% if key == 'mediamtx' %}{{ v.version }}{% else %}v{{ v.version }}{% endif %}{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% endif %}</div>{% endif %}{% endif %}
+{% if module_versions.get(key) %}{% set v = module_versions.get(key) %}{% if v.version or v.update_available %}<div class="meta-line module-version-line" id="module-version-{{ key }}" style="margin-bottom:4px">{% if v.version %}{% if key == 'mediamtx' %}{{ v.version }}{% else %}v{{ v.version }}{% endif %}{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% elif key == 'authentik' and v.get('channel') == 'dev' %} <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v{{ v.get('vetted_release','') }}">· main: v{{ v.get('vetted_release','') }}</span>{% elif key == 'authentik' and not v.update_available and v.get('vetted_release') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}</div>{% endif %}{% endif %}
 <span class="module-status status-{% if mod.installed and mod.running %}running{% elif mod.installed %}stopped{% else %}not-installed{% endif %}" id="module-status-{{ key }}" data-module="{{ key }}" data-gd-overall="{% if key == 'guarddog' and mod.installed and mod.running %}fetch{% endif %}">{% if mod.installed and mod.running %}<span class="status-dot"></span> Running{% elif mod.installed %}<span class="status-dot"></span> Stopped{% else %}Not Installed{% endif %}</span>
 {% if key == 'takserver' and mod.installed %}<div id="takserver-card-cert-expiry" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
 {% if key == 'fedhub' and mod.installed %}<div id="fedhub-card-cert-expiry" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
@@ -44704,7 +44858,8 @@ async function toggleUU(cb){
 }
 function escapeHtml(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML;}
 function formatRamGb(memPct,totalRamGb){if(totalRamGb==null)return '';var gb=(Number(memPct||0)/100)*totalRamGb;return gb.toFixed(2)+' GB';}
-function cpuColor(pct){var n=Number(pct||0);if(n>=90)return 'var(--red)';if(n>=70)return '#eab308';return 'var(--green)';}
+function cpuColor(pct){var n=Number(pct||0);if(n>=80)return 'var(--red)';if(n>=50)return '#eab308';return 'var(--green)';}
+function normCpu(rawPct,vcpus){return vcpus>1?rawPct/vcpus:rawPct;}
 function diskIoColor(mbs){var m=Number(mbs||0);if(m>=200)return 'var(--green)';if(m>=80)return '#eab308';return 'var(--red)';}
 function renderResourceBreakdown(div,data,hostId){
     var err=data.error,cpuTop=data.cpu_top,memTop=data.mem_top,totalRamGb=data.total_ram_gb,processor=data.processor,vcpuCount=data.vcpu_count,diskWrite=data.disk_io_write_mbs,diskSrc=data.disk_io_source,speedWrite=data.disk_speed_test_write_mbs,speedErr=data.disk_speed_test_error;
@@ -44719,13 +44874,14 @@ function renderResourceBreakdown(div,data,hostId){
     else if(speedErr)html+='<div style="margin-bottom:6px;color:var(--red)">Disk speed test: '+escapeHtml(speedErr)+'</div>';
     var ramCell='padding:2px 8px 2px 0;border-bottom:1px solid rgba(255,255,255,0.06);text-align:right;color:var(--text-dim);white-space:nowrap';
     if(cpuTop&&cpuTop.length){
-        html+='<div style="margin-bottom:10px"><strong style="color:var(--cyan)">Top by CPU</strong><table style="'+tbl+';margin-top:4px"><thead><tr><th style="'+th+'">Process</th><th style="'+th+';'+r+'">CPU %</th><th style="'+th+';'+r+'">RAM %</th>'+(totalRamGb!=null?'<th style="'+th+';'+r+'">RAM</th>':'')+'</tr></thead><tbody>';
-        cpuTop.forEach(function(p){var ramStr=formatRamGb(p.mem_pct,totalRamGb);var cpuPct=Number(p.cpu_pct||0);html+='<tr><td style="'+td+'">'+escapeHtml(p.name||'')+'</td><td style="'+td+';'+r+';color:'+cpuColor(cpuPct)+'">'+cpuPct.toFixed(1)+'%</td><td style="'+td+';'+r+'">'+Number(p.mem_pct||0).toFixed(1)+'%</td>'+(totalRamGb!=null?'<td style="'+ramCell+'">'+ramStr+'</td>':'')+'</tr>';});
+        var cpuHdr=vcpuCount?'CPU % (sys)':'CPU %';
+        html+='<div style="margin-bottom:10px"><strong style="color:var(--cyan)">Top by CPU</strong>'+(vcpuCount?'<span style="color:var(--text-dim);font-size:10px;margin-left:6px">normalized across '+vcpuCount+' vCPUs</span>':'')+'<table style="'+tbl+';margin-top:4px"><thead><tr><th style="'+th+'">Process</th><th style="'+th+';'+r+'">'+cpuHdr+'</th><th style="'+th+';'+r+'">RAM %</th>'+(totalRamGb!=null?'<th style="'+th+';'+r+'">RAM</th>':'')+'</tr></thead><tbody>';
+        cpuTop.forEach(function(p){var ramStr=formatRamGb(p.mem_pct,totalRamGb);var rawCpu=Number(p.cpu_pct||0);var dispCpu=normCpu(rawCpu,vcpuCount||1);var tooltip=vcpuCount?'title="'+rawCpu.toFixed(1)+'% per-core ('+rawCpu.toFixed(1)+' / '+vcpuCount+' vCPUs)"':'';html+='<tr><td style="'+td+'">'+escapeHtml(p.name||'')+'</td><td style="'+td+';'+r+';color:'+cpuColor(dispCpu)+'" '+tooltip+'>'+dispCpu.toFixed(1)+'%</td><td style="'+td+';'+r+'">'+Number(p.mem_pct||0).toFixed(1)+'%</td>'+(totalRamGb!=null?'<td style="'+ramCell+'">'+ramStr+'</td>':'')+'</tr>';});
         html+='</tbody></table></div>';
     }
     if(memTop&&memTop.length){
-        html+='<div><strong style="color:var(--cyan)">Top by RAM</strong><table style="'+tbl+';margin-top:4px"><thead><tr><th style="'+th+'">Process</th><th style="'+th+';'+r+'">RAM %</th>'+(totalRamGb!=null?'<th style="'+th+';'+r+'">RAM</th>':'')+'<th style="'+th+';'+r+'">CPU %</th></tr></thead><tbody>';
-        memTop.forEach(function(p){var ramStr=formatRamGb(p.mem_pct,totalRamGb);var cpuPct=Number(p.cpu_pct||0);html+='<tr><td style="'+td+'">'+escapeHtml(p.name||'')+'</td><td style="'+td+';'+r+'">'+Number(p.mem_pct||0).toFixed(1)+'%</td>'+(totalRamGb!=null?'<td style="'+ramCell+'">'+ramStr+'</td>':'')+'<td style="'+td+';'+r+';color:'+cpuColor(cpuPct)+'">'+cpuPct.toFixed(1)+'%</td></tr>';});
+        html+='<div><strong style="color:var(--cyan)">Top by RAM</strong><table style="'+tbl+';margin-top:4px"><thead><tr><th style="'+th+'">Process</th><th style="'+th+';'+r+'">RAM %</th>'+(totalRamGb!=null?'<th style="'+th+';'+r+'">RAM</th>':'')+'<th style="'+th+';'+r+'">'+cpuHdr+'</th></tr></thead><tbody>';
+        memTop.forEach(function(p){var ramStr=formatRamGb(p.mem_pct,totalRamGb);var rawCpu=Number(p.cpu_pct||0);var dispCpu=normCpu(rawCpu,vcpuCount||1);var tooltip=vcpuCount?'title="'+rawCpu.toFixed(1)+'% per-core"':'';html+='<tr><td style="'+td+'">'+escapeHtml(p.name||'')+'</td><td style="'+td+';'+r+'">'+Number(p.mem_pct||0).toFixed(1)+'%</td>'+(totalRamGb!=null?'<td style="'+ramCell+'">'+ramStr+'</td>':'')+'<td style="'+td+';'+r+';color:'+cpuColor(dispCpu)+'" '+tooltip+'>'+dispCpu.toFixed(1)+'%</td></tr>';});
         html+='</tbody></table></div>';
     }
     if(!html)html='No process data.';
@@ -44791,8 +44947,14 @@ function refreshModuleVersions(){
             if(!el)continue;
             var d=data[key];
             var s='';
-            if(d.version)s='v'+d.version;
-            if(d.update_available)s+=(s?' ':'')+'<span style="color:var(--cyan);font-size:10px" title="Update available">update</span>';
+            if(d.version)s=(key==='mediamtx'?'':'v')+d.version;
+            if(d.update_available){
+                s+=(s?' ':'')+'<span style="color:var(--cyan);font-size:10px" title="Update available">update</span>';
+            }else if(key==='authentik'&&d.channel==='dev'&&d.vetted_release){
+                s+=' <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v'+d.vetted_release+'">· main: v'+d.vetted_release+'</span>';
+            }else if(key==='authentik'&&d.vetted_release){
+                s+=' <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted \u2713</span>';
+            }
             el.innerHTML=s;if(s)el.style.display='';
         }
     }).catch(function(){});
