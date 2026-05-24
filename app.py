@@ -366,7 +366,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.37-alpha"
+VERSION = "0.9.38-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -383,6 +383,8 @@ CADDYFILE_USER_BLOCKS_MARKER = "# --- User-added blocks (do not remove) ---"
 CLOUDTAK_ICON = "data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiPz48c3ZnIGlkPSJMYXllcl8xIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHhtbG5zOnhsaW5rPSJodHRwOi8vd3d3LnczLm9yZy8xOTk5L3hsaW5rIiB2aWV3Qm94PSIwIDAgNzQuMyA0Ni42MiI+PGRlZnM+PHN0eWxlPi5jbHMtMXtmaWxsOnVybCgjbGluZWFyLWdyYWRpZW50LTIpO30uY2xzLTJ7ZmlsbDp1cmwoI2xpbmVhci1ncmFkaWVudCk7fTwvc3R5bGU+PGxpbmVhckdyYWRpZW50IGlkPSJsaW5lYXItZ3JhZGllbnQiIHgxPSIxNC4zOCIgeTE9IjguOTMiIHgyPSI2Ni45MiIgeTI9IjYxLjQ3IiBncmFkaWVudFVuaXRzPSJ1c2VyU3BhY2VPblVzZSI+PHN0b3Agb2Zmc2V0PSIwIiBzdG9wLWNvbG9yPSIjZmY5ODIwIi8+PHN0b3Agb2Zmc2V0PSIuNDIiIHN0b3AtY29sb3I9IiNmZmNlMDQiLz48c3RvcCBvZmZzZXQ9Ii40OSIgc3RvcC1jb2xvcj0iZ29sZCIvPjwvbGluZWFyR3JhZGllbnQ+PGxpbmVhckdyYWRpZW50IGlkPSJsaW5lYXItZ3JhZGllbnQtMiIgeDE9IjU5LjI3IiB5MT0iLS4zOCIgeDI9IjcyLjc0IiB5Mj0iMTIuMDgiIGdyYWRpZW50VW5pdHM9InVzZXJTcGFjZU9uVXNlIj48c3RvcCBvZmZzZXQ9IjAiIHN0b3AtY29sb3I9IiNmZjk4MjAiLz48c3RvcCBvZmZzZXQ9Ii4yOSIgc3RvcC1jb2xvcj0iI2ZmYjYxMCIvPjxzdG9wIG9mZnNldD0iLjU3IiBzdG9wLWNvbG9yPSJnb2xkIi8+PC9saW5lYXJHcmFkaWVudD48L2RlZnM+PHBhdGggY2xhc3M9ImNscy0yIiBkPSJNNzIuMDUsMjMuNTVjLTEuMjYtMS44OC0zLjAxLTMuNDUtNS4yMS00LjY1LTEuODUtMS4wMS0zLjY5LTEuNTktNS4wNi0xLjkxLS40Mi0xLjc0LTEuMjMtNC4yOC0yLjc3LTYuODVDNTYuNDQsNS44OCw1MS4zNy42Nyw0MS43LjA2Yy0uNTktLjA0LTEuMTgtLjA2LTEuNzUtLjA2LTcuODIsMC0xMi4wNCwzLjUyLTE0LjE5LDYuNDctLjkxLDEuMjQtMS41MywyLjQ4LTEuOTUsMy41NS0uODYtLjEzLTEuODYtLjIyLTIuOTMtLjIyLTMuNTYsMC02LjUyLDEuMDgtOC41NCwzLjEzLTEuOTEsMS45Mi0zLjIsNC4yNi0zLjczLDYuNzUtLjA5LjQxLS4xNS44LS4xOSwxLjE2LS45NS40Ny0yLjEyLDEuMTYtMy4yOSwyLjExQzEuNTYsMjUuODMtLjIsMjkuNjcuMDIsMzQuMDZjLjIyLDQuNDEsMi4yNyw3Ljk2LDUuOTQsMTAuMjksMi42LDEuNjUsNS4xLDIuMTksNS4zOCwyLjIzbC4yMi4wM2guMjJzNDguODYsMCw0OC44NiwwaC4xcy4xLDAsLjEsMGMuMzQtLjAyLDMuMzktLjI2LDYuNTQtMi4xMywzLjA0LTEuOCw2LjctNS40NSw2LjkyLTEyLjU2LjEtMy4xOC0uNjYtNS45OS0yLjI0LTguMzZaTTE0LjQzLDE1YzEuNzUtMS43Nyw0LjI0LTIuMjYsNi40NS0yLjI2LDIuNzEsMCw0Ljk5LjczLDQuOTkuNzMsMCwwLDEuMzMtMTAuNTMsMTQuMDctMTAuNTMuNSwwLDEuMDMuMDIsMS41Ny4wNSwxNi4yNCwxLjAzLDE3Ljc0LDE2LjU0LDE3Ljc0LDE2LjU0LDAsMCw0LjY3LjQyLDguMjEsMy4zMS0zLjQ3LDMuMjItNC45NSw1LjE5LTEyLjc3LDUuNzUtOC42NS42MS03LjQ3LDMuOTUtNy40NywzLjk1bC00LjA1LTguOThoNS43OWMuMTQtMi44NS0uODctNS42NS01LjMxLTUuNjVoLTguNDlsLTYuNTYsMTQuNjJzMS45Ni0zLjMxLTYuNjktMy45NWMtNy42OS0uNTUtNy41OC0yLjY5LTEwLjYxLTUuODgtLjA2LS41OC0uMjYtNC4zLDMuMTMtNy43MloiLz48cGF0aCBjbGFzcz0iY2xzLTEiIGQ9Ik02MS43OSwzLjczaDIuNTl2LjY0aC0uOTN2Mi4zOGgtLjc0di0yLjM4aC0uOTN2LS42NFpNNjcuMDUsMy43M2wtLjc3LDIuMDMtLjc3LTIuMDNoLS45M3YzLjAzaC43di0ybC43MywyaC41NGwuNzMtMnYyaC43di0zLjAzaC0uOTNaIi8+PC9zdmc+"
 # MediaMTX official logo (external URL to avoid long inline strings)
 MEDIAMTX_LOGO_URL = "/static/mediamtx-logo.png"
+# Cesium 3D Tiles logo (bundled SVG — includes wordmark, no separate label needed)
+CESIUM_TILES_LOGO_URL = "/static/3DTiles_light_color.svg"
 # MediaMTX web editor: regular repo (no LDAP); when Authentik/LDAP is installed we use LDAP branch if set
 MEDIAMTX_EDITOR_REPO = "https://github.com/takwerx/mediamtx-installer.git"
 MEDIAMTX_EDITOR_PATH = "config-editor"  # subdir containing mediamtx_config_editor.py
@@ -972,6 +974,46 @@ def detect_modules():
         email_running = r.stdout.strip() == 'active'
     modules['emailrelay'] = {'name': 'Email Relay', 'installed': email_installed, 'running': email_running,
         'description': 'Postfix relay — notifications for TAK Portal & MediaMTX', 'icon': '📧', 'route': '/emailrelay', 'priority': 9}
+    # Cesium 3D Tiles — pure static file serving via Caddy; no container needed
+    ct_enabled = settings.get('cesium_tiles_enabled', False)
+    ct_dir = os.path.expanduser('~/cesium-tiles')
+    modules['cesium_tiles'] = {
+        'name': 'Cesium 3D Tiles',
+        'installed': bool(ct_enabled),
+        'running': bool(ct_enabled) and os.path.isdir(ct_dir),
+        'description': 'Stream 3D terrain, buildings & point clouds to TAK clients',
+        'icon': '🌍',
+        'icon_url': CESIUM_TILES_LOGO_URL,
+        'route': '/cesium-tiles',
+        'priority': 11,
+    }
+    # WebODM — drone photogrammetry + TAK overlay plugin
+    wo_enabled = settings.get('webodm_enabled', False)
+    wo_dir = os.path.expanduser('~/webodm')
+    wo_running = False
+    try:
+        import subprocess as _sp
+        result = _sp.run(['docker', 'inspect', '--format', '{{.State.Running}}', 'webapp'],
+                         capture_output=True, text=True, timeout=3)
+        wo_running = result.stdout.strip() == 'true'
+        # Self-heal: containers are up but flag got cleared (e.g. interrupted uninstall/deploy)
+        if wo_running and not wo_enabled:
+            _s = load_settings()
+            _s['webodm_enabled'] = True
+            save_settings(_s)
+            wo_enabled = True
+    except Exception:
+        pass
+    modules['webodm'] = {
+        'name': 'WebODM',
+        'installed': bool(wo_enabled),
+        'running': wo_running,
+        'description': 'Drone photo processing → 3D Tiles & TAK overlays',
+        'icon': '📡',
+        'icon_url': 'https://raw.githubusercontent.com/WebODM/WebODM/master/app/static/app/img/logo512.png',
+        'route': '/webodm',
+        'priority': 12,
+    }
     return dict(sorted(modules.items(), key=lambda x: x[1].get('priority', 99)))
 
 def render_custom_banner(settings):
@@ -1121,6 +1163,12 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
     email = modules.get('emailrelay', {})
     if email.get('installed'):
         parts.append(link('/emailrelay', '<span class="nav-icon material-symbols-outlined">outgoing_mail</span>Email Relay'))
+    ct = modules.get('cesium_tiles', {})
+    if ct.get('installed'):
+        parts.append(link('/cesium-tiles', f'<img src="{html.escape(CESIUM_TILES_LOGO_URL)}" alt="Cesium 3D Tiles" class="nav-icon" style="height:24px;width:auto;max-width:100px;object-fit:contain;display:block">', 'Cesium 3D Tiles'))
+    wo = modules.get('webodm', {})
+    if wo.get('installed'):
+        parts.append(link('/webodm', '<img src="https://raw.githubusercontent.com/WebODM/WebODM/master/app/static/app/img/logo512.png" alt="WebODM" class="nav-icon" style="height:24px;width:auto;max-width:72px;object-fit:contain;display:block;filter:brightness(0) invert(1)"><span>WebODM</span>', 'WebODM'))
     parts.append(link('/marketplace', '<span class="nav-icon material-symbols-outlined">shopping_cart</span>Marketplace'))
     parts.append(link('/customization', '<span class="nav-icon material-symbols-outlined">tune</span>Customization'))
     parts.append(link('/help', '<span class="nav-icon material-symbols-outlined">help</span>Help'))
@@ -7438,6 +7486,13 @@ def cloudtak_page():
             sec_legacy_install = not os.path.exists(os.path.join(_ct_dir, '.postgres-password'))
     except Exception:
         pass
+    # Only probe plugin dirs when CloudTAK is installed locally — skip for remote
+    ct_plugins = []
+    if cloudtak.get('installed') and cloudtak_cfg.get('target_mode') != 'remote':
+        try:
+            ct_plugins = _detect_cloudtak_plugins()
+        except Exception:
+            ct_plugins = []
     return render_template_string(CLOUDTAK_TEMPLATE,
         settings=settings, cloudtak=cloudtak,
         version=VERSION,
@@ -7453,6 +7508,7 @@ def cloudtak_page():
         container_info=container_info,
         sec_compromised=sec_compromised,
         sec_legacy_install=sec_legacy_install,
+        cloudtak_plugins=ct_plugins,
         deploying=cloudtak_deploy_status.get('running', False),
         deploy_done=cloudtak_deploy_status.get('complete', False),
         deploy_error=cloudtak_deploy_status.get('error', False))
@@ -9333,6 +9389,8 @@ SERVICE_DOMAIN_DEFAULTS = {
     'cloudtak_video': 'video',
     'mediamtx': 'stream',
     'fedhub': 'fedhub',
+    'cesium_tiles': '3dtiles',
+    'webodm': 'webodm',
 }
 
 def _get_service_domain(settings, service_key):
@@ -11488,6 +11546,43 @@ def generate_caddyfile(settings=None):
             lines.append("")
             _emit_alias_redirect(_get_service_alias(settings, 'fedhub'), fh_host)
 
+    ct_mod = modules.get('cesium_tiles', {})
+    if ct_mod.get('installed'):
+        ct_host = sd.get('cesium_tiles') or _get_service_domain(settings, 'cesium_tiles')
+        ct_dir_abs = os.path.expanduser('~/cesium-tiles')
+        lines.append(f"# Cesium 3D Tiles — static file server (CORS enabled for ATAK WebView)")
+        lines.append(f"{ct_host} {{")
+        lines.append(f"    root * {ct_dir_abs}")
+        lines.append(f"    file_server")
+        lines.append(f"    header Access-Control-Allow-Origin *")
+        lines.append(f"    header Access-Control-Allow-Methods \"GET, HEAD, OPTIONS\"")
+        lines.append(f"    header Cache-Control \"public, max-age=3600\"")
+        lines.append(f"}}")
+        lines.append("")
+        _emit_alias_redirect(_get_service_alias(settings, 'cesium_tiles'), ct_host)
+
+    wo_mod = modules.get('webodm', {})
+    if wo_mod.get('installed'):
+        wo_host = sd.get('webodm') or _get_service_domain(settings, 'webodm')
+        wo_port = settings.get('webodm_port', 8765)
+        wo_up = f'127.0.0.1:{wo_port}'
+        lines.append(f"# WebODM — drone photogrammetry + TAK overlay")
+        lines.append(f"{wo_host} {{")
+        if ak.get('installed'):
+            lines.append(f"    route {{")
+            lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
+            lines.append(f"        forward_auth {ak_up} {{")
+            lines.append(f"            uri /outpost.goauthentik.io/auth/caddy")
+            lines.append(f"            trusted_proxies private_ranges")
+            lines.append(f"        }}")
+            lines.append(f"        reverse_proxy {wo_up}")
+            lines.append(f"    }}")
+        else:
+            lines.append(f"    reverse_proxy {wo_up}")
+        lines.append(f"}}")
+        lines.append("")
+        _emit_alias_redirect(_get_service_alias(settings, 'webodm'), wo_host)
+
     caddyfile = '\n'.join(lines)
     # Preserve user-added blocks (e.g. health.tntak.net for Uptime Robot) that sit below the marker.
     if os.path.exists(CADDYFILE_PATH):
@@ -12233,25 +12328,47 @@ def _get_cloudtak_latest_release_tag(use_cache=True):
 
 
 def _get_cloudtak_version_info():
-    """Return {version: str, update_available: bool, latest: str|None} for CloudTAK."""
+    """Return {version: str, update_available: bool, latest: str|None} for CloudTAK.
+
+    Version resolution order (handles upstream tagging-before-package-bump bug):
+    1. git describe --tags --exact-match: if HEAD is exactly at a release tag,
+       use the tag name (e.g. v13.3.0 → '13.3.0'). This is authoritative even
+       when package.json still says 13.2.0 (dfpc-coe sometimes tags before
+       bumping package.json — the tag is the real version).
+    2. package.json (api/ or web/): used when HEAD is not at an exact tag.
+    3. git describe --tags --always fallback for everything else.
+    """
     import re
     out = {'version': '', 'update_available': False, 'latest': None}
     ct_dir = os.path.expanduser('~/CloudTAK')
-    for pkg in ['package.json', 'api/package.json', 'web/package.json']:
-        pkg_path = os.path.join(ct_dir, pkg)
-        if os.path.isfile(pkg_path):
-            try:
-                with open(pkg_path) as f:
-                    data = json.load(f)
-                out['version'] = (data.get('version') or '').strip()
-                if out['version']:
-                    break
-            except Exception:
-                pass
+    # Step 1: prefer exact git tag — authoritative even when package.json lags
+    if os.path.isdir(os.path.join(ct_dir, '.git')):
+        try:
+            rv = subprocess.run(
+                f'git -C {ct_dir} describe --tags --exact-match HEAD 2>/dev/null',
+                shell=True, capture_output=True, text=True, timeout=5)
+            if rv.returncode == 0 and rv.stdout.strip():
+                out['version'] = rv.stdout.strip().lstrip('vV')
+        except Exception:
+            pass
+    # Step 2: package.json when not at an exact tag
+    if not out['version']:
+        for pkg in ['package.json', 'api/package.json', 'web/package.json']:
+            pkg_path = os.path.join(ct_dir, pkg)
+            if os.path.isfile(pkg_path):
+                try:
+                    with open(pkg_path) as f:
+                        data = json.load(f)
+                    out['version'] = (data.get('version') or '').strip()
+                    if out['version']:
+                        break
+                except Exception:
+                    pass
+    # Step 3: git describe fallback
     if not out['version'] and os.path.isdir(os.path.join(ct_dir, '.git')):
         rv = subprocess.run(f'cd {ct_dir} && git describe --tags --always 2>/dev/null || git log -1 --format="%h"', shell=True, capture_output=True, text=True, timeout=5)
         if rv.returncode == 0 and rv.stdout.strip():
-            out['version'] = rv.stdout.strip()
+            out['version'] = rv.stdout.strip().lstrip('vV')
     r = subprocess.run('docker ps -q -f name=cloudtak-api 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
     if r.returncode == 0 and (r.stdout or '').strip():
         log_r = subprocess.run('docker logs cloudtak-api --tail 150 2>&1', shell=True, capture_output=True, text=True, timeout=10)
@@ -12406,6 +12523,40 @@ def _get_fail2ban_version_info():
     return {'version': installed, 'update_available': update_available, 'latest': available}
 
 
+def _get_webodm_version_info():
+    """Return {version, update_available, latest} for the running WebODM instance."""
+    import subprocess as _sp
+    import json as _json
+    info = {'version': '', 'update_available': False, 'latest': None}
+    try:
+        r = _sp.run(
+            ['docker', 'exec', 'webapp', 'python3', '-c',
+             'import json; d=json.load(open("/webodm/package.json")); print(d["version"])'],
+            capture_output=True, text=True, timeout=10)
+        v = r.stdout.strip()
+        if v:
+            info['version'] = v
+    except Exception:
+        pass
+    try:
+        import urllib.request as _ur
+        req = _ur.Request('https://api.github.com/repos/WebODM/WebODM/releases/latest',
+                          headers={'User-Agent': 'infra-TAK'})
+        resp = _ur.urlopen(req, timeout=8)
+        data = _json.loads(resp.read())
+        latest = data.get('tag_name', '').lstrip('v')
+        if latest:
+            info['latest'] = latest
+            if info['version']:
+                def _tv(s):
+                    try: return tuple(int(x) for x in s.replace('-alpha','').replace('-beta','').split('.')[:3])
+                    except: return (0,)
+                info['update_available'] = _tv(latest) > _tv(info['version'])
+    except Exception:
+        pass
+    return info
+
+
 def get_all_module_versions():
     """Return dict of module_key -> {version, update_available, latest?} for console cards."""
     modules = detect_modules()
@@ -12436,6 +12587,8 @@ def get_all_module_versions():
         result['fedhub'] = _get_fedhub_version_info()
     if modules.get('fail2ban', {}).get('installed'):
         result['fail2ban'] = _get_fail2ban_version_info()
+    if modules.get('webodm', {}).get('installed'):
+        result['webodm'] = _get_webodm_version_info()
     # Guard Dog: version/update follow infra-TAK (scripts ship with console; "Update Guard Dog" uses same codebase)
     if modules.get('guarddog', {}).get('installed'):
         gd_latest = update_cache.get('latest')
@@ -14839,6 +14992,31 @@ cloudtak_deploy_status = {'running': False, 'complete': False, 'error': False}
 cloudtak_uninstall_status = {'running': False, 'done': False, 'error': None}
 _cloudtak_deploy_lock = threading.Lock()
 
+# Plugin catalog — each entry describes a community CloudTAK plugin.
+# install_dir: subdirectory under ~/CloudTAK/api/web/plugins/ that Vite
+#   auto-discovers via import.meta.glob at build time (no wiring needed).
+CLOUDTAK_PLUGINS = [
+    {
+        'key': 'ping',
+        'name': 'Cell Ping / RTT',
+        'description': (
+            'Plot cellphone tower coverage as CoT features. '
+            'Cell Ping produces a u-d-c-c uncertainty circle; '
+            'RTT produces a u-rb-a arc (±70° wedge). '
+            'Posts directly to an active DataSync mission.'
+        ),
+        'repo': 'https://github.com/clptak/cloudtak-plugin-cellphone',
+        'install_dir': 'ping',
+        'requires': 'CloudTAK 13.2+',
+        'author': 'clptak',
+        'license': 'MIT',
+    },
+]
+
+cloudtak_plugin_log = []
+cloudtak_plugin_status = {'running': False, 'complete': False, 'error': False, 'action': '', 'plugin': ''}
+_cloudtak_plugin_lock = threading.Lock()
+
 @app.route('/api/cloudtak/deployment-config', methods=['GET'])
 @login_required
 def cloudtak_get_deployment_config():
@@ -15567,6 +15745,187 @@ def cloudtak_reset_server_config():
             return jsonify({'success': False, 'error': 'docker compose restart timed out'}), 500
         fqdn = settings.get('fqdn', '')
         return jsonify({'success': True, 'message': f'CloudTAK server config cleared. Visit {"map." + fqdn if fqdn else "CloudTAK"} to re-run the bootstrap wizard.'})
+
+
+def _detect_cloudtak_plugins():
+    """Return the CLOUDTAK_PLUGINS catalog annotated with installed/commit/update_available."""
+    ct_dir = os.path.expanduser('~/CloudTAK')
+    plugins_base = os.path.join(ct_dir, 'api', 'web', 'plugins')
+    result = []
+    for p in CLOUDTAK_PLUGINS:
+        install_path = os.path.join(plugins_base, p['install_dir'])
+        installed = os.path.isdir(install_path)
+        sha = None
+        update_available = False
+        if installed:
+            # Local HEAD — short SHA only (no commit message)
+            try:
+                r = subprocess.run(
+                    ['git', '-C', install_path, 'rev-parse', '--short=7', 'HEAD'],
+                    capture_output=True, text=True, timeout=5
+                )
+                if r.returncode == 0:
+                    sha = r.stdout.strip()
+            except Exception:
+                pass
+            # Remote HEAD — compare to detect available updates (5 s timeout)
+            try:
+                r2 = subprocess.run(
+                    ['git', '-C', install_path, 'ls-remote', 'origin', 'HEAD'],
+                    capture_output=True, text=True, timeout=5
+                )
+                if r2.returncode == 0 and r2.stdout.strip():
+                    remote_short = r2.stdout.split()[0][:7]
+                    if sha and remote_short and sha != remote_short:
+                        update_available = True
+            except Exception:
+                pass
+        result.append({**p, 'installed': installed, 'sha': sha, 'update_available': update_available})
+    return result
+
+
+def _run_cloudtak_plugin_action(plugin_key, action):
+    """Background thread: install / update / remove a CloudTAK plugin then rebuild the API image."""
+    global cloudtak_plugin_log, cloudtak_plugin_status
+    cloudtak_plugin_log = []
+    cloudtak_plugin_status = {'running': True, 'complete': False, 'error': False, 'action': action, 'plugin': plugin_key}
+
+    plugin = next((p for p in CLOUDTAK_PLUGINS if p['key'] == plugin_key), None)
+    if not plugin:
+        cloudtak_plugin_log.append(f'Unknown plugin key: {plugin_key}')
+        cloudtak_plugin_status.update({'running': False, 'error': True})
+        return
+
+    ct_dir = os.path.expanduser('~/CloudTAK')
+    plugins_base = os.path.join(ct_dir, 'api', 'web', 'plugins')
+    install_path = os.path.join(plugins_base, plugin['install_dir'])
+
+    def plog(msg):
+        ts = datetime.now().strftime('%H:%M:%S')
+        entry = f'[{ts}] {msg}'
+        cloudtak_plugin_log.append(entry)
+        print(entry, flush=True)
+
+    def run_cmd(cmd, cwd=None, timeout=600, shell=False):
+        cmd_str = cmd if isinstance(cmd, str) else ' '.join(cmd)
+        plog(f'$ {cmd_str}')
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd, shell=shell)
+            for line in (r.stdout or '').splitlines():
+                if line.strip():
+                    plog(line)
+            for line in (r.stderr or '').splitlines():
+                if line.strip():
+                    plog(line)
+            return r.returncode == 0
+        except subprocess.TimeoutExpired:
+            plog('Error: command timed out')
+            return False
+        except Exception as e:
+            plog(f'Error: {e}')
+            return False
+
+    try:
+        if action == 'install':
+            plog(f'Installing plugin: {plugin["name"]}')
+            if os.path.isdir(install_path):
+                plog(f'Plugin directory already exists at {install_path} — already installed?')
+                cloudtak_plugin_status.update({'running': False, 'error': True})
+                return
+            os.makedirs(plugins_base, exist_ok=True)
+            plog('Cloning plugin repository...')
+            if not run_cmd(['git', 'clone', plugin['repo'], install_path]):
+                cloudtak_plugin_status.update({'running': False, 'error': True})
+                return
+
+        elif action == 'update':
+            plog(f'Updating plugin: {plugin["name"]}')
+            if not os.path.isdir(install_path):
+                plog(f'Plugin not installed at {install_path}')
+                cloudtak_plugin_status.update({'running': False, 'error': True})
+                return
+            if not run_cmd(['git', '-C', install_path, 'pull']):
+                cloudtak_plugin_status.update({'running': False, 'error': True})
+                return
+
+        elif action == 'remove':
+            plog(f'Removing plugin: {plugin["name"]}')
+            if not os.path.isdir(install_path):
+                plog('Plugin is not installed — nothing to remove')
+                cloudtak_plugin_status.update({'running': False, 'error': True})
+                return
+            import shutil
+            shutil.rmtree(install_path)
+            plog(f'Removed {install_path}')
+
+        # Rebuild the API image to bake in (or remove) the plugin from the Vite bundle.
+        # Service name is 'api' per upstream docker-compose.yml (cloudtak.sh uses the same).
+        plog('')
+        plog('Rebuilding CloudTAK API image — this takes 5–15 minutes...')
+        if not run_cmd(['docker', 'compose', 'build', '--no-cache', 'api'], cwd=ct_dir, timeout=1200):
+            cloudtak_plugin_status.update({'running': False, 'error': True})
+            return
+
+        plog('Restarting CloudTAK API container...')
+        if not run_cmd(['docker', 'compose', 'up', '-d', '--force-recreate', 'api'], cwd=ct_dir, timeout=120):
+            cloudtak_plugin_status.update({'running': False, 'error': True})
+            return
+
+        action_label = {'install': 'installed', 'update': 'updated', 'remove': 'removed'}.get(action, action)
+        plog(f'✓ Plugin {action_label} successfully.')
+        if action in ('install', 'update'):
+            plog('  → In CloudTAK: Settings → Refresh App to activate the new service worker.')
+            plog('    (Cmd+Shift+R does NOT work — the SW intercepts all requests.)')
+            plog('    Alternatively: close all CloudTAK browser tabs and reopen.')
+            plog('    Plugin appears at the bottom of the right-side menu.')
+        cloudtak_plugin_status.update({'running': False, 'complete': True, 'error': False})
+
+    except Exception as e:
+        plog(f'Unexpected error: {e}')
+        cloudtak_plugin_status.update({'running': False, 'error': True})
+
+
+@app.route('/api/cloudtak/plugins/list')
+@login_required
+def cloudtak_plugins_list():
+    """Return plugin catalog with installed/commit state and current action status."""
+    plugins = _detect_cloudtak_plugins()
+    return jsonify({'plugins': plugins, 'status': cloudtak_plugin_status})
+
+
+@app.route('/api/cloudtak/plugins/action', methods=['POST'])
+@login_required
+def cloudtak_plugin_action():
+    """Trigger install / update / remove for a named plugin."""
+    with _cloudtak_plugin_lock:
+        if cloudtak_plugin_status.get('running'):
+            return jsonify({'error': 'Another plugin action is already running'}), 409
+    data = request.get_json() or {}
+    plugin_key = (data.get('plugin') or '').strip()
+    action = (data.get('action') or '').strip()
+    if not plugin_key or action not in ('install', 'update', 'remove'):
+        return jsonify({'error': 'Invalid request — provide plugin key and action (install/update/remove)'}), 400
+    if not any(p['key'] == plugin_key for p in CLOUDTAK_PLUGINS):
+        return jsonify({'error': f'Unknown plugin: {plugin_key}'}), 400
+    t = threading.Thread(target=_run_cloudtak_plugin_action, args=(plugin_key, action), daemon=True)
+    t.start()
+    return jsonify({'ok': True})
+
+
+@app.route('/api/cloudtak/plugins/log')
+@login_required
+def cloudtak_plugin_log_api():
+    """Poll plugin action log (same ?index=N pattern as /api/cloudtak/deploy/log)."""
+    idx = max(0, int(request.args.get('index', 0)))
+    return jsonify({
+        'entries': cloudtak_plugin_log[idx:],
+        'total': len(cloudtak_plugin_log),
+        'running': cloudtak_plugin_status.get('running', False),
+        'complete': cloudtak_plugin_status.get('complete', False),
+        'error': cloudtak_plugin_status.get('error', False),
+        'action': cloudtak_plugin_status.get('action', ''),
+        'plugin': cloudtak_plugin_status.get('plugin', ''),
+    })
 
 
 def _cloudtak_build_env_content(settings, domain, signing_secret, minio_pass, postgres_pass='docker', remote_host=''):
@@ -16671,6 +17030,11 @@ def run_cloudtak_update():
         plog("")
         plog(f"✓ CloudTAK updated to {release_tag}")
         plog("Update finished — CloudTAK is running.")
+        plog("")
+        plog("⚠ Service worker note: Cmd+Shift+R does NOT work — the CloudTAK SW")
+        plog("  intercepts all requests before they reach the network.")
+        plog("  To see the new version: in CloudTAK open Settings → Refresh App.")
+        plog("  Or: close all CloudTAK browser tabs and reopen.")
         _update_boot_stagger_service()
         cloudtak_deploy_status.update({'running': False, 'complete': True, 'error': False})
     except Exception as e:
@@ -16989,6 +17353,672 @@ def emailrelay_uninstall():
     email_deploy_log.clear()
     email_deploy_status.update({'running': False, 'complete': False, 'error': False})
     return jsonify({'success': True, 'steps': ['Postfix stopped and removed', 'Configuration cleared']})
+
+
+# ── Cesium 3D Tiles ──────────────────────────────────────────────────────────
+
+@app.route('/cesium-tiles')
+@login_required
+def cesium_tiles_page():
+    from flask import make_response
+    settings = load_settings()
+    modules = detect_modules()
+    ct = modules.get('cesium_tiles', {})
+    datasets = _cesium_list_datasets(settings)
+    r = make_response(render_template_string(CESIUM_TILES_TEMPLATE,
+        settings=settings, modules=modules, ct=ct,
+        datasets=datasets, metrics=get_system_metrics(), version=VERSION))
+    r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
+    return r
+
+
+def _cesium_list_datasets(settings):
+    """Scan ~/cesium-tiles/ and return a list of dataset dicts for each subdir with tileset.json."""
+    import glob as _glob
+    ct_dir = os.path.expanduser('~/cesium-tiles')
+    if not os.path.isdir(ct_dir):
+        return []
+    fqdn = (settings.get('fqdn') or '').strip()
+    base_url = f"https://{_get_service_domain(settings, 'cesium_tiles')}" if fqdn else ''
+    datasets = []
+    try:
+        for name in sorted(os.listdir(ct_dir)):
+            subdir = os.path.join(ct_dir, name)
+            if not os.path.isdir(subdir):
+                continue
+            tileset_path = os.path.join(subdir, 'tileset.json')
+            if not os.path.exists(tileset_path):
+                continue
+            # Count tile files (.b3dm, .pnts, .i3dm, .cmpt, .glb, .json)
+            tile_files = _glob.glob(os.path.join(subdir, '**', '*.b3dm'), recursive=True)
+            tile_files += _glob.glob(os.path.join(subdir, '**', '*.pnts'), recursive=True)
+            tile_files += _glob.glob(os.path.join(subdir, '**', '*.i3dm'), recursive=True)
+            tile_files += _glob.glob(os.path.join(subdir, '**', '*.cmpt'), recursive=True)
+            tile_files += _glob.glob(os.path.join(subdir, '**', '*.glb'), recursive=True)
+            tile_count = len(tile_files)
+            # Total size of directory
+            total_bytes = sum(
+                os.path.getsize(os.path.join(dp, fn))
+                for dp, _, files in os.walk(subdir)
+                for fn in files
+            )
+            if total_bytes < 1024 * 1024:
+                size_str = f"{total_bytes / 1024:.0f} KB"
+            elif total_bytes < 1024 * 1024 * 1024:
+                size_str = f"{total_bytes / (1024*1024):.1f} MB"
+            else:
+                size_str = f"{total_bytes / (1024*1024*1024):.2f} GB"
+            tileset_url = f"{base_url}/{name}/tileset.json" if base_url else ''
+            datasets.append({
+                'name': name,
+                'size': size_str,
+                'tile_count': tile_count,
+                'url': tileset_url,
+            })
+    except Exception:
+        pass
+    return datasets
+
+
+@app.route('/api/cesium-tiles/enable', methods=['POST'])
+@login_required
+def cesium_tiles_enable():
+    settings = load_settings()
+    settings['cesium_tiles_enabled'] = True
+    save_settings(settings)
+    ct_dir = os.path.expanduser('~/cesium-tiles')
+    os.makedirs(ct_dir, exist_ok=True)
+    if (settings.get('fqdn') or '').strip():
+        generate_caddyfile(settings)
+        threading.Thread(target=_caddy_restart_after_response, daemon=True).start()
+    return jsonify({'success': True})
+
+
+@app.route('/api/cesium-tiles/disable', methods=['POST'])
+@login_required
+def cesium_tiles_disable():
+    settings = load_settings()
+    settings['cesium_tiles_enabled'] = False
+    save_settings(settings)
+    if (settings.get('fqdn') or '').strip():
+        generate_caddyfile(settings)
+        threading.Thread(target=_caddy_restart_after_response, daemon=True).start()
+    return jsonify({'success': True})
+
+
+@app.route('/api/cesium-tiles/uninstall', methods=['POST'])
+@login_required
+def cesium_tiles_uninstall():
+    import shutil
+    s = load_settings()
+    s['cesium_tiles_enabled'] = False
+    save_settings(s)
+    if (s.get('fqdn') or '').strip():
+        generate_caddyfile(s)
+        threading.Thread(target=_caddy_restart_after_response, daemon=True).start()
+    ct_dir = os.path.expanduser('~/cesium-tiles')
+    try:
+        if os.path.isdir(ct_dir):
+            shutil.rmtree(ct_dir)
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+    return jsonify({'success': True})
+
+
+@app.route('/api/cesium-tiles/datasets')
+@login_required
+def cesium_tiles_datasets():
+    settings = load_settings()
+    return jsonify({'datasets': _cesium_list_datasets(settings)})
+
+
+@app.route('/api/cesium-tiles/upload', methods=['POST'])
+@login_required
+def cesium_tiles_upload():
+    import zipfile
+    import tempfile
+    import shutil
+    ct_dir = os.path.expanduser('~/cesium-tiles')
+    os.makedirs(ct_dir, exist_ok=True)
+    dataset_name = (request.form.get('name') or '').strip()
+    if not dataset_name:
+        return jsonify({'success': False, 'error': 'Dataset name is required'})
+    # Sanitize: letters, digits, hyphens, underscores only
+    import re as _re_ct
+    dataset_name = _re_ct.sub(r'[^A-Za-z0-9_\-]', '-', dataset_name).strip('-') or 'dataset'
+    if 'file' not in request.files:
+        return jsonify({'success': False, 'error': 'No file provided'})
+    f = request.files['file']
+    if not f.filename.lower().endswith('.zip'):
+        return jsonify({'success': False, 'error': 'Upload must be a .zip file'})
+    dest_dir = os.path.join(ct_dir, dataset_name)
+    if os.path.exists(dest_dir):
+        return jsonify({'success': False, 'error': f'Dataset "{dataset_name}" already exists — delete it first or choose a different name'})
+    # Stream to a temp file to avoid loading GB into memory
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix='.zip', dir=ct_dir)
+    try:
+        with os.fdopen(tmp_fd, 'wb') as tmp_f:
+            chunk_size = 64 * 1024
+            while True:
+                chunk = f.stream.read(chunk_size)
+                if not chunk:
+                    break
+                tmp_f.write(chunk)
+        # Validate zip contains tileset.json (at root or one level deep)
+        with zipfile.ZipFile(tmp_path, 'r') as zf:
+            names = zf.namelist()
+            has_tileset = any(
+                n == 'tileset.json' or n.endswith('/tileset.json')
+                for n in names
+            )
+            if not has_tileset:
+                return jsonify({'success': False, 'error': 'Zip does not contain a tileset.json — make sure you zipped the dataset folder itself, not just its contents'})
+            # Detect if there is a single top-level directory wrapping everything
+            top_dirs = {n.split('/')[0] for n in names if n}
+            single_wrap = (len(top_dirs) == 1 and not any(
+                n == 'tileset.json' for n in names
+            ))
+            os.makedirs(dest_dir, exist_ok=True)
+            if single_wrap:
+                # Strip the wrapping directory when extracting
+                wrap = list(top_dirs)[0]
+                for member in zf.infolist():
+                    rel = member.filename[len(wrap):].lstrip('/')
+                    if not rel:
+                        continue
+                    target = os.path.join(dest_dir, rel)
+                    if member.filename.endswith('/'):
+                        os.makedirs(target, exist_ok=True)
+                    else:
+                        os.makedirs(os.path.dirname(target), exist_ok=True)
+                        with zf.open(member) as src, open(target, 'wb') as dst:
+                            shutil.copyfileobj(src, dst)
+            else:
+                zf.extractall(dest_dir)
+    except zipfile.BadZipFile:
+        return jsonify({'success': False, 'error': 'File is not a valid zip archive'})
+    except Exception as e:
+        shutil.rmtree(dest_dir, ignore_errors=True)
+        return jsonify({'success': False, 'error': str(e)})
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+    # Verify tileset.json ended up in the right place
+    if not os.path.exists(os.path.join(dest_dir, 'tileset.json')):
+        shutil.rmtree(dest_dir, ignore_errors=True)
+        return jsonify({'success': False, 'error': 'Could not find tileset.json at the root of the extracted dataset — check your zip structure'})
+    settings = load_settings()
+    return jsonify({'success': True, 'dataset': dataset_name, 'datasets': _cesium_list_datasets(settings)})
+
+
+@app.route('/api/cesium-tiles/upload-folder', methods=['POST'])
+@login_required
+def cesium_tiles_upload_folder():
+    import re as _re_ctf
+    import shutil
+    ct_dir = os.path.expanduser('~/cesium-tiles')
+    os.makedirs(ct_dir, exist_ok=True)
+    raw_name = (request.form.get('name') or '').strip()
+    if not raw_name:
+        return jsonify({'success': False, 'error': 'Dataset name is required'})
+    dataset_name = _re_ctf.sub(r'[^A-Za-z0-9_\-]', '-', raw_name).strip('-') or 'dataset'
+    dest_dir = os.path.join(ct_dir, dataset_name)
+    if os.path.exists(dest_dir):
+        return jsonify({'success': False, 'error': f'Dataset "{dataset_name}" already exists — delete it first or choose a different name'})
+    files = request.files.getlist('files[]')
+    if not files:
+        return jsonify({'success': False, 'error': 'No files received'})
+    # Validate tileset.json is present (filename is the relative path, already top-folder-stripped by JS)
+    has_tileset = any(
+        (f.filename or '').lstrip('/') == 'tileset.json'
+        for f in files
+    )
+    if not has_tileset:
+        return jsonify({'success': False, 'error': 'No tileset.json found — make sure the folder contains tileset.json at its root'})
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+        for f in files:
+            rel = (f.filename or '').lstrip('/')
+            if not rel or '..' in rel.split('/'):
+                continue
+            target = os.path.join(dest_dir, rel)
+            # Prevent path traversal
+            if not os.path.abspath(target).startswith(os.path.abspath(dest_dir) + os.sep):
+                continue
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            f.save(target)
+    except Exception as exc:
+        shutil.rmtree(dest_dir, ignore_errors=True)
+        return jsonify({'success': False, 'error': str(exc)})
+    settings = load_settings()
+    return jsonify({'success': True, 'dataset': dataset_name, 'datasets': _cesium_list_datasets(settings)})
+
+
+@app.route('/api/cesium-tiles/datasets/<name>', methods=['DELETE'])
+@login_required
+def cesium_tiles_delete(name):
+    import shutil
+    import re as _re_ctd
+    if not _re_ctd.match(r'^[A-Za-z0-9_\-]+$', name):
+        return jsonify({'success': False, 'error': 'Invalid dataset name'})
+    ct_dir = os.path.expanduser('~/cesium-tiles')
+    target = os.path.join(ct_dir, name)
+    # Prevent path traversal
+    if not os.path.abspath(target).startswith(os.path.abspath(ct_dir)):
+        return jsonify({'success': False, 'error': 'Invalid path'})
+    if not os.path.isdir(target):
+        return jsonify({'success': False, 'error': 'Dataset not found'})
+    shutil.rmtree(target)
+    settings = load_settings()
+    return jsonify({'success': True, 'datasets': _cesium_list_datasets(settings)})
+
+
+# ── WebODM ───────────────────────────────────────────────────────────────────
+
+WEBODM_DOCKER_COMPOSE = '''version: '2.4'
+volumes:
+  wo_dbdata:
+  wo_appmedia:
+services:
+  wo_db:
+    image: webodm/webodm_db
+    container_name: wo_db
+    volumes:
+      - {wo_dir}/db:/var/lib/postgresql/data:Z
+    restart: unless-stopped
+    oom_score_adj: -100
+  wo_broker:
+    image: redis:7.0.10
+    container_name: wo_broker
+    restart: unless-stopped
+    oom_score_adj: -500
+  wo_webapp:
+    image: webodm/webodm_webapp
+    container_name: webapp
+    entrypoint: /bin/bash -c "service cron start && chmod +x /webodm/*.sh && /bin/bash -c \\"/webodm/wait-for-postgres.sh wo_db /webodm/wait-for-it.sh -t 0 wo_broker:6379 -- /webodm/start.sh\\""
+    volumes:
+      - {wo_dir}/media:/webodm/app/media:z
+      - {wo_dir}/plugins/webodm-tak-overlay:/webodm/app/media/plugins/webodm-tak-overlay:z
+    ports:
+      - "127.0.0.1:{wo_port}:8000"
+    depends_on:
+      - wo_db
+      - wo_broker
+      - wo_worker
+    environment:
+      - WO_PORT={wo_port}
+      - WO_HOST=0.0.0.0
+      - WO_DEBUG=NO
+      - WO_DATABASE_HOST=wo_db
+      - WO_BROKER=redis://wo_broker
+      - WO_SECRET_KEY={wo_secret}
+      - WEB_CONCURRENCY=2
+    restart: unless-stopped
+  wo_worker:
+    image: webodm/webodm_webapp
+    container_name: wo_worker
+    entrypoint: /bin/bash -c "/webodm/wait-for-postgres.sh wo_db /webodm/wait-for-it.sh -t 0 wo_broker:6379 -- /webodm/worker.sh start"
+    volumes:
+      - {wo_dir}/media:/webodm/app/media:z
+    depends_on:
+      - wo_db
+      - wo_broker
+    environment:
+      - WO_DATABASE_HOST=wo_db
+      - WO_BROKER=redis://wo_broker
+      - WO_DEBUG=NO
+      - WO_SECRET_KEY={wo_secret}
+      - WEB_CONCURRENCY=2
+    restart: unless-stopped
+  wo_nodeodm:
+    image: webodm/nodeodx
+    container_name: wo_nodeodm
+    restart: unless-stopped
+    oom_score_adj: 250
+'''
+
+_webodm_deploy_status = {'running': False, 'complete': False, 'error': False, 'log': []}
+
+
+def _webodm_deploy_log(msg, status=None):
+    _webodm_deploy_status['log'].append(msg)
+    if status:
+        _webodm_deploy_status.update(status)
+
+
+def _run_webodm_deploy(settings):
+    import subprocess as _sp
+    import secrets as _sec
+    import shutil as _sh
+    plog = _webodm_deploy_log
+    wo_dir = os.path.expanduser('~/webodm')
+    wo_port = settings.get('webodm_port', 8765)
+    plugin_dir = os.path.join(wo_dir, 'plugins', 'webodm-tak-overlay')
+    compose_path = os.path.join(wo_dir, 'docker-compose.yml')
+    try:
+        plog('Creating directories…')
+        for sub in ['', 'plugins', 'media', 'db']:
+            os.makedirs(os.path.join(wo_dir, sub) if sub else wo_dir, exist_ok=True)
+
+        plog('Installing TAK overlay plugin…')
+        if os.path.isdir(plugin_dir):
+            _sh.rmtree(plugin_dir)
+        r = _sp.run(['git', 'clone', '--depth=1',
+                     'https://github.com/Humble-Helper-96/webodm-tak-overlay.git',
+                     plugin_dir], capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            raise RuntimeError(f'Plugin clone failed: {r.stderr[:300]}')
+        plog(f'Plugin cloned: {plugin_dir}')
+
+        plog('Writing docker-compose.yml…')
+        wo_secret = _sec.token_hex(32)
+        compose_content = WEBODM_DOCKER_COMPOSE.format(
+            wo_dir=wo_dir,
+            wo_port=wo_port,
+            wo_secret=wo_secret,
+        )
+        with open(compose_path, 'w') as f:
+            f.write(compose_content)
+
+        plog('Pulling images (this may take several minutes)…')
+        r = _sp.run(['docker', 'compose', '-f', compose_path, 'pull'],
+                    capture_output=True, text=True, timeout=300,
+                    cwd=wo_dir)
+        if r.returncode != 0:
+            plog(f'Pull warning (non-fatal): {r.stderr[:200]}')
+
+        plog('Hardening UFW — blocking direct access to WebODM ports…')
+        for _wo_ufw_port in [wo_port, 3001]:
+            _sp.run(['ufw', 'deny', f'{_wo_ufw_port}/tcp'], capture_output=True)
+
+        plog('Starting WebODM containers…')
+        r = _sp.run(['docker', 'compose', '-f', compose_path, 'up', '-d'],
+                    capture_output=True, text=True, timeout=120, cwd=wo_dir)
+        if r.returncode != 0:
+            raise RuntimeError(f'docker compose up failed: {r.stderr[:300]}')
+
+        plog('Waiting for WebODM to become ready (up to 90 s)…')
+        import time as _time
+        import urllib.request as _ur
+        for _ in range(18):
+            _time.sleep(5)
+            try:
+                resp = _ur.urlopen(f'http://127.0.0.1:{wo_port}/', timeout=4)
+                if resp.status < 500:
+                    break
+            except Exception:
+                pass
+        else:
+            plog('WebODM did not respond in time — check logs with: docker logs webapp')
+
+        plog('Registering NodeODM processing node…')
+        import time as _t2
+        _t2.sleep(5)
+        try:
+            # Use manage.py addnode — same approach as WebODM's own start.sh,
+            # no auth credentials required, idempotent on duplicate hostname
+            _r_node = _sp.run(
+                ['docker', 'exec', 'webapp', 'python', 'manage.py',
+                 'addnode', 'wo_nodeodm', '3000', '--label', 'NodeODX'],
+                capture_output=True, text=True, timeout=30, cwd=wo_dir)
+            if _r_node.returncode == 0:
+                plog('NodeODM processing node registered.')
+            else:
+                plog(f'Node registration skipped (add manually: wo_nodeodm:3000): {_r_node.stderr[:200]}')
+        except Exception as e:
+            plog(f'Auto node registration skipped: {e}')
+
+        s = load_settings()
+        s['webodm_enabled'] = True
+        save_settings(s)
+        generate_caddyfile(s)
+        import subprocess as _sp2
+        try:
+            _sp2.run(['systemctl', 'reload', 'caddy'], timeout=15, check=True)
+            plog('Caddy reloaded — TLS cert provisioning started.')
+        except Exception as ce:
+            plog(f'Caddy reload warning: {ce}')
+        fqdn = s.get('fqdn', '').strip()
+        ak_token = _get_authentik_env_value(s, 'AUTHENTIK_TOKEN') or _get_authentik_env_value(s, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+        if fqdn and ak_token:
+            plog('Configuring Authentik for WebODM…')
+            _ensure_authentik_webodm_app(fqdn, ak_token, plog=plog, settings=s)
+        else:
+            plog('Authentik not configured — skipping proxy provider setup.')
+        plog('WebODM deployed successfully.')
+        _webodm_deploy_status.update({'running': False, 'complete': True, 'error': False})
+    except Exception as exc:
+        plog(f'ERROR: {exc}')
+        _webodm_deploy_status.update({'running': False, 'complete': False, 'error': str(exc)})
+
+
+@app.route('/webodm')
+@login_required
+def webodm_page():
+    from flask import make_response
+    settings = load_settings()
+    modules = detect_modules()
+    wo = modules.get('webodm', {})
+    wo_host = _get_service_domain(settings, 'webodm')
+    wo_url = f'https://{wo_host}' if wo_host else ''
+    wo_vinfo = _get_webodm_version_info() if wo.get('installed') else {}
+    r = make_response(render_template_string(WEBODM_TEMPLATE,
+        settings=settings, modules=modules, wo=wo,
+        wo_url=wo_url,
+        wo_host=wo_host,
+        deploying=_webodm_deploy_status.get('running', False),
+        deploy_done=_webodm_deploy_status.get('complete', False),
+        deploy_error=_webodm_deploy_status.get('error', False),
+        deploy_log=_webodm_deploy_status.get('log', []),
+        wo_version=wo_vinfo.get('version', ''),
+        wo_latest=wo_vinfo.get('latest', ''),
+        wo_update_available=wo_vinfo.get('update_available', False),
+        metrics=get_system_metrics(), version=VERSION))
+    r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
+    return r
+
+
+@app.route('/api/webodm/deploy', methods=['POST'])
+@login_required
+def webodm_deploy():
+    import threading
+    if _webodm_deploy_status.get('running'):
+        return jsonify({'success': False, 'error': 'Deploy already in progress'})
+    _webodm_deploy_status.update({'running': True, 'complete': False, 'error': False, 'log': []})
+    settings = load_settings()
+    t = threading.Thread(target=_run_webodm_deploy, args=(settings,), daemon=True)
+    t.start()
+    return jsonify({'success': True})
+
+
+@app.route('/api/webodm/deploy-status')
+@login_required
+def webodm_deploy_status_api():
+    return jsonify(_webodm_deploy_status)
+
+
+@app.route('/api/webodm/repair-authentik', methods=['POST'])
+@login_required
+def webodm_repair_authentik():
+    s = load_settings()
+    fqdn = s.get('fqdn', '').strip()
+    ak_token = _get_authentik_env_value(s, 'AUTHENTIK_TOKEN') or _get_authentik_env_value(s, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+    if not fqdn or not ak_token:
+        return jsonify({'success': False, 'error': 'FQDN or Authentik token not configured'})
+    steps = []
+    _ensure_authentik_webodm_app(fqdn, ak_token, plog=steps.append, settings=s)
+    return jsonify({'success': True, 'steps': steps})
+
+
+@app.route('/api/webodm/admin-accounts')
+@login_required
+def webodm_admin_accounts():
+    import subprocess as _sp
+    try:
+        r = _sp.run(
+            ['docker', 'exec', 'webapp', 'python', 'manage.py', 'shell', '-c',
+             'from django.contrib.auth.models import User; print(",".join([u.username for u in User.objects.filter(is_superuser=True)]))'],
+            capture_output=True, text=True, timeout=15)
+        accounts = [u.strip() for u in r.stdout.strip().split(',') if u.strip()]
+        return jsonify({'accounts': accounts})
+    except Exception as e:
+        return jsonify({'accounts': [], 'error': str(e)})
+
+
+@app.route('/api/webodm/reset-password', methods=['POST'])
+@login_required
+def webodm_reset_password():
+    import subprocess as _sp
+    data = request.get_json() or {}
+    username = (data.get('username') or 'admin').strip()
+    password = data.get('password', '')
+    if not password or len(password) < 8:
+        return jsonify({'success': False, 'error': 'Password must be at least 8 characters'})
+    try:
+        r = _sp.run(
+            ['docker', 'exec', 'webapp', 'python', 'manage.py', 'shell', '-c',
+             f'from django.contrib.auth.models import User; u=User.objects.get(username={repr(username)}); u.set_password({repr(password)}); u.save(); print("ok")'],
+            capture_output=True, text=True, timeout=15)
+        if 'ok' in r.stdout:
+            return jsonify({'success': True})
+        return jsonify({'success': False, 'error': r.stderr[:200] or 'User not found'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+
+_webodm_update_status = {'running': False, 'complete': False, 'error': False, 'log': []}
+
+def _run_webodm_update():
+    import subprocess as _sp
+    global _webodm_update_status
+    wo_dir = os.path.expanduser('~/webodm')
+    compose_path = os.path.join(wo_dir, 'docker-compose.yml')
+    log = []
+    def plog(msg):
+        log.append(msg)
+        _webodm_update_status['log'] = list(log)
+    try:
+        plog('Pulling latest WebODM images…')
+        r = _sp.run(['docker', 'compose', '-f', compose_path, 'pull'],
+                    capture_output=True, text=True, timeout=300, cwd=wo_dir)
+        plog(r.stdout[-500:] if r.stdout else '(no output)')
+        if r.returncode != 0:
+            raise RuntimeError(f'docker compose pull failed: {r.stderr[:300]}')
+        plog('Restarting containers with new images…')
+        r = _sp.run(['docker', 'compose', '-f', compose_path, 'up', '-d'],
+                    capture_output=True, text=True, timeout=120, cwd=wo_dir)
+        plog(r.stdout[-300:] if r.stdout else '(no output)')
+        if r.returncode != 0:
+            raise RuntimeError(f'docker compose up failed: {r.stderr[:300]}')
+        plog('Update complete.')
+        _webodm_update_status.update({'running': False, 'complete': True, 'error': False})
+    except Exception as e:
+        plog(f'ERROR: {e}')
+        _webodm_update_status.update({'running': False, 'complete': False, 'error': str(e)})
+
+
+@app.route('/api/webodm/update', methods=['POST'])
+@login_required
+def webodm_update():
+    global _webodm_update_status
+    if _webodm_update_status.get('running'):
+        return jsonify({'started': False, 'error': 'Update already in progress'})
+    _webodm_update_status = {'running': True, 'complete': False, 'error': False, 'log': []}
+    threading.Thread(target=_run_webodm_update, daemon=True).start()
+    return jsonify({'started': True})
+
+
+@app.route('/api/webodm/update-status')
+@login_required
+def webodm_update_status():
+    return jsonify(_webodm_update_status)
+
+
+@app.route('/api/webodm/ready')
+@login_required
+def webodm_ready():
+    """
+    Returns {ready, status, url}.
+    Checks that the webapp container is running and responding to HTTP requests,
+    then confirms the Authentik proxy can reach it (caddy forward_auth is live).
+    Used by the post-deploy warmup phase so the operator doesn't try to open
+    WebODM before it has finished starting up.
+    """
+    import subprocess as _sp
+    import urllib.request as _ur
+    settings = load_settings()
+    wo_host = _get_service_domain(settings, 'webodm')
+    wo_url = f'https://{wo_host}' if wo_host else ''
+
+    # 1. Container health — 'healthy' state means Django is answering its own healthcheck
+    try:
+        r = _sp.run(['docker', 'inspect', '--format={{.State.Health.Status}}', 'webapp'],
+                    capture_output=True, text=True, timeout=6)
+        health = r.stdout.strip()
+    except Exception:
+        health = ''
+
+    if health == 'healthy':
+        return jsonify({'ready': True, 'status': 'healthy', 'url': wo_url})
+
+    # 2. Fallback: probe WebODM's internal API endpoint directly from the container
+    try:
+        r2 = _sp.run(['docker', 'exec', 'webapp', 'curl', '-sf', '--max-time', '4',
+                      'http://localhost:8000/api/'],
+                     capture_output=True, text=True, timeout=8)
+        if r2.returncode == 0:
+            return jsonify({'ready': True, 'status': 'responding', 'url': wo_url})
+    except Exception:
+        pass
+
+    # 3. Not ready yet — figure out a useful status message
+    try:
+        r3 = _sp.run(['docker', 'inspect', '--format={{.State.Status}}', 'webapp'],
+                     capture_output=True, text=True, timeout=6)
+        state = r3.stdout.strip()
+    except Exception:
+        state = 'unknown'
+
+    status_msg = {
+        'starting': 'Container is starting up…',
+        'running': 'Container running — Django is still initialising…',
+        'exited': 'Container exited unexpectedly — check logs',
+    }.get(state, f'Container state: {state}')
+
+    return jsonify({'ready': False, 'status': status_msg, 'url': wo_url})
+
+
+@app.route('/api/webodm/uninstall', methods=['POST'])
+@login_required
+def webodm_uninstall():
+    import subprocess as _sp
+    data = request.json or {}
+    password = data.get('password', '')
+    auth = load_auth()
+    if not auth.get('password_hash') or not check_password_hash(auth['password_hash'], password):
+        return jsonify({'error': 'Invalid admin password'}), 403
+    import shutil as _sh
+    wo_dir = os.path.expanduser('~/webodm')
+    compose_path = os.path.join(wo_dir, 'docker-compose.yml')
+    if os.path.exists(compose_path):
+        _sp.run(['docker', 'compose', '-f', compose_path, 'down', '--volumes'],
+                capture_output=True, timeout=90, cwd=wo_dir)
+    # Wipe bind-mounted postgres data so next deploy starts fresh and
+    # prompts for new admin credentials. media/ (processed jobs) is kept.
+    db_dir = os.path.join(wo_dir, 'db')
+    if os.path.isdir(db_dir):
+        try:
+            _sh.rmtree(db_dir)
+        except Exception:
+            _sp.run(['rm', '-rf', db_dir], capture_output=True)
+    s = load_settings()
+    s['webodm_enabled'] = False
+    save_settings(s)
+    generate_caddyfile(s)
+    _sp.run(['systemctl', 'reload', 'caddy'], timeout=15, capture_output=True)
+    return jsonify({'success': True})
 
 
 def _configure_authentik_smtp_and_recovery(from_addr, plog=None):
@@ -17825,6 +18855,105 @@ def _ensure_authentik_nodered_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
     except Exception as e:
         log(f"  ⚠ Forward auth setup error: {str(e)[:100]}")
     return True
+
+def _ensure_authentik_webodm_app(fqdn, ak_token, plog=None, flow_pk=None, inv_flow_pk=None, settings=None):
+    """Create WebODM proxy provider + application in Authentik, add to embedded outpost.
+    Same pattern as Node-RED / MediaMTX — Caddy forward_auth protects the route."""
+    if not fqdn or not ak_token:
+        return False
+    def log(msg):
+        if plog:
+            plog(msg)
+    import urllib.request as _urlreq
+    import urllib.error
+    _ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+    _ak_url = _get_authentik_api_url(settings) if settings else 'http://127.0.0.1:9090'
+
+    try:
+        if not flow_pk or not inv_flow_pk:
+            for attempt in range(36):
+                try:
+                    req = _urlreq.Request(f'{_ak_url}/api/v3/flows/instances/?designation=authorization&ordering=slug', headers=_ak_headers)
+                    resp = _urlreq.urlopen(req, timeout=10)
+                    flows = json.loads(resp.read().decode())['results']
+                    flow_pk = next((f['pk'] for f in flows if 'implicit' in f.get('slug', '')), flows[0]['pk'] if flows else None)
+                    if flow_pk:
+                        req = _urlreq.Request(f'{_ak_url}/api/v3/flows/instances/?designation=invalidation', headers=_ak_headers)
+                        resp = _urlreq.urlopen(req, timeout=10)
+                        inv_flows = json.loads(resp.read().decode())['results']
+                        inv_flow_pk = next((f['pk'] for f in inv_flows if 'provider' not in f.get('slug', '')), inv_flows[0]['pk'] if inv_flows else None)
+                        if inv_flow_pk:
+                            break
+                except Exception:
+                    pass
+                if attempt % 6 == 0:
+                    log(f"  ⏳ Waiting for authorization flow... ({attempt * 5}s)")
+                time.sleep(5)
+            if not flow_pk or not inv_flow_pk:
+                log("  ⚠ No authorization/invalidation flow — skipping WebODM proxy provider")
+                return False
+            log("  ✓ Got authorization and invalidation flows")
+
+        provider_pk = None
+        try:
+            _wo_host = f'https://{_get_service_domain(settings, "webodm") if settings else f"webodm.{fqdn}"}'
+            _cookie = f'.{fqdn.split(":")[0]}'
+            req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/',
+                data=json.dumps({'name': 'WebODM Proxy', 'authorization_flow': flow_pk,
+                    'invalidation_flow': inv_flow_pk,
+                    'external_host': _wo_host, 'mode': 'forward_single',
+                    'token_validity': 'hours=24', 'cookie_domain': _cookie}).encode(),
+                headers=_ak_headers, method='POST')
+            resp = _urlreq.urlopen(req, timeout=10)
+            provider_pk = json.loads(resp.read().decode())['pk']
+            log("  ✓ Proxy provider created")
+        except Exception as e:
+            if hasattr(e, 'code') and e.code == 400:
+                req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/?search=WebODM', headers=_ak_headers)
+                resp = _urlreq.urlopen(req, timeout=10)
+                results = json.loads(resp.read().decode())['results']
+                if results:
+                    provider_pk = results[0]['pk']
+                    try:
+                        req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/{provider_pk}/',
+                            data=json.dumps({'external_host': _wo_host, 'cookie_domain': _cookie}).encode(),
+                            headers=_ak_headers, method='PATCH')
+                        _urlreq.urlopen(req, timeout=10)
+                    except Exception:
+                        pass
+                log("  ✓ Proxy provider already exists (external_host updated)")
+            else:
+                log(f"  ⚠ Proxy provider error: {str(e)[:100]}")
+
+        if provider_pk:
+            try:
+                req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/',
+                    data=json.dumps({'name': 'WebODM', 'slug': 'webodm',
+                        'provider': provider_pk, 'open_in_new_tab': True}).encode(),
+                    headers=_ak_headers, method='POST')
+                _urlreq.urlopen(req, timeout=10)
+                log("  ✓ Application 'WebODM' created")
+            except Exception as e:
+                if hasattr(e, 'code') and e.code == 400:
+                    try:
+                        req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/webodm/',
+                            data=json.dumps({'provider': provider_pk, 'open_in_new_tab': True}).encode(),
+                            headers=_ak_headers, method='PATCH')
+                        _urlreq.urlopen(req, timeout=10)
+                    except Exception:
+                        pass
+                    log("  ✓ Application 'WebODM' updated")
+                else:
+                    log(f"  ⚠ Application error: {str(e)[:80]}")
+
+            _outpost_add_providers_safe(_ak_url, _ak_headers, [provider_pk], plog=log)
+            _authentik_application_open_in_new_tab(_ak_url, _ak_headers, 'webodm', plog=log)
+        else:
+            log("  ⚠ Could not create or find WebODM proxy provider")
+    except Exception as e:
+        log(f"  ⚠ Forward auth setup error: {str(e)[:100]}")
+    return True
+
 
 def _ensure_authentik_fedhub_proxy_app(fqdn, ak_token, plog=None, flow_pk=None, inv_flow_pk=None, settings=None):
     """Create Federation Hub proxy provider + application in Authentik, add to embedded outpost.
@@ -23059,6 +24188,132 @@ window.doUninstall = function() {
   });
 };
 
+/* ── CloudTAK Plugin Manager ─────────────────────────────────────── */
+
+window._ctPluginLogIndex = 0;
+window._ctPluginLogInterval = null;
+
+window._ctPluginSetBusy = function(pluginKey, action, busy) {
+  var label = { install: 'Install', update: 'Update', remove: 'Remove' }[action] || action;
+  var installBtn = document.getElementById('ct-plugin-install-btn-' + pluginKey);
+  var updateBtn  = document.getElementById('ct-plugin-update-btn-' + pluginKey);
+  var removeBtn  = document.getElementById('ct-plugin-remove-btn-' + pluginKey);
+  [installBtn, updateBtn, removeBtn].forEach(function(btn) {
+    if (!btn) return;
+    btn.disabled = busy;
+    btn.style.opacity = busy ? '0.6' : '';
+  });
+  var activeBtn = { install: installBtn, update: updateBtn, remove: removeBtn }[action];
+  if (activeBtn) {
+    if (busy) {
+      activeBtn._origHTML = activeBtn.innerHTML;
+      activeBtn.innerHTML = '<span class="ct-btn-spinner"></span>' + label + 'ing\u2026';
+    } else if (activeBtn._origHTML) {
+      activeBtn.innerHTML = activeBtn._origHTML;
+      delete activeBtn._origHTML;
+    }
+  }
+};
+
+window.ctPluginAction = function(pluginKey, action) {
+  var label = { install: 'Install', update: 'Update', remove: 'Remove' }[action] || action;
+  if (action === 'remove') {
+    if (!confirm('Remove plugin "' + pluginKey + '"? This will rebuild the CloudTAK API image (~5–15 min).')) return;
+  } else if (action === 'update') {
+    if (!confirm('Update plugin "' + pluginKey + '"? This will pull the latest code and rebuild the API image.')) return;
+  }
+
+  var logCard = document.getElementById('ct-plugin-log-card');
+  var logEl   = document.getElementById('ct-plugin-log');
+  var labelEl = document.getElementById('ct-plugin-log-action');
+
+  window._ctPluginSetBusy(pluginKey, action, true);
+  if (logCard) logCard.style.display = 'block';
+  if (logEl)   logEl.textContent = 'Starting ' + label.toLowerCase() + '...';
+  if (labelEl) labelEl.textContent = '— ' + label + ' ' + pluginKey;
+  if (logCard) logCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+
+  window._ctPluginLogIndex = 0;
+
+  fetch('/api/cloudtak/plugins/action', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ plugin: pluginKey, action: action }),
+    credentials: 'same-origin'
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    if (d && d.error) {
+      if (logEl) logEl.textContent = 'Error: ' + d.error;
+      window._ctPluginSetBusy(pluginKey, action, false);
+      return;
+    }
+    window._ctPollPluginLog(pluginKey, action);
+  }).catch(function(e) {
+    if (logEl) logEl.textContent = 'Request failed: ' + (e && e.message ? e.message : String(e));
+    window._ctPluginSetBusy(pluginKey, action, false);
+  });
+};
+
+window._ctPollPluginLog = function(pluginKey, action) {
+  if (window._ctPluginLogInterval) clearInterval(window._ctPluginLogInterval);
+  window._ctPluginPollFails = 0;
+
+  function doPoll() {
+    fetch('/api/cloudtak/plugins/log?index=' + window._ctPluginLogIndex, { credentials: 'same-origin' })
+      .then(function(r) { return r.json(); })
+      .then(function(d) {
+        window._ctPluginPollFails = 0;
+        if (!d) return;
+        var logEl = document.getElementById('ct-plugin-log');
+        if (d.entries && d.entries.length) {
+          var text = d.entries.join('\n') + '\n';
+          if (window._ctPluginLogIndex === 0) {
+            if (logEl) logEl.textContent = text;
+          } else {
+            if (logEl) logEl.textContent = (logEl.textContent || '') + text;
+          }
+          if (logEl) logEl.scrollTop = logEl.scrollHeight;
+          window._ctPluginLogIndex += d.entries.length;
+        }
+        if (!d.running) {
+          clearInterval(window._ctPluginLogInterval);
+          window._ctPluginLogInterval = null;
+          if (d.complete) {
+            setTimeout(function() { location.reload(); }, 1500);
+          } else if (d.error) {
+            var logEl2 = document.getElementById('ct-plugin-log');
+            if (logEl2) logEl2.textContent = (logEl2.textContent || '') + '\n\n\u2717 Action failed (see log above).';
+            if (pluginKey && action) window._ctPluginSetBusy(pluginKey, action, false);
+          }
+        }
+      })
+      .catch(function() {
+        window._ctPluginPollFails = (window._ctPluginPollFails || 0) + 1;
+        if (window._ctPluginPollFails === 1) {
+          var logEl = document.getElementById('ct-plugin-log');
+          if (logEl) logEl.textContent = (logEl.textContent || '') + '\n[Connection interrupted — reconnecting...]';
+        }
+      });
+  }
+
+  doPoll();
+  window._ctPluginLogInterval = setInterval(doPoll, 1000);
+};
+
+/* Resume log polling if a plugin action was already running when the page loaded */
+(function() {
+  fetch('/api/cloudtak/plugins/log?index=0', { credentials: 'same-origin' })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (!d || !d.running) return;
+      var logCard = document.getElementById('ct-plugin-log-card');
+      var labelEl = document.getElementById('ct-plugin-log-action');
+      if (logCard) logCard.style.display = 'block';
+      if (labelEl) labelEl.textContent = d.action ? '— ' + d.action + ' ' + d.plugin : '';
+      window._ctPluginLogIndex = 0;
+      window._ctPollPluginLog();
+    }).catch(function() {});
+})();
+
 window.doCloudtakResetConfig = function() {
   var msgEl = document.getElementById("ct-reset-msg");
   var btn = document.getElementById("ct-reset-confirm-btn");
@@ -23247,6 +24502,65 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <div class="card">
     <div class="card-title">Container Logs <span id="log-filter-label" style="font-size:11px;color:var(--cyan);margin-left:8px"></span></div>
     <div class="log-box" id="container-logs">Loading...</div>
+  </div>
+  {% endif %}
+
+  <!-- Plugins -->
+  {% if cloudtak_cfg.get('target_mode') == 'remote' %}
+  <div class="card" style="background:rgba(59,130,246,.04);border-color:rgba(59,130,246,.2)">
+    <div class="card-title">Plugins</div>
+    <p style="font-size:13px;color:var(--text-dim)">Plugin management is not available for remote CloudTAK installations. Manage plugins directly on the remote host via SSH using the <a href="https://github.com/dfpc-coe/CloudTAK/tree/main/api/web/plugins" target="_blank" rel="noopener" style="color:var(--cyan)">upstream plugin docs</a>.</p>
+  </div>
+  {% elif cloudtak_plugins is defined %}
+  <div class="card" id="ct-plugins-section">
+    <div class="card-title" style="display:flex;align-items:center;justify-content:space-between">
+      <span>Plugins</span>
+      <a href="https://github.com/dfpc-coe/CloudTAK/tree/main/api/web/plugins" target="_blank" rel="noopener" style="font-size:11px;color:var(--text-dim);text-decoration:none;font-weight:400;letter-spacing:0">upstream docs ↗</a>
+    </div>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:18px">
+      Plugins are baked into the CloudTAK SPA at build time — installing or removing one rebuilds the <code>api</code> image (5–15 min). CloudTAK stays running during the build and is briefly restarted at the end.
+      After install, open CloudTAK → <strong style="color:var(--text-secondary)">Settings → Refresh App</strong> to activate the new service worker. The plugin then appears at the <strong style="color:var(--text-secondary)">bottom of the right-side menu</strong>.
+      <span style="color:var(--text-dim)">(Cmd+Shift+R does not work — CloudTAK's service worker intercepts all requests. Refresh App or close all CloudTAK tabs and reopen.)</span>
+    </p>
+    <div id="ct-plugin-cards" style="display:grid;grid-template-columns:1fr;gap:12px">
+      {% for p in cloudtak_plugins %}
+      <div style="background:var(--bg-surface);border:1px solid {% if p.installed %}rgba(16,185,129,.35){% else %}var(--border){% endif %};border-radius:10px;padding:16px 20px" id="ct-plugin-card-{{ p.key }}">
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px">
+          <div style="flex:1;min-width:0">
+            <div style="font-size:13px;font-weight:600;color:var(--text-primary);margin-bottom:4px">{{ p.name }}</div>
+            <div style="font-size:12px;color:var(--text-secondary);margin-bottom:8px;line-height:1.5">{{ p.description }}</div>
+            <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:8px">
+              <span style="font-size:11px;color:var(--text-dim);font-family:'JetBrains Mono',monospace">author: {{ p.author }}</span>
+              <span style="font-size:11px;color:var(--text-dim);font-family:'JetBrains Mono',monospace">·</span>
+              <span style="font-size:11px;color:var(--text-dim);font-family:'JetBrains Mono',monospace">{{ p.license }}</span>
+              <span style="font-size:11px;color:var(--text-dim);font-family:'JetBrains Mono',monospace">·</span>
+              <span style="font-size:11px;color:var(--text-dim);font-family:'JetBrains Mono',monospace">requires {{ p.requires }}</span>
+            </div>
+            <a href="{{ p.repo }}" target="_blank" rel="noopener" style="font-size:11px;color:var(--cyan);text-decoration:none">{{ p.repo.replace('https://','') }} ↗</a>
+            {% if p.installed and p.sha %}
+            <div style="font-size:11px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;margin-top:4px">installed: {{ p.sha }}{% if p.update_available %} <span style="color:var(--cyan);margin-left:6px">update available</span>{% endif %}</div>
+            {% endif %}
+          </div>
+          <div style="display:flex;flex-direction:column;align-items:flex-end;gap:8px;flex-shrink:0">
+            {% if p.installed %}
+            <span style="font-size:11px;font-weight:600;color:var(--green);background:rgba(16,185,129,.1);border:1px solid rgba(16,185,129,.3);border-radius:5px;padding:3px 9px">INSTALLED</span>
+            <button class="btn btn-ghost" id="ct-plugin-update-btn-{{ p.key }}" style="font-size:12px;padding:7px 14px;{% if p.update_available %}border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan);{% endif %}" onclick="ctPluginAction('{{ p.key }}','update')">⬆ Update{% if p.update_available %} <span style="color:var(--cyan)" title="Update available">●</span>{% endif %}</button>
+            <button class="btn" id="ct-plugin-remove-btn-{{ p.key }}" style="font-size:12px;padding:7px 14px;background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.3)" onclick="ctPluginAction('{{ p.key }}','remove')">Remove</button>
+            {% else %}
+            <span style="font-size:11px;font-weight:600;color:var(--text-dim);background:var(--bg-card);border:1px solid var(--border);border-radius:5px;padding:3px 9px">NOT INSTALLED</span>
+            <button class="btn btn-primary" id="ct-plugin-install-btn-{{ p.key }}" style="font-size:12px;padding:7px 14px" onclick="ctPluginAction('{{ p.key }}','install')">Install</button>
+            {% endif %}
+          </div>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+
+    <!-- Plugin action log (hidden until an action starts) -->
+    <div id="ct-plugin-log-card" style="display:none;margin-top:20px">
+      <div class="section-title" style="margin-bottom:10px">Plugin Log <span id="ct-plugin-log-action" style="color:var(--cyan);font-size:11px;font-weight:400;text-transform:none;letter-spacing:0"></span></div>
+      <div class="log-box" id="ct-plugin-log">Waiting...</div>
+    </div>
   </div>
   {% endif %}
 
@@ -25965,6 +27279,9 @@ def _run_authentik_reconfigure_remote(settings, deploy_cfg, plog):
     if _is_module_deployed(settings, 'nodered'):
         plog("  Configuring Authentik for Node-RED...")
         _ensure_authentik_nodered_app(fqdn, ak_token, plog, settings=settings)
+    if settings.get('webodm_enabled'):
+        plog("  Configuring Authentik for WebODM...")
+        _ensure_authentik_webodm_app(fqdn, ak_token, plog, settings=settings)
     fh_cfg = _get_fedhub_deployment_config(settings)
     if fh_cfg.get('deployed') and (fh_cfg.get('remote', {}).get('host') or '').strip():
         plog("  Configuring Authentik for Federation Hub (forward auth)...")
@@ -31879,6 +33196,116 @@ def _takportal_admin_guardrail(plog_fn=None):
         _log(f"takportal admin guardrail error (non-fatal): {_e}")
 
 
+def _check_takserver_ldap49_and_heal(plog=None):
+    """v0.9.38: Detect TAK Server negative LDAP auth cache and auto-flush the
+    LDAP outpost to clear it.
+
+    When a user fails to authenticate, TAK Server's LdapAuthenticator caches
+    the failed result internally (DistributedPersistentGroupManager). After a
+    password change in TAK Portal, subsequent logins still hit that cache and
+    return LDAP 49 without the request ever reaching Authentik. The only fix is
+    --force-recreate ldap, which forces TAK Server to drop and re-establish its
+    LDAP connection, clearing the cached failure.
+
+    Detection: tail /opt/tak/logs/takserver-api.log and count lines matching
+    'LdapAuthenticator - exception during group assignment' within the last
+    360 seconds. Threshold >= 2: one failure = normal wrong-password typo, no
+    action; two or more in a 5-min window = pattern indicates a stuck negative
+    cache (password changed, user retrying, still blocked).
+
+    Rate limit: 4-minute cooldown via settings['ldap49_cache_flush'] — at most
+    one flush per watchdog tick regardless of how many failures accumulate.
+
+    Called from _authentik_ldap_sa_bind_watchdog_loop before the SA bind probe
+    so the outpost is already fresh when the probe runs.
+    """
+    _log = plog or (lambda m: print(m, flush=True))
+    try:
+        _api_log = '/opt/tak/logs/takserver-api.log'
+        if not os.path.exists(_api_log):
+            return
+
+        _settings = load_settings()
+
+        # 4-minute cooldown — prevents double-flushes within a single tick window
+        _cooldown_info = _settings.get('ldap49_cache_flush') or {}
+        _last_flush = float(_cooldown_info.get('last_flush_ts') or 0)
+        if time.time() - _last_flush < 240:
+            return
+
+        # Tail last 300 lines — covers several minutes on an active box.
+        # Use subprocess list form to avoid shell expansion on the path.
+        _r = subprocess.run(
+            ['tail', '-n', '300', _api_log],
+            capture_output=True, text=True, timeout=5
+        )
+        if _r.returncode != 0 or not _r.stdout:
+            return
+
+        _cutoff = datetime.utcnow() - timedelta(seconds=360)
+        _count = 0
+        _marker = 'LdapAuthenticator - exception during group assignment'
+        for _line in _r.stdout.splitlines():
+            if _marker not in _line:
+                continue
+            try:
+                # TAK Server log format: 2026-05-23-03:18:13.396 [...] WARN ...
+                _ts_str = _line.split(' ')[0]
+                _ts = datetime.strptime(_ts_str, '%Y-%m-%d-%H:%M:%S.%f')
+                if _ts >= _cutoff:
+                    _count += 1
+            except (ValueError, IndexError):
+                # Unparseable timestamp — count conservatively
+                _count += 1
+
+        if _count < 2:
+            return
+
+        _log(f"  LDAP 49 cache-hit watchdog: {_count} user auth failure(s) in "
+             f"last 6 min — flushing LDAP outpost bind cache")
+        _ak_cfg = _get_module_deployment_config(_settings, 'authentik_deployment')
+        _is_remote = (
+            _ak_cfg.get('target_mode') == 'remote' and
+            bool((_ak_cfg.get('remote', {}).get('host') or '').strip())
+        )
+        try:
+            if _is_remote:
+                _module_run(
+                    _ak_cfg,
+                    'cd ~/authentik && docker compose up -d --no-deps --force-recreate ldap 2>&1',
+                    timeout=90
+                )
+            else:
+                _flush_r = subprocess.run(
+                    'cd ~/authentik && docker compose up -d --no-deps --force-recreate ldap 2>&1',
+                    shell=True, capture_output=True, text=True, timeout=90
+                )
+                if _flush_r.returncode != 0:
+                    _log(f"  ⚠ LDAP 49 cache flush failed "
+                         f"(rc={_flush_r.returncode}): {(_flush_r.stdout or '')[:200]}")
+                    return
+            _log("  ✓ LDAP outpost flushed — TAK Server LDAP connection will "
+                 "reset on next auth attempt, clearing the cached failure")
+            # Persist audit trail so operators can track frequency
+            try:
+                _s2 = load_settings()
+                _prior = _s2.get('ldap49_cache_flush') or {}
+                _s2['ldap49_cache_flush'] = {
+                    'last_flush_ts': time.time(),
+                    'flush_count': int(_prior.get('flush_count') or 0) + 1,
+                    'last_trigger_count': _count,
+                }
+                save_settings(_s2)
+            except Exception:
+                pass
+        except Exception as _fe:
+            _log(f"  ⚠ LDAP 49 cache flush error: {str(_fe)[:120]}")
+    except Exception as _e:
+        (_plog := plog or print)(
+            f"  _check_takserver_ldap49_and_heal error (non-fatal): {str(_e)[:120]}"
+        )
+
+
 def _authentik_ldap_sa_bind_watchdog_loop():
     """v0.9.23 (Item 1+2 of PLAN-v0.9.23-alpha.md). Background daemon — periodic
     LDAP SA bind verification + webadmin admin-role drift heal.
@@ -31923,6 +33350,12 @@ def _authentik_ldap_sa_bind_watchdog_loop():
             if not _env_pass:
                 _wt.sleep(300)
                 continue
+
+            # v0.9.38: detect TAK Server negative auth cache and flush if needed,
+            # before the SA bind probe so the outpost is fresh when we test it.
+            _check_takserver_ldap49_and_heal(
+                plog=lambda m: print(f"[ldap-sa-watchdog] {m}", flush=True)
+            )
 
             try:
                 _verdict = _test_ldap_bind_dn_verdict(
@@ -33333,6 +34766,9 @@ def run_authentik_deploy(reconfigure=False):
                         if _is_module_deployed(settings, 'nodered'):
                             plog("  Configuring Authentik for Node-RED...")
                             _ensure_authentik_nodered_app(fqdn, ak_token, plog, settings=settings)
+                        if settings.get('webodm_enabled'):
+                            plog("  Configuring Authentik for WebODM...")
+                            _ensure_authentik_webodm_app(fqdn, ak_token, plog, settings=settings)
                         fh_cfg = _get_fedhub_deployment_config(settings)
                         if fh_cfg.get('deployed') and (fh_cfg.get('remote', {}).get('host') or '').strip():
                             plog("  Configuring Authentik for Federation Hub (forward auth)...")
@@ -34598,6 +36034,10 @@ entries:
                         plog("")
                         plog("  Configuring Authentik for Node-RED...")
                         _ensure_authentik_nodered_app(fqdn, ak_token, plog, flow_pk=flow_pk, inv_flow_pk=inv_flow_pk, settings=settings)
+                    if settings.get('webodm_enabled'):
+                        plog("")
+                        plog("  Configuring Authentik for WebODM...")
+                        _ensure_authentik_webodm_app(fqdn, ak_token, plog, flow_pk=flow_pk, inv_flow_pk=inv_flow_pk, settings=settings)
                     # infra-TAK console (infratak + MediaMTX if deployed) behind Authentik
                     plog("")
                     plog("  Configuring Authentik for infra-TAK Console (infra-TAK + MediaMTX if deployed)...")
@@ -44816,7 +46256,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% for key, mod in modules.items() %}
 <a class="module-card" href="{{ mod.route }}" data-module="{{ key }}">
 <div class="module-header{% if mod.get('icon_url') %} module-header--logo{% endif %}">{% if mod.icon_data %}<img src="{{ mod.icon_data }}" alt="" class="module-icon" style="width:24px;height:24px;object-fit:contain">{% elif key == 'takportal' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">group</span>{% elif key == 'fedhub' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">hub</span>{% elif key == 'emailrelay' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">outgoing_mail</span>{% elif mod.get('icon_url') %}<img src="{{ mod.icon_url }}" alt="" class="module-icon" style="height:36px;width:auto;max-width:{% if key == 'takserver' %}72px{% else %}100px{% endif %};object-fit:contain">{% else %}<span class="module-icon">{{ mod.icon }}</span>{% endif %}
-{% if not mod.get('icon_url') or key in ('takportal', 'fedhub', 'emailrelay', 'fail2ban') %}<div class="module-name">{{ mod.name }}</div>{% endif %}
+{% if not mod.get('icon_url') or key in ('takportal', 'fedhub', 'emailrelay', 'fail2ban', 'webodm') %}<div class="module-name">{{ mod.name }}</div>{% endif %}
 </div>
 <div class="module-desc">{{ mod.description }}</div>
 {% if module_versions.get(key) %}{% set v = module_versions.get(key) %}{% if v.version or v.update_available %}<div class="meta-line module-version-line" id="module-version-{{ key }}" style="margin-bottom:4px">{% if v.version %}{% if key == 'mediamtx' %}{{ v.version }}{% else %}v{{ v.version }}{% endif %}{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% elif key == 'authentik' and v.get('channel') == 'dev' %} <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v{{ v.get('vetted_release','') }}">· main: v{{ v.get('vetted_release','') }}</span>{% elif key == 'authentik' and not v.update_available and v.get('vetted_release') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}</div>{% endif %}{% endif %}
@@ -45284,6 +46724,708 @@ async function doConsoleRollback(){
 }
 </script></body></html>'''
 
+# === WebODM Template ===
+WEBODM_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>WebODM — infra-TAK</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet">
+<style>
+:root{--bg-deep:#080b14;--bg-surface:#0f1219;--bg-card:#161b26;--border:#1e2736;--text-primary:#f1f5f9;--text-secondary:#cbd5e1;--text-dim:#94a3b8;--accent:#3b82f6;--cyan:#06b6d4;--green:#10b981;--red:#ef4444;--yellow:#eab308}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',sans-serif;min-height:100vh;display:flex;flex-direction:row}
+.sidebar{width:220px;min-width:220px;background:var(--bg-surface);border-right:1px solid var(--border);padding:24px 0;flex-shrink:0;display:flex;flex-direction:column}
+.main{flex:1;padding:32px;overflow-y:auto;min-height:100vh}
+.section-title{font-size:20px;font-weight:700;color:var(--text-primary);margin-bottom:24px;display:flex;align-items:center;gap:10px}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:22px 24px;margin-bottom:20px}
+.card-title{font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--text-dim);margin-bottom:16px}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:9px 18px;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;cursor:pointer;border:none;transition:all .2s}
+.btn-primary{background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff}.btn-primary:hover{opacity:.9}.btn-primary:disabled{opacity:.4;cursor:not-allowed}
+.btn-danger{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.2)}.btn-danger:hover{background:rgba(239,68,68,.2)}
+.btn-ghost{background:rgba(59,130,246,.08);color:var(--accent);border:1px solid var(--border)}.btn-ghost:hover{border-color:var(--accent)}
+.status-dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:6px}
+.status-dot.green{background:var(--green);box-shadow:0 0 6px var(--green)}
+.status-dot.yellow{background:var(--yellow)}
+.status-dot.red{background:var(--red)}
+.log-box{background:#0a0d14;border:1px solid var(--border);border-radius:8px;padding:14px 16px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-secondary);max-height:260px;overflow-y:auto;line-height:1.7}
+.log-line{color:var(--text-dim)}.log-line.err{color:var(--red)}.log-line.ok{color:var(--green)}
+.info-grid{display:grid;grid-template-columns:auto 1fr;gap:8px 20px;font-size:13px}
+.info-label{color:var(--text-dim);font-family:'JetBrains Mono',monospace;font-size:11px}
+.info-value{color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:11px;word-break:break-all}
+.step-item{display:flex;gap:14px;align-items:flex-start;padding:10px 0;border-bottom:1px solid rgba(30,39,54,.5)}
+.step-item:last-child{border-bottom:none}
+.step-num{width:24px;height:24px;border-radius:50%;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:1px}
+.step-code{font-family:'JetBrains Mono',monospace;font-size:11px;background:rgba(59,130,246,.08);border:1px solid var(--border);border-radius:4px;padding:1px 6px;color:var(--cyan)}
+.open-btn{display:inline-flex;align-items:center;gap:8px;padding:12px 24px;border-radius:10px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;text-decoration:none;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:700;transition:opacity .2s}.open-btn:hover{opacity:.85}
+.toast{position:fixed;bottom:24px;right:24px;background:#1e2736;border:1px solid var(--border);border-radius:10px;padding:12px 18px;font-size:13px;color:var(--text-primary);display:none;z-index:999}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;display:none;align-items:center;justify-content:center}.modal-overlay.open{display:flex}
+.modal{background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:420px;max-width:90vw}
+.modal h3{font-size:16px;font-weight:700;margin-bottom:12px}.modal p{font-size:13px;color:var(--text-dim);line-height:1.6;margin-bottom:18px}
+.modal-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:18px}
+.form-group{margin-bottom:12px}.form-label{display:block;font-size:12px;color:var(--text-secondary);margin-bottom:6px;font-weight:500}
+.form-input{width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px;color:var(--text-primary);font-size:13px;font-family:'DM Sans',sans-serif;outline:none}.form-input:focus{border-color:var(--accent)}
+.btn-sm{padding:6px 14px;font-size:11px}
+.uninstall-spinner{display:inline-block;width:16px;height:16px;border:2px solid var(--border);border-top-color:var(--cyan);border-radius:50%;animation:uninstall-spin .7s linear infinite;vertical-align:middle;margin-right:6px}
+.uninstall-progress-row{display:flex;align-items:center;gap:6px;margin-top:10px;font-size:12px;color:var(--text-secondary)}
+@keyframes uninstall-spin{to{transform:rotate(360deg)}}
+@keyframes spin{to{transform:rotate(360deg)}}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;color:var(--text-secondary);text-decoration:none;font-size:13px;font-weight:500;transition:all .15s;border-left:2px solid transparent}
+.nav-item:hover{color:var(--text-primary);background:rgba(255,255,255,.04);border-left-color:var(--border)}
+.nav-item.active{color:var(--accent);background:rgba(59,130,246,.08);border-left-color:var(--accent)}
+.nav-icon{font-size:18px;width:22px;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.sidebar-logo{padding:0 20px 16px;border-bottom:1px solid var(--border);margin-bottom:8px}
+.sidebar-logo span{display:block;font-size:15px;font-weight:700;color:var(--text-primary)}
+.sidebar-logo small{display:block;font-size:11px;color:var(--text-dim);margin-top:2px}
+body.light-mode{--bg-deep:#f1f5f9;--bg-surface:#fff;--bg-card:#f8fafc;--border:#e2e8f0;--text-primary:#0f172a;--text-secondary:#334155;--text-dim:#64748b}
+body.light-mode .nav-item:hover{background:rgba(0,0,0,.04)}
+body.light-mode .nav-item.active{background:rgba(59,130,246,.08)}
+</style></head><body>
+{{ sidebar_html }}
+<div class="main">
+<div class="section-title"><img src="https://raw.githubusercontent.com/WebODM/WebODM/master/app/static/app/img/logo512.png" alt="" style="height:28px;width:auto;object-fit:contain;filter:brightness(0) invert(1)">WebODM</div>
+
+{% if not wo.get('installed') %}
+<!-- Deploy state -->
+<div style="background:linear-gradient(135deg,rgba(30,64,175,.08),rgba(6,182,212,.06));border:1px solid rgba(6,182,212,.2);border-radius:10px;padding:20px 24px;margin-bottom:20px">
+<div style="font-size:13px;color:var(--text-secondary);margin-bottom:4px;font-weight:600">Drone Photo Processing for TAK</div>
+<div style="font-size:13px;color:var(--text-dim);line-height:1.6">Deploy WebODM + NodeODM on this server and automatically install the TAK Incident Overlay plugin by <a href="https://github.com/Humble-Helper-96" target="_blank" style="color:var(--cyan);text-decoration:none">Humble-Helper-96</a>. Upload GPS-tagged drone photos → get MBTiles and GeoTIFF overlays ready for ATAK — all from a browser.</div>
+<div style="margin-top:12px;font-size:12px;color:var(--text-dim)">Deploys: WebODM 3.2+ · NodeODM processing node · <a href="https://github.com/Humble-Helper-96/webodm-tak-overlay" target="_blank" style="color:var(--cyan);text-decoration:none">TAK Overlay plugin v0.7.7</a></div>
+</div>
+
+{% if deploying %}
+<div class="card">
+<div class="card-title">Deploying WebODM…</div>
+<div class="log-box" id="deploy-log">{% for line in deploy_log %}<div class="log-line{% if 'ERROR' in line %} err{% elif '✓' in line or 'success' in line.lower() %} ok{% endif %}">{{ line }}</div>{% endfor %}</div>
+<div style="margin-top:14px;font-size:12px;color:var(--text-dim)">Image pull may take several minutes…</div>
+</div>
+<script>
+var WO_URL = {{ wo_url|tojson }};
+(function(){
+var _lastCount = document.getElementById('deploy-log').children.length;
+var _interval = setInterval(function(){
+    fetch('/api/webodm/deploy-status').then(function(r){return r.json();}).then(function(d){
+        var box = document.getElementById('deploy-log');
+        if(box && d.log && d.log.length > _lastCount){
+            for(var i=_lastCount;i<d.log.length;i++){
+                var div=document.createElement('div');
+                var line=d.log[i];
+                div.className='log-line'+(line.indexOf('ERROR')>=0?' err':(line.indexOf('✓')>=0||line.toLowerCase().indexOf('success')>=0?' ok':''));
+                div.textContent=line;
+                box.appendChild(div);
+            }
+            _lastCount=d.log.length;
+            box.scrollTop=box.scrollHeight;
+        }
+        if(!d.running){
+            clearInterval(_interval);
+            if(d.error){
+                setTimeout(function(){window.location.reload();},800);
+            } else {
+                startWarmup();
+            }
+        }
+    }).catch(function(){});
+},3000);
+
+function startWarmup(){
+    var logBox = document.getElementById('deploy-log');
+    var title = document.querySelector('.card-title');
+    if(title) title.textContent = 'WebODM deployed — warming up…';
+    var footer = document.querySelector('[style*="Image pull may take"]');
+    if(footer) footer.remove();
+
+    var warmupDiv = document.createElement('div');
+    warmupDiv.style = 'margin-top:16px;padding:14px 16px;background:rgba(6,182,212,.06);border:1px solid rgba(6,182,212,.2);border-radius:8px;font-size:12px;color:var(--text-dim)';
+    warmupDiv.innerHTML = '<div style="display:flex;align-items:center;gap:10px"><div id="wo-warmup-spinner" style="width:14px;height:14px;border:2px solid rgba(6,182,212,.3);border-top-color:var(--cyan);border-radius:50%;animation:spin .8s linear infinite;flex-shrink:0"></div><span id="wo-warmup-msg">WebODM containers are starting — waiting for readiness check…</span></div><div id="wo-ready-btn-wrap" style="margin-top:14px;display:none"><a id="wo-open-btn" href="#" target="_blank" class="open-btn" style="opacity:.5;pointer-events:none;cursor:default"><span class="material-symbols-outlined" style="font-size:16px">open_in_new</span>Open WebODM</a><span id="wo-ready-label" style="margin-left:12px;font-size:12px;color:var(--green);font-weight:600"></span></div>';
+    if(logBox) logBox.parentNode.insertBefore(warmupDiv, logBox.nextSibling);
+
+    var checks = 0;
+    var maxChecks = 36; // ~3 min max
+    var warmupInterval = setInterval(function(){
+        checks++;
+        fetch('/api/webodm/ready').then(function(r){return r.json();}).then(function(d){
+            var msg = document.getElementById('wo-warmup-msg');
+            if(d.ready){
+                clearInterval(warmupInterval);
+                var spinner = document.getElementById('wo-warmup-spinner');
+                if(spinner) spinner.style.borderTopColor='var(--green)';
+                if(msg) msg.innerHTML = '<span style="color:var(--green);font-weight:600">✓ WebODM is ready</span>';
+                var btnWrap = document.getElementById('wo-ready-btn-wrap');
+                if(btnWrap) btnWrap.style.display='block';
+                var openBtn = document.getElementById('wo-open-btn');
+                if(openBtn){ openBtn.style.opacity='1'; openBtn.style.pointerEvents='auto'; openBtn.style.cursor='pointer'; openBtn.href=d.url||WO_URL||'#'; }
+                var lbl = document.getElementById('wo-ready-label');
+                if(lbl) lbl.textContent = 'Authentik proxy is live — you can log in now';
+            } else {
+                if(msg) msg.textContent = d.status || ('Waiting for WebODM to finish startup… (' + checks * 5 + 's)');
+                if(checks >= maxChecks){
+                    clearInterval(warmupInterval);
+                    if(msg) msg.innerHTML = '<span style="color:var(--yellow)">Taking longer than expected — try opening manually.</span>';
+                    var btnWrap2 = document.getElementById('wo-ready-btn-wrap');
+                    if(btnWrap2) btnWrap2.style.display='block';
+                    var ob2 = document.getElementById('wo-open-btn');
+                    if(ob2){ ob2.style.opacity='1'; ob2.style.pointerEvents='auto'; ob2.style.cursor='pointer'; ob2.href=d.url||WO_URL||'#'; }
+                }
+            }
+        }).catch(function(){});
+    }, 5000);
+}
+})();
+</script>
+{% elif deploy_error %}
+<div class="card">
+<div class="card-title" style="color:var(--red)">Deploy Failed</div>
+<div class="log-box">{% for line in deploy_log %}<div class="log-line{% if 'ERROR' in line %} err{% endif %}">{{ line }}</div>{% endfor %}</div>
+<button class="btn btn-primary" onclick="startDeploy()" style="margin-top:14px" id="deploy-btn">Retry Deploy</button>
+</div>
+{% else %}
+<div class="card" style="max-width:560px">
+<div class="card-title">Deploy WebODM</div>
+<div style="font-size:13px;color:var(--text-dim);margin-bottom:20px;line-height:1.6">This will pull WebODM images (~1.5 GB), start all containers, clone the TAK overlay plugin, and register the NodeODM processing node. Takes 3–8 minutes on first deploy.</div>
+<button class="btn btn-primary" onclick="startDeploy()" id="deploy-btn">
+<span class="material-symbols-outlined" style="font-size:16px">rocket_launch</span>Deploy WebODM
+</button>
+<div id="deploy-status" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
+</div>
+{% endif %}
+
+{% else %}
+<!-- Management state -->
+<div class="card" style="margin-bottom:20px">
+<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
+<div style="display:flex;align-items:center;gap:10px">
+<span class="status-dot {% if wo.get('running') %}green{% else %}yellow{% endif %}"></span>
+<span style="font-size:14px;font-weight:600">{% if wo.get('running') %}Running{% else %}Stopped{% endif %}</span>
+{% if wo_version %}<span style="font-size:12px;color:var(--text-dim);margin-left:10px">v{{ wo_version }}</span>{% endif %}
+{% if wo_update_available and wo_latest %}<span style="font-size:12px;color:var(--cyan);margin-left:8px;font-weight:600">v{{ wo_latest }} available</span>{% endif %}
+{% if wo_url %}
+<span style="font-size:12px;color:var(--text-dim);margin-left:8px">· {{ wo_url }}</span>
+{% endif %}
+</div>
+<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+{% if wo_url %}
+<a href="{{ wo_url }}" target="_blank" class="open-btn">
+<span class="material-symbols-outlined" style="font-size:16px">open_in_new</span>Open WebODM
+</a>
+{% endif %}
+{% if wo_update_available and wo_latest %}
+<button class="btn btn-primary btn-sm" id="wo-update-btn" onclick="updateWebODM(this)">↑ Update to v{{ wo_latest }}</button>
+{% endif %}
+<button class="btn btn-ghost" onclick="repairAuthentik(this)" title="Re-provision Authentik proxy provider and application for WebODM">↻ Repair Authentik</button>
+<button class="btn btn-ghost" onclick="openWoPwModal()" title="Show admin accounts and reset password">🔑 Account Recovery</button>
+<button class="btn btn-danger" onclick="document.getElementById('uninstall-modal').classList.add('open')">Uninstall</button>
+</div>
+</div>
+</div>
+
+<!-- Connection info -->
+<div class="card">
+<div class="card-title">Connection Info</div>
+<div class="info-grid">
+<span class="info-label">WebODM URL</span>
+<span class="info-value">{{ wo_url or 'Configure FQDN in Settings first' }}</span>
+<span class="info-label">Default login</span>
+<span class="info-value">admin / admin (change after first login)</span>
+<span class="info-label">Processing node</span>
+<span class="info-value">wo_nodeodm:3000 (auto-registered)</span>
+<span class="info-label">Plugin</span>
+<span class="info-value">TAK Incident Overlay v0.7.7 by <a href="https://github.com/Humble-Helper-96" target="_blank" style="color:var(--cyan);text-decoration:none">Humble-Helper-96</a></span>
+</div>
+</div>
+
+<!-- Workflow -->
+<div class="card">
+<div class="card-title">TAK Overlay Workflow</div>
+<div class="steps-list">
+<div class="step-item"><div class="step-num">1</div><div class="step-text">Open WebODM at <span class="step-code">{{ wo_url or 'your WebODM URL' }}</span> and log in</div></div>
+<div class="step-item"><div class="step-num">2</div><div class="step-text">Go to the <strong>TAK Incident Overlay</strong> plugin in the sidebar</div></div>
+<div class="step-item"><div class="step-num">3</div><div class="step-text">Upload your GPS-tagged drone photos (up to 150 JPEGs, 300 in high-capacity mode)</div></div>
+<div class="step-item"><div class="step-num">4</div><div class="step-text">Processing runs automatically — typical time 3–25 minutes depending on quality mode</div></div>
+<div class="step-item"><div class="step-num">5</div><div class="step-text">Download the <span class="step-code">.mbtiles</span> file from the completed job</div></div>
+<div class="step-item"><div class="step-num">6</div><div class="step-text">Import into ATAK via <strong>Overlay Manager</strong> → <strong>Add</strong> → select the MBTiles file — the georeferenced orthomap appears on the TAK map at the correct location</div></div>
+</div>
+</div>
+{% endif %}
+</div>
+
+<!-- Uninstall modal -->
+<!-- Account recovery modal -->
+<div id="wo-pw-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;align-items:center;justify-content:center">
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;max-width:420px;width:90%">
+<div style="font-size:15px;font-weight:700;color:var(--text-primary);margin-bottom:4px">WebODM Account Recovery</div>
+<div style="font-size:12px;color:var(--text-dim);margin-bottom:16px">Shows all admin accounts and lets you set a new password for any of them.</div>
+<div id="wo-acct-list" style="background:rgba(6,182,212,.04);border:1px solid var(--border);border-radius:8px;padding:10px 14px;margin-bottom:16px;font-size:12px;color:var(--text-dim)">Loading accounts…</div>
+<label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:6px">Username to reset</label>
+<input id="wo-pw-user" type="text" class="form-input" placeholder="e.g. admin" style="margin-bottom:12px">
+<label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:6px">New password</label>
+<input id="wo-pw-input" type="password" class="form-input" placeholder="Min. 8 characters" style="margin-bottom:10px">
+<label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:6px">Confirm password</label>
+<input id="wo-pw-confirm" type="password" class="form-input" placeholder="Confirm new password" style="margin-bottom:14px">
+<div id="wo-pw-msg" style="font-size:12px;color:var(--red);min-height:16px;margin-bottom:10px"></div>
+<div style="display:flex;gap:10px;justify-content:flex-end">
+<button class="btn btn-ghost btn-sm" onclick="closeWoPwModal()">Cancel</button>
+<button class="btn btn-primary btn-sm" id="wo-pw-btn" onclick="resetWoPassword()">Set Password</button>
+</div>
+</div>
+</div>
+
+<div class="modal-overlay" id="uninstall-modal"><div class="modal">
+  <h3>&#x26a0; Uninstall WebODM?</h3><p>This will stop and remove all WebODM containers and the plugin. Processed job data in ~/webodm/media/ will be preserved on disk.</p>
+  <div style="margin-bottom:16px"><label class="form-label">Admin password</label><input class="form-input" id="uninstall-password" type="password" placeholder="Confirm password"></div>
+  <div class="modal-actions"><button class="btn btn-ghost" onclick="document.getElementById('uninstall-modal').classList.remove('open')">Cancel</button><button class="btn btn-danger" onclick="doUninstall()">Uninstall</button></div>
+  <div id="uninstall-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
+</div></div>
+
+<div id="toast" class="toast"></div>
+<script>
+function startDeploy(){
+    var btn=document.getElementById('deploy-btn');if(btn)btn.disabled=true;
+    var st=document.getElementById('deploy-status');if(st)st.textContent='Starting deploy…';
+    fetch('/api/webodm/deploy',{method:'POST'}).then(r=>r.json()).then(d=>{
+        if(d.success){window.location.reload();}
+        else{if(st)st.innerHTML='<span style="color:var(--red)">Error: '+(d.error||'unknown')+'</span>';if(btn)btn.disabled=false;}
+    }).catch(e=>{if(st)st.innerHTML='<span style="color:var(--red)">Network error</span>';if(btn)btn.disabled=false;});
+}
+function updateWebODM(btn){
+    btn.disabled=true;btn.textContent='Pulling update…';
+    var log=document.getElementById('wo-update-log');
+    if(!log){
+        log=document.createElement('div');
+        log.id='wo-update-log';
+        log.style='margin-top:10px;font-family:"JetBrains Mono",monospace;font-size:11px;color:var(--text-dim);white-space:pre-wrap;max-height:160px;overflow-y:auto;background:rgba(0,0,0,.3);border-radius:6px;padding:10px';
+        btn.parentNode.parentNode.parentNode.appendChild(log);
+    }
+    log.textContent='Starting update...';
+    function poll(){
+        fetch('/api/webodm/update-status').then(r=>r.json()).then(d=>{
+            log.textContent=d.log||'';log.scrollTop=log.scrollHeight;
+            if(d.running){setTimeout(poll,1500);}
+            else if(d.complete){btn.textContent='↑ Update to latest';btn.disabled=false;showToast('✓ WebODM updated — reload page for new version');setTimeout(()=>window.location.reload(),2000);}
+            else if(d.error){btn.textContent='↑ Update to latest';btn.disabled=false;showToast('Update error — see log');}
+        });
+    }
+    fetch('/api/webodm/update',{method:'POST'}).then(r=>r.json()).then(d=>{
+        if(d.started){setTimeout(poll,1000);}
+        else{btn.disabled=false;btn.textContent='↑ Update to latest';showToast('Error: '+(d.error||'unknown'));}
+    });
+}
+function repairAuthentik(btn){
+    btn.disabled=true;btn.textContent='Repairing…';
+    fetch('/api/webodm/repair-authentik',{method:'POST'}).then(r=>r.json()).then(d=>{
+        if(d.success){showToast('✓ Authentik configured — try opening WebODM now.');btn.textContent='↻ Repair Authentik';btn.disabled=false;}
+        else{showToast('Error: '+(d.error||'unknown'));btn.textContent='↻ Repair Authentik';btn.disabled=false;}
+    }).catch(e=>{showToast('Network error');btn.textContent='↻ Repair Authentik';btn.disabled=false;});
+}
+function openWoPwModal(){
+    document.getElementById('wo-pw-modal').style.display='flex';
+    document.getElementById('wo-acct-list').textContent='Loading accounts…';
+    document.getElementById('wo-pw-user').value='';
+    document.getElementById('wo-pw-input').value='';
+    document.getElementById('wo-pw-confirm').value='';
+    document.getElementById('wo-pw-msg').textContent='';
+    fetch('/api/webodm/admin-accounts').then(r=>r.json()).then(d=>{
+        var el=document.getElementById('wo-acct-list');
+        if(d.accounts&&d.accounts.length){
+            el.innerHTML='<span style="color:var(--text-secondary)">Admin accounts: </span>'+d.accounts.map(function(u){return '<code style="color:var(--cyan);margin-right:8px">'+u+'</code>';}).join('');
+            document.getElementById('wo-pw-user').value=d.accounts[0];
+        } else {el.textContent=d.error||'Could not load accounts — WebODM may still be starting.';}
+    }).catch(function(){document.getElementById('wo-acct-list').textContent='Could not reach WebODM container.';});
+}
+function closeWoPwModal(){
+    document.getElementById('wo-pw-modal').style.display='none';
+}
+function resetWoPassword(){
+    var user=document.getElementById('wo-pw-user').value.trim();
+    var pw=document.getElementById('wo-pw-input').value;
+    var pw2=document.getElementById('wo-pw-confirm').value;
+    var msg=document.getElementById('wo-pw-msg');
+    var btn=document.getElementById('wo-pw-btn');
+    msg.textContent='';
+    if(!user){msg.textContent='Enter a username.';return;}
+    if(!pw){msg.textContent='Enter a password.';return;}
+    if(pw.length<8){msg.textContent='Password must be at least 8 characters.';return;}
+    if(pw!==pw2){msg.textContent='Passwords do not match.';return;}
+    btn.disabled=true;btn.textContent='Setting…';
+    fetch('/api/webodm/reset-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:user,password:pw})})
+    .then(r=>r.json()).then(d=>{
+        btn.disabled=false;btn.textContent='Set Password';
+        if(d.success){closeWoPwModal();showToast('✓ Password updated for '+user);}
+        else{msg.textContent='Error: '+(d.error||'unknown');}
+    }).catch(function(){btn.disabled=false;btn.textContent='Set Password';msg.textContent='Network error';});
+}
+function doUninstall(){var pw=document.getElementById('uninstall-password').value,msg=document.getElementById('uninstall-msg');msg.textContent='';fetch('/api/webodm/uninstall',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){if(d.error){msg.textContent=d.error;return;}msg.textContent='Done. Reloading...';setTimeout(function(){location.reload();},800);}).catch(function(e){msg.textContent=e.message||'Request failed';});}
+function showToast(msg){var t=document.getElementById('toast');t.textContent=msg;t.style.display='block';setTimeout(function(){t.style.display='none';},3000);}
+</script></body></html>'''
+
+# === Cesium 3D Tiles Template ===
+CESIUM_TILES_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Cesium 3D Tiles — infra-TAK</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet">
+<style>
+:root{--bg-deep:#080b14;--bg-surface:#0f1219;--bg-card:#161b26;--border:#1e2736;--text-primary:#f1f5f9;--text-secondary:#cbd5e1;--text-dim:#94a3b8;--accent:#3b82f6;--cyan:#06b6d4;--green:#10b981;--red:#ef4444;--yellow:#eab308}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',sans-serif;min-height:100vh;display:flex;flex-direction:row}
+.sidebar{width:220px;min-width:220px;background:var(--bg-surface);border-right:1px solid var(--border);padding:24px 0;flex-shrink:0}
+.material-symbols-outlined{font-family:'Material Symbols Outlined';font-weight:400;font-style:normal;font-size:20px;line-height:1;letter-spacing:normal;white-space:nowrap;direction:ltr;-webkit-font-smoothing:antialiased}
+.nav-icon.material-symbols-outlined{font-size:22px;width:22px;text-align:center}
+.sidebar-logo{padding:0 20px 24px;border-bottom:1px solid var(--border);margin-bottom:16px}
+.sidebar-logo span{font-size:15px;font-weight:700}.sidebar-logo small{display:block;font-size:10px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;margin-top:2px}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;color:var(--text-secondary);text-decoration:none;font-size:13px;font-weight:500;transition:all .15s;border-left:2px solid transparent}
+.nav-item:hover{color:var(--text-primary);background:rgba(255,255,255,.03)}.nav-item.active{color:var(--cyan);background:rgba(6,182,212,.06);border-left-color:var(--cyan)}
+.nav-icon{font-size:15px;width:18px;text-align:center}
+.main{flex:1;min-width:0;overflow-y:auto;padding:32px}
+.section-title{font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--text-dim);text-transform:uppercase;letter-spacing:1.5px;margin-bottom:16px;font-weight:600}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:20px}
+.card-title{font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:16px;font-family:'JetBrains Mono',monospace}
+.status-row{display:flex;align-items:center;gap:12px}
+.status-dot{width:8px;height:8px;border-radius:50%;background:var(--green);animation:pulse 2s infinite;flex-shrink:0}
+.status-dot.off{background:var(--text-dim);animation:none}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.upload-area{border:2px dashed var(--border);border-radius:10px;padding:32px;text-align:center;cursor:pointer;transition:all .3s;background:rgba(15,23,42,.3)}
+.upload-area:hover,.upload-area.drag{border-color:var(--accent);background:rgba(59,130,246,.06)}
+.progress-bar-outer{width:100%;height:6px;background:rgba(59,130,246,.1);border-radius:3px;margin-top:10px;overflow:hidden;display:none}
+.progress-bar-inner{height:100%;border-radius:3px;background:linear-gradient(90deg,var(--accent),var(--cyan));width:0%;transition:width .3s}
+.dataset-table{width:100%;border-collapse:collapse}
+.dataset-table th{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.06em;padding:8px 12px;text-align:left;border-bottom:1px solid var(--border)}
+.dataset-table td{padding:10px 12px;font-size:13px;border-bottom:1px solid rgba(30,39,54,.6);vertical-align:middle}
+.dataset-table tr:last-child td{border-bottom:none}
+.btn{display:inline-flex;align-items:center;padding:8px 16px;border-radius:7px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;cursor:pointer;border:none;transition:all .2s}
+.btn-primary{background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff}.btn-primary:hover{opacity:.9}.btn-primary:disabled{opacity:.4;cursor:not-allowed}
+.btn-ghost{background:rgba(59,130,246,.08);color:var(--accent);border:1px solid var(--border)}.btn-ghost:hover{border-color:var(--accent);background:rgba(59,130,246,.15)}
+.btn-danger{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.2)}.btn-danger:hover{background:rgba(239,68,68,.2)}
+.btn-sm{padding:5px 10px;font-size:11px}
+.url-chip{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--cyan);background:rgba(6,182,212,.06);border:1px solid rgba(6,182,212,.15);border-radius:5px;padding:3px 8px;max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block;vertical-align:middle;cursor:pointer}
+.url-chip:hover{background:rgba(6,182,212,.12)}
+.sample-box{background:linear-gradient(135deg,rgba(30,64,175,.08),rgba(6,182,212,.06));border:1px solid rgba(6,182,212,.2);border-radius:10px;padding:20px 24px;margin-bottom:20px}
+.sample-box a{color:var(--cyan);text-decoration:none}.sample-box a:hover{text-decoration:underline}
+.step-item{display:flex;gap:14px;align-items:flex-start;padding:10px 0;border-bottom:1px solid rgba(30,39,54,.5)}
+.step-item:last-child{border-bottom:none}
+.step-num{width:24px;height:24px;border-radius:50%;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:1px}
+.step-text{font-size:13px;color:var(--text-secondary);line-height:1.5}
+.step-code{font-family:'JetBrains Mono',monospace;font-size:11px;background:rgba(59,130,246,.08);border:1px solid var(--border);border-radius:4px;padding:1px 6px;color:var(--cyan)}
+.details-toggle{width:100%;text-align:left;background:none;border:none;cursor:pointer;display:flex;align-items:center;justify-content:space-between;padding:0;color:var(--text-secondary);font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.06em}
+.details-toggle:hover{color:var(--text-primary)}
+.chevron{transition:transform .2s;font-size:16px;color:var(--text-dim)}
+.chevron.open{transform:rotate(180deg)}
+.collapsed{display:none}
+.form-input{width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:9px 12px;color:var(--text-primary);font-size:13px;font-family:'JetBrains Mono',monospace}
+.form-input:focus{outline:none;border-color:var(--accent)}
+.form-label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px}
+.toast{position:fixed;bottom:24px;right:24px;background:var(--bg-card);border:1px solid var(--border);border-radius:10px;padding:12px 18px;font-size:13px;z-index:999;opacity:0;transition:opacity .3s;pointer-events:none}
+.toast.show{opacity:1}
+.empty-state{text-align:center;padding:32px;color:var(--text-dim);font-size:13px}
+</style></head><body>
+{{ sidebar_html }}
+<div class="main">
+<div style="margin-bottom:20px"><img src="/static/3DTiles_light_color.svg" alt="Cesium 3D Tiles" style="height:40px;width:auto;object-fit:contain"></div>
+
+{% if not ct.get('installed') %}
+<!-- Deploy state -->
+<div class="card" style="max-width:600px">
+<div style="display:flex;align-items:flex-start;gap:20px">
+<span style="font-size:48px;line-height:1;flex-shrink:0">🌍</span>
+<div>
+<div style="font-family:'JetBrains Mono',monospace;font-size:16px;font-weight:700;color:var(--text-primary);margin-bottom:8px">Cesium 3D Tiles</div>
+<div style="font-size:13px;color:var(--text-secondary);line-height:1.6;margin-bottom:16px">
+Serve 3D terrain, building models, and point clouds directly to ATAK and WinTAK clients.
+Any dataset in <a href="https://github.com/CesiumGS/3d-tiles" style="color:var(--cyan);text-decoration:none" target="_blank">Cesium 3D Tiles format</a> works — upload it as a zip and give field users a single <code style="font-family:'JetBrains Mono',monospace;font-size:11px;background:rgba(59,130,246,.08);border:1px solid var(--border);border-radius:4px;padding:1px 6px;color:var(--cyan)">tileset.json</code> URL.
+No new container — served directly by Caddy over HTTPS.
+</div>
+{% if not settings.get('fqdn') %}
+<div style="background:rgba(234,179,8,.07);border:1px solid rgba(234,179,8,.25);border-radius:8px;padding:12px 16px;margin-bottom:16px;font-size:12px;color:var(--yellow)">
+A domain must be configured before enabling Cesium 3D Tiles (Caddy needs it for the <code style="font-size:11px">3dtiles.&lt;domain&gt;</code> vhost).
+<a href="/caddy" style="color:var(--cyan);text-decoration:none;margin-left:6px">Configure domain →</a>
+</div>
+{% endif %}
+<button class="btn btn-primary" onclick="enableModule()" {% if not settings.get('fqdn') %}disabled style="opacity:.5;cursor:not-allowed"{% endif %} id="enable-btn">
+Enable Cesium 3D Tiles
+</button>
+<div id="enable-status" style="margin-top:10px;font-size:12px;color:var(--text-dim)"></div>
+</div>
+</div>
+</div>
+
+{% else %}
+<!-- Management state -->
+{% set ct_domain = settings.get('cesium_tiles_domain') or ('3dtiles.' + settings.get('fqdn','')) %}
+<div class="card" style="margin-bottom:20px">
+<div class="status-row">
+<div class="status-dot {% if not ct.get('running') %}off{% endif %}"></div>
+<div>
+<span style="font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;color:var(--text-primary)">{% if ct.get('running') %}Active{% else %}Not running{% endif %}</span>
+{% if settings.get('fqdn') %}
+<span style="font-size:12px;color:var(--text-dim);margin-left:12px">Base URL: <code style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--cyan)">https://{{ ct_domain }}</code></span>
+{% endif %}
+</div>
+<div style="display:flex;gap:8px;margin-left:auto">
+<button class="btn btn-danger btn-sm" onclick="disableModule()">Disable</button>
+<button class="btn btn-danger btn-sm" onclick="document.getElementById('ct-remove-modal').style.display='flex'" style="background:rgba(239,68,68,.15);border:1px solid rgba(239,68,68,.4)">Remove</button>
+</div>
+</div>
+</div>
+
+<!-- Remove modal -->
+<div id="ct-remove-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:900;align-items:center;justify-content:center">
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:28px;max-width:440px;width:90%">
+<div style="font-family:'JetBrains Mono',monospace;font-size:14px;font-weight:700;color:var(--red);margin-bottom:12px">Remove Cesium 3D Tiles?</div>
+<div style="font-size:13px;color:var(--text-secondary);line-height:1.6;margin-bottom:20px">
+This will disable the module and <strong>permanently delete all tile datasets</strong> from <code style="font-size:11px;color:var(--cyan)">~/cesium-tiles/</code>.<br><br>
+This cannot be undone. Back up any datasets you want to keep before continuing.
+</div>
+<div style="display:flex;gap:10px;justify-content:flex-end">
+<button class="btn btn-ghost btn-sm" onclick="document.getElementById('ct-remove-modal').style.display='none'">Cancel</button>
+<button class="btn btn-danger btn-sm" id="ct-remove-btn" onclick="removeModule()">Delete everything &amp; remove</button>
+</div>
+<div id="ct-remove-status" style="margin-top:10px;font-size:12px;color:var(--text-dim)"></div>
+</div>
+</div>
+
+<!-- How to upload instructions -->
+<div class="card" style="margin-bottom:20px">
+<button class="details-toggle" onclick="toggleUploadHelp(this)">
+<span>How to prepare &amp; upload a dataset</span>
+<span class="material-symbols-outlined chevron" id="upload-help-chevron">expand_more</span>
+</button>
+<div id="upload-help-body" class="collapsed" style="margin-top:16px">
+<div class="step-item">
+<div class="step-num">1</div>
+<div class="step-text"><strong>Get a 3D Tiles dataset.</strong> Any directory that contains a <span class="step-code">tileset.json</span> file at its root is a valid Cesium 3D Tiles dataset. The folder also contains the tile files (<span class="step-code">.b3dm</span>, <span class="step-code">.pnts</span>, <span class="step-code">.i3dm</span>, etc.) referenced by that JSON.</div>
+</div>
+<div class="step-item">
+<div class="step-num">2</div>
+<div class="step-text"><strong>Choose a descriptive name.</strong> In the <em>Dataset Name</em> field below, enter a name that matches what the data represents — e.g. <span class="step-code">downtown-san-diego</span> or <span class="step-code">incident-alpha-buildings</span>. Use lowercase with hyphens, no spaces. This name becomes part of the ATAK URL and appears in the TAK client overlay manager, so field users can identify it at a glance.</div>
+</div>
+<div class="step-item">
+<div class="step-num">3</div>
+<div class="step-text"><strong>Option A — Upload via browser.</strong> Enter a dataset name, then either:<br>
+• <strong>Select Folder</strong> — pick the dataset folder directly from your computer.<br>
+• <strong>Select .zip</strong> — zip the dataset folder first so the <span class="step-code">tileset.json</span> is at the top level inside the zip (not nested inside a sub-folder), then upload the zip.</div>
+</div>
+<div class="step-item">
+<div class="step-num">4</div>
+<div class="step-text"><strong>Option B — Place via SFTP.</strong> Copy the dataset folder directly to the server at:<br>
+<span class="step-code">~/cesium-tiles/&lt;dataset-name&gt;/tileset.json</span><br>
+<span style="font-size:12px;color:var(--text-dim)">The dataset will appear in the list below automatically — no upload needed.</span></div>
+</div>
+<div class="step-item" style="border-bottom:none">
+<div class="step-num">5</div>
+<div class="step-text"><strong>Copy the ATAK URL.</strong> Once the dataset appears in the table below, click its URL chip to copy it. Paste that URL into ATAK's Map Manager (see <em>How to Connect in ATAK</em> below).</div>
+</div>
+</div>
+</div>
+
+<!-- Upload section -->
+<div class="card">
+<div class="card-title">Upload Dataset</div>
+<div style="margin-bottom:16px">
+<label class="form-label">Dataset Name</label>
+<input type="text" id="dataset-name" class="form-input" placeholder="e.g. san-diego-buildings" maxlength="80" oninput="updateUrlPreview(this.value)">
+<div style="margin-top:7px;min-height:18px">
+<span style="font-size:11px;color:var(--text-dim)">ATAK URL: </span>
+<span id="url-preview" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim)">type a name above to preview</span>
+</div>
+</div>
+<div class="upload-area" id="upload-area">
+<input type="file" id="folder-input" webkitdirectory multiple style="display:none" onchange="handleFolderSelect(this.files)">
+<input type="file" id="zip-input" accept=".zip" style="display:none" onchange="handleZipSelect(this.files[0])">
+<span class="material-symbols-outlined" style="font-size:36px;color:var(--text-dim);display:block;margin-bottom:10px">drive_folder_upload</span>
+<div style="font-size:14px;color:var(--text-secondary);margin-bottom:10px" id="file-label">Select your dataset folder or a .zip file</div>
+<div style="display:flex;gap:10px;justify-content:center">
+<button type="button" class="btn btn-ghost btn-sm" onclick="event.stopPropagation();document.getElementById('folder-input').click()">
+<span class="material-symbols-outlined" style="font-size:14px">folder_open</span> Select Folder
+</button>
+<button type="button" class="btn btn-ghost btn-sm" onclick="event.stopPropagation();document.getElementById('zip-input').click()">
+<span class="material-symbols-outlined" style="font-size:14px">folder_zip</span> Select .zip
+</button>
+</div>
+</div>
+<div class="progress-bar-outer" id="progress-outer">
+<div class="progress-bar-inner" id="progress-bar"></div>
+</div>
+<div id="upload-status" style="margin-top:10px;font-size:12px;color:var(--text-dim)"></div>
+<button class="btn btn-primary" onclick="doUpload()" id="upload-btn" style="margin-top:14px" disabled>Upload Dataset</button>
+</div>
+
+<!-- Dataset list -->
+<div class="card">
+<div class="card-title">Installed Datasets ({{ datasets|length }})</div>
+{% if datasets %}
+<table class="dataset-table">
+<thead><tr>
+<th>Name</th><th>Size</th><th>Tiles</th><th>ATAK URL</th><th></th>
+</tr></thead>
+<tbody id="dataset-tbody">
+{% for ds in datasets %}
+<tr id="row-{{ ds.name }}">
+<td style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-primary)">{{ ds.name }}</td>
+<td style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim)">{{ ds.size }}</td>
+<td style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim)">{{ ds.tile_count }}</td>
+<td>
+{% if ds.url %}
+<span class="url-chip" onclick="copyUrl('{{ ds.url }}')" title="Click to copy">{{ ds.url }}</span>
+{% else %}
+<span style="font-size:11px;color:var(--text-dim)">Configure domain first</span>
+{% endif %}
+</td>
+<td><button class="btn btn-danger btn-sm" onclick="deleteDataset('{{ ds.name }}')">Delete</button></td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% else %}
+<div class="empty-state">No datasets yet — upload a zip above or place datasets in <code style="font-family:'JetBrains Mono',monospace;font-size:11px;background:rgba(59,130,246,.08);border:1px solid var(--border);border-radius:4px;padding:1px 6px;color:var(--cyan)">~/cesium-tiles/&lt;name&gt;/</code> via SFTP.</div>
+{% endif %}
+</div>
+
+<!-- ATAK Instructions -->
+<div class="card">
+<button class="details-toggle" onclick="toggleInstructions(this)">
+<span>How to Connect in ATAK / WinTAK</span>
+<span class="material-symbols-outlined chevron" id="instr-chevron">expand_more</span>
+</button>
+<div id="instr-body" class="collapsed" style="margin-top:16px">
+<div style="font-size:12px;color:var(--text-dim);margin-bottom:14px">Source: TAK Developers Confluence — Cesium 3D Tiles</div>
+<div class="steps-list">
+<div class="step-item"><div class="step-num">1</div><div class="step-text">Open ATAK and launch the <strong>Map Manager</strong></div></div>
+<div class="step-item"><div class="step-num">2</div><div class="step-text">Go to the <strong>MOBILE</strong> tab</div></div>
+<div class="step-item"><div class="step-num">3</div><div class="step-text">Select the <strong>Down Arrow</strong>, then the <strong>Add (+)</strong> button</div></div>
+<div class="step-item"><div class="step-num">4</div><div class="step-text">Type in the URL to the dataset's <span class="step-code">tileset.json</span> — e.g. <span class="step-code">https://{{ ct_domain }}/my-dataset/tileset.json</span><br><span style="font-size:12px;color:var(--text-dim)">ATAK will send a request to the URL to check for available services and confirm it is Cesium 3D Tiles content.</span></div></div>
+<div class="step-item"><div class="step-num">5</div><div class="step-text">If the connection succeeds, a window shows available services. <strong>Click the checkbox</strong> next to the tileset to import it.</div></div>
+<div class="step-item"><div class="step-num">6</div><div class="step-text">The dataset is now available under the <strong>Overlay Manager</strong> as a 3D layer. ATAK caches tiles locally in <span class="step-code">atak/3dtilescache/</span>.</div></div>
+</div>
+</div>
+</div>
+
+{% endif %}
+</div>
+<div id="toast" class="toast"></div>
+<script>
+var _pendingFiles=null,_pendingZip=null,_uploadMode=null;
+var _ctBaseUrl='{% if settings.get("fqdn") %}https://{{ ct_domain }}{% else %}{% endif %}';
+function enableModule(){
+    document.getElementById('enable-btn').disabled=true;
+    document.getElementById('enable-status').textContent='Enabling…';
+    fetch('/api/cesium-tiles/enable',{method:'POST'}).then(r=>r.json()).then(d=>{
+        if(d.success)window.location.reload();
+        else{document.getElementById('enable-status').textContent='Error: '+(d.error||'unknown');document.getElementById('enable-btn').disabled=false;}
+    }).catch(e=>{document.getElementById('enable-status').textContent='Network error: '+e.message;document.getElementById('enable-btn').disabled=false;});
+}
+function disableModule(){
+    if(!confirm('Disable Cesium 3D Tiles? The tile files will not be deleted.'))return;
+    fetch('/api/cesium-tiles/disable',{method:'POST'}).then(()=>window.location.reload());
+}
+function removeModule(){
+    var btn=document.getElementById('ct-remove-btn');
+    var st=document.getElementById('ct-remove-status');
+    btn.disabled=true;btn.textContent='Removing…';st.textContent='';
+    fetch('/api/cesium-tiles/uninstall',{method:'POST'}).then(r=>r.json()).then(d=>{
+        if(d.success){window.location.href='/console';}
+        else{st.textContent='Error: '+(d.error||'unknown');btn.disabled=false;btn.textContent='Delete everything & remove';}
+    }).catch(e=>{st.textContent='Network error';btn.disabled=false;btn.textContent='Delete everything & remove';});
+}
+function cleanName(v){return v.replace(/[^A-Za-z0-9_\-]/g,'-').replace(/^-+|-+$/g,'');}
+function updateUrlPreview(v){
+    var n=cleanName(v||'');
+    var el=document.getElementById('url-preview');
+    if(!el)return;
+    if(n&&_ctBaseUrl){el.textContent=_ctBaseUrl+'/'+n+'/tileset.json';el.style.color='var(--cyan)';}
+    else if(n){el.textContent='/'+n+'/tileset.json';el.style.color='var(--text-secondary)';}
+    else{el.textContent='type a name above to preview';el.style.color='var(--text-dim)';}
+}
+function handleFolderSelect(files){
+    if(!files||!files.length)return;
+    _pendingFiles=Array.from(files);_pendingZip=null;_uploadMode='folder';
+    var hasJson=_pendingFiles.some(function(f){var p=f.webkitRelativePath||f.name;return p.split('/').slice(1).join('/')==='tileset.json';});
+    var lbl=document.getElementById('file-label');
+    if(hasJson){lbl.innerHTML='<span style="color:var(--green)">✓ '+_pendingFiles.length+' files — tileset.json found</span>';document.getElementById('upload-btn').disabled=false;}
+    else{lbl.innerHTML='<span style="color:var(--red)">✗ No tileset.json found in this folder</span>';document.getElementById('upload-btn').disabled=true;}
+}
+function handleZipSelect(file){
+    if(!file)return;
+    _pendingZip=file;_pendingFiles=null;_uploadMode='zip';
+    document.getElementById('file-label').innerHTML='<span style="color:var(--green)">✓ '+file.name+' ('+formatBytes(file.size)+')</span>';
+    document.getElementById('upload-btn').disabled=false;
+}
+function formatBytes(b){if(b<1048576)return(b/1024).toFixed(0)+' KB';if(b<1073741824)return(b/1048576).toFixed(1)+' MB';return(b/1073741824).toFixed(2)+' GB';}
+var _uploadArea=document.getElementById('upload-area');
+if(_uploadArea){
+    _uploadArea.addEventListener('dragover',function(e){e.preventDefault();_uploadArea.classList.add('drag');});
+    _uploadArea.addEventListener('dragleave',function(){_uploadArea.classList.remove('drag');});
+    _uploadArea.addEventListener('drop',function(e){
+        e.preventDefault();_uploadArea.classList.remove('drag');
+        var f=e.dataTransfer.files[0];
+        if(!f)return;
+        if(f.name.toLowerCase().endsWith('.zip')){document.getElementById('zip-input').files=e.dataTransfer.files;handleZipSelect(f);}
+        else{showToast('Drop a .zip file here. To upload a folder, use the Select Folder button.');}
+    });
+}
+function doUpload(){
+    var raw=(document.getElementById('dataset-name').value||'').trim();
+    var name=cleanName(raw);
+    if(!name){showToast('Enter a dataset name first.');return;}
+    if(_uploadMode==='folder'&&_pendingFiles){_doFolderUpload(name);}
+    else if(_uploadMode==='zip'&&_pendingZip){_doZipUpload(name);}
+    else{showToast('Select a folder or zip file first.');}
+}
+function _sendXhr(url,fd,onDone){
+    var btn=document.getElementById('upload-btn');
+    var outer=document.getElementById('progress-outer');
+    var bar=document.getElementById('progress-bar');
+    var st=document.getElementById('upload-status');
+    btn.disabled=true;outer.style.display='block';bar.style.width='0%';st.textContent='Uploading…';
+    var xhr=new XMLHttpRequest();
+    xhr.open('POST',url);
+    xhr.upload.onprogress=function(e){if(e.lengthComputable){var pct=Math.round(e.loaded/e.total*100);bar.style.width=pct+'%';st.textContent='Uploading… '+pct+'%';}};
+    xhr.onload=function(){
+        var d;try{d=JSON.parse(xhr.responseText);}catch(ex){d={success:false,error:'Invalid response'};}
+        if(d.success){bar.style.width='100%';st.textContent='';showToast('Dataset "'+d.dataset+'" uploaded.');setTimeout(function(){window.location.reload();},1200);}
+        else{st.innerHTML='<span style="color:var(--red)">Error: '+(d.error||'Upload failed')+'</span>';btn.disabled=false;outer.style.display='none';}
+    };
+    xhr.onerror=function(){st.innerHTML='<span style="color:var(--red)">Network error</span>';btn.disabled=false;outer.style.display='none';};
+    xhr.send(fd);
+}
+function _doFolderUpload(name){
+    var fd=new FormData();
+    fd.append('name',name);
+    for(var i=0;i<_pendingFiles.length;i++){
+        var f=_pendingFiles[i];
+        var rel=(f.webkitRelativePath||f.name).split('/').slice(1).join('/');
+        if(!rel)continue;
+        fd.append('files[]',f,rel);
+    }
+    _sendXhr('/api/cesium-tiles/upload-folder',fd);
+}
+function _doZipUpload(name){
+    var fd=new FormData();fd.append('name',name);fd.append('file',_pendingZip);
+    _sendXhr('/api/cesium-tiles/upload',fd);
+}
+function copyUrl(url){
+    navigator.clipboard.writeText(url).then(function(){showToast('URL copied to clipboard.');}).catch(function(){showToast(url);});
+}
+function deleteDataset(name){
+    if(!confirm('Delete dataset "'+name+'"? This cannot be undone.'))return;
+    fetch('/api/cesium-tiles/datasets/'+encodeURIComponent(name),{method:'DELETE'}).then(r=>r.json()).then(d=>{
+        if(d.success){var row=document.getElementById('row-'+name);if(row)row.remove();showToast('Deleted "'+name+'".');}
+        else showToast('Error: '+(d.error||'Delete failed'));
+    });
+}
+function toggleInstructions(btn){
+    var body=document.getElementById('instr-body');
+    var chev=document.getElementById('instr-chevron');
+    if(body.classList.contains('collapsed')){body.classList.remove('collapsed');chev.classList.add('open');}
+    else{body.classList.add('collapsed');chev.classList.remove('open');}
+}
+function toggleUploadHelp(btn){
+    var body=document.getElementById('upload-help-body');
+    var chev=document.getElementById('upload-help-chevron');
+    if(body.classList.contains('collapsed')){body.classList.remove('collapsed');chev.classList.add('open');}
+    else{body.classList.add('collapsed');chev.classList.remove('open');}
+}
+function showToast(msg){
+    var t=document.getElementById('toast');
+    t.textContent=msg;t.classList.add('show');
+    setTimeout(function(){t.classList.remove('show');},3000);
+}
+</script></body></html>'''
+
 # === Marketplace Template (all services, deploy from here) ===
 MARKETPLACE_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Marketplace — infra-TAK</title>
 <style>
@@ -45358,7 +47500,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% for key, mod in modules.items() %}
 <a class="module-card" href="{{ mod.route }}" data-module="{{ key }}">
 <div class="module-header{% if mod.get('icon_url') %} module-header--logo{% endif %}">{% if mod.icon_data %}<img src="{{ mod.icon_data }}" alt="" class="module-icon" style="width:24px;height:24px;object-fit:contain">{% elif key == 'takportal' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">group</span>{% elif key == 'fedhub' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">hub</span>{% elif key == 'emailrelay' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">outgoing_mail</span>{% elif mod.get('icon_url') %}<img src="{{ mod.icon_url }}" alt="" class="module-icon" style="height:36px;width:auto;max-width:{% if key == 'takserver' %}72px{% else %}100px{% endif %};object-fit:contain">{% else %}<span class="module-icon">{{ mod.icon }}</span>{% endif %}
-{% if not mod.get('icon_url') or key in ('takportal', 'fedhub', 'emailrelay', 'fail2ban') %}<div class="module-name">{{ mod.name }}</div>{% endif %}
+{% if not mod.get('icon_url') or key in ('takportal', 'fedhub', 'emailrelay', 'fail2ban', 'webodm') %}<div class="module-name">{{ mod.name }}</div>{% endif %}
 </div>
 <div class="module-desc">{{ mod.description }}</div>
 <span class="module-status status-not-installed" id="module-status-{{ key }}" data-module="{{ key }}">Not Installed</span>
@@ -47192,6 +49334,70 @@ def _startup_migrations():
             generate_caddyfile(s)
             subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
             print("Startup migration: Caddyfile regenerated + Caddy reloaded")
+
+        # Ensure cesium-tiles directory exists when the module is enabled
+        if s.get('cesium_tiles_enabled'):
+            ct_dir = os.path.expanduser('~/cesium-tiles')
+            if not os.path.isdir(ct_dir):
+                os.makedirs(ct_dir, exist_ok=True)
+                print("Startup migration: created ~/cesium-tiles/")
+
+        # Ensure webodm working directories exist when the module is enabled
+        if s.get('webodm_enabled'):
+            for _wo_sub in ['', 'plugins', 'media', 'db']:
+                _wo_path = os.path.expanduser(f'~/webodm/{_wo_sub}') if _wo_sub else os.path.expanduser('~/webodm')
+                if not os.path.isdir(_wo_path):
+                    os.makedirs(_wo_path, exist_ok=True)
+                    print(f"Startup migration: created ~/webodm/{_wo_sub}")
+
+        # Harden existing WebODM installs: patch compose port bindings + UFW deny
+        # Fixes 0.0.0.0:{wo_port}:8000 → 127.0.0.1:{wo_port}:8000 per PORT-EXPOSURE-POLICY.md Tier 3
+        _wo_compose = os.path.expanduser('~/webodm/docker-compose.yml')
+        if os.path.exists(_wo_compose):
+            try:
+                import re as _re_wo
+                with open(_wo_compose) as _f:
+                    _wo_txt = _f.read()
+                # Patch webapp port binding if it's still 0.0.0.0 (no loopback prefix)
+                _wo_patched = _re_wo.sub(
+                    r'- "(\d+):8000"',
+                    r'- "127.0.0.1:\1:8000"',
+                    _wo_txt
+                )
+                # Remove any host-side nodeodm port mapping (Docker-internal only).
+                # Also strip the now-empty `ports:` key to avoid YAML validation errors.
+                _wo_patched = _re_wo.sub(
+                    r'[ \t]*- "127\.0\.0\.1:3001:3000"\n', '', _wo_patched
+                )
+                _wo_patched = _re_wo.sub(
+                    r'[ \t]+ports:\n(?=[ \t]+(restart:|oom_score_adj:))', '', _wo_patched
+                )
+                # Inject WO_DATABASE_HOST=wo_db if missing — fixes "could not translate host name db"
+                # when our compose uses wo_db as the container name instead of WebODM's default "db"
+                # (upstream settings.py reads os.environ.get('WO_DATABASE_HOST', 'db'))
+                if 'WO_DATABASE_HOST' not in _wo_patched:
+                    _wo_patched = _wo_patched.replace(
+                        '- WO_BROKER=redis://wo_broker',
+                        '- WO_DATABASE_HOST=wo_db\n      - WO_BROKER=redis://wo_broker'
+                    )
+                if _wo_patched != _wo_txt:
+                    with open(_wo_compose, 'w') as _f:
+                        _f.write(_wo_patched)
+                    print("Startup migration: hardened ~/webodm/docker-compose.yml port bindings + WO_DB_HOST (Tier 3/4)")
+                    import subprocess as _sp_wo
+                    _sp_wo.run(['docker', 'compose', '-f', _wo_compose, 'up', '-d'],
+                               capture_output=True, timeout=120, cwd=os.path.expanduser('~/webodm'))
+            except Exception as _wo_e:
+                print(f"Startup migration: webodm compose harden warning: {_wo_e}")
+        # UFW deny belt-and-braces for WebODM ports
+        if s.get('webodm_enabled'):
+            try:
+                _wo_port_val = s.get('webodm_port', 8765)
+                import subprocess as _sp_ufw
+                for _p in [_wo_port_val, 3001]:
+                    _sp_ufw.run(['ufw', 'deny', f'{_p}/tcp'], capture_output=True, timeout=5)
+            except Exception:
+                pass
 
         # Keep guarddog.conf in sync with settings.json DB host (prevents stale IP after migration)
         tak_cfg = _get_tak_deployment_config(s)
