@@ -1046,13 +1046,19 @@ function showDeployConfig(){
     initTakDeployModeUI(cd);
     var modeChosenOnPage=getTakDeploymentMode();
     loadTakDeploymentConfig().then(function(){
-      // Only force single/split if the user explicitly chose it before clicking Configure
-      // and the saved config doesn't override it. external_db is always restored from saved config.
+      // If the user explicitly chose a non-default mode before clicking Configure,
+      // keep that selection even if the saved config says something different
+      // (e.g. external_db chosen but not yet saved → saved config still says single_server).
       var restoredMode=getTakDeploymentMode();
-      if(restoredMode==='single_server'&&modeChosenOnPage==='two_server'){
+      if(modeChosenOnPage!=='single_server'&&restoredMode!==modeChosenOnPage){
         var single=document.getElementById('dep_mode_single');
         var split=document.getElementById('dep_mode_split');
-        if(split){split.checked=true;if(single)single.checked=false;}
+        var extdb=document.getElementById('dep_mode_external_db');
+        if(modeChosenOnPage==='two_server'){
+          if(split){split.checked=true;if(single)single.checked=false;}
+        }else if(modeChosenOnPage==='external_db'){
+          if(extdb){extdb.checked=true;if(single)single.checked=false;}
+        }
       }
       toggleTwoServerPanel();
       updateUploadHint();
@@ -1140,20 +1146,38 @@ function initTakDeployModeUI(rootEl){
       '<div class="form-field"><label>Database Name</label><input type="text" id="edb_name" value="cot"></div>',
       '<div class="form-field"><label>Username</label><input type="text" id="edb_user" value="martiuser"></div>',
       '</div>',
+      '<details style="margin-bottom:14px;border:1px solid rgba(59,130,246,0.25);border-radius:8px;overflow:hidden">',
+      '<summary style="padding:10px 14px;background:rgba(59,130,246,0.08);cursor:pointer;font-size:12px;color:var(--accent);font-family:\'JetBrains Mono\',monospace;font-weight:600;list-style:none;display:flex;align-items:center;gap:8px">',
+      '<span style="font-size:14px">☁</span> Using Azure Database for PostgreSQL? — Required pre-flight steps',
+      '</summary>',
+      '<div style="padding:14px;font-size:12px;color:var(--text-secondary);line-height:1.7">',
+      '<p style="margin:0 0 10px;color:var(--text-primary);font-weight:600">Before clicking Provision Database or Deploy, complete these steps in the Azure Portal:</p>',
+      '<ol style="margin:0 0 12px;padding-left:18px">',
+      '<li style="margin-bottom:6px">Go to your PostgreSQL server → <strong>Settings → Server parameters</strong></li>',
+      '<li style="margin-bottom:6px">Search for <code style="background:#0a0e1a;padding:1px 5px;border-radius:3px;color:var(--cyan)">azure.extensions</code></li>',
+      '<li style="margin-bottom:6px">Add the following value (copy exactly):</li>',
+      '</ol>',
+      '<div style="background:#0a0e1a;border:1px solid var(--border);border-radius:6px;padding:10px 12px;font-family:\'JetBrains Mono\',monospace;font-size:11px;color:var(--green);margin-bottom:10px;word-break:break-all">FUZZYSTRMATCH,POSTGIS,POSTGIS_TOPOLOGY,ADDRESS_STANDARDIZER,PGCRYPTO</div>',
+      '<ol start="4" style="margin:0 0 10px;padding-left:18px">',
+      '<li>Click <strong>Save</strong> in the Azure Portal, then come back here and click <strong>2. Provision Database</strong>.</li>',
+      '</ol>',
+      '<p style="margin:0;font-size:11px;color:var(--text-dim)">Provision Database will automatically handle the remaining Azure-specific grants. Test Connection (step 3) will verify extensions are live before deploy.</p>',
+      '</div>',
+      '</details>',
       '<div class="form-field" style="margin-bottom:12px"><label>App User Password</label><div style="position:relative"><input type="password" id="edb_password" placeholder="DB user password (leave blank to auto-generate)" autocomplete="off" style="width:100%;padding:8px 48px 8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px"><button type="button" id="edb-password-toggle" onclick="toggleSinglePassword(\'edb_password\',\'edb-password-toggle\')" style="position:absolute;right:10px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:12px;font-family:JetBrains Mono,monospace">show</button></div></div>',
       '<div style="margin:14px 0 10px;padding:12px;background:rgba(99,102,241,0.06);border:1px solid rgba(99,102,241,0.2);border-radius:8px">',
       '<div style="font-size:11px;color:var(--text-dim);margin-bottom:8px;text-transform:uppercase;letter-spacing:0.5px;font-weight:600">Provision Database — Admin Credentials</div>',
       '<div style="font-size:11px;color:var(--text-dim);margin-bottom:10px">Used once to create the app user and grant permissions. Not stored.</div>',
       '<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:10px">',
-      '<div class="form-field"><label>Admin Username</label><input type="text" id="edb_admin_user" value="postgres" autocomplete="off" style="width:100%;padding:8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px"></div>',
+      '<div class="form-field"><label>Admin Username</label><input type="text" id="edb_admin_user" placeholder="e.g. postgres or pgadmin" autocomplete="off" style="width:100%;padding:8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px"></div>',
       '<div class="form-field"><label>Admin Password</label><div style="position:relative"><input type="password" id="edb_admin_pass" placeholder="RDS master password" autocomplete="off" style="width:100%;padding:8px 48px 8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px"><button type="button" id="edb-admin-pass-toggle" onclick="toggleSinglePassword(\'edb_admin_pass\',\'edb-admin-pass-toggle\')" style="position:absolute;right:10px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:12px;font-family:JetBrains Mono,monospace">show</button></div></div>',
       '</div>',
-      '<button type="button" onclick="provisionExternalDb()" id="edb_provision_btn" style="padding:8px 14px;background:rgba(99,102,241,0.2);color:#a5b4fc;border:1px solid rgba(99,102,241,0.3);border-radius:8px;font-size:12px;cursor:pointer">3. Provision Database (create user &amp; grants)</button>',
+      '<button type="button" onclick="provisionExternalDb()" id="edb_provision_btn" style="padding:8px 14px;background:rgba(99,102,241,0.2);color:#a5b4fc;border:1px solid rgba(99,102,241,0.3);border-radius:8px;font-size:12px;cursor:pointer">2. Provision Database (create user &amp; grants)</button>',
       '<div id="external-db-provision-log" style="display:none;margin-top:10px;background:#0c0f1a;border:1px solid var(--border);border-radius:8px;padding:12px;font-family:\'JetBrains Mono\',monospace;font-size:11px;white-space:pre-wrap;color:var(--text-secondary)"></div>',
       '</div>',
       '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px">',
       '<button type="button" onclick="saveExternalDbConfig()" style="padding:8px 14px;background:rgba(20,184,166,0.15);color:var(--teal,#14b8a6);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer">1. Save Config</button>',
-      '<button type="button" onclick="testExternalDbConnection()" style="padding:8px 14px;background:rgba(59,130,246,0.15);color:var(--accent);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer">2. Test Connection</button>',
+      '<button type="button" onclick="testExternalDbConnection()" style="padding:8px 14px;background:rgba(59,130,246,0.15);color:var(--accent);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer">3. Test Connection</button>',
       '<div style="font-size:11px;color:var(--text-dim);align-self:center">Then fill Certificate Information below and click Deploy TAK Server.</div>',
       '</div>',
       '<div id="external-db-msg" style="margin-top:10px;font-size:12px;color:var(--text-dim)"></div>',
@@ -1421,7 +1445,7 @@ async function provisionExternalDb(){
     var msg=document.getElementById('external-db-msg');
     var logEl=document.getElementById('external-db-provision-log');
     var btn=document.getElementById('edb_provision_btn');
-    var adminUser=(document.getElementById('edb_admin_user')||{}).value||'postgres';
+    var adminUser=(document.getElementById('edb_admin_user')||{}).value||'';
     var adminPass=(document.getElementById('edb_admin_pass')||{}).value||'';
     if(!adminPass){if(msg){msg.textContent='✗ Admin password is required to provision';msg.style.color='var(--red)';}return;}
     if(btn)btn.disabled=true;
