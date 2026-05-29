@@ -366,7 +366,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.40-alpha"
+VERSION = "0.9.41-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -2702,7 +2702,7 @@ def takserver_external_db_provision():
     # Auto-generate app password if not provided
     generated_pass = False
     if not app_pass:
-        alphabet = string.ascii_letters + string.digits + '!@#%^&*'
+        alphabet = string.ascii_letters + string.digits + '!@#%^*'
         app_pass = ''.join(secrets.choice(alphabet) for _ in range(24))
         generated_pass = True
         plog(f'  Generated strong password for {app_user}')
@@ -2825,9 +2825,22 @@ def takserver_external_db_provision():
         # even with IF NOT EXISTS, so SchemaManager (running as app_user) would fail without this.
         azure_exts = ['fuzzystrmatch', 'postgis', 'postgis_topology', 'address_standardizer', 'pgcrypto']
         plog(f'  Azure: pre-creating required extensions as {admin_user}...')
+        ext_failures = []
         for ext in azure_exts:
             ok, out = run_sql(f'CREATE EXTENSION IF NOT EXISTS {ext};', f'create ext {ext}', use_db=db_name)
-            plog(f'  {"✓" if ok else "⚠"} {ext}: {out if not ok else "OK"}')
+            plog(f'  {"✓" if ok else "△"} {ext}: {out if not ok else "OK"}')
+            if not ok:
+                ext_failures.append(ext)
+        if ext_failures:
+            missing = ', '.join(e.upper() for e in ext_failures)
+            msg = (
+                f'Azure extensions not whitelisted: {missing}. '
+                f'Go to Azure Portal → your PostgreSQL Flexible Server → Server parameters → '
+                f'search "azure.extensions" → add: FUZZYSTRMATCH, POSTGIS, POSTGIS_TOPOLOGY, '
+                f'ADDRESS_STANDARDIZER, PGCRYPTO → Save. Then re-run Provision Database.'
+            )
+            plog(f'  ✗ Extension pre-creation failed — {msg}')
+            return jsonify({'success': False, 'error': msg, 'log': log, 'extensions_not_whitelisted': True}), 400
 
     # Step 4: Grant schema privileges (must connect to the target database)
     plog(f'  Granting schema privileges...')
@@ -12374,6 +12387,7 @@ def _get_authentik_version_info():
     out['vetted_release'] = AUTHENTIK_VETTED_RELEASE
     out['dev_release'] = AUTHENTIK_DEV_RELEASE
     out['channel'] = _channel
+    out['ahead_of_vetted'] = False
     if out['version']:
         installed = re.sub(r'^[vV\$\{AUTHENTIK_TAG:-]*', '', out['version']).rstrip('}').strip()
         out['version'] = installed
@@ -12384,6 +12398,9 @@ def _get_authentik_version_info():
                 _i = tuple(int(x) for x in re.findall(r'\d+', installed))
                 if _t > _i:
                     out['update_available'] = True
+                elif _i > _t and _channel == 'main':
+                    # Installed is newer than fleet-vetted — flag so UI doesn't misleadingly show "vetted ✓"
+                    out['ahead_of_vetted'] = True
             except Exception:
                 out['update_available'] = True
     return out
@@ -35801,6 +35818,7 @@ entries:
             # Step 5: Download docker-compose.yml and patch for blueprints
             plog("")
             plog("\u2501\u2501\u2501 Step 5/10: Downloading Docker Compose File \u2501\u2501\u2501")
+            _compose_fresh_download = False
             if not os.path.exists(compose_path):
                 r = subprocess.run(f'wget -q -O {compose_path} https://goauthentik.io/docker-compose.yml 2>&1', shell=True, capture_output=True, text=True, timeout=30)
                 if r.returncode != 0 or not os.path.exists(compose_path):
@@ -35808,6 +35826,7 @@ entries:
                     authentik_deploy_status.update({'running': False, 'error': True})
                     return
                 plog("\u2713 docker-compose.yml downloaded")
+                _compose_fresh_download = True
             else:
                 plog("\u2713 docker-compose.yml already exists")
 
@@ -35833,7 +35852,8 @@ entries:
             # _ensure_authentik_compose_patches is called after the file is written (see below).
 
         # Pin AUTHENTIK_TAG to the channel-appropriate vetted release.
-        # Only upgrade (target > current); never silently downgrade an operator-upgraded install.
+        # Fresh download: always force to vetted — upstream may ship newer than our vetted release.
+        # Existing install: only upgrade (target > current); never silently downgrade an operator-upgraded install.
         ak_tag = _get_authentik_target_release()
         plog(f"  Authentik version target: {ak_tag}")
         for i, l in enumerate(lines):
@@ -35841,15 +35861,19 @@ entries:
             if m:
                 cur_tag = m.group(1).strip()
                 if cur_tag != ak_tag:
-                    try:
-                        _ct = tuple(int(x) for x in re.findall(r'\d+', cur_tag))
-                        _tt = tuple(int(x) for x in re.findall(r'\d+', ak_tag))
-                        if _tt > _ct:
-                            lines[i] = l.replace(f'AUTHENTIK_TAG:-{m.group(1)}', f'AUTHENTIK_TAG:-{ak_tag}')
-                            needs_write = True
-                    except Exception:
+                    if _compose_fresh_download:
                         lines[i] = l.replace(f'AUTHENTIK_TAG:-{m.group(1)}', f'AUTHENTIK_TAG:-{ak_tag}')
                         needs_write = True
+                    else:
+                        try:
+                            _ct = tuple(int(x) for x in re.findall(r'\d+', cur_tag))
+                            _tt = tuple(int(x) for x in re.findall(r'\d+', ak_tag))
+                            if _tt > _ct:
+                                lines[i] = l.replace(f'AUTHENTIK_TAG:-{m.group(1)}', f'AUTHENTIK_TAG:-{ak_tag}')
+                                needs_write = True
+                        except Exception:
+                            lines[i] = l.replace(f'AUTHENTIK_TAG:-{m.group(1)}', f'AUTHENTIK_TAG:-{ak_tag}')
+                            needs_write = True
         # Inject healthchecks for server and worker if missing (upstream compose may not have them)
         if not any('ak healthcheck' in l or 'ak", "healthcheck' in l for l in lines):
             _hc_block = '    healthcheck:\n      test: ["CMD", "ak", "healthcheck"]\n      start_period: 600s\n      interval: 30s\n      timeout: 10s\n      retries: 5\n'
@@ -36998,9 +37022,9 @@ body{display:flex;min-height:100vh}
 {% if deploying %}
 <div class="status-info"><div class="status-icon running" style="background:rgba(59,130,246,0.1)">🔄</div><div><div class="status-text" style="color:var(--accent)">Deploying...</div><div class="status-detail">Authentik installation in progress</div></div></div>
 {% elif ak.installed and ak.running %}
-<div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--green)">Running</div><div class="status-detail">Identity provider active{% if ak_version_info and ak_version_info.version %} · <span class="os-badge" style="margin-left:4px">v{{ ak_version_info.version }}</span>{% if ak_version_info.update_available and ak_version_info.latest %} · <span style="color:var(--cyan);font-size:11px">v{{ ak_version_info.latest }} available</span>{% elif ak_version_info.channel == 'dev' %} · <span style="color:#f59e0b;font-size:10px" title="Dev channel — testing v{{ ak_version_info.dev_release }}">dev: v{{ ak_version_info.dev_release }}</span>{% elif not ak_version_info.update_available %} · <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% endif %}</div></div></div>
+<div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--green)">Running</div><div class="status-detail">Identity provider active{% if ak_version_info and ak_version_info.version %} · <span class="os-badge" style="margin-left:4px">v{{ ak_version_info.version }}</span>{% if ak_version_info.update_available and ak_version_info.latest %} · <span style="color:var(--cyan);font-size:11px">v{{ ak_version_info.latest }} available</span>{% elif ak_version_info.channel == 'dev' %} · <span style="color:#f59e0b;font-size:10px" title="Dev channel — testing v{{ ak_version_info.dev_release }}">dev: v{{ ak_version_info.dev_release }}</span>{% elif ak_version_info.ahead_of_vetted %} · <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v{{ ak_version_info.vetted_release }}) — not yet validated on main channel">! unvetted</span>{% elif not ak_version_info.update_available %} · <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% endif %}</div></div></div>
 {% elif ak.installed %}
-<div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--red)">Stopped</div><div class="status-detail">Docker containers not running{% if ak_version_info and ak_version_info.version %} · <span class="os-badge" style="margin-left:4px">v{{ ak_version_info.version }}</span>{% if ak_version_info.update_available and ak_version_info.latest %} · <span style="color:var(--cyan);font-size:11px">v{{ ak_version_info.latest }} available</span>{% elif ak_version_info.channel == 'dev' %} · <span style="color:#f59e0b;font-size:10px" title="Dev channel — testing v{{ ak_version_info.dev_release }}">dev: v{{ ak_version_info.dev_release }}</span>{% elif not ak_version_info.update_available %} · <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% endif %}</div></div></div>
+<div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--red)">Stopped</div><div class="status-detail">Docker containers not running{% if ak_version_info and ak_version_info.version %} · <span class="os-badge" style="margin-left:4px">v{{ ak_version_info.version }}</span>{% if ak_version_info.update_available and ak_version_info.latest %} · <span style="color:var(--cyan);font-size:11px">v{{ ak_version_info.latest }} available</span>{% elif ak_version_info.channel == 'dev' %} · <span style="color:#f59e0b;font-size:10px" title="Dev channel — testing v{{ ak_version_info.dev_release }}">dev: v{{ ak_version_info.dev_release }}</span>{% elif ak_version_info.ahead_of_vetted %} · <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v{{ ak_version_info.vetted_release }}) — not yet validated on main channel">! unvetted</span>{% elif not ak_version_info.update_available %} · <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% endif %}</div></div></div>
 {% else %}
 <div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--text-dim)">Not Installed</div><div class="status-detail">Deploy Authentik for identity management & SSO</div></div></div>
 {% endif %}
@@ -38466,13 +38490,33 @@ def _ensure_ldap_flow_authentication_none():
                     break
             if not id_stage_pk:
                 id_stage_pk = _find_stage('stages/identification/', 'ldap-identification-stage')
+            _id_stage_needs_recreation = False
             if id_stage_pk:
                 try:
                     # Include user_fields so PATCH does not trigger "no user fields selected" validation
                     _patch(f'stages/identification/{id_stage_pk}/', {'password_stage': None, 'user_fields': ['username']})
                 except Exception:
                     pass
-            wrong_bindings = len(ldap_bindings) < 3 or need_names != stage_names
+                # Verify the PATCH actually cleared password_stage.  On Authentik 2026.x some
+                # endpoints return HTTP 405 on PATCH (confirmed for policies/bindings; may affect
+                # stages too).  A silent failure leaves password_stage set on the identification
+                # stage, causing the LDAP flow to recurse infinitely on every real user bind
+                # ("exceeded stage recursion depth" → LDAP error 49 / "Invalid credentials").
+                # Fix: read the stage back; if password_stage is still set, DELETE it and force
+                # binding recreation so _create_ldap_stage builds a fresh stage without it.
+                try:
+                    _refreshed = _get(f'stages/identification/{id_stage_pk}/')
+                    if _refreshed.get('password_stage') is not None:
+                        print(f'  LDAP flow fix: PATCH did not clear password_stage on identification stage {id_stage_pk} — DELETE + recreate to resolve spiral', flush=True)
+                        try:
+                            _delete(f'stages/identification/{id_stage_pk}/')
+                        except Exception:
+                            pass
+                        id_stage_pk = None
+                        _id_stage_needs_recreation = True
+                except Exception:
+                    pass
+            wrong_bindings = len(ldap_bindings) < 3 or need_names != stage_names or _id_stage_needs_recreation
             if wrong_bindings:
                 for b in ldap_bindings:
                     try:
@@ -39791,8 +39835,17 @@ def _ensure_authentik_webadmin(skip_bind_verify=False):
                 subprocess.run('cd ~/authentik && docker compose up -d --force-recreate ldap 2>&1',
                     shell=True, capture_output=True, text=True, timeout=90)
             ready2, ready_status2 = _wait_ldap_outpost_ready(timeout_secs=180)
-            verdict2 = _test_ldap_bind_dn_verdict('cn=webadmin,ou=users,dc=takldap', webadmin_pass)
-            if (not ready2) or verdict2 == 'fail':
+            if not ready2:
+                return False, f'webadmin LDAP outpost not ready after recreate. Outpost status: {ready_status2}'
+            last_verdict2 = 'inconclusive'
+            for _attempt2 in range(10):
+                time.sleep(6)
+                _v2 = _test_ldap_bind_dn_verdict('cn=webadmin,ou=users,dc=takldap', webadmin_pass)
+                if _v2 == 'ok':
+                    last_verdict2 = 'ok'
+                    break
+                last_verdict2 = _v2
+            if last_verdict2 == 'fail':
                 return False, f'webadmin exists but LDAP bind verification failed (DN/password). Outpost status: {ready_status2}'
         return True, None
     except urllib.error.HTTPError as e:
@@ -42488,6 +42541,11 @@ def takserver_uninstall():
                     steps.append(f'External DB: {label} — {(r.stderr or r.stdout or "failed")[:120]}')
         else:
             steps.append('External DB cleanup skipped — no credentials stored (run Provision Database on next deploy)')
+        # The .deb installer always creates a local martiuser + cot DB regardless of deployment
+        # mode. Clean them up so re-deploys don't hit stale-password noise in the postinstall.
+        subprocess.run("sudo -u postgres psql -c \"DROP DATABASE IF EXISTS cot;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
+        subprocess.run("sudo -u postgres psql -c \"DROP USER IF EXISTS martiuser;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
+        steps.append('Cleaned up local PostgreSQL side-effect (cot database, martiuser)')
     else:
         # Local PostgreSQL (single-server or two-server mode)
         subprocess.run("sudo -u postgres psql -c \"DROP DATABASE IF EXISTS cot;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
@@ -44592,6 +44650,12 @@ def deploy_takserver():
     requested_mode = (data.get('deployment_mode') or tak_deploy_cfg.get('mode') or 'single_server').strip().lower()
     is_two_server = requested_mode == 'two_server'
     is_external_db = requested_mode == 'external_db'
+    if is_external_db:
+        _edb_cfg = tak_deploy_cfg.get('external_db', {})
+        if not (_edb_cfg.get('host') or '').strip():
+            return jsonify({'error': 'External DB: no database host configured. Fill in the host, save config, and run Provision Database (step 2) + Test Connection (step 3) before deploying.'}), 400
+        if not (_edb_cfg.get('password') or '').strip():
+            return jsonify({'error': 'External DB: Provision Database (step 2) has not been completed — no martiuser password stored. Run Provision Database with all 5 Azure extensions whitelisted, then Test Connection (step 3), before deploying.'}), 400
     try:
         for field, key in [('Country', 'cert_country'), ('State', 'cert_state'),
                            ('City', 'cert_city'), ('Organization', 'cert_org'),
@@ -44821,7 +44885,8 @@ def run_takserver_deploy(config):
                     _cc = _re_early.sub(r'jdbc:postgresql://[^"]*', _jdbc_early, _cc)
                     _cc = _re_early.sub(r'(<connection[^>]*username=")[^"]*(")', lambda m: m.group(1) + _edb_user_early + m.group(2), _cc)
                     if _edb_pass_early:
-                        _cc = _re_early.sub(r'(<connection[^>]*password=")[^"]*(")', lambda m: m.group(1) + _edb_pass_early + m.group(2), _cc)
+                        _edb_pass_xml = html.escape(_edb_pass_early, quote=True)
+                        _cc = _re_early.sub(r'(<connection[^>]*password=")[^"]*(")', lambda m: m.group(1) + _edb_pass_xml + m.group(2), _cc)
                     with open('/opt/tak/CoreConfig.xml', 'w') as _f:
                         _f.write(_cc)
                     log_step(f"✓ CoreConfig JDBC pre-patched to {_edb_host_early}:{_edb_port_early}")
@@ -44970,7 +45035,8 @@ def run_takserver_deploy(config):
                     if needs_patch:
                         cc = re.sub(r'jdbc:postgresql://[^"]*', jdbc_url, cc)
                         if db_pass:
-                            cc = re.sub(r'(<connection[^>]*password=")[^"]*(")', lambda m: m.group(1) + db_pass + m.group(2), cc)
+                            db_pass_xml = html.escape(db_pass, quote=True)
+                            cc = re.sub(r'(<connection[^>]*password=")[^"]*(")', lambda m: m.group(1) + db_pass_xml + m.group(2), cc)
                         subprocess.run(['tee', '/opt/tak/CoreConfig.xml'], input=cc, capture_output=True, text=True, timeout=5)
                         log_step(f"✓ JDBC URL and password set for {db_host}:{db_port}")
                     else:
@@ -45003,14 +45069,13 @@ def run_takserver_deploy(config):
         run_cmd('pkill -9 -f takserver 2>/dev/null; true', check=False); time.sleep(5)
 
         # For external_db: run SchemaManager explicitly against RDS now that CoreConfig
-        # points at the correct host. This is the definitive schema migration for RDS —
-        # the startup-triggered one from Step 5 already ran against the correct host
-        # (due to the early JDBC patch), but we run it again here as a safety net in
-        # case the first run was interrupted or the operator skipped Provision Database.
+        # points at the correct host. SchemaManager has no CLI JDBC flags — it reads
+        # CoreConfig.xml from the working directory. Run from /opt/tak so it finds the
+        # already-patched CoreConfig.xml there rather than falling back to example.xml.
         if config.get('external_db') and os.path.exists('/opt/tak/db-utils/SchemaManager.jar'):
             log_step("External DB: running SchemaManager against RDS (ensuring schema is current)...")
             sm_r = subprocess.run(
-                'sudo -u tak java -jar /opt/tak/db-utils/SchemaManager.jar upgrade 2>&1',
+                'cd /opt/tak && java -jar /opt/tak/db-utils/SchemaManager.jar upgrade 2>&1',
                 shell=True, capture_output=True, text=True, timeout=300
             )
             sm_out = (sm_r.stdout or '') + (sm_r.stderr or '')
@@ -46943,7 +47008,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% if not mod.get('icon_url') or key in ('takportal', 'fedhub', 'emailrelay', 'fail2ban', 'webodm') %}<div class="module-name">{{ mod.name }}</div>{% endif %}
 </div>
 <div class="module-desc">{{ mod.description }}</div>
-{% if module_versions.get(key) %}{% set v = module_versions.get(key) %}{% if v.version or v.update_available %}<div class="meta-line module-version-line" id="module-version-{{ key }}" style="margin-bottom:4px">{% if v.version %}{% if key == 'mediamtx' %}{{ v.version }}{% else %}v{{ v.version }}{% endif %}{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% elif key == 'authentik' and v.get('channel') == 'dev' %} <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v{{ v.get('vetted_release','') }}">· main: v{{ v.get('vetted_release','') }}</span>{% elif key == 'authentik' and not v.update_available and v.get('vetted_release') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}</div>{% endif %}{% endif %}
+{% if module_versions.get(key) %}{% set v = module_versions.get(key) %}{% if v.version or v.update_available %}<div class="meta-line module-version-line" id="module-version-{{ key }}" style="margin-bottom:4px">{% if v.version %}{% if key == 'mediamtx' %}{{ v.version }}{% else %}v{{ v.version }}{% endif %}{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% elif key == 'authentik' and v.get('channel') == 'dev' %} <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v{{ v.get('vetted_release','') }}">· main: v{{ v.get('vetted_release','') }}</span>{% elif key == 'authentik' and v.get('ahead_of_vetted') %} <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v{{ v.get('vetted_release','') }}) — not yet validated on main channel">! unvetted</span>{% elif key == 'authentik' and not v.update_available and v.get('vetted_release') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}</div>{% endif %}{% endif %}
 <span class="module-status status-{% if mod.installed and mod.running %}running{% elif mod.installed %}stopped{% else %}not-installed{% endif %}" id="module-status-{{ key }}" data-module="{{ key }}" data-gd-overall="{% if key == 'guarddog' and mod.installed and mod.running %}fetch{% endif %}">{% if mod.installed and mod.running %}<span class="status-dot"></span> Running{% elif mod.installed %}<span class="status-dot"></span> Stopped{% else %}Not Installed{% endif %}</span>
 {% if key == 'takserver' and mod.installed %}<div id="takserver-card-cert-expiry" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
 {% if key == 'fedhub' and mod.installed %}<div id="fedhub-card-cert-expiry" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
@@ -47076,6 +47141,8 @@ function refreshModuleVersions(){
                 s+=(s?' ':'')+'<span style="color:var(--cyan);font-size:10px" title="Update available">update</span>';
             }else if(key==='authentik'&&d.channel==='dev'&&d.vetted_release){
                 s+=' <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v'+d.vetted_release+'">· main: v'+d.vetted_release+'</span>';
+            }else if(key==='authentik'&&d.ahead_of_vetted&&d.vetted_release){
+                s+=' <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v'+d.vetted_release+') — not yet validated on main channel">! unvetted</span>';
             }else if(key==='authentik'&&d.vetted_release){
                 s+=' <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted \u2713</span>';
             }
@@ -49356,6 +49423,42 @@ def _startup_pin_console_service_home():
         print(f'Startup migration: pin HOME in console unit warning (non-fatal): {_e}')
 
 _startup_pin_console_service_home()
+
+
+# v0.9.41: startup migration — add RuntimeMaxSec=72h to the console service unit.
+# Gunicorn binds on 0.0.0.0:5001 so internet scanners (Censys, Shodan, etc.) hit
+# it directly. They open TCP, probe SSL, then close their side — gunicorn never
+# closes its side → CLOSE-WAIT sockets accumulate over days until the worker
+# can't accept new SSL handshakes (experienced on test6 after ~40 h uptime).
+# RuntimeMaxSec=24h tells systemd to restart the unit daily before enough
+# CLOSE-WAIT sockets can build up to starve the worker. Direct IP:5001
+# access (backdoor) is preserved — bind address is unchanged.
+def _startup_ensure_console_runtime_max_sec():
+    try:
+        svc = '/etc/systemd/system/takwerx-console.service'
+        if not os.path.exists(svc):
+            return
+        with open(svc) as f:
+            content = f.read()
+        if re.search(r'^RuntimeMaxSec=', content, flags=re.MULTILINE):
+            return
+        new = re.sub(
+            r'(^Restart=always\n)',
+            r'\1RuntimeMaxSec=24h\n',
+            content, count=1, flags=re.MULTILINE
+        )
+        if new == content:
+            return
+        with open(svc, 'w') as f:
+            f.write(new)
+        subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=15)
+        print('Startup migration: added RuntimeMaxSec=24h to takwerx-console.service (v0.9.41 — CLOSE-WAIT scanner fix)')
+    except PermissionError:
+        pass
+    except Exception as _e:
+        print(f'Startup migration: RuntimeMaxSec patch warning (non-fatal): {_e}')
+
+_startup_ensure_console_runtime_max_sec()
 
 
 # v0.9.12 A7: startup migration — patch base compose port bindings to loopback
