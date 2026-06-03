@@ -366,7 +366,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.42-alpha"
+VERSION = "0.9.43-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -12533,10 +12533,9 @@ def _get_cloudtak_latest_release_tag(use_cache=True):
                 _cloudtak_release_cache['ts'] = _time.time()
             return tag
     except Exception:
-        # During deploy (use_cache=False) do not use stale cache — return None so we clone default branch
-        if not use_cache:
-            return None
-        return _cloudtak_release_cache.get('tag')
+        # Stale cache is better than nothing — return it regardless of use_cache so that
+        # a GitHub rate-limit or cold-start doesn't hard-block the update flow.
+        return _cloudtak_release_cache.get('tag') or None
 
 
 def _get_cloudtak_version_info():
@@ -12582,8 +12581,9 @@ def _get_cloudtak_version_info():
         if rv.returncode == 0 and rv.stdout.strip():
             out['version'] = rv.stdout.strip().lstrip('vV')
     r = subprocess.run('docker ps -q -f name=cloudtak-api 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
-    if r.returncode == 0 and (r.stdout or '').strip():
-        log_r = subprocess.run('docker logs cloudtak-api --tail 150 2>&1', shell=True, capture_output=True, text=True, timeout=10)
+    _ct_api_id = (r.stdout or '').strip().splitlines()[0].strip() if r.returncode == 0 else ''
+    if _ct_api_id:
+        log_r = subprocess.run(f'docker logs {_ct_api_id} --tail 150 2>&1', shell=True, capture_output=True, text=True, timeout=10)
         if log_r.stdout:
             for line in reversed(log_r.stdout.strip().split('\n')):
                 if '[update-check]' in line:
@@ -15272,6 +15272,14 @@ _cloudtak_deploy_lock = threading.Lock()
 # Plugin catalog — each entry describes a community CloudTAK plugin.
 # install_dir: subdirectory under ~/CloudTAK/api/web/plugins/ that Vite
 #   auto-discovers via import.meta.glob at build time (no wiring needed).
+#
+# local_path (optional): absolute path to the plugin source directory on this
+#   machine. When set, install creates a symlink instead of git-cloning so
+#   edits in the source tree are reflected immediately on next API rebuild.
+#   Vite follows symlinks, so the bundle picks it up without any extra config.
+#   Set repo instead (or in addition) once the plugin has its own public repo.
+_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+
 CLOUDTAK_PLUGINS = [
     {
         'key': 'ping',
@@ -15287,6 +15295,28 @@ CLOUDTAK_PLUGINS = [
         'requires': 'CloudTAK 13.2+',
         'author': 'clptak',
         'license': 'MIT',
+    },
+    {
+        'key': 'tak-dispatcher',
+        'name': 'CloudTAK Dispatcher',
+        'description': (
+            'Standalone dispatcher plugin for CloudTAK — create incidents on the map, '
+            'notify responders via mission thread and direct message. Works without the '
+            'TAK-CAD server plugin; auto-upgrades to full TAK-CAD mode when detected.'
+        ),
+        # Deployed from its own public repo (like ping). The web plugin and the CloudTAK
+        # API routes live in separate subdirs: the installer clones the repo to a cache dir,
+        # copies plugin/ into web/plugins/ and server/*.ts into api/routes/. The server files
+        # must NOT land under web/plugins or CloudTAK's web build (vue-tsc) would type-check
+        # them (they import server-only api libs). plugin-takcad.ts is the optional TAK-CAD
+        # proxy; plugin-dispatcher.ts is the standalone Events/Incidents store.
+        'repo': 'https://github.com/takwerx/cloudtak-dispatcher-plugin',
+        'plugin_subpath': 'plugin',
+        'server_subpath': 'server',
+        'install_dir': 'tak-dispatcher',
+        'requires': 'CloudTAK 13.2+',
+        'author': 'takwerx',
+        'license': 'Proprietary',
     },
 ]
 
@@ -16031,7 +16061,8 @@ def _detect_cloudtak_plugins():
     result = []
     for p in CLOUDTAK_PLUGINS:
         install_path = os.path.join(plugins_base, p['install_dir'])
-        installed = os.path.isdir(install_path)
+        installed = os.path.isdir(install_path) or os.path.islink(install_path)
+        is_local  = bool(p.get('local_path'))
         sha = None
         update_available = False
         if installed:
@@ -16045,19 +16076,20 @@ def _detect_cloudtak_plugins():
                     sha = r.stdout.strip()
             except Exception:
                 pass
-            # Remote HEAD — compare to detect available updates (5 s timeout)
-            try:
-                r2 = subprocess.run(
-                    ['git', '-C', install_path, 'ls-remote', 'origin', 'HEAD'],
-                    capture_output=True, text=True, timeout=5
-                )
-                if r2.returncode == 0 and r2.stdout.strip():
-                    remote_short = r2.stdout.split()[0][:7]
-                    if sha and remote_short and sha != remote_short:
-                        update_available = True
-            except Exception:
-                pass
-        result.append({**p, 'installed': installed, 'sha': sha, 'update_available': update_available})
+            # Remote HEAD — skip for local-path plugins (symlink is always current)
+            if not is_local:
+                try:
+                    r2 = subprocess.run(
+                        ['git', '-C', install_path, 'ls-remote', 'origin', 'HEAD'],
+                        capture_output=True, text=True, timeout=5
+                    )
+                    if r2.returncode == 0 and r2.stdout.strip():
+                        remote_short = r2.stdout.split()[0][:7]
+                        if sha and remote_short and sha != remote_short:
+                            update_available = True
+                except Exception:
+                    pass
+        result.append({**p, 'installed': installed, 'sha': sha, 'update_available': update_available, 'local': is_local})
     return result
 
 
@@ -16102,38 +16134,126 @@ def _run_cloudtak_plugin_action(plugin_key, action):
             plog(f'Error: {e}')
             return False
 
+    local_path = plugin.get('local_path')
+    repo = plugin.get('repo')
+    plugin_subpath = plugin.get('plugin_subpath')
+    server_subpath = plugin.get('server_subpath')
+    # Repo plugins that ship the web plugin and the server route in separate subdirs are
+    # cloned to a cache dir, then plugin_subpath is copied into web/plugins and server_subpath
+    # into api/routes (server *.ts must NOT live under web/plugins or the web build breaks).
+    use_subpaths = bool(repo and (plugin_subpath or server_subpath))
+    cache_path = os.path.join(ct_dir, '.plugin-src', plugin['install_dir'])
+
+    def _web_src():
+        return os.path.join(cache_path, plugin_subpath) if plugin_subpath else cache_path
+
+    def _clone_or_pull_cache():
+        import shutil
+        if os.path.isdir(os.path.join(cache_path, '.git')):
+            return run_cmd(['git', '-C', cache_path, 'pull'])
+        shutil.rmtree(cache_path, ignore_errors=True)
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        return run_cmd(['git', 'clone', repo, cache_path])
+
     try:
         if action == 'install':
             plog(f'Installing plugin: {plugin["name"]}')
-            if os.path.isdir(install_path):
-                plog(f'Plugin directory already exists at {install_path} — already installed?')
+            if os.path.isdir(install_path) or os.path.islink(install_path):
+                plog(f'Plugin already exists at {install_path} — already installed?')
                 cloudtak_plugin_status.update({'running': False, 'error': True})
                 return
             os.makedirs(plugins_base, exist_ok=True)
-            plog('Cloning plugin repository...')
-            if not run_cmd(['git', 'clone', plugin['repo'], install_path]):
-                cloudtak_plugin_status.update({'running': False, 'error': True})
-                return
+            if local_path:
+                # Copy (not symlink) — Docker COPY follows the symlink as-is and
+                # the host path won't exist inside the container, breaking Vite's glob.
+                import shutil
+                plog(f'Copying local plugin source: {local_path} → {install_path}')
+                shutil.copytree(local_path, install_path)
+            elif use_subpaths:
+                import shutil
+                plog(f'Cloning plugin repository: {repo}')
+                if not _clone_or_pull_cache():
+                    cloudtak_plugin_status.update({'running': False, 'error': True})
+                    return
+                plog(f'Copying web plugin: {plugin_subpath or "."} → {install_path}')
+                shutil.copytree(_web_src(), install_path)
+            else:
+                plog('Cloning plugin repository...')
+                if not run_cmd(['git', 'clone', plugin['repo'], install_path]):
+                    cloudtak_plugin_status.update({'running': False, 'error': True})
+                    return
 
         elif action == 'update':
             plog(f'Updating plugin: {plugin["name"]}')
-            if not os.path.isdir(install_path):
+            if not os.path.isdir(install_path) and not os.path.islink(install_path):
                 plog(f'Plugin not installed at {install_path}')
                 cloudtak_plugin_status.update({'running': False, 'error': True})
                 return
-            if not run_cmd(['git', '-C', install_path, 'pull']):
-                cloudtak_plugin_status.update({'running': False, 'error': True})
-                return
+            if local_path:
+                # Re-copy from source so any code changes in the repo are picked up.
+                import shutil
+                plog(f'Re-copying local plugin source: {local_path} → {install_path}')
+                shutil.rmtree(install_path, ignore_errors=True)
+                if os.path.islink(install_path):
+                    os.unlink(install_path)
+                shutil.copytree(local_path, install_path)
+            elif use_subpaths:
+                import shutil
+                plog(f'Pulling plugin repository: {repo}')
+                if not _clone_or_pull_cache():
+                    cloudtak_plugin_status.update({'running': False, 'error': True})
+                    return
+                plog(f'Re-copying web plugin: {plugin_subpath or "."} → {install_path}')
+                shutil.rmtree(install_path, ignore_errors=True)
+                if os.path.islink(install_path):
+                    os.unlink(install_path)
+                shutil.copytree(_web_src(), install_path)
+            else:
+                if not run_cmd(['git', '-C', install_path, 'pull']):
+                    cloudtak_plugin_status.update({'running': False, 'error': True})
+                    return
 
         elif action == 'remove':
             plog(f'Removing plugin: {plugin["name"]}')
-            if not os.path.isdir(install_path):
+            if not os.path.isdir(install_path) and not os.path.islink(install_path):
                 plog('Plugin is not installed — nothing to remove')
                 cloudtak_plugin_status.update({'running': False, 'error': True})
                 return
             import shutil
-            shutil.rmtree(install_path)
+            if os.path.islink(install_path):
+                os.unlink(install_path)
+            else:
+                shutil.rmtree(install_path)
             plog(f'Removed {install_path}')
+
+        # Server-side route files: copied into api/routes/ so the browser plugin
+        # can reach TAK Server plugin APIs via CloudTAK's cert auth. CloudTAK
+        # auto-loads every file in api/routes/ (schema.load('./routes/')). For repo
+        # plugins the routes come from the cloned cache's server_subpath.
+        server_path = plugin.get('server_path')
+        if use_subpaths and server_subpath:
+            server_path = os.path.join(cache_path, server_subpath)
+        if server_path and os.path.isdir(server_path):
+            import shutil
+            routes_base = os.path.join(ct_dir, 'api', 'routes')
+            os.makedirs(routes_base, exist_ok=True)
+            for fname in sorted(os.listdir(server_path)):
+                if not fname.endswith('.ts'):
+                    continue
+                dest = os.path.join(routes_base, fname)
+                if action == 'remove':
+                    if os.path.exists(dest):
+                        os.remove(dest)
+                        plog(f'Removed server route: api/routes/{fname}')
+                else:
+                    shutil.copy2(os.path.join(server_path, fname), dest)
+                    plog(f'Installed server route: api/routes/{fname}')
+
+        # On remove, drop the repo source cache too (kept until now so the server-route
+        # removal above could list which files to delete).
+        if use_subpaths and action == 'remove':
+            import shutil
+            shutil.rmtree(cache_path, ignore_errors=True)
 
         # Rebuild the API image to bake in (or remove) the plugin from the Vite bundle.
         # Service name is 'api' per upstream docker-compose.yml (cloudtak.sh uses the same).
@@ -17237,10 +17357,9 @@ def run_cloudtak_update():
         plog("━━━ Step 1/3: Fetching latest stable release ━━━")
         release_tag = _get_cloudtak_latest_release_tag(use_cache=False)
         if not release_tag:
-            plog("✗ Could not fetch latest release tag from GitHub")
-            cloudtak_deploy_status.update({'running': False, 'error': True})
-            return
-        plog(f"  Target: {release_tag}")
+            plog("  ⚠ Could not fetch release tag from GitHub (rate limit or network) — will pull latest HEAD instead")
+        else:
+            plog(f"  Target: {release_tag}")
 
         plog("")
         plog("━━━ Step 2/3: Checking out stable release ━━━")
@@ -17266,20 +17385,80 @@ def run_cloudtak_update():
                 plog("✗ ~/CloudTAK not found — use Deploy instead")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
-            # Reset local modifications before tag checkout — patches (nginx, port
+            plugins_base = os.path.join(cloudtak_dir, 'api', 'web', 'plugins')
+            # Note which catalog plugins are installed before checkout.
+            # git shallow-fetch checkouts can wipe untracked subdirectories.
+            pre_installed = {
+                p['install_dir']: p for p in CLOUDTAK_PLUGINS
+                if os.path.isdir(os.path.join(plugins_base, p['install_dir']))
+                   or os.path.islink(os.path.join(plugins_base, p['install_dir']))
+            }
+            # Reset local modifications before checkout — patches (nginx, port
             # bindings) live in docker-compose.override.yml which is untracked, so
             # discarding tracked-file dirt is safe and mirrors the TAK Portal update path.
             subprocess.run(
                 f'git -c safe.directory={cloudtak_dir} -C {cloudtak_dir} checkout -- .',
                 shell=True, capture_output=True, text=True, timeout=15)
-            r = subprocess.run(
-                f'cd {cloudtak_dir} && git -c safe.directory={cloudtak_dir} fetch --depth 1 origin tag {release_tag} && git -c safe.directory={cloudtak_dir} checkout {release_tag}',
-                shell=True, capture_output=True, text=True, timeout=120)
+            if release_tag:
+                r = subprocess.run(
+                    f'cd {cloudtak_dir} && git -c safe.directory={cloudtak_dir} fetch --depth 1 origin tag {release_tag} && git -c safe.directory={cloudtak_dir} checkout {release_tag}',
+                    shell=True, capture_output=True, text=True, timeout=120)
+            else:
+                r = subprocess.run(
+                    f'cd {cloudtak_dir} && git -c safe.directory={cloudtak_dir} pull',
+                    shell=True, capture_output=True, text=True, timeout=120)
             if r.returncode != 0:
                 plog(f"✗ Checkout failed: {r.stderr.strip()[:200]}")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
-        plog(f"✓ Checked out {release_tag}")
+            # Restore any catalog plugins that the checkout wiped.
+            os.makedirs(plugins_base, exist_ok=True)
+            routes_base = os.path.join(cloudtak_dir, 'api', 'routes')
+            for install_dir, p in pre_installed.items():
+                dest = os.path.join(plugins_base, install_dir)
+                local_path = p.get('local_path')
+                repo       = p.get('repo')
+                plugin_subpath = p.get('plugin_subpath')
+                server_subpath = p.get('server_subpath')
+                use_subpaths = bool(repo and (plugin_subpath or server_subpath))
+                cache_path = os.path.join(cloudtak_dir, '.plugin-src', install_dir)
+                server_path = p.get('server_path')
+                # Repo plugins with subdirs: clone (or reuse) the cache, source web + routes from it.
+                if use_subpaths:
+                    import shutil as _shutil
+                    if not os.path.isdir(os.path.join(cache_path, '.git')):
+                        _shutil.rmtree(cache_path, ignore_errors=True)
+                        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                        subprocess.run(['git', 'clone', repo, cache_path], capture_output=True, timeout=120)
+                    server_path = os.path.join(cache_path, server_subpath) if server_subpath else None
+                if not os.path.exists(dest) and not os.path.islink(dest):
+                    import shutil as _shutil
+                    if use_subpaths:
+                        web_src = os.path.join(cache_path, plugin_subpath) if plugin_subpath else cache_path
+                        if os.path.isdir(web_src):
+                            _shutil.copytree(web_src, dest)
+                            plog(f"  Restored plugin (repo): {p['name']}")
+                        else:
+                            plog(f"  ⚠ Plugin '{p['name']}' repo missing '{plugin_subpath}' dir")
+                    elif local_path and os.path.isdir(local_path):
+                        _shutil.copytree(local_path, dest)
+                        plog(f"  Restored plugin (copy): {p['name']}")
+                    elif repo:
+                        plog(f"  Restoring plugin (git clone): {p['name']}…")
+                        subprocess.run(['git', 'clone', repo, dest], capture_output=True, timeout=120)
+                        plog(f"  Restored plugin: {p['name']}")
+                    else:
+                        plog(f"  ⚠ Plugin '{p['name']}' was wiped — no repo or local_path to restore from")
+                # Server-side route files live in api/routes/ which the checkout
+                # also wipes — re-copy them whenever the plugin is installed.
+                if server_path and os.path.isdir(server_path):
+                    import shutil as _shutil
+                    os.makedirs(routes_base, exist_ok=True)
+                    for fname in sorted(os.listdir(server_path)):
+                        if fname.endswith('.ts'):
+                            _shutil.copy2(os.path.join(server_path, fname), os.path.join(routes_base, fname))
+                            plog(f"  Restored server route: api/routes/{fname}")
+        plog(f"✓ Checked out {release_tag or 'latest HEAD'}")
 
         plog("")
         plog("━━━ Step 3/3: Rebuilding and restarting ━━━")
@@ -25403,11 +25582,35 @@ window._ctPluginSetBusy = function(pluginKey, action, busy) {
   if (activeBtn) {
     if (busy) {
       activeBtn._origHTML = activeBtn.innerHTML;
-      activeBtn.innerHTML = '<span class="ct-btn-spinner"></span>' + label + 'ing\u2026';
+      var busyLabel = { install: 'Installing', update: 'Updating', remove: 'Removing' }[action] || (label + 'ing');
+      activeBtn.innerHTML = '<span class="ct-btn-spinner"></span>' + busyLabel + '\u2026';
     } else if (activeBtn._origHTML) {
       activeBtn.innerHTML = activeBtn._origHTML;
       delete activeBtn._origHTML;
     }
+  }
+};
+
+window.ctCopyPluginLog = function(btn) {
+  var logEl = document.getElementById('ct-plugin-log');
+  var text = logEl ? logEl.textContent : '';
+  var done = function() {
+    var orig = btn.textContent;
+    btn.textContent = '✓ Copied';
+    setTimeout(function() { btn.textContent = orig; }, 1500);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done).catch(function() {
+      var ta = document.createElement('textarea');
+      ta.value = text; document.body.appendChild(ta); ta.select();
+      try { document.execCommand('copy'); } catch (e) { /* noop */ }
+      document.body.removeChild(ta); done();
+    });
+  } else {
+    var ta = document.createElement('textarea');
+    ta.value = text; document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); } catch (e) { /* noop */ }
+    document.body.removeChild(ta); done();
   }
 };
 
@@ -25787,7 +25990,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
               <span style="font-size:11px;color:var(--text-dim);font-family:'JetBrains Mono',monospace">·</span>
               <span style="font-size:11px;color:var(--text-dim);font-family:'JetBrains Mono',monospace">requires {{ p.requires }}</span>
             </div>
-            <a href="{{ p.repo }}" target="_blank" rel="noopener" style="font-size:11px;color:var(--cyan);text-decoration:none">{{ p.repo.replace('https://','') }} ↗</a>
+            {% if p.repo %}<a href="{{ p.repo }}" target="_blank" rel="noopener" style="font-size:11px;color:var(--cyan);text-decoration:none">{{ p.repo.replace('https://','') }} ↗</a>{% elif p.local %}<span style="font-size:11px;color:var(--text-dim);font-family:'JetBrains Mono',monospace">local dev (dev branch only)</span>{% endif %}
             {% if p.installed and p.sha %}
             <div style="font-size:11px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;margin-top:4px">installed: {{ p.sha }}{% if p.update_available %} <span style="color:var(--cyan);margin-left:6px">update available</span>{% endif %}</div>
             {% endif %}
@@ -25809,7 +26012,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 
     <!-- Plugin action log (hidden until an action starts) -->
     <div id="ct-plugin-log-card" style="display:none;margin-top:20px">
-      <div class="section-title" style="margin-bottom:10px">Plugin Log <span id="ct-plugin-log-action" style="color:var(--cyan);font-size:11px;font-weight:400;text-transform:none;letter-spacing:0"></span></div>
+      <div class="section-title" style="margin-bottom:10px;display:flex;align-items:center;gap:10px">Plugin Log <span id="ct-plugin-log-action" style="color:var(--cyan);font-size:11px;font-weight:400;text-transform:none;letter-spacing:0"></span><button class="btn btn-ghost" style="margin-left:auto;font-size:11px;padding:4px 10px;text-transform:none;letter-spacing:0" onclick="ctCopyPluginLog(this)">⧉ Copy</button></div>
       <div class="log-box" id="ct-plugin-log">Waiting...</div>
     </div>
   </div>
@@ -38993,6 +39196,31 @@ def _test_ldap_bind_dn_verdict(bind_dn, bind_pass):
                 if lr.returncode == 0 and 'invalid credentials' not in out:
                     return 'ok'
                 if 'invalid credentials' in out:
+                    # A flow-execution spiral (slow flow planner on slow-disk boxes, or a
+                    # password_stage left on the identification stage, or internal-routing
+                    # exposure of the Authentik 2026.2.x recursion) surfaces to ldapsearch
+                    # as LDAP 49 "invalid credentials" — even when the password is correct.
+                    # Do NOT hard-fail on that signal alone: a 'fail' verdict triggers the
+                    # caller's destructive DELETE+recreate of the user, which WIPES the
+                    # cached session that would otherwise succeed and locks the box into a
+                    # cold-spiral loop. Peek at the outpost log; if the spiral signature is
+                    # present this is NOT a credential failure → inconclusive (caller will
+                    # not destroy the user; routing/flow repair handles it). A genuine bad
+                    # password produces LDAP 49 WITHOUT the spiral marker and still fails.
+                    try:
+                        if is_remote:
+                            _okp, _slog = _ssh_probe(ak_cfg.get('remote', {}),
+                                'docker logs authentik-ldap-1 --since 90s 2>&1', timeout=15)
+                            _slog = (_slog or '').lower()
+                        else:
+                            _sr = subprocess.run('docker logs authentik-ldap-1 --since 90s 2>&1',
+                                shell=True, capture_output=True, text=True, timeout=10)
+                            _slog = (_sr.stdout or '').lower()
+                        if any(m in _slog for m in spiral_markers):
+                            saw_spiral = True
+                            continue
+                    except Exception:
+                        pass
                     return 'fail'
             except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
                 pass
@@ -45870,14 +46098,40 @@ def run_takserver_deploy(config):
                     break
                 sync_err = (err or 'Unknown sync error')[:120]
                 if attempt == 0:
-                    log_step(f"  ℹ webadmin sync attempt 1 failed: {sync_err} — retrying once...")
+                    # The first webadmin bind on a fresh deploy frequently fails with
+                    # "exceeded stage recursion depth" — a flow-execution spiral, NOT a
+                    # bad password. Cause: webadmin is verified while the LDAP outpost is
+                    # still on internal direct routing, and the ldap-authentication-flow
+                    # may carry a password_stage on its identification stage (recursion).
+                    # adm_ldapservice masks this (cached session); webadmin is a fresh bind
+                    # so it hits the spiral cold. Repair the flow before retrying — this is
+                    # what "Connect TAK Server to LDAP" does (clears password_stage, fixes
+                    # the 3 ldap-* stage bindings, force-recreates the outpost). Without it
+                    # a clean install dead-ends here. Idempotent on already-healthy boxes.
+                    log_step(f"  ℹ webadmin sync attempt 1 failed: {sync_err} — repairing LDAP flow and retrying...")
+                    try:
+                        ok_flow, err_flow = _ensure_ldap_flow_authentication_none()
+                        if ok_flow:
+                            log_step("  ✓ LDAP flow repaired (cleared recursion spiral)")
+                        else:
+                            log_step(f"  ⚠ LDAP flow repair: {err_flow} — retrying webadmin sync anyway")
+                    except Exception as _fe:
+                        log_step(f"  ⚠ LDAP flow repair error (non-fatal): {str(_fe)[:120]}")
                     time.sleep(15)
             if not sync_ok:
-                log_step(f"  ✗ webadmin Authentik sync failed: {sync_err}")
-                deploy_status.update({'error': True, 'running': False})
-                return
-            _remove_webadmin_from_userauth()
-            log_step("  ✓ Removed any flat-file webadmin shadow (8446 → LDAP only)")
+                # Do NOT abort the deploy. TAK Server is installed and running; a webadmin
+                # bind-verify miss is usually a recoverable flow spiral (common on slow-disk
+                # boxes and on installs with no public IP / no LE cert, where the outpost is
+                # stuck on internal routing). Aborting here would also skip Guard Dog, the
+                # LE cert step, and the completion banner over a problem that's fixable in
+                # one click post-deploy. Finish the deploy and tell the operator how to fix.
+                log_step(f"  ⚠ webadmin Authentik sync not verified: {sync_err}")
+                log_step("     TAK Server is installed — this is usually a recoverable LDAP flow spiral, not a TAK Server problem.")
+                log_step("     Fix: TAK Server page → 'Connect TAK Server to LDAP'. Then test https://<host>:8446 (user: webadmin).")
+                log_step("     (webadmin may already work — the cold first bind can false-negative; try the 8446 login first.)")
+            else:
+                _remove_webadmin_from_userauth()
+                log_step("  ✓ Removed any flat-file webadmin shadow (8446 → LDAP only)")
 
         # v0.8.5: Now that TAK Server is installed (heavy LDAP load profile activated),
         # proactively migrate the LDAP outpost to FQDN routing if it's still on internal direct.
