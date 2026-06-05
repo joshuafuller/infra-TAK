@@ -366,7 +366,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.43-alpha"
+VERSION = "0.9.44-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -2506,6 +2506,44 @@ def update_apply():
         })
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)[:200]})
+
+@app.route('/api/console/restart-safe')
+def console_restart_safe():
+    """v0.9.44: localhost-only readiness probe for the daily console-restart
+    timer (tak-console-restart.sh). Returns {"safe": bool, "reason": str|null}.
+
+    safe=False when any deploy/update operation is in flight, so the timer
+    defers the restart instead of killing a mid-flight deploy. Not session/
+    browser driven (mirrors the localhost-only Guard Dog script endpoints), so
+    it carries no @login_required — but it is restricted to loopback callers.
+    """
+    if (request.remote_addr or '') not in ('127.0.0.1', '::1', 'localhost'):
+        return jsonify({'error': 'forbidden'}), 403
+
+    busy = None
+    # 1) Update Now lock — file-based, set at the top of the Update Now endpoint
+    #    (20-min TTL), so it survives even if the worker handling it is wedged.
+    try:
+        _lock = '/var/lib/takwerx-console/update-now.lock'
+        if os.path.exists(_lock):
+            _age = int(time.time() - os.path.getmtime(_lock))
+            if _age < 1200:
+                busy = f'Update Now in progress (~{_age}s ago)'
+    except Exception:
+        pass
+    # 2) Any in-memory *_status dict reporting a running operation. Scanned
+    #    dynamically so new deploy-status globals are covered automatically.
+    if busy is None:
+        try:
+            for _name, _val in list(globals().items()):
+                if _name.endswith('_status') and isinstance(_val, dict) and _val.get('running'):
+                    busy = f'{_name} running'
+                    break
+        except Exception:
+            pass
+
+    return jsonify({'safe': busy is None, 'reason': busy})
+
 
 @app.route('/api/console/rollback', methods=['POST'])
 @login_required
@@ -12049,16 +12087,18 @@ def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
 
     # Step D: Write renewal script
     renewal_script = f'''#!/bin/bash
-# TAK Server Let's Encrypt Certificate Renewal
-# Triggered monthly by systemd timer. Rebuilds TAK JKS from Caddy cert when
-# within 35 days of expiry, then restarts TAK Server.
+# TAK Server Let's Encrypt Certificate Renewal (v0.9.44)
+# Re-imports Caddy's CURRENT cert into TAK's JKS whenever the keystore cert no longer
+# matches Caddy's (Caddy auto-renews on its own schedule), then restarts TAK Server.
+# Fixed from the old logic that gated on Caddy's days-left — which meant TAK never
+# picked up Caddy's renewed cert and its keystore cert silently expired.
 set -euo pipefail
 
 TAK_DOMAIN="{takserver_host}"
 CERT_DIR="{cert_dir}"
 CERT_CRT="$CERT_DIR/$TAK_DOMAIN.crt"
 CERT_KEY="$CERT_DIR/$TAK_DOMAIN.key"
-RENEW_WINDOW_DAYS=35
+JKS="/opt/tak/certs/files/takserver-le.jks"
 LOG_FILE="/var/log/takserver-cert-renewal.log"
 
 log() {{ echo "[$(date -Is)] $*" | tee -a "$LOG_FILE"; }}
@@ -12068,23 +12108,22 @@ if [ ! -f "$CERT_CRT" ] || [ ! -f "$CERT_KEY" ]; then
   exit 1
 fi
 
-END_DATE_RAW=$(openssl x509 -enddate -noout -in "$CERT_CRT" | cut -d= -f2)
-END_EPOCH=$(date -d "$END_DATE_RAW" +%s)
-NOW_EPOCH=$(date +%s)
-DAYS_LEFT=$(( (END_EPOCH - NOW_EPOCH) / 86400 ))
-log "Certificate days remaining for $TAK_DOMAIN: ${{DAYS_LEFT}} day(s)"
+# v0.9.44: sync on cert CONTENT, not Caddy's days-left. Caddy auto-renews on its own,
+# so re-import whenever TAK's keystore cert differs from Caddy's current cert (or the
+# keystore is missing) — otherwise the keystore keeps the old cert and silently expires.
+CADDY_FP=$(openssl x509 -in "$CERT_CRT" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
+TAK_FP=""
+if [ -f "$JKS" ]; then
+  TAK_FP=$(keytool -list -rfc -keystore "$JKS" -storepass {shlex.quote(cert_pass)} 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
+fi
 
-if [ "$DAYS_LEFT" -gt "$RENEW_WINDOW_DAYS" ]; then
-  log "Outside renewal window (${{RENEW_WINDOW_DAYS}}d). No action taken."
+if [ -n "$TAK_FP" ] && [ "$TAK_FP" = "$CADDY_FP" ]; then
+  log "TAK keystore already matches Caddy's current cert. No action."
   exit 0
 fi
 
-log "Within renewal window. Triggering Caddy reload and refreshing TAK keystore..."
-if ! systemctl reload caddy; then
-  log "Caddy reload failed; restarting..."
-  systemctl restart caddy
-fi
-sleep 15
+log "TAK keystore differs from Caddy's current cert (Caddy renewed) — refreshing keystore..."
+rm -f /tmp/takserver-le.p12 /tmp/takserver-le.jks
 
 openssl pkcs12 -export -in "$CERT_CRT" -inkey "$CERT_KEY" \\
   -out /tmp/takserver-le.p12 -name "$TAK_DOMAIN" -password pass:{shlex.quote(cert_pass)}
@@ -12119,7 +12158,7 @@ Description=TAK Server Certificate Renewal Timer
 Requires=takserver-cert-renewal.service
 
 [Timer]
-OnCalendar=monthly
+OnCalendar=daily
 Persistent=true
 
 [Install]
@@ -12130,7 +12169,7 @@ WantedBy=timers.target
     subprocess.run(
         'systemctl daemon-reload && systemctl enable --now takserver-cert-renewal.timer 2>/dev/null; true',
         shell=True, capture_output=True)
-    log_fn("  ✓ Auto-renewal timer enabled (monthly)")
+    log_fn("  ✓ Auto-renewal timer enabled (daily, content-based)")
 
     # Step F: Start TAK Server (was stopped in Step C before CoreConfig patch)
     log_fn("  Starting TAK Server with LE cert on port 8446...")
@@ -12138,6 +12177,61 @@ WantedBy=timers.target
     log_fn("  ✓ TAK Server started")
     log_fn("✓ Port 8446 now serving Let's Encrypt cert — ready for TAK clients")
     return True
+
+
+def _selfheal_takserver_le_cert(plog=None):
+    """v0.9.44: re-sync TAK Server's 8446 Let's Encrypt cert when it has drifted from
+    Caddy's current cert.
+
+    Caddy auto-renews the LE cert on its own ~60-day cycle. The old renewal logic only
+    re-imported into TAK's keystore when CADDY's cert was near expiry — so once Caddy
+    renewed (resetting to ~90 days), the script said "no action" and TAK's keystore kept
+    the OLD cert, which then silently expired. CloudTAK login hits TAK's 8446 enrollment
+    API, so an expired keystore cert breaks login with CERT_HAS_EXPIRED (field: test6,
+    2026-06-04 — every TAK CA/admin cert valid to 2028, but the 8446 LE cert lapsed).
+
+    Here we compare the cert in TAK's keystore against Caddy's current cert and, if they
+    differ or the keystore cert is expired/missing, re-run install_le_cert_on_8446() to
+    repair. Runs daily via the console-restart timer; a no-op (no TAK restart) when the
+    keystore already matches Caddy."""
+    def _log(m):
+        if plog:
+            plog(m)
+        else:
+            print(m, flush=True)
+    try:
+        if not os.path.exists('/opt/tak/renew-letsencrypt.sh'):
+            return  # box never had the LE-on-8446 setup
+        settings = load_settings()
+        host = _get_service_domain(settings, 'takserver')
+        if not host:
+            return
+        cert_crt = (f'/var/lib/caddy/.local/share/caddy/certificates/'
+                    f'acme-v02.api.letsencrypt.org-directory/{host}/{host}.crt')
+        if not os.path.exists(cert_crt):
+            return  # no Caddy LE cert for this host — nothing to sync from
+        jks = '/opt/tak/certs/files/takserver-le.jks'
+        cert_pass = _get_tak_cert_password(settings)
+        caddy_fp = subprocess.run(
+            f'openssl x509 -in {shlex.quote(cert_crt)} -noout -fingerprint -sha256 2>/dev/null',
+            shell=True, capture_output=True, text=True, timeout=15).stdout.strip()
+        tak_fp = ''
+        tak_expired = True
+        if os.path.exists(jks):
+            kt = f'keytool -list -rfc -keystore {shlex.quote(jks)} -storepass {shlex.quote(cert_pass)} 2>/dev/null'
+            tak_fp = subprocess.run(
+                f'{kt} | openssl x509 -noout -fingerprint -sha256 2>/dev/null',
+                shell=True, capture_output=True, text=True, timeout=20).stdout.strip()
+            tak_expired = subprocess.run(
+                f'{kt} | openssl x509 -checkend 0 -noout',
+                shell=True, capture_output=True, timeout=20).returncode != 0
+        if caddy_fp and tak_fp and caddy_fp == tak_fp and not tak_expired:
+            return  # keystore already matches Caddy and is valid — nothing to do
+        _log('takserver LE-cert self-heal: 8446 keystore cert stale/expired vs Caddy '
+             '— re-syncing and restarting TAK Server...')
+        install_le_cert_on_8446(host, _log, wait_for_cert=False)
+    except Exception as e:
+        _log(f'takserver LE-cert self-heal error (non-fatal): {e}')
 
 
 def run_caddy_deploy(domain):
@@ -16054,6 +16148,73 @@ def cloudtak_reset_server_config():
         return jsonify({'success': True, 'message': f'CloudTAK server config cleared. Visit {"map." + fqdn if fqdn else "CloudTAK"} to re-run the bootstrap wizard.'})
 
 
+def _plugin_built_marker_path(ct_dir, install_dir):
+    # v0.9.44: SHA of the source last *successfully built* into the CloudTAK image.
+    # Lives outside any git clone so `git pull` on the cache can't touch it.
+    return os.path.join(ct_dir, '.plugin-src', f'.built-{install_dir}')
+
+
+def _read_plugin_built_sha(ct_dir, install_dir):
+    try:
+        with open(_plugin_built_marker_path(ct_dir, install_dir)) as f:
+            return f.read().strip() or None
+    except Exception:
+        return None
+
+
+def _write_plugin_built_sha(ct_dir, install_dir, sha):
+    try:
+        p = _plugin_built_marker_path(ct_dir, install_dir)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, 'w') as f:
+            f.write((sha or '').strip())
+    except Exception:
+        pass
+
+
+def _snapshot_cloudtak_plugin_state(ct_dir, install_path):
+    """v0.9.44: back up the CloudTAK files a plugin action mutates (api/routes + the web
+    plugin dir) so a failed rebuild can be rolled back — a broken plugin must never leave
+    CloudTAK in an unbuildable state."""
+    import tempfile, shutil
+    snap = tempfile.mkdtemp(prefix='ct-plugin-rollback-')
+    routes = os.path.join(ct_dir, 'api', 'routes')
+    if os.path.isdir(routes):
+        shutil.copytree(routes, os.path.join(snap, 'routes'), symlinks=True)
+    web_existed = os.path.isdir(install_path) or os.path.islink(install_path)
+    if web_existed:
+        shutil.copytree(install_path, os.path.join(snap, 'web'), symlinks=True)
+    return {'snap': snap, 'web_existed': web_existed}
+
+
+def _rollback_cloudtak_plugin_state(ct_dir, install_path, snap_info, plog=None):
+    import shutil
+    if not snap_info or not snap_info.get('snap'):
+        return
+    snap = snap_info['snap']
+    routes = os.path.join(ct_dir, 'api', 'routes')
+    snap_routes = os.path.join(snap, 'routes')
+    if os.path.isdir(snap_routes):
+        shutil.rmtree(routes, ignore_errors=True)
+        shutil.move(snap_routes, routes)
+    if os.path.islink(install_path):
+        os.unlink(install_path)
+    elif os.path.isdir(install_path):
+        shutil.rmtree(install_path, ignore_errors=True)
+    snap_web = os.path.join(snap, 'web')
+    if snap_info.get('web_existed') and os.path.isdir(snap_web):
+        shutil.move(snap_web, install_path)
+    shutil.rmtree(snap, ignore_errors=True)
+    if plog:
+        plog('  ↩ Restored CloudTAK api/routes + plugin dir to the pre-update state.')
+
+
+def _cleanup_snapshot(snap_info):
+    import shutil
+    if snap_info and snap_info.get('snap'):
+        shutil.rmtree(snap_info['snap'], ignore_errors=True)
+
+
 def _detect_cloudtak_plugins():
     """Return the CLOUDTAK_PLUGINS catalog annotated with installed/commit/update_available."""
     ct_dir = os.path.expanduser('~/CloudTAK')
@@ -16065,30 +16226,47 @@ def _detect_cloudtak_plugins():
         is_local  = bool(p.get('local_path'))
         sha = None
         update_available = False
-        if installed:
-            # Local HEAD — short SHA only (no commit message)
+        # Resolve which directory actually holds the plugin's git clone. For repo plugins that
+        # ship the web/server halves in subdirs, install_path (under api/web/plugins/) is a
+        # *copy* with no .git — the real clone lives in ~/CloudTAK/.plugin-src/<install_dir>.
+        # Running `git -C` in a dir that has no .git makes git walk UP the tree and report
+        # CloudTAK's own repo commit/update state instead of the plugin's (the bogus-SHA bug).
+        # Local-path plugins are copied from this repo and have no upstream of their own.
+        git_dir = None
+        if installed and not is_local:
+            uses_subpaths = bool(p.get('repo') and (p.get('plugin_subpath') or p.get('server_subpath')))
+            cand = os.path.join(ct_dir, '.plugin-src', p['install_dir']) if uses_subpaths else install_path
+            if os.path.isdir(os.path.join(cand, '.git')):
+                git_dir = cand
+        if git_dir:
+            # v0.9.44 honest badge: show the SHA actually BUILT into the running image,
+            # not the source cache HEAD. A failed rebuild advances the cache but leaves the
+            # old image live, so comparing the cache would falsely clear the "update" badge.
+            built_sha = _read_plugin_built_sha(ct_dir, p['install_dir'])
+            head_sha = None
             try:
                 r = subprocess.run(
-                    ['git', '-C', install_path, 'rev-parse', '--short=7', 'HEAD'],
+                    ['git', '-C', git_dir, 'rev-parse', '--short=7', 'HEAD'],
                     capture_output=True, text=True, timeout=5
                 )
                 if r.returncode == 0:
-                    sha = r.stdout.strip()
+                    head_sha = r.stdout.strip()
             except Exception:
                 pass
-            # Remote HEAD — skip for local-path plugins (symlink is always current)
-            if not is_local:
-                try:
-                    r2 = subprocess.run(
-                        ['git', '-C', install_path, 'ls-remote', 'origin', 'HEAD'],
-                        capture_output=True, text=True, timeout=5
-                    )
-                    if r2.returncode == 0 and r2.stdout.strip():
-                        remote_short = r2.stdout.split()[0][:7]
-                        if sha and remote_short and sha != remote_short:
-                            update_available = True
-                except Exception:
-                    pass
+            # Built marker wins; fall back to cache HEAD for pre-0.9.44 installs (no marker).
+            sha = built_sha or head_sha
+            # Remote HEAD — an update exists if nothing is built yet or built != upstream.
+            try:
+                r2 = subprocess.run(
+                    ['git', '-C', git_dir, 'ls-remote', 'origin', 'HEAD'],
+                    capture_output=True, text=True, timeout=5
+                )
+                if r2.returncode == 0 and r2.stdout.strip():
+                    remote_short = r2.stdout.split()[0][:7]
+                    if remote_short and (not sha or sha != remote_short):
+                        update_available = True
+            except Exception:
+                pass
         result.append({**p, 'installed': installed, 'sha': sha, 'update_available': update_available, 'local': is_local})
     return result
 
@@ -16155,7 +16333,11 @@ def _run_cloudtak_plugin_action(plugin_key, action):
         os.makedirs(os.path.dirname(cache_path), exist_ok=True)
         return run_cmd(['git', 'clone', repo, cache_path])
 
+    built_ok = False
+    snap = None
     try:
+        # v0.9.44: snapshot the files we're about to mutate so a failed rebuild rolls back.
+        snap = _snapshot_cloudtak_plugin_state(ct_dir, install_path)
         if action == 'install':
             plog(f'Installing plugin: {plugin["name"]}')
             if os.path.isdir(install_path) or os.path.islink(install_path):
@@ -16260,8 +16442,27 @@ def _run_cloudtak_plugin_action(plugin_key, action):
         plog('')
         plog('Rebuilding CloudTAK API image — this takes 5–15 minutes...')
         if not run_cmd(['docker', 'compose', 'build', '--no-cache', 'api'], cwd=ct_dir, timeout=1200):
+            plog('✗ Rebuild failed — rolling back so CloudTAK stays buildable...')
+            _rollback_cloudtak_plugin_state(ct_dir, install_path, snap, plog)
+            snap = None
             cloudtak_plugin_status.update({'running': False, 'error': True})
             return
+        built_ok = True
+        # v0.9.44: record the source SHA that actually built (honest update badge).
+        if action == 'remove':
+            try:
+                os.remove(_plugin_built_marker_path(ct_dir, plugin['install_dir']))
+            except Exception:
+                pass
+        elif not local_path:
+            src = cache_path if use_subpaths else install_path
+            try:
+                rr = subprocess.run(['git', '-C', src, 'rev-parse', '--short=7', 'HEAD'],
+                                    capture_output=True, text=True, timeout=5)
+                if rr.returncode == 0:
+                    _write_plugin_built_sha(ct_dir, plugin['install_dir'], rr.stdout.strip())
+            except Exception:
+                pass
 
         plog('Restarting CloudTAK API container...')
         if not run_cmd(['docker', 'compose', 'up', '-d', '--force-recreate', 'api'], cwd=ct_dir, timeout=120):
@@ -16279,7 +16480,13 @@ def _run_cloudtak_plugin_action(plugin_key, action):
 
     except Exception as e:
         plog(f'Unexpected error: {e}')
+        if not built_ok:
+            plog('Rolling back partial changes...')
+            _rollback_cloudtak_plugin_state(ct_dir, install_path, snap, plog)
+            snap = None
         cloudtak_plugin_status.update({'running': False, 'error': True})
+    finally:
+        _cleanup_snapshot(snap)
 
 
 @app.route('/api/cloudtak/plugins/list')
@@ -30628,6 +30835,130 @@ def _patch_settings_server_ip_prefer_cloud_public(plog=None):
     except Exception as e:
         try:
             plog(f"  server_ip auto-correct: error (non-fatal): {e}")
+        except Exception:
+            pass
+        return False
+
+
+def _list_local_ipv4s():
+    """Return the set of IPv4 addresses currently assigned to this host
+    (loopback excluded). Used to decide whether a stored settings.server_ip
+    still belongs to the box or has gone stale after a subnet move.
+    Best-effort — returns an empty set if it can't enumerate (network down,
+    `hostname` missing). Mirrors start.sh's `hostname -I`."""
+    ips = set()
+    try:
+        import subprocess as _sp
+        out = _sp.run(['hostname', '-I'], capture_output=True, text=True, timeout=3)
+        for tok in (out.stdout or '').split():
+            tok = tok.strip()
+            # hostname -I emits both IPv4 and IPv6 — keep dotted-quads only.
+            if tok and tok.count('.') == 3 and not tok.startswith('127.'):
+                ips.add(tok)
+    except Exception:
+        pass
+    return ips
+
+
+def _primary_local_ipv4():
+    """Return the source IPv4 the kernel would use for default-route egress
+    (i.e. the address operators reach the box on), or '' if undetectable.
+    Uses a UDP-socket connect trick: no packets are sent, it just consults
+    the routing table, so it works even with no internet access."""
+    try:
+        import socket as _sock
+        s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
+        try:
+            s.connect(('1.1.1.1', 80))
+            ip = s.getsockname()[0]
+        finally:
+            s.close()
+        if ip and ip.count('.') == 3 and not ip.startswith('127.'):
+            return ip
+    except Exception:
+        pass
+    return ''
+
+
+def _refresh_stale_private_server_ip(plog=None):
+    """v0.9.44: refresh settings.server_ip when the stored *private* IP no
+    longer belongs to any of this host's interfaces — i.e. the VM was moved
+    to a different subnet after install (issue #36, takwerx/infra-TAK).
+
+    BACKGROUND: start.sh writes server_ip once at fresh-install time and
+    `Update Now` never re-runs start.sh, so a subnet move leaves a stale IP
+    "tattooed" into the Caddy / domain-install page. Field report #36: a box
+    was installed on a 172.24.x.y subnet then moved to a 10.x.y.z subnet; the
+    console kept advertising the old 172.24 address as the DNS A-record target
+    operators were told to point their domain at.
+
+    Gating (all must hold to rewrite):
+      - current settings.server_ip is RFC 1918 private. We NEVER touch a
+        public IP: on cloud VMs that's deliberately the metadata public IP
+        (see _patch_settings_server_ip_prefer_cloud_public) while
+        `hostname -I` there returns the private interface — refreshing would
+        undo that correction.
+      - we can enumerate at least one current local IPv4 (network is up) —
+        otherwise a transient boot-time outage must not blank a good IP.
+      - the stored IP is NOT among the host's current IPv4 addresses. Proof
+        it's stale, not merely a non-primary NIC the operator chose on
+        purpose (those still appear in `hostname -I`).
+      - we can determine a new *private* primary IP to replace it with.
+
+    Unlike the v0.9.29 cloud-public migration this is deliberately NOT
+    one-shot: a box can move subnets repeatedly, so it re-evaluates every
+    boot but only writes (and logs) when the IP actually changed. Pairs with
+    the v0.9.44 daily console-restart timer so a box that moves while running
+    self-heals within a day without an operator restart. Records an audit
+    trail in settings.json under `server_ip_stale_refresh`.
+
+    Safe to call on every console boot from `_startup_migrations`.
+    """
+    if not plog:
+        plog = lambda m: None
+    try:
+        s = load_settings()
+        cur_ip = (s.get('server_ip') or '').strip()
+        # Only ever refresh a private IP — public IPs are cloud-managed.
+        if not cur_ip or not _ip_is_rfc1918_private(cur_ip):
+            return False
+        local_ips = _list_local_ipv4s()
+        if not local_ips:
+            return False  # network not up — don't blank a good IP on a fluke
+        if cur_ip in local_ips:
+            return False  # still a live address on this box — not stale
+        # Stale: stored IP is gone from every interface. Pick the new primary,
+        # falling back to the first private address `hostname -I` reports.
+        new_ip = _primary_local_ipv4()
+        if not (new_ip and _ip_is_rfc1918_private(new_ip)):
+            new_ip = next((ip for ip in sorted(local_ips)
+                           if _ip_is_rfc1918_private(ip)), '')
+        if not new_ip or new_ip == cur_ip:
+            return False
+        plog(
+            f"  server_ip stale-refresh: stored {cur_ip} is not on any local "
+            f"interface (have {sorted(local_ips)}) — VM appears to have moved "
+            f"subnets; updating to {new_ip}"
+        )
+        s['server_ip'] = new_ip
+        s['server_ip_stale_refresh'] = {
+            'applied_at': datetime.utcnow().isoformat() + 'Z',
+            'from': cur_ip,
+            'to': new_ip,
+            'local_ips': sorted(local_ips),
+            'version': VERSION,
+        }
+        save_settings(s)
+        plog(
+            f"  server_ip stale-refresh: applied. {cur_ip} → {new_ip}. "
+            f"DNS A-records / Caddy page now advertise the current address. "
+            f"If you set the old IP on purpose, paste it back in "
+            f"Settings → Server IP."
+        )
+        return True
+    except Exception as e:
+        try:
+            plog(f"  server_ip stale-refresh: error (non-fatal): {e}")
         except Exception:
             pass
         return False
@@ -45043,6 +45374,35 @@ def takserver_rollback_log_api():
     })
 
 
+def _verify_takserver_dpkg_ok(ulog):
+    """v0.9.44: return True iff `takserver` is fully configured (`install ok installed`).
+
+    A .deb postinstall can fail and leave the package `half-configured` while the rest of
+    the upgrade looked fine — field: test6 sat half-configured for 3 weeks while the update
+    reported done. Callers must NOT report success when this returns False. The console
+    also auto-repairs a half-configured state on its next restart via
+    _selfheal_takserver_half_configured, but we surface the failure immediately so it
+    isn't silently missed."""
+    try:
+        r = subprocess.run(['dpkg-query', '-W', '-f=${Status}', 'takserver'],
+                           capture_output=True, text=True, timeout=10)
+        state = (r.stdout or '').strip()
+    except Exception as e:
+        ulog(f"  ⚠ Could not verify takserver dpkg state ({e}) — assuming OK")
+        return True
+    if r.returncode != 0 or not state:
+        ulog("  ⚠ takserver not found in dpkg — skipping state verification")
+        return True
+    if state == 'install ok installed':
+        ulog("✓ takserver dpkg state verified: install ok installed")
+        return True
+    ulog(f"✗ Upgrade left takserver dpkg state '{state}' — NOT fully configured.")
+    ulog("  Reporting failure so it isn't missed. The console auto-repairs a half-configured")
+    ulog("  state on its next restart; otherwise re-run the update once the postinstall")
+    ulog("  cause is resolved.")
+    return False
+
+
 def run_takserver_upgrade(pkg_path):
     def ulog(msg):
         entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
@@ -45139,6 +45499,9 @@ def run_takserver_upgrade(pkg_path):
                 ulog(f"\u26a0 webadmin sync: {err_wa or 'failed'} \u2014 use Sync webadmin button if 8446 login fails")
         generate_caddyfile(settings)
         subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
+        if not _verify_takserver_dpkg_ok(ulog):
+            upgrade_status.update({'running': False, 'complete': False, 'error': True})
+            return
         ulog("TAK Server update complete.")
         upgrade_status.update({'running': False, 'complete': True, 'error': False})
     except Exception as e:
@@ -45330,6 +45693,9 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
         generate_caddyfile(settings)
         subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
 
+        if not _verify_takserver_dpkg_ok(ulog):
+            upgrade_status.update({'running': False, 'complete': False, 'error': True})
+            return
         ulog("")
         ulog("=" * 50)
         ulog("\u2713 Two-server update complete")
@@ -46664,9 +47030,25 @@ def _kernel_patch_start_job():
         'export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a\n'
         'TS() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }\n'
         'echo "[$(TS)] === infra-TAK kernel patch job starting (pid $$) ==="\n'
+        # v0.9.44: OS patching must NEVER sweep in a TAK Server MAJOR upgrade — that is
+        # operator-driven and backup-gated (the console TAK update flow). Field: a kernel
+        # patch pulled takserver 5.6->5.7, whose postinstall failed and wedged dpkg. Hold
+        # the installed TAK packages for the duration of this run, release on exit. Only
+        # holds WE add are released, so any pre-existing operator hold is preserved.
+        'TAK_PKGS="takserver takserver-fed-hub"\n'
+        'HELD=""\n'
+        'PREHELD="$(apt-mark showhold 2>/dev/null)"\n'
+        'for p in $TAK_PKGS; do\n'
+        '  if dpkg -s "$p" >/dev/null 2>&1; then\n'
+        '    case " $PREHELD " in *" $p "*) : ;; *) apt-mark hold "$p" >/dev/null 2>&1 && HELD="$HELD $p" ;; esac\n'
+        '  fi\n'
+        'done\n'
+        '[ -n "$HELD" ] && echo "[$(TS)] TAK packages held for this patch (operator-driven upgrade only):$HELD"\n'
+        'release_holds() { for p in $HELD; do apt-mark unhold "$p" >/dev/null 2>&1; done; [ -n "$HELD" ] && echo "[$(TS)] released TAK holds:$HELD"; }\n'
+        'trap release_holds EXIT\n'
         'echo "[$(TS)] apt-get update"\n'
         'apt-get update 2>&1 || { rc=$?; echo "[$(TS)] FATAL: apt-get update failed (exit $rc)"; exit $rc; }\n'
-        'echo "[$(TS)] apt-get full-upgrade -y"\n'
+        'echo "[$(TS)] apt-get full-upgrade -y (TAK Server packages held)"\n'
         'apt-get -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" full-upgrade 2>&1 \\\n'
         '  || { rc=$?; echo "[$(TS)] FATAL: apt-get full-upgrade failed (exit $rc)"; exit $rc; }\n'
         'echo "[$(TS)] === DONE — safe to reboot ==="\n'
@@ -46711,6 +47093,21 @@ def _kernel_patch_start_job():
     return (True, f"started (unit {_KERNEL_PATCH_UNIT}, pid {new_pid or 'pending'})", new_pid or None)
 
 
+def _kernel_reboot_pending():
+    """v0.9.44: True when the running kernel isn't the newest installed one — a more
+    reliable "reboot needed" signal than /var/run/reboot-required, which can be cleared
+    (e.g. a reboot that didn't land the new kernel, or a notify hook that never fired)
+    while a reboot is still required to activate a freshly-installed kernel."""
+    try:
+        running = subprocess.run(['uname', '-r'], capture_output=True, text=True, timeout=5).stdout.strip()
+        newest = subprocess.run(
+            "ls -1 /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||' | sort -V | tail -1",
+            shell=True, capture_output=True, text=True, timeout=5).stdout.strip()
+        return bool(running and newest and running != newest)
+    except Exception:
+        return False
+
+
 def _kernel_patch_job_state():
     """Return current state of the background kernel-patch transient unit.
     Returns a dict suitable for jsonify:
@@ -46723,6 +47120,13 @@ def _kernel_patch_job_state():
         'log_present': bool,
         'unit_state': str (e.g. 'active/running', 'inactive/dead', 'failed/failed')
       }
+
+    v0.9.44: `done`/`error` are now derived from the job's log markers and the
+    `/var/run/reboot-required` flag rather than the systemd-default Result value,
+    because a *successful* transient unit is garbage-collected within seconds of
+    completing — even while the box is still up — which used to leave the UI stuck
+    on "in progress". `reboot_required` is also returned. The reboot flag auto-clears
+    after the reboot, so it subsumes the v0.9.32 post-reboot guard below.
 
     v0.9.32 fix: post-reboot the transient unit `infratak-kernel-patch.service`
     is gone from systemd's memory (transient units do not survive reboot).
@@ -46760,15 +47164,26 @@ def _kernel_patch_job_state():
         except Exception:
             log_tail = ''
 
-    # Layer 1: gate on LoadState=loaded.
-    # Transient unit gone (post-reboot, never-spawned, masked, etc.) →
-    # don't infer done/err from the default Result property value.
+    # v0.9.44: a pending reboot (new kernel staged) is the authoritative "you
+    # should reboot" signal — and the kernel auto-clears /var/run/reboot-required
+    # after the reboot, so it also ends the post-reboot banner loop the old
+    # LoadState gate was guarding against (more directly than the apt-list probe).
+    reboot_required = os.path.exists('/var/run/reboot-required') or _kernel_reboot_pending()
+
+    # Transient unit gone. systemd garbage-collects a *successful* transient unit
+    # within seconds of completion — even while the box is still up — so the old
+    # "load != loaded => done=False" gate left the UI stuck on "in progress" with
+    # the DONE log showing. Read the job's own log markers + the reboot flag instead.
     if load != 'loaded':
+        last_done = log_tail.rfind('=== DONE')
+        last_fatal = log_tail.rfind('FATAL:')
+        completed_ok = last_done != -1 and last_done > last_fatal
         return {
             'running': False,
             'pid': None,
-            'done': False,
-            'error': False,
+            'done': bool(completed_ok and reboot_required),
+            'error': bool(last_fatal != -1 and last_fatal > last_done),
+            'reboot_required': reboot_required,
             'log_tail': log_tail,
             'log_present': log_present,
             'unit_state': f"not-loaded/{load or 'unknown'}",
@@ -46778,37 +47193,11 @@ def _kernel_patch_job_state():
     # signal — don't depend on log_tail content (log may be rotated, wiped,
     # or empty if the unit died before writing anything). The log-tail
     # banner string is just operator-visible confirmation.
-    done = (not running) and (result == 'success')
+    # Done only if it finished successfully AND a reboot is actually pending —
+    # the "done" banner's whole job is to say "reboot to boot the new kernel",
+    # so if reboot-required is gone (already rebooted) there's nothing to assert.
+    done = (not running) and (result == 'success') and reboot_required
     err = (not running) and (active == 'failed' or (result not in ('', 'success')))
-
-    # Layer 2: cross-check `done` against the apt-list status. If no kernel
-    # update is pending on the box, there is nothing for the "reboot required"
-    # banner to say — downgrade done→False so the JS falls through to the
-    # apt-list check and hides the banner. Cheap: reuses the cached
-    # /api/system/kernel-patch-status response when fresh.
-    if done:
-        try:
-            import time as _kpat
-            _now = _kpat.time()
-            _cache = _kernel_patch_cache.get('data') if _kernel_patch_cache.get('data') else None
-            if _cache and (_now - _kernel_patch_cache.get('ts', 0)) < 60:
-                _patched = bool(_cache.get('patched'))
-            else:
-                _r = subprocess.run(
-                    'apt list --upgradable 2>/dev/null | grep linux-image | wc -l',
-                    shell=True, capture_output=True, text=True, timeout=15
-                )
-                _up = (_r.stdout or '').strip()
-                _patched = (_up.isdigit() and int(_up) == 0)
-            if _patched:
-                # No kernel update pending → there is nothing to reboot for.
-                # Don't keep firing the "Reboot now" banner.
-                done = False
-        except Exception:
-            # Best-effort cross-check; if the apt probe blows up, fall back
-            # to the prior behavior (Layer 1 already protects against the
-            # post-reboot default-Result-success case).
-            pass
 
     # If the job clearly completed (success or failure), bust the kernel
     # patch status cache so the post-reboot banner check picks up reality.
@@ -46819,6 +47208,7 @@ def _kernel_patch_job_state():
         'pid': (pid or None) if running else None,
         'done': done,
         'error': err,
+        'reboot_required': reboot_required,
         'log_tail': log_tail,
         'log_present': log_present,
         'unit_state': f"{active or 'unknown'}/{sub or 'unknown'}" + (f" ({result})" if result else ''),
@@ -51409,10 +51799,238 @@ def _fail2ban_takserver_filter(plog):
 
 
 # === Startup migrations: fix known bad settings and regenerate Caddy if needed ===
+# v0.9.44: canonical guard script for the daily console-restart timer. Written
+# to /usr/local/sbin by _ensure_console_restart_timer(); also committed at
+# scripts/tak-console-restart.sh for operator visibility. Keep the two in sync.
+_CONSOLE_RESTART_SCRIPT = r'''#!/bin/bash
+# infra-TAK console daily restart with idle gate — v0.9.44-alpha.
+#
+# A wedged gunicorn worker keeps port 5001 in LISTEN while serving nothing, so
+# systemd reports takwerx-console "active (running)" and never recovers it
+# (test6 + test8, 2026-06-03: 5-7 day-old workers hung; front door + backdoor
+# both dead while Authentik stayed up). Nothing restarted the console on a
+# schedule. This oneshot, fired daily at 04:00 by takconsolerestart.timer,
+# bounces the console so a wedged worker can never sit dead for days and pulled
+# code actually goes live.
+#
+# Idle gate: ask the console whether a deploy/update is in flight before
+# bouncing it. If it answers "not safe" we defer to the next cycle. If it does
+# NOT answer within the timeout it is almost certainly wedged -- which is
+# EXACTLY when a restart is wanted -- so we proceed.
+set -u
+TAG=tak-console-restart
+log() { logger -t "$TAG" -- "$*" 2>/dev/null; echo "$(date -u +%FT%TZ) [$TAG] $*"; }
+
+# Port = whatever the console unit actually binds, so this works regardless of
+# install dir (/root/infra-TAK, the OG /home/takwerx/infra-TAK, ...). Fall back to 5001.
+PORT="$(grep -oE -- '--bind[ =][^ ]+' /etc/systemd/system/takwerx-console.service 2>/dev/null | grep -oE '[0-9]+$' | head -1)"
+[ -n "${PORT:-}" ] || PORT=5001
+
+SAFE="$(curl -ks -m 5 "https://127.0.0.1:${PORT}/api/console/restart-safe" 2>/dev/null || true)"
+
+if [ -z "$SAFE" ]; then
+    log "console did not respond within 5s on :${PORT} (likely wedged) -- restarting"
+elif printf '%s' "$SAFE" | grep -q '"safe"[: ]*true'; then
+    log "console idle -- restarting to recover workers / load pulled code"
+else
+    REASON="$(printf '%s' "$SAFE" | grep -oP '"reason"[[:space:]]*:[[:space:]]*"\K[^"]*' | head -1)"
+    log "deferred -- console busy (${REASON:-operation in progress}); next cycle will retry"
+    exit 0
+fi
+
+if systemctl restart takwerx-console.service; then
+    log "restart issued OK"
+else
+    log "restart FAILED rc=$?"
+fi
+exit 0
+'''
+
+
+def _ensure_console_restart_timer():
+    """v0.9.44: install/repair the daily console-restart timer + idle-gate script.
+
+    Recovers the wedged-worker failure mode (test6/test8, 2026-06-03): port 5001
+    stays in LISTEN while gunicorn serves nothing, systemd reports the unit
+    "active (running)", and nothing bounces it -- the only periodic restart in
+    the project is Authentik's, never the console. A daily oneshot at 04:00
+    (idle-gated via /api/console/restart-safe) fixes it and also loads pulled
+    code that a never-restarted console would otherwise miss.
+
+    Idempotent -- safe to call on every console boot from _startup_migrations.
+    Returns a short status string for the boot log, or '' when nothing changed.
+    """
+    try:
+        script_path = '/usr/local/sbin/tak-console-restart.sh'
+        svc_path = '/etc/systemd/system/takconsolerestart.service'
+        tmr_path = '/etc/systemd/system/takconsolerestart.timer'
+
+        svc_content = (
+            '[Unit]\n'
+            'Description=infra-TAK console daily restart (idle-gated)\n'
+            'After=takwerx-console.service\n\n'
+            '[Service]\n'
+            'Type=oneshot\n'
+            f'ExecStart={script_path}\n'
+        )
+        # RandomizedDelaySec spreads the fleet's 04:00 restarts so customers
+        # don't all bounce in lockstep; Persistent catches a missed window
+        # (box powered off at 04:00) on next boot.
+        tmr_content = (
+            '[Unit]\n'
+            'Description=Restart infra-TAK console daily at 04:00 (recover wedged worker, load pulled code)\n\n'
+            '[Timer]\n'
+            'OnCalendar=*-*-* 04:00:00\n'
+            'RandomizedDelaySec=1800\n'
+            'Persistent=true\n'
+            'Unit=takconsolerestart.service\n\n'
+            '[Install]\n'
+            'WantedBy=timers.target\n'
+        )
+
+        changed = False
+
+        def _write_if_changed(path, content, mode=None):
+            cur = ''
+            if os.path.exists(path):
+                try:
+                    with open(path) as _f:
+                        cur = _f.read()
+                except Exception:
+                    pass
+            if cur != content:
+                with open(path, 'w') as _f:
+                    _f.write(content)
+                if mode is not None:
+                    os.chmod(path, mode)
+                return True
+            return False
+
+        changed |= _write_if_changed(script_path, _CONSOLE_RESTART_SCRIPT, 0o755)
+        changed |= _write_if_changed(svc_path, svc_content)
+        changed |= _write_if_changed(tmr_path, tmr_content)
+
+        _enabled = subprocess.run(
+            _sudo_wrap(['systemctl', 'is-enabled', 'takconsolerestart.timer']),
+            capture_output=True, text=True, timeout=5)
+        if changed or 'enabled' not in (_enabled.stdout or ''):
+            subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
+            subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', 'takconsolerestart.timer']),
+                           capture_output=True, text=True, timeout=10)
+            return 'console-restart timer installed/armed (daily 04:00, idle-gated)'
+        return ''
+    except Exception as _e:
+        return f'console-restart timer warning: {str(_e)[:120]}'
+
+
+def _selfheal_takserver_half_configured(plog=None):
+    """v0.9.44: silently clear a `takserver` dpkg 'half-configured' state WITHOUT
+    running the .deb postinstall.
+
+    The official TAK Server .deb postinstall is non-idempotent: it consumes then
+    `rm -rf`s /opt/tak/{config,messaging,API} (shipped by the .deb), so once a run
+    fails after deleting them, every `dpkg --configure` retry dies at the first
+    `chmod /opt/tak/config/*.sh` and the package stays `half-configured` forever.
+    That flag blocks ALL apt operations (OS/security patches, the kernel-patch job)
+    even though TAK Server itself keeps running fine.
+
+    We must NOT complete the real postinstall to clear it: its tail runs
+    `setupDefaultPassword.sh` + `takserver-setup-db.sh`, which would reset the DB
+    password and re-run DB setup on a LIVE server. Instead, only when takserver is
+    half-configured AND its service is active, neutralize the postinst (no-op),
+    `dpkg --configure` (flips it to install-ok-installed), then ALWAYS restore the
+    real postinst. The running TAK Server is never touched; apt is unblocked.
+
+    Idempotent: a no-op unless takserver is half-configured with a live service.
+    Field-validated on test6 (2026-06-04)."""
+    import shutil
+
+    def _log(m):
+        if plog:
+            plog(m)
+        else:
+            print(m, flush=True)
+
+    try:
+        r = subprocess.run(['dpkg-query', '-W', '-f=${Status}', 'takserver'],
+                           capture_output=True, text=True, timeout=10)
+    except Exception:
+        return
+    if r.returncode != 0 or (r.stdout or '').strip() != 'install ok half-configured':
+        return  # not installed, or not wedged — nothing to do
+
+    # Only heal a box whose TAK Server is actually running fine; a stopped/broken
+    # install is a real problem we must not paper over.
+    active = False
+    for unit in ('takserver', 'takserver-noplugins'):
+        try:
+            a = subprocess.run(['systemctl', 'is-active', unit],
+                               capture_output=True, text=True, timeout=5)
+            if (a.stdout or '').strip() == 'active':
+                active = True
+                break
+        except Exception:
+            pass
+    if not active:
+        _log('takserver self-heal: half-configured but service not active — leaving for manual review.')
+        return
+
+    postinst = '/var/lib/dpkg/info/takserver.postinst'
+    if not os.path.isfile(postinst):
+        return
+    backup = postinst + '.infratak-selfheal-bak'
+    try:
+        shutil.copy2(postinst, backup)
+    except Exception as e:
+        _log(f'takserver self-heal: could not back up postinst ({e}) — skipping.')
+        return
+
+    try:
+        with open(postinst, 'w') as f:
+            f.write('#!/bin/sh\nexit 0\n')
+        os.chmod(postinst, 0o755)
+        subprocess.run(['dpkg', '--configure', 'takserver'],
+                       capture_output=True, text=True, timeout=180)
+    except Exception as e:
+        _log(f'takserver self-heal: dpkg --configure error ({e}).')
+    finally:
+        # ALWAYS restore the real postinst, no matter what happened above.
+        try:
+            shutil.move(backup, postinst)
+        except Exception:
+            try:
+                if os.path.exists(backup):
+                    shutil.copy2(backup, postinst)
+                    os.remove(backup)
+            except Exception:
+                pass
+
+    try:
+        v = subprocess.run(['dpkg-query', '-W', '-f=${Status}', 'takserver'],
+                           capture_output=True, text=True, timeout=10)
+        st = (v.stdout or '').strip()
+        if st == 'install ok installed':
+            _log('takserver self-heal: cleared dpkg half-configured state '
+                 '(TAK Server untouched, apt unblocked).')
+        else:
+            _log(f'takserver self-heal: state still "{st}" after configure — manual review.')
+    except Exception:
+        pass
+
+
 def _startup_migrations():
     try:
         s = load_settings()
         settings_dirty = False
+
+        # v0.9.44: ensure the daily console-restart timer exists (recovers a
+        # wedged gunicorn worker; loads pulled code). Runs every boot, idempotent.
+        try:
+            _crt_msg = _ensure_console_restart_timer()
+            if _crt_msg:
+                print(f"Startup migration: {_crt_msg}", flush=True)
+        except Exception as _crt_e:
+            print(f"Startup migration: console-restart timer error: {_crt_e}", flush=True)
 
         # Fix fedhub web_ui_port default for Caddy upstream (remote hub HTTP web UI is 8080)
         fh_raw = s.get('fedhub_deployment', {})
@@ -51824,6 +52442,46 @@ def _startup_migrations():
             )
         except Exception as ip_fix_err:
             print(f"Startup migration: server_ip auto-correct error (non-fatal): {ip_fix_err}")
+
+        # v0.9.44 — refresh settings.server_ip when the stored PRIVATE IP no
+        # longer belongs to any local interface (the VM was moved to a
+        # different subnet after install). start.sh writes server_ip once and
+        # Update Now never re-runs it, so a subnet move "tattoos" the old IP
+        # into the Caddy / domain-install page (issue #36: installed on
+        # 172.24.x.y, moved to 10.x.y.z, console kept advertising 172.24 as
+        # the DNS A-record target). NOT one-shot — a box can move repeatedly —
+        # but only writes when the IP actually changed. Only touches private
+        # IPs, so it never undoes the v0.9.29 cloud-public correction above.
+        # See `_refresh_stale_private_server_ip`.
+        try:
+            _refresh_stale_private_server_ip(
+                lambda m: print(f"Startup migration: {m}", flush=True)
+            )
+        except Exception as ip_stale_err:
+            print(f"Startup migration: server_ip stale-refresh error (non-fatal): {ip_stale_err}")
+
+        # v0.9.44 — silently clear a `takserver` dpkg half-configured state left by the
+        # non-idempotent 5.7 .deb postinstall. TAK Server keeps running fine, but the
+        # half-configured flag blocks ALL apt operations (OS/security patches, the kernel
+        # patch). We do NOT run the real postinstall to clear it — its tail re-runs DB
+        # setup + resets the DB password on a live server. See `_selfheal_takserver_half_configured`.
+        try:
+            _selfheal_takserver_half_configured(
+                lambda m: print(f"Startup migration: {m}", flush=True)
+            )
+        except Exception as tak_heal_err:
+            print(f"Startup migration: takserver self-heal error (non-fatal): {tak_heal_err}")
+
+        # v0.9.44 — re-sync TAK Server's 8446 Let's Encrypt cert if it drifted from
+        # Caddy's current cert. Caddy auto-renews independently; the keystore used to
+        # keep the OLD cert and silently expire, breaking CloudTAK login with
+        # CERT_HAS_EXPIRED. No-op when already in sync. See `_selfheal_takserver_le_cert`.
+        try:
+            _selfheal_takserver_le_cert(
+                lambda m: print(f"Startup migration: {m}", flush=True)
+            )
+        except Exception as le_heal_err:
+            print(f"Startup migration: takserver LE-cert self-heal error (non-fatal): {le_heal_err}")
 
         # v0.9.31 — self-heal mediamtx fail-loop on boxes where the takwerx
         # system user is missing entirely. v0.9.29 hardening added
