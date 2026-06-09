@@ -256,6 +256,72 @@ print(', '.join(parts) if parts else '(no config keys)')
 PYEOF
 }
 
+# ── SHIELD: union live context with the save-time on-disk backup (latest.json) ──
+# latest.json is written synchronously on every Configurator SAVE and DELETE
+# (CFG_BACKUP_SNIPPET), so it is the authoritative current set AND honors deletes.
+# Union it with the live REST capture by configName: a momentarily-short live
+# capture (a redeploy race, a busy container) can then never shrink the restored
+# set, and because BOTH sources honor deletes the union never resurrects a deleted
+# config. This is the shield that stops "a stale snapshot overwrote my newer
+# configs" — the bug that wiped Joe's Red Flag. Persistent (/opt/tak) is NOT in the
+# union (it is the stale source); it stays a last-resort fallback in the gate below.
+# (v0.9.50 — see CLAUDE.md "Node-RED config persistence is SACRED")
+docker cp "$CONTAINER:/data/config-backups/latest.json" /tmp/_nr_latest.json 2>/dev/null || rm -f /tmp/_nr_latest.json
+if [ -f "$NR_CTX_GLOBAL" ] || [ -f /tmp/_nr_latest.json ]; then
+  if python3 - "$NR_CTX_GLOBAL" /tmp/_nr_latest.json > /tmp/_nr_union.log 2>&1 <<'PYEOF'
+import json, sys, os
+live_f, latest_f = sys.argv[1], sys.argv[2]
+def load(f):
+    if not os.path.exists(f): return {}
+    try: d = json.load(open(f))
+    except Exception: return {}
+    if isinstance(d, dict) and 'default' in d and isinstance(d['default'], dict): d = d['default']
+    return d if isinstance(d, dict) else {}
+def uw(v):
+    if isinstance(v, dict) and 'msg' in v:
+        m = v['msg']
+        if isinstance(m, str):
+            try: return json.loads(m)
+            except Exception: return m
+        return m
+    if isinstance(v, str):
+        try: return json.loads(v)
+        except Exception: return v
+    return v
+live = load(live_f); latest = load(latest_f)
+if not live and not latest: sys.exit(0)
+# Start from live so non-config keys (_subscribed, _lastPoll_*, caches) are preserved.
+merged = dict(live) if live else dict(latest)
+for k in ('arcgis_configs','tc_configs','pp_configs'):
+    out = []; seen = set()
+    for src in (live, latest):              # live wins on name conflict; union of names
+        lst = uw(src.get(k))
+        if not isinstance(lst, list): continue
+        for c in lst:
+            if not isinstance(c, dict): out.append(c); continue
+            name = c.get('configName') or c.get('name')
+            key = name if name is not None else ('__noname__%d' % len(out))
+            if key in seen: continue
+            seen.add(key); out.append(c)
+    merged[k] = out
+for k in ('tak_settings','ipaws_config'):
+    chosen = None
+    for src in (live, latest):
+        v = uw(src.get(k))
+        if isinstance(v, dict) and v: chosen = v; break
+    merged[k] = chosen if chosen is not None else (uw(merged.get(k)) if isinstance(uw(merged.get(k)), dict) else {})
+json.dump(merged, open(live_f, 'w'))
+print('UNION restored set: ' + ', '.join('%s=%d' % (k, len(merged.get(k, []))) for k in ('arcgis_configs','tc_configs','pp_configs')))
+PYEOF
+  then
+    grep -E 'UNION' /tmp/_nr_union.log 2>/dev/null | sed 's/^/    /' || true
+  else
+    echo "    (latest.json union skipped: $(head -1 /tmp/_nr_union.log 2>/dev/null))"
+  fi
+  rm -f /tmp/_nr_union.log
+fi
+rm -f /tmp/_nr_latest.json
+
 echo "    Context keys (live):  $(_ctx_summary "$NR_CTX_GLOBAL")"
 if _ctx_is_valid "$NR_CTX_GLOBAL"; then
   # Good live backup — also update the persistent snapshot for next time
@@ -535,11 +601,27 @@ for _NR_CERT in "$CERT_HOST_DIR/nodered.pem" "$CERT_HOST_DIR/nodered.key"; do
 done
 
 # ── Patch settings.js on the HOST before the stop/start cycle ────────────────
-# settings.js lives at ~/node-red/settings.js on the host and is volume-mounted
-# into the container.  We patch it here (no docker exec needed) so Node-RED reads
-# contextStorage:localfilesystem on restart and picks up the global.json file copy.
+# settings.js is volume-mounted into the container at /data/settings.js.  We patch
+# the host file (no docker exec needed) so Node-RED reads contextStorage:localfilesystem
+# on restart and picks up the global.json file copy.
+#
+# CRITICAL: derive the REAL host path from the container's bind-mount, NOT "$HOME".
+# deploy.sh runs as root ($HOME=/root) but the container mounts the *install user's*
+# home (e.g. /home/takwerx/node-red/settings.js).  Patching $HOME/node-red/settings.js
+# silently edited the wrong file on every box whose install user wasn't root — so
+# contextStorage/fs never landed in the mounted file, Node-RED kept context in memory
+# only, and every restart/update wiped all Configurator configs.  (Fixed v0.9.50.)
 echo "==> Ensuring contextStorage:localfilesystem in settings.js"
-NR_SETTINGS_HOST="$HOME/node-red/settings.js"
+NR_SETTINGS_HOST="$(docker inspect "$CONTAINER" --format '{{range .Mounts}}{{if eq .Destination "/data/settings.js"}}{{.Source}}{{end}}{{end}}' 2>/dev/null || true)"
+if [ -z "$NR_SETTINGS_HOST" ] || [ ! -f "$NR_SETTINGS_HOST" ]; then
+  # Fallbacks: legacy $HOME assumption, then any single install-user home.
+  if [ -f "$HOME/node-red/settings.js" ]; then
+    NR_SETTINGS_HOST="$HOME/node-red/settings.js"
+  else
+    NR_SETTINGS_HOST="$(ls /home/*/node-red/settings.js 2>/dev/null | head -1 || true)"
+  fi
+fi
+echo "    settings.js (mounted host file): ${NR_SETTINGS_HOST:-<not found>}"
 if [ -f "$NR_SETTINGS_HOST" ]; then
   if ! grep -q 'contextStorage' "$NR_SETTINGS_HOST" 2>/dev/null; then
     echo "    $NR_SETTINGS_HOST: adding contextStorage (localfilesystem + flushInterval:0)"
@@ -588,6 +670,17 @@ PYEOF
 else
   echo "    WARNING: settings.js not found at $NR_SETTINGS_HOST"
   echo "    API-based restore (post-startup) will ensure configs survive regardless."
+fi
+
+# Verify the patch actually landed in the file the CONTAINER reads (/data/settings.js).
+# This is the canary for the wrong-path bug above: if contextStorage is absent here,
+# Node-RED runs memory-only and configs get wiped on the next restart.
+if docker exec "$CONTAINER" grep -q 'contextStorage' /data/settings.js 2>/dev/null; then
+  echo "    settings.js: contextStorage CONFIRMED in mounted /data/settings.js ✓"
+else
+  echo "    *** WARNING: contextStorage NOT present in the container's /data/settings.js ***"
+  echo "    *** Context will be memory-only and configs WILL be wiped on restart.        ***"
+  echo "    *** Mounted host file patched: ${NR_SETTINGS_HOST:-<unknown>}                ***"
 fi
 
 # Copy merged flows to host, then stop Node-RED before writing /data/flows.json.
