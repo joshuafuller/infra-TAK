@@ -369,7 +369,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.48-alpha"
+VERSION = "0.9.49-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -12974,6 +12974,27 @@ def _get_cloudtak_version_info():
             out['latest'] = latest_ver
             if out['version'] != latest_ver:
                 out['update_available'] = True
+    # v0.9.49: suppress a FALSE "update available" caused by the container's
+    # package.json lagging the git tag. dfpc-coe ships patch tags without bumping
+    # package.json (e.g. v13.11.1 carries package.json 13.11.0), so the Step-0
+    # container version can never equal the latest tag and the badge sticks on
+    # forever even when the box is current. If ~/CloudTAK HEAD is checked out
+    # EXACTLY at the latest tag AND the running container shares its major.minor,
+    # the box was genuinely rebuilt from that tag — only the strings differ.
+    # Gating on major.minor still flags a FAILED update (source moved to the new
+    # tag but the container is far behind, e.g. 13.4.0 vs 13.11.1) as available.
+    if out['update_available'] and out['version'] and out['latest']:
+        try:
+            _latest_norm = out['latest'].lstrip('vV')
+            _src = subprocess.run(
+                f'git -C {ct_dir} describe --tags --exact-match HEAD 2>/dev/null',
+                shell=True, capture_output=True, text=True, timeout=5)
+            _src_tag = (_src.stdout or '').strip().lstrip('vV')
+            _mm = lambda v: '.'.join(v.split('.')[:2])
+            if _src_tag and _src_tag == _latest_norm and _mm(out['version']) == _mm(_latest_norm):
+                out['update_available'] = False
+        except Exception:
+            pass
     return out
 
 
@@ -18160,6 +18181,35 @@ def run_cloudtak_update():
                             _shutil.copy2(os.path.join(server_path, fname), os.path.join(routes_base, fname))
                             plog(f"  Restored server route: api/routes/{fname}")
         plog(f"✓ Checked out {release_tag or 'latest HEAD'}")
+
+        # v0.9.49: the checkout above reset the (tracked) compose file to upstream
+        # defaults, which republish every hardened port on 0.0.0.0 — including
+        # media :9997 ("${MEDIA_PORT_API:-9997}:9997"). Since v0.9.48 Caddy binds the
+        # CloudTAK video vhost on server_ip:9997, so a wildcard 0.0.0.0:9997 docker
+        # publish now COLLIDES → `up -d` dies with "address already in use". (Pre-.48
+        # it merely re-exposed the port silently until the next console restart ran
+        # the startup migration.) Re-apply the loopback hardening here — the same
+        # patch the startup migration / deploy path run — BEFORE the build/up.
+        if is_remote:
+            # _patch_cloudtak_compose_ports() edits local files; over SSH apply the
+            # critical media:9997 → loopback rewrite via perl (consistent regex across
+            # distros; sed's brace/backref handling diverges). The `unless /127.0.0.1/`
+            # guard makes it idempotent. Fuller hardening runs on the box's next restart.
+            _media_perl = (
+                "cd ~/CloudTAK && for f in docker-compose.yml docker-compose.yaml; do "
+                "[ -f \"$f\" ] && perl -i -pe "
+                "'s/(- \")(\\$\\{MEDIA_PORT_API:-\\d+\\}:9997\")/${1}127.0.0.1:$2/ unless m{127\\.0\\.0\\.1}' "
+                "\"$f\"; done; true"
+            )
+            ok_sed, _ = _ssh_probe(remote_cfg, _media_perl, timeout=30)
+            plog("  Re-applied media:9997 loopback hardening after checkout"
+                 if ok_sed else "  ⚠ Could not re-apply media:9997 loopback (non-fatal)")
+        else:
+            try:
+                if _patch_cloudtak_compose_ports(cloudtak_dir):
+                    plog("  Re-applied port hardening after checkout (loopback/removed)")
+            except Exception as _pe:
+                plog(f"  ⚠ Port-hardening patch failed (non-fatal): {_pe}")
 
         plog("")
         plog("━━━ Step 3/3: Rebuilding and restarting ━━━")
