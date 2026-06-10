@@ -369,7 +369,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.50-alpha"
+VERSION = "0.9.51-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -9092,11 +9092,35 @@ def fedhub_rotate_ca_log_api():
 
 
 def _caddy_letsencrypt_days_left(settings):
-    """Return days until Let's Encrypt cert expires (for primary FQDN), or None if unavailable."""
+    """Return days until the active Caddy cert expires (for primary FQDN), or None if unavailable.
+    In custom mode (ssl_mode='custom') this reads the uploaded custom cert's expiry instead of
+    an ACME-issued cert, so the page countdown + Guard Dog expiry alerting keep working."""
+    from datetime import datetime
+    # v0.9.51 — custom (bring-your-own) cert: expiry comes from the stored PEM, not ACME.
+    if (settings.get('ssl_mode') or '') == 'custom':
+        cert_path, _ = _custom_cert_paths()
+        if not os.path.isfile(cert_path):
+            return None
+        try:
+            r = subprocess.run(['openssl', 'x509', '-enddate', '-noout', '-in', cert_path],
+                               capture_output=True, text=True, timeout=10)
+            if r.returncode != 0:
+                return None
+            raw = (r.stdout or '').strip().split('=', 1)[-1].strip()
+            for fmt in ('%b %d %H:%M:%S %Y %Z', '%b %d %H:%M:%S %Y GMT', '%b %d %H:%M:%S %Y UTC'):
+                try:
+                    expiry = datetime.strptime(raw, fmt)
+                    break
+                except ValueError:
+                    continue
+            else:
+                return None
+            return max(0, (expiry - datetime.utcnow()).days)
+        except Exception:
+            return None
     fqdn = (settings.get('fqdn') or '').strip().split(':')[0]
     if not fqdn:
         return None
-    from datetime import datetime
     # Try s_client with servername (Caddy may serve cert for base domain or infratak.<fqdn>)
     for servername in (fqdn, f'infratak.{fqdn}'):
         if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9._-]*$', servername):
@@ -9263,18 +9287,60 @@ caddy_deploy_log = []
 def caddy_deploy():
     if caddy_deploy_status['running']:
         return jsonify({'success': False, 'error': 'Deployment already in progress'})
-    data = request.get_json()
-    domain = data.get('domain', '').strip().lower()
+    # v0.9.51 — accept the SSL-mode choice at first deploy. Custom mode comes as a
+    # multipart upload (domain + ssl_mode=custom + cert_file/key_file); the default
+    # Let's Encrypt path is the legacy JSON {domain}. Deploying straight into custom
+    # mode means Caddy never attempts ACME (no failed-validation rate-limit burn on
+    # boxes behind a WAF / where ACME can't reach — the whole reason for custom mode).
+    cert_pem = key_pem = ''
+    if request.files or (request.form and request.form.get('domain')):
+        domain = (request.form.get('domain') or '').strip().lower()
+        ssl_mode = (request.form.get('ssl_mode') or 'fqdn').strip()
+        cf = request.files.get('cert_file')
+        kf = request.files.get('key_file')
+        if cf and cf.filename:
+            cert_pem = cf.read().decode('utf-8', 'replace')
+        if kf and kf.filename:
+            key_pem = kf.read().decode('utf-8', 'replace')
+    else:
+        data = request.get_json(silent=True) or {}
+        domain = (data.get('domain') or '').strip().lower()
+        ssl_mode = (data.get('ssl_mode') or 'fqdn').strip()
     if not domain:
         return jsonify({'success': False, 'error': 'Domain is required'})
     if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]$', domain):
         return jsonify({'success': False, 'error': 'Invalid domain/FQDN format'})
-    # Save domain to settings
+
     settings = load_settings()
     settings['fqdn'] = domain
+    warnings = []
+    if ssl_mode == 'custom':
+        if not cert_pem or not key_pem:
+            return jsonify({'success': False, 'error': 'Custom certificate selected — upload both a certificate (full-chain PEM) and a private key (PEM).'}), 400
+        # Validate against the domain being deployed (fqdn is set above so coverage checks work).
+        v = _validate_custom_cert(cert_pem, key_pem, settings)
+        if not v['ok']:
+            return jsonify({'success': False, 'error': v['error']}), 400
+        cert_path, key_path = _custom_cert_paths()
+        try:
+            os.makedirs(os.path.dirname(cert_path), exist_ok=True)
+            with open(cert_path, 'w') as fh:
+                fh.write(cert_pem.strip() + '\n')
+            os.chmod(cert_path, 0o600)
+            with open(key_path, 'w') as fh:
+                fh.write(key_pem.strip() + '\n')
+            os.chmod(key_path, 0o600)
+        except Exception as e:
+            return jsonify({'success': False, 'error': f'Failed to store certificate files: {e}'}), 500
+        settings['ssl_mode'] = 'custom'
+        warnings = v.get('warnings') or []
+    else:
+        settings['ssl_mode'] = 'fqdn'
     save_settings(settings)
     caddy_deploy_log.clear()
     caddy_deploy_status.update({'running': True, 'complete': False, 'error': False})
+    for w in warnings:
+        caddy_deploy_log.append(f"⚠ {w}")
     threading.Thread(target=run_caddy_deploy, args=(domain,), daemon=True).start()
     return jsonify({'success': True})
 
@@ -9294,6 +9360,291 @@ def caddy_log():
     return jsonify({
         'running': caddy_deploy_status['running'], 'complete': caddy_deploy_status['complete'],
         'error': caddy_deploy_status['error'], 'entries': list(caddy_deploy_log)})
+
+
+# === v0.9.51 — Custom certificate (bring-your-own-cert) ===
+# Paths for the operator-uploaded full-chain PEM + private key (mode 600).
+def _custom_cert_paths():
+    ssl_dir = os.path.join(CONFIG_DIR, 'ssl')
+    return os.path.join(ssl_dir, 'custom-fullchain.pem'), os.path.join(ssl_dir, 'custom-key.pem')
+
+
+def _sync_custom_cert_for_caddy():
+    """Deploy a Caddy-readable copy of the custom cert/key and return its (cert, key) paths.
+
+    The canonical copies live under .config/ssl (mode 600, root-owned) — but Caddy runs as
+    the unprivileged 'caddy' user and cannot even traverse .config (700 root), so pointing
+    Caddy's `tls` directive at .config makes it fail to start with 'permission denied'.
+    We copy them into Caddy's own data dir (~caddy, owned by the caddy user) on every
+    Caddyfile regeneration so the deployed copy always tracks the canonical one.
+    Returns (None, None) if the source cert is missing or the copy fails."""
+    import shutil, pwd
+    src_cert, src_key = _custom_cert_paths()
+    if not (os.path.exists(src_cert) and os.path.exists(src_key)):
+        return None, None
+    try:
+        caddy_pw = pwd.getpwnam('caddy')
+        base = caddy_pw.pw_dir if os.path.isdir(caddy_pw.pw_dir) else '/var/lib/caddy'
+    except KeyError:
+        caddy_pw = None
+        base = '/var/lib/caddy'
+    dst_cert = os.path.join(base, 'infratak-custom-fullchain.pem')
+    dst_key = os.path.join(base, 'infratak-custom-key.pem')
+    try:
+        os.makedirs(base, exist_ok=True)
+        shutil.copyfile(src_cert, dst_cert)
+        shutil.copyfile(src_key, dst_key)
+        if caddy_pw:
+            os.chown(dst_cert, caddy_pw.pw_uid, caddy_pw.pw_gid)
+            os.chown(dst_key, caddy_pw.pw_uid, caddy_pw.pw_gid)
+        os.chmod(dst_cert, 0o644)
+        os.chmod(dst_key, 0o600)
+        return dst_cert, dst_key
+    except Exception as e:
+        print(f"[custom-cert] failed to deploy Caddy-readable cert copy: {e}", flush=True)
+        return None, None
+
+
+def _cert_name_matches(cert_name, target):
+    """True if a cert SAN/CN (cert_name, possibly a *.x wildcard) covers hostname target.
+    Wildcards match exactly one left-most label (RFC 6125): *.example.com matches
+    a.example.com but NOT example.com or a.b.example.com."""
+    cert_name = (cert_name or '').strip().lower().rstrip('.')
+    target = (target or '').strip().lower().rstrip('.')
+    if not cert_name or not target:
+        return False
+    if cert_name == target:
+        return True
+    if cert_name.startswith('*.') and '.' in target:
+        first, rest = target.split('.', 1)
+        return bool(first) and rest == cert_name[2:]
+    return False
+
+
+def _extract_cert_names(cert_file):
+    """Return lowercased set of DNS names (Subject CN + subjectAltName DNS:) from a PEM
+    cert file, parsing `openssl x509 -text` (universal across OpenSSL versions)."""
+    names = set()
+    try:
+        r = subprocess.run(['openssl', 'x509', '-in', cert_file, '-noout', '-text'],
+                           capture_output=True, text=True, timeout=10)
+        out = r.stdout or ''
+        for cn in re.findall(r'Subject:.*?CN\s*=\s*([^,/\n]+)', out):
+            names.add(cn.strip().lower())
+        for dns in re.findall(r'DNS:\s*([^,\s]+)', out):
+            names.add(dns.strip().lower())
+    except Exception:
+        pass
+    return names
+
+
+def _validate_custom_cert(cert_pem, key_pem, settings):
+    """Validate an uploaded full-chain cert + private key for use as Caddy's TLS cert.
+
+    Hard rejects (return ok=False): unparseable PEM, key/cert mismatch, expired cert,
+    SAN/CN not covering the console hostname. Soft warnings (still ok=True): a service
+    subdomain not covered, or no intermediate chain present.
+    Returns {ok, error, warnings[], not_after, names[]}."""
+    import tempfile
+    result = {'ok': False, 'error': None, 'warnings': [], 'not_after': None, 'names': []}
+    cert_pem = (cert_pem or '').strip()
+    key_pem = (key_pem or '').strip()
+    if 'BEGIN CERTIFICATE' not in cert_pem:
+        result['error'] = 'Certificate file is not PEM (no "BEGIN CERTIFICATE" block found).'
+        return result
+    if 'PRIVATE KEY' not in key_pem:
+        result['error'] = 'Private key file is not PEM (no "BEGIN PRIVATE KEY" block found).'
+        return result
+
+    cert_tmp = key_tmp = None
+    try:
+        with tempfile.NamedTemporaryFile('w', suffix='.pem', delete=False) as f:
+            f.write(cert_pem + '\n'); cert_tmp = f.name
+        with tempfile.NamedTemporaryFile('w', suffix='.pem', delete=False) as f:
+            f.write(key_pem + '\n'); key_tmp = f.name
+        os.chmod(key_tmp, 0o600)
+
+        if subprocess.run(['openssl', 'x509', '-noout', '-in', cert_tmp],
+                          capture_output=True, text=True, timeout=10).returncode != 0:
+            result['error'] = 'Certificate could not be parsed by OpenSSL (not a valid PEM certificate).'
+            return result
+        if subprocess.run(['openssl', 'pkey', '-noout', '-in', key_tmp],
+                          capture_output=True, text=True, timeout=10).returncode != 0:
+            result['error'] = ('Private key could not be parsed (not valid PEM, or it is '
+                               'encrypted — decrypt it first, e.g. `openssl rsa -in enc.key -out plain.key`).')
+            return result
+
+        # Key matches cert — compare public keys (works for RSA and EC, unlike modulus-only).
+        cert_pub = subprocess.run(['openssl', 'x509', '-in', cert_tmp, '-noout', '-pubkey'],
+                                  capture_output=True, text=True, timeout=10).stdout.strip()
+        key_pub = subprocess.run(['openssl', 'pkey', '-in', key_tmp, '-pubout'],
+                                 capture_output=True, text=True, timeout=10).stdout.strip()
+        if not cert_pub or not key_pub or cert_pub != key_pub:
+            result['error'] = 'The private key does not match the certificate (public keys differ).'
+            return result
+
+        # Not expired / not before now.
+        if subprocess.run(['openssl', 'x509', '-checkend', '0', '-noout', '-in', cert_tmp],
+                          capture_output=True, text=True, timeout=10).returncode != 0:
+            result['error'] = 'The certificate has expired. Upload a current certificate.'
+            return result
+        ed = subprocess.run(['openssl', 'x509', '-enddate', '-noout', '-in', cert_tmp],
+                            capture_output=True, text=True, timeout=10)
+        result['not_after'] = ((ed.stdout or '').strip().split('=', 1)[-1].strip() or None)
+
+        # SAN/CN coverage.
+        names = _extract_cert_names(cert_tmp)
+        result['names'] = sorted(names)
+        fqdn = (settings.get('fqdn') or '').strip().split(':')[0]
+        sd = _get_all_service_domains(settings)
+        infratak_host = sd.get('infratak') or (f'infratak.{fqdn}' if fqdn else '')
+
+        def _covered(target):
+            return any(_cert_name_matches(n, target) for n in names)
+
+        if infratak_host and not _covered(infratak_host):
+            result['error'] = (f"Certificate does not cover the console hostname '{infratak_host}'. "
+                               f"Names in cert: {', '.join(result['names']) or '(none)'}. "
+                               f"Use a wildcard (e.g. *.{fqdn}) or add the hostname to the SANs.")
+            return result
+        for k, host in sd.items():
+            if host and host != infratak_host and not _covered(host):
+                result['warnings'].append(
+                    f"Cert does not cover {host} ({k}) — that subdomain will show a TLS trust warning.")
+        if cert_pem.count('BEGIN CERTIFICATE') < 2:
+            result['warnings'].append(
+                'Only one certificate in the file (no intermediate chain). If your CA issues via '
+                'an intermediate, clients may not trust it — upload the full-chain PEM (leaf + intermediates).')
+
+        result['ok'] = True
+        return result
+    finally:
+        for p in (cert_tmp, key_tmp):
+            if p:
+                try:
+                    os.unlink(p)
+                except Exception:
+                    pass
+
+
+@app.route('/api/caddy/custom-cert', methods=['POST'])
+@login_required
+def caddy_custom_cert():
+    """Validate, store, and apply an operator-supplied TLS cert (ssl_mode='custom').
+    Accepts multipart file uploads (cert_file/key_file) or form/JSON text (cert_pem/key_pem)."""
+    settings = load_settings()
+    fqdn = (settings.get('fqdn') or '').strip()
+    if not fqdn:
+        return jsonify({'success': False, 'error': 'Set the base domain and deploy Caddy before uploading a custom certificate.'}), 400
+
+    cert_pem = key_pem = ''
+    f = request.files.get('cert_file')
+    if f and f.filename:
+        cert_pem = f.read().decode('utf-8', 'replace')
+    f = request.files.get('key_file')
+    if f and f.filename:
+        key_pem = f.read().decode('utf-8', 'replace')
+    if not cert_pem:
+        cert_pem = (request.form.get('cert_pem') or '').strip()
+    if not key_pem:
+        key_pem = (request.form.get('key_pem') or '').strip()
+    if not cert_pem or not key_pem:
+        data = request.get_json(silent=True) or {}
+        cert_pem = cert_pem or (data.get('cert_pem') or '')
+        key_pem = key_pem or (data.get('key_pem') or '')
+    if not cert_pem or not key_pem:
+        return jsonify({'success': False, 'error': 'Both a certificate (full-chain PEM) and a private key (PEM) are required.'}), 400
+
+    v = _validate_custom_cert(cert_pem, key_pem, settings)
+    if not v['ok']:
+        return jsonify({'success': False, 'error': v['error']}), 400
+
+    cert_path, key_path = _custom_cert_paths()
+    try:
+        os.makedirs(os.path.dirname(cert_path), exist_ok=True)
+        with open(cert_path, 'w') as fh:
+            fh.write(cert_pem.strip() + '\n')
+        os.chmod(cert_path, 0o600)
+        with open(key_path, 'w') as fh:
+            fh.write(key_pem.strip() + '\n')
+        os.chmod(key_path, 0o600)
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'Failed to store certificate files: {e}'}), 500
+
+    settings['ssl_mode'] = 'custom'
+    save_settings(settings)
+    try:
+        generate_caddyfile(settings)
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'Caddyfile regeneration failed: {e}'}), 500
+
+    # Reload Caddy (graceful — keeps serving old config if the new one is invalid).
+    reload_r = subprocess.run('systemctl reload caddy 2>&1', shell=True, capture_output=True, text=True, timeout=60)
+    reloaded = reload_r.returncode == 0
+    if not reloaded:
+        # Fall back to a restart (e.g. Caddy was stopped/paused on this box).
+        restart_r = subprocess.run('systemctl restart caddy 2>&1', shell=True, capture_output=True, text=True, timeout=90)
+        reloaded = restart_r.returncode == 0
+        if not reloaded:
+            return jsonify({'success': False,
+                            'error': f'Cert stored, but Caddy reload failed: {(reload_r.stdout or reload_r.stderr or "").strip()[:300]}'}), 500
+
+    # If TAK Server is installed, re-wire its 8446 enrollment keystore to the custom cert
+    # in the background (stops/restarts TAK — disruptive, so it runs off the request).
+    msg = 'Custom certificate applied. Caddy is now serving your certificate on all subdomains.'
+    try:
+        if os.path.exists('/opt/tak/CoreConfig.xml'):
+            tak_host = _get_service_domain(settings, 'takserver')
+            if tak_host:
+                def _rewire_8446():
+                    install_le_cert_on_8446(tak_host, lambda m: print(f"[custom-cert 8446] {m}", flush=True), wait_for_cert=False)
+                threading.Thread(target=_rewire_8446, daemon=True).start()
+                msg += ' TAK Server\'s 8446 enrollment cert is updating in the background (TAK will restart).'
+    except Exception:
+        pass
+
+    return jsonify({'success': True, 'message': msg, 'warnings': v['warnings'], 'not_after': v['not_after']})
+
+
+@app.route('/api/caddy/ssl-mode', methods=['POST'])
+@login_required
+def caddy_set_ssl_mode():
+    """Switch back to automatic HTTPS (Let's Encrypt) from custom mode. Regenerates the
+    Caddyfile without the custom `tls` directives so Caddy resumes ACME, then reloads.
+    (Switching INTO custom mode is done via /api/caddy/custom-cert, which needs the cert.)"""
+    settings = load_settings()
+    data = request.get_json(silent=True) or {}
+    mode = (data.get('mode') or '').strip()
+    if mode != 'fqdn':
+        return jsonify({'success': False, 'error': 'Only switching back to automatic is supported here; use the custom-cert upload to enable custom mode.'}), 400
+    if not (settings.get('fqdn') or '').strip():
+        return jsonify({'success': False, 'error': 'No base domain configured — deploy Caddy first.'}), 400
+    settings['ssl_mode'] = 'fqdn'
+    save_settings(settings)
+    try:
+        generate_caddyfile(settings)
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'Caddyfile regeneration failed: {e}'}), 500
+    reload_r = subprocess.run('systemctl reload caddy 2>&1', shell=True, capture_output=True, text=True, timeout=60)
+    if reload_r.returncode != 0:
+        restart_r = subprocess.run('systemctl restart caddy 2>&1', shell=True, capture_output=True, text=True, timeout=90)
+        if restart_r.returncode != 0:
+            return jsonify({'success': False, 'error': f'Switched setting, but Caddy reload failed: {(reload_r.stdout or reload_r.stderr or "").strip()[:300]}'}), 500
+    return jsonify({'success': True, 'message': "Switched to automatic HTTPS. Caddy will obtain Let's Encrypt certificates for each subdomain (DNS must resolve to this box and ports 80/443 must be reachable from the internet)."})
+
+
+@app.route('/api/caddy/custom-cert/info')
+@login_required
+def caddy_custom_cert_info():
+    """Return current custom-cert status for the Caddy page (whether one is stored + expiry)."""
+    cert_path, key_path = _custom_cert_paths()
+    info = {'present': os.path.exists(cert_path) and os.path.exists(key_path), 'not_after': None, 'names': []}
+    if info['present']:
+        ed = subprocess.run(['openssl', 'x509', '-enddate', '-noout', '-in', cert_path],
+                            capture_output=True, text=True, timeout=10)
+        info['not_after'] = ((ed.stdout or '').strip().split('=', 1)[-1].strip() or None)
+        info['names'] = sorted(_extract_cert_names(cert_path))
+    return jsonify(info)
 
 def _authentik_sync_all_domain_refs(fqdn, settings, plog=None):
     """Comprehensive domain sync for Authentik — covers all 7 locations missed by the v0.9.1 flow.
@@ -11906,10 +12257,18 @@ def generate_caddyfile(settings=None):
         # CloudTAK itself → the whole Video Lease subsystem (proxy + normal leases)
         # times out. Add a second listener on :9997 with the SAME routing so the
         # upstream CloudTAK image works unmodified and survives its own rebuilds.
-        # MUST bind the public IP: 127.0.0.1:9997 is the cloudtak-media container's
-        # docker publish, so a 0.0.0.0:9997 listener collides and Caddy won't start.
-        # Caddy reuses the hostname's existing cert on :9997 (no ACME conflict).
+        # MUST bind a specific non-loopback IP: 127.0.0.1:9997 is the cloudtak-media
+        # container's docker publish, so a 0.0.0.0:9997 listener collides and Caddy
+        # won't start. Caddy reuses the hostname's existing cert on :9997 (no ACME conflict).
+        # v0.9.51 — universal bind: settings.server_ip may be a PUBLIC/NAT address (Azure,
+        # GCP, any load-balanced box) that isn't assigned to a local interface; binding it
+        # fails with "cannot assign requested address" and kills Caddy on every regen. Bind
+        # a locally-assigned IP: keep server_ip when it's on the NIC, else fall back to the
+        # box's primary local IP (NAT forwards the public :9997 to it). If neither resolves,
+        # skip the listener rather than crash Caddy.
         ct_bind_ip = (settings.get('server_ip') or '').strip()
+        if ct_bind_ip and ct_bind_ip not in _list_local_ipv4s():
+            ct_bind_ip = _primary_local_ipv4()
         if ct_bind_ip:
             ct_video_host = ct_video.split()[0].strip()  # hostname only (drop any TLS/options)
             lines.append(f"# CloudTAK Media (video) on :9997 — CloudTAK hardcodes this port for all media URLs")
@@ -12092,6 +12451,31 @@ def generate_caddyfile(settings=None):
         lines.append("")
         _emit_alias_redirect(_get_service_alias(settings, 'tak_video_restreamer'), tvr_host)
 
+    # v0.9.51 — Custom certificate (bring-your-own-cert) mode. When ssl_mode == 'custom'
+    # the operator has uploaded a full-chain PEM + key on the Caddy page; Caddy must serve
+    # THAT cert (no ACME) on every site. We inject a `tls <cert> <key>` directive into each
+    # site address block (covers the wildcard case — one cert for all subdomains). Per-site
+    # tls disables ACME for that site without needing a global `auto_https off`, so the
+    # automatic HTTP→HTTPS redirect on :80 is preserved.
+    if (settings.get('ssl_mode') or '') == 'custom':
+        # Caddy runs unprivileged and can't read .config — deploy a caddy-readable copy
+        # and point `tls` at THAT (see _sync_custom_cert_for_caddy).
+        cert_path, key_path = _sync_custom_cert_for_caddy()
+        if cert_path and key_path:
+            tls_directive = f"    tls {cert_path} {key_path}"
+            injected = []
+            for ln in lines:
+                injected.append(ln)
+                stripped = ln.rstrip()
+                # A site address block opens at column 0 (no indent), ends with '{', and is
+                # neither a comment, a snippet/global block, nor a bare '{'. Nested blocks
+                # (route {, handle {, transport http {) are indented, so they're skipped.
+                if (stripped.endswith('{') and stripped != '{'
+                        and not stripped[0].isspace()
+                        and not stripped.startswith(('#', '('))):
+                    injected.append(tls_directive)
+            lines = injected
+
     caddyfile = '\n'.join(lines)
     # Preserve user-added blocks (e.g. health.tntak.net for Uptime Robot) that sit below the marker.
     if os.path.exists(CADDYFILE_PATH):
@@ -12232,15 +12616,27 @@ def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
     """
     import re, shutil
 
-    cert_pass = _get_tak_cert_password(load_settings())
-    cert_dir = (f"/var/lib/caddy/.local/share/caddy/certificates/"
-                f"acme-v02.api.letsencrypt.org-directory/{takserver_host}")
-    cert_crt = f"{cert_dir}/{takserver_host}.crt"
-    cert_key = f"{cert_dir}/{takserver_host}.key"
+    _s8446 = load_settings()
+    cert_pass = _get_tak_cert_password(_s8446)
+    # v0.9.51 — in custom (bring-your-own-cert) mode, source 8446's keystore from the
+    # operator-uploaded PEM instead of Caddy's ACME store. The CoreConfig connector patch
+    # below is identical either way; only the cert/key file paths differ.
+    custom_mode = (_s8446.get('ssl_mode') or '') == 'custom'
+    if custom_mode:
+        cert_crt, cert_key = _custom_cert_paths()
+        cert_dir = os.path.dirname(cert_crt)
+        cert_label = "custom"
+    else:
+        cert_dir = (f"/var/lib/caddy/.local/share/caddy/certificates/"
+                    f"acme-v02.api.letsencrypt.org-directory/{takserver_host}")
+        cert_crt = f"{cert_dir}/{takserver_host}.crt"
+        cert_key = f"{cert_dir}/{takserver_host}.key"
+        cert_label = "LE"
     core_config = "/opt/tak/CoreConfig.xml"
 
-    # Optionally wait for Caddy to finish obtaining the cert
-    if wait_for_cert:
+    # Optionally wait for Caddy to finish obtaining the cert (ACME only — a custom cert
+    # is already on disk, so there is nothing to wait for).
+    if wait_for_cert and not custom_mode:
         waited = 0
         while not (os.path.exists(cert_crt) and os.path.exists(cert_key)) and waited < 120:
             log_fn(f"  Waiting for LE cert files... ({waited}s)")
@@ -12248,12 +12644,15 @@ def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
             waited += 10
 
     if not (os.path.exists(cert_crt) and os.path.exists(cert_key)):
-        log_fn(f"  ⚠ LE cert not found at {cert_dir}")
-        log_fn("  Skipping 8446 cert install — DNS may not be propagated yet")
-        log_fn("  Re-run Caddy deploy once the cert is available")
+        log_fn(f"  ⚠ {cert_label} cert not found at {cert_dir}")
+        if custom_mode:
+            log_fn("  Skipping 8446 cert install — upload a custom certificate first")
+        else:
+            log_fn("  Skipping 8446 cert install — DNS may not be propagated yet")
+            log_fn("  Re-run Caddy deploy once the cert is available")
         return False
 
-    log_fn(f"  ✓ LE cert files found for {takserver_host}")
+    log_fn(f"  ✓ {cert_label} cert files found for {takserver_host}")
 
     # Step A: LE cert → PKCS12
     r = subprocess.run(
@@ -12358,9 +12757,8 @@ def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
 set -euo pipefail
 
 TAK_DOMAIN="{takserver_host}"
-CERT_DIR="{cert_dir}"
-CERT_CRT="$CERT_DIR/$TAK_DOMAIN.crt"
-CERT_KEY="$CERT_DIR/$TAK_DOMAIN.key"
+CERT_CRT="{cert_crt}"
+CERT_KEY="{cert_key}"
 JKS="/opt/tak/certs/files/takserver-le.jks"
 LOG_FILE="/var/log/takserver-cert-renewal.log"
 
@@ -12469,10 +12867,14 @@ def _selfheal_takserver_le_cert(plog=None):
         host = _get_service_domain(settings, 'takserver')
         if not host:
             return
-        cert_crt = (f'/var/lib/caddy/.local/share/caddy/certificates/'
-                    f'acme-v02.api.letsencrypt.org-directory/{host}/{host}.crt')
+        # v0.9.51 — source cert is the uploaded PEM in custom mode, else Caddy's ACME store.
+        if (settings.get('ssl_mode') or '') == 'custom':
+            cert_crt, _ = _custom_cert_paths()
+        else:
+            cert_crt = (f'/var/lib/caddy/.local/share/caddy/certificates/'
+                        f'acme-v02.api.letsencrypt.org-directory/{host}/{host}.crt')
         if not os.path.exists(cert_crt):
-            return  # no Caddy LE cert for this host — nothing to sync from
+            return  # no active cert for this host — nothing to sync from
         jks = '/opt/tak/certs/files/takserver-le.jks'
         cert_pass = _get_tak_cert_password(settings)
         caddy_fp = subprocess.run(
@@ -12619,16 +13021,22 @@ def run_caddy_deploy(domain):
             caddy_deploy_status.update({'running': False, 'error': True})
             return
 
-        # Update settings
-        settings['ssl_mode'] = 'fqdn'
+        # Update settings — preserve a custom SSL mode chosen at deploy time; only the
+        # Let's Encrypt path owns ssl_mode='fqdn' (v0.9.51).
+        custom_mode = (settings.get('ssl_mode') or '') == 'custom'
+        if not custom_mode:
+            settings['ssl_mode'] = 'fqdn'
         save_settings(settings)
 
         plog("")
         plog("=" * 50)
         plog(f"✓ Caddy deployed successfully!")
         plog(f"  Domain: https://{domain}")
-        plog(f"  SSL: Let's Encrypt (automatic)")
-        plog("  Note: DNS must point to this server's IP for SSL to activate")
+        if custom_mode:
+            plog(f"  SSL: Custom certificate (your uploaded cert — no ACME)")
+        else:
+            plog(f"  SSL: Let's Encrypt (automatic)")
+            plog("  Note: DNS must point to this server's IP for SSL to activate")
         plog("=" * 50)
         caddy_deploy_status.update({'running': False, 'complete': True})
 
@@ -13171,32 +13579,56 @@ def _get_webodm_version_info():
     return info
 
 
+_tvr_release_cache = {'sha': None, 'ts': 0}
+
+
+def _get_tvr_latest_commit_sha(use_cache=True):
+    """Latest commit SHA (full) on main for raytheonbbn/tak-video-restreamer.
+    The repo ships off main with no releases, so the commit SHA is the only
+    version signal. Cached 4h — like CloudTAK/Authentik — because this lookup
+    runs on every dashboard poll AND every TVR page load; unauthenticated GitHub
+    is 60 req/hr/IP, and a 403 would otherwise silently blank the update badge.
+    Returns stale cache on failure rather than None so a rate-limit doesn't hide
+    a known-available update. Pass use_cache=False to force a fresh check."""
+    import time as _time
+    if use_cache and _tvr_release_cache['sha'] and (_time.time() - _tvr_release_cache['ts'] < 14400):
+        return _tvr_release_cache['sha']
+    try:
+        import urllib.request as _ur
+        req = _ur.Request('https://api.github.com/repos/raytheonbbn/tak-video-restreamer/commits/main',
+                          headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'infra-TAK'})
+        with _ur.urlopen(req, timeout=10) as resp:
+            sha = (json.loads(resp.read().decode()).get('sha') or '').strip() or None
+            if sha:
+                _tvr_release_cache['sha'] = sha
+                _tvr_release_cache['ts'] = _time.time()
+            return sha
+    except Exception as e:
+        print(f"version-info: tvr latest-commit check failed (non-fatal): {e}", flush=True)
+        return _tvr_release_cache.get('sha') or None
+
+
 def _get_tvr_version_info():
-    """Return {version, update_available, latest} for TAK Video Restreamer (git SHA based)."""
+    """Return {version, update_available, latest} for TAK Video Restreamer (git SHA based).
+    Compares FULL local vs remote SHAs — git's --short length is adaptive (7+ as the repo
+    grows) so the old short-vs-[:7] compare could mismatch; display values stay 7 chars."""
     import subprocess as _sp
     info = {'version': '', 'update_available': False, 'latest': None}
     tvr_dir = os.path.expanduser('~/tak-video-restreamer')
+    local_full = ''
     try:
-        r = _sp.run(['git', 'rev-parse', '--short', 'HEAD'],
+        r = _sp.run(['git', 'rev-parse', 'HEAD'],
                     capture_output=True, text=True, timeout=5, cwd=tvr_dir)
         if r.returncode == 0:
-            info['version'] = r.stdout.strip()
-    except Exception:
-        pass
-    try:
-        import urllib.request as _ur, json as _json
-        req = _ur.Request(
-            'https://api.github.com/repos/raytheonbbn/tak-video-restreamer/commits/main',
-            headers={'User-Agent': 'infra-TAK'})
-        resp = _ur.urlopen(req, timeout=8)
-        data = _json.loads(resp.read())
-        latest = (data.get('sha') or '')[:7]
-        if latest:
-            info['latest'] = latest
-            if info['version'] and info['version'] != latest:
-                info['update_available'] = True
-    except Exception:
-        pass
+            local_full = r.stdout.strip()
+            info['version'] = local_full[:7]
+    except Exception as e:
+        print(f"version-info: tvr local SHA lookup failed (non-fatal): {e}", flush=True)
+    latest_full = _get_tvr_latest_commit_sha()
+    if latest_full:
+        info['latest'] = latest_full[:7]
+        if local_full and local_full != latest_full:
+            info['update_available'] = True
     return info
 
 
@@ -14547,6 +14979,7 @@ def mediamtx_uninstall():
     generate_caddyfile(settings)
     subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True)
     steps.append('Updated Caddyfile')
+    _deregister_authentik_proxy_app(settings, 'stream', 'MediaMTX', plog=lambda m: steps.append(m.strip()))
     return jsonify({'success': True, 'steps': steps})
 
 def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
@@ -19612,6 +20045,7 @@ def tvr_uninstall():
     save_settings(s)
     generate_caddyfile(s)
     _sp.run(['systemctl', 'reload', 'caddy'], timeout=15, capture_output=True)
+    _deregister_authentik_proxy_app(s, 'tak-video-restreamer', 'TAK Video Restreamer Proxy')
     return jsonify({'success': True})
 
 
@@ -20801,6 +21235,7 @@ def nodered_uninstall():
             generate_caddyfile(settings)
             subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
             steps.append('Caddyfile updated')
+        _deregister_authentik_proxy_app(settings, 'node-red', 'Node-RED Proxy', plog=lambda m: steps.append(m.strip()))
         return jsonify({'success': True, 'steps': steps})
     except Exception as e:
         return jsonify({'error': f'Uninstall failed: {str(e)[:200]}'}), 500
@@ -21669,6 +22104,108 @@ def _outpost_add_providers_safe(ak_url, ak_headers, provider_pks_to_add, plog=No
     except Exception as e:
         _log(f"  ⚠ Outpost error: {str(e)[:80]}")
         return False
+
+
+def _outpost_remove_providers_safe(ak_url, ak_headers, provider_pks_to_remove, plog=None):
+    """Remove given provider PKs from the embedded outpost — inverse of
+    _outpost_add_providers_safe. GET the outpost, drop the PKs, PATCH back.
+    No-op (no PATCH) if none of the PKs are currently present."""
+    if not provider_pks_to_remove:
+        return False
+    import urllib.request as _req
+    _log = plog or (lambda m: None)
+    try:
+        r = _req.Request(f'{ak_url}/api/v3/outposts/instances/?search=embedded', headers=ak_headers)
+        outposts = json.loads(_req.urlopen(r, timeout=15).read().decode()).get('results', [])
+        embedded = next((o for o in outposts if 'embed' in (o.get('name') or '').lower() or o.get('type') == 'proxy'), None)
+        if not embedded:
+            return False
+        op_pk = embedded.get('pk')
+        full = json.loads(_req.urlopen(_req.Request(f'{ak_url}/api/v3/outposts/instances/{op_pk}/', headers=ak_headers), timeout=15).read().decode())
+        raw = full.get('providers') or []
+
+        def _to_pk(p):
+            if p is None:
+                return None
+            if isinstance(p, int):
+                return p
+            return p.get('pk') or p.get('id')
+
+        current_pks = [_to_pk(p) for p in raw if _to_pk(p) is not None]
+        remove = set(pk for pk in provider_pks_to_remove if pk)
+        new_pks = [pk for pk in current_pks if pk not in remove]
+        if len(new_pks) == len(current_pks):
+            return False  # nothing to remove
+        _req.urlopen(_req.Request(f'{ak_url}/api/v3/outposts/instances/{op_pk}/',
+            data=json.dumps({'providers': new_pks}).encode(), headers=ak_headers, method='PATCH'), timeout=10)
+        _log("  ✓ Provider removed from embedded outpost")
+        return True
+    except Exception as e:
+        _log(f"  ⚠ Outpost remove error: {str(e)[:80]}")
+        return False
+
+
+def _deregister_authentik_proxy_app(settings, app_slug, prov_name, plog=None):
+    """Remove a managed service's Authentik proxy application + provider and drop the
+    provider from the embedded outpost. Called when a service is uninstalled so it
+    stops appearing as a service in Authentik. Idempotent and NON-FATAL: an uninstall
+    must still succeed if Authentik is down or the entries are already gone (404 = ok).
+
+    Slug-scoped — e.g. removing MediaMTX's 'stream' app never touches TAK Video
+    Restreamer's 'tak-video-restreamer' app even though they share the stream.<fqdn>
+    subdomain (they have distinct Authentik slugs/providers)."""
+    _log = plog or (lambda m: None)
+    import urllib.request as _req
+    ak_token = (
+        _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or
+        _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
+    )
+    if not ak_token:
+        _log("  Authentik deregister: no API token — skip")
+        return False
+    ak_url = _get_authentik_api_url(settings)
+    ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+
+    def _del(url):
+        try:
+            _req.urlopen(_req.Request(url, headers=ak_headers, method='DELETE'), timeout=10)
+            return True
+        except Exception as e:
+            if getattr(e, 'code', None) == 404:
+                return True  # already gone
+            _log(f"  ⚠ Authentik deregister DELETE failed ({getattr(e, 'code', None) or str(e)[:60]})")
+            return False
+
+    # Resolve the provider PK via the application first (so we delete the right provider).
+    provider_pk = None
+    try:
+        r = _req.Request(f'{ak_url}/api/v3/core/applications/{app_slug}/', headers=ak_headers)
+        app = json.loads(_req.urlopen(r, timeout=10).read().decode())
+        provider_pk = app.get('provider')
+    except Exception as e:
+        if getattr(e, 'code', None) != 404:
+            _log(f"  ⚠ Authentik deregister: app lookup failed ({str(e)[:60]})")
+    # Fallback: resolve by provider name if the app carried no provider / was already gone.
+    if not provider_pk and prov_name:
+        try:
+            from urllib.parse import quote as _q
+            r = _req.Request(f'{ak_url}/api/v3/providers/proxy/?search={_q(prov_name)}', headers=ak_headers)
+            results = json.loads(_req.urlopen(r, timeout=10).read().decode()).get('results', [])
+            match = next((p for p in results if (p.get('name') or '').strip() == prov_name), None)
+            if match:
+                provider_pk = match.get('pk')
+        except Exception:
+            pass
+
+    # (1) Delete the application — slug is the PK in Authentik's core/applications API.
+    if _del(f'{ak_url}/api/v3/core/applications/{app_slug}/'):
+        _log(f"  ✓ Authentik application '{app_slug}' removed")
+    # (2) Drop the provider from the embedded outpost, then delete the provider.
+    if provider_pk:
+        _outpost_remove_providers_safe(ak_url, ak_headers, [provider_pk], plog=_log)
+        if _del(f'{ak_url}/api/v3/providers/proxy/{provider_pk}/'):
+            _log(f"  ✓ Authentik proxy provider '{prov_name}' removed")
+    return True
 
 
 def _repair_embedded_outpost_all_apps(ak_url, ak_headers, settings, plog=None):
@@ -27479,6 +28016,41 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 </div>
 </details>
+<div class="section-title">SSL Certificate</div>
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
+{% set _sslmode = settings.get('ssl_mode','') %}
+<label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;padding:10px 0">
+<input type="radio" name="ssl-mode" value="fqdn" {% if _sslmode != 'custom' %}checked{% endif %} onchange="toggleSslMode()" style="margin-top:3px">
+<div><div style="font-weight:600;color:var(--text-primary)">Automatic (Let's Encrypt)</div>
+<div style="font-size:12px;color:var(--text-dim);margin-top:2px">Caddy obtains and renews a free trusted certificate over ACME. Requires the box to be reachable from the internet on port 80/443.</div></div>
+</label>
+<label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;padding:10px 0;border-top:1px solid var(--border)">
+<input type="radio" name="ssl-mode" value="custom" {% if _sslmode == 'custom' %}checked{% endif %} onchange="toggleSslMode()" style="margin-top:3px">
+<div><div style="font-weight:600;color:var(--text-primary)">Custom certificate <span style="font-size:11px;color:var(--text-dim);font-weight:400">— bring your own (commercial / enterprise PKI)</span></div>
+<div style="font-size:12px;color:var(--text-dim);margin-top:2px">Upload your own full-chain certificate + private key (PEM). Applied to all subdomains — use a wildcard (e.g. <code style="background:rgba(255,255,255,.05);padding:1px 5px;border-radius:3px">*.{{ settings.get('fqdn','') }}</code>). For domains behind a corporate WAF/gateway where ACME can't reach.</div></div>
+</label>
+<div id="custom-cert-panel" style="margin-top:16px;padding-top:16px;border-top:1px solid var(--border);{% if _sslmode != 'custom' %}display:none{% endif %}">
+<div id="custom-cert-status" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-bottom:16px">Checking current certificate…</div>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+<div><label class="input-label">Certificate (full-chain PEM)</label>
+<input type="file" id="cert-file" accept=".pem,.crt,.cer,.cert,.txt" class="input-field" style="padding:8px"></div>
+<div><label class="input-label">Private key (PEM)</label>
+<input type="file" id="key-file" accept=".pem,.key,.txt" class="input-field" style="padding:8px"></div>
+</div>
+<div style="display:flex;gap:12px;align-items:center">
+<button onclick="applyCustomCert()" id="apply-cert-btn" style="padding:10px 24px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;cursor:pointer">Validate & Apply</button>
+<span id="apply-cert-status" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);line-height:1.5"></span>
+</div>
+<div style="font-size:11px;color:var(--text-dim);margin-top:12px;line-height:1.5">The cert is validated (key match, not expired, hostname coverage) before it's applied. Caddy reloads with no downtime. If TAK Server is installed, its 8446 enrollment cert is updated too (TAK restarts).</div>
+</div>
+<div id="auto-mode-panel" style="margin-top:16px;padding-top:16px;border-top:1px solid var(--border);{% if _sslmode != 'custom' %}display:none{% endif %}">
+<div style="display:flex;gap:12px;align-items:center">
+<button onclick="applyAutoMode()" id="apply-auto-btn" style="padding:10px 24px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;cursor:pointer">Switch to automatic HTTPS</button>
+<span id="apply-auto-status" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);line-height:1.5"></span>
+</div>
+<div style="font-size:11px;color:var(--text-dim);margin-top:12px;line-height:1.5">Stops serving your uploaded certificate and lets Caddy obtain & renew Let's Encrypt certs again. Requires DNS pointing here and ports 80/443 reachable from the internet.</div>
+</div>
+</div>
 {% if configured_urls %}
 <div class="section-title">Configured URLs</div>
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
@@ -27507,13 +28079,33 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div style="text-align:center;margin-bottom:24px">
 <div style="font-size:36px;margin-bottom:12px">🌐</div>
 <div style="font-family:'JetBrains Mono',monospace;font-size:16px;font-weight:600;color:var(--text-secondary)">Configure a Domain Name</div>
-<div style="font-size:13px;color:var(--text-dim);margin-top:8px;max-width:500px;margin-left:auto;margin-right:auto;line-height:1.5">Caddy provides automatic HTTPS with Let's Encrypt certificates. Enter your domain name and point its DNS to this server's IP address.</div>
+<div style="font-size:13px;color:var(--text-dim);margin-top:8px;max-width:500px;margin-left:auto;margin-right:auto;line-height:1.5">Enter your domain, then choose how TLS certificates are issued. Automatic uses Let's Encrypt; Custom serves your own certificate (for domains behind a corporate WAF/gateway where ACME can't reach).</div>
 </div>
-<div style="max-width:500px;margin:0 auto">
+<div style="max-width:680px;margin:0 auto">
 <label class="input-label">Base Domain</label>
 <input type="text" id="domain-input" class="input-field" placeholder="yourdomain.com" style="margin-bottom:8px">
 <div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-bottom:20px">Subdomains auto-configured: infratak · console · tak · authentik · portal · nodered · map · tiles.map · video<br>Point a wildcard DNS (*.yourdomain.com) or individual A records to <span style="color:var(--cyan)">{{ settings.get('server_ip', '') }}</span></div>
-<div style="text-align:center">
+<label class="input-label">SSL Certificate</label>
+<label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;padding:8px 0">
+<input type="radio" name="setup-ssl-mode" value="fqdn" checked onchange="toggleSetupSslMode()" style="margin-top:3px">
+<div><div style="font-weight:600;color:var(--text-primary);font-size:14px">Automatic (Let's Encrypt)</div>
+<div style="font-size:12px;color:var(--text-dim)">Free trusted certs over ACME. Needs ports 80/443 reachable from the internet + DNS pointing here.</div></div>
+</label>
+<label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;padding:8px 0;border-top:1px solid var(--border)">
+<input type="radio" name="setup-ssl-mode" value="custom" onchange="toggleSetupSslMode()" style="margin-top:3px">
+<div><div style="font-weight:600;color:var(--text-primary);font-size:14px">Custom certificate <span style="font-size:11px;color:var(--text-dim);font-weight:400">— bring your own (no ACME)</span></div>
+<div style="font-size:12px;color:var(--text-dim)">Upload a full-chain PEM + key, applied to all subdomains. Use a wildcard (e.g. *.yourdomain.com). Caddy never attempts Let's Encrypt.</div></div>
+</label>
+<div id="setup-custom-cert" style="display:none;margin:12px 0 4px;padding:16px;background:rgba(59,130,246,0.05);border:1px solid rgba(59,130,246,0.15);border-radius:8px">
+<div style="display:grid;grid-template-columns:1fr;gap:14px">
+<div><label class="input-label">Certificate (full-chain PEM)</label>
+<input type="file" id="setup-cert-file" accept=".pem,.crt,.cer,.cert,.txt" class="input-field" style="padding:8px;width:100%"></div>
+<div><label class="input-label">Private key (PEM)</label>
+<input type="file" id="setup-key-file" accept=".pem,.key,.txt" class="input-field" style="padding:8px;width:100%"></div>
+</div>
+<div style="font-size:11px;color:var(--text-dim);margin-top:10px;line-height:1.5">Validated (key match, not expired, hostname coverage) before deploy. If TAK Server is later installed, its 8446 enrollment cert uses this too.</div>
+</div>
+<div style="text-align:center;margin-top:20px">
 <button onclick="deployCaddy()" id="deploy-btn" style="padding:14px 40px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:16px;font-weight:600;cursor:pointer">🚀 Deploy Caddy</button>
 </div>
 </div>
@@ -27531,14 +28123,31 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <script src="/log-tools.js?v={{ version }}"></script>
 <script>initLogToolbar('deploy-log');</script>
 <script>
+function toggleSetupSslMode(){
+    var sel=document.querySelector('input[name="setup-ssl-mode"]:checked');
+    var panel=document.getElementById('setup-custom-cert');
+    if(panel)panel.style.display=(sel&&sel.value==='custom')?'block':'none';
+}
 async function deployCaddy(){
     var domain=document.getElementById('domain-input').value.trim();
     if(!domain){alert('Please enter a domain name');return}
-    if(!confirm('Deploy Caddy with domain: '+domain+'?\\n\\nMake sure DNS is pointing to this server.')){return}
+    var modeEl=document.querySelector('input[name="setup-ssl-mode"]:checked');
+    var mode=modeEl?modeEl.value:'fqdn';
+    var req;
+    if(mode==='custom'){
+        var cf=document.getElementById('setup-cert-file'),kf=document.getElementById('setup-key-file');
+        if(!cf.files.length||!kf.files.length){alert('Custom certificate selected — choose both a certificate and a private key file.');return}
+        if(!confirm('Deploy Caddy for '+domain+' with your custom certificate?\\n\\nCaddy will serve your cert on all subdomains and will not attempt Let\\'s Encrypt.')){return}
+        var fd=new FormData();fd.append('domain',domain);fd.append('ssl_mode','custom');fd.append('cert_file',cf.files[0]);fd.append('key_file',kf.files[0]);
+        req={method:'POST',body:fd};
+    }else{
+        if(!confirm('Deploy Caddy with domain: '+domain+'?\\n\\nMake sure DNS is pointing to this server.')){return}
+        req={method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({domain:domain,ssl_mode:'fqdn'})};
+    }
     var btn=document.getElementById('deploy-btn');
     btn.disabled=true;btn.textContent='Deploying...';btn.style.opacity='0.7';
     try{
-        var r=await fetch('/api/caddy/deploy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({domain:domain})});
+        var r=await fetch('/api/caddy/deploy',req);
         var d=await r.json();
         if(d.success){pollCaddyLog()}
         else{var el=document.getElementById('deploy-log');var card=el?(el.closest('.card')||el.parentElement):null;if(card&&!document.getElementById('deploy-fail-banner')){var b=document.createElement('div');b.id='deploy-fail-banner';b.style.cssText='background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';b.innerHTML='<strong>\u2717 Deployment failed.</strong> Uninstall (if partial) and retry, or click Retry below.';card.insertBefore(b,el||card.firstChild);}if(el)el.textContent='Error: '+d.error;btn.disabled=false;btn.textContent='\u2717 Deployment failed \u2014 Retry';btn.style.background='var(--red)';btn.style.opacity='1';btn.onclick=function(){btn.textContent='\u1f680 Deploy Caddy';btn.style.background='';deployCaddy();};}
@@ -27602,6 +28211,66 @@ async function caddyUninstall(){
     if(!confirm('Remove Caddy and clear domain configuration?'))return;
     try{var r=await fetch('/api/caddy/uninstall',{method:'POST'});var d=await r.json();if(d.success)location.reload()}catch(e){alert('Error: '+e.message)}
 }
+var _currentSslMode='{{ settings.get("ssl_mode","") }}';
+function toggleSslMode(){
+    var sel=document.querySelector('input[name="ssl-mode"]:checked');
+    var v=sel?sel.value:'fqdn';
+    var cp=document.getElementById('custom-cert-panel');
+    var ap=document.getElementById('auto-mode-panel');
+    if(cp)cp.style.display=(v==='custom')?'block':'none';
+    // The "switch to automatic" button only matters when we're currently on a custom cert.
+    if(ap)ap.style.display=(v==='fqdn'&&_currentSslMode==='custom')?'block':'none';
+}
+async function applyAutoMode(){
+    var status=document.getElementById('apply-auto-status');
+    var btn=document.getElementById('apply-auto-btn');
+    if(!confirm('Switch back to automatic HTTPS?\\n\\nCaddy will stop serving your uploaded certificate and obtain Let\\'s Encrypt certs for each subdomain. DNS must point to this box and ports 80/443 must be reachable.'))return;
+    btn.disabled=true;btn.textContent='Switching…';status.style.color='var(--text-secondary)';status.textContent='Regenerating config and reloading Caddy…';
+    try{
+        var r=await fetch('/api/caddy/ssl-mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:'fqdn'})});
+        var d=await r.json();
+        if(d.success){status.style.color='var(--green)';status.textContent='✓ '+(d.message||'Switched.');setTimeout(()=>location.reload(),1500);}
+        else{status.style.color='var(--red)';status.textContent='✗ '+(d.error||'Failed.');btn.disabled=false;btn.textContent='Switch to automatic HTTPS';}
+    }catch(e){status.style.color='var(--red)';status.textContent='Error: '+e.message;btn.disabled=false;btn.textContent='Switch to automatic HTTPS';}
+}
+async function loadCustomCertInfo(){
+    var el=document.getElementById('custom-cert-status');if(!el)return;
+    try{
+        var r=await fetch('/api/caddy/custom-cert/info');var d=await r.json();
+        if(d.present){
+            el.style.color='var(--green)';
+            el.innerHTML='✓ Custom certificate in use'+(d.not_after?' · expires '+d.not_after:'')+(d.names&&d.names.length?'<br><span style="color:var(--text-dim)">Names: '+d.names.join(', ')+'</span>':'');
+        }else{
+            el.style.color='var(--text-dim)';
+            el.textContent='No custom certificate uploaded yet.';
+        }
+    }catch(e){el.textContent='Could not read certificate status.';}
+}
+async function applyCustomCert(){
+    var certF=document.getElementById('cert-file');
+    var keyF=document.getElementById('key-file');
+    var status=document.getElementById('apply-cert-status');
+    var btn=document.getElementById('apply-cert-btn');
+    if(!certF.files.length||!keyF.files.length){status.style.color='var(--red)';status.textContent='Select both a certificate and a private key file.';return}
+    if(!confirm('Validate and apply this custom certificate?\\n\\nCaddy will reload with your certificate on all subdomains. If TAK Server is installed, its 8446 enrollment cert will be updated and TAK will restart.'))return;
+    var fd=new FormData();fd.append('cert_file',certF.files[0]);fd.append('key_file',keyF.files[0]);
+    btn.disabled=true;btn.textContent='Validating…';status.style.color='var(--text-secondary)';status.textContent='Validating and applying…';
+    try{
+        var r=await fetch('/api/caddy/custom-cert',{method:'POST',body:fd});
+        var d=await r.json();
+        if(d.success){
+            status.style.color='var(--green)';
+            var w=(d.warnings&&d.warnings.length)?' ⚠ '+d.warnings.join(' '):'';
+            status.innerHTML='✓ '+(d.message||'Applied.')+w;
+            btn.disabled=false;btn.textContent='Validate & Apply';
+            loadCustomCertInfo();
+        }else{
+            status.style.color='var(--red)';status.textContent='✗ '+(d.error||'Failed.');
+            btn.disabled=false;btn.textContent='Validate & Apply';
+        }
+    }catch(e){status.style.color='var(--red)';status.textContent='Error: '+e.message;btn.disabled=false;btn.textContent='Validate & Apply';}
+}
+document.addEventListener('DOMContentLoaded',function(){if(document.getElementById('custom-cert-panel'))loadCustomCertInfo();});
 async function caddyUpdate(){
     var btn=document.getElementById('caddy-update-btn');
     var status=document.getElementById('caddy-update-status');
@@ -34169,6 +34838,12 @@ def _heal_authentik_proxy_chain_all_services(plog=None, settings=None):
 
         outpost_provider_pks = []
 
+        # Install snapshot for orphan GC below (computed once, not per-service).
+        try:
+            _installed_now = detect_modules()
+        except Exception:
+            _installed_now = {}
+
         for module_key, prov_name, app_slug, app_name, dom_key, open_new_tab in _AUTHENTIK_PROXY_CHAIN_SERVICES:
             # Skip services that aren't deployed (Federation Hub deployed flag
             # lives in cloudtak_deployment? No — _is_module_deployed only knows
@@ -34187,6 +34862,15 @@ def _heal_authentik_proxy_chain_all_services(plog=None, settings=None):
                 deployed = (module_key == 'infratak')
 
             if not deployed:
+                # Orphan GC: if a catalog proxy service is FULLY uninstalled (installed=False,
+                # not merely stopped/undeployed), remove its leftover Authentik app+provider so
+                # it stops showing as a service. Real-world case: MediaMTX after a manual swap to
+                # TAK Video Restreamer (test12) — distinct slugs, so removing MediaMTX's 'stream'
+                # never touches TVR's 'tak-video-restreamer'. Default True → never GC a module
+                # detect_modules() couldn't classify, and never GC infra-TAK itself.
+                if module_key != 'infratak' and not _installed_now.get(module_key, {}).get('installed', True):
+                    _log(f"  ⧗ {prov_name}: service uninstalled — removing orphaned Authentik app")
+                    _deregister_authentik_proxy_app(settings, app_slug, prov_name, plog=_log)
                 continue
 
             service_domain = _get_service_domain(settings, dom_key)
