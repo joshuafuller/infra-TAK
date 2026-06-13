@@ -369,7 +369,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.54-alpha"
+VERSION = "0.9.55-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -1242,6 +1242,7 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
     parts = [logo]
     parts.append(link('/console', '<span class="nav-icon material-symbols-outlined">dashboard</span>Console'))
     parts.append(link('/firewall', '<span class="nav-icon material-symbols-outlined">shield_locked</span>Firewall'))
+    parts.append(link('/hardening', '<span class="nav-icon material-symbols-outlined" style="font-size:26px">shield_toggle</span>Cyber Controls'))
     if os.path.exists('/etc/fail2ban'):
         parts.append(link('/fail2ban', f'<img src="{html.escape(FAIL2BAN_LOGO_URL)}" alt="Fail2ban" class="nav-icon" style="height:24px;width:auto;max-width:72px;object-fit:contain;display:block"><span>Fail2ban</span>', 'Fail2ban'))
     gd = modules.get('guarddog', {})
@@ -1993,12 +1994,15 @@ def login():
         if check_password_hash(auth['password_hash'], request.form.get('password', '')):
             session.clear()
             session['authenticated'] = True
+            # W3: in Hardened posture, password login is the on-box break-glass path — audit it.
+            audit('auth:login-password', 'console password / break-glass')
             return redirect(url_for('console_page'))
         return render_template_string(LOGIN_TEMPLATE, error='Invalid password', version=VERSION, login_logo_url=logo_url)
     return render_template_string(LOGIN_TEMPLATE, error=None, version=VERSION, login_logo_url=logo_url)
 
 @app.route('/logout', methods=['POST'])
 def logout():
+    audit('auth:logout', '')
     session.clear()
     return redirect(url_for('index'))
 
@@ -2017,6 +2021,7 @@ def index():
                 version=VERSION, login_logo_url=logo_url)
         if check_password_hash(auth['password_hash'], request.form.get('password', '')):
             session['authenticated'] = True
+            audit('auth:login-password', 'console password / break-glass')
             return redirect(url_for('console_page'))
         return render_template_string(LOGIN_TEMPLATE, error='Invalid password', version=VERSION, login_logo_url=logo_url)
     if not session.get('authenticated'):
@@ -2072,6 +2077,960 @@ def console_page():
     r = make_response(resp)
     r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
     return r
+
+# ============================================================================
+# "Harden This Box" — Compliance Hardening Module  (v0.9.55, smell-test core)
+# ----------------------------------------------------------------------------
+# A post-assembly security-posture toggle. The DEFAULT is "standard" — a box
+# that never presses the button (cloud OR edge) behaves exactly as today; the
+# absence of hardening.json == standard posture, and every runtime hook below
+# no-ops unless posture == 'hardened'. Hardening is explicit, reversible, and
+# transactional (W6): apply runs controls in order and rolls back every applied
+# control if any one fails, so the flip can never half-land. Recovery is always
+# the on-box break-glass path (reset-console-password.sh) — never a network
+# backdoor. Controls land per W-item: W2 (session lock) here; W3/W4/W1 follow.
+# Parent plan: infra-TAK-notes/docs/PLAN-v0.9.55-harden-this-box.md
+# ============================================================================
+
+HARDENING_CONFIG = 'hardening.json'
+SESSION_IDLE_MAX_DEFAULT = 1800  # 30 min — CJIS idle-lock ceiling (W2), fleet-uniform constant
+
+def load_hardening():
+    """Load hardening.json from CONFIG_DIR. Never raises — {} on missing/error.
+    Missing file == Standard posture (today's behavior, both cloud and edge)."""
+    try:
+        p = os.path.join(CONFIG_DIR, HARDENING_CONFIG)
+        if os.path.exists(p):
+            with open(p) as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+def save_hardening(h):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    p = os.path.join(CONFIG_DIR, HARDENING_CONFIG)
+    with open(p, 'w') as f:
+        json.dump(h, f, indent=2)
+    try:
+        os.chmod(p, 0o600)
+    except Exception:
+        pass
+
+def _hardening_posture():
+    return (load_hardening().get('posture') or 'standard')
+
+def is_hardened():
+    return _hardening_posture() == 'hardened'
+
+# --- W2: 30-minute server-side session idle lock ---------------------------
+# The control's apply/verify/revert only records intent in hardening.json; the
+# authoritative enforcement is this before_request hook, which is always present
+# but only bites when posture == 'hardened'. Under the password-auth path this is
+# the full lock. KNOWN GAP under SSO (W1): clearing the Flask session redirects
+# through Caddy forward_auth, which re-validates against a still-live Authentik
+# session and silently re-authenticates — so the idle lock refreshes rather than
+# re-prompting. Making it re-prompt needs an Authentik session-duration mirror
+# (brand/flow), which is fleet-affecting and not yet built/tested — tracked as the
+# top W1 follow-up; do not claim a working SSO idle-lock until it is validated.
+@app.before_request
+def _enforce_session_idle_lock():
+    try:
+        if not session.get('authenticated'):
+            return  # not logged in — nothing to lock
+        h = load_hardening()
+        if (h.get('posture') or 'standard') != 'hardened':
+            return
+        a = (h.get('applied') or {}).get('W2_session') or {}
+        idle_max = int(a.get('idle_max_seconds', SESSION_IDLE_MAX_DEFAULT))
+        now = int(time.time())
+        last = session.get('last_activity')
+        if last is not None and (now - int(last)) > idle_max:
+            session.clear()
+            if request.path.startswith('/api/'):
+                return jsonify({'error': 'Session expired (idle lock).', 'login_required': True}), 401
+            return redirect(url_for('login'))
+        session['last_activity'] = now
+    except Exception:
+        # A lock failure must never brick a request — fail open to the normal flow.
+        return
+
+def _hardening_control_w2():
+    """W2 — 30-minute server-side session lock."""
+    def apply_(h, log):
+        h.setdefault('applied', {})['W2_session'] = {'idle_max_seconds': SESSION_IDLE_MAX_DEFAULT}
+        log('W2: session idle lock armed (%d min)' % (SESSION_IDLE_MAX_DEFAULT // 60))
+        return True
+    def verify(h):
+        a = (h.get('applied') or {}).get('W2_session')
+        if not a:
+            return (False, 'session idle lock not applied')
+        return (True, 'idle lock = %d min' % (int(a.get('idle_max_seconds', SESSION_IDLE_MAX_DEFAULT)) // 60))
+    def revert(h, log):
+        (h.get('applied') or {}).pop('W2_session', None)
+        log('W2: session idle lock disarmed')
+        return True
+    return {'key': 'W2_session', 'title': '30-minute session lock',
+            'desc': 'Server-side idle timeout forces re-authentication after 30 minutes (CJIS 5.5.5).',
+            'apply': apply_, 'verify': verify, 'revert': revert}
+
+# --- W3: local per-user audit log (JSONL) ----------------------------------
+# Records who/what/when for admin actions. Hardened-posture only, so a Standard
+# box writes nothing (today's behavior preserved). JSONL now → clean CEF/syslog
+# export when off-box shipping lands in .56. Off-box shipping + 365-day retention
+# are NOT in .55 — this is local-only.
+AUDIT_DIR_NAME = 'audit'
+AUDIT_LOG_NAME = 'console-audit.log'
+_AUDIT_MAX_BYTES = 5 * 1024 * 1024  # rotate to .1 past 5 MB; kept local
+
+def _audit_path():
+    return os.path.join(CONFIG_DIR, AUDIT_DIR_NAME, AUDIT_LOG_NAME)
+
+def audit(event, detail='', force=False):
+    """Append a structured JSONL audit line. Hardened-posture only unless force=True
+    (used for posture-flip events that may transition out of hardened). Never raises."""
+    try:
+        if not force and not is_hardened():
+            return
+        d = os.path.join(CONFIG_DIR, AUDIT_DIR_NAME)
+        os.makedirs(d, exist_ok=True)
+        p = os.path.join(d, AUDIT_LOG_NAME)
+        try:
+            if os.path.exists(p) and os.path.getsize(p) > _AUDIT_MAX_BYTES:
+                os.replace(p, p + '.1')
+        except Exception:
+            pass
+        try:
+            user = session.get('authentik_username') or ('console-admin' if session.get('authenticated') else 'anonymous')
+        except Exception:
+            user = 'system'
+        try:
+            ip = _client_ip()
+        except Exception:
+            ip = 'unknown'
+        line = json.dumps({
+            'ts': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'user': user, 'ip': ip, 'event': event, 'detail': str(detail)[:500],
+        }, separators=(',', ':'))
+        with open(p, 'a') as f:
+            f.write(line + '\n')
+        try:
+            os.chmod(p, 0o600)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+def _audit_tail(n=50):
+    out = []
+    try:
+        p = _audit_path()
+        if os.path.exists(p):
+            with open(p) as f:
+                for ln in f.readlines()[-n:]:
+                    try:
+                        out.append(json.loads(ln))
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    return out
+
+# Generic admin-action audit: one after_request hook attributes every state-changing
+# /api/* call instead of hand-instrumenting 300+ routes. Hardened-gated, with a
+# small denylist for poll/health noise.
+_AUDIT_SKIP_PATHS = ('/api/hardening/status', '/api/hardening/audit',
+                     '/api/guarddog/send-sms', '/api/guarddog/send-alert-email')
+
+@app.after_request
+def _audit_state_changes(response):
+    try:
+        if (request.method in ('POST', 'PUT', 'PATCH', 'DELETE')
+                and request.path.startswith('/api/')
+                and request.path not in _AUDIT_SKIP_PATHS
+                and is_hardened()):
+            audit('api:' + request.method + ' ' + request.path, 'status=%s' % response.status_code)
+    except Exception:
+        pass
+    return response
+
+def _hardening_control_w3():
+    """W3 — local per-user audit log. One-way (you don't un-audit), so revert keeps it."""
+    def apply_(h, log):
+        os.makedirs(os.path.join(CONFIG_DIR, AUDIT_DIR_NAME), exist_ok=True)
+        h.setdefault('applied', {})['W3_audit'] = {'path': _audit_path(), 'enabled': True}
+        log('W3: per-user audit log enabled at ' + _audit_path())
+        return True
+    def verify(h):
+        a = (h.get('applied') or {}).get('W3_audit')
+        if not a:
+            return (False, 'audit not enabled')
+        d = os.path.join(CONFIG_DIR, AUDIT_DIR_NAME)
+        ok = os.path.isdir(d) and os.access(d, os.W_OK)
+        return (ok, ('writable: ' + _audit_path()) if ok else 'audit dir present but not writable')
+    def revert(h, log):
+        log('W3: audit log retained (one-way control)')
+        return True
+    return {'key': 'W3_audit', 'title': 'Per-user audit log',
+            'desc': 'Records who/what/when for admin actions locally (off-box shipping is .56).',
+            'apply': apply_, 'verify': verify, 'revert': revert}
+
+# --- W4: port / boundary assertions (read-only; verify, don't rebuild) ------
+# Reuses the existing UFW + fail2ban machinery and reports pass/fail for the W5
+# report. Mutates nothing. Where a TAK/Tomcat surface cannot be reliably evaluated
+# from here, the assertion is 'na' with an honest note — never a false green
+# (CLAUDE.md "no silent caps"). Deep Tomcat STIG remediation is .57.
+
+def _ufw_default_incoming_deny():
+    """True if UFW default incoming policy is deny/reject (from `ufw status verbose`)."""
+    try:
+        r = subprocess.run('sudo ufw status verbose 2>/dev/null || ufw status verbose 2>/dev/null || true',
+                            shell=True, capture_output=True, text=True, timeout=12)
+        for ln in (r.stdout or '').splitlines():
+            l = ln.lower().strip()
+            if l.startswith('default:'):
+                # e.g. "Default: deny (incoming), allow (outgoing), disabled (routed)"
+                inc = l.split('(incoming)')[0]
+                return ('deny' in inc or 'reject' in inc)
+    except Exception:
+        pass
+    return None
+
+def _service_is_active(name):
+    try:
+        r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', name]),
+                           capture_output=True, text=True, timeout=8)
+        return (r.stdout or '').strip() == 'active'
+    except Exception:
+        return None
+
+def _hardening_assertions():
+    """Read-only boundary assertions → list of {key,label,status,detail}.
+    status ∈ pass|fail|warn|na. Consumed by W4 verify, the page, and the W5 report."""
+    res = []
+    def add(key, label, status, detail):
+        res.append({'key': key, 'label': label, 'status': status, 'detail': detail})
+
+    fw = _firewall_status_local()
+    if not fw.get('supported'):
+        add('ufw_enabled', 'UFW firewall present', 'fail', fw.get('error') or 'UFW not installed')
+    else:
+        add('ufw_enabled', 'UFW firewall active', 'pass' if fw.get('enabled') else 'fail',
+            'active' if fw.get('enabled') else 'UFW installed but not enabled')
+        dd = _ufw_default_incoming_deny()
+        add('ufw_default_deny', 'UFW default-deny incoming',
+            'pass' if dd else ('na' if dd is None else 'fail'),
+            'deny by default' if dd else ('could not read default policy' if dd is None else 'default policy is not deny'))
+
+    if os.path.exists('/etc/fail2ban'):
+        active = _service_is_active('fail2ban')
+        add('fail2ban_active', 'fail2ban intrusion prevention',
+            'pass' if active else ('na' if active is None else 'fail'),
+            'active' if active else ('status unknown' if active is None else 'installed but not active'))
+    else:
+        add('fail2ban_active', 'fail2ban intrusion prevention', 'warn', 'not installed')
+
+    # Console :5001 reachability. In Hardened posture (W1) this should be localhost-only.
+    # Probe UFW directly (don't just trust the applied flag) so config drift surfaces.
+    h = load_hardening()
+    w1 = (h.get('applied') or {}).get('W1_sso')
+    port = str((load_settings().get('console_port') or 5001))
+    pub = _w1_console_port_public(port)
+    label = 'Admin console (:%s) not internet-exposed' % port
+    if pub:
+        add('console_localhost', label,
+            'fail' if (w1 and w1.get('console_localhost_only')) else 'warn',
+            'public UFW allow present on :%s' % port)
+    elif w1 and w1.get('console_localhost_only'):
+        add('console_localhost', label, 'pass',
+            'no public UFW allow; reached via SSO reverse proxy (W1)')
+    else:
+        add('console_localhost', label, 'warn',
+            'open to network (Standard posture / W1 not applied)')
+
+    # TAK Tomcat surface — best-effort, honest 'na' where not evaluable here.
+    if os.path.exists('/opt/tak'):
+        webapps = '/opt/tak/webapps'
+        mgr = (os.path.isdir(os.path.join(webapps, 'manager'))
+               or os.path.isdir(os.path.join(webapps, 'host-manager'))) if os.path.isdir(webapps) else False
+        add('tak_tomcat_manager', 'Tomcat manager/host-manager app not deployed',
+            'fail' if mgr else 'pass',
+            'manager webapp present' if mgr else 'no manager/host-manager webapp')
+        add('tak_tomcat_mtls', 'TAK connectors mTLS client-cert (8443/8446)', 'na',
+            'shielded by mTLS+UFW+Caddy; full connector/AJP STIG audit is .57')
+    else:
+        add('tak_tomcat_manager', 'TAK Tomcat surface', 'na', 'TAK Server not installed on this host')
+
+    return res
+
+def _hardening_control_w4():
+    """W4 — port/boundary assertions. Read-only: apply/revert are no-ops; verify
+    fails only if a CRITICAL assertion (UFW/fail2ban) fails."""
+    def apply_(h, log):
+        h.setdefault('applied', {})['W4_assert'] = {'enabled': True}
+        log('W4: boundary assertions enabled (read-only)')
+        return True
+    def verify(h):
+        a = (h.get('applied') or {}).get('W4_assert')
+        if not a:
+            return (False, 'assertions not enabled')
+        crit = {'ufw_enabled', 'fail2ban_active'}
+        fails = [x['key'] for x in _hardening_assertions() if x['status'] == 'fail' and x['key'] in crit]
+        if fails:
+            return (False, 'critical assertion failed: ' + ', '.join(fails))
+        return (True, 'boundary assertions pass (see report for full surface)')
+    def revert(h, log):
+        (h.get('applied') or {}).pop('W4_assert', None)
+        log('W4: boundary assertions disabled')
+        return True
+    return {'key': 'W4_assert', 'title': 'Port & Tomcat boundary assertions',
+            'desc': 'Verifies UFW deny-by-default, fail2ban, and TAK Tomcat shielding (read-only).',
+            'apply': apply_, 'verify': verify, 'revert': revert}
+
+# --- W1: console SSO + per-user MFA + :5001 lockdown (the auth flip; last) -----
+# Built LAST, behind W6's working revert. In Hardened posture the console is
+# reachable ONLY through the existing Caddy `infratak.<fqdn>` vhost (Authentik
+# forward_auth) — per-user SSO with enforced MFA. The shared-password login becomes
+# on-box break-glass (reset-console-password.sh + an SSH tunnel to 127.0.0.1:5001).
+# Three reversible moves, ordered so a fallback exists until the very last step:
+#   1. Authentik: require a configured MFA device on the console application
+#      (expression policy + binding + policy_engine_mode=all). REFUSES if no admin
+#      has MFA enrolled yet — that would lock every SSO user out of the console.
+#   2. Caddy: drop the unauthenticated `/login*` bypass so the password page is no
+#      longer a network ingress (generate_caddyfile keys off _w1_console_locked()).
+#   3. UFW: remove the public :5001 allow so direct-to-port access is dropped by
+#      default-deny; loopback (Caddy proxy + SSH tunnel) is UFW-exempt and still works.
+# Verifying the binding really lands is mandatory (the netbird PR#42 #4 trap:
+# "app has no policy binding"); `ak dump_config` is the release-time env audit.
+W1_MFA_POLICY_NAME = 'infratak-require-mfa'
+W1_MFA_POLICY_EXPR = 'return ak_user_has_authenticator(request.user)'
+
+def _w1_console_locked():
+    """True when W1 has locked the console (Caddy /login bypass dropped). Read by
+    generate_caddyfile so every Caddy regen — from anywhere — honors the posture."""
+    try:
+        return bool((load_hardening().get('applied') or {}).get('W1_sso', {}).get('caddy_login_locked'))
+    except Exception:
+        return False
+
+def _w1_console_port_public(port):
+    """True if UFW has an ALLOW for the console port open to Anywhere (not loopback).
+    None if UFW unsupported/disabled (can't assert lockdown)."""
+    fw = _firewall_status_local()
+    if not fw.get('supported') or not fw.get('enabled'):
+        return None
+    for ln in fw.get('rules', []):
+        l = ln.lower()
+        if port in l and 'allow' in l and 'anywhere' in l:
+            # a source-scoped rule (e.g. "from 127.0.0.1") is not a public allow
+            if 'from' not in l or '127.0.0.1' not in l:
+                return True
+    return False
+
+def _w1_ak_ctx():
+    """(ak_url, ak_headers, settings) for Authentik API; ak_url None if no token."""
+    settings = load_settings()
+    tok = (_get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+           or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN'))
+    if not tok:
+        return (None, None, settings)
+    return (_get_authentik_api_url(settings),
+            {'Authorization': f'Bearer {tok}', 'Content-Type': 'application/json'}, settings)
+
+def _w1_ak_get(ak_url, path, ak_headers):
+    return json.loads(_ak_api_call(f'{ak_url}/api/v3/{path}', headers=ak_headers).read().decode())
+
+def _w1_login_apps(ak_url, ak_headers):
+    """All Authentik LOGIN applications behind Authentik = every app whose provider is NOT
+    an LDAP provider (the LDAP app is the TAK EUD bind path and MUST stay MFA-free, else
+    ATAK/iTAK auth breaks). Returns [(slug, app_pk)]. No hard-coded slugs (fleet-robust)."""
+    ldap_pks = set()
+    try:
+        for p in _w1_ak_get(ak_url, 'providers/ldap/?page_size=100', ak_headers).get('results', []):
+            ldap_pks.add(p.get('pk'))
+    except Exception:
+        pass
+    out = []
+    for a in _w1_ak_get(ak_url, 'core/applications/?superuser_full_list=true&page_size=100',
+                        ak_headers).get('results', []):
+        prov = a.get('provider')
+        if prov and prov not in ldap_pks:
+            out.append((a.get('slug'), a.get('pk')))
+    return out
+
+def _w1_mfa_validate_stage(ak_url, ak_headers):
+    """The authenticator-validate stage bound to default-authentication-flow (the WEB login
+    flow — NOT the LDAP flow). Force-enroll is configured here. (stage_pk, detail) or (None,None)."""
+    flows = _w1_ak_get(ak_url, 'flows/instances/?slug=default-authentication-flow', ak_headers).get('results', [])
+    if not flows:
+        return (None, None)
+    flow_pk = flows[0].get('pk')
+    for b in _w1_ak_get(ak_url, f'flows/bindings/?target={flow_pk}&page_size=100', ak_headers).get('results', []):
+        st = b.get('stage_obj') or {}
+        name = (st.get('name') or '') + ' ' + (st.get('verbose_name') or '')
+        if 'validat' in name.lower():
+            try:
+                d = _w1_ak_get(ak_url, f'stages/authenticator/validate/{st.get("pk")}/', ak_headers)
+                if 'not_configured_action' in d:
+                    return (st.get('pk'), d)
+            except Exception:
+                continue
+    return (None, None)
+
+def _w1_setup_stage_pks(ak_url, ak_headers):
+    """TOTP + WebAuthn authenticator SETUP stage pks (configuration_stages for force-enroll)."""
+    pks = []
+    for kind in ('totp', 'webauthn'):
+        try:
+            for s in _w1_ak_get(ak_url, f'stages/authenticator/{kind}/?page_size=20', ak_headers).get('results', []):
+                pks.append(s.get('pk'))
+        except Exception:
+            pass
+    return pks
+
+# --- Fleet-uniform Authentik login/MFA copy (clearer than the stock "authentik" text) -
+# Replaces "Welcome to authentik!" / "TOTP Device" / "WebAuthn device" with plain-English
+# wording on every box. Independent of hardening posture — login screens should always read
+# clearly. Idempotent; applied by a startup migration when Authentik is present.
+AK_BRAND_TITLE = 'infra-TAK'
+AK_AUTH_FLOW_TITLE = 'Sign in'
+AK_TOTP_FRIENDLY = 'Authenticator App - Scan a QR code'
+AK_WEBAUTHN_FRIENDLY = 'Use a Passkey'
+
+def _ensure_authentik_login_copy(log=None):
+    """Codify clear, fleet-uniform login/MFA wording: brand title, the authentication-flow
+    header, and the TOTP/WebAuthn enrollment button labels. Only PATCHes a field that differs
+    (so it's a no-op on subsequent boots). Never raises. Returns True if anything changed."""
+    def _l(m):
+        if log:
+            log(m)
+    ak_url, ak_headers, _ = _w1_ak_ctx()
+    if not ak_url:
+        return False
+    changed = False
+    try:
+        brands = _w1_ak_get(ak_url, 'core/brands/', ak_headers).get('results', [])
+        if brands and brands[0].get('branding_title') != AK_BRAND_TITLE:
+            bid = brands[0].get('brand_uuid') or brands[0].get('pk')
+            _ak_api_call(f'{ak_url}/api/v3/core/brands/{bid}/',
+                         data=json.dumps({'branding_title': AK_BRAND_TITLE}).encode(),
+                         method='PATCH', headers=ak_headers)
+            changed = True; _l('Authentik brand title → %s' % AK_BRAND_TITLE)
+    except Exception as e:
+        _l('Authentik brand title copy: %s' % str(e)[:100])
+    try:
+        flows = _w1_ak_get(ak_url, 'flows/instances/?slug=default-authentication-flow', ak_headers).get('results', [])
+        if flows and flows[0].get('title') != AK_AUTH_FLOW_TITLE:
+            _ak_api_call(f'{ak_url}/api/v3/flows/instances/default-authentication-flow/',
+                         data=json.dumps({'title': AK_AUTH_FLOW_TITLE}).encode(),
+                         method='PATCH', headers=ak_headers)
+            changed = True; _l('Authentik login header → %s' % AK_AUTH_FLOW_TITLE)
+    except Exception as e:
+        _l('Authentik flow title copy: %s' % str(e)[:100])
+    for kind, friendly in (('totp', AK_TOTP_FRIENDLY), ('webauthn', AK_WEBAUTHN_FRIENDLY)):
+        try:
+            for s in _w1_ak_get(ak_url, f'stages/authenticator/{kind}/?page_size=20', ak_headers).get('results', []):
+                if s.get('friendly_name') != friendly:
+                    _ak_api_call(f'{ak_url}/api/v3/stages/authenticator/{kind}/{s["pk"]}/',
+                                 data=json.dumps({'friendly_name': friendly}).encode(),
+                                 method='PATCH', headers=ak_headers)
+                    changed = True; _l('Authentik %s setup label → %s' % (kind, friendly))
+        except Exception as e:
+            _l('Authentik %s label copy: %s' % (kind, str(e)[:100]))
+    return changed
+
+def _w1_ensure_mfa_policy(ak_url, ak_headers, log):
+    """Ensure the shared require-MFA expression policy exists; return its pk."""
+    pols = _w1_ak_get(ak_url, f'policies/expression/?search={W1_MFA_POLICY_NAME}&page_size=100',
+                      ak_headers).get('results', [])
+    pol_pk = next((p.get('pk') for p in pols if p.get('name') == W1_MFA_POLICY_NAME), None)
+    if pol_pk:
+        return pol_pk
+    body = json.dumps({'name': W1_MFA_POLICY_NAME, 'execution_logging': False,
+                       'expression': W1_MFA_POLICY_EXPR}).encode()
+    pol_pk = json.loads(_ak_api_call(f'{ak_url}/api/v3/policies/expression/', data=body,
+                        method='POST', headers=ak_headers).read().decode()).get('pk')
+    log('W1: created MFA-required policy (%s)' % W1_MFA_POLICY_NAME)
+    return pol_pk
+
+def _w1_apply_mfa(h, log):
+    """All-or-none: enforce per-user MFA on EVERY Authentik login app + force MFA enrollment
+    globally on the WEB auth flow. Lockout-safe order — force-enroll FIRST (a device-less user
+    is walked through enrollment at login instead of being denied), THEN bind the deny-policy
+    to each app. Idempotent; verifies each binding lands (per-app netbird #4 trap); records
+    everything for clean revert. The LDAP flow is never touched (TAK client auth unaffected)."""
+    ak_url, ak_headers, settings = _w1_ak_ctx()
+    if not ak_url:
+        log('W1: no Authentik token — cannot enforce SSO MFA'); return False
+    w1 = h.setdefault('applied', {}).setdefault('W1_sso', {})
+
+    # 0) shared require-MFA policy
+    pol_pk = _w1_ensure_mfa_policy(ak_url, ak_headers, log)
+    w1['ak_mfa_policy_pk'] = pol_pk
+
+    # 1) FORCE-ENROLL FIRST on the web auth flow — after this, nobody can be locked out
+    stage_pk, stage = _w1_mfa_validate_stage(ak_url, ak_headers)
+    if not stage_pk:
+        log("W1: could not locate the web MFA validate stage — aborting (won't bind deny-policies "
+            'without the force-enroll safety net)'); return False
+    setup_pks = _w1_setup_stage_pks(ak_url, ak_headers)
+    if not setup_pks:
+        log('W1: no TOTP/WebAuthn setup stages found — aborting (force-enroll needs a setup stage)')
+        return False
+    if 'ak_force_enroll' not in w1:  # record the TRUE prior only once
+        w1['ak_force_enroll'] = {'stage_pk': stage_pk,
+                                 'prior_not_configured_action': stage.get('not_configured_action'),
+                                 'prior_configuration_stages': stage.get('configuration_stages') or []}
+        save_hardening(h)
+    if stage.get('not_configured_action') != 'configure' or not stage.get('configuration_stages'):
+        _ak_api_call(f'{ak_url}/api/v3/stages/authenticator/validate/{stage_pk}/',
+                     data=json.dumps({'not_configured_action': 'configure',
+                                      'configuration_stages': setup_pks}).encode(),
+                     method='PATCH', headers=ak_headers)
+        log('W1: force-enroll ON (web login walks device-less users through TOTP/WebAuthn setup)')
+    chk = _w1_ak_get(ak_url, f'stages/authenticator/validate/{stage_pk}/', ak_headers)
+    if chk.get('not_configured_action') != 'configure' or not chk.get('configuration_stages'):
+        log('W1: VERIFY FAILED — force-enroll did not stick; aborting before binding deny-policies')
+        return False
+
+    # 2) bind require-MFA to EVERY login app + policy_engine_mode=all
+    apps = _w1_login_apps(ak_url, ak_headers)
+    if not apps:
+        log('W1: no Authentik login apps found — aborting'); return False
+    rec = w1.setdefault('ak_apps', {})
+    for slug, app_pk in apps:
+        prior_mode = _w1_ak_get(ak_url, f'core/applications/{slug}/', ak_headers).get('policy_engine_mode', 'any')
+        binds = _w1_ak_get(ak_url, f'policies/bindings/?target={app_pk}&page_size=100', ak_headers).get('results', [])
+        bind_pk = next((b.get('pk') for b in binds if b.get('policy') == pol_pk), None)
+        if not bind_pk:
+            body = json.dumps({'policy': pol_pk, 'target': app_pk, 'enabled': True,
+                               'order': 10, 'timeout': 30, 'failure_result': False}).encode()
+            bind_pk = json.loads(_ak_api_call(f'{ak_url}/api/v3/policies/bindings/', data=body,
+                                 method='POST', headers=ak_headers).read().decode()).get('pk')
+        rec[slug] = {'app_pk': app_pk, 'binding_pk': bind_pk,
+                     'prior_engine_mode': (rec.get(slug, {}).get('prior_engine_mode') or prior_mode)}
+        # Set engine_mode=all (group AND MFA both required). Re-read and retry once: an app
+        # with another binding (e.g. the Admins-group binding) MUST be 'all' or that binding
+        # alone would satisfy 'any' and bypass the MFA requirement.
+        for _try in (1, 2):
+            cur = _w1_ak_get(ak_url, f'core/applications/{slug}/', ak_headers).get('policy_engine_mode')
+            if cur == 'all':
+                break
+            _ak_api_call(f'{ak_url}/api/v3/core/applications/{slug}/',
+                         data=json.dumps({'policy_engine_mode': 'all'}).encode(),
+                         method='PATCH', headers=ak_headers)
+        save_hardening(h)
+        binds2 = _w1_ak_get(ak_url, f'policies/bindings/?target={app_pk}&page_size=100', ak_headers).get('results', [])
+        if not any(b.get('policy') == pol_pk and b.get('enabled') for b in binds2):
+            log('W1: VERIFY FAILED — MFA binding missing on app %s' % slug); return False
+        if _w1_ak_get(ak_url, f'core/applications/{slug}/', ak_headers).get('policy_engine_mode') != 'all':
+            log('W1: VERIFY FAILED — %s policy_engine_mode is not "all"' % slug); return False
+    w1['ak_app_slug'] = 'infratak'  # console marker for W4 assertion compatibility
+    log('W1: MFA enforced on %d Authentik apps + force-enroll ON (%s)'
+        % (len(apps), ', '.join(s for s, _ in apps)))
+    return True
+
+def _w1_revert_mfa(h, log):
+    """Undo MFA-everywhere: restore the force-enroll stage, delete each app binding + restore
+    its engine_mode, delete the shared policy. Idempotent; never raises."""
+    ak_url, ak_headers, _ = _w1_ak_ctx()
+    if not ak_url:
+        log('W1: no Authentik token — skipping MFA unbind'); return
+    w1 = (h.get('applied') or {}).get('W1_sso') or {}
+    fe = w1.get('ak_force_enroll') or {}
+    if fe.get('stage_pk'):
+        try:
+            _ak_api_call(f'{ak_url}/api/v3/stages/authenticator/validate/{fe["stage_pk"]}/',
+                         data=json.dumps({'not_configured_action': fe.get('prior_not_configured_action') or 'skip',
+                                          'configuration_stages': fe.get('prior_configuration_stages') or []}).encode(),
+                         method='PATCH', headers=ak_headers)
+            log('W1: force-enroll restored to prior (%s)' % (fe.get('prior_not_configured_action') or 'skip'))
+        except Exception as e:
+            log('W1: force-enroll restore error: %s' % str(e)[:120])
+    for slug, info in (w1.get('ak_apps') or {}).items():
+        try:
+            if info.get('binding_pk'):
+                _ak_api_call(f'{ak_url}/api/v3/policies/bindings/{info["binding_pk"]}/',
+                             method='DELETE', headers=ak_headers)
+        except Exception as e:
+            log('W1: binding delete error (%s): %s' % (slug, str(e)[:100]))
+        try:
+            _ak_api_call(f'{ak_url}/api/v3/core/applications/{slug}/',
+                         data=json.dumps({'policy_engine_mode': info.get('prior_engine_mode', 'any')}).encode(),
+                         method='PATCH', headers=ak_headers)
+        except Exception as e:
+            log('W1: engine_mode restore error (%s): %s' % (slug, str(e)[:100]))
+    if w1.get('ak_apps'):
+        log('W1: MFA bindings removed from %d apps; engine_mode restored' % len(w1['ak_apps']))
+    # Backward-compat: pre-MFA-everywhere single-app state (ak_app_slug/ak_mfa_binding_pk).
+    if w1.get('ak_app_slug') and not w1.get('ak_apps'):
+        try:
+            if w1.get('ak_mfa_binding_pk'):
+                _ak_api_call(f'{ak_url}/api/v3/policies/bindings/{w1["ak_mfa_binding_pk"]}/',
+                             method='DELETE', headers=ak_headers)
+            _ak_api_call(f'{ak_url}/api/v3/core/applications/{w1["ak_app_slug"]}/',
+                         data=json.dumps({'policy_engine_mode': w1.get('ak_prior_engine_mode', 'any')}).encode(),
+                         method='PATCH', headers=ak_headers)
+            log('W1: legacy single-app MFA binding reverted (%s)' % w1['ak_app_slug'])
+        except Exception as e:
+            log('W1: legacy revert error: %s' % str(e)[:100])
+    try:
+        if w1.get('ak_mfa_policy_pk'):
+            _ak_api_call(f'{ak_url}/api/v3/policies/expression/{w1["ak_mfa_policy_pk"]}/',
+                         method='DELETE', headers=ak_headers)
+            log('W1: MFA-required policy deleted')
+    except Exception as e:
+        log('W1: policy delete error: %s' % str(e)[:120])
+
+def _w1_caddy_regen(log):
+    """Regenerate + validate + reload Caddy so the /login bypass state matches posture."""
+    try:
+        generate_caddyfile()  # writes CADDYFILE_PATH (honors _w1_console_locked())
+    except Exception as e:
+        log('W1: Caddyfile generation error: %s' % str(e)[:160]); return False
+    # Pre-validate if the caddy binary is reachable; otherwise rely on `systemctl
+    # reload caddy`, which validates internally and refuses a bad config.
+    if subprocess.run('command -v caddy >/dev/null 2>&1', shell=True).returncode == 0:
+        val = subprocess.run('caddy validate --config %s --adapter caddyfile 2>&1' % CADDYFILE_PATH,
+                             shell=True, capture_output=True, text=True, timeout=30)
+        if val.returncode != 0:
+            log('W1: caddy validate FAILED: %s' % (val.stdout or val.stderr or '')[-200:]); return False
+    rl = subprocess.run('systemctl reload caddy 2>&1', shell=True, capture_output=True, text=True, timeout=60)
+    if rl.returncode != 0:
+        log('W1: caddy reload error: %s' % (rl.stdout or rl.stderr or '')[-160:]); return False
+    log('W1: Caddy reloaded'); return True
+
+def _w1_ufw_lock_console(log):
+    """Remove the public :5001 allow (v4+v6). Loopback stays exempt, so SSO + SSH-tunnel
+    break-glass keep working. Returns False if a public allow survives."""
+    port = str((load_settings().get('console_port') or 5001))
+    subprocess.run('sudo ufw delete allow %s/tcp >/dev/null 2>&1; '
+                   'sudo ufw delete allow %s >/dev/null 2>&1; true' % (port, port),
+                   shell=True, capture_output=True, timeout=30)
+    if _w1_console_port_public(port):
+        log('W1: WARNING — :%s still shows a public ALLOW after delete' % port); return False
+    log('W1: UFW public allow for :%s removed (console now localhost-only)' % port); return True
+
+def _w1_ufw_unlock_console(log):
+    port = str((load_settings().get('console_port') or 5001))
+    subprocess.run('sudo ufw allow %s/tcp >/dev/null 2>&1 || ufw allow %s/tcp >/dev/null 2>&1; true'
+                   % (port, port), shell=True, capture_output=True, timeout=30)
+    log('W1: UFW public allow for :%s restored (Standard)' % port)
+
+def _hardening_control_w1():
+    """W1 — console SSO + per-user MFA + :5001 lockdown. Highest risk, so it runs LAST
+    behind W6's working revert. apply is self-cleaning: any sub-step failure rolls back
+    every change W1 already made (the outer transaction does not revert a control that
+    returned False)."""
+    def apply_(h, log):
+        if not _ufw_default_incoming_deny():
+            log('W1: REFUSING — UFW default-incoming is not deny; locking :5001 would not '
+                'actually block external access. Set UFW default deny incoming first.')
+            return False
+        # 1) Authentik MFA (refuses if it would lock everyone out). On failure, clean up
+        # any Authentik objects it recorded before dropping the state.
+        if not _w1_apply_mfa(h, log):
+            _w1_revert_mfa(h, log)
+            (h.get('applied') or {}).pop('W1_sso', None)
+            save_hardening(h)
+            return False
+        w1 = h['applied']['W1_sso']
+        # 2) Caddy: drop the /login bypass (persist flag FIRST so generate_caddyfile sees it)
+        w1['caddy_login_locked'] = True
+        save_hardening(h)
+        if not _w1_caddy_regen(log):
+            w1['caddy_login_locked'] = False; save_hardening(h)
+            _w1_caddy_regen(log)            # restore Standard Caddy
+            _w1_revert_mfa(h, log)          # undo MFA — never leave it half-applied
+            (h.get('applied') or {}).pop('W1_sso', None)
+            return False
+        # 3) UFW: close the public :5001 allow
+        if not _w1_ufw_lock_console(log):
+            w1['caddy_login_locked'] = False; save_hardening(h)
+            _w1_caddy_regen(log)
+            _w1_revert_mfa(h, log)
+            (h.get('applied') or {}).pop('W1_sso', None)
+            return False
+        w1['console_localhost_only'] = True
+        log('W1: console is SSO+MFA only; :5001 localhost-only; password = on-box break-glass')
+        return True
+    def verify(h):
+        w1 = (h.get('applied') or {}).get('W1_sso')
+        if not w1:
+            return (False, 'SSO+MFA flip not applied')
+        port = str((load_settings().get('console_port') or 5001))
+        if _w1_console_port_public(port):
+            return (False, ':%s still has a public UFW allow' % port)
+        napps = len(w1.get('ak_apps') or {})
+        if not napps:
+            return (False, 'MFA policy not bound to any Authentik app')
+        if not (w1.get('ak_force_enroll') or {}).get('stage_pk'):
+            return (False, 'MFA force-enroll not configured')
+        return (True, 'SSO+MFA on %d Authentik apps + force-enroll; :%s localhost-only; break-glass on-box'
+                % (napps, port))
+    def revert(h, log):
+        # reverse order: UFW unlock → Caddy restore → Authentik unbind
+        _w1_ufw_unlock_console(log)
+        w1 = h.setdefault('applied', {}).setdefault('W1_sso', {})
+        w1['caddy_login_locked'] = False
+        save_hardening(h)
+        _w1_caddy_regen(log)
+        _w1_revert_mfa(h, log)
+        (h.get('applied') or {}).pop('W1_sso', None)
+        log('W1: reverted — password login reachable, :5001 reopened, MFA unbound')
+        return True
+    return {'key': 'W1_sso', 'title': 'SSO + per-user MFA (all Authentik apps)',
+            'desc': 'Per-user MFA is enforced on every app behind Authentik (console, Node-RED, TAK '
+                    'Portal, WebODM, MediaMTX, NetBird) with force-enrollment at first login; the '
+                    'console :5001 is localhost-only and its shared password is on-box break-glass. '
+                    'TAK Server, CloudTAK and TAK clients use their own native auth (not behind Authentik).',
+            'apply': apply_, 'verify': verify, 'revert': revert}
+
+def _hardening_registry():
+    """Ordered control list. Apply runs in order; revert runs in reverse.
+    W1 (the risky auth flip) is always LAST so a working revert exists before it."""
+    return [
+        _hardening_control_w2(),
+        _hardening_control_w3(),
+        _hardening_control_w4(),
+        _hardening_control_w1(),
+    ]
+
+def _breakglass_status():
+    """W6 — confirm the on-box break-glass recovery path exists. The posture flip
+    must never permanently lock an operator out: recovery is reset-console-password.sh
+    run from an on-box shell (network-isolated, auditable), NOT a network ingress."""
+    script = os.path.join(BASE_DIR, 'reset-console-password.sh')
+    return {'present': os.path.exists(script), 'path': script,
+            'note': 'On-box shell only. Restores console password login if SSO/Authentik is down.'}
+
+def _hardening_history(h, action, result):
+    h.setdefault('history', []).append({
+        'ts': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'actor': session.get('authentik_username') or 'console-admin',
+        'action': action, 'result': result})
+    # keep the tail bounded
+    h['history'] = h['history'][-200:]
+
+@app.route('/api/hardening/status')
+@login_required
+def hardening_status():
+    h = load_hardening()
+    controls = []
+    for c in _hardening_registry():
+        ok, detail = c['verify'](h)
+        controls.append({'key': c['key'], 'title': c['title'],
+                         'desc': c.get('desc', ''), 'pass': bool(ok), 'detail': detail})
+    return jsonify({
+        'posture': h.get('posture') or 'standard',
+        'controls': controls,
+        'breakglass': _breakglass_status(),
+        'idle_max_seconds': SESSION_IDLE_MAX_DEFAULT,
+        'history': (h.get('history') or [])[-10:],
+    })
+
+@app.route('/api/hardening/apply', methods=['POST'])
+@login_required
+def hardening_apply():
+    """W6-transactional flip to Hardened. Applies controls in order; on ANY failure
+    rolls back the controls already applied (reverse order) and stays Standard."""
+    h = load_hardening()
+    log_lines = []
+    log = log_lines.append
+    applied_ok = []
+    try:
+        for c in _hardening_registry():
+            if not c['apply'](h, log):
+                raise RuntimeError('apply failed: %s' % c['key'])
+            applied_ok.append(c)
+        h['posture'] = 'hardened'
+        _hardening_history(h, 'apply', 'hardened')
+        save_hardening(h)
+        audit('hardening:apply', 'posture=hardened')
+        return jsonify({'success': True, 'posture': 'hardened', 'log': log_lines})
+    except Exception as e:
+        for c in reversed(applied_ok):
+            try:
+                c['revert'](h, log)
+            except Exception:
+                log('rollback error on %s' % c.get('key'))
+        h['posture'] = 'standard'
+        _hardening_history(h, 'apply-rollback', str(e))
+        save_hardening(h)
+        return jsonify({'success': False, 'error': str(e), 'log': log_lines}), 500
+
+@app.route('/api/hardening/revert', methods=['POST'])
+@login_required
+def hardening_revert():
+    """Un-harden back to Standard. Reverts controls in reverse order. Audit (W3) is
+    one-way and intentionally not reverted (you don't un-audit)."""
+    h = load_hardening()
+    log_lines = []
+    log = log_lines.append
+    for c in reversed(_hardening_registry()):
+        try:
+            c['revert'](h, log)
+        except Exception:
+            log('revert error on %s' % c.get('key'))
+    h['posture'] = 'standard'
+    _hardening_history(h, 'revert', 'standard')
+    save_hardening(h)
+    audit('hardening:revert', 'posture=standard', force=True)
+    return jsonify({'success': True, 'posture': 'standard', 'log': log_lines})
+
+def _hardening_tls_posture(settings):
+    """Honest TLS line for the report. self-deploy boxes vary; never claim FIPS."""
+    mode = (settings.get('ssl_mode') or '').strip().lower()
+    if mode == 'custom':
+        return ('Operator-supplied certificate (BYO TLS, v0.9.51 custom-cert module).',
+                'pass')
+    if mode in ('fqdn', 'letsencrypt'):
+        return ("Let's Encrypt CA-issued certificate.", 'pass')
+    return ('Self-signed certificate — browsers will warn. Remediate with a CA-issued '
+            'or DNS-validated cert (Caddy/custom-cert module) before review.', 'warn')
+
+def _hardening_report_html(h, settings):
+    posture = h.get('posture') or 'standard'
+    host = html.escape(settings.get('fqdn') or settings.get('server_ip') or 'unknown')
+    generated = datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
+    bg = _breakglass_status()
+    tls_text, tls_status = _hardening_tls_posture(settings)
+
+    def badge(status):
+        c = {'pass': '#047857', 'fail': '#b91c1c', 'warn': '#a16207', 'na': '#475569'}.get(status, '#475569')
+        return '<span style="color:%s;font-weight:700">%s</span>' % (c, status.upper())
+
+    # Controls (W2/W3/W4 verify)
+    ctl_rows = []
+    for c in _hardening_registry():
+        ok, detail = c['verify'](h)
+        st = 'pass' if ok else ('na' if posture != 'hardened' else 'fail')
+        ctl_rows.append('<tr><td>%s</td><td>%s</td><td>%s</td></tr>'
+                        % (html.escape(c['title']), badge(st), html.escape(detail)))
+
+    # Boundary assertions (W4)
+    asrt_rows = []
+    for a in _hardening_assertions():
+        asrt_rows.append('<tr><td>%s</td><td>%s</td><td>%s</td></tr>'
+                         % (html.escape(a['label']), badge(a['status']), html.escape(a['detail'])))
+
+    # Control-mapping (provides / agency owns / hosting owns)
+    mapping = [
+        ('Unique-user ID + MFA for admin access', 'infra-TAK (W1 SSO+MFA via Authentik)',
+         'Provision per-user accounts; enroll MFA tokens'),
+        ('30-minute idle session lock', 'infra-TAK (W2)', '—'),
+        ('Audit trail: who/what/when', 'infra-TAK (W3 local)',
+         'Off-box retention &ge;365d to your SIEM/WORM (.56)'),
+        ('Network boundary / least-exposure', 'infra-TAK (W4 UFW+fail2ban, TAK mTLS)',
+         'Cloud security groups / NLB if used'),
+        ('TLS in transit', 'infra-TAK (Caddy/custom-cert)',
+         'FIPS-validated termination = cloud LB or on-prem terminator (.58)'),
+        ('Encryption at rest (CJI stores)', 'Deferred (.58 LUKS/Ubuntu Pro FIPS)',
+         'Provider disk encryption / agency policy'),
+        ('Physical security, US-soil, screened personnel', '—',
+         'Cloud provider (CJIS Security Addendum) + agency'),
+        ('Personnel screening, training, IR plan, agreements', '—', 'Agency (attestation)'),
+    ]
+    map_rows = ''.join('<tr><td>%s</td><td>%s</td><td>%s</td></tr>'
+                       % (m[0], m[1], m[2]) for m in mapping)
+
+    cjso = (
+        "This system (infra-TAK TAK stack) carries position and command-and-control data only. "
+        "Per agency policy, criminal history (CHRI) and NCIC query results are NOT entered into TAK "
+        "markers, chat, or data feeds. Administrative access to the console is per-user via SSO with "
+        "enforced MFA (TOTP or WebAuthn/FIDO2; use WebAuthn for phishing-resistant AAL2); all "
+        "administrative actions are logged with the acting user's "
+        "identity and timestamp. The admin console is not exposed to the internet (reachable only "
+        "through the authenticated reverse proxy). TLS is served with an agency- or CA-issued "
+        "certificate. Break-glass recovery requires on-box shell access and is auditable — it is not a "
+        "network backdoor. Hosting is on a US-sovereign cloud region (or agency on-prem); the cloud "
+        "provider owns the physical, personnel, and data-center CJIS controls under its Security Addendum.")
+
+    parts = []
+    parts.append('''<!DOCTYPE html><html><head><meta charset="UTF-8">
+<title>Security Posture Readiness Report — infra-TAK</title>
+<style>
+body{font-family:Arial,Helvetica,sans-serif;margin:40px;color:#0f172a;line-height:1.5;max-width:960px}
+h1{font-size:21px;margin-bottom:4px}h2{font-size:15px;margin:26px 0 8px;border-bottom:2px solid #e2e8f0;padding-bottom:4px}
+table{border-collapse:collapse;width:100%;margin:10px 0}td,th{border:1px solid #cbd5e1;padding:7px 11px;font-size:12.5px;text-align:left;vertical-align:top}
+th{background:#f1f5f9}.meta{color:#475569;font-size:12px}code{background:#f1f5f9;padding:1px 5px;border-radius:3px;font-size:11.5px}
+.box{background:#f8fafc;border:1px solid #cbd5e1;border-radius:6px;padding:14px 16px;font-size:12.5px;white-space:pre-wrap}
+.note{font-size:11.5px;color:#64748b;margin-top:4px}
+@media print{body{margin:0}}
+</style></head><body>''')
+    parts.append('<h1>infra-TAK — Security Posture Readiness Report</h1>')
+    parts.append('<p class="meta">Posture: <strong>%s</strong> &middot; Host: %s &middot; Console v%s &middot; Generated %s</p>'
+                 % (html.escape(posture.upper()), host, html.escape(VERSION), html.escape(generated)))
+    parts.append('<p class="note">Self-deploy evidence document. infra-TAK is not "CJIS certified" — no software is. '
+                 'This maps the technical controls this box provides versus those the agency and cloud provider own.</p>')
+
+    parts.append('<h2>1. Posture controls</h2><table><tr><th>Control</th><th>Status</th><th>Detail</th></tr>'
+                 + ''.join(ctl_rows) + '</table>')
+
+    parts.append('<h2>2. Boundary assertions (read-only)</h2><table><tr><th>Check</th><th>Status</th><th>Detail</th></tr>'
+                 + ''.join(asrt_rows) + '</table>')
+
+    parts.append('<h2>3. TLS / cryptography</h2>')
+    parts.append('<p style="font-size:12.5px">In transit: %s %s</p>' % (badge(tls_status), html.escape(tls_text)))
+    parts.append('<p class="note"><strong>FIPS (honest):</strong> in-transit uses TLS 1.2+ but Caddy/Go is '
+                 '<strong>not</strong> a FIPS-validated cryptographic module — remediate per policy with a FIPS-validated '
+                 'cloud LB or on-prem terminator (.58). At-rest CJI encryption is deferred to .58 (LUKS / Ubuntu Pro FIPS). '
+                 'FIPS 140-2 validations move to NIST&rsquo;s historical list 2026-09-21; target FIPS 140-3 for new procurement.</p>')
+
+    parts.append('<h2>4. Control mapping — who owns what</h2>'
+                 '<table><tr><th>Control area</th><th>infra-TAK provides</th><th>Agency / hosting owns</th></tr>'
+                 + map_rows + '</table>')
+
+    parts.append('<h2>5. Break-glass recovery</h2>')
+    parts.append('<p style="font-size:12.5px">Recovery path: <code>%s</code> &mdash; %s Status: %s.</p>'
+                 % (html.escape(bg['path']), html.escape(bg['note']),
+                    badge('pass' if bg['present'] else 'fail')))
+
+    parts.append('<h2>6. What to tell your security office</h2>')
+    parts.append('<p class="note">Editable starting statement for your CJSO/ISSO — adjust to your environment:</p>')
+    parts.append('<div class="box">%s</div>' % html.escape(cjso))
+
+    parts.append('<h2>7. Deployment guidance — reverse proxy / load balancer</h2>')
+    parts.append('<p style="font-size:12.5px"><strong>No load balancer &ne; non-compliant.</strong> The actual auth '
+                 'boundary is UFW deny-by-default + mTLS client-cert on the TAK Tomcat connectors — a box with no LB is '
+                 'fully defensible on that alone. On real clouds a Network Load Balancer in <strong>TCP passthrough</strong> '
+                 'in front of :8089/:8443 is optional (IP-hiding, flood absorption, HA). An on-box reverse proxy is a '
+                 '<em>want</em>, not a need; any proxy in front of TAK must be TCP passthrough (terminating TLS breaks '
+                 'TAK&rsquo;s client-cert auth). On-box HAProxy is not needed; multi-node HA is out of scope (single-box by design).</p>')
+
+    parts.append('</body></html>')
+    return ''.join(parts)
+
+@app.route('/api/hardening/report')
+@login_required
+def hardening_report():
+    """W5 — self-service Readiness Report (printable HTML): control verify results,
+    W4 boundary assertions, TLS/FIPS honesty, control-mapping (provides/agency/hosting
+    owns), break-glass statement, editable CJSO template, and NLB deployment guidance."""
+    html_doc = _hardening_report_html(load_hardening(), load_settings())
+    from flask import Response
+    return Response(html_doc, mimetype='text/html')
+
+@app.route('/api/hardening/assertions')
+@login_required
+def hardening_assertions():
+    """W4 — read-only boundary assertions (UFW/fail2ban/console/TAK Tomcat)."""
+    return jsonify({'assertions': _hardening_assertions()})
+
+@app.route('/api/hardening/audit')
+@login_required
+def hardening_audit():
+    """W3 — recent local audit lines (newest first). Local-only; .56 ships off-box."""
+    return jsonify({'enabled': bool((load_hardening().get('applied') or {}).get('W3_audit')),
+                    'path': _audit_path(),
+                    'lines': list(reversed(_audit_tail(80)))})
+
+@app.route('/hardening')
+@login_required
+def hardening_page():
+    h = load_hardening()
+    return render_template_string(HARDENING_TEMPLATE,
+        version=VERSION, posture=(h.get('posture') or 'standard'))
 
 @app.route('/marketplace')
 @login_required
@@ -6024,6 +6983,225 @@ def fail2ban_mediamtx_unban_api():
         return jsonify({'ok': False, 'error': 'Invalid IP address'}), 400
     try:
         r = subprocess.run(['fail2ban-client', 'set', 'mediamtx-rtsp', 'unbanip', ip],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            return jsonify({'ok': True, 'ip': ip})
+        return jsonify({'ok': False, 'error': r.stderr.strip()[:200] or 'Unban failed'}), 500
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+
+# --- TAK Portal public-form jail (/lookup apparatus credential + /request-access) ---
+# Bans source IPs that accumulate FAILED attempts on the portal's public forms
+# (bad domain / bad username / captcha fail) — i.e. enumeration of apparatus
+# call-signs or self-enrollment abuse. Defense-in-depth BEHIND the page's CAPTCHA.
+# Reads a structured log the TAK Portal writes (one line per attempt) — the SAME
+# file that serves as the apparatus-lookup audit. Contract the portal must honor:
+#   <ts> ip=<CLIENT_IP> page=<lookup|request-access> result=<ok|bad_domain|bad_user|captcha_fail|rate_limited> email=<x> rig=<y>
+# The IP MUST be the real client (Caddy X-Forwarded-For), or fail2ban bans Caddy.
+TAKPORTAL_F2B_LOG = '/var/log/tak-portal/lookup.log'
+
+def _f2b_portal_jail_enabled():
+    return os.path.exists('/etc/fail2ban/jail.d/infratak-takportal.conf')
+
+def _f2b_read_portal_jail_config():
+    """Read current thresholds + ignoreip from the infratak-takportal jail config."""
+    cfg = {'maxretry': 5, 'findtime': 600, 'bantime': 3600, 'ignoreip': ''}
+    jail_path = '/etc/fail2ban/jail.d/infratak-takportal.conf'
+    if not os.path.exists(jail_path):
+        return cfg
+    try:
+        with open(jail_path) as _f:
+            for line in _f:
+                line = line.strip()
+                for key in ('maxretry', 'findtime', 'bantime'):
+                    if line.startswith(key):
+                        try: cfg[key] = int(line.split('=')[1].strip())
+                        except Exception: pass
+                if line.startswith('ignoreip'):
+                    cfg['ignoreip'] = line.split('=', 1)[1].strip()
+    except Exception:
+        pass
+    return cfg
+
+def _f2b_write_portal_jail(maxretry, findtime, bantime, ignoreip=''):
+    """Write the takportal filter + infratak-takportal jail. Ensures the log file
+    exists so fail2ban can start the jail before the portal ships its log writer."""
+    os.makedirs('/etc/fail2ban/filter.d', exist_ok=True)
+    os.makedirs('/etc/fail2ban/jail.d', exist_ok=True)
+
+    # Ensure the logpath exists (empty is fine) — fail2ban refuses a missing logpath.
+    try:
+        os.makedirs(os.path.dirname(TAKPORTAL_F2B_LOG), exist_ok=True)
+        if not os.path.exists(TAKPORTAL_F2B_LOG):
+            with open(TAKPORTAL_F2B_LOG, 'a'):
+                pass
+            try: os.chmod(TAKPORTAL_F2B_LOG, 0o664)
+            except Exception: pass
+    except Exception:
+        pass
+
+    filter_path = '/etc/fail2ban/filter.d/takportal.conf'
+    filter_conf = (
+        "[Definition]\n"
+        "# Ban on FAILED public-form attempts only (result=ok is never matched), so\n"
+        "# legitimate repeat use of /lookup is never punished. Real client IP = ip=<HOST>.\n"
+        "failregex = ^.*\\bip=<HOST>\\b.*\\bresult=(bad_domain|bad_user|captcha_fail)\\b.*$\n"
+        "ignoreregex =\n"
+    )
+    with open(filter_path, 'w') as _f:
+        _f.write(filter_conf)
+
+    guarddog_action = ""
+    if os.path.exists('/etc/fail2ban/action.d/infratak-guarddog.conf'):
+        guarddog_action = "\n         infratak-guarddog"
+    ignoreip_line = f"ignoreip = 127.0.0.1/8 ::1{' ' + ignoreip.strip() if ignoreip.strip() else ''}\n"
+    jail_conf = (
+        "[takportal]\n"
+        "enabled  = true\n"
+        "filter   = takportal\n"
+        f"logpath  = {TAKPORTAL_F2B_LOG}\n"
+        f"maxretry = {maxretry}\n"
+        f"findtime = {findtime}\n"
+        f"bantime  = {bantime}\n"
+        f"{ignoreip_line}"
+        f"action   = ufw{guarddog_action}\n"
+    )
+    with open('/etc/fail2ban/jail.d/infratak-takportal.conf', 'w') as _f:
+        _f.write(jail_conf)
+
+
+@app.route('/api/fail2ban/takportal/status')
+@login_required
+def fail2ban_takportal_status_api():
+    """Return fail2ban status for the takportal jail (apparatus lookup / request-access)."""
+    if not _f2b_is_available():
+        return jsonify({'available': False, 'error': 'fail2ban not installed'})
+    try:
+        r = subprocess.run(['fail2ban-client', 'status', 'takportal'],
+                           capture_output=True, text=True, timeout=10)
+        status = _f2b_parse_status(r.stdout)
+        status['available']      = True
+        status['daemon_running'] = (subprocess.run(
+            ['systemctl', 'is-active', 'fail2ban'],
+            capture_output=True, text=True).stdout.strip() == 'active')
+        status['jail_enabled'] = _f2b_portal_jail_enabled()
+        status['jail_config']  = _f2b_read_portal_jail_config()
+        status['log_present']  = os.path.exists(TAKPORTAL_F2B_LOG)
+        status['log_path']     = TAKPORTAL_F2B_LOG
+        return jsonify(status)
+    except Exception as e:
+        return jsonify({'available': False, 'error': str(e)[:200]})
+
+
+@app.route('/api/fail2ban/takportal/config', methods=['POST'])
+@login_required
+def fail2ban_takportal_config_api():
+    """Enable/disable the takportal jail and update its thresholds."""
+    if not _f2b_is_available():
+        return jsonify({'ok': False, 'error': 'fail2ban not installed'}), 400
+    data    = request.get_json(force=True) or {}
+    enabled = bool(data.get('enabled', False))
+    if not enabled:
+        jail_path = '/etc/fail2ban/jail.d/infratak-takportal.conf'
+        if os.path.exists(jail_path):
+            os.remove(jail_path)
+        subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+        return jsonify({'ok': True, 'enabled': False})
+    try:
+        maxretry = max(1,  min(100,     int(data.get('maxretry', 5))))
+        findtime = max(10, min(86400,   int(data.get('findtime', 600))))
+        bantime  = max(60, min(2592000, int(data.get('bantime',  3600))))
+        ignoreip = str(data.get('ignoreip', '')).strip()
+    except (ValueError, TypeError) as e:
+        return jsonify({'ok': False, 'error': f'Invalid value: {e}'}), 400
+    try:
+        _f2b_write_portal_jail(maxretry, findtime, bantime, ignoreip)
+        _svc = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'fail2ban']),
+                              capture_output=True, text=True)
+        if _svc.stdout.strip() != 'active':
+            subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', 'fail2ban']),
+                           capture_output=True)
+        subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+        return jsonify({'ok': True, 'enabled': True,
+                        'maxretry': maxretry, 'findtime': findtime, 'bantime': bantime,
+                        'log_present': os.path.exists(TAKPORTAL_F2B_LOG)})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+
+@app.route('/api/fail2ban/takportal/watching')
+@login_required
+def fail2ban_takportal_watching_api():
+    """IPs seen failing the takportal jail (found but not yet banned)."""
+    import re as _re_watch
+    log_path = '/var/log/fail2ban.log'
+    result = []
+    try:
+        found_re = _re_watch.compile(r'\[takportal\] Found (\d[\d.:a-fA-F]+)')
+        ban_re   = _re_watch.compile(r'\[takportal\] Ban (\d[\d.:a-fA-F]+)')
+        unban_re = _re_watch.compile(r'\[takportal\] Unban (\d[\d.:a-fA-F]+)')
+        ts_re    = _re_watch.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})')
+        found_data = {}
+        banned_ips = set()
+        with open(log_path) as _lf:
+            for line in _lf:
+                m = ban_re.search(line)
+                if m: banned_ips.add(m.group(1)); continue
+                m = unban_re.search(line)
+                if m: banned_ips.discard(m.group(1)); continue
+                m = found_re.search(line)
+                if m:
+                    ip = m.group(1)
+                    ts_m = ts_re.match(line)
+                    ts = ts_m.group(1) if ts_m else ''
+                    if ip not in found_data:
+                        found_data[ip] = {'count': 0, 'last_seen': ts}
+                    found_data[ip]['count'] += 1
+                    found_data[ip]['last_seen'] = ts
+        for ip, data in found_data.items():
+            if ip not in banned_ips:
+                result.append({'ip': ip, 'attempts': data['count'], 'last_seen': data['last_seen']})
+        result.sort(key=lambda x: x['attempts'], reverse=True)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200], 'watching': []}), 500
+    return jsonify({'ok': True, 'watching': result})
+
+
+@app.route('/api/fail2ban/takportal/ban', methods=['POST'])
+@login_required
+def fail2ban_takportal_ban_api():
+    """Manually ban an IP in the takportal jail."""
+    if not _f2b_is_available():
+        return jsonify({'ok': False, 'error': 'fail2ban not installed'}), 400
+    data = request.get_json(force=True) or {}
+    ip = (data.get('ip') or '').strip()
+    if not ip or not _VALID_IP_RE.match(ip):
+        return jsonify({'ok': False, 'error': 'Invalid IP address'}), 400
+    try:
+        r = subprocess.run(['fail2ban-client', 'set', 'takportal', 'banip', ip],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            return jsonify({'ok': True, 'ip': ip})
+        return jsonify({'ok': False, 'error': r.stderr.strip()[:200] or 'Ban failed'}), 500
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+
+@app.route('/api/fail2ban/takportal/unban', methods=['POST'])
+@login_required
+def fail2ban_takportal_unban_api():
+    """Unban a specific IP from the takportal jail."""
+    if not _f2b_is_available():
+        return jsonify({'ok': False, 'error': 'fail2ban not installed'}), 400
+    data = request.get_json(force=True) or {}
+    ip   = str(data.get('ip', '')).strip()
+    if not ip or not _VALID_IP_RE.match(ip):
+        return jsonify({'ok': False, 'error': 'Invalid IP address'}), 400
+    try:
+        r = subprocess.run(['fail2ban-client', 'set', 'takportal', 'unbanip', ip],
                            capture_output=True, text=True, timeout=10)
         if r.returncode == 0:
             return jsonify({'ok': True, 'ip': ip})
@@ -12461,16 +13639,20 @@ def generate_caddyfile(settings=None):
     lines.append(f"        reverse_proxy 127.0.0.1:8080")
     lines.append(f"    }}")
     if ak.get('installed'):
-        lines.append(f"    route /login* {{")
-        lines.append(f"        reverse_proxy 127.0.0.1:5001 {{")
-        lines.append(f"            transport http {{")
-        lines.append(f"                tls")
-        lines.append(f"                tls_insecure_skip_verify")
-        lines.append(f"                read_timeout 1h")
-        lines.append(f"                write_timeout 1h")
-        lines.append(f"            }}")
-        lines.append(f"        }}")
-        lines.append(f"    }}")
+        # W1 (Hardened posture): drop the unauthenticated /login bypass so the
+        # shared-password page is no longer a network ingress — SSO+MFA only.
+        # Standard posture keeps it so password login works without Authentik.
+        if not _w1_console_locked():
+            lines.append(f"    route /login* {{")
+            lines.append(f"        reverse_proxy 127.0.0.1:5001 {{")
+            lines.append(f"            transport http {{")
+            lines.append(f"                tls")
+            lines.append(f"                tls_insecure_skip_verify")
+            lines.append(f"                read_timeout 1h")
+            lines.append(f"                write_timeout 1h")
+            lines.append(f"            }}")
+            lines.append(f"        }}")
+            lines.append(f"    }}")
         lines.append(f"    route {{")
         lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
         lines.append(f"        forward_auth {ak_up} {{")
@@ -24408,6 +25590,167 @@ function doUninstall(){var pw=document.getElementById('uninstall-password').valu
 </body></html>
 '''
 
+HARDENING_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Cyber Controls — infra-TAK</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet">
+<style>
+.material-symbols-outlined{font-family:'Material Symbols Outlined';font-weight:400;font-style:normal;font-size:20px;line-height:1;letter-spacing:normal;white-space:nowrap;direction:ltr;-webkit-font-smoothing:antialiased}
+.nav-icon.material-symbols-outlined{font-size:22px;width:22px;text-align:center}
+:root{--bg-deep:#080b14;--bg-surface:#0f1219;--bg-card:#161b26;--border:#1e2736;--text-primary:#f1f5f9;--text-secondary:#cbd5e1;--text-dim:#94a3b8;--accent:#3b82f6;--cyan:#06b6d4;--green:#10b981;--red:#ef4444;--yellow:#eab308}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',sans-serif;min-height:100vh;display:flex;flex-direction:row}
+.sidebar{width:220px;min-width:220px;background:var(--bg-surface);border-right:1px solid var(--border);padding:24px 0;flex-shrink:0}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;color:var(--text-secondary);text-decoration:none;font-size:13px;font-weight:500;transition:all .15s;border-left:2px solid transparent}
+.nav-item:hover{color:var(--text-primary);background:rgba(255,255,255,.03)}.nav-item.active{color:var(--cyan);background:rgba(6,182,212,.06);border-left-color:var(--cyan)}
+.sidebar-logo{padding:0 20px 24px;border-bottom:1px solid var(--border);margin-bottom:16px;overflow:visible;line-height:1.35}
+.sidebar-logo span{font-size:15px;font-weight:700;letter-spacing:.02em;color:var(--text-primary)}
+.sidebar-logo small{display:block;font-size:10px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;margin-top:2px}
+.main{flex:1;min-width:0;overflow-y:auto;padding:32px}
+.page-header{margin-bottom:28px}.page-header h1{font-size:22px;font-weight:700}.page-header p{color:var(--text-secondary);font-size:13px;margin-top:4px}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:20px}
+.card-title{font-size:13px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:16px}
+.status-banner{display:flex;align-items:center;gap:12px;padding:14px 18px;border-radius:10px;margin-bottom:20px;font-size:13px}
+.status-banner.running{background:rgba(16,185,129,.08);border:1px solid rgba(16,185,129,.2);color:var(--green)}
+.status-banner.stopped{background:rgba(234,179,8,.08);border:1px solid rgba(234,179,8,.2);color:var(--yellow)}
+.dot{width:8px;height:8px;border-radius:50%;background:currentColor}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:10px 20px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:none;text-decoration:none}
+.btn-primary{background:var(--accent);color:#fff}.btn-ghost{background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border)}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.ctl-row{display:flex;align-items:flex-start;gap:14px;padding:14px 16px;border:1px solid var(--border);background:var(--bg-deep);border-radius:8px;margin-bottom:8px}
+.ctl-health{width:9px;height:9px;border-radius:50%;flex-shrink:0;margin-top:5px;background:var(--text-dim)}
+.ctl-health.pass{background:var(--green);box-shadow:0 0 5px var(--green)}
+.ctl-health.off{background:var(--text-dim)}
+.ctl-body{flex:1}.ctl-title{font-weight:600;font-size:13px}.ctl-desc{color:var(--text-secondary);font-size:12px;line-height:1.5;margin-top:3px}
+.ctl-detail{color:var(--text-dim);font-size:11px;font-family:'JetBrains Mono',monospace;margin-top:4px}
+.bg-ok{color:var(--green);font-weight:600}.bg-bad{color:var(--red);font-weight:600}
+.hist-line{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);padding:3px 0}
+</style></head>
+<body>
+{{ sidebar_html }}
+<div class="main">
+  <div class="page-header"><h1 style="display:flex;align-items:center;gap:10px"><span class="nav-icon material-symbols-outlined" style="font-size:24px">shield_toggle</span><span>Cyber Controls</span></h1>
+  <p>Flip this assembled stack from the default <strong>Standard</strong> posture into <strong>Hardened</strong> — eliminating the on-sight disqualifiers a security reviewer fails a system for, then self-documenting what it did. Reversible, idempotent, with an on-box break-glass recovery path.</p></div>
+
+  <div id="posture-banner" class="status-banner stopped"><div class="dot"></div><span id="posture-text">Loading…</span></div>
+
+  <div class="card">
+    <div class="card-title">Posture controls</div>
+    <div id="controls">Loading…</div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Boundary assertions (W4) — read-only</div>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:10px">UFW, fail2ban, console exposure, and TAK Tomcat shielding. Nothing is changed here — these are checks for the readiness report. Deep Tomcat STIG remediation is .57.</p>
+    <div id="assertions">Loading…</div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Break-glass recovery (W6)</div>
+    <p style="font-size:13px;color:var(--text-secondary);line-height:1.6">If SSO/Authentik is ever down, console access is recovered from an <strong>on-box shell</strong> with <code style="background:var(--bg-deep);padding:2px 6px;border-radius:4px">./reset-console-password.sh</code> — an access-controlled, auditable path, <strong>not</strong> a network backdoor. Hardening can never permanently lock you out.</p>
+    <p id="breakglass-status" style="margin-top:10px;font-size:12px;font-family:'JetBrains Mono',monospace"></p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Actions</div>
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <button id="apply-btn" class="btn btn-primary" onclick="doApply()"><span class="material-symbols-outlined" style="font-size:18px">lock</span>Apply Hardened posture</button>
+      <button id="revert-btn" class="btn btn-ghost" onclick="doRevert()"><span class="material-symbols-outlined" style="font-size:18px">lock_open</span>Revert to Standard</button>
+      <a class="btn btn-ghost" href="/api/hardening/report" target="_blank"><span class="material-symbols-outlined" style="font-size:18px">description</span>Readiness Report</a>
+      <span id="action-msg" style="font-size:12px;margin-left:6px"></span>
+    </div>
+    <div id="action-log" class="ctl-detail" style="margin-top:12px;white-space:pre-wrap"></div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Recent activity</div>
+    <div id="history" style="font-size:12px;color:var(--text-dim)">—</div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Audit log (W3) — local, who/what/when</div>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:10px">Newest first. Off-box immutable shipping with &ge;365-day retention lands in .56; this is the local record.</p>
+    <div id="audit-log" class="log-box" style="background:#070a12;border:1px solid var(--border);border-radius:8px;padding:14px 16px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:300px;overflow:auto;white-space:pre-wrap">Loading…</div>
+  </div>
+</div>
+<script>
+function esc(s){var d=document.createElement('div');d.textContent=(s==null?'':String(s));return d.innerHTML;}
+function setBusy(b){document.getElementById('apply-btn').disabled=b;document.getElementById('revert-btn').disabled=b;}
+function renderStatus(d){
+  var hardened=(d.posture==='hardened');
+  var banner=document.getElementById('posture-banner');
+  banner.className='status-banner '+(hardened?'running':'stopped');
+  document.getElementById('posture-text').innerHTML='Current posture: <strong>'+(hardened?'HARDENED':'STANDARD')+'</strong>'+(hardened?' — security controls enforced':' — default behavior, nothing enforced');
+  // Posture-aware action buttons: the blue (primary) button is always the move AWAY from current state.
+  var applyBtn=document.getElementById('apply-btn'),revertBtn=document.getElementById('revert-btn');
+  if(hardened){
+    applyBtn.className='btn btn-ghost';applyBtn.disabled=true;
+    applyBtn.innerHTML='<span class="material-symbols-outlined" style="font-size:18px">check</span>Hardened posture active';
+    revertBtn.className='btn btn-primary';revertBtn.disabled=false;
+    revertBtn.innerHTML='<span class="material-symbols-outlined" style="font-size:18px">lock_open</span>Revert to Standard';
+  }else{
+    applyBtn.className='btn btn-primary';applyBtn.disabled=false;
+    applyBtn.innerHTML='<span class="material-symbols-outlined" style="font-size:18px">lock</span>Apply Hardened posture';
+    revertBtn.className='btn btn-ghost';revertBtn.disabled=true;
+    revertBtn.innerHTML='<span class="material-symbols-outlined" style="font-size:18px">lock_open</span>Revert to Standard';
+  }
+  var html='';
+  (d.controls||[]).forEach(function(c){
+    var on=hardened&&c.pass;
+    html+='<div class="ctl-row"><div class="ctl-health '+(on?'pass':'off')+'"></div>'+
+      '<div class="ctl-body"><div class="ctl-title">'+esc(c.title)+'</div>'+
+      '<div class="ctl-desc">'+esc(c.desc||'')+'</div>'+
+      '<div class="ctl-detail">'+(on?'ENFORCED':'not applied')+' — '+esc(c.detail||'')+'</div></div></div>';
+  });
+  document.getElementById('controls').innerHTML=html||'No controls registered yet.';
+  var bg=d.breakglass||{};
+  document.getElementById('breakglass-status').innerHTML=(bg.present?'<span class="bg-ok">&#10003; recovery script present</span>':'<span class="bg-bad">&#10007; recovery script MISSING</span>')+' &middot; '+esc(bg.path||'');
+  var h=(d.history||[]);
+  document.getElementById('history').innerHTML=h.length?h.slice().reverse().map(function(e){return '<div class="hist-line">'+esc(e.ts)+'  '+esc(e.actor)+'  '+esc(e.action)+' -> '+esc(e.result)+'</div>';}).join(''):'No activity yet.';
+}
+function loadStatus(){
+  fetch('/api/hardening/status').then(function(r){return r.json();}).then(renderStatus).catch(function(){document.getElementById('controls').textContent='Failed to load status.';});
+}
+function loadAssertions(){
+  fetch('/api/hardening/assertions').then(function(r){return r.json();}).then(function(d){
+    var map={pass:['pass','&#10003;','var(--green)'],fail:['fail','&#10007;','var(--red)'],warn:['off','&#9888;','var(--yellow)'],na:['off','&#8211;','var(--text-dim)']};
+    var html=(d.assertions||[]).map(function(a){
+      var m=map[a.status]||map.na;
+      return '<div class="ctl-row"><div class="ctl-health '+m[0]+'" style="background:'+m[2]+'"></div>'+
+        '<div class="ctl-body"><div class="ctl-title">'+esc(a.label)+' <span style="color:'+m[2]+';font-family:JetBrains Mono,monospace;font-size:11px">'+a.status.toUpperCase()+'</span></div>'+
+        '<div class="ctl-detail">'+esc(a.detail||'')+'</div></div></div>';
+    }).join('');
+    document.getElementById('assertions').innerHTML=html||'No assertions.';
+  }).catch(function(){document.getElementById('assertions').textContent='Failed to load assertions.';});
+}
+function loadAudit(){
+  fetch('/api/hardening/audit').then(function(r){return r.json();}).then(function(d){
+    var el=document.getElementById('audit-log');
+    var lines=(d.lines||[]);
+    if(!lines.length){el.textContent=d.enabled?'No audit entries yet.':'Audit log inactive (apply Hardened posture to enable).';return;}
+    el.innerHTML=lines.map(function(e){return esc(e.ts)+'  '+esc(e.user)+'  ['+esc(e.ip)+']  '+esc(e.event)+(e.detail?('  '+esc(e.detail)):'');}).join('\\n');
+  }).catch(function(){document.getElementById('audit-log').textContent='Failed to load audit log.';});
+}
+function postFlip(url,confirmMsg){
+  if(!confirm(confirmMsg))return;
+  setBusy(true);
+  var msg=document.getElementById('action-msg');msg.textContent='Working…';msg.style.color='var(--text-dim)';
+  document.getElementById('action-log').textContent='';
+  fetch(url,{method:'POST',headers:{'Content-Type':'application/json'}}).then(function(r){return r.json();}).then(function(d){
+    setBusy(false);
+    msg.textContent=d.success?('Done — posture: '+d.posture):('Error: '+(d.error||'failed'));
+    msg.style.color=d.success?'var(--green)':'var(--red)';
+    document.getElementById('action-log').textContent=(d.log||[]).join('\\n');
+    loadStatus();loadAssertions();loadAudit();
+  }).catch(function(e){setBusy(false);msg.textContent='Request failed';msg.style.color='var(--red)';});
+}
+function doApply(){postFlip('/api/hardening/apply','Apply HARDENED posture? This enforces the security controls listed above. You can revert at any time, and on-box break-glass recovery always works.');}
+function doRevert(){postFlip('/api/hardening/revert','Revert to STANDARD posture? This relaxes the hardening controls back to default behavior.');}
+loadStatus();loadAssertions();loadAudit();
+</script>
+</body></html>
+'''
+
 GUARDDOG_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>Guard Dog — infra-TAK</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -25185,6 +26528,78 @@ Bans IPs via UFW and sends Guard Dog email alerts.
 </div>
 </div><!-- /mediamtx-enabled-section -->
 </div><!-- /MediaMTX RTSP Jail card -->
+
+<!-- TAK Portal Form Jail -->
+<div class="card" id="takportal-jail-card" style="display:none">
+<div class="card-title" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0">
+<div style="display:flex;align-items:center;gap:10px">
+<span>TAK Portal Form Jail</span>
+<span class="badge badge-red" id="takportal-jail-badge" style="font-size:10px;padding:2px 8px"><span class="dot"></span>Disabled</span>
+</div>
+<div style="display:flex;align-items:center;gap:16px">
+<button id="takportal-refresh-btn" onclick="manualTpjRefresh()" style="background:none;border:none;cursor:pointer;color:var(--text-dim);font-size:12px;font-family:\'JetBrains Mono\',monospace;display:inline-flex;align-items:center;gap:5px;padding:0"><span id="takportal-refresh-icon" style="display:inline-block;transition:transform 0.4s">↻</span> Refresh</button>
+<label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:0">
+<span style="font-size:12px;color:var(--text-dim);font-family:\'JetBrains Mono\',monospace">Enable</span>
+<div class="toggle-wrap" style="position:relative;width:40px;height:22px">
+<input type="checkbox" id="takportal-toggle" onchange="toggleTpjJail()" style="opacity:0;width:0;height:0;position:absolute">
+<span id="takportal-toggle-track" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
+<span id="takportal-toggle-thumb" style="position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform .2s;pointer-events:none"></span>
+</div>
+</label>
+</div>
+</div>
+<div style="font-size:12px;color:var(--text-dim);margin-top:8px">Bans IPs that <strong>fail</strong> the public <code>/lookup</code> (apparatus credential) and <code>/request-access</code> (self-enrollment) forms — defense-in-depth behind the page CAPTCHA. Successful lookups never count toward a ban. Reads the TAK Portal request log <code>/var/log/tak-portal/lookup.log</code>, which is also the apparatus-lookup audit.</div>
+<div id="takportal-log-hint" style="display:none;font-size:11px;color:var(--yellow);margin-top:8px"></div>
+
+<div id="takportal-enabled-section" style="display:none">
+<div class="stat-grid" style="margin-top:20px;margin-bottom:8px">
+<div class="stat-card" id="takportal-banned-toggle" onclick="toggleTpjBanPanel()" style="cursor:pointer;transition:border-color 0.2s" title="Click to see banned IPs">
+<div class="stat-value red" id="takportal-stat-banned">0</div>
+<div class="stat-label">Currently Banned <span style="font-size:10px;color:var(--text-dim)" id="takportal-banned-caret">▼ details</span></div>
+</div>
+<div class="stat-card" id="takportal-watching-toggle" onclick="toggleTpjWatchingPanel()" style="cursor:pointer;transition:border-color 0.2s" title="Click to see IPs being watched">
+<div class="stat-value yellow" id="takportal-stat-failed">0</div>
+<div class="stat-label">Currently Watching <span style="font-size:10px;color:var(--text-dim)" id="takportal-watching-caret">▼ details</span></div>
+</div>
+<div class="stat-card" title="Since the fail2ban service was last started or restarted"><div class="stat-value cyan" id="takportal-stat-total-banned">0</div><div class="stat-label">Total Banned <span style="font-size:9px;color:var(--text-dim)">(since last restart)</span></div></div>
+</div>
+
+<div id="takportal-ban-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
+<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">Banned IPs — click Unban to release</div>
+<input type="text" id="takportal-ban-search" oninput="filterTpjBanList()" placeholder="Search IP…" style="width:100%;box-sizing:border-box;margin-bottom:10px;padding:6px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px;outline:none">
+<div id="takportal-ban-list-container" style="max-height:240px;overflow-y:auto">
+<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>
+</div>
+</div>
+
+<div id="takportal-watching-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
+<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px">IPs Under Watch — failed attempts within the find window, not yet banned</div>
+<input type="text" id="takportal-watching-search" oninput="filterTpjWatchingList()" placeholder="Search IP…" style="width:100%;box-sizing:border-box;margin-bottom:10px;padding:6px 10px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px;outline:none">
+<div id="takportal-watching-list"><div style="color:var(--text-dim);font-size:13px;font-family:monospace">Loading…</div></div>
+</div>
+
+<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:16px">
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Max Retries</label>
+<input class="form-input" type="number" id="takportal-cfg-maxretry" value="5" min="1" max="100">
+<div class="form-hint">Failed attempts before ban</div>
+</div>
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Find Window (seconds)</label>
+<input class="form-input" type="number" id="takportal-cfg-findtime" value="600" min="10" max="86400">
+<div class="form-hint">Window to count failures</div>
+</div>
+<div class="form-row" style="margin-bottom:0">
+<label class="form-label">Ban Duration (minutes)</label>
+<input class="form-input" type="number" id="takportal-cfg-bantime" value="60" min="1" max="43200">
+<div class="form-hint">How long to ban the IP</div>
+</div>
+</div>
+<div style="margin-top:16px">
+<button class="btn-primary" onclick="saveTpjConfig()">Save &amp; Reload</button>
+</div>
+</div><!-- /takportal-enabled-section -->
+</div><!-- /TAK Portal Form Jail card -->
 
 <!-- TAK Server Jail -->
 <div class="card" id="tak-jail-card" style="display:none">
@@ -26109,6 +27524,185 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
 
   loadMtxStatus();
   setInterval(function(){ loadMtxStatus(); if (_mtxWatchingPanelOpen) _loadMtxWatchingList(); }, 30000);
+})();
+
+// TAK Portal Form Jail
+(function(){
+  var card = document.getElementById(\'takportal-jail-card\');
+  if (!card) return;
+
+  function loadTpjStatus() {
+    fetch(\'/api/fail2ban/takportal/status\').then(function(r){ return r.json(); }).then(function(d){
+      if (!d.available) return;
+      card.style.display = \'\';
+      var badge  = document.getElementById(\'takportal-jail-badge\');
+      var toggle = document.getElementById(\'takportal-toggle\');
+      var sec    = document.getElementById(\'takportal-enabled-section\');
+      var hint   = document.getElementById(\'takportal-log-hint\');
+      if (badge) {
+        if (d.jail_enabled) { badge.className=\'badge badge-green\'; badge.innerHTML=\'<span class="dot dot-pulse"></span>Active\'; }
+        else                { badge.className=\'badge badge-red\';   badge.innerHTML=\'<span class="dot"></span>Disabled\'; }
+      }
+      if (toggle) toggle.checked = d.jail_enabled;
+      var trk = document.getElementById(\'takportal-toggle-track\');
+      var thb = document.getElementById(\'takportal-toggle-thumb\');
+      if (trk) trk.style.background = d.jail_enabled ? \'var(--green)\' : \'var(--border)\';
+      if (thb) thb.style.transform  = d.jail_enabled ? \'translateX(18px)\' : \'\';
+      if (sec) sec.style.display = d.jail_enabled ? \'\' : \'none\';
+      if (hint) {
+        if (d.jail_enabled && !d.log_present) {
+          hint.style.display = \'\';
+          hint.innerHTML = \'⚠ Jail armed, but the portal log \'+(d.log_path||\'\')+\' has no entries yet — waiting for the TAK Portal writer. It will act as soon as lines arrive.\';
+        } else { hint.style.display = \'none\'; }
+      }
+      if (d.jail_enabled) {
+        document.getElementById(\'takportal-stat-banned\').textContent       = d.currently_banned !== undefined ? d.currently_banned : 0;
+        document.getElementById(\'takportal-stat-failed\').textContent       = d.currently_failed !== undefined ? d.currently_failed : 0;
+        document.getElementById(\'takportal-stat-total-banned\').textContent = d.total_banned      !== undefined ? d.total_banned      : 0;
+        var cfg = d.jail_config || {};
+        if (cfg.maxretry) document.getElementById(\'takportal-cfg-maxretry\').value = cfg.maxretry;
+        if (cfg.findtime) document.getElementById(\'takportal-cfg-findtime\').value = cfg.findtime;
+        if (cfg.bantime)  document.getElementById(\'takportal-cfg-bantime\').value  = Math.round(cfg.bantime / 60);
+        var ips = d.banned_ips || [];
+        window._tpjBannedIps = ips;
+        renderTpjBanList(ips);
+      }
+    }).catch(function(){});
+  }
+
+  window.toggleTpjJail = function() {
+    var enabled = document.getElementById(\'takportal-toggle\').checked;
+    if (!enabled) {
+      fetch(\'/api/fail2ban/takportal/config\', {method:\'POST\', headers:{\'Content-Type\':\'application/json\'}, body:JSON.stringify({enabled:false})})
+        .then(function(r){ return r.json(); }).then(function(d){
+          if (d.ok) { showToast(\'TAK Portal form jail disabled.\', \'success\'); loadTpjStatus(); }
+          else { showToast(d.error || \'Failed to disable\', \'error\'); loadTpjStatus(); }
+        }).catch(function(){ showToast(\'Network error\', \'error\'); loadTpjStatus(); });
+    } else {
+      saveTpjConfig();
+    }
+  };
+
+  window.saveTpjConfig = function() {
+    var body = {
+      enabled:  true,
+      maxretry: parseInt(document.getElementById(\'takportal-cfg-maxretry\').value) || 5,
+      findtime: parseInt(document.getElementById(\'takportal-cfg-findtime\').value)  || 600,
+      bantime:  (parseInt(document.getElementById(\'takportal-cfg-bantime\').value)  || 60) * 60
+    };
+    fetch(\'/api/fail2ban/takportal/config\', {method:\'POST\', headers:{\'Content-Type\':\'application/json\'}, body:JSON.stringify(body)})
+      .then(function(r){ return r.json(); }).then(function(d){
+        if (d.ok) { showToast(\'TAK Portal form jail \' + (d.enabled ? \'enabled and saved.\' : \'disabled.\'), \'success\'); loadTpjStatus(); }
+        else showToast(d.error || \'Save failed\', \'error\');
+      }).catch(function(){ showToast(\'Network error\', \'error\'); });
+  };
+
+  window._tpjBannedIps = [];
+  window.renderTpjBanList = function(ips) {
+    var c = document.getElementById(\'takportal-ban-list-container\'); if (!c) return;
+    if (!ips.length) { c.innerHTML=\'<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>\'; return; }
+    var rows = ips.map(function(ip){
+      return \'<tr style="border-bottom:1px solid var(--border)"><td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">\'+ip+\'</td>\'+
+        \'<td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="unbanTpjIP(\\\'\'+ip+\'\\\')">Unban</button></td></tr>\';
+    }).join(\'\');
+    c.innerHTML = \'<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em"><th style="padding:4px 8px;text-align:left">IP Address</th><th style="padding:4px 8px;text-align:right">Action</th></tr></thead><tbody>\'+rows+\'</tbody></table>\';
+  };
+
+  window.filterTpjBanList = function() {
+    var q = (document.getElementById(\'takportal-ban-search\').value || \'\').trim().toLowerCase();
+    var filtered = q ? window._tpjBannedIps.filter(function(ip){ return ip.toLowerCase().indexOf(q) !== -1; }) : window._tpjBannedIps;
+    renderTpjBanList(filtered);
+  };
+
+  var _tpjWatchingPanelOpen = false;
+  window._tpjWatchingList = [];
+
+  window.renderTpjWatchingList = function(list) {
+    var c = document.getElementById(\'takportal-watching-list\'); if (!c) return;
+    if (!list.length) { c.innerHTML=\'<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently being watched.</div>\'; return; }
+    var rows = list.map(function(w){
+      return \'<tr style="border-bottom:1px solid var(--border)">\'+
+        \'<td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">\'+w.ip+\'</td>\'+
+        \'<td style="padding:5px 8px;text-align:right;font-size:12px;color:var(--yellow)">\'+w.attempts+\'</td>\'+
+        \'<td style="padding:5px 8px;font-size:11px;color:var(--text-dim)">\'+w.last_seen+\'</td>\'+
+        \'<td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="banTpjIP(\\\'\'+w.ip+\'\\\')">Ban Now</button></td></tr>\';
+    }).join(\'\');
+    c.innerHTML = \'<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em"><th style="padding:4px 8px;text-align:left">IP Address</th><th style="padding:4px 8px;text-align:right">Attempts</th><th style="padding:4px 8px">Last Seen</th><th style="padding:4px 8px;text-align:right">Action</th></tr></thead><tbody>\'+rows+\'</tbody></table>\';
+  };
+
+  window.filterTpjWatchingList = function() {
+    var q = (document.getElementById(\'takportal-watching-search\').value || \'\').trim().toLowerCase();
+    window.renderTpjWatchingList(q ? window._tpjWatchingList.filter(function(w){ return w.ip.indexOf(q) !== -1; }) : window._tpjWatchingList);
+  };
+
+  function _loadTpjWatchingList() {
+    fetch(\'/api/fail2ban/takportal/watching\').then(function(r){ return r.json(); }).then(function(d){
+      window._tpjWatchingList = d.watching || [];
+      var s = document.getElementById(\'takportal-watching-search\');
+      var q = s ? s.value.trim().toLowerCase() : \'\';
+      window.renderTpjWatchingList(q ? window._tpjWatchingList.filter(function(w){ return w.ip.indexOf(q) !== -1; }) : window._tpjWatchingList);
+    }).catch(function(){
+      var el = document.getElementById(\'takportal-watching-list\');
+      if (el) el.innerHTML = \'<div style="color:var(--text-dim);font-size:12px">Error loading watch list.</div>\';
+    });
+  }
+
+  window.toggleTpjWatchingPanel = function() {
+    _tpjWatchingPanelOpen = !_tpjWatchingPanelOpen;
+    var panel  = document.getElementById(\'takportal-watching-panel\');
+    var caret  = document.getElementById(\'takportal-watching-caret\');
+    var toggle = document.getElementById(\'takportal-watching-toggle\');
+    if (_tpjWatchingPanelOpen) {
+      if (panel)  panel.style.display = \'block\';
+      if (caret)  caret.textContent = \'▲ hide\';
+      if (toggle) toggle.style.borderColor = \'var(--yellow)\';
+      _loadTpjWatchingList();
+    } else {
+      if (panel)  panel.style.display = \'none\';
+      if (caret)  caret.textContent = \'▼ details\';
+      if (toggle) toggle.style.borderColor = \'\';
+    }
+  };
+
+  window.toggleTpjBanPanel = function() {
+    var panel = document.getElementById(\'takportal-ban-panel\');
+    var caret = document.getElementById(\'takportal-banned-caret\');
+    if (!panel) return;
+    var open = panel.style.display !== \'none\';
+    panel.style.display = open ? \'none\' : \'\';
+    if (caret) caret.textContent = open ? \'▼ details\' : \'▲ details\';
+    if (!open) { var s = document.getElementById(\'takportal-ban-search\'); if(s) s.value=\'\'; renderTpjBanList(window._tpjBannedIps); }
+  };
+
+  window.unbanTpjIP = function(ip) {
+    if (!confirm(\'Unban \' + ip + \' from the TAK Portal form jail?\')) return;
+    fetch(\'/api/fail2ban/takportal/unban\', {method:\'POST\', headers:{\'Content-Type\':\'application/json\'}, body:JSON.stringify({ip:ip})})
+      .then(function(r){ return r.json(); }).then(function(d){
+        if (d.ok) { showToast(ip + \' unbanned.\', \'success\'); loadTpjStatus(); }
+        else showToast(d.error || \'Unban failed\', \'error\');
+      }).catch(function(){ showToast(\'Network error\', \'error\'); });
+  };
+
+  window.banTpjIP = function(ip) {
+    if (!confirm(\'Manually ban \' + ip + \' from the TAK Portal form jail now?\')) return;
+    fetch(\'/api/fail2ban/takportal/ban\', {method:\'POST\', headers:{\'Content-Type\':\'application/json\'}, body:JSON.stringify({ip:ip})})
+      .then(function(r){ return r.json(); }).then(function(d){
+        if (d.ok) { showToast(ip + \' banned.\', \'success\'); loadTpjStatus(); if (_tpjWatchingPanelOpen) _loadTpjWatchingList(); }
+        else showToast(d.error || \'Ban failed\', \'error\');
+      }).catch(function(){ showToast(\'Network error\', \'error\'); });
+  };
+
+  window.manualTpjRefresh = function() {
+    _spinIcon(\'takportal-refresh-icon\', true);
+    var btn = document.getElementById(\'takportal-refresh-btn\');
+    if (btn) btn.disabled = true;
+    loadTpjStatus();
+    if (_tpjWatchingPanelOpen) _loadTpjWatchingList();
+    setTimeout(function(){ _spinIcon(\'takportal-refresh-icon\', false); if (btn) btn.disabled = false; }, 1200);
+  };
+
+  loadTpjStatus();
+  setInterval(function(){ loadTpjStatus(); if (_tpjWatchingPanelOpen) _loadTpjWatchingList(); }, 30000);
 })();
 
 // Repeat Offender Protection
@@ -55664,6 +57258,15 @@ def _startup_migrations():
                     _authentik_verify_runtime_config(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as ak_tune_err:
             print(f"Startup migration: authentik tunings error (non-fatal): {ak_tune_err}")
+
+        # v0.9.55: Fleet-uniform login/MFA copy — replace the stock "Welcome to authentik!" /
+        # "TOTP Device" / "WebAuthn device" wording with plain-English text. Idempotent no-op
+        # once applied; gated on Authentik being present + reachable.
+        try:
+            if os.path.exists(os.path.expanduser('~/authentik/.env')):
+                _ensure_authentik_login_copy(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as ak_copy_err:
+            print(f"Startup migration: authentik login copy error (non-fatal): {ak_copy_err}")
 
         # v0.8.8: Bump idle_in_transaction_session_timeout 30s → 300s. MUST run before
         # the recursion fix below, because the recursion fix restarts authentik-server,
