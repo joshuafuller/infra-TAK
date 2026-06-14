@@ -313,16 +313,23 @@ def _request_host_is_ip():
 
 @app.before_request
 def ensure_session_cookie_domain():
-    """When access is via IP (backdoor), do not set cookie domain so the cookie is sent. Otherwise use FQDN for cross-subdomain."""
-    if _request_host_is_ip():
+    """Pin the session cookie to the FQDN ONLY when the request actually arrives on the FQDN
+    (SSO at infratak.<fqdn>, which needs the cross-subdomain cookie). For ANY other host — a bare
+    IP, `localhost`, or the SSH-tunnel break-glass path — use a host-only cookie. Otherwise the
+    browser silently drops a `.<fqdn>`-scoped cookie that was set over localhost/IP, the session
+    never persists, and the break-glass login bounces back to /login ('flash'). The earlier code
+    only special-cased a literal IP, so `https://localhost:5001` break-glass was broken on every
+    box that has an FQDN configured. (Found 2026-06-13 validating W-IDLE break-glass on test6.)"""
+    host = (request.host or '').split(':')[0].lower()
+    fqdn = ''
+    try:
+        fqdn = (load_settings().get('fqdn') or '').split(':')[0].lower()
+    except Exception:
+        fqdn = ''
+    if fqdn and (host == fqdn or host.endswith('.' + fqdn)):
+        app.config['SESSION_COOKIE_DOMAIN'] = '.' + fqdn
+    else:
         app.config['SESSION_COOKIE_DOMAIN'] = False
-    elif not app.config.get('SESSION_COOKIE_DOMAIN'):
-        try:
-            s = load_settings()
-            if s.get('fqdn'):
-                app.config['SESSION_COOKIE_DOMAIN'] = '.' + s['fqdn'].split(':')[0]
-        except Exception:
-            pass
 
     # Baseline rate limiting
     ip = _client_ip()
@@ -369,7 +376,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.55-alpha"
+VERSION = "0.9.56-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -2124,15 +2131,39 @@ def is_hardened():
     return _hardening_posture() == 'hardened'
 
 # --- W2: 30-minute server-side session idle lock ---------------------------
-# The control's apply/verify/revert only records intent in hardening.json; the
-# authoritative enforcement is this before_request hook, which is always present
-# but only bites when posture == 'hardened'. Under the password-auth path this is
-# the full lock. KNOWN GAP under SSO (W1): clearing the Flask session redirects
-# through Caddy forward_auth, which re-validates against a still-live Authentik
-# session and silently re-authenticates — so the idle lock refreshes rather than
-# re-prompting. Making it re-prompt needs an Authentik session-duration mirror
-# (brand/flow), which is fleet-affecting and not yet built/tested — tracked as the
-# top W1 follow-up; do not claim a working SSO idle-lock until it is validated.
+# --- W-IDLE (v0.9.56): make that lock truly re-prompt under SSO ------------
+WIDLE_STATE_KEY = 'WIDLE_sso'
+# The forward_auth embedded outpost's sign-out path. Lives on the protected host
+# (infratak.<fqdn>); Caddy routes /outpost.goauthentik.io/* to the Authentik outpost.
+# Hitting it clears the outpost session so the next request forces a full re-prompt.
+# (Confirm the exact path on a live forward_auth box before declaring the gap closed.)
+AK_FORWARD_AUTH_SIGNOUT = '/outpost.goauthentik.io/sign_out'
+
+def _widle_sso_logout_active(h):
+    """v0.9.56 W-IDLE — True when an idle lock must force a TRUE SSO re-prompt by signing the
+    browser out of the forward_auth outpost (not merely clearing the Flask session). Requires:
+    the W-IDLE control applied, W1 has SSO-locked the console, AND this very request arrived
+    through forward_auth — it carries the X-Authentik-Username header the local Caddy proxy
+    injects. That last check is essential: the console is ALSO reachable on the loopback
+    break-glass path (127.0.0.1:5001 direct / SSH tunnel) where there is no outpost to sign out
+    of and /outpost.goauthentik.io/* is not served by gunicorn (a sign-out redirect there just
+    times out). On that path this returns False and W2 falls back to the plain console /login."""
+    try:
+        if not ((h.get('applied') or {}).get(WIDLE_STATE_KEY) and _w1_console_locked()):
+            return False
+        return bool(request.headers.get('X-Authentik-Username'))
+    except Exception:
+        return False
+
+# The W2 control's apply/verify/revert only record intent in hardening.json; the
+# authoritative enforcement is this before_request hook, always present but only
+# biting when posture == 'hardened'. On the password-auth path, clearing the Flask
+# session IS the full lock. Under SSO (W1) that alone is silently re-authed by
+# forward_auth against a still-live Authentik session — so when W-IDLE is armed we
+# additionally sign the browser out of the outpost, forcing a fresh login + MFA.
+# Fail-safe: the Flask session is cleared first, so even if sign-out is unreachable
+# the local lock still holds (it just may silently re-auth on that box — which is
+# why the SSO re-prompt is not claimed working until validated on a real box).
 @app.before_request
 def _enforce_session_idle_lock():
     try:
@@ -2145,12 +2176,35 @@ def _enforce_session_idle_lock():
         idle_max = int(a.get('idle_max_seconds', SESSION_IDLE_MAX_DEFAULT))
         now = int(time.time())
         last = session.get('last_activity')
+        # "Activity" must mean a real USER action, not the page's own background polling.
+        # The console dashboard auto-refreshes /api/metrics every 5s, module cards every 8s,
+        # etc. — if every request reset the clock, last_activity would never age past a few
+        # seconds and the idle lock could NEVER fire while a tab is open (it silently didn't —
+        # caught in v0.9.56 W-IDLE validation; the shipped W2 lock had the same hole). So a
+        # read-only GET to /api/* (a poll/data-fetch) does NOT count as activity; only a page
+        # navigation (non-/api GET) or a state-changing call (POST/PUT/PATCH/DELETE) does.
+        is_poll = request.path.startswith('/api/') and request.method == 'GET'
         if last is not None and (now - int(last)) > idle_max:
-            session.clear()
             if request.path.startswith('/api/'):
+                # Don't reset the clock or kill the SSO session on a background poll — just
+                # signal expiry. The true re-prompt fires on the next full-page navigation.
                 return jsonify({'error': 'Session expired (idle lock).', 'login_required': True}), 401
+            session.clear()  # local lock always holds, regardless of what follows
+            if _widle_sso_logout_active(h):
+                # Sign out of the forward_auth outpost so the next request re-prompts. Use the
+                # ABSOLUTE SSO URL captured at apply time — request.host/host_url are the loopback
+                # upstream Caddy proxies to (127.0.0.1:5001), not the SSO vhost. Lazily fall back to
+                # https://infratak.<fqdn> for sessions armed before this URL was stored.
+                surl = ((h.get('applied') or {}).get(WIDLE_STATE_KEY) or {}).get('signout_url')
+                if not surl:
+                    fqdn = (load_settings() or {}).get('fqdn')
+                    if fqdn:
+                        surl = 'https://infratak.%s%s' % (fqdn, AK_FORWARD_AUTH_SIGNOUT)
+                if surl:
+                    return redirect(surl)
             return redirect(url_for('login'))
-        session['last_activity'] = now
+        if not is_poll:
+            session['last_activity'] = now
     except Exception:
         # A lock failure must never brick a request — fail open to the normal flow.
         return
@@ -2172,6 +2226,54 @@ def _hardening_control_w2():
         return True
     return {'key': 'W2_session', 'title': '30-minute session lock',
             'desc': 'Server-side idle timeout forces re-authentication after 30 minutes (CJIS 5.5.5).',
+            'apply': apply_, 'verify': verify, 'revert': revert}
+
+def _hardening_control_widle():
+    """W-IDLE (v0.9.56) — make the W2 idle lock truly re-prompt under SSO. With W1's forward_auth
+    ingress, a plain session.clear() is silently re-authed by Authentik; this arms the W2 hook
+    (_enforce_session_idle_lock) to instead sign the browser out of the forward_auth outpost on
+    idle. State-only control — the enforcement is the always-present hook, gated on this applied
+    flag AND W1 having SSO-locked the console (so it is inert on a password-only box)."""
+    def apply_(h, log):
+        # Capture the console's ABSOLUTE SSO sign-out URL now. It can't be built per-request:
+        # Caddy proxies to gunicorn with the upstream Host (127.0.0.1:5001), so request.host /
+        # request.host_url are the loopback origin, not the SSO vhost. Derive it from the
+        # infra-TAK proxy provider's external_host (fallback: https://infratak.<fqdn>).
+        ak_url, ak_headers, settings = _w1_ak_ctx()
+        signout_url = None
+        try:
+            if ak_url:
+                for p in _w1_ak_get(ak_url, 'providers/proxy/?page_size=100', ak_headers).get('results', []):
+                    eh = (p.get('external_host') or '').rstrip('/')
+                    if eh and 'infratak' in eh:
+                        signout_url = eh + AK_FORWARD_AUTH_SIGNOUT
+                        break
+        except Exception as e:
+            log('W-IDLE: proxy lookup failed (%s)' % str(e)[:80])
+        if not signout_url:
+            fqdn = (settings or {}).get('fqdn')
+            if fqdn:
+                signout_url = 'https://infratak.%s%s' % (fqdn, AK_FORWARD_AUTH_SIGNOUT)
+        h.setdefault('applied', {})[WIDLE_STATE_KEY] = {
+            'mode': 'sso_signout', 'signout_path': AK_FORWARD_AUTH_SIGNOUT, 'signout_url': signout_url}
+        log('W-IDLE: SSO idle-lock re-prompt armed (sign-out → %s)'
+            % (signout_url or '(unresolved → /login fallback)'))
+        return True
+    def verify(h):
+        a = (h.get('applied') or {}).get(WIDLE_STATE_KEY)
+        if not a:
+            return (False, 'SSO idle-lock re-prompt not armed')
+        if not _w1_console_locked():
+            return (True, 'armed; inert until W1 SSO-locks the console')
+        return (True, 'idle lock forces SSO re-auth via %s' % (a.get('signout_url') or AK_FORWARD_AUTH_SIGNOUT))
+    def revert(h, log):
+        (h.get('applied') or {}).pop(WIDLE_STATE_KEY, None)
+        log('W-IDLE: SSO idle-lock re-prompt disarmed (W2 falls back to local session clear)')
+        return True
+    return {'key': WIDLE_STATE_KEY, 'title': 'SSO idle-lock re-prompt',
+            'desc': 'Under SSO the 30-minute idle lock signs you out of Authentik, so re-access needs '
+                    'a fresh login + MFA instead of a silent re-auth. Because an SSO session is shared, '
+                    'this logs you out of all Authentik-fronted apps at once.',
             'apply': apply_, 'verify': verify, 'revert': revert}
 
 # --- W3: local per-user audit log (JSONL) ----------------------------------
@@ -2218,6 +2320,12 @@ def audit(event, detail='', force=False):
             os.chmod(p, 0o600)
         except Exception:
             pass
+        # W7: also queue the line for off-box shipping (fail-open; never blocks here).
+        try:
+            if _offbox_enabled():
+                _offbox_spool(line)
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -2254,6 +2362,206 @@ def _audit_state_changes(response):
         pass
     return response
 
+# ---- W7: off-box immutable audit shipping (v0.9.56) -----------------------
+# Local JSONL (W3) stays the source of truth; W7 mirrors each audit line to an
+# off-box sink so the >=365-day copy lives where the box admin cannot rewrite it.
+# Pluggable: syslog/CEF -> SIEM, or S3-compatible Object-Lock (WORM) bucket.
+# Fail-open + buffered: audit() spools locally; a background thread flushes with
+# retry. A sink failure never blocks a request or the posture flip, and the
+# backlog is surfaced (never silently dropped). Resolves the retention-vs-load
+# tension with W8: short LOCAL Authentik/console retention, the compliance copy off-box.
+OFFBOX_SPOOL_NAME = 'offbox-spool.jsonl'
+OFFBOX_RETENTION_FLOOR = 365            # fleet floor (days); an agency may set higher, never lower
+_offbox_status = {'last_ship_ts': None, 'last_error': None, 'shipped_total': 0}
+_OFFBOX_LOCK = threading.Lock()
+
+def _offbox_spool_path():
+    return os.path.join(CONFIG_DIR, AUDIT_DIR_NAME, OFFBOX_SPOOL_NAME)
+
+def _offbox_config():
+    return (load_hardening().get('offbox_config') or {})
+
+def _offbox_enabled():
+    h = load_hardening()
+    if (h.get('posture') or 'standard') != 'hardened':
+        return False
+    if not (h.get('applied') or {}).get('W7_offbox', {}).get('active'):
+        return False
+    return (h.get('offbox_config') or {}).get('mode', 'off') in ('syslog', 's3objlock')
+
+def _offbox_spool(line_str):
+    try:
+        os.makedirs(os.path.join(CONFIG_DIR, AUDIT_DIR_NAME), exist_ok=True)
+        p = _offbox_spool_path()
+        with open(p, 'a') as f:
+            f.write(line_str + '\n')
+        os.chmod(p, 0o600)
+    except Exception:
+        pass
+
+def _offbox_backlog():
+    try:
+        p = _offbox_spool_path()
+        if not os.path.exists(p):
+            return 0
+        with open(p) as f:
+            return sum(1 for ln in f if ln.strip())
+    except Exception:
+        return 0
+
+def _offbox_to_cef(rec):
+    """Map one audit record to a CEF line (ArcSight-style) for SIEM ingestion."""
+    hdr = 'CEF:0|infra-TAK|console|%s|audit|%s|3|' % (VERSION, rec.get('event', 'event'))
+    ext = 'rt=%s suser=%s src=%s msg=%s' % (
+        rec.get('ts', ''), rec.get('user', ''), rec.get('ip', ''),
+        str(rec.get('detail', '')).replace('\n', ' ').replace('=', '\\='))
+    return hdr + ext
+
+def _offbox_ship_syslog(lines, cfg):
+    """Ship spooled audit lines as RFC5424/CEF over TCP (optionally TLS). Returns
+    (n_shipped, error_or_None); never raises — the error is surfaced via status."""
+    import socket as _socket, ssl as _ssl
+    sink = cfg.get('syslog') or {}
+    host = sink.get('host'); port = int(sink.get('port') or 6514)
+    if not host:
+        return (0, 'no syslog host configured')
+    use_tls = sink.get('tls', True)
+    fqdn = (load_settings().get('fqdn') or 'console')
+    try:
+        raw = _socket.create_connection((host, port), timeout=10)
+        sock = _ssl.create_default_context().wrap_socket(raw, server_hostname=host) if use_tls else raw
+    except Exception as e:
+        return (0, 'connect %s:%s failed: %s' % (host, port, str(e)[:120]))
+    n = 0
+    try:
+        for ln in lines:
+            try:
+                rec = json.loads(ln)
+            except Exception:
+                continue
+            # RFC5424 framing with octet-counting (TCP), local0.info; payload is CEF.
+            frame = '<134>1 %s %s infra-TAK - - - %s' % (rec.get('ts', '-'), fqdn, _offbox_to_cef(rec))
+            b = frame.encode()
+            sock.sendall(('%d ' % len(b)).encode() + b)
+            n += 1
+    except Exception as e:
+        return (n, 'send failed after %d: %s' % (n, str(e)[:120]))
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+    return (n, None)
+
+def _offbox_ship_s3(lines, cfg):
+    """Ship spooled lines as an immutable S3 Object-Lock (WORM) segment. NOT YET WIRED:
+    SigV4 + Object-Lock needs an S3 client and a real bucket to validate against. Structured
+    so the flush loop treats it as a real mode; returns (0, reason) so the backlog is RETAINED
+    and surfaced, never silently dropped. TODO(v0.9.56 W7): implement against a test bucket."""
+    return (0, 's3objlock sink not yet implemented (pending S3 client + test Object-Lock bucket)')
+
+def _offbox_flush_once():
+    """Flush the spool to the configured sink; drop only the confirmed-shipped prefix
+    (partial-success safe). Never raises."""
+    if not _offbox_enabled():
+        return
+    with _OFFBOX_LOCK:
+        p = _offbox_spool_path()
+        try:
+            if not os.path.exists(p):
+                return
+            with open(p) as f:
+                lines = [ln.rstrip('\n') for ln in f if ln.strip()]
+        except Exception:
+            return
+        if not lines:
+            return
+        cfg = _offbox_config()
+        mode = cfg.get('mode')
+        if mode == 'syslog':
+            n, err = _offbox_ship_syslog(lines, cfg)
+        elif mode == 's3objlock':
+            n, err = _offbox_ship_s3(lines, cfg)
+        else:
+            return
+        if n > 0:  # rewrite the spool with the un-shipped remainder
+            try:
+                rest = lines[n:]
+                with open(p, 'w') as f:
+                    f.write(('\n'.join(rest) + '\n') if rest else '')
+                os.chmod(p, 0o600)
+            except Exception:
+                pass
+        _offbox_status['shipped_total'] += n
+        _offbox_status['last_error'] = err
+        if not err:
+            _offbox_status['last_ship_ts'] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+
+def _offbox_shipper_loop():
+    while True:
+        try:
+            _offbox_flush_once()
+        except Exception:
+            pass
+        time.sleep(15)
+
+def _offbox_status_snapshot():
+    cfg = _offbox_config()
+    return {
+        'mode': cfg.get('mode', 'off'),
+        'enabled': _offbox_enabled(),
+        'retention_days': int(cfg.get('retention_days') or OFFBOX_RETENTION_FLOOR),
+        'backlog': _offbox_backlog(),
+        'last_ship_ts': _offbox_status['last_ship_ts'],
+        'last_error': _offbox_status['last_error'],
+        'shipped_total': _offbox_status['shipped_total'],
+        'syslog_host': (cfg.get('syslog') or {}).get('host'),
+        's3_bucket': (cfg.get('s3') or {}).get('bucket'),
+    }
+
+# Start the background shipper once (daemon; idle-cheap when W7 is off).
+try:
+    threading.Thread(target=_offbox_shipper_loop, daemon=True, name='offbox-shipper').start()
+except Exception:
+    pass
+
+def _hardening_control_w7():
+    """W7 — off-box immutable audit shipping. Activates the shipper when a sink is
+    configured; otherwise applies in an honest 'armed but no sink' state the report flags
+    (hardening can still complete, but the report tells the truth — no false green)."""
+    def apply_(h, log):
+        mode = (h.get('offbox_config') or {}).get('mode', 'off')
+        h.setdefault('applied', {})['W7_offbox'] = {'active': True, 'mode': mode}
+        if mode in ('syslog', 's3objlock'):
+            log('W7: off-box audit shipping active (mode=%s)' % mode)
+        else:
+            log('W7: off-box audit armed but NO sink configured — set one in Cyber Controls; '
+                'audit ships nowhere until then (local W3 audit still retained).')
+        return True
+    def verify(h):
+        a = (h.get('applied') or {}).get('W7_offbox')
+        if not a:
+            return (False, 'off-box audit not applied')
+        cfg = h.get('offbox_config') or {}
+        mode = cfg.get('mode', 'off')
+        if mode not in ('syslog', 's3objlock'):
+            return (True, 'armed; no off-box sink configured (local audit only)')
+        err = _offbox_status.get('last_error')
+        bl = _offbox_backlog()
+        if err and bl:
+            return (False, 'sink error (%s); %d lines backlogged' % (str(err)[:60], bl))
+        return (True, 'shipping via %s; backlog=%d, retention>=%dd'
+                % (mode, bl, int(cfg.get('retention_days') or OFFBOX_RETENTION_FLOOR)))
+    def revert(h, log):
+        (h.get('applied') or {}).pop('W7_offbox', None)
+        log('W7: off-box shipping stopped; local audit + already-shipped immutable records retained')
+        return True
+    return {'key': 'W7_offbox', 'title': 'Off-box immutable audit',
+            'desc': 'Mirrors the audit trail off-box (syslog/CEF to a SIEM, or an S3 Object-Lock '
+                    'WORM bucket) so the >=365-day record lives where the box admin cannot rewrite '
+                    'it. Local audit (W3) stays the source of truth.',
+            'apply': apply_, 'verify': verify, 'revert': revert}
+
 def _hardening_control_w3():
     """W3 — local per-user audit log. One-way (you don't un-audit), so revert keeps it."""
     def apply_(h, log):
@@ -2272,7 +2580,7 @@ def _hardening_control_w3():
         log('W3: audit log retained (one-way control)')
         return True
     return {'key': 'W3_audit', 'title': 'Per-user audit log',
-            'desc': 'Records who/what/when for admin actions locally (off-box shipping is .56).',
+            'desc': 'Records who/what/when for admin actions locally; W7 ships these off-box immutably.',
             'apply': apply_, 'verify': verify, 'revert': revert}
 
 # --- W4: port / boundary assertions (read-only; verify, don't rebuild) ------
@@ -2497,6 +2805,16 @@ AK_AUTH_FLOW_TITLE = 'Sign in'
 AK_TOTP_FRIENDLY = 'Authenticator App - Scan a QR code'
 AK_WEBAUTHN_FRIENDLY = 'Use a Passkey'
 
+# v0.9.56 W8 — Authentik event retention is a fleet-uniform constant, NOT the 365-day stock
+# default. The stock default grows authentik_events_event unbounded (200k+ rows / 200MB+ on
+# aged boxes); Authentik's periodic retention sweep over that table spikes authentik-postgresql
+# CPU (field report: 327% bursts on a 32GB box). Authentik's own docs recommend a SHORT local
+# retention when events are forwarded off-box — which the W7 off-box audit sink provides, so the
+# >=365-day compliance copy lives off-box while local Postgres stays light. Fleet constant (no
+# per-operator value, no max(cur,target)); applied as an idempotent startup migration on EVERY
+# box (pure load/hygiene fix, posture-independent). See memory authentik-event-retention-pg-cpu.
+AK_EVENT_RETENTION = 'days=30'
+
 def _ensure_authentik_login_copy(log=None):
     """Codify clear, fleet-uniform login/MFA wording: brand title, the authentication-flow
     header, and the TOTP/WebAuthn enrollment button labels. Only PATCHes a field that differs
@@ -2538,6 +2856,38 @@ def _ensure_authentik_login_copy(log=None):
         except Exception as e:
             _l('Authentik %s label copy: %s' % (kind, str(e)[:100]))
     return changed
+
+def _ensure_authentik_event_retention(log=None):
+    """v0.9.56 W8 — codify Authentik's event retention to the fleet constant AK_EVENT_RETENTION.
+    The stock 365-day default lets authentik_events_event grow to 200k+ rows; the periodic
+    retention sweep over that table spikes authentik-postgresql CPU on modest hardware. We pin a
+    short LOCAL retention (the >=365d compliance copy lives off-box via W7). Idempotent: only
+    PATCHes when the live value differs, so it's a no-op on subsequent boots. Posture-independent
+    (every box). Never raises; never restarts Postgres (a PG restart under load triggers the
+    dramatiq-worker spiral — the retention sweep needs no restart). Returns True if it changed.
+
+    Event retention is a System Settings singleton: GET/PATCH /api/v3/admin/settings/, field
+    `event_retention` (authentik timedelta string, e.g. 'days=30'). One-time backlog reclaim
+    (VACUUM of authentik_events_event) is an operator step, not done here."""
+    def _l(m):
+        if log:
+            log(m)
+    ak_url, ak_headers, _ = _w1_ak_ctx()
+    if not ak_url:
+        return False
+    try:
+        cur = (_w1_ak_get(ak_url, 'admin/settings/', ak_headers) or {}).get('event_retention')
+        if cur == AK_EVENT_RETENTION:
+            return False
+        _ak_api_call(f'{ak_url}/api/v3/admin/settings/',
+                     data=json.dumps({'event_retention': AK_EVENT_RETENTION}).encode(),
+                     method='PATCH', headers=ak_headers)
+        _l('Authentik event retention %s → %s (off-box holds the compliance copy)'
+           % (cur or 'default', AK_EVENT_RETENTION))
+        return True
+    except Exception as e:
+        _l('Authentik event retention: %s' % str(e)[:100])
+        return False
 
 def _w1_ensure_mfa_policy(ak_url, ak_headers, log):
     """Ensure the shared require-MFA expression policy exists; return its pk."""
@@ -2791,7 +3141,9 @@ def _hardening_registry():
     W1 (the risky auth flip) is always LAST so a working revert exists before it."""
     return [
         _hardening_control_w2(),
+        _hardening_control_widle(),
         _hardening_control_w3(),
+        _hardening_control_w7(),
         _hardening_control_w4(),
         _hardening_control_w1(),
     ]
@@ -3020,10 +3372,66 @@ def hardening_assertions():
 @app.route('/api/hardening/audit')
 @login_required
 def hardening_audit():
-    """W3 — recent local audit lines (newest first). Local-only; .56 ships off-box."""
+    """W3 — recent local audit lines (newest first). W7 ships these off-box (status below)."""
     return jsonify({'enabled': bool((load_hardening().get('applied') or {}).get('W3_audit')),
                     'path': _audit_path(),
                     'lines': list(reversed(_audit_tail(80)))})
+
+# --- W7: off-box audit shipping config + status ----------------------------
+@app.route('/api/hardening/offbox/status')
+@login_required
+def hardening_offbox_status():
+    return jsonify(_offbox_status_snapshot())
+
+@app.route('/api/hardening/offbox/config', methods=['POST'])
+@login_required
+def hardening_offbox_config():
+    """Set the off-box sink. Body: {mode:'off'|'syslog'|'s3objlock', retention_days,
+    syslog:{host,port,tls}, s3:{endpoint,region,bucket,prefix,access_key,secret_key}}.
+    Sink credentials live in hardening.json (mode 600). Retention is floored at 365d."""
+    body = request.get_json(force=True, silent=True) or {}
+    mode = body.get('mode', 'off')
+    if mode not in ('off', 'syslog', 's3objlock'):
+        return jsonify({'error': 'invalid mode'}), 400
+    h = load_hardening()
+    cfg = h.get('offbox_config') or {}
+    cfg['mode'] = mode
+    cfg['retention_days'] = max(OFFBOX_RETENTION_FLOOR, int(body.get('retention_days') or OFFBOX_RETENTION_FLOOR))
+    if isinstance(body.get('syslog'), dict):
+        cfg['syslog'] = body['syslog']
+    if isinstance(body.get('s3'), dict):
+        cfg['s3'] = body['s3']
+    # If W7 is already applied, keep its recorded mode in step with the new config.
+    if (h.get('applied') or {}).get('W7_offbox'):
+        h['applied']['W7_offbox']['mode'] = mode
+    h['offbox_config'] = cfg
+    save_hardening(h)
+    audit('hardening:offbox-config', 'mode=%s retention=%dd' % (mode, cfg['retention_days']))
+    return jsonify({'success': True, 'status': _offbox_status_snapshot()})
+
+@app.route('/api/hardening/offbox/test', methods=['POST'])
+@login_required
+def hardening_offbox_test():
+    """Send one probe line to the configured sink and report the result."""
+    cfg = _offbox_config()
+    mode = cfg.get('mode')
+    probe = json.dumps({'ts': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+                        'user': 'console', 'ip': '127.0.0.1',
+                        'event': 'offbox:test', 'detail': 'connectivity probe'})
+    if mode == 'syslog':
+        n, err = _offbox_ship_syslog([probe], cfg)
+        return jsonify({'success': err is None, 'shipped': n, 'error': err})
+    if mode == 's3objlock':
+        n, err = _offbox_ship_s3([probe], cfg)
+        return jsonify({'success': err is None, 'shipped': n, 'error': err})
+    return jsonify({'success': False, 'error': 'no sink configured'})
+
+@app.route('/api/hardening/offbox/ship-now', methods=['POST'])
+@login_required
+def hardening_offbox_ship_now():
+    """Force a flush of the spool to the sink (else it flushes every 15s)."""
+    _offbox_flush_once()
+    return jsonify({'success': True, 'status': _offbox_status_snapshot()})
 
 @app.route('/hardening')
 @login_required
@@ -12561,9 +12969,52 @@ def _cloudtak_bootstrap_preflight(cfg, tak_host, cot_port, marti_port, webtak_po
 
 _CERT_PASS_SAFE_RE = re.compile(r'^[a-zA-Z0-9!@#%^+=_.,:-]+$')
 
+_TAK_CERT_PW_CACHE = {}  # (configured, admin.p12 mtime) -> resolved password; mtime change re-probes
+
 def _get_tak_cert_password(settings):
-    """Current TAK cert export password (default atakatak)."""
-    return (settings.get('tak_cert_password') or 'atakatak').strip() or 'atakatak'
+    """The password the TAK cert actually opens with — ground truth over a possibly-stale
+    settings field. Probes admin.p12 with the configured value then 'atakatak' (legacy RC2 +
+    modern) and returns whichever decrypts it; falls back to the configured value or the fleet
+    default when there's nothing to probe. Never raises; always returns a non-empty string.
+    Every caller (cert open/gen, Portal TAK_API_P12_PASSPHRASE, metrics, FedHub) only ever gets
+    a value that works, so they strictly improve. Result is memoised on the admin.p12 mtime so
+    the 18 callers don't each spawn openssl (cache invalidates when the cert is regenerated).
+    v0.9.56: fixes Portal sync when the configured passphrase diverged from the cert (CORAZ:
+    settings 'Takserver#atak!', cert 'atakatak'). NOTE: cert-metadata.sh is deliberately NOT
+    used — its CAPASS line is a shell default expression (CAPASS=${CAPASS:-atakatak}) that is
+    unreliable read literally (returns the expression) OR sourced (resolved EMPTY on test6)."""
+    configured = (settings.get('tak_cert_password') or '').strip()
+    p12 = '/opt/tak/certs/files/admin.p12'
+    try:
+        mtime = os.path.getmtime(p12) if os.path.exists(p12) else None
+    except Exception:
+        mtime = None
+    if mtime is None:
+        return configured or 'atakatak'      # nothing to probe → today's behavior
+    key = (configured, mtime)
+    if key in _TAK_CERT_PW_CACHE:
+        return _TAK_CERT_PW_CACHE[key]
+    result = None
+    seen = set()
+    for cand in (configured, 'atakatak'):
+        if not cand or cand in seen:
+            continue
+        seen.add(cand)
+        for extra in (['-legacy'], []):
+            try:
+                r = subprocess.run(['openssl', 'pkcs12', '-in', p12, '-passin', 'pass:' + cand,
+                                    '-noout'] + extra, capture_output=True, timeout=10)
+                if r.returncode == 0:
+                    result = cand
+                    break
+            except Exception:
+                continue
+        if result:
+            break
+    if result is None:
+        result = configured or 'atakatak'    # cert opens with neither candidate → don't guess
+    _TAK_CERT_PW_CACHE[key] = result
+    return result
 
 
 def _get_fedhub_cert_password(settings):
@@ -12960,6 +13411,13 @@ def _write_takportal_override():
             "# _patch_takportal_compose_ports() (compose-version-agnostic).\n"
             "services:\n"
             "  tak-portal:\n"
+            # v0.9.56: the portal reaches a LOCAL TAK Server via host.docker.internal:8443
+            # (see _takportal_build_settings_dict TAK_URL). Unlike CloudTAK's api container,
+            # the TAK-Portal compose does NOT define this alias, so without this mapping the
+            # portal can't resolve host.docker.internal and loses TAK contact. Takes effect on
+            # container RECREATE (compose up -d), not a plain restart.
+            "    extra_hosts:\n"
+            "      - \"host.docker.internal:host-gateway\"\n"
             "    networks:\n"
             "      - default\n"
             f"      - {INFRATAK_DOCKER_NETWORK}\n"
@@ -15516,7 +15974,18 @@ def _takportal_build_settings_dict(settings):
     # server_ip breaks TLS hostname verification ("identity could not be verified").
     # Fall back to server_ip for IP-only / no-FQDN installs; then Docker host aliases.
     tak_dns = (_get_takserver_host(settings) or '').strip()
-    if settings.get('fqdn') and tak_dns:
+    tak_local = os.path.isdir('/opt/tak')
+    if tak_local:
+        # TAK is on THIS box → connect to the local JVM via the Docker host alias, NOT
+        # takserver.<fqdn>. On gateway-fronted / load-balanced deploys (cloud is co-primary)
+        # the FQDN resolves to a TLS-terminating front end (App Gateway / LB) whose cert does
+        # not chain to TAK's CA, so the portal's rejectUnauthorized handshake is rejected. The
+        # portal validates the CA chain (checkServerIdentity:()=>undefined), not the hostname,
+        # so the local hop works regardless of SAN. Container has ExtraHosts
+        # host.docker.internal:host-gateway. Recomputed every build (deterministic; never
+        # preserved — TAK_URL is intentionally NOT in PRESERVE_TAKPORTAL_KEYS).
+        tak_url_host = 'host.docker.internal'
+    elif settings.get('fqdn') and tak_dns:
         tak_url_host = tak_dns
     elif server_ip and server_ip not in ('localhost', '127.0.0.1'):
         tak_url_host = server_ip
@@ -19802,6 +20271,20 @@ def run_cloudtak_deploy(cfg=None):
         with open(override_path, 'w') as f:
             f.write(override_yml)
         plog("  docker-compose.override.yml written (api → host.docker.internal for :5001)")
+
+        # v0.9.56: harden base-compose port bindings BEFORE `up -d`. The Step-2 clone pulls
+        # upstream CloudTAK, whose base compose republishes every port on 0.0.0.0 — incl. media
+        # "${MEDIA_PORT_API:-9997}:9997". Since v0.9.48 Caddy binds <localIP>:9997 for the CloudTAK
+        # video vhost, so a wildcard 0.0.0.0:9997 publish COLLIDES and the Caddy reload in Step 5/7
+        # dies ("address already in use") → blank map.<fqdn>. Same patch the startup migration /
+        # update auto-harden run; idempotent (skips 127.0.0.1:*-prefixed lines), so the later passes
+        # are no-ops. Previously only ran on console startup/update, not deploy — a box deployed long
+        # after the last console restart (CORAZ) stayed broken until hand-fixed.
+        try:
+            if _patch_cloudtak_compose_ports(cloudtak_dir):
+                plog("  ✓ Compose port bindings hardened → loopback (media 9997, api 5000, tiles 5002, store 9002; events/postgis/store-9000 unpublished)")
+        except Exception as _ppe:
+            plog(f"  WARNING: compose port-harden failed (Caddy :9997 may collide): {_ppe}")
 
         api_url = ''
         media_url = ''
@@ -57267,6 +57750,15 @@ def _startup_migrations():
                 _ensure_authentik_login_copy(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as ak_copy_err:
             print(f"Startup migration: authentik login copy error (non-fatal): {ak_copy_err}")
+
+        # v0.9.56 W8: Pin Authentik event retention to the fleet constant (stock 365-day default
+        # grows authentik_events_event unbounded → periodic sweep spikes authentik-postgresql CPU).
+        # Idempotent no-op once pinned; gated on Authentik present; never restarts Postgres.
+        try:
+            if os.path.exists(os.path.expanduser('~/authentik/.env')):
+                _ensure_authentik_event_retention(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as ak_evt_err:
+            print(f"Startup migration: authentik event retention error (non-fatal): {ak_evt_err}")
 
         # v0.8.8: Bump idle_in_transaction_session_timeout 30s → 300s. MUST run before
         # the recursion fix below, because the recursion fix restarts authentik-server,
