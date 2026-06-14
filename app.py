@@ -34,7 +34,7 @@ if __name__ == '__main__':
                 _svc_c = _f.read()
             if 'python3' in _svc_c and 'app.py' in _svc_c:
                 print('[auto-upgrade] Upgrading systemd service to gunicorn...')
-                _exec_line = f'{_gunicorn} --bind 0.0.0.0:{_port} --workers 1 --threads 4 --timeout 300 --graceful-timeout 30'
+                _exec_line = f'{_gunicorn} --bind 0.0.0.0:{_port} --workers 1 --threads 8 --timeout 300 --graceful-timeout 30'
                 if _ssl_args:
                     _exec_line += ' ' + ' '.join(_ssl_args)
                 _exec_line += ' app:app'
@@ -44,7 +44,7 @@ if __name__ == '__main__':
                 _sp.run(['systemctl', 'daemon-reload'], capture_output=True)
 
         _args = [_gunicorn, '--bind', f'0.0.0.0:{_port}',
-                 '--workers', '1', '--threads', '4',
+                 '--workers', '1', '--threads', '8',
                  '--timeout', '300', '--graceful-timeout', '30']
         _args.extend(_ssl_args)
         _args.append('app:app')
@@ -290,7 +290,7 @@ def _ensure_gunicorn_upgrade(console_dir=None):
     ssl_args = ''
     if os.path.exists(os.path.join(cert_dir, 'console.crt')):
         ssl_args = f' --certfile={cert_dir}/console.crt --keyfile={cert_dir}/console.key'
-    exec_line = (f'{venv_gunicorn} --bind 0.0.0.0:{port} --workers 1 --threads 4 '
+    exec_line = (f'{venv_gunicorn} --bind 0.0.0.0:{port} --workers 1 --threads 8 '
                  f'--timeout 300 --graceful-timeout 30{ssl_args} app:app')
     content = re.sub(r'^ExecStart=.*$', f'ExecStart={exec_line}', content, flags=re.MULTILINE)
     with open(svc, 'w') as f:
@@ -376,7 +376,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.56-alpha"
+VERSION = "0.9.57-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -385,7 +385,7 @@ GITHUB_REPO = "takwerx/infra-TAK"
 # the version currently under validation.  When vetting passes, promote DEV → VETTED and
 # bump VERSION to a new infra-TAK release.
 AUTHENTIK_VETTED_RELEASE = "2026.2.3"   # fleet-validated — safe for all customers
-AUTHENTIK_DEV_RELEASE    = "2026.5.0"   # under validation on dev channel (2026-05-22)
+AUTHENTIK_DEV_RELEASE    = "2026.5.3"   # under validation on dev channel — conn_max_age idle-CPU spin fix (#22580/#22679, in 2026.5.2+); 2026-06-13
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
 CADDYFILE_USER_BLOCKS_MARKER = "# --- User-added blocks (do not remove) ---"
@@ -1768,7 +1768,42 @@ def _parse_dd_speed_mbs(stderr_or_stdout):
     return None
 
 
-def _run_disk_speed_test_local():
+import threading as _threading
+_disk_speed_cache = {'result': None, 'ts': 0.0, 'running': False}
+_disk_speed_lock = _threading.Lock()
+
+def _run_disk_speed_test_local(use_cache=True):
+    """NON-BLOCKING cached disk benchmark. The raw 256 MiB oflag=dsync write is slow
+    on throttled/loaded disks (the SSD-Nodes boxes throttle intermittently), and
+    running it synchronously on every /api/host-resource-usage click hogged a thread
+    on the 1-worker console — which starved that endpoint AND "check for new release"
+    (both 'Request failed'). This wrapper NEVER blocks the request: it returns the
+    cached value immediately and, when the cache is cold/stale (>10 min), kicks the
+    benchmark off in a background thread so the number appears on a later poll.
+    First-ever call returns {} (no disk number yet) rather than waiting."""
+    import time as _t
+    now = _t.time()
+    have = _disk_speed_cache['result'] is not None
+    if use_cache and have and (now - _disk_speed_cache['ts'] < 600):
+        return _disk_speed_cache['result']
+    def _refresh():
+        try:
+            r = _run_disk_speed_test_local_impl()
+        except Exception:
+            r = {}
+        _disk_speed_cache['result'] = r
+        _disk_speed_cache['ts'] = _t.time()
+        _disk_speed_cache['running'] = False
+    with _disk_speed_lock:
+        if not _disk_speed_cache['running']:
+            _disk_speed_cache['running'] = True
+            try:
+                _threading.Thread(target=_refresh, daemon=True).start()
+            except Exception:
+                _disk_speed_cache['running'] = False
+    return _disk_speed_cache['result'] if have else {}
+
+def _run_disk_speed_test_local_impl():
     """Run 256 MiB sync write (oflag=dsync). Returns dict with disk_speed_test_write_mbs or disk_speed_test_error.
     Uses oflag=dsync to match start.sh and Guard Dog — measures real hardware throughput, not buffer cache."""
     path = _disk_speed_test_path()
@@ -6019,7 +6054,7 @@ def guarddog_page():
     guarddog_monitors_tak = [
         {'name': 'Port 8089', 'id': 'port8089', 'interval': '1 min', 'desc': 'Checks that TAK Server port 8089 is listening and accepting connections. Auto-restarts TAK Server after 3 consecutive failures.'},
         {'name': 'Process', 'id': 'process', 'interval': '1 min', 'desc': 'Verifies all 5 TAK Server Java processes (messaging, api, config, plugins, retention). Auto-restart after 3 consecutive failures.'},
-        {'name': 'Network', 'id': 'network', 'interval': '1 min', 'desc': 'Pings Cloudflare (1.1.1.1) and Google (8.8.8.8). Alerts only (no restart) after 3 failures — helps distinguish network issues from server issues.'},
+        {'name': 'Network', 'id': 'network', 'interval': '1 min', 'desc': 'Pings Cloudflare (1.1.1.1) and Google (8.8.8.8); if ICMP is blocked (common on Azure/cloud) it falls back to a TCP connect to confirm egress. Alerts only (no restart) after 3 failures — helps distinguish network issues from server issues.'},
     ]
     if not is_two_server:
         guarddog_monitors_tak.extend([
@@ -8168,10 +8203,20 @@ def _monitor_health_check(monitor_id):
             r = subprocess.run('pgrep -f "takserver" 2>/dev/null | head -1', shell=True, capture_output=True, text=True, timeout=3)
             return bool(r.stdout.strip())
         if monitor_id == 'network':
+            # ICMP first — fast path where ping is allowed.
             for host in ('1.1.1.1', '8.8.8.8'):
                 r = subprocess.run(['ping', '-c', '1', '-W', '2', host], capture_output=True, timeout=4)
                 if r.returncode == 0:
                     return True
+            # ICMP filtered (e.g. Azure NSG blocks outbound ping) — confirm real egress
+            # via TCP before declaring the network down. Mirrors _detect_local_ip()'s
+            # trust model: TCP/UDP egress is the truth, ICMP is not.
+            for host, port in (('1.1.1.1', 443), ('8.8.8.8', 53)):
+                try:
+                    with socket.create_connection((host, port), timeout=2):
+                        return True
+                except OSError:
+                    continue
             return False
         if monitor_id == 'postgresql':
             r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'postgresql']), capture_output=True, text=True, timeout=3)
@@ -9461,7 +9506,7 @@ def run_guarddog_deploy(alert_email):
             'send-alert-email.sh', 'tak-boot-sequencer.sh', 'tak-post-start.sh',
             'tak-8089-watch.sh', 'tak-oom-watch.sh', 'tak-disk-watch.sh', 'tak-diskio-watch.sh',
             'tak-network-watch.sh', 'tak-process-watch.sh', 'tak-cert-watch.sh', 'tak-intca-watch.sh', 'tak-health-endpoint.py',
-            'tak-metrics-collector.py', 'tak-updates-watch.sh'
+            'tak-metrics-collector.py', 'tak-updates-watch.sh', 'tak-swap-reclaim.sh'
         ]
         # Two-server: remote DB monitors + CoT size (SSH to Server One); single-server: local PG + CoT
         if is_two_server and s1_host:
@@ -9548,6 +9593,8 @@ def run_guarddog_deploy(alert_email):
             ('takdiskguard.timer', '[Unit]\nDescription=Run TAK disk monitor every hour\n\n[Timer]\nOnBootSec=30min\nOnUnitActiveSec=1h\nUnit=takdiskguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ('takdiskioguard.service', '[Unit]\nDescription=Guard Dog Disk I/O Performance Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-diskio-watch.sh\n'),
             ('takdiskioguard.timer', '[Unit]\nDescription=Run disk I/O benchmark every 15 minutes\n\n[Timer]\nOnBootSec=10min\nOnUnitActiveSec=15min\nUnit=takdiskioguard.service\n\n[Install]\nWantedBy=timers.target\n'),
+            ('takswapreclaim.service', '[Unit]\nDescription=Guard Dog Swap Reclaim (stale-swap hygiene)\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-swap-reclaim.sh\n'),
+            ('takswapreclaim.timer', '[Unit]\nDescription=Run swap reclaim every 10 minutes\n\n[Timer]\nOnBootSec=12min\nOnUnitActiveSec=10min\nUnit=takswapreclaim.service\n\n[Install]\nWantedBy=timers.target\n'),
             ('taknetguard.service', '[Unit]\nDescription=TAK Network Monitor\nAfter=network.target\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-network-watch.sh\n'),
             ('taknetguard.timer', '[Unit]\nDescription=TAK Network Monitor Timer\nRequires=taknetguard.service\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=1min\nAccuracySec=30s\n\n[Install]\nWantedBy=timers.target\n'),
             ('takprocessguard.service', '[Unit]\nDescription=TAK Server Process Monitor\nAfter=network.target takserver.service\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-process-watch.sh\n'),
@@ -9701,6 +9748,7 @@ def run_guarddog_deploy(alert_email):
             guarddog_deploy_status.update({'running': False, 'error': True})
             return
         timers = ['tak8089guard.timer', 'takoomguard.timer', 'takdiskguard.timer', 'takdiskioguard.timer',
+                  'takswapreclaim.timer',
                   'taknetguard.timer', 'takprocessguard.timer', 'takcertguard.timer', 'takintcaguard.timer']
         if is_two_server and s1_host:
             timers.append('takremotedbguard.timer')
@@ -13405,19 +13453,28 @@ def _write_takportal_override():
         return False
     try:
         _ensure_infratak_docker_network()
+        settings = load_settings()
+        tak_dns = (_get_takserver_host(settings) or '').strip()
+        # v0.9.57: container host aliases for the Portal's server-side mTLS to the local TAK JVM.
+        # host.docker.internal always maps to the docker host (172.17.0.1). When TAK is on-box
+        # AND an FQDN is set, ALSO alias takserver.<fqdn> → host-gateway so the Portal's mTLS to
+        # https://takserver.<fqdn>:8443/Marti resolves to the local JVM INSIDE the container —
+        # on both normal boxes (skips the public-IP hairpin) and gateway-fronted boxes (skips the
+        # App Gateway cert mismatch; the Portal validates the CA chain, not the hostname). That
+        # lets TAK_URL stay the real FQDN so QR enrollment hosts are correct (see
+        # _takportal_build_settings_dict). extra_hosts take effect on container RECREATE
+        # (compose up -d), not a plain restart.
+        _extra_hosts = "      - \"host.docker.internal:host-gateway\"\n"
+        if settings.get('fqdn') and tak_dns and os.path.isdir('/opt/tak'):
+            _extra_hosts += f"      - \"{tak_dns}:host-gateway\"\n"
         content = (
             "# TAKWERX: TAK Portal runtime overrides — do not edit manually\n"
             "# Port hardening is applied directly to docker-compose.yml by\n"
             "# _patch_takportal_compose_ports() (compose-version-agnostic).\n"
             "services:\n"
             "  tak-portal:\n"
-            # v0.9.56: the portal reaches a LOCAL TAK Server via host.docker.internal:8443
-            # (see _takportal_build_settings_dict TAK_URL). Unlike CloudTAK's api container,
-            # the TAK-Portal compose does NOT define this alias, so without this mapping the
-            # portal can't resolve host.docker.internal and loses TAK contact. Takes effect on
-            # container RECREATE (compose up -d), not a plain restart.
             "    extra_hosts:\n"
-            "      - \"host.docker.internal:host-gateway\"\n"
+            f"{_extra_hosts}"
             "    networks:\n"
             "      - default\n"
             f"      - {INFRATAK_DOCKER_NETWORK}\n"
@@ -15317,6 +15374,23 @@ def _get_authentik_version_info():
                     out['ahead_of_vetted'] = True
             except Exception:
                 out['update_available'] = True
+    # Dev channel only: surface when UPSTREAM has shipped a release newer than our pin,
+    # so the operator learns about new Authentik releases (e.g. a bugfix) without anyone
+    # editing the pin first. Awareness ONLY — never changes what Update installs (the pin).
+    # No GitHub call on main: main stays pinned-and-quiet by design.
+    out['upstream_latest'] = None
+    out['upstream_newer'] = False
+    if _channel == 'dev':
+        try:
+            _up = _get_authentik_latest_release_tag()
+            if _up:
+                out['upstream_latest'] = _up
+                _pin = tuple(int(x) for x in re.findall(r'\d+', target))
+                _ut = tuple(int(x) for x in re.findall(r'\d+', _up))
+                if _ut > _pin:
+                    out['upstream_newer'] = True
+        except Exception:
+            pass
     return out
 
 
@@ -15973,19 +16047,17 @@ def _takportal_build_settings_dict(settings):
     # Prefer takserver.<fqdn> when FQDN is set — TAK certs are issued for DNS names; using
     # server_ip breaks TLS hostname verification ("identity could not be verified").
     # Fall back to server_ip for IP-only / no-FQDN installs; then Docker host aliases.
+    # v0.9.57: TAK_URL host = takserver.<fqdn> when an FQDN is set, so the Portal's QR
+    # enrollment host (derived from TAK_URL's hostname) points devices at the real DNS name,
+    # NOT host.docker.internal. The Portal's server-side mTLS to the local JVM is handled
+    # separately by a takserver.<fqdn>:host-gateway alias in the container's extra_hosts (see
+    # _write_takportal_override) — that resolves the FQDN to 172.17.0.1 INSIDE the container on
+    # both normal and gateway-fronted boxes (the Portal validates the CA chain, not the
+    # hostname). Reverts c384fc8's host.docker.internal override, which leaked into every QR.
+    # Recomputed every build (deterministic; never preserved — TAK_URL is intentionally NOT in
+    # PRESERVE_TAKPORTAL_KEYS).
     tak_dns = (_get_takserver_host(settings) or '').strip()
-    tak_local = os.path.isdir('/opt/tak')
-    if tak_local:
-        # TAK is on THIS box → connect to the local JVM via the Docker host alias, NOT
-        # takserver.<fqdn>. On gateway-fronted / load-balanced deploys (cloud is co-primary)
-        # the FQDN resolves to a TLS-terminating front end (App Gateway / LB) whose cert does
-        # not chain to TAK's CA, so the portal's rejectUnauthorized handshake is rejected. The
-        # portal validates the CA chain (checkServerIdentity:()=>undefined), not the hostname,
-        # so the local hop works regardless of SAN. Container has ExtraHosts
-        # host.docker.internal:host-gateway. Recomputed every build (deterministic; never
-        # preserved — TAK_URL is intentionally NOT in PRESERVE_TAKPORTAL_KEYS).
-        tak_url_host = 'host.docker.internal'
-    elif settings.get('fqdn') and tak_dns:
+    if settings.get('fqdn') and tak_dns:
         tak_url_host = tak_dns
     elif server_ip and server_ip not in ('localhost', '127.0.0.1'):
         tak_url_host = server_ip
@@ -43485,9 +43557,9 @@ body{display:flex;min-height:100vh}
 {% if deploying %}
 <div class="status-info"><div class="status-icon running" style="background:rgba(59,130,246,0.1)">🔄</div><div><div class="status-text" style="color:var(--accent)">Deploying...</div><div class="status-detail">Authentik installation in progress</div></div></div>
 {% elif ak.installed and ak.running %}
-<div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--green)">Running</div><div class="status-detail">Identity provider active{% if ak_version_info and ak_version_info.version %} · <span class="os-badge" style="margin-left:4px">v{{ ak_version_info.version }}</span>{% if ak_version_info.update_available and ak_version_info.latest %} · <span style="color:var(--cyan);font-size:11px">v{{ ak_version_info.latest }} available</span>{% elif ak_version_info.channel == 'dev' %} · <span style="color:#f59e0b;font-size:10px" title="Dev channel — testing v{{ ak_version_info.dev_release }}">dev: v{{ ak_version_info.dev_release }}</span>{% elif ak_version_info.ahead_of_vetted %} · <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v{{ ak_version_info.vetted_release }}) — not yet validated on main channel">! unvetted</span>{% elif not ak_version_info.update_available %} · <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% endif %}</div></div></div>
+<div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--green)">Running</div><div class="status-detail">Identity provider active{% if ak_version_info and ak_version_info.version %} · <span class="os-badge" style="margin-left:4px">v{{ ak_version_info.version }}</span>{% if ak_version_info.channel == 'dev' %} · <span style="color:#f59e0b;font-size:10px" title="Main/vetted channel is pinned to v{{ ak_version_info.vetted_release }} — what production customers run">main: v{{ ak_version_info.vetted_release }}</span>{% if ak_version_info.update_available and ak_version_info.latest %} · <span style="color:var(--cyan);font-size:11px" title="Update available — click Update to install v{{ ak_version_info.latest }}">v{{ ak_version_info.latest }} available</span>{% elif ak_version_info.upstream_newer %} · <span style="color:var(--cyan);font-size:10px" title="Upstream Authentik v{{ ak_version_info.upstream_latest }} is newer than the dev pin. Investigate — if it's good, bump AUTHENTIK_DEV_RELEASE. Not auto-installed.">↑ v{{ ak_version_info.upstream_latest }} available upstream</span>{% endif %}{% else %}{% if ak_version_info.update_available and ak_version_info.latest %} · <span style="color:var(--cyan);font-size:11px">v{{ ak_version_info.latest }} available</span>{% elif ak_version_info.ahead_of_vetted %} · <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v{{ ak_version_info.vetted_release }}) — not yet validated on main channel">! unvetted</span>{% elif not ak_version_info.update_available %} · <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% endif %}{% endif %}</div></div></div>
 {% elif ak.installed %}
-<div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--red)">Stopped</div><div class="status-detail">Docker containers not running{% if ak_version_info and ak_version_info.version %} · <span class="os-badge" style="margin-left:4px">v{{ ak_version_info.version }}</span>{% if ak_version_info.update_available and ak_version_info.latest %} · <span style="color:var(--cyan);font-size:11px">v{{ ak_version_info.latest }} available</span>{% elif ak_version_info.channel == 'dev' %} · <span style="color:#f59e0b;font-size:10px" title="Dev channel — testing v{{ ak_version_info.dev_release }}">dev: v{{ ak_version_info.dev_release }}</span>{% elif ak_version_info.ahead_of_vetted %} · <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v{{ ak_version_info.vetted_release }}) — not yet validated on main channel">! unvetted</span>{% elif not ak_version_info.update_available %} · <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% endif %}</div></div></div>
+<div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--red)">Stopped</div><div class="status-detail">Docker containers not running{% if ak_version_info and ak_version_info.version %} · <span class="os-badge" style="margin-left:4px">v{{ ak_version_info.version }}</span>{% if ak_version_info.channel == 'dev' %} · <span style="color:#f59e0b;font-size:10px" title="Main/vetted channel is pinned to v{{ ak_version_info.vetted_release }} — what production customers run">main: v{{ ak_version_info.vetted_release }}</span>{% if ak_version_info.update_available and ak_version_info.latest %} · <span style="color:var(--cyan);font-size:11px" title="Update available — click Update to install v{{ ak_version_info.latest }}">v{{ ak_version_info.latest }} available</span>{% elif ak_version_info.upstream_newer %} · <span style="color:var(--cyan);font-size:10px" title="Upstream Authentik v{{ ak_version_info.upstream_latest }} is newer than the dev pin. Investigate — if it's good, bump AUTHENTIK_DEV_RELEASE. Not auto-installed.">↑ v{{ ak_version_info.upstream_latest }} available upstream</span>{% endif %}{% else %}{% if ak_version_info.update_available and ak_version_info.latest %} · <span style="color:var(--cyan);font-size:11px">v{{ ak_version_info.latest }} available</span>{% elif ak_version_info.ahead_of_vetted %} · <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v{{ ak_version_info.vetted_release }}) — not yet validated on main channel">! unvetted</span>{% elif not ak_version_info.update_available %} · <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% endif %}{% endif %}</div></div></div>
 {% else %}
 <div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--text-dim)">Not Installed</div><div class="status-detail">Deploy Authentik for identity management & SSO</div></div></div>
 {% endif %}
@@ -45773,6 +45845,105 @@ def _ensure_authentik_tasklog_purge_script(plog=None):
         _log("Authentik tasklog purge script updated to v0.9.26 canonical version (fixes VACUUM-in-transaction bug)")
     except Exception as _e:
         _log(f"Authentik tasklog purge script update error (non-fatal): {_e}")
+
+
+def _auto_authentik_channel_purge(plog=None):
+    """v0.9.57 (B2): inline self-heal for the Authentik Channels-over-Postgres backlog
+    (django_channels_postgres_message).
+
+    On a healthy 2026.5.3 worker this table stays small (~hundreds of rows). During a
+    pre-2026.5.3 conn_max_age spin it balloons to MILLIONS of EXPIRED rows, and
+    Authentik's own clean_expired_models() then times out trying to delete them in one
+    transaction (upstream #20644) → authentik-worker-1 pegs ~150% forever. This catches a
+    ballooned table on every console boot and clears it in BATCHES (which the worker's
+    one-shot delete can't), so a box that already spun self-heals WITHOUT SSH. Pairs with
+    the 2026.5.3 pin (prevents new ballooning) and W8 (event retention).
+
+    Deletes ONLY expired messages (`expires < now()`) — never live ones; never blocks
+    login; idempotent; non-raising. Runs on every console boot via _startup_migrations
+    (no version/Update gate). See memory authentik-worker-channels-dramatiq-uuid-crashloop.
+    """
+    def _log(m):
+        if plog:
+            plog(m)
+        else:
+            print(m, flush=True)
+
+    if not os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
+        return  # Authentik not installed on this host
+
+    # statement_timeout=0 for the mutating ops: Authentik sets a statement_timeout that
+    # cancels a long DELETE/VACUUM mid-flight (seen live on test8). Reads use the default.
+    _PG = ['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik', '-d', 'authentik']
+    _PG_NT = ['docker', 'exec', '-e', 'PGOPTIONS=-c statement_timeout=0',
+              'authentik-postgresql-1', 'psql', '-U', 'authentik', '-d', 'authentik']
+    try:
+        _up = subprocess.run(
+            ['docker', 'inspect', '--format', '{{.State.Running}}', 'authentik-postgresql-1'],
+            capture_output=True, text=True, timeout=10
+        )
+        if _up.returncode != 0 or _up.stdout.strip() != 'true':
+            return
+
+        def _count():
+            r = subprocess.run(
+                _PG + ['-t', '-A', '-c', 'SELECT count(*) FROM django_channels_postgres_message'],
+                capture_output=True, text=True, timeout=30
+            )
+            if r.returncode != 0:
+                return None
+            try:
+                return int((r.stdout or '0').strip())
+            except ValueError:
+                return None
+
+        _n0 = _count()
+        if _n0 is None:
+            return  # table absent (older Authentik) or query failed — leave alone
+        _THRESHOLD = 100000  # healthy ~hundreds; only act on a genuine balloon
+        if _n0 < _THRESHOLD:
+            return  # Healthy — silent no-op
+
+        _log(f"Authentik channels: {_n0} rows (>= {_THRESHOLD}) — batched purge of EXPIRED messages (v0.9.57 B2)")
+
+        _BATCH = 500000
+        _MAX_ITERS = 80  # cap = 40M rows; backstop against a runaway loop
+        _deleted = 0
+        for _i in range(_MAX_ITERS):
+            r = subprocess.run(
+                _PG_NT + ['-t', '-A', '-c',
+                          "WITH d AS (DELETE FROM django_channels_postgres_message "
+                          "WHERE id IN (SELECT id FROM django_channels_postgres_message "
+                          f"WHERE expires < now() LIMIT {_BATCH}) RETURNING 1) SELECT count(*) FROM d"],
+                capture_output=True, text=True, timeout=300
+            )
+            if r.returncode != 0:
+                _log(f"Authentik channels: batch DELETE non-zero: {(r.stderr or '')[:200]}")
+                break
+            try:
+                _b = int((r.stdout or '0').strip())
+            except ValueError:
+                _b = 0
+            _deleted += _b
+            if _b == 0:
+                break
+
+        # VACUUM with PARALLEL 0 — REQUIRED: the container /dev/shm (64 MB) is too small
+        # for parallel-vacuum workers ("could not resize shared memory segment … No space
+        # left on device", hit live on test8). Reclaim failure is non-fatal — the DELETE
+        # already frees the rows (un-pegs the worker); autovacuum finishes the reclaim.
+        _vac = subprocess.run(
+            _PG_NT + ['-c', 'VACUUM (ANALYZE, PARALLEL 0) django_channels_postgres_message;'],
+            capture_output=True, text=True, timeout=900
+        )
+        if _vac.returncode != 0:
+            _log(f"Authentik channels: VACUUM non-zero (non-fatal): {(_vac.stderr or '')[:160]}")
+
+        _n1 = _count()
+        _log(f"Authentik channels: purged {_deleted} expired rows ({_n0} -> {_n1}); "
+             f"clean_expired_models will stop timing out on the next cycle")
+    except Exception as _e:
+        _log(f"Authentik channels purge: skipped ({str(_e)[:120]})")
 
 
 def _auto_authentik_tasklog_purge(plog=None):
@@ -53585,8 +53756,8 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 <div class="metrics-bar" id="metrics-bar">
 <div class="metric-card"><div class="metric-label">CPU</div><div class="metric-value" id="cpu-value">{{ metrics.cpu_percent }}%</div></div>
-<div class="metric-card"><div class="metric-label">Memory</div><div class="metric-value" id="ram-value">{{ metrics.ram_percent }}%</div><div class="metric-detail">{{ metrics.ram_used_gb }}GB / {{ metrics.ram_total_gb }}GB</div></div>
-<div class="metric-card"><div class="metric-label">Disk</div><div class="metric-value" id="disk-value">{{ metrics.disk_percent }}%</div><div class="metric-detail">{{ metrics.disk_used_gb }}GB / {{ metrics.disk_total_gb }}GB</div></div>
+<div class="metric-card"><div class="metric-label">Memory</div><div class="metric-value" id="ram-value">{{ metrics.ram_percent }}%</div><div class="metric-detail" id="ram-detail">{{ metrics.ram_used_gb }}GB / {{ metrics.ram_total_gb }}GB</div></div>
+<div class="metric-card"><div class="metric-label">Disk</div><div class="metric-value" id="disk-value">{{ metrics.disk_percent }}%</div><div class="metric-detail" id="disk-detail">{{ metrics.disk_used_gb }}GB / {{ metrics.disk_total_gb }}GB</div></div>
 <div class="metric-card"><div class="metric-label">Uptime</div><div class="metric-value" id="uptime-value" style="font-size:18px">{{ metrics.uptime }}</div></div>
 {% for host in uu_hosts %}
 <div class="metric-card" style="position:relative" title="OS/apt automatic upgrades on this host." data-uu-target="{{ host.id }}">
@@ -53725,7 +53896,13 @@ async function toggleResourceBreakdown(hostId){
     }
     div.style.display='block';
 }
-setInterval(async()=>{try{const r=await fetch('/api/metrics');const d=await r.json();document.getElementById('cpu-value').textContent=d.cpu_percent+'%';document.getElementById('ram-value').textContent=d.ram_percent+'%';document.getElementById('disk-value').textContent=d.disk_percent+'%';document.getElementById('uptime-value').textContent=d.uptime;if(d.unattended_upgrades_hosts)updateUUHosts(d.unattended_upgrades_hosts);}catch(e){}},5000);
+/* v0.9.57: cap read/poll fetches with a client-side timeout so a slow poll on a busy box
+   ABORTS (freeing the single-worker console's thread) instead of hanging forever and
+   starving on-demand button clicks (the "what's using CPU/RAM" / "check for release"
+   fails that cleared on a page reload). Whitelisted to read endpoints only — the
+   long-running action endpoints (update/apply, *_control, deploy) are never touched. */
+(function(){if(window.__fetchTO)return;window.__fetchTO=1;var _f=window.fetch.bind(window);var L=[['/api/metrics',10000],['/api/modules/version',15000],['/api/modules',12000],['/api/host-resource-usage',30000],['/api/update/check',15000],['/api/guarddog',12000]];window.fetch=function(u,o){o=o||{};if(typeof u==='string'&&!o.signal){for(var i=0;i<L.length;i++){if(u.indexOf(L[i][0])===0){var c=new AbortController();o.signal=c.signal;var t=setTimeout(function(){try{c.abort()}catch(e){}},L[i][1]);return _f(u,o).finally(function(){clearTimeout(t)});}}}return _f(u,o);};})();
+setInterval(async()=>{try{const r=await fetch('/api/metrics');const d=await r.json();document.getElementById('cpu-value').textContent=d.cpu_percent+'%';document.getElementById('ram-value').textContent=d.ram_percent+'%';document.getElementById('disk-value').textContent=d.disk_percent+'%';var _rd=document.getElementById('ram-detail');if(_rd&&d.ram_used_gb!=null)_rd.textContent=d.ram_used_gb+'GB / '+d.ram_total_gb+'GB';var _dd=document.getElementById('disk-detail');if(_dd&&d.disk_used_gb!=null)_dd.textContent=d.disk_used_gb+'GB / '+d.disk_total_gb+'GB';document.getElementById('uptime-value').textContent=d.uptime;if(d.unattended_upgrades_hosts)updateUUHosts(d.unattended_upgrades_hosts);}catch(e){}},5000);
 function refreshModuleCards(){
     fetch('/api/modules').then(r=>r.json()).then(function(mods){
         for(var k in mods){
@@ -53769,10 +53946,15 @@ function refreshModuleVersions(){
             var d=data[key];
             var s='';
             if(d.version)s=(key==='mediamtx'?'':'v')+d.version;
-            if(d.update_available){
+            if(key==='authentik'&&d.channel==='dev'){
+                if(d.vetted_release)s+=' <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v'+d.vetted_release+'">· main: v'+d.vetted_release+'</span>';
+                if(d.update_available){
+                    s+=' <span style="color:var(--cyan);font-size:10px" title="Update available">· update</span>';
+                }else if(d.upstream_newer&&d.upstream_latest){
+                    s+=' <span style="color:var(--cyan);font-size:10px" title="Upstream Authentik v'+d.upstream_latest+' is newer than the dev pin — investigate">· ↑ v'+d.upstream_latest+' upstream</span>';
+                }
+            }else if(d.update_available){
                 s+=(s?' ':'')+'<span style="color:var(--cyan);font-size:10px" title="Update available">update</span>';
-            }else if(key==='authentik'&&d.channel==='dev'&&d.vetted_release){
-                s+=' <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v'+d.vetted_release+'">· main: v'+d.vetted_release+'</span>';
             }else if(key==='authentik'&&d.ahead_of_vetted&&d.vetted_release){
                 s+=' <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v'+d.vetted_release+') — not yet validated on main channel">! unvetted</span>';
             }else if(key==='authentik'&&d.vetted_release){
@@ -55223,8 +55405,8 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% endif %}
 <div class="metrics-bar" id="metrics-bar">
 <div class="metric-card"><div class="metric-label">CPU</div><div class="metric-value" id="cpu-value">{{ metrics.cpu_percent }}%</div></div>
-<div class="metric-card"><div class="metric-label">Memory</div><div class="metric-value" id="ram-value">{{ metrics.ram_percent }}%</div><div class="metric-detail">{{ metrics.ram_used_gb }}GB / {{ metrics.ram_total_gb }}GB</div></div>
-<div class="metric-card"><div class="metric-label">Disk</div><div class="metric-value" id="disk-value">{{ metrics.disk_percent }}%</div><div class="metric-detail">{{ metrics.disk_used_gb }}GB / {{ metrics.disk_total_gb }}GB</div></div>
+<div class="metric-card"><div class="metric-label">Memory</div><div class="metric-value" id="ram-value">{{ metrics.ram_percent }}%</div><div class="metric-detail" id="ram-detail">{{ metrics.ram_used_gb }}GB / {{ metrics.ram_total_gb }}GB</div></div>
+<div class="metric-card"><div class="metric-label">Disk</div><div class="metric-value" id="disk-value">{{ metrics.disk_percent }}%</div><div class="metric-detail" id="disk-detail">{{ metrics.disk_used_gb }}GB / {{ metrics.disk_total_gb }}GB</div></div>
 <div class="metric-card"><div class="metric-label">Uptime</div><div class="metric-value" id="uptime-value" style="font-size:18px">{{ metrics.uptime }}</div></div>
 </div>
 <div class="section-title">Marketplace</div>
@@ -55254,7 +55436,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 </div>
 <script>
-setInterval(async()=>{try{const r=await fetch('/api/metrics');const d=await r.json();document.getElementById('cpu-value').textContent=d.cpu_percent+'%';document.getElementById('ram-value').textContent=d.ram_percent+'%';document.getElementById('disk-value').textContent=d.disk_percent+'%';document.getElementById('uptime-value').textContent=d.uptime}catch(e){}},5000);
+setInterval(async()=>{try{const r=await fetch('/api/metrics');const d=await r.json();document.getElementById('cpu-value').textContent=d.cpu_percent+'%';document.getElementById('ram-value').textContent=d.ram_percent+'%';document.getElementById('disk-value').textContent=d.disk_percent+'%';var _rd=document.getElementById('ram-detail');if(_rd&&d.ram_used_gb!=null)_rd.textContent=d.ram_used_gb+'GB / '+d.ram_total_gb+'GB';var _dd=document.getElementById('disk-detail');if(_dd&&d.disk_used_gb!=null)_dd.textContent=d.disk_used_gb+'GB / '+d.disk_total_gb+'GB';document.getElementById('uptime-value').textContent=d.uptime}catch(e){}},5000);
 </script></body></html>'''
 
 # === TAK Server Template ===
@@ -57700,6 +57882,12 @@ def _startup_migrations():
             _auto_authentik_tasklog_purge(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _atl_e:
             print(f"Startup migration: tasklog purge error (non-fatal): {_atl_e}", flush=True)
+        # v0.9.57 (B2): self-heal a ballooned Channels-over-Postgres backlog
+        # (django_channels_postgres_message). Silent no-op when healthy (< 100k rows).
+        try:
+            _auto_authentik_channel_purge(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _ach_e:
+            print(f"Startup migration: channel purge error (non-fatal): {_ach_e}", flush=True)
 
         # v0.9.31: Clear stale `failed` state on takauthentiktasklogpurge.service
         # when the on-disk script is already the v0.9.26+ fixed version.
