@@ -376,7 +376,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.57.1-alpha"
+VERSION = "0.9.58-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -763,12 +763,39 @@ def _warm_update_cache_bg():
 
 threading.Thread(target=_warm_update_cache_bg, daemon=True).start()
 
+_json_file_cache = {}  # path -> ((mtime_ns, size), text); invalidated on any file change
+
+def _load_json_cached(p):
+    """Read+parse a small JSON config with an mtime/size cache: one stat() per call, a
+    real disk read only when the file actually changes. Returns a FRESH dict each call
+    (json.loads) so callers can safely read-modify-write. {} on missing/unreadable.
+    v0.9.58: the before_request hooks (cookie-domain :314, idle-lock :2202) call
+    load_settings()/load_hardening() on EVERY request — uncached that is 2 disk reads +
+    JSON parses per request, on every poller and button. On a busy/slow-disk single-worker
+    console that serialized into thread-starvation → 'request failed' on the CPU/RAM &
+    check-release buttons (regression introduced with the W1/W2/W-IDLE work; never seen in
+    the first 4 months). stat() is ~microseconds; the file is re-read only after a save
+    (save_settings/save_hardening bump mtime), so reads stay correct."""
+    try:
+        st = os.stat(p)
+    except OSError:
+        return {}
+    key = (st.st_mtime_ns, st.st_size)
+    cached = _json_file_cache.get(p)
+    if not cached or cached[0] != key:
+        try:
+            with open(p) as f:
+                cached = (key, f.read())
+        except OSError:
+            return {}
+        _json_file_cache[p] = cached
+    try:
+        return json.loads(cached[1])
+    except Exception:
+        return {}
+
 def load_settings():
-    p = os.path.join(CONFIG_DIR, 'settings.json')
-    if os.path.exists(p):
-        with open(p) as f:
-            return json.load(f)
-    return {}
+    return _load_json_cached(os.path.join(CONFIG_DIR, 'settings.json'))
 
 def save_settings(s):
     os.makedirs(CONFIG_DIR, exist_ok=True)
@@ -2138,16 +2165,10 @@ HARDENING_CONFIG = 'hardening.json'
 SESSION_IDLE_MAX_DEFAULT = 1800  # 30 min — CJIS idle-lock ceiling (W2), fleet-uniform constant
 
 def load_hardening():
-    """Load hardening.json from CONFIG_DIR. Never raises — {} on missing/error.
-    Missing file == Standard posture (today's behavior, both cloud and edge)."""
-    try:
-        p = os.path.join(CONFIG_DIR, HARDENING_CONFIG)
-        if os.path.exists(p):
-            with open(p) as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return {}
+    """Load hardening.json from CONFIG_DIR (mtime-cached via _load_json_cached — see there
+    for the per-request thread-starvation regression this fixes). Never raises — {} on
+    missing/error. Missing file == Standard posture (both cloud and edge)."""
+    return _load_json_cached(os.path.join(CONFIG_DIR, HARDENING_CONFIG))
 
 def save_hardening(h):
     os.makedirs(CONFIG_DIR, exist_ok=True)
@@ -2243,6 +2264,13 @@ def _enforce_session_idle_lock():
     except Exception:
         # A lock failure must never brick a request — fail open to the normal flow.
         return
+
+# v0.9.58: the auto-reload "Session expired — signing you back in…" band-aid was REMOVED.
+# It masked the real problem (and reload-looped when the Authentik proxy session lapsed
+# fast). The real fix is in generate_caddyfile(): /api/* now BYPASSES the Authentik
+# forward_auth, so background XHR hit the console directly and get a clean same-origin 401
+# (or just succeed via the console session) instead of a cross-origin OAuth redirect that
+# the browser CORS-blocks. No client-side reload hack needed.
 
 def _hardening_control_w2():
     """W2 — 30-minute server-side session lock."""
@@ -2489,11 +2517,96 @@ def _offbox_ship_syslog(lines, cfg):
     return (n, None)
 
 def _offbox_ship_s3(lines, cfg):
-    """Ship spooled lines as an immutable S3 Object-Lock (WORM) segment. NOT YET WIRED:
-    SigV4 + Object-Lock needs an S3 client and a real bucket to validate against. Structured
-    so the flush loop treats it as a real mode; returns (0, reason) so the backlog is RETAINED
-    and surfaced, never silently dropped. TODO(v0.9.56 W7): implement against a test bucket."""
-    return (0, 's3objlock sink not yet implemented (pending S3 client + test Object-Lock bucket)')
+    """Ship the spooled audit lines as ONE immutable S3 Object-Lock (WORM) segment via a
+    SigV4-signed PUT — no boto3 dependency. Object-Lock mode=COMPLIANCE with
+    retain-until = now + retention_days makes the object un-deletable / un-overwritable
+    (even by the account root) until that date — the WORM guarantee for ≥365d audit.
+    Path-style when an `endpoint` is configured (MinIO — the validation target — and any
+    S3-compatible store); AWS virtual-host style otherwise. Fail-CLOSED: returns
+    (0, reason) on ANY error so the spool is RETAINED and surfaced, never dropped.
+    Returns (n_shipped, error_or_None); never raises.
+    Validate (v0.9.58 #3) against a local MinIO Object-Lock bucket: write probe →
+    confirm immutable read-back → attempt delete/overwrite → confirm REFUSED."""
+    import hashlib as _hl, hmac as _hmac, urllib.request as _ur, urllib.error as _ue
+    s3 = cfg.get('s3') or {}
+    bucket = (s3.get('bucket') or '').strip().strip('/')
+    region = (s3.get('region') or 'us-east-1').strip()
+    access_key = (s3.get('access_key') or '').strip()
+    secret_key = (s3.get('secret_key') or '').strip()
+    if not (bucket and access_key and secret_key):
+        return (0, 's3 sink incomplete (need bucket + access_key + secret_key)')
+    endpoint = (s3.get('endpoint') or '').strip().rstrip('/')
+    prefix = (s3.get('prefix') or 'infratak-audit').strip().strip('/')
+    retention_days = max(OFFBOX_RETENTION_FLOOR, int(cfg.get('retention_days') or OFFBOX_RETENTION_FLOOR))
+
+    body = ('\n'.join(lines) + '\n').encode('utf-8')
+    payload_hash = _hl.sha256(body).hexdigest()
+    now = datetime.utcnow()
+    amzdate = now.strftime('%Y%m%dT%H%M%SZ')
+    datestamp = now.strftime('%Y%m%d')
+    retain_until = (now + timedelta(days=retention_days)).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    fqdn = (load_settings().get('fqdn') or 'console').split(':')[0]
+    key = '%s/%s/%s/audit-%s-%s.jsonl' % (prefix, fqdn, now.strftime('%Y/%m/%d'),
+                                          amzdate, payload_hash[:12])
+
+    if endpoint:  # path-style: <endpoint>/<bucket>/<key>  (MinIO / S3-compatible)
+        host = endpoint.split('://', 1)[-1].split('/', 1)[0]
+        raw_uri = '/%s/%s' % (bucket, key)
+        url = '%s/%s/%s' % (endpoint, bucket, key)
+    else:         # AWS virtual-host: <bucket>.s3.<region>.amazonaws.com/<key>
+        host = '%s.s3.%s.amazonaws.com' % (bucket, region)
+        raw_uri = '/' + key
+        url = 'https://%s/%s' % (host, key)
+    # canonical URI: encode each path segment, preserve the slashes
+    canonical_uri = '/'.join(_ur.quote(seg, safe='') for seg in raw_uri.split('/'))
+
+    headers = {
+        'host': host,
+        'content-type': 'application/x-ndjson',
+        'x-amz-content-sha256': payload_hash,
+        'x-amz-date': amzdate,
+        'x-amz-object-lock-mode': 'COMPLIANCE',
+        'x-amz-object-lock-retain-until-date': retain_until,
+    }
+    signed_headers = ';'.join(sorted(headers))
+    canonical_headers = ''.join('%s:%s\n' % (k, headers[k]) for k in sorted(headers))
+    canonical_request = '\n'.join(['PUT', canonical_uri, '', canonical_headers,
+                                   signed_headers, payload_hash])
+
+    algorithm = 'AWS4-HMAC-SHA256'
+    scope = '%s/%s/s3/aws4_request' % (datestamp, region)
+    string_to_sign = '\n'.join([algorithm, amzdate, scope,
+                                _hl.sha256(canonical_request.encode()).hexdigest()])
+
+    def _sign(k, msg):
+        return _hmac.new(k, msg.encode(), _hl.sha256).digest()
+    k_signing = _sign(_sign(_sign(_sign(('AWS4' + secret_key).encode(), datestamp),
+                                  region), 's3'), 'aws4_request')
+    signature = _hmac.new(k_signing, string_to_sign.encode(), _hl.sha256).hexdigest()
+    authz = '%s Credential=%s/%s, SignedHeaders=%s, Signature=%s' % (
+        algorithm, access_key, scope, signed_headers, signature)
+
+    req = _ur.Request(url, data=body, method='PUT')
+    for k in headers:
+        req.add_header(k, headers[k])
+    req.add_header('Authorization', authz)
+    try:
+        resp = _ur.urlopen(req, timeout=20)
+        code = resp.getcode()
+        resp.read()
+        if 200 <= code < 300:
+            return (len(lines), None)
+        return (0, 's3 PUT returned HTTP %s' % code)
+    except _ue.HTTPError as e:
+        detail = ''
+        try:
+            detail = e.read().decode('utf-8', 'replace')[:200]
+        except Exception:
+            pass
+        return (0, 's3 PUT HTTP %s: %s' % (e.code, detail))
+    except Exception as e:
+        return (0, 's3 PUT failed: %s' % str(e)[:160])
 
 def _offbox_flush_once():
     """Flush the spool to the configured sink; drop only the confirmed-shipped prefix
@@ -6618,6 +6731,86 @@ def _f2b_parse_status(raw):
             result['banned_ips'] = [ip.strip() for ip in ips_raw.split() if ip.strip()]
     return result
 
+# Virtual / container / overlay interface prefixes whose subnets must NOT be auto-trusted:
+# docker bridges (172.17-31/16), libvirt, k8s CNIs, VPN/mesh links. These are RFC1918 but
+# are NOT the LAN/VNet a real upstream gateway lives on — auto-trusting them just bloats
+# ignoreip with noise (a box can have ~10 docker /16s). Only the physical NIC's subnet is
+# the one a proxy/gateway shares. (Found during v0.9.58 #6 field test: the test fleet's
+# jails would have picked up 9 docker bridges each.)
+_F2B_VIRTUAL_IFACE_PREFIXES = ('lo', 'docker', 'br-', 'br0', 'veth', 'virbr', 'vnet',
+                               'flannel', 'cni', 'cali', 'kube', 'tailscale', 'nb-',
+                               'wg', 'zt', 'tun', 'tap', 'cilium', 'ovs', 'weave')
+
+def _f2b_local_subnets():
+    """Derive the box's directly-attached *private* IPv4 subnets (CIDR) from the
+    global-scope addresses on its PHYSICAL NICs. On a gateway/proxy/VNet-fronted deploy
+    the upstream gateway usually lives on the box's own attached subnet, so trusting that
+    subnet keeps the gateway from ever being banned — the CORAZ total-outage failure mode
+    ([[fail2ban-bans-azure-gateway]]). Two guards: RFC1918 only (a direct-public box's
+    attached subnet is public — never whitelist public neighbours), and virtual/container
+    interfaces are skipped (docker bridges, CNIs, VPN links — noise, not a gateway LAN).
+    Best-effort; returns [] on any failure (so the jail still gets localhost)."""
+    subnets = []
+    try:
+        r = subprocess.run(['ip', '-o', '-4', 'addr', 'show', 'scope', 'global'],
+                           capture_output=True, text=True, timeout=5)
+        for line in r.stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            ifname = parts[1].split('@')[0]  # strip veth peer suffix (eth0@if5)
+            if ifname.startswith(_F2B_VIRTUAL_IFACE_PREFIXES):
+                continue
+            for i, tok in enumerate(parts):
+                if tok == 'inet' and i + 1 < len(parts):
+                    try:
+                        net = ipaddress.ip_network(parts[i + 1], strict=False)
+                        if net.is_private and str(net) not in subnets:
+                            subnets.append(str(net))
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    return subnets
+
+def _f2b_fleet_ignore_cidrs():
+    """Operator-configured fleet-wide trusted CIDRs (settings 'fail2ban_ignore_cidrs').
+    Use this for an upstream gateway/proxy/LB that does NOT share the box's attached
+    subnet (e.g. Azure App Gateway backends on a sibling /24). Survives a jail regen
+    because every writer re-derives ignoreip from settings on each write."""
+    try:
+        raw = load_settings().get('fail2ban_ignore_cidrs', '') or ''
+    except Exception:
+        raw = ''
+    return [c.strip() for c in raw.replace(',', ' ').split() if c.strip()]
+
+def _f2b_trusted_ignoreip(extra=''):
+    """Build the full ignoreip whitelist for ANY infra-TAK jail, fleet-uniform:
+    localhost + the box's attached private subnet(s) + operator fleet CIDRs + the
+    per-jail operator whitelist (extra). Identical code path on every box; dedups so
+    it is idempotent even if `extra` still carries the localhost tokens."""
+    parts, seen = [], set()
+    candidates = ['127.0.0.1/8', '::1']
+    candidates += _f2b_local_subnets()
+    candidates += _f2b_fleet_ignore_cidrs()
+    candidates += str(extra or '').replace(',', ' ').split()
+    for c in candidates:
+        c = c.strip()
+        if c and c not in seen:
+            seen.add(c)
+            parts.append(c)
+    return ' '.join(parts)
+
+def _f2b_operator_extra(stored):
+    """Strip the fleet-computed tokens (localhost + attached private subnets + fleet CIDRs)
+    from a jail's stored ignoreip, leaving ONLY the per-jail operator entries. Lets a
+    re-write re-derive the fleet part fresh each time, so a REMOVED fleet/gateway CIDR
+    actually propagates out of every jail instead of staying baked into the stored line."""
+    fleet = {'127.0.0.1/8', '::1'}
+    fleet.update(_f2b_local_subnets())
+    fleet.update(_f2b_fleet_ignore_cidrs())
+    return ' '.join(t for t in str(stored or '').split() if t not in fleet)
+
 def _f2b_read_jail_config():
     """Read current thresholds and ignoreip from the infratak-authentik jail config file."""
     jail_path = '/etc/fail2ban/jail.d/infratak-authentik.conf'
@@ -6645,7 +6838,7 @@ def _f2b_write_jail_config(maxretry, findtime, bantime, ignoreip=''):
     guarddog_action = ""
     if os.path.exists('/etc/fail2ban/action.d/infratak-guarddog.conf'):
         guarddog_action = "\n         infratak-guarddog"
-    ignoreip_line = f"ignoreip = 127.0.0.1/8 ::1{' ' + ignoreip.strip() if ignoreip.strip() else ''}\n"
+    ignoreip_line = f"ignoreip = {_f2b_trusted_ignoreip(ignoreip)}\n"
     jail_conf = (
         "[authentik]\n"
         "enabled  = true\n"
@@ -6691,7 +6884,7 @@ def _f2b_write_tak_jail_config(maxretry, findtime, bantime, ignoreip=''):
     guarddog_action = ""
     if os.path.exists('/etc/fail2ban/action.d/infratak-guarddog.conf'):
         guarddog_action = "\n         infratak-guarddog-takserver"
-    ignoreip_line = f"ignoreip = 127.0.0.1/8 ::1{' ' + ignoreip.strip() if ignoreip.strip() else ''}\n"
+    ignoreip_line = f"ignoreip = {_f2b_trusted_ignoreip(ignoreip)}\n"
     jail_conf = (
         "[takserver]\n"
         "enabled  = true\n"
@@ -6737,7 +6930,7 @@ def _f2b_write_ssh_jail_config(maxretry, findtime, bantime, ignoreip=''):
     guarddog_action = ""
     if os.path.exists('/etc/fail2ban/action.d/infratak-guarddog.conf'):
         guarddog_action = "\n         infratak-guarddog"
-    ignoreip_line = f"ignoreip = 127.0.0.1/8 ::1{' ' + ignoreip.strip() if ignoreip.strip() else ''}\n"
+    ignoreip_line = f"ignoreip = {_f2b_trusted_ignoreip(ignoreip)}\n"
     jail_conf = (
         "[sshd]\n"
         "enabled  = true\n"
@@ -7255,8 +7448,11 @@ def _f2b_read_mediamtx_jail_config():
         pass
     return cfg
 
-def _f2b_write_mediamtx_jail(maxretry, findtime, bantime):
-    """Write the mediamtx-rtsp filter file and infratak-mediamtx-rtsp jail config."""
+def _f2b_write_mediamtx_jail(maxretry, findtime, bantime, ignoreip=''):
+    """Write the mediamtx-rtsp filter file and infratak-mediamtx-rtsp jail config.
+    This jail is the one that banned the Azure App Gateway on CORAZ (its health
+    probes look like RTSP opens from the gateway IPs) — so it MUST honour the same
+    trusted-ignoreip whitelist as every other jail ([[fail2ban-bans-azure-gateway]])."""
     os.makedirs('/etc/fail2ban/filter.d', exist_ok=True)
     os.makedirs('/etc/fail2ban/jail.d', exist_ok=True)
 
@@ -7284,7 +7480,7 @@ def _f2b_write_mediamtx_jail(maxretry, findtime, bantime):
         f"maxretry = {maxretry}\n"
         f"findtime = {findtime}\n"
         f"bantime  = {bantime}\n"
-        "ignoreip = 127.0.0.1/8 ::1\n"
+        f"ignoreip = {_f2b_trusted_ignoreip(ignoreip)}\n"
         f"action   = ufw{guarddog_action}\n"
     )
     jail_path = '/etc/fail2ban/jail.d/infratak-mediamtx-rtsp.conf'
@@ -7498,7 +7694,7 @@ def _f2b_write_portal_jail(maxretry, findtime, bantime, ignoreip=''):
     guarddog_action = ""
     if os.path.exists('/etc/fail2ban/action.d/infratak-guarddog.conf'):
         guarddog_action = "\n         infratak-guarddog"
-    ignoreip_line = f"ignoreip = 127.0.0.1/8 ::1{' ' + ignoreip.strip() if ignoreip.strip() else ''}\n"
+    ignoreip_line = f"ignoreip = {_f2b_trusted_ignoreip(ignoreip)}\n"
     jail_conf = (
         "[takportal]\n"
         "enabled  = true\n"
@@ -7656,6 +7852,79 @@ def fail2ban_takportal_unban_api():
 def _f2b_recidive_enabled():
     return os.path.exists('/etc/fail2ban/jail.d/infratak-recidive.conf')
 
+def _f2b_rewrite_all_jails():
+    """Re-derive and re-write every currently-enabled infra-TAK jail from its stored
+    thresholds. Used after the fleet trusted-CIDR whitelist changes so the new value
+    propagates to ALL jails at once (each writer re-reads settings via
+    _f2b_trusted_ignoreip). Returns the list of jails rewritten."""
+    done = []
+    if _f2b_authentik_jail_enabled():
+        c = _f2b_read_jail_config()
+        _f2b_write_jail_config(c['maxretry'], c['findtime'], c['bantime'], _f2b_operator_extra(c.get('ignoreip', '')))
+        done.append('authentik')
+    if _f2b_tak_jail_enabled():
+        c = _f2b_read_tak_jail_config()
+        _f2b_write_tak_jail_config(c['maxretry'], c['findtime'], c['bantime'], _f2b_operator_extra(c.get('ignoreip', '')))
+        done.append('takserver')
+    if _f2b_ssh_jail_enabled():
+        c = _f2b_read_ssh_jail_config()
+        _f2b_write_ssh_jail_config(c['maxretry'], c['findtime'], c['bantime'], _f2b_operator_extra(c.get('ignoreip', '')))
+        done.append('sshd')
+    if _f2b_mediamtx_jail_enabled():
+        c = _f2b_read_mediamtx_jail_config()
+        _f2b_write_mediamtx_jail(c['maxretry'], c['findtime'], c['bantime'])
+        done.append('mediamtx-rtsp')
+    if _f2b_portal_jail_enabled():
+        c = _f2b_read_portal_jail_config()
+        _f2b_write_portal_jail(c['maxretry'], c['findtime'], c['bantime'], _f2b_operator_extra(c.get('ignoreip', '')))
+        done.append('takportal')
+    if _f2b_recidive_enabled():
+        c = _f2b_read_recidive_config()
+        _f2b_write_recidive_config(c['maxretry'], c['findtime'])
+        done.append('recidive')
+    return done
+
+
+@app.route('/api/fail2ban/trusted-cidrs', methods=['GET', 'POST'])
+@login_required
+def fail2ban_trusted_cidrs_api():
+    """Fleet-wide trusted-upstream whitelist (settings 'fail2ban_ignore_cidrs').
+    On a gateway/proxy/VNet-fronted deploy, ALL inbound traffic appears to come from
+    the upstream's handful of IPs; a jail trip then bans the gateway itself and every
+    vhost 502s ([[fail2ban-bans-azure-gateway]]). Operators add the gateway subnet
+    here once and it is baked into every jail's ignoreip — and re-baked on every jail
+    regen, so a MediaMTX redeploy can never re-expose the box."""
+    if request.method == 'GET':
+        return jsonify({
+            'ok': True,
+            'cidrs': _f2b_fleet_ignore_cidrs(),
+            'local_subnets': _f2b_local_subnets(),
+            'effective': _f2b_trusted_ignoreip(),
+        })
+    data = request.get_json(silent=True) or {}
+    raw = str(data.get('cidrs', '') or '').replace(',', ' ').split()
+    cleaned = []
+    for c in raw:
+        c = c.strip()
+        if not c:
+            continue
+        try:
+            ipaddress.ip_network(c, strict=False)  # validate CIDR / bare IP
+        except Exception:
+            return jsonify({'ok': False, 'error': f'Invalid CIDR/IP: {c}'}), 400
+        if c not in cleaned:
+            cleaned.append(c)
+    s = load_settings()
+    s['fail2ban_ignore_cidrs'] = ' '.join(cleaned)
+    save_settings(s)
+    rewritten = _f2b_rewrite_all_jails()
+    try:
+        subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+    except Exception:
+        pass
+    return jsonify({'ok': True, 'cidrs': cleaned, 'rewritten': rewritten,
+                    'effective': _f2b_trusted_ignoreip()})
+
 def _f2b_read_recidive_config():
     cfg = {'maxretry': 3, 'findtime': 86400}
     path = '/etc/fail2ban/jail.d/infratak-recidive.conf'
@@ -7684,10 +7953,13 @@ def _f2b_write_recidive_config(maxretry, findtime):
         "bantime  = -1\n"
         f"findtime = {findtime}\n"
         f"maxretry = {maxretry}\n"
+        f"ignoreip = {_f2b_trusted_ignoreip()}\n"
         "action   = ufw\n"
     )
     with open('/etc/fail2ban/jail.d/infratak-recidive.conf', 'w') as _f:
         _f.write(jail_conf)
+    # NOTE: _f2b_write_recidive_config takes no ignoreip arg — the recidive jail's
+    # ignoreip is always the fleet trusted set (no per-jail operator override needed).
     # Ensure fail2ban SQLite persistence so permanent bans survive restarts
     local_path = '/etc/fail2ban/fail2ban.local'
     db_line = 'dbfile = /var/lib/fail2ban/fail2ban.sqlite3\n'
@@ -14170,7 +14442,16 @@ def generate_caddyfile(settings=None):
             lines.append(f"    }}")
         lines.append(f"    route {{")
         lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
-        lines.append(f"        forward_auth {ak_up} {{")
+        # v0.9.58: background /api XHR must NOT go through forward_auth. An unauthenticated
+        # XHR gets 302-redirected to the cross-origin Authentik OAuth URL (tak.<fqdn>), which
+        # the browser CORS-blocks — that is the console "request failed" on the CPU/RAM,
+        # check-release, etc. buttons once the proxy session lapses. /api is still protected
+        # by the console's own @login_required (clean SAME-origin 401) and the W2 idle-lock,
+        # so SSO+MFA on every PAGE is unchanged; only the silent API calls skip the redirect.
+        lines.append(f"        @needs_sso {{")
+        lines.append(f"            not path /api/*")
+        lines.append(f"        }}")
+        lines.append(f"        forward_auth @needs_sso {ak_up} {{")
         lines.append(f"            uri /outpost.goauthentik.io/auth/caddy")
         lines.append(f"            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid")
         lines.append(f"            trusted_proxies private_ranges")
@@ -26795,6 +27076,24 @@ Bans IPs via UFW and sends Guard Dog email alerts.
 </div>
 {% else %}
 
+<!-- Trusted Upstream Networks (fleet-wide ignoreip) -->
+<div class="card" id="f2b-trusted-card" style="margin-bottom:8px">
+<div class="card-title">🌐 Trusted Upstream Networks</div>
+<div style="font-size:12px;color:var(--text-dim);margin-top:6px;line-height:1.6">
+If this box sits behind a reverse proxy, cloud load balancer, or gateway (Azure App Gateway, an Nginx/HAProxy in front, etc.), inbound traffic appears to come from the upstream\'s handful of IPs. A jail trip could then ban the <strong>gateway itself</strong> — and since it is the only way in, <strong>every site 502s</strong> while the box is perfectly healthy. Add the upstream\'s subnet(s) here and they are whitelisted in <strong>every</strong> jail, and re-applied automatically on each jail rebuild. Localhost and the box\'s own attached private subnet are always trusted.
+</div>
+<div style="margin-top:14px">
+<label class="form-label">Trusted CIDRs / IPs</label>
+<input class="form-input" id="f2b-trusted-cidrs" type="text" placeholder="e.g. 10.35.77.0/24  10.0.0.0/8" style="font-family:monospace" oninput="renderChips(\'f2b-trusted-cidrs\',\'f2b-trusted-chips\')">
+<div id="f2b-trusted-chips" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px"></div>
+</div>
+<div id="f2b-trusted-auto" style="font-size:11px;color:var(--text-dim);margin-top:10px"></div>
+<div style="display:flex;align-items:center;gap:12px;margin-top:14px">
+<button class="btn btn-primary" onclick="saveTrustedCidrs()">Save trusted networks</button>
+<span id="f2b-trusted-msg" style="font-size:12px"></span>
+</div>
+</div>
+
 <!-- Repeat Offender Protection -->
 <div class="card" id="recidive-card" style="margin-bottom:8px">
 <div class="card-title" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0">
@@ -27471,6 +27770,38 @@ function unbanIP(ip) {
     }).catch(()=>showToast(\'Network error\', \'error\'));
 }
 
+function loadTrustedCidrs() {
+  fetch(\'/api/fail2ban/trusted-cidrs\').then(r=>r.json()).then(d=>{
+    if (!d.ok) return;
+    var el = document.getElementById(\'f2b-trusted-cidrs\');
+    if (el) { el.value = (d.cidrs || []).join(\' \'); renderChips(\'f2b-trusted-cidrs\',\'f2b-trusted-chips\'); }
+    var auto = document.getElementById(\'f2b-trusted-auto\');
+    if (auto) {
+      var locals = (d.local_subnets || []);
+      auto.innerHTML = \'Always trusted: <code>127.0.0.1/8 ::1</code>\' +
+        (locals.length ? \' &nbsp;·&nbsp; auto-detected private subnet(s): <code>\' + locals.join(\'</code> <code>\') + \'</code>\' : \'\');
+    }
+  }).catch(()=>{});
+}
+
+function saveTrustedCidrs() {
+  var msg = document.getElementById(\'f2b-trusted-msg\');
+  var val = (document.getElementById(\'f2b-trusted-cidrs\').value || \'\').trim();
+  if (msg) { msg.style.color = \'var(--text-dim)\'; msg.textContent = \'Saving…\'; }
+  fetch(\'/api/fail2ban/trusted-cidrs\', {method:\'POST\', headers:{\'Content-Type\':\'application/json\'}, body:JSON.stringify({cidrs: val})})
+    .then(r=>r.json()).then(d=>{
+      if (d.ok) {
+        if (msg) { msg.style.color = \'var(--green)\'; msg.textContent = \'Saved — applied to \' + (d.rewritten||[]).length + \' jail(s).\'; }
+        showToast(\'Trusted networks saved and applied to all jails.\', \'success\');
+        loadTrustedCidrs();
+      } else {
+        if (msg) { msg.style.color = \'var(--red)\'; msg.textContent = d.error || \'Save failed\'; }
+        showToast(d.error || \'Save failed\', \'error\');
+      }
+    }).catch(()=>{ if (msg) { msg.style.color = \'var(--red)\'; msg.textContent = \'Network error\'; } showToast(\'Network error\', \'error\'); });
+}
+
+loadTrustedCidrs();
 loadStatus();
 loadLog();
 setInterval(function(){ loadStatus(); loadLog(); }, 30000);
@@ -43926,21 +44257,35 @@ async function akUpdate(){
     btn.disabled=true;btn.innerHTML='<span style="display:inline-block;animation:uninstall-spin 1s linear infinite;font-size:14px">↻</span> Updating...';
     document.querySelectorAll('.control-btn').forEach(function(b){if(b!==btn){b.disabled=true;b.style.opacity='0.5'}});
     status.style.display='block';status.style.color='var(--text-secondary)';status.textContent='Pulling latest Authentik image and restarting… (may take 2–5 min)';
+    // v0.9.58 (#5): a long Authentik image pull can outlast a fronting proxy/gateway's
+    // response timeout, which then returns an HTML 502/504 page; the old r.json() then
+    // threw "Unexpected token '<'" and showed a scary failure even though the update was
+    // still running on the box (seen on CORAZ). Detect the gateway-timeout / non-JSON
+    // case and tell the operator to wait, instead of surfacing a parse error.
+    function _akUpdateStillRunning(){
+        status.style.color='var(--cyan)';
+        status.innerHTML='⏳ Authentik update is still running in the background — the image pull can exceed the gateway timeout. This page will refresh automatically in a few minutes (or refresh manually once Authentik is back). Do not re-click Update.';
+        btn.innerHTML='<span style="display:inline-block;animation:uninstall-spin 1s linear infinite;font-size:14px">↻</span> Updating…';
+        setTimeout(()=>location.reload(),180000);
+    }
     try{
         var r=await fetch('/api/authentik/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'update'})});
-        var d=await r.json();
-        if(d.success){
+        var d=null,parseFail=false;
+        try{ d=await r.json(); }catch(_pe){ parseFail=true; }
+        if(parseFail||r.status===502||r.status===504){ _akUpdateStillRunning(); return; }
+        if(d&&d.success){
             status.style.color='var(--green)';status.textContent='✓ Authentik updated successfully. Reloading…';
             setTimeout(()=>location.reload(),2500);
         }else{
-            status.style.color='var(--red)';status.textContent='✗ Update failed: '+(d.error||'unknown error');
+            status.style.color='var(--red)';status.textContent='✗ Update failed: '+((d&&d.error)||'unknown error');
             btn.disabled=false;btn.innerHTML='⬆ Update';
             document.querySelectorAll('.control-btn').forEach(function(b){b.disabled=false;b.style.opacity=''});
         }
     }catch(e){
-        status.style.color='var(--red)';status.textContent='✗ Error: '+e.message;
-        btn.disabled=false;btn.innerHTML='⬆ Update';
-        document.querySelectorAll('.control-btn').forEach(function(b){b.disabled=false;b.style.opacity=''});
+        // The POST itself dropped (proxy reset / timeout mid-pull) — same long-running
+        // case, not a real failure. Surface the wait message, log the real error for debug.
+        try{console.error('akUpdate transport error (treating as still-running):',e);}catch(_le){}
+        _akUpdateStillRunning();
     }
 }
 async function akControl(action){
@@ -53890,7 +54235,7 @@ async function toggleResourceBreakdown(hostId){
     if(div.style.display==='block'){div.style.display='none';return;}
     if(!div.getAttribute('data-loaded')){
         div.style.display='block';div.textContent='Loading\u2026';
-        try{var r=await fetch('/api/host-resource-usage?target='+encodeURIComponent(hostId));var d=await r.json();renderResourceBreakdown(div,d,hostId);div.setAttribute('data-loaded','1');}
+        try{var r=await fetchRetry('/api/host-resource-usage?target='+encodeURIComponent(hostId));var d=await r.json();renderResourceBreakdown(div,d,hostId);div.setAttribute('data-loaded','1');}
         catch(e){div.innerHTML='<span style="color:var(--red)">Request failed</span>';div.setAttribute('data-loaded','1');}
         return;
     }
@@ -53902,6 +54247,29 @@ async function toggleResourceBreakdown(hostId){
    fails that cleared on a page reload). Whitelisted to read endpoints only — the
    long-running action endpoints (update/apply, *_control, deploy) are never touched. */
 (function(){if(window.__fetchTO)return;window.__fetchTO=1;var _f=window.fetch.bind(window);var L=[['/api/metrics',10000],['/api/modules/version',15000],['/api/modules',12000],['/api/host-resource-usage',30000],['/api/update/check',15000],['/api/guarddog',12000]];window.fetch=function(u,o){o=o||{};if(typeof u==='string'&&!o.signal){for(var i=0;i<L.length;i++){if(u.indexOf(L[i][0])===0){var c=new AbortController();o.signal=c.signal;var t=setTimeout(function(){try{c.abort()}catch(e){}},L[i][1]);return _f(u,o).finally(function(){clearTimeout(t)});}}}return _f(u,o);};})();
+/* v0.9.58: idle-lock 401 handler is injected on EVERY console page globally via the
+   _inject_idle_lock_handler after_request hook (app.py) — no longer inline here. */
+/* v0.9.58 (#1): on-demand button fetches fail silently on the FIRST transient miss
+   (a momentary thread-starvation, an aborted poll, a 5xx) and strand the operator
+   until they reload the page. fetchRetry() auto-retries a transient failure 1-2x with
+   a short backoff so a blip just succeeds. Use ONLY for short read/idempotent calls —
+   never for update/apply, deploys, or non-idempotent POSTs. Pairs with __fetchTO above
+   (each retry gets a fresh timeout). */
+async function fetchRetry(url,opts,tries){
+  opts=opts||{}; tries=(tries==null)?2:tries; var lastErr;
+  for(var a=0;a<tries;a++){
+    try{
+      var r=await fetch(url,opts);
+      if(r.status>=500&&a<tries-1){await new Promise(function(res){setTimeout(res,350*(a+1));});continue;}
+      return r;
+    }catch(e){
+      lastErr=e;
+      if(a<tries-1){await new Promise(function(res){setTimeout(res,350*(a+1));});continue;}
+      throw e;
+    }
+  }
+  throw lastErr;
+}
 setInterval(async()=>{try{const r=await fetch('/api/metrics');const d=await r.json();document.getElementById('cpu-value').textContent=d.cpu_percent+'%';document.getElementById('ram-value').textContent=d.ram_percent+'%';document.getElementById('disk-value').textContent=d.disk_percent+'%';var _rd=document.getElementById('ram-detail');if(_rd&&d.ram_used_gb!=null)_rd.textContent=d.ram_used_gb+'GB / '+d.ram_total_gb+'GB';var _dd=document.getElementById('disk-detail');if(_dd&&d.disk_used_gb!=null)_dd.textContent=d.disk_used_gb+'GB / '+d.disk_total_gb+'GB';document.getElementById('uptime-value').textContent=d.uptime;if(d.unattended_upgrades_hosts)updateUUHosts(d.unattended_upgrades_hosts);}catch(e){}},5000);
 function refreshModuleCards(){
     fetch('/api/modules').then(r=>r.json()).then(function(mods){
@@ -54161,7 +54529,7 @@ async function checkUpdate(forceRefresh){
     if(btn){btn.disabled=true;btn.textContent='Checking...';}
     try{
         var url='/api/update/check';if(forceRefresh)url+='?refresh=1';
-        var r=await fetch(url,{credentials:'same-origin',cache:'no-store'});
+        var r=await fetchRetry(url,{credentials:'same-origin',cache:'no-store'});
         var d=await r.json();
         if(d.update_available){
             document.getElementById('update-banner').style.display='block';
@@ -54242,7 +54610,7 @@ async function confirmDevChannel(){
     if(!pw){if(err)err.textContent='Password required';return;}
     if(err)err.textContent='';
     try{
-        var r=await fetch('/api/update/channel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:'dev',password:pw}),credentials:'same-origin'});
+        var r=await fetchRetry('/api/update/channel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:'dev',password:pw}),credentials:'same-origin'});
         var d=await r.json();
         if(d.ok){
             closeDevModal();
@@ -54259,7 +54627,7 @@ async function setUpdateChannel(ch){
     var st=document.getElementById('ch-status');
     if(st)st.textContent='Saving…';
     try{
-        var r=await fetch('/api/update/channel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:ch}),credentials:'same-origin'});
+        var r=await fetchRetry('/api/update/channel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:ch}),credentials:'same-origin'});
         var d=await r.json();
         if(d.ok){
             _currentChannel=ch;
@@ -56518,6 +56886,93 @@ def _startup_ensure_console_runtime_max_sec():
         print(f'Startup migration: RuntimeMaxSec patch warning (non-fatal): {_e}')
 
 _startup_ensure_console_runtime_max_sec()
+
+
+# v0.9.58 (#4): startup migration — ensure the console gunicorn unit runs --threads 8.
+# The v0.9.57 4→8 bump was only written by start.sh (fresh install) and the legacy
+# python3→gunicorn auto-upgrade shim; an ALREADY-gunicorn unit (every existing box)
+# was never rewritten — _ensure_gunicorn_upgrade() early-returns once 'gunicorn' is in
+# the unit. So a plain `git checkout + restart` kept --threads 4 and the 1-worker
+# console still starved its 4 threads under load (the poller fix needs the headroom).
+# Rewrite here so manual deploys converge too. Effective on the next restart (same as
+# the RuntimeMaxSec migration above; guaranteed within 24h by RuntimeMaxSec).
+def _startup_ensure_console_gunicorn_threads():
+    try:
+        svc = '/etc/systemd/system/takwerx-console.service'
+        if not os.path.exists(svc):
+            return
+        with open(svc) as f:
+            content = f.read()
+        m = re.search(r'^ExecStart=.*$', content, flags=re.MULTILINE)
+        if not m or 'gunicorn' not in m.group(0):
+            return  # legacy python3 unit — handled by the __main__ auto-upgrade shim
+        exec_line = m.group(0)
+        if re.search(r'--threads\s+8(\s|$)', exec_line):
+            return  # already 8 — idempotent no-op
+        if re.search(r'--threads\s+\d+', exec_line):
+            new_exec = re.sub(r'--threads\s+\d+', '--threads 8', exec_line)
+        elif re.search(r'--workers\s+\d+', exec_line):
+            new_exec = re.sub(r'(--workers\s+\d+)', r'\1 --threads 8', exec_line, count=1)
+        else:
+            return  # unexpected ExecStart shape — leave it alone
+        if new_exec == exec_line:
+            return
+        content = content.replace(exec_line, new_exec, 1)
+        with open(svc, 'w') as f:
+            f.write(content)
+        subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=15)
+        print('Startup migration: console gunicorn --threads → 8 (v0.9.58 #4; effective next restart)')
+    except PermissionError:
+        pass
+    except Exception as _e:
+        print(f'Startup migration: gunicorn threads patch warning (non-fatal): {_e}')
+
+_startup_ensure_console_gunicorn_threads()
+
+
+# v0.9.58 (#6): startup migration — re-apply the trusted-upstream ignoreip to every
+# enabled fail2ban jail on boot, so the gateway/VNet whitelist + the mediamtx/recidive
+# baseline activate on a plain restart, not only when an operator next touches a jail
+# config. Without this, the v0.9.58 #6 fix stayed latent until a jail write (found during
+# field test: a restarted box kept its pre-.58 jails). Idempotent: rewrites + reloads ONLY
+# when the desired trusted set isn't already present in every jail — a silent no-op after
+# the first boot and on direct-public boxes with no private NIC subnet. Unions existing
+# per-jail operator entries (never drops them) and dedups (fixes doubled-localhost).
+def _startup_reapply_f2b_trusted_ignoreip():
+    try:
+        if not os.path.isdir('/etc/fail2ban/jail.d'):
+            return
+        import glob as _glob
+        jails = _glob.glob('/etc/fail2ban/jail.d/infratak-*.conf')
+        if not jails:
+            return
+        want = set(_f2b_trusted_ignoreip().split())
+        need = False
+        for jp in jails:
+            cur = set()
+            try:
+                with open(jp) as _jf:
+                    for line in _jf:
+                        line = line.strip()
+                        if line.startswith('ignoreip'):
+                            cur = set(line.split('=', 1)[1].split())
+                            break
+            except Exception:
+                continue
+            if not want.issubset(cur):
+                need = True
+                break
+        if not need:
+            return
+        changed = _f2b_rewrite_all_jails()
+        subprocess.run(['fail2ban-client', 'reload'], capture_output=True, timeout=15)
+        print('Startup migration: re-applied fail2ban trusted ignoreip to %s (v0.9.58 #6)' % (changed or []))
+    except PermissionError:
+        pass
+    except Exception as _e:
+        print('Startup migration: f2b trusted-ignoreip re-apply warning (non-fatal): %s' % _e)
+
+_startup_reapply_f2b_trusted_ignoreip()
 
 
 # v0.9.12 A7: startup migration — patch base compose port bindings to loopback
