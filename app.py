@@ -376,7 +376,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "0.9.60-alpha"
+VERSION = "10.0.1-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -399,12 +399,12 @@ CESIUM_TILES_LOGO_URL = "/static/3DTiles_light_color.svg"
 TVR_REPO = "https://github.com/raytheonbbn/tak-video-restreamer.git"
 TVR_INSTALL_DIR = os.path.expanduser("~/tak-video-restreamer")
 NETBIRD_INSTALL_DIR = os.path.expanduser("~/netbird")
-# CFD Remote Assist Portal — Android EUD remote management (OIDC via Authentik)
+# EUD Remote Assist Portal — Android EUD remote management (OIDC via Authentik)
 REMOTE_ASSIST_REPO = "https://github.com/cfd2474/EUD_Remote_Assist_Portal.git"
-REMOTE_ASSIST_INSTALL_DIR = os.path.expanduser("~/cfd-remote-assist")
+REMOTE_ASSIST_INSTALL_DIR = os.path.expanduser("~/eud-remote-assist")
 REMOTE_ASSIST_PORT = 8767
 REMOTE_ASSIST_DEVICE_PORT = 8448
-REMOTE_ASSIST_OIDC_SLUG = "cfd-remote-assist"
+REMOTE_ASSIST_OIDC_SLUG = "eud-remote-assist"
 REMOTE_ASSIST_LOGO_URL = "/static/eud-remote-assist-banner.png"
 # Fleet-vetted NetBird image pins — NEVER ':latest' (boxes deployed days apart must
 # converge to one version; netbirdio pushes new minors every few days). Bump these in an
@@ -711,7 +711,10 @@ MEDIAMTX_REMOTE_EXT_DOM_NORMALIZE_SCRIPT = (
 NODERED_LOGO_URL = "https://nodered.org/about/resources/media/node-red-icon.png"       # icon only (e.g. small nav)
 NODERED_LOGO_URL_2 = "https://nodered.org/about/resources/media/node-red-icon-2.png"   # icon + "Node-RED" text (card, sidebar)
 # Authentik official brand icon (external URL)
-AUTHENTIK_LOGO_URL = "https://raw.githubusercontent.com/goauthentik/authentik/main/website/static/img/icon_left_brand_colour.svg"
+# Pinned to an immutable tag, NOT `main`: goauthentik moved this asset out of
+# website/static/img on main → the old `.../main/...` URL now 404s (broken logo
+# everywhere, all platforms — browser-loaded so arch-independent). A tag ref can't move.
+AUTHENTIK_LOGO_URL = "https://raw.githubusercontent.com/goauthentik/authentik/version-2024.12/website/static/img/icon_left_brand_colour.svg"
 # Caddy official logo for dark backgrounds — white text (Wikimedia Commons)
 CADDY_LOGO_URL = "https://upload.wikimedia.org/wikipedia/commons/5/56/Caddyserver_logo_dark.svg"
 FAIL2BAN_LOGO_URL = "https://avatars.githubusercontent.com/u/1087378?s=128&v=4"
@@ -836,6 +839,585 @@ def save_auth(auth_dict):
         json.dump(auth_dict, f, indent=4)
     os.chmod(p, 0o600)
 
+# ==========================================================================
+# v10.0.1 — Platform detection (arch × distro × install-method)
+# ==========================================================================
+# These four helpers are the foundation of multi-platform deployability
+# (ARM64 + RHEL/Rocky folded into one code path). They are PURE READERS — no
+# privileged calls, no side effects beyond a one-time back-fill of settings.json
+# for boxes installed before these keys existed. On the field-validated
+# amd64-Ubuntu path every one of them returns its legacy-equivalent default
+# ('amd64' / 'debian' / 'native'), so that path stays byte-identical.
+
+def _arch_normalize(machine):
+    """Map a raw `uname -m` value to infra-TAK's two arch tokens. Anything that
+    isn't clearly aarch64 → 'amd64' (the validated default path)."""
+    m = (machine or '').strip().lower()
+    if m in ('aarch64', 'arm64'):
+        return 'arm64'
+    return 'amd64'  # x86_64, amd64, i686, unknown — all take the amd64 path
+
+def _host_arch():
+    """'amd64' | 'arm64' — host CPU architecture.
+
+    Prefers settings.json's 'arch' (written by start.sh at install). For boxes
+    installed before the key existed, back-fills it once from live `uname` and
+    persists it so subsequent calls hit the cached settings read. Used to force
+    the container TAK path on arm64 (no native arm TAK .deb/.rpm exists)."""
+    s = load_settings()
+    a = s.get('arch')
+    if a in ('amd64', 'arm64'):
+        return a
+    try:
+        a = _arch_normalize(os.uname().machine)
+    except Exception:
+        a = 'amd64'
+    # one-time back-fill for pre-v10.0.1 boxes (load_settings is mtime-cached;
+    # the save bumps mtime so the next read returns the populated value)
+    try:
+        s = load_settings()
+        s['arch'] = a
+        save_settings(s)
+    except Exception:
+        pass
+    return a
+
+def _distro_family():
+    """'debian' | 'rhel' — package-manager family, derived from settings.
+
+    apt → 'debian', dnf → 'rhel'. Defaults to 'debian' (the original,
+    byte-identical path) whenever the signal is missing/unknown, so existing
+    amd64-Ubuntu boxes are never re-routed."""
+    s = load_settings()
+    pm = (s.get('pkg_mgr') or '').strip().lower()
+    if pm == 'dnf':
+        return 'rhel'
+    if pm == 'apt':
+        return 'debian'
+    # pkg_mgr unset/unknown — fall back to os_type prefix
+    ot = (s.get('os_type') or '').strip().lower()
+    if ot.startswith(('rocky', 'rhel', 'almalinux', 'centos')):
+        return 'rhel'
+    return 'debian'
+
+def _tak_install_method():
+    """'native' | 'container' — how TAK Server is (or will be) installed here.
+
+    Returns the persisted 'tak_install_method' (set at deploy time) when present.
+    When unset, returns the platform DEFAULT: arm64 → 'container' (no native arm
+    TAK package), everything else → 'native'. Existing amd64 .deb boxes have no
+    key and correctly resolve to 'native'."""
+    s = load_settings()
+    m = s.get('tak_install_method')
+    if m in ('native', 'container'):
+        return m
+    return 'container' if _host_arch() == 'arm64' else 'native'
+
+def _tak_is_container():
+    """True when TAK Server runs as a container (vs native systemd service).
+    The control shim (Phase 3) routes systemctl/exec sites on this."""
+    return _tak_install_method() == 'container'
+
+# --------------------------------------------------------------------------
+# v10.0.1 — Container TAK Server constants + control shim (Phase 3)
+# --------------------------------------------------------------------------
+# The container path (arm64, or operator-selected on amd64) runs TAK Server as
+# two Docker containers built from the official takserver-docker-*.zip
+# (Dockerfile.takserver on eclipse-temurin:17-jammy, Dockerfile.takserver-db on
+# postgres:15.1 — both multi-arch, so they build natively on aarch64). Host
+# /opt/tak is SYMLINKED to the bundle's tak/ dir, so every existing host-side
+# /opt/tak file operation (CoreConfig sed, cert files, the _patch_* helpers)
+# works unchanged; only binary EXECUTION (makeCert/keytool/UserManager) needs
+# `docker exec`. Mirrors the proven installTAK docker sequence.
+TAK_CONTAINER = 'takserver'          # app container name (and image tag)
+TAK_DB_CONTAINER = 'takserver-db'    # db container name
+TAK_DOCKER_NET = 'takserver'         # docker network
+TAK_DB_VOLUME = 'takserver_pgsql'    # named volume for postgres data
+TAK_DOCKER_ROOT = os.path.join(os.path.expanduser('~'), 'tak-docker')  # unzip target
+
+def _tak_exec(inner_cmd):
+    """Return a shell string that runs `inner_cmd` in the TAK Server context.
+      native    → `sudo -u tak bash -c '<inner>'`
+      container → `docker exec <TAK_CONTAINER> bash -c '<inner>'`
+    Used by the v10.0.1 container deploy; the native .deb deploy path is NOT
+    routed through this (it stays byte-identical). New privileged surface
+    (docker exec) is logged for the v10.0.5 sudoers allowlist (NON-ROOT-COMMANDS:
+    docker)."""
+    if _tak_is_container():
+        return f"docker exec {TAK_CONTAINER} bash -c {shlex.quote(inner_cmd)}"
+    return f"sudo -u tak bash -c {shlex.quote(inner_cmd)}"
+
+def _tak_systemctl(action):
+    """Return a shell string for a TAK Server lifecycle action.
+      native    → `systemctl <action> takserver`
+      container → docker equivalent (start/stop/restart map to `docker <action>`;
+                  `is-active` → `docker inspect` running-state; enable/daemon-reload
+                  are no-ops since the container uses --restart=always).
+    NON-ROOT-COMMANDS: docker."""
+    if _tak_is_container():
+        if action == 'restart':
+            return f"docker restart {TAK_CONTAINER}"
+        if action == 'start':
+            return f"docker start {TAK_CONTAINER}"
+        if action == 'stop':
+            return f"docker stop {TAK_CONTAINER}"
+        if action == 'is-active':
+            # prints 'active' when the container is running, else 'inactive' —
+            # matches the string `systemctl is-active` returns so callers parse
+            # it the same way.
+            return (f"sh -c \"[ \\\"$(docker inspect -f '{{{{.State.Running}}}}' "
+                    f"{TAK_CONTAINER} 2>/dev/null)\\\" = true ] && echo active || echo inactive\"")
+        if action in ('enable', 'daemon-reload'):
+            return 'true'  # no-op: container has --restart=always
+    return f"systemctl {action} takserver"
+
+# --------------------------------------------------------------------------
+# v10.0.1 — Package-manager + firewall abstraction (Phase 1)
+# --------------------------------------------------------------------------
+# Thin apt↔dnf and ufw↔firewalld shims so the TAK/module/firewall paths run
+# unchanged on Debian/Ubuntu and gain a RHEL/Rocky (EL9 family) branch. Every
+# helper is a NO-OP-equivalent on apt/ufw boxes (it takes the exact same branch
+# the inline code took before), so the field-validated amd64-Ubuntu path stays
+# byte-identical. New privileged surface (dnf/firewall-cmd) is routed through
+# _sudo_wrap for the v10.0.5 non-root migration (NON-ROOT-COMMANDS: dnf,
+# firewall-cmd) and runs as argv lists (no shell) so quoting is safe.
+
+def _pkg_mgr():
+    """'apt' | 'dnf' — the host package manager. Mirrors _distro_family's
+    derivation but returns the concrete tool name. Defaults to 'apt' (the
+    original byte-identical path) whenever the signal is missing."""
+    s = load_settings()
+    pm = (s.get('pkg_mgr') or '').strip().lower()
+    if pm in ('apt', 'dnf'):
+        return pm
+    return 'dnf' if _distro_family() == 'rhel' else 'apt'
+
+def _pkg_lock_wait(log_fn=None, log_list=None):
+    """Block until the package manager is free to use.
+      apt → existing wait_for_apt_lock (unattended-upgrades/dpkg lock).
+      dnf → wait out any running dnf/yum (the Rocky-script pgrep loop).
+    No-op-equivalent on apt boxes (delegates to the original waiter)."""
+    if _pkg_mgr() == 'apt':
+        return wait_for_apt_lock(log_fn or (lambda *_a, **_k: None),
+                                 log_list if log_list is not None else [])
+    waited = 0
+    while subprocess.run("pgrep -f 'dnf|yum' >/dev/null 2>&1 || [ -f /var/run/yum.pid ]",
+                         shell=True).returncode == 0:
+        if log_fn and waited % 10 == 0:
+            log_fn(f"⏳ Waiting for dnf/yum to finish... {waited}s")
+        time.sleep(2)
+        waited += 2
+        if waited > 1800:  # 30-min safety valve — never hang a deploy forever
+            if log_fn:
+                log_fn("⚠ dnf/yum still busy after 30 min — proceeding anyway")
+            break
+    return True
+
+def _pkg_install(pkgs, repo=None, log_fn=None, timeout=1800):
+    """Install package(s) with the host package manager. Returns (ok, output).
+      apt → DEBIAN_FRONTEND=noninteractive apt-get install -y …
+      dnf → (optionally `dnf install -y <repo-rpm-or-url>` first) then dnf install -y …
+    `pkgs` may be a str or list; entries may be package names, local .rpm/.deb
+    paths, or URLs. No-op-equivalent on apt boxes."""
+    if isinstance(pkgs, str):
+        pkgs = [pkgs]
+    pm = _pkg_mgr()
+    if pm == 'dnf':
+        if repo:
+            subprocess.run(_sudo_wrap(['dnf', 'install', '-y', repo]),
+                           capture_output=True, text=True, timeout=timeout)
+        cmd = _sudo_wrap(['dnf', 'install', '-y'] + list(pkgs))
+        env = None
+    else:
+        cmd = _sudo_wrap(['apt-get', 'install', '-y'] + list(pkgs))
+        env = dict(os.environ, DEBIAN_FRONTEND='noninteractive', NEEDRESTART_MODE='l')
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+    except Exception as e:
+        if log_fn:
+            log_fn(f"  pkg install error ({pm}): {str(e)[:200]}")
+        return False, str(e)
+    out = (r.stdout or '') + (r.stderr or '')
+    ok = r.returncode == 0
+    if log_fn and not ok:
+        log_fn(f"  pkg install failed ({pm}): {out.strip()[:300]}")
+    return ok, out
+
+def _pkg_remove(pkgs, purge=False, timeout=600):
+    """Remove package(s). apt remove/purge ↔ dnf remove. Returns (ok, output)."""
+    if isinstance(pkgs, str):
+        pkgs = [pkgs]
+    if _pkg_mgr() == 'dnf':
+        cmd = _sudo_wrap(['dnf', 'remove', '-y'] + list(pkgs))
+        env = None
+    else:
+        cmd = _sudo_wrap(['apt-get', 'purge' if purge else 'remove', '-y'] + list(pkgs))
+        env = dict(os.environ, DEBIAN_FRONTEND='noninteractive')
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+    except Exception as e:
+        return False, str(e)
+    return r.returncode == 0, (r.stdout or '') + (r.stderr or '')
+
+def _fw_backend():
+    """'ufw' | 'firewalld' | None — which host firewall to drive. Prefers the
+    family-native tool when both are present (Debian→ufw, RHEL→firewalld), so a
+    box converges to one backend deterministically."""
+    have_ufw = subprocess.run('command -v ufw >/dev/null 2>&1', shell=True).returncode == 0
+    have_fwd = subprocess.run('command -v firewall-cmd >/dev/null 2>&1', shell=True).returncode == 0
+    if _distro_family() == 'rhel':
+        if have_fwd:
+            return 'firewalld'
+        if have_ufw:
+            return 'ufw'
+    else:
+        if have_ufw:
+            return 'ufw'
+        if have_fwd:
+            return 'firewalld'
+    return 'firewalld' if have_fwd else ('ufw' if have_ufw else None)
+
+def _fw_allow(port, proto='tcp'):
+    """Open a port in the host firewall (ufw or firewalld). Returns (ok, msg).
+    No-op-safe (ok=True) when no firewall is installed."""
+    be = _fw_backend()
+    if be is None:
+        return True, 'no firewall present'
+    proto = 'udp' if str(proto).lower() == 'udp' else 'tcp'
+    port = int(port)
+    try:
+        if be == 'firewalld':
+            subprocess.run(_sudo_wrap(['firewall-cmd', '--zone=public', '--permanent',
+                                       f'--add-port={port}/{proto}']),
+                           capture_output=True, text=True, timeout=20)
+            r = subprocess.run(_sudo_wrap(['firewall-cmd', '--reload']),
+                               capture_output=True, text=True, timeout=20)
+        else:
+            r = subprocess.run(_sudo_wrap(['ufw', 'allow', f'{port}/{proto}']),
+                               capture_output=True, text=True, timeout=20)
+    except Exception as e:
+        return False, str(e)[:160]
+    return r.returncode == 0, (r.stdout or '') + (r.stderr or '')
+
+def _fw_remove(port, proto='tcp'):
+    """Close a previously-opened port (ufw delete allow ↔ firewalld remove-port)."""
+    be = _fw_backend()
+    if be is None:
+        return True, 'no firewall present'
+    proto = 'udp' if str(proto).lower() == 'udp' else 'tcp'
+    port = int(port)
+    try:
+        if be == 'firewalld':
+            subprocess.run(_sudo_wrap(['firewall-cmd', '--zone=public', '--permanent',
+                                       f'--remove-port={port}/{proto}']),
+                           capture_output=True, text=True, timeout=20)
+            r = subprocess.run(_sudo_wrap(['firewall-cmd', '--reload']),
+                               capture_output=True, text=True, timeout=20)
+        else:
+            r = subprocess.run(_sudo_wrap(['ufw', '--force', 'delete', 'allow', f'{port}/{proto}']),
+                               capture_output=True, text=True, timeout=20)
+    except Exception as e:
+        return False, str(e)[:160]
+    return r.returncode == 0, (r.stdout or '') + (r.stderr or '')
+
+def _fw_ensure_installed(log=None):
+    """v10.0.1: Ensure a host firewall is present AND enabled. On RHEL/Rocky,
+    firewalld is ALWAYS installed + enabled (operator decision 2026-06-21: many
+    deploys are NOT in the cloud, so there's no security group to fall back on; this
+    matches Debian's always-on ufw, gives fleet-uniform state, and the hardening W4
+    controls need a host firewall to assert against). Idempotent — no-op if already
+    present + active.
+
+    LOCKOUT SAFETY: SSH must stay reachable. firewalld's default `public` zone ships
+    with the `ssh` service open, but we add it explicitly BEFORE enabling so a box
+    behind a cloud security group (SSH arrives via the SG, not a host rule) is never
+    cut off when firewalld goes default-deny. Debian path is unchanged (start.sh owns
+    ufw). Returns the active backend ('ufw'|'firewalld'|None)."""
+    def _log(m):
+        if log:
+            try:
+                log(m)
+            except Exception:
+                pass
+    if _distro_family() != 'rhel':
+        return _fw_backend()  # Debian/Ubuntu: ufw is ensured by start.sh
+    have_fwd = subprocess.run('command -v firewall-cmd >/dev/null 2>&1', shell=True).returncode == 0
+    if not have_fwd:
+        _log("  firewall: installing firewalld (RHEL always-on host firewall)…")
+        try:
+            _pkg_install(['firewalld'], log_fn=log)
+        except Exception as e:
+            _log(f"  ⚠ firewalld install failed: {str(e)[:120]}")
+            return _fw_backend()
+    # Keep SSH reachable BEFORE the firewall goes active (lockout guard).
+    subprocess.run(_sudo_wrap(['firewall-cmd', '--zone=public', '--permanent', '--add-service=ssh']),
+                   capture_output=True, text=True, timeout=20)
+    subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', 'firewalld']),
+                   capture_output=True, text=True, timeout=60)
+    subprocess.run(_sudo_wrap(['firewall-cmd', '--reload']),
+                   capture_output=True, text=True, timeout=20)
+    r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'firewalld']),
+                       capture_output=True, text=True, timeout=10)
+    active = (r.stdout or '').strip() == 'active'
+    _log("  ✓ firewalld installed + active (SSH preserved)" if active
+         else "  ⚠ firewalld did not become active after enable")
+    _fw_install_shim(_log)
+    return 'firewalld' if active else _fw_backend()
+
+
+def _fw_install_shim(log=None):
+    """Install the ufw→firewalld translation shim at /usr/local/sbin/ufw on RHEL, so
+    every module deploy's existing `ufw ...` call drives firewalld unchanged (one
+    universal firewall policy, no per-module branching). No-op on Debian and when a
+    REAL ufw is present (we never shadow the genuine tool). Idempotent — re-copies to
+    pick up updates. State-safe: installs a script, changes no firewall rules."""
+    def _log(m):
+        if log:
+            try:
+                log(m)
+            except Exception:
+                pass
+    if _distro_family() != 'rhel':
+        return False
+    # Install at /usr/sbin/ufw so BOTH `ufw` (root PATH) and `sudo ufw` (sudo
+    # secure_path excludes /usr/local/sbin on RHEL) resolve to the shim. Never shadow
+    # a REAL ufw: if any ufw exists without our marker, leave it alone.
+    marker = 'firewalld translation shim'
+    dst = '/usr/sbin/ufw'
+    for p in ('/usr/sbin/ufw', '/usr/bin/ufw', '/sbin/ufw'):
+        if os.path.exists(p):
+            try:
+                with open(p, 'r', errors='ignore') as _f:
+                    if marker not in _f.read(600):
+                        return False  # a real ufw — do not shadow
+            except Exception:
+                return False
+    src = os.path.join(BASE_DIR, 'scripts', 'ufw-firewalld-shim')
+    if not os.path.exists(src):
+        return False
+    try:
+        r = subprocess.run(_sudo_wrap(['install', '-m', '0755', src, dst]),
+                           capture_output=True, text=True, timeout=15)
+        if r.returncode == 0:
+            _log(f"  ✓ ufw→firewalld shim installed ({dst}) — module ufw calls now drive firewalld")
+            return True
+        _log(f"  ⚠ ufw shim install failed: {((r.stderr or '') + (r.stdout or ''))[:120]}")
+    except Exception as e:
+        _log(f"  ⚠ ufw shim install error: {str(e)[:120]}")
+    return False
+
+
+def _fw_allow_from(source, port, proto='tcp'):
+    """Open a port ONLY from a source IP/CIDR. ufw `allow from X to any port Y` ↔
+    firewalld rich rule. v4/v6 family auto-detected from the source. Returns (ok,msg);
+    no-op-safe when no firewall is present."""
+    be = _fw_backend()
+    if be is None:
+        return True, 'no firewall present'
+    proto = 'udp' if str(proto).lower() == 'udp' else 'tcp'
+    port = int(port)
+    fam = 'ipv6' if ':' in str(source) else 'ipv4'
+    try:
+        if be == 'firewalld':
+            rule = (f'rule family="{fam}" source address="{source}" '
+                    f'port port="{port}" protocol="{proto}" accept')
+            subprocess.run(_sudo_wrap(['firewall-cmd', '--zone=public', '--permanent',
+                                       f'--add-rich-rule={rule}']),
+                           capture_output=True, text=True, timeout=20)
+            r = subprocess.run(_sudo_wrap(['firewall-cmd', '--reload']),
+                               capture_output=True, text=True, timeout=20)
+        else:
+            r = subprocess.run(_sudo_wrap(['ufw', 'allow', 'from', str(source),
+                                           'to', 'any', 'port', str(port), 'proto', proto]),
+                               capture_output=True, text=True, timeout=20)
+    except Exception as e:
+        return False, str(e)[:160]
+    return r.returncode == 0, (r.stdout or '') + (r.stderr or '')
+
+
+def _fw_deny(port, proto='tcp'):
+    """Ensure a port is NOT publicly reachable. ufw: explicit `deny`. firewalld: the
+    default `public` zone already drops anything not opened, so this removes any allow
+    for the port (firewalld has no positive 'deny' in a default-drop zone). (ok,msg)."""
+    be = _fw_backend()
+    if be is None:
+        return True, 'no firewall present'
+    proto = 'udp' if str(proto).lower() == 'udp' else 'tcp'
+    port = int(port)
+    try:
+        if be == 'firewalld':
+            subprocess.run(_sudo_wrap(['firewall-cmd', '--zone=public', '--permanent',
+                                       f'--remove-port={port}/{proto}']),
+                           capture_output=True, text=True, timeout=20)
+            r = subprocess.run(_sudo_wrap(['firewall-cmd', '--reload']),
+                               capture_output=True, text=True, timeout=20)
+        else:
+            r = subprocess.run(_sudo_wrap(['ufw', 'deny', f'{port}/{proto}']),
+                               capture_output=True, text=True, timeout=20)
+    except Exception as e:
+        return False, str(e)[:160]
+    return r.returncode == 0, (r.stdout or '') + (r.stderr or '')
+
+
+def _selinux_allow_caddy_port(port, log=None):
+    """On RHEL + SELinux Enforcing, let confined Caddy (httpd_t) bind a
+    non-standard port by labeling it http_port_t for BOTH tcp AND udp. No-op on
+    Debian, when SELinux is not enforcing, or when both protocols are already
+    labeled. Idempotent. Returns True if it changed anything.
+
+    Caddy on EL runs as httpd_t; the built-in http_port_t set covers
+    80/443/8443/9000 etc. but NOT e.g. 9997 (CloudTAK video vhost) — so the bind
+    fails 'permission denied', Caddy rejects the whole config, and the affected
+    443 vhost serves nothing (browser ERR_SSL_PROTOCOL_ERROR). BOTH protocols are
+    required: an HTTPS site listener also opens an HTTP/3 QUIC listener on the
+    SAME port over UDP, and SELinux port labels are per-protocol — labeling only
+    tcp leaves the UDP/QUIC bind denied and Caddy still exits 1 on start.
+    Root-caused on aws-rocky 2026-06-20. NON-ROOT-COMMANDS: semanage, dnf."""
+    try:
+        if _distro_family() != 'rhel':
+            return False
+        port = int(port)
+        enf = subprocess.run(['getenforce'], capture_output=True, text=True, timeout=5)
+        if (enf.stdout or '').strip() != 'Enforcing':
+            return False
+        # Which protocols already have this port under http_port_t? (idempotent)
+        have = {'tcp': False, 'udp': False}
+        cur = subprocess.run('semanage port -l 2>/dev/null', shell=True, capture_output=True, text=True, timeout=15)
+        for ln in (cur.stdout or '').splitlines():
+            f = ln.split()
+            if len(f) >= 3 and f[0] == 'http_port_t' and f[1] in ('tcp', 'udp') \
+                    and str(port) in [p.strip(',') for p in f[2:]]:
+                have[f[1]] = True
+        if have['tcp'] and have['udp']:
+            return False
+        if subprocess.run('command -v semanage >/dev/null 2>&1', shell=True).returncode != 0:
+            subprocess.run(_sudo_wrap(['dnf', 'install', '-y', 'policycoreutils-python-utils']),
+                           capture_output=True, text=True, timeout=180)
+        changed = False
+        for proto in ('tcp', 'udp'):
+            if have[proto]:
+                continue
+            add = subprocess.run(_sudo_wrap(['semanage', 'port', '-a', '-t', 'http_port_t', '-p', proto, str(port)]),
+                                 capture_output=True, text=True, timeout=30)
+            ok = add.returncode == 0
+            if not ok:  # already defined under another label → modify instead
+                mod = subprocess.run(_sudo_wrap(['semanage', 'port', '-m', '-t', 'http_port_t', '-p', proto, str(port)]),
+                                     capture_output=True, text=True, timeout=30)
+                ok = mod.returncode == 0
+                if not ok and log:
+                    log(f"  ⚠ SELinux: could not label {proto}/{port} http_port_t — {((add.stderr or '') + (mod.stderr or '')).strip()[:140]}")
+            changed = changed or ok
+        if changed and log:
+            log(f"  ✓ SELinux: tcp+udp/{port} labeled http_port_t (Caddy may now bind it)")
+        return changed
+    except Exception as e:
+        if log:
+            log(f"  ⚠ SELinux port-label /{port} error (non-fatal): {str(e)[:120]}")
+        return False
+
+
+def _selinux_sync_caddy_ports(log=None):
+    """RHEL self-heal: scan the on-disk Caddyfile for listener ports and ensure
+    each non-standard one is labeled http_port_t so confined Caddy can bind it.
+    Returns the count newly labeled (caller decides whether to reload Caddy).
+    No-op off-RHEL. Catches 9997 (CloudTAK video) and any future module port."""
+    if _distro_family() != 'rhel':
+        return 0
+    try:
+        import re as _re_cp
+        with open(CADDYFILE_PATH, 'r') as f:
+            cad = f.read()
+    except Exception:
+        return 0
+    ports = set()
+    # Site-address openers only — "host:9997 {" / ":9997 {" at column 0. The
+    # leading \S excludes INDENTED reverse_proxy / forward_auth upstream lines
+    # (e.g. "    reverse_proxy 127.0.0.1:5000 {"), which are not Caddy listeners
+    # and must not be relabeled (they belong to other services).
+    for m in _re_cp.finditer(r'(?m)^\S[^#\n]*?:(\d{2,5})\s*\{', cad):
+        ports.add(int(m.group(1)))
+    _default_http = {80, 81, 443, 488, 2019, 8008, 8009, 8443, 9000}
+    n = 0
+    for p in sorted(ports):
+        if p in _default_http:
+            continue
+        if _selinux_allow_caddy_port(p, log=log):
+            n += 1
+    return n
+
+
+def _docker_install_cmd():
+    """Shell command that installs Docker Engine for THIS host's distro family.
+      Debian/Ubuntu → the get.docker.com convenience script (works as-is).
+      RHEL family   → get.docker.com adds Docker's linux/rocky/$releasever repo,
+                      which ships NO docker-ce packages ("Unable to find a match");
+                      use Docker's CentOS repo — the supported repo for the
+                      RHEL-compatible family (Rocky/Alma/RHEL). The `rm -f` clears
+                      any empty rocky repo a prior get.docker.com run left behind.
+    Returns a string for `subprocess.run(..., shell=True)` (run as root, matching
+    the existing get.docker.com sites). NON-ROOT-COMMANDS: dnf, dnf config-manager,
+    systemctl. Validated on Rocky 9.8: installs docker-ce 29.x + starts it.
+    Note: distro family is the LOCAL box; remote/two-server docker installs are
+    NOT routed here (they target a remote host)."""
+    if _distro_family() == 'rhel':
+        return (
+            'dnf -y install dnf-plugins-core && '
+            'rm -f /etc/yum.repos.d/docker-ce.repo && '
+            'dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo && '
+            'dnf -y install docker-ce docker-ce-cli containerd.io docker-compose-plugin && '
+            'systemctl enable --now docker'
+        )
+    return 'curl -fsSL https://get.docker.com | sh'
+
+def _ensure_tak_on_authentik_network():
+    """v10.0.1 — when TAK runs as a container, join it to Authentik's docker
+    network so it can reach the LDAP outpost by container name (the outpost only
+    publishes on the host's 127.0.0.1, unreachable from inside the TAK container).
+    Returns (network_name, ldap_container_name) or (None, None) if N/A or not found.
+    Idempotent — a repeat `docker network connect` is a harmless no-op."""
+    if not _tak_is_container():
+        return None, None
+    try:
+        r = subprocess.run('docker ps --filter name=authentik-ldap --format "{{.Names}}"',
+                           shell=True, capture_output=True, text=True, timeout=10)
+        names = [n for n in (r.stdout or '').splitlines() if n.strip()]
+        if not names:
+            return None, None
+        ldap_name = names[0]
+        ri = subprocess.run(
+            ['docker', 'inspect', '-f',
+             '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}', ldap_name],
+            capture_output=True, text=True, timeout=10)
+        nets = (ri.stdout or '').split()
+        if not nets:
+            return None, None
+        net = nets[0]
+        subprocess.run(['docker', 'network', 'connect', net, TAK_CONTAINER],
+                       capture_output=True, text=True, timeout=15)
+        return net, ldap_name
+    except Exception:
+        return None, None
+
+def _takserver_running_local():
+    """True if local TAK Server is running — container-aware. native →
+    `systemctl is-active takserver`; container → the takserver container's
+    running state via `docker inspect`. Used by detect_modules, the Guard Dog
+    health check, and the start/restart status so the UI reflects reality on a
+    container box (native systemctl is-active is meaningless there)."""
+    if _tak_is_container():
+        try:
+            r = subprocess.run(['docker', 'inspect', '-f', '{{.State.Running}}', TAK_CONTAINER],
+                               capture_output=True, text=True, timeout=10)
+            return r.returncode == 0 and r.stdout.strip() == 'true'
+        except Exception:
+            return False
+    try:
+        r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'takserver']),
+                           capture_output=True, text=True, timeout=5)
+        return r.stdout.strip() == 'active'
+    except Exception:
+        return False
+
 def _apply_authentik_session():
     """If request has Authentik headers (from Caddy forward_auth), set session so we treat user as logged in."""
     # Trust Authentik headers only when request came from local reverse proxy.
@@ -905,8 +1487,10 @@ def detect_modules():
     tak_installed = os.path.exists('/opt/tak') and os.path.exists('/opt/tak/CoreConfig.xml')
     tak_running = False
     if tak_installed:
-        r = _run(_sudo_wrap(['systemctl', 'is-active', 'takserver']), capture_output=True, text=True)
-        tak_running = r.stdout.strip() == 'active'
+        # v10.0.1: container-aware — native systemctl is-active is meaningless
+        # when TAK runs as a Docker container (arm64). _takserver_running_local
+        # branches on install method (docker inspect vs systemctl).
+        tak_running = _takserver_running_local()
     modules['takserver'] = {'name': 'TAK Server', 'installed': tak_installed, 'running': tak_running,
         'description': 'Team Awareness Kit Server', 'icon': '🗺️', 'icon_url': TAK_LOGO_URL, 'route': '/takserver', 'priority': 1}
     # Authentik - Identity Provider (local or remote deployment)
@@ -1042,7 +1626,7 @@ def detect_modules():
         'description': 'Postfix relay — notifications for TAK Portal & MediaMTX', 'icon': '📧', 'route': '/emailrelay', 'priority': 9}
     # Cesium 3D Tiles — pure static file serving via Caddy; no container needed
     ct_enabled = settings.get('cesium_tiles_enabled', False)
-    ct_dir = os.path.expanduser('~/cesium-tiles')
+    ct_dir = _cesium_dir()
     modules['cesium_tiles'] = {
         'name': 'Cesium 3D Tiles',
         'installed': bool(ct_enabled),
@@ -1166,13 +1750,13 @@ def detect_modules():
         'priority': 14,
     }
 
-    # CFD Remote Assist Portal
+    # EUD Remote Assist Portal
     ra_enabled = settings.get('remote_assist_enabled', False)
     ra_running = False
     if ra_enabled:
         try:
             _ra_r = subprocess.run(
-                ['docker', 'ps', '--filter', 'name=cfd-remote-assist-nginx', '--format', '{{.Status}}'],
+                ['docker', 'ps', '--filter', 'name=eud-remote-assist-nginx', '--format', '{{.Status}}'],
                 capture_output=True, text=True, timeout=3)
             ra_running = 'Up' in (_ra_r.stdout or '')
         except Exception:
@@ -1180,7 +1764,7 @@ def detect_modules():
     else:
         try:
             _ra_r = subprocess.run(
-                ['docker', 'ps', '--filter', 'name=cfd-remote-assist-nginx', '--format', '{{.Status}}'],
+                ['docker', 'ps', '--filter', 'name=eud-remote-assist-nginx', '--format', '{{.Status}}'],
                 capture_output=True, text=True, timeout=3)
             if 'Up' in (_ra_r.stdout or ''):
                 _s = load_settings()
@@ -2783,7 +3367,28 @@ def _hardening_control_w3():
 # (CLAUDE.md "no silent caps"). Deep Tomcat STIG remediation is .57.
 
 def _ufw_default_incoming_deny():
-    """True if UFW default incoming policy is deny/reject (from `ufw status verbose`)."""
+    """True if the host firewall denies incoming by default. firewalld: the default
+    zone is default-drop unless its target is ACCEPT (so an active firewalld with the
+    public zone IS deny-by-default). UFW: parse `ufw status verbose`. None = can't read.
+    Name kept for back-compat; covers both backends."""
+    if _fw_backend() == 'firewalld':
+        try:
+            rs = subprocess.run(_sudo_wrap(['firewall-cmd', '--state']),
+                                capture_output=True, text=True, timeout=8)
+            if (rs.stdout or '').strip() != 'running':
+                return False
+            dz = subprocess.run(_sudo_wrap(['firewall-cmd', '--get-default-zone']),
+                                capture_output=True, text=True, timeout=8)
+            zone = (dz.stdout or '').strip() or 'public'
+            # --get-target requires --permanent; without it firewall-cmd errors out.
+            tg = subprocess.run(_sudo_wrap(['firewall-cmd', '--permanent', f'--zone={zone}', '--get-target']),
+                                capture_output=True, text=True, timeout=8)
+            # target 'default'/'%%REJECT%%'/'DROP'/'REJECT' all drop unsolicited incoming;
+            # only an explicit ACCEPT target opens the zone. (Empty/err → treat as deny,
+            # since an active firewalld public zone drops unsolicited traffic by design.)
+            return (tg.stdout or '').strip().upper() != 'ACCEPT'
+        except Exception:
+            return None
     try:
         r = subprocess.run('sudo ufw status verbose 2>/dev/null || ufw status verbose 2>/dev/null || true',
                             shell=True, capture_output=True, text=True, timeout=12)
@@ -2813,13 +3418,14 @@ def _hardening_assertions():
         res.append({'key': key, 'label': label, 'status': status, 'detail': detail})
 
     fw = _firewall_status_local()
+    fw_name = 'firewalld' if fw.get('backend') == 'firewalld' else 'UFW'
     if not fw.get('supported'):
-        add('ufw_enabled', 'UFW firewall present', 'fail', fw.get('error') or 'UFW not installed')
+        add('ufw_enabled', 'Host firewall present', 'fail', fw.get('error') or 'no UFW/firewalld installed')
     else:
-        add('ufw_enabled', 'UFW firewall active', 'pass' if fw.get('enabled') else 'fail',
-            'active' if fw.get('enabled') else 'UFW installed but not enabled')
+        add('ufw_enabled', f'{fw_name} firewall active', 'pass' if fw.get('enabled') else 'fail',
+            'active' if fw.get('enabled') else f'{fw_name} installed but not enabled')
         dd = _ufw_default_incoming_deny()
-        add('ufw_default_deny', 'UFW default-deny incoming',
+        add('ufw_default_deny', f'{fw_name} default-deny incoming',
             'pass' if dd else ('na' if dd is None else 'fail'),
             'deny by default' if dd else ('could not read default policy' if dd is None else 'default policy is not deny'))
 
@@ -2841,10 +3447,10 @@ def _hardening_assertions():
     if pub:
         add('console_localhost', label,
             'fail' if (w1 and w1.get('console_localhost_only')) else 'warn',
-            'public UFW allow present on :%s' % port)
+            'public firewall allow present on :%s' % port)
     elif w1 and w1.get('console_localhost_only'):
         add('console_localhost', label, 'pass',
-            'no public UFW allow; reached via SSO reverse proxy (W1)')
+            'no public firewall allow; reached via SSO reverse proxy (W1)')
     else:
         add('console_localhost', label, 'warn',
             'open to network (Standard posture / W1 not applied)')
@@ -2858,7 +3464,7 @@ def _hardening_assertions():
             'fail' if mgr else 'pass',
             'manager webapp present' if mgr else 'no manager/host-manager webapp')
         add('tak_tomcat_mtls', 'TAK connectors mTLS client-cert (8443/8446)', 'na',
-            'shielded by mTLS+UFW+Caddy; full connector/AJP STIG audit is .57')
+            'shielded by mTLS+firewall+Caddy; full connector/AJP STIG audit is .57')
     else:
         add('tak_tomcat_manager', 'TAK Tomcat surface', 'na', 'TAK Server not installed on this host')
 
@@ -2885,7 +3491,7 @@ def _hardening_control_w4():
         log('W4: boundary assertions disabled')
         return True
     return {'key': 'W4_assert', 'title': 'Port & Tomcat boundary assertions',
-            'desc': 'Verifies UFW deny-by-default, fail2ban, and TAK Tomcat shielding (read-only).',
+            'desc': 'Verifies host-firewall deny-by-default, fail2ban, and TAK Tomcat shielding (read-only).',
             'apply': apply_, 'verify': verify, 'revert': revert}
 
 # --- W1: console SSO + per-user MFA + :5001 lockdown (the auth flip; last) -----
@@ -2915,11 +3521,15 @@ def _w1_console_locked():
         return False
 
 def _w1_console_port_public(port):
-    """True if UFW has an ALLOW for the console port open to Anywhere (not loopback).
-    None if UFW unsupported/disabled (can't assert lockdown)."""
+    """True if the host firewall exposes the console port to the public (not loopback).
+    None if the firewall is unsupported/disabled (can't assert lockdown). Backend-aware:
+    UFW shows 'ALLOW ... Anywhere'; firewalld shows a bare '<port>/tcp (public)' entry
+    (a loopback/source restriction would instead be a [source-rule], not a bare port)."""
     fw = _firewall_status_local()
     if not fw.get('supported') or not fw.get('enabled'):
         return None
+    # Both backends now render rows as '<port>  ALLOW IN  <Anywhere|source>', so one
+    # check works universally: a public allow = the port ALLOWed from Anywhere.
     for ln in fw.get('rules', []):
         l = ln.lower()
         if port in l and 'allow' in l and 'anywhere' in l:
@@ -3244,21 +3854,31 @@ def _w1_caddy_regen(log):
     log('W1: Caddy reloaded'); return True
 
 def _w1_ufw_lock_console(log):
-    """Remove the public :5001 allow (v4+v6). Loopback stays exempt, so SSO + SSH-tunnel
-    break-glass keep working. Returns False if a public allow survives."""
-    port = str((load_settings().get('console_port') or 5001))
-    subprocess.run('sudo ufw delete allow %s/tcp >/dev/null 2>&1; '
-                   'sudo ufw delete allow %s >/dev/null 2>&1; true' % (port, port),
-                   shell=True, capture_output=True, timeout=30)
-    if _w1_console_port_public(port):
-        log('W1: WARNING — :%s still shows a public ALLOW after delete' % port); return False
-    log('W1: UFW public allow for :%s removed (console now localhost-only)' % port); return True
+    """Remove the public :5001 allow. Loopback stays exempt (UFW loopback rule / firewalld
+    trusted `lo`), so SSO reverse-proxy + SSH-tunnel break-glass keep working. Backend-aware
+    (UFW delete allow ↔ firewalld remove-port). Returns False if a public allow survives."""
+    port = int(load_settings().get('console_port') or 5001)
+    be = _fw_backend()
+    if be == 'firewalld':
+        _fw_remove(port, 'tcp')
+    else:
+        subprocess.run('sudo ufw delete allow %s/tcp >/dev/null 2>&1; '
+                       'sudo ufw delete allow %s >/dev/null 2>&1; true' % (port, port),
+                       shell=True, capture_output=True, timeout=30)
+    fw_name = 'firewalld' if be == 'firewalld' else 'UFW'
+    if _w1_console_port_public(str(port)):
+        log('W1: WARNING — :%s still shows a public allow after removal' % port); return False
+    log('W1: %s public allow for :%s removed (console now localhost-only)' % (fw_name, port)); return True
 
 def _w1_ufw_unlock_console(log):
-    port = str((load_settings().get('console_port') or 5001))
-    subprocess.run('sudo ufw allow %s/tcp >/dev/null 2>&1 || ufw allow %s/tcp >/dev/null 2>&1; true'
-                   % (port, port), shell=True, capture_output=True, timeout=30)
-    log('W1: UFW public allow for :%s restored (Standard)' % port)
+    port = int(load_settings().get('console_port') or 5001)
+    be = _fw_backend()
+    if be == 'firewalld':
+        _fw_allow(port, 'tcp')
+    else:
+        subprocess.run('sudo ufw allow %s/tcp >/dev/null 2>&1 || ufw allow %s/tcp >/dev/null 2>&1; true'
+                       % (port, port), shell=True, capture_output=True, timeout=30)
+    log('W1: %s public allow for :%s restored (Standard)' % ('firewalld' if be == 'firewalld' else 'UFW', port))
 
 def _hardening_control_w1():
     """W1 — console SSO + per-user MFA + :5001 lockdown. Highest risk, so it runs LAST
@@ -3267,8 +3887,8 @@ def _hardening_control_w1():
     returned False)."""
     def apply_(h, log):
         if not _ufw_default_incoming_deny():
-            log('W1: REFUSING — UFW default-incoming is not deny; locking :5001 would not '
-                'actually block external access. Set UFW default deny incoming first.')
+            log('W1: REFUSING — host firewall default-incoming is not deny; locking :5001 would '
+                'not actually block external access. Enable the firewall (deny-by-default) first.')
             return False
         # 1) Authentik MFA (refuses if it would lock everyone out). On failure, clean up
         # any Authentik objects it recorded before dropping the state.
@@ -3303,7 +3923,7 @@ def _hardening_control_w1():
             return (False, 'SSO+MFA flip not applied')
         port = str((load_settings().get('console_port') or 5001))
         if _w1_console_port_public(port):
-            return (False, ':%s still has a public UFW allow' % port)
+            return (False, ':%s still has a public firewall allow' % port)
         napps = len(w1.get('ak_apps') or {})
         if not napps:
             return (False, 'MFA policy not bound to any Authentik app')
@@ -3537,7 +4157,7 @@ th{background:#f1f5f9}.meta{color:#475569;font-size:12px}code{background:#f1f5f9
 
     parts.append('<h2>7. Deployment guidance — reverse proxy / load balancer</h2>')
     parts.append('<p style="font-size:12.5px"><strong>No load balancer &ne; non-compliant.</strong> The actual auth '
-                 'boundary is UFW deny-by-default + mTLS client-cert on the TAK Tomcat connectors — a box with no LB is '
+                 'boundary is host-firewall deny-by-default + mTLS client-cert on the TAK Tomcat connectors — a box with no LB is '
                  'fully defensible on that alone. On real clouds a Network Load Balancer in <strong>TCP passthrough</strong> '
                  'in front of :8089/:8443 is optional (IP-hiding, flood absorption, HA). An on-box reverse proxy is a '
                  '<em>want</em>, not a need; any proxy in front of TAK must be TCP passthrough (terminating TLS breaks '
@@ -6130,7 +6750,7 @@ def netbird_uninstall_status_api():
     return jsonify(_netbird_uninstall_status)
 
 
-# ── CFD Remote Assist Portal ──────────────────────────────────────────────────
+# ── EUD Remote Assist Portal ──────────────────────────────────────────────────
 
 _remote_assist_deploy_status = {'running': False, 'complete': False, 'error': False, 'log': []}
 _remote_assist_uninstall_status = {'running': False, 'complete': False, 'error': False}
@@ -6184,7 +6804,7 @@ def _ensure_authentik_remote_assist_app(settings, plog=None):
     _ak_headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
 
     slug = REMOTE_ASSIST_OIDC_SLUG
-    provider_name = 'CFD Remote Assist'
+    provider_name = 'EUD Remote Assist'
     portal_domain = _get_service_domain(settings, 'remote_assist')
     portal_base = f'https://{portal_domain}'
     device_base = f'https://{portal_domain}:{REMOTE_ASSIST_DEVICE_PORT}'
@@ -6228,7 +6848,7 @@ def _ensure_authentik_remote_assist_app(settings, plog=None):
         try:
             req = _urlreq.Request(f'{ak_url}/api/v3/propertymappings/provider/scope/?ordering=scope_name&page_size=50', headers=_ak_headers)
             mappings = json.loads(_urlreq.urlopen(req, timeout=15).read().decode()).get('results', [])
-            scope_mapping_pks = [m['pk'] for m in mappings if m.get('scope_name') in {'openid', 'email', 'profile'}]
+            scope_mapping_pks = [m['pk'] for m in mappings if m.get('scope_name') in {'openid', 'email', 'profile', 'groups'}]
         except Exception:
             pass
 
@@ -6395,12 +7015,13 @@ def _remote_assist_write_env(ra_dir, settings, client_id, pg_password):
     env_lines = [
         f'POSTGRES_USER=cfd',
         f'POSTGRES_PASSWORD={pg_password}',
-        f'POSTGRES_DB=cfd_remote_assist',
+        f'POSTGRES_DB=eud_remote_assist',
         f'PUBLIC_BASE_URL={device_base}',
         f'OIDC_ISSUER={oidc_issuer}',
         f'OIDC_AUDIENCE={client_id}',
         f'OIDC_CLIENT_ID={client_id}',
         f'OIDC_JWKS_URI={oidc_jwks}',
+        f'OIDC_ADMIN_GROUP=authentik Admins',
         f'CORS_ORIGIN={portal_base}',
         f'NGINX_BIND_ADDR=127.0.0.1',
         f'HTTP_PORT={REMOTE_ASSIST_PORT}',
@@ -6427,7 +7048,7 @@ def _run_remote_assist_deploy(settings):
         r = _sp.run(['docker', '--version'], capture_output=True, text=True)
         if r.returncode != 0:
             plog('  Docker not found — installing...')
-            r2 = _sp.run('curl -fsSL https://get.docker.com | sh 2>&1',
+            r2 = _sp.run(_docker_install_cmd() + ' 2>&1',
                          shell=True, capture_output=True, text=True, timeout=300)
             if r2.returncode != 0:
                 raise RuntimeError(f'Docker install failed: {r2.stdout[-300:]}')
@@ -6486,10 +7107,20 @@ def _run_remote_assist_deploy(settings):
 
         plog('')
         plog('━━━ Step 6/6: Firewall & Reverse Proxy ━━━')
-        _sp.run(['ufw', 'deny', f'{REMOTE_ASSIST_PORT}/tcp'], capture_output=True)
-        plog(f'  ✓ ufw deny {REMOTE_ASSIST_PORT}/tcp (loopback/Caddy-only)')
-        _sp.run(['ufw', 'allow', f'{REMOTE_ASSIST_DEVICE_PORT}/tcp'], capture_output=True)
-        plog(f'  ✓ ufw allow {REMOTE_ASSIST_DEVICE_PORT}/tcp (Android device API)')
+        if _distro_family() == 'rhel':
+            # No ufw on RHEL (bare argv ufw aborts the deploy). The admin/proxy port stays
+            # closed — it's loopback/Caddy-only and firewalld default-deny covers it. But the
+            # Android device API port is a real inbound listener (host Caddy), so it must be
+            # opened in firewalld explicitly: the cloud SG sits IN FRONT of the host firewall,
+            # so 'SG handles it' is not enough — firewalld still drops 8448 at the host.
+            _sp.run(f'firewall-cmd --permanent --add-port={REMOTE_ASSIST_DEVICE_PORT}/tcp 2>/dev/null; firewall-cmd --reload 2>/dev/null; true',
+                    shell=True, capture_output=True, timeout=30)
+            plog(f'  ✓ firewalld allow {REMOTE_ASSIST_DEVICE_PORT}/tcp (Android device API); {REMOTE_ASSIST_PORT} Caddy-only (loopback)')
+        else:
+            _sp.run(['ufw', 'deny', f'{REMOTE_ASSIST_PORT}/tcp'], capture_output=True)
+            plog(f'  ✓ ufw deny {REMOTE_ASSIST_PORT}/tcp (loopback/Caddy-only)')
+            _sp.run(['ufw', 'allow', f'{REMOTE_ASSIST_DEVICE_PORT}/tcp'], capture_output=True)
+            plog(f'  ✓ ufw allow {REMOTE_ASSIST_DEVICE_PORT}/tcp (Android device API)')
         s = load_settings()
         s['remote_assist_enabled'] = True
         s['remote_assist_pg_password'] = pg_password
@@ -6688,7 +7319,13 @@ def _run_remote_assist_update():
         settings = load_settings()
         plog('━━━ Step 1/5: Pulling latest source ━━━')
         _remote_assist_restore_tracked_files(ra_dir)
-        r = _sp.run(['git', '-C', ra_dir, 'pull', '--ff-only'],
+        # Ensure remote URL is correct (handles repository rename)
+        _sp.run(['git', '-C', ra_dir, 'remote', 'set-url', 'origin', REMOTE_ASSIST_REPO],
+                capture_output=True, text=True, timeout=10)
+        # Explicitly fetch main to handle shallow clones properly
+        _sp.run(['git', '-C', ra_dir, 'fetch', 'origin', 'main', '--depth', '1'],
+                capture_output=True, text=True, timeout=120)
+        r = _sp.run(['git', '-C', ra_dir, 'reset', '--hard', 'origin/main'],
                     capture_output=True, text=True, timeout=120)
         plog((r.stdout + r.stderr).strip() or '(no output)')
         if r.returncode != 0:
@@ -6852,7 +7489,7 @@ def remote_assist_control_api():
         return jsonify({'success': False, 'error': (r.stderr or r.stdout)[:300]})
     running = False
     try:
-        _st = _sp.run(['docker', 'ps', '--filter', 'name=cfd-remote-assist-nginx', '--format', '{{.Status}}'],
+        _st = _sp.run(['docker', 'ps', '--filter', 'name=eud-remote-assist-nginx', '--format', '{{.Status}}'],
                       capture_output=True, text=True, timeout=5)
         running = 'Up' in (_st.stdout or '')
     except Exception:
@@ -6904,7 +7541,7 @@ def remote_assist_uninstall_api():
             generate_caddyfile(settings)
             _sp.run('systemctl reload caddy 2>&1 || systemctl restart caddy 2>&1',
                     shell=True, capture_output=True, text=True, timeout=90)
-            _deregister_authentik_oauth2_app(settings, REMOTE_ASSIST_OIDC_SLUG, 'CFD Remote Assist')
+            _deregister_authentik_oauth2_app(settings, REMOTE_ASSIST_OIDC_SLUG, 'EUD Remote Assist')
             _remote_assist_uninstall_status.update({'running': False, 'complete': True, 'error': False})
         except Exception:
             _remote_assist_uninstall_status.update({'running': False, 'complete': True, 'error': True})
@@ -6984,7 +7621,10 @@ def takserver_js():
 @app.route('/firewall')
 @login_required
 def firewall_page():
-    return render_template_string(FIREWALL_TEMPLATE, version=VERSION)
+    be = _fw_backend()
+    fw_name = 'firewalld' if be == 'firewalld' else 'UFW'
+    return render_template_string(FIREWALL_TEMPLATE, version=VERSION,
+                                  fw_name=fw_name, fw_backend=(be or 'none'))
 
 @app.route('/guarddog')
 @login_required
@@ -7377,11 +8017,74 @@ def guarddog_deploy_log_api():
         'running': guarddog_deploy_status['running'], 'complete': guarddog_deploy_status['complete'],
         'error': guarddog_deploy_status['error']})
 
+def _parse_firewalld_rich(rule):
+    """Parse a firewalld rich-rule string into (to, action, frm) mirroring UFW columns.
+    e.g. 'rule family="ipv4" source address="10.0.0.5" port port="389" protocol="tcp" accept'
+    → ('389/tcp', 'ALLOW IN', '10.0.0.5')."""
+    import re
+    src = ''
+    m = re.search(r'source address="([^"]+)"', rule)
+    if m:
+        src = m.group(1)
+    pm = re.search(r'port port="([^"]+)" protocol="([^"]+)"', rule)
+    to = (f'{pm.group(1)}/{pm.group(2)}' if pm else (rule[:24] + '…'))
+    action = 'DENY IN' if (' reject' in rule or ' drop' in rule) else 'ALLOW IN'
+    return (to, action, src or 'Anywhere')
+
+
+def _firewalld_status_local():
+    """Return local firewall status NORMALIZED to the exact same shape + line format
+    UFW produces, so the Firewall UI renders identically on every OS — firewalld is
+    just the backend. Rows are '<to>  ALLOW IN/DENY IN  <Anywhere|source>'; a parallel
+    rules_meta lets delete-by-number map a row back to the precise firewalld object."""
+    try:
+        rs = subprocess.run(_sudo_wrap(['firewall-cmd', '--state']),
+                            capture_output=True, text=True, timeout=12)
+        enabled = (rs.stdout or '').strip() == 'running'
+        rp = subprocess.run(_sudo_wrap(['firewall-cmd', '--zone=public', '--list-ports']),
+                            capture_output=True, text=True, timeout=12)
+        svc = subprocess.run(_sudo_wrap(['firewall-cmd', '--zone=public', '--list-services']),
+                             capture_output=True, text=True, timeout=12)
+        rr = subprocess.run(_sudo_wrap(['firewall-cmd', '--zone=public', '--list-rich-rules']),
+                            capture_output=True, text=True, timeout=12)
+        ports = [p for p in (rp.stdout or '').split() if p.strip()]
+        services = [s for s in (svc.stdout or '').split() if s.strip()]
+        rich = [r.strip() for r in (rr.stdout or '').splitlines() if r.strip()]
+        # Normalize to UFW's columns + a parallel meta list. firewalld has no native
+        # rule numbers, so we synthesize stable [ N] positions; the default-drop public
+        # zone denies unopened ports implicitly, and explicit reject rich-rules render
+        # as DENY IN to mirror UFW's deny rows.
+        rows, meta = [], []
+        for p in ports:
+            rows.append((p, 'ALLOW IN', 'Anywhere')); meta.append({'kind': 'port', 'value': p})
+        for s in services:
+            rows.append((s, 'ALLOW IN', 'Anywhere')); meta.append({'kind': 'service', 'value': s})
+        for r in rich:
+            to, action, frm = _parse_firewalld_rich(r)
+            rows.append((to, action, frm)); meta.append({'kind': 'rich', 'value': r})
+
+        def _fmt(idx, row, numbered):
+            to, action, frm = row
+            pfx = f'[{idx + 1:2d}] ' if numbered else ''
+            return f'{pfx}{to:<26}{action:<12}{frm}'
+        rules = [_fmt(i, row, False) for i, row in enumerate(rows)]
+        numbered = [_fmt(i, row, True) for i, row in enumerate(rows)]
+        raw = f"state: {'running' if enabled else 'not running'}\n" + "\n".join(numbered)
+        return {'supported': True, 'enabled': enabled, 'rules': rules,
+                'rules_numbered': numbered, 'rules_meta': meta,
+                'raw': raw, 'raw_numbered': raw, 'backend': 'firewalld'}
+    except Exception as e:
+        return {'supported': False, 'error': str(e)[:160], 'enabled': False, 'rules': [], 'rules_numbered': []}
+
+
 def _firewall_status_local():
-    """Return local firewall status for UI (UFW only)."""
+    """Return local firewall status for UI (UFW or firewalld)."""
+    be = _fw_backend()
+    if be == 'firewalld':
+        return _firewalld_status_local()
     has_ufw = subprocess.run('command -v ufw >/dev/null 2>&1', shell=True).returncode == 0
     if not has_ufw:
-        return {'supported': False, 'error': 'UFW not installed on this host', 'enabled': False, 'rules': [], 'rules_numbered': []}
+        return {'supported': False, 'error': 'No supported firewall (UFW/firewalld) installed on this host', 'enabled': False, 'rules': [], 'rules_numbered': []}
     try:
         r = subprocess.run(
             'sudo ufw status 2>/dev/null || ufw status 2>/dev/null || true',
@@ -7437,11 +8140,12 @@ def firewall_open_port_api():
         return jsonify({'success': False, 'error': 'Protocol must be tcp or udp'}), 400
     st = _firewall_status_local()
     if not st.get('supported'):
-        return jsonify({'success': False, 'error': st.get('error') or 'UFW not available'}), 400
+        return jsonify({'success': False, 'error': st.get('error') or 'No supported firewall (UFW/firewalld) available'}), 400
     try:
-        cmd = f'sudo ufw allow {port}/{proto} >/dev/null 2>&1 || ufw allow {port}/{proto} >/dev/null 2>&1 || true'
-        subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=12)
+        ok, msg = _fw_allow(port, proto)
         st2 = _firewall_status_local()
+        if not ok:
+            return jsonify({'success': False, 'error': (msg or 'firewall command failed')[:160], 'status': st2}), 500
         return jsonify({'success': True, 'message': f'Opened {port}/{proto}', 'status': st2})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)[:160]}), 500
@@ -7459,11 +8163,12 @@ def firewall_close_port_api():
         return jsonify({'success': False, 'error': 'Protocol must be tcp or udp'}), 400
     st = _firewall_status_local()
     if not st.get('supported'):
-        return jsonify({'success': False, 'error': st.get('error') or 'UFW not available'}), 400
+        return jsonify({'success': False, 'error': st.get('error') or 'No supported firewall (UFW/firewalld) available'}), 400
     try:
-        cmd = f'sudo ufw --force delete allow {port}/{proto} >/dev/null 2>&1 || ufw --force delete allow {port}/{proto} >/dev/null 2>&1 || true'
-        subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=12)
+        ok, msg = _fw_remove(port, proto)
         st2 = _firewall_status_local()
+        if not ok:
+            return jsonify({'success': False, 'error': (msg or 'firewall command failed')[:160], 'status': st2}), 500
         return jsonify({'success': True, 'message': f'Closed {port}/{proto}', 'status': st2})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)[:160]}), 500
@@ -7491,13 +8196,26 @@ def firewall_restrict_source_api():
         return jsonify({'success': False, 'error': 'Action must be allow or deny'}), 400
     st = _firewall_status_local()
     if not st.get('supported'):
-        return jsonify({'success': False, 'error': st.get('error') or 'UFW not available'}), 400
+        return jsonify({'success': False, 'error': st.get('error') or 'No supported firewall (UFW/firewalld) available'}), 400
     try:
-        cmd = (
-            f'sudo ufw {action} from {shlex.quote(source)} to any port {port} proto {proto} >/dev/null 2>&1 || '
-            f'ufw {action} from {shlex.quote(source)} to any port {port} proto {proto} >/dev/null 2>&1 || true'
-        )
-        subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=12)
+        be = _fw_backend()
+        if be == 'firewalld':
+            # ufw `allow/deny from X to any port Y` ↔ firewalld rich rule (accept/reject).
+            fam = 'ipv6' if ':' in source else 'ipv4'
+            verb = 'accept' if action == 'allow' else 'reject'
+            rule = (f'rule family="{fam}" source address="{source}" '
+                    f'port port="{port}" protocol="{proto}" {verb}')
+            subprocess.run(_sudo_wrap(['firewall-cmd', '--zone=public', '--permanent',
+                                       f'--add-rich-rule={rule}']),
+                           capture_output=True, text=True, timeout=15)
+            subprocess.run(_sudo_wrap(['firewall-cmd', '--reload']),
+                           capture_output=True, text=True, timeout=15)
+        else:
+            cmd = (
+                f'sudo ufw {action} from {shlex.quote(source)} to any port {port} proto {proto} >/dev/null 2>&1 || '
+                f'ufw {action} from {shlex.quote(source)} to any port {port} proto {proto} >/dev/null 2>&1 || true'
+            )
+            subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=12)
         st2 = _firewall_status_local()
         return jsonify({'success': True, 'message': f'{action.upper()} from {source} to {port}/{proto}', 'status': st2})
     except Exception as e:
@@ -7513,10 +8231,30 @@ def firewall_delete_rule_api():
         return jsonify({'success': False, 'error': 'Rule number must be a positive integer'}), 400
     st = _firewall_status_local()
     if not st.get('supported'):
-        return jsonify({'success': False, 'error': st.get('error') or 'UFW not available'}), 400
+        return jsonify({'success': False, 'error': st.get('error') or 'No supported firewall (UFW/firewalld) available'}), 400
     try:
-        cmd = f'sudo ufw --force delete {number} >/dev/null 2>&1 || ufw --force delete {number} >/dev/null 2>&1 || true'
-        subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=12)
+        be = _fw_backend()
+        if be == 'firewalld':
+            # firewalld has no rule numbering — map the displayed [ N] to the Nth entry
+            # of rules_meta (same order as the rendered rows) and remove the precise
+            # firewalld object (port / service / rich-rule).
+            meta = st.get('rules_meta') or []
+            if number > len(meta):
+                return jsonify({'success': False, 'error': f'No rule #{number} (only {len(meta)} present)'}), 400
+            m = meta[number - 1]
+            if m['kind'] == 'rich':
+                arg = f"--remove-rich-rule={m['value']}"
+            elif m['kind'] == 'service':
+                arg = f"--remove-service={m['value']}"
+            else:
+                arg = f"--remove-port={m['value']}"
+            subprocess.run(_sudo_wrap(['firewall-cmd', '--zone=public', '--permanent', arg]),
+                           capture_output=True, text=True, timeout=15)
+            subprocess.run(_sudo_wrap(['firewall-cmd', '--reload']),
+                           capture_output=True, text=True, timeout=15)
+        else:
+            cmd = f'sudo ufw --force delete {number} >/dev/null 2>&1 || ufw --force delete {number} >/dev/null 2>&1 || true'
+            subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=12)
         st2 = _firewall_status_local()
         return jsonify({'success': True, 'message': f'Deleted rule #{number}', 'status': st2})
     except Exception as e:
@@ -7665,6 +8403,78 @@ def _f2b_read_jail_config():
         pass
     return cfg
 
+def _f2b_banaction():
+    """fail2ban ban action per host firewall family. Debian → 'ufw' (bans the IP on
+    ALL traffic). RHEL has no ufw → 'iptables-allports', the all-ports equivalent
+    (NOT iptables-multiport — that needs a port list and only blocks specific ports).
+    Works on Rocky 9 via nft-backed iptables, with OR without firewalld active
+    (firewalld is off on cloud boxes that rely on the security group). The
+    infratak-guarddog notify action is appended on top by each jail. (Firewalld-
+    native banaction — firewallcmd-* — is part of the broader firewall-parity work.)"""
+    return 'iptables-allports' if _distro_family() == 'rhel' else 'ufw'
+
+
+def _f2b_sshd_logpath():
+    """sshd auth log path: Debian → /var/log/auth.log; RHEL → /var/log/secure."""
+    return '/var/log/secure' if _distro_family() == 'rhel' else '/var/log/auth.log'
+
+
+def _f2b_selfheal_rhel_jails(plog=None):
+    """RHEL self-heal: repair fail2ban jail configs written by a pre-RHEL-port build.
+    A jail with `action = ufw` (no ufw on RHEL) makes the WHOLE fail2ban daemon fail
+    to start ('Unable to read action ufw'); and the sshd jail's
+    `logpath = /var/log/auth.log` never matches (RHEL logs to /var/log/secure).
+    Rewrite both in place across /etc/fail2ban/jail.d/*.conf, then reload (or restart
+    if it's down) so the fix takes effect. No-op on Debian / when nothing is stale /
+    when fail2ban isn't installed. Idempotent."""
+    if _distro_family() != 'rhel':
+        return False
+    _log = plog or (lambda m: None)
+    jaild = '/etc/fail2ban/jail.d'
+    if not os.path.isdir(jaild):
+        return False
+    try:
+        import glob as _glob
+        banaction = _f2b_banaction()  # iptables-allports on RHEL
+        changed = False
+        for path in _glob.glob(os.path.join(jaild, '*.conf')):
+            try:
+                with open(path) as f:
+                    txt = f.read()
+            except Exception:
+                continue
+            new = re.sub(r'(?m)^(\s*action\s*=\s*)ufw\b', r'\g<1>' + banaction, txt)
+            new = new.replace('/var/log/auth.log', '/var/log/secure')
+            if new != txt:
+                with open(path, 'w') as f:
+                    f.write(new)
+                changed = True
+                _log(f"  fail2ban self-heal: patched {os.path.basename(path)} (ufw→{banaction}, auth.log→secure)")
+        # The recidive jail reads fail2ban's OWN log (/var/log/fail2ban.log). On a box
+        # where fail2ban never started cleanly (it was failing on the ufw action), that
+        # file was never created → "Have not found any log file for recidive jail" →
+        # fail2ban still won't start. Pre-create it (logtarget already points there) so
+        # the jail loads on this start.
+        if not os.path.exists('/var/log/fail2ban.log'):
+            subprocess.run(_sudo_wrap(['touch', '/var/log/fail2ban.log']), capture_output=True, timeout=10)
+            changed = True
+            _log("  fail2ban self-heal: created /var/log/fail2ban.log (recidive jail reads it)")
+        # Bring fail2ban up if jails are configured but it isn't running (clears the
+        # failed state left by the pre-fix ufw config).
+        act = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'fail2ban']),
+                             capture_output=True, text=True).stdout.strip()
+        if changed or act != 'active':
+            if act == 'active':
+                subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, text=True, timeout=30)
+            else:
+                subprocess.run(_sudo_wrap(['systemctl', 'restart', 'fail2ban']), capture_output=True, text=True, timeout=30)
+            _log("  ✓ fail2ban self-heal: jails repaired for RHEL and fail2ban (re)started")
+        return changed
+    except Exception as e:
+        _log(f"  ⚠ fail2ban self-heal error (non-fatal): {str(e)[:120]}")
+        return False
+
+
 def _f2b_write_jail_config(maxretry, findtime, bantime, ignoreip=''):
     """Rewrite the infratak-authentik jail config with new thresholds and ignoreip whitelist."""
     jail_path = '/etc/fail2ban/jail.d/infratak-authentik.conf'
@@ -7682,7 +8492,7 @@ def _f2b_write_jail_config(maxretry, findtime, bantime, ignoreip=''):
         f"findtime = {findtime}\n"
         f"bantime  = {bantime}\n"
         f"{ignoreip_line}"
-        f"action   = ufw{guarddog_action}\n"
+        f"action   = {_f2b_banaction()}{guarddog_action}\n"
     )
     with open(jail_path, 'w') as _f:
         _f.write(jail_conf)
@@ -7728,7 +8538,7 @@ def _f2b_write_tak_jail_config(maxretry, findtime, bantime, ignoreip=''):
         f"findtime = {findtime}\n"
         f"bantime  = {bantime}\n"
         f"{ignoreip_line}"
-        f"action   = ufw{guarddog_action}\n"
+        f"action   = {_f2b_banaction()}{guarddog_action}\n"
     )
     with open(jail_path, 'w') as _f:
         _f.write(jail_conf)
@@ -7769,12 +8579,12 @@ def _f2b_write_ssh_jail_config(maxretry, findtime, bantime, ignoreip=''):
         "[sshd]\n"
         "enabled  = true\n"
         "filter   = sshd\n"
-        "logpath  = /var/log/auth.log\n"
+        f"logpath  = {_f2b_sshd_logpath()}\n"
         f"maxretry = {maxretry}\n"
         f"findtime = {findtime}\n"
         f"bantime  = {bantime}\n"
         f"{ignoreip_line}"
-        f"action   = ufw{guarddog_action}\n"
+        f"action   = {_f2b_banaction()}{guarddog_action}\n"
     )
     with open(jail_path, 'w') as _f:
         _f.write(jail_conf)
@@ -8315,7 +9125,7 @@ def _f2b_write_mediamtx_jail(maxretry, findtime, bantime, ignoreip=''):
         f"findtime = {findtime}\n"
         f"bantime  = {bantime}\n"
         f"ignoreip = {_f2b_trusted_ignoreip(ignoreip)}\n"
-        f"action   = ufw{guarddog_action}\n"
+        f"action   = {_f2b_banaction()}{guarddog_action}\n"
     )
     jail_path = '/etc/fail2ban/jail.d/infratak-mediamtx-rtsp.conf'
     with open(jail_path, 'w') as _f:
@@ -8538,7 +9348,7 @@ def _f2b_write_portal_jail(maxretry, findtime, bantime, ignoreip=''):
         f"findtime = {findtime}\n"
         f"bantime  = {bantime}\n"
         f"{ignoreip_line}"
-        f"action   = ufw{guarddog_action}\n"
+        f"action   = {_f2b_banaction()}{guarddog_action}\n"
     )
     with open('/etc/fail2ban/jail.d/infratak-takportal.conf', 'w') as _f:
         _f.write(jail_conf)
@@ -8788,10 +9598,17 @@ def _f2b_write_recidive_config(maxretry, findtime):
         f"findtime = {findtime}\n"
         f"maxretry = {maxretry}\n"
         f"ignoreip = {_f2b_trusted_ignoreip()}\n"
-        "action   = ufw\n"
+        f"action   = {_f2b_banaction()}\n"
     )
     with open('/etc/fail2ban/jail.d/infratak-recidive.conf', 'w') as _f:
         _f.write(jail_conf)
+    # The recidive jail reads fail2ban's own log; pre-create it so the jail loads on
+    # the very first start (on RHEL fail2ban never creates it until a clean start —
+    # chicken/egg). Harmless no-op where the file already exists (e.g. Debian).
+    try:
+        subprocess.run(_sudo_wrap(['touch', '/var/log/fail2ban.log']), capture_output=True, timeout=10)
+    except Exception:
+        pass
     # NOTE: _f2b_write_recidive_config takes no ignoreip arg — the recidive jail's
     # ignoreip is always the fleet trusted set (no per-jail operator override needed).
     # Ensure fail2ban SQLite persistence so permanent bans survive restarts
@@ -9000,10 +9817,10 @@ def _guarddog_health_check(service_id):
     """Quick health check for one service. Returns True if healthy, False otherwise. Used for UI and optional monitors."""
     try:
         if service_id == 'takserver':
-            r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'takserver']), capture_output=True, text=True, timeout=3)
-            if r.returncode != 0:
+            # v10.0.1: container-aware liveness (docker inspect vs systemctl).
+            if not _takserver_running_local():
                 return False
-            # Optional: also check 8089
+            # Also check 8089 is listening (host-published for the container).
             r2 = subprocess.run('ss -ltn "sport = :8089" 2>/dev/null', shell=True, capture_output=True, text=True, timeout=2)
             return 'LISTEN' in (r2.stdout or '')
         if service_id == 'authentik':
@@ -9325,9 +10142,29 @@ def _monitor_health_check(monitor_id):
                     continue
             return False
         if monitor_id == 'postgresql':
-            r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'postgresql']), capture_output=True, text=True, timeout=3)
-            return r.returncode == 0
+            # v10.0.1: container TAK runs PostgreSQL in the takserver-db container,
+            # not a host postgresql.service — check the container's running state
+            # there (native is byte-identical: systemctl is-active postgresql).
+            if _tak_is_container():
+                r = subprocess.run(['docker', 'inspect', '-f', '{{.State.Running}}', TAK_DB_CONTAINER],
+                                   capture_output=True, text=True, timeout=5)
+                return r.returncode == 0 and r.stdout.strip() == 'true'
+            # native: Debian/Ubuntu uses the `postgresql` meta-service; RHEL/EL uses
+            # `postgresql-15.service` (PGDG). Either being active means PG is up.
+            for _pgsvc in ('postgresql', 'postgresql-15'):
+                r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', _pgsvc]), capture_output=True, text=True, timeout=3)
+                if r.returncode == 0 and r.stdout.strip() == 'active':
+                    return True
+            return False
         if monitor_id == 'cotdb':
+            # v10.0.1: container → docker exec -u postgres (peer auth); native →
+            # sudo -u postgres psql. Both query the same cot database size.
+            if _tak_is_container():
+                r = subprocess.run(
+                    ['docker', 'exec', '-u', 'postgres', TAK_DB_CONTAINER,
+                     'psql', '-tAc', "SELECT pg_database_size('cot')"],
+                    capture_output=True, text=True, timeout=8)
+                return r.returncode == 0 and r.stdout.strip().isdigit()
             r = subprocess.run('sudo -u postgres psql -tAc "SELECT pg_database_size(\'cot\')" 2>/dev/null', shell=True, capture_output=True, text=True, timeout=5)
             return r.returncode == 0 and r.stdout.strip().isdigit()
         if monitor_id == 'oom':
@@ -10609,6 +11446,10 @@ def run_guarddog_deploy(alert_email):
         if is_two_server and s1_host:
             plog(f"Two-server mode detected — DB on {s1_host}:{db_port}")
         script_files = [
+            # v10.0.1: shared TAK/DB dispatch lib sourced by the DB/process/cert
+            # watch scripts (native vs container). No-op on deb boxes (its native
+            # branch emits the identical commands); enables container mode here.
+            '_gd-tak-lib.sh',
             'send-alert-email.sh', 'tak-boot-sequencer.sh', 'tak-post-start.sh',
             'tak-8089-watch.sh', 'tak-oom-watch.sh', 'tak-disk-watch.sh', 'tak-diskio-watch.sh',
             'tak-network-watch.sh', 'tak-process-watch.sh', 'tak-cert-watch.sh', 'tak-intca-watch.sh', 'tak-health-endpoint.py',
@@ -10680,6 +11521,12 @@ def run_guarddog_deploy(alert_email):
         gd_conf = {}
         if is_two_server and s1_host:
             gd_conf = {'two_server': True, 'db_host': s1_host, 'db_port': int(db_port)}
+        # v10.0.1: container TAK — tell _gd-tak-lib.sh to dispatch DB/process/cert
+        # work via docker exec against these containers (absent → native mode).
+        if _tak_is_container():
+            gd_conf['tak_mode'] = 'container'
+            gd_conf['tak_container'] = TAK_CONTAINER
+            gd_conf['db_container'] = TAK_DB_CONTAINER
         # v0.9.47: metrics collector extracts admin.p12 for the Marti scrape — needs the cert pass.
         gd_conf['tak_cert_pass'] = _get_tak_cert_password(settings)
         with open('/opt/tak-guarddog/guarddog.conf', 'w') as f:
@@ -10795,13 +11642,23 @@ def run_guarddog_deploy(alert_email):
             with open(path, 'w') as f:
                 f.write(content)
         plog("✓ Systemd units installed")
-        # TAK Server soft start: start after network and PostgreSQL to avoid boot race / restart loops
-        tak_dropin_dir = '/etc/systemd/system/takserver.service.d'
-        os.makedirs(tak_dropin_dir, exist_ok=True)
-        tak_dropin = os.path.join(tak_dropin_dir, 'soft-start.conf')
-        with open(tak_dropin, 'w') as f:
-            f.write('[Unit]\nAfter=network-online.target postgresql.service postgresql-15.service\nWants=network-online.target\n\n[Service]\nExecStartPre=-/opt/tak-guarddog/tak-boot-sequencer.sh\n')
-        plog("✓ TAK Server soft-start drop-in installed (boot sequencer waits for PostgreSQL + Authentik before TAK starts)")
+        # TAK Server soft start: start after network and PostgreSQL to avoid boot race / restart loops.
+        # v10.0.1: skip on container TAK — there is no host takserver.service to
+        # attach a drop-in to (the container uses --restart=always), so the boot
+        # sequencer / ExecStartPre never fires. Writing it would be inert clutter.
+        if _tak_is_container():
+            plog("✓ Container TAK — skipping native soft-start drop-in (container uses --restart=always)")
+        else:
+            tak_dropin_dir = '/etc/systemd/system/takserver.service.d'
+            os.makedirs(tak_dropin_dir, exist_ok=True)
+            tak_dropin = os.path.join(tak_dropin_dir, 'soft-start.conf')
+            with open(tak_dropin, 'w') as f:
+                # TimeoutStartSec must exceed the boot sequencer's MAX_WAIT (120s):
+                # systemd's 90s default would otherwise kill start-pre mid-wait and
+                # mark the unit failed(timeout) before the sequencer's "proceed anyway"
+                # fallback can fire. Universal hardening — applies to every distro.
+                f.write('[Unit]\nAfter=network-online.target postgresql.service postgresql-15.service\nWants=network-online.target\n\n[Service]\nTimeoutStartSec=300\nExecStartPre=-/opt/tak-guarddog/tak-boot-sequencer.sh\n')
+            plog("✓ TAK Server soft-start drop-in installed (boot sequencer waits for PostgreSQL + Authentik before TAK starts)")
         # 4GB swap for memory stability (from reference TAK Server Hardening script)
         try:
             r = subprocess.run(['swapon', '--show'], capture_output=True, text=True, timeout=5)
@@ -14305,6 +15162,120 @@ def _patch_coreconfig_passwords(cert_pass, log_fn=None):
         pass
 
 
+def _patch_coreconfig_cert_enrollment(coreconfig_path, int_ca, cert_pass, config, log_fn=None):
+    """v10.0.1 — version-tolerant CoreConfig patching for cert ENROLLMENT, via
+    ElementTree (NOT sed). Used by the CONTAINER deploy: the takserver-docker
+    bundle ships CoreConfig.example.xml formatted differently from the .deb
+    (absolute cert paths, `<vbm/>` with no attrs), which silently broke the
+    .deb path's string-seds when copied into the container. ElementTree matches
+    elements by tag/attribute regardless of formatting, so it's correct on any
+    TAK version/bundle. The native .deb path is untouched (its seds work on the
+    .deb's CoreConfig format — field-validated on 5.7-RELEASE43).
+
+    Three patches (all confirmed against TAK Server Config Guide v5.7):
+      1. §21.1 — the main <security>/<tls> truststoreFile → certs/files/
+         truststore-<int_ca>.jks. With a CUSTOM intermediate CA the default
+         `truststore-root.jks` does NOT exist (makeCert names it after the CA),
+         so leaving it dangling = "peer not verified" on 8089 (the red dot).
+      2. §22/App C — add <certificateSigning CA="TAKServer"> with the makeCert
+         signing keystore so 8446 can issue client certs (else getCertificateConfig
+         500 → "registration failed").
+      3. §9.6 — auth="x509" on the 8089 tls <input> so LDAP group lookup uses the
+         cert CN. (Connection works without it; groups need it.)
+    Returns (ok, changed_summary). Non-fatal on parse error (returns False)."""
+    import xml.etree.ElementTree as ET
+    import re as _re_ce
+    org = config.get('cert_org', '') or ''
+    ou = config.get('cert_ou', '') or ''
+    try:
+        issued_days = str(int(config.get('issued_cert_validity_days')
+                              or config.get('intermediate_ca_validity_days') or 730))
+    except (TypeError, ValueError):
+        issued_days = '730'
+    try:
+        with open(coreconfig_path, 'r', encoding='utf-8') as f:
+            raw = f.read()
+        m = _re_ce.search(r'<[A-Za-z][\w-]*[^>]*?\bxmlns(?::[\w-]+)?="([^"]+)"', raw)
+        ns_uri = m.group(1) if m else 'http://bbn.com/marti/xml/config'
+        ET.register_namespace('', ns_uri)
+        tree = ET.parse(coreconfig_path)
+        root = tree.getroot()
+    except Exception as e:
+        if log_fn:
+            log_fn(f"  ⚠ cert-enrollment patch: CoreConfig parse failed ({str(e)[:120]}) — patch manually")
+        return False, f'parse failed: {e}'
+    nsp = root.tag.split('}')[0] + '}' if '}' in root.tag else ''
+    def q(tag):
+        return f'{nsp}{tag}'
+    def lt(e):
+        return e.tag.split('}', 1)[1] if '}' in e.tag else e.tag
+    changed = []
+
+    # (1) main <tls> truststore (the non-fed one, under <security>)
+    sec = root.find(q('security'))
+    if sec is None:
+        sec = root.find('security')
+    if sec is not None:
+        for tls in list(sec):
+            if lt(tls) != 'tls':
+                continue
+            tf = tls.get('truststoreFile') or ''
+            if 'fed' in tf.lower():   # skip the federation tls block
+                continue
+            new_tf = f'certs/files/truststore-{int_ca}.jks'
+            if tf != new_tf:
+                tls.set('truststoreFile', new_tf)
+                changed.append('truststore')
+            break
+
+    # (2) <certificateSigning> — remove any existing (incl. template) and add clean
+    existing_cs = root.find(q('certificateSigning'))
+    if existing_cs is None:
+        existing_cs = root.find('certificateSigning')
+    if existing_cs is not None:
+        root.remove(existing_cs)
+    cs = ET.SubElement(root, q('certificateSigning'))
+    cs.set('CA', 'TAKServer')
+    cc = ET.SubElement(cs, q('certificateConfig'))
+    ne = ET.SubElement(cc, q('nameEntries'))
+    for nm, val in (('O', org), ('OU', ou)):
+        e = ET.SubElement(ne, q('nameEntry'))
+        e.set('name', nm)
+        e.set('value', val)
+    cacfg = ET.SubElement(cs, q('TAKServerCAConfig'))
+    cacfg.set('keystore', 'JKS')
+    cacfg.set('keystoreFile', f'certs/files/{int_ca}-signing.jks')
+    cacfg.set('keystorePass', cert_pass)
+    cacfg.set('validityDays', issued_days)
+    cacfg.set('signatureAlg', 'SHA256WithRSA')
+    changed.append('certificateSigning')
+
+    # (3) auth="x509" on the 8089 tls <input>
+    net = root.find(q('network'))
+    if net is None:
+        net = root.find('network')
+    if net is not None:
+        for inp in list(net):
+            if lt(inp) != 'input':
+                continue
+            if inp.get('port') == '8089' and inp.get('protocol') == 'tls':
+                if inp.get('auth') != 'x509':
+                    inp.set('auth', 'x509')
+                    changed.append('8089 x509')
+                break
+
+    try:
+        tree.write(coreconfig_path, encoding='UTF-8', xml_declaration=True)
+    except PermissionError:
+        tmp = coreconfig_path + '.cert-enroll.xml'
+        tree.write(tmp, encoding='UTF-8', xml_declaration=True)
+        subprocess.run(['sudo', 'cp', os.path.abspath(tmp), coreconfig_path],
+                       capture_output=True, text=True, timeout=10)
+    if log_fn:
+        log_fn(f"  ✓ CoreConfig cert-enrollment patched ({', '.join(changed) if changed else 'already ok'})")
+    return True, ', '.join(changed)
+
+
 import re as _re_module
 _ASN1_PRINTABLE_RE = _re_module.compile(r"^[A-Za-z0-9 '()+,\-./:=?]*$")
 
@@ -15586,7 +16557,7 @@ def generate_caddyfile(settings=None):
     ct_mod = modules.get('cesium_tiles', {})
     if ct_mod.get('installed'):
         ct_host = sd.get('cesium_tiles') or _get_service_domain(settings, 'cesium_tiles')
-        ct_dir_abs = os.path.expanduser('~/cesium-tiles')
+        ct_dir_abs = _cesium_dir()
         lines.append(f"# Cesium 3D Tiles — static file server (CORS enabled for ATAK WebView)")
         lines.append(f"{ct_host} {{")
         lines.append(f"    root * {ct_dir_abs}")
@@ -15693,8 +16664,9 @@ def generate_caddyfile(settings=None):
             f'            write_timeout 1h\n'
             f'        }}'
         )
-        lines.append(f"# CFD Remote Assist — admin portal (443). Device API is on :{REMOTE_ASSIST_DEVICE_PORT} only.")
+        lines.append(f"# EUD Remote Assist — admin portal (443). Device API is on :{REMOTE_ASSIST_DEVICE_PORT} only.")
         lines.append(f"{ra_host} {{")
+        lines.append(f"    header Strict-Transport-Security \"max-age=31536000;\"")
         lines.append(f"    @ra_device path /api/v1/* /ws/device /health /version")
         lines.append(f"    respond @ra_device 404")
         lines.append(f"    reverse_proxy {ra_up} {{")
@@ -15703,8 +16675,9 @@ def generate_caddyfile(settings=None):
         lines.append(f"}}")
         lines.append("")
         _emit_alias_redirect(_get_service_alias(settings, 'remote_assist'), ra_host)
-        lines.append(f"# CFD Remote Assist — Android device API (TLS :{REMOTE_ASSIST_DEVICE_PORT})")
+        lines.append(f"# EUD Remote Assist — Android device API (TLS :{REMOTE_ASSIST_DEVICE_PORT})")
         lines.append(f"{ra_host}:{REMOTE_ASSIST_DEVICE_PORT} {{")
+        lines.append(f"    header Strict-Transport-Security \"max-age=31536000;\"")
         lines.append(f"    @ra_device path /api/v1/* /ws/device /health /version")
         lines.append(f"    handle @ra_device {{")
         lines.append(f"        reverse_proxy {ra_up} {{")
@@ -15756,6 +16729,17 @@ def generate_caddyfile(settings=None):
     os.makedirs(os.path.dirname(CADDYFILE_PATH), exist_ok=True)
     with open(CADDYFILE_PATH, 'w') as f:
         f.write(caddyfile)
+    # RHEL: Caddy runs confined as httpd_t, which can only bind ports in
+    # http_port_t (80/443/8443/9000…). A non-standard listener — e.g. the
+    # CloudTAK video vhost on :9997 — is denied (name_bind) so the reload fails
+    # and that 443 vhost serves nothing (ERR_SSL_PROTOCOL_ERROR). Label any
+    # non-standard listener port we just wrote BEFORE callers reload Caddy.
+    # No-op on Debian / non-enforcing. Single choke point — covers every reload
+    # site. Root-caused on aws-rocky (CloudTAK) 2026-06-20.
+    try:
+        _selinux_sync_caddy_ports()
+    except Exception:
+        pass
     return caddyfile
 
 
@@ -15865,6 +16849,120 @@ def wait_for_unattended_upgrade_worker(log_fn, log_list, cancelled_check=None):
         log_list.append(f"  ⏳ {m:02d}:{s:02d}")
 
 
+def _install_le_cert_on_8446_container(takserver_host, log_fn, wait_for_cert=True):
+    """v10.0.1 — container variant of install_le_cert_on_8446. Same outcome (wire
+    the Caddy LE / custom cert onto TAK's 8446 enrollment connector so clients
+    trust it), adapted for the Docker TAK path: openssl on the host writes the p12
+    to the SHARED /opt/tak mount, keytool runs via `docker exec` (no Java on the
+    host), ownership is the container uid (1000), and lifecycle uses `docker` not
+    systemctl. Mirrors the live-validated sequence. Returns True on success."""
+    import re, shutil, time as _t
+    s = load_settings()
+    cert_pass = _get_tak_cert_password(s)
+    custom_mode = (s.get('ssl_mode') or '') == 'custom'
+    if custom_mode:
+        cert_crt, cert_key = _custom_cert_paths()
+        cert_dir = os.path.dirname(cert_crt); cert_label = 'custom'
+    else:
+        cert_dir = (f"/var/lib/caddy/.local/share/caddy/certificates/"
+                    f"acme-v02.api.letsencrypt.org-directory/{takserver_host}")
+        cert_crt = f"{cert_dir}/{takserver_host}.crt"
+        cert_key = f"{cert_dir}/{takserver_host}.key"
+        cert_label = 'LE'
+    core_config = '/opt/tak/CoreConfig.xml'
+    if wait_for_cert and not custom_mode:
+        waited = 0
+        while not (os.path.exists(cert_crt) and os.path.exists(cert_key)) and waited < 120:
+            log_fn(f"  Waiting for {cert_label} cert files... ({waited}s)"); _t.sleep(10); waited += 10
+    if not (os.path.exists(cert_crt) and os.path.exists(cert_key)):
+        log_fn(f"  ⚠ {cert_label} cert not found at {cert_dir} — skipping 8446 cert wire-up")
+        return False
+    log_fn(f"  ✓ {cert_label} cert files found for {takserver_host}")
+    p12 = '/opt/tak/certs/files/takserver-le.p12'
+    jks = '/opt/tak/certs/files/takserver-le.jks'
+    # Step A: cert → PKCS12 on the shared mount (host openssl; the container reads it there)
+    r = subprocess.run(
+        f'openssl pkcs12 -export -in {shlex.quote(cert_crt)} -inkey {shlex.quote(cert_key)} '
+        f'-out {p12} -name {shlex.quote(takserver_host)} -password pass:{shlex.quote(cert_pass)} 2>&1',
+        shell=True, capture_output=True, text=True)
+    if r.returncode != 0:
+        log_fn(f"  ⚠ PKCS12 conversion failed: {r.stderr.strip()[:200]}"); return False
+    # Step B: PKCS12 → JKS via docker exec (the container has Java/keytool; host arm64 does not)
+    r = subprocess.run(
+        _tak_exec('cd /opt/tak/certs/files && rm -f takserver-le.jks && '
+                  f'keytool -importkeystore -srcstorepass {shlex.quote(cert_pass)} '
+                  f'-deststorepass {shlex.quote(cert_pass)} -destkeystore takserver-le.jks '
+                  '-srckeystore takserver-le.p12 -srcstoretype pkcs12 -noprompt') + ' 2>&1',
+        shell=True, capture_output=True, text=True)
+    if r.returncode != 0:
+        log_fn(f"  ⚠ JKS conversion failed: {(r.stderr or r.stdout).strip()[:200]}"); return False
+    subprocess.run(f'chown 1000:1000 {jks} {p12} 2>/dev/null; true', shell=True)
+    log_fn("  ✓ JKS installed to /opt/tak/certs/files/takserver-le.jks")
+    # Step C: patch CoreConfig 8446 connector → LetsEncrypt keystore (host-side via symlink).
+    # TAK-in-container preserves CoreConfig across docker restart (verified), so no stop-first.
+    try:
+        with open(core_config) as f:
+            content = f.read()
+        shutil.copy(core_config, core_config + '.bak-le')
+        new_connector = (
+            '<connector port="8446" clientAuth="false" _name="LetsEncrypt" '
+            'keystore="JKS" keystoreFile="certs/files/takserver-le.jks" '
+            f'keystorePass="{cert_pass}" enableAdminUI="true" enableWebtak="true" '
+            'enableNonAdminUI="false"/>')
+        patched = re.sub(r'<(?:[A-Za-z][\w-]*:)?connector\s+port="8446"[^/]*/\s*>',
+                         new_connector, content, count=1)
+        if patched != content and '_name="LetsEncrypt"' in patched and 'takserver-le.jks' in patched:
+            with open(core_config, 'w') as f:
+                f.write(patched)
+            log_fn("  ✓ CoreConfig.xml 8446 connector patched to LE cert")
+        else:
+            log_fn("  ⚠ 8446 connector not matched — check CoreConfig.xml manually"); return False
+    except Exception as ce:
+        log_fn(f"  ⚠ CoreConfig patch error: {ce}"); return False
+    # Step D: renewal script (container-flavored) + host systemd timer (Caddy auto-renews;
+    # re-import whenever TAK's keystore cert differs from Caddy's current cert).
+    renewal = f'''#!/bin/bash
+set -euo pipefail
+TAK_DOMAIN="{takserver_host}"
+CERT_CRT="{cert_crt}"
+CERT_KEY="{cert_key}"
+P12={p12}
+JKS={jks}
+LOG=/var/log/takserver-cert-renewal.log
+log(){{ echo "[$(date -Is)] $*" | tee -a "$LOG"; }}
+[ -f "$CERT_CRT" ] && [ -f "$CERT_KEY" ] || {{ log "ERROR: Caddy cert files not found for $TAK_DOMAIN"; exit 1; }}
+CADDY_FP=$(openssl x509 -in "$CERT_CRT" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
+TAK_FP=$(docker exec {TAK_CONTAINER} keytool -list -rfc -keystore "$JKS" -storepass {shlex.quote(cert_pass)} 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2 || true)
+[ -n "$TAK_FP" ] && [ "$TAK_FP" = "$CADDY_FP" ] && {{ log "TAK keystore already current."; exit 0; }}
+log "Refreshing TAK keystore from Caddy's current cert..."
+openssl pkcs12 -export -in "$CERT_CRT" -inkey "$CERT_KEY" -out "$P12" -name "$TAK_DOMAIN" -password pass:{shlex.quote(cert_pass)}
+docker exec {TAK_CONTAINER} bash -c "cd /opt/tak/certs/files && rm -f takserver-le.jks && keytool -importkeystore -srcstorepass {shlex.quote(cert_pass)} -deststorepass {shlex.quote(cert_pass)} -destkeystore takserver-le.jks -srckeystore takserver-le.p12 -srcstoretype pkcs12 -noprompt"
+chown 1000:1000 "$JKS" "$P12" 2>/dev/null || true
+docker restart {TAK_CONTAINER}
+log "TAK keystore refreshed and container restarted."
+'''
+    try:
+        _write_priv('/opt/tak/renew-letsencrypt.sh', renewal)
+        subprocess.run('chmod +x /opt/tak/renew-letsencrypt.sh', shell=True)
+        svc = ('[Unit]\nDescription=TAK Server LE Cert Renewal (container)\n'
+               'After=network.target docker.service\n\n[Service]\nType=oneshot\n'
+               'ExecStart=/opt/tak/renew-letsencrypt.sh\n')
+        timer = ('[Unit]\nDescription=TAK Server Certificate Renewal Timer\n'
+                 'Requires=takserver-cert-renewal.service\n\n[Timer]\nOnCalendar=daily\n'
+                 'Persistent=true\n\n[Install]\nWantedBy=timers.target\n')
+        _write_priv('/etc/systemd/system/takserver-cert-renewal.service', svc)
+        _write_priv('/etc/systemd/system/takserver-cert-renewal.timer', timer)
+        subprocess.run('systemctl daemon-reload && systemctl enable --now takserver-cert-renewal.timer 2>/dev/null; true',
+                       shell=True, capture_output=True)
+        log_fn("  ✓ Auto-renewal timer enabled (daily, content-based)")
+    except Exception as _re:
+        log_fn(f"  ⚠ renewal timer setup skipped: {str(_re)[:120]}")
+    # Step E: restart container so 8446 picks up the LE keystore
+    subprocess.run(_tak_systemctl('restart'), shell=True, capture_output=True, timeout=120)
+    log_fn("  ✓ TAK Server (container) restarted — 8446 now serving the trusted cert")
+    return True
+
+
 def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
     """
     Install the Caddy-managed Let's Encrypt cert on TAK Server's port 8446
@@ -15879,6 +16977,11 @@ def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
         log_fn:         Logging function (plog or log_step)
         wait_for_cert:  If True, poll up to 120s for cert files before giving up
     """
+    # v10.0.1: Docker TAK uses a container-adapted path (keytool via docker exec,
+    # JKS on the shared /opt/tak mount, docker lifecycle). Native .deb path below
+    # is byte-identical to pre-v10.
+    if _tak_is_container():
+        return _install_le_cert_on_8446_container(takserver_host, log_fn, wait_for_cert)
     import re, shutil
 
     _s8446 = load_settings()
@@ -16231,6 +17334,41 @@ def run_caddy_deploy(domain):
             subprocess.run('DEBIAN_FRONTEND=noninteractive apt-get install --reinstall -y caddy 2>&1',
                 shell=True, capture_output=True, text=True, timeout=120, env={**os.environ, 'DEBIAN_FRONTEND': 'noninteractive', 'NEEDRESTART_MODE': 'a'})
             r = subprocess.run('which caddy', shell=True, capture_output=True, text=True)
+        elif r.returncode != 0 and pkg_mgr == 'dnf':
+            # v10.0.1 (RHEL): on some EL9 boxes the @caddy/caddy COPR rpm reports a
+            # successful install but its payload (the /usr/bin/caddy binary) never
+            # extracts — `which caddy` then fails and the deploy dies here. The rpm
+            # SCRIPTLETS do run, so the caddy user, systemd unit, SELinux fcontext
+            # (httpd_exec_t on /usr/bin/caddy) and firewall ports are already set up;
+            # only the binary is missing. Guarantee it by fetching the official
+            # static build. Download to a TEMP file and VERIFY it runs before
+            # installing — a partial/transient download would otherwise pass a
+            # mere `which` check and then fail caddy.service with 203/EXEC. Then
+            # atomically install + apply the fcontext the scriptlet set. Arch-aware.
+            # Validated on Rocky 9.6 under SELinux Enforcing.
+            plog("  Binary missing after dnf install (known EL9 COPR payload quirk) — installing official static binary...")
+            _caddy_arch = 'arm64' if _host_arch() == 'arm64' else 'amd64'
+            _caddy_dl = '/tmp/caddy.download'
+            subprocess.run(f'rm -f {_caddy_dl}', shell=True, capture_output=True, text=True)
+            subprocess.run(
+                f'curl -fsSL --retry 3 --retry-delay 2 "https://caddyserver.com/api/download?os=linux&arch={_caddy_arch}" -o {_caddy_dl}',
+                shell=True, capture_output=True, text=True, timeout=300)
+            subprocess.run(f'chmod +x {_caddy_dl} 2>/dev/null; true', shell=True, capture_output=True, text=True)
+            # verify the downloaded binary actually executes before trusting it
+            _caddy_ver = subprocess.run(f'{_caddy_dl} version', shell=True, capture_output=True, text=True, timeout=20)
+            if _caddy_ver.returncode == 0:
+                subprocess.run(f'install -m 0755 {_caddy_dl} /usr/bin/caddy', shell=True, capture_output=True, text=True, timeout=30)
+                # label for SELinux (rpm scriptlet already added the httpd_exec_t fcontext rule);
+                # fall back to chcon if restorecon has no rule, no-op if SELinux disabled.
+                subprocess.run('restorecon -v /usr/bin/caddy 2>/dev/null || chcon -t httpd_exec_t /usr/bin/caddy 2>/dev/null || true',
+                    shell=True, capture_output=True, text=True)
+                subprocess.run('mkdir -p /etc/caddy 2>/dev/null; true', shell=True, capture_output=True, text=True)
+                plog(f"  ✓ official static caddy {(_caddy_ver.stdout or '').split()[0] if _caddy_ver.stdout else ''} installed")
+            else:
+                plog(f"  ✗ static caddy download did not validate: {((_caddy_ver.stderr or _caddy_ver.stdout) or 'no output').strip()[:160]}")
+            subprocess.run(f'rm -f {_caddy_dl}', shell=True, capture_output=True, text=True)
+            # functional final check (not mere presence) so we never false-report success
+            r = subprocess.run('caddy version', shell=True, capture_output=True, text=True)
         if r.returncode != 0:
             plog("✗ Caddy binary not found after install")
             caddy_deploy_status.update({'running': False, 'error': True})
@@ -16264,6 +17402,27 @@ def run_caddy_deploy(domain):
 
         plog("")
         plog("━━━ Step 4/4: Starting Caddy ━━━")
+        # v10.0.1 (RHEL): the @caddy/caddy COPR rpm intermittently leaves /usr/bin/caddy
+        # MISSING even after a `which caddy` passed at install — the binary can extract and
+        # then vanish before we get here (rpm -V shows it `missing`; systemd then dies with
+        # 203/EXEC). Re-verify FUNCTIONALLY right before start and self-heal with the official
+        # static binary, so a missing/broken binary can never reach systemd. Idempotent.
+        if pkg_mgr == 'dnf' and subprocess.run('caddy version', shell=True, capture_output=True).returncode != 0:
+            plog("  Caddy binary missing/non-functional before start — installing official static binary…")
+            _ca = 'arm64' if _host_arch() == 'arm64' else 'amd64'
+            subprocess.run('rm -f /tmp/caddy.download', shell=True, capture_output=True)
+            subprocess.run(f'curl -fsSL --retry 3 --retry-delay 2 "https://caddyserver.com/api/download?os=linux&arch={_ca}" -o /tmp/caddy.download',
+                           shell=True, capture_output=True, timeout=300)
+            subprocess.run('chmod +x /tmp/caddy.download 2>/dev/null; true', shell=True, capture_output=True)
+            _cv = subprocess.run('/tmp/caddy.download version', shell=True, capture_output=True, text=True, timeout=20)
+            if _cv.returncode == 0:
+                subprocess.run('install -m 0755 /tmp/caddy.download /usr/bin/caddy', shell=True, capture_output=True, timeout=30)
+                subprocess.run('restorecon -v /usr/bin/caddy 2>/dev/null || chcon -t httpd_exec_t /usr/bin/caddy 2>/dev/null || true',
+                               shell=True, capture_output=True)
+                plog(f"  ✓ official static caddy {(_cv.stdout or '').split()[0] if _cv.stdout else ''} installed")
+            else:
+                plog(f"  ✗ static caddy download did not validate: {((_cv.stderr or _cv.stdout) or 'no output').strip()[:160]}")
+            subprocess.run('rm -f /tmp/caddy.download', shell=True, capture_output=True)
         subprocess.run('systemctl enable caddy 2>/dev/null; true', shell=True, capture_output=True)
         r = subprocess.run('systemctl restart caddy 2>&1', shell=True, capture_output=True, text=True, timeout=90)
         if r.returncode != 0:
@@ -17634,7 +18793,7 @@ def run_takportal_deploy():
         r = subprocess.run('docker --version', shell=True, capture_output=True, text=True)
         if r.returncode != 0:
             plog("Docker not found. Installing...")
-            subprocess.run('curl -fsSL https://get.docker.com | sh', shell=True, capture_output=True, text=True, timeout=300)
+            subprocess.run(_docker_install_cmd(), shell=True, capture_output=True, text=True, timeout=300)
             r2 = subprocess.run('docker --version', shell=True, capture_output=True, text=True)
             if r2.returncode != 0:
                 plog("\u2717 Failed to install Docker")
@@ -17751,7 +18910,14 @@ def run_takportal_deploy():
             plog("  ✓ infratak Docker network added to docker-compose.yml (Portal ↔ Authentik)")
 
         plog("  Building image (this may take a minute)...")
-        r = subprocess.run(f'cd {portal_dir} && docker compose up -d --build 2>&1', shell=True, capture_output=True, text=True, timeout=900)
+        # Build + create the container WITHOUT starting it. The first boot otherwise
+        # runs TAK Portal's Authentik users-fetch against the shipped placeholder
+        # settings ("your-authentik-url" / "your-real-token-here") and dumps a
+        # harmless-but-alarming ENOTFOUND stack trace into the logs on every fresh
+        # install. We seed real settings.json into the created container below, then
+        # start — so the first boot already has live config. No-op-safe on redeploy
+        # (an already-running container just gets re-seeded + restarted in Step 6).
+        r = subprocess.run(f'cd {portal_dir} && docker compose up -d --build --no-start 2>&1', shell=True, capture_output=True, text=True, timeout=900)
         for line in r.stdout.strip().split('\n'):
             if line.strip() and 'NEEDRESTART' not in line:
                 takportal_deploy_log.append(f"  {line.strip()}")
@@ -17766,6 +18932,34 @@ def run_takportal_deploy():
         _ensure_infratak_network_for_portal()
         _ensure_infratak_network_for_authentik()
 
+        # Seed real settings.json into the created (not-yet-started) container so the
+        # first boot uses live config instead of the placeholder defaults — kills the
+        # ENOTFOUND startup noise. docker cp works on a created/stopped container, and
+        # the infratak network was attached above so authentik-server-1 resolves on
+        # boot. Step 6 re-writes settings.json idempotently (and adds the SSH-onboarded
+        # flag) after the post-start cert/SSH sync, so this is purely a head-start.
+        try:
+            import json as _json_seed
+            _seed_dict = _takportal_build_settings_dict(load_settings())
+            _fd_seed, _tmp_seed = tempfile.mkstemp(suffix='.json', prefix='tak-portal-seed-')
+            try:
+                with os.fdopen(_fd_seed, 'w') as _sf:
+                    _sf.write(_json_seed.dumps(_seed_dict, indent=2))
+                subprocess.run(
+                    f'docker cp {shlex.quote(_tmp_seed)} tak-portal:/usr/src/app/data/settings.json',
+                    shell=True, capture_output=True, text=True, timeout=10)
+                plog("  ✓ Seeded settings.json before first start (suppresses placeholder Authentik fetch)")
+            finally:
+                try:
+                    os.remove(_tmp_seed)
+                except OSError:
+                    pass
+        except Exception as _seed_e:
+            plog(f"  ⚠ Could not pre-seed settings.json: {str(_seed_e)[:80]} (first boot may log a harmless placeholder error)")
+
+        # Start the container now that real settings are in place
+        subprocess.run(f'cd {portal_dir} && docker compose start 2>&1', shell=True, capture_output=True, text=True, timeout=120)
+
         # Wait for container to be healthy
         plog("  Waiting for container...")
         time.sleep(5)
@@ -17778,92 +18972,16 @@ def run_takportal_deploy():
         # Step 5: Copy TAK Server certs into container
         plog("")
         plog("\u2501\u2501\u2501 Step 5/6: Copying TAK Server Certificates \u2501\u2501\u2501")
-        cert_dir = '/opt/tak/certs/files'
-        webadmin_p12 = os.path.join(cert_dir, 'admin.p12')
-        tak_ca = os.path.join(cert_dir, 'truststore-root.p12')
-        # Find the actual cert files
-        if not os.path.exists(webadmin_p12):
-            # Try alternate names
-            for name in ['webadmin.p12', 'admin.p12']:
-                p = os.path.join(cert_dir, name)
-                if os.path.exists(p):
-                    webadmin_p12 = p
-                    break
-        if not os.path.exists(tak_ca):
-            for name in ['truststore-root.p12', 'tak-ca.pem', 'ca.pem']:
-                p = os.path.join(cert_dir, name)
-                if os.path.exists(p):
-                    tak_ca = p
-                    break
-        # Create certs dir in container data volume (persists across rebuilds)
-        subprocess.run('docker exec tak-portal mkdir -p /usr/src/app/data/certs', shell=True, capture_output=True, text=True)
-        certs_copied = True
-        if os.path.exists(webadmin_p12):
-            # Re-encode P12 with modern encryption (AES-256-CBC) — TAK Server generates
-            # legacy RC2-40-CBC which Node.js 22+ / OpenSSL 3.x rejects
-            fd_p12, modern_p12 = tempfile.mkstemp(suffix='.p12', prefix='tak-portal-admin-')
-            os.close(fd_p12)
-            cert_pass = _get_tak_cert_password(load_settings())
-            r = subprocess.run(
-                f'openssl pkcs12 -in {shlex.quote(webadmin_p12)} -passin pass:{shlex.quote(cert_pass)} -nodes -legacy 2>/dev/null | '
-                f'openssl pkcs12 -export -passout pass:{shlex.quote(cert_pass)} -out {shlex.quote(modern_p12)}',
-                shell=True, capture_output=True, text=True, timeout=30)
-            if os.path.exists(modern_p12) and os.path.getsize(modern_p12) > 0:
-                subprocess.run(f'docker cp {shlex.quote(modern_p12)} tak-portal:/usr/src/app/data/certs/tak-client.p12', shell=True, capture_output=True, text=True)
-                try:
-                    os.remove(modern_p12)
-                except OSError:
-                    pass
-                plog(f"  Copied {os.path.basename(webadmin_p12)} -> data/certs/tak-client.p12 (re-encoded for modern OpenSSL)")
-            else:
-                try:
-                    os.remove(modern_p12)
-                except OSError:
-                    pass
-                subprocess.run(f'docker cp {webadmin_p12} tak-portal:/usr/src/app/data/certs/tak-client.p12', shell=True, capture_output=True, text=True)
-                plog(f"  Copied {os.path.basename(webadmin_p12)} -> data/certs/tak-client.p12 (legacy format, re-encode failed)")
-        else:
-            plog("\u26a0 admin.p12 not found in /opt/tak/certs/files/")
-            certs_copied = False
-        # Copy CA chain for TAK Portal. takserver.pem contains the full chain
-        # (server + intermediate + root) which is what TAK Portal expects.
-        # Fallback to building a bundle from ca.pem + root-ca.pem if needed.
-        tak_ca_src = None
-        ca_bundle_path = None
-        takserver_pem = os.path.join(cert_dir, 'takserver.pem')
-        if os.path.exists(takserver_pem):
-            tak_ca_src = takserver_pem
-            plog(f"  Using takserver.pem (full chain)")
-        else:
-            # Build bundle from individual CA files
-            int_ca = os.path.join(cert_dir, 'ca.pem')
-            root_ca = os.path.join(cert_dir, 'root-ca.pem')
-            bundle_parts = []
-            for ca_file in [int_ca, root_ca]:
-                if os.path.exists(ca_file):
-                    with open(ca_file, 'r') as f:
-                        content = f.read().strip()
-                    if 'BEGIN CERTIFICATE' in content and 'TRUSTED' not in content:
-                        bundle_parts.append(content)
-            if bundle_parts:
-                fd_ca, ca_bundle_path = tempfile.mkstemp(suffix='.pem', prefix='tak-ca-bundle-')
-                with os.fdopen(fd_ca, 'w') as f:
-                    f.write('\n'.join(bundle_parts) + '\n')
-                tak_ca_src = ca_bundle_path
-                plog(f"  Built CA bundle from ca.pem + root-ca.pem ({len(bundle_parts)} certs)")
-        if tak_ca_src:
-            subprocess.run(f'docker cp {tak_ca_src} tak-portal:/usr/src/app/data/certs/tak-ca.pem', shell=True, capture_output=True, text=True)
-            if ca_bundle_path is not None and tak_ca_src == ca_bundle_path:
-                try:
-                    os.remove(tak_ca_src)
-                except OSError:
-                    pass
-            plog(f"  -> data/certs/tak-ca.pem")
-        else:
-            plog("\u26a0 No CA cert files found in /opt/tak/certs/files/")
-            certs_copied = False
-        if certs_copied:
+        # v10.0.1: delegate to _takportal_sync_certs — copies BOTH the client cert
+        # (admin.p12 re-encoded to modern PKCS12 via a temp file; the old stdin
+        # pipe silently failed on OpenSSL 3 and shipped an unreadable legacy cert)
+        # and the CA chain. restart=False: Step 6 writes settings.json and the
+        # deploy restarts the container afterwards.
+        _certs_ok, _certs_msg = _takportal_sync_certs(plog=plog)
+        if _certs_ok:
             plog("\u2713 Certificates copied to container data volume")
+        else:
+            plog(f"\u26a0 Certificate copy: {_certs_msg}")
 
         # Step 6: Auto-configure settings.json — use _takportal_build_settings_dict which handles
         # localhost/127.0.0.1 -> host.docker.internal, remote Authentik, token lookup, etc.
@@ -18432,7 +19550,7 @@ def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
     version = m.group(1)
     ok, arch_out = _module_run(deploy_cfg, 'uname -m', timeout=10)
     arch_raw = (arch_out or '').strip() or 'x86_64'
-    arch_map = {'x86_64': 'amd64', 'aarch64': 'arm64v8', 'armv7l': 'armv7'}
+    arch_map = {'x86_64': 'amd64', 'aarch64': 'arm64', 'armv7l': 'armv7'}
     mtx_arch = arch_map.get(arch_raw, 'amd64')
     plog(f"  Version: {version}, arch: {arch_raw} → {mtx_arch}")
 
@@ -18440,7 +19558,9 @@ def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
     plog("")
     plog("━━━ Step 3/7: Downloading & Installing MediaMTX (remote) ━━━")
     url = f"https://github.com/bluenviron/mediamtx/releases/download/v{version}/mediamtx_v{version}_linux_{mtx_arch}.tar.gz"
-    cmd = f'cd /tmp && wget -q -O mediamtx.tar.gz "{url}" && tar -xzf mediamtx.tar.gz && mv -f mediamtx /usr/local/bin/ && chmod +x /usr/local/bin/mediamtx && rm -f mediamtx.tar.gz'
+    # restorecon relabels the binary to bin_t on RHEL/SELinux (mv from /tmp keeps
+    # tmp_t → systemd 203/EXEC); no-op on Debian (|| true). Universal one-liner.
+    cmd = f'cd /tmp && wget -q -O mediamtx.tar.gz "{url}" && tar -xzf mediamtx.tar.gz && mv -f mediamtx /usr/local/bin/ && chmod +x /usr/local/bin/mediamtx && (restorecon /usr/local/bin/mediamtx 2>/dev/null || chcon -t bin_t /usr/local/bin/mediamtx 2>/dev/null || true) && rm -f mediamtx.tar.gz'
     ok, out = _module_run(deploy_cfg, cmd, timeout=120, log_fn=plog)
     if not ok:
         plog(f"✗ Download/install failed: {(out or '')[-200:]}")
@@ -18762,6 +19882,15 @@ paths:
                 _module_run(deploy_cfg, 'systemctl restart mediamtx', timeout=15)
                 plog(f"✓ SSL certificates synced — RTSPS and HTTPS HLS enabled")
                 ssl_ok = True
+                # The Caddyfile's /hls-proxy reverse_proxy only switches to https when
+                # the stream cert exists at generate-time (see _get_mediamtx_hls_upstream).
+                # We just enabled HLS-over-TLS on MediaMTX, so regenerate Caddy NOW —
+                # otherwise it keeps proxying plain HTTP to MediaMTX's HTTPS HLS port and
+                # the browser gets 400 "Client sent an HTTP request to an HTTPS server"
+                # (the encrypt-enable-vs-Caddy-gen ordering race — Caddy was generated
+                # before the LE stream cert had provisioned).
+                _caddy_regenerate_if_fqdn()
+                plog("✓ Caddy regenerated — /hls-proxy now matches the HTTPS HLS backend")
                 # Create cert-sync script on infra-TAK host for renewals
                 rcfg = deploy_cfg.get('remote', {})
                 ssh_user = rcfg.get('ssh_user', 'root')
@@ -18865,15 +19994,47 @@ def run_mediamtx_deploy():
             _run_mediamtx_deploy_remote(settings, deploy_cfg, plog)
             return
 
-        # Step 1: Wait for apt lock / install deps
+        # Step 1: install deps (distro-branched). RHEL/Rocky has no apt. EPEL+CRB are
+        # enabled for the general dep set; full ffmpeg comes from RPM Fusion (below).
+        # EPEL/CRB may already be on from a prior TAK Server deploy — idempotent.
+        # The .deb branch (else) is unchanged.
         plog("━━━ Step 1/7: Installing Dependencies ━━━")
-        wait_for_apt_lock(plog, mediamtx_deploy_log)
-        r = subprocess.run('apt-get update -qq && apt-get install -y wget tar curl ffmpeg openssl python3 python3-pip 2>&1',
-            shell=True, capture_output=True, text=True, timeout=300)
-        if r.returncode != 0:
-            plog(f"✗ apt install failed: {r.stdout[-200:]}")
-            mediamtx_deploy_status.update({'running': False, 'error': True})
-            return
+        if _distro_family() == 'rhel':
+            subprocess.run(_sudo_wrap(['dnf', 'install', '-y', 'epel-release', 'dnf-plugins-core']),
+                           capture_output=True, text=True, timeout=300)
+            subprocess.run('dnf config-manager --set-enabled crb 2>/dev/null || dnf config-manager --set-enabled powertools 2>/dev/null; true',
+                           shell=True, capture_output=True, text=True, timeout=120)
+            # Core deps (required). The MediaMTX binary is pure Go and doesn't need
+            # ffmpeg, so install core deps strictly, then ffmpeg separately.
+            ok, out = _pkg_install(['wget', 'tar', 'curl', 'openssl', 'python3', 'python3-pip'],
+                                   log_fn=plog, timeout=900)
+            if not ok:
+                plog(f"✗ dnf install failed: {(out or '')[-200:]}")
+                mediamtx_deploy_status.update({'running': False, 'error': True})
+                return
+            # ffmpeg: required for recording, the MP4-download conversion, and the
+            # test stream. RHEL/EPEL only ship `ffmpeg-free` (NO libx264/libx265);
+            # full ffmpeg matching the Ubuntu apt build lives in RPM Fusion. Add the
+            # RPM Fusion free repo, then install ffmpeg; fall back to ffmpeg-free.
+            # Warn-not-fail: core MediaMTX streaming works without ffmpeg — only the
+            # recording / MP4 export / test-stream features need it.
+            _rhel_ver = (subprocess.run('rpm -E %rhel', shell=True, capture_output=True, text=True).stdout.strip() or '9')
+            subprocess.run(_sudo_wrap(['dnf', 'install', '-y',
+                f'https://download1.rpmfusion.org/free/el/rpmfusion-free-release-{_rhel_ver}.noarch.rpm']),
+                capture_output=True, text=True, timeout=300)
+            ff_ok, _ = _pkg_install(['ffmpeg'], timeout=900)
+            if not ff_ok:
+                ff_ok, _ = _pkg_install(['ffmpeg-free'], timeout=600)
+            plog("✓ ffmpeg installed (recording / MP4 export / test stream)" if ff_ok else
+                 "⚠ ffmpeg unavailable — MediaMTX streaming OK, but recording / MP4 download / test stream need ffmpeg (RPM Fusion repo unreachable?)")
+        else:
+            wait_for_apt_lock(plog, mediamtx_deploy_log)
+            r = subprocess.run('apt-get update -qq && apt-get install -y wget tar curl ffmpeg openssl python3 python3-pip 2>&1',
+                shell=True, capture_output=True, text=True, timeout=300)
+            if r.returncode != 0:
+                plog(f"✗ apt install failed: {r.stdout[-200:]}")
+                mediamtx_deploy_status.update({'running': False, 'error': True})
+                return
         plog("✓ Dependencies installed (wget, ffmpeg, python3)")
 
         # Install Python packages (try with --break-system-packages for newer pip, else without)
@@ -18897,7 +20058,7 @@ def run_mediamtx_deploy():
         # Step 2: Detect architecture and latest version
         plog("")
         plog("━━━ Step 2/7: Detecting MediaMTX Version ━━━")
-        arch_map = {'x86_64': 'amd64', 'aarch64': 'arm64v8', 'armv7l': 'armv7'}
+        arch_map = {'x86_64': 'amd64', 'aarch64': 'arm64', 'armv7l': 'armv7'}
         arch_raw = subprocess.run('uname -m', shell=True, capture_output=True, text=True).stdout.strip()
         mtx_arch = arch_map.get(arch_raw, 'amd64')
         plog(f"  Architecture: {arch_raw} → {mtx_arch}")
@@ -18926,6 +20087,13 @@ def run_mediamtx_deploy():
             return
         subprocess.run(f'tar -xzf {tmp}/mediamtx.tar.gz -C {tmp}', shell=True, capture_output=True)
         subprocess.run(f'mv -f {tmp}/mediamtx /usr/local/bin/mediamtx && chmod +x /usr/local/bin/mediamtx', shell=True, capture_output=True)
+        # RHEL/SELinux: the binary was downloaded under /tmp (tmp_t) and `mv` preserves
+        # that label, so systemd refuses to exec it → 203/EXEC "Permission denied" and
+        # the service crash-loops. restorecon relabels /usr/local/bin/mediamtx to bin_t
+        # (chcon fallback). No-op on Debian (restorecon/chcon absent → || true).
+        if _distro_family() == 'rhel':
+            subprocess.run('restorecon -v /usr/local/bin/mediamtx 2>/dev/null || chcon -t bin_t /usr/local/bin/mediamtx 2>/dev/null; true',
+                           shell=True, capture_output=True, text=True, timeout=30)
         subprocess.run(f'rm -rf {tmp}', shell=True, capture_output=True)
         plog(f"✓ MediaMTX v{version} installed to /usr/local/bin/mediamtx")
 
@@ -19437,6 +20605,15 @@ WantedBy=multi-user.target
 
                 subprocess.run('systemctl restart mediamtx', shell=True, capture_output=True)
                 time.sleep(2)
+                # Caddy's /hls-proxy reverse_proxy only emits https:// when the stream
+                # cert exists at generate-time (_get_mediamtx_hls_upstream). On a fresh
+                # box the Step-7 Caddyfile was written before the LE cert had issued, so
+                # it may still proxy plain HTTP to MediaMTX's now-HTTPS HLS port → browser
+                # 400 ("Client sent an HTTP request to an HTTPS server"). We just confirmed
+                # the cert AND flipped hlsEncryption: yes, so regenerate Caddy now to
+                # switch /hls-proxy to the https backend (closes the encrypt-vs-gen race).
+                _caddy_regenerate_if_fqdn()
+                plog("✓ Caddy regenerated — /hls-proxy now matches the HTTPS HLS backend")
             else:
                 plog(f"  ⚠ Cert not found after 60s — SSL not wired")
                 plog(f"  Go to Caddy page, reload, then restart MediaMTX to retry")
@@ -21121,6 +22298,26 @@ def _patch_cloudtak_compose_ports(cloudtak_dir=None):
             # Tier 3: store 9002 → loopback
             _ct = _re.sub(r'(\s+- )"?9002:9002"?', r'\g<1>"127.0.0.1:9002:9002"', _ct)
 
+            # v10.0.1 (arm64 only): upstream pins postgis/postgis:<tag>, which is
+            # amd64-only (no arm64 manifest) → the container crash-loops with
+            # "exec format error" on aarch64, taking the api/migrations down with it.
+            # imresamu/postgis mirrors the SAME tag scheme with an arm64 build added,
+            # so swap only the registry/namespace and keep CloudTAK's exact PG/PostGIS
+            # tag. No-op on amd64 (the validated path is byte-identical). Lives here so
+            # it is re-applied after every clone/git-checkout, like the port patches.
+            if _host_arch() == 'arm64':
+                _ct = _re.sub(r'(image:\s*)postgis/postgis:', r'\g<1>imresamu/postgis:', _ct)
+                # tiles (pmtiles) won't run on arm64: its @mapbox/vtquery@0.6.0
+                # native addon has no arm64 build and only compiles via the
+                # deprecated mason toolchain (amd64-only C++ deps). Stop the
+                # crash-loop — restart 'always' → 'no' so it exits once and stays
+                # quiet. pmtiles generation is unavailable on arm64 (non-core; the
+                # map + all other CloudTAK features work). Targets the tiles
+                # service uniquely via its dockerfile path.
+                _ct = _re.sub(
+                    r"(dockerfile:\s*\./tasks/pmtiles/Dockerfile\.compose\s*\n\s*restart:\s*)'?always'?",
+                    r"\g<1>'no'", _ct, count=1)
+
             if _ct != _orig:
                 with open(_path, 'w') as f:
                     f.write(_ct)
@@ -21129,6 +22326,70 @@ def _patch_cloudtak_compose_ports(cloudtak_dir=None):
             pass
         break  # only patch the first matching file
     return changed
+
+
+def _cloudtak_build_arm64_media(cloudtak_dir=None, plog=None):
+    """arm64 only: build media-infra from source and tag it as the exact image
+    CloudTAK's compose pins, so `docker compose up` uses the local arm64 build
+    instead of pulling the amd64-only ghcr.io/dfpc-coe/media-infra:<tag> (which
+    crash-loops with "exec format error" on aarch64).
+
+    media-infra's bases (golang:*-alpine, bluenviron/mediamtx:*-ffmpeg) are
+    multi-arch and it compiles its Go server from source, so it builds natively
+    on arm64 — dfpc-coe just never publishes an arm64 image. Compose has no
+    pull_policy (default 'missing'), so a locally-present tag shadows the pull.
+
+    No-op on amd64 (returns False; the published image is used unchanged).
+    Non-fatal: a failure WARNs and returns False — the deploy continues (media is
+    a non-core video proxy; core CloudTAK runs without it). The compose media
+    ports are untouched (9997/HLS already loopback-bound), so this is port-safe.
+    """
+    if _host_arch() != 'arm64':
+        return False
+    import re as _re
+    _log = plog or (lambda _m: None)
+    if cloudtak_dir is None:
+        cloudtak_dir = os.path.expanduser('~/CloudTAK')
+    image_ref = None
+    for _fname in ('compose.yaml', 'docker-compose.yml'):
+        _p = os.path.join(cloudtak_dir, _fname)
+        if not os.path.exists(_p):
+            continue
+        try:
+            with open(_p) as f:
+                _m = _re.search(r'image:\s*(ghcr\.io/dfpc-coe/media-infra:\S+)', f.read())
+            if _m:
+                image_ref = _m.group(1).strip().strip('"\'')
+        except Exception:
+            pass
+        break
+    if not image_ref:
+        _log("  ⚠ arm64: media-infra image pin not found in compose — media may crash-loop")
+        return False
+    tag = image_ref.rsplit(':', 1)[-1]
+    src_dir = os.path.join(cloudtak_dir, 'media-infra-src')
+    _log(f"  arm64: building media-infra {tag} from source (no arm64 image is published)…")
+    try:
+        subprocess.run(f'rm -rf {shlex.quote(src_dir)}', shell=True, timeout=30)
+        r = subprocess.run(
+            f'git clone --depth 1 --branch {shlex.quote(tag)} '
+            f'https://github.com/dfpc-coe/media-infra.git {shlex.quote(src_dir)}',
+            shell=True, capture_output=True, text=True, timeout=180)
+        if r.returncode != 0:
+            _log(f"  ✗ media-infra clone failed (media will be unavailable): {(r.stderr or '')[:200]}")
+            return False
+        r = subprocess.run(
+            f'docker build -t {shlex.quote(image_ref)} {shlex.quote(src_dir)}',
+            shell=True, capture_output=True, text=True, timeout=1800)
+        if r.returncode != 0:
+            _tail = '\n'.join((r.stdout or r.stderr or '').splitlines()[-8:])
+            _log(f"  ✗ media-infra arm64 build failed (media will be unavailable):\n{_tail}")
+            return False
+        _log(f"  ✓ media-infra {tag} built for arm64 → tagged {image_ref} (local image shadows the amd64 pull)")
+        return True
+    except Exception as e:
+        _log(f"  ✗ media-infra arm64 build error (media will be unavailable): {str(e)[:200]}")
+        return False
 
 
 def _cloudtak_fix_nginx_user(container_name='cloudtak-api-1', total_timeout=180, ssh_cfg=None):
@@ -21369,7 +22630,7 @@ def run_cloudtak_deploy(cfg=None):
         r = subprocess.run('docker --version', shell=True, capture_output=True, text=True)
         if r.returncode != 0:
             plog("  Docker not found — installing...")
-            subprocess.run('curl -fsSL https://get.docker.com | sh', shell=True, capture_output=True, text=True, timeout=300)
+            subprocess.run(_docker_install_cmd(), shell=True, capture_output=True, text=True, timeout=300)
             r2 = subprocess.run('docker --version', shell=True, capture_output=True, text=True)
             if r2.returncode != 0:
                 plog("✗ Failed to install Docker")
@@ -21508,6 +22769,14 @@ def run_cloudtak_deploy(cfg=None):
                 plog("  ✓ Compose port bindings hardened → loopback (media 9997, api 5000, tiles 5002, store 9002; events/postgis/store-9000 unpublished)")
         except Exception as _ppe:
             plog(f"  WARNING: compose port-harden failed (Caddy :9997 may collide): {_ppe}")
+
+        # v10.0.1 (arm64 only): the media-infra image is amd64-only on ghcr; build it
+        # from source on-box and tag it as the pinned image so `up` uses the arm64
+        # build (no-op on amd64). Non-fatal — media is a non-core video proxy.
+        try:
+            _cloudtak_build_arm64_media(cloudtak_dir, plog=plog)
+        except Exception as _me:
+            plog(f"  WARNING: arm64 media-infra build step errored (media may be unavailable): {_me}")
 
         api_url = ''
         media_url = ''
@@ -22441,6 +23710,34 @@ def emailrelay_uninstall():
 
 # ── Cesium 3D Tiles ──────────────────────────────────────────────────────────
 
+def _cesium_dir():
+    """Tiles storage dir. Ubuntu (baseline, unchanged): ~/cesium-tiles. RHEL: the
+    console runs from /root (dr-xr-x---), which the confined `caddy` user CANNOT
+    traverse, so Caddy's file_server 403s. Serve from /var/lib/cesium-tiles instead
+    — caddy-readable + SELinux httpd_sys_content_t (see _cesium_ensure_dir)."""
+    if _distro_family() == 'rhel':
+        return '/var/lib/cesium-tiles'
+    return os.path.expanduser('~/cesium-tiles')
+
+
+def _cesium_ensure_dir():
+    """Create the tiles dir and, on RHEL, make it servable by confined Caddy:
+    world-traversable perms (755) + httpd_sys_content_t label, then relabel so any
+    just-uploaded tiles inherit it. No-op extras on Debian. Returns the dir path."""
+    d = _cesium_dir()
+    os.makedirs(d, exist_ok=True)
+    if _distro_family() == 'rhel':
+        try:
+            subprocess.run(_sudo_wrap(['chmod', '755', d]), capture_output=True, timeout=10)
+            subprocess.run(
+                f"semanage fcontext -a -t httpd_sys_content_t '{d}(/.*)?' 2>/dev/null; "
+                f"restorecon -RF {shlex.quote(d)} 2>/dev/null; true",
+                shell=True, capture_output=True, text=True, timeout=60)
+        except Exception:
+            pass
+    return d
+
+
 @app.route('/cesium-tiles')
 @login_required
 def cesium_tiles_page():
@@ -22459,7 +23756,7 @@ def cesium_tiles_page():
 def _cesium_list_datasets(settings):
     """Scan ~/cesium-tiles/ and return a list of dataset dicts for each subdir with tileset.json."""
     import glob as _glob
-    ct_dir = os.path.expanduser('~/cesium-tiles')
+    ct_dir = _cesium_dir()
     if not os.path.isdir(ct_dir):
         return []
     fqdn = (settings.get('fqdn') or '').strip()
@@ -22510,8 +23807,7 @@ def cesium_tiles_enable():
     settings = load_settings()
     settings['cesium_tiles_enabled'] = True
     save_settings(settings)
-    ct_dir = os.path.expanduser('~/cesium-tiles')
-    os.makedirs(ct_dir, exist_ok=True)
+    ct_dir = _cesium_ensure_dir()  # mkdir + (RHEL) caddy-readable perms + SELinux label
     if (settings.get('fqdn') or '').strip():
         generate_caddyfile(settings)
         threading.Thread(target=_caddy_restart_after_response, daemon=True).start()
@@ -22540,7 +23836,7 @@ def cesium_tiles_uninstall():
     if (s.get('fqdn') or '').strip():
         generate_caddyfile(s)
         threading.Thread(target=_caddy_restart_after_response, daemon=True).start()
-    ct_dir = os.path.expanduser('~/cesium-tiles')
+    ct_dir = _cesium_dir()
     try:
         if os.path.isdir(ct_dir):
             shutil.rmtree(ct_dir)
@@ -22562,8 +23858,8 @@ def cesium_tiles_upload():
     import zipfile
     import tempfile
     import shutil
-    ct_dir = os.path.expanduser('~/cesium-tiles')
-    os.makedirs(ct_dir, exist_ok=True)
+    ct_dir = _cesium_dir()
+    _cesium_ensure_dir()  # create + (RHEL) caddy-readable perms + httpd_sys_content_t (new files inherit it)
     dataset_name = (request.form.get('name') or '').strip()
     if not dataset_name:
         return jsonify({'success': False, 'error': 'Dataset name is required'})
@@ -22642,8 +23938,8 @@ def cesium_tiles_upload():
 def cesium_tiles_upload_folder():
     import re as _re_ctf
     import shutil
-    ct_dir = os.path.expanduser('~/cesium-tiles')
-    os.makedirs(ct_dir, exist_ok=True)
+    ct_dir = _cesium_dir()
+    _cesium_ensure_dir()  # create + (RHEL) caddy-readable perms + httpd_sys_content_t (new files inherit it)
     raw_name = (request.form.get('name') or '').strip()
     if not raw_name:
         return jsonify({'success': False, 'error': 'Dataset name is required'})
@@ -22687,7 +23983,7 @@ def cesium_tiles_delete(name):
     import re as _re_ctd
     if not _re_ctd.match(r'^[A-Za-z0-9_\-]+$', name):
         return jsonify({'success': False, 'error': 'Invalid dataset name'})
-    ct_dir = os.path.expanduser('~/cesium-tiles')
+    ct_dir = _cesium_dir()
     target = os.path.join(ct_dir, name)
     # Prevent path traversal
     if not os.path.abspath(target).startswith(os.path.abspath(ct_dir)):
@@ -23053,9 +24349,17 @@ def _run_webodm_deploy(settings):
         if r.returncode != 0:
             plog(f'Pull warning (non-fatal): {r.stderr[:200]}')
 
-        plog('Hardening UFW — blocking direct access to WebODM ports…')
-        for _wo_ufw_port in [wo_port, 3001]:
-            _sp.run(['ufw', 'deny', f'{_wo_ufw_port}/tcp'], capture_output=True)
+        plog('Hardening firewall — blocking direct access to WebODM ports…')
+        if _distro_family() == 'rhel':
+            # No ufw on RHEL — and the bare `ufw` argv call raises FileNotFoundError
+            # (no shell/fallback) which aborts the deploy. firewalld default-denies
+            # un-opened ports and the cloud security group covers external access, so
+            # the WebODM ports are already not externally reachable. (Firewalld-native
+            # deny is part of the firewall-parity track.)
+            plog('  (RHEL: ufw absent — WebODM ports covered by firewalld default-deny / cloud SG)')
+        else:
+            for _wo_ufw_port in [wo_port, 3001]:
+                _sp.run(['ufw', 'deny', f'{_wo_ufw_port}/tcp'], capture_output=True)
 
         plog('Starting WebODM containers…')
         r = _sp.run(['docker', 'compose', '-f', compose_path, 'up', '-d'],
@@ -23602,10 +24906,12 @@ def _configure_authentik_smtp_and_recovery_remote(deploy_cfg, from_addr, setting
                        shell=True, capture_output=True)
         subprocess.run('ufw reload 2>/dev/null; true', shell=True, capture_output=True)
         _log(f'  UFW: allowed {host} → port 25 (console Postfix)')
-    # Restart Authentik containers on remote
-    _log('  Restarting Authentik containers on remote...')
+    # Recreate ONLY server + worker (SMTP env) — recreating the whole stack races
+    # the just-recreated LDAP outpost → name conflict (see local variant). --no-deps
+    # leaves db/redis/ldap untouched.
+    _log('  Recreating Authentik server + worker for SMTP on remote (ldap/db/redis untouched)...')
     _ok, _out = _module_run(deploy_cfg,
-        'cd ~/authentik && docker compose up -d --force-recreate 2>&1', timeout=120)
+        'cd ~/authentik && docker compose up -d --force-recreate --no-deps --remove-orphans server worker 2>&1', timeout=120)
     if not _ok:
         raise RuntimeError(f'Authentik restart failed on remote: {(_out or "")[:300]}')
     _log('  ✓ Authentik restarted')
@@ -23732,9 +25038,16 @@ services:
             subprocess.run('firewall-cmd --reload 2>/dev/null; true', shell=True, capture_output=True)
             _log("  firewalld: allowed Docker networks → port 25")
 
-    _log("  Restarting Authentik containers...")
+    # Recreate ONLY server + worker (they read the SMTP env). Recreating the whole
+    # stack with --force-recreate races the LDAP outpost — which was just recreated
+    # with its injected token in Step 11 — producing an 'authentik-ldap-1 name
+    # already in use' conflict that aborts the compose op mid-recreate, leaving
+    # server/postgres/redis down + orphan containers (Authentik DOWN after a
+    # "successful" deploy → broken LDAP flow → 8446 WebTAK). --no-deps leaves
+    # postgres/redis/ldap untouched. --remove-orphans cleans any prior orphan.
+    _log("  Recreating Authentik server + worker for SMTP (ldap/db/redis untouched)...")
     r = subprocess.run(
-        f'cd {ak_dir} && docker compose up -d --force-recreate',
+        f'cd {ak_dir} && docker compose up -d --force-recreate --no-deps --remove-orphans server worker',
         shell=True, capture_output=True, text=True, timeout=120)
     if r.returncode != 0:
         raise RuntimeError(f'Authentik restart failed: {r.stderr or r.stdout}')
@@ -24266,7 +25579,7 @@ def _run_tvr_deploy(settings):
         r = _sp.run(['docker', '--version'], capture_output=True, text=True)
         if r.returncode != 0:
             plog('  Docker not found — installing...')
-            r2 = _sp.run('curl -fsSL https://get.docker.com | sh 2>&1',
+            r2 = _sp.run(_docker_install_cmd() + ' 2>&1',
                          shell=True, capture_output=True, text=True, timeout=300)
             if r2.returncode != 0:
                 raise RuntimeError(f'Docker install failed: {r2.stdout[-300:]}')
@@ -24296,6 +25609,28 @@ def _run_tvr_deploy(settings):
                         capture_output=True, text=True)
         commit_sha = sha_r.stdout.strip() or 'unknown'
         plog(f'  Commit SHA: {commit_sha}')
+
+        # v10.0.1 (arm64): the upstream TVR Dockerfile hardcodes the MediaMTX
+        # linux_amd64 release tarball, so on aarch64 the bundled mediamtx binary is
+        # wrong-arch and crash-loops with "exec format error" at runtime (the
+        # python:3.11-slim base is multi-arch, so the image itself builds fine).
+        # Rewrite the embedded download to linux_arm64 (bluenviron's arm64 asset is
+        # named `_linux_arm64`, NOT `_linux_arm64v8` — matches infra-TAK's own
+        # aarch64→arm64 map for the standalone MediaMTX module) before the build.
+        # No-op on amd64 — the upstream Dockerfile is used unchanged.
+        if _host_arch() == 'arm64':
+            _tvr_dockerfile = os.path.join(tvr_dir, 'Dockerfile')
+            try:
+                with open(_tvr_dockerfile) as _df:
+                    _dfc = _df.read()
+                if '_linux_amd64' in _dfc and 'mediamtx_' in _dfc:
+                    with open(_tvr_dockerfile, 'w') as _df:
+                        _df.write(_dfc.replace('_linux_amd64', '_linux_arm64'))
+                    plog('  ✓ arm64: patched TVR Dockerfile MediaMTX binary linux_amd64 → linux_arm64')
+                else:
+                    plog('  ⚠ arm64: TVR Dockerfile MediaMTX amd64 pattern not found — bundled mediamtx may be wrong-arch')
+            except Exception as _de:
+                plog(f'  ⚠ arm64: could not patch TVR Dockerfile for arm64 (mediamtx may fail): {_de}')
 
         # Step 3: Write infra-TAK compose + mediaMTX.yml
         plog('')
@@ -24335,15 +25670,22 @@ def _run_tvr_deploy(settings):
 
         # Step 5: UFW rules
         plog('')
-        plog('━━━ Step 5/6: Configuring Firewall (UFW) ━━━')
-        for port_proto in ['8554/tcp', '8555/tcp', '1935/tcp', '8890/udp']:
-            _sp.run(['ufw', 'allow', port_proto], capture_output=True)
-            plog(f'  ✓ ufw allow {port_proto}')
-        # Block direct access to web UI and HLS — Caddy is the only entry point
-        # TVR web UI is on host port 3100 (not 3000 — that's TAK Portal)
-        for port_proto in ['3100/tcp', '8888/tcp']:
-            _sp.run(['ufw', 'deny', port_proto], capture_output=True)
-            plog(f'  ✓ ufw deny {port_proto} (Caddy-only)')
+        plog('━━━ Step 5/6: Configuring Firewall ━━━')
+        if _distro_family() == 'rhel':
+            # No ufw on RHEL — a bare argv `ufw` call raises FileNotFoundError and
+            # aborts the deploy. Stream ports reach the box via the cloud SG; the web
+            # UI / HLS are blocked from direct access by firewalld default-deny / SG
+            # (Caddy is the entry point). Proper firewalld allow/deny = firewall-parity track.
+            plog('  (RHEL: ufw absent — stream ports via SG; web UI/HLS Caddy-only via firewalld default-deny/SG)')
+        else:
+            for port_proto in ['8554/tcp', '8555/tcp', '1935/tcp', '8890/udp']:
+                _sp.run(['ufw', 'allow', port_proto], capture_output=True)
+                plog(f'  ✓ ufw allow {port_proto}')
+            # Block direct access to web UI and HLS — Caddy is the only entry point
+            # TVR web UI is on host port 3100 (not 3000 — that's TAK Portal)
+            for port_proto in ['3100/tcp', '8888/tcp']:
+                _sp.run(['ufw', 'deny', port_proto], capture_output=True)
+                plog(f'  ✓ ufw deny {port_proto} (Caddy-only)')
 
         # Step 6: Save settings + regenerate Caddyfile
         plog('')
@@ -26078,7 +27420,7 @@ def _run_netbird_deploy(settings):
         r = _sp.run(['docker', '--version'], capture_output=True, text=True)
         if r.returncode != 0:
             plog('  Docker not found — installing...')
-            r2 = _sp.run('curl -fsSL https://get.docker.com | sh 2>&1',
+            r2 = _sp.run(_docker_install_cmd() + ' 2>&1',
                          shell=True, capture_output=True, text=True, timeout=300)
             if r2.returncode != 0:
                 raise RuntimeError(f'Docker install failed: {r2.stdout[-300:]}')
@@ -26198,9 +27540,58 @@ def _ensure_proxy_providers_cookie_domain(ak_url, ak_headers, fqdn, plog=None):
         _log(f"  ⚠ Proxy cookie_domain: {str(e)[:80]}")
 
 
+def _reload_embedded_outpost(plog=None):
+    """Force the Authentik embedded outpost to reload its provider/host list by
+    restarting the authentik-server container (the embedded proxy outpost runs
+    INSIDE that process).
+
+    Why: after a proxy provider is added to the embedded outpost via the API, the
+    RUNNING outpost does not reliably hot-reload — the new external_host returns an
+    Authentik 'Not Found' until the server restarts. Observed on BOTH Ubuntu and
+    RHEL; there is no clean API to force a reload. We restart only the `server`
+    container (not worker/db/redis/ldap) to keep the SSO blip minimal, then wait
+    for the API to come back so the caller's subsequent Authentik calls don't fail.
+    Best-effort; idempotent caller-gated (only invoked when the outpost actually
+    changed). NON-ROOT-COMMANDS: docker."""
+    _log = plog or (lambda m: None)
+    try:
+        names = subprocess.run("docker ps --filter name=authentik-server --format '{{.Names}}'",
+                               shell=True, capture_output=True, text=True, timeout=10).stdout.strip().splitlines()
+        name = names[0].strip() if names else ''
+        if not name:
+            _log("  ⚠ embedded-outpost reload: authentik-server container not found")
+            return False
+        subprocess.run(_sudo_wrap(['docker', 'restart', name]), capture_output=True, text=True, timeout=90)
+        # Wait until authentik-server is back so the caller's later API calls don't
+        # fail. Use the container's own healthcheck — Authentik's HTTP health probes
+        # 400 on a 127.0.0.1 Host (host validation), so an HTTP poll never confirms.
+        ready = False
+        for _ in range(60):  # up to ~120s — server restart can run blueprints/migrations
+            time.sleep(2)
+            h = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.State.Health.Status}}', name]),
+                               capture_output=True, text=True, timeout=10).stdout.strip()
+            if h == 'healthy':
+                ready = True
+                break
+            if not h:  # image has no healthcheck → best-effort settle then accept
+                time.sleep(15)
+                ready = True
+                break
+        if ready:
+            _log(f"  ✓ Authentik embedded outpost reloaded (restarted {name})")
+        else:
+            _log(f"  ✓ Authentik embedded outpost restart issued ({name}) — not confirmed healthy in 120s (proceeding)")
+        return True
+    except Exception as e:
+        _log(f"  ⚠ embedded-outpost reload error: {str(e)[:80]}")
+        return False
+
+
 def _outpost_add_providers_safe(ak_url, ak_headers, provider_pks_to_add, plog=None):
     """Add given provider PKs to the embedded outpost. Never removes existing providers.
-    GET full outpost, normalize providers to PKs, append any missing from provider_pks_to_add, PATCH only if we added and didn't shorten."""
+    GET full outpost, normalize providers to PKs, append any missing from provider_pks_to_add, PATCH only if we added and didn't shorten.
+    On a real change, restart authentik-server so the embedded outpost reloads the
+    new host (it won't hot-reload on its own — Authentik 'Not Found' otherwise)."""
     if not provider_pks_to_add:
         return False
     import urllib.request as _req
@@ -26236,6 +27627,11 @@ def _outpost_add_providers_safe(ak_url, ak_headers, provider_pks_to_add, plog=No
         _req.urlopen(_req.Request(f'{ak_url}/api/v3/outposts/instances/{op_pk}/',
             data=json.dumps({'providers': current_pks}).encode(), headers=ak_headers, method='PATCH'), timeout=10)
         _log("  ✓ Providers added to embedded outpost")
+        # The PATCH lands in the DB but the running embedded outpost won't hot-reload
+        # the new host — restart authentik-server so the new vhost serves instead of
+        # returning an Authentik 'Not Found'. Only here (added > 0), so idempotent
+        # re-runs don't restart Authentik.
+        _reload_embedded_outpost(plog=plog)
         return True
     except Exception as e:
         _log(f"  ⚠ Outpost error: {str(e)[:80]}")
@@ -27347,7 +28743,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 
   <div class="card">
     <div class="card-title">Boundary assertions (W4) — read-only</div>
-    <p style="font-size:12px;color:var(--text-dim);margin-bottom:10px">UFW, fail2ban, console exposure, and TAK Tomcat shielding. Nothing is changed here — these are checks for the readiness report. Deep Tomcat STIG remediation is .57.</p>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:10px">Host firewall, fail2ban, console exposure, and TAK Tomcat shielding. Nothing is changed here — these are checks for the readiness report. Deep Tomcat STIG remediation is .57.</p>
     <div id="assertions">Loading…</div>
   </div>
 
@@ -29612,7 +31008,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 <div class="main">
   <div class="page-header">
     <h1><span class="material-symbols-outlined">shield_locked</span>Firewall</h1>
-    <p>Always-on UFW controls. Open/close ports, restrict by source IP/CIDR, and remove numbered rules.</p>
+    <p>Always-on {{ fw_name }} controls. Open/close ports, restrict by source IP/CIDR, and remove rules.</p>
   </div>
 
   <details class="card" open>
@@ -29658,7 +31054,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
         <input class="form-input" type="number" id="fw-rule-num" min="1" placeholder="Rule #" style="max-width:120px">
         <button class="btn" type="button" id="fw-del-btn" onclick="fwDeleteRule()" style="border-color:var(--red);color:var(--red)">Delete rule</button>
       </div>
-      <p style="margin-top:8px;color:var(--text-dim);font-size:12px">Use numbers shown in "Current Rules" (from <code>ufw status numbered</code>).</p>
+      <p style="margin-top:8px;color:var(--text-dim);font-size:12px">Use the numbers shown in "Current Rules" above.</p>
     </div>
   </details>
 </div>
@@ -33922,6 +35318,143 @@ async function doUninstallPortal(){
 authentik_deploy_log = []
 authentik_deploy_status = {'running': False, 'complete': False, 'error': False}
 
+# ─────────────────────────────────────────────────────────────────────────────
+# v10.0.1: serialize Authentik `docker compose` operations against the deploy.
+#
+# The Authentik/TAK deploy and the background spiral monitor (_authentik_spiral_
+# monitor) BOTH issue `docker compose` operations against the ~/authentik project,
+# in the SAME gunicorn process. On a fresh deploy the monitor's first 10-min tick
+# can land mid-deploy and — false-positiving on a freshly-booted outpost's normal
+# transient "stage recursion / failed to execute flow" markers — fire a routing
+# repair whose `docker compose up` races the deploy's own compose calls. Concurrent
+# `docker compose up` on one project corrupts container state: observed live on
+# aws-arm (2026-06-21) leaving authentik-postgresql-1 force-recreated but never
+# started ("Created", Running=false), so authentik-server-1 could no longer resolve
+# host `postgresql` ("Temporary failure in name resolution") → 502 on its own
+# `ak healthcheck` → server UNHEALTHY → its API 500s → the LDAP service-account sync
+# + webadmin sync (and the manual Resync button) all fail → 8446 lands on WebTAK
+# instead of the Admin GUI.
+#
+# Fix: a process-wide "deploy active" guard. Deploy entry points set it (via the
+# @_with_authentik_deploy_guard decorator); the spiral monitor stands down while it
+# is set, plus a short cooldown so the post-deploy settle isn't disturbed. Both run
+# in the same process, so a plain counter under a lock is sufficient (and reentrant-
+# safe across the Authentik-then-TAK deploy sequence).
+# ─────────────────────────────────────────────────────────────────────────────
+_authentik_deploy_guard_lock = _threading.Lock()
+_authentik_deploy_active_count = [0]
+_authentik_deploy_settled_until = [0.0]
+
+def _authentik_deploy_guard_enter():
+    with _authentik_deploy_guard_lock:
+        _authentik_deploy_active_count[0] += 1
+
+def _authentik_deploy_guard_exit(cooldown_secs=300):
+    with _authentik_deploy_guard_lock:
+        if _authentik_deploy_active_count[0] > 0:
+            _authentik_deploy_active_count[0] -= 1
+        if _authentik_deploy_active_count[0] == 0:
+            _authentik_deploy_settled_until[0] = time.time() + cooldown_secs
+
+def _authentik_deploy_in_progress():
+    with _authentik_deploy_guard_lock:
+        return _authentik_deploy_active_count[0] > 0 or time.time() < _authentik_deploy_settled_until[0]
+
+def _with_authentik_deploy_guard(fn):
+    """Decorator: mark an Authentik/TAK deploy as in-progress for its whole duration
+    so the spiral monitor won't run concurrent `docker compose` on the authentik
+    project. See the block comment above."""
+    import functools
+    @functools.wraps(fn)
+    def _wrapped(*a, **kw):
+        _authentik_deploy_guard_enter()
+        try:
+            return fn(*a, **kw)
+        finally:
+            _authentik_deploy_guard_exit()
+    return _wrapped
+
+
+def _wait_for_authentik_stack_healthy(plog, timeout=240):
+    """v10.0.1: Wait for the LOCAL Authentik stack to report healthy before the deploy
+    runs the LDAP service-account / webadmin sync (both hit the Authentik API and fail
+    with a 500 while authentik-server is unhealthy). Also SELF-HEALS the fresh-deploy
+    failure mode: if a core container (postgresql/server/worker) was left stopped by a
+    recreate race, a one-shot full `docker compose up -d` (no --no-deps) starts it back
+    up. Returns True if the server reports healthy (or is up with no healthcheck), else
+    False (caller proceeds non-fatally). No-ops cleanly for REMOTE Authentik."""
+    try:
+        settings = load_settings()
+        ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+        if ak_cfg.get('target_mode') == 'remote' and (ak_cfg.get('remote', {}).get('host') or '').strip():
+            return True  # remote Authentik — not locally healable from here
+    except Exception:
+        pass
+    ak_dir = os.path.expanduser('~/authentik')
+    if not os.path.exists(os.path.join(ak_dir, 'docker-compose.yml')):
+        return True
+    core = ['authentik-postgresql-1', 'authentik-server-1', 'authentik-worker-1']
+    healed = False
+    deadline = time.time() + timeout
+    last_log = 0.0
+    while time.time() < deadline:
+        # Any core container not running? (created/exited == the recreate-race signature)
+        stopped = []
+        for c in core:
+            r = subprocess.run(f'docker inspect --format "{{{{.State.Running}}}}" {c} 2>/dev/null',
+                shell=True, capture_output=True, text=True, timeout=10)
+            if (r.stdout or '').strip() != 'true':
+                stopped.append(c)
+        if stopped and not healed:
+            plog(f"  ⚠ Authentik stack: {', '.join(stopped)} not running — starting the stack (docker compose up -d)…")
+            subprocess.run(f'cd {ak_dir} && docker compose up -d 2>&1',
+                shell=True, capture_output=True, text=True, timeout=180)
+            healed = True
+            time.sleep(10)
+            continue
+        # Server reporting healthy? (or up with no healthcheck defined)
+        hr = subprocess.run('docker inspect --format "{{.State.Health.Status}}" authentik-server-1 2>/dev/null',
+            shell=True, capture_output=True, text=True, timeout=10)
+        status = (hr.stdout or '').strip()
+        if status == 'healthy':
+            return True
+        if status in ('', '<no value>') and not stopped:
+            return True  # running, no healthcheck — best signal we have
+        if time.time() - last_log > 25:
+            plog(f"  … waiting for Authentik server to become healthy (status: {status or 'unknown'})")
+            last_log = time.time()
+        time.sleep(8)
+    plog(f"  ⚠ Authentik server did not report healthy within {timeout}s — proceeding (sync may need a retry/Resync)")
+    return False
+
+
+def _sync_authentik_ldap_sa_with_retry(plog, attempts=3):
+    """v10.0.1: Wait for Authentik to be healthy, then run the LDAP service-account
+    sync, retrying on a TRANSIENT Authentik API failure (500/502/503/timeout/DNS) —
+    the fresh-deploy window where authentik-server is briefly unhealthy. a25cd5d added
+    the SA-sync call but not this robustness, so a single API 500 left 8446 on WebTAK.
+    Returns (ok, msg)."""
+    last = (False, '')
+    for i in range(attempts):
+        _wait_for_authentik_stack_healthy(plog, timeout=240 if i == 0 else 90)
+        try:
+            ok, msg = _ensure_authentik_ldap_service_account()
+        except Exception as e:
+            ok, msg = False, f'exception: {str(e)[:120]}'
+        last = (ok, msg)
+        if ok:
+            return ok, msg
+        transient = any(s in (msg or '') for s in
+            ('500', '502', '503', 'timed out', 'timeout', "Can't contact",
+             'Temporary failure', 'Connection refused', 'not ready'))
+        if not transient or i == attempts - 1:
+            return ok, msg
+        plog(f"  ℹ LDAP SA-sync attempt {i + 1} hit a transient Authentik error "
+             f"({(msg or '')[:70]}) — waiting for Authentik to settle and retrying…")
+        time.sleep(20)
+    return last
+
+
 @app.route('/authentik')
 @login_required
 def authentik_page():
@@ -37191,13 +38724,31 @@ def _detect_cloud_public_ip():
         except Exception:
             pass
     elif cloud == 'aws':
+        # Try IMDSv2 (token) FIRST — modern AMIs (esp. ARM/Graviton) default to
+        # HttpTokens=required, which 401s the token-less IMDSv1 call. Without this
+        # the public IP silently falls through to the echo services and, if egress
+        # hiccups, to hostname -I (private). Root-caused on aws-arm 2026-06-20.
+        _aws_token = ''
         try:
-            with _ur.urlopen('http://169.254.169.254/latest/meta-data/public-ipv4', timeout=2) as r:
-                _body = (r.read() or b'').decode('utf-8', 'replace').strip()
-            if _body and _ipv4.match(_body):
-                return _body, 'aws-imds-direct'
+            _treq = _ur.Request(
+                'http://169.254.169.254/latest/api/token',
+                method='PUT',
+                headers={'X-aws-ec2-metadata-token-ttl-seconds': '60'},
+            )
+            with _ur.urlopen(_treq, timeout=2) as r:
+                _aws_token = (r.read() or b'').decode('utf-8', 'replace').strip()
         except Exception:
             pass
+        _imds_hdrs = ([{'X-aws-ec2-metadata-token': _aws_token}] if _aws_token else []) + [{}]
+        for _hdrs in _imds_hdrs:
+            try:
+                _mreq = _ur.Request('http://169.254.169.254/latest/meta-data/public-ipv4', headers=_hdrs)
+                with _ur.urlopen(_mreq, timeout=2) as r:
+                    _body = (r.read() or b'').decode('utf-8', 'replace').strip()
+                if _body and _ipv4.match(_body):
+                    return _body, 'aws-imds-direct'
+            except Exception:
+                continue
 
     # Step 3: cloud VM with no direct public IP — fall through to echo services
     # (safe because the cloud-VM precondition has already been established).
@@ -37293,6 +38844,60 @@ def _patch_settings_server_ip_prefer_cloud_public(plog=None):
     except Exception as e:
         try:
             plog(f"  server_ip auto-correct: error (non-fatal): {e}")
+        except Exception:
+            pass
+        return False
+
+
+def _refresh_server_ip_from_imds_direct(plog=None):
+    """Self-heal: keep settings.server_ip synced to the instance's
+    DIRECTLY-ATTACHED cloud public IP (AWS/Azure IMDS), on every boot.
+
+    Why (aws-arm, 2026-06-20): a cloud VM WITHOUT an Elastic/static IP gets a
+    NEW ephemeral public IP on every stop/start. start.sh only detects at
+    install, and the one-shot private->public migration
+    (_patch_settings_server_ip_prefer_cloud_public) won't touch an already-
+    public-but-now-stale server_ip — so the banner / IP access URL drift to a
+    dead IP. There is no manual Settings → Server IP control to fix it by hand.
+
+    Safe gating (all required):
+      - _detect_cloud_public_ip() returns (ip, source) with source ending in
+        'imds-direct' — IMDS reports this public IP as directly attached to the
+        NIC (ground truth). An Elastic/static IP appears here too, so EIP boxes
+        simply stay pinned to the EIP (cur == ip → no-op). Echo/NAT-derived IPs
+        (source '*-nat') are NEVER used to override, so load-balancer /
+        NAT-gateway deployments (instance public IP != operator-facing LB IP)
+        are left untouched.
+      - the detected public IP differs from the stored server_ip.
+    Off-cloud / bare-metal / on-prem: _detect_cloud_public_ip() returns
+    (None, None) → no-op. NOT one-shot (unlike the v0.9.29 migration): an
+    ephemeral-IP box must re-sync on every restart. Mirrors the
+    _refresh_stale_private_server_ip pattern for the cloud-public case.
+    """
+    if not plog:
+        plog = lambda m: None
+    try:
+        ip, source = _detect_cloud_public_ip()
+        if not ip or not source or not source.endswith('imds-direct'):
+            return False
+        s = load_settings()
+        cur = (s.get('server_ip') or '').strip()
+        if cur == ip:
+            return False
+        s['server_ip'] = ip
+        s['server_ip_imds_synced'] = {
+            'at': datetime.utcnow().isoformat() + 'Z',
+            'from': cur or '(unset)',
+            'to': ip,
+            'source': source,
+            'version': VERSION,
+        }
+        save_settings(s)
+        plog(f"  server_ip self-heal: {cur or '(unset)'} → {ip} (IMDS direct-attached public, source={source})")
+        return True
+    except Exception as e:
+        try:
+            plog(f"  server_ip self-heal: error (non-fatal): {e}")
         except Exception:
             pass
         return False
@@ -43036,6 +44641,17 @@ def _authentik_spiral_monitor():
             if not os.path.exists(os.path.join(ak_dir, 'docker-compose.yml')):
                 continue
 
+            # v10.0.1: stand down while a deploy is in progress (or just finished).
+            # The deploy issues its own `docker compose` ops against this project; a
+            # concurrent compose up from this monitor races and can leave a core
+            # container (e.g. postgresql) force-recreated-but-not-started, which makes
+            # authentik-server unhealthy and breaks the LDAP SA / webadmin sync on a
+            # fresh deploy. See the _with_authentik_deploy_guard block comment.
+            if _authentik_deploy_in_progress():
+                print("[spiral monitor] deploy in progress (or just finished) — standing down this cycle "
+                      "(avoids concurrent docker compose on the authentik project)", flush=True)
+                continue
+
             # PROACTIVE pass first: if outpost is on internal routing and all preconditions
             # for FQDN migration are met, migrate now — don't wait for spiral. Idempotent on
             # FQDN-routed boxes so this is a 0.5s no-op when there's nothing to do.
@@ -43066,6 +44682,7 @@ def _authentik_spiral_monitor():
                 pass
 
 
+@_with_authentik_deploy_guard
 def run_authentik_deploy(reconfigure=False):
     def plog(msg):
         entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
@@ -43269,7 +44886,7 @@ def run_authentik_deploy(reconfigure=False):
             r = subprocess.run('docker --version', shell=True, capture_output=True, text=True)
             if r.returncode != 0:
                 plog("Docker not found. Installing...")
-                subprocess.run('curl -fsSL https://get.docker.com | sh', shell=True, capture_output=True, text=True, timeout=300)
+                subprocess.run(_docker_install_cmd(), shell=True, capture_output=True, text=True, timeout=300)
                 r2 = subprocess.run('docker --version', shell=True, capture_output=True, text=True)
                 if r2.returncode != 0:
                     plog("\u2717 Failed to install Docker")
@@ -43556,7 +45173,9 @@ entries:
             plog("\u2501\u2501\u2501 Step 5/10: Downloading Docker Compose File \u2501\u2501\u2501")
             _compose_fresh_download = False
             if not os.path.exists(compose_path):
-                r = subprocess.run(f'wget -q -O {compose_path} https://goauthentik.io/docker-compose.yml 2>&1', shell=True, capture_output=True, text=True, timeout=30)
+                # curl (not wget): Rocky/RHEL minimal ships curl but not wget. -fsSL fails
+                # loudly on HTTP errors and follows redirects. (v10.0.1 universal-installer)
+                r = subprocess.run(f'curl -fsSL -o {compose_path} https://goauthentik.io/docker-compose.yml 2>&1', shell=True, capture_output=True, text=True, timeout=30)
                 if r.returncode != 0 or not os.path.exists(compose_path):
                     plog("\u2717 Failed to download docker-compose.yml")
                     authentik_deploy_status.update({'running': False, 'error': True})
@@ -45575,8 +47194,22 @@ def _apply_coreconfig_ldap_auth_et(coreconfig_path, ldap_host, ldap_pass, plog=N
     """
     import xml.etree.ElementTree as ET
 
+    # v10.0.1: when TAK runs as a container and Authentik is LOCAL, ldap_host
+    # '127.0.0.1' is the CONTAINER's own loopback — not the host where the LDAP
+    # outpost publishes (127.0.0.1:389->3389). TAK then can't reach LDAP →
+    # enrollment "invalid credentials". Join TAK to Authentik's docker network and
+    # use the LDAP container's name + its in-container port (3389). Native/.deb and
+    # remote-Authentik paths are unchanged (ldap_host:389 as before).
+    _ldap_port = 389
+    if _tak_is_container() and ldap_host in ('127.0.0.1', 'localhost'):
+        _net, _ldap_name = _ensure_tak_on_authentik_network()
+        if _ldap_name:
+            ldap_host = _ldap_name
+            _ldap_port = 3389
+            if plog:
+                plog(f"  ✓ container TAK joined Authentik net '{_net}'; LDAP via {ldap_host}:{_ldap_port}")
     _ldap_attrs = {
-        'url': f'ldap://{ldap_host}:389',
+        'url': f'ldap://{ldap_host}:{_ldap_port}',
         'userstring': 'cn={username},ou=users,dc=takldap',
         'updateinterval': '30',
         'groupprefix': 'cn=tak_',
@@ -46522,10 +48155,13 @@ def _ensure_authentik_ldap_service_account():
             # console's first deploy on a fresh box). Operator next action:
             # re-run deploy or trigger Update Now.
             return False, 'LDAP bind confirmed failing after API password set — check ldap-authentication-flow policy bindings'
-        # Inconclusive across all attempts — likely ldapsearch not installable on
-        # this distro. Keep prior permissive behavior: assume API success means
-        # password was written; let downstream operator workflow catch any issue.
-        return True, 'LDAP service account configured (bind verification inconclusive — ldapsearch unavailable). Proceeding.'
+        # Inconclusive across all attempts. _ensure_ldapsearch() ran above, so this
+        # is usually NOT a missing client — it's the outpost being mid-recreate/spiral
+        # while we probe (e.g. the webadmin-sync tail recreates the LDAP container right
+        # after this call). The set_password API call above already succeeded, so the
+        # password IS written; the 5-min watchdog re-verifies once the outpost settles.
+        # Keep permissive behavior: API success means the password was set.
+        return True, 'LDAP service account password set (API ok); live bind verification inconclusive (outpost likely mid-recreate — watchdog will re-verify). Proceeding.'
     except urllib.error.HTTPError as e:
         body = ''
         try:
@@ -46605,8 +48241,15 @@ def _apply_ldap_to_coreconfig():
     ag = subprocess.run(['grep', '-c', 'adminGroup="ROLE_ADMIN"', coreconfig_path], capture_output=True, text=True, timeout=5)
     if ag.returncode != 0 or (ag.stdout or '').strip() == '0':
         return False, 'CoreConfig was written but adminGroup="ROLE_ADMIN" is missing — 8446 would show WebTAK for everyone. Run Connect LDAP again.'
-    # Restart TAK Server
-    r = subprocess.run('sudo systemctl restart takserver 2>&1', shell=True, capture_output=True, text=True, timeout=60)
+    # Restart TAK Server so it reloads the LDAP <auth>. v10.0.1: container-aware —
+    # native systemctl restart fails on a Docker TAK (no systemd unit), which left
+    # the LDAP patch on disk but never loaded (→ enrollment 'invalid credentials').
+    # Verified: TAK-in-container preserves CoreConfig across `docker restart`, so a
+    # plain restart suffices. Native branch is byte-identical to pre-v10.
+    if _tak_is_container():
+        r = subprocess.run(_tak_systemctl('restart') + ' 2>&1', shell=True, capture_output=True, text=True, timeout=120)
+    else:
+        r = subprocess.run('sudo systemctl restart takserver 2>&1', shell=True, capture_output=True, text=True, timeout=60)
     if r.returncode != 0:
         return False, f'CoreConfig patched but TAK Server restart failed: {r.stderr.strip()[:120]}'
     return True, 'LDAP connected — CoreConfig patched and TAK Server restarted.'
@@ -48822,7 +50465,10 @@ def takserver_connect_ldap():
     changed, resync_msg = _resync_ldap_credential_to_coreconfig()
     if changed:
         diag.append(f'Credential resync: {resync_msg}')
-    ok, msg = _ensure_authentik_ldap_service_account()
+    # v10.0.1: wait for Authentik healthy (self-heal a stopped container) + retry on
+    # a transient API 500 — on an unhealthy fresh-deploy Authentik this button used to
+    # fail with "Authentik API 500: <!DOCTYPE html>…" and leave 8446 on WebTAK.
+    ok, msg = _sync_authentik_ldap_sa_with_retry(lambda m: diag.append(m.strip()))
     if not ok:
         if '-w' in (msg or ''):
             msg = 'ldapsearch timed out or failed (check Authentik LDAP outpost logs)'
@@ -49683,58 +51329,12 @@ def takserver_rotate_intca():
 
             log("")
             log("Step 7/7: Updating TAK Portal certificates...")
-            portal_running = subprocess.run('docker ps --format "{{.Names}}" 2>/dev/null | grep -q tak-portal',
-                                            shell=True, capture_output=True).returncode == 0
-            if portal_running:
-                run('docker exec tak-portal mkdir -p /usr/src/app/data/certs', check=False)
-                admin_p12 = os.path.join(cert_dir, 'admin.p12')
-                modern_p12 = '/tmp/tak-portal-admin-modern.p12'
-                subprocess.run(
-                    f'openssl pkcs12 -in {admin_p12} -passin pass:{shlex.quote(cert_pass)} -nodes -legacy 2>/dev/null | '
-                    f'openssl pkcs12 -export -passout pass:{shlex.quote(cert_pass)} -out {modern_p12}',
-                    shell=True, capture_output=True, text=True, timeout=30)
-                if os.path.exists(modern_p12) and os.path.getsize(modern_p12) > 0:
-                    run(f'docker cp {modern_p12} tak-portal:/usr/src/app/data/certs/tak-client.p12', check=False)
-                    os.remove(modern_p12)
-                    log("  ✓ admin.p12 copied to TAK Portal (re-encoded)")
-                else:
-                    run(f'docker cp {admin_p12} tak-portal:/usr/src/app/data/certs/tak-client.p12', check=False)
-                    log("  ✓ admin.p12 copied to TAK Portal")
-                # Keep TAK Portal CA source identical to original deploy behavior:
-                # prefer takserver.pem (full server chain), fallback to ca.pem + root-ca.pem.
-                tak_ca_src = None
-                takserver_pem = os.path.join(cert_dir, 'takserver.pem')
-                if os.path.exists(takserver_pem):
-                    tak_ca_src = takserver_pem
-                    log("  Using takserver.pem (full chain)")
-                else:
-                    int_ca = os.path.join(cert_dir, 'ca.pem')
-                    root_ca = os.path.join(cert_dir, 'root-ca.pem')
-                    bundle_parts = []
-                    for ca_file in [int_ca, root_ca]:
-                        if os.path.exists(ca_file):
-                            with open(ca_file, 'r') as f:
-                                content = f.read().strip()
-                            if 'BEGIN CERTIFICATE' in content and 'TRUSTED' not in content:
-                                bundle_parts.append(content)
-                    if bundle_parts:
-                        ca_bundle_path = '/tmp/tak-ca-bundle-rotate.pem'
-                        with open(ca_bundle_path, 'w') as f:
-                            f.write('\n'.join(bundle_parts) + '\n')
-                        tak_ca_src = ca_bundle_path
-                        log(f"  Built CA bundle from ca.pem + root-ca.pem ({len(bundle_parts)} certs)")
-                if tak_ca_src:
-                    run(f'docker cp {tak_ca_src} tak-portal:/usr/src/app/data/certs/tak-ca.pem', check=False)
-                    if tak_ca_src.startswith('/tmp/'):
-                        try:
-                            os.remove(tak_ca_src)
-                        except Exception:
-                            pass
-                    log("  ✓ CA chain copied to TAK Portal")
-                run('docker restart tak-portal 2>/dev/null', check=False)
-                log("  ✓ TAK Portal restarted with new certificates")
-            else:
-                log("  TAK Portal not running — will update on next deploy")
+            # v10.0.1: delegate to _takportal_sync_certs — refreshes client cert +
+            # CA via a temp-file re-encode (the old stdin pipe failed on OpenSSL 3
+            # and shipped an unreadable legacy cert). restart=True so the portal
+            # picks up the new CA-signed cert.
+            _tp_ok, _tp_msg = _takportal_sync_certs(plog=log, restart=True)
+            log(f"  {'✓' if _tp_ok else '⚠'} TAK Portal cert sync: {_tp_msg}")
 
             log("")
             log("Restarting TAK Server...")
@@ -49827,37 +51427,9 @@ def takserver_revoke_old_ca():
         subprocess.run('systemctl restart takserver 2>&1', shell=True, capture_output=True, text=True, timeout=90)
 
         # 4) Update TAK Portal certs so it can talk to TAK Server (new server cert / chain)
-        portal_running = subprocess.run('docker ps --format "{{.Names}}" 2>/dev/null | grep -q tak-portal', shell=True, capture_output=True).returncode == 0
-        if portal_running:
-            subprocess.run('docker exec tak-portal mkdir -p /usr/src/app/data/certs', shell=True, capture_output=True, text=True)
-            admin_p12 = os.path.join(cert_dir, 'admin.p12')
-            modern_p12 = '/tmp/tak-portal-admin-modern.p12'
-            subprocess.run(
-                f'openssl pkcs12 -in {admin_p12} -passin pass:{shlex.quote(cert_pass)} -nodes -legacy 2>/dev/null | '
-                f'openssl pkcs12 -export -passout pass:{shlex.quote(cert_pass)} -out {modern_p12}',
-                shell=True, capture_output=True, text=True, timeout=30)
-            if os.path.exists(modern_p12) and os.path.getsize(modern_p12) > 0:
-                subprocess.run(f'docker cp {modern_p12} tak-portal:/usr/src/app/data/certs/tak-client.p12', shell=True, capture_output=True, text=True)
-                os.remove(modern_p12)
-            else:
-                subprocess.run(f'docker cp {admin_p12} tak-portal:/usr/src/app/data/certs/tak-client.p12', shell=True, capture_output=True, text=True)
-            takserver_pem = os.path.join(cert_dir, 'takserver.pem')
-            if os.path.isfile(takserver_pem):
-                subprocess.run(f'docker cp {takserver_pem} tak-portal:/usr/src/app/data/certs/tak-ca.pem', shell=True, capture_output=True, text=True)
-            else:
-                bundle = '/tmp/tak-ca-bundle-revoke.pem'
-                int_pem = os.path.join(cert_dir, 'ca.pem')
-                root_pem = os.path.join(cert_dir, 'root-ca.pem')
-                if os.path.isfile(int_pem) and os.path.isfile(root_pem):
-                    with open(bundle, 'w') as f:
-                        f.write(open(int_pem).read())
-                        f.write(open(root_pem).read())
-                    subprocess.run(f'docker cp {bundle} tak-portal:/usr/src/app/data/certs/tak-ca.pem', shell=True, capture_output=True, text=True)
-                    try:
-                        os.remove(bundle)
-                    except Exception:
-                        pass
-            subprocess.run('docker restart tak-portal 2>/dev/null', shell=True, capture_output=True, text=True)
+        # v10.0.1: delegate to _takportal_sync_certs (temp-file re-encode of the
+        # client cert + CA; restart so the portal picks up the new chain).
+        _takportal_sync_certs(restart=True)
 
         msg = (f'Removed {old_ca_alias} from truststore and restarted TAK Server. '
                f'Server cert is now signed by the new CA (clients who re-enrolled via CloudTAK/QR can connect). '
@@ -50033,35 +51605,11 @@ def takserver_rotate_rootca():
                                             shell=True, capture_output=True).returncode == 0
             if portal_running:
                 log("  Updating TAK Portal certificates...")
-                run('docker exec tak-portal mkdir -p /usr/src/app/data/certs', check=False)
-                admin_p12 = os.path.join(cert_dir, 'admin.p12')
-                modern_p12 = '/tmp/tak-portal-admin-modern.p12'
-                r_enc = subprocess.run(
-                    f'openssl pkcs12 -in {admin_p12} -passin pass:{shlex.quote(cert_pass)} -nodes -legacy 2>/dev/null | '
-                    f'openssl pkcs12 -export -passout pass:{shlex.quote(cert_pass)} -out {modern_p12}',
-                    shell=True, capture_output=True, text=True, timeout=30)
-                if os.path.exists(modern_p12) and os.path.getsize(modern_p12) > 0:
-                    run(f'docker cp {modern_p12} tak-portal:/usr/src/app/data/certs/tak-client.p12', check=False)
-                    os.remove(modern_p12)
-                    log("  ✓ admin.p12 copied to TAK Portal (re-encoded)")
-                else:
-                    run(f'docker cp {admin_p12} tak-portal:/usr/src/app/data/certs/tak-client.p12', check=False)
-                    log("  ✓ admin.p12 copied to TAK Portal")
-                takserver_pem = os.path.join(cert_dir, 'takserver.pem')
-                if os.path.exists(takserver_pem):
-                    run(f'docker cp {takserver_pem} tak-portal:/usr/src/app/data/certs/tak-ca.pem', check=False)
-                    log("  ✓ CA chain copied to TAK Portal")
-                else:
-                    int_pem = os.path.join(cert_dir, 'ca.pem')
-                    root_pem = os.path.join(cert_dir, 'root-ca.pem')
-                    bundle = '/tmp/tak-ca-bundle.pem'
-                    run(f'cat {int_pem} {root_pem} > {bundle} 2>/dev/null', check=False)
-                    if os.path.exists(bundle) and os.path.getsize(bundle) > 0:
-                        run(f'docker cp {bundle} tak-portal:/usr/src/app/data/certs/tak-ca.pem', check=False)
-                        os.remove(bundle)
-                        log("  ✓ CA bundle copied to TAK Portal")
-                run('docker restart tak-portal 2>/dev/null', check=False)
-                log("  ✓ TAK Portal restarted with new certificates")
+                # v10.0.1: delegate to _takportal_sync_certs — temp-file re-encode
+                # of the client cert + CA (the old stdin pipe failed on OpenSSL 3
+                # and shipped an unreadable legacy cert). restart=True.
+                _tp_ok, _tp_msg = _takportal_sync_certs(plog=log, restart=True)
+                log(f"  {'✓' if _tp_ok else '⚠'} TAK Portal cert sync: {_tp_msg}")
             else:
                 log("  TAK Portal not running — skip cert copy (will update on next TAK Portal deploy)")
 
@@ -50263,10 +51811,11 @@ def takserver_control():
             changed, msg = _resync_ldap_credential_to_coreconfig()
             if changed:
                 results['ldap_resync'] = msg
-        subprocess.run(_sudo_wrap(['systemctl', action, 'takserver']), capture_output=True, text=True, timeout=60)
+        # v10.0.1: container-aware lifecycle — _tak_systemctl maps start/stop/
+        # restart to `docker ...` in container mode (native systemctl on .deb).
+        subprocess.run(_tak_systemctl(action), shell=True, capture_output=True, text=True, timeout=120)
         time.sleep(3)
-        s = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'takserver']), capture_output=True, text=True)
-        results['core'] = {'success': True, 'running': s.stdout.strip() == 'active'}
+        results['core'] = {'success': True, 'running': _takserver_running_local()}
     return jsonify({'success': True, 'results': results, 'action': action, 'target': target,
                     'running': results.get('core', {}).get('running', None)})
 
@@ -50364,12 +51913,28 @@ def takserver_services():
                     'cpu': '', 'mem_mb': '', 'mem_pct': '',
                     'status': 'stopped'
                 })
-        else:
-            pg = subprocess.run("systemctl is-active postgresql", shell=True, capture_output=True, text=True, timeout=5)
+        elif _tak_is_container():
+            # v10.0.1: single-server container deploy — PostgreSQL runs in the
+            # takserver-db container, not as a host systemd service.
+            pg_running = _tak_container_running(TAK_DB_CONTAINER)
             services.append({
                 'name': 'PostgreSQL', 'icon': '🐘', 'pid': '',
                 'cpu': '', 'mem_mb': '', 'mem_pct': '',
-                'status': 'running' if pg.stdout.strip() == 'active' else 'stopped'
+                'status': 'running' if pg_running else 'stopped'
+            })
+        else:
+            # Native host PostgreSQL: Debian/Ubuntu use the unsuffixed `postgresql`
+            # meta-service; RHEL/EL (PGDG) use `postgresql-15`. EITHER being active
+            # means PG is up. Probing only `postgresql` false-reds every Rocky/RHEL
+            # native box ("PostgreSQL stopped") even though postgresql-15 is serving
+            # cot fine — same EL/Debian split already handled at the deploy probe.
+            pg = subprocess.run("systemctl is-active postgresql postgresql-15 2>/dev/null",
+                shell=True, capture_output=True, text=True, timeout=5)
+            pg_active = 'active' in (pg.stdout or '').split()
+            services.append({
+                'name': 'PostgreSQL', 'icon': '🐘', 'pid': '',
+                'cpu': '', 'mem_mb': '', 'mem_pct': '',
+                'status': 'running' if pg_active else 'stopped'
             })
     except Exception as e:
         services.append({'name': 'Error', 'icon': '❌', 'status': str(e)[:200]})
@@ -50403,6 +51968,30 @@ def takserver_uninstall():
     if not auth.get('password_hash') or not check_password_hash(auth['password_hash'], password):
         return jsonify({'error': 'Invalid admin password'}), 403
     steps = []
+    # v10.0.1: container TAK teardown FIRST. The native systemctl/apt steps below
+    # are no-ops on a Docker TAK (no unit, no package) and --restart=always would
+    # just respawn the containers, so do the real teardown here. Confirmed by the
+    # uninstall test: native Remove left containers/volume/network/bundle behind.
+    if _tak_is_container():
+        for c in (TAK_CONTAINER, TAK_DB_CONTAINER):
+            subprocess.run(['docker', 'rm', '-f', c], capture_output=True, timeout=60)
+        subprocess.run(['docker', 'volume', 'rm', TAK_DB_VOLUME], capture_output=True, timeout=30)
+        subprocess.run(['docker', 'network', 'rm', TAK_DOCKER_NET], capture_output=True, timeout=30)
+        subprocess.run(f'rm -rf {shlex.quote(TAK_DOCKER_ROOT)}', shell=True, capture_output=True, timeout=60)
+        # Remove the /opt/tak symlink explicitly. After ~/tak-docker is gone it is a
+        # DANGLING symlink, which the native `if os.path.exists('/opt/tak')` cleanup
+        # below skips (exists() follows the link → False), leaving it behind.
+        subprocess.run('rm -f /opt/tak 2>/dev/null; true', shell=True, capture_output=True, timeout=10)
+        # Reset the persisted method/credentials so detection falls back to the
+        # platform default (arm64 still defaults to container; a redeploy re-sets it).
+        try:
+            _us = load_settings()
+            _us.pop('tak_install_method', None)
+            _us.pop('tak_db_password', None)
+            save_settings(_us)
+        except Exception:
+            pass
+        steps.append('Container TAK removed (containers, volume, network, ~/tak-docker)')
     # Stop service
     subprocess.run(_sudo_wrap(['systemctl', 'stop', 'takserver']), capture_output=True, timeout=90)
     subprocess.run(_sudo_wrap(['systemctl', 'disable', 'takserver']), capture_output=True, timeout=90)
@@ -50415,31 +52004,52 @@ def takserver_uninstall():
     # `apt-get install` becomes a no-op ("already newest version") that leaves
     # a half-installed system. See deploy Step 4 self-heal for the matching
     # recovery path.
-    pkg_status = subprocess.run(
-        "dpkg-query -W -f='${Status}' takserver 2>/dev/null",
-        shell=True, capture_output=True, text=True
-    ).stdout.strip()
-    if pkg_status:
-        # Try purge (apt first, then dpkg, then dpkg --force-all). Capture
-        # stderr so silent failures don't pretend success.
-        purge_ok = False
-        for cmd in (
-            'DEBIAN_FRONTEND=noninteractive apt-get purge -y takserver',
-            'DEBIAN_FRONTEND=noninteractive dpkg --purge takserver',
-            'DEBIAN_FRONTEND=noninteractive dpkg --purge --force-all takserver',
-        ):
-            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=180)
-            after = subprocess.run(
-                "dpkg-query -W -f='${Status}' takserver 2>/dev/null",
-                shell=True, capture_output=True, text=True
-            ).stdout.strip()
-            if not after or 'not-installed' in after:
-                purge_ok = True
-                break
-        if purge_ok:
-            steps.append('Purged TAK Server package')
-        else:
-            steps.append('⚠ Could not purge takserver package (still registered with dpkg) — manual cleanup required')
+    if _distro_family() == 'rhel':
+        # EL9 native: dnf remove the rpm, then drop the SELinux policy module that
+        # the rpm's apply-selinux.sh loaded (else a reinstall warns it's already there).
+        # IMPORTANT: clean_requirements_on_remove=False — by default `dnf remove
+        # takserver` CASCADES out postgresql15 (and psql) as now-orphaned deps, which
+        # runs BEFORE the cot/martiuser drop below → the drop fails (no psql) and a
+        # redeploy inherits a stale martiuser with a mismatched password. Keeping
+        # postgres (matches the .deb uninstall, which doesn't cascade it) lets the
+        # later DROP DATABASE cot / DROP USER martiuser actually run.
+        _rpm_installed = subprocess.run('rpm -q takserver 2>/dev/null', shell=True, capture_output=True, text=True).stdout.strip()
+        if _rpm_installed.startswith('takserver'):
+            subprocess.run('dnf remove -y --setopt=clean_requirements_on_remove=False takserver 2>&1', shell=True, capture_output=True, text=True, timeout=180)
+            _after = subprocess.run('rpm -q takserver 2>/dev/null', shell=True, capture_output=True, text=True).stdout.strip()
+            if not _after.startswith('takserver') or 'not installed' in _after.lower():
+                steps.append('Removed TAK Server rpm (dnf)')
+            else:
+                subprocess.run('rpm -e --noscripts --nodeps takserver 2>&1', shell=True, capture_output=True, text=True, timeout=120)
+                steps.append('Force-removed TAK Server rpm')
+        # remove the takserver SELinux module (named takserver-policy on EL9)
+        subprocess.run('semodule -r takserver-policy 2>/dev/null; semodule -r takserver 2>/dev/null; true', shell=True, capture_output=True, timeout=60)
+    else:
+        pkg_status = subprocess.run(
+            "dpkg-query -W -f='${Status}' takserver 2>/dev/null",
+            shell=True, capture_output=True, text=True
+        ).stdout.strip()
+        if pkg_status:
+            # Try purge (apt first, then dpkg, then dpkg --force-all). Capture
+            # stderr so silent failures don't pretend success.
+            purge_ok = False
+            for cmd in (
+                'DEBIAN_FRONTEND=noninteractive apt-get purge -y takserver',
+                'DEBIAN_FRONTEND=noninteractive dpkg --purge takserver',
+                'DEBIAN_FRONTEND=noninteractive dpkg --purge --force-all takserver',
+            ):
+                r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=180)
+                after = subprocess.run(
+                    "dpkg-query -W -f='${Status}' takserver 2>/dev/null",
+                    shell=True, capture_output=True, text=True
+                ).stdout.strip()
+                if not after or 'not-installed' in after:
+                    purge_ok = True
+                    break
+            if purge_ok:
+                steps.append('Purged TAK Server package')
+            else:
+                steps.append('⚠ Could not purge takserver package (still registered with dpkg) — manual cleanup required')
     # Clean up /opt/tak
     if os.path.exists('/opt/tak'):
         subprocess.run('rm -rf /opt/tak', shell=True, capture_output=True)
@@ -50476,12 +52086,12 @@ def takserver_uninstall():
             steps.append('External DB cleanup skipped — no credentials stored (run Provision Database on next deploy)')
         # The .deb installer always creates a local martiuser + cot DB regardless of deployment
         # mode. Clean them up so re-deploys don't hit stale-password noise in the postinstall.
-        subprocess.run("sudo -u postgres psql -c \"DROP DATABASE IF EXISTS cot;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
+        subprocess.run("sudo -u postgres psql -c \"DROP DATABASE IF EXISTS cot WITH (FORCE);\" 2>/dev/null || sudo -u postgres psql -c \"DROP DATABASE IF EXISTS cot;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
         subprocess.run("sudo -u postgres psql -c \"DROP USER IF EXISTS martiuser;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
         steps.append('Cleaned up local PostgreSQL side-effect (cot database, martiuser)')
     else:
         # Local PostgreSQL (single-server or two-server mode)
-        subprocess.run("sudo -u postgres psql -c \"DROP DATABASE IF EXISTS cot;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
+        subprocess.run("sudo -u postgres psql -c \"DROP DATABASE IF EXISTS cot WITH (FORCE);\" 2>/dev/null || sudo -u postgres psql -c \"DROP DATABASE IF EXISTS cot;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
         subprocess.run("sudo -u postgres psql -c \"DROP USER IF EXISTS martiuser;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
         steps.append('Cleaned up local PostgreSQL (cot database, martiuser)')
     # Clean up GPG verification artifacts
@@ -50538,16 +52148,38 @@ def upload_takserver_package():
         fp = os.path.join(UPLOAD_DIR, fn)
         f.save(fp)
         sz = round(os.path.getsize(fp) / (1024*1024), 1)
+        # v10.0.1 platform gate: the accepted package type is fixed by arch+distro,
+        # mirroring the existing .deb/.rpm cross-rejection. arm64 → docker .zip only
+        # (no native arm TAK package exists); amd64 RHEL → .rpm only; amd64 Debian/
+        # Ubuntu → .deb only. Reject anything else up-front so a box can't be deployed
+        # with the wrong package by accident.
+        _arch = _host_arch()
+        _native_ext = '.rpm' if _distro_family() == 'rhel' else '.deb'
         if fn.endswith('.deb'):
-            if 'rocky' in os_type:
+            if _arch == 'arm64':
                 os.remove(fp)
-                return jsonify({'error': f'DEB uploaded but system is {os_type}. Need .rpm.'}), 400
+                return jsonify({'error': f'.deb uploaded but this arm64 box deploys TAK Server via the container path — upload the takserver-docker .zip.'}), 400
+            if _distro_family() == 'rhel':
+                os.remove(fp)
+                return jsonify({'error': f'.deb uploaded but system is {os_type} (RHEL family). Need a takserver .rpm.'}), 400
             results['packages'].append({'filename': fn, 'filepath': fp, 'pkg_type': 'deb', 'size_mb': sz})
         elif fn.endswith('.rpm'):
-            if 'ubuntu' in os_type:
+            if _arch == 'arm64':
                 os.remove(fp)
-                return jsonify({'error': f'RPM uploaded but system is {os_type}. Need .deb.'}), 400
+                return jsonify({'error': f'.rpm uploaded but this arm64 box deploys TAK Server via the container path — upload the takserver-docker .zip.'}), 400
+            if _distro_family() != 'rhel':
+                os.remove(fp)
+                return jsonify({'error': f'.rpm uploaded but system is {os_type}. Need a takserver .deb.'}), 400
             results['packages'].append({'filename': fn, 'filepath': fp, 'pkg_type': 'rpm', 'size_mb': sz})
+        elif fn.endswith('.zip') and 'docker' in fn.lower():
+            # official takserver-docker-*.zip — the CONTAINER path. amd64 must use its
+            # native package (.deb/.rpm); arm64 is container-only here, so it takes the
+            # zip. (The TAK deb/rpm are arch-neutral — _all/.noarch — but arm64 deploys
+            # via the container path: it's the supported, field-validated arm path.)
+            if _arch != 'arm64':
+                os.remove(fp)
+                return jsonify({'error': f'Docker .zip uploaded but this is an amd64 {os_type} system — upload the native takserver {_native_ext}. (The docker .zip is the arm64 path.)'}), 400
+            results['packages'].append({'filename': fn, 'filepath': fp, 'pkg_type': 'docker', 'size_mb': sz})
         elif fn.endswith('.key') or 'gpg' in fn.lower():
             results['gpg_key'] = {'filename': fn, 'filepath': fp, 'size_mb': sz}
         elif fn.endswith('.pol') or 'policy' in fn.lower():
@@ -50579,7 +52211,7 @@ def check_existing_uploads():
             continue
         sz = os.path.getsize(fp)
         sz_mb = round(sz / (1024*1024), 1)
-        if fn.endswith('.deb') or fn.endswith('.rpm'):
+        if fn.endswith('.deb') or fn.endswith('.rpm') or (fn.endswith('.zip') and 'docker' in fn.lower()):
             files['packages'].append({'filename': fn, 'filepath': fp, 'size_mb': sz_mb})
         elif fn.endswith('.key') or 'gpg' in fn.lower():
             files['gpg_key'] = {'filename': fn, 'filepath': fp, 'size_mb': sz_mb}
@@ -52631,6 +54263,47 @@ def deploy_takserver():
             _sanitize_cert_field(data.get(key, ''), field)
     except ValueError as e:
         return jsonify({'error': str(e)[:200]}), 400
+
+    # ── v10.0.1: container path (arm64 forced, or operator-selected on amd64) ──
+    # Uses the official takserver-docker-*.zip instead of a .deb/.rpm. Branches
+    # here and returns BEFORE the byte-identical .deb selection logic below.
+    _method = (data.get('install_method') if data.get('install_method') in ('native', 'container')
+               else _tak_install_method())
+    if _method == 'container':
+        zips = [f for f in os.listdir(UPLOAD_DIR) if f.lower().endswith('.zip') and 'docker' in f.lower()]
+        if not zips:
+            return jsonify({'error': 'No takserver-docker .zip found. Upload the official takserver-docker-*.zip bundle (container deploy — required on arm64).'}), 400
+        selected_zip = sorted(zips)[-1]
+        try:
+            _int_days = max(1, min(3652, int(data.get('intermediate_ca_validity_days') or 730)))
+        except (TypeError, ValueError):
+            _int_days = 730
+        try:
+            _iss_days = max(1, min(3652, int(data.get('issued_cert_validity_days') or _int_days)))
+        except (TypeError, ValueError):
+            _iss_days = _int_days
+        if _iss_days > _int_days:
+            return jsonify({'error': f'Issued cert validity ({_iss_days} days) cannot exceed intermediate CA validity ({_int_days} days)'}), 400
+        c_config = {
+            'install_method': 'container',
+            'package_path': os.path.join(UPLOAD_DIR, selected_zip),
+            'cert_country': data.get('cert_country', 'US'), 'cert_state': data.get('cert_state', 'CA'),
+            'cert_city': data.get('cert_city', ''), 'cert_org': data.get('cert_org', ''),
+            'cert_ou': data.get('cert_ou', ''), 'root_ca_name': data.get('root_ca_name', 'ROOT-CA-01'),
+            'intermediate_ca_name': data.get('intermediate_ca_name', 'INTERMEDIATE-CA-01'),
+            'intermediate_ca_validity_days': _int_days, 'issued_cert_validity_days': _iss_days,
+            'enable_admin_ui': data.get('enable_admin_ui', False),
+            'enable_webtak': data.get('enable_webtak', False),
+            'webadmin_password': data.get('webadmin_password', ''),
+        }
+        cert_password = (data.get('cert_password') or data.get('tak_cert_password') or '').strip()
+        if cert_password:
+            _s = load_settings(); _s['tak_cert_password'] = cert_password; save_settings(_s)
+        deploy_log.clear()
+        deploy_status.update({'running': True, 'complete': False, 'error': False})
+        threading.Thread(target=run_takserver_deploy, args=(c_config,), daemon=True).start()
+        return jsonify({'success': True})
+
     pkg_files = [f for f in os.listdir(UPLOAD_DIR) if f.endswith('.deb') or f.endswith('.rpm')]
     if not pkg_files: return jsonify({'error': 'No package file found.'}), 400
     if is_two_server:
@@ -52721,7 +54394,423 @@ def wait_for_package_lock():
     return wait_for_unattended_upgrade_worker(
         log_step, deploy_log, lambda: deploy_status.get('cancelled'))
 
+def _tak_container_running(name):
+    """True if the named docker container exists and is in the running state."""
+    try:
+        r = subprocess.run(
+            ['docker', 'inspect', '-f', '{{.State.Running}}', name],
+            capture_output=True, text=True, timeout=10)
+        return r.returncode == 0 and r.stdout.strip() == 'true'
+    except Exception:
+        return False
+
+
+@_with_authentik_deploy_guard
+def _deploy_takserver_container(config):
+    """v10.0.1 — Deploy TAK Server as Docker containers from the official
+    takserver-docker-*.zip. Used on arm64 (forced — no native arm TAK package)
+    and selectable on amd64. Mirrors the proven installTAK docker sequence and
+    reuses the host-side cert/CoreConfig helpers via the /opt/tak symlink.
+
+    Single-server (bundled PostGIS container) only in v1. Two-server / external
+    DB and Authentik/LDAP auto-wiring are NOT done here — TAK comes up with
+    certs + admin + CoreConfig + firewall; LDAP is the post-deploy one-click
+    'Connect TAK Server to LDAP' (same fallback the .deb path degrades to).
+
+    FIRST CUT — validate on a real arm64 box; the container init timing and
+    configureInDocker behavior are the likely tuning points. Verbose logging is
+    intentional so the first deploy gives a clean debug trace."""
+    try:
+        deploy_status['cancelled'] = False
+        s0 = load_settings()
+        cert_pass = _get_tak_cert_password(s0)
+        zip_path = config['package_path']
+        root_ca = config['root_ca_name']; int_ca = config['intermediate_ca_name']
+        log_step("=" * 50); log_step("TAK Server Deployment Starting (CONTAINER / arm64-capable)"); log_step("=" * 50)
+        log_step(f"  Bundle: {os.path.basename(zip_path)}")
+        log_step(f"  Arch: {_host_arch()} | method: container")
+
+        # ── Step 1/9: Docker prerequisite ───────────────────────────────────
+        log_step(""); log_step("━━━ Step 1/9: Docker Prerequisite ━━━")
+        if not run_cmd('docker --version', "Checking Docker..."):
+            log_step("✗ Docker is not installed/usable — install Docker first (Marketplace deploys it).")
+            deploy_status.update({'error': True, 'running': False}); return
+        run_cmd('systemctl start docker > /dev/null 2>&1', check=False)
+
+        # ── Step 2/9: Unpack bundle + symlink /opt/tak ──────────────────────
+        log_step(""); log_step("━━━ Step 2/9: Unpacking TAK docker bundle ━━━")
+        run_cmd(f'rm -rf {shlex.quote(TAK_DOCKER_ROOT)}', check=False)
+        run_cmd(f'mkdir -p {shlex.quote(TAK_DOCKER_ROOT)}')
+        # Extract with Python's zipfile rather than shelling to `unzip` — minimal
+        # cloud images (incl. this arm64 AMI) ship without unzip (exit 127), and
+        # this is cross-distro with no package install. zipfile does NOT restore
+        # unix permission bits, so re-apply them from external_attr — the bundle's
+        # makeCert.sh/makeRootCa.sh/configureInDocker.sh MUST stay executable.
+        log_step("Extracting bundle (Python zipfile — no unzip dependency)...")
+        try:
+            import zipfile
+            with zipfile.ZipFile(zip_path) as zf:
+                for info in zf.infolist():
+                    out_path = zf.extract(info, TAK_DOCKER_ROOT)
+                    mode = (info.external_attr >> 16) & 0xFFFF
+                    if mode and not info.is_dir():
+                        try:
+                            os.chmod(out_path, mode)
+                        except OSError:
+                            pass
+        except Exception as _ze:
+            log_step(f"✗ Failed to extract the takserver-docker bundle: {str(_ze)[:200]}")
+            deploy_status.update({'error': True, 'running': False}); return
+        # The bundle extracts to <root>/takserver-docker-<ver>/ which holds docker/ + tak/
+        try:
+            entries = [d for d in os.listdir(TAK_DOCKER_ROOT)
+                       if os.path.isdir(os.path.join(TAK_DOCKER_ROOT, d)) and 'docker' in d.lower()]
+            build_ctx = os.path.join(TAK_DOCKER_ROOT, entries[0]) if entries else TAK_DOCKER_ROOT
+        except Exception:
+            build_ctx = TAK_DOCKER_ROOT
+        tak_dir = os.path.join(build_ctx, 'tak')
+        if not os.path.isfile(os.path.join(build_ctx, 'docker', 'Dockerfile.takserver')):
+            log_step(f"✗ Dockerfile.takserver not found under {build_ctx}/docker — is this an official takserver-docker zip?")
+            deploy_status.update({'error': True, 'running': False}); return
+        log_step(f"  Build context: {build_ctx}")
+        # Symlink host /opt/tak → the bundle's tak/ so all host-side /opt/tak
+        # logic (CoreConfig sed, cert files, _patch_* helpers) works unchanged.
+        run_cmd('[ -L /opt/tak ] && rm -f /opt/tak; [ -d /opt/tak ] && rm -rf /opt/tak; true', check=False)
+        run_cmd(f'ln -sfn {shlex.quote(tak_dir)} /opt/tak', "Symlinking /opt/tak → bundle tak/...")
+        log_step("✓ Bundle unpacked and /opt/tak symlinked")
+
+        # ── Step 3/9: Build images (multi-arch base → native arm64 build) ───
+        log_step(""); log_step("━━━ Step 3/9: Building TAK Server images ━━━")
+        log_step("  (first build pulls postgres:15.1 + eclipse-temurin:17-jammy — minutes on arm64)")
+        if not run_cmd(f'cd {shlex.quote(build_ctx)} && docker build -t takserver_db -f docker/Dockerfile.takserver-db . 2>&1', "Building takserver_db image..."):
+            log_step("✗ takserver_db image build failed."); deploy_status.update({'error': True, 'running': False}); return
+        if not run_cmd(f'cd {shlex.quote(build_ctx)} && docker build -t {TAK_CONTAINER} -f docker/Dockerfile.takserver . 2>&1', "Building takserver image..."):
+            log_step("✗ takserver image build failed."); deploy_status.update({'error': True, 'running': False}); return
+        log_step("✓ Images built")
+
+        # ── Step 4/9: Network, volume, run DB + first takserver (cert-gen) ──
+        # ── Step 3.5: martiuser DB password INTO CoreConfig BEFORE the DB inits ─
+        # The DB container's configureInDocker → takserver-setup-db.sh reads the
+        # martiuser password straight out of /opt/tak/CoreConfig.xml at init and
+        # provisions the role with it. pg_hba.conf is `md5`, so an empty password
+        # → "Skipping schema changes, no DB password" → TAK can never auth. So we
+        # MUST seed CoreConfig.xml and set the connection password BEFORE starting
+        # the DB container (this is what installTAK does at its line 1302, before
+        # its docker run). At this point cert_block isn't added yet, so the only
+        # password="" in the file is the <connection> one — a global sed is safe.
+        log_step(""); log_step("━━━ Step 3.5/9: Database credentials ━━━")
+        import secrets as _secrets
+        _alpha = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+        db_pass = ''.join(_secrets.choice(_alpha) for _ in range(20))
+        try:
+            _sdb = load_settings(); _sdb['tak_db_password'] = db_pass; save_settings(_sdb)
+        except Exception:
+            pass
+        run_cmd('[ -f /opt/tak/CoreConfig.xml ] || cp /opt/tak/CoreConfig.example.xml /opt/tak/CoreConfig.xml', "Seeding CoreConfig.xml from example...", check=False)
+        run_cmd(f"sed -i 's/password=\"\"/password=\"{db_pass}\"/g' /opt/tak/CoreConfig.xml /opt/tak/CoreConfig.example.xml",
+                "Setting martiuser DB password in CoreConfig (before DB init)...", check=False)
+        log_step("✓ DB password set in CoreConfig (martiuser will be provisioned with it)")
+
+        log_step(""); log_step("━━━ Step 4/9: Starting containers ━━━")
+        run_cmd(f'docker rm -f {TAK_CONTAINER} {TAK_DB_CONTAINER} 2>/dev/null; true', check=False)
+        run_cmd(f'docker network inspect {TAK_DOCKER_NET} >/dev/null 2>&1 || docker network create {TAK_DOCKER_NET}', "Ensuring docker network...")
+        # Wipe any stale DB volume so postgres re-inits and takserver-setup-db.sh
+        # re-provisions martiuser with the CURRENT password — an existing volume
+        # keeps the old/empty-password role and auth fails.
+        run_cmd(f'docker volume rm {TAK_DB_VOLUME} >/dev/null 2>&1; docker volume create {TAK_DB_VOLUME} >/dev/null 2>&1; true', check=False)
+        run_cmd(
+            f'docker run --mount source={TAK_DB_VOLUME},destination=/var/lib/postgresql '
+            f'-v {shlex.quote(tak_dir)}:/opt/tak:z --restart=always --network {TAK_DOCKER_NET} '
+            f'--network-alias tak-database --name {TAK_DB_CONTAINER} -d takserver_db',
+            "Starting database container...")
+        # First takserver run WITHOUT host ports — just to init the bundle
+        # (configureInDocker copies CoreConfig.example → CoreConfig.xml, lays out
+        # certs/) and give us a container to `docker exec` cert generation into.
+        run_cmd(
+            f'docker run -v {shlex.quote(tak_dir)}:/opt/tak:z --restart=always '
+            f'--network {TAK_DOCKER_NET} --name {TAK_CONTAINER} -d {TAK_CONTAINER}',
+            "Starting TAK Server container (init pass)...")
+        log_step("  Waiting up to 2 min for container init (configureInDocker)...")
+        _ready = False
+        for _ in range(24):
+            time.sleep(5)
+            if deploy_status.get('cancelled'): return
+            if _tak_container_running(TAK_CONTAINER) and os.path.exists('/opt/tak/certs/makeCert.sh'):
+                _ready = True; break
+        if not _ready:
+            log_step("⚠ Container did not report ready in 2 min — continuing; check `docker logs takserver`.")
+        else:
+            log_step("✓ Containers up; bundle initialized")
+
+        # ── Step 5/9: Firewall ──────────────────────────────────────────────
+        log_step(""); log_step("━━━ Step 5/9: Configuring Firewall ━━━")
+        if _distro_family() == 'rhel':
+            be = _fw_backend()
+            for _fp in (22, 8089, 8443, 8446, 5001):
+                _fw_allow(_fp, 'tcp')
+            if be == 'firewalld':
+                log_step("✓ Firewall configured — firewalld active (22, 8089, 8443, 8446, 5001)")
+            else:
+                log_step("ⓘ No host firewall active (firewalld not installed) — relying on the "
+                         "provider security group; TAK ports left reachable")
+        else:
+            for p in ['22/tcp', '8089/tcp', '8443/tcp', '8446/tcp', '5001/tcp']:
+                run_cmd(f'ufw allow {p} > /dev/null 2>&1', check=False)
+            run_cmd('ufw --force enable > /dev/null 2>&1', check=False)
+            log_step("✓ Firewall configured (22, 8089, 8443, 8446, 5001)")
+
+        # ── Step 6/9: Certificates (docker exec; files land in symlinked /opt/tak) ─
+        log_step(""); log_step("━━━ Step 6/9: Generating Certificates ━━━")
+        log_step(f"  Root CA: {root_ca} | Intermediate CA: {int_ca}")
+        run_cmd('rm -rf /opt/tak/certs/files', check=False)
+        run_cmd('cd /opt/tak/certs && cp cert-metadata.sh cert-metadata.sh.original 2>/dev/null; true', check=False)
+        for var, val in [('COUNTRY', config['cert_country']), ('STATE', config['cert_state']),
+                         ('CITY', config['cert_city']), ('ORGANIZATION', config['cert_org']),
+                         ('ORGANIZATIONAL_UNIT', config['cert_ou'])]:
+            if val:
+                run_cmd(f'''sed -i 's/^{var}=.*/{var}="{val}"/' /opt/tak/certs/cert-metadata.sh''', check=False)
+        int_validity_days = config.get('intermediate_ca_validity_days', 730)
+        run_cmd(f'grep -qE "^CA_VALIDITY=" /opt/tak/certs/cert-metadata.sh 2>/dev/null && sed -i "s/^CA_VALIDITY=.*/CA_VALIDITY={int_validity_days}/" /opt/tak/certs/cert-metadata.sh || true', check=False)
+        _patch_openssl_string_mask(log_step)
+        _patch_cert_metadata_password(cert_pass)
+        # Container TAK user is uid 1000 — chown so makeCert (run as that user
+        # inside the container) can write the cert files on the shared mount.
+        run_cmd('chown -R 1000:1000 /opt/tak/certs 2>/dev/null; true', check=False)
+        log_step(f"Creating Root CA: {root_ca}...")
+        run_cmd(_tak_exec(f'cd /opt/tak/certs && echo "{root_ca}" | ./makeRootCa.sh') + ' 2>&1', quiet=True)
+        log_step(f"Creating Intermediate CA: {int_ca}...")
+        run_cmd(_tak_exec(f'cd /opt/tak/certs && echo "y" | ./makeCert.sh ca "{int_ca}"') + ' 2>&1', quiet=True)
+        log_step("Creating server certificate...")
+        run_cmd(_tak_exec('cd /opt/tak/certs && ./makeCert.sh server takserver') + ' 2>&1', quiet=True)
+        log_step("Creating admin certificate...")
+        run_cmd(_tak_exec('cd /opt/tak/certs && ./makeCert.sh client admin') + ' 2>&1', quiet=True)
+        log_step("Creating user certificate...")
+        run_cmd(_tak_exec('cd /opt/tak/certs && ./makeCert.sh client user') + ' 2>&1', quiet=True)
+        run_cmd(_tak_exec(f'keytool -import -alias root-ca -file /opt/tak/certs/files/root-ca.pem -keystore /opt/tak/certs/files/truststore-{int_ca}.jks -storepass {shlex.quote(cert_pass)} -noprompt') + ' 2>&1', check=False)
+        log_step("✓ Certificates created and truststore built")
+
+        # ── Step 7/9: CoreConfig.xml (host-side sed on symlinked /opt/tak) ──
+        log_step(""); log_step("━━━ Step 7/9: Configuring CoreConfig.xml ━━━")
+        # CoreConfig.xml was already seeded + DB-password-set in Step 3.5 (before
+        # the DB init). Here we layer the cert/enrollment patches on top.
+        # The cert/enrollment patches — truststore → INT-CA (fixes 8089 "peer not
+        # verified" / red dot), <certificateSigning> (fixes 8446 "registration
+        # failed"), and 8089 x509 — go through the version-tolerant ElementTree
+        # patcher. The takserver-docker bundle's CoreConfig format (absolute paths,
+        # `<vbm/>`) silently breaks the string-seds the .deb path uses, so we patch
+        # as XML here. The .deb path keeps its field-validated seds (untouched).
+        _ok_ce, _msg_ce = _patch_coreconfig_cert_enrollment(
+            '/opt/tak/CoreConfig.xml', int_ca, cert_pass, config, log_fn=log_step)
+        if not _ok_ce:
+            log_step(f"  ⚠ cert-enrollment patch failed ({_msg_ce}) — enrollment may need a manual fix")
+        _patch_coreconfig_passwords(cert_pass, log_fn=log_step)
+        run_cmd('sed -i \'s|<auth>|<auth x509useGroupCache="true">|g\' /opt/tak/CoreConfig.xml', check=False)
+        admin_ui = str(config.get('enable_admin_ui', False)).lower()
+        webtak = str(config.get('enable_webtak', False)).lower()
+        if config.get('enable_admin_ui') or config.get('enable_webtak'):
+            log_step(f"WebTAK: AdminUI={admin_ui}, WebTAK={webtak}")
+            run_cmd(f'sed -i \'s|"cert_https"/|"cert_https" enableAdminUI="{admin_ui}" enableWebtak="{webtak}" enableNonAdminUI="false"/|g\' /opt/tak/CoreConfig.xml', check=False)
+        _sanitize_coreconfig_name_entries()
+        log_step("✓ CoreConfig.xml configured")
+
+        # ── Step 8/9: Re-run takserver WITH host ports (two-phase) ──────────
+        log_step(""); log_step("━━━ Step 8/9: Final TAK Server run (publishing ports) ━━━")
+        run_cmd(f'docker rm -f {TAK_CONTAINER} 2>/dev/null; true', check=False)
+        run_cmd('rm -f /opt/tak/CoreConfig.xml.backup 2>/dev/null; true', check=False)
+        run_cmd(
+            f'docker run -v {shlex.quote(tak_dir)}:/opt/tak:z --restart=always '
+            f'-p 8089:8089 -p 8443:8443 -p 8446:8446 '
+            f'--network {TAK_DOCKER_NET} --name {TAK_CONTAINER} -d {TAK_CONTAINER}',
+            "Starting TAK Server (ports 8089/8443/8446)...")
+        log_step("  Waiting for messaging microservice to come up (up to 10 min)...")
+        _up = False
+        for waited in range(0, 600, 10):
+            time.sleep(10)
+            if deploy_status.get('cancelled'): return
+            r = subprocess.run(f'docker exec {TAK_CONTAINER} grep -q "Started TAK Server messaging Microservice" /opt/tak/logs/takserver-messaging.log 2>/dev/null',
+                               shell=True, capture_output=True)
+            if r.returncode == 0:
+                _up = True; log_step("✓ TAK Server messaging microservice started"); break
+            if waited and waited % 60 == 0:
+                deploy_log.append(f"  ⏳ {waited//60} min …")
+        if not _up:
+            log_step("⚠ Did not see 'messaging Microservice started' within 10 min — admin promote may need a retry. Check `docker logs takserver`.")
+
+        # ── Step 9/9: Promote admin ─────────────────────────────────────────
+        log_step(""); log_step("━━━ Step 9/9: Promoting Admin ━━━")
+        run_cmd(_tak_exec('java -jar /opt/tak/utils/UserManager.jar certmod -A /opt/tak/certs/files/admin.pem') + ' 2>&1', "Promoting admin certificate...", check=False)
+        # v10.0.1: webadmin handling mirrors the .deb path. When Authentik is
+        # present, webadmin lives in Authentik/LDAP ONLY — creating a flat-file
+        # webadmin shadows LDAP and makes 8446 land on WebTAK instead of the Admin
+        # GUI (the flat-file user has no ROLE_ADMIN group). So remove the shadow;
+        # the Authentik sync (finish section) puts webadmin in tak_ROLE_ADMIN.
+        webadmin_pass = config.get('webadmin_password', '')
+        _s_wa = load_settings()
+        authentik_for_webadmin = bool(webadmin_pass and _get_authentik_env_content(_s_wa))
+        if webadmin_pass:
+            if authentik_for_webadmin:
+                log_step("Authentik detected — webadmin will live in Authentik/LDAP only (skipping flat-file; avoids 8446 WebTAK shadow).")
+                _remove_webadmin_from_userauth()
+            else:
+                log_step("Creating webadmin user (flat-file)...")
+                run_cmd(_tak_exec(f'java -jar /opt/tak/utils/UserManager.jar usermod -A -p {shlex.quote(webadmin_pass)} webadmin') + ' 2>&1', check=False)
+                log_step("✓ webadmin user created")
+        run_cmd(_tak_systemctl('restart'), "Restarting TAK Server...", check=False)
+        time.sleep(15)
+
+        # ── Persist method + regen Caddy + finish ───────────────────────────
+        settings = load_settings()
+        settings['tak_install_method'] = 'container'
+        if webadmin_pass:
+            settings['webadmin_password'] = webadmin_pass
+        save_settings(settings)
+        if settings.get('fqdn'):
+            try:
+                generate_caddyfile(settings)
+                subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True)
+                log_step("  ✓ Caddy config updated for TAK Server")
+            except Exception as _ce:
+                log_step(f"  ⚠ Caddy regen failed (non-fatal): {str(_ce)[:120]}")
+
+        # v10.0.1: make the container deploy self-sufficient like the .deb path —
+        # auto-connect LDAP when Authentik is present, then wire the LE cert onto
+        # 8446. Without these, enrollment fails: 'invalid credentials' (TAK can't
+        # see Authentik/Portal users) and 'identity could not be verified' (8446
+        # serves the self-signed PKI cert). Order mirrors the .deb deploy.
+        # Auto-connect to LDAP if Authentik is already deployed
+        try:
+            ak_installed = bool(detect_modules().get('authentik', {}).get('installed'))
+            if ak_installed and not _coreconfig_has_ldap():
+                log_step(""); log_step("━━━ Connecting TAK Server to LDAP (Authentik detected) ━━━")
+                ldap_ok, ldap_msg = _apply_ldap_to_coreconfig()
+                if ldap_ok:
+                    log_step(f"✓ {ldap_msg}")
+                else:
+                    log_step(f"⚠ LDAP auto-connect: {ldap_msg} — use 'Connect TAK Server to LDAP' after deploy")
+        except Exception as e:
+            log_step(f"⚠ LDAP auto-connect failed: {str(e)[:120]} — use 'Connect TAK Server to LDAP' after deploy")
+        # Wire the Let's Encrypt cert onto the 8446 enrollment connector (trusted
+        # cert so ATAK/iTAK don't reject the server identity).
+        if settings.get('fqdn'):
+            log_step(""); log_step("━━━ Installing trusted cert on 8446 (enrollment) ━━━")
+            try:
+                install_le_cert_on_8446(_get_service_domain(settings, 'takserver'), log_step, wait_for_cert=True)
+            except Exception as _le:
+                log_step(f"  ⚠ LE cert on 8446 failed (non-fatal): {str(_le)[:120]}")
+
+        # v10.0.1: sync webadmin to Authentik (with the LDAP flow repair) so the
+        # FIRST 8446 login lands on the Admin GUI, not WebTAK — same as the .deb
+        # deploy. Without this the container box needs a manual 'Resync LDAP to TAK
+        # Server' (the flow-repair retry below is exactly what that button does).
+        if _get_authentik_env_content(settings):
+            # First ensure the SERVICE ACCOUNT bind works: on a fresh Authentik
+            # deploy adm_ldapservice's DB password can diverge from the .env (the
+            # deploy's "bind verified via docker log" is a false positive), so the
+            # SA bind fails 'Invalid credentials 49' → TAK can't query ANY groups →
+            # every user lands on WebTAK. This sets the pw to the .env value + verifies
+            # the bind (the other half of what 'Resync LDAP to TAK Server' does).
+            # See memory authentik-ldapservice-password-mismatch-fresh-deploy.
+            try:
+                # v10.0.1: wait for Authentik to be healthy (self-heal a stopped
+                # container) + retry on a transient API 500, instead of firing once.
+                _sa_ok, _sa_msg = _sync_authentik_ldap_sa_with_retry(log_step)
+                log_step(f"  {'✓' if _sa_ok else '⚠'} LDAP service-account bind: {_sa_msg}")
+            except Exception as _sae:
+                log_step(f"  ⚠ LDAP service-account sync error (non-fatal): {str(_sae)[:120]}")
+        if webadmin_pass and _get_authentik_env_content(settings):
+            sync_ok = False
+            sync_err = None
+            for attempt in range(2):
+                ok, err = _ensure_authentik_webadmin(skip_bind_verify=False)
+                if ok:
+                    sync_ok = True
+                    log_step("  ✓ webadmin synced to Authentik (tak_ROLE_ADMIN)")
+                    break
+                sync_err = (err or 'Unknown sync error')[:120]
+                if attempt == 0:
+                    log_step(f"  ℹ webadmin sync attempt 1 failed: {sync_err} — repairing LDAP flow and retrying...")
+                    try:
+                        ok_flow, err_flow = _ensure_ldap_flow_authentication_none()
+                        log_step("  ✓ LDAP flow repaired (cleared recursion spiral)" if ok_flow
+                                 else f"  ⚠ LDAP flow repair: {err_flow} — retrying anyway")
+                    except Exception as _fe:
+                        log_step(f"  ⚠ LDAP flow repair error (non-fatal): {str(_fe)[:120]}")
+                    time.sleep(15)
+            if not sync_ok:
+                log_step(f"  ⚠ webadmin Authentik sync not verified: {sync_err}")
+                log_step("     Fix: TAK Server page → 'Resync LDAP to TAK Server', then log in to 8446 (user: webadmin).")
+            else:
+                _remove_webadmin_from_userauth()
+                log_step("  ✓ Removed flat-file webadmin shadow (8446 → LDAP/Admin GUI)")
+            # Proactively migrate the LDAP outpost to FQDN routing (matches .deb;
+            # prevents the heavy-load internal-routing flow spiral).
+            try:
+                _ensure_authentik_ldap_outpost_on_fqdn(log_step)
+            except Exception as _oe:
+                log_step(f"  ⚠ LDAP outpost routing migration skipped (non-fatal): {str(_oe)[:120]}")
+
+        # v10.0.1: a (re)deploy regenerates the TAK CA + admin.p12, so refresh the
+        # TAK Portal client cert + CA if the portal is present — otherwise the
+        # portal keeps the OLD-CA, legacy-algo tak-client.p12 (which its Node 22 /
+        # OpenSSL 3 can't read) and the dashboard shows no connected users / uptime
+        # (Marti stats 503), even though enrollment via 8446 still works. No-ops
+        # cleanly if TAK Portal isn't installed. See memory
+        # takportal-stale-client-cert-on-redeploy.
+        try:
+            if subprocess.run('docker ps --format "{{.Names}}" 2>/dev/null | grep -q tak-portal',
+                              shell=True, capture_output=True, text=True).returncode == 0:
+                log_step(""); log_step("━━━ Refreshing TAK Portal certs (CA changed on redeploy) ━━━")
+                _tp_ok, _tp_msg = _takportal_sync_certs(plog=log_step, restart=True)
+                log_step(f"  {'✓' if _tp_ok else '⚠'} TAK Portal cert sync: {_tp_msg}")
+        except Exception as _tpe:
+            log_step(f"  ⚠ TAK Portal cert sync skipped (non-fatal): {str(_tpe)[:120]}")
+
+        # v10.0.1: auto-deploy Guard Dog so it runs from the start — mirrors the
+        # .deb tail (run_takserver_deploy). run_guarddog_deploy() writes the
+        # container fields into guarddog.conf (via _tak_is_container()) so the
+        # monitors target the takserver / takserver-db containers, not host
+        # postgresql/systemd. run_guarddog_deploy has its own try/except, so a
+        # Guard Dog hiccup never fails the TAK deploy.
+        if not os.path.exists('/opt/tak-guarddog'):
+            log_step("")
+            log_step("━━━ Guard Dog (monitoring) — installing automatically ━━━")
+            alert_email = (load_settings().get('guarddog_alert_email') or '').strip()
+            run_guarddog_deploy(alert_email)
+            if guarddog_deploy_status.get('complete') and not guarddog_deploy_status.get('error'):
+                log_step("✓ Guard Dog installed. Configure notifications on the Guard Dog page.")
+            elif os.path.exists('/opt/tak-guarddog') and not _guarddog_is_enabled():
+                # Partial install (e.g. enable failed): ensure timers are enabled so Guard Dog runs
+                log_step("Enabling Guard Dog timers…")
+                subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
+                for t in _guarddog_timer_list():
+                    subprocess.run(_sudo_wrap(['systemctl', 'enable', t]), capture_output=True, timeout=5)
+                    subprocess.run(_sudo_wrap(['systemctl', 'start', t]), capture_output=True, timeout=5)
+                subprocess.run(_sudo_wrap(['systemctl', 'enable', 'tak-health.service']), capture_output=True, timeout=5)
+                subprocess.run(_sudo_wrap(['systemctl', 'start', 'tak-health.service']), capture_output=True, timeout=5)
+                if _guarddog_is_enabled():
+                    log_step("✓ Guard Dog enabled. Configure notifications on the Guard Dog page.")
+
+        ip = settings.get('server_ip', 'YOUR-IP')
+        log_step(""); log_step("=" * 50)
+        log_step("✓ TAK Server (container) deployment complete")
+        log_step(f"  Admin UI:  https://{settings.get('fqdn') or ip}:8446")
+        log_step(f"  Clients:   {settings.get('fqdn') or ip}:8089 (TLS/x509)")
+        log_step("=" * 50)
+        deploy_status.update({'running': False, 'complete': True, 'error': False})
+    except Exception as e:
+        log_step(f"✗ Container deploy error: {str(e)[:300]}")
+        deploy_status.update({'running': False, 'complete': False, 'error': True})
+
+
+@_with_authentik_deploy_guard
 def run_takserver_deploy(config):
+    # v10.0.1 dispatch: arm64 (or operator-selected) container deploys route to
+    # the Docker path. Everything else runs the body below, which branches Steps
+    # 2/3/4/6 on _distro_family(): RHEL family → native .rpm (PGDG/dnf + SELinux +
+    # firewalld); Debian/Ubuntu → the byte-identical .deb path (every `else` here
+    # is the original apt code verbatim). Steps 1/5/7/8/9 are shared.
+    if config.get('install_method') == 'container':
+        return _deploy_takserver_container(config)
     try:
         deploy_status['cancelled'] = False
         cert_pass = _get_tak_cert_password(load_settings())
@@ -52736,15 +54825,32 @@ def run_takserver_deploy(config):
         log_step("✓ System limits configured")
 
         log_step(""); log_step("━━━ Step 2/9: PostgreSQL Repository ━━━")
-        run_cmd('DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y lsb-release > /dev/null 2>&1', "Installing prerequisites...", check=False)
-        run_cmd('install -d /usr/share/postgresql-common/pgdg', check=False)
-        run_cmd('curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc 2>/dev/null', "Adding PostgreSQL GPG key...")
-        run_cmd('echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list')
-        run_cmd('apt-get update -qq > /dev/null 2>&1', "Updating package lists...")
-        log_step("✓ PostgreSQL repository configured")
+        if _distro_family() == 'rhel':
+            # EL9 native: EPEL + PostgreSQL Global Dev Group (PGDG) repo + Java 17 + CRB.
+            # Ports reference/rocky-scripts/rock9_tak/Rocky_9_TAK_Server_install.sh (steps 2–6).
+            # NOTE: deliberately NO blanket `dnf update -y` (the standalone script does it on a
+            # fresh box; here other modules are already installed and a full update mid-deploy is
+            # an unnecessary fleet risk) — the rpm install resolves its deps from these repos.
+            _pg_arch = 'aarch64' if _host_arch() == 'arm64' else 'x86_64'
+            run_cmd('dnf install -y epel-release 2>&1', "Installing EPEL...", check=False)
+            run_cmd(f'dnf install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-{_pg_arch}/pgdg-redhat-repo-latest.noarch.rpm 2>&1', "Adding PostgreSQL (PGDG) repository...", check=False)
+            run_cmd('dnf -qy module disable postgresql 2>&1', check=False, quiet=True)
+            run_cmd('dnf install -y java-17-openjdk-devel 2>&1', "Installing Java 17 (OpenJDK)...", check=False)
+            run_cmd('dnf config-manager --set-enabled crb 2>&1', check=False, quiet=True)
+            run_cmd('dnf makecache 2>&1', "Refreshing package metadata...", check=False, quiet=True)
+            log_step("✓ EPEL + PostgreSQL (PGDG) repo + Java 17 + CRB configured")
+        else:
+            run_cmd('DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y lsb-release > /dev/null 2>&1', "Installing prerequisites...", check=False)
+            run_cmd('install -d /usr/share/postgresql-common/pgdg', check=False)
+            run_cmd('curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc 2>/dev/null', "Adding PostgreSQL GPG key...")
+            run_cmd('echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list')
+            run_cmd('apt-get update -qq > /dev/null 2>&1', "Updating package lists...")
+            log_step("✓ PostgreSQL repository configured")
 
         log_step(""); log_step("━━━ Step 3/9: Package Verification ━━━")
-        if config.get('gpg_key_path') and config.get('policy_path'):
+        if _distro_family() == 'rhel':
+            log_step("RPM install (dnf verifies repo/package GPG signatures) — skipping debsig")
+        elif config.get('gpg_key_path') and config.get('policy_path'):
             log_step("GPG key and policy found — verifying...")
             run_cmd('DEBIAN_FRONTEND=noninteractive apt-get install -y debsig-verify', check=False)
             r = subprocess.run(f"grep 'id=' {config['policy_path']} | head -1 | sed 's/.*id=\"\\([^\"]*\\)\".*/\\1/'", shell=True, capture_output=True, text=True)
@@ -52773,6 +54879,52 @@ def run_takserver_deploy(config):
         log_step(""); log_step("━━━ Step 4/9: Installing TAK Server ━━━")
         if config.get('two_server') and os.path.exists('/opt/tak'):
             log_step("✓ TAK Server core already installed (two-server step 6) — skipping")
+        elif _distro_family() == 'rhel':
+            # EL9 native .rpm install (ports reference/rocky-scripts steps 7–10:
+            # dnf install rpm → SELinux apply-selinux.sh → alternatives --set java).
+            log_step(f"Installing {pkg_name} (dnf)...")
+            _rpm_ok = subprocess.run(f'rpm -qp {pkg} > /dev/null 2>&1', shell=True, capture_output=True, timeout=30)
+            if _rpm_ok.returncode != 0:
+                log_step("✗ FATAL: the uploaded .rpm is corrupted or incomplete (rpm -qp failed).")
+                log_step("  Delete the upload, download a fresh takserver-*.noarch.rpm from tak.gov, re-upload, and retry.")
+                deploy_status.update({'error': True, 'running': False}); return
+            # half-removed self-heal: rpm DB says installed but /opt/tak is gone
+            _pre = subprocess.run('rpm -q takserver 2>/dev/null', shell=True, capture_output=True, text=True).stdout.strip()
+            if _pre.startswith('takserver') and not os.path.exists('/opt/tak'):
+                log_step("  Detected half-removed takserver (rpm installed, /opt/tak missing) — removing before reinstall...")
+                subprocess.run('dnf remove -y takserver 2>&1', shell=True, capture_output=True, text=True, timeout=180)
+            run_cmd(f'dnf install -y {pkg} 2>&1', "Installing TAK Server rpm (resolving deps from PGDG/EPEL/CRB)...", check=False)
+            if not os.path.exists('/opt/tak'):
+                log_step("  /opt/tak missing after install — forcing reinstall...")
+                run_cmd(f'dnf reinstall -y {pkg} 2>&1 || dnf install -y {pkg} 2>&1', check=False)
+            if not os.path.exists('/opt/tak'):
+                log_step("✗ FATAL: /opt/tak not found after rpm install — run `dnf remove -y takserver && rm -rf /opt/tak` on the host and retry")
+                deploy_status.update({'error': True, 'running': False}); return
+            # SELinux: TAK runs under enforcing; the rpm ships apply-selinux.sh — apply + verify.
+            run_cmd('dnf install -y checkpolicy 2>&1', check=False, quiet=True)
+            _enf = subprocess.run('getenforce 2>/dev/null', shell=True, capture_output=True, text=True).stdout.strip()
+            if _enf == 'Enforcing':
+                if os.path.exists('/opt/tak/apply-selinux.sh'):
+                    run_cmd('cd /opt/tak && ./apply-selinux.sh 2>&1', "Applying TAK Server SELinux policy...", check=False)
+                    _mod = subprocess.run("semodule -l 2>/dev/null | grep -i takserver", shell=True, capture_output=True, text=True).stdout.strip()
+                    if _mod:
+                        log_step(f"  ✓ SELinux policy applied ({_mod.splitlines()[0]})")
+                    else:
+                        log_step("  ⚠ SELinux: takserver module not listed after apply-selinux.sh — TAK may hit AVC denials under enforcing")
+                else:
+                    log_step("  ⚠ /opt/tak/apply-selinux.sh missing — TAK SELinux policy not applied")
+            else:
+                log_step(f"  SELinux {_enf or 'unavailable'} — skipping TAK SELinux policy")
+            # Java default → 17 (arch-aware)
+            _jarch = 'aarch64' if _host_arch() == 'arm64' else 'x86_64'
+            run_cmd(f'alternatives --set java java-17-openjdk.{_jarch} 2>/dev/null; true', check=False, quiet=True)
+            # The rpm ships only CoreConfig.example.xml (the .deb postinst creates
+            # CoreConfig.xml; the rpm does not). Seed it so the SHARED Step 8 CoreConfig
+            # seds have a file to edit — without this Step 8 fails "CoreConfig.xml not
+            # found" on every rpm box. Mirrors the container deploy's seed (line ~53493).
+            run_cmd('[ -f /opt/tak/CoreConfig.xml ] || cp /opt/tak/CoreConfig.example.xml /opt/tak/CoreConfig.xml', "Seeding CoreConfig.xml from example...", check=False)
+            run_cmd('chown tak:tak /opt/tak/CoreConfig.xml 2>/dev/null; true', check=False, quiet=True)
+            log_step("✓ TAK Server installed")
         else:
             settings = load_settings()
             if settings.get('pkg_mgr', 'apt') == 'apt':
@@ -52875,10 +55027,25 @@ def run_takserver_deploy(config):
         log_step("✓ TAK Server started")
 
         log_step(""); log_step("━━━ Step 6/9: Configuring Firewall ━━━")
-        for p in ['22/tcp', '8089/tcp', '8443/tcp', '8446/tcp', '5001/tcp']:
-            run_cmd(f'ufw allow {p} > /dev/null 2>&1')
-        run_cmd('ufw --force enable > /dev/null 2>&1')
-        log_step("✓ Firewall configured (22, 8089, 8443, 8446, 5001)")
+        if _distro_family() == 'rhel':
+            # firewalld via _fw_allow (no-op if firewalld absent). Report HONESTLY: only
+            # claim "configured" when a backend is actually active — otherwise say the box
+            # has no host firewall (relying on the provider security group). Always-on
+            # firewalld on RHEL is gated on the module-port sweep (see PLAN-firewall-
+            # cybercontrols-multiplatform.md) so default-deny can't strand a module's port.
+            be = _fw_backend()
+            for _fp in (22, 8089, 8443, 8446, 5001):
+                _fw_allow(_fp, 'tcp')
+            if be == 'firewalld':
+                log_step("✓ Firewall configured — firewalld active (22, 8089, 8443, 8446, 5001)")
+            else:
+                log_step("ⓘ No host firewall active (firewalld not installed) — relying on the "
+                         "provider security group; TAK ports left reachable")
+        else:
+            for p in ['22/tcp', '8089/tcp', '8443/tcp', '8446/tcp', '5001/tcp']:
+                run_cmd(f'ufw allow {p} > /dev/null 2>&1')
+            run_cmd('ufw --force enable > /dev/null 2>&1')
+            log_step("✓ Firewall configured (22, 8089, 8443, 8446, 5001)")
 
         log_step(""); log_step("━━━ Step 7/9: Generating Certificates ━━━")
         root_ca, int_ca = config['root_ca_name'], config['intermediate_ca_name']
@@ -53087,6 +55254,27 @@ def run_takserver_deploy(config):
                 log_step("Creating webadmin user (flat-file)...")
                 run_cmd(f"java -jar /opt/tak/utils/UserManager.jar usermod -A -p {shlex.quote(webadmin_pass)} webadmin 2>&1", check=False)
                 log_step("✓ webadmin user created")
+        # v10.0.1: sync the LDAP service-account (adm_ldapservice) password into
+        # Authentik on this NATIVE (.deb/.rpm) deploy. Without it the SA password
+        # stays mismatched (Authentik DB ≠ CoreConfig) → TAK's SA bind fails err 49
+        # → group resolution dies → webadmin (even when correctly in tak_ROLE_ADMIN)
+        # can't be confirmed admin → 8446 drops to WebTAK. The container path already
+        # does this (c7b18ad); mirror it here so amd64/RHEL self-heal too — the same
+        # canonical call the "Connect TAK Server to LDAP" route uses. The resync +
+        # restart that follow then align CoreConfig and reload TAK with the now-
+        # matching credential. Non-fatal: a miss just means the operator runs the
+        # Resync button once (the pre-fix behaviour).
+        if _get_authentik_env_content(load_settings()):
+            try:
+                # v10.0.1: wait for Authentik to be healthy (self-heal a stopped
+                # container) + retry on a transient API 500, instead of firing once.
+                ok_sa, msg_sa = _sync_authentik_ldap_sa_with_retry(log_step)
+                if ok_sa:
+                    log_step("  ✓ LDAP service-account password synced to Authentik (8446 admin bind)")
+                else:
+                    log_step(f"  ⚠ LDAP service-account sync: {msg_sa} — run 'Connect TAK Server to LDAP' if 8446 shows WebTAK")
+            except Exception as _sae:
+                log_step(f"  ⚠ LDAP service-account sync error (non-fatal): {str(_sae)[:120]}")
         ne_changed, ne_msg = _sanitize_coreconfig_name_entries()
         if ne_changed:
             log_step(f"  NameEntry fix: {ne_msg}")
@@ -53309,46 +55497,135 @@ def takserver_federation_firewall():
         return jsonify({'success': False, 'error': str(e)[:200]}), 500
 
 
-@app.route('/api/takserver/sync-portal-ca', methods=['POST'])
-@login_required
-def takserver_sync_portal_ca():
-    """Copy current server CA to TAK Portal exactly like deploy Step 5: tak-ca.pem only (TAK_CA_PATH). Same source: takserver.pem or ca.pem+root-ca.pem bundle."""
-    cert_dir = '/opt/tak/certs/files'
+def _takportal_sync_certs(plog=None, restart=False):
+    """Refresh BOTH TAK Portal cert artifacts from the CURRENT TAK Server certs:
+      - data/certs/tak-client.p12  (admin.p12 re-encoded to a modern PKCS12 — TAK
+        emits legacy RC2-40-CBC which the portal's Node 22 / OpenSSL 3 cannot read)
+      - data/certs/tak-ca.pem      (server CA chain for the portal truststore)
+
+    Mirrors run_takportal_deploy Step 5; idempotent; safe to call on every TAK
+    (re)deploy / CA change / resync. Returns (success, message).
+
+    v10.0.1 — why this exists: a container TAK redeploy and the old
+    'sync portal CA' action refreshed ONLY the CA, leaving tak-client.p12 as the
+    OLD-CA + legacy-algo cert. The portal then couldn't read its client cert →
+    Marti stats 503 (no connected users / uptime), while enrollment still worked
+    (that path goes through Authentik/8446, not this cert). Both halves must
+    refresh together. See memory takportal-stale-client-cert-on-redeploy.
+    Works the same on native and container boxes (the portal is always a
+    container and admin.p12 is always at /opt/tak/certs/files)."""
+    def _log(m):
+        if plog:
+            plog(m)
     r = subprocess.run('docker ps --format "{{.Names}}" 2>/dev/null | grep -q tak-portal', shell=True, capture_output=True, text=True)
     if r.returncode != 0:
-        return jsonify({'success': False, 'error': 'TAK Portal container is not running. Start it first.'}), 400
+        return (False, 'TAK Portal container is not running')
+    cert_dir = '/opt/tak/certs/files'
     subprocess.run('docker exec tak-portal mkdir -p /usr/src/app/data/certs', shell=True, capture_output=True, text=True)
-    # Same CA source logic as deploy Step 5: takserver.pem (full chain) or build from ca.pem + root-ca.pem
+    cert_pass = _get_tak_cert_password(load_settings())
+    # --- client cert: admin.p12 -> modern PKCS12 -> tak-client.p12 ---
+    ok_client = False
+    admin_p12 = os.path.join(cert_dir, 'admin.p12')
+    if not os.path.exists(admin_p12):
+        for name in ['webadmin.p12', 'admin.p12']:
+            p = os.path.join(cert_dir, name)
+            if os.path.exists(p):
+                admin_p12 = p
+                break
+    if os.path.exists(admin_p12):
+        fd_p12, modern_p12 = tempfile.mkstemp(suffix='.p12', prefix='tak-portal-admin-')
+        os.close(fd_p12)
+        fd_pem, tmp_pem = tempfile.mkstemp(suffix='.pem', prefix='tak-portal-pem-')
+        os.close(fd_pem)
+        # Re-encode in TWO stages via a temp PEM file — NOT a stdin pipe.
+        # v10.0.1: `openssl pkcs12 -export` does NOT reliably read PEM from stdin
+        # on OpenSSL 3.0.x (Ubuntu 22.04), so the old
+        # `openssl pkcs12 -in ... | openssl pkcs12 -export -out ...` pipe silently
+        # produced an empty file and fell back to copying the unreadable LEGACY
+        # p12 — the real reason the portal could never read its client cert.
+        # -legacy is required to READ TAK's RC2-40-CBC admin.p12; the export stage
+        # defaults to modern AES, which the portal's Node 22 / OpenSSL 3 can read.
+        subprocess.run(
+            f'openssl pkcs12 -in {shlex.quote(admin_p12)} -passin pass:{shlex.quote(cert_pass)} -nodes -legacy -out {shlex.quote(tmp_pem)} 2>/dev/null',
+            shell=True, capture_output=True, text=True, timeout=30)
+        if os.path.exists(tmp_pem) and os.path.getsize(tmp_pem) > 0:
+            subprocess.run(
+                f'openssl pkcs12 -export -in {shlex.quote(tmp_pem)} -passout pass:{shlex.quote(cert_pass)} -out {shlex.quote(modern_p12)} 2>/dev/null',
+                shell=True, capture_output=True, text=True, timeout=30)
+        try:
+            os.remove(tmp_pem)
+        except OSError:
+            pass
+        if os.path.exists(modern_p12) and os.path.getsize(modern_p12) > 0:
+            subprocess.run(f'docker cp {shlex.quote(modern_p12)} tak-portal:/usr/src/app/data/certs/tak-client.p12', shell=True, capture_output=True, text=True)
+            _log("  ✓ tak-client.p12 refreshed (admin.p12 re-encoded to modern PKCS12)")
+            ok_client = True
+        else:
+            subprocess.run(f'docker cp {shlex.quote(admin_p12)} tak-portal:/usr/src/app/data/certs/tak-client.p12', shell=True, capture_output=True, text=True)
+            _log("  ⚠ tak-client.p12 copied in LEGACY format (re-encode failed — portal may not read it)")
+            ok_client = True
+        try:
+            os.remove(modern_p12)
+        except OSError:
+            pass
+    else:
+        _log("  ⚠ admin.p12 not found in /opt/tak/certs/files/ — client cert not refreshed")
+    # --- CA chain: takserver.pem (full chain) or ca.pem+root-ca.pem -> tak-ca.pem ---
+    ok_ca = False
     tak_ca_src = None
+    ca_bundle_path = None
     takserver_pem = os.path.join(cert_dir, 'takserver.pem')
     if os.path.isfile(takserver_pem):
         tak_ca_src = takserver_pem
     else:
-        int_ca = os.path.join(cert_dir, 'ca.pem')
-        root_ca = os.path.join(cert_dir, 'root-ca.pem')
         bundle_parts = []
-        for ca_file in [int_ca, root_ca]:
+        for ca_file in [os.path.join(cert_dir, 'ca.pem'), os.path.join(cert_dir, 'root-ca.pem')]:
             if os.path.isfile(ca_file):
                 with open(ca_file, 'r') as f:
                     content = f.read().strip()
                 if 'BEGIN CERTIFICATE' in content and 'TRUSTED' not in content:
                     bundle_parts.append(content)
-        if not bundle_parts:
-            return jsonify({'success': False, 'error': 'No takserver.pem or valid ca.pem/root-ca.pem in certs/files'}), 500
-        ca_bundle_path = '/tmp/tak-portal-sync-ca.pem'
-        with open(ca_bundle_path, 'w') as f:
-            f.write('\n'.join(bundle_parts) + '\n')
-        tak_ca_src = ca_bundle_path
-    cp = subprocess.run(f'docker cp {tak_ca_src} tak-portal:/usr/src/app/data/certs/tak-ca.pem', shell=True, capture_output=True, text=True, timeout=10)
-    if tak_ca_src.startswith('/tmp/'):
-        try:
-            os.remove(tak_ca_src)
-        except Exception:
-            pass
-    if cp.returncode != 0:
-        return jsonify({'success': False, 'error': (cp.stderr or cp.stdout or 'docker cp failed').strip()[:200]}), 500
-    subprocess.run('docker restart tak-portal 2>/dev/null', shell=True, capture_output=True, text=True, timeout=30)
-    return jsonify({'success': True, 'message': 'Server CA copied to data/certs/tak-ca.pem and portal restarted (same as deploy).'})
+        if bundle_parts:
+            fd_ca, ca_bundle_path = tempfile.mkstemp(suffix='.pem', prefix='tak-ca-bundle-')
+            with os.fdopen(fd_ca, 'w') as f:
+                f.write('\n'.join(bundle_parts) + '\n')
+            tak_ca_src = ca_bundle_path
+    if tak_ca_src:
+        subprocess.run(f'docker cp {tak_ca_src} tak-portal:/usr/src/app/data/certs/tak-ca.pem', shell=True, capture_output=True, text=True, timeout=10)
+        _log("  ✓ tak-ca.pem refreshed (server CA chain)")
+        ok_ca = True
+        if ca_bundle_path is not None and tak_ca_src == ca_bundle_path:
+            try:
+                os.remove(tak_ca_src)
+            except OSError:
+                pass
+    else:
+        _log("  ⚠ no CA cert files found in /opt/tak/certs/files/ — CA not refreshed")
+    if restart and (ok_client or ok_ca):
+        subprocess.run('docker restart tak-portal 2>/dev/null', shell=True, capture_output=True, text=True, timeout=30)
+    if ok_client and ok_ca:
+        return (True, 'TAK Portal client cert + CA refreshed and portal restarted')
+    if ok_ca and not ok_client:
+        return (False, 'CA refreshed but client cert (admin.p12) not found')
+    if ok_client and not ok_ca:
+        return (False, 'Client cert refreshed but CA not found')
+    return (False, 'No certs refreshed (admin.p12 / CA not found in certs/files)')
+
+
+@app.route('/api/takserver/sync-portal-ca', methods=['POST'])
+@login_required
+def takserver_sync_portal_ca():
+    """Resync TAK Portal to TAK Server: refresh BOTH the client cert
+    (data/certs/tak-client.p12) and the CA (data/certs/tak-ca.pem), then restart.
+    v10.0.1: previously copied ONLY the CA, which left a stale/legacy client cert
+    after a CA change → Marti stats 503. Now delegates to _takportal_sync_certs."""
+    r = subprocess.run('docker ps --format "{{.Names}}" 2>/dev/null | grep -q tak-portal', shell=True, capture_output=True, text=True)
+    if r.returncode != 0:
+        return jsonify({'success': False, 'error': 'TAK Portal container is not running. Start it first.'}), 400
+    ok, msg = _takportal_sync_certs(restart=True)
+    if not ok:
+        return jsonify({'success': False, 'error': msg}), 500
+    return jsonify({'success': True, 'message': msg})
 
 
 @app.route('/api/certs/list')
@@ -53528,14 +55805,31 @@ def kernel_patch_status_api():
         running_kernel = subprocess.run(['uname', '-r'], capture_output=True, text=True, timeout=5).stdout.strip()
     except Exception:
         running_kernel = 'unknown'
-    try:
-        upgradable_out = subprocess.run(
-            'apt list --upgradable 2>/dev/null | grep linux-image | wc -l',
-            shell=True, capture_output=True, text=True, timeout=20
-        ).stdout.strip()
-        upgradable_count = int(upgradable_out) if upgradable_out.isdigit() else 0
-    except Exception:
-        upgradable_count = 0
+    # v10.0.1: the "is a kernel update pending?" probe is package-manager
+    # specific. The apt path is byte-identical to pre-v10 (the #1 regression
+    # surface). The dnf path (EL9: RHEL/Rocky/Alma/CentOS) uses `dnf
+    # check-update`, whose exit code 100 means "updates available" — scoped to
+    # the kernel packages so the banner means the same thing on every distro.
+    if (load_settings().get('pkg_mgr', 'apt') or 'apt').lower() == 'dnf':
+        try:
+            r = subprocess.run(
+                'dnf -q check-update kernel kernel-core 2>/dev/null',
+                shell=True, capture_output=True, text=True, timeout=30
+            )
+            # dnf check-update: 100 = updates available, 0 = up to date, 1 = error.
+            # Treat error/timeout as "no banner" (same fail-safe as the apt branch).
+            upgradable_count = 1 if r.returncode == 100 else 0
+        except Exception:
+            upgradable_count = 0
+    else:
+        try:
+            upgradable_out = subprocess.run(
+                'apt list --upgradable 2>/dev/null | grep linux-image | wc -l',
+                shell=True, capture_output=True, text=True, timeout=20
+            ).stdout.strip()
+            upgradable_count = int(upgradable_out) if upgradable_out.isdigit() else 0
+        except Exception:
+            upgradable_count = 0
     data = {
         'running_kernel': running_kernel,
         'upgradable': upgradable_count > 0,
@@ -53680,6 +55974,10 @@ def _kernel_patch_start_job():
         os.makedirs(os.path.dirname(_KERNEL_PATCH_LOGFILE), exist_ok=True)
     except Exception:
         pass
+    # v10.0.1: which OS-upgrade command this job runs is package-manager
+    # specific. The apt script below is byte-identical to pre-v10 (critical
+    # regression surface); the dnf override for EL9 is applied right after.
+    pkg_mgr = (load_settings().get('pkg_mgr', 'apt') or 'apt').lower()
     # Bash script body. Written to a tmp file rather than inlined into the
     # systemd-run argv to keep the unit definition compact.
     script = (
@@ -53711,6 +56009,28 @@ def _kernel_patch_start_job():
         '  || { rc=$?; echo "[$(TS)] FATAL: apt-get full-upgrade failed (exit $rc)"; exit $rc; }\n'
         'echo "[$(TS)] === DONE — safe to reboot ==="\n'
     )
+    if pkg_mgr == 'dnf':
+        # EL9 (RHEL/Rocky/Alma/CentOS) path. Full `dnf -y upgrade`, the OS-wide
+        # equivalent of apt full-upgrade, with the TAK Server packages EXCLUDED —
+        # the SAME invariant the apt path enforces via apt-mark hold: OS patching
+        # must never sweep in an operator-driven, backup-gated TAK major upgrade
+        # (v0.9.44 field incident — a kernel patch pulled takserver 5.6->5.7 and
+        # wedged the package DB). `--exclude='takserver*'` covers takserver and
+        # takserver-fed-hub and needs no versionlock plugin. systemd-run, the
+        # detached-cgroup rationale, and the reboot-pending signal are all
+        # distro-agnostic, so only this script body changes. dnf runs as root
+        # inside the transient unit (no new direct sudo call from the console);
+        # logged for the v10.0.5 sudoers allowlist (NON-ROOT-COMMANDS: dnf).
+        script = (
+            '#!/bin/bash\n'
+            'set -o pipefail\n'
+            'TS() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }\n'
+            'echo "[$(TS)] === infra-TAK kernel patch job starting (pid $$) [dnf/EL9] ==="\n'
+            'echo "[$(TS)] dnf -y upgrade (TAK Server packages excluded)"\n'
+            "dnf -y upgrade --exclude='takserver*' 2>&1 \\\n"
+            '  || { rc=$?; echo "[$(TS)] FATAL: dnf upgrade failed (exit $rc)"; exit $rc; }\n'
+            'echo "[$(TS)] === DONE — safe to reboot ==="\n'
+        )
     _script_path = '/var/lib/infratak-kernel-patch.sh'
     try:
         with open(_script_path, 'w') as _sf:
@@ -54138,7 +56458,7 @@ def run_full_uninstall():
                     break
         if os.path.exists('/opt/tak'):
             subprocess.run('rm -rf /opt/tak', shell=True, capture_output=True)
-        subprocess.run("sudo -u postgres psql -c \"DROP DATABASE IF EXISTS cot;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
+        subprocess.run("sudo -u postgres psql -c \"DROP DATABASE IF EXISTS cot WITH (FORCE);\" 2>/dev/null || sudo -u postgres psql -c \"DROP DATABASE IF EXISTS cot;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
         subprocess.run("sudo -u postgres psql -c \"DROP USER IF EXISTS martiuser;\" 2>/dev/null; true", shell=True, capture_output=True, timeout=30)
         subprocess.run('rm -rf /usr/share/debsig/keyrings/* /etc/debsig/policies/* 2>/dev/null; true', shell=True, capture_output=True, timeout=10)
         for f in os.listdir(UPLOAD_DIR):
@@ -54936,7 +57256,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div id="kernel-patch-banner" style="display:none;background:linear-gradient(135deg,rgba(234,179,8,0.1),rgba(234,179,8,0.05));border:1px solid rgba(234,179,8,0.3);border-radius:12px;padding:14px 20px;margin-bottom:16px;font-family:'JetBrains Mono',monospace">
 <div id="kpatch-idle" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
 <div><div style="font-size:13px;font-weight:600;color:var(--yellow)">&#9888; Kernel update available &mdash; patch now to fix CVE-2026-31431 (Copy Fail)</div>
-<div style="font-size:11px;color:var(--text-dim);margin-top:4px">Runs <code style="background:rgba(255,255,255,.05);padding:1px 6px;border-radius:3px">apt-get full-upgrade</code> in a detached background process &mdash; safe over SSH, survives session drops. Reboot is a separate explicit click.</div></div>
+<div style="font-size:11px;color:var(--text-dim);margin-top:4px">Runs <code style="background:rgba(255,255,255,.05);padding:1px 6px;border-radius:3px">{% if (settings.get('pkg_mgr','apt') or 'apt')|lower == 'dnf' %}dnf upgrade{% else %}apt-get full-upgrade{% endif %}</code> in a detached background process &mdash; safe over SSH, survives session drops. Reboot is a separate explicit click.</div></div>
 <div style="display:flex;gap:8px">
 <button onclick="startKernelPatch()" style="padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Patch now</button>
 <button onclick="dismissKernelBanner()" style="padding:5px 12px;background:none;border:1px solid rgba(234,179,8,0.3);color:var(--text-dim);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">Dismiss</button>
@@ -55321,7 +57641,7 @@ function dismissKernelBanner(){
     // we just hide the UI. The job continues to run regardless.
 }
 async function startKernelPatch(){
-    if(!confirm("Start kernel patch?\\n\\nThis will run apt-get full-upgrade in a detached background process. It typically takes 2-5 minutes. Safe over SSH (the job survives session drops). The box will need a reboot after — that\\u2019s a separate explicit click.\\n\\nContinue?"))return;
+    if(!confirm("Start kernel patch?\\n\\nThis will run a full OS package upgrade in a detached background process. It typically takes 2-5 minutes. Safe over SSH (the job survives session drops). The box will need a reboot after — that\\u2019s a separate explicit click.\\n\\nContinue?"))return;
     var banner=document.getElementById('kernel-patch-banner');
     _kpatchShowState('running');
     document.getElementById('kpatch-pid').textContent='starting...';
@@ -57328,19 +59648,19 @@ function takPurgeFailed(){
 <div id="deploy-mode-first" style="margin-bottom:20px;padding:16px;background:rgba(6,182,212,0.06);border:1px solid var(--border);border-radius:10px">
 <div style="font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--text-dim);margin-bottom:12px;text-transform:uppercase;letter-spacing:1px;font-weight:600">1. Deployment mode</div>
 <div style="display:flex;gap:18px;flex-wrap:wrap;margin-bottom:8px">
-<label style="display:flex;align-items:center;gap:8px;color:var(--text-secondary);cursor:pointer"><input type="radio" name="deployment_mode" id="dep_mode_single" value="single_server" checked style="accent-color:var(--accent)"> One Server <span style="color:var(--text-dim);font-size:12px">(single takserver .deb/.rpm)</span></label>
+<label style="display:flex;align-items:center;gap:8px;color:var(--text-secondary);cursor:pointer"><input type="radio" name="deployment_mode" id="dep_mode_single" value="single_server" checked style="accent-color:var(--accent)"> One Server <span style="color:var(--text-dim);font-size:12px">{% if settings.get('arch') == 'arm64' %}(takserver-docker .zip — container){% else %}(single takserver .deb/.rpm){% endif %}</span></label>
 <label style="display:flex;align-items:center;gap:8px;color:var(--text-secondary);cursor:pointer"><input type="radio" name="deployment_mode" id="dep_mode_split" value="two_server" style="accent-color:var(--accent)"> Split Server <span style="color:var(--text-dim);font-size:12px">(takserver-database + takserver-core)</span></label>
 <label style="display:flex;align-items:center;gap:8px;color:var(--text-secondary);cursor:pointer"><input type="radio" name="deployment_mode" id="dep_mode_external_db" value="external_db" style="accent-color:var(--accent)"> External / Managed DB <span style="color:var(--text-dim);font-size:12px">(AWS RDS, Azure, Cloud SQL)</span></label>
 </div>
 <div id="deploy-mode-first-hint" style="font-size:12px;color:var(--text-dim)">Choose One Server for a standard install. Split Server uses separate DB and core packages. External / Managed DB points TAK Server at your cloud-hosted PostgreSQL.</div>
 </div>
-<div class="upload-area" id="upload-area" data-os-type="{{ settings.get('os_type', '') }}" ondrop="handleDrop(event)" ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)" onclick="var i=document.getElementById('file-input');i.value='';i.click()">
+<div class="upload-area" id="upload-area" data-os-type="{{ settings.get('os_type', '') }}" data-arch="{{ settings.get('arch', '') }}" ondrop="handleDrop(event)" ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)" onclick="var i=document.getElementById('file-input');i.value='';i.click()">
 <div class="upload-icon">📦</div><div class="upload-text">Drop your TAK Server files here</div>
 <div class="upload-hint" style="margin-bottom:6px"><span style="color:var(--text-dim);font-size:12px">Slow upload? Use the backdoor — open <strong>https://{{ settings.get('server_ip', 'SERVER_IP') }}:5001</strong> and upload from the TAK Server page there (skips proxy, no timeout).</span></div>
 <div class="upload-hint" id="upload-requirements-hint">
-<span style="color:var(--text-dim);font-size:12px">One server: takserver .deb/.rpm + optional .pol and .key — Split server: takserver-core and takserver-database.</span>
+<span style="color:var(--text-dim);font-size:12px">{% if settings.get('arch') == 'arm64' %}One server: takserver-docker .zip (container build — no native arm package) + optional .key.{% else %}One server: takserver .deb/.rpm + optional .pol and .key — Split server: takserver-core and takserver-database.{% endif %}</span>
 </div>
-<input type="file" id="file-input" style="display:none" multiple {% if 'ubuntu' in settings.get('os_type', '') %}accept=".deb,.key,.pol"{% elif 'rocky' in settings.get('os_type', '') or 'rhel' in settings.get('os_type', '') %}accept=".rpm,.key"{% else %}accept=".deb,.rpm,.key,.pol"{% endif %} onchange="handleFileSelect(event)">
+<input type="file" id="file-input" style="display:none" multiple {% if settings.get('arch') == 'arm64' %}accept=".zip,.key"{% elif 'ubuntu' in settings.get('os_type', '') %}accept=".deb,.key,.pol"{% elif 'rocky' in settings.get('os_type', '') or 'rhel' in settings.get('os_type', '') %}accept=".rpm,.key"{% else %}accept=".deb,.rpm,.key,.pol"{% endif %} onchange="handleFileSelect(event)">
 </div>
 <div id="progress-area"></div>
 <div id="upload-results" style="display:none">
@@ -57348,7 +59668,7 @@ function takPurgeFailed(){
 <div id="upload-files-list" style="font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--text-secondary)"></div>
 <div id="add-more-area" style="margin-top:16px;text-align:center">
 <button onclick="var i=document.getElementById('file-input-more');i.value='';i.click()" style="padding:8px 20px;background:transparent;color:var(--accent);border:1px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;cursor:pointer">+ Add more files</button>
-<input type="file" id="file-input-more" style="display:none" multiple {% if 'ubuntu' in settings.get('os_type', '') %}accept=".deb,.key,.pol"{% elif 'rocky' in settings.get('os_type', '') or 'rhel' in settings.get('os_type', '') %}accept=".rpm,.key"{% else %}accept=".deb,.rpm,.key,.pol"{% endif %} onchange="handleAddMore(event)">
+<input type="file" id="file-input-more" style="display:none" multiple {% if settings.get('arch') == 'arm64' %}accept=".zip,.key"{% elif 'ubuntu' in settings.get('os_type', '') %}accept=".deb,.key,.pol"{% elif 'rocky' in settings.get('os_type', '') or 'rhel' in settings.get('os_type', '') %}accept=".rpm,.key"{% else %}accept=".deb,.rpm,.key,.pol"{% endif %} onchange="handleAddMore(event)">
 </div>
 <div id="deploy-btn-area" style="margin-top:20px;text-align:center;display:none">
 <button onclick="showDeployConfig()" style="padding:12px 32px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:15px;font-weight:600;cursor:pointer">Configure &amp; Deploy →</button>
@@ -58583,7 +60903,7 @@ def _fail2ban_install_and_configure(plog):
         "maxretry = 5\n"
         "findtime = 600\n"
         "bantime  = 3600\n"
-        "action   = ufw\n"
+        f"action   = {_f2b_banaction()}\n"
     )
     jail_path = '/etc/fail2ban/jail.d/infratak-authentik.conf'
     with open(jail_path, 'w') as _f:
@@ -59113,6 +61433,15 @@ def _startup_migrations():
         except Exception as _crt_e:
             print(f"Startup migration: console-restart timer error: {_crt_e}", flush=True)
 
+        # v10.0.1 (RHEL) — self-heal fail2ban jail configs written by a pre-RHEL-port
+        # build (`action = ufw` → whole daemon won't start; sshd logpath auth.log →
+        # secure). Run EARLY so a slow/failing LDAP-resync migration below can't delay
+        # it. No-op on Debian / when nothing stale. See `_f2b_selfheal_rhel_jails`.
+        try:
+            _f2b_selfheal_rhel_jails(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _f2b_e:
+            print(f"Startup migration: fail2ban self-heal error (non-fatal): {_f2b_e}", flush=True)
+
         # Fix fedhub web_ui_port default for Caddy upstream (remote hub HTTP web UI is 8080)
         fh_raw = s.get('fedhub_deployment', {})
         if fh_raw.get('deployed') or fh_raw.get('web_ui_port') in (8446, '8446', None):
@@ -59136,12 +61465,96 @@ def _startup_migrations():
             subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
             print("Startup migration: Caddyfile regenerated + Caddy reloaded")
 
-        # Ensure cesium-tiles directory exists when the module is enabled
+        # v10.0.1: one-time teardown of the legacy 'cfd-remote-assist' install so a fresh
+        # 'eud-remote-assist' install is clean. The module was renamed cfd→eud; the in-console
+        # Update/Uninstall buttons now target eud paths and can no longer see an old cfd stack,
+        # so a box that installed Remote Assist before the rename would be stranded (old
+        # containers hold ports 8767/8448 → a fresh eud deploy collides). We remove the old
+        # compose stack + DB volume, force-kill any lingering cfd-remote-assist-* containers,
+        # deregister the old Authentik app/provider, drop the source dir, and mark the module
+        # not-installed so the operator reinstalls fresh (= eud). Idempotent: the old dir is
+        # removed at the end, and the guard requires it present with no eud dir yet, so this
+        # runs at most once and is a no-op on fresh boxes.
+        _ra_old_dir = os.path.expanduser('~/cfd-remote-assist')
+        _ra_new_dir = os.path.expanduser('~/eud-remote-assist')
+        if os.path.isdir(_ra_old_dir) and not os.path.isdir(_ra_new_dir):
+            try:
+                print("Startup migration: tearing down legacy cfd-remote-assist install (renamed to eud)", flush=True)
+                _old_compose = os.path.join(_ra_old_dir, 'docker-compose.yml')
+                if os.path.exists(_old_compose):
+                    subprocess.run(['docker', 'compose', '-f', _old_compose, 'down', '-v', '--remove-orphans'],
+                                   capture_output=True, timeout=120)
+                # Belt-and-suspenders: force-remove any container still named cfd-remote-assist-*
+                _ra_old_ids = subprocess.run(['docker', 'ps', '-aq', '--filter', 'name=cfd-remote-assist'],
+                                             capture_output=True, text=True, timeout=15).stdout.split()
+                if _ra_old_ids:
+                    subprocess.run(['docker', 'rm', '-f', *_ra_old_ids], capture_output=True, timeout=60)
+                # Deregister the old Authentik application + provider (legacy slug/name).
+                try:
+                    _deregister_authentik_oauth2_app(s, 'cfd-remote-assist', 'CFD Remote Assist')
+                except Exception:
+                    pass
+                shutil.rmtree(_ra_old_dir, ignore_errors=True)
+                # Reflect reality: no RA install until the operator reinstalls fresh (= eud).
+                s['remote_assist_enabled'] = False
+                save_settings(s)
+                s = load_settings()
+                # Drop the now-dead RA vhost from Caddy so its subdomain doesn't 502.
+                if (s.get('fqdn') or '').strip():
+                    generate_caddyfile(s)
+                    subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True, timeout=15)
+                print("Startup migration: legacy cfd-remote-assist removed — reinstall EUD Remote Assist from the console to recreate it", flush=True)
+            except Exception as e:
+                print(f"Startup migration: error tearing down legacy cfd-remote-assist: {e}", flush=True)
+
+        # v0.9.61: inject OIDC_ADMIN_GROUP into existing remote assist .env
+        if s.get('remote_assist_enabled') or 'remote_assist' in s.get('modules', {}):
+            ra_env_path = os.path.expanduser('~/eud-remote-assist/.env')
+            if os.path.exists(ra_env_path):
+                try:
+                    with open(ra_env_path, 'r') as f:
+                        ra_env_content = f.read()
+                    if 'OIDC_ADMIN_GROUP=' not in ra_env_content:
+                        with open(ra_env_path, 'a') as f:
+                            f.write('\nOIDC_ADMIN_GROUP=authentik Admins\n')
+                        subprocess.run(['docker', 'compose', '-f', os.path.expanduser('~/eud-remote-assist/docker-compose.yml'), 'up', '-d', 'server'], capture_output=True, timeout=30)
+                        print("Startup migration: Added OIDC_ADMIN_GROUP to remote assist .env and recreated backend container", flush=True)
+                except Exception as e:
+                    print(f"Startup migration: error updating remote assist .env: {e}", flush=True)
+
+        # v10.0.1: RHEL boxes deployed before the firewalld fix have the Remote Assist device
+        # API port closed (firewalld default-deny, and the old deploy branch only logged 'via SG').
+        # Open it idempotently so already-deployed RHEL boxes heal on a console restart instead of
+        # needing an RA redeploy. Admin port stays closed (loopback/Caddy-only). Ubuntu uses ufw.
+        if s.get('remote_assist_enabled') and _distro_family() == 'rhel':
+            try:
+                _q = subprocess.run(['firewall-cmd', '--query-port', f'{REMOTE_ASSIST_DEVICE_PORT}/tcp'],
+                                    capture_output=True, text=True, timeout=10)
+                if (_q.stdout or '').strip() != 'yes':
+                    subprocess.run(['firewall-cmd', '--permanent', '--add-port', f'{REMOTE_ASSIST_DEVICE_PORT}/tcp'],
+                                   capture_output=True, timeout=15)
+                    subprocess.run(['firewall-cmd', '--reload'], capture_output=True, timeout=15)
+                    print(f"Startup migration: firewalld opened {REMOTE_ASSIST_DEVICE_PORT}/tcp for RHEL Remote Assist device API", flush=True)
+            except Exception as e:
+                print(f"Startup migration: error opening RA device port in firewalld: {e}", flush=True)
+
+        # Ensure cesium-tiles dir exists + is servable when the module is enabled.
         if s.get('cesium_tiles_enabled'):
-            ct_dir = os.path.expanduser('~/cesium-tiles')
-            if not os.path.isdir(ct_dir):
-                os.makedirs(ct_dir, exist_ok=True)
-                print("Startup migration: created ~/cesium-tiles/")
+            _cesium_ensure_dir()  # idempotent: create + (RHEL) caddy-readable perms + SELinux label
+            # RHEL self-heal: a box enabled before the path move still has a Caddyfile
+            # pointing at the non-traversable ~/cesium-tiles (Caddy 403). If the cesium
+            # vhost root is stale, regenerate + reload so it serves the new dir.
+            if (s.get('fqdn') or '').strip():
+                try:
+                    with open(CADDYFILE_PATH) as _cf:
+                        _cad = _cf.read()
+                except Exception:
+                    _cad = ''
+                if 'cesium' in _cad.lower() and _cesium_dir() not in _cad:
+                    generate_caddyfile(s)
+                    subprocess.run('systemctl reload caddy 2>&1 || systemctl restart caddy 2>&1',
+                                   shell=True, capture_output=True, text=True, timeout=60)
+                    print("Startup migration: cesium vhost repointed to caddy-readable dir + Caddy reloaded", flush=True)
 
         # Ensure webodm working directories exist when the module is enabled
         if s.get('webodm_enabled'):
@@ -59595,6 +62008,39 @@ def _startup_migrations():
             )
         except Exception as ip_stale_err:
             print(f"Startup migration: server_ip stale-refresh error (non-fatal): {ip_stale_err}")
+
+        # v10.0.1 — self-heal settings.server_ip to the instance's directly-
+        # attached cloud public IP (AWS/Azure IMDS) on every boot. A cloud VM
+        # without an Elastic/static IP gets a NEW public IP on each stop/start;
+        # the one-shot private->public migration above won't fix an already-
+        # public-but-stale value, and there's no manual Server IP control. Only
+        # acts on IMDS 'imds-direct' sources (EIP boxes stay pinned; LB/NAT
+        # boxes are never clobbered). No-op off-cloud. NOT one-shot.
+        # See `_refresh_server_ip_from_imds_direct`. Root-caused on aws-arm.
+        try:
+            _refresh_server_ip_from_imds_direct(
+                lambda m: print(f"Startup migration: {m}", flush=True)
+            )
+        except Exception as ip_imds_err:
+            print(f"Startup migration: server_ip IMDS self-heal error (non-fatal): {ip_imds_err}")
+
+        # v10.0.1 (RHEL) — self-heal SELinux labels for non-standard Caddy
+        # listener ports. Confined Caddy (httpd_t) can't bind e.g. :9997 (CloudTAK
+        # video) unless the port is http_port_t, so its reload fails and the vhost
+        # serves nothing. generate_caddyfile() now labels on write, but a box whose
+        # CloudTAK was deployed before this fix is stuck until something relabels +
+        # reloads — do it here. No-op off-RHEL / when nothing needs labeling.
+        # See `_selinux_sync_caddy_ports`. Root-caused on aws-rocky 2026-06-20.
+        try:
+            _ct_labeled = _selinux_sync_caddy_ports(
+                lambda m: print(f"Startup migration: {m}", flush=True)
+            )
+            if _ct_labeled:
+                subprocess.run('systemctl reload caddy 2>&1 || systemctl restart caddy 2>&1',
+                               shell=True, capture_output=True, text=True, timeout=60)
+                print(f"Startup migration: relabeled {_ct_labeled} Caddy port(s) for SELinux and reloaded Caddy", flush=True)
+        except Exception as caddy_selinux_err:
+            print(f"Startup migration: Caddy SELinux port self-heal error (non-fatal): {caddy_selinux_err}")
 
         # v0.9.44 — silently clear a `takserver` dpkg half-configured state left by the
         # non-idempotent 5.7 .deb postinstall. TAK Server keeps running fine, but the
@@ -61812,6 +64258,14 @@ def _post_update_auto_deploy():
 
 _startup_migrations()
 _post_update_auto_deploy()
+
+# Universal firewall: on RHEL, ensure the ufw→firewalld translation shim is present so
+# every module deploy's `ufw ...` call drives firewalld (state-safe — installs a script,
+# changes no rules; no-op on Debian / when a real ufw exists).
+try:
+    _fw_install_shim(lambda m: print(f"[startup] {m}", flush=True))
+except Exception as _e:
+    print(f"[startup] ufw shim install skipped (non-fatal): {_e}", flush=True)
 
 # v0.8.5: periodic LDAP routing spiral monitor (self-healing for boxes whose spiral
 # manifests after the post-update one-shot check). Idempotent, rate-limited (max 1

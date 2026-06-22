@@ -55,6 +55,20 @@ detect_server_ip() {
         "http://169.254.169.254/metadata/instance/network/interface/0/ipv4/ipAddress/0/publicIpAddress?api-version=2021-02-01&format=text" \
         2>/dev/null || true)
     if [ -z "$public_ip" ]; then
+        # AWS IMDSv2 (token) — modern AMIs (esp. ARM/Graviton) default to
+        # HttpTokens=required, which 401s the token-less IMDSv1 call below.
+        local aws_tok
+        aws_tok=$(curl -s --max-time 2 -X PUT \
+            -H "X-aws-ec2-metadata-token-ttl-seconds: 60" \
+            http://169.254.169.254/latest/api/token 2>/dev/null || true)
+        if [ -n "$aws_tok" ]; then
+            public_ip=$(curl -s --max-time 2 \
+                -H "X-aws-ec2-metadata-token: $aws_tok" \
+                http://169.254.169.254/latest/meta-data/public-ipv4 \
+                2>/dev/null || true)
+        fi
+    fi
+    if [ -z "$public_ip" ]; then
         public_ip=$(curl -s --max-time 2 \
             http://169.254.169.254/latest/meta-data/public-ipv4 \
             2>/dev/null || true)
@@ -143,26 +157,42 @@ detect_os() {
                 PKG_MGR="apt"
             fi
             ;;
-        rocky|rhel)
+        rocky|rhel|almalinux|centos)
+            # v10.0.1: whole EL9 family (RHEL/Rocky/AlmaLinux/CentOS Stream),
+            # not just "rocky" — same dnf/firewalld/SELinux/CRB behavior. The
+            # os_type prefix stays "rocky-" so existing `'rocky' in os_type`
+            # checks keep matching; the real family signal is PKG_MGR=dnf.
             if [[ "$OS_VERSION" == 9* ]]; then
                 OS_TYPE="rocky-9"
                 PKG_MGR="dnf"
             else
-                echo -e "${YELLOW}WARNING: $OS_NAME not tested. Rocky 9 recommended.${NC}"
+                echo -e "${YELLOW}WARNING: $OS_NAME not tested. EL9 (Rocky/RHEL/Alma 9) recommended.${NC}"
                 OS_TYPE="rocky-$OS_VERSION"
                 PKG_MGR="dnf"
             fi
             ;;
         *)
             echo -e "${YELLOW}WARNING: $OS_NAME is not officially supported.${NC}"
-            echo -e "${YELLOW}Supported: Ubuntu 22.04/24.04, Debian 12, Rocky Linux 9${NC}"
+            echo -e "${YELLOW}Supported: Ubuntu 22.04/24.04, Debian 12, EL9 (Rocky/RHEL/AlmaLinux/CentOS 9)${NC}"
             OS_TYPE="$OS_ID-$OS_VERSION"
             PKG_MGR="unknown"
             ;;
     esac
 
+    # v10.0.1: CPU architecture (amd64 | arm64). arm64 targets NVIDIA Jetson
+    # Orin (JetPack 6 / Ubuntu 22.04), Ampere, Graviton. Anything unrecognized
+    # falls back to amd64 — the field-validated default path. app.py reads this
+    # via _host_arch() to force the container TAK path on arm64 (no native arm
+    # TAK package exists).
+    case "$(uname -m)" in
+        x86_64|amd64)   ARCH="amd64" ;;
+        aarch64|arm64)  ARCH="arm64" ;;
+        *)              ARCH="amd64" ;;
+    esac
+
     echo -e "  Detected: ${GREEN}$OS_NAME${NC}"
     echo -e "  Type:     ${GREEN}$OS_TYPE${NC}"
+    echo -e "  Arch:     ${GREEN}$ARCH${NC}"
     echo ""
 }
 
@@ -241,7 +271,7 @@ install_dependencies() {
             fi
             if ! NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get install -y \
                 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" \
-                python3 python3-pip python3-venv openssl sshpass > "$apt_log" 2>&1; then
+                python3 python3-pip python3-venv openssl sshpass git wget > "$apt_log" 2>&1; then
                 echo -e "${RED}  apt-get install failed:${NC}"
                 tail -30 "$apt_log"
                 rm -f "$apt_log"
@@ -250,7 +280,7 @@ install_dependencies() {
             rm -f "$apt_log"
             ;;
         dnf)
-            if ! dnf install -y python3 python3-pip openssl sshpass > "$apt_log" 2>&1; then
+            if ! dnf install -y python3 python3-pip openssl sshpass git wget > "$apt_log" 2>&1; then
                 echo -e "${RED}  dnf install failed:${NC}"
                 tail -30 "$apt_log"
                 rm -f "$apt_log"
@@ -352,6 +382,7 @@ EOF
     "os_type": "$OS_TYPE",
     "os_name": "$OS_NAME",
     "pkg_mgr": "$PKG_MGR",
+    "arch": "$ARCH",
     "console_port": 5001,
     "install_dir": "$INSTALL_DIR",
     "created": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
@@ -433,6 +464,22 @@ except Exception:
         SERVICE_HOME="/root"
     fi
 
+    # v10.0.1 (RHEL/SELinux): under SELinux enforcing, systemd (init_t) cannot
+    # traverse the operator's home (user_home_dir_t) nor exec the gunicorn venv
+    # there (user_home_t) — the service crash-loops with 203/EXEC and nothing
+    # binds the console port. Relabeling the venv does NOT help (the /home
+    # traversal is still denied). The console is a trusted root admin service, so
+    # run it in the unconfined service domain; the rest of the box (TAK Server,
+    # etc.) stays confined/enforcing. Validated on Rocky 9.6 under Enforcing with
+    # DEFAULT labels (no relabel, no relocation): exec + import compiled deps +
+    # read app.py + bind socket all succeed, zero AVC denials. On Debian/Ubuntu
+    # `getenforce` is absent, so the directive is omitted and the unit is
+    # byte-identical to today's.
+    SELINUX_DIRECTIVE=""
+    if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" != "Disabled" ]; then
+        SELINUX_DIRECTIVE="SELinuxContext=system_u:system_r:unconfined_service_t:s0"
+    fi
+
     cat > "$SERVICE_FILE" << EOF
 [Unit]
 Description=infra-TAK - Team Awareness Kit Infrastructure Platform
@@ -441,7 +488,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$GUNICORN_BIN $GUNICORN_ARGS app:app
+${SELINUX_DIRECTIVE:+$SELINUX_DIRECTIVE
+}ExecStart=$GUNICORN_BIN $GUNICORN_ARGS app:app
 WorkingDirectory=$USE_DIR
 Restart=always
 RestartSec=5
@@ -456,6 +504,42 @@ EOF
 
     systemctl daemon-reload
     systemctl enable takwerx-console > /dev/null 2>&1
+}
+
+# v10.0.1 (RHEL/SELinux): install the console's SELinux policy module so systemd
+# (init_t) can traverse the in-home clone, read+exec the gunicorn venv entrypoint
+# there, and transition into the unconfined service domain (paired with the
+# unit's SELinuxContext directive). Without it the service crash-loops 203/EXEC
+# under enforcing. Compiled on-box from the shipped .te so it matches the host's
+# policy version. No-op on non-SELinux hosts (Debian/Ubuntu: getenforce absent).
+# Validated on Rocky 9.6 under Enforcing (systemd-run init_t exec+import+read+bind
+# all succeed, zero denials).
+install_selinux_console_policy() {
+    command -v getenforce >/dev/null 2>&1 || return 0
+    [ "$(getenforce 2>/dev/null)" = "Disabled" ] && return 0
+    local te="$INSTALL_DIR/selinux/takwerx_console.te"
+    [ -f "$te" ] || { echo -e "${YELLOW}  ⚠ SELinux policy source missing ($te) — console may not start under enforcing${NC}"; return 0; }
+    # already current? (idempotent re-runs skip the rebuild)
+    if semodule -l 2>/dev/null | grep -q '^takwerx_console'; then
+        echo "  ✓ SELinux console policy already installed"
+        return 0
+    fi
+    if ! command -v checkmodule >/dev/null 2>&1; then
+        dnf install -y checkpolicy >/dev/null 2>&1 || true
+    fi
+    if ! command -v checkmodule >/dev/null 2>&1 || ! command -v semodule_package >/dev/null 2>&1; then
+        echo -e "${YELLOW}  ⚠ SELinux policy tools unavailable — console may not start under enforcing${NC}"
+        return 0
+    fi
+    local tmp; tmp=$(mktemp -d)
+    if checkmodule -M -m -o "$tmp/takwerx_console.mod" "$te" >/dev/null 2>&1 \
+       && semodule_package -o "$tmp/takwerx_console.pp" -m "$tmp/takwerx_console.mod" >/dev/null 2>&1 \
+       && semodule -i "$tmp/takwerx_console.pp" >/dev/null 2>&1; then
+        echo "  ✓ SELinux console policy installed (takwerx_console)"
+    else
+        echo -e "${YELLOW}  ⚠ SELinux console policy failed to install — console may not start under enforcing${NC}"
+    fi
+    rm -rf "$tmp"
 }
 
 # ==========================================
@@ -475,6 +559,9 @@ fi
 # Always use self-signed cert for console (Caddy handles FQDN SSL)
 generate_self_signed_cert
 
+# RHEL/SELinux: install the console policy module before the unit starts
+install_selinux_console_policy
+
 # Create and start systemd service
 create_service
 
@@ -485,13 +572,32 @@ sleep 1
 # Start the console
 systemctl start takwerx-console
 
-# Ensure backdoor port 5001 is allowed (so when UFW is enabled later, e.g. by TAK Server deploy, we don't lock ourselves out)
-if command -v ufw >/dev/null 2>&1; then
-    ufw allow 5001/tcp >/dev/null 2>&1 || true
-fi
-if command -v firewall-cmd >/dev/null 2>&1; then
-    firewall-cmd --permanent --add-port=5001/tcp >/dev/null 2>&1 || true
-    firewall-cmd --reload >/dev/null 2>&1 || true
+# Host firewall: keep the console + SSH reachable, and on RHEL bring up ALWAYS-ON
+# firewalld (operator decision 2026-06-21 — many deploys aren't in a cloud with a
+# security group, and the Cyber-Controls W4 checks need a host firewall to assert
+# against). On Debian, ufw is enabled later by the TAK Server deploy; just open 5001.
+if [ "$PKG_MGR" = "dnf" ]; then
+    # Install firewalld if the image didn't ship it (cloud RHEL AMIs often strip it).
+    command -v firewall-cmd >/dev/null 2>&1 || dnf install -y firewalld >/dev/null 2>&1
+    if command -v firewall-cmd >/dev/null 2>&1; then
+        # Start firewalld FIRST — `firewall-cmd` (even --permanent) needs the daemon
+        # running, and the default `public` zone already allows ssh, so SSH survives.
+        systemctl enable --now firewalld >/dev/null 2>&1 || true
+        # Now add console + SSH explicitly, then seed from current PUBLIC listeners so a
+        # re-run on a box that already has modules doesn't strand their ports (a fresh box
+        # only has SSH + console here). Module deploys open their ports later via the shim.
+        firewall-cmd --permanent --add-service=ssh >/dev/null 2>&1 || true
+        firewall-cmd --permanent --add-port=5001/tcp >/dev/null 2>&1 || true
+        for _p in $(ss -ltnH 2>/dev/null | awk '{print $4}' | grep -vE '^127\.0\.0\.1:|^\[::1\]:' | sed -E 's/.*:([0-9]+)$/\1/' | sort -un); do
+            [ "$_p" = "111" ] && continue   # rpcbind — never expose
+            firewall-cmd --permanent --add-port=${_p}/tcp >/dev/null 2>&1 || true
+        done
+        firewall-cmd --reload >/dev/null 2>&1 || true
+    fi
+else
+    if command -v ufw >/dev/null 2>&1; then
+        ufw allow 5001/tcp >/dev/null 2>&1 || true
+    fi
 fi
 
 # Get access URL — on Azure/AWS the private IP is returned by hostname -I
