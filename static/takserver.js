@@ -1119,12 +1119,18 @@ function initTakDeployModeUI(rootEl){
       '<div id="two-server-config-panel" style="display:none;margin-bottom:20px;padding:16px;background:rgba(59,130,246,0.06);border:1px solid var(--border);border-radius:10px">',
       '<div style="font-family:\'JetBrains Mono\',monospace;font-size:13px;color:var(--text-dim);margin-bottom:12px;text-transform:uppercase;letter-spacing:1px;font-weight:600">Split Server Wizard (Manual Naming)</div>',
       '<div style="font-size:12px;color:var(--text-dim);margin-bottom:10px">Server One = Database Server. Server Two = Core Server.</div>',
+      '<div style="font-size:11px;color:var(--text-secondary);background:rgba(99,102,241,0.06);border:1px solid rgba(99,102,241,0.2);border-radius:8px;padding:10px 12px;margin-bottom:12px;line-height:1.65">',
+      '<div style="font-weight:600;color:var(--accent);margin-bottom:5px;text-transform:uppercase;letter-spacing:0.5px;font-size:10px">How this works — run the steps in order</div>',
+      '<div style="margin-bottom:3px"><b>Cloud box (AWS / Azure, <code>.pem</code> key):</b> Upload cloud key (.pem) &rarr; <b>1</b> Save Config &rarr; <b>4</b> Deploy Server One &rarr; <b>5</b> Pre-stage Server Two &nbsp;<span style="color:var(--text-dim)">(skip 2 &amp; 3)</span></div>',
+      '<div><b>Password box (VPS / SSD&nbsp;Nodes):</b> <b>1</b> Save Config &rarr; <b>2</b> Setup SSH key &rarr; <b>3</b> Copy key to Server One &rarr; <b>4</b> Deploy Server One &rarr; <b>5</b> Pre-stage Server Two</div>',
+      '<div style="margin-top:6px;padding-top:6px;border-top:1px solid rgba(99,102,241,0.18);color:var(--text-dim)">Step 5 only <i>pre-stages</i> the core (installs it + points it at the DB). To <b>finish</b>: scroll down, fill <b>Certificate Information</b>, and click <b>Deploy TAK Server</b> &mdash; that generates certs and wires up auth / LDAP.</div>',
+      '</div>',
       '<label style="display:flex;align-items:center;gap:8px;color:var(--text-secondary);cursor:pointer;font-size:12px;margin-bottom:12px"><input type="checkbox" id="ts_server_two_local" checked onchange="toggleServerTwoLocal()" style="accent-color:var(--accent)"> Use this infra-TAK host as Server Two (Core Server)</label>',
       '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">',
       '<div style="background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:12px">',
       '<div style="font-size:12px;color:var(--cyan);font-weight:600;margin-bottom:8px">Server One: Database Server</div>',
       '<div class="form-field"><label>Host / IP</label><input type="text" id="ts_server_one_host" placeholder="10.0.0.21"></div>',
-      '<div class="form-field"><label>SSH User</label><input type="text" id="ts_server_one_user" placeholder="root"></div>',
+      '<div class="form-field"><label>SSH User</label><input type="text" id="ts_server_one_user" placeholder="root"><div style="font-size:10px;color:var(--text-dim);margin-top:3px">Cloud boxes use the AMI/admin user (AWS: <code>rocky</code>/<code>ubuntu</code>/<code>ec2-user</code>; Azure: your VM admin), <b>not</b> <code>root</code>. VPS / SSD&nbsp;Nodes use <code>root</code>.</div></div>',
       '<div class="form-field"><label>SSH Port</label><input type="number" id="ts_server_one_port" value="22"></div>',
       '<div class="form-field"><label>Auth Method</label><select id="ts_server_one_auth" onchange="toggleTwoServerAuthInputs(\'one\')" style="width:100%;padding:10px 14px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:13px"><option value="ssh_key">SSH key</option><option value="password">User/password</option></select></div>',
       '<div class="form-field" id="ts_server_one_key_wrap"><label>SSH Key Path</label><input type="text" id="ts_server_one_key" placeholder="~/.ssh/id_rsa"></div>',
@@ -1152,7 +1158,12 @@ function initTakDeployModeUI(rootEl){
       '<button type="button" onclick="ensureTakSshKey()" style="padding:8px 14px;background:rgba(139,92,246,0.15);color:var(--purple, #a78bfa);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer">2. Setup SSH key</button>',
       '<button type="button" onclick="installTakSshKey()" style="padding:8px 14px;background:rgba(245,158,11,0.15);color:var(--amber, #f59e0b);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer">3. Copy key to Server One</button>',
       '<button type="button" onclick="deployTakServerOne()" style="padding:8px 14px;background:rgba(99,102,241,0.2);color:var(--indigo,#6366f1);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer">4. Deploy Server One (DB)</button>',
-      '<button type="button" onclick="deployTakServerTwo()" style="padding:8px 14px;background:rgba(34,197,94,0.2);color:var(--green);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer">5. Deploy Server Two (Core)</button>',
+      '<button type="button" onclick="deployTakServerTwo()" title="Pre-stages the Core box: installs takserver-core and points it at Server One\'s DB. The final deploy is the Deploy TAK Server button below." style="padding:8px 14px;background:rgba(34,197,94,0.2);color:var(--green);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer">5. Pre-stage Server Two (Core)</button>',
+      '</div>',
+      '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px">',
+      '<span style="font-size:11px;color:var(--text-dim)">Cloud key-only box (AWS EC2 / Azure)? Upload the key it was launched with (your <code>.pem</code>) — replaces steps 2 &amp; 3:</span>',
+      '<button type="button" onclick="uploadTakSshKeyPick()" style="padding:6px 12px;background:rgba(139,92,246,0.15);color:var(--purple,#a78bfa);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer">&#8593; Upload cloud key (.pem)</button>',
+      '<input type="file" id="ts_keyfile" accept=".pem,.key,.txt,.cer,.ppk" style="display:none" onchange="uploadTakSshKeyFile(this)">',
       '</div>',
       '<div id="two-server-msg" style="margin-top:10px;font-size:12px;color:var(--text-dim)"></div>',
       '<div id="two-server-preflight" style="display:none;margin-top:10px;background:#0c0f1a;border:1px solid var(--border);border-radius:8px;padding:12px;font-family:\'JetBrains Mono\',monospace;font-size:11px;white-space:pre-wrap"></div>',
@@ -1586,6 +1597,30 @@ async function installTakSshKey(){
     }
 }
 
+function uploadTakSshKeyPick(){
+    var el=document.getElementById('ts_keyfile');
+    if(el){el.value='';el.click();}
+}
+
+async function uploadTakSshKeyFile(input){
+    var msg=document.getElementById('two-server-msg');
+    var f=(input&&input.files&&input.files[0])||null;
+    if(!f)return;
+    if(f.size>32768){if(msg){msg.textContent='✗ That file is too large to be an SSH key — pick your .pem private key.';msg.style.color='var(--red)';}return;}
+    if(msg){msg.textContent='Uploading key…';msg.style.color='var(--cyan)';}
+    try{
+      var text=await f.text();
+      var cfg=collectTakDeploymentConfigFromForm();
+      var r=await fetch('/api/takserver/two-server/upload-ssh-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:cfg,private_key:text}),credentials:'same-origin'});
+      var d=await r.json();
+      if(!d.success)throw new Error(d.error||'Upload failed');
+      if(msg){msg.textContent='✓ '+(d.message||'Key uploaded')+(d.fingerprint?'  ('+d.fingerprint+')':'');msg.style.color='var(--green)';}
+      try{loadTakDeploymentConfig();}catch(e){}
+    }catch(e){
+      if(msg){msg.textContent='✗ '+e.message;msg.style.color='var(--red)';}
+    }
+}
+
 async function deployTakServerOne(){
     var msg=document.getElementById('two-server-msg');
     if(msg){msg.textContent='Deploying to Server One (copying package, installing… may take a few minutes)';msg.style.color='var(--cyan)';}
@@ -1713,7 +1748,7 @@ function updateUpgradeFileReady(){
   var msg=document.getElementById('tak-update-msg');
   if(msg){
     if(upgradeFileReady)msg.textContent='';
-    else if(twoServer&&upgradeUploadedPackages.length>0)msg.textContent='Upload both core and database .deb packages.';
+    else if(twoServer&&upgradeUploadedPackages.length>0)msg.textContent='Upload both core and database packages.';
   }
 }
 
@@ -1738,10 +1773,15 @@ async function removeUpgradeFile(filename){
 }
 
 function uploadUpgradeDeb(file){
-  if(!file||!file.name.toLowerCase().endsWith('.deb')){var m=document.getElementById('tak-update-msg');if(m){m.textContent='Select a .deb file.';m.style.color='var(--red)';}return;}
+  var _isCtr=document.body&&document.body.getAttribute('data-tak-container')==='true';
+  var _nativeExt=(document.body&&document.body.getAttribute('data-tak-native-ext'))||'.deb';
+  var _ext=_isCtr?'.zip':_nativeExt;
+  if(!file||!file.name.toLowerCase().endsWith(_ext)){var m=document.getElementById('tak-update-msg');if(m){m.textContent=_isCtr?'Select the takserver-docker-*.zip bundle.':('Select a '+_ext+' file.');m.style.color='var(--red)';}return;}
   var n=file.name.toLowerCase();
-  if(isUpgradeTwoServerMode()){
-    if(n.indexOf('core')===-1&&n.indexOf('database')===-1){var m=document.getElementById('tak-update-msg');if(m){m.textContent='Split mode: only takserver-core and takserver-database .deb are allowed.';m.style.color='var(--red)';}return;}
+  if(_isCtr){
+    if(n.indexOf('docker')===-1){var m=document.getElementById('tak-update-msg');if(m){m.textContent='Upload the official takserver-docker-*.zip bundle (container upgrade).';m.style.color='var(--red)';}return;}
+  }else if(isUpgradeTwoServerMode()){
+    if(n.indexOf('core')===-1&&n.indexOf('database')===-1){var m=document.getElementById('tak-update-msg');if(m){m.textContent='Split mode: only takserver-core and takserver-database packages are allowed.';m.style.color='var(--red)';}return;}
   }else{
     if(n.indexOf('core')!==-1||n.indexOf('database')!==-1){var m=document.getElementById('tak-update-msg');if(m){m.textContent='One-server upgrade: use the single takserver .deb, not core or database packages.';m.style.color='var(--red)';}return;}
   }
@@ -1803,7 +1843,9 @@ function loadExistingUpgradeFiles(){
   if(!pa)return;
   fetch('/api/upload/takserver/existing',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
     var twoServer=isUpgradeTwoServerMode();
-    var pkgs=(d.packages||[]).filter(function(p){var n=(p.filename||'').toLowerCase();if(!n.endsWith('.deb'))return false;if(twoServer)return n.indexOf('core')!==-1||n.indexOf('database')!==-1;return n.indexOf('core')===-1&&n.indexOf('database')===-1;});
+    var _rIsCtr=document.body&&document.body.getAttribute('data-tak-container')==='true';
+    var _rExt=_rIsCtr?'.zip':((document.body&&document.body.getAttribute('data-tak-native-ext'))||'.deb');
+    var pkgs=(d.packages||[]).filter(function(p){var n=(p.filename||'').toLowerCase();if(!n.endsWith(_rExt))return false;if(twoServer)return n.indexOf('core')!==-1||n.indexOf('database')!==-1;return n.indexOf('core')===-1&&n.indexOf('database')===-1;});
     if(pkgs.length===0)return;
     upgradeUploadedPackages=pkgs.slice();
     var ua=document.getElementById('upgrade-upload-area');if(ua){ua.style.maxHeight='80px';ua.style.padding='16px';}
@@ -1828,7 +1870,7 @@ function takToggleUpdate(){takToggleSection('tak-update');}
 function takToggleSection(id){var body=document.getElementById(id+'-body');var icon=document.getElementById(id+'-toggle-icon');if(!body)return;var show=body.style.display==='none';body.style.display=show?'block':'none';if(icon)icon.style.transform=show?'rotate(180deg)':'';}
 async function startTakUpdate(){
   var btn=document.getElementById('tak-update-btn');var msg=document.getElementById('tak-update-msg');
-  if(!upgradeFileReady){if(msg){msg.textContent=isUpgradeTwoServerMode()?'Upload both core and database .deb packages first.':'Upload a .deb package first.';msg.style.color='var(--red)';}return;}
+  if(!upgradeFileReady){if(msg){var _uext=(document.body&&document.body.getAttribute('data-tak-container')==='true')?'.zip':((document.body&&document.body.getAttribute('data-tak-native-ext'))||'.deb');msg.textContent=isUpgradeTwoServerMode()?'Upload both core and database packages first.':('Upload a '+_uext+' package first.');msg.style.color='var(--red)';}return;}
   if(btn)btn.disabled=true;if(msg){msg.textContent='Starting update...';msg.style.color='var(--text-dim)';}
   try{
     var r=await fetch('/api/takserver/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({}),credentials:'same-origin'});

@@ -21,7 +21,11 @@ CONFIG_DIR="$INSTALL_DIR/.config"
 AUTH_FILE="$CONFIG_DIR/auth.json"
 SETTINGS_FILE="$CONFIG_DIR/settings.json"
 
-clear
+# Only clear an interactive screen. Headless callers (e.g. the in-console
+# "Switch to non-root" button, which runs start.sh detached via systemd-run with
+# no TTY) have no terminal — a bare `clear` prints "TERM environment variable not
+# set" and exits non-zero, which under `set -e` aborts the whole install at line 1.
+[ -t 1 ] && clear
 echo ""
 echo -e "${CYAN}${BOLD}  ╔══════════════════════════════════════════════════════╗${NC}"
 echo -e "${CYAN}${BOLD}  ║  infra-TAK                                           ║${NC}"
@@ -30,10 +34,52 @@ echo -e "${CYAN}${BOLD}  ╚═════════════════�
 echo ""
 
 # Check if running as root
-if [ "$EUID" -ne 0 ]; then 
+if [ "$EUID" -ne 0 ]; then
     echo -e "${RED}ERROR: This script must be run as root${NC}"
     echo "Please run: sudo $0"
     exit 1
+fi
+
+# ==========================================
+# Born-non-root mode (v10.0.5)
+# ==========================================
+# Provision the console to run as the UNPRIVILEGED `takwerx` user from
+# /opt/infratak, HOME=/home/takwerx, with ALL privileged work mediated by the
+# root broker (broker/takwerx_broker.py). start.sh itself still runs as root (it
+# does the privileged provisioning); only the CONSOLE drops privilege.
+#
+# Gating: born-non-root is the DEFAULT for FRESH installs; an EXISTING root
+# install stays root (until migrated by scripts/migrate-console-nonroot.sh).
+# Force on with TAKWERX_NONROOT=1, force off with TAKWERX_NONROOT=0. (All
+# privileged shell calls are now broker-mediated — SHELL 0 — and a full deploy is
+# validated non-root under broker-enforce + SELinux-confined, so fresh boxes are
+# safe to default non-root. The broker still defaults PERMISSIVE; enforcing is the
+# operator flip after a fleet soak.)
+NONROOT_USER="takwerx"
+NONROOT_GROUP="takwerx"
+NONROOT_HOME="/home/takwerx"
+NONROOT_INSTALL="/opt/infratak"
+BORN_NONROOT=0
+if [ "${TAKWERX_NONROOT:-}" = "1" ]; then
+    BORN_NONROOT=1
+elif [ "${TAKWERX_NONROOT:-}" = "0" ]; then
+    BORN_NONROOT=0                       # explicit opt-out -> stay root
+else
+    # DEFAULT: a FRESH box is born non-root; an EXISTING ROOT install stays root
+    # (until migrated). Three cases off the existing unit:
+    #   - already non-root (User=takwerx)        -> keep non-root (don't flip back!)
+    #   - existing root install with a password  -> stay root
+    #   - no console / no auth (fresh)           -> born non-root
+    _born_existing="/etc/systemd/system/takwerx-console.service"
+    if [ -f "$_born_existing" ] && grep -qE '^User=takwerx' "$_born_existing" 2>/dev/null; then
+        BORN_NONROOT=1
+    else
+        _born_dir=""
+        [ -f "$_born_existing" ] && _born_dir=$(grep -E '^WorkingDirectory=' "$_born_existing" 2>/dev/null | cut -d= -f2- | tr -d ' ')
+        if [ -z "$_born_dir" ] || [ ! -f "$_born_dir/.config/auth.json" ]; then
+            BORN_NONROOT=1
+        fi
+    fi
 fi
 
 # ==========================================
@@ -308,7 +354,10 @@ install_dependencies() {
         exit 1
     fi
 
-    if ! "$INSTALL_DIR/.venv/bin/pip" install --quiet flask psutil werkzeug gunicorn 2>"$apt_log"; then
+    # pyyaml: the module compose patchers use it for ROBUST, IDEMPOTENT YAML edits.
+    # Without it they fall back to a legacy text patcher that double-appends keys on
+    # re-deploy (duplicate `healthcheck` -> "mapping key already defined" parse error).
+    if ! "$INSTALL_DIR/.venv/bin/pip" install --quiet flask psutil werkzeug gunicorn pyyaml 2>"$apt_log"; then
         echo -e "${RED}  pip install failed:${NC}"
         tail -20 "$apt_log"
         rm -f "$apt_log"
@@ -424,6 +473,221 @@ generate_self_signed_cert() {
 }
 
 # ==========================================
+# Privileged broker (v10.0.5 — non-root console migration, Option B)
+# ==========================================
+# A small ROOT daemon (broker/takwerx_broker.py) mediates every privileged op
+# the console performs, behind an allowlist/rulebook + single audit log. The
+# console (still root in this release) talks to it over /run/takwerx-broker.sock.
+# Installing + starting it here is ADDITIVE and idempotent — it does NOT change
+# how the console runs (the console keeps working exactly as before). It is the
+# foundation the later non-root flip stands on, and lets the broker path be
+# proven now (TAKWERX_FORCE_BROKER=1 + `takwerx_broker.py selftest`).
+install_broker() {
+    # Ensure the console service account exists so the socket can be group-owned
+    # by it (root:takwerx 0660 — only root + the console user may connect).
+    getent group  takwerx >/dev/null 2>&1 || groupadd --system takwerx >/dev/null 2>&1 || true
+    getent passwd takwerx >/dev/null 2>&1 || \
+        useradd --system -g takwerx -d /nonexistent -s /usr/sbin/nologin takwerx >/dev/null 2>&1 || true
+
+    mkdir -p /var/log/takwerx-broker
+    chmod 750 /var/log/takwerx-broker
+
+    local broker_py="$INSTALL_DIR/broker/takwerx_broker.py"
+    if [ ! -f "$broker_py" ]; then
+        echo -e "${YELLOW}  ⚠ broker source missing ($broker_py) — skipping broker install${NC}"
+        return 0
+    fi
+
+    # SELinux: under enforcing, init_t cannot exec the in-home venv python
+    # without the takwerx_console policy module (installed above) + the
+    # unconfined_service_t context — identical situation to the console unit.
+    local BROKER_SELINUX=""
+    if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" != "Disabled" ]; then
+        BROKER_SELINUX="SELinuxContext=system_u:system_r:unconfined_service_t:s0"
+    fi
+
+    cat > /etc/systemd/system/takwerx-broker.service << EOF
+[Unit]
+Description=infra-TAK privileged broker (least-privilege console mediation)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+${BROKER_SELINUX:+$BROKER_SELINUX
+}ExecStart=$INSTALL_DIR/.venv/bin/python3 $broker_py serve
+Restart=always
+RestartSec=2
+RuntimeMaxSec=24h
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable takwerx-broker >/dev/null 2>&1 || true
+    systemctl restart takwerx-broker 2>/dev/null || systemctl start takwerx-broker 2>/dev/null || true
+    sleep 1
+    if systemctl is-active --quiet takwerx-broker; then
+        echo -e "  ${GREEN}✓ Privileged broker running (takwerx-broker.service)${NC}"
+    else
+        echo -e "${YELLOW}  ⚠ Privileged broker did not start — check: journalctl -u takwerx-broker${NC}"
+    fi
+}
+
+# ==========================================
+# Born-non-root provisioning (v10.0.5)
+# ==========================================
+# Make `takwerx` a real, home-owning user; relocate the repo to /opt/infratak
+# owned by takwerx; re-point INSTALL_DIR so every later step (venv build, .config,
+# cert, unit) lands in the non-root install. Idempotent. No-op unless BORN_NONROOT.
+provision_nonroot() {
+    [ "$BORN_NONROOT" = "1" ] || return 0
+    echo -e "${CYAN}  Provisioning non-root console (takwerx @ $NONROOT_INSTALL)...${NC}"
+
+    # Stop a running console first — if it is ALREADY running as takwerx (a
+    # re-provision), `usermod` on takwerx fails with "user currently used by
+    # process" and the home/shell change is silently lost. start.sh restarts the
+    # console at the end regardless.
+    systemctl stop takwerx-console 2>/dev/null || true
+
+    # 1. takwerx group + user with a REAL home and shell. The broker may have
+    #    already created takwerx as a --system nologin acct (home /nonexistent);
+    #    upgrade it in place to a usable home/shell (modules do `cd ~/authentik`
+    #    and run shell scripts). takwerx gets NO sudo and NO docker group — the
+    #    broker performs every privileged op on its behalf.
+    getent group "$NONROOT_GROUP" >/dev/null 2>&1 || groupadd --system "$NONROOT_GROUP"
+    if getent passwd "$NONROOT_USER" >/dev/null 2>&1; then
+        usermod -d "$NONROOT_HOME" -s /bin/bash "$NONROOT_USER" 2>/dev/null || true
+    else
+        useradd -m -d "$NONROOT_HOME" -s /bin/bash -g "$NONROOT_GROUP" "$NONROOT_USER"
+    fi
+    mkdir -p "$NONROOT_HOME"
+    chown "$NONROOT_USER:$NONROOT_GROUP" "$NONROOT_HOME"
+    chmod 755 "$NONROOT_HOME"
+
+    # 2. Relocate the repo to /opt/infratak (owned by takwerx). The .venv is
+    #    path-specific (shebangs) and is rebuilt at the new path by
+    #    install_dependencies; .config/.git are carried over if present.
+    if [ "$INSTALL_DIR" != "$NONROOT_INSTALL" ]; then
+        mkdir -p "$NONROOT_INSTALL"
+        if command -v rsync >/dev/null 2>&1; then
+            rsync -a --exclude '.venv' "$INSTALL_DIR/" "$NONROOT_INSTALL/"
+        else
+            cp -a "$INSTALL_DIR/." "$NONROOT_INSTALL/" 2>/dev/null || true
+            rm -rf "$NONROOT_INSTALL/.venv"
+        fi
+    fi
+    chown -R "$NONROOT_USER:$NONROOT_GROUP" "$NONROOT_INSTALL"
+
+    # 3. Re-point every path the rest of the script uses.
+    INSTALL_DIR="$NONROOT_INSTALL"
+    CONFIG_DIR="$INSTALL_DIR/.config"
+    AUTH_FILE="$CONFIG_DIR/auth.json"
+    SETTINGS_FILE="$CONFIG_DIR/settings.json"
+
+    # 4. Re-home the Server One SSH key for takwerx (SPLIT deploys). An existing ROOT-era
+    #    split stored server_one.ssh_key_path under /root/.ssh — which the non-root console
+    #    (takwerx cannot traverse /root) can't read, silently breaking console->Server One
+    #    SSH: remote-DB unattended-upgrades monitor, Guard Dog DB-auth watch, DB migration,
+    #    Sync DB Password. Copy the key (SAME material — Server One's authorized_keys already
+    #    trusts it) into /home/takwerx/.ssh and rewrite the stored path. Runs as root here,
+    #    so it can read /root and chown to takwerx. Idempotent (skips keys already under the
+    #    takwerx home).
+    if [ -f "$SETTINGS_FILE" ]; then
+        mkdir -p "$NONROOT_HOME/.ssh"
+        chown "$NONROOT_USER:$NONROOT_GROUP" "$NONROOT_HOME/.ssh"
+        chmod 700 "$NONROOT_HOME/.ssh"
+        python3 - "$SETTINGS_FILE" "$NONROOT_HOME" "$NONROOT_USER" <<'PYEOF'
+import json, os, sys, shutil, pwd, grp
+sf, home, user = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    with open(sf) as f: d = json.load(f)
+except Exception:
+    sys.exit(0)
+try:
+    uid = pwd.getpwnam(user).pw_uid; gid = grp.getgrnam(user).gr_gid
+except Exception:
+    sys.exit(0)
+home_prefix = home.rstrip('/') + '/'
+changed = False
+td = d.get('tak_deployment') or {}
+s1 = td.get('server_one') or {}
+kp = (s1.get('ssh_key_path') or '').strip()
+# Re-home only if a key is set and it is NOT already under the takwerx home (catches
+# /root/.ssh and any other stale non-takwerx path). Same material -> no ssh-copy-id needed.
+if kp and not kp.startswith(home_prefix):
+    if os.path.isfile(kp):
+        dst = os.path.join(home, '.ssh', os.path.basename(kp))
+        try:
+            shutil.copy2(kp, dst); os.chmod(dst, 0o600); os.chown(dst, uid, gid)
+            if os.path.isfile(kp + '.pub'):
+                shutil.copy2(kp + '.pub', dst + '.pub'); os.chmod(dst + '.pub', 0o644); os.chown(dst + '.pub', uid, gid)
+            s1['ssh_key_path'] = dst; td['server_one'] = s1; d['tak_deployment'] = td; changed = True
+            print(f"  re-homed Server One SSH key {kp} -> {dst}")
+        except Exception as e:
+            print(f"  WARN: could not re-home Server One SSH key ({kp}): {e}")
+    else:
+        print(f"  WARN: Server One SSH key path {kp} not found on disk — console->Server One SSH will need a re-key")
+if changed:
+    tmp = sf + '.tmp'
+    with open(tmp, 'w') as f: json.dump(d, f, indent=2)
+    os.replace(tmp, sf); os.chown(sf, uid, gid)
+PYEOF
+        chown "$NONROOT_USER:$NONROOT_GROUP" "$SETTINGS_FILE" 2>/dev/null || true
+    fi
+    echo -e "  ${GREEN}✓ takwerx user ready; console will run from $NONROOT_INSTALL${NC}"
+}
+
+# Final ownership pass — after venv build, .config, and cert generation, hand the
+# whole non-root install (and the broker log group) to takwerx. Mode 600 on the
+# password hash is preserved (takwerx, the console user, must read it).
+finalize_nonroot_ownership() {
+    [ "$BORN_NONROOT" = "1" ] || return 0
+    # Broker PATH-shims: let module-deploy shell strings (_module_run) + external
+    # scripts (nodered/deploy.sh, cloudtak.sh) reach docker/systemctl/etc through
+    # the root broker without giving takwerx real privilege. Idempotent.
+    if [ -f "$INSTALL_DIR/broker/install-shims.sh" ]; then
+        bash "$INSTALL_DIR/broker/install-shims.sh" "$INSTALL_DIR/.shims" \
+            "$INSTALL_DIR/broker/takwerx_broker.py" >/dev/null 2>&1 \
+            && echo -e "  ${GREEN}✓ Broker PATH-shims installed${NC}"
+    fi
+    chown -R "$NONROOT_USER:$NONROOT_GROUP" "$INSTALL_DIR"
+}
+
+# Born-non-root: install Docker Engine UP FRONT, as root. Module deploys all begin
+# with a `docker --version` check (broker-mediated → runs as root); if Docker is
+# present that check passes and the deploy proceeds. The non-root console CANNOT
+# install Docker itself (the install is dnf/systemctl/curl|sh as root), so a fresh
+# born-non-root box must have it provisioned here. Mirrors app.py _docker_install_cmd
+# (multiplatform). takwerx is deliberately NOT added to the docker group — every
+# docker op the console runs is mediated by the root broker.
+ensure_docker_nonroot() {
+    [ "$BORN_NONROOT" = "1" ] || return 0
+    if command -v docker >/dev/null 2>&1; then
+        systemctl enable --now docker >/dev/null 2>&1 || true
+        echo -e "  ${GREEN}✓ Docker already present${NC}"
+        return 0
+    fi
+    echo -e "${CYAN}  Installing Docker Engine (born-non-root: console can't install it later)...${NC}"
+    if [ "$PKG_MGR" = "dnf" ]; then
+        dnf -y install dnf-plugins-core >/dev/null 2>&1
+        rm -f /etc/yum.repos.d/docker-ce.repo
+        dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo >/dev/null 2>&1
+        dnf -y install docker-ce docker-ce-cli containerd.io docker-compose-plugin >/dev/null 2>&1
+    else
+        curl -fsSL https://get.docker.com | sh >/dev/null 2>&1
+    fi
+    systemctl enable --now docker >/dev/null 2>&1 || true
+    if command -v docker >/dev/null 2>&1 && systemctl is-active --quiet docker; then
+        echo -e "  ${GREEN}✓ Docker installed + running${NC}"
+    else
+        echo -e "${YELLOW}  ⚠ Docker install may have failed — module deploys will fail until it's present${NC}"
+    fi
+}
+
+# ==========================================
 # Create systemd Service
 # ==========================================
 # If the service already exists and points to a directory that has .config/auth.json,
@@ -432,7 +696,11 @@ generate_self_signed_cert() {
 create_service() {
     SERVICE_FILE="/etc/systemd/system/takwerx-console.service"
     USE_DIR="$INSTALL_DIR"
-    if [ -f "$SERVICE_FILE" ]; then
+    # Born-non-root deliberately RELOCATES to /opt/infratak, so do NOT preserve a
+    # prior WorkingDirectory (that would strand the console at the old in-home
+    # path). For the root model, keep the existing-dir preservation so a re-run
+    # from another clone doesn't switch away from the dir that holds the password.
+    if [ "$BORN_NONROOT" != "1" ] && [ -f "$SERVICE_FILE" ]; then
         EXISTING_DIR=$(grep -E '^WorkingDirectory=' "$SERVICE_FILE" 2>/dev/null | cut -d= -f2- | tr -d ' ')
         if [ -n "$EXISTING_DIR" ] && [ -d "$EXISTING_DIR" ] && [ -f "$EXISTING_DIR/.config/auth.json" ]; then
             USE_DIR="$EXISTING_DIR"
@@ -464,6 +732,19 @@ except Exception:
         SERVICE_HOME="/root"
     fi
 
+    # Born-non-root: the console drops to the unprivileged takwerx user with its
+    # own home, so module deploys (`cd ~/authentik`, etc.) land under
+    # /home/takwerx — NOT /root (which takwerx, mode-700, cannot traverse). All
+    # privileged ops go through the broker, so no User-side sudo/docker group is
+    # needed. The SELinuxContext (unconfined_service_t) is kept: validated to let
+    # the takwerx console exec its venv + bind the port under Enforcing.
+    SERVICE_USER_DIRECTIVE=""
+    if [ "$BORN_NONROOT" = "1" ]; then
+        SERVICE_USER_DIRECTIVE="User=$NONROOT_USER
+Group=$NONROOT_GROUP"
+        SERVICE_HOME="$NONROOT_HOME"
+    fi
+
     # v10.0.1 (RHEL/SELinux): under SELinux enforcing, systemd (init_t) cannot
     # traverse the operator's home (user_home_dir_t) nor exec the gunicorn venv
     # there (user_home_t) — the service crash-loops with 203/EXEC and nothing
@@ -477,7 +758,15 @@ except Exception:
     # byte-identical to today's.
     SELINUX_DIRECTIVE=""
     if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" != "Disabled" ]; then
-        SELINUX_DIRECTIVE="SELinuxContext=system_u:system_r:unconfined_service_t:s0"
+        # Born-non-root + confined policy installed -> run in the dedicated,
+        # confined takwerx_console_t domain (permissive; see install_selinux_
+        # console_policy). Otherwise (root install, or confined build failed) use
+        # unconfined_service_t as before.
+        if [ "$BORN_NONROOT" = "1" ] && [ "${CONFINED_POLICY_OK:-0}" = "1" ]; then
+            SELINUX_DIRECTIVE="SELinuxContext=system_u:system_r:takwerx_console_t:s0"
+        else
+            SELINUX_DIRECTIVE="SELinuxContext=system_u:system_r:unconfined_service_t:s0"
+        fi
     fi
 
     cat > "$SERVICE_FILE" << EOF
@@ -488,7 +777,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-${SELINUX_DIRECTIVE:+$SELINUX_DIRECTIVE
+${SERVICE_USER_DIRECTIVE:+$SERVICE_USER_DIRECTIVE
+}${SELINUX_DIRECTIVE:+$SELINUX_DIRECTIVE
 }ExecStartPre=-$USE_DIR/.venv/bin/python3 $USE_DIR/selfheal_ip.py
 ExecStart=$GUNICORN_BIN $GUNICORN_ARGS app:app
 WorkingDirectory=$USE_DIR
@@ -515,32 +805,50 @@ EOF
 # policy version. No-op on non-SELinux hosts (Debian/Ubuntu: getenforce absent).
 # Validated on Rocky 9.6 under Enforcing (systemd-run init_t exec+import+read+bind
 # all succeed, zero denials).
-install_selinux_console_policy() {
-    command -v getenforce >/dev/null 2>&1 || return 0
-    [ "$(getenforce 2>/dev/null)" = "Disabled" ] && return 0
-    local te="$INSTALL_DIR/selinux/takwerx_console.te"
-    [ -f "$te" ] || { echo -e "${YELLOW}  ⚠ SELinux policy source missing ($te) — console may not start under enforcing${NC}"; return 0; }
-    # already current? (idempotent re-runs skip the rebuild)
-    if semodule -l 2>/dev/null | grep -q '^takwerx_console'; then
-        echo "  ✓ SELinux console policy already installed"
-        return 0
+# Build+install one raw checkmodule .te. Echoes its own status. Returns 0 on
+# success (module installed or already present), 1 otherwise.
+_install_selinux_module() {
+    local name="$1" te="$2"
+    [ -f "$te" ] || return 1
+    if semodule -l 2>/dev/null | grep -qx "$name"; then
+        return 0   # already installed (idempotent re-run)
     fi
-    if ! command -v checkmodule >/dev/null 2>&1; then
-        dnf install -y checkpolicy >/dev/null 2>&1 || true
-    fi
-    if ! command -v checkmodule >/dev/null 2>&1 || ! command -v semodule_package >/dev/null 2>&1; then
-        echo -e "${YELLOW}  ⚠ SELinux policy tools unavailable — console may not start under enforcing${NC}"
-        return 0
-    fi
-    local tmp; tmp=$(mktemp -d)
-    if checkmodule -M -m -o "$tmp/takwerx_console.mod" "$te" >/dev/null 2>&1 \
-       && semodule_package -o "$tmp/takwerx_console.pp" -m "$tmp/takwerx_console.mod" >/dev/null 2>&1 \
-       && semodule -i "$tmp/takwerx_console.pp" >/dev/null 2>&1; then
-        echo "  ✓ SELinux console policy installed (takwerx_console)"
-    else
-        echo -e "${YELLOW}  ⚠ SELinux console policy failed to install — console may not start under enforcing${NC}"
+    command -v checkmodule >/dev/null 2>&1 || dnf install -y checkpolicy >/dev/null 2>&1 || true
+    command -v checkmodule >/dev/null 2>&1 && command -v semodule_package >/dev/null 2>&1 || return 1
+    local tmp; tmp=$(mktemp -d); local rc=1
+    if checkmodule -M -m -o "$tmp/$name.mod" "$te" >/dev/null 2>&1 \
+       && semodule_package -o "$tmp/$name.pp" -m "$tmp/$name.mod" >/dev/null 2>&1 \
+       && semodule -i "$tmp/$name.pp" >/dev/null 2>&1; then
+        rc=0
     fi
     rm -rf "$tmp"
+    return $rc
+}
+
+install_selinux_console_policy() {
+    CONFINED_POLICY_OK=0
+    command -v getenforce >/dev/null 2>&1 || return 0
+    [ "$(getenforce 2>/dev/null)" = "Disabled" ] && return 0
+
+    # 1) The unconfined-helper policy (lets init_t exec the in-home venv +
+    #    transition to unconfined_service_t — used by the ROOT install path).
+    if _install_selinux_module takwerx_console "$INSTALL_DIR/selinux/takwerx_console.te"; then
+        echo "  ✓ SELinux console policy installed (takwerx_console)"
+    else
+        echo -e "${YELLOW}  ⚠ SELinux console policy failed — console may not start under enforcing${NC}"
+    fi
+
+    # 2) Born-non-root: the CONFINED domain (takwerx_console_t) — the console runs
+    #    in its own SELinux domain instead of unconfined_service_t. Ships
+    #    PERMISSIVE (logs AVCs, never blocks) for a safe rollout; enforcing is a
+    #    deliberate flip (drop the `permissive` line in the .te) after a fleet
+    #    soak — already validated to run a full deploy with 0 denials. Sets
+    #    CONFINED_POLICY_OK so create_service emits the takwerx_console_t context.
+    if [ "$BORN_NONROOT" = "1" ] \
+       && _install_selinux_module takwerx_console_confined "$INSTALL_DIR/selinux/takwerx_console_confined.te"; then
+        CONFINED_POLICY_OK=1
+        echo "  ✓ SELinux confined console domain installed (takwerx_console_t, permissive)"
+    fi
 }
 
 # ==========================================
@@ -549,6 +857,11 @@ install_selinux_console_policy() {
 detect_os
 check_disk_io
 wait_for_upgrades
+
+# Born-non-root: provision takwerx + relocate to /opt/infratak BEFORE the venv is
+# built, so .venv/.config/cert/unit all land in the non-root install. No-op unless
+# TAKWERX_NONROOT=1.
+provision_nonroot
 
 install_dependencies
 
@@ -562,6 +875,20 @@ generate_self_signed_cert
 
 # RHEL/SELinux: install the console policy module before the unit starts
 install_selinux_console_policy
+
+# Privileged broker (v10.0.5): install + start the root mediation daemon BEFORE
+# the console, so the broker socket is live by the time the console comes up.
+# Additive — the console still runs as root; this just makes the broker path
+# available (and provable via TAKWERX_FORCE_BROKER=1).
+install_broker
+
+# Born-non-root: provision Docker as root up front (the non-root console can't
+# install it later); no-op unless TAKWERX_NONROOT=1.
+ensure_docker_nonroot
+
+# Born-non-root: now that venv, .config and cert exist, hand the whole install to
+# takwerx (no-op unless TAKWERX_NONROOT=1).
+finalize_nonroot_ownership
 
 # Create and start systemd service
 create_service

@@ -6,6 +6,44 @@ REPO_DIR="$(dirname "$SCRIPT_DIR")"
 CONTAINER="nodered"
 NEW_FLOWS="$SCRIPT_DIR/flows.json"
 
+# v10.0.5 non-root: the console runs as the unprivileged `takwerx` user, which has
+# NO docker access (docker is mediated by the root broker). When run unprivileged
+# with the broker socket present, route every `docker` call through the broker's
+# CLI proxy. Byte-identical as root / on boxes without the broker.
+# `docker cp` OUT writes host files as root; for a destination OUTSIDE /tmp (e.g.
+# the in-tree flows.json) we stage via /tmp and copy it into place AS the console
+# user, so the tree file stays user-owned (git pull / Update Now keep working).
+_TKX_BROKER="${TAKWERX_BROKER:-$REPO_DIR/broker/takwerx_broker.py}"
+if [ "$(id -u)" -ne 0 ] && [ -S /run/takwerx-broker.sock ] && [ -f "$_TKX_BROKER" ]; then
+  docker() {
+    if [ "${1:-}" = "cp" ]; then
+      local _a=( "$@" ); local _n=${#_a[@]}
+      local _src="${_a[_n-2]}"; local _dst="${_a[_n-1]}"
+      # `docker cp container:->host`: the broker writes the dest as ROOT. Stage it
+      # in a user-owned, NON-STICKY temp dir, then copy into place + clean up AS
+      # the console user — so the dest ends up user-owned and a later `rm "$_dst"`
+      # by this script works. (We own the temp dir, so we can rm the root file
+      # inside it — which we couldn't do for a bare root file in sticky /tmp.)
+      if [[ "$_src" == *:* && "$_dst" != *:* ]]; then
+        local _sd _rc=0; _sd=$(mktemp -d)
+        if python3 "$_TKX_BROKER" exec -- docker cp "$_src" "$_sd/f"; then
+          cp -f "$_sd/f" "$_dst" || _rc=$?
+        else
+          _rc=1
+        fi
+        rm -rf "$_sd"
+        return $_rc
+      fi
+    fi
+    python3 "$_TKX_BROKER" exec -- docker "$@"
+  }
+  # Run a privileged HOST command (mkdir/install to /opt/tak, etc.) through the
+  # broker when unprivileged. No-op wrapper as root / without the broker.
+  _priv() { python3 "$_TKX_BROKER" exec -- "$@"; }
+else
+  _priv() { "$@"; }
+fi
+
 cd "$REPO_DIR"
 
 # Pull latest code (skip if called with --no-pull, e.g. from post-update auto-deploy)
@@ -62,7 +100,7 @@ NR_CTX_GLOBAL="/tmp/nr_ctx_global.json"
 NR_CTX_FLOW_CFG="/tmp/nr_ctx_flow_arcgis_cfg.json"
 PERSISTENT_CTX_BACKUP="/opt/tak/nodered-ctx-backup.json"
 rm -f "$NR_CTX_GLOBAL" "$NR_CTX_FLOW_CFG"
-mkdir -p /opt/tak
+_priv mkdir -p /opt/tak
 
 # Try Node-RED REST API first (live in-memory context — works for both memory and filesystem storage)
 NR_API_CTX=$(docker exec "$CONTAINER" curl -sf --max-time 8 http://localhost:1880/context/global 2>/dev/null || echo "")
@@ -325,7 +363,7 @@ rm -f /tmp/_nr_latest.json
 echo "    Context keys (live):  $(_ctx_summary "$NR_CTX_GLOBAL")"
 if _ctx_is_valid "$NR_CTX_GLOBAL"; then
   # Good live backup — also update the persistent snapshot for next time
-  cp "$NR_CTX_GLOBAL" "$PERSISTENT_CTX_BACKUP"
+  _priv install -m 644 "$NR_CTX_GLOBAL" "$PERSISTENT_CTX_BACKUP"
   echo "    Persistent snapshot updated: $PERSISTENT_CTX_BACKUP"
 elif _ctx_is_valid "$PERSISTENT_CTX_BACKUP"; then
   echo "    WARNING: live context has no saved configs — falling back to persistent snapshot"
