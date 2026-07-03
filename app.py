@@ -651,7 +651,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.0.5-alpha"
+VERSION = "10.0.6-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -8588,16 +8588,267 @@ def remote_assist_page():
     ra_url = f'https://{ra_host}' if ra_host else ''
     ra_vinfo = _get_remote_assist_version_info(fresh=True) if ra.get('installed') else {}
     ra_commit = settings.get('remote_assist_commit_sha', '')
+    coturn_ip = settings.get('coturn_ip', '')
+    coturn_port = str(settings.get('coturn_port') or '3478')
+    # Legacy-NetBird coturn detection + shared-mode health (Mike/cfd2474, PR #49)
+    _nb_has, _nb_ctr, _nb_conf = _netbird_coturn_status() if ra.get('installed') else (False, None, None)
+    netbird_coturn_in_use = bool(settings.get('netbird_coturn_in_use'))
     r = make_response(render_template_string(REMOTE_ASSIST_TEMPLATE,
         settings=settings, ra=ra, version=VERSION,
         authentik_installed=ak.get('installed'),
         ra_host=ra_host, ra_url=ra_url,
         ra_vinfo=ra_vinfo, ra_commit=ra_commit,
         remote_assist_logo_url=REMOTE_ASSIST_LOGO_URL,
+        coturn_installed=settings.get('coturn_installed', False),
+        coturn_username=settings.get('coturn_username', ''),
+        coturn_password=settings.get('coturn_password', ''),
+        coturn_ip=coturn_ip,
+        coturn_url=(f'turn:{coturn_ip}:{coturn_port}' if coturn_ip else ''),
+        coturn_suggested_port=('3479' if _nb_has else '3478'),
+        can_configure_nb_coturn=bool(_nb_has and _nb_ctr and _nb_conf),
+        netbird_coturn_in_use=netbird_coturn_in_use,
+        netbird_coturn_missing=(netbird_coturn_in_use and not _nb_ctr),
         deploying=_remote_assist_deploy_status.get('running', False),
         deploy_done=_remote_assist_deploy_status.get('complete', False)))
     r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
     return r
+
+
+# CoTURN image is PINNED (never :latest) — supply-chain rule. Bump deliberately.
+COTURN_IMAGE = 'coturn/coturn:4.14.0'
+# Restrict credentials to a safe charset with NO YAML/shell metacharacters. The
+# values are interpolated into docker-compose.override.yml (then `docker compose up`),
+# so an unvalidated newline/quote could inject arbitrary compose directives
+# (privileged:true, host bind-mounts) — under the non-root/broker model `docker
+# compose` is NOT gated by the broker's `docker run` mount checks, so that would be a
+# real escalation. This charset makes injection impossible.
+_COTURN_USER_RE = re.compile(r'^[A-Za-z0-9._@+=-]{1,64}$')
+_COTURN_PASS_RE = re.compile(r'^[A-Za-z0-9._@+=!%^-]{8,128}$')
+
+
+def _netbird_coturn_status():
+    """(has_netbird, coturn_container, turnserver_conf_host_path).
+
+    Detects a LEGACY/classic NetBird install that runs a SEPARATE coturn
+    container with a bind-mounted /etc/turnserver.conf — that conf can take an
+    extra static `user=` line for Remote Assist (Mike/cfd2474, PR #49). The
+    infra-TAK NetBird hub (all-in-one netbird-server image) embeds its
+    STUN/TURN, so it returns (True, None, None) → standalone CoTURN on an
+    alternate port is the path there."""
+    import subprocess as _sp
+    has_netbird, container, conf_path = False, None, None
+    try:
+        r = _sp.run(['docker', 'ps', '--format', '{{.Names}}'],
+                    capture_output=True, text=True, timeout=10)
+        names = [c.strip() for c in (r.stdout or '').splitlines() if c.strip()]
+        has_netbird = any('netbird' in c.lower() for c in names)
+        if has_netbird:
+            for c in names:
+                cl = c.lower()
+                # Exclude our own Remote Assist coturn ("remote_assist"/"remote-assist"
+                # compose project names) — only a coturn that belongs to NetBird counts.
+                if 'coturn' in cl and 'remote' not in cl and 'assist' not in cl and 'infratak' not in cl:
+                    container = c
+                    break
+            if container:
+                ri = _sp.run(['docker', 'inspect', container],
+                             capture_output=True, text=True, timeout=10)
+                data = json.loads(ri.stdout or '[]')
+                for mount in (data[0].get('Mounts', []) if data else []):
+                    if mount.get('Destination') == '/etc/turnserver.conf':
+                        conf_path = mount.get('Source')
+                        break
+    except Exception:
+        pass
+    return has_netbird, container, conf_path
+
+
+@app.route('/api/remote-assist/coturn/configure-netbird', methods=['POST'])
+@login_required
+def remote_assist_coturn_configure_netbird():
+    """Shared mode: append a DEDICATED static `user=` credential to a legacy
+    NetBird coturn's turnserver.conf instead of running a second TURN server.
+    Never reuses NetBird's own TURN secret — WebRTC creds are browser-visible."""
+    import subprocess as _sp
+    data = request.get_json(silent=True) or {}
+    username = (data.get('username') or '').strip()
+    password = (data.get('password') or '').strip()
+    # Same charsets as the standalone install: these values land in
+    # turnserver.conf, where an embedded newline would inject arbitrary
+    # coturn directives (listening-ip, cert paths, ...).
+    if not _COTURN_USER_RE.match(username):
+        return jsonify({'success': False, 'error': 'Username must be 1–64 chars: letters, digits, . _ @ + = -'})
+    if not _COTURN_PASS_RE.match(password):
+        return jsonify({'success': False, 'error': 'Password must be 8–128 chars: letters, digits, . _ @ + = ! % ^ - (no spaces/quotes).'})
+    has_nb, nb_container, conf_path = _netbird_coturn_status()
+    if not (has_nb and nb_container and conf_path):
+        return jsonify({'success': False, 'error': 'No NetBird coturn with a turnserver.conf mount found on this box.'})
+    settings = load_settings()
+    ip = (settings.get('server_ip') or '').strip()
+    if not _valid_core_ip(ip):
+        return jsonify({'success': False, 'error': 'Server public IP is not set — configure it on the Settings page first.'})
+    try:
+        # Never default to '' on a read failure — a blind write here would
+        # REPLACE NetBird's whole turnserver.conf with our single line.
+        try:
+            conf = _read_priv(conf_path)
+        except Exception as re_err:
+            return jsonify({'success': False, 'error': f'Could not read turnserver.conf ({str(re_err)[:120]}) — aborting without changes.'})
+        user_line = f'user={username}:{password}'
+        lines = conf.splitlines()
+        # Rotation must REVOKE: drop the previously-appended infra-TAK credential
+        # (tracked in settings) so re-configuring doesn't strand old creds live.
+        prev_user = settings.get('coturn_username', '')
+        prev_pass = settings.get('coturn_password', '')
+        prev_line = f'user={prev_user}:{prev_pass}' if prev_user else None
+        new_lines = [l for l in lines if not (prev_line and l.strip() == prev_line and l.strip() != user_line)]
+        if user_line not in [l.strip() for l in new_lines]:
+            new_lines.append(user_line)
+        if new_lines != lines:
+            _write_priv(conf_path, '\n'.join(new_lines).rstrip('\n') + '\n')
+            _sp.run(['docker', 'restart', nb_container], capture_output=True, timeout=90)
+        settings['coturn_installed'] = True
+        settings['coturn_username'] = username
+        settings['coturn_password'] = password
+        settings['coturn_ip'] = ip
+        settings['coturn_port'] = '3478'
+        settings['netbird_coturn_in_use'] = True
+        save_settings(settings)
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)[:300]})
+
+
+@app.route('/api/remote-assist/coturn/install', methods=['POST'])
+@login_required
+def remote_assist_coturn_install():
+    import subprocess as _sp
+    data = request.get_json(silent=True) or {}
+    username = (data.get('username') or '').strip()
+    password = (data.get('password') or '').strip()
+    ip = (data.get('ip') or '').strip()
+    port = str(data.get('port') or '3478').strip() or '3478'
+    if not username or not password or not ip:
+        return jsonify({'success': False, 'error': 'All fields are required.'})
+    if not _COTURN_USER_RE.match(username):
+        return jsonify({'success': False, 'error': 'Username must be 1–64 chars: letters, digits, . _ @ + = -'})
+    if not _COTURN_PASS_RE.match(password):
+        return jsonify({'success': False, 'error': 'Password must be 8–128 chars: letters, digits, . _ @ + = ! % ^ - (no spaces/quotes).'})
+    if not _valid_core_ip(ip):
+        return jsonify({'success': False, 'error': 'Public IP must be a valid IPv4 address.'})
+    # Port is interpolated into the compose override — digits only, sane range.
+    if not port.isdigit() or not (1024 <= int(port) <= 65535):
+        return jsonify({'success': False, 'error': 'Port must be a number between 1024 and 65535 (default 3478).'})
+
+    ra_dir = REMOTE_ASSIST_INSTALL_DIR
+    if not os.path.exists(ra_dir):
+        return jsonify({'success': False, 'error': 'EUD Remote Assist is not installed.'})
+    # NetBird also serves STUN/TURN on 3478, so publishing 3478 next to it fails
+    # ("port is already allocated"). Guide instead of dead-ending: legacy NetBird
+    # (separate coturn container) → the Configure-NetBird flow; the all-in-one
+    # hub → pick an alternate port (Mike/cfd2474, PR #49).
+    if port == '3478':
+        try:
+            _nb_has, _nb_ctr, _nb_conf = _netbird_coturn_status()
+            if _nb_has:
+                if _nb_ctr and _nb_conf:
+                    return jsonify({'success': False, 'error': 'Port 3478 is used by NetBird\'s coturn. Use "Configure NetBird CoTURN" to add Remote Assist credentials to it instead of running a second TURN server — or choose a different port (e.g. 3479).'})
+                return jsonify({'success': False, 'error': 'Port 3478 is used by NetBird (it provides STUN/TURN). Choose a different port (e.g. 3479) to run CoTURN alongside it.'})
+        except Exception:
+            pass
+    fqdn = (load_settings().get('fqdn') or 'remote-assist').strip()
+    override_path = os.path.join(ra_dir, 'docker-compose.override.yml')
+    # Inputs are charset-validated above, so this interpolation cannot break the YAML.
+    override_content = f"""services:
+  coturn:
+    image: {COTURN_IMAGE}
+    restart: unless-stopped
+    ports:
+      - "{port}:{port}/tcp"
+      - "{port}:{port}/udp"
+      - "50000-50050:50000-50050/udp"
+    command:
+      - -c
+      - ""
+      - --log-file=stdout
+      - --external-ip={ip}
+      - --listening-port={port}
+      - --listening-ip=0.0.0.0
+      - --min-port=50000
+      - --max-port=50050
+      - --user={username}:{password}
+      - --realm={fqdn}
+"""
+    try:
+        with open(override_path, 'w') as f:
+            f.write(override_content)
+        r = _sp.run(_remote_assist_compose_cmd(ra_dir, '-f', override_path, 'up', '-d', 'coturn'),
+                    cwd=ra_dir, capture_output=True, text=True, timeout=300)
+        if r.returncode != 0:
+            # docker compose writes pull PROGRESS to stderr, so the head of stderr is
+            # noise — surface the actual failure (last Error/failed line, e.g. a port
+            # conflict), and roll back the half-written override so a retry is clean.
+            _out = ((r.stderr or '') + '\n' + (r.stdout or '')).strip()
+            _lines = [l.strip() for l in _out.splitlines() if l.strip()]
+            _err = next((l for l in reversed(_lines)
+                         if any(k in l.lower() for k in ('error', 'failed', 'allocated', 'in use'))),
+                        (_lines[-1] if _lines else 'docker compose failed'))
+            try:
+                _sp.run(_remote_assist_compose_cmd(ra_dir, '-f', override_path, 'rm', '-sfv', 'coturn'),
+                        cwd=ra_dir, capture_output=True, timeout=60)
+                os.remove(override_path)
+            except Exception:
+                pass
+            if 'allocated' in _err.lower() or 'in use' in _err.lower():
+                _err = f'Port conflict: {port} is already in use by another service — pick a different port (e.g. 3479) and try again. ({_err})'
+            return jsonify({'success': False, 'error': _err[:400]})
+        settings = load_settings()
+        settings['coturn_installed'] = True
+        settings['coturn_username'] = username
+        settings['coturn_password'] = password
+        settings['coturn_ip'] = ip
+        settings['coturn_port'] = port
+        settings['netbird_coturn_in_use'] = False
+        save_settings(settings)
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)[:300]})
+
+
+@app.route('/api/remote-assist/coturn/uninstall', methods=['POST'])
+@login_required
+def remote_assist_coturn_uninstall():
+    import subprocess as _sp
+    ra_dir = REMOTE_ASSIST_INSTALL_DIR
+    override_path = os.path.join(ra_dir, 'docker-compose.override.yml')
+    try:
+        settings = load_settings()
+        if settings.get('netbird_coturn_in_use'):
+            # Shared mode: our only footprint is the appended user= line in
+            # NetBird's turnserver.conf — remove it, never touch NetBird itself.
+            _has_nb, nb_container, conf_path = _netbird_coturn_status()
+            user_line = f"user={settings.get('coturn_username', '')}:{settings.get('coturn_password', '')}"
+            if conf_path and settings.get('coturn_username'):
+                try:
+                    conf = _read_priv(conf_path)
+                    new_conf = '\n'.join(l for l in conf.splitlines() if l.strip() != user_line)
+                    if new_conf != conf:
+                        _write_priv(conf_path, new_conf.rstrip('\n') + '\n')
+                        if nb_container:
+                            _sp.run(['docker', 'restart', nb_container], capture_output=True, timeout=90)
+                except Exception:
+                    pass
+        elif os.path.exists(override_path):
+            _sp.run(_remote_assist_compose_cmd(ra_dir, '-f', override_path, 'rm', '-s', '-v', '-f', 'coturn'),
+                    cwd=ra_dir, capture_output=True, text=True, timeout=120)
+            os.remove(override_path)
+        for k in ('coturn_installed', 'coturn_username', 'coturn_password', 'coturn_ip',
+                  'coturn_port', 'netbird_coturn_in_use'):
+            settings.pop(k, None)
+        save_settings(settings)
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)[:300]})
 
 
 @app.route('/api/remote-assist/deploy', methods=['POST'])
@@ -9329,6 +9580,7 @@ PORT_EXPOSURE_POLICY = [
     {'module': 'mediamtx',   'label': 'MediaMTX RTSP',      'port': 8554, 'tier': 1, 'why': 'Streaming clients (auth+token)'},
     {'module': 'mediamtx',   'label': 'MediaMTX HLS',       'port': 8888, 'tier': 3, 'why': 'Reached via Caddy 443'},
     {'module': 'mediamtx',   'label': 'MediaMTX web-editor','port': 5080, 'tier': 3, 'why': 'Reached via Caddy 443'},
+    {'module': 'remote_assist', 'label': 'CoTURN STUN/TURN', 'port': 3478, 'tier': 1, 'why': 'WebRTC NAT traversal — peers connect directly (public by design)'},
     {'module': 'guarddog',   'label': 'Guard Dog health agent', 'port': 8080, 'tier': 5, 'why': 'Reachable from console only (two-server)'},
 ]
 
@@ -9344,6 +9596,7 @@ _KNOWN_PUBLIC_PORTS = {
     1935, 8555, 3100,                     # TAK Video Restreamer (RTMP 1935, RTSP 8554-8555, web 3100)
     25,                                   # Email Relay (localhost-bound normally)
     8080,                                 # Guard Dog health agent (two-server, source-scoped)
+    3478,                                 # CoTURN STUN/TURN (public by design; UDP relay range 50000-50050 never shows in the TCP-only sweep)
 }
 
 _exposure_cache = {'ts': 0.0, 'data': None}
@@ -9511,11 +9764,17 @@ def _exposure_report(force=False):
 
     rows = []
     red = yellow = 0
+    try:
+        coturn_port = int(settings.get('coturn_port') or 3478)
+    except Exception:
+        coturn_port = 3478
     for ent in PORT_EXPOSURE_POLICY:
         mod = ent['module']
         if mod is not None and mod not in installed:
             continue
         port = ent['port'] if ent['port'] is not None else console_port
+        if mod == 'remote_assist' and ent['port'] == 3478:
+            port = coturn_port  # CoTURN can run on an alternate port beside NetBird
         bind = _exposure_bind_of(port, listen_map)
         sev, note = _exposure_verdict(ent['tier'], bind, fw_states.get(port))
         if sev == 'alert':
@@ -9531,7 +9790,7 @@ def _exposure_report(force=False):
     # not reachable (e.g. rpcbind :111, which start.sh never opens), so it's not an
     # exposure — only flag listeners that are firewall-open, or where there's no
     # enabled host firewall to stop them.
-    known = set(_KNOWN_PUBLIC_PORTS) | {console_port, 22}
+    known = set(_KNOWN_PUBLIC_PORTS) | {console_port, 22, coturn_port}
     fw_enabled = bool(fwstatus.get('enabled'))
     blocked = 0
     undeclared = []
@@ -19186,8 +19445,13 @@ def _get_caddy_version_info():
             if m:
                 out['version'] = 'v' + m.group(1).strip()
         if out['version']:
-            apt = _priv_pipe(['apt', 'list', '--upgradable'], ['grep', '-i', 'caddy'], timeout=10)
-            if apt.returncode == 0 and (apt.stdout or '').strip():
+            # Family-branched: bare `apt` on RHEL raised FileNotFoundError every
+            # poll (benign but noisy in the broker audit log — seen on aws-rocky).
+            if _distro_family() == 'rhel':
+                chk = _priv_pipe(['dnf', '-q', 'check-update', 'caddy'], ['grep', '-i', 'caddy'], timeout=15)
+            else:
+                chk = _priv_pipe(['apt', 'list', '--upgradable'], ['grep', '-i', 'caddy'], timeout=10)
+            if chk.returncode == 0 and (chk.stdout or '').strip():
                 out['update_available'] = True
     except (subprocess.TimeoutExpired, OSError):
         pass
@@ -25223,6 +25487,10 @@ def run_email_deploy(provider_key, smtp_user, smtp_pass, from_addr, from_name):
 # TAKWERX Email Relay — managed by TAK-infra
 inet_interfaces = all
 mynetworks = 127.0.0.0/8 [::1]/128 172.16.0.0/12
+# Send-only smarthost: never treat the base domain as a local destination
+# (default mydestination includes $mydomain -> 550 "User unknown in local
+# recipient table" for any address at the TAK base domain, GH #48)
+mydestination = $myhostname, localhost.localdomain, localhost
 relayhost = [{relay_host}]:{relay_port}
 smtp_sasl_auth_enable = yes
 smtp_sasl_password_maps = hash:/etc/postfix/sasl_passwd
@@ -25248,6 +25516,9 @@ smtp_generic_maps = hash:/etc/postfix/generic
             existing = re.sub(r'^\s*relayhost\s*=.*$', '', existing, flags=re.MULTILINE)
             # Remove any existing mynetworks (we set it in our block for Docker relay)
             existing = re.sub(r'^\s*mynetworks\s*=.*$', '', existing, flags=re.MULTILINE)
+            # Remove any existing mydestination (package default includes $mydomain,
+            # which makes same-domain mail bounce locally — GH #48; ours wins)
+            existing = re.sub(r'^\s*mydestination\s*=.*$', '', existing, flags=re.MULTILINE)
             existing = existing.rstrip()
         _write_priv(main_cf_path, existing + '\n' + main_cf_additions)
         plog("✓ main.cf configured")
@@ -25819,8 +26090,8 @@ services:
     entrypoint: /bin/bash -c "service cron start && chmod +x /webodm/*.sh && /bin/bash -c \\"/webodm/wait-for-postgres.sh wo_db /webodm/wait-for-it.sh -t 0 wo_broker:6379 -- /webodm/start.sh\\""
     volumes:
       - {wo_dir}/media:/webodm/app/media:z
-      - {wo_dir}/plugins/webodm-tak-overlay:/webodm/app/media/plugins/webodm-tak-overlay:z
       - {wo_dir}/plugins/webodm-tak-overlay:/webodm/coreplugins/tak_incident_overlay:z
+      - {wo_dir}/local_settings.py:/webodm/webodm/local_settings.py:ro,z
     ports:
       - "127.0.0.1:{wo_port}:8000"
     depends_on:
@@ -25842,8 +26113,8 @@ services:
     entrypoint: /bin/bash -c "/webodm/wait-for-postgres.sh wo_db /webodm/wait-for-it.sh -t 0 wo_broker:6379 -- /webodm/worker.sh start"
     volumes:
       - {wo_dir}/media:/webodm/app/media:z
-      - {wo_dir}/plugins/webodm-tak-overlay:/webodm/app/media/plugins/webodm-tak-overlay:z
       - {wo_dir}/plugins/webodm-tak-overlay:/webodm/coreplugins/tak_incident_overlay:z
+      - {wo_dir}/local_settings.py:/webodm/webodm/local_settings.py:ro,z
     depends_on:
       - wo_db
       - wo_broker
@@ -25871,6 +26142,112 @@ def _webodm_deploy_log(msg, status=None):
     _webodm_deploy_status['log'].append(msg)
     if status:
         _webodm_deploy_status.update(status)
+
+
+WEBODM_LOCAL_SETTINGS_STUB = (
+    '# Managed by infra-TAK. OIDC login config is written here after the\n'
+    '# Authentik step of a WebODM deploy (GH #50). Do not edit by hand.\n'
+)
+
+
+def _webodm_local_settings_content(settings, client_id, client_secret):
+    """Render WebODM's local_settings.py enabling native OIDC login against
+    Authentik. WebODM >= 3.2.2 (app/oidc_providers.py) requires exactly these
+    keys: name, client_id, client_secret, auth_endpoint, token_endpoint,
+    userinfo_endpoint — a missing/empty key silently disables the provider."""
+    ak_base = _get_authentik_base_url(settings)
+    return (
+        '# Managed by infra-TAK — WebODM native OIDC login via Authentik (GH #50).\n'
+        '# Rewritten on WebODM deploy and Authentik repair. Do not edit by hand.\n'
+        'OIDC_AUTH_PROVIDERS = [{\n'
+        "    'name': 'Authentik',\n"
+        f"    'client_id': {json.dumps(client_id)},\n"
+        f"    'client_secret': {json.dumps(client_secret)},\n"
+        f"    'auth_endpoint': {json.dumps(ak_base + '/application/o/authorize/')},\n"
+        f"    'token_endpoint': {json.dumps(ak_base + '/application/o/token/')},\n"
+        f"    'userinfo_endpoint': {json.dumps(ak_base + '/application/o/userinfo/')},\n"
+        '}]\n'
+    )
+
+
+def _webodm_apply_oidc_local_settings(settings, client_id, client_secret, plog=None):
+    """Write {wo_dir}/local_settings.py with the OIDC provider block and restart
+    the WebODM containers when it changed. Handles local installs (incl. a
+    flipped box keeping /root/webodm — broker-routed reads/writes) and remote
+    deployments. The webapp/worker only pick the file up through the compose
+    mount, so on pre-mount installs we write the file and tell the operator a
+    redeploy is needed instead of restarting for nothing."""
+    def log(msg):
+        if plog:
+            plog(msg)
+    if not client_id or not client_secret:
+        return False
+    content = _webodm_local_settings_content(settings, client_id, client_secret)
+    deploy_cfg = _get_module_deployment_config(settings, 'webodm_deployment')
+    try:
+        if deploy_cfg.get('target_mode') == 'remote':
+            if not deploy_cfg.get('deployed'):
+                return False
+            wo_dir = (deploy_cfg.get('remote', {}).get('_resolved_wo_dir') or '~/webodm').strip()
+            ok, existing = _module_run(deploy_cfg,
+                f'cat {wo_dir}/local_settings.py 2>/dev/null; true', timeout=15)
+            ok_m, _ = _module_run(deploy_cfg,
+                f'grep -q local_settings.py {wo_dir}/docker-compose.yml', timeout=15)
+            mount_present = bool(ok_m)
+            if ok and (existing or '').strip() == content.strip():
+                if mount_present:
+                    log('  ✓ WebODM OIDC login already configured')
+                else:
+                    log('  ⚠ OIDC creds written, but the running compose predates the local_settings mount — redeploy WebODM to activate one-click login')
+                return True
+            import tempfile as _tf
+            with _tf.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as tf:
+                tf.write(content)
+                tmp_ls = tf.name
+            try:
+                ok_cp, _ = _module_copy(deploy_cfg, tmp_ls, f'{wo_dir}/local_settings.py', log_fn=plog)
+            finally:
+                try:
+                    os.unlink(tmp_ls)
+                except Exception:
+                    pass
+            if not ok_cp:
+                log('  ⚠ Could not write local_settings.py on remote — WebODM keeps manual login')
+                return False
+            _module_run(deploy_cfg, f'chmod 600 {wo_dir}/local_settings.py', timeout=15)
+            if not mount_present:
+                log('  ⚠ OIDC creds written, but the running compose predates the local_settings mount — redeploy WebODM to activate one-click login')
+                return True
+            _module_run(deploy_cfg, 'docker restart webapp wo_worker 2>&1', timeout=120)
+            log('  ✓ WebODM native OIDC login configured (webapp restarted)')
+            return True
+
+        wo_dir = _webodm_dir()   # ~/webodm OR (flipped box) /root/webodm
+        compose_path = os.path.join(wo_dir, 'docker-compose.yml')
+        try:
+            compose_txt = _read_priv(compose_path)
+        except Exception:
+            return False   # WebODM not installed locally
+        ls_path = os.path.join(wo_dir, 'local_settings.py')
+        try:
+            existing = _read_priv(ls_path)
+        except Exception:
+            existing = ''
+        mount_present = 'local_settings.py' in compose_txt
+        if existing.strip() == content.strip() and mount_present:
+            log('  ✓ WebODM OIDC login already configured')
+            return True
+        _write_priv(ls_path, content, perm=0o600)
+        if not mount_present:
+            log('  ⚠ OIDC creds written, but the running compose predates the local_settings mount — redeploy WebODM to activate one-click login')
+            return True
+        subprocess.run(_sudo_wrap(['docker', 'restart', 'webapp', 'wo_worker']),
+                       capture_output=True, timeout=120)
+        log('  ✓ WebODM native OIDC login configured (webapp restarted)')
+        return True
+    except Exception as e:
+        log(f'  ⚠ WebODM OIDC local_settings error: {str(e)[:120]}')
+        return False
 
 
 def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
@@ -25906,7 +26283,12 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
 
     # Create directory structure on remote
     plog('━━━ Creating directories (remote) ━━━')
-    ok, out = _module_run(deploy_cfg, f'mkdir -p {wo_dir_remote}/plugins {wo_dir_remote}/media {wo_dir_remote}/db', timeout=15, log_fn=plog)
+    # local_settings.py must exist before `compose up` — Docker would otherwise
+    # create a DIRECTORY at the mount source. touch keeps existing OIDC creds.
+    ok, out = _module_run(deploy_cfg,
+        f'mkdir -p {wo_dir_remote}/plugins {wo_dir_remote}/media {wo_dir_remote}/db && '
+        f'touch {wo_dir_remote}/local_settings.py && chmod 600 {wo_dir_remote}/local_settings.py',
+        timeout=15, log_fn=plog)
     if not ok:
         plog(f'✗ mkdir failed: {out}')
         _webodm_deploy_status.update({'running': False, 'error': True})
@@ -25918,7 +26300,11 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
     ok, out = _module_run(deploy_cfg,
         f'rm -rf {wo_dir_remote}/plugins/webodm-tak-overlay && '
         f'git clone --depth=1 https://github.com/Humble-Helper-96/webodm-tak-overlay.git '
-        f'{wo_dir_remote}/plugins/webodm-tak-overlay 2>&1',
+        f'{wo_dir_remote}/plugins/webodm-tak-overlay 2>&1 && '
+        # Upstream ships an empty __init__.py; WebODM needs Plugin re-exported
+        # at package level or the plugin never loads (GH #50).
+        f'{{ grep -q Plugin {wo_dir_remote}/plugins/webodm-tak-overlay/__init__.py 2>/dev/null || '
+        f'echo from .plugin import Plugin > {wo_dir_remote}/plugins/webodm-tak-overlay/__init__.py; }}',
         timeout=90, log_fn=plog)
     if not ok:
         plog(f'✗ Plugin clone failed: {(out or "")[-300:]}')
@@ -26065,7 +26451,6 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
 def _run_webodm_deploy(settings):
     import subprocess as _sp
     import secrets as _sec
-    import shutil as _sh
     plog = _webodm_deploy_log
     deploy_cfg = _get_module_deployment_config(settings, 'webodm_deployment')
     if deploy_cfg.get('target_mode') == 'remote':
@@ -26075,6 +26460,16 @@ def _run_webodm_deploy(settings):
     wo_port = settings.get('webodm_port', 8765)
     plugin_dir = os.path.join(wo_dir, 'plugins', 'webodm-tak-overlay')
     compose_path = os.path.join(wo_dir, 'docker-compose.yml')
+    # Reapply guard: on a box flipped from root, a root-era install lives at
+    # /root/webodm (deliberately not re-homed). Deploying to ~/webodm there
+    # would create a SECOND install and orphan the existing projects/DB.
+    _existing_dir = _webodm_dir()
+    if _existing_dir != wo_dir:
+        plog(f'ERROR: existing WebODM install found at {_existing_dir} (root-era install on a non-root box). '
+             f'An in-place reapply would create a second install at {wo_dir} and orphan the existing data. '
+             f'Uninstall WebODM from the console first, then deploy fresh.')
+        _webodm_deploy_status.update({'running': False, 'error': True})
+        return
     try:
         plog('Creating directories…')
         for sub in ['', 'plugins', 'media', 'db']:
@@ -26082,13 +26477,40 @@ def _run_webodm_deploy(settings):
 
         plog('Installing TAK overlay plugin…')
         if os.path.isdir(plugin_dir):
-            _sh.rmtree(plugin_dir)
+            # Broker-routed: the running container (root) drops __pycache__/*.pyc
+            # into the bind-mounted plugin dir, which plain rmtree can't remove
+            # under the non-root console (reapply path; fresh deploys never hit it).
+            subprocess.run(_sudo_wrap(['rm', '-rf', plugin_dir]),
+                           capture_output=True, timeout=60, check=True)
         r = _sp.run(['git', 'clone', '--depth=1',
                      'https://github.com/Humble-Helper-96/webodm-tak-overlay.git',
                      plugin_dir], capture_output=True, text=True, timeout=60)
         if r.returncode != 0:
             raise RuntimeError(f'Plugin clone failed: {r.stderr[:300]}')
         plog(f'Plugin cloned: {plugin_dir}')
+        # The plugin repo ships an EMPTY __init__.py, but WebODM's loader does
+        # getattr(<package>, "Plugin") — without a package-level re-export the
+        # plugin never instantiates and silently never appears (GH #50).
+        init_py = os.path.join(plugin_dir, '__init__.py')
+        try:
+            with open(init_py) as f:
+                _init_ok = 'Plugin' in f.read()
+        except OSError:
+            _init_ok = False
+        if not _init_ok:
+            with open(init_py, 'w') as f:
+                f.write('from .plugin import Plugin\n')
+            plog('Patched plugin __init__.py (re-export Plugin for the WebODM loader)')
+
+        # local_settings.py must exist before `compose up` — Docker would otherwise
+        # create a DIRECTORY at the mount source. A reapply keeps existing OIDC creds;
+        # the file can be ROOT-owned (the Authentik sweep writes it via the broker on
+        # non-root boxes), so chmod must be broker-routed too.
+        ls_path = os.path.join(wo_dir, 'local_settings.py')
+        if not os.path.exists(ls_path):
+            with open(ls_path, 'w') as f:
+                f.write(WEBODM_LOCAL_SETTINGS_STUB)
+        _chmod_priv(ls_path, 0o600)
 
         plog('Writing docker-compose.yml…')
         wo_secret = _sec.token_hex(32)
@@ -28027,6 +28449,147 @@ def _ensure_authentik_webodm_app(fqdn, ak_token, plog=None, flow_pk=None, inv_fl
             log("  ⚠ Could not create or find WebODM proxy provider")
     except Exception as e:
         log(f"  ⚠ Forward auth setup error: {str(e)[:100]}")
+
+    # ── Native OIDC login (GH #50) — WebODM >= 3.2.2 ships first-party OIDC
+    # (app/views/oidc.py): an OAuth2 provider here + OIDC_AUTH_PROVIDERS in the
+    # mounted local_settings.py turns WebODM's login page into a single
+    # "Login with Authentik" button, killing the double login behind
+    # forward_auth. The proxy provider above stays in front (defense in depth).
+    # WebODM calls the token/userinfo endpoints from inside the webapp
+    # container with verify=True, so this needs the public https Authentik URL
+    # presenting a cert the container's CA bundle trusts (LE / public custom).
+    try:
+        ak_public = _get_authentik_base_url(settings) if settings else ''
+        if not ak_public.startswith('https://'):
+            log('  ⚠ No public https Authentik URL — skipping WebODM OIDC login setup')
+            return True
+        wo_base = f'https://{_get_service_domain(settings, "webodm") if settings else f"webodm.{fqdn}"}'
+        redirect_uris_obj = [{'matching_mode': 'strict', 'url': f'{wo_base}/oidc/callback/'}]
+
+        # Signing key + openid/email/profile scope mappings (NetBird pattern —
+        # WebODM requests scope "openid email").
+        signing_key_pk = None
+        try:
+            req = _urlreq.Request(f'{_ak_url}/api/v3/crypto/certificatekeypairs/?has_key=true&ordering=name&page_size=50', headers=_ak_headers)
+            certs = json.loads(_urlreq.urlopen(req, timeout=15).read().decode()).get('results', [])
+            signing_key_pk = next((c['pk'] for c in certs if 'authentik' in (c.get('name') or '').lower() and 'self-signed' in (c.get('name') or '').lower()),
+                                  certs[0]['pk'] if certs else None)
+        except Exception:
+            pass
+        scope_mapping_pks = []
+        try:
+            req = _urlreq.Request(f'{_ak_url}/api/v3/propertymappings/provider/scope/?ordering=scope_name&page_size=50', headers=_ak_headers)
+            mappings = json.loads(_urlreq.urlopen(req, timeout=15).read().decode()).get('results', [])
+            scope_mapping_pks = [m['pk'] for m in mappings if m.get('scope_name') in ('openid', 'email', 'profile')]
+        except Exception:
+            pass
+        _oidc_extras = {}
+        if signing_key_pk:
+            _oidc_extras['signing_key'] = signing_key_pk
+        if scope_mapping_pks:
+            _oidc_extras['property_mappings'] = scope_mapping_pks
+
+        _oidc_name = 'WebODM OIDC'
+        oidc_pk, client_id, client_secret = None, '', ''
+        # Reuse an existing provider (keeps client_id/secret stable across
+        # deploys/repairs); heal redirect_uris + grant_types on it. A provider
+        # missing its secret is useless — delete and recreate.
+        try:
+            req = _urlreq.Request(f'{_ak_url}/api/v3/providers/oauth2/?search=WebODM', headers=_ak_headers)
+            for ex in json.loads(_urlreq.urlopen(req, timeout=15).read().decode())['results']:
+                if ex.get('name') != _oidc_name:
+                    continue
+                req = _urlreq.Request(f'{_ak_url}/api/v3/providers/oauth2/{ex["pk"]}/', headers=_ak_headers)
+                detail = json.loads(_urlreq.urlopen(req, timeout=15).read().decode())
+                if detail.get('client_id') and detail.get('client_secret'):
+                    oidc_pk, client_id, client_secret = ex['pk'], detail['client_id'], detail['client_secret']
+                    patch = {'redirect_uris': redirect_uris_obj, 'client_type': 'confidential',
+                             'grant_types': ['authorization_code', 'refresh_token']}
+                    patch.update(_oidc_extras)
+                    try:
+                        req = _urlreq.Request(f'{_ak_url}/api/v3/providers/oauth2/{oidc_pk}/',
+                            data=json.dumps(patch).encode(), headers=_ak_headers, method='PATCH')
+                        _urlreq.urlopen(req, timeout=10)
+                    except Exception:
+                        pass
+                    log('  ✓ WebODM OIDC provider already exists (healed)')
+                else:
+                    try:
+                        req = _urlreq.Request(f'{_ak_url}/api/v3/providers/oauth2/{ex["pk"]}/',
+                            headers=_ak_headers, method='DELETE')
+                        _urlreq.urlopen(req, timeout=10)
+                    except Exception:
+                        pass
+                break
+        except Exception:
+            pass
+        if not oidc_pk:
+            payload = {
+                'name': _oidc_name,
+                'authorization_flow': flow_pk,
+                'invalidation_flow': inv_flow_pk,
+                'client_type': 'confidential',
+                'redirect_uris': redirect_uris_obj,
+                # grant_types defaults to EMPTY on Authentik 2024.x+ create — an
+                # empty list rejects every OIDC login before the user sees a
+                # form (the NetBird/FedHub trap). Set it explicitly.
+                'grant_types': ['authorization_code', 'refresh_token'],
+            }
+            payload.update(_oidc_extras)
+            req = _urlreq.Request(f'{_ak_url}/api/v3/providers/oauth2/',
+                data=json.dumps(payload).encode(), headers=_ak_headers, method='POST')
+            p = json.loads(_urlreq.urlopen(req, timeout=15).read().decode())
+            oidc_pk, client_id, client_secret = p.get('pk'), p.get('client_id', ''), p.get('client_secret', '')
+            log(f'  ✓ WebODM OIDC provider created, client_id={client_id[:8]}...')
+
+        # Separate application — an Authentik app holds ONE provider and the
+        # 'webodm' app already carries the proxy provider. blank://blank keeps
+        # this one out of the user launcher (same trick as the SSO connector).
+        try:
+            req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/',
+                data=json.dumps({'name': _oidc_name, 'slug': 'webodm-oidc',
+                    'provider': oidc_pk, 'meta_launch_url': 'blank://blank'}).encode(),
+                headers=_ak_headers, method='POST')
+            _urlreq.urlopen(req, timeout=10)
+            log("  ✓ Application 'WebODM OIDC' created")
+        except Exception as e:
+            if hasattr(e, 'code') and e.code == 400:
+                try:
+                    req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/webodm-oidc/',
+                        data=json.dumps({'provider': oidc_pk, 'meta_launch_url': 'blank://blank'}).encode(),
+                        headers=_ak_headers, method='PATCH')
+                    _urlreq.urlopen(req, timeout=10)
+                except Exception:
+                    pass
+                log("  ✓ Application 'WebODM OIDC' updated")
+            else:
+                log(f'  ⚠ WebODM OIDC application error: {str(e)[:80]}')
+
+        # webadmin ships WITHOUT an email, but WebODM's OIDC callback hard-requires
+        # a non-empty email claim ("OIDC claims missing required sub or email" →
+        # generic "SSO login failed"; field: aws-rocky 2026-07-02). Heal an empty
+        # email with a deterministic synthetic address on the box FQDN. Other
+        # operator-created users must have an email set in Authentik to use SSO.
+        try:
+            req = _urlreq.Request(f'{_ak_url}/api/v3/core/users/?search=webadmin', headers=_ak_headers)
+            _wa_users = json.loads(_urlreq.urlopen(req, timeout=10).read().decode())['results']
+            _wa = next((u for u in _wa_users if u.get('username') == 'webadmin'), None)
+            if _wa and not (_wa.get('email') or '').strip():
+                _wa_email = f'webadmin@{fqdn.split(":")[0]}'
+                req = _urlreq.Request(f'{_ak_url}/api/v3/core/users/{_wa["pk"]}/',
+                    data=json.dumps({'email': _wa_email}).encode(),
+                    headers=_ak_headers, method='PATCH')
+                _urlreq.urlopen(req, timeout=10)
+                log(f'  ✓ webadmin had no email — set {_wa_email} (WebODM OIDC login requires an email claim)')
+        except Exception:
+            pass
+
+        if oidc_pk and client_id and client_secret and settings:
+            _webodm_apply_oidc_local_settings(settings, client_id, client_secret, plog=plog)
+        elif not client_secret:
+            log('  ⚠ No OIDC client secret — WebODM keeps manual login only')
+    except Exception as e:
+        log(f'  ⚠ WebODM OIDC setup error: {str(e)[:120]}')
     return True
 
 
@@ -39417,6 +39980,10 @@ def _apply_authentik_pg_tuning(ak_dir, plog):
                 _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'postgresql']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120
             )
             plog("  ✓ PostgreSQL recreated with enterprise tuning (max_connections=2000, shared_buffers=12GB, effective_cache_size=36GB, work_mem=16MB, maintenance_work_mem=2GB, wal_buffers=64MB, max_wal_size=4GB, statement_timeout=120s, idle_session_timeout=300s)")
+            # The patch may also have ADDED services (redis) — a targeted recreate
+            # doesn't start those; full up -d is an idempotent no-op otherwise.
+            subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ak_dir,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180)
         else:
             _run_priv_chain([['docker', 'compose', 'exec', '-T', 'postgresql', 'psql', '-U', 'authentik', '-d', 'authentik', '-c', 'SELECT pg_reload_conf();']], 'and', timeout=15, cwd=ak_dir)
             plog("  ✓ PostgreSQL: tuning already current, config reloaded")
@@ -46514,6 +47081,17 @@ def _authentik_fix_pg_idle_timeout(plog):
         plog(f"  ✗ pg idle timeout: Postgres recreate exception: {e}")
         return False
 
+    # The compose patch above may also have ADDED services (redis on pre-v0.9.17
+    # composes). A service declared in compose but never `up`'d has ZERO container —
+    # the targeted postgresql recreate doesn't start it (seen live: console restart
+    # brought up pgbouncer but not redis). Full up -d is an idempotent no-op otherwise.
+    try:
+        subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ak_dir,
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180)
+        plog("  ✓ pg idle timeout: compose up -d — any newly declared services (redis) started")
+    except Exception as _up_e:
+        plog(f"  ⚠ pg idle timeout: full compose up -d failed (non-fatal): {str(_up_e)[:120]}")
+
     plog("  pg idle timeout: waiting up to 60s for Postgres to be ready")
     pg_ready = False
     for _attempt in range(12):
@@ -47550,6 +48128,9 @@ entries:
                     if webadmin_pass:
                         try:
                             user_data = {'username': 'webadmin', 'name': 'TAK Admin', 'is_active': True,
+                                # Synthetic email — WebODM's OIDC login (and any OIDC consumer
+                                # requiring an email claim) fails on an email-less user.
+                                'email': f'webadmin@{(fqdn or "tak.local").split(":")[0]}',
                                 'groups': [group_pk] if group_pk else []}
                             req = urllib.request.Request(f'{ak_url}/api/v3/core/users/',
                                 data=json.dumps(user_data).encode(), headers=ak_headers, method='POST')
@@ -51175,6 +51756,9 @@ def _ensure_authentik_webadmin(skip_bind_verify=False):
                 # Keep webadmin as a true admin account in Authentik even when TAK was deployed first.
                 'is_superuser': True,
                 'path': 'users',
+                # Synthetic email — WebODM's OIDC login (and any OIDC consumer
+                # requiring an email claim) fails on an email-less user.
+                'email': f'webadmin@{((settings.get("fqdn") or "tak.local").strip() or "tak.local").split(":")[0]}',
                 'groups': [group_pk] if group_pk else []
             }
             req_local = _req.Request(f'{url}/api/v3/core/users/', data=json.dumps(ud).encode(), headers=headers, method='POST')
@@ -55119,7 +55703,46 @@ def _tak_snapshot(label, plog=None):
         _snap_tak_cfg = _get_tak_deployment_config(_snap_settings)
         _snap_two_server = _snap_tak_cfg.get('mode') == 'two_server'
         _snap_s1 = _snap_tak_cfg.get('server_one', {})
-        if _snap_two_server and _snap_s1.get('host'):
+        _snap_edb = _snap_tak_cfg.get('external_db', {}) if _snap_tak_cfg.get('mode') == 'external_db' else {}
+        if _snap_edb.get('host'):
+            # external_db / RDS: the DB is managed (no SSH, no local postgres) — dump over
+            # TCP with the client pg_dump. Stream to a console-writable temp, then broker-cp
+            # into the root-owned snapshot dir (same pattern as the two-server branch).
+            # Previously this mode fell through to the local branch: non-root skipped
+            # "deferred", root hard-failed (no local postgres OS user). PLAN-v10.0.6 §3.
+            import shutil as _shu
+            _eh = _snap_edb['host']
+            _ep = int(_snap_edb.get('port') or 5432)
+            _en = _snap_edb.get('name') or 'cot'
+            _eu = _snap_edb.get('user') or 'martiuser'
+            if not _shu.which('pg_dump'):
+                plog("  snapshot: external-DB mode but no pg_dump client on this box — DB dump skipped "
+                     "(managed-DB automated backups still apply; install postgresql client tools to capture dumps in snapshots)")
+            else:
+                plog(f"  snapshot: external-DB mode — pg_dump over TCP from {_eh}:{_ep}")
+                import tempfile
+                _fd, _tmp_dump = tempfile.mkstemp(prefix='cot-snap-', suffix='.pgdump')
+                os.close(_fd)
+                try:
+                    _pg_env = dict(os.environ)
+                    _pg_env['PGPASSWORD'] = _snap_edb.get('password') or ''
+                    with open(_tmp_dump, 'wb') as _f:
+                        r2 = subprocess.run(
+                            ['pg_dump', '-Fc', '-h', _eh, '-p', str(_ep), '-U', _eu, '-d', _en],
+                            stdout=_f, stderr=subprocess.PIPE, timeout=600, env=_pg_env)
+                    if r2.returncode == 0 and os.path.getsize(_tmp_dump) > 0:
+                        _cp = subprocess.run(_sudo_wrap(['cp', _tmp_dump, pg_dump_path]), capture_output=True, timeout=120)
+                        if _cp.returncode == 0:
+                            meta['db_dump'] = True
+                            plog(f"  snapshot: cot pg_dump (external DB {_eh}) written ({os.path.getsize(_tmp_dump) // 1024} KB)")
+                        else:
+                            plog(f"  snapshot: pg_dump copy into snapshot FAILED: {(_cp.stderr or b'').decode()[:160]}")
+                    else:
+                        plog(f"  snapshot: external-DB pg_dump FAILED (check network path + client-vs-server version): {(r2.stderr or b'').decode()[:200]}")
+                finally:
+                    try: os.remove(_tmp_dump)
+                    except Exception: pass
+        elif _snap_two_server and _snap_s1.get('host'):
             plog("  snapshot: two-server mode — streaming pg_dump from Server One via SSH")
             _ssh_dump_cmd = 'sudo -u postgres pg_dump -Fc cot'
             _host = (_snap_s1.get('host') or '').strip()
@@ -55412,86 +56035,119 @@ _snapshot_log   = []
 _snapshot_status = {'running': False, 'complete': False, 'error': False}
 
 def _tak_setup_snapshot_schedule(plog=None):
-    """v0.9.3: Write/update a systemd timer for scheduled TAK Server snapshots.
+    """v10.0.6: scheduled snapshots now run IN-PROCESS (see _tak_snapshot_scheduler) —
+    the v0.9.3 systemd timer NEVER worked (4 broken layers: parsed a `-p` port the
+    console unit doesn't have → bogus 2121; curled http on an https-only console; used
+    a session cookie nothing ever created; and the endpoint is @login_required with no
+    loopback bypass — it 401'd even when reachable). All it produced was a red
+    takserver-snapshot.service in `systemctl --failed` (seen on test12).
 
-    The timer calls POST /api/takserver/snapshot/run with source='scheduled'.
-    Schedule defaults to daily at 02:00 local time; operator can change via UI.
-    Idempotent — rewrites unit files each time so schedule changes take effect.
-    """
+    This function now just REMOVES the legacy units (idempotent, clears the failed
+    state) — the in-process scheduler reads tak_snapshot_schedule live, so enable/
+    disable/schedule changes need no setup step at all."""
     if plog is None:
         plog = lambda m: print(m, flush=True)
-
-    settings  = load_settings()
-    snap_cfg  = settings.get('tak_snapshot_schedule') or {}
-    enabled   = snap_cfg.get('enabled', False)
-    frequency = snap_cfg.get('frequency', 'daily')   # 'daily' | 'weekly'
-    hour      = int(snap_cfg.get('hour', 2))
-    minute    = int(snap_cfg.get('minute', 0))
-    retention = int(snap_cfg.get('retention', 7))
-
-    # Read the console port from environment or default
     try:
-        _port_r = subprocess.run(
-            "systemctl show takwerx-console --property=ExecStart 2>/dev/null | grep -o '\\-p [0-9]*' | awk '{print $2}'",
-            shell=True, capture_output=True, text=True, timeout=5
-        )
-        _port = (_port_r.stdout or '').strip() or '2121'
-    except Exception:
-        _port = '2121'
-
-    service_unit = f"""[Unit]
-Description=infra-TAK Scheduled TAK Server Snapshot
-After=network.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/bin/curl -s -X POST -H "Content-Type: application/json" \\
-    -b /opt/tak-console-session.cookie \\
-    http://127.0.0.1:{_port}/api/takserver/snapshot/run \\
-    -d '{{"source":"scheduled"}}'
-User=takwerx
-
-[Install]
-WantedBy=multi-user.target
-"""
-
-    if frequency == 'weekly':
-        on_calendar = f"Sat *-*-* {hour:02d}:{minute:02d}:00"
-    else:
-        on_calendar = f"*-*-* {hour:02d}:{minute:02d}:00"
-
-    timer_unit = f"""[Unit]
-Description=infra-TAK Scheduled TAK Server Snapshot Timer
-Requires=takserver-snapshot.service
-
-[Timer]
-OnCalendar={on_calendar}
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-"""
-
-    svc_path   = '/etc/systemd/system/takserver-snapshot.service'
-    timer_path = '/etc/systemd/system/takserver-snapshot.timer'
-
-    try:
-        _write_priv(svc_path, service_unit)
-        _write_priv(timer_path, timer_unit)
-        subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
-
-        if enabled:
-            subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', 'takserver-snapshot.timer']),
-                           capture_output=True, timeout=10)
-            plog(f"  snapshot schedule: enabled ({frequency} at {hour:02d}:{minute:02d}, retention={retention})")
-        else:
+        _legacy = ['/etc/systemd/system/takserver-snapshot.service',
+                   '/etc/systemd/system/takserver-snapshot.timer']
+        if any(os.path.exists(p) for p in _legacy):
             subprocess.run(_sudo_wrap(['systemctl', 'disable', '--now', 'takserver-snapshot.timer']),
                            capture_output=True, timeout=10)
+            subprocess.run(_sudo_wrap(['rm', '-f'] + _legacy), capture_output=True, timeout=10)
+            subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
+            subprocess.run(_sudo_wrap(['systemctl', 'reset-failed', 'takserver-snapshot.service']),
+                           capture_output=True, timeout=10)
+            plog("  snapshot schedule: legacy systemd timer removed — scheduling is in-process now")
+        cfg = (load_settings().get('tak_snapshot_schedule') or {})
+        if cfg.get('enabled'):
+            plog(f"  snapshot schedule: enabled ({cfg.get('frequency', 'daily')} at "
+                 f"{int(cfg.get('hour', 2)):02d}:{int(cfg.get('minute', 0)):02d}, "
+                 f"retention={int(cfg.get('retention', 7))}) — runs in-process")
+        else:
             plog("  snapshot schedule: disabled")
         return True
     except Exception as e:
         plog(f"  snapshot schedule: error — {e}")
         return False
+
+
+def _tak_snapshot_scheduler():
+    """v10.0.6: in-process scheduled TAK snapshots (replaces the never-functional
+    systemd timer — see _tak_setup_snapshot_schedule docstring). Daemon thread,
+    one-minute tick; reads tak_snapshot_schedule live so UI changes apply without
+    any restart. Catch-up semantics match the old timer's Persistent=true: if the
+    console was down at HH:MM, the snapshot fires on the next tick that day. The
+    occurrence is stamped BEFORE the run so a failing snapshot doesn't retry every
+    minute. Prunes only `scheduled-*` snapshots beyond the retention count —
+    manual and pre-update snapshots are never touched."""
+    global _snapshot_status, _snapshot_log
+    import time as _st
+    _st.sleep(180)  # let _startup_migrations finish before the first tick
+    while True:
+        try:
+            s = load_settings()
+            cfg = s.get('tak_snapshot_schedule') or {}
+            if not cfg.get('enabled') or not os.path.exists('/opt/tak'):
+                _st.sleep(60)
+                continue
+            now = datetime.now()
+            hour = max(0, min(23, int(cfg.get('hour', 2))))
+            minute = max(0, min(59, int(cfg.get('minute', 0))))
+            weekly = (cfg.get('frequency', 'daily') == 'weekly')
+            occurrence = now.strftime('%Y-%m-%d')
+            due = ((not weekly or now.weekday() == 5)                      # Sat for weekly
+                   and (now.hour, now.minute) >= (hour, minute)
+                   and cfg.get('last_scheduled_run') != occurrence
+                   and not _snapshot_status.get('running'))
+            if not due:
+                _st.sleep(60)
+                continue
+            # Stamp first — a failing snapshot must not re-fire every minute all day.
+            cfg['last_scheduled_run'] = occurrence
+            s['tak_snapshot_schedule'] = cfg
+            save_settings(s)
+            label = f"scheduled-{now.strftime('%Y%m%d-%H%M%S')}"
+            def plog(m):
+                entry = f"[{datetime.now().strftime('%H:%M:%S')}] {m}"
+                _snapshot_log.append(entry)
+                print(f"[snapshot-scheduler] {m}", flush=True)
+            _snapshot_log = []
+            _snapshot_status = {'running': True, 'complete': False, 'error': False}
+            plog(f"scheduled snapshot starting — {label}")
+            ok, result = _tak_snapshot(label, plog)
+            if ok:
+                _snapshot_status = {'running': False, 'complete': True, 'error': False}
+                try:
+                    s2 = load_settings()
+                    sn = s2.get('tak_snapshots') or []
+                    for snap in sn:
+                        if snap.get('label') == label:
+                            snap['source'] = 'scheduled'
+                    # Retention: newest N scheduled snapshots survive.
+                    retention = max(1, min(90, int(cfg.get('retention', 7))))
+                    scheduled = sorted(
+                        [x for x in sn if x.get('source') == 'scheduled'
+                         or str(x.get('label', '')).startswith('scheduled-')],
+                        key=lambda x: x.get('taken_at', ''), reverse=True)
+                    for victim in scheduled[retention:]:
+                        v_ok, v_label = _validate_snapshot_label(victim.get('label', ''))
+                        if not v_ok:
+                            continue
+                        subprocess.run(_sudo_wrap(['rm', '-rf', os.path.join(SNAPSHOT_DIR, v_label)]),
+                                       capture_output=True, timeout=60)
+                        sn = [x for x in sn if x.get('label') != v_label]
+                        plog(f"retention: pruned old scheduled snapshot {v_label}")
+                    s2['tak_snapshots'] = sn
+                    save_settings(s2)
+                except Exception as _pe:
+                    plog(f"retention prune error (non-fatal): {str(_pe)[:120]}")
+                plog("scheduled snapshot complete")
+            else:
+                _snapshot_status = {'running': False, 'complete': False, 'error': True}
+                plog(f"scheduled snapshot FAILED: {result}")
+        except Exception as _sched_e:
+            print(f"[snapshot-scheduler] tick error (non-fatal): {str(_sched_e)[:200]}", flush=True)
+        _st.sleep(60)
 
 
 @app.route('/api/takserver/snapshot/schedule', methods=['GET'])
@@ -55502,10 +56158,9 @@ def takserver_snapshot_schedule_get_api():
     cfg = s.get('tak_snapshot_schedule') or {
         'enabled': False, 'frequency': 'daily', 'hour': 2, 'minute': 0, 'retention': 7
     }
-    # Check if timer is actually active
-    r = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'takserver-snapshot.timer']),
-                       capture_output=True, text=True)
-    cfg['timer_active'] = (r.stdout.strip() == 'active')
+    # v10.0.6: scheduling is in-process (daemon thread reads settings live), so
+    # "active" simply mirrors enabled — no systemd timer exists anymore.
+    cfg['timer_active'] = bool(cfg.get('enabled'))
     return jsonify(cfg)
 
 
@@ -60829,8 +61484,8 @@ body.light-mode .nav-item.active{background:rgba(59,130,246,.08)}
 <div class="main">
 <div class="section-title"><img src="https://raw.githubusercontent.com/WebODM/WebODM/master/app/static/app/img/logo512.png" alt="" style="height:28px;width:auto;object-fit:contain;filter:brightness(0) invert(1)">WebODM</div>
 
-{% if not wo.get('installed') %}
-<!-- Deploy state -->
+{% if not wo.get('installed') or deploying or deploy_error %}
+<!-- Deploy state (also shown for an in-place Reapply on an installed box) -->
 <div style="background:linear-gradient(135deg,rgba(30,64,175,.08),rgba(6,182,212,.06));border:1px solid rgba(6,182,212,.2);border-radius:10px;padding:20px 24px;margin-bottom:20px">
 <div style="font-size:13px;color:var(--text-secondary);margin-bottom:4px;font-weight:600">Drone Photo Processing for TAK</div>
 <div style="font-size:13px;color:var(--text-dim);line-height:1.6">Deploy WebODM + NodeODM on this server and automatically install the TAK Incident Overlay plugin by <a href="https://github.com/Humble-Helper-96" target="_blank" style="color:var(--cyan);text-decoration:none">Humble-Helper-96</a>. Upload GPS-tagged drone photos → get MBTiles and GeoTIFF overlays ready for ATAK — all from a browser.</div>
@@ -61049,6 +61704,7 @@ function woTestSsh(){
 <button class="btn btn-primary btn-sm" id="wo-update-btn" onclick="updateWebODM(this)">↑ Update to v{{ wo_latest }}</button>
 {% endif %}
 <button class="btn btn-ghost" onclick="repairAuthentik(this)" title="Re-provision Authentik proxy provider and application for WebODM">↻ Repair Authentik</button>
+<button class="btn btn-ghost" onclick="reapplyWebODM(this)" title="Re-run the deploy in place: re-clone the TAK overlay plugin, refresh docker-compose and the OIDC login config, restart containers. Projects and data are kept.">⟳ Reapply Plugin &amp; Config</button>
 <button class="btn btn-ghost" onclick="openWoPwModal()" title="Show admin accounts and reset password">🔑 Account Recovery</button>
 <button class="btn btn-danger" onclick="document.getElementById('uninstall-modal').classList.add('open')">Uninstall</button>
 </div>
@@ -61120,8 +61776,13 @@ function startDeploy(){
     var btn=document.getElementById('deploy-btn');if(btn)btn.disabled=true;
     var st=document.getElementById('deploy-status');if(st)st.textContent='Saving config…';
     // Persist deployment config (incl. ODM resource caps) before kicking off the deploy,
-    // which reads the saved webodm_deployment cfg and takes no request body.
-    fetch('/api/webodm/deployment-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:_woCfg()}),credentials:'same-origin'})
+    // which reads the saved webodm_deployment cfg and takes no request body. The config
+    // form only exists in the fresh-deploy state — on Retry (error state) there is no
+    // form, so skip the save and deploy with the already-saved config (_woCfg would
+    // throw on the missing elements).
+    (document.getElementById('wo-remote-cfg')
+      ? fetch('/api/webodm/deployment-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:_woCfg()}),credentials:'same-origin'})
+      : Promise.resolve())
       .then(function(){if(st)st.textContent='Starting deploy…';return fetch('/api/webodm/deploy',{method:'POST'});})
       .then(r=>r.json()).then(d=>{
         if(d.success){window.location.reload();}
@@ -61150,6 +61811,14 @@ function updateWebODM(btn){
         if(d.started){setTimeout(poll,1000);}
         else{btn.disabled=false;btn.textContent='↑ Update to latest';showToast('Error: '+(d.error||'unknown'));}
     });
+}
+function reapplyWebODM(btn){
+    if(!confirm('Re-run the WebODM deploy in place?\\n\\nThis re-clones the TAK overlay plugin, rewrites docker-compose (adding the one-click Authentik login config), and restarts the WebODM containers.\\n\\nProjects, accounts and processed data are KEPT. Running processing jobs will be interrupted and everyone is logged out of WebODM.'))return;
+    btn.disabled=true;btn.textContent='Starting…';
+    fetch('/api/webodm/deploy',{method:'POST'}).then(r=>r.json()).then(d=>{
+        if(d.success){window.location.reload();}
+        else{showToast('Error: '+(d.error||'unknown'));btn.disabled=false;btn.textContent='⟳ Reapply Plugin & Config';}
+    }).catch(e=>{showToast('Network error');btn.disabled=false;btn.textContent='⟳ Reapply Plugin & Config';});
 }
 function repairAuthentik(btn){
     btn.disabled=true;btn.textContent='Repairing…';
@@ -61901,6 +62570,31 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     {% if ra_vinfo.get('version') or ra_commit %}<div class="info-item"><div class="info-label">Installed version</div><div class="info-value" id="ra-installed-version">v{{ ra_vinfo.get('version') or ra_commit }}{% if ra_vinfo.get('running') and ra_vinfo.get('running') != ra_vinfo.get('version') %} <span id="ra-running-mismatch" style="color:var(--yellow)">(running v{{ ra_vinfo.get('running') }})</span>{% endif %}</div></div>{% endif %}
     <div class="info-item" id="ra-latest-row"{% if not ra_vinfo.get('latest') %} style="display:none"{% endif %}><div class="info-label">Newest version available</div><div class="info-value" id="ra-latest-version">{% if ra_vinfo.get('latest') %}v{{ ra_vinfo.get('latest') }} <span id="ra-latest-status" style="font-size:11px{% if ra_vinfo.get('update_available') %};color:var(--cyan){% else %};color:var(--text-dim){% endif %}">{% if ra_vinfo.get('update_available') %}update ready{% elif ra_vinfo.get('is_current') %}current{% endif %}</span>{% else %}<span style="color:var(--text-dim)">checking…</span>{% endif %}</div></div>
   </div></div>
+  <div class="card">
+    <div class="card-title">CoTURN Server (Optional)</div>
+    {% if coturn_installed %}
+      {% if netbird_coturn_missing %}
+      <div style="background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);border-radius:8px;padding:12px 14px;margin-bottom:14px;font-size:13px;color:var(--red)">NetBird&#39;s coturn container is gone (NetBird updated or was removed) — TURN is DOWN for Remote Assist. Uninstall below, then install a standalone CoTURN server.</div>
+      {% elif netbird_coturn_in_use %}
+      <div style="font-size:12px;color:var(--text-dim);margin-bottom:12px">TURN provided by NetBird&#39;s coturn (shared — dedicated Remote Assist credentials appended to its config).</div>
+      {% endif %}
+      <div class="info-grid" style="margin-bottom:16px">
+        <div class="info-item"><div class="info-label">Server URL</div><div class="info-value">{{ coturn_url }}</div></div>
+        <div class="info-item"><div class="info-label">Username</div><div class="info-value"><span id="coturn-user-val" data-val="{{ coturn_username|e }}">&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;</span> <button type="button" onclick="toggleCredVal('coturn-user-val',this)" style="background:none;border:none;cursor:pointer;color:var(--text-dim);font-size:11px;margin-left:6px">show</button></div></div>
+        <div class="info-item"><div class="info-label">Password</div><div class="info-value"><span id="coturn-pass-val" data-val="{{ coturn_password|e }}">&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;</span> <button type="button" onclick="toggleCredVal('coturn-pass-val',this)" style="background:none;border:none;cursor:pointer;color:var(--text-dim);font-size:11px;margin-left:6px">show</button></div></div>
+      </div>
+      <button class="btn btn-danger" onclick="document.getElementById('uninstall-coturn-modal').classList.add('open')">Uninstall CoTURN</button>
+    {% else %}
+      {% if can_configure_nb_coturn %}
+      <p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px">NetBird with its own coturn container detected. Add dedicated Remote Assist credentials to NetBird&#39;s TURN server instead of running a second one — or install a standalone CoTURN on a different port.</p>
+      <button class="btn btn-primary" onclick="document.getElementById('configure-nb-coturn-modal').classList.add('open')">Configure NetBird CoTURN</button>
+      <button class="btn btn-ghost" onclick="document.getElementById('install-coturn-modal').classList.add('open')">Install standalone instead</button>
+      {% else %}
+      <p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px">Install a local CoTURN (STUN/TURN) server to help WebRTC connections traverse NAT/firewalls. Runs alongside EUD Remote Assist.</p>
+      <button class="btn btn-primary" onclick="document.getElementById('install-coturn-modal').classList.add('open')">Install CoTURN Server</button>
+      {% endif %}
+    {% endif %}
+  </div>
   <div class="card" id="logs-card" style="display:none"><div class="card-title">Container logs</div><div class="log-box" id="container-logs">Loading...</div></div>
   {% else %}
   <div class="card"><div class="card-title">Deploy EUD Remote Assist</div>
@@ -61918,6 +62612,35 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <div style="margin-bottom:16px"><label class="form-label">Admin password</label><input class="form-input" id="uninstall-password" type="password" placeholder="Confirm password"></div>
   <div class="modal-actions"><button class="btn btn-ghost" onclick="document.getElementById('uninstall-modal').classList.remove('open')">Cancel</button><button class="btn btn-danger" onclick="doUninstall()">Uninstall</button></div>
   <div id="uninstall-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
+</div></div>
+<div class="modal-overlay" id="install-coturn-modal"><div class="modal">
+  <h3>Install CoTURN Server</h3>
+  <p style="font-size:13px;color:var(--text-secondary)">Provide credentials and the public IPv4 address where the TURN server will be reachable.</p>
+  <div style="margin-bottom:12px"><label class="form-label">Username</label><input class="form-input" id="coturn-user" type="text" placeholder="turnuser" autocomplete="off"></div>
+  <div style="margin-bottom:12px"><label class="form-label">Password</label>
+    <div style="display:flex;gap:6px;align-items:center"><input class="form-input" id="coturn-pass" type="password" placeholder="Password (min 8)" autocomplete="new-password" style="flex:1"><button type="button" onclick="togglePwInput('coturn-pass',this)" style="background:none;border:1px solid var(--border);border-radius:6px;cursor:pointer;color:var(--text-dim);font-size:11px;padding:7px 9px">show</button></div>
+    <div style="font-size:11px;color:var(--text-dim);margin-top:4px">8&#8211;128 chars: letters, digits, and <span style="font-family:'JetBrains Mono',monospace">. _ @ + = ! % ^ -</span> &mdash; no spaces, quotes, or other symbols.</div>
+  </div>
+  <div style="margin-bottom:12px"><label class="form-label">Public IP Address</label><input class="form-input" id="coturn-ip" type="text" placeholder="e.g. 203.0.113.50" value="{{ settings.get('server_ip', '') }}"></div>
+  <div style="margin-bottom:16px"><label class="form-label">Port</label><input class="form-input" id="coturn-port" type="text" placeholder="3478" value="{{ coturn_suggested_port }}">{% if coturn_suggested_port != '3478' %}<div style="font-size:11px;color:var(--text-dim);margin-top:4px">Pre-set to 3479 — NetBird on this box already uses the standard port 3478. Any port works; Remote Assist clients are told which one.</div>{% endif %}</div>
+  <div class="modal-actions"><button class="btn btn-ghost" onclick="document.getElementById('install-coturn-modal').classList.remove('open')">Cancel</button><button class="btn btn-primary" onclick="doCoturnInstall()">Install</button></div>
+  <div id="coturn-install-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
+</div></div>
+<div class="modal-overlay" id="configure-nb-coturn-modal"><div class="modal">
+  <h3>Configure NetBird CoTURN</h3>
+  <p style="font-size:13px;color:var(--text-secondary)">Adds a dedicated Remote Assist credential to NetBird&#39;s coturn (its own secret stays private) and restarts that container.</p>
+  <div style="margin-bottom:12px"><label class="form-label">Username</label><input class="form-input" id="nb-coturn-user" type="text" placeholder="turnuser" autocomplete="off"></div>
+  <div style="margin-bottom:16px"><label class="form-label">Password</label>
+    <div style="display:flex;gap:6px;align-items:center"><input class="form-input" id="nb-coturn-pass" type="password" placeholder="Password (min 8)" autocomplete="new-password" style="flex:1"><button type="button" onclick="togglePwInput('nb-coturn-pass',this)" style="background:none;border:1px solid var(--border);border-radius:6px;cursor:pointer;color:var(--text-dim);font-size:11px;padding:7px 9px">show</button></div>
+    <div style="font-size:11px;color:var(--text-dim);margin-top:4px">8&#8211;128 chars: letters, digits, and <span style="font-family:'JetBrains Mono',monospace">. _ @ + = ! % ^ -</span> &mdash; no spaces, quotes, or other symbols.</div>
+  </div>
+  <div class="modal-actions"><button class="btn btn-ghost" onclick="document.getElementById('configure-nb-coturn-modal').classList.remove('open')">Cancel</button><button class="btn btn-primary" onclick="doNBCoturnConfig()">Configure</button></div>
+  <div id="nb-coturn-config-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
+</div></div>
+<div class="modal-overlay" id="uninstall-coturn-modal"><div class="modal">
+  <h3>Uninstall CoTURN?</h3><p>This removes the CoTURN container and its configuration. EUD Remote Assist itself is unaffected.</p>
+  <div class="modal-actions"><button class="btn btn-ghost" onclick="document.getElementById('uninstall-coturn-modal').classList.remove('open')">Cancel</button><button class="btn btn-danger" onclick="doCoturnUninstall()">Uninstall</button></div>
+  <div id="coturn-uninstall-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
 </div></div>
 <script src="/log-tools.js?v={{ version }}"></script>
 <script>initLogToolbar('deploy-log');initLogToolbar('deploy-log-dyn');initLogToolbar('container-logs');</script>
@@ -61977,6 +62700,33 @@ function refreshRaVersion(manual){
     }
     restoreCheckBtn();
   }).catch(function(){restoreCheckBtn();});
+}
+function doCoturnInstall(){
+  var u=document.getElementById('coturn-user').value,p=document.getElementById('coturn-pass').value,ip=document.getElementById('coturn-ip').value,port=(document.getElementById('coturn-port').value||'3478'),msg=document.getElementById('coturn-install-msg');
+  if(!u||!p||!ip){msg.textContent='All fields are required.';return;}
+  msg.style.color='var(--text-dim)';msg.textContent='Installing…';
+  fetch('/api/remote-assist/coturn/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p,ip:ip,port:port}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    if(!d.success){msg.style.color='var(--red)';msg.textContent=d.error||'Install failed';return;}
+    msg.style.color='var(--green)';msg.textContent='Success! Reloading…';setTimeout(function(){location.reload();},1000);
+  }).catch(function(e){msg.style.color='var(--red)';msg.textContent=e.message||'Request failed';});
+}
+function togglePwInput(id,btn){var i=document.getElementById(id);if(i.type==='password'){i.type='text';btn.textContent='hide';}else{i.type='password';btn.textContent='show';}}
+function toggleCredVal(id,btn){var s=document.getElementById(id);if(btn.textContent==='show'){s.textContent=s.getAttribute('data-val');btn.textContent='hide';}else{s.textContent='••••••••';btn.textContent='show';}}
+function doNBCoturnConfig(){
+  var u=document.getElementById('nb-coturn-user').value,p=document.getElementById('nb-coturn-pass').value,msg=document.getElementById('nb-coturn-config-msg');
+  if(!u||!p){msg.textContent='Username and password are required.';return;}
+  msg.style.color='var(--text-dim)';msg.textContent='Configuring…';
+  fetch('/api/remote-assist/coturn/configure-netbird',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    if(!d.success){msg.style.color='var(--red)';msg.textContent=d.error||'Configure failed';return;}
+    msg.style.color='var(--green)';msg.textContent='Success! Reloading…';setTimeout(function(){location.reload();},1000);
+  }).catch(function(e){msg.style.color='var(--red)';msg.textContent=e.message||'Request failed';});
+}
+function doCoturnUninstall(){
+  var msg=document.getElementById('coturn-uninstall-msg');msg.style.color='var(--text-dim)';msg.textContent='Uninstalling…';
+  fetch('/api/remote-assist/coturn/uninstall',{method:'POST',credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    if(!d.success){msg.style.color='var(--red)';msg.textContent=d.error||'Uninstall failed';return;}
+    msg.style.color='var(--green)';msg.textContent='Success! Reloading…';setTimeout(function(){location.reload();},1000);
+  }).catch(function(e){msg.style.color='var(--red)';msg.textContent=e.message||'Request failed';});
 }
 </script>
 </body></html>'''
@@ -63534,6 +64284,10 @@ def _startup_rehome_module(subdir, container_name, wait_healthy=60):
             _compose(src, 'up -d')
             return
         subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx', dst]), capture_output=True, timeout=300)
+        if _distro_family() == 'rhel':
+            # mv preserves the /root-era SELinux label (admin_home_t) — benign in the
+            # field (0 AVC denials) but wrong under /home; relabel to the policy default.
+            subprocess.run(_sudo_wrap(['restorecon', '-R', dst]), capture_output=True, timeout=300)
         # 3) Up from the NEW home.
         _compose(dst, 'up -d')
         # 4) VERIFY the key container returns; ROLL BACK if not (never leave the module down).
@@ -65611,11 +66365,12 @@ def _startup_migrations():
         except Exception as _ak_rep_err:
             print(f"Startup migration: authentik reputation policy error (non-fatal): {_ak_rep_err}")
 
-        # v0.9.3: Ensure TAK Server snapshot timer matches settings (idempotent rewrite).
+        # v10.0.6: snapshot scheduling moved in-process — this call now just removes the
+        # legacy (never-functional) systemd units and clears their failed state. Runs
+        # UNCONDITIONALLY (not gated on enabled): boxes with the schedule since turned
+        # off still carry the red takserver-snapshot.service until cleaned.
         try:
-            _s = load_settings()
-            if (_s.get('tak_snapshot_schedule') or {}).get('enabled'):
-                _tak_setup_snapshot_schedule(lambda m: print(f"Startup migration: {m}", flush=True))
+            _tak_setup_snapshot_schedule(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _snap_err:
             print(f"Startup migration: snapshot schedule error (non-fatal): {_snap_err}")
     except Exception as e:
@@ -65779,6 +66534,23 @@ def _post_update_auto_deploy():
     state. Belt to Item 1's (single-flight lock) suspenders.
     """
     try:
+        # v10.0.6: clear the Update Now single-flight lock AT STARTUP. The lock
+        # cannot outlive the process that wrote it — update_apply() ends in a
+        # systemctl restart, so any lock present at import time belongs to a
+        # finished (or killed) update. Previously it was only cleared at the END
+        # of the migration thread (minutes of Guard Dog/Authentik work, or never
+        # if a transient gunicorn worker reaped the thread), locking the operator
+        # out of Update Now for the 20-min TTL after every successful update
+        # (field: aws-rocky + test12, 2026-07-02 — "already in progress 687s ago"
+        # on a box already restarted onto the new SHA).
+        _update_lock = '/var/lib/takwerx-console/update-now.lock'
+        _had_update_lock = os.path.exists(_update_lock)
+        if _had_update_lock:
+            try:
+                os.unlink(_update_lock)
+                print("Post-update: cleared Update Now single-flight lock at startup", flush=True)
+            except Exception as _ce:
+                print(f"Post-update: could not clear Update Now lock at startup (non-fatal): {_ce}", flush=True)
         s = load_settings()
         last_ver = s.get('last_console_version', '')
         # Dev-channel iterations keep the SAME version string (e.g. 0.9.52-alpha) but advance the
@@ -65837,34 +66609,23 @@ def _post_update_auto_deploy():
             except Exception as _shce:
                 print(f"Post-update (same-version): compose self-heal error (non-fatal): {_shce}", flush=True)
 
-            # v0.9.24 Items 1+2: even a no-op deploy (same VERSION) must
-            # release the Update Now single-flight lock — the operator did
-            # click the button and expects to be able to click it again.
-            # If the lock is present on a same-version restart, the previous
-            # deploy was likely interrupted (killed mid-bootstrap, OOM, manual
-            # restart, etc.) — run the service recovery sweep to bring up any
-            # service that ended in Exited/inactive state before clearing.
-            try:
-                _update_lock = '/var/lib/takwerx-console/update-now.lock'
-                if os.path.exists(_update_lock):
-                    print(
-                        "Post-update: same-version restart with active Update Now lock "
-                        "(prior deploy likely interrupted) — running service recovery sweep",
-                        flush=True
+            # v0.9.24 Item 2 (lock itself now cleared at startup above): a lock
+            # present on a same-version restart means the previous deploy was
+            # likely interrupted (killed mid-bootstrap, OOM, manual restart) —
+            # run the service recovery sweep to bring up any service that ended
+            # in Exited/inactive state.
+            if _had_update_lock:
+                print(
+                    "Post-update: same-version restart with active Update Now lock "
+                    "(prior deploy likely interrupted) — running service recovery sweep",
+                    flush=True
+                )
+                try:
+                    _post_update_service_recovery_sweep(
+                        lambda m: print(f"Post-update sweep: {m}", flush=True)
                     )
-                    try:
-                        _post_update_service_recovery_sweep(
-                            lambda m: print(f"Post-update sweep: {m}", flush=True)
-                        )
-                    except Exception as _se:
-                        print(f"Post-update: service recovery sweep error (non-fatal): {_se}", flush=True)
-                    try:
-                        os.unlink(_update_lock)
-                        print("Post-update: cleared Update Now single-flight lock", flush=True)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+                except Exception as _se:
+                    print(f"Post-update: service recovery sweep error (non-fatal): {_se}", flush=True)
             return
 
         lock_path = '/tmp/takwerx-post-update.lock'
@@ -67563,6 +68324,15 @@ try:
     _threading_spiral.Thread(target=_authentik_spiral_monitor, daemon=True, name='authentik-spiral-monitor').start()
 except Exception as _e:
     print(f"[startup] failed to start spiral monitor (non-fatal): {_e}", flush=True)
+
+# v10.0.6: in-process scheduled TAK snapshots (replaces the never-functional systemd
+# timer). Reads tak_snapshot_schedule live each tick — no-op while disabled or when
+# TAK isn't installed.
+try:
+    import threading as _threading_snap
+    _threading_snap.Thread(target=_tak_snapshot_scheduler, daemon=True, name='tak-snapshot-scheduler').start()
+except Exception as _e:
+    print(f"[startup] failed to start snapshot scheduler (non-fatal): {_e}", flush=True)
 
 # v10.0.4: server_ip self-heal (belt-and-braces). The primary path is the unit's
 # ExecStartPre=selfheal_ip.py (heals BEFORE gunicorn binds, so a regenerated cert is
