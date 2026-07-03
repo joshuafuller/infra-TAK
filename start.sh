@@ -506,6 +506,23 @@ install_broker() {
         BROKER_SELINUX="SELinuxContext=system_u:system_r:unconfined_service_t:s0"
     fi
 
+    # v10.0.8 ENFORCE is OPT-IN (never auto-flips). A FRESH install (no prior
+    # broker audit history) is OPTED IN automatically by dropping the opt-in
+    # marker — but the broker still WATCHES for 72h of clean audit before it
+    # actually enforces, so a new box never breaks its own initial deploy. An
+    # EXISTING box that merely updates gets NO marker here, so it stays in watch
+    # mode until an operator presses "Turn on enforcing" in the console. This
+    # makes "don't break production" the default. The env var is left UNSET (the
+    # opt-in marker + the 72h readiness gate drive the decision); the SSH-only
+    # kill switch is still Environment=TAKWERX_BROKER_ENFORCE=0 + daemon-reload +
+    # restart.
+    if [ ! -f /var/log/takwerx-broker/audit.log ]; then
+        mkdir -p /var/lib/takwerx-broker
+        [ -f /var/lib/takwerx-broker/enforce-optin ] || \
+            printf 'fresh-install\n' > /var/lib/takwerx-broker/enforce-optin
+        chmod 644 /var/lib/takwerx-broker/enforce-optin 2>/dev/null || true
+    fi
+
     cat > /etc/systemd/system/takwerx-broker.service << EOF
 [Unit]
 Description=infra-TAK privileged broker (least-privilege console mediation)
