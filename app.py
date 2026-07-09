@@ -668,7 +668,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.0.9-alpha"
+VERSION = "10.1.0-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -2313,6 +2313,18 @@ def detect_modules():
         'priority': 14,
     }
 
+    # Connectivity Wizard (v10.1.0) — built-in console tool, no deploy step: always present.
+    modules['connectivity'] = {
+        'name': 'Connectivity Wizard',
+        'installed': True,
+        'running': True,
+        'description': 'Detect this network\'s reality (public IP, double-NAT, CGNAT) and guide the box to reachable-from-anywhere',
+        'icon': '🧭',
+        'icon_url': '/static/connectivity-icon.svg',
+        'route': '/connectivity',
+        'priority': 15,
+    }
+
     # EUD Remote Assist Portal
     ra_enabled = settings.get('remote_assist_enabled', False)
     ra_running = False
@@ -2513,6 +2525,7 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
     ra = modules.get('remote_assist', {})
     if ra.get('installed'):
         parts.append(link('/remote-assist', f'<img src="{REMOTE_ASSIST_LOGO_URL}" alt="EUD Remote Assist" class="nav-icon" style="height:22px;width:auto;max-width:140px;object-fit:contain;display:block">', 'EUD Remote Assist'))
+    parts.append(link('/connectivity', '<span class="nav-icon material-symbols-outlined">router</span>Connectivity'))
     parts.append(link('/marketplace', '<span class="nav-icon material-symbols-outlined">shopping_cart</span>Marketplace'))
     parts.append(link('/customization', '<span class="nav-icon material-symbols-outlined">tune</span>Customization'))
     parts.append(link('/help', '<span class="nav-icon material-symbols-outlined">help</span>Help'))
@@ -8006,6 +8019,1425 @@ def netbird_uninstall_status_api():
     return jsonify(_netbird_uninstall_status)
 
 
+# ── Connectivity Wizard (v10.1.0) ─────────────────────────────────────────────
+# Leg 0 (Intent: static vs portable) + Leg 1 (Detect: STUN / traceroute / CGNAT)
+# per docs/PLAN-v10.1.0-connectivity-wizard.md (private notes repo).
+
+# pystun3's bundled default server list is stale (returns NAT type but a null
+# external IP) — always probe an explicit list, first server that returns an
+# external IP wins. NAT-type strings vary per server (Google lacks the RFC 3489
+# changed-address test), so nat_type is informational; classification keys on
+# external-IP vs traceroute-hop analysis, which is deterministic.
+CONNECTIVITY_STUN_SERVERS = [
+    ('stun.l.google.com', 19302),
+    ('stun.counterpath.com', 3478),
+    ('stun.cloudflare.com', 3478),
+    ('stun.sipgate.net', 3478),
+]
+
+_CONN_CGNAT_NET = ipaddress.ip_network('100.64.0.0/10')  # RFC 6598 — what Starlink hands out
+
+_connectivity_detect_status = {'running': False, 'complete': False, 'error': '', 'log': [], 'result': None}
+
+_conn_cloud_cache = {'checked': False, 'is_cloud': False}
+
+
+def _conn_is_cloud():
+    """Is this box a cloud VM? Every cloud's IMDS (AWS/Azure/OCI/GCP) answers SOMETHING on
+    link-local 169.254.169.254 — even a 4xx counts; home networks have nothing there.
+    Cached for the process lifetime (a box doesn't change worlds without a reboot).
+    On a cloud VM the wizard is a verifier, not a pathfinder — the static/portable
+    question is suppressed and Class A gets cloud copy instead of router talk."""
+    if _conn_cloud_cache['checked']:
+        return _conn_cloud_cache['is_cloud']
+    is_cloud = False
+    try:
+        urllib.request.urlopen('http://169.254.169.254/', timeout=1.5)
+        is_cloud = True
+    except urllib.error.HTTPError:
+        is_cloud = True   # an HTTP error status is still an answer — something lives there
+    except Exception:
+        is_cloud = False
+    _conn_cloud_cache.update({'checked': True, 'is_cloud': is_cloud})
+    return is_cloud
+
+
+def _conn_ip_kind(ip_str):
+    """'public' | 'private' (RFC 1918) | 'cgnat' (100.64/10) | 'other' | 'invalid'."""
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except (ValueError, TypeError):
+        return 'invalid'
+    if ip in _CONN_CGNAT_NET:
+        return 'cgnat'
+    if ip.is_private:
+        return 'private'
+    if ip.is_global:
+        return 'public'
+    return 'other'
+
+
+def _conn_local_network(log):
+    """LAN address(es) + default gateway via iproute2 (Leg 1, box-side, no privileges needed)."""
+    info = {'interfaces': [], 'gateway': '', 'gateway_iface': ''}
+    try:
+        r = subprocess.run(['ip', '-4', 'route', 'show', 'default'],
+                           capture_output=True, text=True, timeout=5)
+        m = re.search(r'default via (\S+) dev (\S+)', r.stdout or '')
+        if m:
+            info['gateway'], info['gateway_iface'] = m.group(1), m.group(2)
+            log('Default gateway: %s via %s' % (info['gateway'], info['gateway_iface']))
+        r = subprocess.run(['ip', '-4', '-o', 'addr', 'show', 'scope', 'global'],
+                           capture_output=True, text=True, timeout=5)
+        for line in (r.stdout or '').splitlines():
+            m = re.match(r'\d+:\s+(\S+)\s+inet\s+([\d.]+)/(\d+)', line.strip())
+            if m:
+                info['interfaces'].append({'iface': m.group(1), 'ip': m.group(2), 'prefix': int(m.group(3))})
+        if info['interfaces']:
+            log('LAN: ' + ', '.join('%s=%s' % (i['iface'], i['ip']) for i in info['interfaces']))
+    except Exception as ex:
+        log('Local network detection failed: %s' % str(ex)[:120])
+    return info
+
+
+def _conn_stun_probe(log):
+    """Public IP + NAT type via STUN (pystun3) — the Leg 1 keystone signal."""
+    try:
+        import stun
+    except ImportError:
+        log('pystun3 is not installed — re-run `sudo ./start.sh` to pull new console dependencies')
+        return {'error': 'pystun3 not installed (re-run sudo ./start.sh)'}
+    for host, port in CONNECTIVITY_STUN_SERVERS:
+        try:
+            nat_type, ext_ip, ext_port = stun.get_ip_info(source_port=0, stun_host=host, stun_port=port)
+            if ext_ip:
+                log('STUN %s:%s → %s, external %s:%s' % (host, port, nat_type, ext_ip, ext_port))
+                return {'nat_type': nat_type or '', 'external_ip': ext_ip,
+                        'external_port': ext_port, 'server': '%s:%s' % (host, port)}
+            log('STUN %s:%s returned no external IP — trying next server' % (host, port))
+        except Exception as ex:
+            log('STUN %s:%s failed: %s' % (host, port, str(ex)[:80]))
+    return {'error': 'all STUN servers failed (is outbound UDP blocked?)'}
+
+
+def _conn_traceroute(log):
+    """First hops toward 1.1.1.1 — the double-NAT vs CGNAT discriminator."""
+    tr = shutil.which('traceroute')
+    if not tr:
+        log('traceroute not present — installing via package shim')
+        try:
+            _pkg_install(['traceroute'], log_fn=log)
+        except Exception as ex:
+            log('traceroute install failed: %s' % str(ex)[:120])
+        tr = shutil.which('traceroute')
+        if not tr:
+            return {'hops': [], 'error': 'traceroute unavailable'}
+    try:
+        r = subprocess.run([tr, '-n', '-m', '6', '-q', '1', '-w', '2', '1.1.1.1'],
+                           capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return {'hops': [], 'error': 'traceroute timed out'}
+    hops = []
+    for line in (r.stdout or '').splitlines():
+        m = re.match(r'\s*(\d+)\s+([\d.]+|\*)', line)
+        if not m:
+            continue
+        ip = m.group(2) if m.group(2) != '*' else ''
+        hops.append({'hop': int(m.group(1)), 'ip': ip,
+                     'kind': _conn_ip_kind(ip) if ip else 'no-reply'})
+    if hops:
+        log('Route: ' + ' → '.join((h['ip'] or '*') + ('(%s)' % h['kind'] if h['ip'] else '')
+                                   for h in hops))
+    return {'hops': hops}
+
+
+def _conn_gateway_fingerprint(gw_ip, log):
+    """Best-effort gateway model hint (feeds the Leg 3 known-gateways table later)."""
+    try:
+        ipaddress.ip_address(gw_ip)
+    except (ValueError, TypeError):
+        return {}
+    try:
+        req = urllib.request.Request('http://%s/' % gw_ip, method='GET')
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            server = resp.headers.get('Server', '')
+            body = resp.read(4096).decode('utf-8', 'replace')
+        m = re.search(r'<title[^>]*>(.*?)</title>', body, re.I | re.S)
+        title = m.group(1).strip()[:120] if m else ''
+        if server or title:
+            log('Gateway fingerprint: server=%r title=%r' % (server, title))
+        return {'server': server, 'title': title}
+    except Exception as ex:
+        return {'error': str(ex)[:120]}
+
+
+def _conn_hairpin_probe(settings, log):
+    """Can the box reach its own FQDN? (NAT-hairpin signal, reused idea from the FQDN migration probe)."""
+    fqdn = (settings.get('fqdn') or '').strip()
+    if not fqdn:
+        return {'tested': False}
+    try:
+        r = subprocess.run(['curl', '-skm', '6', '-o', '/dev/null', '-w', '%{http_code}',
+                            'https://%s/' % fqdn], capture_output=True, text=True, timeout=12)
+        code = (r.stdout or '').strip()
+        ok = code.isdigit() and code != '000'
+        log('Hairpin: https://%s/ → %s' % (fqdn, code if ok else 'unreachable (hairpin NAT likely)'))
+        return {'tested': True, 'ok': ok, 'http_code': code}
+    except Exception as ex:
+        return {'tested': True, 'ok': False, 'error': str(ex)[:120]}
+
+
+def _conn_classify(intent, stun_res, trace, is_cloud=False):
+    """Leg 2 — Class A (clean public) / B (double-NAT) / C (CGNAT), + the recommendation.
+    Portable intent overrides the recommendation to the anchor regardless of class:
+    a port-forward is glued to one network and dies on the next one (PLAN §7a/§7b).
+    Cloud VMs (is_cloud) never travel and have no router — Class A becomes 'verify
+    your cloud firewall', and the portable override does not apply."""
+    reasons = []
+    provisional = False
+    ext_ip = stun_res.get('external_ip') or ''
+    ext_kind = _conn_ip_kind(ext_ip)
+    # Only hops BEFORE the first public hop describe our side of the NAT; private
+    # hops inside a carrier core after a public hop would be false double-NAT.
+    pre_public, cgnat_hop = [], ''
+    for h in trace.get('hops', []):
+        if not h['ip']:
+            continue
+        if h['kind'] == 'public':
+            break
+        if h['kind'] == 'private':
+            pre_public.append(h['ip'])
+        elif h['kind'] == 'cgnat' and not cgnat_hop:
+            cgnat_hop = h['ip']
+    cgnat = bool(cgnat_hop) or ext_kind == 'cgnat'
+    double_nat = (not cgnat) and len(set(pre_public)) >= 2
+    # Opaque path: every hop between the local gateway and the first public hop stayed
+    # silent. Mobile carriers (field-observed: Verizon hotspot, 2026-07-07) hand out
+    # public-looking IPs while firewalling ALL inbound at the carrier edge — no CGNAT
+    # hop to catch, STUN looks clean, but Class A is a lie only VERIFY can expose.
+    silent_mid, answered_mid, saw_public = 0, 0, False
+    for h in trace.get('hops', [])[1:]:
+        if h.get('kind') == 'public':
+            saw_public = True
+            break
+        if h.get('ip'):
+            answered_mid += 1
+        else:
+            silent_mid += 1
+    path_opaque = saw_public and silent_mid >= 2 and answered_mid == 0
+    if cgnat_hop:
+        reasons.append('traceroute hop %s is in 100.64.0.0/10 — carrier-grade NAT' % cgnat_hop)
+    if ext_kind == 'cgnat':
+        reasons.append('STUN external IP %s is itself CGNAT space' % ext_ip)
+    if double_nat:
+        reasons.append('two RFC-1918 gateways before the first public hop (%s) — double-NAT'
+                       % ' → '.join(sorted(set(pre_public))))
+    if cgnat:
+        net_class = 'C'
+        reasons.append('Class C: no public inbound is possible on this network')
+    elif double_nat:
+        net_class = 'B'
+        reasons.append('Class B: bridge/IP-passthrough the upstream gateway, then re-detect')
+    elif ext_kind == 'public':
+        net_class = 'A'
+        reasons.append('Class A: clean public IP %s — port-forward + DDNS works here' % ext_ip)
+        if path_opaque:
+            provisional = True
+            reasons.append('…but every hop to the internet stayed silent — mobile/hotspot '
+                           'carriers often show a public IP while still blocking ALL inbound. '
+                           'Treat Class A as provisional until VERIFY proves a port from outside')
+    else:
+        net_class = 'unknown'
+        reasons.append('could not establish a public IP — check outbound connectivity and re-run')
+    if is_cloud and net_class == 'A':
+        recommendation = 'cloud_verify'
+        reasons.append('Cloud VM: reachability is provided by the host — what usually needs '
+                       'attention is the cloud firewall (security list / NSG ingress)')
+    elif intent == 'portable' and not is_cloud:
+        recommendation = 'anchor'
+        reasons.append('Portable box: recommendation is the relay regardless of class — '
+                       'this network\'s answer would be stale on the next network')
+    elif net_class == 'A':
+        recommendation = 'ddns_portforward'
+    elif net_class == 'B':
+        recommendation = 'bridge_then_ddns'
+    elif net_class == 'C':
+        recommendation = 'anchor'
+    else:
+        recommendation = 'rerun'
+    return {'net_class': net_class, 'cgnat': cgnat, 'double_nat': double_nat,
+            'provisional': provisional, 'recommendation': recommendation, 'reasons': reasons}
+
+
+def _run_connectivity_detect(settings):
+    st = _connectivity_detect_status
+
+    def log(msg):
+        st['log'].append(msg)
+
+    try:
+        intent = settings.get('connectivity_intent') or ''
+        is_cloud = _conn_is_cloud()
+        log('Leg 1 — DETECT starting (intent: %s%s)'
+            % (intent or 'not chosen yet', ', cloud VM' if is_cloud else ''))
+        local = _conn_local_network(log)
+        stun_res = _conn_stun_probe(log)
+        trace = _conn_traceroute(log)
+        gw_fp = _conn_gateway_fingerprint(local.get('gateway', ''), log) if local.get('gateway') else {}
+        hairpin = _conn_hairpin_probe(settings, log)
+        result = _conn_classify(intent, stun_res, trace, is_cloud=is_cloud)
+        result.update({'intent': intent, 'cloud': is_cloud, 'local': local, 'stun': stun_res,
+                       'trace': trace, 'gateway_fingerprint': gw_fp, 'hairpin': hairpin})
+        st['result'] = result
+        log('Classification: Class %s — recommendation: %s' % (result['net_class'], result['recommendation']))
+        st.update({'running': False, 'complete': True, 'error': ''})
+    except Exception as ex:
+        st.update({'running': False, 'complete': True, 'error': str(ex)[:300]})
+
+
+@app.route('/connectivity')
+@login_required
+def connectivity_page():
+    settings = load_settings()
+    return render_template_string(
+        CONNECTIVITY_TEMPLATE,
+        settings=settings,
+        version=VERSION,
+        intent=settings.get('connectivity_intent', ''),
+        is_cloud=_conn_is_cloud(),
+    )
+
+
+@app.route('/api/connectivity/state')
+@login_required
+def connectivity_state_api():
+    settings = load_settings()
+    return jsonify({
+        'intent': settings.get('connectivity_intent', ''),
+        'detect_running': _connectivity_detect_status.get('running', False),
+        'has_result': _connectivity_detect_status.get('result') is not None,
+    })
+
+
+@app.route('/api/connectivity/intent', methods=['POST'])
+@login_required
+def connectivity_intent_api():
+    intent = ((request.json or {}).get('intent') or '').strip()
+    if intent not in ('static', 'portable'):
+        return jsonify({'error': 'intent must be "static" or "portable"'}), 400
+    settings = load_settings()
+    settings['connectivity_intent'] = intent
+    save_settings(settings)
+    return jsonify({'success': True, 'intent': intent})
+
+
+@app.route('/api/connectivity/detect', methods=['POST'])
+@login_required
+def connectivity_detect_api():
+    if _connectivity_detect_status.get('running'):
+        return jsonify({'error': 'Detection already in progress'}), 409
+    _connectivity_detect_status.update(
+        {'running': True, 'complete': False, 'error': '', 'log': [], 'result': None})
+    settings = load_settings()
+    threading.Thread(target=_run_connectivity_detect, args=(settings,), daemon=True).start()
+    return jsonify({'success': True})
+
+
+@app.route('/api/connectivity/detect-status')
+@login_required
+def connectivity_detect_status_api():
+    st = _connectivity_detect_status
+    return jsonify({
+        'running': st.get('running', False),
+        'complete': st.get('complete', False),
+        'error': st.get('error', ''),
+        'log': st.get('log', []),
+        'result': st.get('result'),
+    })
+
+
+# ── Leg 4 — CONNECT ANCHOR (box-side automation) ──────────────────────────────
+# Turns the manual wg0.conf hand-assembly into a form: the console generates the
+# box WireGuard keypair, writes the tunnel config, and dials the anchor. The
+# anchor VPS itself is still stood up manually (RUNBOOK-oracle-anchor-provisioning,
+# private notes) — this automates only the box half. Field-validated field defaults
+# from the 2026-07-07 Starlink build: overlay 172.31.99.0/24, box .2, anchor .1,
+# udp/443 (guest nets filter high UDP ports; 443 looks like HTTPS/QUIC).
+_CONN_WG_IF = 'wg0'
+_CONN_BOX_WG_IP = '172.31.99.2'
+_CONN_ANCHOR_WG_IP = '172.31.99.1'
+_CONN_WG_KEY_RE = re.compile(r'^[A-Za-z0-9+/]{43}=$')  # 32-byte base64 WireGuard key
+
+
+def _conn_wg_conf_path():
+    return '/etc/wireguard/%s.conf' % _CONN_WG_IF
+
+
+def _conn_anchor_status():
+    """Parse `wg show wg0` into a status dict. Never raises."""
+    out = {'configured': False, 'up': False, 'handshake_secs': None,
+           'endpoint': '', 'rx_bytes': None, 'tx_bytes': None}
+    settings = load_settings()
+    anchor = settings.get('connectivity_anchor') or {}
+    if anchor.get('anchor_ip'):
+        out['configured'] = True
+        out['anchor_ip'] = anchor.get('anchor_ip')
+        out['wg_port'] = anchor.get('wg_port')
+        out['box_pubkey'] = anchor.get('box_pubkey', '')
+    try:
+        r = subprocess.run(_sudo_wrap(['wg', 'show', _CONN_WG_IF, 'dump']),
+                           capture_output=True, text=True, timeout=8)
+        if r.returncode != 0 or not r.stdout.strip():
+            return out
+        lines = r.stdout.strip().splitlines()
+        # dump format: first line = interface; peer lines follow (tab-separated).
+        # peer: pubkey preshared endpoint allowed-ips latest-handshake rx tx keepalive
+        for ln in lines[1:]:
+            f = ln.split('\t')
+            if len(f) >= 8:
+                out['up'] = True
+                out['endpoint'] = f[2] if f[2] != '(none)' else ''
+                hs = int(f[4]) if f[4].isdigit() else 0
+                out['rx_bytes'] = int(f[5]) if f[5].isdigit() else 0
+                out['tx_bytes'] = int(f[6]) if f[6].isdigit() else 0
+                if hs > 0:
+                    import time as _t
+                    # dump gives an absolute epoch for latest handshake; convert to age.
+                    out['handshake_secs'] = max(0, int(_t.time()) - hs)
+    except Exception:
+        pass
+    return out
+
+
+@app.route('/api/connectivity/anchor/status')
+@login_required
+def connectivity_anchor_status_api():
+    return jsonify(_conn_anchor_status())
+
+
+def _conn_validate_anchor_inputs(anchor_ip, anchor_pubkey, wg_port):
+    """Shared strict validation. Returns (ok, wg_port_int_or_error_string)."""
+    try:
+        ipaddress.ip_address(anchor_ip)
+    except (ValueError, TypeError):
+        return False, 'Anchor IP is not a valid IP address.'
+    if anchor_pubkey is not None and not _CONN_WG_KEY_RE.fullmatch(anchor_pubkey or ''):
+        return False, 'Anchor WireGuard public key is malformed (expected a 44-char base64 key ending in "=").'
+    try:
+        wg_port = int(wg_port)
+    except (ValueError, TypeError):
+        return False, 'WireGuard port must be a number.'
+    if not (1 <= wg_port <= 65535):
+        return False, 'WireGuard port out of range.'
+    return True, wg_port
+
+
+def _conn_configure_box_tunnel(anchor_ip, anchor_pubkey, wg_port):
+    """Generate the box keypair, write /etc/wireguard/wg0.conf, bring up the tunnel.
+    Callers must have validated inputs already. Returns (ok, box_pubkey, error)."""
+    if not shutil.which('wg'):
+        try:
+            _pkg_install(['wireguard-tools'])
+        except Exception as ex:
+            return False, '', 'Could not install wireguard-tools: %s' % str(ex)[:160]
+        if not shutil.which('wg'):
+            return False, '', 'wireguard-tools unavailable after install.'
+    try:
+        priv = subprocess.run(['wg', 'genkey'], capture_output=True, text=True, timeout=10).stdout.strip()
+        pub = subprocess.run(['wg', 'pubkey'], input=priv + '\n', capture_output=True, text=True, timeout=10).stdout.strip()
+    except Exception as ex:
+        return False, '', 'Key generation failed: %s' % str(ex)[:160]
+    if not (_CONN_WG_KEY_RE.fullmatch(priv) and _CONN_WG_KEY_RE.fullmatch(pub)):
+        return False, '', 'Generated key looked malformed — aborting.'
+    conf = (
+        '[Interface]\n'
+        'Address = %s/24\n'
+        'PrivateKey = %s\n\n'
+        '[Peer]\n'
+        'PublicKey = %s\n'
+        'Endpoint = %s:%d\n'
+        'AllowedIPs = %s/32\n'
+        'PersistentKeepalive = 25\n'
+    ) % (_CONN_BOX_WG_IP, priv, anchor_pubkey, anchor_ip, wg_port, _CONN_ANCHOR_WG_IP)
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(prefix='wg-', suffix='.conf')
+        os.write(fd, conf.encode())
+        os.close(fd)
+        os.chmod(tmp_path, 0o600)
+        inst = _run_priv_chain([
+            ['install', '-D', '-m', '600', '-o', 'root', '-g', 'root', tmp_path, _conn_wg_conf_path()],
+        ], mode='and')
+        if not inst or inst.returncode != 0:
+            return False, '', 'Could not write tunnel config: %s' % ((inst.stderr if inst else '') or 'install failed')[:160]
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+    up = _run_priv_chain([
+        ['systemctl', 'enable', 'wg-quick@%s' % _CONN_WG_IF],
+        ['systemctl', 'restart', 'wg-quick@%s' % _CONN_WG_IF],
+    ], mode='seq')
+    if not up or up.returncode != 0:
+        return False, '', 'Tunnel config written but bring-up failed: %s' % ((up.stderr if up else '') or 'systemctl failed')[:160]
+    return True, pub, ''
+
+
+@app.route('/api/connectivity/anchor/configure', methods=['POST'])
+@login_required
+def connectivity_anchor_configure_api():
+    data = request.get_json(silent=True) or {}
+    anchor_ip = (data.get('anchor_ip') or '').strip()
+    anchor_pubkey = (data.get('anchor_pubkey') or '').strip()
+    ok, wg_port = _conn_validate_anchor_inputs(anchor_ip, anchor_pubkey, data.get('wg_port', 443))
+    if not ok:
+        return jsonify({'success': False, 'error': wg_port}), 400
+    cfg_ok, pub, err = _conn_configure_box_tunnel(anchor_ip, anchor_pubkey, wg_port)
+    if not cfg_ok:
+        return jsonify({'success': False, 'error': err}), 500
+
+    settings = load_settings()
+    settings['connectivity_anchor'] = {
+        'anchor_ip': anchor_ip, 'anchor_pubkey': anchor_pubkey,
+        'wg_port': wg_port, 'box_pubkey': pub,
+    }
+    save_settings(settings)
+    return jsonify({
+        'success': True,
+        'box_pubkey': pub,
+        'add_box_cmd': 'sudo ./connectivity-anchor-bootstrap.sh add-box %s' % pub,
+    })
+
+
+@app.route('/api/connectivity/anchor/disconnect', methods=['POST'])
+@login_required
+def connectivity_anchor_disconnect_api():
+    _run_priv_chain([
+        ['systemctl', 'disable', 'wg-quick@%s' % _CONN_WG_IF],
+        ['systemctl', 'stop', 'wg-quick@%s' % _CONN_WG_IF],
+        ['rm', '-f', _conn_wg_conf_path()],
+    ], mode='seq')
+    settings = load_settings()
+    settings.pop('connectivity_anchor', None)
+    save_settings(settings)
+    return jsonify({'success': True})
+
+
+# ── Leg 4 (full) — PROVISION ANCHOR OVER SSH (upload the .key, console does it all) ──
+# Mirrors the TAK split-deploy pattern (takserver_two_server_upload_ssh_key): the
+# operator makes the Oracle VM + downloads its SSH key, then just enters the anchor
+# IP and uploads that key. The console SSHes in, runs the bootstrap, reads the WG
+# public key out of the output, configures the box tunnel, and authorizes the box on
+# the anchor with add-box — no terminal, no hand-copied keys.
+_CONN_ANCHOR_BOOTSTRAP_RAW = ('https://raw.githubusercontent.com/takwerx/infra-TAK/'
+                              'dev/scripts/connectivity-anchor-bootstrap.sh')
+_CONN_ANCHOR_KEY_PATH = os.path.expanduser('~/.ssh/infratak_anchor')
+_CONN_SSH_USER_RE = re.compile(r'^[a-z_][a-z0-9_-]{0,31}$')
+_connectivity_provision_status = {'running': False, 'complete': False, 'error': '', 'log': []}
+
+
+def _conn_prov_log(msg):
+    _connectivity_provision_status['log'].append(msg)
+
+
+def _conn_write_anchor_key(key_text):
+    """Write + validate the uploaded anchor SSH private key to a FIXED 0600 path
+    (never request-controlled → no traversal). Rejects passphrase-protected keys
+    (can't be used non-interactively). Returns (ok, error). Mirrors split-deploy."""
+    key_text = (key_text or '').replace('\r\n', '\n').replace('\r', '\n')
+    if not key_text.strip():
+        return False, 'No SSH key provided.'
+    if not key_text.endswith('\n'):
+        key_text += '\n'
+    if '-----BEGIN' not in key_text or 'PRIVATE KEY' not in key_text:
+        return False, 'That does not look like an SSH private key (expected a "-----BEGIN … PRIVATE KEY-----" block, e.g. the Oracle .key file).'
+    try:
+        os.makedirs(os.path.dirname(_CONN_ANCHOR_KEY_PATH), mode=0o700, exist_ok=True)
+        fd = os.open(_CONN_ANCHOR_KEY_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as f:
+            f.write(key_text)
+        os.chmod(_CONN_ANCHOR_KEY_PATH, 0o600)
+    except Exception as e:
+        return False, 'Could not store key: %s' % str(e)[:160]
+    try:
+        r = subprocess.run(['ssh-keygen', '-y', '-f', _CONN_ANCHOR_KEY_PATH],
+                           capture_output=True, text=True, timeout=10)
+    except Exception as e:
+        try:
+            os.remove(_CONN_ANCHOR_KEY_PATH)
+        except Exception:
+            pass
+        return False, 'Key validation failed: %s' % str(e)[:160]
+    if r.returncode != 0:
+        try:
+            os.remove(_CONN_ANCHOR_KEY_PATH)
+        except Exception:
+            pass
+        _e = (r.stderr or r.stdout or '').lower()
+        if 'passphrase' in _e:
+            return False, 'The key is passphrase-protected — re-export it without a passphrase and upload that.'
+        return False, 'Invalid or unsupported private key format.'
+    return True, ''
+
+
+def _conn_anchor_ssh(anchor_ip, ssh_user, remote_cmd, timeout=180):
+    """Run one command on the anchor over SSH with the uploaded key. Returns (ok, output)."""
+    host_cfg = {'host': anchor_ip, 'ssh_user': ssh_user, 'ssh_port': 22,
+                'auth_method': 'ssh_key', 'ssh_key_path': _CONN_ANCHOR_KEY_PATH}
+    return _ssh_probe(host_cfg, remote_cmd, timeout=timeout)
+
+
+def _run_connectivity_provision(anchor_ip, ssh_user, wg_port):
+    st = _connectivity_provision_status
+    try:
+        _conn_prov_log('Connecting to relay %s as %s…' % (anchor_ip, ssh_user))
+        ok, out = _conn_anchor_ssh(anchor_ip, ssh_user, 'echo relay-reachable', timeout=25)
+        if not ok:
+            st.update({'running': False, 'complete': True, 'error': 'Cannot SSH to the relay: %s' % out[:200]})
+            return
+        # Fetch + run the bootstrap on the anchor. WG_PORT is an int (validated); the
+        # URL is a fixed constant. Nothing operator-typed lands in this remote shell string.
+        _conn_prov_log('Running the relay setup (this installs WireGuard + forwards)…')
+        setup_cmd = ("curl -fsSL '%s' -o ~/connectivity-anchor-bootstrap.sh && "
+                     "chmod +x ~/connectivity-anchor-bootstrap.sh && "
+                     "sudo WG_PORT=%d bash ~/connectivity-anchor-bootstrap.sh setup"
+                     ) % (_CONN_ANCHOR_BOOTSTRAP_RAW, wg_port)
+        ok, out = _conn_anchor_ssh(anchor_ip, ssh_user, setup_cmd, timeout=240)
+        if not ok:
+            st.update({'running': False, 'complete': True, 'error': 'Anchor bootstrap failed: %s' % out[:300]})
+            return
+        m = re.search(r'WireGuard public key\s*:\s*([A-Za-z0-9+/]{43}=)', out)
+        if not m:
+            st.update({'running': False, 'complete': True, 'error': 'Could not read the relay WireGuard key from the setup output.'})
+            return
+        anchor_pubkey = m.group(1)
+        _conn_prov_log('Relay is up. Configuring this box\'s tunnel…')
+        cfg_ok, box_pub, err = _conn_configure_box_tunnel(anchor_ip, anchor_pubkey, wg_port)
+        if not cfg_ok:
+            st.update({'running': False, 'complete': True, 'error': err})
+            return
+        _conn_prov_log('Authorizing this box on the relay…')
+        # box_pub is a validated base64 WG key (fullmatch in _conn_configure_box_tunnel).
+        addbox_cmd = 'sudo bash ~/connectivity-anchor-bootstrap.sh add-box %s' % box_pub
+        ok, out = _conn_anchor_ssh(anchor_ip, ssh_user, addbox_cmd, timeout=60)
+        if not ok:
+            st.update({'running': False, 'complete': True, 'error': 'Box configured but authorizing it on the relay failed: %s' % out[:200]})
+            return
+        settings = load_settings()
+        settings['connectivity_anchor'] = {
+            'anchor_ip': anchor_ip, 'anchor_pubkey': anchor_pubkey,
+            'wg_port': wg_port, 'box_pubkey': box_pub, 'provisioned': True,
+        }
+        save_settings(settings)
+        _conn_prov_log('Done. The tunnel is dialing — status will show connected shortly.')
+        st.update({'running': False, 'complete': True, 'error': ''})
+    except Exception as ex:
+        st.update({'running': False, 'complete': True, 'error': str(ex)[:300]})
+
+
+@app.route('/api/connectivity/anchor/provision', methods=['POST'])
+@login_required
+def connectivity_anchor_provision_api():
+    if _connectivity_provision_status.get('running'):
+        return jsonify({'success': False, 'error': 'A provisioning run is already in progress.'}), 409
+    data = request.get_json(silent=True) or {}
+    anchor_ip = (data.get('anchor_ip') or '').strip()
+    ssh_user = (data.get('ssh_user') or 'ubuntu').strip()
+    ssh_key = data.get('ssh_private_key') or ''
+    ok, wg_port = _conn_validate_anchor_inputs(anchor_ip, None, data.get('wg_port', 443))
+    if not ok:
+        return jsonify({'success': False, 'error': wg_port}), 400
+    if not _CONN_SSH_USER_RE.fullmatch(ssh_user):
+        return jsonify({'success': False, 'error': 'SSH username has invalid characters.'}), 400
+    key_ok, key_err = _conn_write_anchor_key(ssh_key)
+    if not key_ok:
+        return jsonify({'success': False, 'error': key_err}), 400
+    _connectivity_provision_status.update({'running': True, 'complete': False, 'error': '', 'log': []})
+    threading.Thread(target=_run_connectivity_provision, args=(anchor_ip, ssh_user, wg_port), daemon=True).start()
+    return jsonify({'success': True})
+
+
+@app.route('/api/connectivity/anchor/provision-status')
+@login_required
+def connectivity_anchor_provision_status_api():
+    st = _connectivity_provision_status
+    return jsonify({'running': st.get('running', False), 'complete': st.get('complete', False),
+                    'error': st.get('error', ''), 'log': st.get('log', [])})
+
+
+# ── Leg 5 — VERIFY (green/red reachability matrix) ─────────────────────────────
+# Proves clients can actually reach the stack from the public internet — the loop
+# that kills router/NSG trial-and-error. v1 vantage decision (deliberate deviation
+# from the PLAN's relay-side :5099 prober): the relay CANNOT probe its own public
+# IP — locally-originated packets skip the PREROUTING DNAT and never traverse the
+# cloud NSG, so a relay-side self-probe false-REDs a perfectly working setup. A
+# direct outbound TCP connect from THIS BOX to the relay's public endpoint walks
+# the true client path end-to-end (internet → cloud NSG → relay DNAT → WireGuard →
+# box service) — the same round trip the LDAP-outpost FQDN probe validated in the
+# field 2026-07-08. The :5099 seed prober stays on the relay for a future
+# third-vantage / Class-A probe-back build.
+_CONN_VERIFY_PORTS = [
+    (443,  'Web UIs (Portal / CloudTAK / Authentik via Caddy)', True),
+    (8089, 'TAK streaming (CoT / ATAK-iTAK connections)',        True),
+    (8443, 'Marti API / WebTAK',                                  True),
+    (8446, 'Certificate + QR enrollment',                         True),
+    (80,   "Let's Encrypt renewal (HTTP-01)",                     False),
+]
+
+_connectivity_verify_status = {'running': False, 'complete': False, 'error': '', 'result': None}
+
+
+def _conn_verify_tcp(host, port, timeout=5):
+    """One TCP connect probe. Returns {'state','ms','detail'} and never raises."""
+    import socket as _s
+    t0 = time.time()
+    try:
+        with _s.create_connection((host, port), timeout=timeout):
+            return {'state': 'green', 'ms': int((time.time() - t0) * 1000), 'detail': ''}
+    except OSError as ex:
+        return {'state': 'red', 'ms': int((time.time() - t0) * 1000),
+                'detail': (getattr(ex, 'strerror', '') or str(ex))[:80]}
+
+
+def _run_connectivity_verify(settings):
+    st = _connectivity_verify_status
+    try:
+        anchor = settings.get('connectivity_anchor') or {}
+        result = {'ports': {}, 'target': '', 'mode': '', 'vantage': '', 'ts': int(time.time())}
+        if anchor.get('anchor_ip'):
+            result['target'] = anchor['anchor_ip']
+            result['mode'] = 'relay'
+            result['vantage'] = ("this box → the relay's public address — the exact path clients take "
+                                 "(internet → cloud firewall/NSG → relay forward → tunnel → this box)")
+        else:
+            fqdn = (settings.get('fqdn') or '').split(':')[0].strip()
+            result['target'] = fqdn or (settings.get('server_ip') or '').strip()
+            result['mode'] = 'direct'
+            result['vantage'] = ("this box → its own public address. On a home network without NAT "
+                                 "hairpin this can show red even when outside clients connect fine — "
+                                 "confirm with a phone on cellular if reds look wrong.")
+        if not result['target']:
+            st.update({'running': False, 'complete': True, 'result': None,
+                       'error': 'Nothing to verify yet — connect a relay (or set an FQDN / public IP) first.'})
+            return
+        required_green = 0
+        for port, label, required in _CONN_VERIFY_PORTS:
+            probe = _conn_verify_tcp(result['target'], port)
+            probe['label'] = label
+            probe['required'] = required
+            if probe['state'] == 'red':
+                # The killer diagnostic: is the service even listening locally? Separates
+                # "deploy the module first" from "the path (router/NSG/forward) is blocked".
+                local = _conn_verify_tcp('127.0.0.1', port, timeout=2)
+                probe['local_listener'] = (local['state'] == 'green')
+                probe['hint'] = ('service reachable locally but NOT from outside — check the path: '
+                                 + ('relay cloud firewall/NSG ingress + forwarded ports' if result['mode'] == 'relay'
+                                    else 'router port forward + ISP/CGNAT')) if probe['local_listener'] else \
+                                'nothing listening on this box yet — deploy the module that owns this port'
+            if probe['state'] == 'green' and required:
+                required_green += 1
+            result['ports'][str(port)] = probe
+        result['all_green'] = required_green == sum(1 for _, _, req in _CONN_VERIFY_PORTS if req)
+        st.update({'running': False, 'complete': True, 'error': '', 'result': result})
+    except Exception as ex:
+        st.update({'running': False, 'complete': True, 'error': str(ex)[:300]})
+
+
+@app.route('/api/connectivity/verify', methods=['POST'])
+@login_required
+def connectivity_verify_api():
+    if _connectivity_verify_status.get('running'):
+        return jsonify({'error': 'A verify run is already in progress'}), 409
+    _connectivity_verify_status.update(
+        {'running': True, 'complete': False, 'error': '', 'result': None})
+    settings = load_settings()
+    threading.Thread(target=_run_connectivity_verify, args=(settings,), daemon=True).start()
+    return jsonify({'success': True})
+
+
+@app.route('/api/connectivity/verify-status')
+@login_required
+def connectivity_verify_status_api():
+    st = _connectivity_verify_status
+    return jsonify({'running': st.get('running', False), 'complete': st.get('complete', False),
+                    'error': st.get('error', ''), 'result': st.get('result')})
+
+
+# ── Leg 6 — WIFI JOIN (tell the box its next network, from the browser) ────────
+# Kills the netplan hand-edit for a portable box: scan/list networks + add one from
+# the UI. SAFETY MODEL (headless box reached remotely — a bad apply strands it):
+#  - ADDITIVE ONLY: never removes an existing access-point, so the current
+#    connection can't be dropped by adding a new one.
+#  - VALIDATE BEFORE APPLY: back up the netplan file, write the new one, run
+#    `netplan generate`; if it fails, RESTORE the backup and abort — never apply
+#    an unvalidated config.
+#  - Multiplatform: nmcli (NetworkManager / RHEL) when present, else netplan
+#    (Ubuntu). Both via the privileged broker (_sudo_wrap / _run_priv_chain).
+
+
+def _ensure_iw():
+    """Ensure the `iw` CLI exists (wireless scan/detect on netplan boxes without
+    NetworkManager). Field gap 2026-07-08: stock Ubuntu 22.04 SERVER does not ship
+    `iw` (desktop does) — so on exactly the boxes that need the netplan path, the
+    WiFi card's scan silently returned nothing. Mirrors _ensure_ldapsearch: tiny
+    package, installed on demand through the apt↔dnf shim (package is named `iw`
+    on both families). Checks sbin paths explicitly — the console user's PATH may
+    exclude /usr/sbin even when the binary is installed."""
+    for p in ('/usr/sbin/iw', '/sbin/iw', '/usr/bin/iw'):
+        if os.path.exists(p):
+            return True
+    if shutil.which('iw'):
+        return True
+    try:
+        _pkg_install('iw', timeout=120)
+    except Exception:
+        pass
+    return any(os.path.exists(p) for p in ('/usr/sbin/iw', '/sbin/iw', '/usr/bin/iw')) or bool(shutil.which('iw'))
+
+
+def _conn_wifi_iface():
+    """Detect the wireless interface name (e.g. wlp1s0). Empty if none."""
+    try:
+        _ensure_iw()
+        r = subprocess.run(_sudo_wrap(['iw', 'dev']), capture_output=True, text=True, timeout=8)
+        m = re.search(r'Interface\s+(\S+)', r.stdout or '')
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    try:
+        for n in sorted(os.listdir('/sys/class/net')):
+            if os.path.exists('/sys/class/net/%s/wireless' % n):
+                return n
+    except Exception:
+        pass
+    return ''
+
+
+def _conn_wifi_netplan_file():
+    """The netplan file that defines the wifis: block (where APs live).
+
+    Reads via the BROKER — netplan yamls are root-600 by design (they hold WiFi
+    PSKs; cloud-init tightened this after CVE-2022-… era), so a direct open() as
+    the non-root console EPERMs on every file and this reported 'No netplan wifi
+    config found' on a box that was ON WiFi at that very moment (field-hit
+    2026-07-08, NUC — first live Leg 6 test). Returns '' if no file has a
+    wifis: block (caller creates our own layered file)."""
+    try:
+        import glob as _glob
+        for f in sorted(_glob.glob('/etc/netplan/*.yaml')):
+            try:
+                r = subprocess.run(_sudo_wrap(['cat', f]), capture_output=True, text=True, timeout=8)
+                if r.returncode == 0 and 'wifis' in (r.stdout or ''):
+                    return f
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return ''
+
+
+def _conn_wifi_saved():
+    """SSIDs the box already knows (from nmcli or the netplan file)."""
+    out = []
+    if shutil.which('nmcli'):
+        try:
+            r = subprocess.run(_sudo_wrap(['nmcli', '-t', '-f', 'NAME,TYPE', 'connection', 'show']),
+                               capture_output=True, text=True, timeout=10)
+            for line in (r.stdout or '').splitlines():
+                p = line.split(':')
+                if len(p) >= 2 and 'wireless' in p[1]:
+                    out.append(p[0])
+        except Exception:
+            pass
+        return out
+    # netplan branch: read every yaml via the broker (root-600 files — a direct
+    # open() EPERMs as the non-root console and the saved list showed empty even
+    # while the box was connected; same field bug as _conn_wifi_netplan_file).
+    try:
+        import glob as _glob
+        import yaml as _yaml
+        for f in sorted(_glob.glob('/etc/netplan/*.yaml')):
+            try:
+                r = subprocess.run(_sudo_wrap(['cat', f]), capture_output=True, text=True, timeout=8)
+                doc = _yaml.safe_load(r.stdout or '') or {}
+                for _iface, cfg in ((doc.get('network') or {}).get('wifis') or {}).items():
+                    for _ssid in (cfg.get('access-points') or {}).keys():
+                        if _ssid not in out:
+                            out.append(_ssid)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
+
+
+def _conn_wifi_scan():
+    """Best-effort list of visible SSIDs (+ signal where available)."""
+    nets, seen = [], set()
+
+    def _add(ssid, signal=''):
+        ssid = (ssid or '').strip()
+        if ssid and ssid not in seen:
+            seen.add(ssid)
+            nets.append({'ssid': ssid, 'signal': signal})
+    if shutil.which('nmcli'):
+        try:
+            subprocess.run(_sudo_wrap(['nmcli', 'dev', 'wifi', 'rescan']), capture_output=True, timeout=15)
+            r = subprocess.run(_sudo_wrap(['nmcli', '-t', '-f', 'SSID,SIGNAL', 'dev', 'wifi', 'list']),
+                               capture_output=True, text=True, timeout=20)
+            for line in (r.stdout or '').splitlines():
+                p = line.rsplit(':', 1)
+                _add(p[0], p[1] if len(p) > 1 else '')
+        except Exception:
+            pass
+        return nets
+    iface = _conn_wifi_iface()
+    if iface:
+        try:
+            _ensure_iw()
+            r = subprocess.run(_sudo_wrap(['iw', 'dev', iface, 'scan']),
+                               capture_output=True, text=True, timeout=25)
+            for line in (r.stdout or '').splitlines():
+                s = line.strip()
+                if s.startswith('SSID:'):
+                    _add(s[5:])
+        except Exception:
+            pass
+    return nets
+
+
+def _conn_wifi_visible():
+    """SSIDs currently in range, from the radio's CACHED scan results — cheap and
+    instant (no active scan), so it's safe to include on the list poll. nmcli uses
+    its cached `dev wifi list`; netplan uses `iw dev <iface> scan dump` (kernel
+    cache from the client's periodic background scans). The active 'Scan for
+    networks' button refreshes the cache. Best-effort; empty if unavailable."""
+    seen = set()
+    if shutil.which('nmcli'):
+        try:
+            r = subprocess.run(_sudo_wrap(['nmcli', '-t', '-f', 'SSID', 'dev', 'wifi', 'list']),
+                               capture_output=True, text=True, timeout=8)
+            for ln in (r.stdout or '').splitlines():
+                s = ln.strip()
+                if s:
+                    seen.add(s)
+        except Exception:
+            pass
+        return list(seen)
+    iface = _conn_wifi_iface()
+    if iface:
+        try:
+            _ensure_iw()
+            r = subprocess.run(_sudo_wrap(['iw', 'dev', iface, 'scan', 'dump']),
+                               capture_output=True, text=True, timeout=8)
+            for ln in (r.stdout or '').splitlines():
+                s = ln.strip()
+                if s.startswith('SSID:'):
+                    v = s[5:].strip()
+                    if v:
+                        seen.add(v)
+        except Exception:
+            pass
+    return list(seen)
+
+
+def _conn_setup_ap_active():
+    """True if the Setup AP is currently broadcasting (flag written by the engine)."""
+    return os.path.exists('/var/lib/takguard/setup-ap.active')
+
+
+def _conn_wifi_add(ssid, psk):
+    """Add a wifi network ADDITIVELY and bring config up. Returns (ok, error).
+    netplan path validates-before-apply with backup/restore; never strands."""
+    if not (1 <= len(ssid.encode('utf-8')) <= 32):
+        return False, 'Network name must be 1–32 characters.'
+    if psk and not (8 <= len(psk) <= 63):
+        return False, 'WiFi password must be 8–63 characters (WPA requirement).'
+    # NetworkManager path (RHEL / any box with nmcli).
+    # v10.1.0 parity fix: use `connection add` (create the PROFILE, activate
+    # nothing), NOT `dev wifi connect` — connect ACTIVATES, i.e. it switches
+    # the box onto the new network immediately (breaking the "adding never
+    # disconnects the one you're on" promise) and it FAILS outright for an SSID
+    # that isn't in range (breaking pre-provision, the flagship Leg 6 feature).
+    # `connection add` + autoconnect matches netplan's additive semantics:
+    # NM joins the network when it sees it, current connection untouched.
+    if shutil.which('nmcli'):
+        iface = _conn_wifi_iface() or '*'
+        if ssid in _conn_wifi_saved():
+            if not psk:
+                return True, ''
+            # Same SSID re-added with a (possibly new) password → update in place.
+            cmd = ['nmcli', 'connection', 'modify', ssid, 'wifi-sec.psk', psk]
+        else:
+            cmd = ['nmcli', 'connection', 'add', 'type', 'wifi',
+                   'con-name', ssid, 'ifname', iface, 'ssid', ssid,
+                   'connection.autoconnect', 'yes']
+            if psk:
+                cmd += ['wifi-sec.key-mgmt', 'wpa-psk', 'wifi-sec.psk', psk]
+        r = subprocess.run(_sudo_wrap(cmd), capture_output=True, text=True, timeout=45)
+        if r.returncode != 0:
+            return False, (r.stderr or r.stdout or 'nmcli profile add failed').strip()[:200]
+        # Provisioning from the Setup AP: stop it so NM autoconnects to the new
+        # profile (the AP owns the radio until then).
+        if _conn_setup_ap_active():
+            subprocess.run(_sudo_wrap(['systemctl', 'stop', 'takwerx-setup-ap.service']),
+                           capture_output=True, text=True, timeout=60)
+        return True, ''
+    # netplan path (Ubuntu).
+    f = _conn_wifi_netplan_file()
+    created_new = False
+    if not f:
+        # No wifis: block anywhere (ethernet-only cloud-init, or WiFi configured
+        # outside netplan). Create our OWN lexically-layered file instead of
+        # failing — netplan merges mappings across files, and never touching
+        # cloud-init's file means cloud-init can't clobber our APs later.
+        f = '/etc/netplan/90-infratak-wifi.yaml'
+        created_new = True
+    iface = _conn_wifi_iface()
+    if not iface:
+        return False, 'No wireless interface detected.'
+    try:
+        import yaml as _yaml
+        # Read current config via privileged cat (file may be root-only).
+        cur = subprocess.run(_sudo_wrap(['cat', f]), capture_output=True, text=True, timeout=10)
+        doc = _yaml.safe_load(cur.stdout or '') or {}
+        net = doc.setdefault('network', {})
+        net.setdefault('version', 2)
+        wifis = net.setdefault('wifis', {})
+        ap = wifis.setdefault(iface, {})
+        ap.setdefault('dhcp4', True)
+        points = ap.setdefault('access-points', {})
+        # ADDITIVE: add/replace only THIS ssid, keep every other AP untouched.
+        if psk:
+            points[ssid] = {'auth': {'key-management': 'psk', 'password': psk}}
+        else:
+            points[ssid] = {}
+        new_yaml = _yaml.safe_dump(doc, default_flow_style=False, sort_keys=False)
+    except Exception as ex:
+        return False, 'Could not read/parse netplan config: %s' % str(ex)[:160]
+    # Write via temp → privileged install, keeping a backup for restore-on-failure.
+    tmp_path = bak = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(prefix='netplan-', suffix='.yaml')
+        os.write(fd, new_yaml.encode())
+        os.close(fd)
+        os.chmod(tmp_path, 0o600)
+        bak = f + '.infratak-wifi.bak'
+        if not created_new:
+            _run_priv_chain([['cp', '-a', f, bak]], mode='and')
+        inst = _run_priv_chain([['install', '-m', '600', '-o', 'root', '-g', 'root', tmp_path, f]], mode='and')
+        if not inst or inst.returncode != 0:
+            return False, 'Could not write netplan config.'
+        # VALIDATE — if generate fails, roll back and abort (never apply). For a
+        # freshly created file there is no backup to restore — remove it instead
+        # (leaves the box exactly as it was).
+        gen = _run_priv_chain([['netplan', 'generate']], mode='and')
+        if not gen or gen.returncode != 0:
+            if created_new:
+                _run_priv_chain([['rm', '-f', f], ['netplan', 'generate']], mode='seq')
+            else:
+                _run_priv_chain([['cp', '-a', bak, f], ['netplan', 'generate']], mode='seq')
+            return False, 'New network config failed validation — reverted, nothing changed. (%s)' \
+                % ((gen.stderr if gen else '') or '')[:140]
+        # If the Setup AP is broadcasting (the operator is provisioning FROM it),
+        # the radio is busy being the AP — a raw `netplan apply` would fight
+        # hostapd. Instead stop the AP: its teardown restores the client and runs
+        # netplan apply, so the box joins the just-added network (in range at the
+        # new location) and drops the AP in one step. Otherwise apply directly
+        # (additive — doesn't drop the current connection).
+        if _conn_setup_ap_active():
+            subprocess.run(_sudo_wrap(['systemctl', 'stop', 'takwerx-setup-ap.service']),
+                           capture_output=True, text=True, timeout=60)
+            return True, ''
+        appl = _run_priv_chain([['netplan', 'apply']], mode='and')
+        if not appl or appl.returncode != 0:
+            return False, 'Config validated but apply failed: %s' % ((appl.stderr if appl else '') or '')[:140]
+        return True, ''
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
+@app.route('/api/connectivity/wifi/list')
+@login_required
+def connectivity_wifi_list_api():
+    ap_active = _conn_setup_ap_active()
+    # In AP mode the radio can't scan, so skip the (stale/empty) visible probe.
+    return jsonify({'iface': _conn_wifi_iface(), 'saved': _conn_wifi_saved(),
+                    'current': _conn_wifi_current(),
+                    'visible': [] if ap_active else _conn_wifi_visible(),
+                    'ap_active': ap_active})
+
+
+@app.route('/api/connectivity/wifi/scan')
+@login_required
+def connectivity_wifi_scan_api():
+    return jsonify({'networks': _conn_wifi_scan()})
+
+
+@app.route('/api/connectivity/wifi/add', methods=['POST'])
+@login_required
+def connectivity_wifi_add_api():
+    data = request.get_json(silent=True) or {}
+    ssid = (data.get('ssid') or '').strip()
+    psk = data.get('password') or ''
+    if not ssid:
+        return jsonify({'success': False, 'error': 'Enter a network name (SSID).'}), 400
+    ok, err = _conn_wifi_add(ssid, psk)
+    if not ok:
+        return jsonify({'success': False, 'error': err}), 400
+    return jsonify({'success': True})
+
+
+# ── Leg 6c — CURRENT + FORGET (which network the box is on; drop a saved one) ──
+def _conn_wifi_current():
+    """SSID the box is CURRENTLY associated to (''=not connected). Reads `iw dev`
+    (broker-gated, cross-platform) — the associated interface prints an `ssid`
+    line. No nmcli-specific shape needed."""
+    iface = _conn_wifi_iface()
+    if not iface:
+        return ''
+    try:
+        _ensure_iw()
+        r = subprocess.run(_sudo_wrap(['iw', 'dev']), capture_output=True, text=True, timeout=8)
+        cur_if = None
+        for ln in (r.stdout or '').splitlines():
+            s = ln.strip()
+            if s.startswith('Interface '):
+                cur_if = s.split(None, 1)[1].strip()
+            elif s.startswith('ssid ') and cur_if == iface:
+                return s[5:].strip()
+    except Exception:
+        pass
+    return ''
+
+
+def _conn_wifi_forget(ssid):
+    """Remove a saved network. Returns (ok, error). nmcli: delete the profile.
+    netplan: strip the SSID from every netplan file that has it, then
+    validate-before-apply (revert on failure). Never touches other APs."""
+    ssid = (ssid or '').strip()
+    if not ssid:
+        return False, 'No network specified.'
+    if shutil.which('nmcli'):
+        r = subprocess.run(_sudo_wrap(['nmcli', 'connection', 'delete', ssid]),
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            return False, (r.stderr or r.stdout or 'delete failed').strip()[:200]
+        return True, ''
+    # netplan: read-modify-write each file that contains the AP (via broker).
+    import glob as _glob
+    import yaml as _yaml
+    touched = False
+    for f in sorted(_glob.glob('/etc/netplan/*.yaml')):
+        try:
+            r = subprocess.run(_sudo_wrap(['cat', f]), capture_output=True, text=True, timeout=8)
+            if r.returncode != 0 or 'access-points' not in (r.stdout or ''):
+                continue
+            doc = _yaml.safe_load(r.stdout or '') or {}
+            wifis = ((doc.get('network') or {}).get('wifis') or {})
+            removed_here = False
+            for _iface, cfg in wifis.items():
+                aps = cfg.get('access-points') or {}
+                if ssid in aps:
+                    del aps[ssid]
+                    removed_here = True
+            if not removed_here:
+                continue
+            new_yaml = _yaml.safe_dump(doc, default_flow_style=False, sort_keys=False)
+            tmp = None
+            try:
+                fd, tmp = tempfile.mkstemp(prefix='netplan-', suffix='.yaml')
+                os.write(fd, new_yaml.encode())
+                os.close(fd)
+                os.chmod(tmp, 0o600)
+                bak = f + '.infratak-forget.bak'
+                _run_priv_chain([['cp', '-a', f, bak]], mode='and')
+                _run_priv_chain([['install', '-m', '600', '-o', 'root', '-g', 'root', tmp, f]], mode='and')
+                gen = _run_priv_chain([['netplan', 'generate']], mode='and')
+                if not gen or gen.returncode != 0:
+                    _run_priv_chain([['cp', '-a', bak, f], ['netplan', 'generate']], mode='seq')
+                    return False, 'Config failed validation — reverted, nothing changed.'
+                touched = True
+            finally:
+                if tmp and os.path.exists(tmp):
+                    try:
+                        os.remove(tmp)
+                    except Exception:
+                        pass
+        except Exception:
+            continue
+    if not touched:
+        return False, 'That network is not saved on this box.'
+    _run_priv_chain([['netplan', 'apply']], mode='and')
+    return True, ''
+
+
+def _conn_wifi_use(ssid):
+    """Switch the box onto an already-SAVED network now, using the stored
+    credentials (no re-typing the password). Returns (ok, error).
+      nmcli   — `nmcli connection up <ssid>` (activates the saved profile).
+      netplan — wpa_cli: find the saved network id, select it (associates now),
+                then re-enable all others so roaming/fallback still works after.
+    The switch is runtime; netplan config (all networks enabled) is authoritative
+    again on the next apply/reboot."""
+    ssid = (ssid or '').strip()
+    if not ssid:
+        return False, 'No network specified.'
+    if ssid not in _conn_wifi_saved():
+        return False, 'That network is not saved yet — add it first (with its password).'
+    # If provisioning FROM the Setup AP, the radio is the AP — wpa_cli/nmcli-up
+    # can't take effect. Stop the AP so the box reconnects to its known networks
+    # (the target, being saved + in range, is what it lands on).
+    if _conn_setup_ap_active():
+        subprocess.run(_sudo_wrap(['systemctl', 'stop', 'takwerx-setup-ap.service']),
+                       capture_output=True, text=True, timeout=60)
+        return True, ''
+    if shutil.which('nmcli'):
+        r = subprocess.run(_sudo_wrap(['nmcli', 'connection', 'up', ssid]),
+                           capture_output=True, text=True, timeout=45)
+        if r.returncode != 0:
+            return False, (r.stderr or r.stdout or 'switch failed').strip()[:200]
+        return True, ''
+    iface = _conn_wifi_iface()
+    if not iface:
+        return False, 'No wireless interface detected.'
+    try:
+        lst = subprocess.run(_sudo_wrap(['wpa_cli', '-i', iface, 'list_networks']),
+                             capture_output=True, text=True, timeout=10)
+        net_id = None
+        for ln in (lst.stdout or '').splitlines():
+            parts = ln.split('\t')
+            if len(parts) >= 2 and parts[1] == ssid:
+                net_id = parts[0].strip()
+                break
+        if net_id is None or not net_id.isdigit():
+            return False, 'Saved network not found in the WiFi supplicant — try re-adding it.'
+        sel = subprocess.run(_sudo_wrap(['wpa_cli', '-i', iface, 'select_network', net_id]),
+                             capture_output=True, text=True, timeout=15)
+        if 'OK' not in (sel.stdout or ''):
+            return False, 'Switch command was not accepted: %s' % (sel.stdout or sel.stderr or '')[:120]
+        # Re-enable the others so the box can still roam/fall back later.
+        subprocess.run(_sudo_wrap(['wpa_cli', '-i', iface, 'enable_network', 'all']),
+                       capture_output=True, text=True, timeout=10)
+        return True, ''
+    except Exception as ex:
+        return False, 'Could not switch network: %s' % str(ex)[:160]
+
+
+@app.route('/api/connectivity/wifi/use', methods=['POST'])
+@login_required
+def connectivity_wifi_use_api():
+    data = request.get_json(silent=True) or {}
+    ssid = (data.get('ssid') or '').strip()
+    ok, err = _conn_wifi_use(ssid)
+    if not ok:
+        return jsonify({'success': False, 'error': err}), 400
+    return jsonify({'success': True})
+
+
+@app.route('/api/connectivity/wifi/forget', methods=['POST'])
+@login_required
+def connectivity_wifi_forget_api():
+    data = request.get_json(silent=True) or {}
+    ssid = (data.get('ssid') or '').strip()
+    if not ssid:
+        return jsonify({'success': False, 'error': 'No network specified.'}), 400
+    # Forgetting the network the box is CURRENTLY using disconnects it. Allow it,
+    # but require the operator to acknowledge (client sends confirm=true) AND warn
+    # if the Setup AP isn't armed to catch the box.
+    current = _conn_wifi_current()
+    if ssid == current and not data.get('confirm'):
+        ap = _conn_setup_ap_read_conf()
+        return jsonify({'success': False, 'needs_confirm': True, 'is_current': True,
+                        'setup_ap_ready': bool(ap.get('has_password')),
+                        'error': 'This is the network the box is using right now — forgetting it disconnects the box.'}), 409
+    ok, err = _conn_wifi_forget(ssid)
+    if not ok:
+        return jsonify({'success': False, 'error': err}), 400
+    return jsonify({'success': True})
+
+
+# ── Leg 6b — SETUP AP (broadcast own wifi for local provisioning) ─────────────
+# When the box has no uplink, it broadcasts `infraTAK-setup-<host>` (WPA2) so an
+# operator joins from a laptop, lands on the console login (captive redirect), and
+# uses the WiFi card to pick a real network. ONE radio: broadcasting = not a wifi
+# client, so this only runs with no uplink to lose. The powerful bits live in the
+# root systemd unit takwerx-setup-ap.service (engine tak-setup-ap.sh); the console
+# only start/stops that unit through the broker — no new broker privilege.
+_SETUP_AP_CONF = '/var/lib/takguard/setup-ap.conf'
+_SETUP_AP_ACTIVE_FLAG = '/var/lib/takguard/setup-ap.active'
+
+
+def _conn_setup_ap_default_ssid():
+    try:
+        h = socket.gethostname().split('.')[0]
+    except Exception:
+        h = 'box'
+    return 'infraTAK-setup-%s' % h
+
+
+def _conn_setup_ap_read_conf():
+    """Read the engine conf via the broker (root-600). Returns a dict of the
+    SETUP_AP_* keys (ssid/auto only — never returns the password)."""
+    out = {'ssid': _conn_setup_ap_default_ssid(), 'auto': True, 'has_password': False}
+    try:
+        r = subprocess.run(_sudo_wrap(['cat', _SETUP_AP_CONF]), capture_output=True, text=True, timeout=8)
+        for ln in (r.stdout or '').splitlines():
+            ln = ln.strip()
+            if ln.startswith('SETUP_AP_SSID='):
+                v = ln.split('=', 1)[1].strip().strip('"').strip("'")
+                if v:
+                    out['ssid'] = v
+            elif ln.startswith('SETUP_AP_AUTO='):
+                out['auto'] = ln.split('=', 1)[1].strip() != '0'
+            elif ln.startswith('SETUP_AP_PASS=') and len(ln.split('=', 1)[1].strip()) >= 8:
+                out['has_password'] = True
+    except Exception:
+        pass
+    return out
+
+
+def _conn_setup_ap_write_conf(ssid, password, auto):
+    """Write the root-600 engine conf via a temp file + privileged install."""
+    ssid = (ssid or '').strip() or _conn_setup_ap_default_ssid()
+    _console_url = ''
+    try:
+        _st = load_settings()
+        _console_port = int(_st.get('console_port') or 5001)
+        # If the box has a real cert (LE via Caddy, or a custom cert), the setup AP
+        # can send the laptop to the console's Caddy vhost by NAME — the AP's wildcard
+        # DNS resolves it to the box, Caddy presents the TRUSTED cert (no warning), and
+        # Caddy is the sanctioned auth proxy (it strips client X-Authentik-* — no
+        # bypass). Fresh/self-signed boxes have no trusted cert, so the engine falls
+        # back to the box's own self-signed https (accept-the-warning floor).
+        _ssl_mode = (_st.get('ssl_mode') or '').strip().lower()
+        _fqdn = (_st.get('fqdn') or '').split(':')[0].strip()
+        if _fqdn and _ssl_mode in ('fqdn', 'custom'):
+            _ihost = _get_all_service_domains(_st).get('infratak')
+            if _ihost:
+                _console_url = 'https://%s/' % _ihost
+    except Exception:
+        _console_port = 5001
+    lines = ['# infra-TAK Setup AP config (managed by the console)\n',
+             'SETUP_AP_SSID=%s\n' % ssid,
+             'SETUP_AP_CONSOLE_PORT=%d\n' % _console_port,
+             'SETUP_AP_CONSOLE_URL=%s\n' % _console_url,
+             'SETUP_AP_AUTO=%s\n' % ('1' if auto else '0')]
+    if password:
+        lines.append('SETUP_AP_PASS=%s\n' % password)
+    tmp = None
+    try:
+        _makedirs_priv('/var/lib/takguard')
+        fd, tmp = tempfile.mkstemp(prefix='setup-ap-', suffix='.conf')
+        # If no new password given, preserve the existing one (read via broker).
+        if not password:
+            try:
+                r = subprocess.run(_sudo_wrap(['cat', _SETUP_AP_CONF]), capture_output=True, text=True, timeout=8)
+                for ln in (r.stdout or '').splitlines():
+                    if ln.strip().startswith('SETUP_AP_PASS='):
+                        lines.append(ln if ln.endswith('\n') else ln + '\n')
+                        break
+            except Exception:
+                pass
+        os.write(fd, ''.join(lines).encode())
+        os.close(fd)
+        os.chmod(tmp, 0o600)
+        inst = _run_priv_chain([['install', '-m', '600', '-o', 'root', '-g', 'root', tmp, _SETUP_AP_CONF]], mode='and')
+        return bool(inst and inst.returncode == 0)
+    except Exception:
+        return False
+    finally:
+        if tmp and os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+
+
+def _conn_setup_ap_status():
+    st = {'active': os.path.exists(_SETUP_AP_ACTIVE_FLAG), 'ap_capable': None, 'has_wifi': bool(_conn_wifi_iface())}
+    st.update(_conn_setup_ap_read_conf())
+    return st
+
+
+@app.route('/api/connectivity/setup-ap/status')
+@login_required
+def connectivity_setup_ap_status_api():
+    return jsonify(_conn_setup_ap_status())
+
+
+@app.route('/api/connectivity/setup-ap/reveal')
+@login_required
+def connectivity_setup_ap_reveal_api():
+    """Return the current setup-AP password (the operator must be able to read it
+    to type it on a laptop — the engine may have auto-generated a random one).
+    On-demand only (not in the status poll), authenticated. Read via the broker."""
+    pw = ''
+    try:
+        r = subprocess.run(_sudo_wrap(['cat', _SETUP_AP_CONF]), capture_output=True, text=True, timeout=8)
+        for ln in (r.stdout or '').splitlines():
+            if ln.strip().startswith('SETUP_AP_PASS='):
+                pw = ln.split('=', 1)[1].strip()
+                break
+    except Exception:
+        pass
+    return jsonify({'password': pw})
+
+
+@app.route('/api/connectivity/setup-ap/config', methods=['POST'])
+@login_required
+def connectivity_setup_ap_config_api():
+    data = request.get_json(silent=True) or {}
+    ssid = (data.get('ssid') or '').strip()
+    password = data.get('password') or ''
+    auto = bool(data.get('auto', True))
+    if password and not (8 <= len(password) <= 63):
+        return jsonify({'success': False, 'error': 'Setup-WiFi password must be 8–63 characters (WPA2).'}), 400
+    if ssid and not (1 <= len(ssid.encode('utf-8')) <= 32):
+        return jsonify({'success': False, 'error': 'Setup-WiFi name must be 1–32 characters.'}), 400
+    # Strict charset (defense-in-depth: the root engine parses the conf by
+    # assignment, not `source`, but never let shell-active bytes into a
+    # root-read config file). Reject shell metacharacters, quotes, newlines.
+    _bad = set('`$();&|<>\\\'"\n\r\t')
+    if any(c in _bad for c in ssid) or any(c in _bad for c in password):
+        return jsonify({'success': False, 'error': 'Name/password may not contain quotes, newlines, or any of ` $ ( ) ; & | < > \\'}), 400
+    if not _conn_setup_ap_write_conf(ssid, password, auto):
+        return jsonify({'success': False, 'error': 'Could not save Setup AP config.'}), 500
+    return jsonify({'success': True, 'status': _conn_setup_ap_status()})
+
+
+@app.route('/api/connectivity/setup-ap/start', methods=['POST'])
+@login_required
+def connectivity_setup_ap_start_api():
+    if not _conn_wifi_iface():
+        return jsonify({'success': False, 'error': 'No wireless interface on this box — cannot broadcast a setup network.'}), 400
+    # Start the root service through the broker. This SEVERS any wifi uplink (the
+    # radio becomes the AP), so the HTTP response is sent before the switch lands;
+    # the operator reconnects locally to the setup wifi.
+    r = subprocess.run(_sudo_wrap(['systemctl', 'start', 'takwerx-setup-ap.service']),
+                       capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        return jsonify({'success': False, 'error': (r.stderr or r.stdout or 'start failed').strip()[:200]}), 500
+    return jsonify({'success': True})
+
+
+@app.route('/api/connectivity/setup-ap/stop', methods=['POST'])
+@login_required
+def connectivity_setup_ap_stop_api():
+    r = subprocess.run(_sudo_wrap(['systemctl', 'stop', 'takwerx-setup-ap.service']),
+                       capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        return jsonify({'success': False, 'error': (r.stderr or r.stdout or 'stop failed').strip()[:200]}), 500
+    return jsonify({'success': True})
+
+
 # ── EUD Remote Assist Portal ──────────────────────────────────────────────────
 
 _remote_assist_deploy_status = {'running': False, 'complete': False, 'error': False, 'log': []}
@@ -9202,6 +10634,14 @@ def guarddog_page():
         {'id': 'cloudtak', 'name': 'CloudTAK', 'monitored': modules.get('cloudtak', {}).get('installed'), 'monitors': [{'name': 'Container', 'id': 'cloudtak_ctr', 'interval': '1 min', 'desc': 'Checks CloudTAK container. Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'updates', 'name': 'Updates', 'monitored': gd.get('installed'), 'monitors': [{'name': 'Update check', 'id': 'updates_check', 'interval': '6 h', 'desc': 'Checks for newer versions of infra-TAK, Authentik, MediaMTX, CloudTAK, and TAK Portal (same sources as the console update icons). Sends one email when any update is available (or when the set of available updates changes). Uses same alert email as other monitors. If this monitor is red or missing, click Update Guard Dog above to reinstall/update timers and scripts.'}]},
     ])
+    # v10.1.0 Leg 7: relay (connectivity anchor) health — only shown once a relay is
+    # configured. When up, the relay IS the box's ingress; a stale tunnel = clients
+    # can't reach the box, so it belongs on the health board next to everything else.
+    if (settings.get('connectivity_anchor') or {}).get('anchor_ip'):
+        _anchor_ip = settings['connectivity_anchor'].get('anchor_ip')
+        guarddog_services.append({'id': 'relay', 'name': f'Relay ({_anchor_ip})', 'monitored': gd.get('installed'), 'monitors': [
+            {'name': 'Tunnel', 'id': 'relay_tunnel', 'interval': '1 min', 'desc': f'Checks the WireGuard tunnel to the relay ({_anchor_ip}) by handshake age (fresh = healthy). Alerts after 3 consecutive stale checks (~3 min) and auto-clears on recovery. While the tunnel is down, no-VPN clients cannot reach this box through the relay address.'},
+        ]})
     guarddog_docs_url = f'https://github.com/{GITHUB_REPO}/blob/main/docs/GUARDDOG.md'
     notifications_configured = bool((settings.get('guarddog_alert_email') or '').strip())
     # Detect if Guard Dog config is current or needs re-deploy
@@ -11732,6 +13172,7 @@ def _guarddog_service_monitor_ids(settings):
         'nodered': ['nodered_http'],
         'cloudtak': ['cloudtak_ctr'],
         'updates': ['updates_check'],
+        'relay': ['relay_tunnel'],
     }
     return multi
 
@@ -11763,6 +13204,8 @@ def _guarddog_monitored_service_ids(settings):
         ids.append('cloudtak')
     if modules.get('guarddog', {}).get('installed'):
         ids.append('updates')
+    if (settings.get('connectivity_anchor') or {}).get('anchor_ip'):
+        ids.append('relay')
     return ids
 
 
@@ -11936,6 +13379,16 @@ def _monitor_health_check(monitor_id):
     """Quick health check for individual monitors. Returns True/False/None."""
     import socket
     try:
+        if monitor_id == 'relay_tunnel':
+            # Healthy = a fresh WireGuard handshake (<180s). Mirrors the Leg 7
+            # watcher's threshold. None if no relay configured / interface absent.
+            st = _conn_anchor_status()
+            if not st.get('configured'):
+                return None
+            hs = st.get('handshake_secs')
+            if hs is None:
+                return False
+            return hs <= 180
         if monitor_id == 'port8089':
             r = subprocess.run('ss -ltn "sport = :8089" 2>/dev/null', shell=True, capture_output=True, text=True, timeout=2)
             return 'LISTEN' in (r.stdout or '')
@@ -12557,8 +14010,9 @@ def _guarddog_diskio_report_inner():
 def _guarddog_timer_list():
     """All Guard Dog timer unit names (core + optional service monitors)."""
     return ['tak8089guard.timer', 'takoomguard.timer', 'takdiskguard.timer', 'takdiskioguard.timer',
-            'takdbguard.timer', 'takcotdbguard.timer', 'taknetguard.timer', 'takprocessguard.timer',
-            'takcertguard.timer', 'takintcaguard.timer',
+            'takdbguard.timer', 'takcotdbguard.timer', 'taknetguard.timer', 'takrelayguard.timer',
+            'takwerxsetupapwatch.timer',
+            'takprocessguard.timer', 'takcertguard.timer', 'takintcaguard.timer',
             'takauthentikguard.timer', 'takauthentiktasklogpurge.timer',
             'takmediamtxguard.timer', 'taknoderedguard.timer', 'takcloudtakguard.timer',
             'taktakportalguard.timer', 'takfedhubguard.timer']
@@ -13272,7 +14726,15 @@ def run_guarddog_deploy(alert_email):
             'tak-8089-watch.sh', 'tak-oom-watch.sh', 'tak-disk-watch.sh', 'tak-diskio-watch.sh',
             'tak-network-watch.sh', 'tak-process-watch.sh', 'tak-cert-watch.sh', 'tak-intca-watch.sh', 'tak-health-endpoint.py',
             'tak-metrics-collector.py', 'tak-updates-watch.sh', 'tak-swap-reclaim.sh',
-            'tak-buildcache-reclaim.sh'
+            'tak-buildcache-reclaim.sh',
+            # v10.1.0 Leg 7: relay tunnel health. Installed fleet-wide — the script
+            # no-ops silently when no relay is configured (no /etc/wireguard/wg0.conf),
+            # and starts watching the moment the operator connects a relay later.
+            'tak-relay-watch.sh',
+            # v10.1.0 Leg 6b: Setup AP engine + auto-trigger watcher. The engine is
+            # invoked by a systemd unit (console start/stop) and by the watcher; the
+            # watcher no-ops on boxes with no wifi radio or with auto-AP disabled.
+            'tak-setup-ap.sh', 'tak-setup-ap-watch.sh'
         ]
         # Two-server: remote DB monitors + CoT size (SSH to Server One); single-server: local PG + CoT
         if is_two_server and s1_host:
@@ -13366,6 +14828,14 @@ def run_guarddog_deploy(alert_email):
             ('takbuildcachereclaim.timer', '[Unit]\nDescription=Run Docker build-cache reclaim hourly (disk-capacity hygiene)\n\n[Timer]\nOnBootSec=45min\nOnUnitActiveSec=1h\nUnit=takbuildcachereclaim.service\n\n[Install]\nWantedBy=timers.target\n'),
             ('taknetguard.service', '[Unit]\nDescription=TAK Network Monitor\nAfter=network.target\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-network-watch.sh\n'),
             ('taknetguard.timer', '[Unit]\nDescription=TAK Network Monitor Timer\nRequires=taknetguard.service\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=1min\nAccuracySec=30s\n\n[Install]\nWantedBy=timers.target\n'),
+            ('takrelayguard.service', '[Unit]\nDescription=TAK Relay Tunnel Monitor (connectivity anchor)\nAfter=network.target\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-relay-watch.sh\n'),
+            ('takrelayguard.timer', '[Unit]\nDescription=TAK Relay Tunnel Monitor Timer\nRequires=takrelayguard.service\n\n[Timer]\nOnBootSec=3min\nOnUnitActiveSec=1min\nAccuracySec=30s\n\n[Install]\nWantedBy=timers.target\n'),
+            # v10.1.0 Leg 6b: Setup AP. The service is the console's start/stop handle
+            # (RemainAfterExit so `systemctl start` = AP up, `stop` = AP down + client
+            # restored). The watcher timer drives the automatic no-uplink trigger.
+            ('takwerx-setup-ap.service', '[Unit]\nDescription=infra-TAK Setup AP (broadcast own wifi for local provisioning)\nAfter=network.target\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/opt/tak-guarddog/tak-setup-ap.sh start\nExecStop=/opt/tak-guarddog/tak-setup-ap.sh stop\n'),
+            ('takwerxsetupapwatch.service', '[Unit]\nDescription=infra-TAK Setup AP auto-trigger watcher\nAfter=network.target\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-setup-ap-watch.sh\n'),
+            ('takwerxsetupapwatch.timer', '[Unit]\nDescription=infra-TAK Setup AP watcher timer\nRequires=takwerxsetupapwatch.service\n\n[Timer]\nOnBootSec=30s\nOnUnitActiveSec=30s\nAccuracySec=10s\n\n[Install]\nWantedBy=timers.target\n'),
             ('takprocessguard.service', '[Unit]\nDescription=TAK Server Process Monitor\nAfter=network.target takserver.service\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-process-watch.sh\n'),
             ('takprocessguard.timer', '[Unit]\nDescription=TAK Server Process Monitor Timer\nRequires=takprocessguard.service\n\n[Timer]\nOnBootSec=20min\nOnUnitActiveSec=1min\nAccuracySec=30s\n\n[Install]\nWantedBy=timers.target\n'),
             ('takcertguard.service', '[Unit]\nDescription=TAK Certificate Expiry Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-cert-watch.sh\n'),
@@ -13521,7 +14991,8 @@ def run_guarddog_deploy(alert_email):
             return
         timers = ['tak8089guard.timer', 'takoomguard.timer', 'takdiskguard.timer', 'takdiskioguard.timer',
                   'takswapreclaim.timer', 'takbuildcachereclaim.timer',
-                  'taknetguard.timer', 'takprocessguard.timer', 'takcertguard.timer', 'takintcaguard.timer']
+                  'taknetguard.timer', 'takrelayguard.timer', 'takwerxsetupapwatch.timer',
+                  'takprocessguard.timer', 'takcertguard.timer', 'takintcaguard.timer']
         if is_two_server and s1_host:
             timers.append('takremotedbguard.timer')
             timers.append('takcotdbguard.timer')
@@ -18131,12 +19602,40 @@ def generate_caddyfile(settings=None):
     lines.append(f"    route /health* {{")
     lines.append(f"        reverse_proxy 127.0.0.1:8080")
     lines.append(f"    }}")
+    # SECURITY (v10.1.0): the send-alert-email / send-sms endpoints have NO @login_required
+    # and gate on loopback IP only — meant for the box's own Guard Dog scripts, which POST
+    # to 127.0.0.1:5001 DIRECTLY (never via Caddy). Reached through Caddy 443 they'd let an
+    # unauthenticated internet client send arbitrary email/SMS from the box. Block them at
+    # the public edge (404). Internal loopback callers are unaffected (they don't traverse
+    # Caddy). Ordered before the proxy routes so it wins.
+    lines.append(f"    route /api/guarddog/send-alert-email* {{")
+    lines.append(f"        respond 404")
+    lines.append(f"    }}")
+    lines.append(f"    route /api/guarddog/send-sms* {{")
+    lines.append(f"        respond 404")
+    lines.append(f"    }}")
+    # SECURITY (v10.1.0, CVE-class): the console trusts X-Authentik-Username from any
+    # 127.0.0.1 caller (that is how forward_auth logs the SSO user in). Caddy does NOT
+    # strip client-supplied X-Authentik-* by default, and the plain reverse_proxy paths
+    # (/login, and /api/* which is EXCLUDED from forward_auth) pass it straight through
+    # to the console → a public request `X-Authentik-Username: admin` got a full admin
+    # session with no password (confirmed exploitable). Strip every X-Authentik-* from
+    # the CLIENT at the top of each console route, inside `route {}` (which preserves
+    # directive order) so it runs BEFORE forward_auth re-injects the AUTHENTIC value
+    # from the auth response. Non-forward_auth paths then get nothing → bypass closed;
+    # the SSO path is unchanged (forward_auth adds the real header after the strip).
+    _AK_FWD_HEADERS = ('X-Authentik-Username', 'X-Authentik-Groups', 'X-Authentik-Email',
+                       'X-Authentik-Name', 'X-Authentik-Uid')
+    def _emit_ak_header_strip(indent):
+        for _h in _AK_FWD_HEADERS:
+            lines.append(f"{indent}request_header -{_h}")
     if ak.get('installed'):
         # W1 (Hardened posture): drop the unauthenticated /login bypass so the
         # shared-password page is no longer a network ingress — SSO+MFA only.
         # Standard posture keeps it so password login works without Authentik.
         if not _w1_console_locked():
             lines.append(f"    route /login* {{")
+            _emit_ak_header_strip("        ")
             lines.append(f"        reverse_proxy 127.0.0.1:5001 {{")
             lines.append(f"            transport http {{")
             lines.append(f"                tls")
@@ -18147,6 +19646,7 @@ def generate_caddyfile(settings=None):
             lines.append(f"        }}")
             lines.append(f"    }}")
         lines.append(f"    route {{")
+        _emit_ak_header_strip("        ")
         lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
         # v0.9.58: background /api XHR must NOT go through forward_auth. An unauthenticated
         # XHR gets 302-redirected to the cross-origin Authentik OAuth URL (tak.<fqdn>), which
@@ -18172,12 +19672,17 @@ def generate_caddyfile(settings=None):
         lines.append(f"        }}")
         lines.append(f"    }}")
     else:
-        lines.append(f"    reverse_proxy 127.0.0.1:5001 {{")
-        lines.append(f"        transport http {{")
-        lines.append(f"            tls")
-        lines.append(f"            tls_insecure_skip_verify")
-        lines.append(f"            read_timeout 1h")
-        lines.append(f"            write_timeout 1h")
+        # No Authentik: the whole vhost is a plain proxy — strip client X-Authentik-*
+        # so a forged header can't reach the console's loopback-trust (same bypass).
+        lines.append(f"    route {{")
+        _emit_ak_header_strip("        ")
+        lines.append(f"        reverse_proxy 127.0.0.1:5001 {{")
+        lines.append(f"            transport http {{")
+        lines.append(f"                tls")
+        lines.append(f"                tls_insecure_skip_verify")
+        lines.append(f"                read_timeout 1h")
+        lines.append(f"                write_timeout 1h")
+        lines.append(f"            }}")
         lines.append(f"        }}")
         lines.append(f"    }}")
     lines.append(f"}}")
@@ -18616,16 +20121,33 @@ def generate_caddyfile(settings=None):
 
     caddyfile = '\n'.join(lines)
     # Preserve user-added blocks (e.g. health.tntak.net for Uptime Robot) that sit below the marker.
+    # v10.1.0: the marker is now ALWAYS emitted at the end of the generated file. It used to
+    # exist only if an operator already knew the magic string and typed it in by hand — so in
+    # practice every regeneration (module deploy/remove, domain change, cert-mode flip, W1,
+    # Fed Hub) silently wiped custom entries. Field complaint 2026-07-08. Capture takes the
+    # content AFTER the marker line (not including it) so exactly one marker section exists.
+    user_blocks = ''
     if os.path.exists(CADDYFILE_PATH):
         try:
             with open(CADDYFILE_PATH) as f:
                 existing = f.read()
             if CADDYFILE_USER_BLOCKS_MARKER in existing:
-                user_blocks = existing[existing.index(CADDYFILE_USER_BLOCKS_MARKER):].rstrip()
-                if user_blocks:
-                    caddyfile = caddyfile.rstrip() + '\n\n' + user_blocks
+                after = existing.split(CADDYFILE_USER_BLOCKS_MARKER, 1)[1]
+                # Drop our own help comments (re-emitted fresh below on every regen — they must
+                # not accumulate as "user content"); keep everything else verbatim.
+                _help_prefixes = ('# Anything below this line survives',
+                                  '# Add custom site blocks here')
+                user_lines = [l for l in after.splitlines()
+                              if not l.strip().startswith(_help_prefixes)]
+                user_blocks = '\n'.join(user_lines).strip('\n')
         except Exception:
             pass
+    caddyfile = (caddyfile.rstrip() + '\n\n'
+                 + CADDYFILE_USER_BLOCKS_MARKER + '\n'
+                 + '# Anything below this line survives every infra-TAK regeneration.\n'
+                 + '# Add custom site blocks here (extra domains, redirects, monitors).\n')
+    if user_blocks:
+        caddyfile += '\n' + user_blocks + '\n'
     # v10.0.5 non-root: /etc/caddy may not exist yet (RHEL copr caddy doesn't
     # pre-create it) — a raw os.makedirs EPERM'd as the takwerx console ([Errno 13]
     # '/etc/caddy'), failing the deploy before the broker-routed write below.
@@ -35519,6 +37041,718 @@ function confirmUninstallNetbird() {
 '''
 
 
+CONNECTIVITY_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Connectivity Wizard — infra-TAK</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet">
+<style>
+:root{--bg-deep:#080b14;--bg-surface:#0f1219;--bg-card:#161b26;--border:#1e2736;--border-hover:#2a3548;--text-primary:#f1f5f9;--text-secondary:#cbd5e1;--text-dim:#94a3b8;--accent:#3b82f6;--cyan:#06b6d4;--green:#10b981;--red:#ef4444;--yellow:#eab308}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',sans-serif;min-height:100vh;display:flex;flex-direction:row}
+.sidebar{width:220px;min-width:220px;background:var(--bg-surface);border-right:1px solid var(--border);padding:24px 0;flex-shrink:0}
+.material-symbols-outlined{font-family:'Material Symbols Outlined';font-weight:400;font-style:normal;font-size:20px;line-height:1;letter-spacing:normal;white-space:nowrap;direction:ltr;-webkit-font-smoothing:antialiased}
+.nav-icon.material-symbols-outlined{font-size:22px;width:22px;text-align:center}
+.sidebar-logo{padding:0 20px 24px;border-bottom:1px solid var(--border);margin-bottom:16px}
+.sidebar-logo span{font-size:15px;font-weight:700}.sidebar-logo small{display:block;font-size:10px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;margin-top:2px}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;color:var(--text-secondary);text-decoration:none;font-size:13px;font-weight:500;transition:all .15s;border-left:2px solid transparent}
+.nav-item:hover{color:var(--text-primary);background:rgba(255,255,255,.03)}.nav-item.active{color:var(--cyan);background:rgba(6,182,212,.06);border-left-color:var(--cyan)}
+.nav-icon{font-size:15px;width:18px;text-align:center}
+.main{flex:1;min-width:0;overflow-y:auto;padding:32px;max-width:1080px}
+.page-header{margin-bottom:28px}.page-header h1{font-size:22px;font-weight:700;display:flex;align-items:center;gap:12px}.page-header p{color:var(--text-secondary);font-size:13px;margin-top:4px}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:20px}
+.card-title{font-size:13px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:16px}
+.info-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.info-item{background:#0a0e1a;border-radius:8px;padding:12px 14px}
+.info-label{font-size:11px;color:var(--text-dim);margin-bottom:3px;text-transform:uppercase}
+.info-value{font-size:13px;font-family:'JetBrains Mono',monospace;word-break:break-all}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:10px 20px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:none;transition:all .2s}
+.btn-primary{background:var(--accent);color:#fff}.btn-primary:hover{opacity:.9}.btn-primary:disabled{opacity:.5;cursor:default}
+.control-btn{padding:10px 20px;border:1px solid var(--border);border-radius:8px;background:var(--bg-card);color:var(--text-secondary);font-family:'JetBrains Mono',monospace;font-size:13px;cursor:pointer;transition:all 0.2s}
+.control-btn:hover{border-color:var(--border-hover);color:var(--text-primary)}
+.control-btn:disabled{opacity:.5;cursor:default}
+.form-label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px}
+.form-input{width:100%;max-width:400px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px;color:var(--text-primary);font-size:13px;outline:none;transition:border-color .2s}
+.form-input:focus{border-color:var(--accent)}
+.log-box{background:#070a12;border:1px solid var(--border);border-radius:8px;padding:16px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:260px;overflow-y:auto;white-space:pre-wrap;margin-top:14px}
+.intent-tiles{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.intent-tile{background:#0a0e1a;border:2px solid var(--border);border-radius:12px;padding:20px;cursor:pointer;transition:all .15s;text-align:left;color:var(--text-primary);font-family:inherit}
+.intent-tile:hover{border-color:var(--border-hover)}
+.intent-tile.selected{border-color:var(--cyan);background:rgba(6,182,212,.06)}
+.intent-tile .t-emoji{font-size:26px}.intent-tile .t-title{font-size:14px;font-weight:700;margin:8px 0 4px;color:var(--text-primary)}
+.intent-tile .t-desc{font-size:12px;color:var(--text-secondary);line-height:1.5}
+.class-badge{display:inline-flex;align-items:center;gap:8px;font-family:'JetBrains Mono',monospace;font-weight:700;font-size:14px;padding:6px 14px;border-radius:8px}
+.class-A{background:rgba(16,185,129,.1);color:var(--green);border:1px solid rgba(16,185,129,.3)}
+.class-B{background:rgba(234,179,8,.1);color:var(--yellow);border:1px solid rgba(234,179,8,.3)}
+.class-C{background:rgba(6,182,212,.1);color:var(--cyan);border:1px solid rgba(6,182,212,.3)}
+.class-unknown{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.3)}
+.reco-banner{border-radius:10px;padding:16px 18px;font-size:13px;line-height:1.6;margin-top:16px;background:rgba(6,182,212,.06);border:1px solid rgba(6,182,212,.25)}
+.reasons{margin-top:14px;font-size:12px;color:var(--text-secondary);line-height:1.7}
+.hops{font-family:'JetBrains Mono',monospace;font-size:12px;margin-top:10px;color:var(--text-secondary)}
+.hops .cgnat{color:var(--cyan);font-weight:700}.hops .private{color:var(--yellow)}.hops .public{color:var(--green)}
+@keyframes spin{to{transform:rotate(360deg)}}
+.spinner{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.2);border-top-color:#fff;border-radius:50%;animation:spin .8s linear infinite}
+.seg{display:inline-flex;background:#0a0e1a;border:1px solid var(--border);border-radius:9px;padding:3px;gap:3px;margin-bottom:20px}
+.seg-btn{padding:7px 20px;border:none;background:none;color:var(--text-dim);font-size:12px;font-weight:600;cursor:pointer;border-radius:6px;font-family:inherit;transition:all .15s}
+.seg-btn:hover{color:var(--text-secondary)}
+.seg-btn.active{background:var(--accent);color:#fff}
+.filebtn{display:inline-flex;align-items:center;gap:6px;padding:9px 16px;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer;background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border);transition:all .15s;white-space:nowrap}
+.filebtn:hover{border-color:var(--border-hover);color:var(--text-primary)}
+.filebtn.loaded{border-color:rgba(16,185,129,.4);color:var(--green)}
+textarea.form-input{resize:vertical}
+</style></head>
+<body>
+{{ sidebar_html }}
+<div class="main">
+  <div class="page-header">
+    <h1><span class="material-symbols-outlined" style="font-size:30px;color:var(--cyan)">router</span><span>Connectivity Wizard</span></h1>
+    <p>Make this box reachable by TAK clients from anywhere — detect the network's reality, then follow the right path. No networking degree required.</p>
+  </div>
+
+  {% if is_cloud %}
+  <div class="card">
+    <div class="card-title">Step 1 — Where will this box live?</div>
+    <div style="display:flex;align-items:center;gap:12px;background:rgba(6,182,212,.06);border:1px solid rgba(6,182,212,.25);border-radius:10px;padding:14px 18px;font-size:13px;line-height:1.6">
+      <span class="material-symbols-outlined" style="color:var(--cyan);font-size:24px">cloud_done</span>
+      <span><b>Cloud server detected</b> — this box lives in a datacenter with its own public front door, so the stays-put-or-travels question doesn't apply. Run detection below to verify the internet can actually reach your TAK ports (the usual culprit on cloud is a missing security-list / firewall ingress rule, not NAT).</span>
+    </div>
+  </div>
+  {% else %}
+  <div class="card">
+    <div class="card-title">Step 1 — Where will this box live?</div>
+    <div class="intent-tiles">
+      <button type="button" class="intent-tile" id="tile-static" onclick="setIntent('static')">
+        <span class="material-symbols-outlined" style="font-size:30px;color:var(--cyan)">home_work</span>
+        <div class="t-title">It stays in one place</div>
+        <div class="t-desc">Home, office, or on-premises server room — plugged into the same network all the time. The wizard tunes the answer to that one network (a port-forward or DDNS can work here).</div>
+      </button>
+      <button type="button" class="intent-tile" id="tile-portable" onclick="setIntent('portable')">
+        <span class="material-symbols-outlined" style="font-size:30px;color:var(--cyan)">travel</span>
+        <div class="t-title">It moves with me</div>
+        <div class="t-desc">Travels between networks (home, work, hotspots). Port-forwards die on the next network — the box will dial OUT to a fixed public anchor instead, so friends always hit the same address.</div>
+      </button>
+    </div>
+    <div id="intent-status" style="margin-top:10px;font-size:12px;color:var(--text-dim)"></div>
+  </div>
+  {% endif %}
+
+  <div class="card">
+    <div class="card-title">Step 2 — Detect this network</div>
+    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px">Probes the box's real situation: public IP + NAT type (STUN), carrier-grade NAT (100.64/10), double-NAT, gateway model, hairpin. All outbound — nothing is exposed by detection. Re-run this on every new network a portable box joins.</p>
+    <button class="btn btn-primary" id="detect-btn" onclick="runDetect()">Run Detection</button>
+    <div class="log-box" id="detect-log" style="display:none"></div>
+  </div>
+
+  <div class="card" id="result-card" style="display:none">
+    <div class="card-title">Result</div>
+    <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+      <span class="class-badge" id="class-badge"></span>
+      <span id="class-caption" style="font-size:13px;color:var(--text-secondary)"></span>
+    </div>
+    <div class="info-grid" style="margin-top:16px" id="result-grid"></div>
+    <div class="hops" id="result-hops"></div>
+    <div class="reasons" id="result-reasons"></div>
+    <div class="reco-banner" id="reco-banner"></div>
+  </div>
+
+  <div class="card" id="anchor-card" style="display:none">
+    <div class="card-title" id="anchor-card-title">Connect a Relay</div>
+
+    <div id="anchor-connected" style="display:none">
+      <div style="display:flex;align-items:center;gap:12px;background:rgba(16,185,129,.07);border:1px solid rgba(16,185,129,.25);border-radius:10px;padding:16px 18px">
+        <span class="dot" style="background:var(--green)"></span>
+        <div style="flex:1">
+          <div style="font-size:14px;font-weight:600;color:var(--green)">Relay connected</div>
+          <div id="anchor-connected-detail" style="font-size:12px;color:var(--text-secondary);margin-top:3px;font-family:'JetBrains Mono',monospace"></div>
+        </div>
+      </div>
+      <div style="margin-top:14px;display:flex;gap:16px;align-items:center">
+        <a href="#" onclick="reconfigureRelay(event)" style="font-size:12px;color:var(--accent);text-decoration:none">Reconfigure / use a different relay</a>
+        <a href="#" onclick="disconnectRelay(event)" style="font-size:12px;color:var(--red);text-decoration:none">Disconnect</a>
+      </div>
+    </div>
+
+    <div id="anchor-form">
+    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px">
+      Your box has no public inbound, so it dials OUT to a small always-free public VPS (the relay).
+      Friends connect to the relay's public address with no VPN, from any network your box is on.
+      Create the relay VM first (Oracle Free Tier — <a href="https://github.com/takwerx/infra-TAK/blob/main/docs/RELAY-SETUP.md" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);text-decoration:none">step-by-step guide &#8599;</a>); then just enter its IP and
+      upload its key below, and this box sets up the whole tunnel for you.
+    </p>
+    <div id="anchor-status-line" style="font-size:12px;margin-bottom:18px"></div>
+
+    <label class="form-label">Relay public IP</label>
+    <input class="form-input" id="anchor-ip" placeholder="e.g. 137.131.49.36" style="margin-bottom:18px">
+
+    <label class="form-label">Relay SSH key <span style="color:var(--text-dim);font-weight:400">— the .key file Oracle gave you</span></label>
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
+      <input type="file" id="anchor-key-file" accept=".key,.pem,.txt,text/plain" onchange="loadKeyFile(event)" style="display:none">
+      <label for="anchor-key-file" class="filebtn">Choose .key file</label>
+      <span id="anchor-key-name" style="font-size:12px;color:var(--text-dim)">no file chosen</span>
+    </div>
+    <div style="margin-bottom:16px"><a href="#" onclick="togglePaste(event)" style="font-size:11px;color:var(--accent);text-decoration:none">or paste the key text instead</a></div>
+    <textarea class="form-input" id="anchor-ssh-key" rows="4" placeholder="Paste the private key text here" style="display:none;margin-bottom:16px;font-family:'JetBrains Mono',monospace;font-size:11px"></textarea>
+    <label class="form-label">SSH username</label>
+    <input class="form-input" id="anchor-ssh-user" value="ubuntu" style="margin-bottom:18px;max-width:200px">
+    <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+      <button class="btn btn-primary" id="anchor-provision-btn" onclick="provisionAnchor()">Set Up Relay</button>
+      <span style="font-size:11px;color:var(--text-dim)">port <input id="anchor-port" value="443" style="width:64px;background:#0a0e1a;border:1px solid var(--border);border-radius:6px;padding:5px 8px;color:var(--text-primary);font-size:12px;font-family:'JetBrains Mono',monospace"> · 443 slips through restrictive networks</span>
+    </div>
+    <div class="log-box" id="anchor-provision-log" style="display:none"></div>
+    </div>
+  </div>
+
+  <div class="card" id="verify-card">
+    <div class="card-title">Verify Reachability</div>
+    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px">
+      Prove that clients can actually reach this stack from the public internet — every port TAK
+      needs, tested end-to-end over the real path (relay firewall, cloud security lists, port
+      forwards, tunnel). Fix anything red, then run it again until it&#39;s all green.
+    </p>
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:14px">
+      <button class="btn btn-primary" id="verify-btn" onclick="runVerify()">Verify Reachability</button>
+      <span id="verify-status" style="font-size:11px;color:var(--text-dim)"></span>
+    </div>
+    <div id="verify-banner" style="display:none;margin-bottom:14px"></div>
+    <div id="verify-matrix" style="display:flex;flex-direction:column;gap:8px"></div>
+    <div id="verify-vantage" style="margin-top:12px;font-size:11px;color:var(--text-dim)"></div>
+  </div>
+
+  <div class="card" id="wifi-card">
+    <div class="card-title">WiFi Networks</div>
+    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px">
+      Tell this box about a WiFi network — including one you're <b>not on yet</b>, so a portable box
+      joins it automatically when you get there. Adding a network never disconnects the one you're on.
+    </p>
+    <div id="wifi-saved" style="font-size:12px;color:var(--text-dim);margin-bottom:14px"></div>
+    <div id="wifi-ap-note" style="display:none;margin-bottom:14px;padding:11px 13px;background:rgba(59,130,246,.07);border:1px solid rgba(59,130,246,.25);border-radius:8px;font-size:12px;color:var(--text-secondary)">
+      <b style="color:var(--accent)">Setup mode:</b> this box is broadcasting its own WiFi right now, so it can&#39;t scan for other networks. Just <b>type the network name and password</b> below and Add it — the box will join that network and turn the setup WiFi off.
+    </div>
+    <div id="wifi-scan-row" style="display:flex;align-items:center;gap:12px;margin-bottom:10px">
+      <button class="control-btn" id="wifi-scan-btn" onclick="scanWifi()">Scan for networks</button>
+      <span id="wifi-scan-status" style="font-size:11px;color:var(--text-dim)"></span>
+    </div>
+    <div id="wifi-scan-list" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:16px"></div>
+    <label class="form-label">Network name (SSID)</label>
+    <input class="form-input" id="wifi-ssid" placeholder="exact network name" style="margin-bottom:12px;max-width:320px">
+    <label class="form-label">WiFi password <span style="color:var(--text-dim);font-weight:400">(leave blank for an open network)</span></label>
+    <div style="position:relative;max-width:320px;margin-bottom:16px">
+      <input class="form-input" id="wifi-psk" type="password" placeholder="8–63 characters" style="max-width:none;padding-right:44px">
+      <span onclick="toggleWifiPsk()" id="wifi-psk-eye" class="material-symbols-outlined" title="Show password" style="position:absolute;right:12px;top:50%;transform:translateY(-50%);cursor:pointer;font-size:19px;color:var(--text-dim);user-select:none">visibility</span>
+    </div>
+    <button class="btn btn-primary" id="wifi-add-btn" onclick="addWifi()">Add Network</button>
+    <div id="wifi-add-status" style="margin-top:12px;font-size:12px;color:var(--text-dim)"></div>
+  </div>
+
+  <div class="card" id="setupap-card">
+    <div class="card-title">Setup Network (connect a laptop directly)</div>
+    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px">
+      When this box can&#39;t reach the internet, it broadcasts its own WiFi so you can join it
+      from a laptop or phone — right here in a new location — log in, and pick a network above.
+      It does this <b>automatically</b> when it has no connection; you can also start it now.
+    </p>
+    <div id="setupap-state" style="font-size:13px;margin-bottom:10px"></div>
+    <div id="setupap-current" style="font-size:12px;color:var(--text-dim);margin-bottom:16px"></div>
+
+    <div style="display:flex;flex-wrap:wrap;gap:20px;margin-bottom:16px">
+      <div style="flex:1;min-width:240px">
+        <label class="form-label">Setup WiFi name</label>
+        <input class="form-input" id="setupap-ssid" placeholder="infraTAK-setup-…" style="margin-bottom:14px">
+        <label class="form-label">Setup WiFi password <span style="color:var(--text-dim);font-weight:400">(8–63 chars — you type this on your laptop)</span></label>
+        <div style="position:relative;max-width:320px">
+          <input class="form-input" id="setupap-pass" type="password" placeholder="leave blank to keep current" style="max-width:none;padding-right:44px">
+          <span onclick="toggleSetupPass()" id="setupap-eye" class="material-symbols-outlined" title="Show password" style="position:absolute;right:12px;top:50%;transform:translateY(-50%);cursor:pointer;font-size:19px;color:var(--text-dim);user-select:none">visibility</span>
+        </div>
+      </div>
+    </div>
+    <label style="display:flex;align-items:center;gap:9px;font-size:13px;color:var(--text-secondary);margin-bottom:18px;cursor:pointer">
+      <input type="checkbox" id="setupap-auto" checked style="width:16px;height:16px;accent-color:var(--accent)">
+      Automatically broadcast when the box has no internet (recommended)
+    </label>
+
+    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+      <button class="control-btn" id="setupap-save" onclick="saveSetupAp()">Save settings</button>
+      <button class="btn btn-primary" id="setupap-start" onclick="startSetupAp()">Start Setup WiFi now</button>
+      <button class="control-btn" id="setupap-stop" onclick="stopSetupAp()" style="display:none">Stop &amp; reconnect</button>
+      <span id="setupap-status" style="font-size:12px;color:var(--text-dim)"></span>
+    </div>
+    <div style="margin-top:14px;padding:12px 14px;background:rgba(234,179,8,.06);border:1px solid rgba(234,179,8,.22);border-radius:8px;font-size:12px;color:var(--text-secondary)">
+      <b style="color:var(--yellow)">Heads up:</b> starting the Setup WiFi disconnects this box from its current
+      WiFi (one radio can&#39;t do both). You&#39;ll lose remote access until you join the Setup WiFi from a nearby
+      device — then your browser opens the login automatically. Don&#39;t start it remotely unless someone is at the box.
+    </div>
+  </div>
+</div>
+
+<script>
+let currentIntent = {{ intent|tojson }};
+const CLASS_CAPTIONS = {
+  'A': 'Clean public IP — the easy path',
+  'B': 'Double-NAT — two routers between you and the internet',
+  'C': 'Carrier-grade NAT — this network can never accept inbound connections',
+  'unknown': 'Could not classify this network'
+};
+const RECO_TEXT = {
+  'anchor': '<b>Recommended path: a relay.</b> This box dials OUT over an encrypted tunnel to a small always-free public VPS (Oracle Free Tier). Friends and clients connect to the relay\\'s public address with <b>no VPN</b> — identical from any network this box sits on. Set one up in the <b>Connect a Relay</b> card below — enter its IP and upload its key, and this box does the rest.',
+  'ddns_portforward': '<b>Recommended path: DDNS + port forwarding.</b> This network has a clean public IP. A dynamic-DNS hostname (Cloudflare) plus forwarding the TAK ports on your router makes this box reachable — friends connect to a name, no VPN. Follow the <a href="https://github.com/takwerx/infra-TAK/blob/main/docs/DDNS-SETUP.md" target="_blank" rel="noopener noreferrer" style="color:var(--cyan)">step-by-step guide &#8599;</a> (DHCP reservation, the five forwards, Cloudflare token, never-DMZ), then prove it with <b>Verify Reachability</b> below.',
+  'bridge_then_ddns': '<b>Recommended path: bridge the upstream gateway, then re-detect.</b> Two routers are NATing in a row. Put the ISP\\'s gateway in bridge / IP-passthrough mode so your own router holds the public IP, then run detection again — this box should re-classify as Class A. (Full walk-through of the direct path: <a href="https://github.com/takwerx/infra-TAK/blob/main/docs/DDNS-SETUP.md" target="_blank" rel="noopener noreferrer" style="color:var(--cyan)">DDNS guide &#8599;</a>.)',
+  'rerun': 'Detection could not establish this network\\'s public IP. Check that the box has outbound internet and run detection again.',
+  'cloud_verify': '<b>Cloud VM — already reachable.</b> The internet routes straight to this box\\'s public IP; there is no router and nothing to forward. What\\'s worth checking is the cloud-side firewall (security list / NSG): make sure the TAK ports are open as ingress, set up your domain via the Caddy module, and prove each port with <b>Verify Reachability</b> below.'
+};
+
+function paintIntent(){
+  const ts = document.getElementById('tile-static');
+  if(!ts) return;   // cloud VM: intent tiles are not rendered
+  ts.classList.toggle('selected', currentIntent==='static');
+  document.getElementById('tile-portable').classList.toggle('selected', currentIntent==='portable');
+}
+async function setIntent(intent){
+  try{
+    const r = await fetch('/api/connectivity/intent', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({intent})});
+    const d = await r.json();
+    if(d.success){ currentIntent = intent; paintIntent();
+      document.getElementById('intent-status').textContent = intent==='portable'
+        ? 'Saved — portable: the recommendation will always be a relay; re-run detection on every new network.'
+        : 'Saved — static: detection will pick the cheapest path for this one network.';
+    } else { document.getElementById('intent-status').textContent = d.error || 'Save failed'; }
+  }catch(e){ document.getElementById('intent-status').textContent = 'Save failed: '+e; }
+}
+
+let pollTimer = null;
+async function runDetect(){
+  const btn = document.getElementById('detect-btn');
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Detecting…';
+  document.getElementById('detect-log').style.display = 'block';
+  document.getElementById('result-card').style.display = 'none';
+  try{
+    const r = await fetch('/api/connectivity/detect', {method:'POST'});
+    if(r.status === 409){ /* already running — just poll */ }
+  }catch(e){}
+  pollTimer = setInterval(pollDetect, 1500);
+}
+async function pollDetect(){
+  try{
+    const r = await fetch('/api/connectivity/detect-status');
+    const d = await r.json();
+    const logEl = document.getElementById('detect-log');
+    logEl.textContent = (d.log || []).join('\\n');
+    logEl.scrollTop = logEl.scrollHeight;
+    if(!d.running){
+      clearInterval(pollTimer); pollTimer = null;
+      const btn = document.getElementById('detect-btn');
+      btn.disabled = false; btn.textContent = 'Run Detection Again';
+      if(d.error){ logEl.textContent += '\\nERROR: ' + d.error; }
+      if(d.result){ renderResult(d.result); }
+    }
+  }catch(e){}
+}
+function esc(s){ const d = document.createElement('div'); d.textContent = (s==null?'':String(s)); return d.innerHTML; }
+function renderResult(res){
+  document.getElementById('result-card').style.display = 'block';
+  const badge = document.getElementById('class-badge');
+  badge.className = 'class-badge class-' + res.net_class;
+  badge.textContent = res.net_class === 'unknown' ? 'UNCLASSIFIED' : ('CLASS ' + res.net_class + (res.provisional ? '?' : ''));
+  document.getElementById('class-caption').textContent = (CLASS_CAPTIONS[res.net_class] || '') + (res.provisional ? ' — provisional: this carrier hides its network, inbound is unproven' : '');
+  const stun = res.stun || {}, local = res.local || {}, hair = res.hairpin || {};
+  const items = [
+    ['Public IP (STUN)', stun.external_ip || stun.error || '—'],
+    ['NAT type', stun.nat_type || '—'],
+    ['LAN address', (local.interfaces && local.interfaces.length) ? local.interfaces.map(i=>i.iface+' '+i.ip).join(', ') : '—'],
+    ['Default gateway', local.gateway ? (local.gateway + (local.gateway_iface ? ' ('+local.gateway_iface+')' : '')) : '—'],
+    ['CGNAT (100.64/10)', res.cgnat ? 'YES' : 'no'],
+    ['Double-NAT', res.double_nat ? 'YES' : 'no'],
+    ['Hairpin (own FQDN)', hair.tested ? (hair.ok ? 'reachable' : 'NOT reachable') : 'not tested (no FQDN set)'],
+    ['Gateway fingerprint', (res.gateway_fingerprint && (res.gateway_fingerprint.title || res.gateway_fingerprint.server)) || '—']
+  ];
+  document.getElementById('result-grid').innerHTML = items.map(([l,v]) =>
+    '<div class="info-item"><div class="info-label">'+esc(l)+'</div><div class="info-value">'+esc(v)+'</div></div>').join('');
+  const hops = (res.trace && res.trace.hops) || [];
+  document.getElementById('result-hops').innerHTML = hops.length
+    ? 'Route: ' + hops.map(h => h.ip ? '<span class="'+esc(h.kind)+'">'+esc(h.ip)+'</span>' : '*').join(' → ')
+    : '';
+  document.getElementById('result-reasons').innerHTML =
+    (res.reasons || []).map(r => '• ' + esc(r)).join('<br>');
+  document.getElementById('reco-banner').innerHTML = RECO_TEXT[res.recommendation] || '';
+  // Reveal the relay card when the relay is recommended; refreshAnchorStatus also
+  // reveals it if a relay is already configured, and won't hide a connected one.
+  if(res.recommendation === 'anchor'){ document.getElementById('anchor-card').style.display = 'block'; }
+  refreshAnchorStatus();
+}
+
+function fmtAge(s){
+  if(s == null) return 'no handshake yet';
+  if(s < 90) return s + 's ago';
+  if(s < 5400) return Math.round(s/60) + ' min ago';
+  return Math.round(s/3600) + ' h ago';
+}
+let anchorReconfiguring = false;
+function showRelayForm(show){
+  document.getElementById('anchor-form').style.display = show ? 'block' : 'none';
+  document.getElementById('anchor-connected').style.display = show ? 'none' : 'block';
+  document.getElementById('anchor-card-title').textContent = show ? 'Connect a Relay' : 'Relay';
+}
+function reconfigureRelay(ev){ if(ev) ev.preventDefault(); anchorReconfiguring = true; showRelayForm(true); }
+async function disconnectRelay(ev){
+  if(ev) ev.preventDefault();
+  if(!confirm('Disconnect this box from the relay? Friends will lose access until you reconnect.')) return;
+  try{ await fetch('/api/connectivity/anchor/disconnect', {method:'POST'}); }catch(e){}
+  anchorReconfiguring = true; showRelayForm(true);
+  document.getElementById('anchor-status-line').innerHTML = '<span style="color:var(--text-dim)">Disconnected.</span>';
+  refreshAnchorStatus();
+}
+async function refreshAnchorStatus(){
+  try{
+    const r = await fetch('/api/connectivity/anchor/status');
+    const d = await r.json();
+    // Once a relay is set up, the card leads with a connected summary; the form
+    // hides behind Reconfigure so a returning operator isn't shown an empty form.
+    const connected = d.up && d.handshake_secs != null && d.handshake_secs < 180;
+    if((d.configured || connected) && !anchorReconfiguring){
+      document.getElementById('anchor-card').style.display = 'block';
+      showRelayForm(false);
+      const detail = (connected ? 'Tunnel up · ' : 'Configured, waiting for handshake · ')
+        + (d.endpoint || (d.anchor_ip ? d.anchor_ip + ':' + (d.wg_port||443) : ''))
+        + (d.handshake_secs != null ? ' · last handshake ' + fmtAge(d.handshake_secs) : '');
+      document.getElementById('anchor-connected-detail').textContent = detail;
+    } else if(!d.configured && !anchorReconfiguring){
+      showRelayForm(true);
+    }
+    const el = document.getElementById('anchor-status-line');
+    if(connected){
+      el.innerHTML = '<span style="color:var(--green)">● Tunnel UP</span> — last handshake ' + esc(fmtAge(d.handshake_secs)) + (d.endpoint ? ' · ' + esc(d.endpoint) : '');
+    } else if(d.configured){
+      el.innerHTML = '<span style="color:var(--yellow)">● Configured, waiting for handshake</span>' + (d.endpoint ? ' · ' + esc(d.endpoint) : '');
+    } else {
+      el.innerHTML = '<span style="color:var(--text-dim)">Not connected to a relay yet.</span>';
+    }
+  }catch(e){}
+}
+function loadKeyFile(ev){
+  const f = ev.target.files && ev.target.files[0];
+  if(!f) return;
+  const reader = new FileReader();
+  reader.onload = function(e){
+    document.getElementById('anchor-ssh-key').value = e.target.result;
+    document.getElementById('anchor-key-name').textContent = f.name;
+    document.querySelector('label[for="anchor-key-file"]').classList.add('loaded');
+    document.getElementById('anchor-provision-log').style.display = 'none';
+  };
+  reader.readAsText(f);
+}
+function togglePaste(ev){
+  ev.preventDefault();
+  const ta = document.getElementById('anchor-ssh-key');
+  ta.style.display = (ta.style.display === 'none') ? 'block' : 'none';
+  if(ta.style.display === 'block') ta.focus();
+}
+let provPollTimer = null;
+async function provisionAnchor(){
+  const btn = document.getElementById('anchor-provision-btn');
+  const log = document.getElementById('anchor-provision-log');
+  const ip = document.getElementById('anchor-ip').value.trim();
+  const user = document.getElementById('anchor-ssh-user').value.trim() || 'ubuntu';
+  const key = document.getElementById('anchor-ssh-key').value;
+  const port = document.getElementById('anchor-port').value.trim() || '443';
+  if(!ip || !key.trim()){ log.style.display='block'; log.textContent = 'Enter the relay IP and paste the SSH key first.'; return; }
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Setting up…';
+  log.style.display = 'block'; log.textContent = 'Starting…';
+  try{
+    const r = await fetch('/api/connectivity/anchor/provision', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({anchor_ip: ip, ssh_user: user, ssh_private_key: key, wg_port: parseInt(port,10)})});
+    const d = await r.json();
+    if(!d.success){ log.textContent = d.error || 'Failed to start.'; btn.disabled=false; btn.textContent='Set Up Relay Automatically'; return; }
+    provPollTimer = setInterval(pollProvision, 1500);
+  }catch(e){ log.textContent = 'Failed: '+e; btn.disabled=false; btn.textContent='Set Up Relay Automatically'; }
+}
+async function pollProvision(){
+  try{
+    const r = await fetch('/api/connectivity/anchor/provision-status');
+    const d = await r.json();
+    const log = document.getElementById('anchor-provision-log');
+    log.textContent = (d.log||[]).join('\\n');
+    log.scrollTop = log.scrollHeight;
+    if(!d.running && d.complete){
+      clearInterval(provPollTimer); provPollTimer = null;
+      const btn = document.getElementById('anchor-provision-btn');
+      btn.disabled = false; btn.textContent = 'Set Up Relay Again';
+      if(d.error){ log.textContent += '\\nERROR: ' + d.error; }
+      else { anchorReconfiguring = false; }
+      refreshAnchorStatus();
+    }
+  }catch(e){}
+}
+let verifyTimer = null;
+async function runVerify(){
+  const btn = document.getElementById('verify-btn');
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Verifying…';
+  document.getElementById('verify-status').textContent = 'connecting to each port from this box over the public path…';
+  try{
+    const r = await fetch('/api/connectivity/verify', {method:'POST'});
+    if(r.status === 409){ /* already running — just poll */ }
+  }catch(e){}
+  verifyTimer = setInterval(pollVerify, 1200);
+}
+async function pollVerify(){
+  try{
+    const r = await fetch('/api/connectivity/verify-status');
+    const d = await r.json();
+    if(!d.running){
+      clearInterval(verifyTimer); verifyTimer = null;
+      const btn = document.getElementById('verify-btn');
+      btn.disabled = false; btn.textContent = 'Verify Again';
+      document.getElementById('verify-status').textContent = '';
+      if(d.error){
+        document.getElementById('verify-status').textContent = d.error;
+        return;
+      }
+      if(d.result){ renderVerify(d.result); }
+    }
+  }catch(e){}
+}
+function renderVerify(res){
+  const banner = document.getElementById('verify-banner');
+  banner.style.display = 'block';
+  if(res.all_green){
+    banner.innerHTML = '<div style="display:flex;align-items:center;gap:12px;background:rgba(16,185,129,.07);border:1px solid rgba(16,185,129,.25);border-radius:10px;padding:14px 16px">'
+      + '<span class="dot" style="background:var(--green)"></span>'
+      + '<div style="font-size:13px;font-weight:600;color:var(--green)">All green — clients on the public internet can reach this stack.</div></div>';
+  }else{
+    banner.innerHTML = '<div style="display:flex;align-items:center;gap:12px;background:rgba(239,68,68,.07);border:1px solid rgba(239,68,68,.25);border-radius:10px;padding:14px 16px">'
+      + '<span class="dot" style="background:var(--red)"></span>'
+      + '<div style="font-size:13px;color:var(--text-secondary)"><b style="color:var(--red)">Not reachable yet.</b> Fix the red rows below, then Verify Again — repeat until all green.</div></div>';
+  }
+  const order = ['443','8089','8443','8446','80'];
+  const rows = [];
+  for(const p of order){
+    const v = (res.ports || {})[p];
+    if(!v) continue;
+    const green = v.state === 'green';
+    const dotColor = green ? 'var(--green)' : (v.required ? 'var(--red)' : 'var(--yellow)');
+    let detail = green ? ('connected' + (v.ms != null ? ' · ' + v.ms + ' ms' : '')) : (v.hint || v.detail || 'no route');
+    rows.push('<div style="display:flex;align-items:center;gap:12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px">'
+      + '<span class="dot" style="background:' + dotColor + ';flex-shrink:0"></span>'
+      + '<span style="font-family:\\'JetBrains Mono\\',monospace;font-size:13px;min-width:52px">' + esc(p) + '</span>'
+      + '<span style="font-size:12px;color:var(--text-secondary);flex:1">' + esc(v.label || '') + (v.required ? '' : ' <span style="color:var(--text-dim)">(optional)</span>') + '</span>'
+      + '<span style="font-size:11px;color:' + (green ? 'var(--text-dim)' : 'var(--text-secondary)') + ';max-width:46%;text-align:right">' + esc(detail) + '</span>'
+      + '</div>');
+  }
+  document.getElementById('verify-matrix').innerHTML = rows.join('');
+  document.getElementById('verify-vantage').textContent = 'Tested: ' + (res.target || '') + ' — ' + (res.vantage || '');
+}
+function toggleWifiPsk(){
+  const i = document.getElementById('wifi-psk'), e = document.getElementById('wifi-psk-eye');
+  const show = i.type === 'password';
+  i.type = show ? 'text' : 'password';
+  e.textContent = show ? 'visibility_off' : 'visibility';
+  e.title = show ? 'Hide password' : 'Show password';
+}
+function toggleSetupPass(){
+  const i = document.getElementById('setupap-pass'), e = document.getElementById('setupap-eye');
+  const show = i.type === 'password';
+  i.type = show ? 'text' : 'password';
+  e.textContent = show ? 'visibility_off' : 'visibility';
+}
+async function refreshSetupAp(){
+  try{
+    const r = await fetch('/api/connectivity/setup-ap/status');
+    const d = await r.json();
+    const ssid = document.getElementById('setupap-ssid');
+    if(document.activeElement !== ssid && !ssid.value){ ssid.placeholder = d.ssid || 'infraTAK-setup-…'; }
+    document.getElementById('setupap-auto').checked = !!d.auto;
+    const stateEl = document.getElementById('setupap-state');
+    const startBtn = document.getElementById('setupap-start');
+    const stopBtn = document.getElementById('setupap-stop');
+    const curEl = document.getElementById('setupap-current');
+    curEl.innerHTML = 'Setup WiFi name: <b style="color:var(--text-secondary);font-family:\\'JetBrains Mono\\',monospace">' + esc(d.ssid) + '</b> · '
+      + (d.has_password ? '<a href="#" onclick="revealSetupPass(event)" style="color:var(--accent);text-decoration:none">show password</a> <span id="setupap-revealed" style="font-family:\\'JetBrains Mono\\',monospace"></span>'
+                        : '<span style="color:var(--yellow)">no password set — a random one is generated on first use (show it after)</span>');
+    if(!d.has_wifi){
+      stateEl.innerHTML = '<span style="color:var(--text-dim)">This box has no WiFi radio — the Setup Network feature needs one.</span>';
+      startBtn.disabled = true;
+    }else if(d.active){
+      stateEl.innerHTML = '<span class="dot" style="background:var(--green)"></span> <b style="color:var(--green)">Setup WiFi is broadcasting</b> as “' + esc(d.ssid) + '”. Join it from a device to configure a network.';
+      startBtn.style.display = 'none'; stopBtn.style.display = 'inline-flex';
+    }else{
+      stateEl.innerHTML = '<span class="dot" style="background:var(--text-dim)"></span> Setup WiFi is off — the box is using its normal connection.' + (d.has_password ? '' : ' <span style="color:var(--yellow)">Set a password below before you rely on it.</span>');
+      startBtn.style.display = 'inline-flex'; stopBtn.style.display = 'none';
+    }
+  }catch(e){}
+}
+async function revealSetupPass(ev){
+  if(ev) ev.preventDefault();
+  const el = document.getElementById('setupap-revealed');
+  try{ const r = await fetch('/api/connectivity/setup-ap/reveal'); const d = await r.json();
+    el.textContent = d.password ? ('  ' + d.password) : '  (generated on first use)';
+  }catch(e){}
+}
+async function saveSetupAp(){
+  const btn = document.getElementById('setupap-save');
+  btn.disabled = true;
+  const body = {ssid: document.getElementById('setupap-ssid').value.trim(),
+                password: document.getElementById('setupap-pass').value,
+                auto: document.getElementById('setupap-auto').checked};
+  const s = document.getElementById('setupap-status');
+  try{
+    const r = await fetch('/api/connectivity/setup-ap/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    const d = await r.json();
+    s.textContent = d.success ? 'Saved.' : (d.error || 'Save failed');
+    s.style.color = d.success ? 'var(--green)' : 'var(--red)';
+    if(d.success){ document.getElementById('setupap-pass').value = ''; refreshSetupAp(); }
+  }catch(e){ s.textContent = 'Save failed'; s.style.color = 'var(--red)'; }
+  btn.disabled = false;
+}
+async function startSetupAp(){
+  if(!confirm('Start the Setup WiFi now?\\n\\nThis disconnects the box from its current WiFi. You will lose access here until you join the Setup WiFi from a device next to the box.')) return;
+  const s = document.getElementById('setupap-status');
+  s.textContent = 'Starting… you may lose this page as the box switches to Setup WiFi.'; s.style.color = 'var(--text-dim)';
+  try{ await fetch('/api/connectivity/setup-ap/start', {method:'POST'}); }catch(e){}
+  setTimeout(refreshSetupAp, 4000);
+}
+async function stopSetupAp(){
+  const s = document.getElementById('setupap-status');
+  s.textContent = 'Stopping Setup WiFi and reconnecting…'; s.style.color = 'var(--text-dim)';
+  try{ const r = await fetch('/api/connectivity/setup-ap/stop', {method:'POST'}); const d = await r.json();
+    s.textContent = d.success ? 'Reconnecting to your network…' : (d.error || 'Stop failed');
+  }catch(e){}
+  setTimeout(refreshSetupAp, 4000);
+}
+async function refreshWifiSaved(){
+  try{
+    const r = await fetch('/api/connectivity/wifi/list');
+    const d = await r.json();
+    const el = document.getElementById('wifi-saved');
+    savedWifiSet = d.saved || [];
+    // Setup-AP mode: the radio can't scan (it's the AP). Hide the scan row, show the
+    // "type the name" note, and don't gate Use buttons on in-range (we can't know it).
+    const apMode = !!d.ap_active;
+    document.getElementById('wifi-ap-note').style.display = apMode ? 'block' : 'none';
+    document.getElementById('wifi-scan-row').style.display = apMode ? 'none' : 'flex';
+    if(apMode){ document.getElementById('wifi-scan-list').innerHTML = ''; }
+    if(d.saved && d.saved.length){
+      const cur = d.current || '';
+      // Connected network first, then the rest alphabetically.
+      const ordered = d.saved.slice().sort((a,b) => (a===cur?-1:b===cur?1:a.localeCompare(b)));
+      const visible = d.visible || [];
+      let html = '<div style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.04em;margin-bottom:8px">Known networks</div>';
+      html += ordered.map(s => {
+        const isCur = (s === cur);
+        // In AP mode we can't scan, so treat all as usable (unknown range) rather
+        // than greying out every Use button.
+        const inRange = isCur || apMode || visible.indexOf(s) !== -1;
+        const j = JSON.stringify(s).replace(/"/g,'&quot;');
+        const badge = isCur
+          ? '<span style="color:var(--text-dim);font-size:11px">— connected now</span>'
+          : (apMode
+              ? ''
+              : (inRange
+                  ? '<span style="color:var(--green);font-size:11px;display:inline-flex;align-items:center;gap:3px"><span class="dot" style="background:var(--green);width:6px;height:6px"></span>in range</span>'
+                  : '<span style="color:var(--text-dim);font-size:11px">not in range</span>'));
+        return '<div style="display:flex;align-items:center;gap:10px;padding:9px 12px;background:#0a0e1a;border:1px solid ' + (isCur ? 'rgba(16,185,129,.3)' : 'var(--border)') + ';border-radius:8px;margin-bottom:6px">'
+          + '<span class="dot" style="background:' + (isCur ? 'var(--green)' : (inRange ? 'var(--green)' : 'var(--text-dim)')) + ';flex-shrink:0"></span>'
+          + '<span style="flex:1;min-width:0;color:' + (isCur ? 'var(--green)' : 'var(--text-primary)') + ';font-size:13px;overflow:hidden;text-overflow:ellipsis">' + esc(s) + ' ' + badge + '</span>'
+          + (isCur ? '' : '<button type="button" onclick="useWifi(' + j + ')"' + (inRange ? '' : ' disabled') + ' title="' + (inRange ? 'Switch the box to this network now' : 'Not in range right now') + '" style="background:rgba(59,130,246,' + (inRange ? '.12' : '.04') + ');color:var(--accent);border:1px solid rgba(59,130,246,' + (inRange ? '.3' : '.12') + ');border-radius:6px;padding:4px 12px;font-size:12px;cursor:' + (inRange ? 'pointer' : 'default') + ';opacity:' + (inRange ? '1' : '.45') + '">Use</button>')
+          + '<button type="button" onclick="forgetWifi(' + j + ',' + isCur + ')" title="Remove this saved network" style="background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.3);border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer">Remove</button>'
+          + '</div>';
+      }).join('');
+      el.innerHTML = html;
+    } else {
+      el.textContent = 'No saved WiFi networks yet.';
+    }
+  }catch(e){}
+}
+async function forgetWifi(ssid, isCurrent){
+  let msg = 'Forget “' + ssid + '”? The box will no longer join it automatically.';
+  if(isCurrent){ msg = 'Forget “' + ssid + '” — the network the box is using RIGHT NOW?\\n\\nThis disconnects the box. If you are managing it remotely you will lose access unless the Setup WiFi is set up to catch it. Only do this if you are near the box.'; }
+  if(!confirm(msg)) return;
+  try{
+    let r = await fetch('/api/connectivity/wifi/forget', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ssid: ssid, confirm: !!isCurrent})});
+    let d = await r.json();
+    if(d.needs_confirm){
+      // server flagged current-network without confirm — our isCurrent check should
+      // have caught it, but honor the server gate.
+      if(!confirm('This is the active network — really disconnect the box?')) return;
+      r = await fetch('/api/connectivity/wifi/forget', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ssid: ssid, confirm: true})});
+      d = await r.json();
+    }
+    if(!d.success && d.error){ alert(d.error); }
+  }catch(e){}
+  setTimeout(refreshWifiSaved, 1500);
+}
+async function scanWifi(){
+  const btn = document.getElementById('wifi-scan-btn');
+  const st = document.getElementById('wifi-scan-status');
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Scanning…'; st.textContent = '';
+  try{
+    const r = await fetch('/api/connectivity/wifi/scan');
+    const d = await r.json();
+    const list = document.getElementById('wifi-scan-list');
+    const nets = (d.networks || []).filter(n => n.ssid);
+    if(!nets.length){ st.textContent = 'No networks found (or scanning not supported here — type the name below).'; }
+    list.innerHTML = nets.map(n =>
+      '<button type="button" class="control-btn" style="font-size:12px;padding:6px 12px" onclick="pickWifi(' + JSON.stringify(n.ssid).replace(/"/g,'&quot;') + ')">'
+      + esc(n.ssid) + (n.signal ? ' <span style="color:var(--text-dim)">· ' + esc(n.signal) + '</span>' : '') + '</button>').join('');
+  }catch(e){ st.textContent = 'Scan failed.'; }
+  btn.disabled = false; btn.textContent = 'Scan for networks';
+  // The active scan just refreshed the radio's cache — update the known-networks
+  // in-range badges from it (so a network you just turned on now shows in range).
+  refreshWifiSaved();
+}
+let savedWifiSet = [];
+function pickWifi(ssid){
+  // If the box already knows this network, switch to it with the stored password
+  // (no re-typing). Otherwise prefill the add form so the operator enters the key.
+  if(savedWifiSet.indexOf(ssid) !== -1){
+    useWifi(ssid);
+    return;
+  }
+  document.getElementById('wifi-ssid').value = ssid;
+  document.getElementById('wifi-psk').focus();
+}
+async function useWifi(ssid){
+  const st = document.getElementById('wifi-add-status');
+  st.style.color = 'var(--text-dim)';
+  st.textContent = 'Switching to “' + ssid + '”…';
+  try{
+    const r = await fetch('/api/connectivity/wifi/use', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ssid: ssid})});
+    const d = await r.json();
+    if(d.success){ st.style.color = 'var(--green)'; st.textContent = 'Switching to “' + ssid + '” — it may take a few seconds to connect.'; }
+    else { st.style.color = 'var(--red)'; st.textContent = d.error || 'Switch failed'; }
+  }catch(e){ st.style.color='var(--red)'; st.textContent='Switch failed'; }
+  setTimeout(refreshWifiSaved, 4000);
+}
+async function addWifi(){
+  const btn = document.getElementById('wifi-add-btn');
+  const st = document.getElementById('wifi-add-status');
+  const ssid = document.getElementById('wifi-ssid').value.trim();
+  const psk = document.getElementById('wifi-psk').value;
+  if(!ssid){ st.textContent = 'Enter a network name first.'; return; }
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Adding…'; st.textContent = '';
+  try{
+    const r = await fetch('/api/connectivity/wifi/add', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ssid: ssid, password: psk})});
+    const d = await r.json();
+    if(d.success){
+      st.innerHTML = '<span style="color:var(--green)">Added “' + esc(ssid) + '”.</span> The box will join it automatically when in range.';
+      document.getElementById('wifi-psk').value = '';
+      refreshWifiSaved();
+    } else { st.textContent = d.error || 'Could not add network.'; }
+  }catch(e){ st.textContent = 'Failed: ' + e; }
+  btn.disabled = false; btn.textContent = 'Add Network';
+}
+setInterval(function(){ if(document.getElementById('anchor-card').style.display !== 'none'){ refreshAnchorStatus(); } }, 5000);
+// On landing, surface an already-configured relay without needing to Run Detection.
+refreshAnchorStatus();
+refreshWifiSaved();
+refreshSetupAp();
+setInterval(refreshSetupAp, 7000);
+paintIntent();
+// If a detection is already running/finished (page reload), pick it up.
+fetch('/api/connectivity/state').then(r=>r.json()).then(d=>{
+  if(d.detect_running){ runDetect(); }
+  else if(d.has_result){ document.getElementById('detect-log').style.display='block'; pollDetect(); }
+}).catch(()=>{});
+</script>
+</body></html>'''
+
 MEDIAMTX_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>MediaMTX — infra-TAK</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -39632,42 +41866,12 @@ networks:
         _remote_ram_mb = int((_ram_out or '0').strip())
     except Exception:
         pass
-    if _remote_ram_mb >= 49152:
-        _pg_cmd_remote = _AUTHENTIK_PG_COMMAND_ENTERPRISE
-        plog(f"  Remote RAM: {_remote_ram_mb} MB — enterprise PG settings")
-    elif _remote_ram_mb >= 16384:
-        _pg_cmd_remote = ('postgres -c max_connections=1000 -c shared_buffers=4GB '
-                          '-c effective_cache_size=12GB -c work_mem=8MB '
-                          '-c maintenance_work_mem=512MB -c wal_buffers=16MB '
-                          '-c max_wal_size=2GB -c statement_timeout=120s '
-                          '-c idle_session_timeout=300s -c idle_in_transaction_session_timeout=300s '
-                          '-c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6')
-        plog(f"  Remote RAM: {_remote_ram_mb} MB — 16GB PG tier")
-    elif _remote_ram_mb >= 8192:
-        _pg_cmd_remote = ('postgres -c max_connections=500 -c shared_buffers=2GB '
-                          '-c effective_cache_size=6GB -c work_mem=4MB '
-                          '-c maintenance_work_mem=256MB -c wal_buffers=8MB '
-                          '-c max_wal_size=1GB -c statement_timeout=120s '
-                          '-c idle_session_timeout=300s -c idle_in_transaction_session_timeout=300s '
-                          '-c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6')
-        plog(f"  Remote RAM: {_remote_ram_mb} MB — 8GB PG tier")
-    elif _remote_ram_mb >= 4096:
-        _pg_cmd_remote = ('postgres -c max_connections=300 -c shared_buffers=1GB '
-                          '-c effective_cache_size=3GB -c work_mem=2MB '
-                          '-c maintenance_work_mem=128MB -c wal_buffers=4MB '
-                          '-c max_wal_size=512MB -c statement_timeout=120s '
-                          '-c idle_session_timeout=300s -c idle_in_transaction_session_timeout=300s '
-                          '-c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6')
-        plog(f"  Remote RAM: {_remote_ram_mb} MB — 4GB PG tier")
-    else:
-        _pg_cmd_remote = ('postgres -c max_connections=200 -c shared_buffers=256MB '
-                          '-c effective_cache_size=768MB -c work_mem=1MB '
-                          '-c maintenance_work_mem=64MB -c wal_buffers=2MB '
-                          '-c max_wal_size=256MB -c statement_timeout=120s '
-                          '-c idle_session_timeout=300s -c idle_in_transaction_session_timeout=300s '
-                          '-c tcp_keepalives_idle=60 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6')
-        _tier = f"{_remote_ram_mb} MB" if _remote_ram_mb > 0 else "unknown (probe failed)"
-        plog(f"  Remote RAM: {_tier} — minimum safe PG settings")
+    # v10.1.0: tier ladder factored into _authentik_pg_command_for_ram so the
+    # LOCAL deploy paths use the identical deterministic autotune (they used to
+    # hardcode enterprise — 12GB shared_buffers on any box).
+    _pg_cmd_remote, _pg_tier_remote = _authentik_pg_command_for_ram(_remote_ram_mb)
+    _ram_label = f"{_remote_ram_mb} MB" if _remote_ram_mb > 0 else "unknown (probe failed)"
+    plog(f"  Remote RAM: {_ram_label} — {_pg_tier_remote} PG settings")
     compose_content = compose_content.replace(
         'command: ' + _AUTHENTIK_PG_COMMAND_ENTERPRISE,
         'command: ' + _pg_cmd_remote,
@@ -40090,29 +42294,16 @@ def _ensure_authentik_compose_patches_legacy(compose_path, plog=None):
             lines = f.readlines()
         changed = False
 
-        # v0.9.28-alpha: enterprise PG tuning is now defined once at the top
-        # of app.py as _AUTHENTIK_PG_COMMAND_ENTERPRISE. The legacy patcher
-        # writes that canonical string unconditionally — no operator-override
-        # preservation (per .cursor/rules/fleet-uniform-config.mdc).
-        #
-        # Historical note: v0.9.23-v0.9.27 used a smaller command with
-        # max_connections=500 and no memory tuning. v0.9.28 raises this to
-        # max_connections=2000 + shared_buffers=12GB etc. to absorb the
-        # Authentik #20714 channels_postgres leak amplifier at production
-        # scale (100s of TAK clients per Authentik instance).
-        pg_cmd = _AUTHENTIK_PG_COMMAND_ENTERPRISE
+        # v10.1.0: RAM-tiered canonical command (_authentik_pg_command_for_ram) —
+        # the legacy patcher used to write enterprise (12GB shared_buffers)
+        # unconditionally, which over-provisions any box under 48GB. Still no
+        # operator-override preservation (per .cursor/rules/fleet-uniform-config.mdc):
+        # any command that differs from this box's tier-canonical string is rewritten.
+        pg_cmd, _pg_tier_lbl = _authentik_pg_command_for_ram(_local_ram_mb())
         _pg_full = ''.join(lines)
         has_pg_cmd = bool(re.search(r'command:\s*postgres\b.*max_connections=', _pg_full))
-        # Enterprise migration: detect any non-enterprise command line
-        # (anything missing shared_buffers, or max_connections < 2000,
-        # is treated as needing update). The detection is intentionally
-        # permissive — if any required enterprise arg is missing/lower,
-        # we rewrite the whole command to canonical.
         _pg_mc_match = re.search(r'max_connections=(\d+)', _pg_full)
-        _pg_sb_match = re.search(r'shared_buffers=(\d+)([KMG]?B)', _pg_full)
-        _mc_needs = not _pg_mc_match or (_pg_mc_match.group(1).isdigit() and int(_pg_mc_match.group(1)) < 2000)
-        _sb_needs = not _pg_sb_match  # enterprise requires shared_buffers tuning
-        needs_pg_update = has_pg_cmd and (_mc_needs or _sb_needs)
+        needs_pg_update = has_pg_cmd and (pg_cmd not in _pg_full)
         if not has_pg_cmd:
             patched = []
             for line in lines:
@@ -40124,7 +42315,7 @@ def _ensure_authentik_compose_patches_legacy(compose_path, plog=None):
                 lines = patched
                 changed = True
                 if plog:
-                    plog(f"  ✓ Added enterprise PostgreSQL tuning (max_connections=2000, shared_buffers=12GB, effective_cache_size=36GB, work_mem=16MB)")
+                    plog(f"  ✓ Added PostgreSQL tuning ({_pg_tier_lbl})")
         elif needs_pg_update:
             for i, line in enumerate(lines):
                 if 'command: postgres' in line and 'max_connections' in line:
@@ -40133,7 +42324,7 @@ def _ensure_authentik_compose_patches_legacy(compose_path, plog=None):
                     changed = True
                     if plog:
                         _old_mc = _pg_mc_match.group(1) if _pg_mc_match else '?'
-                        plog(f"  ✓ Updated PostgreSQL to enterprise tuning (max_connections={_old_mc}→2000, +shared_buffers=12GB, +effective_cache_size=36GB) [legacy patcher]")
+                        plog(f"  ✓ Updated PostgreSQL tuning to {_pg_tier_lbl} (max_connections was {_old_mc}) [legacy patcher]")
                     break
 
         if not any('ak healthcheck' in l or 'ak", "healthcheck' in l for l in lines):
@@ -40279,33 +42470,30 @@ def _ensure_authentik_compose_patches(compose_path, plog=None):
     services = data.setdefault('services', {})
 
     # ── PostgreSQL command-line tuning ────────────────────────────────────────
-    # v0.9.28-alpha: enterprise PG tuning (12-core / 48 GB hardware tier).
-    # The canonical command string is _AUTHENTIK_PG_COMMAND_ENTERPRISE at the
-    # top of app.py — referenced here so all migration paths converge to the
-    # same string. NO max(cur, target) override-preservation — fleet uniform
-    # config rule (.cursor/rules/fleet-uniform-config.mdc).
-    #
-    # Note on size deltas vs v0.9.27:
-    #   max_connections 500 → 2000  (maintainer-endorsed Authentik #20714 mitigation)
-    #   + shared_buffers=12GB, effective_cache_size=36GB (PG canonical 25%/75% of 48GB)
-    #   + work_mem=16MB, maintenance_work_mem=2GB, wal_buffers=64MB, max_wal_size=4GB
-    #
-    # Memory budget on a 48 GB box at peak: ~35-38 GB (PG shared + 1500
-    # backends @ 10 MB + Authentik containers + OS), leaves ~10 GB headroom.
-    _pg_target_cmd = _AUTHENTIK_PG_COMMAND_ENTERPRISE
+    # v10.1.0: RAM-tiered deterministic autotune (was: unconditional enterprise —
+    # 12GB shared_buffers regardless of box RAM, an 8× over-provision on a 16GB
+    # NUC that only ran on Linux overcommit; confirmed live 2026-07-08). The
+    # canonical ladder is _authentik_pg_command_for_ram at the top of app.py —
+    # the remote deploy uses the same one, so every box converges from the same
+    # observable (total RAM). NO max(cur, target) override-preservation — fleet
+    # uniform config rule (.cursor/rules/fleet-uniform-config.mdc).
+    _local_ram = _local_ram_mb()
+    _pg_target_cmd, _pg_tier = _authentik_pg_command_for_ram(_local_ram)
     pg = services.setdefault('postgresql', {})
     _existing_pg_cmd = str(pg.get('command') or '')
     _pg_mc_m = re.search(r'max_connections=(\d+)', _existing_pg_cmd)
-    _pg_sb_m = re.search(r'shared_buffers=', _existing_pg_cmd)
-    # Enterprise convergence: always write canonical command when current
-    # differs. Per fleet-uniform-config rule, no per-box override carve-out.
+    _pg_sb_m = re.search(r'shared_buffers=(\S+)', _existing_pg_cmd)
+    # Tier convergence: always write the canonical command when current differs.
+    # Per fleet-uniform-config rule, no per-box override carve-out.
     if pg.get('command') != _pg_target_cmd:
         _old_mc = _pg_mc_m.group(1) if _pg_mc_m else '(none)'
-        _had_sb = 'yes' if _pg_sb_m else 'no'
+        _old_sb = _pg_sb_m.group(1) if _pg_sb_m else '(none)'
         pg['command'] = _pg_target_cmd
         changed = True
         if plog:
-            plog(f"  ✓ Set enterprise PostgreSQL tuning (max_connections={_old_mc}→2000, shared_buffers tuned={_had_sb}→yes-12GB, +effective_cache_size=36GB +work_mem=16MB +maintenance_work_mem=2GB +wal_buffers=64MB +max_wal_size=4GB)")
+            _new_mc = re.search(r'max_connections=(\d+)', _pg_target_cmd).group(1)
+            _new_sb = re.search(r'shared_buffers=(\S+)', _pg_target_cmd).group(1)
+            plog(f"  ✓ Set PostgreSQL tuning for {_local_ram} MB RAM ({_pg_tier}): max_connections={_old_mc}→{_new_mc}, shared_buffers={_old_sb}→{_new_sb}")
 
     # ── Server healthcheck ────────────────────────────────────────────────────
     _target_hc = {
@@ -40730,12 +42918,21 @@ def _apply_authentik_ldap_routing_repair(ak_dir, plog):
             _record_spiral_repair_attempt('recreate_failed', evidence)
             return
 
-        _t.sleep(30)
-        _val = subprocess.run(_sudo_wrap(['docker', 'logs', 'authentik-ldap-1', '--since', '30s']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
-        _val_out = (_val.stdout or '').lower()
-        connected = 'successfully connected websocket' in _val_out
-        has_tls_err = 'remote error: tls' in _val_out or 'tls: internal error' in _val_out
-        has_route_err = '503 service unavailable' in _val_out or '502 bad gateway' in _val_out
+        # Poll up to 2 min for the websocket, don't single-sample at 30s: a slow outpost
+        # (cold image, busy box, or an upstream auth hiccup it retries through) connects
+        # late and a one-shot check false-rolled-back the migration (field-hit 2026-07-08,
+        # NUC — validation window closed before the outpost finished starting). Hard TLS /
+        # routing errors still abort the wait early; only a confirmed websocket passes.
+        connected = has_tls_err = has_route_err = False
+        for _val_i in range(8):
+            _t.sleep(15)
+            _val = subprocess.run(_sudo_wrap(['docker', 'logs', 'authentik-ldap-1', '--since', '150s']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
+            _val_out = (_val.stdout or '').lower()
+            connected = 'successfully connected websocket' in _val_out
+            has_tls_err = 'remote error: tls' in _val_out or 'tls: internal error' in _val_out
+            has_route_err = '503 service unavailable' in _val_out or '502 bad gateway' in _val_out
+            if connected or has_tls_err or has_route_err:
+                break
 
         if connected and not has_tls_err and not has_route_err:
             plog(f"  ✓ routing repair: LDAP outpost healthy on https://{fqdn} via Caddy (spiral broken)")
@@ -40767,7 +42964,7 @@ def _record_spiral_repair_attempt(outcome, evidence):
         pass
 
 
-def _ensure_authentik_ldap_outpost_on_fqdn(plog):
+def _ensure_authentik_ldap_outpost_on_fqdn(plog, require_tak=True):
     """v0.8.5 PROACTIVE routing migration. Complements _apply_authentik_ldap_routing_repair
     (reactive) by migrating any box where the LDAP outpost is on internal direct routing
     (`http://authentik-server-1:9000`) to FQDN routing (`https://<fqdn>`) — without waiting
@@ -40784,7 +42981,10 @@ def _ensure_authentik_ldap_outpost_on_fqdn(plog):
       2. Outpost AUTHENTIK_HOST == http://authentik-server-1:9000 (internal direct)
       3. .env has AUTHENTIK_HOST=https://<fqdn> (FQDN configured)
       4. https://<fqdn>/-/health/live/ reachable from inside the LDAP container (Caddy up)
-      5. TAK Server installed at /opt/tak (heavy LDAP load profile — not light/console-only)
+      5. TAK Server installed at /opt/tak (heavy LDAP load profile — not light/console-only).
+         Waived with require_tak=False — used by the Authentik deploy's final SA-bind verify,
+         which runs BEFORE TAK exists and deadlocks on internal routing (2026.x flow recursion
+         kills every bind regardless of password; field-confirmed 2026-07-08 on a fresh deploy).
 
     Only when ALL pass do we migrate. Failure on any → log skip reason and exit. Idempotent.
 
@@ -40800,7 +43000,7 @@ def _ensure_authentik_ldap_outpost_on_fqdn(plog):
         return
 
     try:
-        if not os.path.exists('/opt/tak'):
+        if require_tak and not os.path.exists('/opt/tak'):
             plog("  proactive routing: TAK Server not installed — leaving outpost on internal routing (light-load profile)")
             return
 
@@ -40853,7 +43053,7 @@ def _ensure_authentik_ldap_outpost_on_fqdn(plog):
             plog(f"  proactive routing: direct FQDN probe failed (likely NAT hairpin) but host Caddy is up — "
                  f"migrating anyway; outpost will reach Caddy via host-gateway (post-recreate validation confirms or rolls back)")
         else:
-            plog(f"  proactive routing: all preconditions met (TAK installed, FQDN configured, Caddy reachable) — migrating outpost to FQDN")
+            plog(f"  proactive routing: preconditions met (FQDN configured, Caddy reachable from container{', TAK installed' if os.path.exists('/opt/tak') else ''}) — migrating outpost to FQDN")
 
         import time as _t
         backup_path = f'{compose_path}.bak.proactive-routing.{int(_t.time())}'
@@ -40881,12 +43081,21 @@ def _ensure_authentik_ldap_outpost_on_fqdn(plog):
             subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--no-deps', '--force-recreate', 'ldap']), cwd=ak_dir, capture_output=True, text=True, timeout=90)
             return
 
-        _t.sleep(30)
-        _val = subprocess.run(_sudo_wrap(['docker', 'logs', 'authentik-ldap-1', '--since', '30s']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
-        _val_out = (_val.stdout or '').lower()
-        connected = 'successfully connected websocket' in _val_out
-        has_tls_err = 'remote error: tls' in _val_out or 'tls: internal error' in _val_out
-        has_route_err = '503 service unavailable' in _val_out or '502 bad gateway' in _val_out
+        # Poll up to 2 min for the websocket, don't single-sample at 30s: a slow outpost
+        # (cold image, busy box, or an upstream auth hiccup it retries through) connects
+        # late and a one-shot check false-rolled-back the migration (field-hit 2026-07-08,
+        # NUC — validation window closed before the outpost finished starting). Hard TLS /
+        # routing errors still abort the wait early; only a confirmed websocket passes.
+        connected = has_tls_err = has_route_err = False
+        for _val_i in range(8):
+            _t.sleep(15)
+            _val = subprocess.run(_sudo_wrap(['docker', 'logs', 'authentik-ldap-1', '--since', '150s']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
+            _val_out = (_val.stdout or '').lower()
+            connected = 'successfully connected websocket' in _val_out
+            has_tls_err = 'remote error: tls' in _val_out or 'tls: internal error' in _val_out
+            has_route_err = '503 service unavailable' in _val_out or '502 bad gateway' in _val_out
+            if connected or has_tls_err or has_route_err:
+                break
 
         if connected and not has_tls_err and not has_route_err:
             plog(f"  ✓ proactive routing: LDAP outpost healthy on https://{fqdn} via Caddy")
@@ -42764,6 +44973,70 @@ _AUTHENTIK_PG_COMMAND_ENTERPRISE = (
     ' -c tcp_keepalives_interval=10'
     ' -c tcp_keepalives_count=6'
 )
+
+# Shared timeout/keepalive tail — identical across every PG tier.
+_AUTHENTIK_PG_COMMAND_TAIL = (
+    ' -c statement_timeout=120s'
+    ' -c idle_session_timeout=300s'
+    ' -c idle_in_transaction_session_timeout=300s'
+    ' -c tcp_keepalives_idle=60'
+    ' -c tcp_keepalives_interval=10'
+    ' -c tcp_keepalives_count=6'
+)
+
+
+def _local_ram_mb():
+    """Total RAM of THIS box in MB (0 if unreadable). Same observable the remote
+    deploy probes with `free -m` — keyed off /proc/meminfo locally."""
+    try:
+        with open('/proc/meminfo') as _f:
+            for _l in _f:
+                if _l.startswith('MemTotal:'):
+                    return int(_l.split()[1]) // 1024
+    except Exception:
+        pass
+    return 0
+
+
+def _authentik_pg_command_for_ram(ram_mb):
+    """Deterministic RAM→PG-tuning ladder. Returns (command_string, tier_label).
+
+    v10.1.0: the LOCAL Authentik deploy hardcoded _AUTHENTIK_PG_COMMAND_ENTERPRISE
+    (12GB shared_buffers, sized for the 48GB hardware tier) regardless of box RAM —
+    an 8× over-provision on a 16GB NUC that only ran at all thanks to Linux
+    overcommit ([[authentik-pg-tuning-ignores-box-ram]], confirmed live 2026-07-08).
+    The REMOTE deploy already tiered by probed RAM; this helper is that same ladder,
+    factored out so every writer (remote deploy, local deploy, legacy patcher)
+    converges on the same deterministic autotune — fleet-uniform rule: same signal
+    → same config on every box, no operator-override preservation.
+
+    Probe-failure (ram_mb=0) gets the minimum-safe tier, matching the remote path.
+
+    Thresholds sit at ~92% of the nominal size: a physical 16GB box reports ~15.9GB
+    (kernel/firmware reservations), and a hard >=16384 gate would demote real
+    hardware one tier down. Deterministic and identical on every box.
+    """
+    if ram_mb >= 45056:
+        return _AUTHENTIK_PG_COMMAND_ENTERPRISE, 'enterprise (48GB+)'
+    if ram_mb >= 15000:
+        return ('postgres -c max_connections=1000 -c shared_buffers=4GB'
+                ' -c effective_cache_size=12GB -c work_mem=8MB'
+                ' -c maintenance_work_mem=512MB -c wal_buffers=16MB'
+                ' -c max_wal_size=2GB' + _AUTHENTIK_PG_COMMAND_TAIL), '16GB tier'
+    if ram_mb >= 7500:
+        return ('postgres -c max_connections=500 -c shared_buffers=2GB'
+                ' -c effective_cache_size=6GB -c work_mem=4MB'
+                ' -c maintenance_work_mem=256MB -c wal_buffers=8MB'
+                ' -c max_wal_size=1GB' + _AUTHENTIK_PG_COMMAND_TAIL), '8GB tier'
+    if ram_mb >= 3700:
+        return ('postgres -c max_connections=300 -c shared_buffers=1GB'
+                ' -c effective_cache_size=3GB -c work_mem=2MB'
+                ' -c maintenance_work_mem=128MB -c wal_buffers=4MB'
+                ' -c max_wal_size=512MB' + _AUTHENTIK_PG_COMMAND_TAIL), '4GB tier'
+    return ('postgres -c max_connections=200 -c shared_buffers=256MB'
+            ' -c effective_cache_size=768MB -c work_mem=1MB'
+            ' -c maintenance_work_mem=64MB -c wal_buffers=2MB'
+            ' -c max_wal_size=256MB' + _AUTHENTIK_PG_COMMAND_TAIL), 'minimum-safe tier'
 
 # v0.9.28-alpha: enterprise scaling — PgBouncer tier.
 #   DEFAULT_POOL_SIZE 75 → 300: with PG max_connections bumped to 2000, the
@@ -48646,7 +50919,13 @@ entries:
                             user_data = {'username': 'webadmin', 'name': 'TAK Admin', 'is_active': True,
                                 # Synthetic email — WebODM's OIDC login (and any OIDC consumer
                                 # requiring an email claim) fails on an email-less user.
-                                'email': f'webadmin@{(fqdn or "tak.local").split(":")[0]}',
+                                # settings.get, NOT the bare `fqdn` local — fqdn is only assigned in
+                                # Step 12 (line ~50296), so referencing it here raised UnboundLocalError,
+                                # the except at "Admin group setup error" swallowed it, and the REST of
+                                # Step 11 — including the real-outpost-token swap into compose — was
+                                # skipped: the LDAP outpost stayed on AUTHENTIK_TOKEN: placeholder and
+                                # 403'd forever. Field-hit 2026-07-08 (NUC redeploy with leftover /opt/tak).
+                                'email': f'webadmin@{(settings.get("fqdn") or "tak.local").split(":")[0]}',
                                 'groups': [group_pk] if group_pk else []}
                             req = urllib.request.Request(f'{ak_url}/api/v3/core/users/',
                                 data=json.dumps(user_data).encode(), headers=ak_headers, method='POST')
@@ -50876,28 +53155,59 @@ def _authentik_deploy_final_verify_ldap_sa(ldap_svc_pass, plog, attempts=12, del
     if not _ensure_ldapsearch():
         plog("  \u2717 ldapsearch not available — install ldap-utils (Debian) or openldap-clients (RHEL).")
         return False
+    # v10.1.0: a LIVE ldapsearch bind is the ONLY proof. The old Docker-log fallback
+    # ("authenticated from session") was a FALSE POSITIVE — the outpost emits that line
+    # even while serving err-49 rejections from its failure cache, independent of whether
+    # the CURRENT password binds. Two real diseases hide behind that mask, each with a
+    # one-shot heal below: (1) fresh deploys ship the outpost on internal routing, which
+    # the 2026.x flow recursion turns into guaranteed bind failure (the common case —
+    # field-confirmed 2026-07-08, NUC); (2) SA password drift between Authentik's DB and
+    # .env (memory: authentik-ldapservice-password-mismatch-fresh-deploy). Retesting fixes
+    # neither, so the loop heals both, and only green-lights on a real live bind.
+    healed_routing = False
+    healed = False
     for i in range(1, attempts + 1):
         plog(f"  Final check: LDAP SA bind ({i}/{attempts})...")
         if _test_ldap_bind_dn(sa_dn, ldap_svc_pass):
-            plog("  \u2713 LDAP service-account bind verified (adm_ldapservice). Safe to proceed to TAK Server.")
+            plog("  ✓ LDAP service-account bind verified via live ldapsearch (adm_ldapservice). Safe to proceed to TAK Server.")
             return True
-        # Fallback: directly check Docker logs for a recent "authenticated from session"
-        # entry for the SA.  This catches the case where ldapsearch's exit code is
-        # misleading (e.g. bind succeeds but base-scope search returns LDAP error 32)
-        # and _test_ldap_bind_dn_verdict mis-classifies the result as inconclusive.
-        try:
-            r_fb = subprocess.run(
-                _sudo_wrap(['docker', 'logs', 'authentik-ldap-1', '--since', '90s']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
-            fb_log = (r_fb.stdout or '').lower()
-            if 'authenticated from session' in fb_log and 'adm_ldapservice' in fb_log:
-                plog("  \u2713 LDAP SA bind verified via Docker log (authenticated from session). Safe to proceed.")
-                return True
-        except Exception:
-            pass
+        # Heal 1 — ROUTING (the usual fresh-deploy disease, field-confirmed 2026-07-08 NUC):
+        # a fresh deploy ships the outpost on internal routing (http://authentik-server-1:9000),
+        # which exposes the Authentik 2026.x flow recursion — the FIRST bind dies with
+        # "exceeded stage recursion depth" and the outpost then serves cached 0ms rejections
+        # for the correct password. No amount of password syncing fixes it, and the FQDN
+        # migration normally waits for TAK to be installed — which deadlocks this gate on the
+        # Authentik-then-TAK deploy order. Migrate to FQDN-via-Caddy now (hairpin-safe
+        # host-gateway, validates + rolls back if FQDN isn't viable), then re-verify live.
+        if not healed_routing and i >= 3:
+            healed_routing = True
+            plog("  ⏳ SA bind not passing — checking LDAP outpost routing (internal routing spirals on Authentik 2026.x)…")
+            try:
+                _ensure_authentik_ldap_outpost_on_fqdn(plog, require_tak=False)
+                if _test_ldap_bind_dn(sa_dn, ldap_svc_pass):
+                    plog("  ✓ LDAP SA bind verified via live ldapsearch after routing migration. Safe to proceed.")
+                    return True
+            except Exception as _rte:
+                plog(f"     routing migration error: {str(_rte)[:120]}")
+        # Heal 2 — PASSWORD: sync the SA password to the .env value, then keep verifying
+        # with the live bind — no fake log-grep shortcut. _ensure_authentik_ldap_service_account
+        # sets the password via the Authentik API + recreates the outpost; called at most once.
+        if not healed and i >= 5:
+            healed = True
+            plog("  ⏳ SA bind still not passing — actively syncing adm_ldapservice password to the .env value…")
+            try:
+                ok_sa, msg_sa = _ensure_authentik_ldap_service_account()
+                plog(f"     adm_ldapservice password sync: {str(msg_sa)[:120]}")
+                if ok_sa and _test_ldap_bind_dn(sa_dn, ldap_svc_pass):
+                    plog("  ✓ LDAP SA bind verified via live ldapsearch after password sync. Safe to proceed.")
+                    return True
+            except Exception as _sae:
+                plog(f"     SA password sync error: {str(_sae)[:120]}")
         if i < attempts:
             time.sleep(delay_sec)
-    plog("  \u2717 Final LDAP SA bind failed after Caddy/SMTP/restart.")
-    plog("     Check: docker logs authentik-ldap-1 — fix flow/outpost errors before deploying TAK Server.")
+    plog("  ✗ Final LDAP SA bind FAILED — live ldapsearch never returned 0, even after routing + password heals.")
+    plog("     Do NOT trust an 8446 login yet: TAK enrollment will reject users (LDAP err 49) until this binds.")
+    plog("     Inspect: docker logs authentik-ldap-1 (flow spiral / outpost error), then 'Resync LDAP to TAK Server'.")
     return False
 
 
@@ -61491,7 +63801,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% for key, mod in modules.items() %}
 <a class="module-card" href="{{ mod.route }}" data-module="{{ key }}">
 <div class="module-header{% if mod.get('icon_url') %} module-header--logo{% endif %}">{% if mod.icon_data %}<img src="{{ mod.icon_data }}" alt="" class="module-icon" style="width:24px;height:24px;object-fit:contain">{% elif key == 'takportal' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">group</span>{% elif key == 'fedhub' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">hub</span>{% elif key == 'emailrelay' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">outgoing_mail</span>{% elif mod.get('icon_url') %}<img src="{{ mod.icon_url }}" alt="" class="module-icon" style="height:{% if key == 'remote_assist' %}32px{% else %}36px{% endif %};width:auto;max-width:{% if key == 'takserver' %}72px{% elif key == 'remote_assist' %}100%{% else %}100px{% endif %};object-fit:contain">{% else %}<span class="module-icon">{{ mod.icon }}</span>{% endif %}
-{% if not mod.get('icon_url') or key in ('takportal', 'fedhub', 'emailrelay', 'fail2ban', 'webodm', 'tak_video_restreamer', 'netbird') %}<div class="module-name">{{ mod.name }}</div>{% endif %}
+{% if not mod.get('icon_url') or key in ('takportal', 'fedhub', 'emailrelay', 'fail2ban', 'webodm', 'tak_video_restreamer', 'netbird', 'connectivity') %}<div class="module-name">{{ mod.name }}</div>{% endif %}
 </div>
 {% if key != 'tak_video_restreamer' %}<div class="module-desc">{{ mod.description }}</div>{% endif %}
 {% if module_versions.get(key) %}{% set v = module_versions.get(key) %}{% if v.version or v.update_available %}<div class="meta-line module-version-line" id="module-version-{{ key }}" style="margin-bottom:4px">{% if v.version %}{% if key in ('mediamtx', 'tak_video_restreamer', 'remote_assist') %}{{ v.version }}{% else %}v{{ v.version }}{% endif %}{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% elif key == 'authentik' and v.get('channel') == 'dev' %} <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v{{ v.get('vetted_release','') }}">· main: v{{ v.get('vetted_release','') }}</span>{% elif key == 'authentik' and v.get('ahead_of_vetted') %} <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v{{ v.get('vetted_release','') }}) — not yet validated on main channel">! unvetted</span>{% elif key == 'authentik' and not v.update_available and v.get('vetted_release') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% elif key == 'netbird' and v.get('channel') == 'dev' %} <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v{{ v.get('vetted','') }}">· main: v{{ v.get('vetted','') }}</span>{% if v.get('upstream_newer') and v.get('upstream_latest') %} <span style="color:#f59e0b;font-size:10px" title="netbirdio shipped v{{ v.get('upstream_latest') }}, newer than the vetted pin — try on dev, promote to main if it passes">· ↑ v{{ v.get('upstream_latest') }} upstream</span>{% endif %}{% elif key == 'netbird' and v.get('vetted') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}</div>{% endif %}{% endif %}
@@ -63385,7 +65695,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% for key, mod in modules.items() %}
 <a class="module-card{% if mod.get('_conflict_with') %} blocked{% endif %}" href="{{ mod.route }}" data-module="{{ key }}">
 <div class="module-header{% if mod.get('icon_url') %} module-header--logo{% endif %}">{% if mod.icon_data %}<img src="{{ mod.icon_data }}" alt="" class="module-icon" style="width:24px;height:24px;object-fit:contain">{% elif key == 'takportal' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">group</span>{% elif key == 'fedhub' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">hub</span>{% elif key == 'emailrelay' %}<span class="module-icon material-symbols-outlined" style="font-size:28px">outgoing_mail</span>{% elif mod.get('icon_url') %}<img src="{{ mod.icon_url }}" alt="" class="module-icon" style="height:{% if key == 'remote_assist' %}32px{% else %}36px{% endif %};width:auto;max-width:{% if key == 'takserver' %}72px{% elif key == 'remote_assist' %}100%{% else %}100px{% endif %};object-fit:contain">{% else %}<span class="module-icon">{{ mod.icon }}</span>{% endif %}
-{% if not mod.get('icon_url') or key in ('takportal', 'fedhub', 'emailrelay', 'fail2ban', 'webodm', 'tak_video_restreamer', 'netbird') %}<div class="module-name">{{ mod.name }}</div>{% endif %}
+{% if not mod.get('icon_url') or key in ('takportal', 'fedhub', 'emailrelay', 'fail2ban', 'webodm', 'tak_video_restreamer', 'netbird', 'connectivity') %}<div class="module-name">{{ mod.name }}</div>{% endif %}
 </div>
 <div class="module-desc">{{ mod.description }}</div>
 {% if mod.get('_conflict_with') %}
@@ -66127,6 +68437,45 @@ def _startup_migrations():
             generate_caddyfile(s)
             subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
             print("Startup migration: Caddyfile regenerated + Caddy reloaded")
+
+        # v10.1.0 SECURITY (critical, one-time per box): regenerate the Caddyfile so the
+        # console vhost strips client-supplied X-Authentik-* headers. Without this, a
+        # public request `X-Authentik-Username: admin` to any /api/* or /login on an
+        # FQDN box reached the console's loopback-trust and got an admin session with NO
+        # password (confirmed exploitable). Only FQDN boxes have a Caddy-fronted console
+        # (self-signed/no-FQDN boxes hit 5001 directly, no Caddy path → not exposed).
+        #
+        # RETRY-UNTIL-APPLIED (field 2026-07-09, tak-10): generate_caddyfile writes via the
+        # broker, which on a non-root box may not be ready this early in startup — the
+        # broker `mkdir /etc/caddy` returned 125, generate threw, and the box was left
+        # VULNERABLE with the flag unset. For a security fix that is not acceptable. So:
+        # retry with a short backoff, VERIFY the strip is actually in generate's returned
+        # content (a successful return means the file write succeeded too — generate raises
+        # if the broker write fails), and only stamp the flag on a confirmed application.
+        if (s.get('fqdn') or '').strip() and not s.get('caddy_xauth_strip_v1'):
+            _applied = False
+            _last_err = None
+            for _xs_attempt in range(6):
+                try:
+                    _cf = generate_caddyfile(s)
+                    if _cf and 'request_header -X-Authentik' in _cf:
+                        subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
+                        _applied = True
+                        break
+                    _last_err = 'strip absent from generated Caddyfile'
+                except Exception as _xs_e:
+                    _last_err = str(_xs_e)[:160]
+                time.sleep(4)
+            if _applied:
+                s['caddy_xauth_strip_v1'] = True
+                save_settings(s)
+                s = load_settings()
+                print("Startup migration: Caddyfile regenerated to strip client X-Authentik-* (auth-bypass fix)")
+            else:
+                # Flag intentionally NOT set → retries on the next restart. Loud, so the
+                # box being left exposed is visible in the journal.
+                print(f"Startup migration: ⚠ SECURITY: X-Authentik strip NOT applied after retries "
+                      f"(box may be exposed until next restart): {_last_err}", flush=True)
 
         # v10.0.1: one-time teardown of the legacy 'cfd-remote-assist' install so a fresh
         # 'eud-remote-assist' install is clean. The module was renamed cfd→eud; the in-console

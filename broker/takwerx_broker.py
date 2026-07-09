@@ -34,6 +34,7 @@ import logging
 import logging.handlers
 import os
 import pwd
+import re
 import shutil
 import socket
 import socketserver
@@ -189,6 +190,11 @@ EXEC_ALLOW = {
     'getenforce', 'getsebool', 'restorecon', 'semanage', 'semodule', 'chcon',
     # read-only inspection (routed for a single audit point)
     'ss', 'ip', 'getent', 'getcap',
+    # v10.1.0: `wg show …` is read-only WireGuard inspection (relay tunnel status /
+    # handshake age for the connectivity anchor + Guard Dog relay health). Gated to
+    # the `show` subcommand only — `wg set`/`setconf`/`genkey` are denied (see
+    # _check_wg). Same read-only class as `ss`/`ip`.
+    'wg',
     # v10.0.8 harvest (born-non-root fleet): `lsof` is read-only (the console
     # checks whether the apt/dpkg lock is held before an install). `find` is
     # read-only TOO once its exec/write/delete actions are gated (see _check_find)
@@ -219,6 +225,25 @@ EXEC_ALLOW = {
     # fixed kernel-patch shape (see _check_systemd_run). No broader than the
     # already-allowed `systemctl start <console-written-unit>`.
     'systemd-run',
+    # v10.1.0 Leg 6 (WiFi Join) — these were MISSING, so the whole WiFi card
+    # no-op'd on non-root boxes (scan denied → empty list; add denied at
+    # netplan generate). Field-hit 2026-07-08 on the NUC. All three tightly
+    # gated to the exact shapes the WiFi card issues:
+    #   iw      — `iw dev` + `iw dev <iface> scan` ONLY (read-only wireless
+    #             inspection; set/del/txpower shapes denied — see _check_iw)
+    #   netplan — `netplan generate|apply` ONLY, no further args (see
+    #             _check_netplan). State-changing by design: that IS the
+    #             feature, and the console validates-before-apply with a
+    #             backup/restore. The netplan YAML itself is written via the
+    #             already-path-checked install/cp under /etc/netplan/.
+    #   nmcli   — the four fixed WiFi shapes (rescan / list / connection show /
+    #             connect <ssid> [password <psk>]) — see _check_nmcli; free
+    #             args may not start with '-' (no option injection).
+    'iw', 'netplan', 'nmcli',
+    # v10.1.0 Leg 6c "use this network now": switch to a SAVED network via the
+    # supplicant without re-entering the password. Gated to the read + the two
+    # scoped switch verbs only — see _check_wpa_cli.
+    'wpa_cli',
 }
 
 # Package-manager subcommands the console legitimately uses. Anything else (and
@@ -292,6 +317,9 @@ PATH_ALLOW = (
     '/usr/share/keyrings/',      # apt repo signing keys (gpg --dearmor dest)
     '/etc/debsig/',              # debsig policy dir — TAK .deb signature verification
     '/usr/share/debsig/',        # debsig keyring dir (same)
+    '/etc/netplan/',             # v10.1.0 Leg 6 WiFi Join: cat/cp/install of the
+                                 # netplan YAML (additive AP add, validate-before-apply).
+                                 # Root-owned dir; console cannot symlink-plant here.
     '/opt/tak/',
     '/opt/tak-guarddog/',
     TAK_BUNDLE_DIR + '/',        # console-owned TAK docker bundle (ln source for /opt/tak)
@@ -581,9 +609,122 @@ def check_exec(argv, cwd=None):
         _check_cp(argv, cwd)
     elif base == 'sysctl':
         _check_sysctl(argv)
+    elif base == 'iw':
+        _check_iw(argv)
+    elif base == 'netplan':
+        _check_netplan(argv)
+    elif base == 'nmcli':
+        _check_nmcli(argv)
+    elif base == 'wg':
+        _check_wg(argv)
+    elif base == 'wpa_cli':
+        _check_wpa_cli(argv)
     elif base in PATH_CHECKED_BINS:
         _check_path_args(base, argv, cwd)
     return argv
+
+
+_IFACE_RE = re.compile(r'^[A-Za-z0-9_.:][A-Za-z0-9_.:-]{0,14}$')  # no leading '-' (option smuggling)
+
+
+def _check_iw(argv):
+    """iw: read-only wireless inspection ONLY — `iw dev` (list interfaces),
+    `iw dev <iface> scan` (active scan) and `iw dev <iface> scan dump` (cached
+    results, no radio activity). Every state-changing shape (set txpower,
+    interface add/del, connect, reg set, …) is denied. v10.1.0 Leg 6."""
+    rest = argv[1:]
+    if rest == ['dev']:
+        return
+    if len(rest) == 3 and rest[0] == 'dev' and rest[2] == 'scan' and _IFACE_RE.match(rest[1]):
+        return
+    if len(rest) == 4 and rest[0] == 'dev' and rest[2] == 'scan' and rest[3] == 'dump' and _IFACE_RE.match(rest[1]):
+        return
+    raise Denied('iw: only `iw dev` and `iw dev <iface> scan [dump]` allowed')
+
+
+def _check_wpa_cli(argv):
+    """wpa_cli: only the shapes the "use this saved network now" flow issues:
+      wpa_cli -i <iface> list_networks           (read)
+      wpa_cli -i <iface> select_network <id>     (id = digits only)
+      wpa_cli -i <iface> enable_network all|<id>
+    Everything else — set_network (could set a psk/identity), add/remove_network,
+    save_config, p2p, wps, raw `set` — is denied. iface matches the strict regex;
+    the network id is numeric; `enable_network` takes `all` or a numeric id."""
+    r = argv[1:]
+    if len(r) >= 3 and r[0] == '-i' and _IFACE_RE.match(r[1]):
+        verb = r[2]
+        rest = r[3:]
+        if verb == 'list_networks' and not rest:
+            return
+        if verb == 'select_network' and len(rest) == 1 and rest[0].isdigit():
+            return
+        if verb == 'enable_network' and len(rest) == 1 and (rest[0] == 'all' or rest[0].isdigit()):
+            return
+    raise Denied('wpa_cli: only list_networks / select_network <id> / enable_network are allowed')
+
+
+def _check_wg(argv):
+    """wg: read-only `wg show …` ONLY. Every mutating subcommand (set, setconf,
+    addconf, syncconf, genkey, genpsk, pubkey) is denied — the console reads tunnel
+    status/handshake age; it never reconfigures WireGuard (that's the anchor
+    bootstrap's job, run as root)."""
+    if len(argv) >= 2 and argv[1] == 'show':
+        return
+    raise Denied('wg: only `wg show` is allowed')
+
+
+def _check_netplan(argv):
+    """netplan: `generate` (validate) and `apply` only, with NO further args —
+    the console's WiFi add validates-before-apply with a backup/restore. The
+    YAML content itself arrives via the path-checked install/cp under
+    /etc/netplan/, so this cannot apply a file the path rules didn't admit.
+    `netplan set`/`try --state`/anything else is denied."""
+    if len(argv) == 2 and argv[1] in ('generate', 'apply'):
+        return
+    raise Denied('netplan: only `netplan generate` / `netplan apply` allowed')
+
+
+def _check_nmcli(argv):
+    """nmcli: exactly the WiFi-card shapes (NetworkManager boxes):
+      nmcli dev wifi rescan
+      nmcli -t -f SSID,SIGNAL dev wifi list
+      nmcli -t -f NAME,TYPE connection show
+      nmcli connection add type wifi con-name <ssid> ifname <iface|*> ssid <ssid>
+            connection.autoconnect yes [wifi-sec.key-mgmt wpa-psk wifi-sec.psk <psk>]
+      nmcli connection modify <ssid> wifi-sec.psk <psk>
+    `connection add` creates a PROFILE and activates nothing — deliberately NOT
+    `dev wifi connect`, which switches the live network (can drop the console's
+    own uplink) and fails for out-of-range SSIDs (breaks pre-provision). Free
+    args (ssid/iface/psk) must not start with '-' — no option injection. Every
+    other nmcli verb (con up/down/delete, radio, device set, …) is denied."""
+    rest = argv[1:]
+    if rest == ['dev', 'wifi', 'rescan']:
+        return
+    if rest in (['-t', '-f', 'SSID,SIGNAL', 'dev', 'wifi', 'list'],
+                ['-t', '-f', 'NAME,TYPE', 'connection', 'show']):
+        return
+
+    def _free(a):
+        return bool(a) and not a.startswith('-')
+    if (len(rest) in (12, 16)
+            and rest[0:5] == ['connection', 'add', 'type', 'wifi', 'con-name']
+            and _free(rest[5]) and rest[6] == 'ifname'
+            and (rest[7] == '*' or _IFACE_RE.match(rest[7]))
+            and rest[8] == 'ssid' and _free(rest[9])
+            and rest[10:12] == ['connection.autoconnect', 'yes']
+            and (len(rest) == 12 or (rest[12:15] == ['wifi-sec.key-mgmt', 'wpa-psk', 'wifi-sec.psk']
+                                     and _free(rest[15])))):
+        return
+    if (len(rest) == 5 and rest[0:2] == ['connection', 'modify']
+            and _free(rest[2]) and rest[3] == 'wifi-sec.psk' and _free(rest[4])):
+        return
+    # v10.1.0 Leg 6c: forget a saved network.  nmcli connection delete <name>
+    if len(rest) == 3 and rest[0:2] == ['connection', 'delete'] and _free(rest[2]):
+        return
+    # v10.1.0 Leg 6c: switch to a saved network.  nmcli connection up <name>
+    if len(rest) == 3 and rest[0:2] == ['connection', 'up'] and _free(rest[2]):
+        return
+    raise Denied('nmcli: only the WiFi scan/list/profile-add/delete/up shapes are allowed')
 
 
 def _check_pkgmgr(argv):
@@ -1643,7 +1784,15 @@ def _evaluate(req):
 def _summary(req):
     op = req.get('op')
     if op == 'exec':
-        return ' '.join(map(str, req.get('argv') or []))[:200]
+        argv = [str(a) for a in (req.get('argv') or [])]
+        # Redact secrets that legitimately ride in argv (v10.1.0: the nmcli WiFi
+        # profile shapes carry the operator-entered PSK — it must never reach
+        # the persistent audit log or journald; CJIS "secrets never logged").
+        # Generic rule: the token FOLLOWING a literal password-ish key.
+        for i, a in enumerate(argv[:-1]):
+            if a in ('password', 'wifi-sec.psk'):
+                argv[i + 1] = '***'
+        return ' '.join(argv)[:200]
     return str(req.get('path'))[:200]
 
 

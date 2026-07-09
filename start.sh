@@ -357,7 +357,9 @@ install_dependencies() {
     # pyyaml: the module compose patchers use it for ROBUST, IDEMPOTENT YAML edits.
     # Without it they fall back to a legacy text patcher that double-appends keys on
     # re-deploy (duplicate `healthcheck` -> "mapping key already defined" parse error).
-    if ! "$INSTALL_DIR/.venv/bin/pip" install --quiet flask psutil werkzeug gunicorn pyyaml 2>"$apt_log"; then
+    # pystun3: Connectivity Wizard (v10.1.0) NAT/public-IP detection. Pinned — pure-python,
+    # vetted at 2.0.0; bump deliberately, not by re-running start.sh.
+    if ! "$INSTALL_DIR/.venv/bin/pip" install --quiet flask psutil werkzeug gunicorn pyyaml pystun3==2.0.0 2>"$apt_log"; then
         echo -e "${RED}  pip install failed:${NC}"
         tail -20 "$apt_log"
         rm -f "$apt_log"
@@ -945,23 +947,39 @@ else
     fi
 fi
 
-# Get access URL — on Azure/AWS the private IP is returned by hostname -I
-# Try to resolve the public IP so operators get the right URL
+# Get access URL — on cloud VMs the public IP genuinely reaches the box (1:1 NAT), so
+# it's a real access URL. On home/hotspot/CGNAT networks the "public" IP is NOT reachable
+# from outside (that's what the Connectivity module exists to solve) — printing it first
+# sends first-time users to a dead URL. Tell the two worlds apart with one probe: every
+# cloud (AWS/Azure/OCI/GCP) answers SOMETHING on link-local IMDS 169.254.169.254 (any
+# HTTP code, even 4xx); home networks have nothing there → timeout → code 000.
 SERVER_IP=$(hostname -I | awk '{print $1}')
 PUBLIC_IP=$(curl -s --max-time 3 https://api.ipify.org 2>/dev/null || echo "")
+IMDS_CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 http://169.254.169.254/ 2>/dev/null || echo 000)
 
 echo ""
 echo -e "${GREEN}${BOLD}  ╔══════════════════════════════════════════════════════╗${NC}"
 echo -e "${GREEN}${BOLD}  ║  infra-TAK is running!                               ║${NC}"
 echo -e "${GREEN}${BOLD}  ╚══════════════════════════════════════════════════════╝${NC}"
 echo ""
-if [ -n "$PUBLIC_IP" ] && [ "$PUBLIC_IP" != "$SERVER_IP" ]; then
+if [ "$IMDS_CODE" != "000" ] && [ -n "$PUBLIC_IP" ] && [ "$PUBLIC_IP" != "$SERVER_IP" ]; then
+    # Cloud VM: the public IP is a real front door.
     echo -e "  ${BOLD}Access (public):${NC}  https://$PUBLIC_IP:5001"
     echo -e "  ${BOLD}Access (private):${NC} https://$SERVER_IP:5001"
+elif [ -n "$PUBLIC_IP" ] && [ "$PUBLIC_IP" != "$SERVER_IP" ]; then
+    # Home/hotspot box: the LAN URL is the ONLY one that works right now.
+    echo -e "  ${BOLD}Access:${NC} https://$SERVER_IP:5001"
+    echo -e "  ${YELLOW}(from a phone/laptop on the SAME network as this box)${NC}"
 else
     echo -e "  ${BOLD}Access:${NC} https://$SERVER_IP:5001"
 fi
 echo -e "  ${YELLOW}(Accept the self-signed certificate warning in your browser)${NC}"
+if [ "$IMDS_CODE" = "000" ] && [ -n "$PUBLIC_IP" ] && [ "$PUBLIC_IP" != "$SERVER_IP" ]; then
+    echo ""
+    echo -e "  ${CYAN}Heads up: your internet-facing IP ($PUBLIC_IP) will NOT reach this box${NC}"
+    echo -e "  ${CYAN}from outside yet — home/carrier NAT blocks inbound. Once you're logged in,${NC}"
+    echo -e "  ${CYAN}open the Connectivity module to make this box reachable from anywhere.${NC}"
+fi
 echo ""
 echo -e "  ${BOLD}Service:${NC} systemctl status takwerx-console"
 echo -e "  ${BOLD}Logs:${NC}    journalctl -u takwerx-console -f"
