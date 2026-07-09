@@ -59,6 +59,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 from functools import wraps
 import os, re, ssl, json, secrets, subprocess, time, psutil, threading, html, shutil, copy, tempfile, shlex, ipaddress
+import hmac
 import urllib.request
 import urllib.parse
 from datetime import datetime, timedelta
@@ -514,8 +515,9 @@ def inject_cloudtak_icon():
         _settings = load_settings()
         _banner = render_custom_banner(_settings)
         _cert_pw_nag = render_default_cert_password_warning(_settings)
+        _gd_gap = render_gd_delivery_gap_banner(_settings)
         _sidebar = render_sidebar(detect_modules(), request.path.strip('/') or 'console', takwerx_logo_url=_login_logo_url())
-        d['sidebar_html'] = Markup(_banner + _cert_pw_nag + _sidebar)
+        d['sidebar_html'] = Markup(_banner + _cert_pw_nag + _gd_gap + _sidebar)
         # Resolve a service's public domain (custom Caddy override or default prefix.<fqdn>)
         # so templates link to the operator-configured host instead of hardcoding takportal.<fqdn>.
         d['service_domain'] = lambda key: _get_service_domain(_settings, key)
@@ -668,7 +670,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.0-alpha"
+VERSION = "10.1.1-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -1963,6 +1965,46 @@ def _takserver_running_local():
     except Exception:
         return False
 
+# v10.1.1 S1 (defense-in-depth for the v10.1.0 X-Authentik header bypass): a
+# shared secret that Caddy injects as X-Infratak-Proxy-Auth ONLY on requests
+# that passed the console vhost's forward_auth. Once `enforce` is armed (by the
+# caddy_proxy_auth_gate_v1 startup migration, after verifying the Caddyfile
+# actually injects it), loopback + X-Authentik-Username alone is never enough
+# to mint a session — the secret proves the identity header came from
+# forward_auth, not a forged client/local-process request. State lives in
+# .config/proxy_auth.json (0600): {'secret': hex, 'enforce': bool}.
+_PROXY_AUTH_FILE = os.path.join(CONFIG_DIR, 'proxy_auth.json')
+_proxy_auth_cache = {'mtime': None, 'state': {}}
+
+def _save_proxy_auth_state(state):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    tmp = _PROXY_AUTH_FILE + '.tmp'
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        json.dump(state, f)
+    os.replace(tmp, _PROXY_AUTH_FILE)
+    _proxy_auth_cache['mtime'] = None
+
+def _proxy_auth_state(create=False):
+    """Return the proxy-auth state dict, cached by file mtime (read per request
+    from login_required — must stay cheap). create=True mints the secret if
+    absent (called from generate_caddyfile, NOT armed here — enforce stays off
+    until the startup migration verifies Caddy injects it)."""
+    try:
+        st = os.stat(_PROXY_AUTH_FILE)
+        if _proxy_auth_cache['mtime'] != st.st_mtime:
+            with open(_PROXY_AUTH_FILE) as f:
+                _proxy_auth_cache['state'] = json.load(f) or {}
+            _proxy_auth_cache['mtime'] = st.st_mtime
+        state = dict(_proxy_auth_cache['state'])
+    except Exception:
+        state = {}
+    if create and not (state.get('secret') or '').strip():
+        state['secret'] = secrets.token_hex(32)
+        state.setdefault('enforce', False)
+        _save_proxy_auth_state(state)
+    return state
+
 def _apply_authentik_session():
     """If request has Authentik headers (from Caddy forward_auth), set session so we treat user as logged in."""
     # Trust Authentik headers only when request came from local reverse proxy.
@@ -1970,11 +2012,23 @@ def _apply_authentik_session():
     if request.remote_addr not in ('127.0.0.1', '::1'):
         return False
     uname = request.headers.get('X-Authentik-Username')
-    if uname:
-        session['authenticated'] = True
-        session['authentik_username'] = uname
-        return True
-    return False
+    if not uname:
+        return False
+    # v10.1.1 S1: once armed, require the Caddy-injected proxy-auth secret too.
+    # Loopback alone is forgeable by any local process (and was the v10.1.0
+    # remote bypass when the client-header strip was missing) — the secret is
+    # only ever attached by Caddy AFTER forward_auth passed.
+    pa = _proxy_auth_state()
+    if pa.get('enforce'):
+        _pa_secret = (pa.get('secret') or '').strip()
+        # An empty secret must never authenticate — compare_digest('','') is True,
+        # which would silently degrade back to header-only trust. Fail closed.
+        if not _pa_secret or not hmac.compare_digest(
+                request.headers.get('X-Infratak-Proxy-Auth') or '', _pa_secret):
+            return False
+    session['authenticated'] = True
+    session['authentik_username'] = uname
+    return True
 
 def login_required(f):
     @wraps(f)
@@ -2460,6 +2514,42 @@ def render_custom_banner(settings):
 def render_default_cert_password_warning(settings):
     """Removed in v0.9.35 — the atakatak default-password nag was too alarmist for operators who know what they're doing."""
     return ''
+
+
+def render_gd_delivery_gap_banner(settings):
+    """v10.1.1 (F5): show a banner ONLY when Guard Dog has an ACTIVE alert (a
+    monitor is down) AND no notification email/SMS is configured — the gap that
+    let NE-TAK's disk warnings land in a UI nobody had open while the disk filled
+    to 97%. NOT a standing "you have no email" nag: v0.9.35 already removed a
+    per-page nag banner (render_default_cert_password_warning) for being too
+    alarmist. This fires only when there is genuinely something to deliver and
+    nowhere to deliver it. Reads the in-memory GD monitor cache (no subprocess);
+    stays quiet on a healthy box or before the cache is warm."""
+    try:
+        s = settings or {}
+        if not (s.get('guarddog_deployed_version') or '').strip():
+            return ''  # Guard Dog not deployed here
+        has_email = bool((s.get('guarddog_alert_email') or '').strip()
+                         or (s.get('guarddog_deployed_email') or '').strip())
+        has_sms = bool((s.get('guarddog_sms') or {}).get('provider'))
+        if has_email or has_sms:
+            return ''  # a delivery path exists
+        # Only nag when a monitor is ACTUALLY down (an alert with nowhere to go).
+        # Fail quiet on a cold/empty cache — never nag a box we haven't assessed.
+        mon = _guarddog_page_cache.get('monitor_result') or {}
+        if not any(v is False for v in mon.values()):
+            return ''
+    except Exception:
+        return ''
+    return (
+        '<div style="position:relative;z-index:40;background:rgba(234,179,8,.12);'
+        'border-bottom:1px solid rgba(234,179,8,.4);color:#eab308;'
+        'padding:8px 16px;font-size:13px;text-align:center;font-weight:600">'
+        '⚠ Guard Dog has an active alert but no notification email is configured — '
+        'this alert has nowhere to go. '
+        '<a href="/guarddog" style="color:#eab308;text-decoration:underline">Configure notifications →</a>'
+        '</div>'
+    )
 
 
 def render_sidebar(modules, active_path, takwerx_logo_url=None):
@@ -10626,7 +10716,10 @@ def guarddog_page():
             {'name': 'Root CA / Intermediate CA', 'id': 'fedhub_intca', 'interval': 'Escalating', 'desc': f'Monitors Root CA and Intermediate CA expiry on {fh_host} (same 90-day escalation as TAK Server intca).'},
         ]})
     guarddog_services.extend([
-        {'id': 'authentik', 'name': 'Authentik', 'monitored': modules.get('authentik', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'id': 'authentik_http', 'interval': '1 min', 'desc': 'Checks Authentik HTTP (9090). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
+        {'id': 'authentik', 'name': 'Authentik', 'monitored': modules.get('authentik', {}).get('installed'), 'monitors': [
+            {'name': 'Container / HTTP', 'id': 'authentik_http', 'interval': '1 min', 'desc': 'Checks Authentik HTTP (9090). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'},
+            {'name': 'Channels table', 'id': 'authentik_channels', 'interval': '10 min', 'desc': 'Size of the django_channels_postgres_message table (websocket message backlog). Green under 1GB; red at 1GB+ means the in-process reaper is failing and the table is bloating toward a disk-fill (the NE-TAK 605GB incident). Size-based check — never count(*).'},
+        ]},
         {'id': 'takportal', 'name': 'TAK Portal', 'monitored': modules.get('takportal', {}).get('installed'), 'monitors': [{'name': 'Container', 'id': 'takportal_ctr', 'interval': '1 min', 'desc': 'Checks TAK Portal container is running. Alert and auto-restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'mediamtx', 'name': 'MediaMTX', 'monitored': modules.get('mediamtx', {}).get('installed'), 'monitors': [{'name': 'Service', 'id': 'mediamtx_svc', 'interval': '1 min', 'desc': 'Checks systemd mediamtx. Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'tak_video_restreamer', 'name': 'TAK Video Restreamer', 'monitored': modules.get('tak_video_restreamer', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'id': 'tvr_http', 'interval': '1 min', 'desc': 'Checks tak-video-restreamer container health (GET /login on port 3100). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
@@ -10949,6 +11042,78 @@ def _remotedb_host_port_from_tak_settings():
     except (TypeError, ValueError):
         p = 5432
     return h, p
+
+
+def _tak_db_topology(settings=None):
+    """v10.1.1 (F7): ground truth for WHERE TAK's CoT database actually lives —
+    read from CoreConfig.xml's `<connection url="jdbc:postgresql://HOST:PORT/cot">`
+    (what TAK Server itself connects to), NOT from settings alone. NE-TAK is a
+    split box whose CoreConfig points at a remote DB (172.93.50.224) but whose
+    console settings never recorded two-server mode, so the GD monitors checked a
+    nonexistent LOCAL postgres and showed permanent false-red — while a REAL
+    remote-DB outage was invisible.
+
+    Returns (mode, host, port):
+      'container' — TAK runs its own DB container (host is the container name)
+      'remote'    — CoreConfig url host is not loopback/localhost
+      'local'     — loopback DB (native single-server), or CoreConfig unreadable
+    """
+    import re as _re_topo
+    # Container TAK: its DB is the takserver-db container regardless of the url.
+    if _tak_is_container():
+        return 'container', TAK_DB_CONTAINER, 5432
+    # Parse the live CoreConfig connection url (may be root-owned → broker read).
+    url_host, url_port = '', 5432
+    try:
+        content = ''
+        try:
+            with open('/opt/tak/CoreConfig.xml') as _f:
+                content = _f.read()
+        except (PermissionError, FileNotFoundError):
+            try:
+                content = _read_priv('/opt/tak/CoreConfig.xml') or ''
+            except Exception:
+                content = ''
+        m = _re_topo.search(r'jdbc:postgresql://([^:/]+)(?::(\d+))?/cot', content)
+        if m:
+            url_host = (m.group(1) or '').strip()
+            if m.group(2):
+                url_port = int(m.group(2))
+    except Exception:
+        pass
+    if url_host and url_host not in ('127.0.0.1', 'localhost', '::1'):
+        return 'remote', url_host, url_port
+    # Fall back to saved two-server settings (post-migration source of truth).
+    _sh, _sp = _remotedb_host_port_from_tak_settings()
+    if _sh:
+        return 'remote', _sh, (_sp or 5432)
+    return 'local', '127.0.0.1', url_port
+
+
+def _read_martiuser_password_from_local_coreconfig():
+    """Return (password, source) for TAK's martiuser DB user from the LOCAL
+    CoreConfig.xml — what TAK Server actually authenticates with. XML-unescaped
+    (TAK's JDBC decodes &amp; etc.; we must match). ('', reason) if not found."""
+    try:
+        try:
+            cc = _read_priv('/opt/tak/CoreConfig.xml')  # v10.0.5 non-root: read via broker
+        except Exception:
+            try:
+                with open('/opt/tak/CoreConfig.xml') as _f:
+                    cc = _f.read()
+            except Exception:
+                cc = ''
+        for pat in (
+            r'<connection[^>]*url\s*=\s*["\']jdbc:postgresql://[^"\']+/cot["\'][^>]*password\s*=\s*["\']([^"\']*)["\']',
+            r'<connection[^>]*username\s*=\s*["\']martiuser["\'][^>]*password\s*=\s*["\']([^"\']*)["\']',
+            r'<connection[^>]*password\s*=\s*["\']([^"\']*)["\']',
+        ):
+            m = re.search(pat, cc)
+            if m and (m.group(1) or '').strip():
+                return html.unescape(m.group(1).strip()), 'CoreConfig.xml'
+    except Exception:
+        pass
+    return '', 'martiuser password not found in local CoreConfig.xml'
 
 
 @app.route('/api/guarddog/deploy-health-agent', methods=['POST'])
@@ -13165,7 +13330,7 @@ def _guarddog_service_monitor_ids(settings):
         'takserver': takserver_ids,
         'remotedb': ['remotedb_tcp', 'remotedb_agent', 'remotedb_auth'],
         'federation_hub': ['fedhub_svc', 'fedhub_port', 'fedhub_mongo', 'fedhub_disk', 'fedhub_cert', 'fedhub_intca'],
-        'authentik': ['authentik_http'],
+        'authentik': ['authentik_http', 'authentik_channels'],
         'takportal': ['takportal_ctr'],
         'mediamtx': ['mediamtx_svc'],
         'tak_video_restreamer': ['tvr_http'],
@@ -13412,10 +13577,22 @@ def _monitor_health_check(monitor_id):
                     continue
             return False
         if monitor_id == 'postgresql':
+            # v10.1.1 (F7): key off TAK's real DB topology (CoreConfig ground truth),
+            # not a hardcoded local assumption. A split box whose CoreConfig points at
+            # a remote DB was checking a nonexistent local postgres → permanent false-red.
+            _db_mode, _db_host, _db_port = _tak_db_topology()
+            if _db_mode == 'remote':
+                # Remote DB: TCP-connect to the CoreConfig host:port (no SSH). A real
+                # outage of the remote DB now turns this dot red instead of hiding it.
+                try:
+                    with socket.create_connection((_db_host, _db_port), timeout=2):
+                        return True
+                except OSError:
+                    return False
             # v10.0.1: container TAK runs PostgreSQL in the takserver-db container,
             # not a host postgresql.service — check the container's running state
             # there (native is byte-identical: systemctl is-active postgresql).
-            if _tak_is_container():
+            if _db_mode == 'container' or _tak_is_container():
                 r = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.State.Running}}', TAK_DB_CONTAINER]),
                                    capture_output=True, text=True, timeout=5)
                 return r.returncode == 0 and r.stdout.strip() == 'true'
@@ -13427,6 +13604,29 @@ def _monitor_health_check(monitor_id):
                     return True
             return False
         if monitor_id == 'cotdb':
+            # v10.1.1 (F7): remote DB → psql over TCP with CoreConfig's martiuser creds;
+            # fall back to TCP-reachable-only if auth fails (so the dot reflects "DB up"
+            # even when the console can't read the size). Split boxes no longer false-red.
+            _db_mode, _db_host, _db_port = _tak_db_topology()
+            if _db_mode == 'remote':
+                _pw, _ = _read_martiuser_password_from_local_coreconfig()
+                if _pw:
+                    _env = dict(os.environ, PGPASSWORD=_pw, PGCONNECT_TIMEOUT='4')
+                    try:
+                        r = subprocess.run(
+                            ['psql', '-h', _db_host, '-p', str(_db_port), '-U', 'martiuser',
+                             '-d', 'cot', '-tAc', "SELECT pg_database_size('cot')"],
+                            capture_output=True, text=True, timeout=8, env=_env)
+                        if r.returncode == 0 and r.stdout.strip().isdigit():
+                            return True
+                    except FileNotFoundError:
+                        pass  # no psql client on this box — fall through to TCP reachability
+                # Auth failed / no password / no psql client — degrade to TCP reachability.
+                try:
+                    with socket.create_connection((_db_host, _db_port), timeout=3):
+                        return True
+                except OSError:
+                    return False
             # v10.0.1: container → docker exec -u postgres (peer auth); native →
             # sudo -u postgres psql. Both query the same cot database size.
             if _tak_is_container():
@@ -13540,27 +13740,10 @@ def _monitor_health_check(monitor_id):
             if tak_cfg.get('mode') != 'two_server':
                 return None
             s1_cfg = tak_cfg.get('server_one', {})
-            # Read password from LOCAL CoreConfig.xml (what TAK Server actually uses)
-            local_pw = ''
-            try:
-                try:
-                    cc = _read_priv('/opt/tak/CoreConfig.xml')   # v10.0.5 non-root: read via broker
-                except Exception:
-                    cc = ''
-                for pat in (
-                    r'<connection[^>]*url\s*=\s*["\']jdbc:postgresql://[^"\']+/cot["\'][^>]*password\s*=\s*["\']([^"\']*)["\']',
-                    r'<connection[^>]*username\s*=\s*["\']martiuser["\'][^>]*password\s*=\s*["\']([^"\']*)["\']',
-                    r'<connection[^>]*password\s*=\s*["\']([^"\']*)["\']',
-                ):
-                    m = re.search(pat, cc)
-                    if m and (m.group(1) or '').strip():
-                        # v0.9.46: CoreConfig stores the password XML-escaped (e.g. & -> &amp;).
-                        # TAK's JDBC decodes it; we must too, or a regenerated password with an
-                        # XML-special char (&,<,>,",') auths in TAK but false-fails this check.
-                        local_pw = html.unescape(m.group(1).strip())
-                        break
-            except Exception:
-                pass
+            # Read password from LOCAL CoreConfig.xml (what TAK Server actually uses).
+            # v0.9.46: CoreConfig stores it XML-escaped; the helper unescapes so a
+            # regenerated password with an XML-special char doesn't false-fail.
+            local_pw, _ = _read_martiuser_password_from_local_coreconfig()
             if not local_pw:
                 return False
             ok, _ = _verify_server_one_db_password(s1_cfg, local_pw)
@@ -13571,6 +13754,29 @@ def _monitor_health_check(monitor_id):
             req = urllib.request.Request(ak_url + '/', method='GET')
             with urllib.request.urlopen(req, timeout=8) as resp:
                 return resp.status in (200, 302, 301)
+        if monitor_id == 'authentik_channels':
+            # v10.1.1 (F5): django_channels_postgres_message size, size-based (never
+            # count(*) — that can't complete on a ballooned table, the NE-TAK 605GB
+            # blind spot). Green < 1GB, red >= 1GB (the in-process reaper (F1–F4)
+            # should keep it KB-range; a red dot means the reaper is failing and the
+            # disk is at risk). None when Authentik isn't installed / PG not up.
+            if not os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
+                return None
+            r = subprocess.run(
+                _sudo_wrap(['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik',
+                 '-d', 'authentik', '-tA', '-c',
+                 "SELECT COALESCE(pg_total_relation_size(to_regclass("
+                 "'django_channels_postgres_message')),-1)"]),
+                capture_output=True, text=True, timeout=10)
+            if r.returncode != 0:
+                return None
+            try:
+                _sz = int((r.stdout or '-1').strip())
+            except ValueError:
+                return None
+            if _sz < 0:
+                return None  # table absent (older Authentik)
+            return _sz < 1024 * 1024 * 1024  # red at >= 1GB
         if monitor_id == 'mediamtx_svc':
             settings = load_settings()
             mtx_cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
@@ -14014,6 +14220,7 @@ def _guarddog_timer_list():
             'takwerxsetupapwatch.timer',
             'takprocessguard.timer', 'takcertguard.timer', 'takintcaguard.timer',
             'takauthentikguard.timer', 'takauthentiktasklogpurge.timer',
+            'takdbrepack.timer', 'takretentionguard.timer',
             'takmediamtxguard.timer', 'taknoderedguard.timer', 'takcloudtakguard.timer',
             'taktakportalguard.timer', 'takfedhubguard.timer']
 
@@ -14258,6 +14465,12 @@ def guarddog_update():
             new_timers.append('takcotdbguard.timer')
         if os.path.isfile(rp_tmr_path):
             new_timers.append('takdbrepack.timer')
+        # v10.1.1 (F8): takretentionguard.timer was WRITTEN by run_guarddog_deploy but
+        # never added to the enable list, so every full deploy left it loaded/disabled
+        # and it never ran once (test6: cot_router bloated to 53GB / 2.9k live rows —
+        # the "deletes don't return disk" pathology the online repack is meant to cure).
+        if os.path.isfile(rg_tmr_path):
+            new_timers.append('takretentionguard.timer')
         if os.path.isfile(bc_tmr_path):
             new_timers.append('takbuildcachereclaim.timer')
         if os.path.isfile(tp_tmr_path):
@@ -18074,16 +18287,40 @@ def _get_mediamtx_upstream(settings):
 
 
 def _get_mediamtx_hls_upstream(settings):
-    """Return (upstream, hls_encrypted) for MediaMTX HLS in Caddy."""
-    mtx_domain = _get_service_domain(settings, 'mediamtx') if settings.get('fqdn') else ''
-    cert_base = '/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory'
-    hls_encrypted = bool(mtx_domain and os.path.exists(f'{cert_base}/{mtx_domain}/{mtx_domain}.crt'))
+    """Return (upstream, hls_encrypted) for MediaMTX HLS in Caddy.
+
+    hls_encrypted MUST reflect MediaMTX's ACTUAL `hlsEncryption` (source of truth
+    in mediamtx.yml), NOT the presence of a Caddy-managed LE cert file. The old
+    cert-path heuristic lived under /var/lib/caddy (0750 caddy:caddy), which the
+    non-root takwerx console CANNOT traverse → os.path.exists → False on every
+    non-root box → the plain-HTTP /hls-proxy upstream → MediaMTX's TLS listener
+    answers 400 "HTTP request to an HTTPS server" → HLS playback broken fleet-wide
+    on non-root (v10.0.5+ regression; same class as the GH #52 cert-download bug).
+    Read the encryption flag from the config MediaMTX itself uses."""
+    def _hls_encrypted_from_yml(path='/usr/local/etc/mediamtx.yml'):
+        try:
+            try:
+                with open(path) as f:
+                    txt = f.read()
+            except (PermissionError, FileNotFoundError):
+                txt = _read_priv(path) or ''  # root-owned → broker read
+            m = re.search(r'(?m)^\s*hlsEncryption:\s*(\S+)', txt)
+            return bool(m and m.group(1).strip().strip('"\'').lower() in ('yes', 'true'))
+        except Exception:
+            return False
     cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
     if cfg.get('target_mode') == 'remote':
         host = (cfg.get('remote', {}).get('host') or '').strip()
         if host:
-            return f'{host}:8888', hls_encrypted
-    return '127.0.0.1:8888', hls_encrypted
+            # Remote MediaMTX: the yml lives on the remote host (too heavy to read
+            # here every regen). Preserve the prior cert-existence signal as a
+            # best-effort for the remote case — the non-root traversal problem is
+            # local-console-only, so this path is unaffected by the fleet bug.
+            mtx_domain = _get_service_domain(settings, 'mediamtx') if settings.get('fqdn') else ''
+            cert_base = '/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory'
+            enc = bool(mtx_domain and os.path.exists(f'{cert_base}/{mtx_domain}/{mtx_domain}.crt'))
+            return f'{host}:8888', enc
+    return '127.0.0.1:8888', _hls_encrypted_from_yml()
 
 
 def _get_nodered_upstream(settings):
@@ -19614,6 +19851,13 @@ def generate_caddyfile(settings=None):
     lines.append(f"    route /api/guarddog/send-sms* {{")
     lines.append(f"        respond 404")
     lines.append(f"    }}")
+    # v10.1.1 S2: same class — restart-safe is a loopback-only readiness probe for
+    # the console-restart timer (calls 127.0.0.1:5001 directly, never via Caddy).
+    # Through Caddy it would pass the loopback gate and leak deploy-in-flight
+    # state to unauthenticated clients. No legitimate edge caller exists → 404.
+    lines.append(f"    route /api/console/restart-safe* {{")
+    lines.append(f"        respond 404")
+    lines.append(f"    }}")
     # SECURITY (v10.1.0, CVE-class): the console trusts X-Authentik-Username from any
     # 127.0.0.1 caller (that is how forward_auth logs the SSO user in). Caddy does NOT
     # strip client-supplied X-Authentik-* by default, and the plain reverse_proxy paths
@@ -19624,8 +19868,10 @@ def generate_caddyfile(settings=None):
     # directive order) so it runs BEFORE forward_auth re-injects the AUTHENTIC value
     # from the auth response. Non-forward_auth paths then get nothing → bypass closed;
     # the SSO path is unchanged (forward_auth adds the real header after the strip).
+    # v10.1.1 S1: X-Infratak-Proxy-Auth is stripped from clients here too — only
+    # Caddy itself may attach it (below, after forward_auth passes).
     _AK_FWD_HEADERS = ('X-Authentik-Username', 'X-Authentik-Groups', 'X-Authentik-Email',
-                       'X-Authentik-Name', 'X-Authentik-Uid')
+                       'X-Authentik-Name', 'X-Authentik-Uid', 'X-Infratak-Proxy-Auth')
     def _emit_ak_header_strip(indent):
         for _h in _AK_FWD_HEADERS:
             lines.append(f"{indent}request_header -{_h}")
@@ -19662,6 +19908,15 @@ def generate_caddyfile(settings=None):
         lines.append(f"            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid")
         lines.append(f"            trusted_proxies private_ranges")
         lines.append(f"        }}")
+        # v10.1.1 S1: attach the proxy-auth secret AFTER forward_auth, on the same
+        # matcher — so it is present exactly when forward_auth passed (a 302'd
+        # request never reaches this directive; /api/* skips both). The console
+        # requires it alongside X-Authentik-Username once the gate is armed, so a
+        # forged identity header alone is dead even if the client strip above ever
+        # regresses on a future plain-proxy path.
+        _pa_secret = (_proxy_auth_state(create=True).get('secret') or '').strip()
+        if _pa_secret:
+            lines.append(f"        request_header @needs_sso X-Infratak-Proxy-Auth {_pa_secret}")
         lines.append(f"        reverse_proxy 127.0.0.1:5001 {{")
         lines.append(f"            transport http {{")
         lines.append(f"                tls")
@@ -49996,7 +50251,20 @@ def _authentik_spiral_monitor():
     where Authentik isn't installed.
     """
     import time as _t
-    lock_path = '/tmp/takwerx-spiral-monitor.lock'
+    # v10.1.1: namespace the lockfile by uid. On a root→non-root-flipped box
+    # (v10.0.5+), the old fixed-path `/tmp/takwerx-spiral-monitor.lock` is left
+    # 0644 root:root from the root era; the takwerx console can neither overwrite
+    # it (EPERM) nor delete it (/tmp sticky bit) → the monitor stood down forever
+    # → the periodic channels reaper (F4) never ran (found live on test12/tak-10,
+    # lock dated Jun 29 root:root). The uid suffix gives the console a path it
+    # owns, so the stale root file is simply irrelevant. Best-effort clean it up.
+    lock_path = f'/tmp/takwerx-spiral-monitor-{os.getuid()}.lock'
+    _legacy_lock = '/tmp/takwerx-spiral-monitor.lock'
+    if os.path.exists(_legacy_lock):
+        try:
+            os.unlink(_legacy_lock)  # succeeds only if we own it; harmless if not
+        except OSError:
+            pass
 
     # Try to acquire the singleton lock. If another worker already holds it AND that PID
     # is alive, this worker exits the function (no monitor here, the other worker has it).
@@ -50038,6 +50306,21 @@ def _authentik_spiral_monitor():
                 print("[spiral monitor] deploy in progress (or just finished) — standing down this cycle "
                       "(avoids concurrent docker compose on the authentik project)", flush=True)
                 continue
+
+            # v10.1.1 (F4): PERIODIC channels reaper — the boot-only self-heal let
+            # NE-TAK grow a 605GB table for a month between console restarts. Run the
+            # same F1-gated purge every cycle. A healthy tick logs nothing (the purge
+            # returns silently below the size gate) except one liveness line per 24h,
+            # so the journal isn't spammed but we can prove the reaper is alive.
+            try:
+                _now = _t.time()
+                _last_live = getattr(_authentik_spiral_monitor, '_ch_last_liveness', 0)
+                if _now - _last_live >= 86400:
+                    print("[spiral monitor] channels reaper: healthy (liveness)", flush=True)
+                    _authentik_spiral_monitor._ch_last_liveness = _now
+                _auto_authentik_channel_purge(lambda m: print(f"[spiral monitor] {m}", flush=True))
+            except Exception as _ch_e:
+                print(f"[spiral monitor] channels reaper error (non-fatal): {_ch_e}", flush=True)
 
             # PROACTIVE pass first: if outpost is on internal routing and all preconditions
             # for FQDN migration are met, migrate now — don't wait for spiral. Idempotent on
@@ -54127,21 +54410,36 @@ def _ensure_authentik_tasklog_purge_script(plog=None):
         _log(f"Authentik tasklog purge script update error (non-fatal): {_e}")
 
 
+_CHANNELS_TBL = 'django_channels_postgres_message'
+# v10.1.1 (F1) size/row gates — catalog lookups, O(1) at ANY table size. The old
+# count(*) gate could never complete on a ballooned table (NE-TAK 605GB: count
+# timed out → None → silent return → the self-heal failed exactly when needed).
+_CH_SIZE_TRIGGER = 200 * 1024 * 1024        # >200MB → act
+_CH_RELTUPLES_TRIGGER = 100_000             # OR planner-estimated >100k rows → act
+_CH_TRUNCATE_PUREBLOAT = 1024 * 1024 * 1024  # >1GB + 0 live rows → TRUNCATE (F3)
+_CH_TRUNCATE_TRAFFIC = 5 * 1024 * 1024 * 1024  # >5GB + reltuples<100k → TRUNCATE (F3)
+
+def _mb(_bytes):
+    try:
+        return int(_bytes) // (1024 * 1024)
+    except Exception:
+        return -1
+
 def _auto_authentik_channel_purge(plog=None):
-    """v0.9.57 (B2): inline self-heal for the Authentik Channels-over-Postgres backlog
-    (django_channels_postgres_message).
+    """v0.9.57 (B2) / v10.1.1 (F1–F3): inline self-heal for the Authentik
+    Channels-over-Postgres backlog (django_channels_postgres_message).
 
-    On a healthy 2026.5.3 worker this table stays small (~hundreds of rows). During a
-    pre-2026.5.3 conn_max_age spin it balloons to MILLIONS of EXPIRED rows, and
-    Authentik's own clean_expired_models() then times out trying to delete them in one
-    transaction (upstream #20644) → authentik-worker-1 pegs ~150% forever. This catches a
-    ballooned table on every console boot and clears it in BATCHES (which the worker's
-    one-shot delete can't), so a box that already spun self-heals WITHOUT SSH. Pairs with
-    the 2026.5.3 pin (prevents new ballooning) and W8 (event retention).
+    On a healthy 2026.5.3 worker this table stays small (~hundreds of rows). The
+    #20714 producer leak (or a pre-2026.5.3 conn_max_age spin) balloons it to
+    HUNDREDS OF MILLIONS of expired rows — NE-TAK reached 605GB / a full disk in
+    ~32 days, undetected, because every prior defense gated on `count(*)`, which
+    can NEVER complete once the table is huge. This version gates on catalog size
+    (O(1)), reclaims disk with TRUNCATE fast-paths, and logs EVERY exit so a
+    skipped self-heal is greppable.
 
-    Deletes ONLY expired messages (`expires < now()`) — never live ones; never blocks
-    login; idempotent; non-raising. Runs on every console boot via _startup_migrations
-    (no version/Update gate). See memory authentik-worker-channels-dramatiq-uuid-crashloop.
+    Idempotent; non-raising; never blocks login. Runs on console boot via
+    _startup_migrations AND every ~10 min via the spiral monitor (F4). See memory
+    authentik-channels-605gb-netak-incident.
     """
     def _log(m):
         if plog:
@@ -54150,11 +54448,11 @@ def _auto_authentik_channel_purge(plog=None):
             print(m, flush=True)
 
     if not os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
-        return  # Authentik not installed on this host
+        return  # Authentik not installed on this host — silent (nothing to greppably report)
 
-    # statement_timeout=0 for the mutating ops: Authentik sets a statement_timeout that
-    # cancels a long DELETE/VACUUM mid-flight (seen live on test8). Reads use the default.
     _PG = ['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik', '-d', 'authentik']
+    # statement_timeout=0 for the mutating ops (Authentik sets a statement_timeout
+    # that cancels a long DELETE/VACUUM mid-flight, seen live on test8).
     _PG_NT = ['docker', 'exec', '-e', 'PGOPTIONS=-c statement_timeout=0',
               'authentik-postgresql-1', 'psql', '-U', 'authentik', '-d', 'authentik']
     try:
@@ -54163,37 +54461,101 @@ def _auto_authentik_channel_purge(plog=None):
             capture_output=True, text=True, timeout=10
         )
         if _up.returncode != 0 or _up.stdout.strip() != 'true':
+            _log("Authentik channels: authentik-postgresql-1 not running — skipping")
             return
 
-        def _count():
+        # F1: single O(1) catalog probe → (total_size_bytes, reltuples). Both -1 if
+        # the table is absent (older Authentik). to_regclass avoids an error when
+        # the relation doesn't exist. Never count(*).
+        _gate_sql = (
+            f"SELECT COALESCE(pg_total_relation_size(to_regclass('{_CHANNELS_TBL}')), -1), "
+            f"COALESCE((SELECT reltuples::bigint FROM pg_class WHERE relname='{_CHANNELS_TBL}'), -1)"
+        )
+        _g = subprocess.run(_PG + ['-tAF,', '-c', _gate_sql], capture_output=True, text=True, timeout=15)
+        if _g.returncode != 0:
+            _log(f"Authentik channels: size query failed: {(_g.stderr or '').strip()[:200]}")
+            return
+        try:
+            _size_b, _reltup = (int(x) for x in (_g.stdout or '').strip().split(','))
+        except Exception:
+            _log(f"Authentik channels: could not parse size query output: {(_g.stdout or '').strip()[:120]}")
+            return
+        if _size_b < 0:
+            _log("Authentik channels: table absent (older Authentik) — skipping")
+            return
+
+        if _size_b <= _CH_SIZE_TRIGGER and _reltup < _CH_RELTUPLES_TRIGGER:
+            # Healthy. Caller decides whether to log (boot logs it; the periodic
+            # reaper stays silent to avoid journal spam — see F4).
+            return
+
+        _log(f"Authentik channels: size={_mb(_size_b)}MB reltuples~{_reltup} "
+             f"(gate: >{_mb(_CH_SIZE_TRIGGER)}MB or >{_CH_RELTUPLES_TRIGGER} rows) — acting")
+
+        # F3: TRUNCATE fast-paths reclaim disk that a DELETE+VACUUM leaves allocated.
+        def _has_live_rows():
+            # Uses the `expires` index (10s cap). '1' → a live row exists; '' → none;
+            # None → probe timed out/failed (treat as "unknown, don't pure-bloat truncate").
             r = subprocess.run(
-                _PG + ['-t', '-A', '-c', 'SELECT count(*) FROM django_channels_postgres_message'],
-                capture_output=True, text=True, timeout=30
+                ['docker', 'exec', '-e', 'PGOPTIONS=-c statement_timeout=10000',
+                 'authentik-postgresql-1', 'psql', '-U', 'authentik', '-d', 'authentik',
+                 '-tA', '-c', f"SELECT 1 FROM {_CHANNELS_TBL} WHERE expires >= now() LIMIT 1"],
+                capture_output=True, text=True, timeout=15
             )
             if r.returncode != 0:
                 return None
-            try:
-                return int((r.stdout or '0').strip())
-            except ValueError:
-                return None
+            return (r.stdout or '').strip() == '1'
 
-        _n0 = _count()
-        if _n0 is None:
-            return  # table absent (older Authentik) or query failed — leave alone
-        _THRESHOLD = 100000  # healthy ~hundreds; only act on a genuine balloon
-        if _n0 < _THRESHOLD:
-            return  # Healthy — silent no-op
+        def _truncate(reason):
+            # lock_timeout=30s + one retry: TRUNCATE needs an ACCESS EXCLUSIVE lock;
+            # under live websocket traffic it may wait. Fail fast rather than hang.
+            for _try in range(2):
+                r = subprocess.run(
+                    ['docker', 'exec', '-e', 'PGOPTIONS=-c lock_timeout=30000 -c statement_timeout=0',
+                     'authentik-postgresql-1', 'psql', '-U', 'authentik', '-d', 'authentik',
+                     '-c', f'TRUNCATE {_CHANNELS_TBL}'],
+                    capture_output=True, text=True, timeout=60
+                )
+                if r.returncode == 0:
+                    # CHECKPOINT so the freed space is returned promptly (mirrors the
+                    # NE-TAK field remediation).
+                    subprocess.run(_PG_NT + ['-c', 'CHECKPOINT'], capture_output=True, text=True, timeout=120)
+                    _g2 = subprocess.run(_PG + ['-tA', '-c',
+                        f"SELECT COALESCE(pg_total_relation_size(to_regclass('{_CHANNELS_TBL}')),-1)"],
+                        capture_output=True, text=True, timeout=15)
+                    _after = _mb(_g2.stdout.strip()) if _g2.returncode == 0 else -1
+                    _log(f"Authentik channels: TRUNCATE ({reason}) — {_mb(_size_b)}MB -> {_after}MB reclaimed")
+                    return True
+                _log(f"Authentik channels: TRUNCATE attempt {_try+1} non-zero: {(r.stderr or '').strip()[:160]}")
+                time.sleep(2)
+            return False
 
-        _log(f"Authentik channels: {_n0} rows (>= {_THRESHOLD}) — batched purge of EXPIRED messages (v0.9.57 B2)")
+        _live = _has_live_rows()
+        if _size_b > _CH_TRUNCATE_PUREBLOAT and _live is False:
+            # Pure bloat: >1GB and not a single live row — nothing to lose. Heals
+            # test8 (6.2GB/~62 rows) and test12 (1.5GB/~1.1k rows).
+            if _truncate('pure bloat, 0 live rows'):
+                return
+            # fall through to DELETE if the truncate couldn't get its lock
+        elif _size_b > _CH_TRUNCATE_TRAFFIC and _reltup < _CH_RELTUPLES_TRIGGER:
+            # Ballooned with traffic: >5GB but the planner sees <100k rows → the mass
+            # is expired bloat. Drops seconds-old ephemeral websocket messages;
+            # Authentik reconnects (same surgical call made on NE-TAK).
+            if _truncate('ballooned bloat >5GB'):
+                return
 
+        # Otherwise (or if TRUNCATE couldn't lock): batched DELETE of expired rows,
+        # then VACUUM. PARALLEL 0 — the container /dev/shm (64MB) is too small for
+        # parallel-vacuum workers ("could not resize shared memory segment", test8).
+        _log(f"Authentik channels: batched DELETE of expired rows (live rows present or below TRUNCATE size)")
         _BATCH = 500000
-        _MAX_ITERS = 80  # cap = 40M rows; backstop against a runaway loop
+        _MAX_ITERS = 80  # cap = 40M rows/pass; backstop against a runaway loop
         _deleted = 0
         for _i in range(_MAX_ITERS):
             r = subprocess.run(
                 _PG_NT + ['-t', '-A', '-c',
-                          "WITH d AS (DELETE FROM django_channels_postgres_message "
-                          "WHERE id IN (SELECT id FROM django_channels_postgres_message "
+                          f"WITH d AS (DELETE FROM {_CHANNELS_TBL} "
+                          f"WHERE id IN (SELECT id FROM {_CHANNELS_TBL} "
                           f"WHERE expires < now() LIMIT {_BATCH}) RETURNING 1) SELECT count(*) FROM d"],
                 capture_output=True, text=True, timeout=300
             )
@@ -54208,20 +54570,19 @@ def _auto_authentik_channel_purge(plog=None):
             if _b == 0:
                 break
 
-        # VACUUM with PARALLEL 0 — REQUIRED: the container /dev/shm (64 MB) is too small
-        # for parallel-vacuum workers ("could not resize shared memory segment … No space
-        # left on device", hit live on test8). Reclaim failure is non-fatal — the DELETE
-        # already frees the rows (un-pegs the worker); autovacuum finishes the reclaim.
         _vac = subprocess.run(
-            _PG_NT + ['-c', 'VACUUM (ANALYZE, PARALLEL 0) django_channels_postgres_message;'],
+            _PG_NT + ['-c', f'VACUUM (ANALYZE, PARALLEL 0) {_CHANNELS_TBL};'],
             capture_output=True, text=True, timeout=900
         )
         if _vac.returncode != 0:
             _log(f"Authentik channels: VACUUM non-zero (non-fatal): {(_vac.stderr or '')[:160]}")
 
-        _n1 = _count()
-        _log(f"Authentik channels: purged {_deleted} expired rows ({_n0} -> {_n1}); "
-             f"clean_expired_models will stop timing out on the next cycle")
+        _g3 = subprocess.run(_PG + ['-tA', '-c',
+            f"SELECT COALESCE(pg_total_relation_size(to_regclass('{_CHANNELS_TBL}')),-1)"],
+            capture_output=True, text=True, timeout=15)
+        _after = _mb(_g3.stdout.strip()) if _g3.returncode == 0 else -1
+        _log(f"Authentik channels: purged {_deleted} expired rows, {_mb(_size_b)}MB -> {_after}MB "
+             f"(VACUUM keeps the file allocated — autovacuum/TRUNCATE reclaims fully)")
     except Exception as _e:
         _log(f"Authentik channels purge: skipped ({str(_e)[:120]})")
 
@@ -61798,19 +62159,41 @@ def run_takserver_deploy(config):
         log_step(f"✗ FATAL ERROR: {str(e)}")
         deploy_status.update({'error': True, 'running': False})
 
+def _send_cert_file_priv(cert_dir, filename):
+    """Stream a cert file to the browser, reading 0600 tak:tak files via the
+    broker (GH #52). TAK Server writes private-key material (.p12/.key) 0600
+    tak:tak; the non-root takwerx console can't open() them, so raw
+    send_from_directory hit PermissionError → HTTP 500. Plain open() stays the
+    fast path for world-readable files and root-era consoles. Do NOT loosen the
+    key perms instead — the privileged read is the fix.
+    """
+    from flask import send_file
+    import io
+    fp = os.path.join(cert_dir, filename)
+    if not os.path.isfile(fp):
+        return jsonify({'error': f'{filename} not found'}), 404
+    try:
+        with open(fp, 'rb') as f:
+            data = f.read()
+    except PermissionError:
+        try:
+            r = subprocess.run(_sudo_wrap(['cat', fp]), capture_output=True, timeout=15)
+            data = r.stdout if r.returncode == 0 else b''
+        except Exception:
+            data = b''
+        if not data:
+            return jsonify({'error': f'Could not read {filename}: permission denied for the console user and the privileged read failed'}), 500
+    return send_file(io.BytesIO(data), as_attachment=True, download_name=filename)
+
 @app.route('/api/download/admin-cert')
 @login_required
 def download_admin_cert():
-    p = '/opt/tak/certs/files'
-    if os.path.exists(os.path.join(p, 'admin.p12')): return send_from_directory(p, 'admin.p12', as_attachment=True)
-    return jsonify({'error': 'admin.p12 not found'}), 404
+    return _send_cert_file_priv('/opt/tak/certs/files', 'admin.p12')
 
 @app.route('/api/download/user-cert')
 @login_required
 def download_user_cert():
-    p = '/opt/tak/certs/files'
-    if os.path.exists(os.path.join(p, 'user.p12')): return send_from_directory(p, 'user.p12', as_attachment=True)
-    return jsonify({'error': 'user.p12 not found'}), 404
+    return _send_cert_file_priv('/opt/tak/certs/files', 'user.p12')
 
 @app.route('/api/download/truststore')
 @login_required
@@ -61819,7 +62202,8 @@ def download_truststore():
     if os.path.exists(p):
         for f in os.listdir(p):
             if f.startswith('truststore-') and f.endswith('.p12') and 'root' not in f:
-                return send_from_directory(p, f, as_attachment=True)
+                # truststore-*.p12 is 0600 tak:tak too (GH #52) — same privileged read.
+                return _send_cert_file_priv(p, f)
     return jsonify({'error': 'truststore not found'}), 404
 
 
@@ -62069,11 +62453,7 @@ def download_cert_file(filename):
     import re
     if not re.match(r'^[a-zA-Z0-9._-]+$', filename):
         return jsonify({'error': 'Invalid filename'}), 400
-    cert_path = '/opt/tak/certs/files'
-    fp = os.path.join(cert_path, filename)
-    if os.path.exists(fp) and os.path.isfile(fp):
-        return send_from_directory(cert_path, filename, as_attachment=True)
-    return jsonify({'error': 'File not found'}), 404
+    return _send_cert_file_priv('/opt/tak/certs/files', filename)
 
 @app.route('/api/deploy/log')
 @login_required
@@ -68394,6 +68774,43 @@ def _selfheal_takserver_half_configured(plog=None):
 
 def _startup_migrations():
     try:
+        # v10.1.1 S3: broker-readiness startup GATE. On a non-root box the broker
+        # socket can come up AFTER the console (field 2026-07-09, tak-10: the
+        # X-Authentik strip migration lost this race — broker mkdir returned 125,
+        # generate_caddyfile threw, the box stayed exposed with the flag unset).
+        # Rather than every broker-dependent migration carrying its own retry loop,
+        # block here until the broker mediates a real EXEC.
+        #
+        # Probe with exec, NOT op:ping (T&E 2026-07-09, test12): the long-running
+        # field broker (only start.sh restarts it, never a console pull) can hang
+        # its ping response, so pinging timed out the full 60s on every non-root
+        # box — false alarm + 60s added to every startup, no protection. exec is
+        # the path the migrations actually use and it responds instantly; a cheap
+        # `systemctl --version` (what the broker's own selftest uses — allowlisted,
+        # always rc 0, no dependency on any service's state) proves the broker is
+        # mediating. Short 30s cap; the per-migration retries remain the backstop.
+        if _broker_should_route():
+            _bk_t0 = time.time()
+            _bk_ok = False
+            while time.time() - _bk_t0 < 30:
+                try:
+                    if _broker_available():
+                        _bk = subprocess.run(
+                            _sudo_wrap(['systemctl', '--version']),
+                            capture_output=True, text=True, timeout=8)
+                        if _bk.returncode == 0 and 'systemd' in (_bk.stdout or ''):
+                            _bk_ok = True
+                            break
+                except Exception:
+                    pass
+                time.sleep(2)
+            _bk_waited = time.time() - _bk_t0
+            if _bk_ok and _bk_waited >= 2:
+                print(f"Startup migrations: broker ready after {_bk_waited:.0f}s wait", flush=True)
+            elif not _bk_ok:
+                print("Startup migration: ⚠ broker not mediating exec after 30s — broker-dependent "
+                      "migrations may fail and will retry on the next console restart", flush=True)
+
         s = load_settings()
         settings_dirty = False
 
@@ -68438,6 +68855,28 @@ def _startup_migrations():
             subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
             print("Startup migration: Caddyfile regenerated + Caddy reloaded")
 
+        # v10.1.1 (one-time per box): heal the /hls-proxy TLS upstream fleet-wide.
+        # The non-root console computed hls_encrypted=False (it can't traverse
+        # caddy's 0750 cert dir to stat the LE cert) and emitted a PLAIN-HTTP
+        # /hls-proxy block → MediaMTX's TLS listener answered 400 → HLS playback
+        # broken on every non-root FQDN box with hlsEncryption:yes. The template
+        # now reads hlsEncryption from mediamtx.yml; regen the Caddyfile once so the
+        # LIVE file picks up the https:// upstream (Update Now / dev-pull heals the
+        # fleet without a MediaMTX redeploy). Idempotent; flag-gated.
+        if (s.get('fqdn') or '').strip() and not s.get('caddy_hls_encfix_v1'):
+            try:
+                if detect_modules().get('mediamtx', {}).get('installed'):
+                    _hcf = generate_caddyfile(s)
+                    subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
+                    _hls_https = ('reverse_proxy https://' in (_hcf or '') and 'tls_server_name' in (_hcf or ''))
+                    print(f"Startup migration: Caddyfile regenerated for /hls-proxy TLS upstream "
+                          f"(HLS encfix; https_upstream={_hls_https})", flush=True)
+                s['caddy_hls_encfix_v1'] = True
+                save_settings(s)
+                s = load_settings()
+            except Exception as _hls_e:
+                print(f"Startup migration: HLS encfix regen error (non-fatal, will retry): {_hls_e}", flush=True)
+
         # v10.1.0 SECURITY (critical, one-time per box): regenerate the Caddyfile so the
         # console vhost strips client-supplied X-Authentik-* headers. Without this, a
         # public request `X-Authentik-Username: admin` to any /api/* or /login on an
@@ -68476,6 +68915,58 @@ def _startup_migrations():
                 # box being left exposed is visible in the journal.
                 print(f"Startup migration: ⚠ SECURITY: X-Authentik strip NOT applied after retries "
                       f"(box may be exposed until next restart): {_last_err}", flush=True)
+
+        # v10.1.1 S1: arm the proxy-auth gate (belt-and-suspenders for the bypass
+        # class above). Regenerate the Caddyfile so forward_auth-passed requests
+        # carry the X-Infratak-Proxy-Auth secret, VERIFY the generated content,
+        # reload Caddy, and only then flip enforce on — so SSO never breaks from
+        # the console requiring a header Caddy isn't injecting yet.
+        if not s.get('caddy_proxy_auth_gate_v1'):
+            if not (s.get('fqdn') or '').strip():
+                # No FQDN → no Caddy-fronted console → no legitimate forward_auth
+                # source for X-Authentik-* headers. Arm immediately: any loopback
+                # request bearing that header on this box is forged.
+                _pa = _proxy_auth_state(create=True)
+                _pa['enforce'] = True
+                _save_proxy_auth_state(_pa)
+                s['caddy_proxy_auth_gate_v1'] = True
+                save_settings(s)
+                s = load_settings()
+                print("Startup migration: proxy-auth gate armed (no FQDN — header SSO requires Caddy)", flush=True)
+            else:
+                _pa_applied = False
+                _pa_err = None
+                for _pa_try in range(6):
+                    try:
+                        _cf = generate_caddyfile(s)
+                        # Console forward_auth is uniquely 'forward_auth @needs_sso';
+                        # if it is emitted, the secret injection must be too. The
+                        # client strip must be present in every posture.
+                        _pa_ok = bool(_cf) and 'request_header -X-Infratak-Proxy-Auth' in _cf and \
+                            ('forward_auth @needs_sso' not in _cf
+                             or 'request_header @needs_sso X-Infratak-Proxy-Auth' in _cf) and \
+                            'route /api/console/restart-safe*' in _cf  # S2 edge block rides the same regen
+                        if _pa_ok:
+                            subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
+                            _pa_applied = True
+                            break
+                        _pa_err = 'proxy-auth directives absent from generated Caddyfile'
+                    except Exception as _pa_e:
+                        _pa_err = str(_pa_e)[:160]
+                    time.sleep(4)
+                if _pa_applied:
+                    _pa = _proxy_auth_state(create=True)
+                    _pa['enforce'] = True
+                    _save_proxy_auth_state(_pa)
+                    s['caddy_proxy_auth_gate_v1'] = True
+                    save_settings(s)
+                    s = load_settings()
+                    print("Startup migration: proxy-auth gate armed (Caddy injects X-Infratak-Proxy-Auth on forward_auth)", flush=True)
+                else:
+                    # Not armed → the 10.1.0 client-header strip remains the (sole)
+                    # defense; retry on the next restart. Loud on purpose.
+                    print(f"Startup migration: ⚠ SECURITY: proxy-auth gate NOT armed after retries "
+                          f"(strip-only defense until next restart): {_pa_err}", flush=True)
 
         # v10.0.1: one-time teardown of the legacy 'cfd-remote-assist' install so a fresh
         # 'eud-remote-assist' install is clean. The module was renamed cfd→eud; the in-console
@@ -68784,12 +69275,46 @@ def _startup_migrations():
             _auto_authentik_tasklog_purge(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _atl_e:
             print(f"Startup migration: tasklog purge error (non-fatal): {_atl_e}", flush=True)
-        # v0.9.57 (B2): self-heal a ballooned Channels-over-Postgres backlog
-        # (django_channels_postgres_message). Silent no-op when healthy (< 100k rows).
+        # v0.9.57 (B2) / v10.1.1 (F1–F3): self-heal a ballooned Channels-over-Postgres
+        # backlog (django_channels_postgres_message). Size-gated (O(1)), TRUNCATE
+        # fast-paths reclaim disk, every exit logs. Silent no-op when healthy.
         try:
             _auto_authentik_channel_purge(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _ach_e:
             print(f"Startup migration: channel purge error (non-fatal): {_ach_e}", flush=True)
+
+        # v10.1.1 (F6): remove the NE-TAK temporary channels-reaper cron. The
+        # 2026-07-08 field remediation installed /etc/cron.d/authentik-channels-reaper
+        # (every 5 min) to stop-gap the disk fill. The in-process reaper (F4) now owns
+        # this on every box, so the cron is redundant — and a plain-VACUUM cron can't
+        # reclaim the disk the way the TRUNCATE path does. Idempotent; broker-routed
+        # remove so it works on the non-root fleet too.
+        try:
+            _ntc = '/etc/cron.d/authentik-channels-reaper'
+            if os.path.exists(_ntc):
+                subprocess.run(_sudo_wrap(['rm', '-f', _ntc]), capture_output=True, timeout=15)
+                print("Startup migration: channels reaper: legacy temp cron removed — in-process reaper active", flush=True)
+        except Exception as _ntc_e:
+            print(f"Startup migration: temp channels cron removal error (non-fatal): {_ntc_e}", flush=True)
+
+        # v10.1.1 (F8): enable the DB-repack + retention-guard timers on the existing
+        # fleet without a Guard Dog redeploy. Their unit files were written by
+        # run_guarddog_deploy but takretentionguard.timer was never in the enable list,
+        # and takdbrepack was only enabled by clicking Update on the GD page. Any box
+        # with the unit present but not enabled → enable --now (Update Now path heals
+        # the whole fleet; test6's 53GB cot_router bloat gets its weekly online repack).
+        try:
+            for _gd_t in ('takdbrepack.timer', 'takretentionguard.timer'):
+                if not os.path.exists(f'/etc/systemd/system/{_gd_t}'):
+                    continue
+                _en = subprocess.run(_sudo_wrap(['systemctl', 'is-enabled', _gd_t]),
+                                     capture_output=True, text=True, timeout=5)
+                if (_en.stdout or '').strip() != 'enabled':
+                    subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', _gd_t]),
+                                   capture_output=True, timeout=10)
+                    print(f"Startup migration: enabled {_gd_t} (was {(_en.stdout or 'disabled').strip()})", flush=True)
+        except Exception as _gdt_e:
+            print(f"Startup migration: GD maintenance-timer enable error (non-fatal): {_gdt_e}", flush=True)
 
         # v0.9.31: Clear stale `failed` state on takauthentiktasklogpurge.service
         # when the on-disk script is already the v0.9.26+ fixed version.
