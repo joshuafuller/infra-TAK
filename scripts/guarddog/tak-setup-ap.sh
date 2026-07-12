@@ -58,13 +58,21 @@ fi
 # Caddy serves the real cert → no warning). Otherwise the box's own self-signed
 # https (accept-the-warning floor for fresh/no-domain boxes).
 CONSOLE_URL="${CONSOLE_URL:-}"
+# The OFFLINE setup AP cannot do SSO (Caddy :443 -> Authentik forward_auth hangs with
+# no internet) and the full dashboard crawls offline (dozens of subprocess probes). So
+# send the laptop STRAIGHT to the light /connectivity page on the console's OWN port
+# (bypasses Caddy/Authentik), addressed by the FQDN by name when we have one (the AP
+# wildcard DNS resolves it to the box) so it is still "the domain name". Self-signed
+# cert on :CONSOLE_PORT -> accept-the-warning floor (a valid-cert + no-SSO path would
+# need a Caddy setup-vhost, tracked separately). Field-hit 2026-07-10 home AP test.
+NEXT_PATH="/login?next=/connectivity"
 if [ -n "$CONSOLE_URL" ]; then
-    OPEN_URL="$CONSOLE_URL"
-    OPEN_TRUSTED=1
+    _fqdn_host="${CONSOLE_URL#*://}"; _fqdn_host="${_fqdn_host%%/*}"; _fqdn_host="${_fqdn_host%%:*}"
+    OPEN_URL="https://${_fqdn_host}:${CONSOLE_PORT}${NEXT_PATH}"
 else
-    OPEN_URL="https://${AP_IP}:${CONSOLE_PORT}/"
-    OPEN_TRUSTED=0
+    OPEN_URL="https://${AP_IP}:${CONSOLE_PORT}${NEXT_PATH}"
 fi
+OPEN_TRUSTED=0
 # WPA2 requires 8..63 chars. If unset/short, generate a RANDOM PSK once and persist
 # it (root-600) — NEVER derive it from the hostname (finding B: the hostname is
 # advertised in the SSID, so a host-derived key is effectively public). The console
@@ -116,6 +124,19 @@ restore_client(){
         while iptables -D DOCKER-USER -i "$IFACE" -j DROP 2>/dev/null; do :; done
         iptables -F takwerx_setupap 2>/dev/null
         iptables -X takwerx_setupap 2>/dev/null
+        # RHEL/firewalld: remove the runtime captive/console port opens added in
+        # apply_isolation (the iface is still in its zone here — nmcli down is below).
+        if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
+            # HARDCODED nm-shared — never --get-zone-of-interface here: on teardown it
+            # can resolve to 'public' and this --remove-port would then strip the
+            # console's legit 80/443/5001 off the PUBLIC zone (field-hit 2026-07-11,
+            # bricked console/FQDN access). The AP's ports only ever live in nm-shared.
+            FWZONE=nm-shared
+            for _p in 80 443 8088 "$CONSOLE_PORT"; do
+                firewall-cmd --zone="$FWZONE" --remove-port="${_p}/tcp" >>"$LOG" 2>/dev/null || true
+            done
+            firewall-cmd --zone="$FWZONE" --remove-forward-port="port=80:proto=tcp:toport=8088:toaddr=${AP_IP}" >>"$LOG" 2>/dev/null || true
+        fi
         ip addr flush dev "$IFACE" 2>/dev/null
         ip link set "$IFACE" down 2>/dev/null
     fi
@@ -156,13 +177,42 @@ apply_isolation(){
     # sanctioned hook and is consulted before the per-container ACCEPTs. No-op if absent.
     iptables -I DOCKER-USER -i "$IFACE" -j DROP 2>/dev/null || true
 
+    # RHEL/firewalld: the raw iptables above is a no-op under nftables, AND NM's
+    # method=shared drops the AP iface into the `nm-shared` zone (services: dhcp dns
+    # ssh + a priority-32767 reject) — so the captive + console HTTP ports are
+    # REJECTED and nothing HTTP is reachable on the AP (field-hit 2026-07-10, home
+    # Setup-AP test: DHCP worked, http/5001 refused). Open them on the AP iface's
+    # firewalld zone at runtime (cleared on reload/reboot; removed on AP stop below)
+    # — the firewalld equivalent of the iptables allowlist above. Isolation still
+    # holds: only these ports are opened, and the zone's default-reject stands.
+    if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
+        # HARDCODED nm-shared — the NM method=shared AP interface lives in firewalld's
+        # nm-shared zone. Do NOT derive the zone from the interface: during teardown
+        # `--get-zone-of-interface` can resolve to 'public', and then restore_client's
+        # `--remove-port` strips the console's legit 80/443/5001 off the PUBLIC zone —
+        # bricking console + FQDN access mid AP cycle (field-hit 2026-07-11).
+        FWZONE=nm-shared
+        for _p in 80 443 8088 "$CONSOLE_PORT"; do
+            firewall-cmd --zone="$FWZONE" --add-port="${_p}/tcp" >>"$LOG" 2>&1 || true
+        done
+        # Captive redirect, RHEL/nftables equivalent of the raw `iptables REDIRECT`
+        # below (which is a no-op under firewalld): DNAT AP-client :80 -> the captive
+        # responder :8088 so the OS captive-check (captive.apple.com etc., pointed at us
+        # by the dnsmasq wildcard) lands on the dumb 200 page and the "join" popup fires.
+        # Without it, :80 is Caddy, which answers with a redirect and SUPPRESSES the
+        # popup (field gap 2026-07-11 vs cfd2474's hostapd+iptables DNAT that pops
+        # reliably on Debian). Scoped to nm-shared so only AP clients are affected.
+        firewall-cmd --zone="$FWZONE" --add-forward-port="port=80:proto=tcp:toport=8088:toaddr=${AP_IP}" >>"$LOG" 2>&1 || true
+        log "apply_isolation: opened captive/console ports + :80->:8088 captive DNAT on firewalld zone $FWZONE"
+    fi
+
     # captive :80 responder on :8088; redirect AP :80 to it. Serves a real HTML
     # landing page (200, tap-through button) — macOS's Captive Network Assistant
     # renders it (it silently ignores a 302 to self-signed HTTPS). The button points
     # at OPEN_URL: the trusted Caddy vhost by name when the box has a real cert (no
     # warning), else the box's self-signed https (accept-the-warning floor).
     iptables -t nat -A PREROUTING -i "$IFACE" -p tcp --dport 80 -j REDIRECT --to-ports 8088
-    CAP_AP_IP="$AP_IP" CAP_URL="$OPEN_URL" CAP_IPURL="https://${AP_IP}:${CONSOLE_PORT}/" CAP_TRUSTED="$OPEN_TRUSTED" setsid bash -c "exec -a takwerx-captive python3 - <<'PY'
+    CAP_AP_IP="$AP_IP" CAP_URL="$OPEN_URL" CAP_IPURL="https://${AP_IP}:${CONSOLE_PORT}${NEXT_PATH}" CAP_TRUSTED="$OPEN_TRUSTED" setsid bash -c "exec -a takwerx-captive python3 - <<'PY'
 import os, http.server, socketserver
 PORT = 8088
 IP = os.environ.get('CAP_AP_IP', '10.42.0.1')
@@ -193,9 +243,33 @@ PAGE = ('<!doctype html><html><head><meta charset=utf-8>'
 BODY = PAGE.encode()
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(s):
-        # Apple/Android/MS captive probes and everything else all get the landing
-        # page with 200 so the OS shows a captive popup (a 200 'Success' body would
-        # instead make the OS think there's real internet and suppress the popup).
+        # Standard captive-portal contract: any request that is not for the portal
+        # itself gets a 302 to the plain-http portal URL; only the portal URL serves
+        # the landing page. Android needs the redirect as its portal signal — a
+        # direct 200-with-body on its probe (Samsung sends plain 'GET /', not
+        # generate_204) is classified as broken internet, NOT a portal, and no
+        # sign-in flow appears (field-hit 2026-07-11, Galaxy Tab S8). iOS follows
+        # the 302 to plain http and renders the landing page in CNA — only a 302
+        # to self-signed httpS would suppress the popup.
+        # Match the portal host:port EXACTLY. Samsung/Android-15 probes the bare
+        # gateway (Host: 10.42.0.1, no port) and must be 302d like any foreign
+        # host — a 200 there reads as broken-network, not portal (field-hit
+        # 2026-07-11, Galaxy Tab S8: startswith(IP) served it the landing page and
+        # no sign-in flow ever appeared). The redirect Location carries :8088, so
+        # the follow-up request Hosts as portal and gets the page.
+        # NOTE this python lives inside a double-quoted bash -c string: NO double
+        # quotes, backticks, or dollar signs anywhere in this heredoc.
+        host = s.headers.get('Host', '')
+        if host != '%s:%d' % (IP, PORT):
+            s.send_response(302)
+            s.send_header('Location', 'http://%s:%d/' % (IP, PORT))
+            s.send_header('Content-Length', '0')
+            s.send_header('Cache-Control', 'no-store')
+            s.end_headers()
+            return
+        # Request addressed to the portal itself: serve the landing page with 200
+        # (a 200 'Success' body on the probe host would instead make the OS think
+        # there's real internet and suppress the popup).
         s.send_response(200)
         s.send_header('Content-Type', 'text/html; charset=utf-8')
         s.send_header('Content-Length', str(len(BODY)))
@@ -219,6 +293,21 @@ start_ap(){
     trap 'log "start: FAILED — restoring client"; restore_client; echo "start-failed"; exit 9' ERR
 
     if have_nm; then
+        # Rocky/RHEL images ship NM with ignore-carrier=* — an unplugged NIC keeps
+        # its activation AND its metric-100 default route, blackholing all egress
+        # even after a successful wifi join (field-hit 2026-07-11: OXFORD leased in
+        # 2s post-Stop, tunnel dead until the cable returned). Assert carrier
+        # honoring for ethernet (wifi semantics untouched). Root-side here because
+        # the console broker deliberately cannot write /etc/NetworkManager. The
+        # console's join path ALSO explicitly disconnects cable-less ethernet
+        # (_conn_clear_dead_ethernet) — this conf is the boot-time belt.
+        NMCARRIER="/etc/NetworkManager/conf.d/99-takwerx-ethernet-carrier.conf"
+        if [ ! -f "$NMCARRIER" ]; then
+            printf '[device-takwerx-ethernet-carrier]\nmatch-device=type:ethernet\nignore-carrier=no\n' > "$NMCARRIER"
+            chmod 644 "$NMCARRIER"
+            systemctl reload NetworkManager 2>/dev/null || true
+            log "start: wrote $NMCARRIER (ethernet honors carrier loss)"
+        fi
         set -e
         nmcli radio wifi on
         nmcli device disconnect "$IFACE" 2>/dev/null || true
@@ -239,10 +328,23 @@ autoconnect=false
 [wifi]
 mode=ap
 band=bg
+# Pin a universally-legal 2.4GHz channel. Left unpinned, NM can pick ch 12/13
+# (EU-only) and US-domain phones/tablets can't even SEE the setup SSID
+# (field-hit 2026-07-11: Android tablet blind to the AP on ch 13). The hostapd
+# path below already pins channel=6; keep the NM path identical.
+channel=6
 ssid=$AP_SSID
 
 [wifi-security]
 key-mgmt=wpa-psk
+# pmf=1 (disable) keeps NM from advertising WPA3-SAE transition mode (it
+# expands key-mgmt to 'WPA-PSK WPA-PSK-SHA256 SAE' otherwise). Older Android
+# EUDs refuse to associate to transition-mode APs entirely (field-hit
+# 2026-07-11: Android tablet 'tries' then drops back, zero frames reaching
+# the AP). Pure WPA2-PSK is the compatibility floor every EUD speaks; fine
+# for a short-lived, client-isolated provisioning AP. Matches the hostapd
+# path (wpa=2, WPA-PSK, no ieee80211w).
+pmf=1
 psk=$AP_PASS
 
 [ipv4]
@@ -252,6 +354,15 @@ method=shared
 method=ignore
 EOF
         chmod 600 "$NMCONN"
+        # NM method=shared serves DHCP + DNS via its own dnsmasq (the package is
+        # pulled by the console before start, while the box was still online). Drop a
+        # shared-dnsmasq wildcard so EVERY name — including the box FQDN — resolves to
+        # the AP IP on the isolated setup net; that is what makes the captive/console
+        # reachable BY NAME here, mirroring the hostapd path's `address=/#/AP_IP`.
+        # NM includes /etc/NetworkManager/dnsmasq-shared.d/*.conf in the shared dnsmasq.
+        mkdir -p /etc/NetworkManager/dnsmasq-shared.d
+        printf 'address=/#/%s\n' "$AP_IP" > /etc/NetworkManager/dnsmasq-shared.d/50-takwerx-captive.conf
+        chmod 644 /etc/NetworkManager/dnsmasq-shared.d/50-takwerx-captive.conf
         nmcli connection reload
         nmcli connection up takwerx-hotspot
         set +e

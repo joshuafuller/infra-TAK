@@ -315,6 +315,21 @@ def _detached_console_restart(delay=2):
     threading.Thread(target=_go, daemon=True).start()
 
 
+def _detached_power_action(verb, delay=2):
+    """Power the box off / reboot it after a short delay, detached, so the current
+    HTTP response returns before the box halts. Mirrors _detached_console_restart:
+    systemd owns the transition, so it completes even though this thread is killed.
+    `verb` is 'poweroff' or 'reboot' — both broker-allowed (verb-gated)."""
+    def _go():
+        time.sleep(delay)
+        try:
+            subprocess.run(_sudo_wrap(['systemctl', verb]),
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+    threading.Thread(target=_go, daemon=True).start()
+
+
 def _write_priv(path, content, mode='w', perm=None):
     """Write to a privileged path. Routes through the broker when active;
     otherwise direct (root) or 'sudo tee' (legacy non-root). When `perm` is
@@ -670,7 +685,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.1-alpha"
+VERSION = "10.1.2-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -3359,6 +3374,18 @@ def _login_logo_url():
         return url_for('static', filename=LOGIN_LOGO_FILENAME)
     return None
 
+def _safe_next_path():
+    """A validated SAME-SITE path from ?next= (or the posted form) for the post-login
+    redirect. Used by the setup-AP captive to deep-link straight to the light
+    /connectivity page on the offline AP (the heavy dashboard crawls with no internet).
+    Local absolute paths only — never an off-site URL (open-redirect guard). Empty if
+    absent/unsafe → caller falls back to the normal console page. The login form has no
+    action= so it POSTs to the current URL, preserving ?next through the round-trip."""
+    nxt = (request.args.get('next') or request.form.get('next') or '').strip()
+    if nxt.startswith('/') and not nxt.startswith('//') and '://' not in nxt and '\\' not in nxt:
+        return nxt
+    return ''
+
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'GET' and _apply_authentik_session():
@@ -3376,7 +3403,7 @@ def login():
             session['authenticated'] = True
             # W3: in Hardened posture, password login is the on-box break-glass path — audit it.
             audit('auth:login-password', 'console password / break-glass')
-            return redirect(url_for('console_page'))
+            return redirect(_safe_next_path() or url_for('console_page'))
         return render_template_string(LOGIN_TEMPLATE, error='Invalid password', version=VERSION, login_logo_url=logo_url)
     return render_template_string(LOGIN_TEMPLATE, error=None, version=VERSION, login_logo_url=logo_url)
 
@@ -3402,7 +3429,7 @@ def index():
         if check_password_hash(auth['password_hash'], request.form.get('password', '')):
             session['authenticated'] = True
             audit('auth:login-password', 'console password / break-glass')
-            return redirect(url_for('console_page'))
+            return redirect(_safe_next_path() or url_for('console_page'))
         return render_template_string(LOGIN_TEMPLATE, error='Invalid password', version=VERSION, login_logo_url=logo_url)
     if not session.get('authenticated'):
         return render_template_string(LOGIN_TEMPLATE, error=None, version=VERSION, login_logo_url=logo_url)
@@ -4528,7 +4555,17 @@ def _w1_caddy_regen(log):
         val = subprocess.run('caddy validate --config %s --adapter caddyfile 2>&1' % CADDYFILE_PATH,
                              shell=True, capture_output=True, text=True, timeout=30)
         if val.returncode != 0:
-            log('W1: caddy validate FAILED: %s' % (val.stdout or val.stderr or '')[-200:]); return False
+            out = (val.stdout or val.stderr or '')
+            # On custom-cert (ssl_mode='custom') + non-root boxes this validate runs as
+            # takwerx, which can't traverse /var/lib/caddy (0750 caddy:caddy) to open the
+            # deployed cert copy — a FALSE fail (the caddy service reads it fine).
+            # Permission-denied is inconclusive, not a bad config: defer to the reload
+            # below, which validates as the caddy user and refuses a bad config anyway.
+            if 'permission denied' in out.lower():
+                log("W1: caddy pre-validate inconclusive (cert unreadable by console user); "
+                    "deferring to caddy's own reload validation")
+            else:
+                log('W1: caddy validate FAILED: %s' % out[-200:]); return False
     rl = subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
     if rl.returncode != 0:
         log('W1: caddy reload error: %s' % (rl.stdout or rl.stderr or '')[-160:]); return False
@@ -5495,6 +5532,27 @@ def console_restart_safe():
             pass
 
     return jsonify({'safe': busy is None, 'reason': busy})
+
+
+@app.route('/api/console/power', methods=['POST'])
+@login_required
+def console_power_api():
+    """Power off / reboot the box from the console (no SSH). Destructive and
+    outward-facing — poweroff needs a physical power-on to return — so it
+    re-confirms the console password (mirrors the dev-channel-switch gate) ON TOP
+    of @login_required, so it can't be an accidental click. Runs the systemctl
+    verb through the broker (verb-gated: poweroff + reboot are allowlisted),
+    detached so the HTTP response returns before the box goes down."""
+    data = request.get_json(silent=True) or {}
+    action = (data.get('action') or '').strip()
+    password = data.get('password') or ''
+    if action not in ('poweroff', 'reboot'):
+        return jsonify({'success': False, 'error': 'action must be "poweroff" or "reboot".'}), 400
+    auth = load_auth()
+    if not auth.get('password_hash') or not check_password_hash(auth['password_hash'], password):
+        return jsonify({'success': False, 'error': 'Incorrect console password.', 'need_password': True}), 403
+    _detached_power_action(action, delay=2)
+    return jsonify({'success': True, 'action': action})
 
 
 _CONSOLE_UNIT = '/etc/systemd/system/takwerx-console.service'
@@ -8195,8 +8253,24 @@ def _conn_stun_probe(log):
     try:
         import stun
     except ImportError:
-        log('pystun3 is not installed — re-run `sudo ./start.sh` to pull new console dependencies')
-        return {'error': 'pystun3 not installed (re-run sudo ./start.sh)'}
+        # Boxes that took 10.1.x via Update Now (git pull + restart) never re-ran
+        # start.sh, so the new dependency is missing FLEET-WIDE on updated boxes
+        # (field-hit 2026-07-12, test12: whole detection card UNCLASSIFIED).
+        # Self-install into the console's own venv — same on-demand pattern as
+        # _ensure_iw/_ensure_nm_wifi; the venv is ours, no root needed.
+        log('pystun3 is not installed — installing into the console venv…')
+        try:
+            r = subprocess.run([_sys.executable, '-m', 'pip', 'install', '--quiet', 'pystun3'],
+                               capture_output=True, text=True, timeout=120)
+            if r.returncode != 0:
+                raise RuntimeError((r.stderr or r.stdout or 'pip failed').strip()[:160])
+            import importlib
+            importlib.invalidate_caches()
+            import stun
+            log('pystun3 installed')
+        except Exception as ex:
+            log('pystun3 auto-install failed (%s) — re-run `sudo ./start.sh`' % str(ex)[:120])
+            return {'error': 'pystun3 not installed (re-run sudo ./start.sh)'}
     for host, port in CONNECTIVITY_STUN_SERVERS:
         try:
             nat_type, ext_ip, ext_port = stun.get_ip_info(source_port=0, stun_host=host, stun_port=port)
@@ -8542,6 +8616,13 @@ def _conn_configure_box_tunnel(anchor_ip, anchor_pubkey, wg_port):
     conf = (
         '[Interface]\n'
         'Address = %s/24\n'
+        # MTU 1280 (IPv6 floor): wg-quick's auto MTU assumes a 1500 path; cellular
+        # carriers translate IPv4 into IPv6 (464XLAT, +20B) and the encapsulated
+        # packet silently exceeds the path — small packets (handshakes, pings,
+        # 302s) pass, the first full-size TCP segment dies forever (field-hit
+        # 2026-07-11 night: console 000 through the tunnel over AT&T while ping
+        # worked; relay SACKed every byte EXCEPT the first 1368-byte segment).
+        'MTU = 1280\n'
         'PrivateKey = %s\n\n'
         '[Peer]\n'
         'PublicKey = %s\n'
@@ -8581,7 +8662,7 @@ def connectivity_anchor_configure_api():
     data = request.get_json(silent=True) or {}
     anchor_ip = (data.get('anchor_ip') or '').strip()
     anchor_pubkey = (data.get('anchor_pubkey') or '').strip()
-    ok, wg_port = _conn_validate_anchor_inputs(anchor_ip, anchor_pubkey, data.get('wg_port', 443))
+    ok, wg_port = _conn_validate_anchor_inputs(anchor_ip, anchor_pubkey, data.get('wg_port', 51820))
     if not ok:
         return jsonify({'success': False, 'error': wg_port}), 400
     cfg_ok, pub, err = _conn_configure_box_tunnel(anchor_ip, anchor_pubkey, wg_port)
@@ -8736,7 +8817,7 @@ def connectivity_anchor_provision_api():
     anchor_ip = (data.get('anchor_ip') or '').strip()
     ssh_user = (data.get('ssh_user') or 'ubuntu').strip()
     ssh_key = data.get('ssh_private_key') or ''
-    ok, wg_port = _conn_validate_anchor_inputs(anchor_ip, None, data.get('wg_port', 443))
+    ok, wg_port = _conn_validate_anchor_inputs(anchor_ip, None, data.get('wg_port', 51820))
     if not ok:
         return jsonify({'success': False, 'error': wg_port}), 400
     if not _CONN_SSH_USER_RE.fullmatch(ssh_user):
@@ -8822,14 +8903,29 @@ def _run_connectivity_verify(settings):
                 # "deploy the module first" from "the path (router/NSG/forward) is blocked".
                 local = _conn_verify_tcp('127.0.0.1', port, timeout=2)
                 probe['local_listener'] = (local['state'] == 'green')
-                probe['hint'] = ('service reachable locally but NOT from outside — check the path: '
-                                 + ('relay cloud firewall/NSG ingress + forwarded ports' if result['mode'] == 'relay'
-                                    else 'router port forward + ISP/CGNAT')) if probe['local_listener'] else \
-                                'nothing listening on this box yet — deploy the module that owns this port'
+                if not probe['local_listener']:
+                    probe['hint'] = 'nothing listening on this box yet — deploy the module that owns this port'
+                elif result['mode'] == 'relay':
+                    # Relay vantage is a REAL outside path (box -> relay public -> tunnel
+                    # -> back); a red here is trustworthy.
+                    probe['hint'] = ('service reachable locally but NOT from outside — check the path: '
+                                     'relay cloud firewall/NSG ingress + forwarded ports')
+                else:
+                    # Direct mode probes the box's OWN public address — a self-probe that
+                    # fails on any network without NAT hairpin (home routers, 1:1-NAT
+                    # VPSes; field-hit 2026-07-12: test12 all-red while the operator was
+                    # browsing the console THROUGH port 443). A failed self-probe proves
+                    # nothing about outside reachability — never present it as red.
+                    probe['state'] = 'unverified'
+                    probe['hint'] = ('listening on this box, but the box cannot reach its own public '
+                                     'address on this network (no NAT hairpin) — outside clients may '
+                                     'connect fine; confirm from a phone on cellular')
             if probe['state'] == 'green' and required:
                 required_green += 1
             result['ports'][str(port)] = probe
         result['all_green'] = required_green == sum(1 for _, _, req in _CONN_VERIFY_PORTS if req)
+        result['required_red'] = sum(1 for p in result['ports'].values() if p.get('required') and p.get('state') == 'red')
+        result['unverified'] = sum(1 for p in result['ports'].values() if p.get('state') == 'unverified')
         st.update({'running': False, 'complete': True, 'error': '', 'result': result})
     except Exception as ex:
         st.update({'running': False, 'complete': True, 'error': str(ex)[:300]})
@@ -8885,6 +8981,44 @@ def _ensure_iw():
     except Exception:
         pass
     return any(os.path.exists(p) for p in ('/usr/sbin/iw', '/sbin/iw', '/usr/bin/iw')) or bool(shutil.which('iw'))
+
+
+def _ensure_nm_wifi():
+    """Ensure NetworkManager's WiFi plugin is present on RHEL-family boxes.
+
+    RHEL/Rocky/Alma — minimal AND server installs — DO NOT ship
+    `NetworkManager-wifi` (it is a separate package), so a fresh box shows the
+    WiFi device as 'unmanaged' and every nmcli WiFi op (scan/add/connect) fails
+    silently. Field-hit 2026-07-09 (Rocky NUC, first RHEL Leg-6 test); confirmed
+    documented Rocky behaviour. Ubuntu ships WiFi support by default, so this is
+    a RHEL-only gap — no-op on debian. Mirrors _ensure_iw: tiny package,
+    installed on demand through the apt↔dnf shim (the existing nmcli code path
+    then handles scan/add/persist). Restarts NetworkManager once after install
+    so the radio flips 'managed'. Cheap once installed (glob short-circuits).
+    Returns True when the plugin is present."""
+    if _distro_family() != 'rhel':
+        return True  # Ubuntu/debian ship WiFi support with NetworkManager.
+    if not shutil.which('nmcli'):
+        return False  # no NetworkManager — WiFi is not driven via nmcli here.
+    import glob as _glob
+
+    def _have_plugin():
+        for pat in ('/usr/lib64/NetworkManager/*/libnm-device-plugin-wifi.so',
+                    '/usr/lib64/NetworkManager/libnm-device-plugin-wifi.so',
+                    '/usr/lib/NetworkManager/*/libnm-device-plugin-wifi.so',
+                    '/usr/lib/NetworkManager/libnm-device-plugin-wifi.so'):
+            if _glob.glob(pat):
+                return True
+        return False
+    if _have_plugin():
+        return True
+    try:
+        _pkg_install('NetworkManager-wifi', timeout=300)
+        # Reload NM so it loads the new plugin and flips the WiFi device managed.
+        _run_priv_chain([['systemctl', 'restart', 'NetworkManager']], mode='and', timeout=60)
+    except Exception:
+        pass
+    return _have_plugin()
 
 
 def _conn_wifi_iface():
@@ -8966,6 +9100,7 @@ def _conn_wifi_saved():
 
 def _conn_wifi_scan():
     """Best-effort list of visible SSIDs (+ signal where available)."""
+    _ensure_nm_wifi()  # RHEL: pull NetworkManager-wifi so the radio is manageable
     nets, seen = [], set()
 
     def _add(ssid, signal=''):
@@ -9046,6 +9181,7 @@ def _conn_wifi_add(ssid, psk):
         return False, 'Network name must be 1–32 characters.'
     if psk and not (8 <= len(psk) <= 63):
         return False, 'WiFi password must be 8–63 characters (WPA requirement).'
+    _ensure_nm_wifi()  # RHEL: pull NetworkManager-wifi so nmcli can manage the radio
     # NetworkManager path (RHEL / any box with nmcli).
     # v10.1.0 parity fix: use `connection add` (create the PROFILE, activate
     # nothing), NOT `dev wifi connect` — connect ACTIVATES, i.e. it switches
@@ -9062,19 +9198,25 @@ def _conn_wifi_add(ssid, psk):
             # Same SSID re-added with a (possibly new) password → update in place.
             cmd = ['nmcli', 'connection', 'modify', ssid, 'wifi-sec.psk', psk]
         else:
+            # ipv4.may-fail no: without it NM declares the connection 'activated'
+            # on IPv6 alone when DHCPv4 gets no answer (field-hit 2026-07-11,
+            # iPhone hotspot: 'dhcp4: no lease' but nmcli up rc=0) — a state with
+            # no usable IPv4, no tunnel, and a join loop that thinks it won.
             cmd = ['nmcli', 'connection', 'add', 'type', 'wifi',
                    'con-name', ssid, 'ifname', iface, 'ssid', ssid,
-                   'connection.autoconnect', 'yes']
+                   'connection.autoconnect', 'yes', 'ipv4.may-fail', 'no']
             if psk:
                 cmd += ['wifi-sec.key-mgmt', 'wpa-psk', 'wifi-sec.psk', psk]
         r = subprocess.run(_sudo_wrap(cmd), capture_output=True, text=True, timeout=45)
         if r.returncode != 0:
             return False, (r.stderr or r.stdout or 'nmcli profile add failed').strip()[:200]
-        # Provisioning from the Setup AP: stop it so NM autoconnects to the new
-        # profile (the AP owns the radio until then).
-        if _conn_setup_ap_active():
-            subprocess.run(_sudo_wrap(['systemctl', 'stop', 'takwerx-setup-ap.service']),
-                           capture_output=True, text=True, timeout=60)
+        # ADDITIVE-ONLY, even from the Setup AP (2026-07-11 redesign). Honor the card's
+        # promise "Adding a network never disconnects the one you're on": just save the
+        # profile (autoconnect=yes) and leave the AP broadcasting, so the operator can
+        # pre-provision several networks before committing. The SWITCH to a saved network
+        # happens ONLY when they explicitly hit "Stop Setup WiFi" (setup-ap/stop ->
+        # _conn_join_best_saved), which is where the deterministic join-out-of-AP-mode
+        # now lives (NM autoconnect coming out of AP mode is unreliable on RHEL).
         return True, ''
     # netplan path (Ubuntu).
     f = _conn_wifi_netplan_file()
@@ -9138,9 +9280,13 @@ def _conn_wifi_add(ssid, psk):
         # netplan apply, so the box joins the just-added network (in range at the
         # new location) and drops the AP in one step. Otherwise apply directly
         # (additive — doesn't drop the current connection).
+        # ADDITIVE-ONLY on the Setup AP (2026-07-11 redesign): the netplan config is
+        # written + validated above but deliberately NOT applied here — leave the AP
+        # broadcasting and the radio untouched so the operator can pre-provision more
+        # networks. The switch happens only on the explicit "Stop Setup WiFi", whose
+        # teardown (restore_client) runs `netplan apply` and joins the saved network.
+        # Off the AP, apply now (additive — doesn't drop the current connection).
         if _conn_setup_ap_active():
-            subprocess.run(_sudo_wrap(['systemctl', 'stop', 'takwerx-setup-ap.service']),
-                           capture_output=True, text=True, timeout=60)
             return True, ''
         appl = _run_priv_chain([['netplan', 'apply']], mode='and')
         if not appl or appl.returncode != 0:
@@ -9185,14 +9331,81 @@ def connectivity_wifi_add_api():
     return jsonify({'success': True})
 
 
+# ── Reaching This Box — every LAN address the console (:port) answers on now ──
+def _conn_reach_addresses():
+    """Every LAN address this box's console (:port) is reachable at right now —
+    the data behind the 'Reaching This Box' card (v10.1.2). Lists each real
+    Ethernet/WiFi interface with its IP + a ready console URL, flags the one the
+    current request arrived on ('you're here now'), and marks the WiFi ones so
+    the UI can say 'use this after you unplug Ethernet' (the exact friction of a
+    portable box hopping Ethernet→WiFi). Internal bridges (docker/veth/virbr/
+    br-/cni/flannel) are excluded — they are not a reach path. No mDNS: this
+    reads the box's OWN addresses inside the authenticated console, adds no
+    listener and broadcasts nothing (deliberate — mDNS/Avahi was rejected on
+    STIG/attack-surface grounds)."""
+    try:
+        port = str(load_settings().get('console_port') or 5001)
+    except Exception:
+        port = '5001'
+    wifi_if = _conn_wifi_iface()
+    here = ''
+    try:
+        here = (request.host or '').rsplit(':', 1)[0].strip('[]')
+    except Exception:
+        here = ''
+    addrs = []
+    info = _conn_local_network(lambda *_a, **_k: None)
+    for i in info.get('interfaces', []):
+        name = (i.get('iface') or '').strip()
+        ip = (i.get('ip') or '').strip()
+        if not name or not ip or name == 'lo':
+            continue
+        if name.startswith(('docker', 'veth', 'virbr', 'br-', 'cni', 'flannel', 'tailscale', 'wg')):
+            continue  # internal / overlay bridges — not a LAN reach path
+        addrs.append({
+            'iface': name,
+            'kind': 'wifi' if name == wifi_if else 'ethernet',
+            'ip': ip,
+            'url': 'https://%s:%s' % (ip, port),
+            'current': bool(here) and ip == here,
+        })
+    # Ethernet first, then WiFi (mirrors the "unplug Ethernet → fall to WiFi" story).
+    addrs.sort(key=lambda a: (a['kind'] != 'ethernet', a['iface']))
+    return {'port': port, 'addresses': addrs,
+            'has_wifi': any(a['kind'] == 'wifi' for a in addrs),
+            'has_ethernet': any(a['kind'] == 'ethernet' for a in addrs)}
+
+
+@app.route('/api/connectivity/addresses')
+@login_required
+def connectivity_addresses_api():
+    return jsonify(_conn_reach_addresses())
+
+
 # ── Leg 6c — CURRENT + FORGET (which network the box is on; drop a saved one) ──
 def _conn_wifi_current():
-    """SSID the box is CURRENTLY associated to (''=not connected). Reads `iw dev`
-    (broker-gated, cross-platform) — the associated interface prints an `ssid`
-    line. No nmcli-specific shape needed."""
+    """SSID the box is CURRENTLY associated to (''=not connected). Prefers nmcli's
+    active-connection view — reliable on RHEL and works even when the radio can't
+    scan (associated + on Ethernet). Falls back to `iw dev`. Field-hit 2026-07-11:
+    on a box connected to OXFORD, `iw dev` printed NO `ssid` line (driver quirk), so
+    the console wrongly showed the live network as 'not in range' instead of
+    'connected now'. Our added profiles use con-name==SSID, so the active connection
+    name IS the SSID."""
     iface = _conn_wifi_iface()
     if not iface:
         return ''
+    if shutil.which('nmcli'):
+        try:
+            r = subprocess.run(_sudo_wrap(['nmcli', '-t', '-f', 'DEVICE,TYPE,STATE,CONNECTION', 'device', 'status']),
+                               capture_output=True, text=True, timeout=8)
+            for ln in (r.stdout or '').splitlines():
+                p = ln.split(':')
+                if len(p) >= 4 and p[0] == iface and p[1] == 'wifi' and p[2] == 'connected':
+                    name = ':'.join(p[3:]).strip()
+                    if name and name != '--':
+                        return name
+        except Exception:
+            pass
     try:
         _ensure_iw()
         r = subprocess.run(_sudo_wrap(['iw', 'dev']), capture_output=True, text=True, timeout=8)
@@ -9508,6 +9721,19 @@ def connectivity_setup_ap_config_api():
 def connectivity_setup_ap_start_api():
     if not _conn_wifi_iface():
         return jsonify({'success': False, 'error': 'No wireless interface on this box — cannot broadcast a setup network.'}), 400
+    _ensure_nm_wifi()  # RHEL: the NM hotspot (mode=ap) path needs NetworkManager-wifi installed
+    # RHEL: the NM hotspot uses method=shared, whose DHCP + captive DNS is served by
+    # dnsmasq — a fresh Rocky box lacks it, so a joined client gets NO IP (browser:
+    # ERR_INTERNET_DISCONNECTED) and the FQDN can't resolve on the isolated AP net.
+    # Pull it NOW while the box is still online (this endpoint is reached over the very
+    # uplink the AP is about to replace). The captive DNS wildcard that makes the FQDN
+    # resolve to the box is written root-side by the engine (tak-setup-ap.sh) — the
+    # console broker deliberately can't write /etc/NetworkManager (not in PATH_ALLOW).
+    if _distro_family() == 'rhel':
+        try:
+            _pkg_install('dnsmasq', timeout=300)
+        except Exception:
+            pass
     # Start the root service through the broker. This SEVERS any wifi uplink (the
     # radio becomes the AP), so the HTTP response is sent before the switch lands;
     # the operator reconnects locally to the setup wifi.
@@ -9518,6 +9744,109 @@ def connectivity_setup_ap_start_api():
     return jsonify({'success': True})
 
 
+def _conn_clear_dead_ethernet():
+    """Tear down ethernet connections whose cable is physically gone. Rocky/RHEL
+    images ship NetworkManager with ignore-carrier=* — an unplugged NIC KEEPS its
+    activation and its metric-100 default route, which blackholes all egress even
+    after a wifi join succeeds (field-hit 2026-07-11: OXFORD associated + leased in
+    2s after Stop, but the relay tunnel stayed dead until the cable came back —
+    every packet was routed into the dead wire). Only touches devices with
+    carrier=0; a NIC with a live cable is never disconnected. NM re-arms
+    autoconnect on the next carrier-up, so replugging the cable restores wired."""
+    try:
+        r = subprocess.run(_sudo_wrap(['nmcli', '-t', '-f', 'DEVICE,TYPE,STATE', 'device', 'status']),
+                           capture_output=True, text=True, timeout=10)
+        for ln in (r.stdout or '').splitlines():
+            parts = ln.split(':')
+            if len(parts) < 3 or parts[1] != 'ethernet' or not parts[2].startswith('connected'):
+                continue
+            dev = parts[0]
+            try:
+                with open('/sys/class/net/%s/carrier' % dev) as f:
+                    if f.read().strip() == '1':
+                        continue
+            except Exception:
+                continue  # cannot prove the cable is gone -> leave the device alone
+            subprocess.run(_sudo_wrap(['nmcli', 'device', 'disconnect', dev]),
+                           capture_output=True, text=True, timeout=15)
+    except Exception:
+        pass
+
+
+def _conn_join_best_saved():
+    """After the Setup AP stops (the explicit 'done — switch now' action; add is
+    additive), join the best saved CLIENT wifi. NM's autoconnect coming out of AP mode
+    is unreliable on RHEL (radio comes up idle -> box offline -> watcher re-broadcasts
+    the AP), so do it explicitly. Prefers in-range saved SSIDs (skips a slow 'up'
+    timeout on out-of-range profiles), never touches the takwerx-hotspot AP profile.
+    Best-effort; runs detached from the stop API."""
+    if not shutil.which('nmcli'):
+        return
+    time.sleep(2)  # let the AP teardown (restore_client) free + re-enable the radio
+    # Kill any cable-less ethernet FIRST — its stale default route (RHEL
+    # ignore-carrier=*) outranks the wifi route and blackholes the box even after
+    # a perfect join.
+    _conn_clear_dead_ethernet()
+    try:
+        r = subprocess.run(_sudo_wrap(['nmcli', '-t', '-f', 'NAME,TYPE', 'connection', 'show']),
+                           capture_output=True, text=True, timeout=10)
+        saved = []
+        for ln in (r.stdout or '').splitlines():
+            parts = ln.rsplit(':', 1)
+            if len(parts) == 2 and 'wireless' in parts[1] and parts[0] != 'takwerx-hotspot':
+                saved.append(parts[0])
+    except Exception:
+        saved = []
+    if not saved:
+        return
+    try:
+        visible = set(_conn_wifi_visible())
+    except Exception:
+        visible = set()
+    ordered = [n for n in saved if n in visible] + [n for n in saved if n not in visible]
+
+    def _wifi_has_ipv4():
+        # nmcli up returns 0 even for an IPv6-only 'activated' state (older
+        # profiles without ipv4.may-fail=no; field-hit 2026-07-11) — a join with
+        # no usable IPv4 is a FAILURE here, not a success.
+        try:
+            iface = _conn_wifi_iface()
+            if not iface:
+                return True  # can't verify -> don't block the join on it
+            rc = subprocess.run(_sudo_wrap(['nmcli', '-t', '-f', 'IP4.ADDRESS', 'device', 'show', iface]),
+                                capture_output=True, text=True, timeout=10)
+            return 'IP4.ADDRESS' in (rc.stdout or '')
+        except Exception:
+            return True
+
+    for name in ordered:
+        try:
+            rr = subprocess.run(_sudo_wrap(['nmcli', 'connection', 'up', name]),
+                                capture_output=True, text=True, timeout=40)
+            if rr.returncode == 0 and not _wifi_has_ipv4():
+                # IPv6-only limbo: tear it down and let the next candidate try.
+                subprocess.run(_sudo_wrap(['nmcli', 'connection', 'down', name]),
+                               capture_output=True, text=True, timeout=15)
+                continue
+            if rr.returncode == 0:
+                # Uplink changed interface/address — bounce the relay tunnel.
+                # Kernel WireGuard caches the peer's source address; after moving
+                # from ethernet to wifi it can keep stamping the OLD source and
+                # never complete a handshake (field 2026-07-11: OXFORD joined,
+                # default route correct via wlp1s0, tunnel stayed dead until the
+                # cable returned). A wg-quick restart resets the socket; the
+                # relay reconnects in ~2s. No-op when no relay is provisioned.
+                if os.path.exists('/etc/wireguard/%s.conf' % _CONN_WG_IF):
+                    try:
+                        subprocess.run(_sudo_wrap(['systemctl', 'restart', 'wg-quick@%s' % _CONN_WG_IF]),
+                                       capture_output=True, text=True, timeout=30)
+                    except Exception:
+                        pass
+                return
+        except Exception:
+            continue
+
+
 @app.route('/api/connectivity/setup-ap/stop', methods=['POST'])
 @login_required
 def connectivity_setup_ap_stop_api():
@@ -9525,6 +9854,10 @@ def connectivity_setup_ap_stop_api():
                        capture_output=True, text=True, timeout=60)
     if r.returncode != 0:
         return jsonify({'success': False, 'error': (r.stderr or r.stdout or 'stop failed').strip()[:200]}), 500
+    # Stopping the AP is now the explicit "done provisioning — switch to a saved
+    # network" step (add is additive). Deterministically join the best saved client
+    # wifi in a detached thread (NM autoconnect out of AP mode is unreliable on RHEL).
+    threading.Thread(target=_conn_join_best_saved, daemon=True).start()
     return jsonify({'success': True})
 
 
@@ -37450,7 +37783,7 @@ textarea.form-input{resize:vertical}
     <input class="form-input" id="anchor-ssh-user" value="ubuntu" style="margin-bottom:18px;max-width:200px">
     <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
       <button class="btn btn-primary" id="anchor-provision-btn" onclick="provisionAnchor()">Set Up Relay</button>
-      <span style="font-size:11px;color:var(--text-dim)">port <input id="anchor-port" value="443" style="width:64px;background:#0a0e1a;border:1px solid var(--border);border-radius:6px;padding:5px 8px;color:var(--text-primary);font-size:12px;font-family:'JetBrains Mono',monospace"> · 443 slips through restrictive networks</span>
+      <span style="font-size:11px;color:var(--text-dim)">port <input id="anchor-port" value="51820" style="width:64px;background:#0a0e1a;border:1px solid var(--border);border-radius:6px;padding:5px 8px;color:var(--text-primary);font-size:12px;font-family:'JetBrains Mono',monospace"> · 51820 = carrier-safe default; 443 for restrictive venue firewalls (anchor serves both)</span>
     </div>
     <div class="log-box" id="anchor-provision-log" style="display:none"></div>
     </div>
@@ -37470,6 +37803,15 @@ textarea.form-input{resize:vertical}
     <div id="verify-banner" style="display:none;margin-bottom:14px"></div>
     <div id="verify-matrix" style="display:flex;flex-direction:column;gap:8px"></div>
     <div id="verify-vantage" style="margin-top:12px;font-size:11px;color:var(--text-dim)"></div>
+  </div>
+
+  <div class="card" id="reach-card">
+    <div class="card-title">Reaching This Box</div>
+    <div style="font-size:12px;color:var(--text-secondary);margin-bottom:14px">
+      The console (<b>:<span id="reach-port">5001</span></b>) answers at every address below right now. <b>Copy the WiFi one before you unplug Ethernet</b> — that is where you reconnect once the box is wireless. Nothing here is broadcast; it just reads this box&#39;s own addresses.
+    </div>
+    <div id="reach-list" style="font-size:12px;color:var(--text-dim)">Loading…</div>
+    <div style="margin-top:10px"><button class="control-btn" onclick="loadReach()">Refresh</button></div>
   </div>
 
   <div class="card" id="wifi-card">
@@ -37665,7 +38007,7 @@ async function refreshAnchorStatus(){
       document.getElementById('anchor-card').style.display = 'block';
       showRelayForm(false);
       const detail = (connected ? 'Tunnel up · ' : 'Configured, waiting for handshake · ')
-        + (d.endpoint || (d.anchor_ip ? d.anchor_ip + ':' + (d.wg_port||443) : ''))
+        + (d.endpoint || (d.anchor_ip ? d.anchor_ip + ':' + (d.wg_port||51820) : ''))
         + (d.handshake_secs != null ? ' · last handshake ' + fmtAge(d.handshake_secs) : '');
       document.getElementById('anchor-connected-detail').textContent = detail;
     } else if(!d.configured && !anchorReconfiguring){
@@ -37706,7 +38048,7 @@ async function provisionAnchor(){
   const ip = document.getElementById('anchor-ip').value.trim();
   const user = document.getElementById('anchor-ssh-user').value.trim() || 'ubuntu';
   const key = document.getElementById('anchor-ssh-key').value;
-  const port = document.getElementById('anchor-port').value.trim() || '443';
+  const port = document.getElementById('anchor-port').value.trim() || '51820';
   if(!ip || !key.trim()){ log.style.display='block'; log.textContent = 'Enter the relay IP and paste the SSH key first.'; return; }
   btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Setting up…';
   log.style.display = 'block'; log.textContent = 'Starting…';
@@ -37770,6 +38112,10 @@ function renderVerify(res){
     banner.innerHTML = '<div style="display:flex;align-items:center;gap:12px;background:rgba(16,185,129,.07);border:1px solid rgba(16,185,129,.25);border-radius:10px;padding:14px 16px">'
       + '<span class="dot" style="background:var(--green)"></span>'
       + '<div style="font-size:13px;font-weight:600;color:var(--green)">All green — clients on the public internet can reach this stack.</div></div>';
+  }else if(!res.required_red && res.unverified){
+    banner.innerHTML = '<div style="display:flex;align-items:center;gap:12px;background:rgba(234,179,8,.07);border:1px solid rgba(234,179,8,.25);border-radius:10px;padding:14px 16px">'
+      + '<span class="dot" style="background:var(--yellow)"></span>'
+      + '<div style="font-size:13px;color:var(--text-secondary)"><b style="color:var(--yellow)">Could not verify from inside.</b> Everything is listening, but this box cannot probe its own public address on this network (common on VPSes and home routers without NAT hairpin). Confirm from a phone on cellular — outside clients may already connect fine.</div></div>';
   }else{
     banner.innerHTML = '<div style="display:flex;align-items:center;gap:12px;background:rgba(239,68,68,.07);border:1px solid rgba(239,68,68,.25);border-radius:10px;padding:14px 16px">'
       + '<span class="dot" style="background:var(--red)"></span>'
@@ -37781,7 +38127,7 @@ function renderVerify(res){
     const v = (res.ports || {})[p];
     if(!v) continue;
     const green = v.state === 'green';
-    const dotColor = green ? 'var(--green)' : (v.required ? 'var(--red)' : 'var(--yellow)');
+    const dotColor = green ? 'var(--green)' : (v.state === 'unverified' ? 'var(--yellow)' : (v.required ? 'var(--red)' : 'var(--yellow)'));
     let detail = green ? ('connected' + (v.ms != null ? ' · ' + v.ms + ' ms' : '')) : (v.hint || v.detail || 'no route');
     rows.push('<div style="display:flex;align-items:center;gap:12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px">'
       + '<span class="dot" style="background:' + dotColor + ';flex-shrink:0"></span>'
@@ -37865,9 +38211,26 @@ async function startSetupAp(){
 async function stopSetupAp(){
   const s = document.getElementById('setupap-status');
   s.textContent = 'Stopping Setup WiFi and reconnecting…'; s.style.color = 'var(--text-dim)';
-  try{ const r = await fetch('/api/connectivity/setup-ap/stop', {method:'POST'}); const d = await r.json();
+  // Field-hit 2026-07-11 (twice): an expired session makes @login_required
+  // bounce this POST to the login page; r.json() then throws and the old empty
+  // catch swallowed it — the tap silently did NOTHING and the box stayed in AP
+  // mode until someone plugged ethernet back in. Surface every failure and give
+  // the operator a re-login path that returns here.
+  try{
+    const r = await fetch('/api/connectivity/setup-ap/stop', {method:'POST'});
+    if (r.redirected || (r.headers.get('content-type')||'').indexOf('json') === -1){
+      s.style.color = 'var(--red, #f87171)';
+      s.innerHTML = 'Your session expired — <a href="/login?next=/connectivity" style="color:var(--cyan)">log in again</a>, then press Stop once more.';
+      return;
+    }
+    const d = await r.json();
     s.textContent = d.success ? 'Reconnecting to your network…' : (d.error || 'Stop failed');
-  }catch(e){}
+    if (!d.success){ s.style.color = 'var(--red, #f87171)'; return; }
+  }catch(e){
+    s.style.color = 'var(--red, #f87171)';
+    s.textContent = 'Stop did not reach the box (' + e + ') — check you are still on the setup WiFi and try again.';
+    return;
+  }
   setTimeout(refreshSetupAp, 4000);
 }
 async function refreshWifiSaved(){
@@ -37887,16 +38250,19 @@ async function refreshWifiSaved(){
       // Connected network first, then the rest alphabetically.
       const ordered = d.saved.slice().sort((a,b) => (a===cur?-1:b===cur?1:a.localeCompare(b)));
       const visible = d.visible || [];
+      // Empty visible = the radio couldn't scan (AP mode, OR associated + on Ethernet
+      // where the driver won't background-scan) — we do NOT actually know range, so
+      // don't label it or grey out Use (field-hit 2026-07-11: a box connected to
+      // OXFORD wrongly showed every network, including OXFORD, as "not in range").
+      const scanEmpty = visible.length === 0;
       let html = '<div style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.04em;margin-bottom:8px">Known networks</div>';
       html += ordered.map(s => {
         const isCur = (s === cur);
-        // In AP mode we can't scan, so treat all as usable (unknown range) rather
-        // than greying out every Use button.
-        const inRange = isCur || apMode || visible.indexOf(s) !== -1;
+        const inRange = isCur || apMode || scanEmpty || visible.indexOf(s) !== -1;
         const j = JSON.stringify(s).replace(/"/g,'&quot;');
         const badge = isCur
           ? '<span style="color:var(--text-dim);font-size:11px">— connected now</span>'
-          : (apMode
+          : ((apMode || scanEmpty)
               ? ''
               : (inRange
                   ? '<span style="color:var(--green);font-size:11px;display:inline-flex;align-items:center;gap:3px"><span class="dot" style="background:var(--green);width:6px;height:6px"></span>in range</span>'
@@ -37913,6 +38279,35 @@ async function refreshWifiSaved(){
       el.textContent = 'No saved WiFi networks yet.';
     }
   }catch(e){}
+}
+async function loadReach(){
+  try{
+    const r = await fetch('/api/connectivity/addresses');
+    const d = await r.json();
+    const el = document.getElementById('reach-list');
+    const pe = document.getElementById('reach-port'); if(pe && d.port){ pe.textContent = d.port; }
+    const a = d.addresses || [];
+    if(!a.length){ el.textContent = 'No LAN addresses detected yet.'; return; }
+    el.innerHTML = a.map(function(x){
+      const isWifi = x.kind === 'wifi';
+      const label = (isWifi ? 'WiFi · ' : 'Ethernet · ') + esc(x.iface);
+      const here = x.current ? '<span style="color:var(--green);font-size:11px;margin-left:8px">← you are here</span>' : '';
+      const hint = (isWifi && !x.current) ? '<div style="font-size:11px;color:var(--text-dim);margin-top:3px">↳ use this after you unplug Ethernet</div>' : '';
+      const jurl = JSON.stringify(x.url).replace(/"/g,'&quot;');
+      return '<div style="padding:10px 12px;background:#0a0e1a;border:1px solid ' + (x.current ? 'rgba(16,185,129,.3)' : 'var(--border)') + ';border-radius:8px;margin-bottom:6px">'
+        + '<div style="display:flex;align-items:center;gap:10px">'
+        + '<span class="dot" style="background:' + (isWifi ? 'var(--accent)' : 'var(--green)') + ';flex-shrink:0"></span>'
+        + '<span style="flex:1;min-width:0;color:var(--text-primary);font-size:13px">' + label + '<span style="color:var(--text-dim);font-family:monospace;margin-left:8px">' + esc(x.ip) + '</span>' + here + '</span>'
+        + '<button type="button" onclick="copyReach(' + jurl + ',this)" title="Copy the console URL" style="background:rgba(59,130,246,.12);color:var(--accent);border:1px solid rgba(59,130,246,.3);border-radius:6px;padding:4px 12px;font-size:12px;cursor:pointer;white-space:nowrap">Copy URL</button>'
+        + '</div>'
+        + '<div style="font-size:11px;color:var(--text-dim);font-family:monospace;margin-top:5px;word-break:break-all">' + esc(x.url) + '</div>'
+        + hint
+        + '</div>';
+    }).join('');
+  }catch(e){ const el=document.getElementById('reach-list'); if(el){ el.textContent='Could not read addresses.'; } }
+}
+function copyReach(url, btn){
+  try{ navigator.clipboard.writeText(url); const t=btn.textContent; btn.textContent='Copied'; setTimeout(function(){ btn.textContent=t; }, 1200); }catch(e){}
 }
 async function forgetWifi(ssid, isCurrent){
   let msg = 'Forget “' + ssid + '”? The box will no longer join it automatically.';
@@ -37986,7 +38381,7 @@ async function addWifi(){
       body: JSON.stringify({ssid: ssid, password: psk})});
     const d = await r.json();
     if(d.success){
-      st.innerHTML = '<span style="color:var(--green)">Added “' + esc(ssid) + '”.</span> The box will join it automatically when in range.';
+      st.innerHTML = '<span style="color:var(--green)">Added “' + esc(ssid) + '” to this box’s WiFi list.</span> Nothing else disconnects. It joins automatically when in range — or, if you’re on the Setup WiFi, turn it off below to switch to it now.';
       document.getElementById('wifi-psk').value = '';
       refreshWifiSaved();
     } else { st.textContent = d.error || 'Could not add network.'; }
@@ -37998,6 +38393,8 @@ setInterval(function(){ if(document.getElementById('anchor-card').style.display 
 refreshAnchorStatus();
 refreshWifiSaved();
 refreshSetupAp();
+loadReach();
+setInterval(loadReach, 15000);
 setInterval(refreshSetupAp, 7000);
 paintIntent();
 // If a detection is already running/finished (page reload), pick it up.
@@ -64141,7 +64538,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% endfor %}
 </div>
 <div class="section-title">Console</div>
-<div class="meta-line" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">v{{ version }} | {{ settings.get('os_name', 'Unknown OS') }} | {{ settings.get('server_ip', 'N/A') }}{% if settings.get('fqdn') %} | {{ settings.get('fqdn') }}{% endif %}<div style="display:inline-flex;border:1px solid var(--border);border-radius:6px;overflow:hidden;margin-left:2px" title="Update channel"><button id="ch-main-btn" onclick="setUpdateChannel('main')" style="padding:3px 10px;font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:600;border:none;cursor:pointer;transition:background .15s,color .15s;{% if settings.get('update_channel','main')=='main' %}background:#22c55e;color:#0f172a;{% else %}background:transparent;color:#64748b;{% endif %}">main</button><button id="ch-dev-btn" onclick="promptDevChannel()" style="padding:3px 10px;font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:600;border:none;border-left:1px solid var(--border);cursor:pointer;transition:background .15s,color .15s;{% if settings.get('update_channel','main')=='dev' %}background:#eab308;color:#0f172a;{% else %}background:transparent;color:#64748b;{% endif %}">dev</button></div><span id="ch-status" style="font-size:10px;opacity:0.7"></span><button type="button" id="check-release-btn" onclick="checkUpdate(true)" style="padding:4px 10px;background:rgba(59,130,246,0.15);color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">Check for new release</button><a href="/firewall" id="exp-badge-console" title="Service exposure — click for detail" style="display:inline-flex;align-items:center;gap:6px;padding:4px 10px;text-decoration:none;border:1px solid var(--border);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;color:#94a3b8"><span id="exp-badge-dot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#94a3b8"></span><span id="exp-badge-text">exposure…</span></a></div>
+<div class="meta-line" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">v{{ version }} | {{ settings.get('os_name', 'Unknown OS') }} | {{ settings.get('server_ip', 'N/A') }}{% if settings.get('fqdn') %} | {{ settings.get('fqdn') }}{% endif %}<div style="display:inline-flex;border:1px solid var(--border);border-radius:6px;overflow:hidden;margin-left:2px" title="Update channel"><button id="ch-main-btn" onclick="setUpdateChannel('main')" style="padding:3px 10px;font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:600;border:none;cursor:pointer;transition:background .15s,color .15s;{% if settings.get('update_channel','main')=='main' %}background:#22c55e;color:#0f172a;{% else %}background:transparent;color:#64748b;{% endif %}">main</button><button id="ch-dev-btn" onclick="promptDevChannel()" style="padding:3px 10px;font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:600;border:none;border-left:1px solid var(--border);cursor:pointer;transition:background .15s,color .15s;{% if settings.get('update_channel','main')=='dev' %}background:#eab308;color:#0f172a;{% else %}background:transparent;color:#64748b;{% endif %}">dev</button></div><span id="ch-status" style="font-size:10px;opacity:0.7"></span><button type="button" id="check-release-btn" onclick="checkUpdate(true)" style="padding:4px 10px;background:rgba(59,130,246,0.15);color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">Check for new release</button><button type="button" onclick="promptPower('reboot')" title="Reboot this box (asks for your console password)" style="padding:4px 10px;background:rgba(59,130,246,0.15);color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">Reboot</button><button type="button" onclick="promptPower('poweroff')" title="Power off this box (asks for your console password)" style="padding:4px 10px;background:rgba(239,68,68,0.1);color:var(--red);border:1px solid rgba(239,68,68,0.25);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;cursor:pointer">Power Off</button><a href="/firewall" id="exp-badge-console" title="Service exposure — click for detail" style="display:inline-flex;align-items:center;gap:6px;padding:4px 10px;text-decoration:none;border:1px solid var(--border);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:10px;color:#94a3b8"><span id="exp-badge-dot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#94a3b8"></span><span id="exp-badge-text">exposure…</span></a></div>
 <script>
 (function(){
   var a=document.getElementById('exp-badge-console');if(!a)return;
@@ -64167,6 +64564,19 @@ body{display:flex;flex-direction:row;min-height:100vh}
     <div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">
       <button onclick="closeDevModal()" style="padding:7px 16px;background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border);border-radius:8px;cursor:pointer;font-family:inherit;font-size:12px">Cancel</button>
       <button onclick="confirmDevChannel()" style="padding:7px 16px;background:var(--yellow);color:#0f172a;border:none;border-radius:8px;cursor:pointer;font-family:inherit;font-size:12px;font-weight:700">Switch to dev</button>
+    </div>
+  </div>
+</div>
+<div id="power-pw-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;align-items:center;justify-content:center">
+  <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:340px;max-width:90vw;font-family:'JetBrains Mono',monospace">
+    <div id="power-pw-title" style="font-size:13px;font-weight:700;color:var(--yellow);margin-bottom:6px">⚠ Power</div>
+    <div id="power-pw-msg" style="font-size:11px;color:var(--text-dim);margin-bottom:16px;line-height:1.5">Enter your console password to confirm.</div>
+    <label style="display:block;font-size:11px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">Console password</label>
+    <input id="power-pw-input" type="password" style="width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text-primary);font-size:13px;font-family:'JetBrains Mono',monospace;box-sizing:border-box" placeholder="password" onkeydown="if(event.key==='Enter')confirmPower()">
+    <div id="power-pw-err" style="font-size:11px;color:var(--red);margin-top:6px;min-height:16px"></div>
+    <div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">
+      <button onclick="closePowerModal()" style="padding:7px 16px;background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border);border-radius:8px;cursor:pointer;font-family:inherit;font-size:12px">Cancel</button>
+      <button id="power-pw-confirm" onclick="confirmPower()" style="padding:7px 16px;background:var(--yellow);color:#0f172a;border:none;border-radius:8px;cursor:pointer;font-family:inherit;font-size:12px;font-weight:700">Confirm</button>
     </div>
   </div>
 </div>
@@ -64659,6 +65069,50 @@ async function confirmDevChannel(){
             setTimeout(function(){var s=document.getElementById('ch-status');if(s)s.textContent='';},3000);
         }else{if(err)err.textContent=d.error||'Incorrect password';}
     }catch(e){if(err)err.textContent='Error: '+e.message;}
+}
+var _powerAction='';
+function promptPower(action){
+    _powerAction=action;
+    var m=document.getElementById('power-pw-modal');
+    var inp=document.getElementById('power-pw-input');
+    var err=document.getElementById('power-pw-err');
+    var ttl=document.getElementById('power-pw-title');
+    var msg=document.getElementById('power-pw-msg');
+    var btn=document.getElementById('power-pw-confirm');
+    if(action==='poweroff'){
+      if(ttl)ttl.textContent='⚠ Power off this box';
+      if(msg)msg.textContent='The box shuts down completely — you will need physical access to power it back on. Enter your console password to confirm.';
+      if(btn){btn.textContent='Power Off';btn.style.background='var(--red)';btn.style.color='#fff';}
+    }else{
+      if(ttl)ttl.textContent='⚠ Reboot this box';
+      if(msg)msg.textContent='The box restarts — you will lose the console for about a minute while it comes back. Enter your console password to confirm.';
+      if(btn){btn.textContent='Reboot';btn.style.background='var(--yellow)';btn.style.color='#0f172a';}
+    }
+    if(err){err.style.color='var(--red)';err.textContent='';}
+    if(btn)btn.disabled=false;
+    if(inp)inp.value='';
+    if(m){m.style.display='flex';setTimeout(function(){if(inp)inp.focus();},80);}
+}
+function closePowerModal(){
+    var m=document.getElementById('power-pw-modal');
+    if(m)m.style.display='none';
+}
+async function confirmPower(){
+    var inp=document.getElementById('power-pw-input');
+    var err=document.getElementById('power-pw-err');
+    var msg=document.getElementById('power-pw-msg');
+    var pw=(inp?inp.value:'').trim();
+    if(!pw){if(err){err.style.color='var(--red)';err.textContent='Password required';}return;}
+    if(err){err.style.color='var(--red)';err.textContent='';}
+    try{
+        var r=await fetchRetry('/api/console/power',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:_powerAction,password:pw}),credentials:'same-origin'});
+        var d=await r.json();
+        if(d.success){
+            if(msg)msg.textContent=(_powerAction==='poweroff'?'Powering off now — this console will go offline in a moment.':'Rebooting now — the console will return in about a minute.');
+            if(err){err.style.color='var(--green)';err.textContent='Command sent.';}
+            var btn=document.getElementById('power-pw-confirm');if(btn)btn.disabled=true;
+        }else{if(err){err.style.color='var(--red)';err.textContent=d.error||'Incorrect password';}}
+    }catch(e){if(err){err.style.color='var(--red)';err.textContent='Error: '+e.message;}}
 }
 async function setUpdateChannel(ch){
     var st=document.getElementById('ch-status');
@@ -67408,7 +67862,44 @@ def _startup_ensure_hardening_posture():
     except Exception as _e:
         print('[startup-posture] skipped (non-fatal): %s' % str(_e)[:160], flush=True)
 
+
+def _startup_ensure_console_ports():
+    """Self-heal the console/Caddy firewall ports on every console start (= every
+    boot). RHEL field-hit 2026-07-11: after a reboot, 80/443/5001 were GONE from
+    firewalld — SSH + the TAK ports survived (those are --permanent) but the console
+    (5001) AND the FQDN-via-Caddy (80/443) were firewall-dead, locking the operator
+    out both ways. RHEL-ONLY: firewalld drops any rule that isn't --permanent on
+    reboot; Ubuntu's ufw persists rules, so this never bites there (hence VPS boxes
+    'never lose ports'). _fw_allow adds --permanent, so re-asserting here makes the
+    ports durable across every future reboot. Idempotent (re-adding an open port is a
+    no-op). The INVERSE of _startup_ensure_hardening_posture (which re-CLOSES 5001 on
+    a Hardened box): here we keep 5001 open on Standard boxes, and always keep Caddy's
+    80/443 open when the box fronts an FQDN so the reachable-by-name path survives
+    reboots too."""
+    try:
+        if _fw_backend() != 'firewalld':
+            return  # ufw persists rules across reboots — only firewalld loses runtime-only
+        try:
+            hardened = (load_hardening().get('posture') or 'standard') == 'hardened'
+        except Exception:
+            hardened = False
+        # 5001: the console's own port — open on a Standard box. A Hardened box
+        # deliberately closes it (_startup_ensure_hardening_posture owns that).
+        if not hardened:
+            try:
+                _fw_allow(int(load_settings().get('console_port') or 5001), 'tcp')
+            except Exception:
+                _fw_allow(5001, 'tcp')
+        # 80 + 443: Caddy fronts the FQDN/console vhost whenever ssl is fqdn/custom —
+        # needed on BOTH postures (a Hardened box reaches the console via Caddy 443).
+        if (load_settings().get('ssl_mode') or '') in ('fqdn', 'custom'):
+            _fw_allow(80, 'tcp')
+            _fw_allow(443, 'tcp')
+    except Exception as _e:
+        print('[startup-ports] console-ports ensure warning (non-fatal): %s' % str(_e)[:160], flush=True)
+
 _startup_ensure_hardening_posture()
+_startup_ensure_console_ports()
 
 
 def _startup_ensure_server_one_ssh_key():
