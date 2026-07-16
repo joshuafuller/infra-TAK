@@ -685,7 +685,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.2-alpha"
+VERSION = "10.1.3-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -694,7 +694,10 @@ GITHUB_REPO = "takwerx/infra-TAK"
 # the version currently under validation.  When vetting passes, promote DEV → VETTED and
 # bump VERSION to a new infra-TAK release.
 AUTHENTIK_VETTED_RELEASE = "2026.5.3"   # v0.9.57.1: promoted dev→vetted — conn_max_age idle-CPU spin fix (#22580, fixed 2026.5.2); 2026.2.3→2026.5.3 jump validated live on CORAZ prod + test6/8/12 soak
-AUTHENTIK_DEV_RELEASE    = "2026.5.3"   # under validation on dev channel — conn_max_age idle-CPU spin fix (#22580/#22679, in 2026.5.2+); 2026-06-13
+AUTHENTIK_DEV_RELEASE    = "2026.5.4"   # OFFLINE FALLBACK ONLY — dev channel tracks upstream-latest live (_get_authentik_target_release); this value is used only when the GitHub lookup is unreachable. Bump it to the current latest when convenient, but it no longer gates what dev installs.
+# CloudTAK version gate — v13.45+ introduced major hub/api split (stateful vs stateless modes).
+# This is a BREAKING CHANGE for plugin deployment. Gate to 13.44.0 until plugin compat verified.
+CLOUDTAK_VETTED_RELEASE = "13.44.0"     # v10.1.3+: pinned to 13.44.0 — v13.45+ requires plugin migration for hub/api split
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
 CADDYFILE_USER_BLOCKS_MARKER = "# --- User-added blocks (do not remove) ---"
@@ -729,8 +732,8 @@ REMOTE_ASSIST_LOGO_URL = "/static/eud-remote-assist-banner.png"
 # newer, as AWARENESS only — Update always installs the channel target, never raw upstream.
 NETBIRD_SERVER_IMAGE = "netbirdio/netbird-server:0.72.3"      # VETTED (main) — field-validated working pair
 NETBIRD_DASHBOARD_IMAGE = "netbirdio/dashboard:v2.39.0"
-NETBIRD_SERVER_DEV_IMAGE = "netbirdio/netbird-server:0.72.3"  # DEV candidate under validation (== vetted until a newer one is being tried)
-NETBIRD_DASHBOARD_DEV_IMAGE = "netbirdio/dashboard:v2.39.0"
+NETBIRD_SERVER_DEV_IMAGE = "netbirdio/netbird-server:0.74.4"  # DEV candidate under validation (upstream latest pair 2026-07-14; promote to vetted after login + peer connect pass)
+NETBIRD_DASHBOARD_DEV_IMAGE = "netbirdio/dashboard:v2.90.4"
 
 
 def _get_netbird_target_images(settings=None):
@@ -1148,7 +1151,17 @@ def _load_json_cached(p):
         return {}
 
 def load_settings():
-    return _load_json_cached(os.path.join(CONFIG_DIR, 'settings.json'))
+    s = _load_json_cached(os.path.join(CONFIG_DIR, 'settings.json'))
+    # Type guard: a core identity key persisted with a non-scalar type (e.g. server_ip
+    # written as [null, null] from an unpacked (ip, source) tuple) crashes every
+    # `(settings.get(...) or '').strip()` — including at module import, so the console
+    # can't even boot to self-heal. Drop the bad key so the '' fallbacks hold;
+    # _heal_settings_core_keys() re-derives and re-persists it on boot.
+    for _k in CORE_SETTINGS_KEYS:
+        _v = s.get(_k)
+        if _v is not None and not isinstance(_v, (str, int)):
+            del s[_k]
+    return s
 
 # v10.0.3 — settings.json is the box's identity (fqdn, ssl_mode, os_type, server_ip…)
 # and is written from 166 call sites across many background threads. The original
@@ -1181,7 +1194,11 @@ def save_settings(s):
             except Exception:
                 _disk = {}
             if isinstance(_disk, dict):
-                _refilled = [k for k in CORE_SETTINGS_KEYS if k not in s and k in _disk]
+                # Type guard mirrors load_settings: never refill a corrupted non-scalar
+                # value (e.g. server_ip=[null, null]) back into the outgoing dict.
+                _refilled = [k for k in CORE_SETTINGS_KEYS
+                             if k not in s and k in _disk
+                             and (_disk[k] is None or isinstance(_disk[k], (str, int)))]
                 for k in _refilled:
                     s[k] = _disk[k]
                 if _refilled:
@@ -1236,8 +1253,11 @@ def _detect_console_port():
 def _detect_server_ip_safe():
     """Best-effort public/host IP for self-heal only (never raises, time-boxed)."""
     try:
-        ip = _detect_cloud_public_ip()
-        if ip:
+        # _detect_cloud_public_ip returns (ip, source) — including (None, None) on
+        # failure, which is a TRUTHY tuple. Unpack it; returning the raw tuple here
+        # is what wrote server_ip=[null, null] into settings.json (test8, 2026-07-14).
+        ip, _src = _detect_cloud_public_ip()
+        if ip and isinstance(ip, str):
             return ip
     except Exception:
         pass
@@ -1281,8 +1301,10 @@ def _heal_settings_core_keys():
     except Exception:
         return
     _identity = ('os_type', 'os_name', 'pkg_mgr', 'arch', 'console_port', 'install_dir', 'ssl_mode')
-    # Fast no-op: identity intact AND (fqdn present OR genuinely no domain to recover).
-    if all(s.get(k) for k in _identity) and (s.get('fqdn') or _recover_fqdn() is None):
+    # Fast no-op: identity intact AND server_ip present AND (fqdn present OR genuinely
+    # no domain to recover). server_ip is included so a value dropped by the
+    # load_settings type guard (corrupted to a list on disk) gets re-derived here.
+    if all(s.get(k) for k in _identity) and s.get('server_ip') and (s.get('fqdn') or _recover_fqdn() is None):
         return
     healed = {}
     if not s.get('install_dir'):
@@ -8702,8 +8724,17 @@ def connectivity_anchor_disconnect_api():
 # IP and uploads that key. The console SSHes in, runs the bootstrap, reads the WG
 # public key out of the output, configures the box tunnel, and authorizes the box on
 # the anchor with add-box — no terminal, no hand-copied keys.
+# v10.1.3 (security residual from the 10.1.2 review): the bootstrap is fetched from
+# an IMMUTABLE commit SHA (never a branch) and its bytes are verified against a known
+# SHA-256 before it runs as root on the operator's anchor — no curl|bash of mutable
+# remote code (CLAUDE.md supply-chain rule). WHEN YOU EDIT connectivity-anchor-
+# bootstrap.sh: commit it, then update BOTH the commit SHA in the URL and the digest
+# below (`git show <sha>:scripts/connectivity-anchor-bootstrap.sh | shasum -a 256`).
+_CONN_ANCHOR_BOOTSTRAP_COMMIT = '73857d0eefa5f26e19923456f1e1c340faa3e2e3'
+_CONN_ANCHOR_BOOTSTRAP_SHA256 = 'ce5c321f84617da2f35f5b0c3898e1e7bea99cc09e39b1fa76c90d1dd6d3e503'
 _CONN_ANCHOR_BOOTSTRAP_RAW = ('https://raw.githubusercontent.com/takwerx/infra-TAK/'
-                              'dev/scripts/connectivity-anchor-bootstrap.sh')
+                              + _CONN_ANCHOR_BOOTSTRAP_COMMIT
+                              + '/scripts/connectivity-anchor-bootstrap.sh')
 _CONN_ANCHOR_KEY_PATH = os.path.expanduser('~/.ssh/infratak_anchor')
 _CONN_SSH_USER_RE = re.compile(r'^[a-z_][a-z0-9_-]{0,31}$')
 _connectivity_provision_status = {'running': False, 'complete': False, 'error': '', 'log': []}
@@ -8768,16 +8799,22 @@ def _run_connectivity_provision(anchor_ip, ssh_user, wg_port):
         if not ok:
             st.update({'running': False, 'complete': True, 'error': 'Cannot SSH to the relay: %s' % out[:200]})
             return
-        # Fetch + run the bootstrap on the anchor. WG_PORT is an int (validated); the
-        # URL is a fixed constant. Nothing operator-typed lands in this remote shell string.
+        # Fetch, VERIFY the pinned SHA-256, then run the bootstrap on the anchor. The
+        # URL is an immutable commit SHA + fixed digest (no branch); WG_PORT is a
+        # validated int. Nothing operator-typed lands in this remote shell string. A
+        # digest mismatch aborts BEFORE any sudo bash runs (supply-chain guard).
         _conn_prov_log('Running the relay setup (this installs WireGuard + forwards)…')
         setup_cmd = ("curl -fsSL '%s' -o ~/connectivity-anchor-bootstrap.sh && "
+                     "echo '%s  '$HOME'/connectivity-anchor-bootstrap.sh' | sha256sum -c - && "
                      "chmod +x ~/connectivity-anchor-bootstrap.sh && "
                      "sudo WG_PORT=%d bash ~/connectivity-anchor-bootstrap.sh setup"
-                     ) % (_CONN_ANCHOR_BOOTSTRAP_RAW, wg_port)
+                     ) % (_CONN_ANCHOR_BOOTSTRAP_RAW, _CONN_ANCHOR_BOOTSTRAP_SHA256, wg_port)
         ok, out = _conn_anchor_ssh(anchor_ip, ssh_user, setup_cmd, timeout=240)
         if not ok:
-            st.update({'running': False, 'complete': True, 'error': 'Anchor bootstrap failed: %s' % out[:300]})
+            _err = out[:300]
+            if 'sha256sum' in out.lower() or 'FAILED' in out:
+                _err = 'Anchor bootstrap integrity check failed (unexpected script contents) — aborted before running. %s' % _err
+            st.update({'running': False, 'complete': True, 'error': 'Anchor bootstrap failed: %s' % _err})
             return
         m = re.search(r'WireGuard public key\s*:\s*([A-Za-z0-9+/]{43}=)', out)
         if not m:
@@ -11120,6 +11157,20 @@ def guarddog_page():
         ak_tasklog_installed=_ak_tasklog_installed,
         ak_tasklog_last=_ak_tasklog_last)
 
+# v10.1.3 (security residual from the 10.1.2 review): guarddog_alert_email is
+# string-substituted into root-executed script text (ALERT_EMAIL_PLACEHOLDER), so it
+# is allowlist-validated at every API entry point AND re-checked at each substitution
+# site — quotes/;/`/$/whitespace can never reach a shell. Fix lives at the source:
+# every placeholder consumer goes through _safe_alert_email().
+_ALERT_EMAIL_RE = re.compile(r'^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$')
+
+
+def _safe_alert_email(addr):
+    """The address if it matches the strict allowlist, else '' (alerts disabled)."""
+    addr = (addr or '').strip()
+    return addr if _ALERT_EMAIL_RE.match(addr) else ''
+
+
 @app.route('/api/guarddog/deploy', methods=['POST'])
 @login_required
 def guarddog_deploy_api():
@@ -11127,9 +11178,11 @@ def guarddog_deploy_api():
         return jsonify({'error': 'Deployment already in progress'}), 409
     data = request.json or {}
     alert_email = (data.get('alert_email') or '').strip()
+    if alert_email and not _safe_alert_email(alert_email):
+        return jsonify({'error': 'Invalid alert email address'}), 400
     settings = load_settings()
     if not alert_email:
-        alert_email = (settings.get('guarddog_alert_email') or '').strip()
+        alert_email = _safe_alert_email(settings.get('guarddog_alert_email'))
     # Allow deploy with no email (monitors run; alerts only after user configures email)
     settings['guarddog_alert_email'] = alert_email
     nickname = (data.get('server_nickname') or '').strip()
@@ -11339,7 +11392,7 @@ def _sync_guarddog_remote_db_from_settings(settings=None):
         try:
             content = open(src, 'r', encoding='utf-8').read()
             content = (content
-                .replace('ALERT_EMAIL_PLACEHOLDER', alert_email)
+                .replace('ALERT_EMAIL_PLACEHOLDER', _safe_alert_email(alert_email))
                 .replace('ALERT_SMS_PLACEHOLDER', '')
                 .replace('CERT_PASS_PLACEHOLDER', cert_pass)
                 .replace('CONSOLE_VERSION_PLACEHOLDER', VERSION)
@@ -14978,6 +15031,8 @@ def guarddog_test_email():
     to_addr = data.get('to', '').strip() or (settings.get('guarddog_alert_email') or '').strip()
     if not to_addr:
         return jsonify({'success': False, 'error': 'No email address configured'}), 400
+    if not _safe_alert_email(to_addr):
+        return jsonify({'success': False, 'error': 'Invalid alert email address'}), 400
     if data.get('save'):
         settings['guarddog_alert_email'] = to_addr
         save_settings(settings)
@@ -14997,6 +15052,8 @@ def guarddog_notifications_save():
     data = request.json or {}
     settings = load_settings()
     email = (data.get('alert_email') or '').strip()
+    if email and not _safe_alert_email(email):
+        return jsonify({'success': False, 'error': 'Invalid alert email address'}), 400
     nickname = (data.get('server_nickname') or '').strip()
     settings['guarddog_alert_email'] = email
     settings['guarddog_server_nickname'] = nickname
@@ -15322,7 +15379,7 @@ def run_guarddog_deploy(alert_email):
             content = open(src, 'r').read()
             cert_pass = _get_tak_cert_password(settings)
             content = (content
-                .replace('ALERT_EMAIL_PLACEHOLDER', alert_email)
+                .replace('ALERT_EMAIL_PLACEHOLDER', _safe_alert_email(alert_email))
                 .replace('ALERT_SMS_PLACEHOLDER', alert_sms or '')
                 .replace('CERT_PASS_PLACEHOLDER', cert_pass)
                 .replace('CONSOLE_VERSION_PLACEHOLDER', VERSION))
@@ -15753,6 +15810,7 @@ def cloudtak_page():
         cloudtak_version=ct_version,
         cloudtak_update_available=ct_update_available,
         cloudtak_latest=ct_latest,
+        cloudtak_version_info=ct_vinfo,
         cloudtak_icon=CLOUDTAK_ICON,
         cloudtak_cfg=cloudtak_cfg,
         cloudtak_tak_suggest=cloudtak_tak_suggest,
@@ -21725,28 +21783,48 @@ def _get_authentik_latest_release_tag(use_cache=True):
 
 
 def _get_authentik_target_release(settings=None):
-    """Return the operator-approved Authentik version for this box's channel.
+    """Return the Authentik version this box's channel is allowed to update to.
 
-    Dev channel (update_channel='dev' in settings.json): AUTHENTIK_DEV_RELEASE — the
-    version currently under validation by the operator.
+    Dev channel (update_channel='dev'): whatever Authentik has shipped LATEST upstream.
+    Dev simply tracks the newest release — an update shows up the moment upstream ships
+    one, no pin editing required. Falls back to AUTHENTIK_DEV_RELEASE only if the GitHub
+    lookup is unavailable (offline / rate-limited).
 
     Main channel (default): AUTHENTIK_VETTED_RELEASE — the last fleet-validated release.
-    Customers on main are never offered an Authentik version that hasn't been explicitly
-    vetted and promoted by bumping AUTHENTIK_VETTED_RELEASE in a new infra-TAK release.
+    Customers on main are never offered a version that hasn't been explicitly vetted and
+    promoted by bumping AUTHENTIK_VETTED_RELEASE in a new infra-TAK release. This is the gate.
     """
     if settings is None:
         settings = load_settings()
     channel = (settings.get('update_channel') or 'main').strip().lower()
-    return AUTHENTIK_DEV_RELEASE if channel == 'dev' else AUTHENTIK_VETTED_RELEASE
+    if channel == 'dev':
+        return _get_authentik_latest_release_tag() or AUTHENTIK_DEV_RELEASE
+    return AUTHENTIK_VETTED_RELEASE
 
 
 def _get_authentik_version_info():
-    """Return {version: str, update_available: bool, latest: str|None} for Authentik."""
+    """Return {version: str, update_available: bool, latest: str|None} for Authentik.
+
+    'version' is what is ACTUALLY RUNNING — read from the live container's image tag.
+    The compose pin is only a FALLBACK (used when the container is down): the pin is
+    what's *configured*, which can lag the running container after an out-of-band
+    upgrade, so it must not be the primary source for "what am I on". """
     out = {'version': '', 'update_available': False, 'latest': None}
     import re
+    # Authoritative: the running authentik-server container's image tag.
+    try:
+        r = subprocess.run(
+            _sudo_wrap(['docker', 'ps', '--filter', 'name=authentik-server', '--format', '{{.Image}}']),
+            capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout.strip():
+            _img = r.stdout.strip().split('\n')[0]
+            if ':' in _img:
+                out['version'] = _img.rsplit(':', 1)[1].strip()
+    except Exception:
+        pass
     ak_dir = os.path.expanduser('~/authentik')
     compose_path = os.path.join(ak_dir, 'docker-compose.yml')
-    if os.path.isfile(compose_path):
+    if not out['version'] and os.path.isfile(compose_path):
         try:
             with open(compose_path) as f:
                 content = f.read()
@@ -21771,10 +21849,11 @@ def _get_authentik_version_info():
             settings = load_settings()
             ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
             if ak_cfg.get('target_mode') == 'remote' and ak_cfg.get('deployed') and (ak_cfg.get('remote', {}).get('host') or '').strip():
+                # Running container first (authoritative), same as the local path.
                 ok, remote_out = _ssh_probe(ak_cfg['remote'],
-                    'docker images ghcr.io/goauthentik/server --format "{{.Tag}}" 2>/dev/null | head -1', timeout=10)
-                if ok and remote_out and remote_out.strip():
-                    out['version'] = remote_out.strip()
+                    'docker ps --filter name=authentik-server --format "{{.Image}}" 2>/dev/null | head -1', timeout=10)
+                if ok and remote_out and ':' in remote_out:
+                    out['version'] = remote_out.strip().rsplit(':', 1)[1].strip()
                 if not out['version']:
                     ok, remote_out = _ssh_probe(ak_cfg['remote'],
                         'grep -m1 "AUTHENTIK_TAG" ~/authentik/docker-compose.yml 2>/dev/null', timeout=10)
@@ -21872,26 +21951,39 @@ def _get_cloudtak_latest_release_tag(use_cache=True):
         return _cloudtak_release_cache.get('tag') or None
 
 
-def _get_cloudtak_version_info():
-    """Return {version: str, update_available: bool, latest: str|None} for CloudTAK.
+def _get_cloudtak_target_release_tag(settings=None, use_cache=True):
+    """Channel-target CloudTAK release tag (e.g. 'v13.44.0') — mirrors
+    _get_authentik_target_release. Main → the vetted pin, always (deterministic, no
+    GitHub dependency). Dev → upstream latest, falling back to the pin if GitHub is
+    unreachable. Deploy AND update both install this tag — a main-channel box must
+    never receive raw upstream latest (13.45+ breaks plugin compatibility)."""
+    s = settings if settings is not None else load_settings()
+    if (s.get('update_channel') or 'main').strip().lower() == 'dev':
+        tag = _get_cloudtak_latest_release_tag(use_cache=use_cache)
+        if tag:
+            return tag
+    return 'v' + CLOUDTAK_VETTED_RELEASE
 
-    Version resolution order:
-    0. The RUNNING cloudtak-api container's package.json — authoritative for what is
-       actually serving. The git source tree is NOT a reliable version signal: a
-       FAILED "Update Now" checks out the new tag BEFORE the (failed) image rebuild,
-       so the source sits at e.g. v13.10.0 while the container still runs v13.4.0.
-       Reading git first made the console report the un-built version (caught on
-       test12 2026-06-07: source v13.10.0, container v13.4.0). Prefer the container.
-    1. git describe --tags --exact-match: if HEAD is exactly at a release tag, use the
-       tag name (authoritative even when package.json lags — dfpc-coe sometimes tags
-       before bumping package.json). Used only when no container is running.
-    2. package.json (api/ or web/) in the source tree.
-    3. git describe --tags --always fallback for everything else.
+
+def _get_cloudtak_version_info():
+    """Return CloudTAK version info matching Authentik pattern.
+
+    Returns {version, update_available, latest, vetted_release, channel, upstream_latest, upstream_newer}.
+    Main channel: pinned to CLOUDTAK_VETTED_RELEASE — updates only to what we vet and authorize.
+    Dev channel: targets upstream latest — anything past the main pin shows (and installs) as an update.
     """
     import re
-    out = {'version': '', 'update_available': False, 'latest': None}
+    out = {'version': '', 'update_available': False, 'latest': None,
+           'vetted_release': CLOUDTAK_VETTED_RELEASE, 'channel': 'main',
+           'upstream_latest': None, 'upstream_newer': False}
     ct_dir = os.path.expanduser('~/CloudTAK')
-    # Step 0: prefer the RUNNING container's version (what's actually serving).
+
+    # Detect channel (main or dev)
+    _s = load_settings()
+    _channel = (_s.get('update_channel') or 'main').strip().lower()
+    out['channel'] = _channel
+
+    # Resolve running version: container first (authoritative), then git, then package.json
     try:
         rcid = subprocess.run(_sudo_wrap(['docker', 'ps', '-q', '-f', 'name=cloudtak-api']), capture_output=True, text=True, timeout=5)
         _cid_lines = (rcid.stdout or '').strip().splitlines() if rcid.returncode == 0 else []
@@ -21904,7 +21996,7 @@ def _get_cloudtak_version_info():
                 out['version'] = ver
     except Exception:
         pass
-    # Step 1: prefer exact git tag — authoritative even when package.json lags
+
     if not out['version'] and os.path.isdir(os.path.join(ct_dir, '.git')):
         try:
             rv = subprocess.run(
@@ -21914,7 +22006,7 @@ def _get_cloudtak_version_info():
                 out['version'] = rv.stdout.strip().lstrip('vV')
         except Exception:
             pass
-    # Step 2: package.json when not at an exact tag
+
     if not out['version']:
         for pkg in ['package.json', 'api/package.json', 'web/package.json']:
             pkg_path = os.path.join(ct_dir, pkg)
@@ -21927,77 +22019,36 @@ def _get_cloudtak_version_info():
                         break
                 except Exception:
                     pass
-    # Step 3: git describe fallback
-    if not out['version'] and os.path.isdir(os.path.join(ct_dir, '.git')):
-        rv = subprocess.run(f'cd {ct_dir} && git describe --tags --always 2>/dev/null || git log -1 --format="%h"', shell=True, capture_output=True, text=True, timeout=5)
-        if rv.returncode == 0 and rv.stdout.strip():
-            out['version'] = rv.stdout.strip().lstrip('vV')
-    r = subprocess.run(_sudo_wrap(['docker', 'ps', '-q', '-f', 'name=cloudtak-api']), capture_output=True, text=True, timeout=5)
-    # Guard: docker ps -q returns empty (rc 0) when no container is running — e.g.
-    # the post-update recreate window. `''.splitlines()[0]` was an IndexError → 500
-    # on /api/modules/version while CloudTAK was being recreated (caught in v0.9.48 T&E).
-    _ct_lines = (r.stdout or '').strip().splitlines() if r.returncode == 0 else []
-    _ct_api_id = _ct_lines[0].strip() if _ct_lines else ''
-    if _ct_api_id:
-        log_r = subprocess.run(_sudo_wrap(['docker', 'logs', _ct_api_id, '--tail', '150']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
-        if log_r.stdout:
-            for line in reversed(log_r.stdout.strip().split('\n')):
-                if '[update-check]' in line:
-                    m = re.search(r'latest=([^\s]+)', line)
-                    if m:
-                        out['latest'] = m.group(1).strip()
-                    if 'update=true' in line:
-                        out['update_available'] = True
-                    break
-    if out['version'] and not out['latest']:
-        tag = _get_cloudtak_latest_release_tag()
-        if tag:
-            latest_ver = tag.lstrip('vV')
-            out['latest'] = latest_ver
-            if out['version'] != latest_ver:
-                out['update_available'] = True
-    # v0.9.54: suppress a FALSE "update available" caused by the container's
-    # api/package.json lagging the git release tag. dfpc-coe ships release tags
-    # whose api/package.json trails the tag — and the lag now crosses a MINOR
-    # boundary (the v13.14.0 tag carries api/package.json 13.13.0, root 13.14.0).
-    # The v0.9.49 gate compared the container's major.minor to the LATEST TAG's
-    # major.minor (13.13 vs 13.14) and so wrongly kept the badge lit on a fully
-    # up-to-date box, making every Update Now look like a no-op (caught on test12
-    # 2026-06-12: HEAD v13.14.0, container 13.13.0, badge stuck).
-    #
-    # Correct signal: the box is current iff ~/CloudTAK HEAD is checked out
-    # EXACTLY at the latest release tag AND the running container's version equals
-    # the version baked into THAT tag's api/package.json (what a correct rebuild
-    # produces — the container reads /home/etl/api/package.json, so compare against
-    # the source api/package.json, never the tag string or root package.json).
-    # If the container is behind the source api/package.json, the rebuild did not
-    # land (source moved, image didn't) — keep showing the update.
-    if out['update_available'] and out['version'] and out['latest']:
+
+    # Channel-appropriate target (same model as Authentik): main → CLOUDTAK_VETTED_RELEASE
+    # (only what we pin and authorize), dev → upstream latest (dev boxes exist to test
+    # what's coming — anything past the main pin surfaces as an installable update).
+    out['latest'] = CLOUDTAK_VETTED_RELEASE
+    out['upstream_latest'] = None
+    out['upstream_newer'] = False
+    if _channel == 'dev':
         try:
-            _latest_norm = out['latest'].lstrip('vV')
-            _src = subprocess.run(
-                f'git -C {ct_dir} describe --tags --exact-match HEAD 2>/dev/null',
-                shell=True, capture_output=True, text=True, timeout=5)
-            _src_tag = (_src.stdout or '').strip().lstrip('vV')
-            if _src_tag and _src_tag == _latest_norm:
-                _src_api_ver = ''
-                _api_pkg = os.path.join(ct_dir, 'api', 'package.json')
-                if os.path.isfile(_api_pkg):
-                    try:
-                        with open(_api_pkg) as _f:
-                            _src_api_ver = (json.load(_f).get('version') or '').strip()
-                    except Exception:
-                        _src_api_ver = ''
-                if _src_api_ver and out['version'] == _src_api_ver:
-                    out['update_available'] = False
-                    # Display the tag version (e.g. 13.14.0), NOT the lagging
-                    # container api/package.json string (13.13.0). The box runs
-                    # the latest tag's code — only dfpc's internal version field
-                    # lags (#1479) — so showing the stale number reads as "the
-                    # update didn't take" even though the box is fully current.
-                    out['version'] = _src_tag
+            _up = _get_cloudtak_latest_release_tag()
+            if _up:
+                out['upstream_latest'] = _up.lstrip('vV')
+                _pin = tuple(int(x) for x in re.findall(r'\d+', CLOUDTAK_VETTED_RELEASE))
+                _ut = tuple(int(x) for x in re.findall(r'\d+', out['upstream_latest']))
+                if _ut > _pin:
+                    out['upstream_newer'] = True
+                    out['latest'] = out['upstream_latest']
         except Exception:
             pass
+
+    # Compare installed vs target: only flag update_available if target > installed
+    if out['version'] and out['latest']:
+        try:
+            _installed = tuple(int(x) for x in re.findall(r'\d+', out['version']))
+            _target = tuple(int(x) for x in re.findall(r'\d+', out['latest']))
+            if _target > _installed:
+                out['update_available'] = True
+        except Exception:
+            pass
+
     return out
 
 
@@ -23228,6 +23279,13 @@ def run_takportal_deploy():
             plog("\u2713 Certificates copied to container data volume")
         else:
             plog(f"\u26a0 Certificate copy: {_certs_msg}")
+        # v10.1.x (PLAN-v10.1.4 item 2): enroll the portal's map bridge (admin cert) in
+        # every TAK channel so /map receives live CoT on installs where TAK honors
+        # UserAuthenticationFile.xml (else admin is capped at __ANON__ -> empty map).
+        try:
+            _takportal_sync_map_channels(plog=plog)
+        except Exception as _mce:
+            plog(f"\u26a0 Map-channel sync (non-fatal): {_mce}")
 
         # Step 6: Auto-configure settings.json — use _takportal_build_settings_dict which handles
         # localhost/127.0.0.1 -> host.docker.internal, remote Authentik, token lookup, etc.
@@ -26265,12 +26323,64 @@ def _cloudtak_build_override_yml(settings):
     # `ports: !reset` is NOT used here because Docker Compose v5.x (shipped
     # with Docker Engine 27+) does not support the !reset YAML tag — it
     # resolves to null, silently dropping ALL port bindings.
+    # v10.1.3+: Mount console cert for CloudTAK API to trust the self-signed HTTPS endpoint.
+    # CloudTAK v13+ reaches TAKWERX Console at https://host.docker.internal:5001 to fetch
+    # config. The api container must trust the console's self-signed cert. v10.1.3 does this
+    # WITHOUT weakening TLS: the console cert now carries DNS:host.docker.internal in its SAN
+    # (start.sh / selfheal_ip regen), so mounting it and pointing NODE_EXTRA_CA_CERTS at it
+    # lets Node VALIDATE the console connection (CA-trust + hostname) while keeping cert
+    # verification ON for every OTHER outbound HTTPS (TAK Server, tile/feed sources).
+    # Fallback: a box whose cert predates the SAN (start.sh not re-run) or a REMOTE/split
+    # deploy (the mounted path is local; the console isn't on the remote host) keeps the old
+    # NODE_TLS_REJECT_UNAUTHORIZED=0 so CloudTAK still reaches the console — it self-upgrades
+    # to the validated path once start.sh regenerates the cert with the SAN.
+    console_cert_src = os.path.join(CONFIG_DIR, 'ssl', 'console.crt')
+    try:
+        _ct_is_remote = _get_cloudtak_deployment_config(settings).get('target_mode') == 'remote'
+    except Exception:
+        _ct_is_remote = False
+    # Validated path only when the LIVE console is SERVING a cert with the
+    # host.docker.internal SAN. _startup_migrations sets console_cert_docker_san=True only
+    # on a boot where gunicorn actually loaded a SAN-carrying cert (and regenerates the cert
+    # on disk when it's missing, converging over the next restart). Gating on that flag —
+    # not the on-disk cert — avoids tripping CloudTAK into validating a cert the console
+    # hasn't reloaded yet (the regenerated-but-not-served race).
+    _cert_has_docker_san = (not _ct_is_remote
+                            and bool(settings.get('console_cert_docker_san'))
+                            and os.path.isfile(console_cert_src))
+
+    if _cert_has_docker_san:
+        # Validated path: trust the console cert as an extra CA, keep TLS verification on.
+        tls_env_block = (
+            '      # v10.1.3: validate the console cert (SAN carries host.docker.internal)\n'
+            '      # instead of disabling TLS — verification stays ON for all other egress.\n'
+            '      NODE_EXTRA_CA_CERTS: "/etc/ssl/certs/takwerx-console.crt"\n'
+            '      CONSOLE_URL: "https://host.docker.internal:5001"\n'
+        )
+        cert_vol_block = (
+            '    volumes:\n'
+            f'      - "{console_cert_src}:/etc/ssl/certs/takwerx-console.crt:ro"\n'
+        )
+    else:
+        # Fallback (remote deploy, or cert predates the SAN): reach the console without
+        # verifying its cert. Re-run `sudo ./start.sh` to regenerate the cert with the
+        # host.docker.internal SAN and this converges to the validated path above.
+        tls_env_block = (
+            '      # Fallback: console cert lacks the host.docker.internal SAN (run\n'
+            '      # `sudo ./start.sh` to regenerate it and enable NODE_EXTRA_CA_CERTS validation).\n'
+            '      NODE_TLS_REJECT_UNAUTHORIZED: "0"\n'
+            '      CONSOLE_URL: "https://host.docker.internal:5001"\n'
+        )
+        cert_vol_block = ""
+
     return f"""# TAKWERX: CloudTAK container overrides — v0.9.11+v0.9.12 security hardening
 # Port hardening applied directly to compose.yaml by _patch_cloudtak_compose_ports().
 services:
   api:
     extra_hosts:
 {hosts_block}
+    environment:
+{tls_env_block}{cert_vol_block}
   events:
     extra_hosts:
 {hosts_block}
@@ -26792,9 +26902,9 @@ def run_cloudtak_deploy(cfg=None):
 
             plog("")
             plog("━━━ Step 3/6: Cloning/Updating CloudTAK on remote ━━━")
-            remote_release_tag = _get_cloudtak_latest_release_tag(use_cache=False)
+            remote_release_tag = _get_cloudtak_target_release_tag(use_cache=False)
             if remote_release_tag:
-                plog(f"  Target: stable release {remote_release_tag}")
+                plog(f"  Target: stable release {remote_release_tag} (channel target)")
                 prep_cmd = (
                     f"rm -rf ~/CloudTAK && git clone --depth 1 --branch {remote_release_tag} https://github.com/dfpc-coe/CloudTAK.git ~/CloudTAK && "
                     "test -f ~/CloudTAK/docker-compose.yml -o -f ~/CloudTAK/compose.yaml"
@@ -26819,9 +26929,17 @@ def run_cloudtak_deploy(cfg=None):
             plog("")
             plog("━━━ Step 4/6: Writing CloudTAK config on remote ━━━")
             import secrets as _secrets
+            # v10.1.3+: Preserve postgres password across redeploys (same as local deploy)
+            postgres_pass = settings.get('cloudtak_postgres_password', '').strip()
+            if not postgres_pass or len(postgres_pass) < 24:
+                postgres_pass = _secrets.token_hex(24)
+                settings['cloudtak_postgres_password'] = postgres_pass
+                try:
+                    save_settings(settings)
+                except Exception:
+                    pass
             signing_secret = _secrets.token_hex(32)
             minio_pass = _secrets.token_hex(16)
-            postgres_pass = _secrets.token_hex(24)
             env_content = _cloudtak_build_env_content(settings, domain, signing_secret, minio_pass, postgres_pass=postgres_pass, remote_host=remote_host)
             override_yml = _cloudtak_build_override_yml(settings)
             tmp_dir = tempfile.mkdtemp(prefix='cloudtak-remote-')
@@ -26941,7 +27059,7 @@ def run_cloudtak_deploy(cfg=None):
         # Step 2: Clone or update repo
         plog("")
         plog("━━━ Step 2/7: Cloning CloudTAK ━━━")
-        release_tag = _get_cloudtak_latest_release_tag(use_cache=False)
+        release_tag = _get_cloudtak_target_release_tag(use_cache=False)
         if os.path.exists(cloudtak_dir):
             # A real checkout needs a VALID repo, not merely a .git directory — a deleted or
             # interrupted CloudTAK can leave a HOLLOW .git (objects/ + info/ but no HEAD/config),
@@ -27013,7 +27131,7 @@ def run_cloudtak_deploy(cfg=None):
                     return
                 _cloudtak_git_prep(cloudtak_dir, plog)
         else:
-            release_tag = _get_cloudtak_latest_release_tag(use_cache=False)
+            release_tag = _get_cloudtak_target_release_tag(use_cache=False)
             tag_label = release_tag or 'main (latest release tag unavailable)'
             plog(f"  Cloning from GitHub (shallow, {tag_label})...")
             clone_timeout = 600  # 10 min — VPS→GitHub can be slow
@@ -27060,7 +27178,7 @@ def run_cloudtak_deploy(cfg=None):
         if not os.path.exists(compose_yml) and not os.path.exists(compose_yaml):
             plog("  docker-compose.yml missing — re-cloning...")
             subprocess.run(f'rm -rf {cloudtak_dir}', shell=True, capture_output=True, timeout=30)
-            _rclone_tag = release_tag if 'release_tag' in dir() else _get_cloudtak_latest_release_tag()
+            _rclone_tag = release_tag if 'release_tag' in dir() else _get_cloudtak_target_release_tag()
             _rclone_branch = f' --branch {_rclone_tag}' if _rclone_tag else ''
             r = subprocess.run(f'git clone --depth 1{_rclone_branch} https://github.com/dfpc-coe/CloudTAK.git {cloudtak_dir}', shell=True, capture_output=True, text=True, timeout=600)
             if r.returncode != 0:
@@ -27081,9 +27199,41 @@ def run_cloudtak_deploy(cfg=None):
         plog("━━━ Step 3/7: Configuring .env ━━━")
         env_path = os.path.join(cloudtak_dir, '.env')
         import secrets as _secrets
+
+        # v10.1.3+: Preserve the postgis password across redeploys. Source order:
+        # settings.json → the existing .env → generate (fresh install only). Postgres
+        # bakes POSTGRES_PASSWORD into pg_authid at first initdb and ignores it after,
+        # so writing a fresh password over a live volume = 'password authentication
+        # failed' on every API boot. The .env fallback covers pre-v10.1.3 installs and
+        # settings.json loss; _cloudtak_sync_postgis_password() after `up -d` converges
+        # any box that already carries a mismatch.
+        postgres_pass = settings.get('cloudtak_postgres_password', '')
+        postgres_pass = postgres_pass.strip() if isinstance(postgres_pass, str) else ''
+        if postgres_pass:
+            plog("  Reusing stored postgis password (settings)")
+        else:
+            try:
+                with open(env_path) as _ef:
+                    for _l in _ef:
+                        if _l.strip().startswith('POSTGRES_PASSWORD='):
+                            postgres_pass = _l.strip().split('=', 1)[1].strip()
+                            break
+            except Exception:
+                pass
+            if postgres_pass:
+                plog("  Reusing postgis password from existing .env")
+            else:
+                postgres_pass = _secrets.token_hex(24)
+                plog("  Generated new postgis password (fresh install)")
+            # Persist so future redeploys use the same password
+            settings['cloudtak_postgres_password'] = postgres_pass
+            try:
+                save_settings(settings)
+            except Exception as e:
+                plog(f"  ⚠ Could not persist postgres password to settings: {e}")
+
         signing_secret = _secrets.token_hex(32)
         minio_pass = _secrets.token_hex(16)
-        postgres_pass = _secrets.token_hex(24)
 
         env_content = _cloudtak_build_env_content(settings, domain, signing_secret, minio_pass, postgres_pass=postgres_pass)
         with open(env_path, 'w') as f:
@@ -27160,32 +27310,109 @@ def run_cloudtak_deploy(cfg=None):
         except Exception as _te:
             plog(f"  ⚠ tiles arm64 base patch skipped (non-fatal): {str(_te)[:100]}")
 
-        # Step 4: Build Docker images (stream output, 45 min timeout)
+        # Step 4: Build Docker images (stream output, 90 min timeout with retry + recovery)
         plog("")
         plog("━━━ Step 4/7: Building Docker Images ━━━")
-        plog("  This may take 5-10 minutes on first run...")
-        proc = subprocess.Popen(
-            _sudo_wrap(['docker', 'compose', 'build', '--no-cache']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=cloudtak_dir, bufsize=1
-        )
-        def _read_build():
-            for line in iter(proc.stdout.readline, ''):
-                line = line.rstrip()
-                if line:
-                    plog(f"  {line}")
-        reader = threading.Thread(target=_read_build, daemon=True)
-        reader.start()
+        plog("  This may take 10-45 minutes on first run (depends on VPS resources and network)")
+
+        # Pre-flight: check resources before attempting build
+        plog("  Checking system resources...")
         try:
-            proc.wait(timeout=2700)  # 45 min max
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            plog("✗ Docker build timed out after 45 minutes — try again or check server resources (RAM, disk)")
+            disk_result = subprocess.run(['df', '/'], capture_output=True, text=True, timeout=10)
+            for line in disk_result.stdout.strip().split('\n')[1:]:
+                parts = line.split()
+                if len(parts) >= 5:
+                    plog(f"    Disk: {parts[-2]} used, {parts[-1]} mounted at /")
+                    break
+            mem_result = subprocess.run(['free', '-h'], capture_output=True, text=True, timeout=10)
+            for line in mem_result.stdout.strip().split('\n'):
+                if line.startswith('Mem:'):
+                    plog(f"    Memory: {line.split()[1]} total")
+                    break
+        except Exception as e:
+            plog(f"    ⚠ Could not check resources: {e}")
+
+        # Build with retry logic (up to 2 attempts)
+        MAX_BUILD_ATTEMPTS = 2
+        BUILD_TIMEOUT = 5400  # 90 min (increased from 45 min to account for slow VPS/network)
+        RETRY_WAIT = 60  # 1 min between retries
+
+        build_success = False
+        for build_attempt in range(MAX_BUILD_ATTEMPTS):
+            if build_attempt > 0:
+                plog("")
+                plog(f"━━━ Step 4/7 (Retry {build_attempt}/{MAX_BUILD_ATTEMPTS - 1}): Building Docker Images ━━━")
+                plog(f"  Waiting {RETRY_WAIT}s before retry...")
+                time.sleep(RETRY_WAIT)
+                # Clean up docker state from failed attempt (preserve volumes)
+                plog("  Cleaning up from previous build attempt...")
+                try:
+                    subprocess.run(
+                        _sudo_wrap(['docker', 'compose', 'down', '--remove-orphans']),
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        timeout=120, cwd=cloudtak_dir
+                    )
+                    plog("  ✓ Cleaned up containers")
+                except Exception as cleanup_err:
+                    plog(f"  ⚠ Cleanup issue (continuing anyway): {str(cleanup_err)[:80]}")
+
+            plog(f"  Build attempt {build_attempt + 1}/{MAX_BUILD_ATTEMPTS}...")
+            proc = subprocess.Popen(
+                _sudo_wrap(['docker', 'compose', 'build', '--no-cache']),
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                cwd=cloudtak_dir, bufsize=1
+            )
+
+            def _read_build():
+                for line in iter(proc.stdout.readline, ''):
+                    line = line.rstrip()
+                    if line:
+                        plog(f"    {line}")
+
+            reader = threading.Thread(target=_read_build, daemon=True)
+            reader.start()
+
+            try:
+                proc.wait(timeout=BUILD_TIMEOUT)
+                reader.join(timeout=5)
+                if proc.returncode == 0:
+                    plog("✓ Images built successfully")
+                    build_success = True
+                    break
+                else:
+                    plog(f"⚠ Build failed with exit code {proc.returncode}")
+                    if build_attempt < MAX_BUILD_ATTEMPTS - 1:
+                        plog("  Will retry...")
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                reader.join(timeout=5)
+                plog(f"⚠ Build timed out after {BUILD_TIMEOUT // 60} minutes (attempt {build_attempt + 1}/{MAX_BUILD_ATTEMPTS})")
+                if build_attempt < MAX_BUILD_ATTEMPTS - 1:
+                    plog("  Retrying...")
+                else:
+                    plog("  All retries exhausted")
+
+        # Final failure handling
+        if not build_success:
+            plog("")
+            plog("✗ Docker build failed after all retry attempts")
+            plog("")
+            plog("RECOVERY STEPS:")
+            plog("1. Check system resources:")
+            plog("     df -h  # Ensure you have ≥20GB free disk")
+            plog("     free -h  # Ensure you have ≥8GB free RAM")
+            plog("2. Clean up docker state:")
+            plog(f"     cd {cloudtak_dir} && sudo docker compose down --remove-orphans")
+            plog("     sudo docker system prune -a --volumes  # WARNING: removes ALL unused images/volumes")
+            plog("3. Retry deploy from console, or manually:")
+            plog(f"     cd {cloudtak_dir} && sudo docker compose build --no-cache")
+            plog("4. If failure persists, you may need to re-clone CloudTAK:")
+            plog(f"     sudo rm -rf {cloudtak_dir}")
+            plog("     (then retry deploy from console)")
+            plog("")
             cloudtak_deploy_status.update({'running': False, 'error': True})
             return
-        reader.join(timeout=5)
-        if proc.returncode != 0:
-            plog(f"✗ Docker build failed")
-            cloudtak_deploy_status.update({'running': False, 'error': True})
-            return
+
         plog("✓ Images built")
 
         # Step 5: Start containers including media on remapped ports
@@ -27204,6 +27431,9 @@ def run_cloudtak_deploy(cfg=None):
             cloudtak_deploy_status.update({'running': False, 'error': True})
             return
         plog("✓ Containers started")
+        # Converge the postgis role password to .env — repairs any pre-existing
+        # mismatch (e.g. a past deploy that regenerated .env over a live volume).
+        _cloudtak_sync_postgis_password(cloudtak_dir, plog=plog)
         plog("✓ Restart complete.")
 
         # Open port 5000 (and 5002 for tiles) so http://ip:5000 works when no domain or before Caddy is used.
@@ -27510,6 +27740,8 @@ def run_cloudtak_redeploy(cfg=None):
             cloudtak_deploy_status.update({'running': False, 'error': True})
             return
         plog("✓ Containers restarted")
+        # Converge the postgis role password to .env (repairs latent mismatches).
+        _cloudtak_sync_postgis_password(cloudtak_dir, plog=plog)
         time.sleep(3)
         # Restore /api proxy to 127.0.0.1:5001 (Node in container) if a previous patch sent it to the host
         api_container = None
@@ -27558,6 +27790,82 @@ def run_cloudtak_redeploy(cfg=None):
         cloudtak_deploy_status['running'] = False
 
 
+def _cloudtak_sync_postgis_password(cloudtak_dir=None, plog=None, remote_cfg=None):
+    """Converge the postgis ROLE password onto the .env POSTGRES_PASSWORD value.
+
+    Postgres bakes POSTGRES_PASSWORD into pg_authid on the FIRST initdb of the data
+    volume and ignores the env var forever after. Any deploy that regenerated .env
+    over an existing volume left the two out of sync — latent until the next
+    container restart (e.g. an update rebuild), when the API dies with 'password
+    authentication failed for user "docker"' (test12/test6, 2026-07-13). Rather than
+    reconstruct how a box got here, make the DB match .env: unix-socket connections
+    inside the official postgres image are trust-authenticated, so ALTER USER works
+    regardless of the old password. Idempotent (no-op when already in sync);
+    best-effort, never raises. Returns True when verified in sync."""
+    _log = plog or (lambda m: None)
+    try:
+        if remote_cfg:
+            # One guarded pipeline on the remote box. Passwords are console-generated
+            # hex (or the legacy 'docker' literal) — no shell-quoting hazards.
+            script = (
+                "cd ~/CloudTAK 2>/dev/null && "
+                "PW=$(grep -E '^POSTGRES_PASSWORD=' .env 2>/dev/null | head -1 | cut -d= -f2-) && "
+                "CID=$(docker ps -q -f name=postgis | head -1) && "
+                "[ -n \"$PW\" ] && [ -n \"$CID\" ] || { echo SKIP; exit 0; }; "
+                "for i in 1 2 3 4 5 6; do docker exec \"$CID\" pg_isready -U docker -q 2>/dev/null && break; sleep 5; done; "
+                "if docker exec -e PGPASSWORD=\"$PW\" \"$CID\" psql -h 127.0.0.1 -U docker -d gis -tAc 'SELECT 1' >/dev/null 2>&1; then echo INSYNC; "
+                "elif docker exec \"$CID\" psql -U docker -d gis -c \"ALTER USER docker WITH PASSWORD '$PW'\" >/dev/null 2>&1; then echo SYNCED; "
+                "else echo FAILED; fi"
+            )
+            ok, out = _ssh_probe(remote_cfg, script, timeout=90)
+            verdict = (out or '').strip().splitlines()[-1] if (out or '').strip() else ''
+            if verdict == 'INSYNC':
+                _log("  ✓ postgis password verified in sync with .env")
+                return True
+            if verdict == 'SYNCED':
+                _log("  ✓ postgis role password converged to .env value (was out of sync)")
+                return True
+            _log(f"  ⚠ postgis password sync inconclusive ({verdict or 'no output'})")
+            return False
+        cloudtak_dir = cloudtak_dir or os.path.expanduser('~/CloudTAK')
+        pw = ''
+        with open(os.path.join(cloudtak_dir, '.env')) as f:
+            for line in f:
+                if line.strip().startswith('POSTGRES_PASSWORD='):
+                    pw = line.strip().split('=', 1)[1].strip()
+                    break
+        if not pw or "'" in pw:
+            return False
+        r = subprocess.run(_sudo_wrap(['docker', 'ps', '-q', '-f', 'name=postgis']),
+                           capture_output=True, text=True, timeout=10)
+        cid = (r.stdout or '').strip().splitlines()[0].strip() if (r.stdout or '').strip() else ''
+        if not cid:
+            return False
+        for _ in range(6):  # postgis can take a moment to accept connections after up -d
+            rdy = subprocess.run(_sudo_wrap(['docker', 'exec', cid, 'pg_isready', '-U', 'docker', '-q']),
+                                 capture_output=True, timeout=15)
+            if rdy.returncode == 0:
+                break
+            time.sleep(5)
+        t = subprocess.run(_sudo_wrap(['docker', 'exec', '-e', f'PGPASSWORD={pw}', cid,
+                                       'psql', '-h', '127.0.0.1', '-U', 'docker', '-d', 'gis', '-tAc', 'SELECT 1']),
+                           capture_output=True, text=True, timeout=20)
+        if t.returncode == 0:
+            _log("  ✓ postgis password verified in sync with .env")
+            return True
+        a = subprocess.run(_sudo_wrap(['docker', 'exec', cid, 'psql', '-U', 'docker', '-d', 'gis',
+                                       '-c', f"ALTER USER docker WITH PASSWORD '{pw}'"]),
+                           capture_output=True, text=True, timeout=20)
+        if a.returncode == 0:
+            _log("  ✓ postgis role password converged to .env value (was out of sync)")
+            return True
+        _log(f"  ⚠ postgis password sync failed: {(a.stderr or t.stderr or '').strip()[:160]}")
+        return False
+    except Exception as e:
+        _log(f"  ⚠ postgis password sync errored (non-fatal): {e}")
+        return False
+
+
 def run_cloudtak_update():
     """Fetch latest stable release tag, checkout, rebuild images, restart. Preserves DB and config."""
     def plog(msg):
@@ -27571,12 +27879,14 @@ def run_cloudtak_update():
         remote_cfg = cfg.get('remote', {}) if is_remote else {}
         remote_host = (remote_cfg.get('host') or '').strip() if is_remote else ''
 
-        plog("━━━ Step 1/3: Fetching latest stable release ━━━")
-        release_tag = _get_cloudtak_latest_release_tag(use_cache=False)
-        if not release_tag:
-            plog("  ⚠ Could not fetch release tag from GitHub (rate limit or network) — will pull latest HEAD instead")
-        else:
-            plog(f"  Target: {release_tag}")
+        plog("━━━ Step 1/3: Resolving target release ━━━")
+        # Channel model (same as Authentik): main installs ONLY the vetted pin —
+        # never raw upstream latest, which can be past the pin (e.g. 13.45+ breaks
+        # plugin compatibility). Dev installs upstream latest so new releases get
+        # tested before the pin is bumped.
+        _channel = (settings.get('update_channel') or 'main').strip().lower()
+        release_tag = _get_cloudtak_target_release_tag(settings, use_cache=False)
+        plog(f"  Target: {release_tag} ({'dev channel — upstream latest' if _channel == 'dev' else 'main channel — fleet-vetted pin'})")
 
         plog("")
         plog("━━━ Step 2/3: Checking out stable release ━━━")
@@ -27721,8 +28031,9 @@ def run_cloudtak_update():
                 plog("✗ Neither `docker compose` nor `docker-compose` is available on the remote host")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
+            # v10.1.3+: Increase timeout to 90 min (was 45 min) for slow VPS networks
             build_cmd = f"cd ~/CloudTAK && {dcc} build --no-cache && {dcc} up -d"
-            ok, out = _ssh_probe(remote_cfg, build_cmd, timeout=2700)
+            ok, out = _ssh_probe(remote_cfg, build_cmd, timeout=5400)
             if not ok:
                 plog(f"✗ Build/restart failed on remote: {(out or '')[:600]}")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
@@ -27734,18 +28045,41 @@ def run_cloudtak_update():
                 plog("✗ Neither `docker compose` nor `docker-compose` is available")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
-            # Detected compose binary only — no fallback chain that would mask the real
-            # build error with a bogus 'docker-compose: not found'. Surface the tail of
-            # the combined output so an actual build failure is diagnosable.
-            r = subprocess.run(
-                f'{dcc} build --no-cache && {dcc} up -d 2>&1',
-                shell=True, capture_output=True, text=True, timeout=2700, cwd=cloudtak_dir)
-            if r.returncode != 0:
-                _tail = '\n'.join((r.stdout or r.stderr or 'unknown').strip().splitlines()[-20:])
-                plog(f"✗ Build/restart failed (via `{dcc}`):\n{_tail}")
+            # v10.1.3+: Use streaming output to avoid broker timeout on large builds.
+            # capture_output=True with timeout=2700 causes broker to timeout at 10min.
+            # Stream output instead (same as deploy function).
+            plog("  Streaming build output...")
+            proc = subprocess.Popen(
+                f'{dcc} build --no-cache && {dcc} up -d',
+                shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, cwd=cloudtak_dir, bufsize=1
+            )
+            def _read_update_output():
+                for line in iter(proc.stdout.readline, ''):
+                    line = line.rstrip()
+                    if line:
+                        plog(f"  {line}")
+            reader = threading.Thread(target=_read_update_output, daemon=True)
+            reader.start()
+            try:
+                proc.wait(timeout=5400)  # 90 min (same as deploy)
+                reader.join(timeout=5)
+                if proc.returncode != 0:
+                    plog(f"✗ Build/restart failed with exit code {proc.returncode}")
+                    cloudtak_deploy_status.update({'running': False, 'error': True})
+                    return
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                reader.join(timeout=5)
+                plog("✗ Build timed out after 90 minutes")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
         plog("✓ Containers rebuilt and restarted")
+        # Converge the postgis role password to .env BEFORE declaring success — the
+        # rebuild restarts the API, which is exactly when a latent password mismatch
+        # (from any past .env regeneration over the live volume) surfaces as
+        # 'password authentication failed for user "docker"' (test12/test6 2026-07-13).
+        _cloudtak_sync_postgis_password(plog=plog, remote_cfg=(remote_cfg if is_remote else None))
         # v0.9.48 (Part B+C/D): the rebuild recreated cloudtak-media from the image
         # default — re-apply the self-heal (HLS config + ephemeral-aware reaper).
         _cloudtak_media_hls_heal(plog=plog, remote_cfg=(remote_cfg if is_remote else None), wait=True)
@@ -37650,7 +37984,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 .card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:20px}
 .card-title{font-size:13px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:16px}
 .info-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-.info-item{background:#0a0e1a;border-radius:8px;padding:12px 14px}
+.info-item{background:var(--bg-deep);border-radius:8px;padding:12px 14px}
 .info-label{font-size:11px;color:var(--text-dim);margin-bottom:3px;text-transform:uppercase}
 .info-value{font-size:13px;font-family:'JetBrains Mono',monospace;word-break:break-all}
 .btn{display:inline-flex;align-items:center;gap:8px;padding:10px 20px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:none;transition:all .2s}
@@ -37659,11 +37993,11 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 .control-btn:hover{border-color:var(--border-hover);color:var(--text-primary)}
 .control-btn:disabled{opacity:.5;cursor:default}
 .form-label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px}
-.form-input{width:100%;max-width:400px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px;color:var(--text-primary);font-size:13px;outline:none;transition:border-color .2s}
+.form-input{width:100%;max-width:400px;background:var(--bg-deep);border:1px solid var(--border);border-radius:8px;padding:10px 14px;color:var(--text-primary);font-size:13px;outline:none;transition:border-color .2s}
 .form-input:focus{border-color:var(--accent)}
-.log-box{background:#070a12;border:1px solid var(--border);border-radius:8px;padding:16px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:260px;overflow-y:auto;white-space:pre-wrap;margin-top:14px}
+.log-box{background:#070a12;border:1px solid var(--border);border-radius:8px;padding:16px;font-family:'JetBrains Mono',monospace;font-size:11px;color:#94a3b8;max-height:260px;overflow-y:auto;white-space:pre-wrap;margin-top:14px}
 .intent-tiles{display:grid;grid-template-columns:1fr 1fr;gap:14px}
-.intent-tile{background:#0a0e1a;border:2px solid var(--border);border-radius:12px;padding:20px;cursor:pointer;transition:all .15s;text-align:left;color:var(--text-primary);font-family:inherit}
+.intent-tile{background:var(--bg-deep);border:2px solid var(--border);border-radius:12px;padding:20px;cursor:pointer;transition:all .15s;text-align:left;color:var(--text-primary);font-family:inherit}
 .intent-tile:hover{border-color:var(--border-hover)}
 .intent-tile.selected{border-color:var(--cyan);background:rgba(6,182,212,.06)}
 .intent-tile .t-emoji{font-size:26px}.intent-tile .t-title{font-size:14px;font-weight:700;margin:8px 0 4px;color:var(--text-primary)}
@@ -37679,7 +38013,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 .hops .cgnat{color:var(--cyan);font-weight:700}.hops .private{color:var(--yellow)}.hops .public{color:var(--green)}
 @keyframes spin{to{transform:rotate(360deg)}}
 .spinner{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.2);border-top-color:#fff;border-radius:50%;animation:spin .8s linear infinite}
-.seg{display:inline-flex;background:#0a0e1a;border:1px solid var(--border);border-radius:9px;padding:3px;gap:3px;margin-bottom:20px}
+.seg{display:inline-flex;background:var(--bg-deep);border:1px solid var(--border);border-radius:9px;padding:3px;gap:3px;margin-bottom:20px}
 .seg-btn{padding:7px 20px;border:none;background:none;color:var(--text-dim);font-size:12px;font-weight:600;cursor:pointer;border-radius:6px;font-family:inherit;transition:all .15s}
 .seg-btn:hover{color:var(--text-secondary)}
 .seg-btn.active{background:var(--accent);color:#fff}
@@ -37783,7 +38117,7 @@ textarea.form-input{resize:vertical}
     <input class="form-input" id="anchor-ssh-user" value="ubuntu" style="margin-bottom:18px;max-width:200px">
     <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
       <button class="btn btn-primary" id="anchor-provision-btn" onclick="provisionAnchor()">Set Up Relay</button>
-      <span style="font-size:11px;color:var(--text-dim)">port <input id="anchor-port" value="51820" style="width:64px;background:#0a0e1a;border:1px solid var(--border);border-radius:6px;padding:5px 8px;color:var(--text-primary);font-size:12px;font-family:'JetBrains Mono',monospace"> · 51820 = carrier-safe default; 443 for restrictive venue firewalls (anchor serves both)</span>
+      <span style="font-size:11px;color:var(--text-dim)">port <input id="anchor-port" value="51820" style="width:64px;background:var(--bg-deep);border:1px solid var(--border);border-radius:6px;padding:5px 8px;color:var(--text-primary);font-size:12px;font-family:'JetBrains Mono',monospace"> · 51820 = carrier-safe default; 443 for restrictive venue firewalls (anchor serves both)</span>
     </div>
     <div class="log-box" id="anchor-provision-log" style="display:none"></div>
     </div>
@@ -38129,7 +38463,7 @@ function renderVerify(res){
     const green = v.state === 'green';
     const dotColor = green ? 'var(--green)' : (v.state === 'unverified' ? 'var(--yellow)' : (v.required ? 'var(--red)' : 'var(--yellow)'));
     let detail = green ? ('connected' + (v.ms != null ? ' · ' + v.ms + ' ms' : '')) : (v.hint || v.detail || 'no route');
-    rows.push('<div style="display:flex;align-items:center;gap:12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px">'
+    rows.push('<div style="display:flex;align-items:center;gap:12px;background:var(--bg-deep);border:1px solid var(--border);border-radius:8px;padding:10px 14px">'
       + '<span class="dot" style="background:' + dotColor + ';flex-shrink:0"></span>'
       + '<span style="font-family:\\'JetBrains Mono\\',monospace;font-size:13px;min-width:52px">' + esc(p) + '</span>'
       + '<span style="font-size:12px;color:var(--text-secondary);flex:1">' + esc(v.label || '') + (v.required ? '' : ' <span style="color:var(--text-dim)">(optional)</span>') + '</span>'
@@ -38267,7 +38601,7 @@ async function refreshWifiSaved(){
               : (inRange
                   ? '<span style="color:var(--green);font-size:11px;display:inline-flex;align-items:center;gap:3px"><span class="dot" style="background:var(--green);width:6px;height:6px"></span>in range</span>'
                   : '<span style="color:var(--text-dim);font-size:11px">not in range</span>'));
-        return '<div style="display:flex;align-items:center;gap:10px;padding:9px 12px;background:#0a0e1a;border:1px solid ' + (isCur ? 'rgba(16,185,129,.3)' : 'var(--border)') + ';border-radius:8px;margin-bottom:6px">'
+        return '<div style="display:flex;align-items:center;gap:10px;padding:9px 12px;background:var(--bg-deep);border:1px solid ' + (isCur ? 'rgba(16,185,129,.3)' : 'var(--border)') + ';border-radius:8px;margin-bottom:6px">'
           + '<span class="dot" style="background:' + (isCur ? 'var(--green)' : (inRange ? 'var(--green)' : 'var(--text-dim)')) + ';flex-shrink:0"></span>'
           + '<span style="flex:1;min-width:0;color:' + (isCur ? 'var(--green)' : 'var(--text-primary)') + ';font-size:13px;overflow:hidden;text-overflow:ellipsis">' + esc(s) + ' ' + badge + '</span>'
           + (isCur ? '' : '<button type="button" onclick="useWifi(' + j + ')"' + (inRange ? '' : ' disabled') + ' title="' + (inRange ? 'Switch the box to this network now' : 'Not in range right now') + '" style="background:rgba(59,130,246,' + (inRange ? '.12' : '.04') + ');color:var(--accent);border:1px solid rgba(59,130,246,' + (inRange ? '.3' : '.12') + ');border-radius:6px;padding:4px 12px;font-size:12px;cursor:' + (inRange ? 'pointer' : 'default') + ';opacity:' + (inRange ? '1' : '.45') + '">Use</button>')
@@ -38294,7 +38628,7 @@ async function loadReach(){
       const here = x.current ? '<span style="color:var(--green);font-size:11px;margin-left:8px">← you are here</span>' : '';
       const hint = (isWifi && !x.current) ? '<div style="font-size:11px;color:var(--text-dim);margin-top:3px">↳ use this after you unplug Ethernet</div>' : '';
       const jurl = JSON.stringify(x.url).replace(/"/g,'&quot;');
-      return '<div style="padding:10px 12px;background:#0a0e1a;border:1px solid ' + (x.current ? 'rgba(16,185,129,.3)' : 'var(--border)') + ';border-radius:8px;margin-bottom:6px">'
+      return '<div style="padding:10px 12px;background:var(--bg-deep);border:1px solid ' + (x.current ? 'rgba(16,185,129,.3)' : 'var(--border)') + ';border-radius:8px;margin-bottom:6px">'
         + '<div style="display:flex;align-items:center;gap:10px">'
         + '<span class="dot" style="background:' + (isWifi ? 'var(--accent)' : 'var(--green)') + ';flex-shrink:0"></span>'
         + '<span style="flex:1;min-width:0;color:var(--text-primary);font-size:13px">' + label + '<span style="color:var(--text-dim);font-family:monospace;margin-left:8px">' + esc(x.ip) + '</span>' + here + '</span>'
@@ -39565,7 +39899,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 {{ sidebar_html }}
 <div class="main">
   <div class="page-header">
-    <h1><img src="{{ cloudtak_icon }}" alt="" style="height:28px;vertical-align:middle;margin-right:8px">CloudTAK{% if cloudtak_version %} <span style="font-weight:500;color:var(--text-dim);font-size:16px">· v{{ cloudtak_version }}</span>{% endif %}{% if cloudtak_update_available %} <span style="font-size:12px;color:var(--cyan);font-weight:600;margin-left:8px">v{{ cloudtak_latest }} available</span>{% endif %}</h1>
+    <h1><img src="{{ cloudtak_icon }}" alt="" style="height:28px;vertical-align:middle;margin-right:8px">CloudTAK{% if cloudtak_version_info and cloudtak_version_info.version %} <span class="os-badge" style="margin-left:6px;font-weight:500;font-size:14px">v{{ cloudtak_version_info.version }}</span>{% if cloudtak_version_info.channel == 'dev' %} · <span style="color:#f59e0b;font-size:11px" title="Main/vetted channel is pinned to v{{ cloudtak_version_info.vetted_release }} — what production customers run">main: v{{ cloudtak_version_info.vetted_release }}</span>{% if cloudtak_version_info.update_available and cloudtak_version_info.latest %} · <span style="color:var(--cyan);font-size:12px" title="Update available — click Update to install v{{ cloudtak_version_info.latest }}">v{{ cloudtak_version_info.latest }} available</span>{% elif cloudtak_version_info.upstream_newer %} · <span style="color:var(--cyan);font-size:11px" title="Upstream CloudTAK v{{ cloudtak_version_info.upstream_latest }} is newer than the vetted pin. v13.45+ requires plugin migration for the hub/api split — bump CLOUDTAK_VETTED_RELEASE only after plugins are validated. Not auto-installed.">↑ v{{ cloudtak_version_info.upstream_latest }} available upstream</span>{% endif %}{% else %}{% if cloudtak_version_info.update_available and cloudtak_version_info.latest %} · <span style="color:var(--cyan);font-size:12px" title="Update available — click Update to install v{{ cloudtak_version_info.latest }}">v{{ cloudtak_version_info.latest }} available</span>{% else %} · <span style="color:var(--green);font-size:11px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% endif %}{% endif %}</h1>
     <p>Browser-based TAK client — in-browser map and situational awareness via TAK Server</p>
   </div>
 
@@ -49483,6 +49817,43 @@ def _start_ldap_sa_bind_watchdog():
         name='ldap-sa-bind-watchdog'
     )
     _t.start()
+
+
+_takportal_mapsync_watchdog_started = False
+
+
+def _takportal_mapsync_watchdog_loop():
+    """v10.1.x (PLAN-v10.1.4 item 4). Daemon: every 10 min, re-assert the TAK Portal
+    map bridge (`admin` cert) TAK-channel membership via _takportal_sync_map_channels().
+    This is what picks up channels created later in the portal with no operator action,
+    and heals a UAF admin entry reset to __ANON__ by a TAK redeploy — within one tick.
+    Idempotent (no UAF write / no portal restart when membership already matches; never
+    shrinks on a failed/empty Marti fetch). Override: takportal_mapsync_disabled=true."""
+    import time as _wt
+    _wt.sleep(150)  # let startup migrations + first cert sync settle
+    _ok_interval = 6  # ~1h between liveness lines
+    _ok_counter = 0
+    while True:
+        try:
+            if not load_settings().get('takportal_mapsync_disabled'):
+                _takportal_sync_map_channels()
+            _ok_counter += 1
+            if _ok_counter % _ok_interval == 0:
+                print("[takportal-map-sync] watchdog alive", flush=True)
+        except Exception as _e:
+            print(f"[takportal-map-sync] watchdog error (non-fatal): {_e}", flush=True)
+        _wt.sleep(600)
+
+
+def _start_takportal_mapsync_watchdog():
+    """Start the TAK Portal map-channel self-heal daemon (idempotent, once per process)."""
+    global _takportal_mapsync_watchdog_started
+    if _takportal_mapsync_watchdog_started:
+        return
+    _takportal_mapsync_watchdog_started = True
+    import threading as _thr
+    _thr.Thread(target=_takportal_mapsync_watchdog_loop, daemon=True,
+                name='takportal-mapsync-watchdog').start()
 
 
 # ---------------------------------------------------------------------------
@@ -62677,6 +63048,175 @@ def takserver_federation_firewall():
         return jsonify({'success': False, 'error': str(e)[:200]}), 500
 
 
+def _tak_admin_marti_get(url, timeout=12):
+    """GET a TAK Marti/user-management REST endpoint with the admin client cert.
+    Returns (parsed_json, None) on success or (None, error_str). Reuses the legacy-
+    PKCS12 extraction the cert workflows use: TAK emits RC2-40-CBC that OpenSSL 3
+    rejects without -legacy, and admin.p12 is 0600 tak:tak so it is cat'd via the
+    broker (raw openssl as takwerx -> empty PEM). REST is DB-agnostic — works whether
+    TAK's Postgres is local or remote (CORAZ's is Azure PG), unlike a direct DB query."""
+    import json as _json
+    cert_dir = '/opt/tak/certs/files'
+    admin_p12 = os.path.join(cert_dir, 'admin.p12')
+    if not os.path.exists(admin_p12):
+        for name in ('webadmin.p12', 'admin.p12'):
+            p = os.path.join(cert_dir, name)
+            if os.path.exists(p):
+                admin_p12 = p
+                break
+    if not os.path.exists(admin_p12):
+        return None, 'admin.p12 not found'
+    cert_pass = _get_tak_cert_password(load_settings())
+    _tmp_src = _pem = _key = None
+    try:
+        _cat = subprocess.run(_sudo_wrap(['cat', admin_p12]), capture_output=True, timeout=10)
+        if _cat.returncode != 0 or not _cat.stdout:
+            return None, 'admin.p12 unreadable via broker'
+        _fd, _tmp_src = tempfile.mkstemp(suffix='.p12', prefix='tak-marti-src-')
+        with os.fdopen(_fd, 'wb') as _f:
+            _f.write(_cat.stdout)
+        _fdp, _pem = tempfile.mkstemp(suffix='.pem', prefix='tak-marti-cert-')
+        os.close(_fdp)
+        _fdk, _key = tempfile.mkstemp(suffix='.key', prefix='tak-marti-key-')
+        os.close(_fdk)
+        subprocess.run(
+            f'openssl pkcs12 -in {shlex.quote(_tmp_src)} -passin pass:{shlex.quote(cert_pass)} -clcerts -nokeys -legacy 2>/dev/null > {shlex.quote(_pem)}',
+            shell=True, capture_output=True, text=True, timeout=10)
+        subprocess.run(
+            f'openssl pkcs12 -in {shlex.quote(_tmp_src)} -passin pass:{shlex.quote(cert_pass)} -nocerts -nodes -legacy 2>/dev/null > {shlex.quote(_key)}',
+            shell=True, capture_output=True, text=True, timeout=10)
+        if not os.path.exists(_pem) or os.path.getsize(_pem) == 0:
+            return None, 'PEM extraction failed'
+        r = subprocess.run(['curl', '-sk', '--max-time', '8', '--cert', _pem, '--key', _key, url],
+                           capture_output=True, text=True, timeout=timeout)
+        body = (r.stdout or '').strip()
+        if r.returncode != 0 or not body:
+            return None, f'curl_exit_{r.returncode}'
+        try:
+            return _json.loads(body), None
+        except _json.JSONDecodeError:
+            return None, 'invalid_json'
+    except Exception as e:
+        return None, str(e)[:120]
+    finally:
+        for _p in (_tmp_src, _pem, _key):
+            if _p:
+                try:
+                    os.remove(_p)
+                except OSError:
+                    pass
+
+
+# TAK's UserAuthenticationFile.xml uses this default namespace; every element tag
+# comes back from ElementTree namespaced ({ns}User, {ns}groupList).
+_TAK_UAF_NS = 'http://bbn.com/marti/xml/bindings'
+
+# Split-box park message is logged once per process (see item 6 in the sync below).
+_mapsync_splitbox_logged = False
+
+
+def _takportal_sync_map_channels(plog=None):
+    """Keep the TAK Portal map bridge user (the `admin` cert) enrolled in EVERY TAK
+    channel, so the portal /map's single server-side CoT bridge receives all feeds on
+    every box — not just where CoreConfig <File/> (no location) accidentally disables
+    file-auth group caps. Where TAK honors UserAuthenticationFile.xml (the <File
+    location=...> form newer installers write), admin is pinned to __ANON__ and the map
+    is connected-but-empty (CORAZ prod: 0/0 visible). See PLAN-v10.1.4.
+
+    Deterministic + fleet-uniform: target membership = the box's LIVE Marti channel
+    list (no operator knob, no max(cur,target)). NEVER shrinks on a failed/empty fetch.
+    Idempotent: rewrites the UAF and restarts tak-portal ONLY when the set actually
+    changes. No-ops cleanly when portal / TAK / UAF / admin-entry are absent. The UAF is
+    edited with ElementTree via the broker (never regex — malformed XML crashes TAK's
+    FileAuthenticator); nodered/webadmin entries and admin's fingerprint/role are left
+    untouched, and CoreConfig auth wiring is not touched at all."""
+    def _log(m):
+        if plog:
+            plog(m)
+        else:
+            print(f"[takportal-map-sync] {m}", flush=True)
+    # Split-box (TAK on Server One): the UAF lives on the remote box, not here. Remote
+    # UAF read/write + Marti + portal restart is >20 lines — parked (PLAN-v10.1.4 item 6).
+    # Log ONCE per process (not every 10-min watchdog tick), never silently "succeed".
+    try:
+        if _get_tak_deployment_config(load_settings()).get('mode') == 'two_server':
+            global _mapsync_splitbox_logged
+            if not _mapsync_splitbox_logged:
+                _mapsync_splitbox_logged = True
+                _log("split-box (TAK on Server One): map-channel sync not supported yet — UAF is on the remote box; parked")
+            return
+    except Exception:
+        pass
+    uaf = '/opt/tak/UserAuthenticationFile.xml'
+    if not os.path.exists(uaf):
+        return
+    # Portal must be installed (container present, running or not) — else nothing to sync for.
+    if _priv_pipe(['docker', 'ps', '-a', '--format', '{{.Names}}'], ['grep', '-q', 'tak-portal']).returncode != 0:
+        return
+    # 1. Live channel list from Marti (REST; DB-agnostic).
+    data, err = _tak_admin_marti_get('https://127.0.0.1:8443/Marti/api/groups/all')
+    if data is None:
+        _log(f"Marti group fetch failed ({err}) — skipping, membership left as-is (never-shrink)")
+        return
+    items = data.get('data', data) if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        _log("Marti group response malformed — skipping (never-shrink)")
+        return
+    names = set()
+    for g in items:
+        n = ((g.get('name') if isinstance(g, dict) else str(g)) or '').strip()
+        if n and n != 'ROLE_ADMIN':
+            names.add(n)
+    target = set(names)
+    target.add('__ANON__')
+    # Never-shrink-on-error: TAK down / no real channels returned -> do not write.
+    if not (target - {'__ANON__'}):
+        _log("Marti returned no non-system channels — skipping (never-shrink)")
+        return
+    # 2. Parse the UAF and converge every admin entry's <groupList> to the target set.
+    try:
+        content = _read_priv(uaf)
+    except Exception:
+        content = ''
+    if not content or 'identifier="admin"' not in content:
+        return
+    import xml.etree.ElementTree as ET
+    ET.register_namespace('', _TAK_UAF_NS)  # emit unprefixed tags + xmlns default, matching the source
+    try:
+        root = ET.fromstring(content)
+    except Exception as e:
+        _log(f"UAF parse failed ({str(e)[:80]}) — skipping (never write malformed XML)")
+        return
+    ns = '{%s}' % _TAK_UAF_NS
+    admin_els = [u for u in root.iter()
+                 if u.tag in (ns + 'User', 'User') and u.get('identifier') == 'admin']
+    if not admin_els:
+        return
+    changed = False
+    old_count = 0
+    for admin_el in admin_els:
+        # Only plain <groupList> (bidirectional). Leave <groupListIN>/<groupListOUT> (nodered) alone.
+        existing = [c for c in list(admin_el) if c.tag in (ns + 'groupList', 'groupList')]
+        current = set((c.text or '').strip() for c in existing if (c.text or '').strip())
+        old_count = max(old_count, len(current))
+        if current == target:
+            continue
+        for c in existing:
+            admin_el.remove(c)
+        for name in sorted(target):
+            ET.SubElement(admin_el, ns + 'groupList').text = name
+        changed = True
+    if not changed:
+        _log(f"admin bridge already in {len(target)} channels — no change, no restart")
+        return
+    import io as _io
+    _buf = _io.StringIO()
+    ET.ElementTree(root).write(_buf, xml_declaration=True, encoding='unicode')
+    _write_priv(uaf, _buf.getvalue())
+    _log(f"admin bridge channel membership {old_count} -> {len(target)}; restarting tak-portal")
+    subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']), capture_output=True, text=True, timeout=90)
+
+
 def _takportal_sync_certs(plog=None, restart=False):
     """Refresh BOTH TAK Portal cert artifacts from the CURRENT TAK Server certs:
       - data/certs/tak-client.p12  (admin.p12 re-encoded to a modern PKCS12 — TAK
@@ -62805,6 +63345,15 @@ def _takportal_sync_certs(plog=None, restart=False):
         _log("  ⚠ no CA cert files found in /opt/tak/certs/files/ — CA not refreshed")
     if restart and (ok_client or ok_ca):
         subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']), capture_output=True, text=True, timeout=30)
+        # v10.1.x (PLAN-v10.1.4 item 5): a restart-intent cert resync can follow a TAK
+        # redeploy that regenerated UserAuthenticationFile.xml (admin reset to __ANON__).
+        # Re-assert the map bridge's channel membership so /map isn't empty until the
+        # 10-min watchdog tick. (Deploy path calls with restart=False -> item 2 handles
+        # it explicitly -> no double-fire here.)
+        try:
+            _takportal_sync_map_channels(plog=plog)
+        except Exception as _mce:
+            _log(f"  ⚠ Map-channel sync (non-fatal): {_mce}")
     if ok_client and ok_ca:
         return (True, 'TAK Portal client cert + CA refreshed and portal restarted')
     if ok_ca and not ok_client:
@@ -63003,6 +63552,48 @@ def api_host_resource_usage():
     return jsonify(_top_processes_local())
 
 
+# GH #53: the banner used to hardcode "patch now to fix CVE-2026-31431 (Copy Fail)"
+# for ANY pending kernel update, forever — a false exposure claim on every box already
+# running a fixed kernel (and on RHEL, where the fixed build was never tracked at all).
+# A CVE is only named while the RUNNING kernel is older than the version that fixed it
+# on a distro we have a table entry for; everything else gets the generic banner. New
+# one-time CVE pushes add a table row here and auto-expire once the fleet patches past.
+_KERNEL_CVE_FIXES = {
+    'CVE-2026-31431 (Copy Fail)': {
+        # distro codename (VERSION_CODENAME in /etc/os-release) -> first fixed kernel
+        'jammy': (5, 15, 0, 179),
+    },
+}
+
+
+def _running_kernel_tuple(release):
+    """'5.15.0-179-generic' or '5.14.0-503.14.1.el9_5' -> (5,15,0,179); None if unparseable."""
+    m = re.match(r'^(\d+)\.(\d+)\.(\d+)-(\d+)', release or '')
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def _kernel_cve_banner(running_kernel):
+    """CVE label the RUNNING kernel is still exposed to, or None. Unknown distro or
+    unparseable kernel -> None: never claim an exposure we can't verify."""
+    codename = ''
+    try:
+        with open('/etc/os-release') as f:
+            for line in f:
+                if line.startswith('VERSION_CODENAME='):
+                    codename = line.split('=', 1)[1].strip().strip('"')
+                    break
+    except Exception:
+        pass
+    running = _running_kernel_tuple(running_kernel)
+    if not codename or not running:
+        return None
+    for cve, fixed_by in _KERNEL_CVE_FIXES.items():
+        fixed = fixed_by.get(codename)
+        if fixed and running < fixed:
+            return cve
+    return None
+
+
 _kernel_patch_cache = {'ts': 0, 'data': None}
 
 @app.route('/api/system/kernel-patch-status')
@@ -63046,6 +63637,9 @@ def kernel_patch_status_api():
         'running_kernel': running_kernel,
         'upgradable': upgradable_count > 0,
         'patched': upgradable_count == 0,
+        # Named only while the running kernel predates the fix (GH #53) — the
+        # banner text for a routine point-release must not claim CVE exposure.
+        'cve_banner': _kernel_cve_banner(running_kernel) if upgradable_count > 0 else None,
     }
     _kernel_patch_cache.update({'ts': now, 'data': data})
     return jsonify(data)
@@ -64475,7 +65069,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 <div id="kernel-patch-banner" style="display:none;background:linear-gradient(135deg,rgba(234,179,8,0.1),rgba(234,179,8,0.05));border:1px solid rgba(234,179,8,0.3);border-radius:12px;padding:14px 20px;margin-bottom:16px;font-family:'JetBrains Mono',monospace">
 <div id="kpatch-idle" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
-<div><div style="font-size:13px;font-weight:600;color:var(--yellow)">&#9888; Kernel update available &mdash; patch now to fix CVE-2026-31431 (Copy Fail)</div>
+<div><div style="font-size:13px;font-weight:600;color:var(--yellow)">&#9888; Kernel update available &mdash; patch now<span id="kpatch-cve"></span></div>
 <div style="font-size:11px;color:var(--text-dim);margin-top:4px">Runs <code style="background:rgba(255,255,255,.05);padding:1px 6px;border-radius:3px">{% if (settings.get('pkg_mgr','apt') or 'apt')|lower == 'dnf' %}dnf upgrade{% else %}apt-get full-upgrade{% endif %}</code> in a detached background process &mdash; safe over SSH, survives session drops. Reboot is a separate explicit click.</div></div>
 <div style="display:flex;gap:8px">
 <button onclick="startKernelPatch()" style="padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Patch now</button>
@@ -64594,7 +65188,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% if not mod.get('icon_url') or key in ('takportal', 'fedhub', 'emailrelay', 'fail2ban', 'webodm', 'tak_video_restreamer', 'netbird', 'connectivity') %}<div class="module-name">{{ mod.name }}</div>{% endif %}
 </div>
 {% if key != 'tak_video_restreamer' %}<div class="module-desc">{{ mod.description }}</div>{% endif %}
-{% if module_versions.get(key) %}{% set v = module_versions.get(key) %}{% if v.version or v.update_available %}<div class="meta-line module-version-line" id="module-version-{{ key }}" style="margin-bottom:4px">{% if v.version %}{% if key in ('mediamtx', 'tak_video_restreamer', 'remote_assist') %}{{ v.version }}{% else %}v{{ v.version }}{% endif %}{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% elif key == 'authentik' and v.get('channel') == 'dev' %} <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v{{ v.get('vetted_release','') }}">· main: v{{ v.get('vetted_release','') }}</span>{% elif key == 'authentik' and v.get('ahead_of_vetted') %} <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v{{ v.get('vetted_release','') }}) — not yet validated on main channel">! unvetted</span>{% elif key == 'authentik' and not v.update_available and v.get('vetted_release') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% elif key == 'netbird' and v.get('channel') == 'dev' %} <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v{{ v.get('vetted','') }}">· main: v{{ v.get('vetted','') }}</span>{% if v.get('upstream_newer') and v.get('upstream_latest') %} <span style="color:#f59e0b;font-size:10px" title="netbirdio shipped v{{ v.get('upstream_latest') }}, newer than the vetted pin — try on dev, promote to main if it passes">· ↑ v{{ v.get('upstream_latest') }} upstream</span>{% endif %}{% elif key == 'netbird' and v.get('vetted') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}</div>{% endif %}{% endif %}
+{% if module_versions.get(key) %}{% set v = module_versions.get(key) %}{% if v.version or v.update_available %}<div class="meta-line module-version-line" id="module-version-{{ key }}" style="margin-bottom:4px">{% if v.version %}{% if key in ('mediamtx', 'tak_video_restreamer', 'remote_assist') %}{{ v.version }}{% else %}v{{ v.version }}{% endif %}{% endif %}{% if key == 'authentik' %}{% if v.get('channel') == 'dev' %} <span style="color:#f59e0b;font-size:10px" title="Main/vetted channel is pinned at v{{ v.get('vetted_release','') }} — what production customers run">· main: v{{ v.get('vetted_release','') }}</span>{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% elif v.get('ahead_of_vetted') %} <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v{{ v.get('vetted_release','') }}) — not yet validated on main channel">! unvetted</span>{% elif v.get('channel') != 'dev' and v.get('vetted_release') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% elif key == 'netbird' and v.get('channel') == 'dev' %} <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v{{ v.get('vetted','') }}">· main: v{{ v.get('vetted','') }}</span>{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">· update</span>{% endif %}{% elif key == 'netbird' and v.get('vetted') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% elif key == 'cloudtak' %}{% if v.get('channel') == 'dev' and v.get('vetted_release') %} <span style="color:#f59e0b;font-size:10px" title="Main/vetted channel is pinned at v{{ v.get('vetted_release','') }} — what production customers run">· main: v{{ v.get('vetted_release','') }}</span>{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">· update</span>{% elif v.get('channel') != 'dev' and v.get('vetted_release') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% elif v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% endif %}</div>{% endif %}{% endif %}
 <span class="module-status status-{% if mod.installed and mod.running %}running{% elif mod.installed %}stopped{% else %}not-installed{% endif %}" id="module-status-{{ key }}" data-module="{{ key }}" data-gd-overall="{% if key == 'guarddog' and mod.installed and mod.running %}fetch{% endif %}">{% if mod.installed and mod.running %}<span class="status-dot"></span> Running{% elif mod.installed %}<span class="status-dot"></span> Stopped{% else %}Not Installed{% endif %}</span>
 {% if key == 'takserver' and mod.installed %}<div id="takserver-card-cert-expiry" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
 {% if key == 'fedhub' and mod.installed %}<div id="fedhub-card-cert-expiry" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
@@ -64756,17 +65350,20 @@ function refreshModuleVersions(){
                 if(d.vetted_release)s+=' <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v'+d.vetted_release+'">· main: v'+d.vetted_release+'</span>';
                 if(d.update_available){
                     s+=' <span style="color:var(--cyan);font-size:10px" title="Update available">· update</span>';
-                }else if(d.upstream_newer&&d.upstream_latest){
-                    s+=' <span style="color:var(--cyan);font-size:10px" title="Upstream Authentik v'+d.upstream_latest+' is newer than the dev pin — investigate">· ↑ v'+d.upstream_latest+' upstream</span>';
                 }
             }else if(key==='netbird'&&d.channel==='dev'){
                 if(d.vetted)s+=' <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v'+d.vetted+'">· main: v'+d.vetted+'</span>';
                 if(d.update_available){
                     s+=' <span style="color:var(--cyan);font-size:10px" title="Update available">· update</span>';
-                }else if(d.upstream_newer&&d.upstream_latest){
-                    s+=' <span style="color:#f59e0b;font-size:10px" title="netbirdio shipped v'+d.upstream_latest+', newer than the vetted pin — try on dev, promote to main if it passes">· ↑ v'+d.upstream_latest+' upstream</span>';
                 }
             }else if(key==='netbird'&&d.vetted&&!d.update_available){
+                s+=' <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>';
+            }else if(key==='cloudtak'&&d.channel==='dev'){
+                if(d.vetted_release)s+=' <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v'+d.vetted_release+'">· main: v'+d.vetted_release+'</span>';
+                if(d.update_available){
+                    s+=' <span style="color:var(--cyan);font-size:10px" title="Update available">· update</span>';
+                }
+            }else if(key==='cloudtak'&&d.vetted_release&&!d.update_available){
                 s+=' <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>';
             }else if(d.update_available){
                 s+=(s?' ':'')+'<span style="color:var(--cyan);font-size:10px" title="Update available">update</span>';
@@ -64888,6 +65485,8 @@ async function checkKernelPatch(){
         var r=await fetch('/api/system/kernel-patch-status',{credentials:'same-origin',cache:'no-store'});
         var d=await r.json();
         if(d.patched){localStorage.removeItem('kernel-patch-dismissed');banner.style.display='none';return;}
+        var cveEl=document.getElementById('kpatch-cve');
+        if(cveEl)cveEl.textContent=d.cve_banner?(' to fix '+d.cve_banner):'';
         if(!dismissed){banner.style.display='block';_kpatchShowState('idle');}
     }catch(e){}
 }
@@ -67500,7 +68099,7 @@ def _auto_update_guarddog():
             with open(src) as f:
                 content = f.read()
             content = (content
-                .replace('ALERT_EMAIL_PLACEHOLDER', alert_email)
+                .replace('ALERT_EMAIL_PLACEHOLDER', _safe_alert_email(alert_email))
                 .replace('ALERT_SMS_PLACEHOLDER', '')
                 .replace('CERT_PASS_PLACEHOLDER', cert_pass)
                 .replace('CONSOLE_VERSION_PLACEHOLDER', VERSION))
@@ -69263,6 +69862,99 @@ def _selfheal_takserver_half_configured(plog=None):
         pass
 
 
+def _console_serves_docker_san(settings):
+    """Ground truth: is the LIVE console (gunicorn) currently SERVING a cert whose SAN
+    includes host.docker.internal? Opens a real TLS connection to the console's own port
+    and inspects the presented cert. Returns True/False, or None if the listener couldn't
+    be probed (startup race). gunicorn picks up a regenerated certfile within the same boot,
+    so this flips to True on the SAME restart the cert is regenerated — no second restart."""
+    try:
+        _port = int(settings.get('console_port') or 5001)
+    except Exception:
+        _port = 5001
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        with _socket.create_connection(('127.0.0.1', _port), timeout=5) as _s:
+            with ctx.wrap_socket(_s, server_hostname='host.docker.internal') as _ss:
+                _der = _ss.getpeercert(binary_form=True)
+        _pem = ssl.DER_cert_to_PEM_cert(_der)
+        _r = subprocess.run(['openssl', 'x509', '-noout', '-ext', 'subjectAltName'],
+                            input=_pem, capture_output=True, text=True, timeout=10)
+        return 'host.docker.internal' in (_r.stdout or '')
+    except Exception:
+        return None
+
+
+def _ensure_console_cert_docker_san(settings):
+    """Converge the console self-signed cert onto a SAN that includes host.docker.internal,
+    so the CloudTAK api container can VALIDATE its https://host.docker.internal:5001 hop
+    (NODE_EXTRA_CA_CERTS) instead of disabling TLS verification for all its egress.
+
+    Runs on EVERY console boot — the same self-heal path every update triggers — so the
+    whole fleet converges in ONE restart with no operator action (no start.sh). Steps:
+      1. If the on-disk cert lacks the SAN, regenerate it (preserving the box's server_ip).
+         gunicorn serves the regenerated certfile within the SAME boot (verified across
+         Ubuntu/RHEL/ARM), so no second restart is needed to serve it.
+      2. Set settings['console_cert_docker_san'] to match what the console is ACTUALLY
+         SERVING on its port (ground truth via _console_serves_docker_san), NOT the on-disk
+         file — so CloudTAK's validated NODE_EXTRA_CA_CERTS branch turns on only once the
+         live console genuinely presents the SAN cert. Falls back to the on-disk cert only
+         if the live listener can't be probed (startup race); disk==served within a boot.
+    The console serves console.crt on its port in every ssl_mode (Caddy fronts the public
+    FQDN separately; CloudTAK always hits the port directly), so the SAN is needed in all
+    modes. Returns a log string, or '' when nothing changed. Best-effort; never raises."""
+    try:
+        crt = os.path.join(CONFIG_DIR, 'ssl', 'console.crt')
+        if not os.path.isfile(crt):
+            return ''
+
+        def _disk_has_san():
+            try:
+                r = subprocess.run(['openssl', 'x509', '-in', crt, '-noout', '-ext', 'subjectAltName'],
+                                   capture_output=True, text=True, timeout=10)
+                return r.returncode == 0 and 'host.docker.internal' in (r.stdout or '')
+            except Exception:
+                return False
+
+        regen_note = ''
+        if not _disk_has_san():
+            ip = (settings.get('server_ip') or '').strip()
+            if not re.match(r'^\d+\.\d+\.\d+\.\d+$', ip):
+                ip = '127.0.0.1'
+            try:
+                import selfheal_ip
+                selfheal_ip.regen_self_signed_cert(ip)
+                regen_note = 'regenerated console cert with host.docker.internal SAN; '
+            except Exception as e:
+                return f"console cert: SAN regen failed (non-fatal): {str(e)[:100]}"
+
+        # Gate the flag on what's actually being SERVED (falls back to on-disk if the
+        # live listener can't be probed — disk and served match within a boot).
+        served = _console_serves_docker_san(settings)
+        if served is None:
+            served = _disk_has_san()
+        cur_flag = bool(settings.get('console_cert_docker_san'))
+        if served and not cur_flag:
+            settings['console_cert_docker_san'] = True
+            try:
+                save_settings(settings)
+            except Exception:
+                pass
+            return regen_note + "console serving host.docker.internal SAN — CloudTAK TLS validation enabled"
+        if not served and cur_flag:
+            settings['console_cert_docker_san'] = False
+            try:
+                save_settings(settings)
+            except Exception:
+                pass
+            return regen_note + "console not yet serving SAN cert — CloudTAK on TLS fallback"
+        return regen_note.rstrip('; ') if regen_note else ''
+    except Exception as e:
+        return f"console cert SAN check error (non-fatal): {str(e)[:100]}"
+
+
 def _startup_migrations():
     try:
         # v10.1.1 S3: broker-readiness startup GATE. On a non-root box the broker
@@ -69313,6 +70005,16 @@ def _startup_migrations():
                 print(f"Startup migration: {_crt_msg}", flush=True)
         except Exception as _crt_e:
             print(f"Startup migration: console-restart timer error: {_crt_e}", flush=True)
+
+        # v10.1.3 — converge the console cert onto a host.docker.internal SAN so CloudTAK
+        # validates (not disables) TLS to the console. Rides every update's restart; two-step
+        # (regenerate on disk → served + flagged on the next boot). See the helper's docstring.
+        try:
+            _certsan_msg = _ensure_console_cert_docker_san(s)
+            if _certsan_msg:
+                print(f"Startup migration: {_certsan_msg}", flush=True)
+        except Exception as _certsan_e:
+            print(f"Startup migration: console cert SAN error (non-fatal): {_certsan_e}", flush=True)
 
         # v10.0.1 (RHEL) — self-heal fail2ban jail configs written by a pre-RHEL-port
         # build (`action = ufw` → whole daemon won't start; sshd logpath auth.log →
@@ -70281,6 +70983,13 @@ def _startup_migrations():
         except Exception as _tge:
             print(f"Startup migration: takportal admin guardrail error (non-fatal): {_tge}", flush=True)
 
+        # v10.1.x (PLAN-v10.1.4 item 3): assert the portal map bridge's TAK channel
+        # membership at boot so /map isn't empty for one watchdog cycle after a restart.
+        try:
+            _takportal_sync_map_channels(plog=lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _mce:
+            print(f"Startup migration: takportal map-channel sync error (non-fatal): {_mce}", flush=True)
+
         # v0.9.23: webadmin admin-role drift guardrail (boot-time check).
         # Catches webadmin missing from tak_ROLE_ADMIN / authentik Admins, deactivated,
         # or CoreConfig adminGroup attribute stripped — the class of drift that lands
@@ -70309,6 +71018,13 @@ def _startup_migrations():
                 print("Startup: LDAP SA bind watchdog started (interval=5min, checks SA bind + webadmin roles)", flush=True)
         except Exception as _lwe:
             print(f"Startup: LDAP SA bind watchdog start failed (non-fatal): {_lwe}", flush=True)
+
+        # v10.1.x (PLAN-v10.1.4 item 4): TAK Portal map-channel self-heal (10-min tick).
+        try:
+            _start_takportal_mapsync_watchdog()
+            print("Startup: TAK Portal map-channel watchdog started (interval=10min)", flush=True)
+        except Exception as _mwe:
+            print(f"Startup: TAK Portal map-channel watchdog start failed (non-fatal): {_mwe}", flush=True)
 
         # v0.9.23 Phase 1 (FORENSIC): seed the Authentik audit-log scraper. On
         # first-ever run per box this sets the high-water mark silently (no log
