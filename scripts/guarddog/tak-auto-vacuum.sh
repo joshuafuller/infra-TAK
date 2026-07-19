@@ -126,13 +126,29 @@ psql_exec() {
 
 # Two-server mode requires SSH to Server One
 if [ "$TWO_SERVER_MODE" = "1" ]; then
+  # v10.1.4 (WS5): both branches are clean skips, not failures — exit 0 so
+  # `systemctl --failed` doesn't list this unit forever on split boxes without a
+  # substituted key (test8, 10.1.3 T&E). The skip is logged for diagnosis.
   if [ -z "$SSH_TARGET" ]; then
-    log_line "Auto-VACUUM: two_server mode but db_host is empty, skipped"
-    exit 1
+    log_line "Auto-VACUUM: two_server mode but db_host is empty, skipped (clean)"
+    exit 0
   fi
   if [ ! -f "$SSH_KEY" ]; then
-    log_line "Auto-VACUUM: two_server mode but SSH key not found at ${SSH_KEY}, skipped"
-    exit 1
+    log_line "Auto-VACUUM: two_server mode but SSH key not found at ${SSH_KEY}, skipped (clean)"
+    exit 0
+  fi
+fi
+
+# v10.1.4 (WS5b): LOCAL mode is also a clean skip when this host has no postgres
+# at all (no unix user or no psql binary) — a box whose CoT DB lives elsewhere
+# but whose split config was lost (test8 2026-07-18: tak_deployment missing from
+# settings.json) otherwise fails this unit on every timer fire, forever. A box
+# that genuinely lost its local DB has louder alarms (db-watch, TAK itself); a
+# permanently failed vacuum unit is pure noise. The skip is logged for diagnosis.
+if [ "$TWO_SERVER_MODE" != "1" ]; then
+  if ! id -u postgres >/dev/null 2>&1 || ! command -v psql >/dev/null 2>&1; then
+    log_line "Auto-VACUUM: local mode but no local postgres on this host (CoT DB is remote or containerized), skipped (clean)"
+    exit 0
   fi
 fi
 

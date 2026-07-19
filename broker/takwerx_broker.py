@@ -52,9 +52,18 @@ AUDIT_DIR = '/var/log/takwerx-broker'
 AUDIT_LOG = os.path.join(AUDIT_DIR, 'audit.log')
 BROKER_USER = 'takwerx'                       # console runs as this once flipped
 MAX_MSG = 32 * 1024 * 1024                    # 32 MiB hard cap per request/response
-DEFAULT_TIMEOUT = 600                         # seconds; broker-side ceiling
+DEFAULT_TIMEOUT = 600                         # seconds; default when caller sends no timeout
+MAX_TIMEOUT = 7200                            # seconds; ceiling for caller-requested timeouts.
+                                              # CloudTAK `docker compose build --no-cache` runs
+                                              # 20-60+ min; clamping requests to 600s killed every
+                                              # non-root CloudTAK rebuild at exactly 10 min
+                                              # (test12, 2026-07-17 — exit 125 mid-build).
 SELF_PATH = os.path.realpath(__file__)
 BROKER_UNIT = '/etc/systemd/system/takwerx-broker.service'
+# The console repo this broker ships inside (…/broker/takwerx_broker.py -> repo
+# root). Used by the v10.1.4 repo-ownership self-heal carve-out in _check_chown —
+# derived from SELF_PATH, never from client input.
+CONSOLE_REPO_DIR = os.path.dirname(os.path.dirname(SELF_PATH))
 
 # The console-owned TAK Server docker bundle is unzipped here (app.py
 # TAK_DOCKER_ROOT = ~/tak-docker) and bind-mounted into the TAK containers at
@@ -620,9 +629,38 @@ def check_exec(argv, cwd=None):
         _check_wg(argv)
     elif base == 'wpa_cli':
         _check_wpa_cli(argv)
+    elif base == 'chown':
+        _check_chown(argv, cwd)
     elif base in PATH_CHECKED_BINS:
         _check_path_args(base, argv, cwd)
     return argv
+
+
+def _check_chown(argv, cwd=None):
+    """chown: path-checked like the other coreutils — plus ONE exact carve-out
+    for the v10.1.4 repo-ownership self-heal. Root-shell git operations leave
+    root-owned entries inside the takwerx-owned console repo; git-as-takwerx
+    then cannot unlink files under them and Update Now half-applies: HEAD moves
+    while the blocked files keep OLD content, and the box silently runs mixed
+    versions (test8 2026-07-18: broker + flows.json stayed 10.1.3 under a
+    10.1.4 HEAD). The console repairs that with exactly:
+
+        chown -R -h takwerx:takwerx <CONSOLE_REPO_DIR>
+
+    Safety: the target must equal the broker's OWN repo root (from SELF_PATH,
+    never client input, rejected if the root itself is a symlink), the owner is
+    pinned to BROKER_USER, and -h is REQUIRED so symlinks are re-owned, never
+    followed (the repo is console-writable — a followed link could re-own an
+    arbitrary root path). This grants nothing beyond re-asserting the design
+    invariant "the console owns its repo". Every other chown shape falls
+    through to the standard path allowlist."""
+    if (len(argv) == 5
+            and argv[1] == '-R' and argv[2] == '-h'
+            and argv[3] == f'{BROKER_USER}:{BROKER_USER}'
+            and os.path.normpath(argv[4]) == CONSOLE_REPO_DIR
+            and not os.path.islink(CONSOLE_REPO_DIR)):
+        return
+    _check_path_args('chown', argv, cwd)
 
 
 _IFACE_RE = re.compile(r'^[A-Za-z0-9_.:][A-Za-z0-9_.:-]{0,14}$')  # no leading '-' (option smuggling)
@@ -1401,7 +1439,7 @@ def _do_exec(req):
         raise Denied(f'exec path not on trusted PATH: {argv[0]}')
     inp = req.get('input_b64')
     input_bytes = base64.b64decode(inp) if inp else None
-    timeout = min(int(req.get('timeout') or DEFAULT_TIMEOUT), DEFAULT_TIMEOUT)
+    timeout = min(int(req.get('timeout') or DEFAULT_TIMEOUT), MAX_TIMEOUT)
     cwd = req.get('cwd') or None
     if cwd and not (isinstance(cwd, str) and os.path.isdir(cwd)):
         cwd = None
@@ -1793,8 +1831,35 @@ def _summary(req):
         for i, a in enumerate(argv[:-1]):
             if a in ('password', 'wifi-sec.psk'):
                 argv[i + 1] = '***'
+        # In-token secrets (v10.1.4 WS15): the CloudTAK postgis sync rides the DB
+        # password INSIDE a single argv token, so the following-token rule above
+        # misses it — `psql ... -c "ALTER USER docker WITH PASSWORD 'secret'"` and
+        # the env-assignment `PGPASSWORD=secret`. Redact the secret substring in
+        # place (CJIS "secrets never logged"; the audit dir is root-only 0750, this
+        # closes the last plaintext-DB-password path into the log + journald).
+        argv = [_redact_inline_secrets(a) for a in argv]
         return ' '.join(argv)[:200]
     return str(req.get('path'))[:200]
+
+
+_INLINE_SECRET_RES = (
+    # PASSWORD '...' / PASSWORD "..." (SQL role DDL — quote style preserved, value masked)
+    re.compile(r"(?i)(PASSWORD\s+)('[^']*'|\"[^\"]*\"|\S+)"),
+    # PGPASSWORD=... / *_PASSWORD=... / *PASSWD=... / *TOKEN=... / *SECRET=... env assignments
+    re.compile(r"(?i)\b([A-Z0-9_]*(?:PASSWORD|PASSWD|TOKEN|SECRET|API_?KEY)=)(\S+)"),
+)
+
+
+def _redact_inline_secrets(s):
+    """Mask secret values embedded inside a single argv token (SQL PASSWORD '…'
+    and NAME=value env assignments). Never raises."""
+    try:
+        out = s
+        for rx in _INLINE_SECRET_RES:
+            out = rx.sub(lambda m: m.group(1) + '***', out)
+        return out
+    except Exception:
+        return s
 
 
 def _summary_safe(req, field=None):
@@ -2130,8 +2195,19 @@ def cli_exec(args):
         'cwd': os.getcwd(),
         'input_b64': base64.b64encode(stdin_data).decode() if stdin_data else None,
     }
+    # Long-command support: callers (app.py build paths) export TAKWERX_BROKER_TIMEOUT
+    # (seconds) so a CloudTAK --no-cache rebuild isn't killed at the 600s default. The
+    # value rides the request (daemon clamps to MAX_TIMEOUT) and stretches the client
+    # socket wait past the daemon-side subprocess deadline. Timeout-only — the daemon
+    # still ignores all caller env for the child process itself.
     try:
-        resp = client_send(req)
+        _env_t = int(os.environ.get('TAKWERX_BROKER_TIMEOUT') or 0)
+    except ValueError:
+        _env_t = 0
+    if _env_t > 0:
+        req['timeout'] = min(_env_t, MAX_TIMEOUT)
+    try:
+        resp = client_send(req, timeout=(req.get('timeout') or DEFAULT_TIMEOUT) + 60)
     except (OSError, socket.timeout) as e:
         sys.stderr.write(f'takwerx_broker: cannot reach broker: {e}\n')
         return 125
