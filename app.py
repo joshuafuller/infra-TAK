@@ -698,7 +698,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.7-alpha"
+VERSION = "10.1.8-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -1201,12 +1201,19 @@ def save_settings(s):
     os.makedirs(CONFIG_DIR, exist_ok=True)
     p = os.path.join(CONFIG_DIR, 'settings.json')
     with _settings_write_lock:
-        # (3) Never-drop-core-keys guard. Fast path: when the caller carries every core
-        # key (the overwhelming common case — callers do load→modify→save) we skip the
-        # disk read entirely. A core key is only ever MISSING from the incoming dict on
-        # the torn-read {} bug, never from a legit caller (which sets keys, e.g. fqdn='',
-        # rather than deleting them) — so refilling from the last-good on-disk copy is
-        # always correct and can never resurrect an intentionally-cleared value.
+        # (3) Never-drop guard. Fast path: when the caller carries every core key (the
+        # overwhelming common case — callers do load→modify→save) we skip the disk read
+        # entirely. A core key is only ever MISSING from the incoming dict on the
+        # torn-read {} bug (_load_json_cached returns {} on a parse error), never from a
+        # legit caller — so a missing core key is the torn-read signature. v10.1.8: when
+        # that signature fires, refill ALL disk keys the incoming dict is missing, not
+        # just the core 9 — the 2026-07-22 incident (test6/test8) refilled core identity
+        # but silently dropped tak_deployment, email_relay, guarddog_alert_email and
+        # webadmin_password on the same torn save. Intentional deletes (uninstall flows
+        # pop email_relay, netbird_pat, remote_assist_*, …) always start from a FULL
+        # load_settings() dict, so all core keys are present, this branch never runs,
+        # and deletes are honored — the trigger, not an allowlist, is what keeps the
+        # guard from resurrecting removed keys.
         if not all(k in s for k in CORE_SETTINGS_KEYS):
             try:
                 with open(p) as _f:
@@ -1214,16 +1221,19 @@ def save_settings(s):
             except Exception:
                 _disk = {}
             if isinstance(_disk, dict):
-                # Type guard mirrors load_settings: never refill a corrupted non-scalar
-                # value (e.g. server_ip=[null, null]) back into the outgoing dict.
-                _refilled = [k for k in CORE_SETTINGS_KEYS
-                             if k not in s and k in _disk
-                             and (_disk[k] is None or isinstance(_disk[k], (str, int)))]
+                # Core keys keep the scalar type guard from load_settings: never refill
+                # a corrupted non-scalar value (e.g. server_ip=[null, null]). Non-core
+                # keys are arbitrary JSON (tak_deployment/email_relay are dicts) — they
+                # parsed from the last-good file, so refill them as-is.
+                _refilled = [k for k in _disk
+                             if k not in s
+                             and (k not in CORE_SETTINGS_KEYS
+                                  or _disk[k] is None or isinstance(_disk[k], (str, int)))]
                 for k in _refilled:
                     s[k] = _disk[k]
                 if _refilled:
-                    print(f"[save_settings] GUARD: refilled missing core keys from disk "
-                          f"{_refilled} — caller dropped them (torn-read race?)", flush=True)
+                    print(f"[save_settings] GUARD: refilled missing keys from disk "
+                          f"{sorted(_refilled)} — caller dropped them (torn-read race?)", flush=True)
         # (1) Atomic write: write a sibling temp file, fsync, then rename over the target
         # so a reader always sees the old or new COMPLETE file, never a half-written one.
         tmp = None
@@ -7237,9 +7247,16 @@ def _setup_server_one_rhel(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=N
         'sudo dnf -qy module disable postgresql 2>&1 || true; '
         'sudo dnf -y install dnf-plugins-core 2>&1 || true; '
         '(sudo dnf config-manager --set-enabled crb 2>/dev/null || sudo dnf config-manager --set-enabled powertools 2>/dev/null || true); '
+        # GH #56: verify EPEL actually landed — the DB rpm's postgis deps (hdf5,
+        # xerces-c) come from EPEL and fail with a misleading error without it.
+        '(rpm -q epel-release >/dev/null 2>&1 && echo EPEL_OK || echo EPEL_MISSING); '
         'echo REPO_DONE'
     )
     _, rout = _ssh_probe(s1, repo_cmd, timeout=240)
+    if 'EPEL_MISSING' in (rout or ''):
+        log.append('⚠ EPEL repo NOT installed on Server One — the takserver-database rpm\'s '
+                   'postgis dependencies (hdf5, xerces-c) will fail to resolve. On genuine RHEL run: '
+                   f'sudo dnf -y install https://dl.fedoraproject.org/pub/epel/epel-release-latest-{el_ver}.noarch.rpm')
     log.append('Repos (EPEL/PGDG/CRB): ' + ('configured.' if 'REPO_DONE' in (rout or '') else ('warnings — ' + (rout or '')[:300])))
 
     # Step 2: install the takserver-database .noarch.rpm (the DB installer), unless already set up.
@@ -7881,6 +7898,9 @@ def takserver_two_server_deploy_server_two():
     if _distro_family() == 'rhel':
         _pg_arch = 'aarch64' if _host_arch() == 'arm64' else 'x86_64'
         run_cmd('dnf install -y epel-release 2>&1', check=False, quiet=True)
+        # GH #56: genuine RHEL has no `epel-release` in its enabled repos — fall back
+        # to the Fedora EPEL rpm URL (no-op when the package name resolved above).
+        run_cmd('rpm -q epel-release > /dev/null 2>&1 || dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm 2>&1', check=False, quiet=True)
         run_cmd(f'dnf install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-{_pg_arch}/pgdg-redhat-repo-latest.noarch.rpm 2>&1', check=False, quiet=True)
         run_cmd('dnf -qy module disable postgresql 2>&1', check=False, quiet=True)
         run_cmd('dnf install -y java-17-openjdk-devel 2>&1', check=False, quiet=True)
@@ -19123,7 +19143,12 @@ _register_module_remote_routes('fedhub', 'fedhub_deployment', get_config_fn=_get
 
 
 def _get_cloudtak_upstreams(settings):
-    """Return CloudTAK upstream endpoints for Caddy and readiness checks."""
+    """Return CloudTAK upstream endpoints for Caddy and readiness checks.
+
+    video_hls (raw MediaMTX HLS, 18888) is NOT routed by Caddy anymore — all
+    video.<fqdn> traffic (incl. /stream/*) must go to video_api (media-infra,
+    9997): media-infra alone can serve external http(s) proxy leases. Kept here
+    only for readiness checks / diagnostics."""
     cfg = _get_cloudtak_deployment_config(settings)
     if cfg.get('target_mode') == 'remote':
         host = (cfg.get('remote', {}).get('host') or '').strip()
@@ -21118,14 +21143,16 @@ def generate_caddyfile(settings=None):
         lines.append(f"}}")
         lines.append("")
         _emit_alias_redirect(_get_service_alias(settings, 'cloudtak_tiles'), ct_tiles)
-        lines.append(f"# CloudTAK Media (video) — /stream/* → HLS, rest → MediaMTX API")
+        lines.append(f"# CloudTAK Media (video) — EVERYTHING → media-infra proxy (video_api).")
+        lines.append(f"# /stream/* must NOT go to raw MediaMTX HLS (18888): media-infra's hls.ts is the")
+        lines.append(f"# only component that can serve external http(s) proxy leases (it fetches the")
+        lines.append(f"# upstream manifest itself — MediaMTX never has those paths), and it expects the")
+        lines.append(f"# full /stream/... prefix. media-infra also proxies MediaMTX's internal HLS for")
+        lines.append(f"# native/RTSP lease paths, so this routing is correct for BOTH lease types —")
+        lines.append(f"# do NOT split /stream/* back out to 18888 (that 404'd every external-HLS video")
+        lines.append(f"# in CloudTAK while RTSP leases worked by accident; TN box, 2026-07-10).")
         lines.append(f"{ct_video} {{")
-        lines.append(f"    handle_path /stream/* {{")
-        lines.append(f"        reverse_proxy {ct_up['video_hls']}")
-        lines.append(f"    }}")
-        lines.append(f"    handle {{")
-        lines.append(f"        reverse_proxy {ct_up['video_api']}")
-        lines.append(f"    }}")
+        lines.append(f"    reverse_proxy {ct_up['video_api']}")
         lines.append(f"}}")
         lines.append("")
         _emit_alias_redirect(_get_service_alias(settings, 'cloudtak_video'), ct_video)
@@ -21149,15 +21176,11 @@ def generate_caddyfile(settings=None):
             ct_bind_ip = _primary_local_ipv4()
         if ct_bind_ip:
             ct_video_host = ct_video.split()[0].strip()  # hostname only (drop any TLS/options)
-            lines.append(f"# CloudTAK Media (video) on :9997 — CloudTAK hardcodes this port for all media URLs")
+            lines.append(f"# CloudTAK Media (video) on :9997 — CloudTAK hardcodes this port for all media URLs.")
+            lines.append(f"# Same routing rule as the 443 vhost: everything → media-infra (video_api).")
             lines.append(f"{ct_video_host}:9997 {{")
             lines.append(f"    bind {ct_bind_ip}")
-            lines.append(f"    handle_path /stream/* {{")
-            lines.append(f"        reverse_proxy {ct_up['video_hls']}")
-            lines.append(f"    }}")
-            lines.append(f"    handle {{")
-            lines.append(f"        reverse_proxy {ct_up['video_api']}")
-            lines.append(f"    }}")
+            lines.append(f"    reverse_proxy {ct_up['video_api']}")
             lines.append(f"}}")
             lines.append("")
 
@@ -21482,6 +21505,38 @@ def _caddy_regenerate_if_fqdn():
         threading.Thread(target=_caddy_restart_after_response, daemon=True).start()
     except Exception:
         pass
+
+
+def _selfheal_cloudtak_stream_route(log):
+    """
+    v10.1.8 — fix CloudTAK video /stream/* routing on already-deployed boxes.
+    The old template sent video.<fqdn> /stream/* to raw MediaMTX HLS (18888) via
+    handle_path; the correct backend is media-infra (video_api :9997), which is
+    the only component able to serve external http(s) proxy leases — so every
+    external-HLS video 404'd in CloudTAK (TN box field incident 2026-07-10).
+    First landed as feb6757 (10.1.3-dev), test-reverted in 805fdce over an RTSP
+    concern that turned out unfounded (media-infra's hls.ts proxies MediaMTX's
+    internal HLS for native/RTSP lease paths too) — the revert shipped in
+    10.1.3–10.1.7, so this heals boxes from that whole range.
+    Detection: 'handle_path /stream/*' in the GENERATED section of the live
+    Caddyfile (user blocks below the marker are ignored so a hand-written stanza
+    can't loop this). The fixed template never emits that string → idempotent.
+    """
+    if not os.path.exists(CADDYFILE_PATH):
+        return False
+    try:
+        with open(CADDYFILE_PATH) as f:
+            live = f.read()
+    except Exception:
+        return False
+    generated = live.split(CADDYFILE_USER_BLOCKS_MARKER, 1)[0]
+    if 'handle_path /stream/*' not in generated:
+        return False
+    log("CloudTAK video: stale /stream/* route (handle_path → MediaMTX 18888) detected — regenerating Caddyfile")
+    generate_caddyfile()
+    _run_priv_chain([['systemctl', 'reload', 'caddy'], ['systemctl', 'restart', 'caddy']], 'or', timeout=60)
+    log("CloudTAK video: /stream/* now routed to media-infra (:9997) and Caddy reloaded")
+    return True
 
 
 def wait_for_apt_lock(log_fn, log_list):
@@ -24971,6 +25026,18 @@ def run_mediamtx_deploy():
         if _distro_family() == 'rhel':
             subprocess.run(_sudo_wrap(['dnf', 'install', '-y', 'epel-release', 'dnf-plugins-core']),
                            capture_output=True, text=True, timeout=300)
+            # GH #56: genuine RHEL has no `epel-release` package, and dnf aborts the
+            # WHOLE transaction above on the unmatched name — so dnf-plugins-core is
+            # lost too. Fall back to the Fedora EPEL rpm URL and re-install the
+            # plugins on their own (both no-ops on clones where the name resolved).
+            if subprocess.run(['rpm', '-q', 'epel-release'], capture_output=True).returncode != 0:
+                _el = ((_read_os_release()[0] or '').split('-', 1) + [''])[1].split('.')[0] or '9'
+                subprocess.run(_sudo_wrap(['dnf', 'install', '-y', f'https://dl.fedoraproject.org/pub/epel/epel-release-latest-{_el}.noarch.rpm']),
+                               capture_output=True, text=True, timeout=300)
+                subprocess.run(_sudo_wrap(['dnf', 'install', '-y', 'dnf-plugins-core']),
+                               capture_output=True, text=True, timeout=300)
+                if subprocess.run(['rpm', '-q', 'epel-release'], capture_output=True).returncode != 0:
+                    plog("⚠ EPEL repo could not be installed — some dependencies may fail to resolve.")
             _run_priv_chain([['dnf', 'config-manager', '--set-enabled', 'crb'], ['dnf', 'config-manager', '--set-enabled', 'powertools']], 'or', timeout=120)
             # Core deps (required). The MediaMTX binary is pure Go and doesn't need
             # ffmpeg, so install core deps strictly, then ffmpeg separately.
@@ -26580,7 +26647,14 @@ def _cloudtak_server_routes_dir(ct_dir, require_split=False):
 def _snapshot_cloudtak_plugin_state(ct_dir, install_path):
     """v0.9.44: back up the CloudTAK files a plugin action mutates (the server
     routes dir + the web plugin dir) so a failed rebuild can be rolled back — a
-    broken plugin must never leave CloudTAK in an unbuildable state."""
+    broken plugin must never leave CloudTAK in an unbuildable state.
+
+    v10.1.8: also record the api image tag + ID the RUNNING container uses. A
+    rebuild that fails AFTER the image already built (timeout finalizing, etc.)
+    leaves the tag pointing at the new image even though the source gets rolled
+    back — the next unrelated `compose up -d` then silently ships the
+    rolled-back plugin. The running container still references the pre-build
+    image, so capture both here and retag on rollback."""
     import tempfile, shutil
     snap = tempfile.mkdtemp(prefix='ct-plugin-rollback-')
     routes = _cloudtak_server_routes_dir(ct_dir)
@@ -26589,7 +26663,19 @@ def _snapshot_cloudtak_plugin_state(ct_dir, install_path):
     web_existed = os.path.isdir(install_path) or os.path.islink(install_path)
     if web_existed:
         shutil.copytree(install_path, os.path.join(snap, 'web'), symlinks=True)
-    return {'snap': snap, 'web_existed': web_existed, 'routes_dir': routes}
+    api_image_tag = api_image_id = ''
+    try:
+        cid = subprocess.run(['docker', 'compose', 'ps', '-q', 'api'], cwd=ct_dir,
+                             capture_output=True, text=True, timeout=30).stdout.strip().splitlines()
+        if cid:
+            insp = subprocess.run(['docker', 'inspect', '-f', '{{.Config.Image}} {{.Image}}', cid[0]],
+                                  capture_output=True, text=True, timeout=30).stdout.split()
+            if len(insp) == 2:
+                api_image_tag, api_image_id = insp[0], insp[1]
+    except Exception:
+        pass
+    return {'snap': snap, 'web_existed': web_existed, 'routes_dir': routes,
+            'api_image_tag': api_image_tag, 'api_image_id': api_image_id}
 
 
 def _rollback_cloudtak_plugin_state(ct_dir, install_path, snap_info, plog=None):
@@ -26612,6 +26698,22 @@ def _rollback_cloudtak_plugin_state(ct_dir, install_path, snap_info, plog=None):
     shutil.rmtree(snap, ignore_errors=True)
     if plog:
         plog('  ↩ Restored CloudTAK server routes + plugin dir to the pre-update state.')
+    # v10.1.8: if the failed rebuild already advanced the image tag, point it back
+    # at the pre-build image so the next `compose up -d` can't ship the rolled-back
+    # plugin. The old image is still referenced by the running container (and by
+    # this retag), so it can't have been pruned out from under us.
+    tag, old_id = snap_info.get('api_image_tag'), snap_info.get('api_image_id')
+    if tag and old_id:
+        try:
+            cur = subprocess.run(['docker', 'image', 'inspect', '-f', '{{.Id}}', tag],
+                                 capture_output=True, text=True, timeout=30).stdout.strip()
+            if cur and cur != old_id:
+                subprocess.run(['docker', 'tag', old_id, tag],
+                               capture_output=True, text=True, timeout=30)
+                if plog:
+                    plog(f'  ↩ Re-pointed image tag {tag} back at the pre-build image.')
+        except Exception:
+            pass
 
 
 def _cleanup_snapshot(snap_info):
@@ -27139,6 +27241,11 @@ def _cloudtak_build_override_yml(settings):
                             and bool(settings.get('console_cert_docker_san'))
                             and os.path.isfile(console_cert_src))
 
+    # W5/W5e media-infra pin — arch-conditional, see the comment in the template below.
+    media_image = ('ghcr.io/dfpc-coe/media-infra:v9.1.1'
+                   if (settings.get('arch') or '').lower() in ('arm64', 'aarch64')
+                   else 'ghcr.io/dfpc-coe/media-infra:v9.7.0')
+
     if _cert_has_docker_san:
         # Validated path: trust the console cert as an extra CA, keep TLS verification on.
         tls_env_block = (
@@ -27177,6 +27284,21 @@ services:
     environment:
       API_URL: "http://api:5000"
   media:
+    # v10.1.8 W5: pin media-infra PAST upstream CloudTAK's v9.1.1 pin. v9.1.1's
+    # hls route fetch()es whatever the lease proxy URL is — an rtsp:// proxy hits
+    # undici "unknown scheme" → every RTSP-lease playback 500s once /stream is
+    # correctly routed to media-infra (W1). ≥v9.5 routes non-HLS proxies to
+    # MediaMTX's internal HLS instead. v9.7.0 = MediaMTX 1.19.2 (needs the
+    # net.core.rmem_max sysctl — see _startup_media_kernel_bufs). Field-proven
+    # test6 2026-07-24.
+    # W5e: ≥v9.2 ships amd64-ONLY — v9.1.1 is upstream's last arm64 build
+    # (verified against ghcr manifests 2026-07-24; an unconditional v9.7.0 pin
+    # crash-looped cloudtak-media on aws-arm: 'exec format error'). ARM stays
+    # pinned to v9.1.1: external-HLS leases work; RTSP-lease playback there
+    # remains the pre-existing 10.1.7 behavior — documented ARM caveat (same
+    # class as pmtiles). settings['arch'] is the LOCAL box arch; a REMOTE ARM
+    # CloudTAK target is out of the pin's scope (parked in PLAN-v10.1.8).
+    image: {media_image}
     extra_hosts:
 {hosts_block}
     environment:
@@ -27233,29 +27355,57 @@ services:
 # builds → treated as not-applicable, never an error. Drift only happens on a container
 # RECREATE (every edit survives a plain `docker restart`). The converger is
 # check-before-apply → a no-op (no restart, no video drop) on an already-correct box.
+# v10.1.8 W5: ported to media-infra v9.7.0 — that image ships NO yq (grep the raw
+# yaml instead; accept `no|false` so files healed by the old yq path don't re-trip),
+# and runs COMPILED js from /dist (the v9.6.0 TS build rewrite): patch BOTH the old
+# .ts source paths (≤v9.1.1 runs them directly) and the new /dist/lib/*.js.
 _CT_MEDIA_CHECK_SH = r'''
-if [ "$(yq -r '.hlsVariant' /mediamtx.yml 2>/dev/null)" = mpegts ] \
- && [ "$(yq -r '.hlsAlwaysRemux' /mediamtx.yml 2>/dev/null)" = false ] \
- && [ "$(yq -r '.hlsSegmentCount' /mediamtx.yml 2>/dev/null)" = 3 ] \
- && [ "$(yq -r '.hlsSegmentDuration' /mediamtx.yml 2>/dev/null)" = 500ms ] \
- && [ "$(yq -r '.hlsPartDuration' /mediamtx.yml 2>/dev/null)" = 200ms ]; then H=ok; else H=drift; fi
-if [ ! -f /lib/persist.ts ]; then R=na
-elif grep -qF "'ephemeral', 'all'" /lib/persist.ts; then R=ok
-else R=drift; fi
-if [ ! -f /lib/payload.ts ]; then P=na
-elif grep -qF "replace(/#/g, '%23')" /lib/payload.ts; then P=ok
-else P=drift; fi
+if grep -q "^hlsVariant: mpegts" /mediamtx.yml 2>/dev/null \
+ && grep -qE "^hlsAlwaysRemux: (no|false)" /mediamtx.yml 2>/dev/null \
+ && grep -q "^hlsSegmentCount: 3" /mediamtx.yml 2>/dev/null \
+ && grep -q "^hlsSegmentDuration: 500ms" /mediamtx.yml 2>/dev/null \
+ && grep -q "^hlsPartDuration: 200ms" /mediamtx.yml 2>/dev/null; then H=ok; else H=drift; fi
+R=na
+for f in /lib/persist.ts /dist/lib/persist.js; do
+  [ -f "$f" ] || continue
+  if grep -qF "'ephemeral', 'all'" "$f"; then [ "$R" = drift ] || R=ok; else R=drift; fi
+done
+P=na
+for f in /lib/payload.ts /dist/lib/payload.js; do
+  [ -f "$f" ] || continue
+  if grep -qF "replace(/#/g, '%23')" "$f"; then [ "$P" = drift ] || P=ok; else P=drift; fi
+done
 printf '%s %s %s\n' "$H" "$R" "$P"
 '''
 _CT_MEDIA_APPLY_SH = r'''
-yq -i '.hlsVariant = "mpegts" | .hlsAlwaysRemux = false | .hlsSegmentCount = 3 | .hlsSegmentDuration = "500ms" | .hlsPartDuration = "200ms"' /mediamtx.yml
-if [ -f /lib/persist.ts ]; then
-  sed -i "s/'ephemeral', 'false'/'ephemeral', 'all'/g" /lib/persist.ts
-fi
-if [ -f /lib/payload.ts ]; then
-  sed -i "s|source: path.proxy,|source: path.proxy.startsWith('srt://') ? path.proxy.replace(/#/g, '%23') : path.proxy,|" /lib/payload.ts
-fi
+sed -i "/^hlsVariant:/d; /^hlsAlwaysRemux:/d; /^hlsSegmentCount:/d; /^hlsSegmentDuration:/d; /^hlsPartDuration:/d" /mediamtx.yml
+printf 'hlsVariant: mpegts\nhlsAlwaysRemux: no\nhlsSegmentCount: 3\nhlsSegmentDuration: 500ms\nhlsPartDuration: 200ms\n' >> /mediamtx.yml
+for f in /lib/persist.ts /dist/lib/persist.js; do
+  [ -f "$f" ] && sed -i "s/'ephemeral', 'false'/'ephemeral', 'all'/g" "$f"
+done
+for f in /lib/payload.ts /dist/lib/payload.js; do
+  [ -f "$f" ] && sed -i "s|source: path.proxy,|source: path.proxy.startsWith('srt://') ? path.proxy.replace(/#/g, '%23') : path.proxy,|" "$f"
+done
+true
 '''
+
+
+def _cloudtak_open_stream_ports(log=None):
+    """v10.1.8 W5: explicitly ALLOW CloudTAK's direct-streaming host ports. The
+    port policy always classed RTSP 18554 / RTMP 11935 / SRT 18890 as Tier 1
+    (public streaming endpoints) and merely refrained from denying them — but on
+    a default-deny firewall "not denied" is still CLOSED, so EUD/TAK-ICU
+    publishes into CloudTAK leases were silently dropped (test6, 2026-07-24).
+    Idempotent; ufw↔firewalld via the shim. SRT is UDP; RTSP also gets UDP for
+    clients that negotiate RTP over UDP."""
+    _log = log or (lambda m: print(m, flush=True))
+    opened = []
+    for port, proto in ((18554, 'tcp'), (18554, 'udp'), (11935, 'tcp'), (18890, 'udp')):
+        ok, _msg = _fw_allow(port, proto)
+        if ok:
+            opened.append(f'{port}/{proto}')
+    if opened:
+        _log(f"  CloudTAK streaming ports allowed: {', '.join(opened)}")
 
 
 def _ct_media_converged(check_out):
@@ -27300,7 +27450,10 @@ def _cloudtak_media_hls_heal(plog=None, remote_cfg=None, wait=False):
                 "if [ -z \"$m\" ]; then echo NOCONTAINER; exit 0; fi; "
                 "out=$(echo %s | base64 -d | docker exec -i \"$m\" sh 2>/dev/null); "
                 "set -- $out; "
-                "if [ \"$1\" = mpegts ] && [ \"$2\" = true ] && { [ \"$3\" = ok ] || [ \"$3\" = na ]; }; then echo OK; exit 0; fi; "
+                # v10.1.8: compare against the check script's ACTUAL output ("ok ok na").
+                # The old comparison ("mpegts"/"true") never matched → every remote heal
+                # re-applied + restarted the media container needlessly.
+                "if [ \"$1\" = ok ] && { [ \"$2\" = ok ] || [ \"$2\" = na ]; } && { [ \"$3\" = ok ] || [ \"$3\" = na ]; }; then echo OK; exit 0; fi; "
                 "echo %s | base64 -d | docker exec -i \"$m\" sh && docker restart \"$m\" >/dev/null && echo HEALED || echo FAIL"
             ) % (tries, chk_b64, apply_b64)
             ok, out = _ssh_probe(remote_cfg, cmd, timeout=120)
@@ -63308,8 +63461,34 @@ def run_takserver_deploy(config):
             # fresh box; here other modules are already installed and a full update mid-deploy is
             # an unnecessary fleet risk) — the rpm install resolves its deps from these repos.
             _pg_arch = 'aarch64' if _host_arch() == 'arm64' else 'x86_64'
+            # GH #56: genuine RHEL (subscription-manager) doesn't carry `epel-release`
+            # in any enabled repo — only the clones (Rocky/Alma/Stream) do. The bare
+            # install fails "No match for argument: epel-release", Step 2 used to print
+            # its ✓ anyway, and the failure surfaced two steps later as an unrelated-
+            # looking postgis33_15 → hdf5/xerces-c dependency wall (EPEL packages).
+            # Chain repo-name → Fedora URL rpm, enable CRB the subscription-manager way
+            # on genuine RHEL, then VERIFY epel-release actually landed and hard-stop
+            # naming EPEL as the cause if it didn't — Step 4 cannot succeed without it.
+            _os_id = (_read_os_release()[0] or '')          # e.g. 'rhel-9.4', 'rocky-9'
+            _el_ver = (_os_id.split('-', 1) + [''])[1].split('.')[0] or '9'
+            def _epel_installed():
+                return subprocess.run('rpm -q epel-release', shell=True, capture_output=True,
+                                      timeout=30, env=_broker_shim_env()).returncode == 0
             run_cmd('dnf install -y epel-release 2>&1', "Installing EPEL...", check=False)
-            run_cmd(f'dnf install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-{_pg_arch}/pgdg-redhat-repo-latest.noarch.rpm 2>&1', "Adding PostgreSQL (PGDG) repository...", check=False)
+            if not _epel_installed():
+                run_cmd(f'dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-{_el_ver}.noarch.rpm 2>&1',
+                        "EPEL not in enabled repos (genuine RHEL?) — installing from the Fedora EPEL rpm URL...", check=False)
+            if _os_id.startswith('rhel'):
+                run_cmd(f'subscription-manager repos --enable codeready-builder-for-rhel-{_el_ver}-{_pg_arch}-rpms 2>&1',
+                        "Enabling CodeReady Builder (subscription-manager)...", check=False, quiet=True)
+            if not _epel_installed():
+                log_step("✗ FATAL: the EPEL repo could not be installed. TAK Server's PostGIS dependencies")
+                log_step("  (hdf5, xerces-c, …) come from EPEL — Step 4 WILL fail without it.")
+                log_step("  Fix manually, then retry the deploy:")
+                log_step(f"    dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-{_el_ver}.noarch.rpm")
+                log_step(f"    subscription-manager repos --enable codeready-builder-for-rhel-{_el_ver}-{_pg_arch}-rpms   # genuine RHEL only")
+                deploy_status.update({'error': True, 'running': False}); return
+            run_cmd(f'dnf install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-{_el_ver}-{_pg_arch}/pgdg-redhat-repo-latest.noarch.rpm 2>&1', "Adding PostgreSQL (PGDG) repository...", check=False)
             run_cmd('dnf -qy module disable postgresql 2>&1', check=False, quiet=True)
             run_cmd('dnf install -y java-17-openjdk-devel 2>&1', "Installing Java 17 (OpenJDK)...", check=False)
             run_cmd('dnf config-manager --set-enabled crb 2>&1', check=False, quiet=True)
@@ -69528,6 +69707,39 @@ def _startup_harden_caddy_boot():
 _startup_harden_caddy_boot()
 
 
+def _startup_media_kernel_bufs():
+    """v10.1.8 W5: MediaMTX ≥1.19 (media-infra v9.7.0) requires a ≥4MB kernel UDP
+    read buffer and treats failure as FATAL — the cloudtak-media container
+    crash-loops on the default net.core.rmem_max (~208KB). net.core is a HOST
+    sysctl (not per-container). Fleet constant, harmless on boxes without
+    CloudTAK, so applied unconditionally. Same broker pattern as WS6b: persist
+    via /etc/sysctl.d + apply runtime with `sysctl -w <param>=<val>` (the broker
+    gates sysctl on the parameter namespace, so `-p <file>` is denied non-root)."""
+    sysctl_path = '/etc/sysctl.d/99-takwerx-media-bufs.conf'
+    sysctl_content = 'net.core.rmem_max = 4194304\nnet.core.wmem_max = 4194304\n'
+    try:
+        cur = ''
+        try:
+            with open(sysctl_path) as f:
+                cur = f.read()
+        except Exception:
+            pass
+        if cur.strip() != sysctl_content.strip():
+            _write_priv(sysctl_path, sysctl_content)
+            ok = True
+            for knob in ('net.core.rmem_max=4194304', 'net.core.wmem_max=4194304'):
+                _sr = subprocess.run(_sudo_wrap(['sysctl', '-w', knob]), capture_output=True, timeout=10)
+                ok = ok and _sr.returncode == 0
+            if ok:
+                print('Startup migration: media kernel buffers applied (net.core.rmem/wmem_max=4MB; MediaMTX 1.19 requirement; v10.1.8 W5)')
+            else:
+                print('Startup migration: media kernel buffer file written; runtime apply deferred to next boot')
+    except Exception as _e:
+        print(f'Startup migration: media kernel buffer warning (non-fatal): {_e}')
+
+_startup_media_kernel_bufs()
+
+
 def _startup_ensure_broker():
     """v10.0.5: ensure the privileged broker (takwerx-broker.service) is installed
     + running on every console start. The T&E flow is `git pull + systemctl
@@ -70191,6 +70403,9 @@ def _startup_harden_cloudtak_ports():
                 _cloudtak_media_hls_heal(wait=True)
             else:
                 print(f"Startup migration: CloudTAK recreate warning: {(r.stdout or '')[:200]}")
+        # v10.1.8 W5: Tier-1 streaming ports were never explicitly ALLOWED — on a
+        # default-deny firewall, EUD publishes into CloudTAK leases were dropped.
+        _cloudtak_open_stream_ports()
     except Exception as _e:
         print(f"Startup migration: CloudTAK port harden error (non-fatal): {_e}")
 
@@ -72080,6 +72295,20 @@ def _startup_migrations():
                 print(f"Startup migration: relabeled {_ct_labeled} Caddy port(s) for SELinux and reloaded Caddy", flush=True)
         except Exception as caddy_selinux_err:
             print(f"Startup migration: Caddy SELinux port self-heal error (non-fatal): {caddy_selinux_err}")
+
+        # v10.1.8 — re-route CloudTAK video /stream/* to media-infra (:9997). The old
+        # Caddy template sent it to raw MediaMTX HLS (18888), which 404'd every
+        # external-HLS proxy lease (RTSP leases worked by accident). Deployed boxes
+        # (incl. everything that installed on 10.1.3–10.1.7) keep the stale Caddyfile
+        # until something regenerates it — do it here. Idempotent: fires only while
+        # the stale pattern exists in the generated section. See
+        # `_selfheal_cloudtak_stream_route`. Field: TN box 2026-07-10, CloudTAK#1570.
+        try:
+            _selfheal_cloudtak_stream_route(
+                lambda m: print(f"Startup migration: {m}", flush=True)
+            )
+        except Exception as ct_stream_err:
+            print(f"Startup migration: CloudTAK /stream route self-heal error (non-fatal): {ct_stream_err}")
 
         # v0.9.44 — silently clear a `takserver` dpkg half-configured state left by the
         # non-idempotent 5.7 .deb postinstall. TAK Server keeps running fine, but the
@@ -74101,6 +74330,7 @@ def _post_update_auto_deploy():
                             _sudo_wrap(['ufw', 'allow', '9997/tcp']), capture_output=True, timeout=10
                         )
                         print("  CloudTAK UFW rules applied (deny 5000,5002,5003,5433,9000,9002,18888; allow 9997 for Caddy video)")
+                        _cloudtak_open_stream_ports()
                     except Exception as _ue:
                         print(f"  WARNING: UFW rules failed: {_ue}")
 
