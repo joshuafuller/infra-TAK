@@ -2,7 +2,7 @@
 # connectivity-anchor-bootstrap.sh — Connectivity Wizard (v10.1.0) anchor VPS bootstrap
 #
 # Stands up the public "mailbox" that a CGNAT or portable infra-TAK box dials OUT to:
-#   internet client ──tcp──▶ anchor public IP :8089/:8443/:8446 ──kernel DNAT──▶ WireGuard ──▶ box
+#   internet client ──▶ anchor public IP :80/:443/:8089/:8443/:8446 (+ video) ──kernel DNAT──▶ WireGuard ──▶ box
 #
 # The forward is PURE L4 (kernel PREROUTING DNAT over a WireGuard p2p tunnel).
 # The anchor has no TLS stack in the path at all — TAK's mutual-TLS handshake
@@ -19,8 +19,11 @@
 #   ./connectivity-anchor-bootstrap.sh status
 #
 # Cloud-side reminder (the script cannot do this for you): open ingress in the
-# provider firewall (OCI Security List / NSG) for udp/51820, tcp/8089, tcp/8443,
-# tcp/8446. (The :5099 prober is tunnel-only since v10.1.3 — no cloud ingress.)
+# provider firewall (OCI Security List / NSG) for BOTH udp/51820 and udp/443 (the
+# tunnel and its alternate — the box dials the one it was configured with, so the
+# other being closed strands it), plus tcp/{80,443,8089,8443,8446} and, if you
+# stream, tcp/{8554,8322} + udp/8890. The setup run prints the exact list at the
+# end. (The :5099 prober is tunnel-only since v10.1.3 — no cloud ingress.)
 
 set -euo pipefail
 
@@ -29,6 +32,10 @@ WG_IF="wg0"
 # filter uncommon high UDP ports (51820) but pass UDP 443 — it looks like HTTPS/QUIC.
 # 443 is the portable-survivor default; override with WG_PORT=51820 on permissive networks.
 WG_PORT="${WG_PORT:-443}"
+# The relay serves BOTH udp ports and redirects the alternate to the live one, so a
+# box can switch without touching the cloud firewall. Defined here (not inside
+# apply_forward_rules) because the UDP forward loop has to exclude both.
+WG_ALT_PORT=$([ "${WG_PORT}" = "443" ] && echo 51820 || echo 443)
 WG_NET="172.31.99.0/24"          # deliberately NOT in 100.64/10 — must never collide with carrier CGNAT space
 ANCHOR_WG_IP="172.31.99.1"
 BOX_WG_IP="172.31.99.2"
@@ -36,7 +43,17 @@ TAK_PORTS="${TAK_PORTS:-8089 8443 8446}"   # streaming / Marti+WebTAK / cert enr
 WEB_PORTS="${WEB_PORTS:-80 443}"           # Caddy: Let's Encrypt ACME challenge + all web UIs
                                            # (Portal, Authentik, CloudTAK, console). Without these a
                                            # relayed box can never get a cert or serve the web side.
-FWD_PORTS="$WEB_PORTS $TAK_PORTS"          # everything the relay forwards to the box
+# v10.1.10: MediaMTX video. The configurator offers RTSP, RTSPS and SRT, so a relayed
+# box carries all three.
+MEDIA_PORTS="${MEDIA_PORTS:-8554 8322}"    # 8554 RTSP · 8322 RTSPS
+FWD_PORTS="$WEB_PORTS $TAK_PORTS $MEDIA_PORTS"   # TCP forwards
+# UDP forwards. SRT is UDP by protocol design, and until v10.1.10 this script only ever
+# wrote `-p tcp` rules — which made SRT look like something a relay fundamentally could
+# not carry. It isn't: DNAT handles UDP, the MASQUERADE and ESTABLISHED/RELATED rules
+# below are protocol-agnostic, and WireGuard carries UDP natively. It was simply never
+# written. RTSP's UDP transport (8000/8001) stays out on purpose — our MediaMTX ships
+# `rtspTransports: [tcp]`, so no client negotiates it.
+UDP_FWD_PORTS="${UDP_FWD_PORTS:-8890}"     # 8890 SRT
 PROBER_PORT="5099"
 PROBER_DIR="/opt/takwerx-prober"
 PROBER_TOKEN_FILE="/etc/takwerx-prober.token"
@@ -83,6 +100,17 @@ apply_forward_rules() {
         # Oracle images ship a FORWARD chain ending in REJECT — insert, don't append.
         ipt_ensure filter FORWARD -d "$BOX_WG_IP" -p tcp --dport "$p" -j ACCEPT
     done
+    # UDP forwards (SRT). Guarded against the WireGuard ports: DNAT'ing the port the
+    # tunnel itself listens on would send the dial-in down the tunnel it is trying to
+    # establish and strand the relay.
+    for p in $UDP_FWD_PORTS; do
+        if [ "$p" = "$WG_PORT" ] || [ "$p" = "$WG_ALT_PORT" ]; then
+            echo "  ⚠ skipping UDP $p — that is the WireGuard tunnel port"
+            continue
+        fi
+        ipt_ensure nat PREROUTING -p udp --dport "$p" -j DNAT --to-destination "${BOX_WG_IP}:${p}"
+        ipt_ensure filter FORWARD -d "$BOX_WG_IP" -p udp --dport "$p" -j ACCEPT
+    done
     ipt_ensure nat POSTROUTING -o "$WG_IF" -d "$BOX_WG_IP" -j MASQUERADE
     ipt_ensure filter FORWARD -s "$BOX_WG_IP" -m state --state ESTABLISHED,RELATED -j ACCEPT
     # Anchor-local inbound: WireGuard dial-in (Oracle INPUT chain also ends in REJECT).
@@ -97,7 +125,6 @@ apply_forward_rules() {
     # responses never delivered; the identical exchange works on udp/51820), while
     # some restrictive venue firewalls allow ONLY 443. Redirect the alternate port
     # to the primary so a box can use either endpoint port without reprovisioning.
-    WG_ALT_PORT=$([ "$WG_PORT" = "443" ] && echo 51820 || echo 443)
     ipt_ensure filter INPUT -p udp --dport "$WG_ALT_PORT" -j ACCEPT
     ipt_ensure nat PREROUTING -p udp --dport "$WG_ALT_PORT" -j REDIRECT --to-ports "$WG_PORT"
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
@@ -105,6 +132,9 @@ apply_forward_rules() {
         ufw allow "${WG_ALT_PORT}/udp" >/dev/null
         ufw delete allow "${PROBER_PORT}/tcp" >/dev/null 2>&1 || true
         for p in $FWD_PORTS; do ufw allow "${p}/tcp" >/dev/null; done
+        for p in $UDP_FWD_PORTS; do
+            [ "$p" = "$WG_PORT" ] || [ "$p" = "$WG_ALT_PORT" ] || ufw allow "${p}/udp" >/dev/null
+        done
     fi
     persist_iptables
 }
@@ -256,10 +286,10 @@ EOF
     echo ""
     echo "✓ Anchor is up.  Public IP: ${pub_ip}"
     echo "  WireGuard public key : $(cat "$WG_DIR/anchor.pub")"
-    echo "  Forwarded ports      : ${FWD_PORTS} → ${BOX_WG_IP} (kernel DNAT, no TLS in path)"
+    echo "  Forwarded ports      : tcp ${FWD_PORTS} · udp ${UDP_FWD_PORTS} → ${BOX_WG_IP} (kernel DNAT, no TLS in path)"
     echo "  VERIFY prober        : http://${ANCHOR_WG_IP}:${PROBER_PORT}/probe (tunnel-only)  token: $(cat "$PROBER_TOKEN_FILE")"
     echo ""
-    echo "NEXT: 1) open udp/${WG_PORT} + udp/${WG_ALT_PORT} AND tcp/{${FWD_PORTS// /,}} in the cloud"
+    echo "NEXT: 1) open udp/{${WG_PORT},${WG_ALT_PORT},${UDP_FWD_PORTS// /,}} AND tcp/{${FWD_PORTS// /,}} in the cloud"
     echo "         provider firewall (OCI NSG / Security List) — the script cannot reach that."
     echo "         ⚠ udp/443 AND tcp/443 are BOTH needed — different protocols (tunnel vs HTTPS)."
     echo "         ⚠ OCI TRAP: put the port in DESTINATION Port Range, leave SOURCE blank."
