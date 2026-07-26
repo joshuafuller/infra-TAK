@@ -330,10 +330,50 @@ def _detached_power_action(verb, delay=2):
     threading.Thread(target=_go, daemon=True).start()
 
 
+CORECONFIG_PATH = '/opt/tak/CoreConfig.xml'
+CORECONFIG_BACKUP = CORECONFIG_PATH + '.infratak-prev'
+
+
+def _backup_coreconfig_before_write(path, content, mode):
+    """Keep the previous CoreConfig.xml as `.infratak-prev` before we overwrite it.
+
+    CoreConfig is the one file TAK Server will not start without, and roughly a
+    dozen code paths rewrite it (deploy, LDAP connect/resync, webadmin sync, LE
+    cert install on 8446, TAK upgrade re-stamp, domain change, split-DB TLS
+    converge, several startup migrations). Until now NONE of them kept a copy —
+    and the container deploy actively deleted `CoreConfig.xml.backup`. A bad
+    write left no way back.
+
+    Deliberately ONE rolling copy, not a timestamped history: it is the
+    last-known-good, it is trivially restorable by hand, and it cannot fill a
+    disk. Only fires for full-file writes of CoreConfig itself, only when the
+    content actually differs (so a no-op converge does not churn the backup away),
+    and NEVER raises — a backup problem must not block the write that TAK needs."""
+    try:
+        if path != CORECONFIG_PATH or 'a' in mode:
+            return
+        try:
+            cur = _read_priv(CORECONFIG_PATH)
+        except Exception:
+            return                      # nothing there yet (first write) — nothing to save
+        if isinstance(cur, (bytes, bytearray)):
+            cur = cur.decode('utf-8', 'replace')
+        new = content.decode('utf-8', 'replace') if isinstance(content, (bytes, bytearray)) else str(content)
+        if not (cur or '').strip() or cur == new:
+            return                      # empty, or an identical rewrite — keep the older copy
+        _write_priv(CORECONFIG_BACKUP, cur, perm=0o640)
+    except Exception:
+        pass
+
+
 def _write_priv(path, content, mode='w', perm=None):
     """Write to a privileged path. Routes through the broker when active;
     otherwise direct (root) or 'sudo tee' (legacy non-root). When `perm` is
-    given (octal int), the file is chmod'd to it after the write."""
+    given (octal int), the file is chmod'd to it after the write.
+
+    Full-file writes of CoreConfig.xml first stash the previous version as
+    `.infratak-prev` — see _backup_coreconfig_before_write()."""
+    _backup_coreconfig_before_write(path, content, mode)
     if _broker_should_route() and _broker_available():
         data = content if isinstance(content, (bytes, bytearray)) else str(content).encode()
         req = {'op': 'write', 'path': path, 'mode': mode,
@@ -386,6 +426,36 @@ def _read_priv(path):
             return f.read()
     proc = subprocess.run(['sudo', '-n', 'cat', path], capture_output=True, text=True, check=True)
     return proc.stdout
+
+
+def _read_coreconfig(path=CORECONFIG_PATH):
+    """Read CoreConfig.xml as text — the ONE way the console is allowed to read it.
+
+    v10.1.9: W7 hardening tightened /opt/tak/CoreConfig.xml to 640 tak:tak (it
+    carries the martiuser DB password in plaintext and had been world-readable).
+    The console runs as `takwerx`, which is deliberately NOT in group `tak` — see
+    [[broker-privilege-boundary]] and GH #52 — so a plain open() started raising
+    PermissionError on every non-root box. Sixteen call sites read CoreConfig
+    with a bare `except`, so instead of erroring they returned a WRONG ANSWER:
+    _coreconfig_has_ldap() said "no LDAP", and the TAK Server page offered
+    "Connect TAK Server to LDAP" on boxes that were already connected. Silent
+    misdetection also reached cert-enrollment patching, group-cache/webadmin
+    sync and the split-DB TLS converge checks.
+
+    Direct read first (root installs, and cheaper than a socket round trip), then
+    the broker. Raises the ORIGINAL OSError when neither route works, so callers
+    keep their existing FileNotFoundError / 'coreconfig_unreadable' semantics —
+    an unreadable CoreConfig must surface as an error, never as "no LDAP".
+    Writes already go through _write_priv(); this is the read half of that pair.
+    """
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return f.read()
+    except OSError as direct_err:
+        try:
+            return _read_priv(path)
+        except Exception:
+            raise direct_err
 
 
 def _makedirs_priv(path, mode=None, exist_ok=True):
@@ -698,7 +768,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.8-alpha"
+VERSION = "10.1.9-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -713,7 +783,15 @@ AUTHENTIK_DEV_RELEASE    = "2026.5.4"   # OFFLINE FALLBACK ONLY — dev channel 
 # ConfigStateless contract. v10.1.4 migrated the dispatcher plugin + the installer to that
 # contract and validated 13.49.0 end-to-end on test12 (plugins built, routes loaded, Events
 # CRUD in browser) — un-gated per operator decision 2026-07-17.
-CLOUDTAK_VETTED_RELEASE = "13.50.0"     # v10.1.6: validated on 5-box fleet (Ubuntu/Rocky/ARM) 2026-07-21; pre-13.45 plugin installs refused
+CLOUDTAK_VETTED_RELEASE = "13.54.3"     # v10.1.9: 13.50.0 -> 13.54.3, validated 2026-07-26 on Ubuntu/Rocky/ARM64; pre-13.45 plugin installs refused
+                                        # The GATE STAYS. Operator decision 2026-07-26: keep gating CloudTAK
+                                        # and bump the vetted number deliberately. dfpc-coe ships fast (six
+                                        # releases 13.53.1 -> 13.54.3 in three days, 24-26 Jul) and 13.45's
+                                        # hub/api split already broke plugin server routes once — this pin is
+                                        # what keeps a customer clicking Update from landing on whatever
+                                        # merged that morning. Dev-channel boxes still track upstream latest,
+                                        # so the fleet runs ahead of the pin by design; bumping is a one-line
+                                        # change once it has been watched.
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Marker in Caddyfile: content below this line is preserved when infra-TAK regenerates the file (e.g. health.tntak.net for Uptime Robot).
 CADDYFILE_USER_BLOCKS_MARKER = "# --- User-added blocks (do not remove) ---"
@@ -767,7 +845,9 @@ def _get_netbird_target_images(settings=None):
 # MediaMTX web editor: regular repo (no LDAP); when Authentik/LDAP is installed we use LDAP branch if set
 MEDIAMTX_EDITOR_REPO = "https://github.com/takwerx/mediamtx-installer.git"
 MEDIAMTX_EDITOR_PATH = "config-editor"  # subdir containing mediamtx_config_editor.py
-MEDIAMTX_EDITOR_REF = "main"  # set to release tag (e.g. v1.1.9) for deterministic editor deploys
+MEDIAMTX_EDITOR_REF = "main"  # PIN to "v2.1.0" when the editor ships it (10.1.9 W3: Public-toggle
+                              # fix + embedded hls.js are on installer dev awaiting tag) — an
+                              # unpinned ref is a supply-chain gap our own /module-scan rule bans.
 MEDIAMTX_EDITOR_LDAP_BRANCH = None  # LDAP behavior comes from mediamtx_ldap_overlay.py in this repo; use repo default branch
 # Fail-safe overlay script: never exits failure so ExecStartPre cannot block the web editor from starting
 MEDIAMTX_ENSURE_OVERLAY_SCRIPT = r'''#!/usr/bin/env python3
@@ -1822,6 +1902,53 @@ def _fw_install_shim(log=None):
     return False
 
 
+def _fw_port_source_scoped(port, proto='tcp'):
+    """True when this port is allowed ONLY from specific sources, not from Anywhere.
+
+    Lets the startup re-assert tell "firewalld lost its runtime rules on reboot"
+    (re-open it) apart from "the operator narrowed this on purpose" (leave it
+    alone). Without the distinction, restricting the console port to one address
+    on a firewalld box was silently widened back to Anywhere on the next console
+    start — and UFW boxes behaved differently, because the re-assert returns early
+    for ufw. Conservative: any doubt returns False, i.e. keep today's behaviour."""
+    proto = 'udp' if str(proto).lower() == 'udp' else 'tcp'
+    try:
+        port = int(port)
+    except Exception:
+        return False
+    be = _fw_backend()
+    try:
+        if be == 'firewalld':
+            # A blanket `--add-port=` beats any rich rule — if it is present the
+            # port IS open to Anywhere, whatever else is configured.
+            r = subprocess.run(_sudo_wrap(['firewall-cmd', '--zone=public', '--list-ports']),
+                               capture_output=True, text=True, timeout=20)
+            if f'{port}/{proto}' in (r.stdout or '').split():
+                return False
+            r = subprocess.run(_sudo_wrap(['firewall-cmd', '--zone=public', '--list-rich-rules']),
+                               capture_output=True, text=True, timeout=20)
+            for line in (r.stdout or '').splitlines():
+                if (f'port="{port}"' in line and 'source' in line
+                        and 'accept' in line and f'protocol="{proto}"' in line):
+                    return True
+            return False
+        if be == 'ufw':
+            # `ufw status` renders a scoped rule as `5001/tcp   ALLOW IN   1.2.3.4`
+            # and an open one as `... ALLOW IN   Anywhere`.
+            r = subprocess.run(_sudo_wrap(['ufw', 'status']), capture_output=True, text=True, timeout=20)
+            scoped = False
+            for line in (r.stdout or '').splitlines():
+                if f'{port}/{proto}' not in line or 'ALLOW' not in line:
+                    continue
+                if 'Anywhere' in line:
+                    return False        # an open rule exists — not scoped
+                scoped = True
+            return scoped
+    except Exception:
+        pass
+    return False
+
+
 def _fw_allow_from(source, port, proto='tcp'):
     """Open a port ONLY from a source IP/CIDR. ufw `allow from X to any port Y` ↔
     firewalld rich rule. v4/v6 family auto-detected from the source. Returns (ok,msg);
@@ -2600,12 +2727,35 @@ def detect_modules():
 
     return dict(sorted(modules.items(), key=lambda x: x[1].get('priority', 99)))
 
+# Height of the fixed identification bar. Any OTHER fixed top bar must stack below
+# it and add this to its own offset — see _custom_banner_height().
+CUSTOM_BANNER_H = 84
+
+
+def _custom_banner_height(settings):
+    """Vertical space the fixed identification banner occupies, or 0 when it is not
+    rendered. Mirrors render_custom_banner()'s own render/skip conditions exactly —
+    a second fixed bar that guesses this wrong either overlaps the banner or leaves
+    a gap. Keep the two in step."""
+    try:
+        cust = (settings or {}).get('customization', {}) or {}
+        if not cust.get('banner_enabled'):
+            return 0
+        if not html.escape((cust.get('banner_text') or '')[:120]).strip():
+            return 0
+        return CUSTOM_BANNER_H
+    except Exception:
+        return 0
+
+
 def render_custom_banner(settings):
     """Return HTML (style + fixed div) for the custom identification banner, or '' if disabled.
 
     Uses position:fixed so it overlays the top of every page without touching individual
     templates. The accompanying <style> block pushes body content down by the banner height
-    so nothing is obscured.
+    so nothing is obscured. NOTE: position:fixed is load-bearing, not cosmetic — every page
+    has `body{display:flex;flex-direction:row}`, so an in-flow banner here would become a
+    flex COLUMN instead of a top bar (see render_gd_delivery_gap_banner).
     """
     import re as _re_banner
     cust = settings.get('customization', {}) if settings else {}
@@ -2617,7 +2767,7 @@ def render_custom_banner(settings):
 
     logo_b64 = cust.get('agency_logo_b64') or ''
     logo_h = 68  # doubled from original 34px
-    banner_h = 84  # tall enough to frame the larger logo with padding
+    banner_h = CUSTOM_BANNER_H  # tall enough to frame the larger logo with padding
 
     # Font — map friendly names to CSS font-family stacks
     _font_map = {
@@ -2708,7 +2858,17 @@ def render_gd_delivery_gap_banner(settings):
     per-page nag banner (render_default_cert_password_warning) for being too
     alarmist. This fires only when there is genuinely something to deliver and
     nowhere to deliver it. Reads the in-memory GD monitor cache (no subprocess);
-    stays quiet on a healthy box or before the cache is warm."""
+    stays quiet on a healthy box or before the cache is warm.
+
+    v10.1.9: this banner is `position:fixed`, NOT in flow. It is concatenated onto
+    the front of `sidebar_html`, which every template renders as a direct child of
+    `body{display:flex;flex-direction:row}` — so as an in-flow div it became a flex
+    ITEM, i.e. a ~800px COLUMN sized to its one long line of text, shoving the
+    sidebar and the whole page right and leaving its faint rgba(...,.12) background
+    looking like dead black space. Found on aws-ubuntu 2026-07-26, the only box
+    meeting the render condition (a monitor down AND no email/SMS), which is why it
+    survived since v10.1.1. Same fixed-bar treatment as render_custom_banner, and it
+    stacks BELOW that banner when both are showing."""
     try:
         s = settings or {}
         if not (s.get('guarddog_deployed_version') or '').strip():
@@ -2725,10 +2885,23 @@ def render_gd_delivery_gap_banner(settings):
             return ''
     except Exception:
         return ''
+    _top = _custom_banner_height(s)      # sit under the identification bar when it is up
+    _h = 34
     return (
-        '<div style="position:relative;z-index:40;background:rgba(234,179,8,.12);'
-        'border-bottom:1px solid rgba(234,179,8,.4);color:#eab308;'
-        'padding:8px 16px;font-size:13px;text-align:center;font-weight:600">'
+        '<style>'
+        # Wins over render_custom_banner's own padding-top rule: both are !important
+        # and this <style> is emitted after it (see the inject_cloudtak_icon
+        # concatenation order), so the later declaration applies. Covers BOTH bars.
+        f'body{{padding-top:{_top + _h}px!important}}'
+        '.gd-gap-banner{'
+        f'position:fixed;top:{_top}px;left:0;right:0;height:{_h}px;z-index:205;'
+        'display:flex;align-items:center;justify-content:center;gap:6px;'
+        'box-sizing:border-box;padding:0 16px;overflow:hidden;'
+        'background:rgba(234,179,8,.12);border-bottom:1px solid rgba(234,179,8,.4);'
+        'color:#eab308;font-size:13px;font-weight:600;line-height:1.2;text-align:center'
+        '}'
+        '</style>'
+        '<div class="gd-gap-banner">'
         '⚠ Guard Dog has an active alert but no notification email is configured — '
         'this alert has nowhere to go. '
         '<a href="/guarddog" style="color:#eab308;text-decoration:underline">Configure notifications →</a>'
@@ -7304,8 +7477,10 @@ def _setup_server_one_rhel(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=N
         'sudo sed -i "/^[[:space:]]*#*[[:space:]]*listen_addresses[[:space:]]*=/d" "$PGDATA/postgresql.conf"; '
         "printf \"\\nlisten_addresses = '*'\\n\" | sudo tee -a \"$PGDATA/postgresql.conf\" >/dev/null; "
         'sudo sed -i "s/md5host/md5\\nhost/g" "$PGDATA/pg_hba.conf"; '
+        # v10.1.9 W1: fresh splits get hostssl+SCRAM (encrypted wire); retrofit boxes keep their
+        # existing plaintext line here — _enable_server_one_db_tls handles their upgrade.
         f'grep -q "^host.*{core_ip}/32" "$PGDATA/pg_hba.conf" 2>/dev/null || '
-        f'printf "\\nhost    all    all    {core_ip}/32    md5\\n" | sudo tee -a "$PGDATA/pg_hba.conf" >/dev/null; '
+        f'printf "\\nhostssl all all {core_ip}/32 scram-sha-256\\n" | sudo tee -a "$PGDATA/pg_hba.conf" >/dev/null; '
         'sudo systemctl restart "$PGSVC" 2>&1; echo "ACTIVE=$(systemctl is-active "$PGSVC" 2>/dev/null)"'
     )
     _, cout = _ssh_probe(s1, cfg_cmd, timeout=40)
@@ -7363,7 +7538,9 @@ def _setup_server_one_rhel(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=N
         else:
             log.append('WARNING: TAK schema build did not confirm — the cot DB may have no tables '
                        '(8446 login will 500). Output: ' + (scout or '')[:400])
-    return True, log, db_password
+    # Step 8 (v10.1.9 W1): encrypt the core↔DB wire — TLS + SCRAM (CJIS in-transit).
+    tls_pem = _server_one_tls_step(s1, core_ip, db_password, log)
+    return True, log, db_password, tls_pem
 
 
 def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
@@ -7482,8 +7659,10 @@ def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
         "sudo sed -i '/^\\s*#*\\s*listen_addresses\\s*=/d' \"$PG_MAIN/postgresql.conf\" && "
         "printf \"\\nlisten_addresses = '*'\\n\" | sudo tee -a \"$PG_MAIN/postgresql.conf\" > /dev/null && "
         'sudo sed -i "s/md5host/md5\\nhost/g" "$PG_MAIN/pg_hba.conf" && '
+        # v10.1.9 W1: fresh splits get hostssl+SCRAM (encrypted wire); retrofit boxes keep their
+        # existing plaintext line here — _enable_server_one_db_tls handles their upgrade.
         f'(grep -q "^host.*{core_ip}/32" "$PG_MAIN/pg_hba.conf" 2>/dev/null || '
-        f'printf "\\nhost    all    all    {core_ip}/32    md5\\n" | sudo tee -a "$PG_MAIN/pg_hba.conf" > /dev/null) && '
+        f'printf "\\nhostssl all all {core_ip}/32 scram-sha-256\\n" | sudo tee -a "$PG_MAIN/pg_hba.conf" > /dev/null) && '
         '(sudo pg_ctlcluster 15 main restart 2>/dev/null || sudo systemctl restart postgresql 2>/dev/null || true)'
     )
     ok, out = _ssh_probe(s1, pg_config_cmd, timeout=30)
@@ -7535,7 +7714,624 @@ def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
     else:
         log.append('Warning: could not read DB password from Server One — CoreConfig may need manual password fix.')
 
-    return True, log, db_password
+    # Step 5 (v10.1.9 W1): encrypt the core↔DB wire — TLS + SCRAM (CJIS in-transit).
+    tls_pem = _server_one_tls_step(s1, core_ip, db_password, log)
+    return True, log, db_password, tls_pem
+
+
+def _redact_db_secret(text, secret=None):
+    """Strip DB passwords out of captured command output before it reaches a log
+    or an API response. psql echoes the offending statement on error, so a failed
+    `ALTER USER … PASSWORD 'x'` would otherwise leak the credential into journald
+    and into the deploy log the browser receives."""
+    out = text or ''
+    if secret:
+        out = out.replace(secret, '***')
+    # Belt and braces: redact any PASSWORD '…' / PGPASSWORD=… shape we didn't expect.
+    out = re.sub(r"(?i)(password\s+')[^']*(')", r'\1***\2', out)
+    out = re.sub(r'(?i)(PGPASSWORD=)\S+', r'\1***', out)
+    return out
+
+
+def _enable_server_one_db_tls(s1, core_ip, db_password=None, remove_plaintext=False):
+    """Enable PostgreSQL native TLS + SCRAM on Server One (the split-deploy DB box) over SSH.
+    Idempotent — safe to re-run on every deploy/retrofit pass. Pairs with the CoreConfig
+    sslEnabled/sslMode/sslRootCert attributes per TAK Server Config Guide Appendix D:
+      1. self-signed 10y cert in the PG data dir, SAN = the exact host the core box dials
+         (sslMode=verify-full on the JDBC side pins it)
+      2. postgresql.conf managed lines (# infra-TAK-dbtls): ssl=on, cert paths,
+         password_encryption=scram-sha-256
+      3. pg_hba: hostssl <core_ip>/32 scram-sha-256 inserted ABOVE any plaintext host line;
+         the plaintext line is dropped only when remove_plaintext=True — the retrofit path
+         removes it only AFTER verifying the TLS connection live, never before
+      4. re-hash martiuser to SCRAM (needs db_password; PG15 default hashing is already
+         SCRAM on both families, this converges pre-15-era md5 stragglers)
+    Returns (ok, log_lines, cert_pem). cert_pem='' on failure — callers MUST treat that as
+    'leave CoreConfig untouched'; pointing TAK at a cert we failed to capture kills the DB link."""
+    log = []
+    if not _valid_core_ip(core_ip):
+        return False, ['DB TLS: core IP failed validation, refusing shell interpolation.'], ''
+    s1_host = (s1.get('host') or '').strip()
+    if not re.fullmatch(r'[A-Za-z0-9.\-]{1,253}', s1_host or ''):
+        return False, ['DB TLS: Server One host failed validation, refusing shell interpolation.'], ''
+    is_ip = bool(re.fullmatch(r'\d{1,3}(\.\d{1,3}){3}', s1_host))
+    san = f'IP:{s1_host}' if is_ip else f'DNS:{s1_host}'
+
+    # v10.1.9 W1 FIX (found on the first fresh two-server DEPLOY, AWS 2026-07-25):
+    # the hostssl rule must name the address Server One ACTUALLY sees the core
+    # arrive from — which is NOT necessarily settings['server_ip'].
+    #
+    # `_resolve_core_ip()` returns the box's PUBLIC address. That is right when the
+    # split is addressed publicly (SSD Nodes class, where the two boxes talk over
+    # the internet), and WRONG whenever Server One is addressed privately: on AWS
+    # with Server One at 172.31.41.4 the core arrives from 172.31.43.128, so a
+    # `hostssl <public>/32` rule never matches and the connection silently falls
+    # through to TAK's own stock `host all martiuser 0.0.0.0/0 md5`. Traffic still
+    # ended up encrypted (the JDBC side pins verify-full), but ONLY client-side —
+    # the server was not requiring it, so a CoreConfig reset by a TAK upgrade would
+    # silently downgrade the link to cleartext with nothing to notice.
+    #
+    # Server One already knows the answer: sshd sets $SSH_CLIENT on the session the
+    # console is driving, and that is the source address AFTER any NAT. Union it
+    # with core_ip so both the private and public routes are covered. Same
+    # `$SSH_CLIENT ∪ server_ip` shape that fixed the Guard Dog health agent.
+    core_ips = []
+    src_ok, src_out = _ssh_probe(s1, 'echo "SRC=${SSH_CLIENT%% *}"', timeout=20)
+    if src_ok:
+        for _line in (src_out or '').splitlines():
+            if _line.startswith('SRC='):
+                _cand = _line.split('=', 1)[1].strip()
+                if _valid_core_ip(_cand):
+                    core_ips.append(_cand)
+                break
+    if core_ip not in core_ips:
+        core_ips.append(core_ip)          # always keep the configured/public route
+
+    # Delete-then-insert each, ALWAYS, so placement is corrected on every run and
+    # never left below a broader rule (pg_hba is first-match-wins).
+    hba_cmd = ''
+    for _ip in core_ips:
+        _ip_sed = _ip.replace('.', r'\.')
+        hba_cmd += (
+            f'sudo sed -i -E "/^hostssl[[:space:]]+all[[:space:]]+all[[:space:]]+{_ip_sed}\\/32/d" "$HBA"; '
+            f'if sudo grep -Eq "^(host|hostssl|hostnossl|local)[[:space:]]" "$HBA"; then '
+            f'sudo sed -i "0,/^\\(host\\|hostssl\\|hostnossl\\|local\\)[[:space:]]/s//hostssl all all {_ip}\\/32 scram-sha-256\\n&/" "$HBA"; '
+            f'else printf "\\nhostssl all all {_ip}/32 scram-sha-256\\n" | sudo tee -a "$HBA" >/dev/null; fi; '
+        )
+
+    cfg_cmd = (
+        'DATA=$(sudo -u postgres psql -tAc "show data_directory" 2>/dev/null); '
+        'CONF=$(sudo -u postgres psql -tAc "show config_file" 2>/dev/null); '
+        'HBA=$(sudo -u postgres psql -tAc "show hba_file" 2>/dev/null); '
+        '{ [ -z "$DATA" ] || [ -z "$CONF" ] || [ -z "$HBA" ]; } && { echo NO_PG; exit 0; }; '
+        'if ! sudo test -s "$DATA/infratak-db.crt"; then '
+        'sudo openssl req -x509 -newkey rsa:4096 -sha256 -days 3650 -nodes '
+        '-keyout "$DATA/infratak-db.key" -out "$DATA/infratak-db.crt" '
+        f'-subj "/CN={s1_host}" -addext "subjectAltName={san}" >/dev/null 2>&1 '
+        '&& sudo chown postgres:postgres "$DATA/infratak-db.key" "$DATA/infratak-db.crt" '
+        '&& sudo chmod 600 "$DATA/infratak-db.key" && sudo chmod 644 "$DATA/infratak-db.crt" '
+        '&& echo CERT_GENERATED || echo CERT_FAILED; else echo CERT_EXISTS; fi; '
+        # Managed config lines: delete-then-append keeps this idempotent across re-runs.
+        'sudo sed -i "/# infra-TAK-dbtls$/d" "$CONF"; '
+        'printf "ssl = on # infra-TAK-dbtls\\n'
+        'ssl_cert_file = \'%s/infratak-db.crt\' # infra-TAK-dbtls\\n'
+        'ssl_key_file = \'%s/infratak-db.key\' # infra-TAK-dbtls\\n'
+        'password_encryption = scram-sha-256 # infra-TAK-dbtls\\n" "$DATA" "$DATA" '
+        '| sudo tee -a "$CONF" >/dev/null; '
+        # hostssl must go ABOVE **every** existing host rule, not just an exact
+        # <core_ip>/32 match. pg_hba is first-match-wins, and real boxes carry
+        # broader rules (test8's Server One had `host all martiuser 0.0.0.0/0 md5`)
+        # that would otherwise match the core box first and make our line dead
+        # code. Insert before the FIRST host/hostssl/local rule in the file.
+        # Delete-then-insert, ALWAYS. An existing hostssl line is not good enough —
+        # a line appended at the BOTTOM (what earlier code did, and what test8 was
+        # left carrying) sits below broader rules and is never consulted. Removing
+        # ours first and re-inserting at the top makes placement correct on every
+        # run, not just the first.
+        + hba_cmd +
+        'sudo -u postgres psql -qc "select pg_reload_conf();" >/dev/null 2>&1; '
+        'echo "SSL=$(sudo -u postgres psql -tAc "show ssl" 2>/dev/null)"'
+    )
+    ok, out = _ssh_probe(s1, cfg_cmd, timeout=90)
+    out = out or ''
+    if 'NO_PG' in out:
+        return False, ['DB TLS: PostgreSQL not reachable on Server One (could not resolve data dir).'], ''
+    if 'CERT_FAILED' in out:
+        return False, ['DB TLS: certificate generation failed on Server One: ' + out[:300]], ''
+    if 'SSL=on' not in out:
+        return False, ['DB TLS: ssl did not report on after reload: ' + out[:300]], ''
+    log.append('DB TLS: cert %s, ssl=on, hostssl %s scram-sha-256 in pg_hba.'
+               % ('generated' if 'CERT_GENERATED' in out else 'already present',
+                  ', '.join(f'{_i}/32' for _i in core_ips)))
+    if len(core_ips) > 1:
+        log.append('DB TLS: Server One sees the core arrive from %s; %s (configured) also allowed.'
+                   % (core_ips[0], core_ips[-1]))
+
+    if db_password:
+        sql = "ALTER USER martiuser WITH PASSWORD '" + db_password.replace("'", "''") + "'"
+        rok, rout = _ssh_probe(s1, 'sudo -u postgres psql -qc ' + shlex.quote(sql) + ' && echo REHASHED', timeout=30)
+        if rok and 'REHASHED' in (rout or ''):
+            log.append('DB TLS: martiuser re-hashed to SCRAM.')
+        else:
+            # NEVER echo psql's output raw: on a syntax error psql quotes the failing
+            # statement back ("LINE 1: ALTER USER … PASSWORD 'secret'"), and this log
+            # goes to journald AND into the deploy's JSON response. CJIS: secrets are
+            # never logged (same rule the broker's _summary redaction enforces).
+            log.append('DB TLS warning: martiuser SCRAM re-hash did not confirm — '
+                       + _redact_db_secret(rout or '', db_password)[:200])
+
+    if remove_plaintext:
+        # Only the retrofit calls this, and only after verifying a live TLS connection.
+        #
+        # We remove ONLY the exact `<core_ip>/32` line infra-TAK itself wrote. We do
+        # NOT touch broader operator rules (e.g. `host all martiuser 0.0.0.0/0 md5`,
+        # found live on test8's Server One) — other consumers may depend on them and
+        # silently deleting an operator's ACL could take them down. Instead we DETECT
+        # any remaining non-TLS rule that still admits the core box and surface it
+        # loudly, because while one exists the plaintext path is not actually closed.
+        # v10.1.9 W1 FIX: ALSO drop TAK Server's own stock permissive rule.
+        # `host all martiuser 0.0.0.0/0 md5` appeared on a BRAND-NEW Server One
+        # minutes after a fresh deploy, with no human ever touching its pg_hba
+        # (AWS two-server validation, 2026-07-25) — and `git log -S'0.0.0.0/0'`
+        # proves infra-TAK has never written one. So it is TAK's own db-setup
+        # artifact present on every split box, NOT an operator ACL, which is what
+        # makes removing it safe. Anything we do NOT recognise is still left alone
+        # and reported. Only ever reached with remove_plaintext=True, which the
+        # retrofit sets solely AFTER verifying a live TLS connection.
+        stock = r'^host[[:space:]]+all[[:space:]]+(martiuser|all)[[:space:]]+0\.0\.0\.0/0[[:space:]]'
+        # The pattern contains a literal '/' (0.0.0.0/0), which would terminate a
+        # sed /addr/ delimiter — escape it for sed, leave it plain for grep.
+        stock_sed = stock.replace('/', r'\/')
+        _sed_ips = [ip.replace('.', r'\.') for ip in core_ips]
+        dels = ''.join(
+            f'sudo sed -i -E "/^host[[:space:]]+.*{s}\\/32/d" "$HBA"; ' for s in _sed_ips)
+        counts = ' + '.join(
+            f'$(sudo grep -cE "^host[[:space:]]+.*{s}/32" "$HBA" || true)' for s in _sed_ips)
+        rm_cmd = (
+            'HBA=$(sudo -u postgres psql -tAc "show hba_file" 2>/dev/null); '
+            '[ -z "$HBA" ] && { echo NO_PG; exit 0; }; '
+            # Back up before ANY edit — this file is the box's access control.
+            'sudo cp -a "$HBA" "$HBA.takwerx-bak" 2>/dev/null; '
+            # Count what we actually delete — claiming "plaintext removed" when the
+            # sed matched nothing is a false success report (test8: there was never
+            # a /32 line, yet the migration announced it had removed one).
+            f'N=$(( {counts} )); '
+            f'S=$(sudo grep -cE \'{stock}\' "$HBA" || true); '
+            + dels +
+            f'sudo sed -i -E "/{stock_sed}/d" "$HBA"; '
+            'sudo -u postgres psql -qc "select pg_reload_conf();" >/dev/null 2>&1; '
+            'echo "PLAINTEXT_REMOVED=$N"; '
+            'echo "STOCK_REMOVED=$S"; '
+            # Anything still `host` (not hostssl) that isn't loopback-only is a
+            # residual cleartext path to this database.
+            'echo RESIDUAL_START; '
+            'sudo grep -E "^host[[:space:]]" "$HBA" | grep -vE "127\\.0\\.0\\.1/32|::1/128" || true; '
+            'echo RESIDUAL_END'
+        )
+        rok, rout = _ssh_probe(s1, rm_cmd, timeout=30)
+        out_s = rout or ''
+        if rok and 'PLAINTEXT_REMOVED=' in out_s:
+            nrem = out_s.split('PLAINTEXT_REMOVED=', 1)[1].split('\n', 1)[0].strip()
+            _ips_txt = ', '.join(core_ips)
+            log.append('DB TLS: removed %s plaintext pg_hba line(s) for %s.' % (nrem, _ips_txt)
+                       if nrem not in ('', '0') else
+                       'DB TLS: no dedicated plaintext pg_hba line for %s existed to remove.' % _ips_txt)
+            srem = (out_s.split('STOCK_REMOVED=', 1)[1].split('\n', 1)[0].strip()
+                    if 'STOCK_REMOVED=' in out_s else '')
+            if srem not in ('', '0'):
+                log.append("DB TLS: removed %s of TAK Server's own stock `host all <user> 0.0.0.0/0` "
+                           'rule(s) — the cleartext-from-anywhere path is now closed '
+                           '(pg_hba backed up alongside itself as .takwerx-bak).' % srem)
+            try:
+                residual = out_s.split('RESIDUAL_START', 1)[1].split('RESIDUAL_END', 1)[0].strip()
+            except IndexError:
+                residual = ''
+            if residual:
+                log.append('DB TLS ⚠ RESIDUAL CLEARTEXT PATH — Server One still has non-TLS '
+                           'pg_hba rule(s) that admit remote clients. The core↔DB link is now '
+                           'encrypted, but these leave another way in and are NOT ours to delete '
+                           '(other consumers may rely on them). Operator review required:')
+                for line in residual.splitlines()[:6]:
+                    log.append('    ' + line.strip())
+        else:
+            log.append('DB TLS warning: could not remove plaintext pg_hba line — ' + out_s[:200])
+
+    pok, pem = _ssh_probe(s1, 'DATA=$(sudo -u postgres psql -tAc "show data_directory" 2>/dev/null); sudo cat "$DATA/infratak-db.crt"', timeout=20)
+    pem = (pem or '').strip()
+    if not (pok and pem.startswith('-----BEGIN CERTIFICATE-----')):
+        return False, log + ['DB TLS: could not read back the server cert — CoreConfig will NOT be switched to TLS.'], ''
+    log.append('DB TLS: server cert captured for JDBC verify-full pinning.')
+    return True, log, pem
+
+
+def _server_one_tls_step(s1, core_ip, db_password, log):
+    """Deploy-tail TLS step shared by the Debian and RHEL Server One paths. Returns cert_pem
+    ('' on failure). On failure also fail-opens a firewalled plaintext pg_hba line — a fresh
+    split only wrote hostssl, which never matches non-TLS connections, so without this a TLS
+    hiccup would leave the core box with no matching pg_hba entry at all."""
+    tls_ok, tls_log, tls_pem = _enable_server_one_db_tls(s1, core_ip, db_password=db_password)
+    log.extend(tls_log)
+    if tls_ok:
+        return tls_pem
+    log.append('WARNING: DB TLS enable failed — falling back to the firewalled plaintext path; '
+               'CoreConfig stays non-TLS until a later pass succeeds.')
+    if _valid_core_ip(core_ip):
+        ip_sed = core_ip.replace('.', r'\.')
+        _ssh_probe(s1, (
+            'HBA=$(sudo -u postgres psql -tAc "show hba_file" 2>/dev/null); '
+            '[ -z "$HBA" ] && exit 0; '
+            f'sudo grep -Eq "^host[[:space:]].*{ip_sed}/32" "$HBA" || '
+            f'printf "\\nhost    all    all    {core_ip}/32    md5\\n" | sudo tee -a "$HBA" >/dev/null; '
+            'sudo -u postgres psql -qc "select pg_reload_conf();" >/dev/null 2>&1; true'
+        ), timeout=30)
+    return ''
+
+
+TAK_DB_TLS_ROOTCERT_PATH = '/opt/tak/certs/files/takdb-root.crt'
+
+
+def _coreconfig_db_tls_converge(cc, settings=None):
+    """v10.1.9 W1: stamp the TAK-documented ssl attributes (CoreConfig.xsd <connection>:
+    sslEnabled/sslMode/sslRootCert — TAK Server Config Guide Appendix D) onto the DB
+    <connection> element when this box is a two_server core with a captured Server One cert.
+    Pure string transform — callers write the result via their own privileged write path.
+    Guards, in order of importance:
+      - only touches a <connection> whose jdbc host EQUALS the saved Server One host, so
+        single-box (127.0.0.1) and external-DB configs are never stamped with our cert
+      - returns cc unchanged unless the pinned root cert is verifiably on disk (pointing
+        TAK at a missing sslRootCert kills the DB link at boot)
+      - never raises; any failure returns the input unchanged."""
+    try:
+        if '<connection' not in (cc or ''):
+            return cc
+        s = settings if settings is not None else load_settings()
+        cfg = _get_tak_deployment_config(s)
+        if cfg.get('mode') != 'two_server':
+            return cc
+        s1_host = (cfg.get('server_one', {}).get('host') or '').strip()
+        if not s1_host:
+            return cc
+        pem = (cfg.get('database', {}).get('ssl_root_cert_pem') or '').strip()
+        stamp_ok = pem.startswith('-----BEGIN CERTIFICATE-----')
+        if stamp_ok:
+            # Materialize the pinned root cert (idempotent, tak-readable).
+            # NB: _read_priv RAISES (BrokerError / CalledProcessError) when the path
+            # doesn't exist — which is ALWAYS true on the first run. Treat "cannot
+            # read" as "not present yet", never as a reason to abort: swallowing it
+            # here is what made the stamp a silent no-op on every non-root box
+            # (caught live on test8 2026-07-25, first real run of this code).
+            try:
+                existing = (_read_priv(TAK_DB_TLS_ROOTCERT_PATH) or '').strip()
+            except Exception:
+                existing = ''
+            if existing != pem:
+                _makedirs_priv(os.path.dirname(TAK_DB_TLS_ROOTCERT_PATH))
+                _write_priv(TAK_DB_TLS_ROOTCERT_PATH, pem + '\n')
+                subprocess.run(_sudo_wrap(['chown', 'tak:tak', TAK_DB_TLS_ROOTCERT_PATH]), capture_output=True, timeout=15)
+                subprocess.run(_sudo_wrap(['chmod', '644', TAK_DB_TLS_ROOTCERT_PATH]), capture_output=True, timeout=15)
+                try:
+                    stamp_ok = (_read_priv(TAK_DB_TLS_ROOTCERT_PATH) or '').strip() == pem
+                except Exception as _ce:
+                    print(f"DB TLS converge: pinned cert unreadable after write ({_ce}) — not stamping", flush=True)
+                    stamp_ok = False
+
+        def _stamp(m):
+            attrs, close = m.group(1), m.group(2)
+            um = re.search(r'jdbc:postgresql://([^:/"]+)', attrs)
+            if not um or um.group(1) != s1_host:
+                return m.group(0)
+            # Strip first: stale attrs pinning a previous host's cert fail verify-full and
+            # kill the DB link (e.g. after a Server One migration to a new box).
+            attrs = re.sub(r'\s+ssl(Enabled|Mode|RootCert|Cert|Key)="[^"]*"', '', attrs)
+            if not stamp_ok:
+                return attrs + close
+            return (attrs + ' sslEnabled="true" sslMode="verify-full" sslRootCert="'
+                    + TAK_DB_TLS_ROOTCERT_PATH + '"' + close)
+        return re.sub(r'(<connection\b[^>]*?)(\s*/?>)', _stamp, cc)
+    except Exception as e:
+        # Return the input unchanged (never corrupt CoreConfig) but SAY SO — a
+        # silent return here hid a total failure behind "no CoreConfig change".
+        print(f"DB TLS converge: skipped, returning CoreConfig unchanged ({e})", flush=True)
+        return cc
+
+
+def _harden_sensitive_permissions(plog=None):
+    """v10.1.9 W7 — tighten world-readable secrets left behind by default umasks.
+
+    Found live on test8 2026-07-25 while auditing after an operator report:
+      - /opt/tak/certs/files/admin.key was 644 (tak:tak). The TAK ADMIN client
+        private key, readable by `takwerx` — i.e. a console compromise could
+        impersonate the TAK administrator, which is exactly what running the
+        console non-root is supposed to prevent. Written by TAK's own cert
+        scripts under a default umask, not by us.
+      - authentik/.env, CloudTAK/.env, TAK-Portal/.env were 644, each carrying
+        DB passwords + signing keys. These we generate, so this one IS ours.
+      - /opt/tak/CoreConfig.xml was 674 — the DB password in plaintext, world
+        readable.
+
+    None of these are network-reachable; they are local privilege-escalation
+    stepping stones. Idempotent and cheap, so it runs on every console boot via
+    _startup_migrations (console-path delivery — existing boxes get it from a
+    normal update, no SSH). Ownership is never changed, only the mode, so a
+    service that already reads its own file keeps working:
+      *.key / *.p12 / *.jks → 600      (owner-only; TAK runs as their owner)
+      module .env           → 600      (owner-only; compose runs as that user)
+      CoreConfig.xml        → 640      (tak group keeps read; world loses it)
+
+    GUARD (added after W7 broke CoreConfig reads): every tightening is verified —
+    if the console could get the bytes of a file before the chmod and cannot after
+    it, the mode is REVERTED and reported. See _console_can_read() below.
+    """
+    def _say(m):
+        (plog or (lambda x: print(f"Permissions hardening: {x}", flush=True)))(m)
+
+    def _console_can_read(path):
+        """Can THIS console process actually obtain the contents of `path`?
+
+        Direct read first, then the privileged route (broker / sudo cat) — a
+        broker-routed read counts, because that is how the console is SUPPOSED
+        to reach hardened files (CoreConfig.xml since v10.1.9). Only False when
+        neither route yields bytes. Always True as root, so the guard is a no-op
+        on root installs — which is correct: root never lost a read.
+
+        Deliberately a REAL read, not os.access(): the broker enforces a path
+        allowlist, so 'the mode allows it' and 'the console can get it' are
+        different questions and only the read answers the second one. Contents
+        are discarded immediately — these are secret files, nothing is logged.
+        """
+        try:
+            with open(path, 'rb') as f:
+                f.read(1)
+            return True
+        except OSError:
+            pass
+        try:
+            _read_priv(path)
+            return True
+        except Exception:
+            return False
+
+    targets = []
+    # ── /opt/tak/certs is DELIBERATELY NOT hardened ───────────────────────────
+    # It is a SHARED directory by design: bind-mounted into the Node-RED
+    # container (`/opt/tak/certs/files -> /certs`) which runs as uid 1000, while
+    # the files are owned by `tak` (uid 1491). Tightening them to 600 locked
+    # Node-RED out and killed its TAK feeds fleet-wide —
+    #   [tls-config:TAK Mission API TLS] Error: EACCES: permission denied,
+    #   open '/certs/admin.key'
+    # — on test8/test6/test12/NUC the moment this shipped (2026-07-25). The
+    # loose mode on admin.key IS a real weakness, but it cannot be fixed by
+    # chmod alone: a legitimate consumer needs cross-uid read. The fix is a
+    # separate, narrower cert path for Node-RED (or a shared group), tracked on
+    # the roadmap — NOT a blanket chmod. Do not re-add this without solving that.
+    #
+    # Module .env files (we generate these). Cover both the non-root home and the
+    # root-era layout that pre-flip boxes still carry.
+    for home in ('/home/takwerx', '/root'):
+        for mod in ('authentik', 'CloudTAK', 'TAK-Portal', 'node-red', 'nodered',
+                    'netbird', 'eud-remote-assist', 'webodm', 'emailrelay'):
+            targets.append((f'{home}/{mod}/.env', '600'))
+    targets.append(('/opt/tak/CoreConfig.xml', '640'))
+
+    fixed, blocked = [], []
+    for path, want in targets:
+        try:
+            r = subprocess.run(_sudo_wrap(['stat', '-c', '%a', path]),
+                               capture_output=True, text=True, timeout=15)
+            cur = (r.stdout or '').strip()
+            if not cur or r.returncode != 0:
+                continue                      # not present on this box
+            # Only tighten. Never widen a mode an operator deliberately narrowed.
+            if int(cur, 8) & ~int(want, 8):
+                could_read = _console_can_read(path)
+                c = subprocess.run(_sudo_wrap(['chmod', want, path]), capture_output=True, timeout=15)
+                if c.returncode != 0:
+                    continue
+                # ── The guard ────────────────────────────────────────────────
+                # W7 has now twice tightened a path something legitimately reads:
+                # /opt/tak/certs killed Node-RED's TAK feeds fleet-wide, and
+                # CoreConfig.xml 640 locked `takwerx` out of the file that 16
+                # call sites read — where a bare `except` turned "cannot read"
+                # into a confidently WRONG answer ("LDAP not connected" on a
+                # connected box). Both were caught in the field, not here.
+                # So: never leave a mode we cannot read through. If the console
+                # could get the bytes before and cannot now, put the mode back
+                # and say so — a hardening step that breaks the console is a
+                # bug to surface, not a security win to keep.
+                if could_read and not _console_can_read(path):
+                    subprocess.run(_sudo_wrap(['chmod', cur, path]), capture_output=True, timeout=15)
+                    blocked.append(f'{path} ({cur}->{want} REVERTED)')
+                    continue
+                fixed.append(f'{path} {cur}->{want}')
+        except Exception:
+            continue
+    if fixed:
+        _say(f'tightened {len(fixed)} file(s): ' + '; '.join(fixed[:8])
+             + (f' (+{len(fixed) - 8} more)' if len(fixed) > 8 else ''))
+    if blocked:
+        _say('⚠ NOT hardened — the console can no longer read these after the chmod, '
+             'so the old mode was restored. Route the reader through the broker '
+             '(_read_priv / _read_coreconfig) before tightening again: '
+             + '; '.join(blocked))
+    return fixed
+
+
+# v10.1.9 W1: bump whenever the retrofit's BEHAVIOUR changes, so boxes that
+# already recorded completion under an older build get the new pass exactly once.
+# 1 = original. 2 = $SSH_CLIENT-scoped hostssl + removal of TAK's stock
+#     `host all <user> 0.0.0.0/0` rule.
+SPLIT_DB_TLS_FIX_VERSION = 2
+
+
+def _split_db_tls_complete(state=None):
+    """True only when the retrofit has run AND at the CURRENT fix version.
+
+    Without this, a marker written by an older build locks the box out of every
+    later fix forever — test8 recorded plain 'enabled' before the stock-rule
+    removal existed, so it would have kept its cleartext path with the migration
+    permanently skipped. Legacy 'enabled' parses as v1 and therefore re-runs once.
+    Uses '@v' rather than ':' so it cannot collide with the 'attempts:N' form."""
+    s = (state if state is not None else _split_db_tls_state()) or ''
+    if not s.startswith('enabled'):
+        return False
+    ver = 1
+    if '@v' in s:
+        try:
+            ver = int(s.split('@v', 1)[1])
+        except ValueError:
+            ver = 1
+    return ver >= SPLIT_DB_TLS_FIX_VERSION
+
+
+def _split_db_tls_state(value=None):
+    """Read/write the retrofit's completion marker.
+
+    Deliberately a SEPARATE file, not a key in settings.json: the console has many
+    background threads doing load→modify→save on settings, and one of them clobbered
+    this flag on test8 (2026-07-25 — migration wrote it at 02:03:21, an unrelated
+    thread that had loaded earlier re-saved at 02:10:52 and the key vanished). A
+    lost marker means the migration re-runs forever. This file has exactly one
+    writer, so it cannot lose a race."""
+    path = os.path.join(CONFIG_DIR, 'split-db-tls.state')
+    if value is None:
+        try:
+            with open(path) as f:
+                return (f.read() or '').strip()
+        except OSError:
+            return ''
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(path, 'w') as f:
+            f.write(str(value).strip())
+        os.chmod(path, 0o600)
+    except OSError as e:
+        print(f"Split DB TLS retrofit: could not persist state marker ({e})", flush=True)
+    return str(value).strip()
+
+
+def _migrate_split_db_tls():
+    """v10.1.9 W1 retrofit: encrypt an EXISTING split-box core↔DB link via the normal console
+    update path (no operator SSH/start.sh — console-path delivery rule). Runs in a background
+    thread from _startup_migrations. Ordered so a failure can never sever a working DB link:
+      1. enable TLS server-side (hostssl inserted ABOVE the existing plaintext line)
+      2. stamp CoreConfig ssl attrs, restart takserver
+      3. VERIFY live: pg_stat_ssl shows the martiuser connection encrypted
+      4. only then remove the plaintext pg_hba line and mark split_db_tls_state=enabled
+    On verify failure: CoreConfig rolled back, takserver restarted on the plaintext path,
+    attempt recorded (held after 3 — clear split_db_tls_attempts in settings to re-arm)."""
+    _p = lambda m: print(f"Split DB TLS retrofit: {m}", flush=True)
+    try:
+        time.sleep(90)  # let boot settle: broker, takserver autostart, network
+        s = load_settings()
+        cfg = _get_tak_deployment_config(s)
+        if cfg.get('mode') != 'two_server':
+            return
+        _state = _split_db_tls_state()
+        if _split_db_tls_complete(_state):
+            return
+        if _state.startswith('enabled'):
+            _p(f"re-running: marker is {_state or 'enabled'} (fix v1), current fix version is "
+               f"v{SPLIT_DB_TLS_FIX_VERSION} — applying the newer pass once")
+        attempts = int(_state.split(':', 1)[1]) if _state.startswith('attempts:') else 0
+        if attempts >= 3:
+            _p("held after 3 failed attempts — investigate, then clear split_db_tls_attempts in settings to re-arm")
+            return
+        s1 = cfg.get('server_one', {})
+        if not (s1.get('host') or '').strip() or not os.path.exists('/opt/tak/CoreConfig.xml'):
+            return
+        core_ip = _resolve_core_ip(s, cfg)
+        if not core_ip:
+            _p("core IP unresolved — will retry next boot")
+            return
+        ok, out = _ssh_probe(s1, 'echo SSH_OK', timeout=20)
+        if not ok or 'SSH_OK' not in (out or ''):
+            _p("Server One SSH unreachable — will retry next boot: " + (out or '')[:200])
+            return
+
+        db_password = (cfg.get('database', {}).get('password') or '').strip()
+        tls_ok, tls_log, pem = _enable_server_one_db_tls(s1, core_ip, db_password=db_password)
+        for line in tls_log:
+            _p(line)
+        if not tls_ok or not pem:
+            _p("server-side TLS enable failed — plaintext path untouched; will retry next boot")
+            return
+        s = load_settings()
+        cfg = _get_tak_deployment_config(s)
+        cfg.setdefault('database', {})['ssl_root_cert_pem'] = pem
+        s['tak_deployment'] = cfg
+        save_settings(s)
+
+        cc_orig = _read_priv('/opt/tak/CoreConfig.xml') or ''
+        if not cc_orig.strip():
+            _p("could not read CoreConfig — will retry next boot")
+            return
+        cc_new = _coreconfig_db_tls_converge(cc_orig, s)
+        r_act = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'takserver']),
+                               capture_output=True, text=True, timeout=15)
+        was_active = (r_act.stdout or '').strip() == 'active'
+        if not was_active:
+            # Never juggle the link while the operator has TAK down — stamp and defer.
+            if cc_new != cc_orig:
+                _write_priv('/opt/tak/CoreConfig.xml', cc_new)
+                _p("CoreConfig stamped; takserver not active — TLS verify + plaintext removal deferred")
+            else:
+                _p("takserver not active — TLS verify deferred to a boot where it runs")
+            return
+        if cc_new != cc_orig:
+            _write_priv('/opt/tak/CoreConfig.xml', cc_new)
+            _p("CoreConfig stamped (sslEnabled, sslMode=verify-full) — restarting takserver")
+            subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takserver']), capture_output=True, timeout=180)
+        elif 'sslEnabled="true"' not in cc_orig:
+            _p("no CoreConfig change and no ssl attrs present — will retry next boot")
+            return
+
+        # Verify the live link is actually TLS (TAK's pool comes up over ~1-3 min).
+        q = ('sudo -u postgres psql -tAc "SELECT (bool_or(s.ssl))::text || \'/\' || count(*)::text '
+             'FROM pg_stat_ssl s JOIN pg_stat_activity a USING(pid) '
+             'WHERE a.usename=\'martiuser\' AND a.client_addr IS NOT NULL"')
+        verified = False
+        saw_plain = False
+        for _ in range(24):  # ~4 min
+            time.sleep(10)
+            vok, vout = _ssh_probe(s1, q, timeout=25)
+            vout = (vout or '').strip()
+            if vok and '/' in vout:
+                flag, cnt = vout.split('/', 1)
+                if cnt.strip().isdigit() and int(cnt.strip()) > 0:
+                    if flag.strip() == 'true':
+                        verified = True
+                        break
+                    saw_plain = True
+        if verified:
+            rm_ok, rm_log, _pem2 = _enable_server_one_db_tls(s1, core_ip, db_password=db_password,
+                                                             remove_plaintext=True)
+            for line in rm_log:
+                _p(line)
+            # Record WHICH kind of done this was. The retrofit runs exactly once and
+            # is then skipped forever, so a residual cleartext rule we deliberately
+            # chose not to delete would be announced in a single journal line and
+            # never mentioned again — the operator's cue to close it disappears.
+            # 'enabled-residual' still counts as complete, so the migration stays
+            # one-shot; it just keeps re-warning on every boot. The @v suffix is
+            # what lets a LATER fix reach this box exactly once (see
+            # _split_db_tls_complete) instead of being skipped forever.
+            _split_db_tls_state(('enabled-residual' if any('RESIDUAL CLEARTEXT PATH' in l for l in rm_log)
+                                 else 'enabled') + f'@v{SPLIT_DB_TLS_FIX_VERSION}')
+            if any('RESIDUAL CLEARTEXT PATH' in l for l in rm_log):
+                _p("✓ DONE — the core↔DB link is now TLS (verify-full pinned). NOTE: Server One "
+                   "still accepts non-TLS connections from other clients (listed above) — that "
+                   "residual path is the operator's to close.")
+            else:
+                _p("✓ COMPLETE — core↔DB link is TLS (verify-full pinned) and no cleartext path remains")
+            return
+        _p("✗ TLS link did NOT verify (%s) — rolling CoreConfig back to the plaintext path"
+           % ("connections still plaintext" if saw_plain else "no martiuser connection observed"))
+        _write_priv('/opt/tak/CoreConfig.xml', cc_orig)
+        subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takserver']), capture_output=True, timeout=180)
+        _split_db_tls_state(f'attempts:{attempts + 1}')
+        _p(f"rolled back and takserver restarted; attempt {attempts + 1}/3 recorded — will retry next boot")
+    except Exception as e:
+        _p(f"error (non-fatal, will retry next boot): {e}")
 
 
 def _fetch_db_password_from_server_one(s1_cfg):
@@ -7642,10 +8438,16 @@ def takserver_two_server_open_db_firewall():
     if db_pkg_path and not os.path.isfile(db_pkg_path):
         db_pkg_path = None
 
-    ok, log, db_password = _setup_server_one(s1, core_ip, db_port,
-                                              db_pkg_path=db_pkg_path, db_pkg_name=db_pkg if db_pkg_path else None)
+    res = _setup_server_one(s1, core_ip, db_port,
+                            db_pkg_path=db_pkg_path, db_pkg_name=db_pkg if db_pkg_path else None)
+    # Failure paths return 3-tuples; success returns a 4th element: the DB TLS root cert PEM.
+    ok, log, db_password = res[0], res[1], res[2]
+    tls_pem = res[3] if len(res) > 3 else ''
     if db_password:
         cfg['database']['password'] = db_password
+    if tls_pem:
+        cfg['database']['ssl_root_cert_pem'] = tls_pem
+    if db_password or tls_pem:
         settings['tak_deployment'] = cfg
         save_settings(settings)
 
@@ -7695,12 +8497,24 @@ def takserver_two_server_runbook():
         f'sudo ufw delete allow {db_port}/tcp || true',
         f'sudo ufw deny {db_port}/tcp',
         'sudo ufw --force enable',
+        '# v10.1.9: encrypt the core↔DB wire (TLS + SCRAM) — TAK Server Config Guide Appendix D',
+        'PGDATA=$(sudo -u postgres psql -tAc "show data_directory")',
+        f'sudo openssl req -x509 -newkey rsa:4096 -sha256 -days 3650 -nodes -keyout "$PGDATA/infratak-db.key" -out "$PGDATA/infratak-db.crt" -subj "/CN={db_host}" -addext "subjectAltName=IP:{db_host}"',
+        'sudo chown postgres:postgres "$PGDATA"/infratak-db.* && sudo chmod 600 "$PGDATA/infratak-db.key" && sudo chmod 644 "$PGDATA/infratak-db.crt"',
+        'CONF=$(sudo -u postgres psql -tAc "show config_file")',
+        'printf "ssl = on\\nssl_cert_file = \'%s/infratak-db.crt\'\\nssl_key_file = \'%s/infratak-db.key\'\\npassword_encryption = scram-sha-256\\n" "$PGDATA" "$PGDATA" | sudo tee -a "$CONF"',
+        f'echo "hostssl all all {core_host_for_db_acl}/32 scram-sha-256" | sudo tee -a "$(sudo -u postgres psql -tAc \'show hba_file\')"   # replaces any plaintext host line for {core_host_for_db_acl}',
+        'sudo -u postgres psql -c "select pg_reload_conf();"',
     ]
     server_two_steps = [
         '# Server Two: Core Server',
         'sudo apt-get update && sudo apt-get install -y lsb-release',
         f'sudo apt install -y ./{core_pkg}' if core_pkg else 'sudo apt install -y ./takserver-core_x.x-RELEASExx_all.deb',
         f'sudo sed -i \'s|jdbc:postgresql://127.0.0.1:5432/cot|jdbc:postgresql://{db_host}:{db_port}/cot|g\' /opt/tak/CoreConfig.xml',
+        '# v10.1.9: pin + encrypt the DB link — copy the server cert from Server One, then add',
+        f'#   sslEnabled="true" sslMode="verify-full" sslRootCert="/opt/tak/certs/files/takdb-root.crt"',
+        '#   to the <connection …> element in /opt/tak/CoreConfig.xml (Config Guide Appendix D)',
+        f'sudo scp <user>@{db_host}:"$(ssh <user>@{db_host} sudo -u postgres psql -tAc \'show data_directory\')/infratak-db.crt" /opt/tak/certs/files/takdb-root.crt && sudo chown tak:tak /opt/tak/certs/files/takdb-root.crt',
         'sudo systemctl daemon-reload',
         'sudo systemctl enable takserver',
         'sudo systemctl restart takserver',
@@ -7709,7 +8523,9 @@ def takserver_two_server_runbook():
     notes = [
         'Manual naming/order preserved: Server One (Database Server) first, then Server Two (Core Server).',
         'Database password is generated by the TAK installer; confirm the value in /opt/tak/CoreConfig.example.xml on Server One and ensure Server Two CoreConfig.xml matches it.',
-        'For production, enable PostgreSQL TLS per Appendix D and use sslEnabled/sslMode fields in CoreConfig.xml.',
+        'PostgreSQL TLS per Appendix D is included above (v10.1.9): server cert + hostssl/SCRAM on '
+        'Server One, sslEnabled/sslMode=verify-full/sslRootCert on the CoreConfig <connection>. '
+        'The console-driven deploy does all of this automatically.',
     ]
     return jsonify({
         'success': True,
@@ -7791,11 +8607,16 @@ def takserver_two_server_deploy_server_one():
         if not ok_ver:
             return jsonify({'success': False, 'error': ver_err}), 400
 
-    ok, log, db_password = _setup_server_one(s1, core_ip, db_port,
-                                              db_pkg_path=local_deb, db_pkg_name=db_pkg)
+    res = _setup_server_one(s1, core_ip, db_port,
+                            db_pkg_path=local_deb, db_pkg_name=db_pkg)
+    # Failure paths return 3-tuples; success returns a 4th element: the DB TLS root cert PEM.
+    ok, log, db_password = res[0], res[1], res[2]
+    tls_pem = res[3] if len(res) > 3 else ''
     if db_password:
         if preserve_saved_host:
             # Do not persist alternate host — migration still needs saved Server One = current DB source.
+            # Same for the TLS cert: storing the ALTERNATE box's cert against the saved host would
+            # break verify-full pinning on the still-live link; migration stores it on cutover.
             settings = load_settings()
             cfg_save = _get_tak_deployment_config(settings)
             cfg_save.setdefault('database', {})['password'] = db_password
@@ -7804,6 +8625,8 @@ def takserver_two_server_deploy_server_one():
             log.append('Note: Saved Server One host unchanged (alternate deploy). Use Start migration when ready.')
         else:
             cfg['database']['password'] = db_password
+            if tls_pem:
+                cfg['database']['ssl_root_cert_pem'] = tls_pem
             settings['tak_deployment'] = cfg
             save_settings(settings)
 
@@ -7956,6 +8779,9 @@ def takserver_two_server_deploy_server_two():
                     lambda m: m.group(1) + db_password + m.group(2),
                     content
                 )
+
+            # v10.1.9 W1: stamp the documented ssl attrs when Server One captured a TLS cert.
+            content = _coreconfig_db_tls_converge(content)
 
             _write_priv(core_config, content)
 
@@ -11939,18 +12765,13 @@ def _tak_db_topology(settings=None):
     # Container TAK: its DB is the takserver-db container regardless of the url.
     if _tak_is_container():
         return 'container', TAK_DB_CONTAINER, 5432
-    # Parse the live CoreConfig connection url (may be root-owned → broker read).
+    # Parse the live CoreConfig connection url (root-owned + 640 → broker read).
     url_host, url_port = '', 5432
     try:
-        content = ''
         try:
-            with open('/opt/tak/CoreConfig.xml') as _f:
-                content = _f.read()
-        except (PermissionError, FileNotFoundError):
-            try:
-                content = _read_priv('/opt/tak/CoreConfig.xml') or ''
-            except Exception:
-                content = ''
+            content = _read_coreconfig() or ''
+        except Exception:
+            content = ''
         m = _re_topo.search(r'jdbc:postgresql://([^:/]+)(?::(\d+))?/cot', content)
         if m:
             url_host = (m.group(1) or '').strip()
@@ -11973,13 +12794,9 @@ def _read_martiuser_password_from_local_coreconfig():
     (TAK's JDBC decodes &amp; etc.; we must match). ('', reason) if not found."""
     try:
         try:
-            cc = _read_priv('/opt/tak/CoreConfig.xml')  # v10.0.5 non-root: read via broker
+            cc = _read_coreconfig()   # v10.0.5 non-root / v10.1.9 W7 640: via broker
         except Exception:
-            try:
-                with open('/opt/tak/CoreConfig.xml') as _f:
-                    cc = _f.read()
-            except Exception:
-                cc = ''
+            cc = ''
         for pat in (
             r'<connection[^>]*url\s*=\s*["\']jdbc:postgresql://[^"\']+/cot["\'][^>]*password\s*=\s*["\']([^"\']*)["\']',
             r'<connection[^>]*username\s*=\s*["\']martiuser["\'][^>]*password\s*=\s*["\']([^"\']*)["\']',
@@ -12657,6 +13474,60 @@ def _f2b_local_subnets():
         pass
     return subnets
 
+
+# Overlay interfaces infra-TAK ITSELF brings up to manage a box: the WireGuard
+# relay/anchor from the Connectivity Wizard, and NetBird. These are EXCLUDED from
+# _f2b_local_subnets() above (they match _F2B_VIRTUAL_IFACE_PREFIXES), which is
+# right for docker/CNI noise and WRONG here — see _f2b_mgmt_tunnel_subnets().
+_F2B_MGMT_TUNNEL_PREFIXES = ('wg', 'nb-', 'netbird')
+# NetBird hands out 100.64.0.0/10 (RFC 6598 shared space). Python's is_private is
+# False for it, so the RFC1918 test in _f2b_local_subnets() would reject it twice
+# over — once on the interface name, once on the address.
+_F2B_CGNAT = ipaddress.ip_network('100.64.0.0/10')
+
+
+def _f2b_mgmt_tunnel_subnets():
+    """Subnets of the management tunnels infra-TAK itself creates — never bannable.
+
+    A box behind CGNAT or without a static IP is reached ONLY through its tunnel
+    (the Oracle-relay strategy). fail2ban's `iptables-allports` action blocks EVERY
+    port from a banned address, so one ban on the tunnel gateway locks the operator
+    out of a machine they cannot walk up to — and `recidive` escalates repeats from
+    an hour to far longer. Field-hit 2026-07-26: the sshd jail banned the relay's
+    172.31.99.1 and the box went dark to the relay while still answering ping.
+
+    This became reachable because the no-rsyslog fix (469f2a2) made the sshd jail
+    actually run on boxes where it had been dead — the jail working is the point,
+    but it must not eat the road in.
+
+    Scope is deliberately narrow: ONLY interfaces we bring up ourselves. A
+    third-party VPN (tailscale/zt/tun/tap) may carry users we do not vouch for, so
+    those stay excluded and the operator can add them via `fail2ban_ignore_cidrs`.
+    Accepts RFC1918 or CGNAT. Best-effort; [] on any failure."""
+    subnets = []
+    try:
+        r = subprocess.run(['ip', '-o', '-4', 'addr', 'show', 'scope', 'global'],
+                           capture_output=True, text=True, timeout=5)
+        for line in r.stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            ifname = parts[1].split('@')[0]
+            if not ifname.startswith(_F2B_MGMT_TUNNEL_PREFIXES):
+                continue
+            for i, tok in enumerate(parts):
+                if tok == 'inet' and i + 1 < len(parts):
+                    try:
+                        net = ipaddress.ip_network(parts[i + 1], strict=False)
+                    except Exception:
+                        continue
+                    if (net.is_private or net.subnet_of(_F2B_CGNAT)) and str(net) not in subnets:
+                        subnets.append(str(net))
+    except Exception:
+        pass
+    return subnets
+
+
 def _f2b_fleet_ignore_cidrs():
     """Operator-configured fleet-wide trusted CIDRs (settings 'fail2ban_ignore_cidrs').
     Use this for an upstream gateway/proxy/LB that does NOT share the box's attached
@@ -12676,6 +13547,7 @@ def _f2b_trusted_ignoreip(extra=''):
     parts, seen = [], set()
     candidates = ['127.0.0.1/8', '::1']
     candidates += _f2b_local_subnets()
+    candidates += _f2b_mgmt_tunnel_subnets()   # never ban the road in
     candidates += _f2b_fleet_ignore_cidrs()
     candidates += str(extra or '').replace(',', ' ').split()
     for c in candidates:
@@ -12692,6 +13564,7 @@ def _f2b_operator_extra(stored):
     actually propagates out of every jail instead of staying baked into the stored line."""
     fleet = {'127.0.0.1/8', '::1'}
     fleet.update(_f2b_local_subnets())
+    fleet.update(_f2b_mgmt_tunnel_subnets())
     fleet.update(_f2b_fleet_ignore_cidrs())
     return ' '.join(t for t in str(stored or '').split() if t not in fleet)
 
@@ -12727,8 +13600,191 @@ def _f2b_banaction():
 
 
 def _f2b_sshd_logpath():
-    """sshd auth log path: Debian → /var/log/auth.log; RHEL → /var/log/secure."""
-    return '/var/log/secure' if _distro_family() == 'rhel' else '/var/log/auth.log'
+    """sshd auth log path, or '' when this box has no syslog file to tail.
+
+    Debian → /var/log/auth.log; RHEL → /var/log/secure. BUT plenty of real
+    installs have no rsyslog at all — minimal/on-prem install profiles, images
+    that strip it, or rsyslog present but disabled — and then neither file
+    exists and sshd logs only to the systemd journal. Do NOT assume this is a
+    new-distro problem: the field report came from Ubuntu 22.04.5 LTS on-prem,
+    which ships rsyslog by default. Never infer the log file from the OS
+    version; check whether it is actually there.
+
+    Pointing a jail at a logpath that does not exist makes fail2ban fail during
+    CONFIG PARSING, which takes down the ENTIRE daemon — every jail, not just
+    sshd, so the box silently ends up with no protection at all:
+        ERROR Failed during configuration: Have not found any log file for sshd jail
+        ERROR Async configuration of server failed
+    Field-reported on a fresh install by an operator (Josh, VA — 2026-07-25),
+    who root-caused it correctly and worked around it with `backend = systemd`.
+    Our own fleet never hit it because every box happens to run rsyslog.
+
+    Returning '' tells the caller to write `backend = systemd` and NO logpath.
+    Checks the other family's path too — the box's reality beats our guess."""
+    preferred = '/var/log/secure' if _distro_family() == 'rhel' else '/var/log/auth.log'
+    for p in (preferred, '/var/log/auth.log', '/var/log/secure'):
+        try:
+            if os.path.exists(p):
+                return p
+        except Exception:
+            pass
+    return ''
+
+
+def _f2b_selfheal_sshd_backend(plog=None):
+    """Repair an sshd jail pointing at a syslog file this box does not have.
+
+    Field-reported 2026-07-25 on Ubuntu 22.04.5 LTS on-prem: where rsyslog is
+    absent or disabled, neither /var/log/auth.log nor /var/log/secure exists,
+    sshd logs only to the journal, and a jail carrying
+    `logpath = /var/log/auth.log` makes fail2ban abort while PARSING config:
+        ERROR Failed during configuration: Have not found any log file for sshd jail
+    That kills the whole daemon, so EVERY jail stops — the box looks protected
+    and is not. Swap the dead logpath for `backend = systemd`.
+
+    Deliberately narrow: only `[sshd]` jails, and only when the referenced file
+    is genuinely missing. Other jails (authentik, takserver) tail real files that
+    may legitimately be absent until that module is deployed, and rewriting them
+    to the journal would be wrong. Both families, idempotent, no-op when healthy.
+    """
+    _log = plog or (lambda m: None)
+    jaild = '/etc/fail2ban/jail.d'
+    if not os.path.isdir(jaild) or not _f2b_is_available():
+        return False
+    import glob as _glob
+    changed = []
+    for path in sorted(_glob.glob(os.path.join(jaild, '*.conf'))):
+        try:
+            with open(path) as f:
+                text = f.read()
+        except OSError:
+            continue
+        if '[sshd]' not in text:
+            continue
+        out, hit = [], False
+        for line in text.splitlines(True):
+            m = re.match(r'^\s*logpath\s*=\s*(\S+)\s*$', line)
+            if m and not os.path.exists(m.group(1)):
+                out.append('backend  = systemd\n')   # journal instead of a dead file
+                hit = True
+            else:
+                out.append(line)
+        if hit:
+            try:
+                _write_priv(path, ''.join(out))
+                changed.append(os.path.basename(path))
+            except Exception as e:
+                _log(f"fail2ban self-heal: could not rewrite {path}: {e}")
+    if not changed:
+        return False
+    _log('fail2ban: sshd jail pointed at a syslog file this box does not have '
+         '(no rsyslog) — switched to the systemd journal in ' + ', '.join(changed) +
+         '. That misconfiguration stops the WHOLE daemon, so no jail was running.')
+    try:
+        subprocess.run(_sudo_wrap(['systemctl', 'restart', 'fail2ban']),
+                       capture_output=True, timeout=60)
+        st = subprocess.run(['systemctl', 'is-active', 'fail2ban'],
+                            capture_output=True, text=True, timeout=15).stdout.strip()
+        _log(f'fail2ban: restarted after self-heal — now {st}')
+    except Exception as e:
+        _log(f'fail2ban: restart after self-heal failed ({e}) — check `systemctl status fail2ban`')
+    return True
+
+
+def _f2b_selfheal_tunnel_ignoreip(plog=None):
+    """Add the management-tunnel subnets to every infra-TAK jail's ignoreip, and
+    release anything already banned inside one.
+
+    Boxes deployed before this fix carry an ignoreip with no tunnel subnet, so the
+    relay/NetBird gateway stays bannable — and on a CGNAT box that tunnel is the
+    only way in. Console-path delivery: this runs at startup so a normal update
+    fixes it with no SSH. Idempotent; no-op when there is no tunnel or nothing to
+    change. See _f2b_mgmt_tunnel_subnets() for why this is narrow by design."""
+    _log = plog or (lambda m: None)
+    if not _f2b_is_available():
+        return False
+    tun = _f2b_mgmt_tunnel_subnets()
+    if not tun:
+        return False                      # no tunnel on this box — nothing to trust
+    jaild = '/etc/fail2ban/jail.d'
+    if not os.path.isdir(jaild):
+        return False
+    import glob as _glob
+    changed = []
+    for path in sorted(_glob.glob(os.path.join(jaild, 'infratak-*.conf'))):
+        try:
+            with open(path) as f:
+                text = f.read()
+        except OSError:
+            continue
+        out, hit = [], False
+        for line in text.splitlines(True):
+            m = re.match(r'^\s*ignoreip\s*=\s*(.*?)\s*$', line)
+            if not m:
+                out.append(line)
+                continue
+            cur = m.group(1)
+            new = _f2b_trusted_ignoreip(_f2b_operator_extra(cur))
+            if set(new.split()) != set(cur.split()):
+                out.append(f'ignoreip = {new}\n')
+                hit = True
+            else:
+                out.append(line)
+        if hit:
+            try:
+                _write_priv(path, ''.join(out))
+                changed.append(os.path.basename(path))
+            except Exception as e:
+                _log(f'fail2ban: could not update ignoreip in {path}: {e}')
+
+    # Release anything already banned inside a tunnel — the operator may be locked
+    # out RIGHT NOW, and a config rewrite alone does not lift a live ban.
+    nets = []
+    for c in tun:
+        try:
+            nets.append(ipaddress.ip_network(c))
+        except Exception:
+            pass
+    unbanned = []
+    try:
+        st = subprocess.run(_sudo_wrap(['fail2ban-client', 'status']),
+                            capture_output=True, text=True, timeout=30)
+        jails = []
+        for line in (st.stdout or '').splitlines():
+            if 'Jail list:' in line:
+                jails = [j.strip() for j in line.split(':', 1)[1].replace(',', ' ').split()]
+        for j in jails:
+            js = subprocess.run(_sudo_wrap(['fail2ban-client', 'status', j]),
+                                capture_output=True, text=True, timeout=30)
+            for line in (js.stdout or '').splitlines():
+                if 'Banned IP list:' not in line:
+                    continue
+                for ip in line.split(':', 1)[1].split():
+                    try:
+                        addr = ipaddress.ip_address(ip.strip())
+                    except ValueError:
+                        continue
+                    if any(addr in n for n in nets):
+                        subprocess.run(_sudo_wrap(['fail2ban-client', 'set', j, 'unbanip', str(addr)]),
+                                       capture_output=True, timeout=30)
+                        unbanned.append(f'{addr} ({j})')
+    except Exception as e:
+        _log(f'fail2ban: tunnel unban sweep failed (non-fatal): {e}')
+
+    if not changed and not unbanned:
+        return False
+    if changed:
+        _log('fail2ban: management tunnel ' + ', '.join(tun) +
+             ' added to ignoreip in ' + ', '.join(changed) +
+             ' — the relay/NetBird path can no longer be banned.')
+        try:
+            subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=60)
+        except Exception:
+            pass
+    if unbanned:
+        _log('fail2ban: released ' + ', '.join(unbanned) +
+             ' — a management-tunnel address was banned, which blocks EVERY port from it.')
+    return True
 
 
 def _f2b_selfheal_rhel_jails(plog=None):
@@ -12884,11 +13940,16 @@ def _f2b_write_ssh_jail_config(maxretry, findtime, bantime, ignoreip=''):
     if os.path.exists('/etc/fail2ban/action.d/infratak-guarddog.conf'):
         guarddog_action = "\n         infratak-guarddog"
     ignoreip_line = f"ignoreip = {_f2b_trusted_ignoreip(ignoreip)}\n"
+    # No syslog file on this box (no rsyslog) → read sshd auth events straight
+    # from the journal. Writing a logpath that does not exist would kill the
+    # whole fail2ban daemon at config-parse time — see _f2b_sshd_logpath().
+    _lp = _f2b_sshd_logpath()
+    _source_line = f"logpath  = {_lp}\n" if _lp else "backend  = systemd\n"
     jail_conf = (
         "[sshd]\n"
         "enabled  = true\n"
         "filter   = sshd\n"
-        f"logpath  = {_f2b_sshd_logpath()}\n"
+        f"{_source_line}"
         f"maxretry = {maxretry}\n"
         f"findtime = {findtime}\n"
         f"bantime  = {bantime}\n"
@@ -13240,6 +14301,75 @@ def _f2b_get_available_version():
         pass
     return None
 
+def _f2b_console_client_ip():
+    """The address the operator is actually reaching the console from.
+
+    `request.remote_addr` is the PROXY when the console sits behind Caddy (which is
+    the normal deployment), so it would report 127.0.0.1 and we would tell every
+    operator they are safe. Prefer the forwarded chain's first hop."""
+    try:
+        xff = (request.headers.get('X-Forwarded-For') or '').split(',')[0].strip()
+        if xff:
+            ipaddress.ip_address(xff)
+            return xff
+    except Exception:
+        pass
+    try:
+        ra = (request.remote_addr or '').strip()
+        ipaddress.ip_address(ra)
+        return ra
+    except Exception:
+        return ''
+
+
+def _f2b_ignoreip_explained():
+    """ignoreip broken into labelled groups, plus whether the CALLER's own address
+    is covered.
+
+    `ignoreip` is one opaque space-separated string, so nobody can tell what is
+    protected or why — and the one entry that matters most (the management tunnel)
+    is invisible. Worse, an operator reaching the box by a path we do NOT
+    auto-detect (a jump host, a third-party VPN we deliberately do not trust) has
+    no way to know they are one ban away from losing the box. Say it plainly."""
+    groups = []
+
+    def add(label, cidrs, why):
+        cidrs = [c for c in (cidrs or []) if c]
+        if cidrs:
+            groups.append({'label': label, 'cidrs': cidrs, 'why': why})
+
+    add('Localhost', ['127.0.0.1/8', '::1'], 'this box talking to itself')
+    add("This box's network", _f2b_local_subnets(),
+        'the LAN or VNet this box sits on — stops an upstream gateway or load balancer being banned')
+    add('Management tunnel', _f2b_mgmt_tunnel_subnets(),
+        'the WireGuard / NetBird link this box is managed through — a ban here blocks every port '
+        'and locks you out of a box you may not be able to reach any other way')
+    add('Added by you', _f2b_fleet_ignore_cidrs(),
+        "from 'fail2ban_ignore_cidrs' in settings")
+
+    client = _f2b_console_client_ip()
+    covered, matched = None, ''
+    if client:
+        try:
+            addr = ipaddress.ip_address(client)
+            for g in groups:
+                for c in g['cidrs']:
+                    try:
+                        if addr in ipaddress.ip_network(c, strict=False):
+                            covered, matched = True, f"{c} ({g['label']})"
+                            break
+                    except (ValueError, TypeError):
+                        continue      # v4/v6 mismatch or malformed entry
+                if covered:
+                    break
+            if covered is None:
+                covered = False
+        except ValueError:
+            covered = None
+    return {'groups': groups, 'client_ip': client, 'client_covered': covered,
+            'client_matched': matched}
+
+
 @app.route('/api/fail2ban/ssh/status')
 @login_required
 def fail2ban_ssh_status_api():
@@ -13256,6 +14386,7 @@ def fail2ban_ssh_status_api():
             capture_output=True, text=True).stdout.strip() == 'active')
         status['jail_enabled']   = _f2b_ssh_jail_enabled()
         status['jail_config']    = _f2b_read_ssh_jail_config()
+        status['ignoreip']       = _f2b_ignoreip_explained()
         return jsonify(status)
     except Exception as e:
         return jsonify({'available': False, 'error': str(e)[:200]})
@@ -14270,6 +15401,147 @@ def _guarddog_run_one_service(sid, monitor_ids):
     if val is not None:
         return (sid, 'ok' if val else 'fail')
     return (sid, None)
+
+
+def _detect_disk_layout():
+    """v10.1.9 W2/WI-2 — is TAK boxed into a fraction of this disk?
+
+    Fresh installs strand space away from root, where ALL of TAK lives (Docker,
+    /opt/tak, Postgres, Authentik, CloudTAK): RHEL/Anaconda parks the remainder in
+    a separate /home LV; Ubuntu/subiquity leaves unallocated VG extents. Read-only.
+
+    Returns {mode, root_gb, root_pct_of_vg, vg_free_gb, home_lv_gb, home_used_mb,
+             reclaimable_gb, vg, root_lv, home_lv, fold_safe}
+    with mode ∈ {'ok','free_extents','idle_home','both'}; mode 'ok' also covers
+    'not on LVM / nothing to reclaim'."""
+    out = {'mode': 'ok', 'root_gb': 0, 'root_pct_of_vg': 100, 'vg_free_gb': 0,
+           'home_lv_gb': 0, 'home_used_mb': 0, 'reclaimable_gb': 0,
+           'vg': '', 'root_lv': '', 'home_lv': '', 'fold_safe': False}
+
+    def _run(argv, timeout=20):
+        # lvs/vgs read PV metadata → privileged, so these route through the broker.
+        try:
+            r = subprocess.run(_sudo_wrap(argv), capture_output=True, text=True, timeout=timeout)
+            return (r.stdout or '').strip() if r.returncode == 0 else ''
+        except Exception:
+            return ''
+
+    def _run_plain(argv, timeout=20):
+        # df/findmnt report on mounted filesystems unprivileged — running them
+        # unwrapped avoids a needless broker deny on an enforcing box.
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+            return (r.stdout or '').strip() if r.returncode == 0 else ''
+        except Exception:
+            return ''
+
+    try:
+        root_dev = _run_plain(['findmnt', '-no', 'SOURCE', '/'])
+        if not root_dev:
+            return out
+        vg = _run(['lvs', '--noheadings', '-o', 'vg_name', root_dev])
+        root_lv = _run(['lvs', '--noheadings', '-o', 'lv_name', root_dev])
+        if not vg or not root_lv:
+            return out              # not on LVM — nothing this feature can do
+        out['vg'], out['root_lv'] = vg, root_lv
+
+        def _bytes(s):
+            return int(re.sub(r'\D', '', s or '0') or 0)
+
+        vg_size_b = _bytes(_run(['vgs', '--noheadings', '-o', 'vg_size', '--units', 'b', vg]))
+        vg_free_b = _bytes(_run(['vgs', '--noheadings', '-o', 'vg_free', '--units', 'b', vg]))
+        root_size_b = _bytes(_run(['lvs', '--noheadings', '-o', 'lv_size', '--units', 'b', root_dev]))
+        out['root_gb'] = round(root_size_b / 1024 ** 3, 1)
+        out['vg_free_gb'] = round(vg_free_b / 1024 ** 3, 1)
+        if vg_size_b:
+            out['root_pct_of_vg'] = int(root_size_b * 100 / vg_size_b)
+
+        home_dev = _run_plain(['findmnt', '-no', 'SOURCE', '/home'])
+        home_size_b = home_used_b = 0
+        if home_dev:
+            home_vg = _run(['lvs', '--noheadings', '-o', 'vg_name', home_dev])
+            home_lv = _run(['lvs', '--noheadings', '-o', 'lv_name', home_dev])
+            if home_vg == vg and home_lv:
+                out['home_lv'] = f'{home_vg}/{home_lv}'
+                home_size_b = _bytes(_run(['lvs', '--noheadings', '-o', 'lv_size', '--units', 'b', home_dev]))
+                du = _run_plain(['df', '-B1', '--output=used', '/home'])
+                lines = [l for l in du.splitlines() if l.strip()]
+                home_used_b = _bytes(lines[-1]) if len(lines) > 1 else 0
+                out['home_lv_gb'] = round(home_size_b / 1024 ** 3, 1)
+                out['home_used_mb'] = round(home_used_b / 1024 ** 2, 1)
+                # Same 2 GiB ceiling the broker enforces — keep the UI honest about
+                # whether the fold-in would actually be accepted.
+                out['fold_safe'] = home_used_b <= 2 * 1024 ** 3
+
+        has_free = vg_free_b >= 1024 ** 3
+        has_home = bool(out['home_lv']) and out['fold_safe'] and home_size_b >= 1024 ** 3
+        out['mode'] = ('both' if (has_free and has_home) else
+                       'free_extents' if has_free else
+                       'idle_home' if has_home else 'ok')
+        reclaimable_b = (vg_free_b if has_free else 0) + (home_size_b if has_home else 0)
+        out['reclaimable_gb'] = round(reclaimable_b / 1024 ** 3, 1)
+        return out
+    except Exception:
+        return out
+
+
+@app.route('/api/guarddog/disk-layout')
+@login_required
+def guarddog_disk_layout_api():
+    """Read-only disk-layout report (WI-2). Drives the 'X GB reclaimable' card."""
+    return jsonify({'success': True, 'layout': _detect_disk_layout()})
+
+
+@app.route('/api/console/disk/reclaim', methods=['POST'])
+@login_required
+def console_disk_reclaim_api():
+    """v10.1.9 W2/WI-3 — reclaim stranded disk for TAK.
+
+    mode='grow_free' is non-destructive (extend root into free extents).
+    mode='fold_home' DESTROYS the /home LV after backing it up, so — like the
+    Power Off control — it re-confirms the console password on top of
+    @login_required and makes the caller echo the exact LV being destroyed.
+    All privileged work happens inside the broker's fixed-shape `disk_reclaim`
+    op; the console never composes LVM argv itself."""
+    data = request.get_json(silent=True) or {}
+    mode = (data.get('mode') or '').strip()
+    if mode not in ('grow_free', 'fold_home'):
+        return jsonify({'success': False, 'error': 'mode must be "grow_free" or "fold_home".'}), 400
+
+    req = {'op': 'disk_reclaim', 'mode': mode}
+    if mode == 'fold_home':
+        password = data.get('password') or ''
+        auth = load_auth()
+        if not auth.get('password_hash') or not check_password_hash(auth['password_hash'], password):
+            return jsonify({'success': False, 'error': 'Incorrect console password.', 'need_password': True}), 403
+        layout = _detect_disk_layout()
+        if not layout.get('home_lv'):
+            return jsonify({'success': False, 'error': 'No separate /home LV found — nothing to fold in.'}), 400
+        if not layout.get('fold_safe'):
+            return jsonify({'success': False, 'error': f"/home holds {layout.get('home_used_mb')} MB — "
+                                                       "too much to fold in safely. Move the data off first."}), 400
+        confirm = (data.get('confirm_lv') or '').strip()
+        if confirm != layout['home_lv']:
+            return jsonify({'success': False, 'error': f"confirm_lv must be exactly '{layout['home_lv']}'.",
+                            'expected_lv': layout['home_lv']}), 400
+        req['confirm_lv'] = confirm
+        # On a fresh box there is ALWAYS a login shell sitting in /home — the
+        # person who installed it. The modal states that shells get signed out,
+        # so grant the broker leave to close them; it still hard-refuses on any
+        # holder that is not a plain interactive shell.
+        req['close_shells'] = True
+
+    try:
+        # The fold-in rsyncs/tars /home and stops docker — allow a long window.
+        res = _broker_request(req, timeout=2400)
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'Broker request failed: {e}'}), 500
+    if not res.get('ok'):
+        return jsonify({'success': False, 'error': res.get('error') or 'Reclaim failed.',
+                        'log': res.get('log') or []}), 400
+    return jsonify({'success': True, 'mode': mode, 'log': res.get('log') or [],
+                    'df_after': res.get('df_after', ''), 'backup': res.get('backup', ''),
+                    'layout': _detect_disk_layout()})
 
 
 @app.route('/api/guarddog/health')
@@ -19868,13 +21140,14 @@ def _patch_coreconfig_cert_enrollment(coreconfig_path, int_ca, cert_pass, config
     except (TypeError, ValueError):
         issued_days = '730'
     try:
-        with open(coreconfig_path, 'r', encoding='utf-8') as f:
-            raw = f.read()
+        # v10.1.9: read via _read_coreconfig() and parse the STRING — ET.parse()
+        # opens the path itself, which the non-root console cannot do at 640 tak:tak.
+        raw = _read_coreconfig(coreconfig_path)
         m = _re_ce.search(r'<[A-Za-z][\w-]*[^>]*?\bxmlns(?::[\w-]+)?="([^"]+)"', raw)
         ns_uri = m.group(1) if m else 'http://bbn.com/marti/xml/config'
         ET.register_namespace('', ns_uri)
-        tree = ET.parse(coreconfig_path)
-        root = tree.getroot()
+        root = ET.fromstring(raw)
+        tree = ET.ElementTree(root)
     except Exception as e:
         if log_fn:
             log_fn(f"  ⚠ cert-enrollment patch: CoreConfig parse failed ({str(e)[:120]}) — patch manually")
@@ -20014,8 +21287,7 @@ def _sanitize_coreconfig_name_entries():
     if not os.path.exists(coreconfig):
         return False, 'no_coreconfig'
     try:
-        with open(coreconfig, 'r') as f:
-            content = f.read()
+        content = _read_coreconfig(coreconfig)
     except Exception:
         return False, 'coreconfig_unreadable'
     if '<nameEntry' not in content:
@@ -36052,7 +37324,7 @@ If this box sits behind a reverse proxy, cloud load balancer, or gateway (Azure 
 </label>
 </div>
 </div>
-<div style="font-size:12px;color:var(--text-dim);margin-top:8px">Monitors <code>/var/log/auth.log</code> for failed SSH login attempts. Guard Dog email alert fires on ban. Default thresholds are stricter than Authentik — SSH brute-force is higher severity.</div>
+<div style="font-size:12px;color:var(--text-dim);margin-top:8px">Watches failed SSH logins &mdash; from the system auth log, or the systemd journal on boxes without rsyslog. Guard Dog email alert fires on ban. Default thresholds are stricter than Authentik — SSH brute-force is higher severity.</div>
 
 <div id="ssh-enabled-section" style="display:none">
 <div class="stat-grid" style="margin-top:20px;margin-bottom:8px">
@@ -36065,6 +37337,14 @@ If this box sits behind a reverse proxy, cloud load balancer, or gateway (Azure 
 <div class="stat-label">Currently Failed <span style="font-size:10px;color:var(--text-dim)" id="ssh-watching-caret">▼ details</span></div>
 </div>
 <div class="stat-card" title="Since the fail2ban service was last started or restarted"><div class="stat-value cyan" id="ssh-stat-total-banned">0</div><div class="stat-label">Total Banned <span style="font-size:9px;color:var(--text-dim)">(since last restart)</span></div></div>
+</div>
+
+<div id="ssh-safety-banner" style="display:none;margin-bottom:14px;border-radius:8px;padding:12px 14px;font-size:12px;line-height:1.5"></div>
+
+<div id="ssh-neverban-panel" style="margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
+<div style="font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px">Never Banned</div>
+<div style="font-size:11px;color:var(--text-dim);margin-bottom:12px">Addresses fail2ban will never lock out, and why. A ban blocks <b>every port</b> from an address &mdash; not just SSH.</div>
+<div id="ssh-neverban-list"><div style="color:var(--text-dim);font-size:12px;font-family:\'JetBrains Mono\',monospace">Loading…</div></div>
 </div>
 
 <div id="ssh-watching-panel" style="display:none;margin-bottom:16px;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:16px">
@@ -36836,6 +38116,46 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
   var sshCard = document.getElementById(\'ssh-jail-card\');
   if (!sshCard) return;
 
+  function renderNeverBan(info) {
+    var list = document.getElementById(\'ssh-neverban-list\');
+    var banner = document.getElementById(\'ssh-safety-banner\');
+    if (!list) return;
+    if (!info || !info.groups) { list.innerHTML = \'<div style="color:var(--text-dim);font-size:12px">Unavailable.</div>\'; return; }
+    var esc = function(s){ var d=document.createElement(\'div\'); d.textContent=(s===undefined||s===null)?\'\':String(s); return d.innerHTML; };
+    var html = \'\';
+    info.groups.forEach(function(g){
+      var chips = g.cidrs.map(function(c){
+        return \'<code style="background:rgba(255,255,255,.06);border:1px solid var(--border);border-radius:4px;padding:1px 6px;margin-right:6px;font-size:11px">\' + esc(c) + \'</code>\';
+      }).join(\'\');
+      html += \'<div style="margin-bottom:10px">\'
+           +  \'<div style="font-size:12px;color:var(--text-primary);font-weight:600;margin-bottom:3px">\' + esc(g.label) + \'</div>\'
+           +  \'<div style="margin-bottom:3px">\' + chips + \'</div>\'
+           +  \'<div style="font-size:11px;color:var(--text-dim)">\' + esc(g.why) + \'</div>\'
+           +  \'</div>\';
+    });
+    list.innerHTML = html || \'<div style="color:var(--text-dim);font-size:12px">Nothing whitelisted.</div>\';
+
+    if (!banner) return;
+    if (info.client_covered === true) {
+      banner.style.display = \'block\';
+      banner.style.background = \'rgba(34,197,94,0.08)\';
+      banner.style.border = \'1px solid rgba(34,197,94,0.35)\';
+      banner.style.color = \'var(--text-secondary)\';
+      banner.innerHTML = \'\\u2713 You are connected from <code>\' + esc(info.client_ip) + \'</code>, covered by \'
+                       + \'<code>\' + esc(info.client_matched) + \'</code>. fail2ban cannot lock you out from here.\';
+    } else if (info.client_covered === false) {
+      banner.style.display = \'block\';
+      banner.style.background = \'rgba(234,179,8,0.10)\';
+      banner.style.border = \'1px solid rgba(234,179,8,0.45)\';
+      banner.style.color = \'var(--text-secondary)\';
+      banner.innerHTML = \'\\u26a0 You are connected from <code>\' + esc(info.client_ip) + \'</code>, which is <b>not</b> on the never-ban list. \'
+                       + \'If fail2ban bans it, <b>every port</b> from that address is blocked and you lose access to this box. \'
+                       + \'Add it below if this is how you normally reach it.\';
+    } else {
+      banner.style.display = \'none\';
+    }
+  }
+
   function loadSshStatus() {
     fetch(\'/api/fail2ban/ssh/status\').then(function(r){ return r.json(); }).then(function(d){
       if (!d.available) return;
@@ -36862,6 +38182,7 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
         if (cfg.bantime)  document.getElementById(\'ssh-cfg-bantime\').value  = Math.round(cfg.bantime  / 60);
         var ipEl = document.getElementById(\'ssh-cfg-ignoreip\');
         if (ipEl) { ipEl.value = (cfg.ignoreip || \'\').replace(/127\\.0\\.0\\.1\\/8\\s*::1\\s*/,\'\').trim(); renderChips(\'ssh-cfg-ignoreip\', \'ssh-cfg-ignoreip-chips\'); }
+        renderNeverBan(d.ignoreip);
         var ips = d.banned_ips || [];
         window._sshBannedIps = ips;
         renderSshBanList(ips);
@@ -44199,10 +45520,10 @@ networks:
                 subprocess.run(_sudo_wrap(['cp', coreconfig_path, backup_path]), capture_output=True, timeout=10)
                 plog("  Backed up CoreConfig.xml")
 
-            with open(coreconfig_path, 'r') as f:
-                config_content = f.read()
-
             # v0.9.21: use ElementTree parse-and-mutate (prevents duplicate <ldap> elements — Issue #6)
+            # (v10.1.9: the dead `config_content = open(...).read()` that sat here is gone —
+            # nothing consumed it since the text patcher was replaced, and at 640 tak:tak it
+            # was one more non-root PermissionError waiting to happen.)
             _et_ok, _et_msg = _apply_coreconfig_ldap_auth_et(coreconfig_path, host, ldap_svc_pass, plog)
             if _et_ok:
                 if 'idempotent' in _et_msg:
@@ -50661,8 +51982,7 @@ def _authentik_webadmin_role_check_and_heal(plog_fn=None):
         try:
             _cc_path = '/opt/tak/CoreConfig.xml'
             if os.path.exists(_cc_path):
-                with open(_cc_path, 'r', encoding='utf-8') as _f:
-                    _cc = _f.read()
+                _cc = _read_coreconfig(_cc_path)
                 if 'adm_ldapservice' in _cc and 'adminGroup="ROLE_ADMIN"' not in _cc:
                     _log("CoreConfig.xml adminGroup attribute MISSING — calling _resync_ldap_credential_to_coreconfig")
                     try:
@@ -53024,11 +54344,9 @@ entries:
                     subprocess.run(_sudo_wrap(['cp', coreconfig_path, backup_path]), capture_output=True, timeout=10)
                     plog(f"  Backed up CoreConfig.xml")
 
-                # Read current config
-                with open(coreconfig_path, 'r') as f:
-                    config_content = f.read()
-
                 # v0.9.21: use ElementTree parse-and-mutate (prevents duplicate <ldap> elements — Issue #6)
+                # (v10.1.9: dead `config_content` read removed — see the same spot in the
+                # remote-LDAP path; unused since the text patcher was replaced.)
                 _et_ok, _et_msg = _apply_coreconfig_ldap_auth_et(coreconfig_path, '127.0.0.1', ldap_pass, plog)
                 if _et_ok:
                     if 'idempotent' in _et_msg:
@@ -54893,8 +56211,7 @@ def _apply_coreconfig_ldap_auth_et(coreconfig_path, ldap_host, ldap_pass, plog=N
     # self-heals on the next LDAP sync (Update Now path on existing installs).
     import re as _re_ns
     try:
-        with open(coreconfig_path, 'r', encoding='utf-8') as _f:
-            _cc_raw = _f.read()
+        _cc_raw = _read_coreconfig(coreconfig_path)
         # Detect the TAK config namespace URI from the root xmlns declaration
         _m_ns = _re_ns.search(r'<[A-Za-z][\w-]*[^>]*?\bxmlns(?::[\w-]+)?="([^"]+)"', _cc_raw)
         _ns_uri = _m_ns.group(1) if _m_ns else 'http://bbn.com/marti/xml/config'
@@ -54915,8 +56232,11 @@ def _apply_coreconfig_ldap_auth_et(coreconfig_path, ldap_host, ldap_pass, plog=N
                 plog("  ✓ CoreConfig.xml: stripped legacy ns0: prefixes (was breaking LDAP auth)")
         # Register the namespace URI to the empty prefix so ET.write() emits clean XML
         ET.register_namespace('', _ns_uri)
-        tree = ET.parse(coreconfig_path)
-        root = tree.getroot()
+        # v10.1.9: parse the STRING we already hold — ET.parse() would re-open the
+        # path itself, which the non-root console cannot do at 640 tak:tak. Parse the
+        # ns0-stripped text when we just rewrote it, so this run sees its own fix.
+        root = ET.fromstring(_cc_clean if _had_ns0 else _cc_raw)
+        tree = ET.ElementTree(root)
     except ET.ParseError as e:
         if plog:
             plog(f"  ⚠ CoreConfig.xml parse error ({e}) — falling back to text-based patcher")
@@ -55056,8 +56376,7 @@ def _apply_coreconfig_ldap_auth_text(coreconfig_path, ldap_host, ldap_pass, plog
         '    </auth>'
     )
     try:
-        with open(coreconfig_path, 'r') as f:
-            content = f.read()
+        content = _read_coreconfig(coreconfig_path)
         new_content = _re.sub(
             r'<(?:[A-Za-z][\w-]*:)?auth[^>]*>.*?</(?:[A-Za-z][\w-]*:)?auth\s*>',
             auth_block, content, flags=_re.DOTALL | _re.IGNORECASE,
@@ -55084,8 +56403,11 @@ def _coreconfig_has_ldap():
     if not os.path.exists(path):
         return False
     try:
-        with open(path, 'r') as f:
-            content = f.read()
+        # v10.1.9: MUST go through _read_coreconfig(). This is the function W7's
+        # 640 broke: a plain open() raised PermissionError as `takwerx`, the
+        # except below swallowed it, and the TAK Server page then offered
+        # "Connect TAK Server to LDAP" on an already-connected box.
+        content = _read_coreconfig(path)
         m_start = re.search(r'<(?:[A-Za-z][\w-]*:)?auth\b', content, re.IGNORECASE)
         if not m_start:
             return False
@@ -55134,8 +56456,7 @@ def _resync_ldap_credential_to_coreconfig():
     if not os.path.exists(coreconfig):
         return False, 'no_coreconfig'
     try:
-        with open(coreconfig, 'r') as f:
-            cc = f.read()
+        cc = _read_coreconfig(coreconfig)
     except Exception:
         return False, 'coreconfig_unreadable'
     if 'adm_ldapservice' not in cc:
@@ -58222,9 +59543,8 @@ def takserver_connect_ldap():
         import re as _re
         cc_pass = ''
         if os.path.exists('/opt/tak/CoreConfig.xml'):
-            with open('/opt/tak/CoreConfig.xml') as f:
-                m = _re.search(r'serviceAccountCredential="([^"]*)"', f.read())
-                cc_pass = m.group(1) if m else ''
+            m = _re.search(r'serviceAccountCredential="([^"]*)"', _read_coreconfig())
+            cc_pass = m.group(1) if m else ''
         if ldap_pass and cc_pass:
             diag.append(f'Password match: {"YES" if ldap_pass == cc_pass else "NO (MISMATCH!)"}')
         elif not cc_pass:
@@ -58341,8 +59661,7 @@ def takserver_ldap_drift_check():
     if not os.path.exists(coreconfig):
         return jsonify({'match': True, 'detail': 'no_coreconfig'})
     try:
-        with open(coreconfig, 'r') as f:
-            cc = f.read()
+        cc = _read_coreconfig(coreconfig)
     except Exception:
         return jsonify({'match': True, 'detail': 'coreconfig_unreadable'})
     if 'adm_ldapservice' not in cc:
@@ -62161,13 +63480,13 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
         if db_host:
             import re as _re
             try:
-                with open('/opt/tak/CoreConfig.xml', 'r') as f:
-                    cc = f.read()
+                cc = _read_coreconfig()
                 jdbc_url = f'jdbc:postgresql://{db_host}:{db_port}/cot'
                 if '127.0.0.1' in cc and db_host not in cc:
                     cc = _re.sub(r'jdbc:postgresql://[^"]*', jdbc_url, cc)
                     if db_password:
                         cc = _re.sub(r'(<connection[^>]*password=")[^"]*(")', lambda m: m.group(1) + db_password + m.group(2), cc)
+                    cc = _coreconfig_db_tls_converge(cc)  # v10.1.9 W1: re-stamp ssl attrs the upgrade reset
                     _write_priv('/opt/tak/CoreConfig.xml', cc)
                     ulog(f"✓ CoreConfig.xml JDBC restored to {db_host}:{db_port}")
                 else:
@@ -62217,8 +63536,7 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
             if pw_ok:
                 ulog("⚠ DB password changed during upgrade — re-patching CoreConfig.xml")
                 try:
-                    with open('/opt/tak/CoreConfig.xml', 'r') as f:
-                        cc = f.read()
+                    cc = _read_coreconfig()
                     cc = _re.sub(r'(<connection[^>]*password=")[^"]*(")', lambda m: m.group(1) + fresh_pw + m.group(2), cc)
                     _write_priv('/opt/tak/CoreConfig.xml', cc)
                     db_password = fresh_pw
@@ -62403,6 +63721,7 @@ def run_takserver_upgrade_two_server_rhel(core_rpm_path, db_rpm_path, s1_cfg, ta
                     cc = _re.sub(r'jdbc:postgresql://[^"]*', jdbc_url, cc)
                     if db_password:
                         cc = _re.sub(r'(<connection[^>]*password=")[^"]*(")', lambda m: m.group(1) + db_password + m.group(2), cc)
+                    cc = _coreconfig_db_tls_converge(cc)  # v10.1.9 W1: re-stamp ssl attrs the upgrade reset
                     _write_priv('/opt/tak/CoreConfig.xml', cc)
                     ulog(f"✓ CoreConfig.xml JDBC restored to {s1_host}:{db_port}")
                 else:
@@ -62662,7 +63981,10 @@ def run_takserver_two_server_db_migrate(
 
         mlog('')
         mlog('━━━ PostgreSQL remote access on new Server One ━━━')
-        ok_pg, log_lines, _pw_unused = _setup_server_one(new_s1_cfg, core_ip, db_port, None, None)
+        res_pg = _setup_server_one(new_s1_cfg, core_ip, db_port, None, None)
+        # Failure paths return 3-tuples; success returns a 4th element: the DB TLS root cert PEM.
+        ok_pg, log_lines = res_pg[0], res_pg[1]
+        new_tls_pem = res_pg[3] if len(res_pg) > 3 else ''
         for line in log_lines:
             mlog(line)
         if not ok_pg:
@@ -62704,9 +64026,25 @@ def run_takserver_two_server_db_migrate(
         cfg = _get_tak_deployment_config(settings)
         cfg['server_one'] = dict(new_s1_cfg)
         cfg.setdefault('database', {})['password'] = pw_verify
+        # v10.1.9 W1: the pinned DB cert follows the host — store the NEW box's cert, or drop
+        # the key entirely if its TLS enable failed (a stale cert would fail verify-full).
+        if new_tls_pem:
+            cfg['database']['ssl_root_cert_pem'] = new_tls_pem
+        else:
+            cfg['database'].pop('ssl_root_cert_pem', None)
         settings['tak_deployment'] = cfg
         save_settings(settings)
         mlog('✓ Server One host updated in settings')
+        # (Re)stamp or strip the DB TLS attrs for the NEW host before TAK starts.
+        try:
+            cc2 = _read_priv('/opt/tak/CoreConfig.xml') or ''
+            cc2n = _coreconfig_db_tls_converge(cc2, settings)
+            if cc2n != cc2:
+                _write_priv('/opt/tak/CoreConfig.xml', cc2n)
+                mlog('✓ DB TLS attributes converged for new Server One' if new_tls_pem
+                     else '✓ Stale DB TLS attributes stripped (new host not TLS yet)')
+        except Exception as _e:
+            mlog(f'⚠ DB TLS converge skipped: {_e}')
         sg_ok, sg_msg = _sync_guarddog_remote_db_from_settings(settings)
         mlog(f'{"✓" if sg_ok else "⚠"} Guard Dog remote DB config: {sg_msg}')
 
@@ -63478,9 +64816,34 @@ def run_takserver_deploy(config):
             if not _epel_installed():
                 run_cmd(f'dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-{_el_ver}.noarch.rpm 2>&1',
                         "EPEL not in enabled repos (genuine RHEL?) — installing from the Fedora EPEL rpm URL...", check=False)
+            # GH #56, second half (found on a genuine RHEL 9.8 AWS box, 2026-07-25):
+            # CodeReady Builder ships libqhull_r and friends that PostGIS needs, but
+            # its repo id is NOT the same everywhere:
+            #   registered RHEL  codeready-builder-for-rhel-9-<arch>-rpms
+            #   AWS RHUI RHEL    codeready-builder-for-rhel-9-rhui-rpms
+            #   clones           crb
+            # Both commands we used before FAIL on RHUI — `subscription-manager repos
+            # --enable` returns "Repositories disabled by configuration" (the box is
+            # not registered; AWS licenses it through RHUI), and `--set-enabled crb`
+            # returns "Unable to read consumer identity". CRB was therefore left
+            # disabled on every AWS RHEL box. Ask dnf which repo actually exists
+            # instead of guessing, and enable that one.
             if _os_id.startswith('rhel'):
                 run_cmd(f'subscription-manager repos --enable codeready-builder-for-rhel-{_el_ver}-{_pg_arch}-rpms 2>&1',
                         "Enabling CodeReady Builder (subscription-manager)...", check=False, quiet=True)
+            _crb_id = ''
+            try:
+                _crb_id = subprocess.run(
+                    "dnf repolist --all 2>/dev/null | awk '{print $1}' | "
+                    "grep -E '^(codeready-builder[A-Za-z0-9._-]*-rpms|crb)$' | "
+                    "grep -vE 'source|debug' | head -1",
+                    shell=True, capture_output=True, text=True, timeout=120,
+                    env=_broker_shim_env()).stdout.strip()
+            except Exception:
+                _crb_id = ''
+            if _crb_id:
+                run_cmd(f'dnf config-manager --set-enabled {shlex.quote(_crb_id)} 2>&1',
+                        f"Enabling CodeReady Builder ({_crb_id})...", check=False)
             if not _epel_installed():
                 log_step("✗ FATAL: the EPEL repo could not be installed. TAK Server's PostGIS dependencies")
                 log_step("  (hdf5, xerces-c, …) come from EPEL — Step 4 WILL fail without it.")
@@ -63491,7 +64854,8 @@ def run_takserver_deploy(config):
             run_cmd(f'dnf install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-{_el_ver}-{_pg_arch}/pgdg-redhat-repo-latest.noarch.rpm 2>&1', "Adding PostgreSQL (PGDG) repository...", check=False)
             run_cmd('dnf -qy module disable postgresql 2>&1', check=False, quiet=True)
             run_cmd('dnf install -y java-17-openjdk-devel 2>&1', "Installing Java 17 (OpenJDK)...", check=False)
-            run_cmd('dnf config-manager --set-enabled crb 2>&1', check=False, quiet=True)
+            # (the old blanket `--set-enabled crb` lived here; the discovery above
+            #  already covers the clone case, and on RHUI it only ever errored)
             run_cmd('dnf makecache 2>&1', "Refreshing package metadata...", check=False, quiet=True)
             log_step("✓ EPEL + PostgreSQL (PGDG) repo + Java 17 + CRB configured")
         else:
@@ -63678,8 +65042,7 @@ def run_takserver_deploy(config):
                 log_step(f"External DB: pre-patching CoreConfig JDBC → {_edb_host_early}:{_edb_port_early} (before first start)...")
                 try:
                     import re as _re_early
-                    with open('/opt/tak/CoreConfig.xml', 'r') as _f:
-                        _cc = _f.read()
+                    _cc = _read_coreconfig()
                     _jdbc_early = f'jdbc:postgresql://{_edb_host_early}:{_edb_port_early}/cot'
                     _cc = _re_early.sub(r'jdbc:postgresql://[^"]*', _jdbc_early, _cc)
                     _cc = _re_early.sub(r'(<connection[^>]*username=")[^"]*(")', lambda m: m.group(1) + _edb_user_early + m.group(2), _cc)
@@ -63905,6 +65268,7 @@ def run_takserver_deploy(config):
                         if db_pass:
                             db_pass_xml = html.escape(db_pass, quote=True)
                             cc = re.sub(r'(<connection[^>]*password=")[^"]*(")', lambda m: m.group(1) + db_pass_xml + m.group(2), cc)
+                        cc = _coreconfig_db_tls_converge(cc)  # v10.1.9 W1: stamp ssl attrs on the split link
                         subprocess.run(_sudo_wrap(['tee', '/opt/tak/CoreConfig.xml']), input=cc, capture_output=True, text=True, timeout=5)
                         log_step(f"✓ JDBC URL and password set for {db_host}:{db_port}")
                     else:
@@ -64114,6 +65478,25 @@ def run_takserver_deploy(config):
         log_step(f"  Certificate Password: {cert_pass}")
         log_step(f"  Admin cert: /opt/tak/certs/files/admin.p12")
         deploy_status.update({'complete': True, 'running': False})
+
+        # v10.1.9 W1: close the split-deploy cleartext window immediately.
+        # TAK Server's OWN db setup writes `host all martiuser 0.0.0.0/0 md5` into
+        # Server One's pg_hba while this deploy runs, and the deploy's TLS step
+        # deliberately does NOT remove it (removal is only safe AFTER a live TLS
+        # connection is verified, and TAK has not connected yet at that point). So
+        # a freshly deployed split box carried that cleartext rule until the next
+        # console restart — could be days. TAK is up and connected by here, so kick
+        # the retrofit now: it verifies TLS live, then removes the rule. It is
+        # idempotent and self-skipping, so this is safe even if nothing needs doing.
+        try:
+            if (_get_tak_deployment_config(load_settings()).get('mode') == 'two_server'
+                    and not _split_db_tls_complete()):
+                threading.Thread(target=_migrate_split_db_tls, daemon=True).start()
+                log_step("Split DB TLS: verifying the core↔DB link and closing any cleartext path "
+                         "(runs in the background; see the console log).")
+        except Exception as _sdt_e:
+            log_step(f"Split DB TLS: could not start the post-deploy pass ({_sdt_e}) — "
+                     "it will run on the next console restart.")
 
         # Auto-deploy Guard Dog so it runs from the start (user can disable or configure notifications later)
         if not os.path.exists('/opt/tak-guarddog'):
@@ -66437,6 +67820,42 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <pre id="kpatch-log-error" style="margin-top:10px;background:#0a0e1a;border:1px solid rgba(239,68,68,0.25);border-radius:6px;padding:10px;font-size:10px;color:var(--text-secondary);max-height:200px;overflow-y:auto;white-space:pre-wrap;word-break:break-word;font-family:'JetBrains Mono',monospace"></pre>
 </div>
 </div>
+<!-- v10.1.9 W8 — disk-reclaim card. Hidden unless /api/guarddog/disk-layout reports
+     mode != 'ok'. Backend (WI-1/2/3) already exists and is NOT touched by this card. -->
+<div id="disk-reclaim-card" style="display:none;background:linear-gradient(135deg,rgba(234,179,8,0.1),rgba(234,179,8,0.05));border:1px solid rgba(234,179,8,0.3);border-radius:12px;padding:14px 20px;margin-bottom:16px;font-family:'JetBrains Mono',monospace">
+<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
+<div style="flex:1;min-width:280px">
+<div style="font-size:13px;font-weight:600;color:var(--yellow)">&#128190; <span id="disk-reclaim-headline">Disk layout</span></div>
+<div id="disk-reclaim-detail" style="font-size:11px;color:var(--text-dim);margin-top:4px;line-height:1.5"></div>
+</div>
+<div id="disk-reclaim-actions" style="display:flex;gap:8px;flex-wrap:wrap">
+<button type="button" id="disk-grow-btn" onclick="diskReclaimGrow()" style="display:none;padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Reclaim free space</button>
+<button type="button" id="disk-fold-btn" onclick="promptDiskFold()" style="display:none;padding:6px 14px;background:rgba(239,68,68,0.1);color:var(--red);border:1px solid rgba(239,68,68,0.35);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Reclaim /home &mdash; destructive</button>
+</div>
+</div>
+<div id="disk-reclaim-status" style="display:none;font-size:11px;margin-top:10px"></div>
+<pre id="disk-reclaim-log" style="display:none;margin-top:10px;background:#0a0e1a;border:1px solid rgba(59,130,246,0.15);border-radius:6px;padding:10px;font-size:10px;color:var(--text-secondary);max-height:200px;overflow-y:auto;white-space:pre-wrap;word-break:break-word;font-family:'JetBrains Mono',monospace"></pre>
+</div>
+<div id="disk-fold-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;align-items:center;justify-content:center">
+  <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:420px;max-width:90vw;font-family:'JetBrains Mono',monospace">
+    <div style="font-size:13px;font-weight:700;color:var(--red);margin-bottom:6px">&#9888; Destroy the /home volume</div>
+    <div style="font-size:11px;color:var(--text-dim);margin-bottom:12px;line-height:1.5">This <b>permanently removes</b> the logical volume below and gives its space to root. Its contents are archived to <code style="background:rgba(255,255,255,.05);padding:1px 5px;border-radius:3px">/var/lib/takwerx-broker/home-fold/</code> (root-only) and restored into a plain <code style="background:rgba(255,255,255,.05);padding:1px 5px;border-radius:3px">/home</code> directory first. <b>Docker is stopped</b> for the duration &mdash; every container goes down and comes back, and <b>any shell logged in under /home is signed out</b> (log back in after). If anything other than a shell is using /home, this stops and changes nothing.</div>
+    <div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:10px 12px;margin-bottom:14px">
+      <div style="font-size:10px;color:var(--text-dim);margin-bottom:4px">Volume to be destroyed</div>
+      <div id="disk-fold-lv" style="font-size:15px;font-weight:700;color:var(--red);word-break:break-all">-</div>
+      <div id="disk-fold-lv-meta" style="font-size:10px;color:var(--text-dim);margin-top:4px"></div>
+    </div>
+    <label style="display:block;font-size:11px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">Type the volume name to confirm</label>
+    <input id="disk-fold-lv-input" type="text" autocomplete="off" spellcheck="false" style="width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text-primary);font-size:13px;font-family:'JetBrains Mono',monospace;box-sizing:border-box;margin-bottom:12px" placeholder="vg/home">
+    <label style="display:block;font-size:11px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">Console password</label>
+    <input id="disk-fold-pw" type="password" style="width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text-primary);font-size:13px;font-family:'JetBrains Mono',monospace;box-sizing:border-box" placeholder="password" onkeydown="if(event.key==='Enter')confirmDiskFold()">
+    <div id="disk-fold-err" style="font-size:11px;color:var(--red);margin-top:6px;min-height:16px"></div>
+    <div style="display:flex;gap:8px;margin-top:14px;justify-content:flex-end">
+      <button id="disk-fold-cancel" onclick="closeDiskFoldModal()" style="padding:7px 16px;background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border);border-radius:8px;cursor:pointer;font-family:inherit;font-size:12px">Cancel</button>
+      <button id="disk-fold-confirm" onclick="confirmDiskFold()" style="padding:7px 16px;background:var(--red);color:#fff;border:none;border-radius:8px;cursor:pointer;font-family:inherit;font-size:12px;font-weight:700">Destroy and reclaim</button>
+    </div>
+  </div>
+</div>
 <div class="metrics-bar" id="metrics-bar">
 <div class="metric-card"><div class="metric-label">CPU</div><div class="metric-value" id="cpu-value">{{ metrics.cpu_percent }}%</div></div>
 <div class="metric-card"><div class="metric-label">Memory</div><div class="metric-value" id="ram-value">{{ metrics.ram_percent }}%</div><div class="metric-detail" id="ram-detail">{{ metrics.ram_used_gb }}GB / {{ metrics.ram_total_gb }}GB</div></div>
@@ -66650,6 +68069,147 @@ async function fetchRetry(url,opts,tries){
   }
   throw lastErr;
 }
+/* ---- v10.1.9 W8: disk-reclaim card ----------------------------------------
+   Frontend for the WI-1/2/3 backend that already exists (_detect_disk_layout,
+   GET /api/guarddog/disk-layout, POST /api/console/disk/reclaim). The card is
+   invisible on a healthy box (mode 'ok', which also covers "not on LVM").
+   grow_free is non-destructive -> one confirm. fold_home DESTROYS an LV -> the
+   Power-Off treatment: password re-confirm plus the operator types the exact LV,
+   which is what the API's confirm_lv echo is for. */
+var _diskLayout=null,_diskBusy=false;
+function _diskEsc(s){var d=document.createElement('div');d.textContent=(s==null?'':String(s));return d.innerHTML;}
+function _diskEl(id){return document.getElementById(id);}
+function diskLayoutRefresh(){
+    if(_diskBusy)return;
+    var card=_diskEl('disk-reclaim-card');if(!card)return;
+    /* Every /api/guarddog* URL inherits a 12s global abort (see __fetchTO). The
+       layout probe shells out to lvs/vgs through the broker and can outrun that on
+       a loaded box, so it supplies its own longer signal to opt out. */
+    var ctl=new AbortController();var to=setTimeout(function(){try{ctl.abort();}catch(e){}},30000);
+    fetch('/api/guarddog/disk-layout',{credentials:'same-origin',signal:ctl.signal}).then(function(r){return r.json();}).then(function(d){
+        clearTimeout(to);
+        if(!d||!d.success||!d.layout)return;
+        _diskLayout=d.layout;
+        _diskRenderCard(d.layout);
+    }).catch(function(){clearTimeout(to);});
+}
+function _diskRenderCard(L){
+    var card=_diskEl('disk-reclaim-card');if(!card)return;
+    if(!L||L.mode==='ok'){card.style.display='none';return;}
+    card.style.display='block';
+    var head=_diskEl('disk-reclaim-headline');
+    if(head)head.textContent='Root is only '+L.root_pct_of_vg+'% of this disk — '+L.reclaimable_gb+' GB is reclaimable for TAK';
+    var bits=[];
+    if(L.mode==='free_extents'||L.mode==='both')
+        bits.push('<b>'+_diskEsc(L.vg_free_gb)+' GB</b> of volume group <b>'+_diskEsc(L.vg)+'</b> is unallocated. Growing <b>'+_diskEsc(L.root_lv)+'</b> into it is non-destructive, needs no reboot, and nothing has to stop.');
+    if(L.mode==='idle_home'||L.mode==='both')
+        bits.push('<b>'+_diskEsc(L.home_lv)+'</b> is a separate <b>'+_diskEsc(L.home_lv_gb)+' GB</b> volume holding only '+_diskEsc(L.home_used_mb)+' MB. Folding it into root hands that space to TAK — <b>this destroys the volume</b> and stops Docker while it runs.');
+    bits.push('TAK Server, Docker, Postgres, Authentik and CloudTAK all live on root ('+_diskEsc(L.root_gb)+' GB), so space parked anywhere else is unusable.');
+    var det=_diskEl('disk-reclaim-detail');
+    if(det)det.innerHTML=bits.join('<br>');
+    var grow=_diskEl('disk-grow-btn'),fold=_diskEl('disk-fold-btn');
+    if(grow){
+        var showGrow=(L.mode==='free_extents'||L.mode==='both');
+        grow.style.display=showGrow?'':'none';
+        grow.textContent='Reclaim '+L.vg_free_gb+' GB';
+    }
+    if(fold)fold.style.display=(L.mode==='idle_home'||L.mode==='both')?'':'none';
+}
+function _diskSetBusy(on,text){
+    _diskBusy=on;
+    var grow=_diskEl('disk-grow-btn'),fold=_diskEl('disk-fold-btn'),st=_diskEl('disk-reclaim-status');
+    if(grow)grow.disabled=on;
+    if(fold)fold.disabled=on;
+    if(st&&text){st.style.display='block';st.style.color='var(--cyan)';st.textContent=text;}
+}
+function _diskShowResult(ok,msg,d){
+    var st=_diskEl('disk-reclaim-status'),lg=_diskEl('disk-reclaim-log');
+    if(st){st.style.display='block';st.style.color=ok?'var(--green)':'var(--red)';st.textContent=(ok?'✓ ':'✗ ')+msg;}
+    var lines=(d&&d.log)?d.log.slice():[];
+    if(d&&d.df_after)lines.push('','',d.df_after);
+    if(d&&d.backup)lines.push('','Backup archive kept at '+d.backup+' (root-only, 0600).');
+    if(lg){
+        if(lines.length){lg.style.display='block';lg.textContent=lines.join('\\n');}
+        else{lg.style.display='none';lg.textContent='';}
+    }
+}
+async function diskReclaimGrow(){
+    var L=_diskLayout;if(!L)return;
+    if(!confirm('Grow '+L.root_lv+' into '+L.vg_free_gb+' GB of unallocated space?\\n\\nNon-destructive: no data is touched, no reboot, nothing stops. The filesystem is grown online.'))return;
+    _diskSetBusy(true,'Growing root — this takes a few seconds…');
+    try{
+        var r=await fetch('/api/console/disk/reclaim',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:'grow_free'}),credentials:'same-origin'});
+        var d=await r.json();
+        _diskSetBusy(false,'');
+        if(d.success){
+            _diskShowResult(true,'Root grew into the free extents.',d);
+            if(d.layout){_diskLayout=d.layout;_diskRenderCard(d.layout);}
+        }else{
+            _diskShowResult(false,d.error||'Reclaim failed.',d);
+        }
+    }catch(e){
+        _diskSetBusy(false,'');
+        _diskShowResult(false,'Request failed: '+(e.message||'unknown'),null);
+    }
+}
+function promptDiskFold(){
+    var L=_diskLayout;if(!L||!L.home_lv)return;
+    var m=_diskEl('disk-fold-modal');
+    var lv=_diskEl('disk-fold-lv'),meta=_diskEl('disk-fold-lv-meta');
+    var inp=_diskEl('disk-fold-lv-input'),pw=_diskEl('disk-fold-pw'),err=_diskEl('disk-fold-err');
+    if(lv)lv.textContent=L.home_lv;
+    if(meta)meta.textContent=L.home_lv_gb+' GB volume, '+L.home_used_mb+' MB in use — root gains the whole '+L.home_lv_gb+' GB.';
+    if(inp){inp.value='';inp.placeholder=L.home_lv;}
+    if(pw)pw.value='';
+    if(err){err.style.color='var(--red)';err.textContent='';}
+    var btn=_diskEl('disk-fold-confirm');if(btn){btn.disabled=false;btn.textContent='Destroy and reclaim';}
+    var cancel=_diskEl('disk-fold-cancel');if(cancel)cancel.disabled=false;
+    if(m){m.style.display='flex';setTimeout(function(){if(inp)inp.focus();},80);}
+}
+function closeDiskFoldModal(){
+    if(_diskBusy)return;      /* never let the operator lose sight of a running fold-in */
+    var m=_diskEl('disk-fold-modal');
+    if(m)m.style.display='none';
+}
+async function confirmDiskFold(){
+    var L=_diskLayout;if(!L||!L.home_lv)return;
+    var inp=_diskEl('disk-fold-lv-input'),pw=_diskEl('disk-fold-pw'),err=_diskEl('disk-fold-err');
+    var typed=(inp?inp.value:'').trim(),pass=(pw?pw.value:'');
+    function fail(msg){if(err){err.style.color='var(--red)';err.textContent=msg;}}
+    if(typed!==L.home_lv){fail('Type the volume name exactly: '+L.home_lv);return;}
+    if(!pass){fail('Console password required');return;}
+    fail('');
+    var btn=_diskEl('disk-fold-confirm'),cancel=_diskEl('disk-fold-cancel');
+    if(btn){btn.disabled=true;btn.textContent='Working…';}
+    if(cancel)cancel.disabled=true;
+    _diskSetBusy(true,'Folding '+L.home_lv+' into root — Docker is stopped for this. Can take several minutes on a large /home. Do not close this tab.');
+    if(err){err.style.color='var(--cyan)';err.textContent='Archiving /home, then removing the volume… this window stays open until it finishes.';}
+    /* Deliberately no client-side timeout: the broker allows up to 40 min for the
+       rsync + tar + lvremove + filesystem grow. */
+    try{
+        var r=await fetch('/api/console/disk/reclaim',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:'fold_home',password:pass,confirm_lv:L.home_lv}),credentials:'same-origin'});
+        var d=await r.json();
+        _diskSetBusy(false,'');
+        if(d.success){
+            var m=_diskEl('disk-fold-modal');if(m)m.style.display='none';
+            _diskShowResult(true,L.home_lv+' folded into root.',d);
+            if(d.layout){_diskLayout=d.layout;_diskRenderCard(d.layout);}
+        }else{
+            if(btn){btn.disabled=false;btn.textContent='Destroy and reclaim';}
+            if(cancel)cancel.disabled=false;
+            fail(d.error||'Reclaim failed.');
+            /* Broker failure paths roll back (fstab restored, /home remounted, Docker
+               restarted) and return their log — show it rather than swallow it. */
+            if(d.log&&d.log.length)_diskShowResult(false,d.error||'Reclaim failed.',d);
+        }
+    }catch(e){
+        _diskSetBusy(false,'');
+        if(btn){btn.disabled=false;btn.textContent='Destroy and reclaim';}
+        if(cancel)cancel.disabled=false;
+        fail('Connection lost: '+(e.message||'unknown')+'. The fold-in may still be running on the box — wait a few minutes, reload this page, and check the card before retrying.');
+    }
+}
+diskLayoutRefresh();
 setInterval(async()=>{try{const r=await fetch('/api/metrics');const d=await r.json();document.getElementById('cpu-value').textContent=d.cpu_percent+'%';document.getElementById('ram-value').textContent=d.ram_percent+'%';document.getElementById('disk-value').textContent=d.disk_percent+'%';var _rd=document.getElementById('ram-detail');if(_rd&&d.ram_used_gb!=null)_rd.textContent=d.ram_used_gb+'GB / '+d.ram_total_gb+'GB';var _dd=document.getElementById('disk-detail');if(_dd&&d.disk_used_gb!=null)_dd.textContent=d.disk_used_gb+'GB / '+d.disk_total_gb+'GB';document.getElementById('uptime-value').textContent=d.uptime;if(d.unattended_upgrades_hosts)updateUUHosts(d.unattended_upgrades_hosts);}catch(e){}},5000);
 function refreshModuleCards(){
     fetch('/api/modules').then(r=>r.json()).then(function(mods){
@@ -70008,11 +71568,25 @@ def _startup_ensure_console_ports():
             hardened = False
         # 5001: the console's own port — open on a Standard box. A Hardened box
         # deliberately closes it (_startup_ensure_hardening_posture owns that).
+        #
+        # BUT do not clobber an operator who has deliberately source-scoped it.
+        # This re-assert exists because firewalld loses runtime-only rules across a
+        # reboot — not to force the port world-open. An operator who replaced the
+        # blanket allow with `rule family=ipv4 source address=X port port=5001
+        # accept` had it silently widened back to Anywhere on the next console
+        # start, with nothing said. UFW boxes never had this problem (the whole
+        # function returns early for ufw), so the behaviour differed by platform
+        # for no reason the operator could see.
         if not hardened:
             try:
-                _fw_allow(int(load_settings().get('console_port') or 5001), 'tcp')
+                _cport = int(load_settings().get('console_port') or 5001)
             except Exception:
-                _fw_allow(5001, 'tcp')
+                _cport = 5001
+            if _fw_port_source_scoped(_cport, 'tcp'):
+                print('[startup-ports] :%d is source-scoped by the operator — leaving it alone '
+                      '(not re-adding the blanket allow)' % _cport, flush=True)
+            else:
+                _fw_allow(_cport, 'tcp')
         # 80 + 443: Caddy fronts the FQDN/console vhost whenever ssl is fqdn/custom —
         # needed on BOTH postures (a Hardened box reaches the console via Caddy 443).
         if (load_settings().get('ssl_mode') or '') in ('fqdn', 'custom'):
@@ -71551,6 +73125,50 @@ def _startup_migrations():
             _f2b_selfheal_rhel_jails(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _f2b_e:
             print(f"Startup migration: fail2ban self-heal error (non-fatal): {_f2b_e}", flush=True)
+
+        # v10.1.9 — field report (2026-07-25): on an image with no rsyslog the sshd
+        # jail's logpath points at a file that does not exist, fail2ban dies during
+        # config parse, and EVERY jail stops. Repair it to the systemd journal.
+        try:
+            _f2b_selfheal_sshd_backend(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _f2b_e2:
+            print(f"Startup migration: fail2ban sshd-backend self-heal error (non-fatal): {_f2b_e2}", flush=True)
+
+        # v10.1.9 — never let fail2ban ban the road in. Adds the WireGuard/NetBird
+        # management subnets to every jail's ignoreip and releases any tunnel address
+        # already banned. Field-hit 2026-07-26: the sshd jail banned the relay and the
+        # box went dark to it. Runs AFTER the backend self-heal so the jail is sane first.
+        try:
+            _f2b_selfheal_tunnel_ignoreip(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _f2b_e3:
+            print(f"Startup migration: fail2ban tunnel-ignoreip self-heal error (non-fatal): {_f2b_e3}", flush=True)
+
+        # v10.1.9 W7 — tighten world-readable secrets (TAK private keys, module
+        # .env files, CoreConfig). Idempotent, only ever narrows a mode.
+        try:
+            _harden_sensitive_permissions()
+        except Exception as _hp_e:
+            print(f"Startup migration: permissions hardening error (non-fatal): {_hp_e}", flush=True)
+
+        # v10.1.9 W1 — retrofit: encrypt an existing split-box core↔DB link (TLS + SCRAM).
+        # One-shot per box; involves a takserver restart + live verification (minutes), so it
+        # runs in a background thread and never delays console startup. Console-path delivery:
+        # existing splits (test8, NE-TAK class) get TLS from a normal update, no SSH needed.
+        try:
+            _sdt_cfg = _get_tak_deployment_config(s)
+            _sdt_state = _split_db_tls_state() if _sdt_cfg.get('mode') == 'two_server' else 'n/a'
+            if _sdt_cfg.get('mode') == 'two_server' and not _split_db_tls_complete(_sdt_state):
+                threading.Thread(target=_migrate_split_db_tls, daemon=True).start()
+                print("Startup migration: split DB TLS retrofit launched in background", flush=True)
+            elif _sdt_state.startswith('enabled-residual'):
+                # Re-assert every boot. The core<->DB link IS encrypted; what remains
+                # is a broader non-TLS pg_hba rule that is not ours to delete. Saying
+                # it once and going quiet reads as "handled" when it is not.
+                print("Split DB TLS: ⚠ core<->DB link is encrypted (verify-full pinned), but Server One "
+                      "still accepts NON-TLS connections from other clients. Review its pg_hba.conf and "
+                      "remove any remaining `host ...` rule that is not loopback-only.", flush=True)
+        except Exception as _sdt_e:
+            print(f"Startup migration: split DB TLS launch error (non-fatal): {_sdt_e}", flush=True)
 
         # Fix fedhub web_ui_port default for Caddy upstream (remote hub HTTP web UI is 8080)
         fh_raw = s.get('fedhub_deployment', {})
