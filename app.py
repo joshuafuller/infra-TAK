@@ -768,7 +768,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.10-alpha"
+VERSION = "10.1.11-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -8121,6 +8121,35 @@ def _harden_sensitive_permissions(plog=None):
             cur = (r.stdout or '').strip()
             if not cur or r.returncode != 0:
                 continue                      # not present on this box
+            # Before tightening: a file inside a user's home must be OWNED by that
+            # user. Pre-flip boxes carry root-owned .env files under /home/takwerx
+            # (written when the console still ran as root). Combine that with the
+            # 600 below and the owner of the home — the console, and the user that
+            # runs `docker compose` — cannot read its own config at all. That is
+            # what killed the TAK Portal console page on test12: PermissionError on
+            # /home/takwerx/TAK-Portal/.env, 500 on every load, silent since the
+            # mode changed on 2026-07-25. Fixing ownership keeps the security goal
+            # (nobody but the owner can read it) while restoring the owner's access,
+            # and is the reason 600 was safe to assume in the first place.
+            # Scoped to THIS console's own home, deliberately. The targets list also
+            # covers /root/<mod>/.env for pre-flip boxes, and on a flipped box those
+            # are stale copies that the non-root migration left owned by takwerx —
+            # "owner should match the home" would chown them back to root and undo
+            # that migration. Narrowing to the running console's home fixes the file
+            # that is actually read and leaves the leftovers alone. (Without this it
+            # only worked by accident: os.stat('/root') raises for takwerx, so the
+            # chown was skipped by exception rather than by intent.)
+            try:
+                import pwd as _pwd2
+                _me = _pwd2.getpwuid(os.getuid())
+                my_home = os.path.realpath(_me.pw_dir)
+                if os.path.realpath(path).startswith(my_home + os.sep) \
+                        and os.stat(path).st_uid != _me.pw_uid:
+                    subprocess.run(_sudo_wrap(['chown', f'{_me.pw_name}:{_me.pw_name}', path]),
+                                   capture_output=True, timeout=15)
+                    fixed.append(f'{path} owner->{_me.pw_name}')
+            except Exception:
+                pass
             # Only tighten. Never widen a mode an operator deliberately narrowed.
             if int(cur, 8) & ~int(want, 8):
                 could_read = _console_can_read(path)
@@ -13537,12 +13566,15 @@ def _f2b_parse_status(raw):
             result['banned_ips'] = [ip.strip() for ip in ips_raw.split() if ip.strip()]
     return result
 
-# Virtual / container / overlay interface prefixes whose subnets must NOT be auto-trusted:
-# docker bridges (172.17-31/16), libvirt, k8s CNIs, VPN/mesh links. These are RFC1918 but
-# are NOT the LAN/VNet a real upstream gateway lives on — auto-trusting them just bloats
-# ignoreip with noise (a box can have ~10 docker /16s). Only the physical NIC's subnet is
-# the one a proxy/gateway shares. (Found during v0.9.58 #6 field test: the test fleet's
-# jails would have picked up 9 docker bridges each.)
+# Virtual / container / overlay interface prefixes that are NOT a gateway LAN: docker
+# bridges (172.17-31/16), libvirt, k8s CNIs, VPN/mesh links. These are RFC1918 but are NOT
+# the LAN/VNet a real upstream gateway lives on, so _f2b_local_subnets() skips them — only
+# the physical NIC's subnet is the one a proxy/gateway shares. (Found during v0.9.58 #6
+# field test: the test fleet's jails would have picked up 9 docker bridges each.)
+#
+# v10.1.11: skipping them HERE is still right, but they are no longer untrusted overall —
+# our own containers live on the docker bridges and _f2b_container_subnets() trusts those
+# deliberately. See that function for why the "just noise" reasoning was wrong.
 _F2B_VIRTUAL_IFACE_PREFIXES = ('lo', 'docker', 'br-', 'br0', 'veth', 'virbr', 'vnet',
                                'flannel', 'cni', 'cali', 'kube', 'tailscale', 'nb-',
                                'wg', 'zt', 'tun', 'tap', 'cilium', 'ovs', 'weave')
@@ -13633,6 +13665,113 @@ def _f2b_mgmt_tunnel_subnets():
     return subnets
 
 
+# Bridges that carry OUR OWN containers. Deliberately narrow: docker0, docker's
+# user-defined networks (`br-<12 hex>` — note this does NOT match a host bridge named
+# `br0`), and podman's equivalents. A third-party CNI/VPN bridge is NOT in here.
+_F2B_CONTAINER_IFACE_PREFIXES = ('docker', 'br-', 'podman', 'cni-podman')
+
+
+def _f2b_container_subnets():
+    """Subnets of the container bridges infra-TAK itself brings up — never bannable.
+
+    TAK Portal, Node-RED and CloudTAK all run as containers and reach TAK Server at
+    its PUBLIC FQDN (`TAK_URL = https://takserver.<fqdn>:8443/Marti`), so TAK logs
+    their docker-bridge address as the remote peer. The takserver jail bans on ANY
+    TLS handshake rejection (`NioNettyServerHandler error ... Remote address: <HOST>`)
+    at 20 hits / 300 s — and the portal's dashboard poll runs every 15 s, i.e. exactly
+    20 attempts per 300 s. One handshake fault (expired client cert, rotated CA, TAK
+    restarting) therefore bans our own service in ~5 minutes, deterministically. The
+    ban is `iptables-allports`/`ufw`, so it severs that container from the host on
+    EVERY port, and `recidive` (bantime -1) escalates a repeat to permanent.
+
+    Field-hit 2026-07-25: the takserver jail banned 172.21.0.2 — the nodered container
+    — on test8 and test12 within two seconds of each other, with recidive already
+    counting. Operators were "fixing" the resulting API failures by disabling fail2ban
+    outright, which is a far worse trade than trusting our own bridges.
+
+    This reverses the v0.9.58 judgement that docker bridges are "just noise" in
+    ignoreip. That call weighed a ~10-token-longer ignoreip against nothing, because
+    the ban-our-own-services failure mode had not been seen yet. The residual risk is
+    narrow: these bridges are host-local and not routable from off-box, so an external
+    attacker cannot source an address into them; and fail2ban was never the control
+    containing a compromised container. Best-effort; [] on any failure."""
+    subnets = []
+    try:
+        r = subprocess.run(['ip', '-o', '-4', 'addr', 'show', 'scope', 'global'],
+                           capture_output=True, text=True, timeout=5)
+        for line in r.stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            ifname = parts[1].split('@')[0]
+            if not ifname.startswith(_F2B_CONTAINER_IFACE_PREFIXES):
+                continue
+            for i, tok in enumerate(parts):
+                if tok == 'inet' and i + 1 < len(parts):
+                    try:
+                        net = ipaddress.ip_network(parts[i + 1], strict=False)
+                    except Exception:
+                        continue
+                    # RFC1918 only — never whitelist a public range off a bridge name.
+                    if net.is_private and str(net) not in subnets:
+                        subnets.append(str(net))
+    except Exception:
+        pass
+    return subnets
+
+
+def _f2b_own_addresses():
+    """The box's OWN addresses — never bannable. A machine must not ban itself.
+
+    Hit for real on test8, 2026-07-27: five failed logins driven from the box itself
+    made the Authentik jail ban 63.250.55.132 — the box's own public IP — and ufw
+    duly installed rules dropping it on EVERY port. Anything that reaches the box via
+    its own public address is then severed: a service dialling its own FQDN, a
+    health check, a loopback-through-the-edge path. Nothing in the ignore list
+    prevented it, because _f2b_local_subnets() is RFC1918-only by design and a public
+    address is not private.
+
+    Two sources, because neither alone is complete:
+      - addresses actually on the physical NICs (covers bare metal / direct-public),
+      - settings['server_ip'], which on AWS/Azure is the NAT'd public address that
+        never appears in `ip addr` at all.
+    Emitted as bare host addresses, deliberately NOT the surrounding subnet — on a
+    direct-public box that would whitelist unrelated neighbours."""
+    out = []
+
+    def _add(a):
+        if a and a not in out:
+            out.append(a)
+
+    try:
+        r = subprocess.run(['ip', '-o', 'addr', 'show', 'scope', 'global'],
+                           capture_output=True, text=True, timeout=5)
+        for line in r.stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            ifname = parts[1].split('@')[0]
+            if ifname.startswith(_F2B_VIRTUAL_IFACE_PREFIXES):
+                continue                  # container/VPN bridges are trusted as subnets
+            for i, tok in enumerate(parts):
+                if tok in ('inet', 'inet6') and i + 1 < len(parts):
+                    try:
+                        _add(str(ipaddress.ip_interface(parts[i + 1]).ip))
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    try:
+        sip = (load_settings().get('server_ip') or '')
+        sip = sip.strip() if isinstance(sip, str) else ''
+        if sip:
+            _add(str(ipaddress.ip_address(sip)))
+    except Exception:
+        pass
+    return out
+
+
 def _f2b_fleet_ignore_cidrs():
     """Operator-configured fleet-wide trusted CIDRs (settings 'fail2ban_ignore_cidrs').
     Use this for an upstream gateway/proxy/LB that does NOT share the box's attached
@@ -13646,13 +13785,16 @@ def _f2b_fleet_ignore_cidrs():
 
 def _f2b_trusted_ignoreip(extra=''):
     """Build the full ignoreip whitelist for ANY infra-TAK jail, fleet-uniform:
-    localhost + the box's attached private subnet(s) + operator fleet CIDRs + the
-    per-jail operator whitelist (extra). Identical code path on every box; dedups so
-    it is idempotent even if `extra` still carries the localhost tokens."""
+    localhost + the box's attached private subnet(s) + our own container bridges +
+    operator fleet CIDRs + the per-jail operator whitelist (extra). Identical code
+    path on every box; dedups so it is idempotent even if `extra` still carries the
+    localhost tokens."""
     parts, seen = [], set()
     candidates = ['127.0.0.1/8', '::1']
     candidates += _f2b_local_subnets()
     candidates += _f2b_mgmt_tunnel_subnets()   # never ban the road in
+    candidates += _f2b_container_subnets()     # never ban our own services
+    candidates += _f2b_own_addresses()         # never ban ourselves
     candidates += _f2b_fleet_ignore_cidrs()
     candidates += str(extra or '').replace(',', ' ').split()
     for c in candidates:
@@ -13670,6 +13812,8 @@ def _f2b_operator_extra(stored):
     fleet = {'127.0.0.1/8', '::1'}
     fleet.update(_f2b_local_subnets())
     fleet.update(_f2b_mgmt_tunnel_subnets())
+    fleet.update(_f2b_container_subnets())
+    fleet.update(_f2b_own_addresses())
     fleet.update(_f2b_fleet_ignore_cidrs())
     return ' '.join(t for t in str(stored or '').split() if t not in fleet)
 
@@ -13796,21 +13940,572 @@ def _f2b_selfheal_sshd_backend(plog=None):
     return True
 
 
-def _f2b_selfheal_tunnel_ignoreip(plog=None):
-    """Add the management-tunnel subnets to every infra-TAK jail's ignoreip, and
-    release anything already banned inside one.
+# ── Filters infra-TAK owns ────────────────────────────────────────────────────
+# SINGLE SOURCE OF TRUTH. Every writer below pulls from here, and
+# _f2b_selfheal_filters() repairs a box that is missing one. Distro-shipped
+# filters (sshd, recidive) are deliberately absent — we never overwrite those.
+#
+# Why this exists (found 2026-07-27): jail configs were self-healed at startup
+# but filter files were NOT — the only code that wrote them was the one-shot
+# Marketplace install path. So a box could end up with `enabled = true` and no
+# filter, which makes fail2ban skip the jail on EVERY reload and fail
+# `fail2ban-client -t` outright. test6 sat like that from ≥2026-06-29 with
+# Authentik brute-force protection silently absent, while the console showed
+# the jail as configured. A security control that cannot fire must never be
+# reachable by a code path that leaves no trace.
+_F2B_OWNED_FILTERS = {
+    'authentik': (
+        "[Definition]\n"
+        "# Read from Authentik's OWN source, 2026-07-27 (authentik 2026.5.x,\n"
+        "# authentik/stages/identification/stage.py):\n"
+        "#     self.stage.logger.info(\n"
+        "#         \"invalid_login\", identifier=uid_field, client_ip=client_ip,\n"
+        "#         action=\"invalid_identifier\", ...)\n"
+        "# structlog renders the first positional arg as \"event\", so the line is\n"
+        "#     {... \"event\":\"invalid_login\" ... \"client_ip\":\"1.2.3.4\" ...}\n"
+        "#\n"
+        "# The previous filter matched \"action\": \"login_failed\" and never fired once on\n"
+        "# any box: that string does not appear in the log at all. `login_failed` is a\n"
+        "# Django SIGNAL name (authentik/core/signals.py), not a logged field — it feeds\n"
+        "# Authentik's own reputation scoring, not this file.\n"
+        "#\n"
+        "# REQUIRES AUTHENTIK_LOG_LEVEL=info — the call above is logger.info(), so at\n"
+        "# `warning` the line is never emitted and this jail cannot fire.\n"
+        "#\n"
+        "# Field order is not guaranteed by structlog, so match client_ip in EITHER\n"
+        "# direction relative to the event. Both alternatives cannot match the same line\n"
+        "# (each requires the other token on the opposite side), so no double-counting.\n"
+        "#\n"
+        "# SCOPE, deliberately: this catches an unknown/invalid IDENTIFIER — credential\n"
+        "# stuffing and username enumeration, the dominant attack. A wrong PASSWORD on a\n"
+        "# valid username logs \"Invalid credentials\" with NO client_ip\n"
+        "# (stages/password/stage.py), so it is not bannable from the log in this\n"
+        "# version. Authentik's built-in reputation policy covers that case natively.\n"
+        "failregex = \"event\":\\s*\"invalid_login\".*\"client_ip\":\\s*\"<HOST>\"\n"
+        "            \"client_ip\":\\s*\"<HOST>\".*\"event\":\\s*\"invalid_login\"\n"
+        "ignoreregex =\n"
+        # datepattern is MANDATORY here, not tidiness. Without it fail2ban runs its
+        # auto date-detector over Authentik's JSON, which mixes ISO strings with float
+        # epochs, and dies with IndexError('string index out of range') on EVERY line
+        # — logged as "Failed to process line", so the jail reads the file, matches
+        # nothing, and looks perfectly healthy. Confirmed on test8 2026-07-27: auto
+        # detect = IndexError and 0 processed; explicit pattern = 13/40 matched.
+        "datepattern = \"timestamp\":\\s*\"%%Y-%%m-%%dT%%H:%%M:%%S\n"
+    ),
+    'takserver': (
+        "[Definition]\n"
+        "# Match TAK Server (Netty) TLS/SSL/handshake rejection lines.\n"
+        "# Covers: PEER_DID_NOT_RETURN_A_CERTIFICATE, NO_SHARED_CIPHER,\n"
+        "#         UNSUPPORTED_PROTOCOL, NotSslRecordException.\n"
+        "# Log timestamp format: 2026-05-02-15:58:55.145 (YYYY-MM-DD-HH:MM:SS.mmm)\n"
+        "failregex = NioNettyServerHandler error.*Remote address: <HOST>;\n"
+        "ignoreregex =\n"
+        "datepattern = %%Y-%%m-%%d-%%H:%%M:%%S\n"
+        "              {^LN-BEG}\n"
+    ),
+    'takportal': (
+        "[Definition]\n"
+        "# Reads CADDY's access log for the TAK Portal host (v10.1.11). The Portal's\n"
+        "# public, unauthenticated /lookup and /request-access forms are enumerable;\n"
+        "# this bans an IP that keeps getting REJECTED on them. Caddy is the edge, so\n"
+        "# client_ip is the true client with no X-Forwarded-For trust required.\n"
+        "#\n"
+        "# Scoped to those two paths ONLY — a 4xx anywhere else on the Portal (an\n"
+        "# authenticated page, a missing asset) must never ban anyone. Success (2xx)\n"
+        "# and redirects (3xx) are never matched, so normal use cannot accumulate\n"
+        "# strikes. 429 is deliberately EXCLUDED: rate-limited callers behind one NAT\n"
+        "# would punish a whole site for one noisy user.\n"
+        "# \\s* after each colon: Go's encoder emits compact JSON, but tolerating a\n"
+        "# space costs nothing and stops a formatting change from silently disarming\n"
+        "# this jail — which is exactly how the last two died.\n"
+        "failregex = \"client_ip\":\\s*\"<HOST>\".*\"uri\":\\s*\"/(?:lookup|request-access)[^\"]*\".*\"status\":\\s*(?:400|401|403)\\b\n"
+        "ignoreregex =\n"
+    ),
+    'mediamtx-rtsp': (
+        "[Definition]\n"
+        "# Match RTSP connection opens per source IP.\n"
+        "# Counts 'opened' events — catches scanners before their probe cycle completes;\n"
+        "# legitimate ATAK clients reconnect occasionally but never at scanner rates.\n"
+        "failregex = \\[RTSP\\] \\[conn <HOST>:\\d+\\] opened\n"
+        "ignoreregex =\n"
+    ),
+}
 
-    Boxes deployed before this fix carry an ignoreip with no tunnel subnet, so the
-    relay/NetBird gateway stays bannable — and on a CGNAT box that tunnel is the
-    only way in. Console-path delivery: this runs at startup so a normal update
-    fixes it with no SSH. Idempotent; no-op when there is no tunnel or nothing to
-    change. See _f2b_mgmt_tunnel_subnets() for why this is narrow by design."""
+
+# Filter contents we have SHIPPED in the past and now know to be wrong. A file whose
+# bytes exactly match one of these is ours and stale, so it is safe to upgrade. A file
+# matching NONE of them has been hand-edited and is never touched.
+#
+# Why this exists: _f2b_selfheal_filters() originally only created MISSING filters, so
+# a corrected filter could never reach a box that already had the broken one — it
+# healed test6 (no file) and silently skipped every other box (stale file). Found while
+# verifying the Authentik jail end-to-end on test8, 2026-07-27: the jail was loaded,
+# fed, and logging invalid_login, and still matched 0 lines because the on-disk filter
+# was the old login_failed one.
+_F2B_LEGACY_FILTERS = {
+    'authentik': [
+        # v0.9.0–v10.1.11: matched "action": "login_failed", a string Authentik never
+        # logs. login_failed is a Django signal name, not a log field. Never matched once.
+        '[Definition]\n'
+        '# Match Authentik JSON log lines containing login_failed events.\n'
+        '# Authentik emits structured JSON; client_ip contains the real IP since v0.8.9\n'
+        '# fixed AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS.\n'
+        'failregex = "action": "login_failed".*"client_ip": "<HOST>"\n'
+        '            "client_ip": "<HOST>".*"action": "login_failed"\n'
+        'ignoreregex =\n',
+        # v10.1.11 first cut: correct event name, but NO datepattern — fail2ban's auto
+        # date-detector threw IndexError on every Authentik JSON line, so it matched
+        # nothing while appearing healthy.
+        '[Definition]\n# Read from Authentik\'s OWN source, 2026-07-27 (authentik 2026.5.x,\n# authentik/stages/identification/stage.py):\n#     self.stage.logger.info(\n#         "invalid_login", identifier=uid_field, client_ip=client_ip,\n#         action="invalid_identifier", ...)\n# structlog renders the first positional arg as "event", so the line is\n#     {... "event":"invalid_login" ... "client_ip":"1.2.3.4" ...}\n#\n# The previous filter matched "action": "login_failed" and never fired once on\n# any box: that string does not appear in the log at all. `login_failed` is a\n# Django SIGNAL name (authentik/core/signals.py), not a logged field — it feeds\n# Authentik\'s own reputation scoring, not this file.\n#\n# REQUIRES AUTHENTIK_LOG_LEVEL=info — the call above is logger.info(), so at\n# `warning` the line is never emitted and this jail cannot fire.\n#\n# Field order is not guaranteed by structlog, so match client_ip in EITHER\n# direction relative to the event. Both alternatives cannot match the same line\n# (each requires the other token on the opposite side), so no double-counting.\n#\n# SCOPE, deliberately: this catches an unknown/invalid IDENTIFIER — credential\n# stuffing and username enumeration, the dominant attack. A wrong PASSWORD on a\n# valid username logs "Invalid credentials" with NO client_ip\n# (stages/password/stage.py), so it is not bannable from the log in this\n# version. Authentik\'s built-in reputation policy covers that case natively.\nfailregex = "event":\\s*"invalid_login".*"client_ip":\\s*"<HOST>"\n            "client_ip":\\s*"<HOST>".*"event":\\s*"invalid_login"\nignoreregex =\n',
+    ],
+}
+
+
+def _f2b_enabled_jail_files():
+    """[(jail_name, filter_name, path)] for every enabled infratak-*.conf jail."""
+    out = []
+    jaild = '/etc/fail2ban/jail.d'
+    if not os.path.isdir(jaild):
+        return out
+    import glob as _glob
+    for path in sorted(_glob.glob(os.path.join(jaild, 'infratak-*.conf'))):
+        try:
+            with open(path) as f:
+                text = f.read()
+        except OSError:
+            continue
+        m = re.search(r'^\s*\[([^\]]+)\]', text, re.M)
+        if not m:
+            continue
+        name = m.group(1).strip()
+        en = re.search(r'^\s*enabled\s*=\s*(\S+)', text, re.M)
+        if not en or en.group(1).strip().lower() not in ('true', 'yes', '1'):
+            continue
+        fm = re.search(r'^\s*filter\s*=\s*(\S+)', text, re.M)
+        out.append((name, fm.group(1).strip() if fm else name, path))
+    return out
+
+
+def _f2b_loaded_jails():
+    """Jail names the RUNNING fail2ban actually has. [] if it cannot be asked.
+
+    NOT the same as the jails on disk — that gap is the whole point."""
+    try:
+        r = subprocess.run(_sudo_wrap(['fail2ban-client', 'status']),
+                           capture_output=True, text=True, timeout=30)
+        for line in (r.stdout or '').splitlines():
+            if 'Jail list:' in line:
+                return [j.strip() for j in line.split(':', 1)[1].replace(',', ' ').split() if j.strip()]
+    except Exception:
+        pass
+    return []
+
+
+def _f2b_dead_jails():
+    """Jails that are configured but protecting nothing. [(jail, filter, reason)].
+
+    TWO failure modes, because fixing only the first still leaves a green console
+    over a control that cannot fire:
+
+    1. NOT LOADED — enabled on disk but absent from the running daemon, usually a
+       missing filter file. (test6/authentik, ≥2026-06-29.)
+    2. STARVING — loaded and healthy-looking, but its logpath is 0 bytes, so it has
+       never been fed a single line and never can be. (takportal, since 2026-06-12:
+       the jail shipped ahead of the TAK Portal writer that was meant to emit the
+       log, and the container has no mount for that path either.) A 0-byte file is
+       used as the signal rather than staleness — a quiet box legitimately has quiet
+       logs, but a log that has never received one byte is unambiguous."""
+    dead = []
+    loaded = _f2b_loaded_jails()
+    if not loaded:
+        return dead                       # daemon unreachable — cannot judge, don't guess
+    for name, filt, path in _f2b_enabled_jail_files():
+        if name not in loaded:
+            reason = ('filter file /etc/fail2ban/filter.d/%s.conf is missing' % filt
+                      if not os.path.exists('/etc/fail2ban/filter.d/%s.conf' % filt)
+                      else 'enabled on disk but not loaded by fail2ban')
+            dead.append((name, filt, reason))
+            continue
+        # Loaded — but is anything actually reaching it?
+        try:
+            with open(path) as f:
+                jt = f.read()
+        except OSError:
+            continue
+        if re.search(r'^\s*backend\s*=\s*systemd', jt, re.M):
+            continue                      # journal-fed, no logpath to size-check
+        lm = re.search(r'^\s*logpath\s*=\s*(\S+)', jt, re.M)
+        if not lm:
+            continue
+        lp = lm.group(1)
+        try:
+            if os.path.getsize(lp) == 0:
+                dead.append((name, filt,
+                             'loaded, but its log %s is 0 bytes — nothing has ever '
+                             'written to it, so this jail can never fire' % lp))
+        except OSError:
+            dead.append((name, filt, 'loaded, but its log %s cannot be read' % lp))
+    return dead
+
+
+def _f2b_selfheal_filters(plog=None):
+    """Write any MISSING filter file for an enabled jail whose filter we own.
+
+    A jail with no filter is skipped by fail2ban on every reload and makes
+    `fail2ban-client -t` fail for the whole daemon. Console-path delivery: runs at
+    startup so a normal update repairs it with no SSH.
+
+    Writes in exactly two cases: the file is MISSING, or its bytes exactly match a
+    version WE shipped and have since corrected (_F2B_LEGACY_FILTERS). Anything else
+    is operator-modified and is left alone. Creating-only was not enough — a corrected
+    filter then never reached any box that already had the broken one."""
     _log = plog or (lambda m: None)
     if not _f2b_is_available():
         return False
-    tun = _f2b_mgmt_tunnel_subnets()
+    _makedirs_priv('/etc/fail2ban/filter.d', exist_ok=True)
+    wrote, upgraded = [], []
+    for name, filt, _path in _f2b_enabled_jail_files():
+        if filt not in _F2B_OWNED_FILTERS:
+            continue                      # distro filter (sshd/recidive) — not ours to write
+        fpath = '/etc/fail2ban/filter.d/%s.conf' % filt
+        want = _F2B_OWNED_FILTERS[filt]
+        cur = None
+        if os.path.exists(fpath):
+            try:
+                with open(fpath) as f:
+                    cur = f.read()
+            except OSError:
+                continue
+            if cur == want:
+                continue                  # already current
+            if cur not in _F2B_LEGACY_FILTERS.get(filt, []):
+                continue                  # operator-modified — never clobber
+        try:
+            _write_priv(fpath, want)
+            (upgraded if cur is not None else wrote).append(f'{filt} (jail {name})')
+        except Exception as e:
+            _log(f'fail2ban: could not write filter {fpath}: {e}')
+    if not wrote and not upgraded:
+        return False
+    if wrote:
+        _log('fail2ban: wrote MISSING filter(s) ' + ', '.join(wrote) +
+             ' — those jails were enabled but skipped on every reload, so they were '
+             'protecting nothing.')
+    if upgraded:
+        _log('fail2ban: UPGRADED stale filter(s) ' + ', '.join(upgraded) +
+             ' — the shipped pattern could never match a real log line, so those jails '
+             'were loaded and healthy-looking while banning nobody.')
+    try:
+        subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=60)
+    except Exception:
+        pass
+    return True
+
+
+# The forwarder that feeds the Authentik jail. `docker logs -f X 2>&1 >> FILE` is
+# WRONG: bash applies redirections left to right, so `2>&1` points stderr at the
+# CURRENT stdout (systemd's StandardOutput=null) and only then does `>>` move stdout
+# to the file. Net effect: stderr is discarded. Authentik writes its structured JSON
+# — including every auth event — to stderr, so the jail was fed nothing but the
+# entrypoint's stdout chatter (Django migration output). Measured on test8
+# 2026-07-27: 192 of the last 200 stderr lines were JSON; stdout was
+# "No migrations to apply." Correct order is `>> FILE 2>&1`.
+# `2>&1 |` (before the pipe) sends BOTH streams to grep — Authentik's JSON is on stderr.
+#
+# The grep is not an optimisation, it is what makes the jail work at all. auth.log's only
+# consumer is this jail, and feeding it the full firehose broke fail2ban outright: its
+# auto date-detector hits Authentik's mixed timestamp formats (ISO strings, float epochs,
+# and bare text from the Django entrypoint) and throws
+# IndexError('string index out of range') on EVERY line — logged as "Failed to process
+# line", so the jail tails the file, matches nothing, and looks perfectly healthy.
+# Confirmed on test8 2026-07-27: full log = IndexError and nothing processed; a file of
+# only invalid_login lines = 5/5 matched, clean.
+#
+# Narrowing here also fixes the second problem it caused: auth.log had grown to 21MB of
+# migration chatter with no rotation. Nothing is lost — `docker logs` still holds the
+# complete stream for humans.
+_AK_FORWARDER_EXEC = ("ExecStart=/bin/bash -c 'docker logs -f authentik-server-1 2>&1 "
+                      "| grep --line-buffered -F invalid_login "
+                      ">> /var/log/authentik/auth.log'\n")
+
+_AK_FORWARDER_UNIT = (
+    "[Unit]\n"
+    "Description=Authentik Docker Log Forwarder for fail2ban\n"
+    "After=docker.service\n"
+    "Requires=docker.service\n\n"
+    "[Service]\n"
+    "Type=simple\n"
+    "Restart=always\n"
+    "RestartSec=10\n"
+    + _AK_FORWARDER_EXEC +
+    "StandardOutput=null\n"
+    "StandardError=null\n\n"
+    "[Install]\n"
+    "WantedBy=multi-user.target\n"
+)
+
+
+def _f2b_selfheal_authentik_log_level(plog=None):
+    """Flip AUTHENTIK_LOG_LEVEL warning -> info so the Authentik jail can actually fire.
+
+    The only failed-login line carrying a client IP is
+    `logger.info("invalid_login", ..., client_ip=...)`
+    (authentik/stages/identification/stage.py). We set `warning` in v0.8.7 to trim log
+    volume, not realising it silently disabled the whole jail — which is why that jail
+    has never banned anything on any box. `info` is upstream's OWN default, and volume
+    is now bounded by _f2b_ensure_authentik_logrotate().
+
+    Narrow on purpose:
+      - only when the Authentik jail is actually enabled (no jail, no reason to touch
+        a working Authentik),
+      - only when the value is exactly `warning`, i.e. OUR old default. An operator who
+        deliberately chose `debug`/`error` keeps it,
+      - recreates Authentik so the change takes effect. Skipping that would leave the
+        setting written and the jail still dead, which is the exact failure this whole
+        release is about. Costs one brief SSO interruption, ONCE."""
+    _log = plog or (lambda m: None)
+    if not _f2b_authentik_jail_enabled():
+        return False
+    ak_dir = os.path.expanduser('~/authentik')
+    env_path = os.path.join(ak_dir, '.env')
+    if not os.path.exists(env_path):
+        return False
+    try:
+        with open(env_path) as f:
+            content = f.read()
+    except OSError:
+        return False
+    m = re.search(r'^AUTHENTIK_LOG_LEVEL\s*=\s*(\S*)\s*$', content, re.M)
+    if not m or m.group(1).strip().lower() != 'warning':
+        return False                      # absent, already info, or operator's own choice
+    new = re.sub(r'^AUTHENTIK_LOG_LEVEL\s*=.*$', 'AUTHENTIK_LOG_LEVEL=info', content, count=1, flags=re.M)
+    try:
+        _write_priv(env_path, new)
+    except Exception as e:
+        _log(f'fail2ban: could not raise AUTHENTIK_LOG_LEVEL (non-fatal): {e}')
+        return False
+    _log('fail2ban: AUTHENTIK_LOG_LEVEL warning -> info. The Authentik brute-force jail '
+         'matches logger.info("invalid_login"), so at `warning` it could never fire — '
+         'and never had. Recreating Authentik to apply; brief SSO interruption, once.')
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ak_dir,
+                           capture_output=True, text=True, timeout=300)
+        if r.returncode != 0:
+            _log('fail2ban: Authentik recreate returned %s — the new log level applies at '
+                 'its next restart; jail stays dormant until then.'
+                 % (r.stderr or r.stdout or '')[-160:].strip())
+    except Exception as e:
+        _log(f'fail2ban: Authentik recreate failed ({e}) — new log level applies on next restart.')
+    return True
+
+
+def _f2b_ensure_authentik_logrotate(plog=None):
+    """Bound /var/log/authentik/auth.log. It has NEVER been rotated.
+
+    Found at 21MB and growing on test8 (2026-07-27) with no logrotate rule anywhere
+    — and the stderr-redirect fix in this same release makes it grow FASTER, because
+    the file now receives the JSON stream it was always supposed to. Unbounded is a
+    disk-exhaustion path on a long-lived box, so the fix ships with its own brake.
+
+    `copytruncate` is REQUIRED, not stylistic: the writer is
+    `docker logs -f ... >> auth.log`, a long-lived process holding an open fd. A
+    rename-and-create rotation would leave it writing to the unlinked inode forever
+    and the jail would silently starve — the exact class of bug this release is
+    about. copytruncate keeps the fd valid; fail2ban handles truncation natively."""
+    _log = plog or (lambda m: None)
+    if not os.path.isdir('/etc/logrotate.d'):
+        return False
+    path = '/etc/logrotate.d/infratak-authentik'
+    conf = (
+        "# infra-TAK v10.1.11 — auth.log feeds the Authentik fail2ban jail and was\n"
+        "# previously unrotated. copytruncate: the docker-logs forwarder holds the fd.\n"
+        "/var/log/authentik/auth.log {\n"
+        "    daily\n"
+        "    rotate 7\n"
+        "    maxsize 50M\n"
+        "    copytruncate\n"
+        "    compress\n"
+        "    delaycompress\n"
+        "    missingok\n"
+        "    notifempty\n"
+        "    su root root\n"
+        "}\n"
+    )
+    try:
+        if os.path.exists(path):
+            with open(path) as f:
+                if f.read() == conf:
+                    return False          # already correct
+        _write_priv(path, conf)
+        _chmod_priv(path, 0o644)          # logrotate refuses group/world-writable files
+        _log('fail2ban: added logrotate for /var/log/authentik/auth.log — it had no '
+             'rotation at all and was growing without bound.')
+        return True
+    except Exception as e:
+        _log(f'fail2ban: could not write the Authentik logrotate rule (non-fatal): {e}')
+        return False
+
+
+def _f2b_selfheal_ak_forwarder(plog=None):
+    """Bring the Authentik log forwarder up to the current, working definition.
+
+    Two generations of this unit were broken and BOTH are still out there, because the
+    unit was only ever written when absent — a box that received a broken one kept it
+    forever:
+      1. `docker logs -f X 2>&1 >> FILE` with StandardError=null. Bash applies
+         redirections left to right, so stderr went to null — and stderr is exactly
+         where Authentik writes its JSON. The jail was fed stdout chatter only.
+      2. The un-narrowed fix for (1): correct streams, but the whole firehose. That
+         crashes fail2ban's date detector on every line (see _AK_FORWARDER_EXEC), so
+         the jail still matched nothing while looking healthy.
+
+    Trigger is the absence of the `invalid_login` grep, which only the current
+    definition has — that identifies both broken generations without trying to
+    enumerate them, and leaves a genuinely hand-edited unit that already narrows the
+    stream alone."""
+    _log = plog or (lambda m: None)
+    svc_path = '/etc/systemd/system/authentik-log-forwarder.service'
+    if not os.path.exists(svc_path):
+        return False
+    try:
+        with open(svc_path) as f:
+            cur = f.read()
+    except OSError:
+        return False
+    if 'invalid_login' in cur:
+        return False                      # already current (or a hand-rolled narrowing)
+    try:
+        _write_priv(svc_path, _AK_FORWARDER_UNIT)
+    except Exception as e:
+        _log(f'fail2ban: could not repair the Authentik log forwarder: {e}')
+        return False
+    # The old unit appended the firehose; leftover chatter would keep crashing the date
+    # detector on the lines already in the file. Truncate so the jail starts clean —
+    # safe because this file is the jail's private feed, not an audit record, and the
+    # full stream remains in `docker logs`.
+    try:
+        subprocess.run(_sudo_wrap(['truncate', '-s', '0', '/var/log/authentik/auth.log']),
+                       capture_output=True, timeout=15)
+    except Exception:
+        pass
+    try:
+        subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=30)
+        subprocess.run(_sudo_wrap(['systemctl', 'restart', 'authentik-log-forwarder']),
+                       capture_output=True, timeout=30)
+        subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=60)
+    except Exception:
+        pass
+    _log('fail2ban: rebuilt the Authentik log forwarder — it now captures stderr (where '
+         'Authentik logs auth events) and forwards ONLY invalid_login lines. The full '
+         'stream was crashing fail2ban\'s date detector on every line, so the jail read '
+         'the file and matched nothing.')
+    return True
+
+
+def _f2b_selfheal_portal_caddy_log(plog=None):
+    """Repoint the takportal jail at Caddy's access log, and make Caddy emit it.
+
+    The jail shipped in 2026-06 reading /var/log/tak-portal/lookup.log, a file the
+    TAK Portal was meant to write and never did — so it has sat loaded and starving
+    ever since while /lookup and /request-access stayed public. TAK-Portal is a
+    third-party repo, so we feed the jail from the log Caddy already produces.
+
+    Two halves, both idempotent:
+      1. Caddyfile — regenerate so the Portal site block gains its `log` block.
+         Only when the Portal is installed AND the block is absent. Reload (not
+         restart) so a bad config is REFUSED and the running Caddy is untouched.
+      2. Jail — rewrite logpath/maxretry, preserving operator thresholds.
+
+    Deliberately does nothing on a box with no TAK Portal."""
+    _log = plog or (lambda m: None)
+    if not _f2b_is_available():
+        return False
+    if not _f2b_portal_jail_enabled():
+        return False                      # no portal jail on this box — nothing to do
+    changed = False
+
+    # ── 1. Make Caddy emit the log ────────────────────────────────────────────
+    # Ownership FIRST, unconditionally: a root-owned logfile makes Caddy reject the
+    # entire config, which only shows up as a dead Caddy at the next restart. Repair
+    # it even when the Caddyfile already looks right — "the file says so" is not
+    # evidence Caddy accepted it, and on the 2026-07-27 rollout it had not.
+    try:
+        _f2b_prepare_portal_caddy_log()
+    except Exception:
+        pass
+    try:
+        if os.path.exists(CADDYFILE_PATH):
+            with open(CADDYFILE_PATH) as f:
+                live = f.read()
+            generated = live.split(CADDYFILE_USER_BLOCKS_MARKER, 1)[0]
+            if TAKPORTAL_CADDY_LOG not in generated:
+                generate_caddyfile()
+            # Always reload and CHECK, even if the block was already on disk — the
+            # running Caddy may have refused it. reload (never restart) leaves the
+            # previous config serving if it is refused again.
+            rl = subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']),
+                                capture_output=True, text=True, timeout=60)
+            if rl.returncode != 0:
+                _log('fail2ban: Caddy REFUSED the config carrying the portal access log '
+                     '(%s). The running config is untouched, but the ON-DISK Caddyfile is '
+                     'now unloadable — Caddy would fail to start on reboot. Portal jail '
+                     'left on its old logpath.'
+                     % (rl.stdout or rl.stderr or '')[-200:].strip())
+                return False          # do NOT repoint the jail at a log nothing writes
+            _log('fail2ban: Caddy accepted the portal access log %s — the takportal jail '
+                 'finally has something to read.' % TAKPORTAL_CADDY_LOG)
+            changed = True
+    except Exception as e:
+        _log(f'fail2ban: portal access-log setup failed (non-fatal): {e}')
+        return False
+
+    # ── 2. Repoint the jail ───────────────────────────────────────────────────
+    try:
+        jail_path = '/etc/fail2ban/jail.d/infratak-takportal.conf'
+        with open(jail_path) as f:
+            cur = f.read()
+        if TAKPORTAL_CADDY_LOG in cur:
+            return changed                # already repointed
+        cfg = _f2b_read_portal_jail_config()
+        # The old default (5) was tuned for the per-result contract. HTTP status is a
+        # blunter signal, so lift a still-default jail to the new floor; an operator
+        # who deliberately chose a higher number keeps it.
+        maxretry = cfg.get('maxretry', 5)
+        if maxretry <= 5:
+            maxretry = TAKPORTAL_F2B_MAXRETRY
+        _f2b_write_portal_jail(maxretry, cfg.get('findtime', 600),
+                               cfg.get('bantime', 3600),
+                               _f2b_operator_extra(cfg.get('ignoreip', '')))
+        subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=60)
+        _log('fail2ban: takportal jail repointed to Caddy\'s access log (maxretry=%d) — '
+             'it had been watching a file nothing writes since 2026-06-12.' % maxretry)
+        return True
+    except Exception as e:
+        _log(f'fail2ban: could not repoint the takportal jail (non-fatal): {e}')
+        return changed
+
+
+def _f2b_selfheal_trusted_ignoreip(plog=None):
+    """Add the never-bannable subnets to every infra-TAK jail's ignoreip, and release
+    anything already banned inside one.
+
+    Two classes, both of which fail2ban must never cut:
+      - management tunnels (WireGuard relay / NetBird) — the road IN. On a CGNAT box
+        that tunnel is the only way to reach the machine.
+      - our own container bridges — the road BETWEEN our services. See
+        _f2b_container_subnets(): the takserver jail banned the nodered container on
+        test8/test12 on 2026-07-25, and TAK Portal polls TAK on a 15 s timer that hits
+        the jail's 20-per-300 s threshold exactly.
+
+    Boxes deployed before each fix carry an ignoreip missing those subnets. Console-path
+    delivery: this runs at startup so a normal update fixes it with no SSH. Idempotent;
+    no-op when there is nothing to trust or nothing to change."""
+    _log = plog or (lambda m: None)
+    if not _f2b_is_available():
+        return False
+    tun = _f2b_mgmt_tunnel_subnets() + _f2b_container_subnets() + _f2b_own_addresses()
     if not tun:
-        return False                      # no tunnel on this box — nothing to trust
+        return False                      # no tunnel and no containers — nothing to trust
     jaild = '/etc/fail2ban/jail.d'
     if not os.path.isdir(jaild):
         return False
@@ -13842,8 +14537,9 @@ def _f2b_selfheal_tunnel_ignoreip(plog=None):
             except Exception as e:
                 _log(f'fail2ban: could not update ignoreip in {path}: {e}')
 
-    # Release anything already banned inside a tunnel — the operator may be locked
-    # out RIGHT NOW, and a config rewrite alone does not lift a live ban.
+    # Release anything already banned inside a trusted subnet — the operator may be
+    # locked out RIGHT NOW, or TAK Portal may be severed from TAK Server RIGHT NOW,
+    # and a config rewrite alone does not lift a live ban.
     nets = []
     for c in tun:
         try:
@@ -13874,21 +14570,21 @@ def _f2b_selfheal_tunnel_ignoreip(plog=None):
                                        capture_output=True, timeout=30)
                         unbanned.append(f'{addr} ({j})')
     except Exception as e:
-        _log(f'fail2ban: tunnel unban sweep failed (non-fatal): {e}')
+        _log(f'fail2ban: trusted-subnet unban sweep failed (non-fatal): {e}')
 
     if not changed and not unbanned:
         return False
     if changed:
-        _log('fail2ban: management tunnel ' + ', '.join(tun) +
+        _log('fail2ban: trusted subnets ' + ', '.join(tun) +
              ' added to ignoreip in ' + ', '.join(changed) +
-             ' — the relay/NetBird path can no longer be banned.')
+             ' — the management tunnel and our own containers can no longer be banned.')
         try:
             subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=60)
         except Exception:
             pass
     if unbanned:
         _log('fail2ban: released ' + ', '.join(unbanned) +
-             ' — a management-tunnel address was banned, which blocks EVERY port from it.')
+             ' — a management-tunnel or container address was banned, which blocks EVERY port from it.')
     return True
 
 
@@ -14088,6 +14784,11 @@ def fail2ban_status_api():
             ['systemctl', 'is-active', 'authentik-log-forwarder'],
             capture_output=True, text=True).stdout.strip() == 'active')
         status['version'] = _f2b_get_version()
+        # v10.1.11 — report jails that are enabled on disk but NOT running. Without
+        # this the page reads config files and calls a dead jail healthy, which is
+        # exactly how Authentik went a month with no brute-force protection.
+        status['dead_jails'] = [{'jail': j, 'filter': f, 'reason': r}
+                                for j, f, r in _f2b_dead_jails()]
         return jsonify(status)
     except Exception as e:
         return jsonify({'available': False, 'error': str(e)[:200]})
@@ -14121,21 +14822,7 @@ def fail2ban_authentik_toggle_api():
         # (e.g. servers that installed Fail2ban before this service was introduced).
         svc_path = '/etc/systemd/system/authentik-log-forwarder.service'
         if not os.path.exists(svc_path):
-            forwarder_service = (
-                "[Unit]\n"
-                "Description=Authentik Docker Log Forwarder for fail2ban\n"
-                "After=docker.service\n"
-                "Requires=docker.service\n\n"
-                "[Service]\n"
-                "Type=simple\n"
-                "Restart=always\n"
-                "RestartSec=10\n"
-                "ExecStart=/bin/bash -c 'docker logs -f authentik-server-1 2>&1 >> /var/log/authentik/auth.log'\n"
-                "StandardOutput=null\n"
-                "StandardError=null\n\n"
-                "[Install]\n"
-                "WantedBy=multi-user.target\n"
-            )
+            forwarder_service = _AK_FORWARDER_UNIT
             _makedirs_priv('/var/log/authentik', exist_ok=True)
             _write_priv(svc_path, forwarder_service)
             subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True)
@@ -14644,14 +15331,7 @@ def _f2b_write_mediamtx_jail(maxretry, findtime, bantime, ignoreip=''):
     _makedirs_priv('/etc/fail2ban/jail.d', exist_ok=True)
 
     filter_path = '/etc/fail2ban/filter.d/mediamtx-rtsp.conf'
-    filter_conf = (
-        "[Definition]\n"
-        "# Match RTSP connection opens per source IP.\n"
-        "# Counts 'opened' events — catches scanners before their probe cycle completes;\n"
-        "# legitimate ATAK clients reconnect occasionally but never at scanner rates.\n"
-        "failregex = \\[RTSP\\] \\[conn <HOST>:\\d+\\] opened\n"
-        "ignoreregex =\n"
-    )
+    filter_conf = _F2B_OWNED_FILTERS['mediamtx-rtsp']
     _write_priv(filter_path, filter_conf)
 
     guarddog_action = ""
@@ -14824,6 +15504,97 @@ def fail2ban_mediamtx_unban_api():
 #   <ts> ip=<CLIENT_IP> page=<lookup|request-access> result=<ok|bad_domain|bad_user|captcha_fail|rate_limited> email=<x> rig=<y>
 # The IP MUST be the real client (Caddy X-Forwarded-For), or fail2ban bans Caddy.
 TAKPORTAL_F2B_LOG = '/var/log/tak-portal/lookup.log'
+# v10.1.11 — what the jail ACTUALLY reads. The native log above was never written
+# (see generate_caddyfile()'s TAK Portal block), so the jail is fed from Caddy's
+# access log for the Portal host instead. Caddy owns /var/log/caddy and rolls this
+# file itself (10MiB x5), so it needs no logrotate rule of ours.
+TAKPORTAL_CADDY_LOG = '/var/log/caddy/takportal-access.log'
+# Blunter signal than the original per-result contract (HTTP status can't tell a
+# fat-fingered domain from a scripted probe), so the threshold is raised: a human
+# will not fail these two forms 15 times in 10 minutes; an enumerator does hundreds.
+TAKPORTAL_F2B_MAXRETRY = 15
+
+
+def _f2b_prepare_portal_caddy_log():
+    """Make the access log exist AND be writable by Caddy. Must run BEFORE any reload.
+
+    fail2ban refuses a jail whose logpath is missing, so the file has to exist up
+    front — but creating it from the console lands it root-owned, and Caddy drops to
+    its own unprivileged user. Caddy then cannot open it and REJECTS THE WHOLE CONFIG
+    (`open ...: permission denied`, HTTP 400 from the admin API).
+
+    That failure is quiet and delayed in the worst way: `systemctl reload` leaves the
+    running server on its previous config, so the box looks fine — until something
+    restarts Caddy (a reboot) and it cannot load the on-disk Caddyfile at all, taking
+    every proxied service down with it. Hit on the v10.1.11 rollout, 2026-07-27.
+
+    The owner comes from Caddy's OWN systemd unit (`User=`/`Group=`), not from the
+    log directory — deriving it from the directory looked clever and was wrong: on
+    RHEL the caddy package leaves /var/log/caddy as root:root, so a box there just
+    chowned root to root and stayed broken while Debian boxes healed (nuc,
+    2026-07-27). The unit is authoritative and readable even when Caddy is stopped.
+
+    Both the directory AND the file are chowned: Caddy writes rolled siblings
+    (<name>-<ts>.log) into the same directory, so a root-owned directory fails
+    rotation the same way a root-owned file fails the initial open.
+
+    Idempotent; repairs files/dirs left root-owned by an earlier build."""
+    logdir = os.path.dirname(TAKPORTAL_CADDY_LOG)
+    try:
+        _makedirs_priv(logdir, exist_ok=True)
+    except Exception:
+        pass
+
+    def _unit_val(prop):
+        try:
+            r = subprocess.run(['systemctl', 'show', 'caddy', '-p', prop, '--value'],
+                               capture_output=True, text=True, timeout=10)
+            return (r.stdout or '').strip()
+        except Exception:
+            return ''
+    user = _unit_val('User') or ''
+    if not user:
+        try:                              # fall back to the running process
+            r = subprocess.run(['ps', '-o', 'user=', '-C', 'caddy'],
+                               capture_output=True, text=True, timeout=10)
+            user = (r.stdout or '').split('\n')[0].strip()
+        except Exception:
+            user = ''
+    if not user:
+        user = 'caddy'
+    try:                                  # never chown to a user that does not exist
+        import pwd as _pwd
+        _pwd.getpwnam(user)
+    except Exception:
+        return ''                         # unknown Caddy user — leave everything alone
+    group = _unit_val('Group') or user
+    owner = f'{user}:{group}'
+
+    try:
+        subprocess.run(_sudo_wrap(['chown', owner, logdir]), capture_output=True, timeout=15)
+        if not os.path.exists(TAKPORTAL_CADDY_LOG):
+            subprocess.run(_sudo_wrap(['touch', TAKPORTAL_CADDY_LOG]), capture_output=True, timeout=15)
+        # Always re-assert: the file may already exist root-owned from an earlier build.
+        subprocess.run(_sudo_wrap(['chown', owner, TAKPORTAL_CADDY_LOG]),
+                       capture_output=True, timeout=15)
+        _chmod_priv(TAKPORTAL_CADDY_LOG, 0o644)   # fail2ban reads as root; 644 is ample
+    except Exception:
+        pass
+
+    # RHEL/SELinux delta — ownership alone is NOT enough. A directory we create under
+    # /var/log inherits `var_log_t`, but the policy labels Caddy's log tree
+    # `httpd_log_t`, so a confined Caddy is denied the write no matter who owns it and
+    # rejects the whole config with a bare "permission denied". Ownership looked
+    # correct on nuc while Caddy still refused (2026-07-27); only the label was wrong.
+    # restorecon applies the policy's OWN label — never chcon (which hardcodes a type
+    # the policy may change), and never a boolean or a permissive flip.
+    try:
+        if subprocess.run(['selinuxenabled'], capture_output=True, timeout=10).returncode == 0:
+            subprocess.run(_sudo_wrap(['restorecon', '-R', logdir]),
+                           capture_output=True, timeout=60)
+    except Exception:
+        pass                              # not an SELinux box (selinuxenabled absent)
+    return owner
 
 def _f2b_portal_jail_enabled():
     return os.path.exists('/etc/fail2ban/jail.d/infratak-takportal.conf')
@@ -14854,23 +15625,10 @@ def _f2b_write_portal_jail(maxretry, findtime, bantime, ignoreip=''):
     _makedirs_priv('/etc/fail2ban/filter.d', exist_ok=True)
     _makedirs_priv('/etc/fail2ban/jail.d', exist_ok=True)
 
-    # Ensure the logpath exists (empty is fine) — fail2ban refuses a missing logpath.
-    # v10.0.5 non-root: /var/log/tak-portal is root-owned — create + touch via broker.
-    try:
-        _makedirs_priv(os.path.dirname(TAKPORTAL_F2B_LOG))
-        subprocess.run(_sudo_wrap(['touch', TAKPORTAL_F2B_LOG]), capture_output=True)
-        _chmod_priv(TAKPORTAL_F2B_LOG, 0o664)
-    except Exception:
-        pass
+    _f2b_prepare_portal_caddy_log()
 
     filter_path = '/etc/fail2ban/filter.d/takportal.conf'
-    filter_conf = (
-        "[Definition]\n"
-        "# Ban on FAILED public-form attempts only (result=ok is never matched), so\n"
-        "# legitimate repeat use of /lookup is never punished. Real client IP = ip=<HOST>.\n"
-        "failregex = ^.*\\bip=<HOST>\\b.*\\bresult=(bad_domain|bad_user|captcha_fail)\\b.*$\n"
-        "ignoreregex =\n"
-    )
+    filter_conf = _F2B_OWNED_FILTERS['takportal']
     _write_priv(filter_path, filter_conf)
 
     guarddog_action = ""
@@ -14881,7 +15639,7 @@ def _f2b_write_portal_jail(maxretry, findtime, bantime, ignoreip=''):
         "[takportal]\n"
         "enabled  = true\n"
         "filter   = takportal\n"
-        f"logpath  = {TAKPORTAL_F2B_LOG}\n"
+        f"logpath  = {TAKPORTAL_CADDY_LOG}\n"
         f"maxretry = {maxretry}\n"
         f"findtime = {findtime}\n"
         f"bantime  = {bantime}\n"
@@ -22460,6 +23218,20 @@ def generate_caddyfile(settings=None):
         portal_host = sd['takportal']
         lines.append(f"# TAK Portal")
         lines.append(f"{portal_host} {{")
+        # v10.1.11 — access log that FEEDS the takportal fail2ban jail. /lookup and
+        # /request-access are public and unauthenticated (see @public below), so they
+        # are enumerable. The jail was written in 2026-06 against a log the Portal was
+        # supposed to emit; the Portal never shipped that writer and the container has
+        # no mount for the path, so the jail sat armed and starving. TAK-Portal is a
+        # third-party repo, so rather than wait on it, ban from the log Caddy already
+        # has — it is the edge, so it sees the real client IP with no XFF trust needed.
+        lines.append(f"    log {{")
+        lines.append(f"        output file {TAKPORTAL_CADDY_LOG} {{")
+        lines.append(f"            roll_size 10MiB")
+        lines.append(f"            roll_keep 5")
+        lines.append(f"            roll_keep_for 720h")
+        lines.append(f"        }}")
+        lines.append(f"    }}")
         if ak.get('installed'):
             lines.append(f"    route {{")
             lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
@@ -24632,14 +25404,24 @@ def takportal_page():
                     containers.append({'name': parts[0] if len(parts) > 0 else 'tak-portal', 'status': parts[1] if len(parts) > 1 else ''})
             container_info['containers'] = containers
             container_info['status'] = containers[0]['status'] if containers else ''
-    # Get portal port from .env if exists
+    # Get portal port from .env if exists.
+    # _read_priv, not open(): v10.1.9 W7 hardened module .env files to 600 and they are
+    # root-owned, so a non-root console gets PermissionError and this whole page 500s
+    # (test12, 2026-07-27 — the file's mode changed 2026-07-25 02:37 and the page has
+    # been dead since). W7's own guard did not catch it because _console_can_read()
+    # accepts a BROKER-routed read as success, which is correct policy — but only if
+    # the caller actually uses the broker. This one used a bare open().
+    # A missing/unreadable .env must never take the page down: the port falls back.
     portal_port = '3000'
     env_path = os.path.expanduser('~/TAK-Portal/.env')
     if os.path.exists(env_path):
-        with open(env_path) as f:
-            for line in f:
+        try:
+            for line in (_read_priv(env_path) or '').splitlines():
                 if line.strip().startswith('WEB_UI_PORT='):
                     portal_port = line.strip().split('=', 1)[1].strip() or '3000'
+        except Exception as _pp_e:
+            print(f"takportal_page: could not read {env_path} ({_pp_e}) — "
+                  f"falling back to port {portal_port}", flush=True)
     # Real version (package.json) and update-available (from container logs)
     vinfo = _get_takportal_version_info()
     portal_version = vinfo['version'] or ''
@@ -48381,7 +49163,15 @@ def _authentik_apply_official_tunings(plog):
         ('AUTHENTIK_WEB__MAX_REQUESTS_JITTER', '50', 'jitter ±50 so workers do not recycle in lockstep'),
         ('AUTHENTIK_CACHE__TIMEOUT_FLOWS', '600', 'flows cache 600s (vs default 300s) — reduces DB pressure'),
         ('AUTHENTIK_CACHE__TIMEOUT_POLICIES', '600', 'policies cache 600s (vs default 300s) — reduces DB pressure'),
-        ('AUTHENTIK_LOG_LEVEL', 'warning', 'log level warning (vs default info) — reduces log overhead'),
+        # v10.1.11: back to upstream's own default (info). `warning` was set in v0.8.7
+        # purely to trim log volume, before we knew it silently disables the Authentik
+        # brute-force jail: the only failed-login line carrying a client IP is
+        # `logger.info("invalid_login", ..., client_ip=...)` in
+        # authentik/stages/identification/stage.py, so at `warning` it is never emitted
+        # and the jail cannot fire. It never had, on any box. The log-volume concern is
+        # now handled properly by _f2b_ensure_authentik_logrotate() rather than by
+        # throwing away the security events.
+        ('AUTHENTIK_LOG_LEVEL', 'info', 'log level info (upstream default) — REQUIRED: the Authentik fail2ban jail matches logger.info("invalid_login"); at warning it can never fire'),
     ]
     for key, value, description in target_settings:
         existing = next((ln for ln in new_lines if re.match(rf'^{re.escape(key)}\s*=', ln)), None)
@@ -72561,36 +73351,14 @@ def _fail2ban_install_and_configure(plog):
     plog("fail2ban migration: created /var/log/authentik/")
 
     # Step 3: Write log forwarder systemd service
-    forwarder_service = (
-        "[Unit]\n"
-        "Description=Authentik Docker Log Forwarder for fail2ban\n"
-        "After=docker.service\n"
-        "Requires=docker.service\n\n"
-        "[Service]\n"
-        "Type=simple\n"
-        "Restart=always\n"
-        "RestartSec=10\n"
-        "ExecStart=/bin/bash -c 'docker logs -f authentik-server-1 2>&1 >> /var/log/authentik/auth.log'\n"
-        "StandardOutput=null\n"
-        "StandardError=null\n\n"
-        "[Install]\n"
-        "WantedBy=multi-user.target\n"
-    )
+    forwarder_service = _AK_FORWARDER_UNIT
     svc_path = '/etc/systemd/system/authentik-log-forwarder.service'
     _write_priv(svc_path, forwarder_service)
     plog(f"fail2ban migration: wrote {svc_path}")
 
     # Step 4: Write fail2ban filter (matches Authentik JSON log lines)
     _makedirs_priv('/etc/fail2ban/filter.d', exist_ok=True)
-    filter_conf = (
-        "[Definition]\n"
-        "# Match Authentik JSON log lines containing login_failed events.\n"
-        "# Authentik emits structured JSON; client_ip contains the real IP since v0.8.9\n"
-        "# fixed AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS.\n"
-        "failregex = \"action\": \"login_failed\".*\"client_ip\": \"<HOST>\"\n"
-        "            \"client_ip\": \"<HOST>\".*\"action\": \"login_failed\"\n"
-        "ignoreregex =\n"
-    )
+    filter_conf = _F2B_OWNED_FILTERS['authentik']
     filter_path = '/etc/fail2ban/filter.d/authentik.conf'
     _write_priv(filter_path, filter_conf)
     plog(f"fail2ban migration: wrote {filter_path}")
@@ -72852,17 +73620,7 @@ def _fail2ban_takserver_filter(plog):
     #             ... Remote address: 1.2.3.4; ... Certificate error: peer not verified;
     # %% in ini = literal % after ConfigParser → shell sees %Y, etc.
     _makedirs_priv('/etc/fail2ban/filter.d', exist_ok=True)
-    filter_conf = (
-        "[Definition]\n"
-        "# Match TAK Server (Netty) TLS/SSL/handshake rejection lines.\n"
-        "# Covers: PEER_DID_NOT_RETURN_A_CERTIFICATE, NO_SHARED_CIPHER,\n"
-        "#         UNSUPPORTED_PROTOCOL, NotSslRecordException.\n"
-        "# Log timestamp format: 2026-05-02-15:58:55.145 (YYYY-MM-DD-HH:MM:SS.mmm)\n"
-        "failregex = NioNettyServerHandler error.*Remote address: <HOST>;\n"
-        "ignoreregex =\n"
-        "datepattern = %%Y-%%m-%%d-%%H:%%M:%%S\n"
-        "              {^LN-BEG}\n"
-    )
+    filter_conf = _F2B_OWNED_FILTERS['takserver']
     filter_path = '/etc/fail2ban/filter.d/takserver.conf'
     _write_priv(filter_path, filter_conf)
     plog(f"fail2ban takserver filter: wrote {filter_path}")
@@ -73277,14 +74035,55 @@ def _startup_migrations():
         except Exception as _f2b_e2:
             print(f"Startup migration: fail2ban sshd-backend self-heal error (non-fatal): {_f2b_e2}", flush=True)
 
-        # v10.1.9 — never let fail2ban ban the road in. Adds the WireGuard/NetBird
-        # management subnets to every jail's ignoreip and releases any tunnel address
-        # already banned. Field-hit 2026-07-26: the sshd jail banned the relay and the
-        # box went dark to it. Runs AFTER the backend self-heal so the jail is sane first.
+        # v10.1.9 — never let fail2ban ban the road in. v10.1.11 — nor the road between
+        # our own services. Adds the WireGuard/NetBird management subnets AND the docker
+        # container bridges to every jail's ignoreip, and releases any address inside
+        # them that is already banned. Field-hits: the sshd jail banned the relay and the
+        # box went dark (2026-07-26); the takserver jail banned the nodered container on
+        # test8/test12 (2026-07-25), the same way it bans TAK Portal and breaks its Marti
+        # API calls. Runs AFTER the backend self-heal so the jail is sane first.
         try:
-            _f2b_selfheal_tunnel_ignoreip(lambda m: print(f"Startup migration: {m}", flush=True))
+            _f2b_selfheal_trusted_ignoreip(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _f2b_e3:
-            print(f"Startup migration: fail2ban tunnel-ignoreip self-heal error (non-fatal): {_f2b_e3}", flush=True)
+            print(f"Startup migration: fail2ban trusted-ignoreip self-heal error (non-fatal): {_f2b_e3}", flush=True)
+
+        # v10.1.11 — a jail that cannot fire is worse than no jail, because every
+        # surface reports it as configured. Repair the two ways we shipped one:
+        # a missing filter file (jail skipped on every reload, and the whole daemon
+        # fails `fail2ban-client -t`), and the Authentik log forwarder redirecting
+        # stderr — where Authentik writes every auth event — to /dev/null.
+        try:
+            _f2b_selfheal_filters(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _f2b_e4:
+            print(f"Startup migration: fail2ban filter self-heal error (non-fatal): {_f2b_e4}", flush=True)
+        try:
+            _f2b_selfheal_ak_forwarder(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _f2b_e5:
+            print(f"Startup migration: Authentik log-forwarder self-heal error (non-fatal): {_f2b_e5}", flush=True)
+        try:
+            _f2b_selfheal_portal_caddy_log(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _f2b_e7:
+            print(f"Startup migration: takportal Caddy-log self-heal error (non-fatal): {_f2b_e7}", flush=True)
+        # Rotation BEFORE raising the log level — auth.log has never been rotated and
+        # the level bump increases its rate. Never turn up the tap before fitting the drain.
+        try:
+            _f2b_ensure_authentik_logrotate(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _f2b_e8:
+            print(f"Startup migration: Authentik logrotate error (non-fatal): {_f2b_e8}", flush=True)
+        try:
+            _f2b_selfheal_authentik_log_level(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _f2b_e9:
+            print(f"Startup migration: Authentik log-level self-heal error (non-fatal): {_f2b_e9}", flush=True)
+
+        # ...then say so loudly if anything is STILL dead. This is the check that
+        # would have caught test6's month of unprotected Authentik.
+        try:
+            _dead = _f2b_dead_jails()
+            for _jn, _jf, _jr in _dead:
+                print(f"Startup migration: fail2ban WARNING — jail '{_jn}' is enabled but NOT "
+                      f"running ({_jr}). It is protecting NOTHING.", flush=True)
+        except Exception as _f2b_e6:
+            print(f"Startup migration: fail2ban dead-jail check error (non-fatal): {_f2b_e6}", flush=True)
 
         # v10.1.9 W7 — tighten world-readable secrets (TAK private keys, module
         # .env files, CoreConfig). Idempotent, only ever narrows a mode.
