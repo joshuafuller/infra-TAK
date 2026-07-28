@@ -768,7 +768,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.12-alpha"
+VERSION = "10.1.13-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -25514,9 +25514,22 @@ def _takportal_build_settings_dict(settings):
         tak_url_host = server_ip
     else:
         tak_url_host = tak_dns or 'host.docker.internal'
-    # SSH: only pre-populate when TAK Server is on the same box
+    # SSH: only pre-populate when TAK Server is on the same box. The portal container
+    # must ALWAYS reach the host's sshd via host.docker.internal (extra_hosts maps it to
+    # host-gateway — see _write_takportal_override): server_ip hairpins and times out from
+    # inside the container on Azure/NAT boxes, and on-prem boxes only expose :22 internally.
     tak_local = os.path.isdir('/opt/tak')
-    ssh_host = ('host.docker.internal' if server_ip in ('localhost', '127.0.0.1', '') else server_ip) if tak_local else ''
+    ssh_host = 'host.docker.internal' if tak_local else ''
+    # SSH user = whoever the console runs as — that's whose ~/.ssh/authorized_keys
+    # _takportal_setup_ssh installs the portal key into (root, or takwerx after the
+    # non-root flip).
+    ssh_user = 'root'
+    if tak_local:
+        try:
+            import pwd as _pwd
+            ssh_user = _pwd.getpwuid(os.getuid()).pw_name
+        except Exception:
+            pass
     return {
         "AUTHENTIK_URL": f"http://{auth_url_host}:{auth_url_port}",
         "AUTHENTIK_TOKEN": ak_token or "",
@@ -25552,7 +25565,7 @@ def _takportal_build_settings_dict(settings):
         "BRAND_LOGO_URL": "",
         "TAK_SSH_HOST": ssh_host,
         "TAK_SSH_PORT": "22",
-        "TAK_SSH_USER": "root",
+        "TAK_SSH_USER": ssh_user,
         "TAK_SSH_PRIVATE_KEY_PATH": "data/ssh/tak_ssh_ed25519",
         "TAK_SSH_PUBLIC_KEY_PATH": "data/ssh/tak_ssh_ed25519.pub",
         "TAK_SSH_PASSPHRASE": "",
@@ -25564,9 +25577,22 @@ def _takportal_merged_settings_json(settings):
     existing = _takportal_get_existing_settings()
     our = _takportal_build_settings_dict(settings)
     merged = dict(existing) if isinstance(existing, dict) else {}
+    # SSH target: an operator-entered host/user/port (on-prem internal IP, non-root SSH
+    # user) must survive every settings push. Only values infra-TAK itself is known to
+    # have written are overwritten — so boxes broken by the old server_ip default
+    # self-heal on the next push, while manual fixes are never clobbered again.
+    _server_ip = (settings.get('server_ip') or '').strip()
+    _ssh_managed = {
+        'TAK_SSH_HOST': {'host.docker.internal', _server_ip},
+        'TAK_SSH_USER': {'root', (our.get('TAK_SSH_USER') or '')},
+        'TAK_SSH_PORT': {'22'},
+    }
     for k, v in our.items():
-        if k in PRESERVE_TAKPORTAL_KEYS and (merged.get(k) or '').strip():
+        cur = (merged.get(k) or '').strip() if isinstance(merged.get(k), str) else ''
+        if k in PRESERVE_TAKPORTAL_KEYS and cur:
             continue
+        if k in _ssh_managed and cur and cur not in _ssh_managed[k]:
+            continue  # operator-customized SSH target — never overwrite
         merged[k] = v
     return json.dumps(merged, indent=2)
 
@@ -28637,7 +28663,13 @@ def cloudtak_uninstall():
                     # v10.0.8: no shell — --project-directory replaces the bash-cd (denied by
                     # the broker rulebook). `docker compose` only: the legacy docker-compose
                     # fallback was itself a bug (see cloudtak-update-docker-compose memory).
-                    _broker_compose(cloudtak_dir, 'down -v --rmi local', timeout=300)
+                    # v10.1.13: never let a slow/failing compose down (--rmi local can exceed
+                    # the 300s timeout) abort the uninstall thread — the survivors sweep below
+                    # is what guarantees the cloudtak-* names are actually freed.
+                    try:
+                        _broker_compose(cloudtak_dir, 'down -v --rmi local', timeout=300)
+                    except Exception as _cde:
+                        print(f"cloudtak uninstall: compose down issue (continuing to sweep): {_cde}", flush=True)
                 # Belt-and-suspenders: force-remove any surviving cloudtak-* containers by name
                 # (covers a dir-less / root-owned state where compose down didn't catch them) —
                 # two broker calls replace the old bash+xargs pipeline (both denied).
@@ -30530,11 +30562,63 @@ def run_cloudtak_deploy(cfg=None):
         # Step 5: Start containers including media on remapped ports
         plog("")
         plog("━━━ Step 5/7: Starting Containers ━━━")
+        # v10.1.13: unconditional pre-up sweep (field report pwtak/Josh — 4 consecutive
+        # deploys failed at this step on "container name /cloudtak-media-1 already in
+        # use"). A container left by a prior failed run doesn't carry the labels this
+        # compose project expects, so `up` refuses the name instead of recreating it —
+        # and the deploy path had NO teardown of its own (only uninstall did). A fresh
+        # deploy owns every cloudtak-* name by definition; volumes are untouched, so
+        # DB data survives.
+        _pre = subprocess.run(_sudo_wrap(['docker', 'ps', '-aq', '--filter', 'name=cloudtak']),
+                              capture_output=True, text=True, timeout=30)
+        _stale = (_pre.stdout or '').split()
+        if _stale:
+            plog(f"  Removing {len(_stale)} stale cloudtak container(s) from prior runs...")
+            subprocess.run(_sudo_wrap(['docker', 'rm', '-f'] + _stale), capture_output=True, timeout=120)
         plog("  Starting all containers including media (remapped ports)...")
         plog("  Standalone MediaMTX stays on original ports — no conflict")
         r = subprocess.run(
             _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=600, cwd=cloudtak_dir
         )
+        # v10.1.13 (pwtak rounds 2+3): name conflicts here come in two flavors.
+        # (a) A FOREIGN holder (no/other compose project labels) left by earlier runs —
+        #     must be removed. (b) A holder compose CREATED MOMENTS AGO in this very
+        #     run and then collided with (create/list race observed on Docker 29.x /
+        #     compose v5: the retry conflicted with a fresh id that did not exist when
+        #     the retry started). Removing (b) just recreates the race — but because
+        #     it IS properly project-labeled, the next `up` simply ADOPTS it. So:
+        #     retry up to 3 times, each pass removing only foreign holders and leaving
+        #     project-labeled ones for adoption. Volumes/DB are never touched.
+        _project = os.path.basename(cloudtak_dir).lower()
+        for _attempt in range(3):
+            if r.returncode == 0 or 'already in use by container' not in (r.stdout or ''):
+                break
+            _holders = sorted(set(re.findall(r'already in use by container "([0-9a-f]{12,64})"', r.stdout or '')))
+            if not _holders:
+                break
+            _foreign = []
+            for _h in _holders:
+                _ins = subprocess.run(
+                    _sudo_wrap(['docker', 'inspect', '-f',
+                                '{{index .Config.Labels "com.docker.compose.project"}}', _h]),
+                    capture_output=True, text=True, timeout=15)
+                _proj = (_ins.stdout or '').strip()
+                if _ins.returncode != 0:
+                    continue  # already gone — nothing holds the name anymore
+                if _proj == _project:
+                    plog(f"  Holder {_h[:12]}: created by this compose project (daemon race) — next up adopts it")
+                else:
+                    _foreign.append(_h)
+                    plog(f"  Holder {_h[:12]}: foreign (project={_proj or 'none'}) — removing")
+            if _foreign:
+                subprocess.run(_sudo_wrap(['docker', 'rm', '-f'] + _foreign),
+                               capture_output=True, timeout=120)
+            time.sleep(3)
+            plog(f"  Retrying docker compose up (attempt {_attempt + 2}/4)...")
+            r = subprocess.run(
+                _sudo_wrap(['docker', 'compose', 'up', '-d']),
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=600, cwd=cloudtak_dir
+            )
         if r.returncode != 0:
             plog(f"✗ docker compose up failed")
             for line in r.stdout.strip().split('\n')[-10:]:
@@ -30612,6 +30696,7 @@ def run_cloudtak_deploy(cfg=None):
         start_ts = time.time()
         _last_diag_ts = [0.0]
         _last_status_ts = [0.0]
+        _last_heal_ts = [start_ts]  # first corrupt-icon check ~3 min in — normal startups never trip it
         diag_throttle = 60  # repeat a diagnostic line at most once per minute so we keep heartbeat
         def _check_url(url, name):
             # 15s per-request timeout: during Drizzle migrations Node can be
@@ -30647,6 +30732,20 @@ def run_cloudtak_deploy(cfg=None):
             elif elapsed > 0 and now_ts - _last_status_ts[0] >= 30:
                 _last_status_ts[0] = now_ts
                 plog(f"  ⏳ Waiting for backend... ({elapsed}s elapsed, max {max_wait_sec}s)")
+            # v10.1.13: one corrupt icon row in the persistent postgis volume makes the
+            # api crash-loop on spritesheet regen FOREVER — this poll would then wait the
+            # full 30 min for a process that can never bind, and every redeploy fails the
+            # same way because the volume survives redeploys (field report pwtak
+            # 2026-07-28). Check for that exact signature every 3 min and heal in-loop;
+            # gated on crash-loop state + sprite/libpng log signature, so healthy
+            # first-boot migrations never trip it.
+            if now_ts - _last_heal_ts[0] >= 180:
+                _last_heal_ts[0] = now_ts
+                try:
+                    if _selfheal_cloudtak_corrupt_icons(plog=lambda m: plog(f"  icon-heal: {m}")):
+                        plog("  ✓ corrupt icon row(s) removed and api restarted — continuing to wait for it to bind")
+                except Exception:
+                    pass
             time.sleep(poll_interval)
 
         if not api_ready:
@@ -42945,7 +43044,7 @@ window.pollLog = function(redeployBtn) {
               var banner = document.createElement("div");
               banner.id = "deploy-fail-banner";
               banner.style.cssText = "background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)";
-              banner.innerHTML = "<strong>\u2717 Deployment failed.</strong> Uninstall (if partial) and retry, or click Retry below.";
+              banner.innerHTML = "<strong>\u2717 Deployment failed.</strong> Retry below, or wipe the partial install and start clean: <button onclick=\"document.getElementById('uninstall-modal').classList.add('open')\" style='margin-left:8px;padding:6px 14px;background:transparent;border:1px solid rgba(239,68,68,0.5);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer'>\ud83d\uddd1 Remove failed install</button>";
               logCard.insertBefore(banner, logCard.querySelector(".log-box") || logCard.firstChild);
             }
             var btn = document.getElementById("deploy-btn");
@@ -43633,7 +43732,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   <div id="log-card" class="card" style="display:{% if deploying or deploy_error %}block{% else %}none{% endif %}">
     <div class="card-title">Deploy Log</div>
     {% if deploy_error %}
-    <div id="deploy-fail-banner" style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)"><strong>&#x2717; Deployment failed.</strong> Uninstall (if partial) and retry, or click Retry below.</div>
+    <div id="deploy-fail-banner" style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)"><strong>&#x2717; Deployment failed.</strong> Retry below, or wipe the partial install and start clean: <button onclick="document.getElementById('uninstall-modal').classList.add('open')" style="margin-left:8px;padding:6px 14px;background:transparent;border:1px solid rgba(239,68,68,0.5);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer">&#x1F5D1; Remove failed install</button></div>
     {% endif %}
     <div class="log-box" id="deploy-log-dyn">{% if deploy_error %}Deployment failed. See log above.{% else %}Waiting...{% endif %}</div>
   </div>
@@ -72342,13 +72441,24 @@ def _startup_ensure_broker():
         active = subprocess.run(['systemctl', 'is-active', 'takwerx-broker'],
                                 capture_output=True, text=True, timeout=8).stdout.strip()
         if unit_changed or active != 'active' or src_hash != old_hash:
-            subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takwerx-broker']), capture_output=True, timeout=20)
-            try:
-                with open(stamp, 'w') as sf:
-                    sf.write(src_hash)
-            except OSError:
-                pass
-            print('Startup migration: privileged broker installed/(re)started (takwerx-broker.service)', flush=True)
+            _rr = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takwerx-broker']),
+                                 capture_output=True, text=True, timeout=20)
+            if _rr.returncode == 0:
+                try:
+                    with open(stamp, 'w') as sf:
+                        sf.write(src_hash)
+                except OSError:
+                    pass
+                print('Startup migration: privileged broker installed/(re)started (takwerx-broker.service)', flush=True)
+            else:
+                # v10.1.13: never stamp a FAILED restart. Stamping it made the box
+                # believe the broker converged, so the stale daemon was never
+                # retried — a console then issues verbs its own broker denies,
+                # and every privileged action fails until a manual start.sh
+                # (the 2026-07-28 field wedge). Leaving the old stamp makes the
+                # next console boot retry the restart.
+                print(f"Startup migration: ⚠ broker restart FAILED (rc={_rr.returncode}): "
+                      f"{(_rr.stderr or _rr.stdout or '').strip()[:200]} — will retry next boot", flush=True)
             # v10.1.4 (WS9): after the restart, BLOCK until the new daemon mediates a real
             # exec. The restart tears down the socket, and the module-level migrations that
             # run next (hardening posture re-assert, TAK Portal recreate, …) raced the new
@@ -77205,6 +77315,84 @@ def _post_update_auto_deploy():
     except Exception as e:
         print(f"Post-update auto-deploy error: {e}")
 
+# v10.1.13: make broker fixes ride Update Now. The broker daemon executes
+# broker/takwerx_broker.py from THIS repo (start.sh unit ExecStart), so a console
+# update already puts new broker source on disk — but the RUNNING daemon keeps the
+# old code and old rulebook until something restarts it (RuntimeMaxSec=24h bounds
+# that on newer units; older units run stale forever). That is how a box ends up
+# with a console issuing operations its own broker denies (field report
+# 2026-07-28: privileged actions failing across modules on a non-root box).
+# Compare the daemon's running-source sha (ping.src_sha) with the repo file and
+# restart the daemon on mismatch. A daemon that doesn't report src_sha predates
+# this mechanism and is by definition stale → restart. `systemctl restart` is
+# verb-allowed by every rulebook generation, so the stale daemon itself executes
+# its own refresh. Synchronous and bounded (~20s worst case) — it MUST complete
+# before _startup_migrations()/_post_update_auto_deploy() start issuing broker
+# ops, so the restart can never kill an in-flight migration operation.
+def _broker_converge_running_source(plog=None):
+    _log = plog or (lambda m: print(m, flush=True))
+    sock_path = '/run/takwerx-broker.sock'
+    if not (os.path.exists(sock_path) and os.path.isfile(_BROKER_SCRIPT)):
+        return False
+    import hashlib as _hl
+    import time as _tm
+    try:
+        with open(_BROKER_SCRIPT, 'rb') as f:
+            want = _hl.sha256(f.read()).hexdigest()
+    except Exception:
+        return False
+
+    def _ping(timeout=45):
+        # brokerctl's own client (600s socket timeout, proven transport). A raw
+        # 5s socket ping FALSE-NEGATIVED fleet-wide (T&E test6 2026-07-28): the
+        # ping response builds enforce-readiness state from the rotating audit
+        # log, which takes >5s on a busy box, so the converge silently no-opped.
+        try:
+            r = subprocess.run([_sys.executable, _BROKER_SCRIPT, 'ping'],
+                               capture_output=True, text=True, timeout=timeout)
+            if r.returncode != 0 or not (r.stdout or '').strip():
+                return None
+            return json.loads(r.stdout.strip())
+        except Exception:
+            return None
+
+    resp = _ping()
+    if not resp or not resp.get('pong'):
+        _log("[broker-converge] broker did not answer ping — skipping this boot (retries next restart)")
+        return False
+    have = (resp.get('src_sha') or '').strip()
+    if have == want:
+        return False
+    _log(f"[broker-converge] running daemon source "
+         f"{'unreported (pre-10.1.13 daemon)' if not have else have[:12]} != repo {want[:12]} "
+         f"— restarting takwerx-broker to load the updated code/rulebook")
+    try:
+        subprocess.run(_sudo_wrap(['systemctl', '--no-block', 'restart', 'takwerx-broker']),
+                       capture_output=True, text=True, timeout=20)
+    except Exception as e:
+        _log(f"[broker-converge] restart request failed (non-fatal): {e}")
+        return False
+    for _ in range(6):
+        _tm.sleep(2)
+        r2 = _ping(timeout=20)
+        if r2 and r2.get('pong'):
+            got = (r2.get('src_sha') or '').strip()
+            if got == want:
+                _log("[broker-converge] ✓ broker restarted on current repo source")
+            else:
+                _log(f"[broker-converge] ⚠ broker restarted but reports "
+                     f"{got[:12] or 'no src_sha'} from {r2.get('src_path') or '?'} — its unit "
+                     f"likely points at a different install dir; run `sudo ./start.sh` once to re-home it")
+            return True
+    _log("[broker-converge] ⚠ broker did not answer within 12s of restart (non-fatal)")
+    return True
+
+
+try:
+    _broker_converge_running_source()
+except Exception as _e:
+    print(f"[startup] broker source convergence skipped (non-fatal): {_e}", flush=True)
+
 _startup_migrations()
 _post_update_auto_deploy()
 
@@ -77233,6 +77421,171 @@ try:
     _threading_snap.Thread(target=_tak_snapshot_scheduler, daemon=True, name='tak-snapshot-scheduler').start()
 except Exception as _e:
     print(f"[startup] failed to start snapshot scheduler (non-fatal): {_e}", flush=True)
+
+# v10.1.13: heal a CloudTAK api crash-loop caused by corrupt icon rows. CloudTAK
+# regenerates iconset spritesheets at startup from base64 PNG rows in the postgis
+# `icons` table; ONE undecodable row (e.g. a truncated upload) throws in
+# SpriteBuilder.from_icons and kills the API process on every restart — the whole
+# map UI stays down until the row is removed (field report pwtak 2026-07-28:
+# "vipspng: libpng read error"). Rows that cannot be decoded have never rendered
+# and crash the API, so deleting them loses nothing. Boot-time so a console
+# Update Now is enough to heal an affected box — no SSH.
+_CLOUDTAK_ICON_HEAL_SQL = r"""
+DO $heal$
+DECLARE r RECORD; bin bytea; bad boolean; n integer := 0;
+BEGIN
+  FOR r IN SELECT ctid, iconset, name, data FROM icons LOOP
+    bad := false;
+    BEGIN
+      IF r.data IS NULL OR position(',' in r.data) = 0 THEN
+        bad := true;
+      ELSE
+        bin := decode(split_part(r.data, ',', 2), 'base64');
+        IF r.data LIKE 'data:image/png%' AND (
+             substring(bin from 1 for 8) <> '\x89504e470d0a1a0a'::bytea
+             OR position('\x49454e44'::bytea in bin) = 0) THEN
+          bad := true;
+        END IF;
+      END IF;
+    EXCEPTION WHEN OTHERS THEN
+      bad := true;
+    END;
+    IF bad THEN
+      RAISE NOTICE 'deleting undecodable icon % / %', r.iconset, r.name;
+      DELETE FROM icons WHERE ctid = r.ctid;
+      n := n + 1;
+    END IF;
+  END LOOP;
+  RAISE NOTICE 'icon heal: % corrupt row(s) deleted', n;
+END $heal$;
+"""
+
+
+def _selfheal_cloudtak_corrupt_icons(plog=None):
+    """Detect a cloudtak-api-1 crash-loop with the sprite-build signature, delete
+    undecodable icon rows from the postgis DB, and restart the api container.
+    Idempotent no-op on healthy boxes / boxes without CloudTAK. Returns True only
+    when a heal was performed."""
+    _log = plog or (lambda m: print(m, flush=True))
+    try:
+        insp = subprocess.run(
+            _sudo_wrap(['docker', 'inspect', 'cloudtak-api-1', '-f',
+                        '{{.State.Status}} {{.RestartCount}}']),
+            capture_output=True, text=True, timeout=15)
+        if insp.returncode != 0:
+            return False  # no CloudTAK api container on this box
+        parts = (insp.stdout or '').split()
+        status = parts[0] if parts else ''
+        restarts = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+        if status == 'running' and restarts < 3:
+            return False
+        logs = subprocess.run(
+            _sudo_wrap(['docker', 'logs', '--tail', '300', 'cloudtak-api-1']),
+            capture_output=True, text=True, timeout=20)
+        blob = (logs.stdout or '') + (logs.stderr or '')
+        if not (('from_icons' in blob or 'SpriteBuilder' in blob or 'sprites' in blob)
+                and ('libpng' in blob or 'vips' in blob)):
+            return False
+        _log("api crash-looping on sprite build — scanning icons table for undecodable rows")
+        r = subprocess.run(
+            _sudo_wrap(['docker', 'exec', 'cloudtak-postgis-1', 'psql', '-U', 'docker',
+                        '-d', 'gis', '-v', 'ON_ERROR_STOP=1', '-c', _CLOUDTAK_ICON_HEAL_SQL]),
+            capture_output=True, text=True, timeout=120)
+        out = ((r.stdout or '') + '\n' + (r.stderr or '')).strip()
+        if r.returncode != 0:
+            _log(f"psql FAILED (rc={r.returncode}): {out[:400]}")
+            return False
+        _log(out[:600])
+        # v10.1.13 (pwtak round 2): the structural SQL pass misses deep corruption —
+        # a row with valid PNG framing can still make sharp/vips throw (bad zlib
+        # stream, or an encode/resource failure: "vips2png: unable to write to
+        # target"). Field: heal reported 0 rows deleted, crash persisted. So ALSO
+        # guard the regen call inside the container: one bad iconset then logs and
+        # skips instead of killing the API. Runtime patch via docker cp (works on a
+        # crash-looping container, unlike exec); survives docker restart; a
+        # container recreate re-triggers this heal through the crash signature.
+        # Field-proven manually on test6 2026-07-28 (fresh install, map came LIVE):
+        # two delivery gotchas the first cut got wrong —
+        #  1. The api RUNS compiled dist/**/icons.js; the .ts paths in its stack
+        #     traces are source-map illusions. Patch the dist file first.
+        #  2. No host temp files: docker-cp-as-root output isn't readable by the
+        #     non-root console (EACCES on test6). Stream the file as a tar through
+        #     stdout/stdin instead — binary-safe through the broker.
+        try:
+            import io as _io
+            import tarfile as _tarmod
+            _patched = 'no-candidate-file'
+            _guard_re = re.compile(r'await [A-Za-z_$][\w$.]*\.regen\(config, iconset\.uid\);')
+            for _cand in ('/home/etl/api/dist/stateless/routes/icons.js',
+                          '/home/etl/api/dist/routes/icons.js',
+                          '/home/etl/api/stateless/routes/icons.ts',
+                          '/home/etl/api/routes/icons.ts'):
+                _out = subprocess.run(_sudo_wrap(['docker', 'cp', f'cloudtak-api-1:{_cand}', '-']),
+                                      capture_output=True, timeout=30)
+                if _out.returncode != 0 or not _out.stdout:
+                    continue
+                try:
+                    with _tarmod.open(fileobj=_io.BytesIO(_out.stdout)) as _tf:
+                        _member = _tf.getmembers()[0]
+                        _src = _tf.extractfile(_member).read().decode('utf-8')
+                except Exception:
+                    continue
+                if 'TAKWERX-regen-guard' in _src:
+                    _patched = 'already'
+                    break
+                _m = _guard_re.search(_src)
+                if not _m:
+                    _patched = f'nomatch:{_cand}'
+                    continue
+                _orig = _m.group(0)
+                _src = _src.replace(_orig, (
+                    'try { ' + _orig + " } catch (e) { console.error("
+                    "'TAKWERX-regen-guard: sprite regen failed for iconset', iconset.uid, e); }"), 1)
+                _data = _src.encode('utf-8')
+                _buf = _io.BytesIO()
+                with _tarmod.open(fileobj=_buf, mode='w') as _tw:
+                    _ti = _tarmod.TarInfo(name=os.path.basename(_cand))
+                    _ti.size = len(_data)
+                    _ti.mode = _member.mode
+                    _ti.uid, _ti.gid = _member.uid, _member.gid
+                    _tw.addfile(_ti, _io.BytesIO(_data))
+                _cpb = subprocess.run(
+                    _sudo_wrap(['docker', 'cp', '-', f'cloudtak-api-1:{os.path.dirname(_cand)}']),
+                    input=_buf.getvalue(), capture_output=True, timeout=30)
+                _patched = (f'patched:{_cand}' if _cpb.returncode == 0
+                            else f'copy-back-failed:{(_cpb.stderr or b"").decode(errors="replace")[:120]}')
+                break
+            _log(f"regen-guard: {_patched}")
+        except Exception as _ge:
+            _log(f"regen-guard error (non-fatal): {_ge}")
+        subprocess.run(_sudo_wrap(['docker', 'restart', 'cloudtak-api-1']),
+                       capture_output=True, text=True, timeout=90)
+        _log("cloudtak-api-1 restarted after icon heal")
+        return True
+    except Exception as e:
+        _log(f"error (non-fatal): {e}")
+        return False
+
+
+try:
+    import threading as _threading_iconheal
+
+    def _startup_icon_heal():
+        import time as _t
+        # First check after the container runtime settles; a couple of re-checks so a
+        # crash-loop that develops slowly after boot is still caught.
+        for _i in range(3):
+            _t.sleep(90 if _i == 0 else 120)
+            try:
+                if _selfheal_cloudtak_corrupt_icons(
+                        plog=lambda m: print(f"[startup-iconheal] {m}", flush=True)):
+                    return
+            except Exception:
+                pass
+    _threading_iconheal.Thread(target=_startup_icon_heal, daemon=True,
+                               name='cloudtak-icon-heal').start()
+except Exception as _e:
+    print(f"[startup] failed to start icon heal (non-fatal): {_e}", flush=True)
 
 # v10.1.4 (WS10): converge the CloudTAK postgis role password to .env once per boot.
 # The update-flow sync ran with a false in-sync check for a release (trust-loopback
