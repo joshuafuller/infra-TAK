@@ -768,7 +768,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.13-alpha"
+VERSION = "10.1.14-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -12506,7 +12506,7 @@ def guarddog_page():
         {'name': 'Auto-VACUUM', 'id': 'autovacuum', 'interval': 'Daily (3am)', 'desc': 'Checks dead tuple count daily. Runs VACUUM ANALYZE automatically if dead tuples exceed 1M. Prevents database bloat from data retention.'},
     ])
     guarddog_monitors_tak.extend([
-        {'name': 'OOM', 'id': 'oom', 'interval': '1 min', 'desc': 'Scans TAK Server logs for OutOfMemoryError. Auto-restarts TAK Server and sends alert when detected.'},
+        {'name': 'OOM', 'id': 'oom', 'interval': '1 min', 'desc': 'Scans TAK Server messaging + API logs for OutOfMemoryError. Auto-restarts TAK Server and sends alert naming the process that tripped.'},
         {'name': 'Disk', 'id': 'disk', 'interval': '1 hour', 'desc': 'Checks root and TAK logs filesystem usage. Alert only when usage exceeds 80% (warning) or 90% (critical).'},
         {'name': 'Docker build-cache reclaim', 'id': 'buildcache', 'interval': 'Hourly', 'desc': 'Reclaims dead Docker BuildKit build cache (the disk that quietly fills from repeated CloudTAK/image rebuilds). At 70%+ root disk it prunes cache older than 7 days (keeps recent cache so rebuilds stay fast); at 85%+ it reclaims ALL unused cache to rescue a filling disk. Never touches images, containers, or volumes.'},
         {'name': 'Certificate', 'id': 'cert', 'interval': 'Daily', 'desc': 'Checks TAK Server Let\'s Encrypt JKS cert expiry. Auto-renewal runs at 35 days remaining. Alert fires at 25 days — meaning renewal failed and action is required.'},
@@ -16652,8 +16652,11 @@ def _monitor_health_check(monitor_id):
         if monitor_id == 'oom':
             # Only count OOM entries logged after TAK's last start so a pre-restart OOM
             # doesn't keep the monitor permanently red after a successful recovery.
-            log_path = '/opt/tak/logs/takserver-messaging.log'
-            if not os.path.isfile(log_path):
+            # v10.1.14: TAK runs 5 JVMs with separate heaps — large DataSyncs exhaust
+            # the api process, not messaging — so scan both logs and sum.
+            log_paths = [p for p in ('/opt/tak/logs/takserver-messaging.log',
+                                     '/opt/tak/logs/takserver-api.log') if os.path.isfile(p)]
+            if not log_paths:
                 return None
             tr = subprocess.run(
                 _sudo_wrap(['systemctl', 'show', 'takserver', '--property=ActiveEnterTimestamp', '--value']), capture_output=True, text=True, timeout=3)
@@ -16665,16 +16668,22 @@ def _monitor_health_check(monitor_id):
                     tak_prefix = f'{parts[1]}-{parts[2]}'  # "2026-05-19-14:32:38"
             except Exception:
                 pass
-            if tak_prefix:
-                # awk: track timestamped lines >= TAK start, count OOM in that window only
-                r = subprocess.run(
-                    f'awk -v s="{tak_prefix}" \'/^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}-/{{a=($0>=s)}} a&&/OutOfMemoryError/{{c++}} END{{print c+0}}\' "{log_path}" 2>/dev/null',
-                    shell=True, capture_output=True, text=True, timeout=10)
-            else:
-                r = subprocess.run(
-                    f'tail -n 10000 "{log_path}" | grep -c "OutOfMemoryError" 2>/dev/null',
-                    shell=True, capture_output=True, text=True, timeout=5)
-            return (r.stdout.strip() or '0') == '0'
+            total = 0
+            for log_path in log_paths:
+                if tak_prefix:
+                    # awk: track timestamped lines >= TAK start, count OOM in that window only
+                    r = subprocess.run(
+                        f'awk -v s="{tak_prefix}" \'/^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}-/{{a=($0>=s)}} a&&/OutOfMemoryError/{{c++}} END{{print c+0}}\' "{log_path}" 2>/dev/null',
+                        shell=True, capture_output=True, text=True, timeout=10)
+                else:
+                    r = subprocess.run(
+                        f'tail -n 10000 "{log_path}" | grep -c "OutOfMemoryError" 2>/dev/null',
+                        shell=True, capture_output=True, text=True, timeout=5)
+                try:
+                    total += int(r.stdout.strip() or '0')
+                except ValueError:
+                    pass
+            return total == 0
         if monitor_id == 'disk':
             r = subprocess.run("df / --output=pcent 2>/dev/null | tail -1", shell=True, capture_output=True, text=True, timeout=3)
             pct = int(r.stdout.strip().rstrip('%'))
@@ -29226,6 +29235,36 @@ def _run_cloudtak_plugin_action(plugin_key, action):
             cloudtak_plugin_status.update({'running': False, 'error': True})
             return
 
+        # v10.1.14 (W5): the rebuild bakes a FRESH image — any regen-guard patch in the
+        # previous container is gone with it. If an iconset still needs the guard, the
+        # new api crash-loops on sprite regen and NOTHING on this path healed it (nuc +
+        # pwtak 2026-07-29: plugin install alone → permanent loop; the deploy-loop and
+        # startup heals never run here). Watch the api and re-apply the heal the moment
+        # the crash signature appears; the heal is a self-gating no-op on healthy boxes.
+        plog('Waiting for the rebuilt API (sprite-regen self-heal armed — dfpc-coe/CloudTAK#1623)...')
+        _api_up = False
+        for _i in range(40):  # 40 × 15s = 10 min; first crash cycle can take ~4 min to surface
+            time.sleep(15)
+            try:
+                _req = urllib.request.Request('http://127.0.0.1:5000/api/server', method='GET')
+                with urllib.request.urlopen(_req, timeout=5) as _resp:
+                    if _resp.status == 200:
+                        _api_up = True
+                        break
+            except Exception:
+                pass
+            if _i >= 3:  # give a healthy start ~60s of grace before probing for the loop
+                try:
+                    if _selfheal_cloudtak_corrupt_icons(plog=lambda m: plog(f'  icon-heal: {m}')):
+                        plog('  ✓ sprite-regen guard re-applied to the rebuilt image — waiting for the api to bind')
+                except Exception:
+                    pass
+        if _api_up:
+            plog('✓ CloudTAK API is up.')
+        else:
+            plog('⚠ API not confirmed up within 10 min. If it is crash-looping on sprite regen, '
+                 'restart the console (startup heal re-patches it) or redeploy CloudTAK.')
+
         action_label = {'install': 'installed', 'update': 'updated', 'remove': 'removed'}.get(action, action)
         plog(f'✓ Plugin {action_label} successfully.')
         if action in ('install', 'update'):
@@ -30629,7 +30668,9 @@ def run_cloudtak_deploy(cfg=None):
         plog("✓ Containers started")
         # Converge the postgis role password to .env — repairs any pre-existing
         # mismatch (e.g. a past deploy that regenerated .env over a live volume).
-        _cloudtak_sync_postgis_password(cloudtak_dir, plog=plog)
+        # fresh=True: on a first-ever initdb the readiness window can still lose —
+        # log a polite deferral instead of a scary ⚠ (boot converge finishes it).
+        _cloudtak_sync_postgis_password(cloudtak_dir, plog=plog, fresh=True)
         plog("✓ Restart complete.")
 
         # Open port 5000 (and 5002 for tiles) so http://ip:5000 works when no domain or before Caddy is used.
@@ -31001,7 +31042,7 @@ def run_cloudtak_redeploy(cfg=None):
         cloudtak_deploy_status['running'] = False
 
 
-def _cloudtak_sync_postgis_password(cloudtak_dir=None, plog=None, remote_cfg=None):
+def _cloudtak_sync_postgis_password(cloudtak_dir=None, plog=None, remote_cfg=None, fresh=False):
     """Converge the postgis ROLE password onto the .env POSTGRES_PASSWORD value.
 
     Postgres bakes POSTGRES_PASSWORD into pg_authid on the FIRST initdb of the data
@@ -31023,7 +31064,7 @@ def _cloudtak_sync_postgis_password(cloudtak_dir=None, plog=None, remote_cfg=Non
                 "PW=$(grep -E '^POSTGRES_PASSWORD=' .env 2>/dev/null | head -1 | cut -d= -f2-) && "
                 "CID=$(docker ps -q -f name=postgis | head -1) && "
                 "[ -n \"$PW\" ] && [ -n \"$CID\" ] || { echo SKIP; exit 0; }; "
-                "for i in 1 2 3 4 5 6; do docker exec \"$CID\" pg_isready -U docker -q 2>/dev/null && break; sleep 5; done; "
+                "for i in $(seq 1 24); do docker exec \"$CID\" sh -c 'pg_isready -h \"$(hostname -i)\" -U docker -q' 2>/dev/null && break; sleep 5; done; "
                 "docker exec \"$CID\" psql -U docker -d gis -c \"ALTER USER docker WITH PASSWORD '$PW'\" >/dev/null 2>&1; "
                 "if docker exec -e PGPASSWORD=\"$PW\" \"$CID\" sh -c 'psql -h \"$(hostname -i)\" -U docker -d gis -tAc \"SELECT 1\"' >/dev/null 2>&1; then echo SYNCED; "
                 "else echo FAILED; fi"
@@ -31052,12 +31093,24 @@ def _cloudtak_sync_postgis_password(cloudtak_dir=None, plog=None, remote_cfg=Non
         cid = (r.stdout or '').strip().splitlines()[0].strip() if (r.stdout or '').strip() else ''
         if not cid:
             return False
-        for _ in range(6):  # postgis can take a moment to accept connections after up -d
-            rdy = subprocess.run(_sudo_wrap(['docker', 'exec', cid, 'pg_isready', '-U', 'docker', '-q']),
+        ready = False
+        for _ in range(24):  # fresh initdb can outlast a short window — allow 2 min after up -d
+            # Probe over the container's NETWORK IP, not the default unix socket: during
+            # initdb the entrypoint runs a TEMPORARY socket-only server, so a socket
+            # pg_isready reports ready while TCP (the path the api and our verify use)
+            # is still refused — seen on nuc 2026-07-29, ⚠ fired 1s after up -d.
+            rdy = subprocess.run(_sudo_wrap(['docker', 'exec', cid, 'sh', '-c',
+                                             'pg_isready -h "$(hostname -i)" -U docker -q']),
                                  capture_output=True, timeout=15)
             if rdy.returncode == 0:
+                ready = True
                 break
             time.sleep(5)
+        if not ready and fresh:
+            # First-ever initdb on a fresh volume — not a failure. Boot converge and
+            # the next container restart re-run this sync and finish the job.
+            _log("  postgis still initializing — password sync deferred (boot converge will finish it)")
+            return False
         # v10.1.4 (WS10): ALWAYS converge, then verify over the path the api actually
         # uses. The old check-then-fix tested `psql -h 127.0.0.1` INSIDE the postgis
         # container — initdb's default pg_hba TRUSTS loopback, so that test passes with
@@ -37329,7 +37382,7 @@ if(document.getElementById('nodered-remote-metrics-bar')){loadNoderedRemoteMetri
 function startDeploy(){var btn=document.getElementById('deploy-btn');btn.disabled=true;document.getElementById('log-card').style.display='block';document.getElementById('deploy-log-dyn').textContent='Starting...';logIndex=0;
 var config=typeof collectNoderedDeployConfig==='function'?collectNoderedDeployConfig():{};
 fetch('/api/nodered/deploy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:config}),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
-if(d.error){var lg=document.getElementById('log-card');var dyn=document.getElementById('deploy-log-dyn');if(dyn)dyn.textContent='Error: '+d.error;if(lg&&!document.getElementById('deploy-fail-banner')){var b=document.createElement('div');b.id='deploy-fail-banner';b.style.cssText='background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';b.innerHTML='<strong>\u2717 Deployment failed.</strong> Uninstall (if partial) and retry, or click Retry below.';lg.insertBefore(b,lg.querySelector('.log-box')||lg.firstChild);}btn.disabled=false;btn.textContent='\u2717 Deployment failed \u2014 Retry';btn.style.background='var(--red)';btn.style.opacity='1';btn.onclick=function(){btn.textContent='\u1f680 Deploy Node-RED';btn.style.background='';startDeploy();};return;}pollLog();});}
+if(d.error){var lg=document.getElementById('log-card');var dyn=document.getElementById('deploy-log-dyn');if(dyn)dyn.textContent='Error: '+d.error;if(lg&&!document.getElementById('deploy-fail-banner')){var b=document.createElement('div');b.id='deploy-fail-banner';b.style.cssText='background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';b.innerHTML='<strong>\u2717 Deployment failed.</strong> Retry below, or wipe the partial install and start clean: ';var _ub=document.createElement('button');_ub.innerHTML='&#x1F5D1; Remove failed install';_ub.style.cssText='margin-left:8px;padding:6px 14px;background:transparent;border:1px solid rgba(239,68,68,0.5);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer';_ub.onclick=function(){document.getElementById('uninstall-modal').classList.add('open')};b.appendChild(_ub);lg.insertBefore(b,lg.querySelector('.log-box')||lg.firstChild);}btn.disabled=false;btn.textContent='\u2717 Deployment failed \u2014 Retry';btn.style.background='var(--red)';btn.style.opacity='1';btn.onclick=function(){btn.textContent='🚀 Deploy Node-RED';btn.style.background='';startDeploy();};return;}pollLog();});}
 function pollLog(){function pickLogEl(){var lc=document.getElementById('log-card');return (lc&&lc.style.display!=='none'?document.getElementById('deploy-log-dyn'):null)||document.getElementById('deploy-log')||document.getElementById('deploy-log-dyn');}
 var logEl=pickLogEl();function showCancel(show){var s=document.getElementById('nodered-cancel-btn-static'),d=document.getElementById('nodered-cancel-btn-dyn');if(s)s.style.display=show?'inline-block':'none';if(d)d.style.display=show?'inline-block':'none';}
 function doPoll(){logEl=pickLogEl();fetch('/api/nodered/deploy/log?index='+logIndex,{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
@@ -37337,7 +37390,7 @@ if(d.entries&&d.entries.length){if(logIndex===0&&logEl)logEl.textContent='';if(l
 showCancel(d.running);
 if(!d.running){clearInterval(logInterval);var btn=document.getElementById('deploy-btn');if(btn)btn.disabled=false;
 if(d.cancelled){if(logEl)logEl.textContent+=String.fromCharCode(10,10)+'Cancelled.';}
-else if(d.error){var lc=document.getElementById('log-card');if(logEl)logEl.textContent+=String.fromCharCode(10,10)+'\u2717 Deployment failed (see log above).';if(lc&&!document.getElementById('deploy-fail-banner')){var b=document.createElement('div');b.id='deploy-fail-banner';b.style.cssText='background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';b.innerHTML='<strong>\u2717 Deployment failed.</strong> Uninstall (if partial) and retry, or click Retry below.';lc.insertBefore(b,lc.querySelector('.log-box')||lc.firstChild);}if(btn){btn.textContent='\u2717 Deployment failed \u2014 Retry';btn.style.background='var(--red)';btn.style.opacity='1';btn.onclick=function(){btn.textContent='\u1f680 Deploy Node-RED';btn.style.background='';startDeploy();};}}
+else if(d.error){var lc=document.getElementById('log-card');if(logEl)logEl.textContent+=String.fromCharCode(10,10)+'\u2717 Deployment failed (see log above).';if(lc&&!document.getElementById('deploy-fail-banner')){var b=document.createElement('div');b.id='deploy-fail-banner';b.style.cssText='background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';b.innerHTML='<strong>\u2717 Deployment failed.</strong> Retry below, or wipe the partial install and start clean: ';var _ub=document.createElement('button');_ub.innerHTML='&#x1F5D1; Remove failed install';_ub.style.cssText='margin-left:8px;padding:6px 14px;background:transparent;border:1px solid rgba(239,68,68,0.5);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer';_ub.onclick=function(){document.getElementById('uninstall-modal').classList.add('open')};b.appendChild(_ub);lc.insertBefore(b,lc.querySelector('.log-box')||lc.firstChild);}if(btn){btn.textContent='\u2717 Deployment failed \u2014 Retry';btn.style.background='var(--red)';btn.style.opacity='1';btn.onclick=function(){btn.textContent='🚀 Deploy Node-RED';btn.style.background='';startDeploy();};}}
 else if(d.complete){if(logEl)logEl.textContent+=String.fromCharCode(10,10)+'Deploy complete - page will reload in 15s (or refresh now).';setTimeout(function(){location.reload();},15000);}}});}doPoll();logInterval=setInterval(doPoll,800);}
 function cancelNoderedDeploy(){if(!confirm('Cancel the deployment? You can deploy again after.'))return;fetch('/api/nodered/deploy/cancel',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin'}).then(function(){/* next poll will show cancelled */});}
 if(document.getElementById('deploy-log-card')){logIndex=0;pollLog();}
@@ -42594,11 +42647,11 @@ function startDeploy() {
           var banner = document.createElement('div');
           banner.id = 'deploy-fail-banner';
           banner.style.cssText = 'background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';
-          banner.innerHTML = '<strong>\u2717 Deployment failed.</strong> Uninstall (if partial) and retry, or click Retry below.';
+          banner.innerHTML='<strong>\u2717 Deployment failed.</strong> Retry below, or wipe the partial install and start clean: ';var _ub=document.createElement('button');_ub.innerHTML='&#x1F5D1; Remove failed install';_ub.style.cssText='margin-left:8px;padding:6px 14px;background:transparent;border:1px solid rgba(239,68,68,0.5);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer';_ub.onclick=function(){document.getElementById('uninstall-modal').classList.add('open')};banner.appendChild(_ub);
           lg.insertBefore(banner, lg.querySelector('.log-box') || lg.firstChild);
         }
         var btn = document.getElementById('deploy-btn');
-        if (btn) { btn.disabled = false; btn.textContent = '\u2717 Deployment failed \u2014 Retry'; btn.style.background = 'var(--red)'; btn.style.opacity = '1'; btn.onclick = function() { btn.textContent = '\u1f680 Deploy MediaMTX'; btn.style.background = ''; startDeploy(); }; }
+        if (btn) { btn.disabled = false; btn.textContent = '\u2717 Deployment failed \u2014 Retry'; btn.style.background = 'var(--red)'; btn.style.opacity = '1'; btn.onclick = function() { btn.textContent = '🚀 Deploy MediaMTX'; btn.style.background = ''; startDeploy(); }; }
       } else {
         pollLog();
       }
@@ -42634,11 +42687,11 @@ function pollLog() {
               var banner = document.createElement('div');
               banner.id = 'deploy-fail-banner';
               banner.style.cssText = 'background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';
-              banner.innerHTML = '<strong>\u2717 Deployment failed.</strong> Uninstall (if partial) and retry, or click Retry below.';
+              banner.innerHTML='<strong>\u2717 Deployment failed.</strong> Retry below, or wipe the partial install and start clean: ';var _ub=document.createElement('button');_ub.innerHTML='&#x1F5D1; Remove failed install';_ub.style.cssText='margin-left:8px;padding:6px 14px;background:transparent;border:1px solid rgba(239,68,68,0.5);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer';_ub.onclick=function(){document.getElementById('uninstall-modal').classList.add('open')};banner.appendChild(_ub);
               logCard.insertBefore(banner, logCard.querySelector('.log-box') || logCard.firstChild);
             }
             var btn = document.getElementById('deploy-btn');
-            if (btn) { btn.textContent = '\u2717 Deployment failed \u2014 Retry'; btn.style.background = 'var(--red)'; btn.style.opacity = '1'; btn.disabled = false; btn.onclick = function() { btn.textContent = '\u1f680 Deploy MediaMTX'; btn.style.background = ''; startDeploy(); }; }
+            if (btn) { btn.textContent = '\u2717 Deployment failed \u2014 Retry'; btn.style.background = 'var(--red)'; btn.style.opacity = '1'; btn.disabled = false; btn.onclick = function() { btn.textContent = '🚀 Deploy MediaMTX'; btn.style.background = ''; startDeploy(); }; }
           }
         }
       });
@@ -43053,7 +43106,7 @@ window.pollLog = function(redeployBtn) {
               btn.textContent = "\u2717 Deployment failed \u2014 Retry";
               btn.style.background = "var(--red)";
               btn.style.opacity = "1";
-              btn.onclick = function() { btn.textContent = "\u1f680 Deploy CloudTAK"; btn.style.background = ""; startDeploy(); };
+              btn.onclick = function() { btn.textContent = "🚀 Deploy CloudTAK"; btn.style.background = ""; startDeploy(); };
             }
           }
           if (d.complete) setTimeout(function() { location.reload(); }, 1500);
@@ -43737,7 +43790,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     <div class="log-box" id="deploy-log-dyn">{% if deploy_error %}Deployment failed. See log above.{% else %}Waiting...{% endif %}</div>
   </div>
   {% if deploy_error %}
-  <script>(function(){ var btn = document.getElementById("deploy-btn"); if(btn){ btn.disabled = false; btn.textContent = "\u2717 Deployment failed \u2014 Retry"; btn.style.background = "var(--red)"; btn.style.opacity = "1"; btn.onclick = function(){ btn.textContent = "\u1f680 Deploy CloudTAK"; btn.style.background = ""; startDeploy(); }; } })();</script>
+  <script>(function(){ var btn = document.getElementById("deploy-btn"); if(btn){ btn.disabled = false; btn.textContent = "\u2717 Deployment failed \u2014 Retry"; btn.style.background = "var(--red)"; btn.style.opacity = "1"; btn.onclick = function(){ btn.textContent = "🚀 Deploy CloudTAK"; btn.style.background = ""; startDeploy(); }; } })();</script>
   {% endif %}
 </div>
 
@@ -43889,7 +43942,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
         var r=await fetch('/api/emailrelay/log');var d=await r.json();
         if(d.entries&&d.entries.length>last){el.textContent=d.entries.join('\\n');el.scrollTop=el.scrollHeight;last=d.entries.length}
         if(!d.running){clearInterval(iv);
-        if(d.error){var card=el.parentElement;if(card&&!document.getElementById('deploy-fail-banner')){var b=document.createElement('div');b.id='deploy-fail-banner';b.style.cssText='background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';b.innerHTML='<strong>\u2717 Deployment failed.</strong> Uninstall (if partial) and retry, or click Retry below.';card.insertBefore(b,el);}var rbtn=document.createElement('button');rbtn.textContent='\u2717 Deployment failed \u2014 Retry';rbtn.style.cssText='margin-top:12px;padding:12px 24px;background:var(--red);color:#fff;border:none;border-radius:8px;font-weight:600;cursor:pointer';rbtn.onclick=function(){location.reload();};card.appendChild(rbtn);}
+        if(d.error){var card=el.parentElement;if(card&&!document.getElementById('deploy-fail-banner')){var b=document.createElement('div');b.id='deploy-fail-banner';b.style.cssText='background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';b.innerHTML='<strong>\u2717 Deployment failed.</strong> Retry below, or wipe the partial install and start clean: ';var _ub=document.createElement('button');_ub.innerHTML='&#x1F5D1; Remove failed install';_ub.style.cssText='margin-left:8px;padding:6px 14px;background:transparent;border:1px solid rgba(239,68,68,0.5);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer';_ub.onclick=function(){emailUninstall()};b.appendChild(_ub);card.insertBefore(b,el);}var rbtn=document.createElement('button');rbtn.textContent='\u2717 Deployment failed \u2014 Retry';rbtn.style.cssText='margin-top:12px;padding:12px 24px;background:var(--red);color:#fff;border:none;border-radius:8px;font-weight:600;cursor:pointer';rbtn.onclick=function(){location.reload();};card.appendChild(rbtn);}
         else if(d.complete){setTimeout(()=>location.reload(),1500)}}
     },1500);
 })();
@@ -43979,7 +44032,7 @@ Switching providers later requires only updating Postfix credentials — no chan
 <div class="section-title">Deploy Email Relay</div>
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
 {% if deploy_error %}
-<div id="deploy-fail-banner" style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)"><strong>&#x2717; Deployment failed.</strong> Uninstall (if partial) and retry, or click Retry below.</div>
+<div id="deploy-fail-banner" style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)"><strong>&#x2717; Deployment failed.</strong> Retry below, or wipe the partial install and start clean: <button onclick="emailUninstall()" style="margin-left:8px;padding:6px 14px;background:transparent;border:1px solid rgba(239,68,68,0.5);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer">&#x1F5D1; Remove failed install</button></div>
 {% endif %}
 <div class="form-grid">
 <div class="form-group full">
@@ -44050,7 +44103,7 @@ async function deployRelay(){
     var d=await r.json();
     if(d.success){location.reload()}
     else{var card=btn.closest('div[style*="background:var(--bg-card)"]')||btn.parentElement;
-    if(card&&!document.getElementById('deploy-fail-banner')){var b=document.createElement('div');b.id='deploy-fail-banner';b.style.cssText='background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';b.innerHTML='<strong>\u2717 Deployment failed.</strong> Uninstall (if partial) and retry, or click Retry below.';card.insertBefore(b,card.firstChild);}
+    if(card&&!document.getElementById('deploy-fail-banner')){var b=document.createElement('div');b.id='deploy-fail-banner';b.style.cssText='background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';b.innerHTML='<strong>\u2717 Deployment failed.</strong> Retry below, or wipe the partial install and start clean: ';var _ub=document.createElement('button');_ub.innerHTML='&#x1F5D1; Remove failed install';_ub.style.cssText='margin-left:8px;padding:6px 14px;background:transparent;border:1px solid rgba(239,68,68,0.5);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer';_ub.onclick=function(){emailUninstall()};b.appendChild(_ub);card.insertBefore(b,card.firstChild);}
     btn.disabled=false;btn.textContent='\u2717 Deployment failed \u2014 Retry';btn.style.background='var(--red)';btn.style.opacity='1';btn.onclick=function(){btn.textContent='\u1f4e7 Deploy Email Relay';btn.style.background='';deployRelay();};}
 }
 
@@ -44354,7 +44407,7 @@ async function deployCaddy(){
         var r=await fetch('/api/caddy/deploy',req);
         var d=await r.json();
         if(d.success){pollCaddyLog()}
-        else{var el=document.getElementById('deploy-log');var card=el?(el.closest('.card')||el.parentElement):null;if(card&&!document.getElementById('deploy-fail-banner')){var b=document.createElement('div');b.id='deploy-fail-banner';b.style.cssText='background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';b.innerHTML='<strong>\u2717 Deployment failed.</strong> Uninstall (if partial) and retry, or click Retry below.';card.insertBefore(b,el||card.firstChild);}if(el)el.textContent='Error: '+d.error;btn.disabled=false;btn.textContent='\u2717 Deployment failed \u2014 Retry';btn.style.background='var(--red)';btn.style.opacity='1';btn.onclick=function(){btn.textContent='\u1f680 Deploy Caddy';btn.style.background='';deployCaddy();};}
+        else{var el=document.getElementById('deploy-log');var card=el?(el.closest('.card')||el.parentElement):null;if(card&&!document.getElementById('deploy-fail-banner')){var b=document.createElement('div');b.id='deploy-fail-banner';b.style.cssText='background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';b.innerHTML='<strong>\u2717 Deployment failed.</strong> Retry below, or wipe the partial install and start clean: ';var _ub=document.createElement('button');_ub.innerHTML='&#x1F5D1; Remove failed install';_ub.style.cssText='margin-left:8px;padding:6px 14px;background:transparent;border:1px solid rgba(239,68,68,0.5);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer';_ub.onclick=function(){caddyUninstall()};b.appendChild(_ub);card.insertBefore(b,el||card.firstChild);}if(el)el.textContent='Error: '+d.error;btn.disabled=false;btn.textContent='\u2717 Deployment failed \u2014 Retry';btn.style.background='var(--red)';btn.style.opacity='1';btn.onclick=function(){btn.textContent='🚀 Deploy Caddy';btn.style.background='';deployCaddy();};}
     }catch(e){alert('Error: '+e.message);btn.disabled=false;btn.textContent='🚀 Deploy Caddy';btn.style.opacity='1'}
 }
 function pollCaddyLog(){
@@ -44383,7 +44436,7 @@ function pollCaddyLog(){
             }
             if(!d.running){clearInterval(iv);
             if(d.complete){setTimeout(()=>location.reload(),3000)}
-            else if(d.error){var card=el.closest('.card');if(card&&!document.getElementById('deploy-fail-banner')){var b=document.createElement('div');b.id='deploy-fail-banner';b.style.cssText='background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';b.innerHTML='<strong>\u2717 Deployment failed.</strong> Uninstall (if partial) and retry, or click Retry below.';card.insertBefore(b,card.firstChild);}var btn=document.getElementById('deploy-btn');if(btn){btn.disabled=false;btn.textContent='\u2717 Deployment failed \u2014 Retry';btn.style.background='var(--red)';btn.style.opacity='1';btn.onclick=function(){btn.textContent='\u1f680 Deploy Caddy';btn.style.background='';deployCaddy();};}}}
+            else if(d.error){var card=el.closest('.card');if(card&&!document.getElementById('deploy-fail-banner')){var b=document.createElement('div');b.id='deploy-fail-banner';b.style.cssText='background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';b.innerHTML='<strong>\u2717 Deployment failed.</strong> Retry below, or wipe the partial install and start clean: ';var _ub=document.createElement('button');_ub.innerHTML='&#x1F5D1; Remove failed install';_ub.style.cssText='margin-left:8px;padding:6px 14px;background:transparent;border:1px solid rgba(239,68,68,0.5);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer';_ub.onclick=function(){caddyUninstall()};b.appendChild(_ub);card.insertBefore(b,card.firstChild);}var btn=document.getElementById('deploy-btn');if(btn){btn.disabled=false;btn.textContent='\u2717 Deployment failed \u2014 Retry';btn.style.background='var(--red)';btn.style.opacity='1';btn.onclick=function(){btn.textContent='🚀 Deploy Caddy';btn.style.background='';deployCaddy();};}}}
         }catch(e){}
     },1000);
 }
@@ -44915,11 +44968,11 @@ async function deployPortal(){
         }
         var d=await r.json();
         if(d.success)pollDeployLog();
-        else{var lg=document.getElementById('deploy-log');if(lg)lg.textContent='\u2717 '+d.error;var card=lg?lg.closest('.card'):null;if(card&&!document.getElementById('deploy-fail-banner')){var b=document.createElement('div');b.id='deploy-fail-banner';b.style.cssText='background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';b.innerHTML='<strong>\u2717 Deployment failed.</strong> Uninstall (if partial) and retry, or click Retry below.';card.insertBefore(b,card.firstChild);}btn.disabled=false;btn.textContent='\u2717 Deployment failed \u2014 Retry';btn.style.background='var(--red)';btn.style.opacity='1';btn.style.cursor='pointer';btn.onclick=function(){btn.textContent='\u1f680 Deploy TAK Portal';btn.style.background='';deployPortal();};}
+        else{var lg=document.getElementById('deploy-log');if(lg)lg.textContent='\u2717 '+d.error;var card=lg?lg.closest('.card'):null;if(card&&!document.getElementById('deploy-fail-banner')){var b=document.createElement('div');b.id='deploy-fail-banner';b.style.cssText='background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';b.innerHTML='<strong>\u2717 Deployment failed.</strong> Retry below, or wipe the partial install and start clean: ';var _ub=document.createElement('button');_ub.innerHTML='&#x1F5D1; Remove failed install';_ub.style.cssText='margin-left:8px;padding:6px 14px;background:transparent;border:1px solid rgba(239,68,68,0.5);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer';_ub.onclick=function(){document.getElementById('portal-uninstall-modal').classList.add('open')};b.appendChild(_ub);card.insertBefore(b,card.firstChild);}btn.disabled=false;btn.textContent='\u2717 Deployment failed \u2014 Retry';btn.style.background='var(--red)';btn.style.opacity='1';btn.style.cursor='pointer';btn.onclick=function(){btn.textContent='🚀 Deploy TAK Portal';btn.style.background='';deployPortal();};}
     }catch(e){
         document.getElementById('deploy-log').textContent='Error: '+e.message;
         btn.disabled=false;btn.textContent='\u2717 Deployment failed \u2014 Retry';btn.style.background='var(--red)';btn.style.opacity='1';btn.style.cursor='pointer';
-        btn.onclick=function(){btn.textContent='\u1f680 Deploy TAK Portal';btn.style.background='';deployPortal();};
+        btn.onclick=function(){btn.textContent='🚀 Deploy TAK Portal';btn.style.background='';deployPortal();};
     }
 }
 
@@ -44970,9 +45023,9 @@ function pollDeployLog(){
         else if(d.error){
             var el=document.getElementById('deploy-log');
             var card=el?el.closest('.card'):null;
-            if(card&&!document.getElementById('deploy-fail-banner')){var b=document.createElement('div');b.id='deploy-fail-banner';b.style.cssText='background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';b.innerHTML='<strong>\u2717 Deployment failed.</strong> Uninstall (if partial) and retry, or click Retry below.';card.insertBefore(b,card.firstChild);}
+            if(card&&!document.getElementById('deploy-fail-banner')){var b=document.createElement('div');b.id='deploy-fail-banner';b.style.cssText='background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';b.innerHTML='<strong>\u2717 Deployment failed.</strong> Retry below, or wipe the partial install and start clean: ';var _ub=document.createElement('button');_ub.innerHTML='&#x1F5D1; Remove failed install';_ub.style.cssText='margin-left:8px;padding:6px 14px;background:transparent;border:1px solid rgba(239,68,68,0.5);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer';_ub.onclick=function(){document.getElementById('portal-uninstall-modal').classList.add('open')};b.appendChild(_ub);card.insertBefore(b,card.firstChild);}
             var btn=document.getElementById('deploy-btn');
-            if(btn){btn.disabled=false;btn.textContent='\u2717 Deployment failed \u2014 Retry';btn.style.background='var(--red)';btn.style.opacity='1';btn.style.cursor='pointer';btn.onclick=function(){btn.textContent='\u1f680 Deploy TAK Portal';btn.style.background='';deployPortal();};}
+            if(btn){btn.disabled=false;btn.textContent='\u2717 Deployment failed \u2014 Retry';btn.style.background='var(--red)';btn.style.opacity='1';btn.style.cursor='pointer';btn.onclick=function(){btn.textContent='🚀 Deploy TAK Portal';btn.style.background='';deployPortal();};}
         }
     }).catch(function(e){
         var el=document.getElementById('deploy-log');
@@ -44984,7 +45037,7 @@ function pollDeployLog(){
             el.scrollTop=el.scrollHeight;
         }
         var btn=document.getElementById('deploy-btn');
-        if(btn){btn.disabled=false;btn.textContent='\u2717 Deployment failed \u2014 Retry';btn.style.background='var(--red)';btn.style.opacity='1';btn.style.cursor='pointer';btn.onclick=function(){btn.textContent='\u1f680 Deploy TAK Portal';btn.style.background='';deployPortal();};}
+        if(btn){btn.disabled=false;btn.textContent='\u2717 Deployment failed \u2014 Retry';btn.style.background='var(--red)';btn.style.opacity='1';btn.style.cursor='pointer';btn.onclick=function(){btn.textContent='🚀 Deploy TAK Portal';btn.style.background='';deployPortal();};}
     });
 }
 
@@ -56802,7 +56855,7 @@ async function deployAk(){
         var r=await fetch('/api/authentik/deploy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:config})});
         var d=await r.json();
         if(d.success)pollDeployLog();
-        else{var lg=document.getElementById('deploy-log');if(lg)lg.textContent='Error: '+d.error;var card=lg?lg.closest('.card'):null;if(card&&!document.getElementById('deploy-fail-banner')){var b=document.createElement('div');b.id='deploy-fail-banner';b.style.cssText='background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';b.innerHTML='<strong>\u2717 Deployment failed.</strong> Uninstall (if partial) and retry, or click Retry below.';card.insertBefore(b,card.firstChild);}btn.disabled=false;btn.textContent='\u2717 Deployment failed \u2014 Retry';btn.style.background='var(--red)';btn.style.opacity='1';btn.style.cursor='pointer';btn.onclick=function(){btn.textContent='Deploy Authentik';btn.style.background='';deployAk();};}
+        else{var lg=document.getElementById('deploy-log');if(lg)lg.textContent='Error: '+d.error;var card=lg?lg.closest('.card'):null;if(card&&!document.getElementById('deploy-fail-banner')){var b=document.createElement('div');b.id='deploy-fail-banner';b.style.cssText='background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';b.innerHTML='<strong>\u2717 Deployment failed.</strong> Retry below, or wipe the partial install and start clean: ';var _ub=document.createElement('button');_ub.innerHTML='&#x1F5D1; Remove failed install';_ub.style.cssText='margin-left:8px;padding:6px 14px;background:transparent;border:1px solid rgba(239,68,68,0.5);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer';_ub.onclick=function(){document.getElementById('ak-uninstall-modal').classList.add('open')};b.appendChild(_ub);card.insertBefore(b,card.firstChild);}btn.disabled=false;btn.textContent='\u2717 Deployment failed \u2014 Retry';btn.style.background='var(--red)';btn.style.opacity='1';btn.style.cursor='pointer';btn.onclick=function(){btn.textContent='Deploy Authentik';btn.style.background='';deployAk();};}
     }catch(e){document.getElementById('deploy-log').textContent='Error: '+e.message}
 }
 async function reconfigureAk(){
@@ -56913,7 +56966,7 @@ function pollDeployLog(){
         else if(d.error){
             var el=document.getElementById('deploy-log');
             var card=el?el.closest('.card'):null;
-            if(card&&!document.getElementById('deploy-fail-banner')){var b=document.createElement('div');b.id='deploy-fail-banner';b.style.cssText='background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';b.innerHTML='<strong>\u2717 Deployment failed.</strong> Uninstall (if partial) and retry, or click Retry below.';card.insertBefore(b,card.firstChild);}
+            if(card&&!document.getElementById('deploy-fail-banner')){var b=document.createElement('div');b.id='deploy-fail-banner';b.style.cssText='background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:12px 16px;margin-bottom:12px;font-size:13px;color:var(--red)';b.innerHTML='<strong>\u2717 Deployment failed.</strong> Retry below, or wipe the partial install and start clean: ';var _ub=document.createElement('button');_ub.innerHTML='&#x1F5D1; Remove failed install';_ub.style.cssText='margin-left:8px;padding:6px 14px;background:transparent;border:1px solid rgba(239,68,68,0.5);border-radius:6px;color:var(--red);font-size:12px;font-weight:600;cursor:pointer';_ub.onclick=function(){document.getElementById('ak-uninstall-modal').classList.add('open')};b.appendChild(_ub);card.insertBefore(b,card.firstChild);}
             var btn=document.getElementById('deploy-btn');
             if(btn){btn.disabled=false;btn.textContent='\u2717 Deployment failed \u2014 Retry';btn.style.background='var(--red)';btn.style.opacity='1';btn.style.cursor='pointer';btn.onclick=function(){btn.textContent='Deploy Authentik';btn.style.background='';deployAk();};}
         }
@@ -66255,8 +66308,27 @@ def run_takserver_deploy(config):
                 _cc = _cc.replace('"cert_https"/',
                                   f'"cert_https" enableAdminUI="{admin_ui}" enableWebtak="{webtak}" enableNonAdminUI="false"/')
             _write_priv('/opt/tak/CoreConfig.xml', _cc)
+            # v10.1.14 (W6): verify the edits actually landed. These failures used to be
+            # swallowed (one log line, deploy still "succeeded") — a broker hiccup left
+            # nuc on STOCK CoreConfig for 3 weeks: root-only truststore (leaf-only TLS
+            # clients → certificate-unknown, CloudTAK bootstrap dead) and no
+            # certificateSigning block (QR enrollment dead). A misconfigured TAK is a
+            # FAILED deploy, not a warning.
+            _cc_check = _read_priv('/opt/tak/CoreConfig.xml')
+            if isinstance(_cc_check, (bytes, bytearray)):
+                _cc_check = _cc_check.decode('utf-8', 'replace')
+            _missing = [_m for _m, _ok in (
+                (f'intermediate truststore (truststore-{int_ca}.jks)', f'truststore-{int_ca}.jks' in _cc_check),
+                ('certificateSigning enrollment block', 'TAKServerCAConfig' in _cc_check),
+                ('x509 auth input on 8089', 'auth="x509"' in _cc_check),
+            ) if not _ok]
+            if _missing:
+                raise RuntimeError(f"post-write verification failed — missing: {', '.join(_missing)}")
         except Exception as _cce:
-            log_step(f"  ✗ CoreConfig patch failed: {_cce}")
+            log_step(f"  ✗ CoreConfig patch FAILED: {_cce}")
+            log_step("  ✗ TAK would run MISCONFIGURED (X.509 auth / truststore / enrollment) — aborting deploy.")
+            log_step("    Re-run the deploy; if this repeats, check broker health (journalctl -u takwerx-console).")
+            deploy_status.update({'error': True, 'running': False}); return
         _patch_coreconfig_passwords(cert_pass, log_fn=log_step)
         # For two-server and external_db: ensure JDBC URL and password point to the remote DB host
         import re
@@ -70920,12 +70992,12 @@ var logInterval=null;
 function pickLogEl(){var lc=document.getElementById('log-card');return (lc&&lc.style.display!=='none'?document.getElementById('deploy-log-dyn'):null)||document.getElementById('deploy-log')||document.getElementById('deploy-log-dyn');}
 function startDeploy(){var btn=document.getElementById('deploy-btn');if(btn)btn.disabled=true;document.getElementById('log-card').style.display='block';var logEl=document.getElementById('deploy-log-dyn');if(logEl)logEl.textContent='Starting...';
 fetch('/api/remote-assist/deploy',{method:'POST',credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
-if(!d.success){var dyn=document.getElementById('deploy-log-dyn');if(dyn)dyn.textContent='Error: '+(d.error||'Deploy failed');if(btn){btn.disabled=false;btn.textContent='\u2717 Deployment failed \u2014 Retry';btn.style.background='var(--red)';btn.onclick=function(){btn.textContent='\u1f680 Deploy EUD Remote Assist';btn.style.background='';startDeploy();};}return;}
+if(!d.success){var dyn=document.getElementById('deploy-log-dyn');if(dyn)dyn.textContent='Error: '+(d.error||'Deploy failed');if(btn){btn.disabled=false;btn.textContent='\u2717 Deployment failed \u2014 Retry';btn.style.background='var(--red)';btn.onclick=function(){btn.textContent='🚀 Deploy EUD Remote Assist';btn.style.background='';startDeploy();};}return;}
 pollLog();});}
 function pollLog(){function doPoll(){var logEl=pickLogEl();fetch('/api/remote-assist/deploy-status',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
 if(d.log&&d.log.length){if(logEl){if(logEl.textContent==='Starting...'||logEl.textContent==='Waiting...')logEl.textContent='';logEl.textContent=d.log.join(String.fromCharCode(10))+String.fromCharCode(10);logEl.scrollTop=logEl.scrollHeight;}}
 if(!d.running){clearInterval(logInterval);var btn=document.getElementById('deploy-btn');if(btn)btn.disabled=false;
-if(d.error){if(logEl)logEl.textContent+=(logEl.textContent?String.fromCharCode(10,10):'')+'\u2717 Deployment failed (see log above).';if(btn){btn.textContent='\u2717 Deployment failed \u2014 Retry';btn.style.background='var(--red)';btn.onclick=function(){btn.textContent='\u1f680 Deploy EUD Remote Assist';btn.style.background='';startDeploy();};}}
+if(d.error){if(logEl)logEl.textContent+=(logEl.textContent?String.fromCharCode(10,10):'')+'\u2717 Deployment failed (see log above).';if(btn){btn.textContent='\u2717 Deployment failed \u2014 Retry';btn.style.background='var(--red)';btn.onclick=function(){btn.textContent='🚀 Deploy EUD Remote Assist';btn.style.background='';startDeploy();};}}
 else if(d.complete){if(logEl)logEl.textContent+=(logEl.textContent?String.fromCharCode(10,10):'')+'Deploy complete - page will reload in 15s (or refresh now).';setTimeout(function(){location.reload();},15000);}}});}
 doPoll();logInterval=setInterval(doPoll,800);}
 if(document.getElementById('deploy-log-card')){pollLog();}
@@ -74077,6 +74149,93 @@ def _ensure_console_cert_docker_san(settings):
         return f"console cert SAN check error (non-fatal): {str(e)[:100]}"
 
 
+def _heal_takserver_coreconfig_step8():
+    """v10.1.14 (W6): repair CoreConfigs damaged by silently-swallowed Step-8 writes.
+
+    TAK deploy Step 8 (X.509 input, intermediate truststore, certificateSigning
+    enrollment block) used to log write failures and keep going — a broker hiccup
+    (stale-daemon era, fixed by the 10.1.13 boot converge) or a pre-10.0.5 sed
+    denial left the box running STOCK CoreConfig: leaf-only TLS clients get
+    `certificate unknown` (CloudTAK bootstrap dies with UND_ERR_SOCKET) and QR/cert
+    enrollment is unconfigured (nuc, 2026-07-29). Detect that exact signature,
+    restore the missing pieces from the box's own cert material, restart TAK.
+    Idempotent no-op on healthy boxes; never raises; never guesses — each repair
+    requires the matching cert artifact to exist on disk. The 8089 auth="x509"
+    gap is WARN-only (rewriting auth semantics of a live port is riskier than the
+    gap; the deploy-path hard-fail prevents new cases)."""
+    try:
+        if subprocess.run(_sudo_wrap(['test', '-f', '/opt/tak/CoreConfig.xml']),
+                          capture_output=True, timeout=10).returncode != 0:
+            return None
+        cc = _read_priv('/opt/tak/CoreConfig.xml')
+        if isinstance(cc, (bytes, bytearray)):
+            cc = cc.decode('utf-8', 'replace')
+        if not (cc or '').strip():
+            return None
+        needs_trust = 'truststoreFile="certs/files/truststore-root.jks"' in cc
+        needs_enroll = ('<vbm enabled="false"/>' in cc) and ('TAKServerCAConfig' not in cc)
+        # NOTE: no check on the 8089 input's auth attr — TAK's own upgrades rewrite
+        # input lines without it on perfectly healthy boxes (whole fleet flagged on
+        # first rollout), so its absence carries no damage signal.
+        if not needs_trust and not needs_enroll:
+            return None
+        # Derive the box's intermediate CA name + org fields from its own signing CA.
+        try:
+            ca_pem = _read_priv('/opt/tak/certs/files/ca.pem') or ''
+        except Exception:
+            ca_pem = ''
+        if isinstance(ca_pem, (bytes, bytearray)):
+            ca_pem = ca_pem.decode('utf-8', 'replace')
+        if not ca_pem.strip():
+            return 'Step-8 CoreConfig heal: damage signature present but certs/files/ca.pem unreadable — skipped'
+        r = subprocess.run(['openssl', 'x509', '-noout', '-subject', '-nameopt', 'sep_multiline'],
+                           input=ca_pem, capture_output=True, text=True, timeout=10)
+        subj = {}
+        for _line in (r.stdout or '').splitlines():
+            _line = _line.strip()
+            if '=' in _line:
+                _k, _, _v = _line.partition('=')
+                subj[_k.strip()] = _v.strip()
+        int_ca = subj.get('CN', '')
+        if not int_ca:
+            return 'Step-8 CoreConfig heal: damage signature present but CA CN unparseable — skipped'
+        fixes = []
+        new_cc = cc
+        if needs_trust:
+            ts_path = f'/opt/tak/certs/files/truststore-{int_ca}.jks'
+            if subprocess.run(_sudo_wrap(['test', '-f', ts_path]), capture_output=True, timeout=10).returncode == 0:
+                new_cc = new_cc.replace('truststoreFile="certs/files/truststore-root.jks"',
+                                        f'truststoreFile="certs/files/truststore-{int_ca}.jks"')
+                fixes.append(f'truststore → truststore-{int_ca}.jks')
+            else:
+                fixes.append(f'truststore-root referenced but truststore-{int_ca}.jks absent — NOT changed')
+        if needs_enroll:
+            signing = f'/opt/tak/certs/files/{int_ca}-signing.jks'
+            if subprocess.run(_sudo_wrap(['test', '-f', signing]), capture_output=True, timeout=10).returncode == 0:
+                cert_pass = _get_tak_cert_password(load_settings())
+                cert_block = ('<certificateSigning CA="TAKServer"><certificateConfig>\n'
+                              f'<nameEntries>\n<nameEntry name="O" value="{subj.get("O", "TAK")}"/>\n'
+                              f'<nameEntry name="OU" value="{subj.get("OU", "TAK")}"/>\n</nameEntries>\n'
+                              '</certificateConfig>\n<TAKServerCAConfig keystore="JKS" '
+                              f'keystoreFile="certs/files/{int_ca}-signing.jks" keystorePass="{cert_pass}" '
+                              'validityDays="730" signatureAlg="SHA256WithRSA" />\n'
+                              '</certificateSigning>\n<vbm enabled="false"/>')
+                new_cc = new_cc.replace('<vbm enabled="false"/>', cert_block, 1)
+                fixes.append('certificateSigning enrollment block restored')
+            else:
+                fixes.append(f'{int_ca}-signing.jks absent — enrollment block NOT restored')
+        if new_cc != cc:
+            _write_priv('/opt/tak/CoreConfig.xml', new_cc)  # keeps .infratak-prev backup
+            subprocess.run(_tak_systemctl('restart'), shell=True, capture_output=True, timeout=180)
+            return ('Step-8 CoreConfig HEAL applied: ' + '; '.join(fixes)
+                    + ' — TAK Server restarted (previous config kept as CoreConfig.xml.infratak-prev)')
+        if fixes:
+            return 'Step-8 CoreConfig heal: ' + '; '.join(fixes)
+        return None
+    except Exception as e:
+        return f'Step-8 CoreConfig heal error (non-fatal): {e}'
+
+
 def _startup_migrations():
     try:
         # v10.1.1 S3: broker-readiness startup GATE. On a non-root box the broker
@@ -74641,6 +74800,16 @@ def _startup_migrations():
                         print(f"Startup migration: LDAP recreate after heal exception: {_re_err}", flush=True)
         except Exception as _shc_err:
             print(f"Startup migration: compose self-heal error (non-fatal): {_shc_err}", flush=True)
+
+        # v10.1.14 (W6): heal TAK CoreConfigs damaged by silently-swallowed deploy
+        # Step-8 writes (root-only truststore → CloudTAK bootstrap dead; missing
+        # certificateSigning → QR enrollment dead). Self-gating; no-op when healthy.
+        try:
+            _s8 = _heal_takserver_coreconfig_step8()
+            if _s8:
+                print(f"Startup migration: {_s8}", flush=True)
+        except Exception as _s8e:
+            print(f"Startup migration: Step-8 CoreConfig heal error (non-fatal): {_s8e}", flush=True)
 
         # v0.9.26 (2026-05-17, after tak-10 surfaced sustained ~80% Authentik
         # server CPU with the symptom traced to the v0.9.5 weekly tasklog
@@ -77572,9 +77741,13 @@ try:
 
     def _startup_icon_heal():
         import time as _t
-        # First check after the container runtime settles; a couple of re-checks so a
-        # crash-loop that develops slowly after boot is still caught.
-        for _i in range(3):
+        # First check after the container runtime settles, then keep re-checking for
+        # ~15 min: the post-update CloudTAK hardening RECREATES the api container a few
+        # minutes after boot (wiping any regen-guard patch — recreate rebuilds from the
+        # image), and the resulting crash-loop takes another ~4 min to surface (nuc
+        # 2026-07-29: heal at +2m, hardening recreate at +3.5m, loop at ~+8m — the old
+        # 3-check/5.5-min window had just closed). Self-gating no-op when healthy.
+        for _i in range(8):
             _t.sleep(90 if _i == 0 else 120)
             try:
                 if _selfheal_cloudtak_corrupt_icons(
