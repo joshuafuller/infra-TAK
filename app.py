@@ -768,7 +768,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.14-alpha"
+VERSION = "10.1.15-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -776,8 +776,8 @@ GITHUB_REPO = "takwerx/infra-TAK"
 # Dev-channel boxes (update_channel = 'dev' in settings.json) use AUTHENTIK_DEV_RELEASE —
 # the version currently under validation.  When vetting passes, promote DEV → VETTED and
 # bump VERSION to a new infra-TAK release.
-AUTHENTIK_VETTED_RELEASE = "2026.5.3"   # v0.9.57.1: promoted dev→vetted — conn_max_age idle-CPU spin fix (#22580, fixed 2026.5.2); 2026.2.3→2026.5.3 jump validated live on CORAZ prod + test6/8/12 soak
-AUTHENTIK_DEV_RELEASE    = "2026.5.4"   # OFFLINE FALLBACK ONLY — dev channel tracks upstream-latest live (_get_authentik_target_release); this value is used only when the GitHub lookup is unreachable. Bump it to the current latest when convenient, but it no longer gates what dev installs.
+AUTHENTIK_VETTED_RELEASE = "2026.5.6"   # v10.1.15: promoted — PG conn-leak + dramatiq broker fixes (5.5/5.6). 60-min soak on 4 boxes 2026-07-30 (test6, test12, nuc/Rocky-nonroot, aws-arm/ARM64) all clean; PG-bounce test on test12 PASSED with 0 CRITICALs (the 5.4 yellow-flag dramatiq cluster did not reproduce — hold rationale resolved)
+AUTHENTIK_DEV_RELEASE    = "2026.5.6"   # OFFLINE FALLBACK ONLY — dev channel tracks upstream-latest live (_get_authentik_target_release); this value is used only when the GitHub lookup is unreachable. Bump it to the current latest when convenient, but it no longer gates what dev installs.
 # CloudTAK version gate. v13.45 split the server into hub (stateful) / api (stateless) modes —
 # a breaking change for plugin server routes, which now live in api/stateless/routes/ with the
 # ConfigStateless contract. v10.1.4 migrated the dispatcher plugin + the installer to that
@@ -3027,15 +3027,31 @@ document.addEventListener('DOMContentLoaded',_syncThemeUI);
 </script>'''
     return light_mode_block + f'<nav class="sidebar"{nav_style}>\n  ' + '\n  '.join(parts) + '\n</nav>'
 
+# v10.1.15: the headline CPU number is a 60s rolling average, not a raw sample.
+# psutil.cpu_percent(interval=0.5) polled every 5s is an honest half-second
+# snapshot — but this stack is bursty (Node-RED flows, Authentik sweeps, PG
+# checkpoints), so the biggest number on the page swung 5%→90% between polls
+# and operators read burst noise as "the server is pegged" (TN TAK sized VM
+# upgrades off it). The instantaneous value stays available as cpu_percent_now.
+# Samples are fed by the /api/metrics polls themselves (5s per open console
+# tab); after an idle gap the window re-primes from the first fresh sample.
+_CPU_AVG_WINDOW_S = 60
+_cpu_avg_samples = []  # (monotonic_ts, pct)
+
 def get_system_metrics():
-    cpu = psutil.cpu_percent(interval=0.5)
+    cpu_now = psutil.cpu_percent(interval=0.5)
+    _ts = time.monotonic()
+    _cpu_avg_samples.append((_ts, cpu_now))
+    del _cpu_avg_samples[:max(0, len(_cpu_avg_samples) - 64)]
+    _window = [p for t, p in _cpu_avg_samples if t >= _ts - _CPU_AVG_WINDOW_S]
+    cpu = round(sum(_window) / len(_window), 1)
     ram = psutil.virtual_memory()
     disk = psutil.disk_usage('/')
     boot = datetime.fromtimestamp(psutil.boot_time())
     uptime = datetime.now() - boot
     d, h, m = uptime.days, uptime.seconds // 3600, (uptime.seconds % 3600) // 60
     uu = _get_unattended_upgrades_status()
-    return {'cpu_percent': cpu, 'ram_percent': round(ram.percent, 1),
+    return {'cpu_percent': cpu, 'cpu_percent_now': round(cpu_now, 1), 'ram_percent': round(ram.percent, 1),
         'ram_used_gb': round(ram.used / (1024**3), 1), 'ram_total_gb': round(ram.total / (1024**3), 1),
         'disk_percent': round(disk.percent, 1), 'disk_used_gb': round(disk.used / (1024**3), 1),
         'disk_total_gb': round(disk.total / (1024**3), 1), 'uptime': f"{d}d {h}h {m}m",
@@ -3618,13 +3634,37 @@ def _friendly_process_name(args):
     return first.split('/')[-1] if first else '?'
 
 
+# v10.1.15: memory column uses PSS (proportional set size), not RSS. ps pmem is
+# RSS-based, so summing a group re-counts shared memory once per process —
+# Postgres is the worst case: ~25 backends each "owning" the same shared_buffers
+# made the console report Authentik at ~2x its real footprint (7.8GB vs ~3GB on
+# a fleet box), and operators sized VMs off that number. PSS divides shared
+# pages among their sharers so per-group sums are truthful. Fallback: processes
+# below 0.1% pmem, or where /proc/<pid>/smaps_rollup is unreadable (non-root,
+# racing exit), keep the RSS-based pmem — same 3-field output either way.
+_TOP_PROCESSES_PS_CMD = (
+    "ps -eo pid,pcpu,pmem,args --no-headers 2>/dev/null | awk '\n"
+    "BEGIN { while ((getline l < \"/proc/meminfo\") > 0) if (l ~ /^MemTotal:/) { split(l, a); mt = a[2]; break }\n"
+    "        close(\"/proc/meminfo\") }\n"
+    "{ pid = $1; cpu = $2; mem = $3\n"
+    "  args = \"\"; for (i = 4; i <= NF; i++) args = args (i > 4 ? \" \" : \"\") $i\n"
+    "  if (mem + 0 >= 0.1 && mt > 0) {\n"
+    "    f = \"/proc/\" pid \"/smaps_rollup\"; pss = -1\n"
+    "    while ((getline l < f) > 0) if (l ~ /^Pss:/) { split(l, a); pss = a[2]; break }\n"
+    "    close(f)\n"
+    "    if (pss >= 0) mem = pss / mt * 100\n"
+    "  }\n"
+    "  printf \"%s %.2f %s\\n\", cpu, mem, args }'"
+)
+
+
 def _top_processes_local():
     """Return { cpu_top, mem_top, total_ram_gb } with friendly names (takserver, authentik, etc.) and percentages."""
     try:
         total_ram_gb = _get_total_ram_gb_local()
         r = subprocess.run(
-            'ps -eo pcpu,pmem,args --no-headers 2>/dev/null',
-            shell=True, capture_output=True, text=True, timeout=5
+            _TOP_PROCESSES_PS_CMD,
+            shell=True, capture_output=True, text=True, timeout=10
         )
         out = (r.stdout or '').strip()
         by_name = {}
@@ -3669,7 +3709,7 @@ def _top_processes_remote(remote_cfg):
         return {'cpu_top': [], 'mem_top': [], 'error': 'no host'}
     try:
         total_ram_gb = _get_total_ram_gb_remote(remote_cfg)
-        ok, out = _ssh_probe(remote_cfg, 'ps -eo pcpu,pmem,args --no-headers 2>/dev/null', timeout=10)
+        ok, out = _ssh_probe(remote_cfg, _TOP_PROCESSES_PS_CMD, timeout=15)
         if not ok or not out:
             return {'cpu_top': [], 'mem_top': [], 'error': (out or 'ssh failed')[:80]}
         by_name = {}
@@ -68971,7 +69011,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
   </div>
 </div>
 <div class="metrics-bar" id="metrics-bar">
-<div class="metric-card"><div class="metric-label">CPU</div><div class="metric-value" id="cpu-value">{{ metrics.cpu_percent }}%</div></div>
+<div class="metric-card"><div class="metric-label">CPU</div><div class="metric-value" id="cpu-value">{{ metrics.cpu_percent }}%</div><div class="metric-detail" id="cpu-detail">1-min avg &middot; now {{ metrics.cpu_percent_now }}%</div></div>
 <div class="metric-card"><div class="metric-label">Memory</div><div class="metric-value" id="ram-value">{{ metrics.ram_percent }}%</div><div class="metric-detail" id="ram-detail">{{ metrics.ram_used_gb }}GB / {{ metrics.ram_total_gb }}GB</div></div>
 <div class="metric-card"><div class="metric-label">Disk</div><div class="metric-value" id="disk-value">{{ metrics.disk_percent }}%</div><div class="metric-detail" id="disk-detail">{{ metrics.disk_used_gb }}GB / {{ metrics.disk_total_gb }}GB</div></div>
 <div class="metric-card"><div class="metric-label">Uptime</div><div class="metric-value" id="uptime-value" style="font-size:18px">{{ metrics.uptime }}</div></div>
@@ -69324,7 +69364,7 @@ async function confirmDiskFold(){
     }
 }
 diskLayoutRefresh();
-setInterval(async()=>{try{const r=await fetch('/api/metrics');const d=await r.json();document.getElementById('cpu-value').textContent=d.cpu_percent+'%';document.getElementById('ram-value').textContent=d.ram_percent+'%';document.getElementById('disk-value').textContent=d.disk_percent+'%';var _rd=document.getElementById('ram-detail');if(_rd&&d.ram_used_gb!=null)_rd.textContent=d.ram_used_gb+'GB / '+d.ram_total_gb+'GB';var _dd=document.getElementById('disk-detail');if(_dd&&d.disk_used_gb!=null)_dd.textContent=d.disk_used_gb+'GB / '+d.disk_total_gb+'GB';document.getElementById('uptime-value').textContent=d.uptime;if(d.unattended_upgrades_hosts)updateUUHosts(d.unattended_upgrades_hosts);}catch(e){}},5000);
+setInterval(async()=>{try{const r=await fetch('/api/metrics');const d=await r.json();document.getElementById('cpu-value').textContent=d.cpu_percent+'%';var _cd=document.getElementById('cpu-detail');if(_cd&&d.cpu_percent_now!=null)_cd.textContent='1-min avg · now '+d.cpu_percent_now+'%';document.getElementById('ram-value').textContent=d.ram_percent+'%';document.getElementById('disk-value').textContent=d.disk_percent+'%';var _rd=document.getElementById('ram-detail');if(_rd&&d.ram_used_gb!=null)_rd.textContent=d.ram_used_gb+'GB / '+d.ram_total_gb+'GB';var _dd=document.getElementById('disk-detail');if(_dd&&d.disk_used_gb!=null)_dd.textContent=d.disk_used_gb+'GB / '+d.disk_total_gb+'GB';document.getElementById('uptime-value').textContent=d.uptime;if(d.unattended_upgrades_hosts)updateUUHosts(d.unattended_upgrades_hosts);}catch(e){}},5000);
 function refreshModuleCards(){
     fetch('/api/modules').then(r=>r.json()).then(function(mods){
         for(var k in mods){
@@ -71133,7 +71173,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 {% endif %}
 <div class="metrics-bar" id="metrics-bar">
-<div class="metric-card"><div class="metric-label">CPU</div><div class="metric-value" id="cpu-value">{{ metrics.cpu_percent }}%</div></div>
+<div class="metric-card"><div class="metric-label">CPU</div><div class="metric-value" id="cpu-value">{{ metrics.cpu_percent }}%</div><div class="metric-detail" id="cpu-detail">1-min avg &middot; now {{ metrics.cpu_percent_now }}%</div></div>
 <div class="metric-card"><div class="metric-label">Memory</div><div class="metric-value" id="ram-value">{{ metrics.ram_percent }}%</div><div class="metric-detail" id="ram-detail">{{ metrics.ram_used_gb }}GB / {{ metrics.ram_total_gb }}GB</div></div>
 <div class="metric-card"><div class="metric-label">Disk</div><div class="metric-value" id="disk-value">{{ metrics.disk_percent }}%</div><div class="metric-detail" id="disk-detail">{{ metrics.disk_used_gb }}GB / {{ metrics.disk_total_gb }}GB</div></div>
 <div class="metric-card"><div class="metric-label">Uptime</div><div class="metric-value" id="uptime-value" style="font-size:18px">{{ metrics.uptime }}</div></div>
@@ -71165,7 +71205,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 </div>
 <script>
-setInterval(async()=>{try{const r=await fetch('/api/metrics');const d=await r.json();document.getElementById('cpu-value').textContent=d.cpu_percent+'%';document.getElementById('ram-value').textContent=d.ram_percent+'%';document.getElementById('disk-value').textContent=d.disk_percent+'%';var _rd=document.getElementById('ram-detail');if(_rd&&d.ram_used_gb!=null)_rd.textContent=d.ram_used_gb+'GB / '+d.ram_total_gb+'GB';var _dd=document.getElementById('disk-detail');if(_dd&&d.disk_used_gb!=null)_dd.textContent=d.disk_used_gb+'GB / '+d.disk_total_gb+'GB';document.getElementById('uptime-value').textContent=d.uptime}catch(e){}},5000);
+setInterval(async()=>{try{const r=await fetch('/api/metrics');const d=await r.json();document.getElementById('cpu-value').textContent=d.cpu_percent+'%';var _cd=document.getElementById('cpu-detail');if(_cd&&d.cpu_percent_now!=null)_cd.textContent='1-min avg · now '+d.cpu_percent_now+'%';document.getElementById('ram-value').textContent=d.ram_percent+'%';document.getElementById('disk-value').textContent=d.disk_percent+'%';var _rd=document.getElementById('ram-detail');if(_rd&&d.ram_used_gb!=null)_rd.textContent=d.ram_used_gb+'GB / '+d.ram_total_gb+'GB';var _dd=document.getElementById('disk-detail');if(_dd&&d.disk_used_gb!=null)_dd.textContent=d.disk_used_gb+'GB / '+d.disk_total_gb+'GB';document.getElementById('uptime-value').textContent=d.uptime}catch(e){}},5000);
 </script></body></html>'''
 
 # === TAK Server Template ===
