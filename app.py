@@ -768,7 +768,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.15-alpha"
+VERSION = "10.1.16-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -8144,6 +8144,7 @@ def _harden_sensitive_permissions(plog=None):
     # chmod alone: a legitimate consumer needs cross-uid read. The fix is a
     # separate, narrower cert path for Node-RED (or a shared group), tracked on
     # the roadmap — NOT a blanket chmod. Do not re-add this without solving that.
+    # Leftover 600s from the W7 window are healed by _heal_nodered_cert_read_access().
     #
     # Module .env files (we generate these). Cover both the non-root home and the
     # root-era layout that pre-flip boxes still carry.
@@ -8223,6 +8224,66 @@ def _harden_sensitive_permissions(plog=None):
              '(_read_priv / _read_coreconfig) before tightening again: '
              + '; '.join(blocked))
     return fixed
+
+
+def _heal_nodered_cert_read_access(plog=None):
+    """v10.1.16 — heal leftover W7 damage on the one cert pair Node-RED must read.
+
+    W7 (cabf599) blanket-tightened /opt/tak/certs to 600 and was reverted ~40
+    minutes later (705d9e6) — but the revert only STOPPED the chmod; it never
+    restored files already tightened. Boxes whose feeds broke loudly were fixed
+    by hand during the 2026-07-25 incident; a box with flows deployed but no
+    configurator configs fails silently ([tls-config:TAK Mission API TLS]
+    EACCES in the container log and nothing else) — found on the NUC
+    2026-08-01, five weeks stale.
+
+    This is the sanctioned EXCEPTION to "only tighten, never widen"
+    (_harden_sensitive_permissions above): exactly two files, admin.pem and
+    admin.key under /opt/tak/certs/files, restored to the 644 that TAK's own
+    cert scripts produce — the Node-RED container (uid 1000) reads them through
+    a bind mount while `tak` owns them, so owner-only modes starve a legitimate
+    consumer (operator decision 2026-07-25: Node-RED keeps the admin cert).
+    Runs only when a local Node-RED install exists (the consumer), never
+    touches ownership, and never touches any other file — CA/signing keys stay
+    as tight as they are. Idempotent, cheap, every boot."""
+    def _say(m):
+        (plog or (lambda x: print(f"Node-RED cert heal: {x}", flush=True)))(m)
+
+    # The consumer: a local Node-RED install — compose dir in this console's
+    # home, or the container itself (a root-era ~/node-red is invisible to a
+    # flipped takwerx console; same union as detect_modules()).
+    present = os.path.exists(os.path.join(os.path.expanduser('~/node-red'), 'docker-compose.yml'))
+    if not present:
+        try:
+            r = subprocess.run(['docker', 'ps', '-a', '--filter', 'name=nodered',
+                                '--format', '{{.Names}}'],
+                               capture_output=True, text=True, timeout=8,
+                               env=_broker_shim_env())
+            present = bool((r.stdout or '').strip())
+        except Exception:
+            present = False
+    if not present:
+        return
+
+    for fname in ('admin.pem', 'admin.key'):
+        path = f'/opt/tak/certs/files/{fname}'
+        try:
+            r = subprocess.run(_sudo_wrap(['stat', '-c', '%a', path]),
+                               capture_output=True, text=True, timeout=15)
+            cur = (r.stdout or '').strip()
+            if not cur or r.returncode != 0:
+                continue                      # TAK not installed / file absent
+            if int(cur, 8) & 0o044 == 0o044:
+                continue                      # group+other read already present
+            c = subprocess.run(_sudo_wrap(['chmod', '644', path]),
+                               capture_output=True, timeout=15)
+            if c.returncode == 0:
+                _say(f'{path} {cur}->644 (Node-RED bind-mount consumer, uid 1000)')
+            else:
+                _say(f'⚠ could not restore {path} (mode {cur}) — Node-RED TAK '
+                     f'TLS will fail with EACCES until it is 644')
+        except Exception:
+            continue
 
 
 # v10.1.9 W1: bump whenever the retrofit's BEHAVIOUR changes, so boxes that
@@ -46048,6 +46109,1226 @@ def authentik_reputation_clear_scores_api():
         return jsonify({'ok': False, 'error': str(e)[:200]}), 500
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Identity Bridge (v10.1.16) — agency AD/Entra → Authentik SCIM → auto agency
+# + TAK Portal template. W1 config store, W2 reconciler, W3 routes, W5 loop,
+# W7 username derivation.
+# Provisioning half only: roster in + auto assignment (no OAuth login leg).
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ── W7: username derivation ────────────────────────────────────────────────
+# TAK Portal usernames are <base><token> (or <token><base>), where the token is
+# the agency's lowercased `suffix` and the order is its `usernameTokenPlacement`.
+# The portal builds that ONLY in its own create-user flow
+# (services/access.service.js:139-158) and has NO rename path anywhere, so a
+# SCIM-created user never gets one — we must supply it.
+#
+# Why this runs as an Authentik property mapping and not (only) as a rename:
+# probed on the NUC 2026-08-01, every SCIM push (PATCH and PUT alike) re-runs
+# the source's property mappings and OVERWRITES `username` from the incoming
+# `userName`. A bare reconciler rename therefore flaps — we rename, the agency's
+# next push reverts it. The mapping is the only mechanism that holds, and it is
+# self-healing because it re-asserts on every push. (Attributes and group
+# memberships are NOT clobbered by a push — verified — so W2 is unaffected.)
+
+IDP_USERNAME_MAX_BASE = 64          # portal has no cap; Authentik's is 150
+IDP_USERNAME_ALLOWED_RE = re.compile(r'[^a-z0-9._-]')
+
+# Fleet constant, NOT a per-agency knob (fleet-uniform rule). Every box joins
+# the identifier and the agency token with this. The portal concatenates bare,
+# but bare concatenation means two agencies share a username namespace whenever
+# one token is a head/tail of the other (`pd` vs `spd`) — and Authentik ADOPTS a
+# colliding username instead of rejecting it (sources/scim/views/v2/users.py:
+# `if _user := User.objects.filter(username=...).first(): user = _user`), which
+# makes that a silent cross-agency ACCOUNT TAKEOVER. The separator makes it
+# impossible to express rather than something we detect afterwards.
+IDP_USERNAME_SEP = '.'
+
+# Which SCIM attribute carries the agency's unique employee identifier. Agencies
+# do not all put it in the same place and WE write the spec their IT implements,
+# so this is per-bridge config, not a guess. Value -> how to read it from the
+# raw SCIM payload.
+IDP_SCIM_ENTERPRISE_EXT = 'urn:ietf:params:scim:schemas:extension:enterprise:2.0:User'
+IDP_USERNAME_FIELDS = {
+    'employeeNumber': 'Employee number (SCIM enterprise extension) — recommended',
+    'externalId': 'externalId (always sent by Entra, usually a GUID)',
+    'userName': 'userName (local-part before any @)',
+    'title': 'title',
+}
+IDP_USERNAME_FIELD_DEFAULT = 'employeeNumber'
+
+
+def _idp_normalize_base(raw):
+    """Normalise an agency-supplied identifier to the portal's badge charset
+    (^[A-Za-z0-9._-]+$ — validateBadgeNumber, users.service.js:84-92).
+
+    Deliberately MINIMAL: lowercase and strip whitespace, nothing else. This is
+    the agency's own badge/employee number, so we must not mangle it — a value
+    that still fails the charset is reported, not silently repaired. Returns ''
+    when nothing usable is left, and the caller must then SKIP the user.
+
+    (The previous name-derivation folded accents, stripped apostrophes and
+    collapsed spaces. All of that is gone with the name-based scheme: names are
+    not unique, and a colliding username is an account takeover, not an error.)
+    """
+    s = str(raw or '').strip().lower()
+    s = re.sub(r'\s+', '', s)
+    if not s or IDP_USERNAME_ALLOWED_RE.search(s):
+        return ''
+    return s[:IDP_USERNAME_MAX_BASE]
+
+
+def _idp_username_field(bridge):
+    f = str((bridge or {}).get('username_field') or IDP_USERNAME_FIELD_DEFAULT).strip()
+    return f or IDP_USERNAME_FIELD_DEFAULT
+
+
+def _idp_read_scim_field(scim_user, field):
+    """Raw (un-normalised) value of the configured field from a SCIM record.
+    Unknown field names are treated as a literal key or a dotted path, so an
+    operator can point at something we did not anticipate."""
+    d = scim_user if isinstance(scim_user, dict) else {}
+    if field == 'employeeNumber':
+        ext = d.get(IDP_SCIM_ENTERPRISE_EXT)
+        return (ext or {}).get('employeeNumber') if isinstance(ext, dict) else None
+    if field == 'externalId':
+        return d.get('externalId')
+    if field == 'userName':
+        return str(d.get('userName') or '').split('@', 1)[0]
+    if field == 'title':
+        return d.get('title')
+    cur = d
+    for part in str(field).split('.'):
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(part)
+    return cur
+
+
+def _idp_derive_base(scim_user, bridge=None):
+    """base = the AGENCY'S unique employee identifier (badge / employee number),
+    read from the bridge's configured field. NEVER derived from a person's name.
+
+    Operator decision 2026-08-01: names are not unique — two J. Smiths at one
+    agency both derive `jsmith`, and Authentik then merges them into one
+    account. The agency already guarantees uniqueness of its own badge numbers,
+    which is exactly what they are for, and TAK Portal already models this: its
+    field is labelled "Badge Number / Username" and it stores the pre-token
+    value as `badge_number`.
+
+    Returns '' when the field is absent/empty/unusable — the caller MUST skip
+    the user and say so. There is no fallback to the name: a silent fallback
+    re-introduces the collision this whole design removes.
+    """
+    return _idp_normalize_base(
+        _idp_read_scim_field(scim_user, _idp_username_field(bridge)))
+
+
+def _idp_agency_token(agency):
+    """(token, placement) for an agency record — mirrors the portal exactly:
+    token is `suffix` LOWERCASED (never groupPrefix, not even for prefix
+    placement); placement is 'prefix' only for the portal's recognised aliases,
+    everything else — including missing or garbage — falls back to 'suffix'
+    (normalizeUsernameTokenPlacement, access.service.js:116-127)."""
+    a = agency if isinstance(agency, dict) else {}
+    # The token is embedded in the generated property-mapping source AND lands
+    # in usernames. repr() already makes the embedding injection-proof, but we
+    # constrain the charset anyway: belt-and-braces on generated code, and it
+    # keeps the username inside the portal's own accepted set.
+    token = IDP_USERNAME_ALLOWED_RE.sub('', str(a.get('suffix') or '').strip().lower())
+    raw = a.get('usernameTokenPlacement')
+    if raw is None:
+        raw = a.get('usernameSuffixPlacement')
+    v = str(raw or '').strip().lower()
+    placement = 'prefix' if v in ('prefix', 'start', 'before', 'leading') else 'suffix'
+    return token, placement
+
+
+def _idp_username_for(base, agency):
+    """Join the agency token to the identifier with IDP_USERNAME_SEP.
+
+    The portal itself concatenates bare (access.service.js:155-157) so a
+    bridged username is NOT byte-identical to a hand-created one (`1234.fire`
+    vs `e-1fire`). That divergence is deliberate and was weighed: the portal
+    still infers the agency correctly because it matches on endsWith(suffix),
+    and TAK's LDAP bind `cn={username}` is fine with a period. What we get in
+    return is that no agency can ever produce another agency's username."""
+    token, placement = _idp_agency_token(agency)
+    if not base or not token:
+        return ''
+    return (token + IDP_USERNAME_SEP + base) if placement == 'prefix' \
+        else (base + IDP_USERNAME_SEP + token)
+
+
+def _idp_token_ambiguity(agency, agencies):
+    """Agencies whose token makes usernames ambiguous with this one.
+
+    Usernames are BARE concatenation (the portal uses no separator and we must
+    match it byte-for-byte), so two agencies collide whenever one token is a
+    prefix/suffix of the other: agency `pd` + officer "Jane Adams" → jadamspd,
+    and agency `spd` + a crafted "J Adam" → jadamspd too. The agency's own AD
+    controls the name half, so this is reachable by a remote party, not just
+    bad luck — one agency can mint a username that reads as another's officer,
+    or squat it so the real officer can never be provisioned.
+
+    We cannot fix it by adding a separator (that would diverge from the
+    portal's own usernames, which is the whole point of W7), and placement is
+    immutable, so this is SURFACED, never silently "handled"."""
+    token, placement = _idp_agency_token(agency)
+    out = []
+    if not token:
+        return out
+    for other in (agencies or []):
+        # identity, not suffix-equality: the portal enforces unique suffixes
+        # today, but keying "is this me?" on the very field we are testing for
+        # collisions would silently skip the worst case if that ever changes.
+        if not isinstance(other, dict) or other is agency:
+            continue
+        otok, oplace = _idp_agency_token(other)
+        if not otok:
+            continue
+        if placement == 'prefix' and oplace == 'prefix':
+            bad = token.startswith(otok) or otok.startswith(token)
+        elif placement == 'suffix' and oplace == 'suffix':
+            bad = token.endswith(otok) or otok.endswith(token)
+        else:
+            bad = (token == otok)
+        if bad:
+            out.append(f'{other.get("name") or otok} ({otok})')
+    return out
+
+
+def _idp_username_preview(agency, bridge=None):
+    """Human-readable example for the wizard/instruction sheet. Placement and
+    token are IMMUTABLE once an agency exists (no portal edit path), so showing
+    the resulting shape before the operator connects is the only chance to
+    notice a wrong one."""
+    token, placement = _idp_agency_token(agency)
+    if not token:
+        return ''
+    field = _idp_username_field(bridge)
+    example = _idp_username_for('1234', agency) or '1234'
+    where = 'before' if placement == 'prefix' else 'after'
+    return (f'Users will sign in as "{example}" — the employee identifier the '
+            f'agency sends in "{field}", with the agency code "{token}" {where} '
+            f'it, separated by "{IDP_USERNAME_SEP}".')
+
+
+def _idp_property_mapping_expression(agency, bridge=None):
+    """The Python body for the per-bridge Authentik SCIM SOURCE property
+    mapping. Runs inside Authentik on every push, so it must be self-contained
+    and must never raise — an exception here fails the agency's whole roster.
+
+    Contract — read from the CODE, not the docs. The docs page says "each
+    top-level SCIM attribute becomes a variable"; for SCIM *sources* that is
+    wrong, and following it cost a failed live test on the NUC (the mapping
+    returned {} and authentik silently kept the base username, with no error
+    event because nothing raised). The truth, from
+    authentik/sources/scim/views/v2/base.py:
+        self.manager = self.mapper.get_manager(self.model, ["data"])
+    and core/sources/mapper.py, which builds the context as
+        ["source", "properties"] + context_keys
+    so an expression gets exactly three useful names: `data` (the whole SCIM
+    payload), `properties` (the base properties authentik already derived), and
+    `source`. There is no bare `userName`/`name`/`emails`.
+
+    Merge order (core/sources/mapper.py:build_object_properties): base
+    properties first — sources/scim/models.py:get_base_user_properties sets
+    `username = data["userName"]` — then each mapping's dict merged on top.
+
+    FAIL CLOSED. If the configured identifier field is missing we return {},
+    which leaves authentik's base username in place... which would be the raw
+    userName, i.e. exactly the un-namespaced value we are trying to avoid. So
+    instead we return a username authentik will REJECT? No — authentik would
+    then adopt-or-create something wrong. The only safe option is to raise a
+    ValueError, which authentik catches, logs as a CONFIGURATION_ERROR event,
+    and which causes the record to be skipped rather than created wrong.
+    """
+    token, placement = _idp_agency_token(agency)
+    field = _idp_username_field(bridge)
+    return (
+        "# infra-TAK Identity Bridge - generated, do not hand-edit.\n"
+        "# Username = the agency's own employee identifier + the agency code,\n"
+        "# joined by a separator so two agencies can never collide.\n"
+        "import re\n"
+        f"TOKEN = {token!r}\n"
+        f"PLACEMENT = {placement!r}\n"
+        f"SEP = {IDP_USERNAME_SEP!r}\n"
+        f"FIELD = {field!r}\n"
+        f"EXT = {IDP_SCIM_ENTERPRISE_EXT!r}\n"
+        "def _norm(raw):\n"
+        "    s = str(raw or '').strip().lower()\n"
+        "    s = re.sub(r'\\s+', '', s)\n"
+        "    if not s or re.search(r'[^a-z0-9._-]', s):\n"
+        "        return ''\n"
+        f"    return s[:{IDP_USERNAME_MAX_BASE}]\n"
+        "def _v(fn, default=None):\n"
+        "    try:\n"
+        "        return fn()\n"
+        "    except Exception:\n"
+        "        return default\n"
+        "_d = _v(lambda: data, None)\n"
+        "_d = _d if isinstance(_d, dict) else {}\n"
+        "_raw = None\n"
+        "if FIELD == 'employeeNumber':\n"
+        "    _e = _d.get(EXT)\n"
+        "    _raw = _e.get('employeeNumber') if isinstance(_e, dict) else None\n"
+        "elif FIELD == 'externalId':\n"
+        "    _raw = _d.get('externalId')\n"
+        "elif FIELD == 'userName':\n"
+        "    _raw = str(_d.get('userName') or '').split('@')[0]\n"
+        "elif FIELD == 'title':\n"
+        "    _raw = _d.get('title')\n"
+        "else:\n"
+        "    _cur = _d\n"
+        "    for _p in FIELD.split('.'):\n"
+        "        _cur = _cur.get(_p) if isinstance(_cur, dict) else None\n"
+        "    _raw = _cur\n"
+        "_base = _norm(_raw)\n"
+        "if not _base or not TOKEN:\n"
+        "    # Fail closed. Falling through would let authentik keep the raw\n"
+        "    # userName, i.e. an un-namespaced account that can collide with -\n"
+        "    # and silently take over - another agency's user. Raising makes\n"
+        "    # authentik log a CONFIGURATION_ERROR and skip the record.\n"
+        "    raise ValueError(\n"
+        "        'infra-TAK Identity Bridge: no usable value in %r for user %r. '\n"
+        "        'The agency must send a unique employee identifier in that '\n"
+        "        'field (letters, digits, dot, dash, underscore only).'\n"
+        "        % (FIELD, _d.get('userName')))\n"
+        "return {'username': (TOKEN + SEP + _base) if PLACEMENT == 'prefix' "
+        "else (_base + SEP + TOKEN)}\n"
+    )
+
+
+IDP_MAPPING_NAME_FMT = 'infra-TAK Identity Bridge username ({slug})'
+
+
+def _idp_ensure_property_mapping(ak_url, ak_headers, source_slug, agency, bridge=None):
+    """W7 Layer 1 — create/update the per-source username property mapping and
+    make sure the SCIM source actually uses it.
+
+    Returns (ok: bool, detail: str). Never raises.
+
+    Two things this is careful about:
+      * **Append, never replace.** If `user_property_mappings` is set to ONLY
+        ours, authentik stops running the stock mappings and the roster loses
+        email/display name. We read the current list and add ours to it.
+      * **Regenerate every time.** The expression has the agency's token and
+        placement baked in, so re-writing it on every create/save keeps the box
+        fleet-uniform and self-correcting rather than trusting stored state.
+    """
+    name = IDP_MAPPING_NAME_FMT.format(slug=source_slug)
+    expr = _idp_property_mapping_expression(agency, bridge)
+    try:
+        existing = None
+        for m in _idp_ak_list(ak_url, ak_headers,
+                              f'propertymappings/source/scim/?name={urllib.parse.quote(name)}'):
+            if m.get('name') == name:
+                existing = m
+                break
+        if existing:
+            if (existing.get('expression') or '') != expr:
+                _idp_ak_json(ak_url, ak_headers,
+                             f"propertymappings/source/scim/{existing['pk']}/",
+                             {'name': name, 'expression': expr}, 'PATCH')
+                detail = 'mapping updated'
+            else:
+                detail = 'mapping already current'
+            pm_pk = existing['pk']
+        else:
+            created = _idp_ak_json(ak_url, ak_headers, 'propertymappings/source/scim/',
+                                   {'name': name, 'expression': expr}, 'POST')
+            pm_pk = created.get('pk')
+            detail = 'mapping created'
+        if not pm_pk:
+            return (False, 'could not create property mapping')
+
+        src = _idp_ak_json(ak_url, ak_headers,
+                           f'sources/scim/{urllib.parse.quote(source_slug)}/')
+        cur = list(src.get('user_property_mappings') or [])
+        if pm_pk not in cur:
+            cur.append(pm_pk)          # APPEND — never clobber the defaults
+            _idp_ak_json(ak_url, ak_headers,
+                         f'sources/scim/{urllib.parse.quote(source_slug)}/',
+                         {'user_property_mappings': cur}, 'PATCH')
+            detail += ', attached to source'
+        return (True, detail)
+    except Exception as e:
+        return (False, f'{type(e).__name__}: {str(e)[:160]}')
+
+
+def _idp_selftest_username():
+    """Guard the console-side derivation against drift. Returns [] when clean.
+    Called once at import; failures are logged, never fatal."""
+    mur = {'suffix': 'mur', 'usernameTokenPlacement': 'suffix'}
+    pre = {'suffix': 'tst', 'usernameTokenPlacement': 'prefix'}
+    EXT = 'urn:ietf:params:scim:schemas:extension:enterprise:2.0:User'
+    emp = {'username_field': 'employeeNumber'}
+    cases = [
+        # the normal path: agency badge number + separator + agency code
+        ({EXT: {'employeeNumber': '1234'}}, emp, mur, '1234.mur'),
+        ({EXT: {'employeeNumber': 'BC1'}}, emp, mur, 'bc1.mur'),
+        ({EXT: {'employeeNumber': 'e-1'}}, emp, mur, 'e-1.mur'),
+        ({EXT: {'employeeNumber': '1234'}}, emp, pre, 'tst.1234'),
+        # other configurable fields
+        ({'externalId': 'A77'}, {'username_field': 'externalId'}, mur, 'a77.mur'),
+        ({'userName': '9001@agency.example'}, {'username_field': 'userName'}, mur, '9001.mur'),
+        ({'title': '4412'}, {'username_field': 'title'}, mur, '4412.mur'),
+        # dotted custom path
+        ({'x': {'y': 'zz9'}}, {'username_field': 'x.y'}, mur, 'zz9.mur'),
+        # FAIL CLOSED — never fall back to a name
+        ({'name': {'givenName': 'John', 'familyName': 'Smith'}}, emp, mur, ''),
+        ({EXT: {'employeeNumber': ''}}, emp, mur, ''),
+        # whitespace is STRIPPED, not rejected — matches the portal's own
+        # normalizeBadge (users.service.js:77-82), which trims/lowercases and
+        # removes all whitespace before validating
+        ({EXT: {'employeeNumber': 'has space'}}, emp, mur, 'hasspace.mur'),
+        # charset is the portal's: reject rather than mangle
+        ({EXT: {'employeeNumber': "o'brien"}}, emp, mur, ''),
+        ({EXT: {'employeeNumber': 'jos\u00e9'}}, emp, mur, ''),
+        # placement garbage falls back to suffix, exactly like the portal
+        ({EXT: {'employeeNumber': '55'}}, emp,
+         {'suffix': 'mur', 'usernameTokenPlacement': 'sideways'}, '55.mur'),
+    ]
+    fails = []
+    for rec, br, ag, want in cases:
+        got = _idp_username_for(_idp_derive_base(rec, br), ag)
+        if got != want:
+            fails.append(f'{rec} + {br} + {ag.get("suffix")} -> {got!r} (want {want!r})')
+    # the separator is what makes cross-agency collision impossible — prove it
+    a = _idp_username_for(_idp_derive_base({EXT: {'employeeNumber': '1234'}}, emp),
+                          {'suffix': 'pd'})
+    b = _idp_username_for(_idp_derive_base({EXT: {'employeeNumber': '1234'}}, emp),
+                          {'suffix': 'spd'})
+    if a == b or not a.endswith('.pd') or not b.endswith('.spd'):
+        fails.append(f'separator failed to namespace: {a!r} vs {b!r}')
+    return fails
+
+
+try:
+    _idp_st = _idp_selftest_username()
+    if _idp_st:
+        print(f'[idp-bridge] WARNING username derivation selftest failed: {_idp_st}')
+except Exception as _e:
+    print(f'[idp-bridge] WARNING username selftest error: {_e}')
+
+# W1 — config store: .config/idp-bridges.json, mode 600.
+# Shape: {'bridges': {slug: {agency_suffix, scim_source_slug,
+#         map:{adGroup:template}, default_template, enabled,
+#         policy:'ad_owns_template', last_status:{…}}}}
+# SCIM tokens stay in Authentik — this file holds no secrets.
+IDP_BRIDGES_PATH = os.path.join(CONFIG_DIR, 'idp-bridges.json')
+IDP_BRIDGE_SLUG_RE = re.compile(r'^[-a-zA-Z0-9_]{1,64}$')
+_idp_bridges_write_lock = threading.Lock()
+_idp_bridge_sync_lock = threading.Lock()  # serialize Sync Now vs the 300s loop
+
+
+def _idp_bridges_load():
+    try:
+        with open(IDP_BRIDGES_PATH) as f:
+            d = json.loads(f.read())
+        if isinstance(d, dict) and isinstance(d.get('bridges'), dict):
+            return d
+    except Exception:
+        pass
+    return {'bridges': {}}
+
+
+def _idp_bridges_save(data):
+    # Atomic write (tmp+fsync+replace, same shields as save_settings) — the
+    # mapping table is operator-entered state a torn write must not wipe.
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with _idp_bridges_write_lock:
+        tmp = IDP_BRIDGES_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, IDP_BRIDGES_PATH)
+
+
+def _idp_bridge_portal_file(path):
+    """Read a JSON file out of the tak-portal container. None = container
+    absent/unreadable (the caller decides whether that's a skip or an error)."""
+    try:
+        r = subprocess.run(
+            _sudo_wrap(['docker', 'exec', 'tak-portal', 'cat', path]),
+            capture_output=True, text=True, timeout=15)
+        if r.returncode != 0 or not (r.stdout or '').strip():
+            return None
+        return json.loads(r.stdout)
+    except Exception:
+        return None
+
+
+def _idp_ak_list(ak_url, ak_headers, path):
+    """GET an Authentik list endpoint following pagination; path may carry a query."""
+    results, page = [], 1
+    while True:
+        sep = '&' if '?' in path else '?'
+        res = _w1_ak_get(ak_url, f'{path}{sep}page={page}&page_size=100', ak_headers)
+        results.extend(res.get('results') or [])
+        nxt = int((res.get('pagination') or {}).get('next') or 0)
+        if nxt <= page:
+            break
+        page = nxt
+    return results
+
+
+def _idp_ak_json(ak_url, ak_headers, path, body=None, method='GET'):
+    resp = _ak_api_call(f'{ak_url}/api/v3/{path}',
+                        data=json.dumps(body).encode() if body is not None else None,
+                        method=method, headers=ak_headers)
+    raw = resp.read().decode() or '{}'
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+
+def _idp_ak_group_by_name(ak_url, ak_headers, name, cache):
+    """Exact-name group lookup (with per-pass cache). Returns the full group
+    object incl. `users` pks, or None. ONLY for OUR OWN objects — the portal's
+    template groups (tak_*), whose names come from agency-templates.json.
+    Incoming/role groups are resolved by SCIM-source linkage instead (see
+    _idp_bridge_reconcile) so one agency's feed can't claim another's group by
+    name. Names go into the URL — always quoted."""
+    if name in cache:
+        return cache[name]
+    g = None
+    try:
+        for cand in _idp_ak_list(ak_url, ak_headers,
+                                 f'core/groups/?name={urllib.parse.quote(name)}&include_users=true'):
+            if cand.get('name') == name:
+                g = cand
+                break
+    except Exception:
+        g = None
+    cache[name] = g
+    return g
+
+
+def _idp_converge_usernames(ak_url, ak_headers, slug, agency, bridge, summary, warn):
+    """W7 Layer 2 — bring users that landed BEFORE the property mapping existed
+    onto the derived username, and record the base for badge_number.
+
+    Returns {user_pk: base} for every SCIM user of this source (renamed or not)
+    so the attribute pass can stamp `badge_number` without re-deriving.
+
+    On its own a rename is futile — a SCIM push overwrites `username` from the
+    incoming `userName` (probed 2026-08-01). This is only correct BECAUSE the
+    property mapping is installed first: mapping and rename then agree, so this
+    is a convergence accelerator for the backlog, not a tug-of-war.
+
+    Rename guard — the username IS the LDAP bind identity an ATAK/iTAK EUD
+    authenticates with, so a rename breaks a deployed user's login:
+      1. only users this SCIM source owns (membership in scim_users IS the
+         proof — a hand-created user never appears there), and
+      2. only users who have NEVER signed in (`last_login` is null), and
+      3. never pinned.
+    Anything else that needs a rename is surfaced as a named, actionable row.
+    """
+    bases = {}
+    try:
+        rows = _idp_ak_list(ak_url, ak_headers,
+                            f'sources/scim_users/?source__slug={urllib.parse.quote(slug)}')
+    except Exception as e:
+        warn(f'could not list SCIM source users: {str(e)[:120]}')
+        return bases
+    for row in rows:
+        try:
+            uo = row.get('user_obj') or {}
+            pk, cur = row.get('user'), (uo.get('username') or '')
+            if pk is None:
+                continue
+            raw = row.get('attributes') if isinstance(row.get('attributes'), dict) else {}
+            base = _idp_derive_base(raw, bridge)
+            if not base:
+                warn(f'{cur or pk}: no usable value in the {_idp_username_field(bridge)!r} field — SKIPPED (the agency must send a unique employee identifier there)')
+                continue
+            bases[pk] = base
+            want = _idp_username_for(base, agency)
+            if not want or want == cur:
+                continue
+            if (uo.get('attributes') or {}).get('idp_bridge', {}).get('pinned') is True:
+                continue
+            if uo.get('last_login'):
+                summary['rename_skipped'].append(f'{cur} → {want} (has signed in)')
+                continue
+            # Never rename ONTO an existing account. The target may belong to
+            # another agency (tokens can be prefix/suffix-ambiguous — see
+            # _idp_token_ambiguity) or be a hand-created/privileged user. The
+            # PATCH would fail on the unique constraint anyway; catching it here
+            # turns a silent 400 into a named, actionable row.
+            taken = [u for u in _idp_ak_list(
+                ak_url, ak_headers, f'core/users/?username={urllib.parse.quote(want)}')
+                if u.get('username') == want and u.get('pk') != pk]
+            if taken:
+                summary['collisions'].append(
+                    f'{cur} → {want} (already taken by user pk {taken[0].get("pk")})')
+                warn(f'{cur}: target username {want!r} already exists and is NOT this '
+                     'agency\'s user — not renamed; resolve by hand')
+                continue
+            _idp_ak_json(ak_url, ak_headers, f'core/users/{pk}/', {'username': want}, 'PATCH')
+            summary['renamed'] += 1
+            summary['rename_detail'].append(f'{cur} → {want}')
+        except Exception as e:
+            warn(f'username converge {row.get("external_id")}: {str(e)[:120]}')
+    return bases
+
+
+def _idp_bridge_reconcile(slug, bridge):
+    """W2 — one reconcile pass for one bridge (generalizes the NUC-proven
+    poc-glue.py): stamp the portal's create-user attribute contract on every
+    SCIM-fed user and add the mapped template's Authentik groups.
+
+    Invariants (PLAN v10.1.16): add-only on groups (never remove), merge-only
+    on attributes, skip pinned (attributes.idp_bridge.pinned == true), unmapped
+    group → default_template, missing template/group ⇒ warning in status —
+    never exception-out of the loop. Multi-role users get the UNION of all
+    matched templates' groups with current_template = the template of the
+    alphabetically-first matched mapping (deterministic), and are flagged.
+    Idempotent: attributes compared before PATCH (applied_at excluded), group
+    membership checked before add — a clean second pass reports 0 changes."""
+    now = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+    summary = {'ts': now, 'ok': False, 'skipped': False,
+               'users_seen': 0, 'converged': 0, 'changed': 0, 'pinned': 0,
+               'unmapped': 0, 'multi_role': [], 'warnings': [],
+               'incoming_groups': [],
+               # W7
+               'renamed': 0, 'rename_detail': [], 'rename_skipped': [],
+               'removed': 0, 'removed_detail': [],
+               'mapping': '', 'username_preview': '', 'collisions': []}
+
+    def warn(msg):
+        if msg not in summary['warnings']:
+            summary['warnings'].append(msg)
+
+    ak_url, ak_headers, settings = _w1_ak_ctx()
+    if not ak_url:
+        summary['skipped'] = True
+        warn('Authentik token unavailable (is Authentik installed?)')
+        return summary
+    agencies = _idp_bridge_portal_file('/usr/src/app/data/agencies.json')
+    templates = _idp_bridge_portal_file('/usr/src/app/data/agency-templates.json')
+    if not isinstance(agencies, list) or not isinstance(templates, list):
+        summary['skipped'] = True
+        warn('tak-portal container not readable — sync skipped')
+        return summary
+
+    suffix = (bridge.get('agency_suffix') or '').strip()
+    agency = next((a for a in agencies if isinstance(a, dict) and a.get('suffix') == suffix), None)
+    if not agency:
+        warn(f'agency {suffix!r} not found in TAK Portal agencies.json')
+        return summary
+    tpl_by_name = {t.get('name'): t for t in templates
+                   if isinstance(t, dict) and t.get('agencySuffix') == suffix}
+    mapping = {str(k): str(v) for k, v in (bridge.get('map') or {}).items() if k and v}
+    default_tpl = (bridge.get('default_template') or '').strip()
+    scim_slug = (bridge.get('scim_source_slug') or '').strip()
+
+    # ── W7 ── Layer 1 FIRST, always: the property mapping is what makes every
+    # future push land on the right username. Only once it is in place is a
+    # rename convergent rather than a flap (see _idp_converge_usernames).
+    summary['username_preview'] = _idp_username_preview(agency, bridge)
+    if not _idp_agency_token(agency)[0]:
+        warn(f'agency {suffix!r} has no username identifier set in TAK Portal — '
+             'usernames cannot be derived')
+    else:
+        _pm_ok, _pm_detail = _idp_ensure_property_mapping(ak_url, ak_headers, scim_slug, agency, bridge)
+        summary['mapping'] = _pm_detail
+        if not _pm_ok:
+            warn(f'username property mapping NOT installed ({_pm_detail}) — new users '
+                 'will land without the agency identifier')
+    base_by_pk = _idp_converge_usernames(ak_url, ak_headers, scim_slug, agency, bridge, summary, warn)
+
+    # Cross-agency ambiguity: bare concatenation means tokens that are a
+    # prefix/suffix of one another share a username namespace. Not fixable here
+    # (a separator would diverge from the portal's own usernames, and placement
+    # is immutable) — so name it loudly. The per-rename check in
+    # _idp_converge_usernames is the enforcement; this is the explanation.
+    for _amb in _idp_token_ambiguity(agency, agencies):
+        warn(f'agency identifier {_idp_agency_token(agency)[0]!r} is ambiguous with '
+             f'{_amb} — their usernames can collide; check any collision rows below')
+
+    # Intra-agency collisions: two people deriving to the same username. No
+    # silent mangling — a guessed username for a real officer is worse than a
+    # named failure.
+    _seen_base = {}
+    for _pk, _b in base_by_pk.items():
+        _seen_base.setdefault(_b, []).append(_pk)
+    for _b, _pks in sorted(_seen_base.items()):
+        if len(_pks) > 1:
+            _who = ', '.join(str(p) for p in sorted(_pks))
+            summary['collisions'].append(f'{_idp_username_for(_b, agency)} (user pks {_who})')
+            warn(f'{len(_pks)} users derive to the same username '
+                 f'{_idp_username_for(_b, agency)!r} — resolve manually; nothing was renamed')
+
+    gcache = {}
+    # Incoming role groups are resolved by the SCIM SOURCE LINKAGE (group_obj.pk
+    # from /sources/scim_groups/?source__slug=), NOT by global name lookup. On a
+    # multi-agency box a name lookup would let agency A's feed pick up a group
+    # named the same as agency B's role group and stamp B's agency/template
+    # (and B's TAK channel groups) onto A's users — a cross-agency privilege
+    # boundary break, and unrevertable because group adds are add-only. Only
+    # groups this bridge's own source pushed are ever treated as incoming.
+    incoming = {}   # name -> group pk (this source only)
+    try:
+        for sg in _idp_ak_list(ak_url, ak_headers,
+                               f'sources/scim_groups/?source__slug={urllib.parse.quote(scim_slug)}'):
+            go = sg.get('group_obj') or {}
+            nm, gpk = (go.get('name') or '').strip(), go.get('pk')
+            if nm and gpk:
+                incoming[nm] = gpk
+    except Exception:
+        warn('could not list SCIM source groups — no incoming groups this pass')
+    for nm in mapping:
+        if nm not in incoming:
+            warn(f'mapped group {nm!r} has not been pushed by this agency\'s SCIM source yet')
+
+    members_by_group = {}
+    for nm in sorted(incoming):
+        try:
+            g = _idp_ak_json(ak_url, ak_headers,
+                             f'core/groups/{urllib.parse.quote(str(incoming[nm]))}/?include_users=true')
+        except Exception as e:
+            warn(f'incoming group {nm!r}: {str(e)[:120]}')
+            continue
+        members_by_group[nm] = list(g.get('users') or [])
+        summary['incoming_groups'].append({
+            'name': nm, 'members': len(members_by_group[nm]),
+            'template': mapping.get(nm), 'mapped': nm in mapping})
+        if nm not in mapping:
+            warn(f'incoming group {nm!r} is not mapped — members get the default template')
+
+    # Source users = role-group members ∪ users this SCIM source pushed
+    # ∪ users previously stamped by this bridge (attributes.idp_bridge.source).
+    user_pks = set()
+    for pks in members_by_group.values():
+        user_pks.update(pks)
+    try:
+        for su in _idp_ak_list(ak_url, ak_headers,
+                               f'sources/scim_users/?source__slug={urllib.parse.quote(scim_slug)}'):
+            if su.get('user') is not None:
+                user_pks.add(su['user'])
+    except Exception:
+        pass
+    try:
+        _attr_q = urllib.parse.quote(json.dumps({'idp_bridge': {'source': slug}}))
+        for u in _idp_ak_list(ak_url, ak_headers, f'core/users/?attributes={_attr_q}'):
+            if u.get('pk') is not None:
+                user_pks.add(u['pk'])
+    except Exception:
+        pass
+
+    orphaned = 0
+    for pk in sorted(user_pks):
+        try:
+            user = _idp_ak_json(ak_url, ak_headers, f'core/users/{pk}/')
+            username = user.get('username') or str(pk)
+            attrs = user.get('attributes') or {}
+            ib = attrs.get('idp_bridge') or {}
+            summary['users_seen'] += 1
+            if ib.get('pinned') is True:
+                summary['pinned'] += 1
+                continue
+            matched = [nm for nm in sorted(mapping.keys())
+                       if pk in (members_by_group.get(nm) or [])]
+            in_any_incoming = any(pk in mpks for mpks in members_by_group.values())
+            if matched:
+                tpl_names = []
+                for nm in matched:
+                    if mapping[nm] not in tpl_names:
+                        tpl_names.append(mapping[nm])
+                current_tpl = mapping[matched[0]]
+                if len(matched) > 1 and len(summary['multi_role']) < 20:
+                    summary['multi_role'].append(username)
+            elif in_any_incoming:
+                summary['unmapped'] += 1
+                if not default_tpl:
+                    warn('users in unmapped groups present but no default template set')
+                    continue
+                tpl_names = [default_tpl]
+                current_tpl = default_tpl
+            else:
+                # previously bridge-managed, now in no incoming role group:
+                # merge-only philosophy — leave everything as-is, flag in status
+                orphaned += 1
+                summary['converged'] += 1
+                continue
+
+            tpl_groups, have_tpl = [], False
+            for tn in tpl_names:
+                tpl = tpl_by_name.get(tn)
+                if not tpl:
+                    warn(f'template {tn!r} not found for agency {suffix!r}')
+                    continue
+                have_tpl = True
+                for gn in (tpl.get('groups') or []):
+                    if gn not in tpl_groups:
+                        tpl_groups.append(gn)
+            if not have_tpl:
+                continue
+            cur_tpl_obj = tpl_by_name.get(current_tpl)
+            role = (cur_tpl_obj.get('role') or 'Team Member') if cur_tpl_obj else 'Team Member'
+
+            desired = dict(attrs)
+            desired.update({
+                'agency': agency.get('suffix'),
+                'agency_name': agency.get('name'),
+                'agency_abbreviation': agency.get('groupPrefix'),
+                'agency_color': agency.get('color'),
+                'role': role,
+                'current_template': current_tpl,
+            })
+            desired.setdefault('created_template', current_tpl)
+            desired.setdefault('created_method', 'idp-bridge')
+            desired.setdefault('created_at', now)
+            # W7: the rest of the portal's create-time contract. The portal's
+            # "Created By" column reads created_by_*; without them a bridged
+            # user renders differently from a hand-created one.
+            # badge_number is the PRE-token base (users.service.js:1319) and is
+            # written AUTHORITATIVELY, not setdefault: it must stay in lockstep
+            # with the derived username, and a stale operator-typed badge that
+            # disagrees with the username is wrong data, not a preference worth
+            # preserving. AD owns the name for a bridged user (policy is
+            # 'ad_owns_template').
+            if base_by_pk.get(pk):
+                desired['badge_number'] = base_by_pk[pk]
+            desired.setdefault('created_by_username', 'idp-bridge')
+            desired.setdefault('created_by_display_name', 'Identity Bridge')
+            new_ib = dict(ib)
+            new_ib['source'] = slug
+            new_ib['applied_template'] = current_tpl
+            desired['idp_bridge'] = new_ib
+
+            adds = []
+            for gn in tpl_groups:
+                g = _idp_ak_group_by_name(ak_url, ak_headers, gn, gcache)
+                if not g:
+                    warn(f'template group {gn!r} missing in Authentik')
+                    continue
+                if pk not in (g.get('users') or []):
+                    adds.append(g)
+
+            # ── Role change: the template IS the definition of what channels a
+            # user has, so when AD moves someone from Patrol to Command they must
+            # END UP with the new template's groups — not both. Add-only would
+            # make memberships cumulative and everyone would drift toward holding
+            # every channel the agency has, which quietly defeats offboarding.
+            #
+            # Strictly bounded: we only ever remove groups THIS BRIDGE recorded
+            # granting (idp_bridge.applied_groups). Groups added by hand, by the
+            # portal, or the incoming SCIM role groups themselves are never
+            # touched — the guarantee is "we never take away access we did not
+            # give".
+            removes = []
+            prev_granted = ib.get('applied_groups')
+            if isinstance(prev_granted, list):
+                for gn in prev_granted:
+                    if gn in tpl_groups:
+                        continue                      # still part of the new template
+                    g = _idp_ak_group_by_name(ak_url, ak_headers, gn, gcache)
+                    if g and pk in (g.get('users') or []):
+                        removes.append(g)
+            new_ib['applied_groups'] = list(tpl_groups)
+
+            # change detection excludes applied_at so a no-op pass PATCHes nothing
+            cmp_new = dict(desired)
+            cmp_new['idp_bridge'] = {k: v for k, v in new_ib.items() if k != 'applied_at'}
+            cmp_cur = dict(attrs)
+            cmp_cur['idp_bridge'] = {k: v for k, v in ib.items() if k != 'applied_at'}
+            if cmp_new != cmp_cur or adds or removes:
+                new_ib['applied_at'] = now
+                _idp_ak_json(ak_url, ak_headers, f'core/users/{pk}/',
+                             {'attributes': desired}, 'PATCH')
+                for g in adds:
+                    _idp_ak_json(ak_url, ak_headers,
+                                 f"core/groups/{g['pk']}/add_user/", {'pk': pk}, 'POST')
+                    g.setdefault('users', []).append(pk)
+                for g in removes:
+                    _idp_ak_json(ak_url, ak_headers,
+                                 f"core/groups/{g['pk']}/remove_user/", {'pk': pk}, 'POST')
+                    try:
+                        g['users'].remove(pk)
+                    except (KeyError, ValueError):
+                        pass
+                    summary['removed'] += 1
+                    if len(summary['removed_detail']) < 20:
+                        summary['removed_detail'].append(f'{username}: -{g.get("name")}')
+                summary['changed'] += 1
+            summary['converged'] += 1
+        except Exception as e:
+            warn(f'user {pk}: {str(e)[:120]}')
+
+    if orphaned:
+        warn(f'{orphaned} bridge-managed user(s) no longer in any incoming role group (left untouched)')
+    summary['ok'] = True
+    return summary
+
+
+def _idp_bridge_run_all(slugs=None, persist_skipped=False):
+    """Run reconcile for the given bridge slugs (None = all enabled bridges);
+    persist per-bridge last_status. Loop calls drop 'stack absent' skips so a
+    box without Authentik/portal doesn't churn the config file every 5 min."""
+    cfg = _idp_bridges_load()
+    bridges = cfg.get('bridges') or {}
+    if slugs is None:
+        slugs = [s for s, b in bridges.items() if b.get('enabled')]
+    out = {}
+    with _idp_bridge_sync_lock:
+        for s in slugs:
+            b = bridges.get(s)
+            if not b:
+                continue
+            try:
+                out[s] = _idp_bridge_reconcile(s, b)
+            except Exception as e:
+                out[s] = {'ok': False, 'ts': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+                          'warnings': [f'reconcile crashed: {str(e)[:160]}']}
+        if out:
+            cfg2 = _idp_bridges_load()
+            wrote = False
+            for s, summ in out.items():
+                if summ.get('skipped') and not persist_skipped:
+                    continue
+                if s in (cfg2.get('bridges') or {}):
+                    cfg2['bridges'][s]['last_status'] = summ
+                    wrote = True
+            if wrote:
+                _idp_bridges_save(cfg2)
+    return out
+
+
+def _idp_bridge_loop():
+    """W5 — background reconcile every 300 s (pattern: _offbox_shipper_loop).
+    Idle-cheap: no enabled bridges → just the sleep. Skips silently when
+    Authentik or the tak-portal container is absent (reconcile marks skipped)."""
+    while True:
+        time.sleep(300)
+        try:
+            _idp_bridge_run_all()
+        except Exception:
+            pass
+
+
+try:
+    threading.Thread(target=_idp_bridge_loop, daemon=True, name='idp-bridge').start()
+except Exception:
+    pass
+
+
+@app.route('/api/authentik/idp-bridge/status')
+@login_required
+def idp_bridge_status_api():
+    """W3 — bridges + per-bridge last_status (last sync, users seen/converged,
+    incoming groups w/ member counts + mapped template, warnings). Also serves
+    the wizard pick-lists (portal agencies + templates). No secrets in here."""
+    cfg = _idp_bridges_load()
+    agencies = _idp_bridge_portal_file('/usr/src/app/data/agencies.json')
+    templates = _idp_bridge_portal_file('/usr/src/app/data/agency-templates.json')
+    portal_ok = isinstance(agencies, list) and isinstance(templates, list)
+    out_bridges = {}
+    for slug, b in (cfg.get('bridges') or {}).items():
+        out_bridges[slug] = {
+            'agency_suffix': b.get('agency_suffix'),
+            'scim_source_slug': b.get('scim_source_slug'),
+            'map': b.get('map') or {},
+            'default_template': b.get('default_template') or '',
+            'username_field': _idp_username_field(b),
+            'enabled': bool(b.get('enabled')),
+            'policy': b.get('policy') or 'ad_owns_template',
+            'last_status': b.get('last_status') or {},
+        }
+    return jsonify({
+        'ok': True,
+        'portal_ok': portal_ok,
+        'username_fields': IDP_USERNAME_FIELDS,
+        'username_field_default': IDP_USERNAME_FIELD_DEFAULT,
+        'bridges': out_bridges,
+        # W7: placement/token are immutable once an agency exists, so the UI
+        # shows the resulting username shape BEFORE the operator connects.
+        'agencies': [{'suffix': a.get('suffix'), 'name': a.get('name'),
+                      'groupPrefix': a.get('groupPrefix'), 'color': a.get('color'),
+                      'token': _idp_agency_token(a)[0],
+                      'placement': _idp_agency_token(a)[1],
+                      'username_preview': _idp_username_preview(a),
+                      'ambiguous_with': _idp_token_ambiguity(a, agencies or [])}
+                     for a in (agencies or []) if isinstance(a, dict)],
+        'templates': [{'name': t.get('name'), 'agencySuffix': t.get('agencySuffix'),
+                       'role': t.get('role'), 'groups': len(t.get('groups') or [])}
+                      for t in (templates or []) if isinstance(t, dict)],
+    })
+
+
+@app.route('/api/authentik/idp-bridge/save', methods=['POST'])
+@login_required
+def idp_bridge_save_api():
+    """W3 — save mapping table / default template / enabled for one bridge."""
+    d = request.get_json(silent=True) or {}
+    slug = (d.get('slug') or '').strip()
+    if not IDP_BRIDGE_SLUG_RE.match(slug):
+        return jsonify({'ok': False, 'error': 'invalid bridge id'}), 400
+    cfg = _idp_bridges_load()
+    b = (cfg.get('bridges') or {}).get(slug)
+    if not b:
+        return jsonify({'ok': False, 'error': 'unknown bridge'}), 404
+    if 'map' in d:
+        m = d.get('map')
+        if not isinstance(m, dict):
+            return jsonify({'ok': False, 'error': 'map must be an object'}), 400
+        clean = {}
+        for k, v in m.items():
+            k, v = str(k).strip()[:128], str(v).strip()[:128]
+            if k and v:
+                clean[k] = v
+        b['map'] = clean
+    if 'default_template' in d:
+        b['default_template'] = str(d.get('default_template') or '').strip()[:128]
+    if 'username_field' in d:
+        uf = str(d.get('username_field') or '').strip() or IDP_USERNAME_FIELD_DEFAULT
+        if uf not in IDP_USERNAME_FIELDS and not re.match(r'^[A-Za-z0-9_.:-]{1,128}$', uf):
+            return jsonify({'ok': False, 'error': 'invalid username field'}), 400
+        b['username_field'] = uf
+    if 'enabled' in d:
+        b['enabled'] = bool(d.get('enabled'))
+    _idp_bridges_save(cfg)
+    # converge quickly after an edit (idempotent; the 300s loop is the backstop)
+    threading.Thread(target=_idp_bridge_run_all, kwargs={'slugs': [slug]},
+                     daemon=True, name='idp-bridge-save').start()
+    return jsonify({'ok': True})
+
+
+@app.route('/api/authentik/idp-bridge/create', methods=['POST'])
+@login_required
+def idp_bridge_create_api():
+    """W3 — connect-agency wizard: create (or reuse) the Authentik SCIM source
+    for a portal agency and return the two paste values (SCIM URL + token).
+    The token is returned ONCE in this response and never stored or logged by
+    the console — it lives in Authentik; re-running the wizard re-fetches it."""
+    import urllib.error as _uerr
+    d = request.get_json(silent=True) or {}
+    suffix = (d.get('agency_suffix') or '').strip()
+    if not re.match(r'^[a-zA-Z0-9_-]{1,32}$', suffix):
+        return jsonify({'ok': False, 'error': 'invalid agency'}), 400
+    agencies = _idp_bridge_portal_file('/usr/src/app/data/agencies.json')
+    if not isinstance(agencies, list):
+        return jsonify({'ok': False, 'error': 'TAK Portal not reachable (is it installed and running?)'}), 400
+    agency = next((a for a in agencies if isinstance(a, dict) and a.get('suffix') == suffix), None)
+    if not agency:
+        return jsonify({'ok': False, 'error': f'agency {suffix} not found in TAK Portal'}), 404
+    ak_url, ak_headers, settings = _w1_ak_ctx()
+    if not ak_url:
+        return jsonify({'ok': False, 'error': 'Authentik token unavailable (is Authentik installed?)'}), 400
+    prefix = (agency.get('groupPrefix') or suffix).strip().lower()
+    scim_slug = re.sub(r'[^a-z0-9_-]', '', f'{prefix}-scim')[:50] or f'{suffix}-scim'
+    src = None
+    try:
+        src = _idp_ak_json(ak_url, ak_headers, f'sources/scim/{urllib.parse.quote(scim_slug)}/')
+    except _uerr.HTTPError as e:
+        if e.code != 404:
+            return jsonify({'ok': False, 'error': f'Authentik API error HTTP {e.code}'}), 502
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 502
+    try:
+        if not src or not src.get('slug'):
+            src = _idp_ak_json(ak_url, ak_headers, 'sources/scim/', {
+                'name': (d.get('name') or f"{agency.get('name') or suffix} SCIM").strip()[:120],
+                'slug': scim_slug,
+                'enabled': True,
+            }, 'POST')
+        tok_ident = (src.get('token_obj') or {}).get('identifier') or ''
+        token_key = ''
+        if tok_ident:
+            vk = _idp_ak_json(ak_url, ak_headers,
+                              f'core/tokens/{urllib.parse.quote(tok_ident)}/view_key/')
+            token_key = vk.get('key') or ''
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'could not create SCIM source: {str(e)[:200]}'}), 502
+
+    # W7 — install the username property mapping NOW, before the agency can push
+    # a single user. A bridge that runs even briefly without one produces bare
+    # usernames that later get corrected, which is exactly the churn we avoid.
+    username_field = str(d.get('username_field') or '').strip() or IDP_USERNAME_FIELD_DEFAULT
+    if username_field not in IDP_USERNAME_FIELDS and not re.match(r'^[A-Za-z0-9_.:-]{1,128}$', username_field):
+        return jsonify({'ok': False, 'error': 'invalid username field'}), 400
+    token, _placement = _idp_agency_token(agency)
+    mapping_warn = ''
+    ambiguous = _idp_token_ambiguity(agency, agencies)
+    # Ambiguous agency codes are a HARD BLOCK, not a warning: authentik adopts a
+    # colliding username instead of rejecting it, so the failure mode is silent
+    # cross-agency account takeover. The code is immutable after the agency is
+    # created, so connect time is the only moment this is still fixable.
+    if ambiguous:
+        return jsonify({'ok': False, 'ambiguous_with': ambiguous, 'error':
+                        'Agency code %r is ambiguous with %s. Usernames from these '
+                        'agencies could collide, and Authentik merges colliding '
+                        'accounts rather than rejecting them. Use a distinct agency '
+                        'code (it cannot be changed after the agency is created).'
+                        % (token, ', '.join(ambiguous))}), 400
+    if not token:
+        mapping_warn = (f"Agency {agency.get('name') or suffix} has no Username Agency "
+                        "Identifier set in TAK Portal — usernames cannot be derived. "
+                        "Set it on the agency (it cannot be changed later) and reconnect.")
+    else:
+        pm_ok, pm_detail = _idp_ensure_property_mapping(
+            ak_url, ak_headers, scim_slug, agency, {'username_field': username_field})
+        if not pm_ok:
+            mapping_warn = (f'Username mapping could NOT be installed ({pm_detail}). '
+                            'Users will land without the agency identifier until this is fixed.')
+
+    scim_url = f'{_get_authentik_base_url(settings)}/source/scim/{scim_slug}/v2'
+    cfg = _idp_bridges_load()
+    cfg.setdefault('bridges', {})
+    b = cfg['bridges'].get(scim_slug) or {}
+    b.setdefault('map', {})
+    b.setdefault('default_template', '')
+    b.setdefault('username_field', IDP_USERNAME_FIELD_DEFAULT)
+    b.setdefault('enabled', False)
+    b.setdefault('created_at', datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'))
+    b['agency_suffix'] = suffix
+    b['scim_source_slug'] = scim_slug
+    b['username_field'] = username_field
+    b['policy'] = 'ad_owns_template'
+    cfg['bridges'][scim_slug] = b
+    _idp_bridges_save(cfg)
+    # populate the incoming-groups listing right away (bridge may still be disabled)
+    threading.Thread(target=_idp_bridge_run_all, kwargs={'slugs': [scim_slug]},
+                     daemon=True, name='idp-bridge-create').start()
+    agency_label = agency.get('name') or suffix
+    preview = _idp_username_preview(agency, {'username_field': username_field})
+    instructions = (
+        f"Give these two values to {agency_label}'s IT team (Microsoft Entra: "
+        "Enterprise Applications → New application → Create your own application → "
+        "Provisioning → Automatic):\n\n"
+        f"  Tenant / SCIM URL:  {scim_url}\n"
+        "  Secret Token:       (shown once above — copy it now)\n\n"
+        "Then have them assign the directory groups they want to send "
+        "(e.g. TAK-Patrol, TAK-Command) to that application and turn provisioning "
+        "On. Their roster appears here automatically — map each incoming group to "
+        "a TAK template below and enable the bridge.\n\n"
+        f"{preview}\n\n"
+        "IMPORTANT - two things their IT must get right:\n"
+        f"  1. Send a UNIQUE employee identifier (badge number, employee number) "
+        f"in the '{username_field}' attribute. Do NOT use names - two people "
+        "called J. Smith would end up sharing one TAK account. Letters, digits, "
+        "dot, dash and underscore only.\n"
+        "  2. Put each person in exactly ONE of the role groups they send us. "
+        "Someone in two role groups has no single template, so we will flag "
+        "them and assign nothing until it is corrected.\n\n"
+        "They do not need to build the username themselves - we add the agency "
+        "code.\n\n"
+        "KEEPING THIS RUNNING\n"
+        "  New Token       - issues a fresh secret and invalidates the current "
+        "one immediately. Use it if the token has been shared too widely or "
+        "someone with access has left. Their provisioning FAILS until they "
+        "paste the new value in, so tell them before you press it.\n"
+        "  Remove          - disconnects the console only. The SCIM source "
+        "stays in Authentik, the agency keeps pushing, and existing users are "
+        "untouched. You just stop auto-assigning agency and templates.\n"
+        "  Remove + 'also delete Authentik source' - additionally deletes the "
+        "SCIM endpoint itself, so the agency's provisioning starts failing on "
+        "their next cycle. Users and groups already created are still NOT "
+        "deleted - this cuts the feed, it does not remove people."
+    )
+    return jsonify({'ok': True, 'bridge': scim_slug, 'scim_url': scim_url,
+                    'token': token_key, 'token_shown_once': True,
+                    'username_preview': preview, 'mapping_warning': mapping_warn,
+                    'ambiguous_with': ambiguous,
+                    'instructions': instructions})
+
+
+@app.route('/api/authentik/idp-bridge/sync', methods=['POST'])
+@login_required
+def idp_bridge_sync_api():
+    """W3 — run the reconciler now; returns per-bridge summaries."""
+    d = request.get_json(silent=True) or {}
+    slug = (d.get('slug') or '').strip()
+    if slug and not IDP_BRIDGE_SLUG_RE.match(slug):
+        return jsonify({'ok': False, 'error': 'invalid bridge id'}), 400
+    res = _idp_bridge_run_all(slugs=[slug] if slug else None, persist_skipped=True)
+    return jsonify({'ok': True, 'results': res})
+
+
+@app.route('/api/authentik/idp-bridge/rotate-token', methods=['POST'])
+@login_required
+def idp_bridge_rotate_token_api():
+    """W3 — issue a NEW SCIM token for a bridge, invalidating the old one.
+
+    Needed because the token is a live credential handed to a third party: it
+    ends up in emails and ticket systems, staff turn over, and it grants write
+    access to that agency's roster (anyone holding it can inject users who will
+    be auto-assigned that agency's templates and channels). There has to be a
+    way to roll it without deleting and rebuilding the whole bridge.
+
+    Uses Authentik's own set_key so the token IDENTITY is unchanged — the
+    source keeps working, only the secret changes. The agency's provisioning
+    breaks until they paste the new value in, which is the point.
+
+    Returned ONCE, never stored by the console and never logged.
+    """
+    import secrets as _sec
+    d = request.get_json(silent=True) or {}
+    slug = (d.get('slug') or '').strip()
+    if not IDP_BRIDGE_SLUG_RE.match(slug):
+        return jsonify({'ok': False, 'error': 'invalid bridge id'}), 400
+    cfg = _idp_bridges_load()
+    b = (cfg.get('bridges') or {}).get(slug)
+    if not b:
+        return jsonify({'ok': False, 'error': 'unknown bridge'}), 404
+    ak_url, ak_headers, settings = _w1_ak_ctx()
+    if not ak_url:
+        return jsonify({'ok': False, 'error': 'Authentik unavailable'}), 400
+    src_slug = (b.get('scim_source_slug') or slug)
+    try:
+        src = _idp_ak_json(ak_url, ak_headers,
+                           f'sources/scim/{urllib.parse.quote(src_slug)}/')
+        ident = (src.get('token_obj') or {}).get('identifier')
+        if not ident:
+            return jsonify({'ok': False, 'error': 'source has no token object'}), 502
+        new_key = _sec.token_urlsafe(45)
+        _ak_api_call(f'{ak_url}/api/v3/core/tokens/{urllib.parse.quote(ident)}/set_key/',
+                     data=json.dumps({'key': new_key}).encode(),
+                     method='POST', headers=ak_headers)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'could not rotate: {str(e)[:200]}'}), 502
+    scim_url = f'{_get_authentik_base_url(settings)}/source/scim/{src_slug}/v2'
+    return jsonify({'ok': True, 'token': new_key, 'scim_url': scim_url,
+                    'note': 'The previous token stopped working immediately. The '
+                            'agency must paste this new value into their Entra '
+                            'provisioning or their roster sync will fail.'})
+
+
+@app.route('/api/authentik/idp-bridge/delete', methods=['POST'])
+@login_required
+def idp_bridge_delete_api():
+    """W3 — remove bridge config. delete_source (default OFF) also deletes the
+    Authentik SCIM source (stops the agency's pushes). Users/groups already in
+    Authentik are never touched — the add-only philosophy extends to delete."""
+    d = request.get_json(silent=True) or {}
+    slug = (d.get('slug') or '').strip()
+    if not IDP_BRIDGE_SLUG_RE.match(slug):
+        return jsonify({'ok': False, 'error': 'invalid bridge id'}), 400
+    cfg = _idp_bridges_load()
+    b = (cfg.get('bridges') or {}).pop(slug, None)
+    if not b:
+        return jsonify({'ok': False, 'error': 'unknown bridge'}), 404
+    _idp_bridges_save(cfg)
+    src_deleted = False
+    if d.get('delete_source') is True:
+        try:
+            ak_url, ak_headers, _s = _w1_ak_ctx()
+            if ak_url:
+                _ak_api_call(f"{ak_url}/api/v3/sources/scim/"
+                             f"{urllib.parse.quote(b.get('scim_source_slug') or slug)}/",
+                             method='DELETE', headers=ak_headers)
+                src_deleted = True
+        except Exception:
+            pass
+    return jsonify({'ok': True, 'source_deleted': src_deleted})
+
+
 def _run_authentik_deploy_remote(settings, deploy_cfg, plog):
     """Deploy Authentik on a remote host via SSH (Docker Compose)."""
     import secrets as _sec
@@ -56533,7 +57814,7 @@ body{display:flex;min-height:100vh}
 <div style="margin-top:6px;font-size:10px;color:var(--text-dim);line-height:1.5">If <strong>akadmin</strong> or <strong>webadmin</strong> shows <span style="color:var(--red)">DEACTIVATED</span> (e.g. someone clicked Deactivate in TAK Portal or the Authentik UI), click Reactivate to restore login. Tries Authentik API first, falls back to <code style="color:var(--cyan)">docker exec authentik-server-1 ak shell</code>.</div>
 </div>
 </div>
-<div class="section-title">LDAP Configuration</div>
+<div class="section-title" data-collapse="ldap-config" data-collapsed="1">LDAP Configuration</div>
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
 <div style="font-family:'JetBrains Mono',monospace;font-size:12px;line-height:2">
 <div><span style="color:var(--text-dim)">Base DN:</span> <span style="color:var(--cyan)">DC=takldap</span></div>
@@ -56578,7 +57859,7 @@ body{display:flex;min-height:100vh}
 <a href="/takportal" style="padding:8px 20px;background:var(--bg-surface);color:var(--green);border:1px solid rgba(16,185,129,0.3);border-radius:8px;font-size:13px;font-weight:600;text-decoration:none;white-space:nowrap">→ TAK Portal</a>
 </div>
 {% endif %}
-<div class="section-title">Container Logs <span id="log-filter-label" style="font-size:11px;color:var(--cyan);margin-left:8px"></span></div>
+<div class="section-title" data-collapse="container-logs" data-collapsed="1">Container Logs <span id="log-filter-label" style="font-size:11px;color:var(--cyan);margin-left:8px"></span></div>
 <div class="deploy-log" id="container-log">Loading logs...</div>
 <div class="card" id="ak-log-card" style="display:none;margin-top:24px">
   <div class="card-title">Update config & reconnect — Log</div>
@@ -56590,7 +57871,7 @@ body{display:flex;min-height:100vh}
   <div class="deploy-log" id="deploy-log" data-authentik-url="{{ authentik_base_url }}">Waiting...</div>
 </div>
 {% else %}
-<div class="section-title">About Authentik</div>
+<div class="section-title" data-collapse="about-authentik" data-collapsed="1">About Authentik</div>
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
 <div style="font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--text-secondary);line-height:1.8">
 Authentik is an open-source <span style="color:var(--cyan)">Identity Provider</span> supporting SSO, SAML, OAuth2/OIDC, LDAP, and RADIUS.<br><br>
@@ -56698,7 +57979,7 @@ Additional admins: Authentik → Groups → authentik Admins → Users.
 </div>
 {% endif %}
 {% if ak.installed and ak.running %}
-<div class="section-title" style="margin-top:24px">Reputation Policy <span style="font-size:11px;color:var(--text-dim);font-weight:400;text-transform:none;letter-spacing:0">Flow-level brute-force blocking</span></div>
+<div class="section-title" data-collapse="reputation" data-collapsed="1" style="margin-top:24px">Reputation Policy <span style="font-size:11px;color:var(--text-dim);font-weight:400;text-transform:none;letter-spacing:0">Flow-level brute-force blocking</span></div>
 <div class="card">
 <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
   <div>
@@ -56735,6 +58016,20 @@ Additional admins: Authentik → Groups → authentik Admins → Users.
   <button onclick="clearRepScores()" style="padding:6px 14px;background:rgba(239,68,68,0.1);color:var(--red);border:1px solid rgba(239,68,68,0.3);border-radius:6px;font-size:12px;cursor:pointer;font-family:\'JetBrains Mono\',monospace">Clear All Scores</button>
   <button onclick="refreshRepScores()" style="padding:6px 14px;background:rgba(59,130,246,0.1);color:var(--accent);border:1px solid rgba(59,130,246,0.3);border-radius:6px;font-size:12px;cursor:pointer;font-family:\'JetBrains Mono\',monospace">↻ Refresh</button>
 </div>
+</div>
+{% endif %}
+{% if ak.installed and ak.running %}
+<div class="section-title" data-collapse="identity-bridge" data-collapsed="1" style="margin-top:24px">Identity Bridge <span style="font-size:11px;color:var(--text-dim);font-weight:400;text-transform:none;letter-spacing:0">Agency AD/Entra roster &rarr; auto agency + TAK template</span></div>
+<div class="card">
+<div style="font-size:12px;color:var(--text-dim);margin-bottom:14px">Agencies manage TAK users from their own Active Directory / Entra: a SCIM feed pushes their roster into Authentik ahead of first login, and the console auto-assigns agency + TAK Portal template from the mapping table below. The bridge only ever manages channels it granted itself &mdash; anything you set by hand is never touched, and pinned users are skipped entirely. When AD moves someone to a different role group, they move to that template's channels and lose the old ones. Runs automatically every 5 minutes.</div>
+<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:6px">
+  <select class="form-input" id="idpb-agency" style="width:auto;min-width:200px" onchange="idpbPreview()"><option value="">Loading agencies...</option></select>
+  <button class="btn-primary" id="idpb-create-btn" onclick="idpbCreate()">Connect Agency</button>
+  <span style="font-size:11px;color:var(--text-dim)">Creates (or reuses) the agency's SCIM source in Authentik and shows the two values their IT team pastes into Entra provisioning.</span>
+</div>
+<div id="idpb-preview" style="display:none;margin-top:8px;padding:10px 12px;border-left:3px solid var(--accent);background:rgba(59,130,246,0.06);font-size:12px;color:var(--text-primary)"></div>
+<div id="idpb-token-panel" style="display:none;margin-top:10px;padding:14px;border:1px solid rgba(16,185,129,0.4);border-radius:8px;background:rgba(16,185,129,0.06)"></div>
+<div id="idpb-list" style="margin-top:14px"><div style="font-size:12px;color:var(--text-dim)">Loading...</div></div>
 </div>
 {% endif %}
 
@@ -57276,6 +58571,397 @@ document.addEventListener('DOMContentLoaded', function() {
   setInterval(_repLoad,30000);
 })();
 {% endif %}
+{% if ak.installed and ak.running %}
+(function(){
+  var AK_BASE='{{ authentik_base_url }}';
+  var D=null,dirty=false,holdRender=false;
+  function esc(s){return escapeHtml(String(s==null?'':s));}
+  // escapeHtml() serializes a text node — it escapes < > & but NOT quotes, so it is
+  // only safe in TEXT position. Group names and usernames here are pushed by the
+  // agency's remote AD/SCIM feed: a name like  Ops" autofocus onfocus="…  would break
+  // out of an attribute and run script in the console admin's session. Every
+  // attribute interpolation below goes through escAttr.
+  function escAttr(s){return esc(s).replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
+  function agencyName(sfx){var a=((D&&D.agencies)||[]).filter(function(x){return x.suffix===sfx;})[0];return a?a.name:sfx;}
+  // Which SCIM attribute carries the agency's unique employee identifier.
+  // Agencies do not all put it in the same place, and we write the spec their
+  // IT implements — so this is configured, never guessed.
+  function fieldOptions(selected){
+    var fields=(D&&D.username_fields)||{};
+    var out='';
+    Object.keys(fields).forEach(function(k){
+      out+='<option value="'+escAttr(k)+'"'+(k===selected?' selected':'')+'>'+esc(k)+' — '+esc(fields[k])+'</option>';
+    });
+    if(selected&&!fields[selected]){
+      out+='<option value="'+escAttr(selected)+'" selected>'+esc(selected)+' (custom)</option>';
+    }
+    return out;
+  }
+  function tplOptions(sfx,selected,emptyLabel){
+    var out='<option value="">'+esc(emptyLabel)+'</option>';
+    ((D&&D.templates)||[]).filter(function(t){return t.agencySuffix===sfx;}).forEach(function(t){
+      out+='<option value="'+escAttr(t.name)+'"'+(t.name===selected?' selected':'')+'>'+esc(t.name)+'</option>';
+    });
+    return out;
+  }
+  function statusStrip(st){
+    if(!st||!st.ts){return '<span style="font-size:12px;color:var(--text-dim)">Never synced &mdash; waiting for the agency to push users (or hit Sync Now).</span>';}
+    var bits=[(st.users_seen||0)+' users',(st.converged||0)+' converged'];
+    if(st.unmapped){bits.push(st.unmapped+' unmapped&rarr;default');}
+    if(st.pinned){bits.push(st.pinned+' pinned');}
+    if(st.renamed){bits.push(st.renamed+' renamed');}
+    if(st.removed){bits.push(st.removed+' channel(s) removed');}
+    if(st.rename_skipped&&st.rename_skipped.length){bits.push(st.rename_skipped.length+' rename skipped');}
+    bits.push((st.changed||0)+' changed last run');
+    var s='<span style="color:var(--cyan);font-family:JetBrains Mono,monospace;font-size:11px">'+bits.join(' &middot; ')+'</span> <span style="color:var(--text-dim);font-size:10px">last sync '+esc(st.ts)+'</span>';
+    if(st.username_preview){s+='<div style="font-size:11px;color:var(--text-dim);margin-top:4px">'+esc(st.username_preview)+'</div>';}
+    if(st.multi_role&&st.multi_role.length){s+='<div style="font-size:11px;color:var(--yellow);margin-top:4px">multi-role (group union applied): '+esc(st.multi_role.join(', '))+'</div>';}
+    (st.rename_detail||[]).forEach(function(r){s+='<div style="font-size:11px;color:var(--green);margin-top:3px">renamed '+esc(r)+'</div>';});
+    // Removals only ever touch channels this bridge granted — a role change
+    // must MOVE someone, not add to what they already had.
+    (st.removed_detail||[]).forEach(function(r){s+='<div style="font-size:11px;color:var(--text-dim);margin-top:3px">role change '+esc(r)+'</div>';});
+    // A skipped rename is the guard doing its job: the username is the LDAP bind
+    // identity, so we never rename someone who has already signed in.
+    (st.rename_skipped||[]).forEach(function(r){s+='<div style="font-size:11px;color:var(--yellow);margin-top:3px">&#9888; not renamed: '+esc(r)+' &mdash; renaming would break their EUD login; fix by hand if needed</div>';});
+    (st.collisions||[]).forEach(function(c){s+='<div style="font-size:11px;color:var(--red);margin-top:3px">&#9888; username collision: '+esc(c)+'</div>';});
+    (st.warnings||[]).forEach(function(w){s+='<div style="font-size:11px;color:var(--yellow);margin-top:4px">&#9888; '+esc(w)+'</div>';});
+    return s;
+  }
+  function _idpbToast(msg,type){
+    var t=document.getElementById('idpb-toast');
+    if(!t){t=document.createElement('div');t.id='idpb-toast';t.style.cssText='position:fixed;bottom:24px;right:24px;padding:12px 20px;border-radius:8px;font-size:13px;z-index:9999;transition:opacity 0.3s';document.body.appendChild(t);}
+    t.textContent=msg;t.style.background=type==='success'?'rgba(16,185,129,0.15)':'rgba(239,68,68,0.15)';t.style.border='1px solid '+(type==='success'?'rgba(16,185,129,0.4)':'rgba(239,68,68,0.4)');t.style.color=type==='success'?'var(--green)':'var(--red)';t.style.opacity='1';setTimeout(function(){t.style.opacity='0';},3500);
+  }
+  var btnStyle='padding:6px 14px;background:rgba(59,130,246,0.1);color:var(--accent);border:1px solid rgba(59,130,246,0.3);border-radius:6px;font-size:12px;cursor:pointer;font-family:JetBrains Mono,monospace';
+  var btnStyleRed='padding:6px 14px;background:rgba(239,68,68,0.1);color:var(--red);border:1px solid rgba(239,68,68,0.3);border-radius:6px;font-size:12px;cursor:pointer;font-family:JetBrains Mono,monospace';
+  var thStyle='text-align:left;padding:4px 8px;font-size:10px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:.08em';
+  function render(){
+    var list=document.getElementById('idpb-list');if(!list||!D)return;
+    var sel=document.getElementById('idpb-agency');
+    if(sel){
+      var cur=sel.value;
+      // An agency that already has a bridge is not offered again — connecting
+      // it twice would just re-show its token and confuse who owns what.
+      var taken={};
+      Object.keys(D.bridges||{}).forEach(function(k){taken[(D.bridges[k]||{}).agency_suffix]=1;});
+      var opts='<option value="">- pick agency -</option>';
+      var avail=0;
+      (D.agencies||[]).forEach(function(a){
+        if(taken[a.suffix])return;
+        avail++;
+        opts+='<option value="'+escAttr(a.suffix)+'">'+esc(a.name)+' ('+esc(a.groupPrefix)+')</option>';
+      });
+      if(!avail){opts='<option value="">- all agencies connected -</option>';}
+      sel.innerHTML=opts;if(cur){sel.value=cur;}
+      idpbPreview();
+    }
+    if(!D.portal_ok){list.innerHTML='<div style="font-size:12px;color:var(--yellow)">TAK Portal is not reachable &mdash; agencies and templates live there. Install/start TAK Portal first.</div>';return;}
+    var slugs=Object.keys(D.bridges||{});
+    if(!slugs.length){list.innerHTML='<div style="font-size:12px;color:var(--text-dim)">No bridges yet. Pick an agency above and Connect.</div>';return;}
+    var html='';
+    slugs.sort().forEach(function(slug){
+      var b=D.bridges[slug];var st=b.last_status||{};
+      var groups=(st.incoming_groups||[]).slice();
+      var seen={};groups.forEach(function(g){seen[g.name]=1;});
+      Object.keys(b.map||{}).forEach(function(n){if(!seen[n]){groups.push({name:n,members:null});}});
+      groups.sort(function(a,c){return a.name<c.name?-1:1;});
+      var rows='';
+      groups.forEach(function(g){
+        var mapped=(b.map||{})[g.name]||'';
+        rows+='<tr style="border-bottom:1px solid var(--border)">'
+          +'<td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">'+esc(g.name)
+          +(mapped?'':' <span style="font-size:9px;color:var(--yellow);background:rgba(234,179,8,0.1);padding:1px 6px;border-radius:4px;border:1px solid rgba(234,179,8,0.3)">unmapped</span>')
+          +'</td>'
+          +'<td style="padding:5px 8px;font-size:12px;color:var(--text-dim)">'+(g.members==null?'-':g.members)+'</td>'
+          +'<td style="padding:5px 8px"><select class="form-input idpb-map-'+escAttr(slug)+'" data-group="'+escAttr(g.name)+'" style="width:auto;min-width:150px">'+tplOptions(b.agency_suffix,mapped,'- default -')+'</select></td>'
+          +'</tr>';
+      });
+      if(!rows){rows='<tr><td colspan="3" style="padding:6px 8px;font-size:12px;color:var(--text-dim)">No incoming groups yet &mdash; the agency has not pushed groups (or run Sync Now).</td></tr>';}
+      html+='<div style="border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:12px">'
+        +'<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:8px">'
+        +'<div><span style="font-size:13px;font-weight:600;color:var(--text-primary)">'+esc(agencyName(b.agency_suffix))+'</span> '
+        +'<span style="font-size:11px;color:var(--text-dim);font-family:JetBrains Mono,monospace">'+esc(slug)+'</span> '
+        +(b.enabled?'<span class="badge badge-green"><span class="dot dot-pulse"></span>Enabled</span>':'<span class="badge badge-red"><span class="dot"></span>Disabled</span>')
+        +'</div>'
+        +'<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+        +'<button data-idpb-act="toggle" data-idpb-slug="'+escAttr(slug)+'" data-idpb-en="'+(b.enabled?'0':'1')+'" style="'+btnStyle+'">'+(b.enabled?'Disable':'Enable')+'</button>'
+        +'<button data-idpb-act="sync" data-idpb-slug="'+escAttr(slug)+'" style="'+btnStyle+'">Sync Now</button>'
+        +'<button data-idpb-act="instructions" data-idpb-slug="'+escAttr(slug)+'" style="'+btnStyle+'">Instructions</button>'
+        +'<button data-idpb-act="rotate" data-idpb-slug="'+escAttr(slug)+'" style="'+btnStyle+'" title="Issue a new SCIM token. The old one stops working immediately.">New Token</button>'
+        +'<label style="font-size:10px;color:var(--text-dim);display:flex;align-items:center;gap:4px;margin:0" title="Unticked, Remove only disconnects the console: the SCIM source stays in Authentik and the agency keeps pushing. Ticked, the source is deleted too and their provisioning stops. Either way, users already created are never deleted."><input type="checkbox" id="idpb-delsrc-'+escAttr(slug)+'"> also delete Authentik source <span style="color:var(--text-dim);border:1px solid var(--border);border-radius:50%;width:13px;height:13px;display:inline-flex;align-items:center;justify-content:center;font-size:9px">?</span></label>'
+        +'<button data-idpb-act="delete" data-idpb-slug="'+escAttr(slug)+'" style="'+btnStyleRed+'">Remove</button>'
+        +'</div></div>'
+        +'<div id="idpb-out-'+escAttr(slug)+'" style="display:none;margin-bottom:12px;padding:12px 14px;border:1px solid var(--border);border-radius:8px;background:rgba(255,255,255,0.02)"></div>'
+        +'<div style="margin-bottom:10px">'+statusStrip(st)+'</div>'
+        +'<table style="width:100%;border-collapse:collapse;margin-bottom:10px"><thead><tr>'
+        +'<th style="'+thStyle+'">Incoming group</th><th style="'+thStyle+'">Members</th><th style="'+thStyle+'">TAK template</th>'
+        +'</tr></thead><tbody>'+rows+'</tbody></table>'
+        +'<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">'
+        +'<label style="font-size:12px;color:var(--text-dim);margin:0">Username field:</label>'
+        +'<select class="form-input" id="idpb-field-'+escAttr(slug)+'" style="width:auto;min-width:200px">'+fieldOptions(b.username_field)+'</select>'
+        +'<label style="font-size:12px;color:var(--text-dim);margin:0">Default template (unmapped groups):</label>'
+        +'<select class="form-input" id="idpb-default-'+escAttr(slug)+'" style="width:auto;min-width:150px">'+tplOptions(b.agency_suffix,b.default_template,'- none -')+'</select>'
+        +'<button class="btn-primary" data-idpb-act="save" data-idpb-slug="'+escAttr(slug)+'">Save Mapping</button>'
+        +'</div></div>';
+    });
+    list.innerHTML=html;
+  }
+  // Never leave the card sitting on "Loading..." — a silent return here made a
+  // failed status call indistinguishable from a slow one, which cost a real
+  // debugging session on the NUC. Any failure now names itself in the card.
+  function _idpbFail(msg,detail){
+    var list=document.getElementById('idpb-list');
+    if(!list)return;
+    var sel=document.getElementById('idpb-agency');
+    if(sel&&/Loading/.test(sel.innerHTML)){sel.innerHTML='<option value="">- unavailable -</option>';}
+    list.innerHTML='<div style="font-size:12px;color:var(--red)">&#9888; '+esc(msg)+'</div>'
+      +(detail?'<div style="font-size:11px;color:var(--text-dim);margin-top:4px;font-family:JetBrains Mono,monospace">'+esc(detail)+'</div>':'')
+      +'<div style="font-size:11px;color:var(--text-dim);margin-top:6px">Retrying every 30s. If this persists, check '
+      +'<code>journalctl -u takwerx-console</code> and reload the page (an expired SSO session shows up here as 401).</div>';
+  }
+  function load(force){
+    fetch('/api/authentik/idp-bridge/status').then(function(r){
+      if(!r.ok){throw new Error('HTTP '+r.status+(r.status===401?' — not authenticated; reload the page':''));}
+      return r.json();
+    }).then(function(d){
+      if(!d||!d.ok){_idpbFail('Identity Bridge status unavailable.',(d&&d.error)||'server returned ok=false');return;}
+      D=d;
+      if((force||!dirty)&&!holdRender){dirty=false;render();}
+    }).catch(function(e){_idpbFail('Could not load Identity Bridge status.',e&&e.message);});
+  }
+  var _listEl=document.getElementById('idpb-list');
+  if(_listEl){_listEl.addEventListener('change',function(){dirty=true;});}
+  // Buttons carry data-idpb-act and are dispatched here rather than via an
+  // inline onclick that interpolates slug. Building such an onclick needs an
+  // escaped quote, and this template is a Python triple-quoted literal, so a
+  // source-level backslash-quote collapses to a bare quote before the browser
+  // ever sees it: two adjacent string literals, SyntaxError, and EVERY script
+  // on the page dies. That is what broke this card on the NUC 2026-08-01.
+  // Nothing here needs escaping, so it cannot recur, and slug never lands in
+  // executable position.
+  if(_listEl){_listEl.addEventListener('click',function(e){
+    var t=e.target;
+    while(t&&t!==_listEl&&!t.getAttribute('data-idpb-act')){t=t.parentElement;}
+    if(!t||t===_listEl)return;
+    var act=t.getAttribute('data-idpb-act'),slug=t.getAttribute('data-idpb-slug');
+    if(!act||!slug)return;
+    if(act==='toggle'){idpbToggle(slug,t.getAttribute('data-idpb-en')==='1');}
+    else if(act==='sync'){idpbSync(slug);}
+    else if(act==='instructions'){idpbInstructions(slug);}
+    else if(act==='delete'){idpbDelete(slug);}
+    else if(act==='save'){idpbSave(slug);}
+    else if(act==='rotate'){idpbRotate(slug);}
+  });}
+  // Placement + token are immutable once a portal agency exists (no edit path),
+  // so showing the resulting username shape here is the operator's only chance
+  // to notice a wrong one before officers start landing under it.
+  window.idpbPreview=function(){
+    var el=document.getElementById('idpb-preview');
+    var sfx=(document.getElementById('idpb-agency')||{}).value;
+    if(!el)return;
+    var a=((D&&D.agencies)||[]).filter(function(x){return x.suffix===sfx;})[0];
+    if(!sfx||!a){el.style.display='none';return;}
+    el.style.display='block';
+    if(!a.token){
+      el.innerHTML='<span style="color:var(--yellow)">&#9888; '+esc(a.name)+' has no Username Agency Identifier set in TAK Portal, so usernames cannot be derived. Set it on the agency first &mdash; it cannot be changed after the agency is created.</span>';
+      return;
+    }
+    var amb=(a.ambiguous_with||[]);
+    el.innerHTML='<strong>'+esc(a.username_preview)+'</strong>'
+      +'<div style="color:var(--text-dim);margin-top:4px">Identifier <code>'+esc(a.token)+'</code> ('+esc(a.placement)+'). '
+      +'This is fixed when the agency is created and cannot be changed later &mdash; check it now.</div>'
+      +(amb.length?'<div style="color:var(--red);margin-top:6px">&#9888; This identifier is ambiguous with '+esc(amb.join(', '))
+        +'. Usernames are joined without a separator, so those agencies share a namespace and their users can collide. '
+        +'Consider a distinct identifier before connecting (it cannot be changed later).</div>':'');
+  };
+  window.idpbCreate=function(){
+    var sfx=(document.getElementById('idpb-agency')||{}).value;
+    if(!sfx){_idpbToast('Pick an agency first.','error');return;}
+    var btn=document.getElementById('idpb-create-btn');btn.disabled=true;btn.textContent='Connecting...';
+    fetch('/api/authentik/idp-bridge/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({agency_suffix:sfx})})
+      .then(function(r){return r.json();}).then(function(d){
+        btn.disabled=false;btn.textContent='Connect Agency';
+        if(!d.ok){
+          _idpbToast(d.error||'Failed','error');
+          if(d.ambiguous_with&&d.ambiguous_with.length){
+            var pv=document.getElementById('idpb-preview');
+            if(pv){pv.style.display='block';pv.innerHTML='<span style="color:var(--red)">&#9888; '+esc(d.error)+'</span>';}
+          }
+          return;
+        }
+        var p=document.getElementById('idpb-token-panel');
+        p.style.display='block';
+        p.innerHTML='<button onclick="idpbHideToken()" style="float:right;background:none;border:1px solid var(--border);color:var(--text-dim);border-radius:6px;padding:2px 10px;cursor:pointer;font-size:11px">Hide</button>'
+          +'<div style="font-size:12px;font-weight:600;color:var(--green);margin-bottom:8px">Agency connected. Give these two values to their IT team &mdash; the token is shown ONCE, copy it now:</div>'
+          +'<div style="font-family:JetBrains Mono,monospace;font-size:12px;color:var(--cyan);word-break:break-all;margin-bottom:6px">SCIM URL: '+esc(d.scim_url)+'</div>'
+          +'<div style="font-family:JetBrains Mono,monospace;font-size:12px;color:var(--cyan);word-break:break-all;margin-bottom:10px">Token: '+esc(d.token||'(could not fetch token - check Authentik)')+'</div>'
+          +(d.mapping_warning?'<div style="font-size:12px;color:var(--red);margin-bottom:10px">&#9888; '+esc(d.mapping_warning)+'</div>':'')
+          +'<pre style="font-size:11px;color:var(--text-dim);white-space:pre-wrap;margin:0;font-family:inherit">'+esc(d.instructions||'')+'</pre>';
+        dirty=false;setTimeout(function(){load(true);},1200);
+      }).catch(function(){btn.disabled=false;btn.textContent='Connect Agency';_idpbToast('Network error','error');});
+  };
+  // The panel shows a live credential — let the operator clear it off screen
+  // once they have copied it, rather than leaving it up until a page reload.
+  // The panel sits at the TOP of the card while the buttons that fill it are in
+  // the bridge boxes below, so writing to it without scrolling reads as "the
+  // button does nothing". Every writer calls this.
+  function _idpbShowPanel(html){
+    var p=document.getElementById('idpb-token-panel');
+    if(!p)return;
+    p.style.display='block';
+    holdRender=true;
+    p.innerHTML='<button onclick="idpbHideToken()" style="float:right;background:none;border:1px solid var(--border);color:var(--text-dim);border-radius:6px;padding:2px 10px;cursor:pointer;font-size:11px">Hide</button>'+html;
+    if(p.scrollIntoView){p.scrollIntoView({behavior:'smooth',block:'center'});}
+  }
+  // Render a result inside the agency box the operator clicked in. The shared
+  // panel at the top of the card is only right for Connect, where the button is
+  // genuinely up there; using it for per-agency actions threw the operator to
+  // the top of the page away from what they were doing.
+  function _idpbShowIn(slug, html){
+    var el=document.getElementById('idpb-out-'+slug);
+    if(!el){_idpbShowPanel(html);return;}   // fall back if the box is not rendered
+    // The 30s refresh re-renders the whole list, which would erase a token the
+    // operator is still copying — and it is shown exactly once. Hold rendering
+    // until they dismiss it.
+    holdRender=true;
+    el.style.display='block';
+    el.innerHTML='<button onclick="idpbHideIn(&quot;'+escAttr(slug)+'&quot;)" style="float:right;background:none;border:1px solid var(--border);color:var(--text-dim);border-radius:6px;padding:2px 10px;cursor:pointer;font-size:11px">Hide</button>'+html;
+  }
+  window.idpbHideIn=function(slug){
+    var el=document.getElementById('idpb-out-'+slug);
+    if(el){el.style.display='none';el.innerHTML='';}
+    holdRender=false;
+  };
+  window.idpbHideToken=function(){
+    var p=document.getElementById('idpb-token-panel');
+    if(p){p.style.display='none';p.innerHTML='';}
+    holdRender=false;
+  };
+  window.idpbRotate=function(slug){
+    if(!confirm('Issue a NEW token for "'+slug+'"? The current token stops working immediately, and this agency roster sync will FAIL until their IT pastes the new value into Entra.'))return;
+    fetch('/api/authentik/idp-bridge/rotate-token',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug})})
+      .then(function(r){return r.json();}).then(function(d){
+        if(!d.ok){_idpbToast(d.error||'Failed','error');return;}
+        _idpbShowIn(slug,
+           '<div style="font-size:12px;font-weight:600;color:var(--yellow);margin-bottom:8px">New token issued &mdash; shown ONCE, copy it now:</div>'
+          +'<div style="font-family:JetBrains Mono,monospace;font-size:12px;color:var(--cyan);word-break:break-all;margin-bottom:6px">SCIM URL: '+esc(d.scim_url)+'</div>'
+          +'<div style="font-family:JetBrains Mono,monospace;font-size:12px;color:var(--cyan);word-break:break-all;margin-bottom:10px">Token: '+esc(d.token)+'</div>'
+          +'<div style="font-size:11px;color:var(--yellow)">'+esc(d.note||'')+'</div>');
+        _idpbToast('Token rotated.','success');
+      }).catch(function(){_idpbToast('Network error','error');});
+  };
+  window.idpbSave=function(slug){
+    var map={};
+    document.querySelectorAll('select.idpb-map-'+slug).forEach(function(s){
+      if(s.value){map[s.getAttribute('data-group')]=s.value;}
+    });
+    var defEl=document.getElementById('idpb-default-'+slug);
+    var fldEl=document.getElementById('idpb-field-'+slug);
+    fetch('/api/authentik/idp-bridge/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug,map:map,default_template:defEl?defEl.value:'',username_field:fldEl?fldEl.value:''})})
+      .then(function(r){return r.json();}).then(function(d){
+        if(d.ok){_idpbToast('Mapping saved - syncing now.','success');dirty=false;setTimeout(function(){load(true);},2500);}
+        else{_idpbToast(d.error||'Failed','error');}
+      }).catch(function(){_idpbToast('Network error','error');});
+  };
+  window.idpbToggle=function(slug,en){
+    fetch('/api/authentik/idp-bridge/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug,enabled:en})})
+      .then(function(r){return r.json();}).then(function(d){
+        if(d.ok){_idpbToast('Bridge '+(en?'enabled':'disabled')+'.','success');dirty=false;setTimeout(function(){load(true);},800);}
+        else{_idpbToast(d.error||'Failed','error');}
+      }).catch(function(){_idpbToast('Network error','error');});
+  };
+  window.idpbSync=function(slug){
+    _idpbToast('Syncing...','success');
+    fetch('/api/authentik/idp-bridge/sync',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug})})
+      .then(function(r){return r.json();}).then(function(d){
+        if(d.ok){
+          var st=(d.results||{})[slug]||{};
+          _idpbToast('Sync done: '+(st.users_seen||0)+' users, '+(st.changed||0)+' changed.',st.ok?'success':'error');
+          dirty=false;load(true);
+        }else{_idpbToast(d.error||'Failed','error');}
+      }).catch(function(){_idpbToast('Network error','error');});
+  };
+  window.idpbInstructions=function(slug){
+    var b=(D&&D.bridges||{})[slug];
+    if(!b){_idpbToast('No bridge config for '+slug,'error');return;}
+    var url=AK_BASE+'/source/scim/'+(b.scim_source_slug||slug)+'/v2';
+    var shape=b.username_preview||'';
+    _idpbShowIn(slug,
+      '<div style="font-size:12px;font-weight:600;color:var(--text-primary);margin-bottom:8px">'+esc(agencyName(b.agency_suffix))+' &mdash; instruction sheet</div>'
+      +'<div style="font-family:JetBrains Mono,monospace;font-size:12px;color:var(--cyan);word-break:break-all;margin-bottom:6px">SCIM URL: '+esc(url)+'</div>'
+      // The old text said "re-run Connect Agency to see the token again" — that
+      // stopped being possible when connected agencies were removed from the
+      // picker. New Token is the way now.
+      +'<div style="font-size:11px;color:var(--text-dim);margin-bottom:10px">Token: shown once, at connect time. It cannot be read back &mdash; use <strong>New Token</strong> above to issue a replacement (that invalidates the current one).</div>'
+      +(shape?'<div style="font-size:11px;color:var(--text-primary);margin-bottom:10px">'+esc(shape)+'</div>':'')
+      +'<pre style="font-size:11px;color:var(--text-dim);white-space:pre-wrap;margin:0;font-family:inherit">'
+      +'In Microsoft Entra: Enterprise Applications - New application - Create your own application - Provisioning - Automatic. '
+      +'Paste the SCIM URL and the token, then assign the directory groups to send and turn provisioning On.<br><br>'
+      +'Two things their IT must get right:<br>'
+      +'  1. Send a UNIQUE employee identifier (badge or employee number) in the "'+esc(b.username_field||'employeeNumber')+'" attribute. Not names - two people called J. Smith would share one TAK account.<br>'
+      +'  2. Put each person in exactly ONE role group. Someone in two has no single template, so we flag them and assign nothing.</pre>');
+  };
+  window.idpbDelete=function(slug){
+    var delSrcEl=document.getElementById('idpb-delsrc-'+slug);
+    var delSrc=!!(delSrcEl&&delSrcEl.checked);
+    // No apostrophes in these strings on purpose — see the delegated-click note
+    // above: a source-level escaped quote collapses and breaks the whole script.
+    if(!confirm('Remove bridge "'+slug+'"?'+(delSrc?' The Authentik SCIM source will ALSO be deleted, so this agency stops pushing.':' The Authentik SCIM source is kept (agency pushes keep landing in Authentik).')+' Users and groups already in Authentik are never touched.')){return;}
+    fetch('/api/authentik/idp-bridge/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({slug:slug,delete_source:delSrc})})
+      .then(function(r){return r.json();}).then(function(d){
+        if(d.ok){_idpbToast('Bridge removed'+(d.source_deleted?' (source deleted).':'.'),'success');dirty=false;load(true);}
+        else{_idpbToast(d.error||'Failed','error');}
+      }).catch(function(){_idpbToast('Network error','error');});
+  };
+  load(true);
+  setInterval(function(){load(false);},30000);
+})();
+{% endif %}
+// ── Collapsible sections ────────────────────────────────────────────────────
+// Any .section-title carrying data-collapse="<id>" becomes a toggle for the
+// element that follows it. data-collapsed="1" is the default state; the
+// operator's choice is remembered per-section so a page they collapsed stays
+// collapsed on the next visit.
+(function(){
+  function apply(h, body, open){
+    body.forEach(function(el){ el.style.display = open ? '' : 'none'; });
+    var car = h.querySelector('.sect-caret');
+    if(car){ car.textContent = open ? '\u25BE' : '\u25B8'; }
+    h.setAttribute('aria-expanded', open ? 'true' : 'false');
+  }
+  document.querySelectorAll('.section-title[data-collapse]').forEach(function(h){
+    // A section is everything between this header and the next one — Container
+    // Logs is a toolbar AND a log box, and hiding only the first element left
+    // the logs on screen with a collapsed caret above them.
+    var body = [];
+    for(var n = h.nextElementSibling; n && !n.classList.contains('section-title'); n = n.nextElementSibling){
+      body.push(n);
+    }
+    if(!body.length) return;
+    var key = 'idpb-sect2-' + h.getAttribute('data-collapse');
+    var stored = null;
+    try { stored = localStorage.getItem(key); } catch(e) {}
+    var open = stored === null ? h.getAttribute('data-collapsed') !== '1' : stored === 'open';
+    var car = document.createElement('span');
+    car.className = 'sect-caret';
+    car.style.cssText = 'display:inline-block;width:14px;color:var(--text-dim);font-size:11px';
+    h.insertBefore(car, h.firstChild);
+    h.style.cursor = 'pointer';
+    h.setAttribute('role', 'button');
+    h.setAttribute('tabindex', '0');
+    h.title = 'Click to show/hide';
+    apply(h, body, open);
+    function toggle(){
+      open = !open;
+      apply(h, body, open);
+      try { localStorage.setItem(key, open ? 'open' : 'closed'); } catch(e) {}
+    }
+    h.addEventListener('click', toggle);
+    h.addEventListener('keydown', function(e){
+      if(e.key === 'Enter' || e.key === ' '){ e.preventDefault(); toggle(); }
+    });
+  });
+})();
 </script>
 </body></html>'''
 
@@ -62777,6 +64463,62 @@ def takserver_security_config_post():
     return jsonify({'success': True, 'validity_days': validity_days, 'message': f'Issued cert validity set to {validity_days} days. TAK Server restarted.'})
 
 
+# ── TAK Server 5.8 upgrade gate ─────────────────────────────────────────────
+# TAK 5.8 ships a PostgreSQL 15->18 database migration. Installing the 5.8
+# package on a PG-15 box through our update flow wedges TAK mid-upgrade
+# (SchemaManager runs against the wrong PG major) and there is no clean way back
+# without a restore. Until the guided migration ships, the console REFUSES 5.8+
+# artifacts. Background: private notes ROADMAP.md, "Ubuntu 24.04 LTS
+# transition", Phase 0.5.
+TAK_GATE_BLOCK_FROM = (5, 8)
+TAK_GATE_MESSAGE = (
+    'STOP - TAK Server 5.8+ requires a PostgreSQL 15 to 18 database migration. '
+    'Do not install it manually. Console support for a guided upgrade is coming '
+    'in an upcoming release.'
+)
+# First major.minor after "takserver" in the artifact name. Covers every shape
+# we accept: takserver_5.7-RELEASE43_all.deb, takserver-5.8-RELEASE1.noarch.rpm,
+# takserver-docker-5.4-RELEASE.zip, takserver-core_5.7-..., takserver-database-...
+_TAK_VER_RE = re.compile(r'takserver[^0-9]*(\d+)\.(\d+)', re.I)
+
+
+def _tak_artifact_version(filename):
+    """(major, minor) parsed from an artifact filename, or None if unparseable."""
+    m = _TAK_VER_RE.search(os.path.basename(str(filename or '')))
+    if not m:
+        return None
+    try:
+        return (int(m.group(1)), int(m.group(2)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _tak_target_version_gate(*filenames):
+    """Return the STOP message if ANY artifact is >= 5.8, else None.
+
+    Unparseable names are ALLOWED on purpose — an operator with an oddly named
+    but legitimate 5.7 package must not be locked out of updating, and the gate
+    is a guard rail rather than an authorisation boundary.
+
+    settings['allow_tak_58'] (truthy, settings.json only, no UI) bypasses this so
+    real 5.8 artifacts can be exercised on dev boxes without reverting the gate.
+    """
+    try:
+        allow = bool(load_settings().get('allow_tak_58'))
+    except Exception:
+        allow = False
+    for fn in filenames:
+        ver = _tak_artifact_version(fn)
+        if not ver or ver < TAK_GATE_BLOCK_FROM:
+            continue
+        if allow:
+            print('[tak-gate] BYPASSED by allow_tak_58: permitting TAK %d.%d artifact %r'
+                  % (ver[0], ver[1], os.path.basename(str(fn))), flush=True)
+            return None
+        return TAK_GATE_MESSAGE
+    return None
+
+
 @app.route('/api/takserver/update', methods=['POST'])
 @login_required
 def takserver_update():
@@ -62794,6 +64536,9 @@ def takserver_update():
         if not _zips:
             return jsonify({'error': 'Container upgrade: upload the new takserver-docker-*.zip bundle (not a .deb).'}), 400
         _zip = os.path.join(UPLOAD_DIR, sorted(_zips, key=lambda f: os.path.getmtime(os.path.join(UPLOAD_DIR, f)))[-1])
+        _g = _tak_target_version_gate(_zip)
+        if _g:
+            return jsonify({'error': _g}), 400
         upgrade_log.clear()
         upgrade_status.update({'running': True, 'complete': False, 'error': False})
         threading.Thread(target=run_takserver_upgrade_container, args=(_zip,), daemon=True).start()
@@ -62813,6 +64558,9 @@ def takserver_update():
             _db_rpm = next((f for f in _all_rpms if 'database' in f.lower()), '')
             if not _core_rpm or not _db_rpm:
                 return jsonify({'error': 'Two-server update requires both takserver-core and takserver-database .noarch.rpm packages. Upload both.'}), 400
+            _g = _tak_target_version_gate(_core_rpm, _db_rpm)
+            if _g:
+                return jsonify({'error': _g}), 400
             _s1 = _tak_cfg.get('server_one', {})
             if not _s1.get('host'):
                 return jsonify({'error': 'Server One host not configured in deployment settings.'}), 400
@@ -62827,6 +64575,9 @@ def takserver_update():
                        key=lambda f: os.path.getmtime(os.path.join(UPLOAD_DIR, f)), reverse=True)
         if not _rpms:
             return jsonify({'error': 'No takserver .rpm found. Upload the new takserver-*.noarch.rpm from tak.gov first (the single-server package, not core/database).'}), 400
+        _g = _tak_target_version_gate(_rpms[0])
+        if _g:
+            return jsonify({'error': _g}), 400
         # external_db: pass the RDS block so the upgrade runs SchemaManager against the managed DB.
         _edb = _tak_cfg.get('external_db') if _tak_cfg.get('mode') == 'external_db' else None
         upgrade_log.clear()
@@ -62847,6 +64598,9 @@ def takserver_update():
         db_pkg = next((f for f in pkg_files if 'database' in f.lower()), '')
         if not core_pkg or not db_pkg:
             return jsonify({'error': 'Two-server update requires both takserver-core and takserver-database .deb packages. Upload both.'}), 400
+        _g = _tak_target_version_gate(core_pkg, db_pkg)
+        if _g:
+            return jsonify({'error': _g}), 400
         s1 = tak_cfg.get('server_one', {})
         if not s1.get('host'):
             return jsonify({'error': 'Server One host not configured in deployment settings.'}), 400
@@ -62861,6 +64615,9 @@ def takserver_update():
         single_pkgs = [f for f in pkg_files if '-database' not in f.lower() and '-core' not in f.lower()]
         if not single_pkgs:
             return jsonify({'error': 'Only split packages (core/database) found. For one-server update, upload the single takserver .deb. Remove the wrong files and upload the correct package.'}), 400
+        _g = _tak_target_version_gate(single_pkgs[0])
+        if _g:
+            return jsonify({'error': _g}), 400
         upgrade_log.clear()
         upgrade_status.update({'running': True, 'complete': False, 'error': False})
         threading.Thread(target=run_takserver_upgrade, args=(os.path.join(UPLOAD_DIR, single_pkgs[0]),), daemon=True).start()
@@ -71111,6 +72868,7 @@ function doCoturnUninstall(){
     msg.style.color='var(--green)';msg.textContent='Success! Reloading…';setTimeout(function(){location.reload();},1000);
   }).catch(function(e){msg.style.color='var(--red)';msg.textContent=e.message||'Request failed';});
 }
+
 </script>
 </body></html>'''
 
@@ -71470,6 +73228,10 @@ function takPurgeFailed(){
 {% elif 'ubuntu' in settings.get('os_type', '') %}<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">To upgrade to a newer release, download the new <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver_X.X_all.deb</span> from tak.gov, upload it below, then click Update. This runs <span style="font-family:'JetBrains Mono',monospace;font-size:12px">apt install ./package.deb</span> and restarts TAK Server.</p>
 {% else %}<p style="font-size:13px;color:var(--text-secondary);line-height:1.5;margin-bottom:16px;padding-top:16px">To upgrade to a newer release, download the new <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-X.X-RELEASE-XX.noarch.rpm</span> from tak.gov, upload it below, then click Update. This runs <span style="font-family:'JetBrains Mono',monospace;font-size:12px">dnf install ./package.rpm</span> and restarts TAK Server &mdash; your <strong>database is preserved</strong>.</p>
 {% endif %}
+<div style="border-left:3px solid var(--yellow);background:rgba(234,179,8,0.08);padding:12px 14px;border-radius:6px;margin-bottom:16px">
+<div style="font-size:13px;font-weight:600;color:var(--yellow);margin-bottom:4px">Upgrading to TAK Server 5.8?</div>
+<div style="font-size:12px;color:var(--text-secondary);line-height:1.5">5.8 includes a PostgreSQL database migration (15 to 18). This console will <strong>block 5.8 installs</strong> until guided-upgrade support ships in an upcoming release. Uploading a 5.8 package is safe &mdash; the update itself is what is refused.</div>
+</div>
 <div class="upload-area" id="upgrade-upload-area" style="padding:24px;margin-bottom:16px" {% if not two_server_mode %}onclick="document.getElementById('upgrade-file-input').click()"{% endif %} ondrop="handleUpgradeDrop(event)" ondragover="event.preventDefault();this.classList.add('dragover')" ondragleave="event.preventDefault();this.classList.remove('dragover')">
 <input type="file" id="upgrade-file-input" style="display:none" accept="{{ '.zip' if tak_is_container else ('.deb' if 'ubuntu' in settings.get('os_type','') else '.rpm') }}" {% if two_server_mode %}multiple{% endif %} onchange="handleUpgradeFile(event)">
 <div id="upgrade-upload-text" style="color:var(--text-dim);font-size:13px">{% if two_server_mode %}<span style="color:var(--yellow)">Drag and drop</span> both <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-core</span> and <span style="font-family:'JetBrains Mono',monospace;color:var(--cyan)">takserver-database</span> {{ '.deb' if 'ubuntu' in settings.get('os_type','') else '.noarch.rpm' }} here. Browse is disabled in split mode so only these two packages can be used.{% else %}Click or drop to select upgrade package ({{ '.zip' if tak_is_container else ('.deb' if 'ubuntu' in settings.get('os_type','') else '.rpm') }}){% endif %}</div>
@@ -74410,6 +76172,15 @@ def _startup_migrations():
             _harden_sensitive_permissions()
         except Exception as _hp_e:
             print(f"Startup migration: permissions hardening error (non-fatal): {_hp_e}", flush=True)
+
+        # v10.1.16 — restore Node-RED's read on admin.pem/admin.key if the W7-era
+        # blanket chmod (or anything since) left them owner-only. Loud-failure
+        # boxes were hand-fixed in the 2026-07-25 incident; the NUC sat silently
+        # broken for five weeks because no configurator config exercised the TLS.
+        try:
+            _heal_nodered_cert_read_access(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _nrh_e:
+            print(f"Startup migration: Node-RED cert heal error (non-fatal): {_nrh_e}", flush=True)
 
         # v10.1.9 W1 — retrofit: encrypt an existing split-box core↔DB link (TLS + SCRAM).
         # One-shot per box; involves a takserver restart + live verification (minutes), so it
@@ -77689,7 +79460,8 @@ def _selfheal_cloudtak_corrupt_icons(plog=None):
         if status == 'running' and restarts < 3:
             return False
         logs = subprocess.run(
-            _sudo_wrap(['docker', 'logs', '--tail', '300', 'cloudtak-api-1']),
+            _sudo_wrap(['docker', 'logs', '--since', '3m', '--tail', '300',
+                        'cloudtak-api-1']),
             capture_output=True, text=True, timeout=20)
         blob = (logs.stdout or '') + (logs.stderr or '')
         if not (('from_icons' in blob or 'SpriteBuilder' in blob or 'sprites' in blob)
@@ -77787,12 +79559,19 @@ try:
         # image), and the resulting crash-loop takes another ~4 min to surface (nuc
         # 2026-07-29: heal at +2m, hardening recreate at +3.5m, loop at ~+8m — the old
         # 3-check/5.5-min window had just closed). Self-gating no-op when healthy.
+        # Do NOT stop after a successful heal. Field, nuc 2026-08-02: heal ran at
+        # +2.5 min and patched the regen-guard, then "CloudTAK recreated with
+        # hardened port bindings" fired 79 s later, rebuilt the container from the
+        # image, wiped the patch, and the api crash-looped for hours with nothing
+        # watching — because the loop had already returned. The 15-min window this
+        # code deliberately opens was useless while the first success closed it.
+        # The check is self-gating (healthy + no RECENT crash signature = no-op),
+        # so keeping the watch open costs a docker inspect every 2 min.
         for _i in range(8):
             _t.sleep(90 if _i == 0 else 120)
             try:
-                if _selfheal_cloudtak_corrupt_icons(
-                        plog=lambda m: print(f"[startup-iconheal] {m}", flush=True)):
-                    return
+                _selfheal_cloudtak_corrupt_icons(
+                    plog=lambda m: print(f"[startup-iconheal] {m}", flush=True))
             except Exception:
                 pass
     _threading_iconheal.Thread(target=_startup_icon_heal, daemon=True,
