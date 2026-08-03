@@ -768,7 +768,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.17-alpha"
+VERSION = "10.1.18-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -929,35 +929,44 @@ def main():
             (r'\bdef api_share_links_generate\s*\(', ('/api/share-links/generate', 'share-links/generate'), 'api_share_links_generate_core'),
             (r'\bdef api_share_links_revoke\s*\(', ('/api/share-links/revoke', 'share-links/revoke'), 'api_share_links_revoke_core'),
     ):
+        # Idempotency guard (2026-08-03 field crash, test6): once this endpoint
+        # is stamped anywhere, later runs must SKIP the target entirely. Without
+        # this, run 2 can't re-find the (now endpoint=-carrying) hinted route,
+        # falls through to the nearest-route fallback below, and stamps an
+        # UNRELATED decorator with a duplicate endpoint -> Flask AssertionError
+        # -> editor crash-loop on every start (upstream v2.1.0 put its new
+        # /api/playback-mode POST route inside the 20-line window).
+        if ("endpoint='" + endpoint_val + "'") in src:
+            continue
         for i in range(len(lines) - 1, -1, -1):
             if not re.search(def_pat, lines[i]):
                 continue
+            # Walk ONLY this def's contiguous decorator block (the lines
+            # directly above it, each starting with '@'). The old 20-line
+            # window could reach a NEIGHBOURING route's decorators — that is
+            # exactly how the 2026-08-03 test6 crash happened (upstream v2.1.0
+            # put /api/playback-mode POST inside the window and it got stamped
+            # with the share-links endpoint -> duplicate -> Flask refused the
+            # app). Prefer the hinted route line; else the block's only
+            # unstamped @app.route; else stamp NOTHING (a miss is safe — the
+            # duplicate-endpoint symptom this patch exists for surfaces loudly).
+            block = []
             j = i - 1
-            while j >= 0 and j >= i - 20:
-                line = lines[j]
-                if '@app.route' in line and 'endpoint=' not in line and any(h in line for h in route_hints):
-                    if line.rstrip().endswith(')'):
-                        lines[j] = line.rstrip()[:-1] + ", endpoint='" + endpoint_val + "')\n"
-                    else:
-                        lines[j] = line.rstrip().rstrip(')') + ", endpoint='" + endpoint_val + "')\n"
-                    src = ''.join(lines)
-                    changed = True
-                    break
+            while j >= 0 and lines[j].lstrip().startswith('@'):
+                block.append(j)
                 j -= 1
-            else:
-                # Fallback: patch the nearest @app.route above this def (same route block)
-                j = i - 1
-                while j >= 0 and j >= i - 20:
-                    if '@app.route' in lines[j] and 'endpoint=' not in lines[j]:
-                        l = lines[j]
-                        if l.rstrip().endswith(')'):
-                            lines[j] = l.rstrip()[:-1] + ", endpoint='" + endpoint_val + "')\n"
-                        else:
-                            lines[j] = l.rstrip().rstrip(')') + ", endpoint='" + endpoint_val + "')\n"
-                        src = ''.join(lines)
-                        changed = True
-                        break
-                    j -= 1
+            route_js = [k for k in block if '@app.route' in lines[k] and 'endpoint=' not in lines[k]]
+            hinted = [k for k in route_js if any(h in lines[k] for h in route_hints)]
+            pick = hinted or route_js
+            if pick:
+                k = pick[0]
+                l = lines[k]
+                if l.rstrip().endswith(')'):
+                    lines[k] = l.rstrip()[:-1] + ", endpoint='" + endpoint_val + "')\n"
+                else:
+                    lines[k] = l.rstrip().rstrip(')') + ", endpoint='" + endpoint_val + "')\n"
+                src = ''.join(lines)
+                changed = True
             break
 
     # 5. No-cache headers so browsers/proxies never serve stale editor pages
@@ -1002,17 +1011,25 @@ MEDIAMTX_REMOTE_EP_PATCH_SCRIPT = (
     "f='/opt/mediamtx-webeditor/mediamtx_config_editor.py'\n"
     "with open(f) as h: src=h.read()\n"
     "lines=src.splitlines(keepends=True)\n"
-    "for (dp,rh,ev) in [(r'\\\\bdef shared_stream_page\\\\s*\\\\(',('/shared/',),'shared_stream_page_core'),(r'\\\\bdef shared_hls_proxy\\\\s*\\\\(',('/shared-hls','shared_hls'),'shared_hls_proxy_core'),(r'\\\\bdef api_share_links_list\\\\s*\\\\(',('/api/share-links','share-links'),'api_share_links_list_core'),(r'\\\\bdef api_share_links_generate\\\\s*\\\\(',('/api/share-links/generate','share-links/generate'),'api_share_links_generate_core'),(r'\\\\bdef api_share_links_revoke\\\\s*\\\\(',('/api/share-links/revoke','share-links/revoke'),'api_share_links_revoke_core')]:\n"
+    # NB escaping: this script reaches the target as a FILE (python3 /tmp/<name>.py,
+    # app.py ~26727 — no shell layer), so regexes here need SINGLE logical
+    # backslashes (\\b in this source = \b in the written file). The old
+    # quadruple-escaped patterns (\\\\bdef -> literal backslash in the regex)
+    # never matched anything — the remote ep-patch was a silent no-op.
+    "for (dp,rh,ev) in [(r'\\bdef shared_stream_page\\s*\\(',('/shared/',),'shared_stream_page_core'),(r'\\bdef shared_hls_proxy\\s*\\(',('/shared-hls','shared_hls'),'shared_hls_proxy_core'),(r'\\bdef api_share_links_list\\s*\\(',('/api/share-links','share-links'),'api_share_links_list_core'),(r'\\bdef api_share_links_generate\\s*\\(',('/api/share-links/generate','share-links/generate'),'api_share_links_generate_core'),(r'\\bdef api_share_links_revoke\\s*\\(',('/api/share-links/revoke','share-links/revoke'),'api_share_links_revoke_core')]:\n"
+    " if \"endpoint='\"+ev+\"'\" in src: continue\n"
     " for i in range(len(lines)-1,-1,-1):\n"
     "  if not re.search(dp,lines[i]): continue\n"
-    "  for j in range(i-1,max(-1,i-20),-1):\n"
-    "   L=lines[j]\n"
-    "   if '@app.route' in L and 'endpoint=' not in L and any(h in L for h in rh):\n"
-    "    lines[j]=L.rstrip()[:-1]+\", endpoint='\"+ev+\"')\\n\"; break\n"
-    "  else:\n"
-    "   for j in range(i-1,max(-1,i-20),-1):\n"
-    "    if '@app.route' in lines[j] and 'endpoint=' not in lines[j]:\n"
-    "     L=lines[j]; lines[j]=L.rstrip()[:-1]+\", endpoint='\"+ev+\"')\\n\"; break\n"
+    "  blk=[]\n"
+    "  j=i-1\n"
+    "  while j>=0 and lines[j].lstrip().startswith('@'):\n"
+    "   blk.append(j); j-=1\n"
+    "  rjs=[k for k in blk if '@app.route' in lines[k] and 'endpoint=' not in lines[k]]\n"
+    "  hin=[k for k in rjs if any(h in lines[k] for h in rh)]\n"
+    "  pick=hin or rjs\n"
+    "  if pick:\n"
+    "   k=pick[0]; L=lines[k]\n"
+    "   lines[k]=L.rstrip()[:-1]+\", endpoint='\"+ev+\"')\\n\"\n"
     "  break\n"
     "with open(f,'w') as h: h.write(''.join(lines))\n"
 )
@@ -2053,6 +2070,93 @@ def _selinux_allow_caddy_port(port, log=None):
         if log:
             log(f"  ⚠ SELinux port-label /{port} error (non-fatal): {str(e)[:120]}")
         return False
+
+
+def _selinux_heal_module_dir_labels(log=None):
+    """v10.1.18 (RHEL/SELinux) — relabel console-user module trees whose SELinux
+    type has drifted from the policy default.
+
+    Field origin (NUC, 2026-08-03, 10.1.18 A3 harvest): every file under
+    ~/CloudTAK carried `user_home_dir_t` — the type for a home DIRECTORY, stamped
+    on regular FILES. The confined console domain has no read rule for that type
+    on files (correctly — no policy should), so every module-detection stat of
+    docker-compose.yml / .override.yml / .env logged a would-deny. That single
+    tree was ~80% of the domain's residual AVCs; relabeling it took the box from
+    ~1 denial/min to ZERO. Sibling trees (~/authentik, ~/node-red, ~/TAK-Portal,
+    ~/infra-TAK) were already correct, so this is drift from the CloudTAK deploy
+    path — the correct fix is a relabel, NOT an allow rule for the wrong type
+    (that would bake the drift into shipped policy forever).
+
+    Deliberately generic over the known module dirs rather than CloudTAK-only:
+    the same drift class can appear on any tree we create, and the check is a
+    cheap string compare per directory.
+
+    Idempotent and safe: reads the policy default with `matchpathcon` and calls
+    `restorecon -R` ONLY on a genuine mismatch. Read-only on a healthy box.
+    No-op off-RHEL / when SELinux is disabled. Returns the number relabeled."""
+    if _distro_family() != 'rhel':
+        return 0
+    if not shutil.which('matchpathcon'):
+        return 0
+    try:
+        if (subprocess.run(['getenforce'], capture_output=True, text=True,
+                           timeout=10).stdout or '').strip() == 'Disabled':
+            return 0
+    except Exception:
+        return 0
+
+    def _log(m):
+        if log:
+            log(m)
+        else:
+            print(f"[selinux-labels] {m}", flush=True)
+
+    # v10.1.18b: enumerate the home's subdirectories rather than carrying a
+    # hardcoded module list. The first cut listed five known dirs and MISSED
+    # ~/eud-remote-assist and ~/netbird on aws-rocky, both left as admin_home_t
+    # by the root-era install — 128 denials/boot that the list could never see.
+    # Any module dir we create can drift; scanning finds them all, including
+    # modules added after this code was written.
+    home = os.path.expanduser('~')
+    healed = 0
+    try:
+        candidates = sorted(d for d in os.listdir(home)
+                            if os.path.isdir(os.path.join(home, d)) and not d.startswith('.'))
+    except Exception:
+        candidates = []
+    # The HOME DIRECTORY ITSELF is checked first: on aws-rocky /home/takwerx was
+    # home_root_t (the label for /home) instead of user_home_dir_t, while
+    # /home/rocky next to it was correct — so the console's own home was
+    # unreadable-by-policy and the earlier subdirectory-only scan could never
+    # see it. Anything wrong at this level poisons everything under it.
+    for path in [home] + [os.path.join(home, n) for n in candidates]:
+        name = os.path.basename(path) or path
+        if not os.path.isdir(path):
+            continue
+        try:
+            want = subprocess.run(['matchpathcon', path], capture_output=True,
+                                  text=True, timeout=15).stdout or ''
+            # "<path>\t<user>:<role>:<type>:<level>" -> type
+            want_t = want.strip().split('\t')[-1].split(':')[2] if ':' in want else ''
+            cur = subprocess.run(['ls', '-Zd', path], capture_output=True,
+                                 text=True, timeout=15).stdout or ''
+            cur_t = cur.strip().split()[0].split(':')[2] if ':' in cur else ''
+        except Exception:
+            continue
+        if not (want_t and cur_t) or want_t == cur_t:
+            continue
+        _log(f"{name}: SELinux type drift {cur_t} -> {want_t}; relabeling (restorecon -R)")
+        try:
+            r = subprocess.run(_sudo_wrap(['restorecon', '-R', path]),
+                               capture_output=True, text=True, timeout=300)
+            if r.returncode == 0:
+                healed += 1
+                _log(f"{name}: ✓ relabeled to {want_t}")
+            else:
+                _log(f"{name}: ⚠ restorecon failed: {(r.stderr or r.stdout or '')[:160]}")
+        except Exception as e:
+            _log(f"{name}: ⚠ restorecon error: {str(e)[:120]}")
+    return healed
 
 
 def _selinux_sync_caddy_ports(log=None):
@@ -28571,6 +28675,175 @@ def cloudtak_bootstrap_admin_p12_status_api():
     })
 
 
+# v10.1.18 — CloudTAK CoreEvents bootstrap ADMIN cert ("Channels Disabled Admin
+# Cert", Nick Ingalls 2026-08-03). CloudTAK ≥13.59.0 reposts Events as m-g CoTs
+# over connection 0 (the cert in server.auth) and silently skips channels that
+# cert can't resolve. TAK's channel selection only engages for certs whose EKU
+# carries the enrollment OID 1.2.840.113549.1.9.7 — makeCert.sh certs do NOT
+# have it, so a makeCert-issued cert bypasses the group cache ("channels
+# disabled"); certmod -A makes it ROLE_ADMIN, and stock
+# x509assignAdminAllGroups=true then grants every in/out group dynamically,
+# including channels created later. So: makeCert client + certmod -A, nothing
+# else. The CN is a fixed constant a TAK Portal user can never collide with
+# (UAF matches fingerprint OR identifier==CN; portal org-suffixes usernames,
+# which mitigates, but the reserved -svc- name closes it).
+# NO auto-bootstrap (operator decision 2026-08-03): the operator downloads the
+# p12 and uploads it in the CloudTAK wizard / Admin → Server swap themselves.
+CLOUDTAK_BOOTSTRAP_CERT_CN = 'cloudtak-svc-bootstrap'
+
+
+def _cloudtak_bootstrap_cert_target(settings):
+    """Where the TAK cert store for the bootstrap admin cert lives.
+    Returns ('local', None) when /opt/tak/certs is on this box (native or
+    container — /opt/tak is symlinked into the bundle on the container path),
+    ('remote', server_two_cfg) on a split deploy with a remote TAK core, or
+    ('absent', None)."""
+    if os.path.exists('/opt/tak/certs/makeCert.sh'):
+        return 'local', None
+    try:
+        tak_cfg = _get_tak_deployment_config(settings)
+        s2 = tak_cfg.get('server_two', {}) if isinstance(tak_cfg.get('server_two'), dict) else {}
+        s2_host = (s2.get('host') or '').strip()
+        if (tak_cfg.get('mode') == 'two_server' and s2_host
+                and not s2.get('use_localhost')
+                and s2_host not in ('127.0.0.1', 'localhost', '::1')):
+            return 'remote', s2
+    except Exception:
+        pass
+    return 'absent', None
+
+
+@app.route('/api/cloudtak/generate-bootstrap-cert', methods=['POST'])
+@login_required
+def cloudtak_generate_bootstrap_cert_api():
+    """Generate (idempotent) the CoreEvents-ready CloudTAK bootstrap admin cert:
+    makeCert.sh client cloudtak-svc-bootstrap + UserManager certmod -A."""
+    settings = load_settings()
+    cn = CLOUDTAK_BOOTSTRAP_CERT_CN
+    mode, s2 = _cloudtak_bootstrap_cert_target(settings)
+    if mode == 'absent':
+        return jsonify({'success': False,
+                        'error': 'TAK Server certificate store not found — deploy TAK Server first '
+                                 '(or configure the two-server Core SSH settings).'}), 400
+
+    if mode == 'remote':
+        # Split deploy: certs + UserManager live on the remote TAK core. One SSH
+        # round-trip: generate if missing, then (always) converge the admin flip.
+        # CN is a fixed constant — nothing request-controlled enters the command.
+        cmd = (
+            f'cd /opt/tak/certs && '
+            f'if [ -f files/{cn}.p12 ]; then echo P12_EXISTS; else '
+            f'echo y | sudo -u tak ./makeCert.sh client {cn} 2>&1; fi && '
+            f'test -f files/{cn}.p12 && echo P12_OK && '
+            f'sudo java -jar /opt/tak/utils/UserManager.jar certmod -A /opt/tak/certs/files/{cn}.pem 2>&1 '
+            f'&& echo CERTMOD_OK'
+        )
+        ok, out = _ssh_probe(s2, cmd, timeout=120)
+        out = out or ''
+        if 'P12_OK' not in out:
+            return jsonify({'success': False,
+                            'error': f'Remote cert generation failed on TAK core: {out[-400:]}'}), 500
+        return jsonify({
+            'success': True, 'cn': cn, 'p12': f'{cn}.p12', 'remote': True,
+            'created': 'P12_EXISTS' not in out,
+            'admin_flip_ok': 'CERTMOD_OK' in out,
+            'download_url': '/api/cloudtak/bootstrap-cert/download',
+            'note': ('' if 'CERTMOD_OK' in out else
+                     'Cert exists but the ROLE_ADMIN flip (certmod -A) failed on the remote core — '
+                     'Events will not deliver until it succeeds; see the SSH output in the console log.'),
+        })
+
+    # Local (native or container) — mirrors takserver_create_client_cert.
+    cert_dir = '/opt/tak/certs/files'
+    p12_path = os.path.join(cert_dir, f'{cn}.p12')
+    pem_path = os.path.join(cert_dir, f'{cn}.pem')
+    created = False
+    try:
+        if not os.path.exists(p12_path):
+            _patch_openssl_string_mask()
+            if _tak_is_container():
+                _run_priv_chain([['chmod', '500', '/opt/tak/certs/cert-metadata.sh']], 'and')
+            else:
+                _run_priv_chain([['chown', 'tak:tak', '/opt/tak/certs/cert-metadata.sh'],
+                                 ['chmod', '500', '/opt/tak/certs/cert-metadata.sh']], 'and')
+            r = subprocess.run(
+                _rotate_tak_cert_cmd(f'cd /opt/tak/certs && echo y | runuser -u tak -- /opt/tak/certs/makeCert.sh client {cn} 2>&1'),
+                shell=True, capture_output=True, text=True, timeout=60)
+            if r.returncode != 0 or not os.path.exists(p12_path):
+                return jsonify({'success': False,
+                                'error': f'makeCert.sh failed: {(r.stdout or r.stderr or "")[-400:]}'}), 500
+            created = True
+
+        # ROLE_ADMIN flip — the entire point of this cert (assignAdminAllGroups
+        # then feeds it every channel). Unlike the best-effort group assignment
+        # in create-client-cert, a failure here is surfaced, not swallowed.
+        cmd = f'java -jar /opt/tak/utils/UserManager.jar certmod -A {shlex.quote(pem_path)}'
+        full = _tak_exec(cmd) if _tak_is_container() else (cmd + ' 2>&1')
+        gr = subprocess.run(full, shell=True, capture_output=True, text=True, timeout=60)
+        certmod_ok = gr.returncode == 0
+        # Canary — never assume the jar wrote the UAF entry (native non-root
+        # consoles can't write the tak-owned UAF from a bare java run).
+        uaf_has_entry = False
+        try:
+            uaf_has_entry = f'identifier="{cn}"' in (_read_priv('/opt/tak/UserAuthenticationFile.xml') or '')
+        except Exception:
+            pass
+        note = ''
+        if not (certmod_ok and uaf_has_entry):
+            note = ('The ROLE_ADMIN flip (certmod -A) did not verify — Events will not deliver '
+                    'until the UAF carries this cert with ROLE_ADMIN. Output: '
+                    + (gr.stdout or gr.stderr or '')[-300:])
+        return jsonify({
+            'success': True, 'cn': cn, 'p12': f'{cn}.p12', 'remote': False,
+            'created': created,
+            'admin_flip_ok': bool(certmod_ok and uaf_has_entry),
+            'download_url': '/api/cloudtak/bootstrap-cert/download',
+            'note': note,
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)[:300]}), 500
+
+
+@app.route('/api/cloudtak/bootstrap-cert/download')
+@login_required
+def cloudtak_bootstrap_cert_download():
+    """Download cloudtak-svc-bootstrap.p12 — local cert store, or fetched over
+    SSH from the remote TAK core on a split deploy (same pattern as
+    _load_admin_p12_bytes_from_tak_core)."""
+    settings = load_settings()
+    cn = CLOUDTAK_BOOTSTRAP_CERT_CN
+    mode, s2 = _cloudtak_bootstrap_cert_target(settings)
+    if mode == 'local':
+        return _send_cert_file_priv('/opt/tak/certs/files', f'{cn}.p12')
+    if mode == 'remote':
+        cmd = (
+            "python3 - <<'PY'\n"
+            "import base64,sys\n"
+            f"p='/opt/tak/certs/files/{cn}.p12'\n"
+            "try:\n"
+            "  b=open(p,'rb').read()\n"
+            "  print(base64.b64encode(b).decode())\n"
+            "except Exception as e:\n"
+            "  print('ERR:'+str(e))\n"
+            "  sys.exit(1)\n"
+            "PY"
+        )
+        ok, out = _ssh_probe(s2, cmd, timeout=30)
+        if ok and out:
+            import base64 as _b64mod
+            try:
+                data = _b64mod.b64decode((out or '').strip().splitlines()[-1])
+            except Exception:
+                data = b''
+            if data:
+                resp = app.response_class(data, mimetype='application/x-pkcs12')
+                resp.headers['Content-Disposition'] = f'attachment; filename={cn}.p12'
+                return resp
+        return jsonify({'error': f'Could not fetch {cn}.p12 from the remote TAK core — '
+                                 'generate it first.'}), 404
+    return jsonify({'error': 'TAK Server certificate store not found'}), 404
+
+
 @app.route('/api/cloudtak/deploy', methods=['POST'])
 @login_required
 def cloudtak_deploy_api():
@@ -43411,6 +43684,38 @@ window.ctCopyPluginLog = function(btn) {
   }
 };
 
+window.ctGenBootstrapCert = function(btn) {
+  var out = document.getElementById('ct-bootstrap-cert-result');
+  var esc = function(s) { var d = document.createElement('div'); d.textContent = String(s == null ? '' : s); return d.innerHTML; };
+  var orig = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Generating…';
+  if (out) { out.style.display = 'block'; out.innerHTML = '<span style="color:var(--text-dim)">Generating certificate + applying ROLE_ADMIN (this takes a few seconds)…</span>'; }
+  fetch('/api/cloudtak/generate-bootstrap-cert', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: '{}',
+    credentials: 'same-origin'
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    btn.disabled = false; btn.textContent = orig;
+    if (!out) return;
+    if (!d || !d.success) {
+      out.innerHTML = '<span style="color:var(--red)">✗ ' + esc((d && d.error) || 'Generation failed') + '</span>';
+      return;
+    }
+    var html = '<div style="color:var(--green);font-weight:600">✓ ' + esc(d.cn) + '.p12 ' + (d.created ? 'generated' : 'already exists') +
+               (d.admin_flip_ok ? ' — ROLE_ADMIN applied (all channels via assignAdminAllGroups)' : '') + '</div>';
+    if (!d.admin_flip_ok) {
+      html += '<div style="color:var(--yellow);margin-top:6px">⚠ ' + esc(d.note || 'ROLE_ADMIN flip did not verify.') + '</div>';
+    }
+    html += '<div style="margin-top:8px"><a href="' + d.download_url + '" style="color:var(--cyan);font-weight:600">⬇ Download ' + d.cn + '.p12</a>' +
+            ' <span style="color:var(--text-dim);font-size:12px;margin-left:10px">certificate password: <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--yellow)">{{ cloudtak_cert_password }}</code></span></div>';
+    out.innerHTML = html;
+  }).catch(function(e) {
+    btn.disabled = false; btn.textContent = orig;
+    if (out) out.innerHTML = '<span style="color:var(--red)">✗ Request failed: ' + (e && e.message ? e.message : String(e)) + '</span>';
+  });
+};
+
 window.ctPluginAction = function(pluginKey, action) {
   var label = { install: 'Install', update: 'Update', remove: 'Remove' }[action] || action;
   if (action === 'remove') {
@@ -43711,13 +44016,11 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
         </div>
 
         <div style="background:var(--bg-surface);border:1px solid var(--border);border-radius:10px;padding:14px 18px">
-          <div style="font-size:12px;font-weight:700;color:var(--cyan);font-family:\'JetBrains Mono\',monospace;margin-bottom:8px">STEP 2 — Download the bootstrap user.p12 certificate</div>
-          <ol style="margin:0;padding-left:18px;color:var(--text-secondary)">
-            <li style="margin-bottom:5px">In infra-TAK, go to <strong style="color:var(--text-primary)">TAK Server</strong> → <strong style="color:var(--text-primary)">Certificates</strong></li>
-            <li style="margin-bottom:5px">Find <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--yellow)">user.p12</code> in the certificate list (created automatically during deploy)</li>
-            <li style="margin-bottom:5px">Click <strong style="color:var(--text-primary)">Download</strong> → save <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--yellow)">user.p12</code> to your computer</li>
-            <li style="color:var(--text-dim);font-size:12px">The certificate password is shown on this same Certificates page — note it, you will need it in Step 3.</li>
-          </ol>
+          <div style="font-size:12px;font-weight:700;color:var(--cyan);font-family:\'JetBrains Mono\',monospace;margin-bottom:8px">STEP 2 — Generate &amp; download the Bootstrap Admin certificate</div>
+          <p style="margin:0 0 10px;font-size:12px;color:var(--text-secondary)">CloudTAK 13.59+ (Core Events) reposts Events over this certificate and <strong style="color:var(--text-primary)">silently skips channels the cert can\'t reach</strong> — it needs a <em>channels-disabled admin</em> cert, not a regular user cert. This button creates <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--yellow)">cloudtak-svc-bootstrap.p12</code> with exactly that shape (makeCert-issued + ROLE_ADMIN, all channels via TAK\'s assignAdminAllGroups).</p>
+          <button class="btn btn-primary" onclick="ctGenBootstrapCert(this)" style="font-size:12px">Generate CloudTAK Bootstrap Admin p12</button>
+          <div id="ct-bootstrap-cert-result" style="display:none;margin-top:10px;font-size:12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px"></div>
+          <p style="margin:10px 0 0;font-size:12px;color:var(--text-dim)">Already running CloudTAK? Generate + download here, then swap it once in <strong style="color:var(--text-primary)">CloudTAK Admin → Server → Admin Certificate</strong> — no re-bootstrap needed. (The legacy <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px">user.p12</code> still connects, but Events will not deliver with it.)</p>
         </div>
 
         <div style="background:var(--bg-surface);border:1px solid var(--border);border-radius:10px;padding:14px 18px">
@@ -43726,7 +44029,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
             <li style="margin-bottom:5px">Open CloudTAK in your browser{% if settings.fqdn %} at <a href="https://map.{{ settings.fqdn }}" target="_blank" rel="noopener" style="color:var(--cyan)">https://map.{{ settings.fqdn }}</a>{% endif %} — if the setup/config page does not appear, wait a minute and reload (CloudTAK may still be starting); if it stays stale, clear it via <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--text-secondary)">DevTools → Application → Clear site data</code></li>
             <li style="margin-bottom:5px">When prompted for the TAK Server address, enter: {% if settings.fqdn %}<code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--cyan)">takserver.{{ settings.fqdn }}</code>{% else %}<code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--cyan)">takserver.yourdomain.com</code>{% endif %}</li>
             <li style="margin-bottom:5px">Enter username: <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--green)">cloudtakadmin-suffix</code> (the full suffixed name from Step 1) and the password you set in Step 1</li>
-            <li style="margin-bottom:5px">Upload <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--yellow)">user.p12</code> and enter the certificate password you noted in Step 2</li>
+            <li style="margin-bottom:5px">Upload <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--yellow)">cloudtak-svc-bootstrap.p12</code> from Step 2 and enter the certificate password shown there</li>
             <li>CloudTAK will save and reload to the login page — sign in with your <code style="background:#0a0e1a;padding:1px 6px;border-radius:3px;color:var(--green)">cloudtakadmin-suffix</code> credentials</li>
           </ol>
         </div>
@@ -50410,6 +50713,23 @@ def _heal_container_ports_loopback(plog=None):
                 subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx-webeditor']),
                                capture_output=True, text=True, timeout=60)
                 _log("container-ports: mediamtx-webeditor overlay refreshed (loopback bind) + restarted")
+            # 2026-08-03 field crash (test6): the pre-guard ep-patch double-ran and
+            # stamped the editor's /api/playback-mode POST route (upstream v2.1.0)
+            # with the share-links endpoint -> duplicate Flask endpoint -> editor
+            # crash-loop on every start. The guard above stops NEW damage; this
+            # heals the exact known mangle already on disk. Exact-string on
+            # purpose: any other duplicate shape should surface, not be guessed at.
+            ed = '/opt/mediamtx-webeditor/mediamtx_config_editor.py'
+            bad = "@app.route('/api/playback-mode', methods=['POST'], endpoint='api_share_links_list_core')"
+            try:
+                ed_src = _read_priv(ed)
+            except Exception:
+                ed_src = ''
+            if bad in ed_src:
+                _write_priv(ed, ed_src.replace(bad, "@app.route('/api/playback-mode', methods=['POST'])"))
+                subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx-webeditor']),
+                               capture_output=True, text=True, timeout=60)
+                _log("container-ports: mediamtx-webeditor duplicate-endpoint mangle healed + restarted")
     except Exception as e:
         _log(f"container-ports: mediamtx-webeditor loopback heal skipped (non-fatal): {str(e)[:140]}")
 
@@ -68766,7 +69086,12 @@ def _takportal_sync_map_channels(plog=None):
         content = _read_priv(uaf)
     except Exception:
         content = ''
-    if not content or 'identifier="admin"' not in content:
+    # v10.1.18: also converge the CloudTAK CoreEvents bootstrap admin cert
+    # (cloudtak-svc-bootstrap) when its UAF entry exists — belt-and-suspenders
+    # over x509assignAdminAllGroups, per the CORAZ __ANON__ precedent (a
+    # ROLE_ADMIN entry whose groupList drifts empty delivers to nobody).
+    sync_ids = ('admin', CLOUDTAK_BOOTSTRAP_CERT_CN)
+    if not content or not any(f'identifier="{i}"' in content for i in sync_ids):
         return
     import xml.etree.ElementTree as ET
     ET.register_namespace('', _TAK_UAF_NS)  # emit unprefixed tags + xmlns default, matching the source
@@ -68777,7 +69102,7 @@ def _takportal_sync_map_channels(plog=None):
         return
     ns = '{%s}' % _TAK_UAF_NS
     admin_els = [u for u in root.iter()
-                 if u.tag in (ns + 'User', 'User') and u.get('identifier') == 'admin']
+                 if u.tag in (ns + 'User', 'User') and u.get('identifier') in sync_ids]
     if not admin_els:
         return
     changed = False
@@ -68795,13 +69120,13 @@ def _takportal_sync_map_channels(plog=None):
             ET.SubElement(admin_el, ns + 'groupList').text = name
         changed = True
     if not changed:
-        _log(f"admin bridge already in {len(target)} channels — no change, no restart")
+        _log(f"admin bridge (+bootstrap cert) already in {len(target)} channels — no change, no restart")
         return
     import io as _io
     _buf = _io.StringIO()
     ET.ElementTree(root).write(_buf, xml_declaration=True, encoding='unicode')
     _write_priv(uaf, _buf.getvalue())
-    _log(f"admin bridge channel membership {old_count} -> {len(target)}; restarting tak-portal")
+    _log(f"admin bridge (+bootstrap cert) channel membership {old_count} -> {len(target)}; restarting tak-portal")
     subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']), capture_output=True, text=True, timeout=90)
 
 
@@ -77352,6 +77677,23 @@ def _startup_migrations():
         except Exception as caddy_selinux_err:
             print(f"Startup migration: Caddy SELinux port self-heal error (non-fatal): {caddy_selinux_err}")
 
+        # v10.1.18 — self-heal SELinux label DRIFT on the console user's module
+        # trees. Found during the 10.1.18 A3 harvest (NUC 2026-08-03): the whole
+        # ~/CloudTAK tree carried `user_home_dir_t` — a DIRECTORY type stamped on
+        # every FILE inside it — which alone produced ~80% of the confined
+        # domain's remaining would-deny AVCs (getattr/open/read on
+        # docker-compose.yml, .override.yml, .env). Sibling trees (~/authentik,
+        # ~/node-red, ~/TAK-Portal, ~/infra-TAK) were correctly `user_home_t`, so
+        # this is deploy-path drift, not a policy gap — the fix is a relabel, and
+        # writing an allow rule for the wrong type would have baked the drift into
+        # shipped policy permanently.
+        # Idempotent + cheap: compares each dir's current type against the policy
+        # default (matchpathcon) and only calls restorecon on a real mismatch.
+        try:
+            _selinux_heal_module_dir_labels(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _lbl_err:
+            print(f"Startup migration: SELinux module-dir label heal error (non-fatal): {_lbl_err}")
+
         # v10.1.8 — re-route CloudTAK video /stream/* to media-infra (:9997). The old
         # Caddy template sent it to raw MediaMTX HLS (18888), which 404'd every
         # external-HLS proxy lease (RTSP leases worked by accident). Deployed boxes
@@ -79768,6 +80110,118 @@ try:
     _broker_converge_running_source()
 except Exception as _e:
     print(f"[startup] broker source convergence skipped (non-fatal): {_e}", flush=True)
+
+
+# v10.1.18 (SELinux enforce-the-domain): verify the box's
+# takwerx_console_confined module actually matches the shipped .te — never
+# assume a policy landed. The INSTALL is root-side in the broker's startup
+# (_selinux_policy_converge in broker/takwerx_broker.py): the boot converge
+# above already restarted the broker if its source changed, so on a normal
+# update the refresh is in flight when this gate starts polling. For a
+# .te-only bump (broker source unchanged → no restart above) the gate
+# requests ONE broker restart itself — `systemctl restart` is rulebook-allowed
+# — then re-polls. Refresh-only: a box never provisioned with the confined
+# domain (root install) is left alone.
+#
+# WHY THIS IS A GATE AND NOT A BACKGROUND THREAD (operator catch, 2026-08-03):
+# the customer path is Update Now → new code on disk → console restart. The
+# console then boots, restarts the broker, and the broker compiles+installs the
+# policy in a BACKGROUND thread — which takes ~10-60 s. Run as a daemon thread,
+# this check let `_startup_migrations()` proceed immediately, so a release's NEW
+# code ran its first-boot migrations under the PREVIOUS release's policy. Field
+# evidence: NUC 2026-08-03, console up 12:33:24, policy 1.5 not loaded until
+# 12:33:37 — the whole converge ran on the old rule set (and produced denials
+# that the new rules already covered). Invisible under permissive; under an
+# ENFORCING domain that is a first-boot breakage on every customer box whose
+# release adds a rule. So: when a policy change is PENDING, block here until it
+# lands (bounded) before any migration runs. No pending change = fast no-op.
+def _startup_selinux_policy_canary():
+    name = 'takwerx_console_confined'
+    te = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'selinux', name + '.te')
+    if not (shutil.which('getenforce') and os.path.isfile(te)):
+        return
+    try:
+        mode = (subprocess.run(['getenforce'], capture_output=True, text=True,
+                               timeout=10).stdout or '').strip()
+    except Exception:
+        return
+    if mode == 'Disabled':
+        return
+    import re as _re
+    try:
+        with open(te) as f:
+            m = _re.match(r'^module\s+%s\s+([0-9.]+)' % name, f.readline())
+        want = m.group(1) if m else ''
+    except OSError:
+        want = ''
+    if not want:
+        return
+    try:
+        listed = subprocess.run(_sudo_wrap(['semodule', '-l']), capture_output=True,
+                                text=True, timeout=60).stdout or ''
+    except Exception:
+        listed = ''
+    if name not in {ln.strip().split()[0] for ln in listed.splitlines() if ln.strip()}:
+        print(f"[selinux-canary] {name} not installed on this box (root-install / "
+              f"non-confined) — refresh-only, skipping", flush=True)
+        return
+    stamp = f'/etc/selinux/.takwerx-{name}.ver'
+
+    def _stamp():
+        try:
+            with open(stamp) as f:
+                return f.read().strip()
+        except OSError:
+            return ''
+
+    def _wait(seconds):
+        import time as _tm
+        for _ in range(max(1, seconds // 5)):
+            if _stamp() == want:
+                return True
+            _tm.sleep(5)
+        return _stamp() == want
+
+    # Fast path: already converged (the overwhelming majority of boots — the .te
+    # only changes on releases that touch it). Costs one file read.
+    if _stamp() == want:
+        print(f"[selinux-canary] ✓ {name} at shipped version {want} (box {mode}; "
+              f"domain mode is whatever the shipped .te declares — see its header)", flush=True)
+        return
+    # A policy change IS pending. Hold the boot here (bounded) so migrations run
+    # under the policy that shipped WITH this code, not the previous release's.
+    print(f"[selinux-canary] policy change pending ({_stamp() or 'unstamped'} -> {want}) — "
+          f"holding startup migrations until it lands", flush=True)
+    if _wait(180):
+        print(f"[selinux-canary] ✓ {name} converged to {want} before migrations "
+              f"(box {mode})", flush=True)
+        return
+    # .te-only bump: nothing restarted the broker this boot — request one.
+    print(f"[selinux-canary] {name} stamp {_stamp() or 'absent'} != shipped {want} — "
+          f"restarting takwerx-broker to run its policy refresh", flush=True)
+    try:
+        subprocess.run(_sudo_wrap(['systemctl', '--no-block', 'restart', 'takwerx-broker']),
+                       capture_output=True, text=True, timeout=20)
+    except Exception as e:
+        print(f"[selinux-canary] broker restart request failed (non-fatal): {e}", flush=True)
+        return
+    if _wait(180):
+        print(f"[selinux-canary] ✓ {name} refreshed to {want} after broker restart", flush=True)
+    else:
+        print(f"[selinux-canary] ⚠ {name} still at {_stamp() or 'unstamped'} (want {want}) — "
+              f"check the broker audit log (op=selinux-policy) on this box; "
+              f"the domain may be running an OLD allow set. Proceeding with startup "
+              f"(a stuck policy install must never block the console from booting).",
+              flush=True)
+
+
+# Synchronous by design — see the ordering note above. Bounded at ~6 min worst
+# case (two 180 s waits) and a no-op when no policy change is pending, so it can
+# never wedge a boot; any failure path falls through to the migrations.
+try:
+    _startup_selinux_policy_canary()
+except Exception as _e:
+    print(f"[startup] selinux policy canary skipped (non-fatal): {_e}", flush=True)
 
 _startup_migrations()
 _post_update_auto_deploy()
