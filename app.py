@@ -774,7 +774,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.25-alpha"
+VERSION = "10.1.26-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -14371,6 +14371,209 @@ def _f2b_dead_jails():
     return dead
 
 
+# Log files infra-TAK ITSELF produces and one of our jails then reads. These we may
+# create: an empty file is harmless (the jail tails it and matches nothing until the
+# real writer appends), and its ABSENCE is fatal to the whole daemon.
+#
+# Everything NOT on this list belongs to another program — TAK Server's log4j owns
+# /opt/tak/logs/*, Caddy owns its access logs — and those run as their own
+# unprivileged users. Creating one of those root-owned would break the real writer,
+# which is the failure `_f2b_prepare_portal_caddy_log()` was written for. A jail
+# pointing at a missing FOREIGN log gets parked instead (see below).
+_F2B_SELF_OWNED_LOGS = ('/var/log/authentik/auth.log', '/var/log/fail2ban.log')
+
+# Suffix for a jail parked because its logpath does not exist. Parking (rather than
+# editing `enabled`) keeps the existence-based _f2b_*_jail_enabled() checks honest,
+# so the console reports the jail as off instead of showing a control that is not
+# running.
+_F2B_PARK_SUFFIX = '.parked-missing-log'
+
+
+def _f2b_ensure_ak_logfile(plog=None):
+    """Create /var/log/authentik/auth.log when it is missing. NEVER truncates.
+
+    The Authentik jail hard-codes `logpath = /var/log/authentik/auth.log`, but the only
+    thing that has ever created that file is the append redirect inside
+    authentik-log-forwarder.service — and the installer starts that unit ONLY when an
+    Authentik container is already running (migration step 6, and the same conditional
+    in the jail-toggle route). Set fail2ban up before Authentik is deployed, or during
+    a redeploy/upgrade window, and the jail is written pointing at a file nothing will
+    ever create. Install only ever made the DIRECTORY.
+
+    fail2ban does not skip such a jail — it aborts config parsing, so the whole daemon
+    dies and EVERY jail stops, sshd included. What made this survive so long is that
+    `fail2ban-client reload` (what almost all of our code calls) merely logs the bad
+    jail and leaves the running daemon up: the box looks healthy for weeks, until a
+    reboot or a package upgrade cold-starts fail2ban and it can never come back.
+
+        ERROR Failed during configuration: Have not found any log file for authentik jail
+        fail2ban.service: Main process exited, code=exited, status=255/EXCEPTION
+
+    Field report yfdtak-2, 2026-08-06, on v10.1.25 — every jail on that box was down
+    and no `systemctl start` would fix it.
+
+    Same guard the other three jails already had, and the one this jail never got:
+    sshd falls back to `backend = systemd` (_f2b_sshd_logpath), the portal log is
+    created and chowned up front (_f2b_prepare_portal_caddy_log), recidive's
+    /var/log/fail2ban.log is touched before the daemon starts."""
+    _log = plog or (lambda m: None)
+    path = '/var/log/authentik/auth.log'
+    if os.path.exists(path):
+        return False
+    try:
+        _makedirs_priv('/var/log/authentik', exist_ok=True)
+        subprocess.run(_sudo_wrap(['touch', path]), capture_output=True, timeout=15)
+        _chmod_priv(path, 0o640)
+    except Exception as e:
+        _log(f'fail2ban: could not create {path} (non-fatal): {e}')
+        return False
+    if not os.path.exists(path):
+        _log('fail2ban: %s is STILL missing after create — the Authentik jail will keep '
+             'fail2ban from starting. Check the log forwarder.' % path)
+        return False
+    _log('fail2ban: created the missing %s. The Authentik jail reads it, and a missing '
+         'logpath aborts the ENTIRE fail2ban daemon at config parse — not just that '
+         'jail — so this box had no fail2ban protection at all after its next restart.'
+         % path)
+    return True
+
+
+def _f2b_guard_jail_logpaths(plog=None):
+    """One jail's missing logpath must never take down every jail. Enforce that.
+
+    Runs before anything (re)starts fail2ban, over every enabled infratak-* jail:
+
+      1. RE-ARM first — a jail parked by an earlier pass whose log now exists comes
+         back. Without this the guard would be a one-way door: install TAK Server the
+         day after the takserver jail got parked and it would stay parked forever.
+      2. CREATE the logs we own (_F2B_SELF_OWNED_LOGS), plus the portal access log via
+         its owner-aware helper — Caddy must be able to write it, so it cannot just be
+         touched root-owned.
+      3. PARK what is left — a jail whose logpath belongs to another program and does
+         not exist. Renaming it aside costs that ONE jail; leaving it costs all of
+         them, because the daemon refuses to start at all. Real case: the takserver
+         jail on a split-box deploy, where TAK Server runs on the other server and
+         /opt/tak/logs/ does not exist here.
+      4. RESTART a daemon that is down, once, and report what state it reached.
+
+    Jails with `backend = systemd` are skipped — they read the journal and have no
+    logpath to lose (mediamtx, and sshd on a box with no rsyslog).
+
+    Parking is deliberately louder than it is clever: it logs the jail, the path, and
+    the reason, and _f2b_dead_jails() keeps reporting the gap, so a parked jail shows
+    up as missing protection instead of quietly passing as configured."""
+    _log = plog or (lambda m: None)
+    if not _f2b_is_available():
+        return False
+    jaild = '/etc/fail2ban/jail.d'
+    if not os.path.isdir(jaild):
+        return False
+    import glob as _glob
+    changed = False
+
+    # ── 1. Re-arm jails whose log has come back ───────────────────────────────
+    for parked in sorted(_glob.glob(os.path.join(jaild, 'infratak-*.conf' + _F2B_PARK_SUFFIX))):
+        try:
+            with open(parked) as f:
+                text = f.read()
+        except OSError:
+            continue
+        m = re.search(r'^\s*logpath\s*=\s*(\S+)', text, re.M)
+        if not m or not os.path.exists(m.group(1)):
+            continue
+        live = parked[:-len(_F2B_PARK_SUFFIX)]
+        try:
+            subprocess.run(_sudo_wrap(['mv', parked, live]), capture_output=True, timeout=15)
+            if os.path.exists(live):
+                changed = True
+                _log('fail2ban: re-armed %s — its log %s exists again.'
+                     % (os.path.basename(live), m.group(1)))
+        except Exception as e:
+            _log(f'fail2ban: could not re-arm {os.path.basename(parked)} (non-fatal): {e}')
+
+    # ── 2/3. Create what we own, park what we do not ──────────────────────────
+    for name, filt, jpath in _f2b_enabled_jail_files():
+        try:
+            with open(jpath) as f:
+                jt = f.read()
+        except OSError:
+            continue
+        if re.search(r'^\s*backend\s*=\s*systemd', jt, re.M):
+            continue                      # journal-fed — no logpath to lose
+        lm = re.search(r'^\s*logpath\s*=\s*(\S+)', jt, re.M)
+        if not lm:
+            continue
+        lp = lm.group(1)
+        if os.path.exists(lp):
+            continue
+        # fail2ban accepts a GLOB as logpath. None of our jails ship one, but an
+        # operator-edited jail may, and os.path.exists() is always False for a glob —
+        # which would park a jail that is working perfectly. Never park a pattern:
+        # act only on literal paths, where "missing" is unambiguous.
+        if any(ch in lp for ch in '*?['):
+            continue
+        # Ours to create?
+        if lp == '/var/log/authentik/auth.log':
+            changed |= bool(_f2b_ensure_ak_logfile(_log))
+        elif lp in _F2B_SELF_OWNED_LOGS:
+            try:
+                _makedirs_priv(os.path.dirname(lp), exist_ok=True)
+                subprocess.run(_sudo_wrap(['touch', lp]), capture_output=True, timeout=15)
+                _chmod_priv(lp, 0o640)
+                if os.path.exists(lp):
+                    changed = True
+                    _log('fail2ban: created the missing %s that the %s jail reads — its '
+                         'absence stops the whole daemon.' % (lp, name))
+            except Exception as e:
+                _log(f'fail2ban: could not create {lp} (non-fatal): {e}')
+        elif lp == TAKPORTAL_CADDY_LOG:
+            try:
+                _f2b_prepare_portal_caddy_log()   # owner-aware: Caddy must write it
+            except Exception:
+                pass
+        if os.path.exists(lp):
+            continue
+        # Not ours, still missing → park this jail so the others can run.
+        try:
+            subprocess.run(_sudo_wrap(['mv', jpath, jpath + _F2B_PARK_SUFFIX]),
+                           capture_output=True, timeout=15)
+            if not os.path.exists(jpath):
+                changed = True
+                _log('fail2ban: PARKED the %s jail — its logpath %s does not exist on '
+                     'this box, and fail2ban aborts the ENTIRE daemon over one missing '
+                     'log file. That jail is now off (it was never able to run); every '
+                     'other jail keeps working. It re-arms automatically once %s '
+                     'appears.' % (name, lp, lp))
+        except Exception as e:
+            _log(f'fail2ban: could not park {os.path.basename(jpath)} (non-fatal): {e}')
+
+    if not changed:
+        return False
+
+    # ── 4. Bring the daemon back ──────────────────────────────────────────────
+    try:
+        act = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'fail2ban']),
+                             capture_output=True, text=True, timeout=15).stdout.strip()
+        if act == 'active':
+            subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=60)
+            _log('fail2ban: reloaded after logpath repair.')
+        else:
+            subprocess.run(_sudo_wrap(['systemctl', 'restart', 'fail2ban']),
+                           capture_output=True, timeout=60)
+            now = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'fail2ban']),
+                                 capture_output=True, text=True, timeout=15).stdout.strip()
+            if now == 'active':
+                _log('fail2ban: was %s and is now ACTIVE after the logpath repair — jails '
+                     'are protecting this box again.' % (act or 'not running'))
+            else:
+                _log('fail2ban: still %s after the logpath repair — something else is '
+                     'wrong; check `systemctl status fail2ban`.' % (now or 'not running'))
+    except Exception as e:
+        _log(f'fail2ban: restart after logpath repair failed ({e}) — check '
+             '`systemctl status fail2ban`')
+    return True
+
+
 def _f2b_selfheal_filters(plog=None):
     """Write any MISSING filter file for an enabled jail whose filter we own.
 
@@ -14522,6 +14725,65 @@ def _f2b_selfheal_authentik_log_level(plog=None):
     return True
 
 
+# Hard ceiling for /var/log/authentik/auth.log. Same number as the `maxsize 50M` in
+# the logrotate rule below, so both mechanisms converge on the same operational state.
+_F2B_AK_LOG_MAX_BYTES = 50 * 1024 * 1024
+
+
+def _f2b_bound_ak_logfile(plog=None):
+    """Cap auth.log from the console, because logrotate CANNOT be installed on a
+    non-root box — and never has been.
+
+    `_f2b_ensure_authentik_logrotate()` writes /etc/logrotate.d/infratak-authentik.
+    That prefix is not on the broker's allow-list, so on every non-root box the write is
+    denied and the rule has simply never existed. Measured 2026-08-06: test6 (non-root)
+    sat at 25 MB with no rotation of any kind, and nuc logs the denial at every boot —
+    `broker write denied (/etc/logrotate.d/infratak-authentik): path not in allow-list`.
+    The v10.1.11 release believed it had fitted a drain before turning up the tap; on
+    the non-root half of the fleet it had not.
+
+    **Widening the broker is NOT the fix.** logrotate executes `prerotate`/`postrotate`
+    blocks as root, so write access to /etc/logrotate.d/ is a console->root escalation
+    primitive — precisely what the broker exists to prevent. Same reasoning that kept
+    /etc/tmpfiles.d/ off the list. The ceiling is enforced here instead, using verbs the
+    console already holds. Mechanism differs by box; the outcome does not — a root box
+    rotates and keeps 7 days, a non-root box hard-truncates at the same 50 MB, and
+    neither can grow without bound.
+
+    TRUNCATION, not deletion or rename, is required. The forwarder is a long-lived
+    `docker logs -f ... >> auth.log` holding an open append fd. Every write path here
+    opens O_TRUNC on the SAME inode — broker `_do_write()`, root `open(path,'w')`,
+    legacy `sudo tee` — so the fd stays valid and the forwarder keeps appending at the
+    new EOF. Rename-and-create would leave it writing to an unlinked inode forever and
+    the jail would starve silently, which is the failure the logrotate rule's
+    `copytruncate` was chosen to avoid. Nothing of value is lost: this file is the
+    jail's private feed and `docker logs` still holds the complete stream.
+
+    (`truncate -s 0` is deliberately not used — that binary is not on the broker's exec
+    allow-list, which is also why the existing call in `_f2b_selfheal_ak_forwarder()` is
+    a silent no-op on non-root boxes.)"""
+    _log = plog or (lambda m: None)
+    path = '/var/log/authentik/auth.log'
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return False
+    if size <= _F2B_AK_LOG_MAX_BYTES:
+        return False
+    try:
+        _write_priv(path, '', perm=0o640)
+    except Exception as e:
+        _log('fail2ban: could not cap %s (non-fatal): %s' % (path, e))
+        return False
+    _log('fail2ban: %s had grown to %.1f MB unrotated, so the console truncated it in '
+         'place (same inode — the forwarder keeps appending, the jail reads from the new '
+         'EOF, and the full stream is still in `docker logs`). logrotate cannot be '
+         'installed on this box: /etc/logrotate.d/ is off the broker allow-list by '
+         'design, because logrotate runs postrotate scripts as root.'
+         % (path, size / 1048576.0))
+    return True
+
+
 def _f2b_ensure_authentik_logrotate(plog=None):
     """Bound /var/log/authentik/auth.log. It has NEVER been rotated.
 
@@ -14565,7 +14827,12 @@ def _f2b_ensure_authentik_logrotate(plog=None):
              'rotation at all and was growing without bound.')
         return True
     except Exception as e:
-        _log(f'fail2ban: could not write the Authentik logrotate rule (non-fatal): {e}')
+        # Expected on every non-root box: /etc/logrotate.d/ is off the broker allow-list
+        # by design (postrotate runs as root). _f2b_bound_ak_logfile() enforces the same
+        # 50 MB ceiling from the console, so the log is still bounded.
+        _log('fail2ban: logrotate rule not installed (%s). Expected on a non-root box — '
+             'the console enforces the same %d MB ceiling directly instead.'
+             % (str(e)[:120], _F2B_AK_LOG_MAX_BYTES // (1024 * 1024)))
         return False
 
 
@@ -14870,6 +15137,11 @@ def _f2b_write_jail_config(maxretry, findtime, bantime, ignoreip=''):
     """Rewrite the infratak-authentik jail config with new thresholds and ignoreip whitelist."""
     jail_path = '/etc/fail2ban/jail.d/infratak-authentik.conf'
     _makedirs_priv('/etc/fail2ban/jail.d', exist_ok=True)
+    # Never write this jail without its log file present: a missing logpath aborts the
+    # WHOLE fail2ban daemon at config parse, not just this jail. The forwarder that
+    # normally creates it is started only when Authentik is already running, so on any
+    # box where it is not, this is the difference between fail2ban starting and not.
+    _f2b_ensure_ak_logfile()
     guarddog_action = ""
     if os.path.exists('/etc/fail2ban/action.d/infratak-guarddog.conf'):
         guarddog_action = "\n         infratak-guarddog"
@@ -33931,6 +34203,16 @@ def _ensure_authentik_nodered_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
             # 5) Add to embedded outpost
             _outpost_add_providers_safe(_ak_url, _ak_headers, [provider_pk], plog=log)
             _authentik_application_open_in_new_tab(_ak_url, _ak_headers, 'node-red', plog=log)
+            # 6) Restrict to authentik Admins — MUST run here, not only in the
+            # Authentik deploy/reconfigure paths. Fleet deploy order is
+            # Caddy → Authentik → … → Node-RED, so at Authentik-deploy time
+            # `_is_module_deployed(settings,'nodered')` is False and the app does
+            # not exist yet; the Node-RED deploy then created it with NO policy
+            # binding, which in Authentik means "visible to every authenticated
+            # user". TAK Portal AGENCY admins (members of
+            # `authentik-<ABBR>-AgencyAdmin`, not `authentik Admins`) therefore
+            # saw the Node-RED tile — only GLOBAL admins should. Idempotent.
+            _ensure_app_access_policies(_ak_url, _ak_headers, plog=log)
         else:
             log("  ⚠ Could not create or find Node-RED proxy provider")
     except Exception as e:
@@ -36292,13 +36574,60 @@ def _ensure_app_access_policies(ak_url, ak_headers, plog=None):
         else:
             _log(f"  ✓ Policy exists: {policy_name}")
 
-        # 3) Admin-only apps: bind the admin policy (infra-TAK, Node-RED, NetBird, Remote Assist). LDAP must be open to all authenticated users (QR registration, device bind). TAK Portal and MediaMTX: no binding = all authenticated users.
-        admin_only_slugs = ['infra-tak', 'infratak', 'console', 'node-red', 'netbird', REMOTE_ASSIST_OIDC_SLUG]
-        user_visible_slugs = ['mediamtx', 'stream', 'tak-portal', 'ldap']  # no policy = visible to all authenticated users (LDAP needed for QR registration)
+        # 3) DEFAULT-DENY. The access model (operator, 2026-08-06):
+        #      global admin (`authentik Admins`)  -> every application
+        #      agency admin / regular user        -> TAK Portal + Stream ONLY
+        #                                            (Stream's regular-user view = the
+        #                                             active-streams page; MediaMTX then
+        #                                             scopes by vid_* LDAP group)
+        # So the allowlist below is the COMPLETE set of applications a non-global-admin may
+        # see, and everything else gets the admin policy — including any app slug this code
+        # has never heard of.
+        #
+        # It is default-DENY on purpose. The old code bound the policy only to a hardcoded
+        # admin_only_slugs list, so every module added later (webodm, webodm-oidc, fedhub,
+        # tak-video-restreamer) landed in NEITHER list and was therefore visible to every
+        # authenticated user. Enumerating what must be locked down is a losing game; the
+        # user-visible set is small, stable, and reviewable. A new user-facing module must be
+        # added to the allowlist explicitly — the default-deny log line below makes that
+        # obvious the first time it fires.
+        #
+        # LDAP MUST stay open: QR registration and EUD device bind authenticate non-admin
+        # users against it (see the removal loop below, and HANDOFF-LDAP-AUTHENTIK).
+        user_visible_slugs = ['tak-portal', 'stream', 'mediamtx', 'ldap']
+        # Known admin-only slugs — kept only so the log says "restricted" rather than
+        # "default-deny" for the ones we ship deliberately. Not a gate: the gate is the
+        # allowlist above.
+        admin_only_slugs = ['infra-tak', 'infratak', 'console', 'node-red', 'netbird',
+                            'webodm', 'webodm-oidc', 'fedhub', 'federation-hub',
+                            'tak-video-restreamer', REMOTE_ASSIST_OIDC_SLUG]
 
-        all_apps = _api_get('core/applications/?page_size=100')['results']
+        # superuser_full_list=true is MANDATORY here, not a nicety. Authentik's
+        # ApplicationViewSet.list() runs the POLICY ENGINE against the REQUESTING user and
+        # returns only the apps that user passes — see upstream
+        # authentik/core/api/applications.py::list() ("Custom list method that checks
+        # Policy based access instead of guardian"); only `superuser_full_list=true` +
+        # is_superuser short-circuits to the unfiltered queryset.
+        #
+        # We call this as akadmin (bootstrap token). Once the Cyber Controls W1 policy
+        # `infratak-require-mfa` (`return ak_user_has_authenticator(request.user)`) was
+        # bound to every application, akadmin — which has no MFA device — FAILED it, so
+        # this list came back nearly EMPTY and the binding loop below iterated almost
+        # nothing. Measured on the fleet 2026-08-06: without the param test6=1 app,
+        # test8=0 apps, test12=1 app; with it, 9/10/9. That is why Node-RED on test8 was
+        # never restricted and TAK Portal AGENCY admins could see it — the function that
+        # was supposed to lock it down could not see the application at all.
+        all_apps = _api_get('core/applications/?page_size=100&superuser_full_list=true')['results']
+        if not all_apps:
+            _log("  ✗ Authentik returned 0 applications — cannot verify or apply access "
+                 "policies. Check the token is a superuser (akadmin) token.")
+            return False
+        _log(f"  ✓ {len(all_apps)} applications visible for policy binding")
 
         def _bind_policy_to_app(app_pk, app_name, pol_pk, pol_name):
+            """Returns 'already' | 'bound' | 'FAILED'. A failed bind must never be
+            reported as 'already restricted' — this is an access control, and a silent
+            failure here is what let unbound admin-only apps stay world-visible."""
             bindings = _api_get(f'policies/bindings/?target={app_pk}&page_size=100')['results']
             already = any(
                 str(b.get('policy')) == str(pol_pk) or
@@ -36306,17 +36635,16 @@ def _ensure_app_access_policies(ak_url, ak_headers, plog=None):
                 for b in bindings
             )
             if already:
-                return False
+                return 'already'
             try:
                 _api_post('policies/bindings/', {
                     'target': app_pk, 'policy': pol_pk,
                     'order': 0, 'negate': False, 'enabled': True, 'timeout': 30,
                 })
-                return True
+                return 'bound'
             except urllib.error.HTTPError as e:
-                if e.code != 400:
-                    _log(f"  ⚠ {app_name}: binding error: {e}")
-                return False
+                _log(f"  ⚠ {app_name}: binding error: {e.code} {e.reason}")
+                return 'FAILED'
 
         # Remove "Allow MediaMTX users" binding from stream/mediamtx if present (so they become visible to all authenticated users)
         mtx_policy_name = 'Allow MediaMTX users'
@@ -36335,38 +36663,78 @@ def _ensure_app_access_policies(ak_url, ak_headers, plog=None):
                     except Exception:
                         pass
                     break
-        # Remove "Allow authentik Admins" binding from LDAP if present (blocks QR registration / device bind for non-admin users)
+        # ── LDAP apps must carry NO restrictive policy at all.
+        # Identified by PROVIDER, not by the slug 'ldap' — same rule as _w1_login_apps(),
+        # which is fleet-robust against a differently-named LDAP application.
+        #
+        # Two policies get stripped:
+        #   `Allow authentik Admins` — would block QR registration / device bind for
+        #      non-admin users.
+        #   W1_MFA_POLICY_NAME       — "the LDAP app is the TAK EUD bind path and MUST stay
+        #      MFA-free, else ATAK/iTAK auth breaks" (_w1_login_apps docstring, app.py:4749).
+        #      W1 already EXCLUDES ldap-provider apps when it binds the MFA policy, but it
+        #      only ever adds and never removes, so a box that picked the binding up from an
+        #      earlier W1 pass kept it forever. Found on test8 2026-08-06: `ldap` carried
+        #      `infratak-require-mfa` while test6/test12 did not — a user who has not enrolled
+        #      MFA yet saw ZERO applications, so the EUD bind path they need in order to
+        #      enroll was itself gated behind MFA. Enforcing the invariant here (rather than
+        #      in W1) means every boot heals it.
+        ldap_provider_pks = set()
+        try:
+            for p in _api_get('providers/ldap/?page_size=100').get('results', []):
+                ldap_provider_pks.add(p.get('pk'))
+        except Exception as e:
+            _log(f"  ⚠ Could not list LDAP providers ({str(e)[:60]}) — falling back to slug 'ldap'")
+        ldap_app_pks = {a.get('pk') for a in all_apps
+                        if (a.get('provider') and a.get('provider') in ldap_provider_pks)
+                        or (not ldap_provider_pks and a.get('slug') == 'ldap')}
+
+        ok = True
         for app in all_apps:
-            app_slug = app.get('slug', '')
-            if app_slug != 'ldap':
+            if app.get('pk') not in ldap_app_pks:
                 continue
-            app_pk = app.get('pk', '')
             app_name = app.get('name', '')
-            bindings = _api_get(f'policies/bindings/?target={app_pk}&page_size=100')['results']
-            for b in bindings:
-                if (b.get('policy_obj', {}) or {}).get('name') == policy_name:
-                    try:
-                        _api_delete(f'policies/bindings/{b["pk"]}/')
-                        _log(f"  ✓ {app_name}: removed restrictive policy — now open to all authenticated users")
-                    except Exception:
-                        pass
-                    break
+            for b in _api_get(f'policies/bindings/?target={app["pk"]}&page_size=100')['results']:
+                bname = (b.get('policy_obj', {}) or {}).get('name')
+                if bname not in (policy_name, W1_MFA_POLICY_NAME):
+                    continue
+                try:
+                    _api_delete(f'policies/bindings/{b["pk"]}/')
+                    _log(f"  ✓ {app_name}: removed {bname!r} — LDAP bind path must stay open "
+                         f"(EUD enrollment / ATAK-iTAK auth)")
+                except Exception as e:
+                    ok = False
+                    _log(f"  ✗ {app_name}: could NOT remove {bname!r} ({str(e)[:60]}) — "
+                         f"EUD enrollment may fail for users without MFA")
 
         for app in all_apps:
             app_slug = app.get('slug', '')
             app_pk = app.get('pk', '')
             app_name = app.get('name', '')
 
-            if app_slug in admin_only_slugs:
-                if _bind_policy_to_app(app_pk, app_name, policy_pk, policy_name):
-                    _log(f"  ✓ {app_name}: restricted to authentik Admins")
-                else:
-                    _log(f"  ✓ {app_name}: already restricted to authentik Admins")
-
-            elif app_slug in user_visible_slugs:
+            # LDAP apps are matched by provider (above), so keep them out of default-deny
+            # even when the slug is not the literal 'ldap'.
+            if app_slug in user_visible_slugs or app_pk in ldap_app_pks:
                 _log(f"  ✓ {app_name}: open to all authenticated users (no restrictive binding)")
+                continue
 
-        return True
+            # Everything else is admin-only, whether or not we recognise the slug.
+            res = _bind_policy_to_app(app_pk, app_name, policy_pk, policy_name)
+            known = app_slug in admin_only_slugs
+            if res == 'bound':
+                _log(f"  ✓ {app_name}: restricted to authentik Admins"
+                     + ('' if known else f" (default-deny — slug {app_slug!r} is not on the "
+                                         f"user-visible allowlist; add it there if regular "
+                                         f"users are meant to see this app)"))
+            elif res == 'already':
+                _log(f"  ✓ {app_name}: already restricted to authentik Admins")
+            else:
+                ok = False
+                _log(f"  ✗ {app_name}: NOT restricted — still visible to all "
+                     f"authenticated users (incl. TAK Portal agency admins). Re-run "
+                     f"Authentik → Reconfigure, or bind 'Allow authentik Admins' by hand.")
+
+        return ok
 
     except urllib.error.HTTPError as e:
         _log_http_err(e)
@@ -62966,6 +63334,59 @@ threading.Thread(target=_startup_authentik_idle_load_converge, daemon=True,
                  name='startup-ak-idle-load-converge').start()
 
 
+def _startup_app_access_policy_converge(log=None):
+    """Re-assert the application access policies (`Allow authentik Admins` bound to
+    every admin-only app) at every boot, so a console update heals field boxes.
+
+    Why this needs a boot converge rather than living only in the deploy paths:
+    `_ensure_app_access_policies()` used to run only from the Authentik
+    deploy/reconfigure paths, the NetBird install, the Remote Assist OIDC setup and
+    the LDAP fix button. The fleet deploy order is Caddy → Authentik → … → Node-RED,
+    so at Authentik-deploy time Node-RED is not installed and its Authentik
+    application does not exist; the later Node-RED deploy created the app with NO
+    policy binding, and in Authentik an unbound application is visible to EVERY
+    authenticated user. TAK Portal AGENCY admins (membership in
+    `authentik-<ABBR>-AgencyAdmin`, per the portal's access.service.js) therefore saw
+    the Node-RED tile even though only GLOBAL admins (`authentik Admins`, the
+    portal's PORTAL_AUTH_REQUIRED_GROUP) should. Existing boxes cannot be told to
+    "redeploy Node-RED", so the heal has to ride the console update.
+
+    Runs in a daemon thread; bounded wait on the Authentik API; idempotent; never
+    raises. Silent no-op when Authentik/forward-auth is not configured."""
+    def _l(m):
+        line = f'App access policy converge: {m}'
+        if log:
+            log(f'  {line}')
+        print(line, flush=True)
+
+    try:
+        # Don't race the synchronous startup migrations (or an Authentik recreate).
+        if not _STARTUP_IMPORT_DONE.wait(timeout=1200):
+            _l('startup import still not done after 20 min — proceeding anyway (backstop)')
+        settings = load_settings()
+        if not (settings.get('fqdn') or '').strip():
+            return  # no forward auth → no proxy apps to police
+        ak_token = (_get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+                    or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN'))
+        if not ak_token:
+            return  # Authentik absent / token unreadable — silent skip
+        ak_url = _get_authentik_api_url(settings)
+        ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+        if not _wait_for_authentik_api(ak_url, ak_headers, max_attempts=90):
+            _l('Authentik API not ready — retries on next restart/deploy')
+            return
+        _ensure_app_access_policies(ak_url, ak_headers, plog=_l)
+    except Exception as _e:
+        try:
+            _l(f'error (non-fatal): {str(_e)[:200]}')
+        except Exception:
+            pass
+
+
+threading.Thread(target=_startup_app_access_policy_converge, daemon=True,
+                 name='startup-app-access-policy-converge').start()
+
+
 def _fail2ban_install_and_configure(plog):
     """Install and configure fail2ban for Authentik brute-force protection (v0.9.0).
 
@@ -63023,8 +63444,12 @@ def _fail2ban_install_and_configure(plog):
         return False
     plog("fail2ban migration: fail2ban installed")
 
-    # Step 2: Create log directory
+    # Step 2: Create log directory AND the log file itself. The file — not just the
+    # directory — is what the jail written in step 5 requires: step 6 starts the
+    # forwarder that would create it only if Authentik is already running, and
+    # fail2ban aborts the entire daemon over a logpath that does not resolve.
     _makedirs_priv('/var/log/authentik', exist_ok=True)
+    _f2b_ensure_ak_logfile(plog)
     plog("fail2ban migration: created /var/log/authentik/")
 
     # Step 3: Write log forwarder systemd service
@@ -63799,6 +64224,19 @@ def _startup_migrations():
         except Exception as _f2b_e2:
             print(f"Startup migration: fail2ban sshd-backend self-heal error (non-fatal): {_f2b_e2}", flush=True)
 
+        # v10.1.26 — the same class, generalised: ANY enabled jail whose logpath does
+        # not exist aborts the WHOLE daemon at config parse, so one missing file takes
+        # every jail down (field report yfdtak-2, 2026-08-06 — fail2ban dead, no
+        # `systemctl start` would fix it). Creates the logs we own (the Authentik jail's
+        # auth.log had no creator at all unless the forwarder happened to be running),
+        # parks a jail pointing at a foreign log that does not exist, and restarts a
+        # daemon left dead by this. Runs after the sshd-backend repair so both
+        # parse-fatal shapes are fixed before anything starts fail2ban.
+        try:
+            _f2b_guard_jail_logpaths(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _f2b_e2b:
+            print(f"Startup migration: fail2ban logpath guard error (non-fatal): {_f2b_e2b}", flush=True)
+
         # v10.1.9 — never let fail2ban ban the road in. v10.1.11 — nor the road between
         # our own services. Adds the WireGuard/NetBird management subnets AND the docker
         # container bridges to every jail's ignoreip, and releases any address inside
@@ -63834,6 +64272,15 @@ def _startup_migrations():
             _f2b_ensure_authentik_logrotate(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _f2b_e8:
             print(f"Startup migration: Authentik logrotate error (non-fatal): {_f2b_e8}", flush=True)
+        # v10.1.26 — the drain the logrotate rule was supposed to be. That rule has NEVER
+        # installed on a non-root box (/etc/logrotate.d/ is off the broker allow-list, and
+        # widening it would hand the console root via postrotate), so auth.log grew
+        # unbounded there — 25 MB on test6, measured 2026-08-06. Enforce the same ceiling
+        # from here, on every box, with verbs the console already has.
+        try:
+            _f2b_bound_ak_logfile(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _f2b_e8b:
+            print(f"Startup migration: Authentik log cap error (non-fatal): {_f2b_e8b}", flush=True)
         try:
             _f2b_selfheal_authentik_log_level(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _f2b_e9:
