@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.26-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.26-alpha)**
+**Current release: [v10.1.27-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.27-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -318,6 +318,39 @@ Each page has buttons that do specific things. Here's what they do and when to u
 
 **FQDN Mode** — Caddy + Let's Encrypt for proper SSL. Required for TAK client QR enrollment. Can upgrade from IP mode through the web console without SSH.
 
+### Subdomains (DNS)
+
+You give infra-TAK **one base domain**; it derives a subdomain per service and gets a
+Let's Encrypt certificate for each one Caddy is fronting.
+
+**A wildcard `*.yourdomain.com` A record covers all of them and is the recommended
+setup.** If your DNS provider or policy requires individual A records, you must create
+one **per subdomain below** — every record points at the same server IP.
+
+| Subdomain | Service | What it is |
+|---|---|---|
+| `infratak` | infra-TAK Console | The management console (behind Authentik when SSO is enabled) |
+| `takserver` | TAK Server | Admin WebGUI + Marti API |
+| `tak` | Authentik | Identity provider / SSO login |
+| `takportal` | TAK Portal | User & certificate management |
+| `nodered` | Node-RED | Flow editor (behind Authentik when SSO is enabled) |
+| `map` | CloudTAK | Browser TAK client |
+| `tiles.map` | CloudTAK | Tile server |
+| `video` | CloudTAK | Map video / HLS |
+| `stream` | MediaMTX *or* TAK Video Restreamer | Stream web console & HLS (whichever of the two is installed) |
+| `fedhub` | Federation Hub | Hub web UI (TLS terminated at Caddy) |
+| `3dtiles` | Cesium 3D Tiles | 3D terrain / photogrammetry tile server |
+| `webodm` | WebODM | Drone photogrammetry processing |
+| `netbird` | NetBird | Overlay-network management UI |
+| `remote` | EUD Remote Assist | Remote-assist portal |
+
+Only the subdomains for modules you actually deploy need to resolve — but a wildcard
+record means you never have to come back and add one when you deploy something new.
+
+**Renaming a subdomain:** Caddy page → *Service Domains* → set a per-service override.
+The Caddy page always lists the subdomains **this box** is really using, including your
+overrides, so treat that list as authoritative over this table.
+
 ## QR Code Enrollment
 
 | Client | Status | Notes |
@@ -341,6 +374,12 @@ Each page has buttons that do specific things. Here's what they do and when to u
 ---
 
 ## Changelog
+
+### v10.1.27-alpha — 2026-08-07 — infra-TAK stops assuming it is the only thing on your server
+
+**Headline: installing onto a server that already runs other software used to fail in confusing ways — and sometimes to report success for work it never did. This release makes infra-TAK check first, and tell you the truth when something goes wrong.** Three separate problems were reported from a single real deployment, and all three came from the same assumption: that infra-TAK is the only thing on the box. First, **port conflicts are now caught before a deploy starts.** If something already on your server holds a port infra-TAK needs — a system OpenLDAP on 389, another web server on 443 — the deploy now stops and tells you the port, the program holding it, and its process ID, instead of failing later with a raw Docker error or hanging forever on "Syncing". infra-TAK will never stop or reconfigure your software to make room for itself; it reports the conflict and steps aside so you can decide. Second, **Caddy failures are visible again.** Start, Restart and Reload reported success immediately and did the real work in the background, so a Caddy that could not start simply showed as "Stopped" and the button appeared to do nothing — the only way to find out why was to read system logs over SSH. The console now waits for the real outcome and shows you the reason it failed. Third, **setting up the PostgreSQL repository can no longer break your server's package manager.** If your server already had a PostgreSQL repository configured, infra-TAK added a second, conflicting one — a combination that breaks *every* package operation on the machine, not just ours, including security updates. It now detects and reuses what is already there; if its own change is ever what breaks things, it removes that change and restores your previous state before reporting the error. That step also no longer prints a checkmark when it has actually failed. Alongside these: **a TAK Server deploy now ends with a summary of anything that needs attention**, so a non-fatal warning is the last thing you read rather than something two hundred lines up; **the DNS setup instructions are correct and complete** — the subdomain list is generated from your actual configuration instead of a hardcoded list that had drifted (it said `portal` where the real subdomain is `takportal`, and omitted `takserver` entirely), and the README now carries the full list; and **Ubuntu 24.04 now warns that it is not yet validated** instead of installing silently, with Ubuntu 22.04 LTS remaining the supported baseline. **Who should update:** everyone, and especially anyone installing onto a server that already runs other services. **Upgrade:** automatic on the next console update — no configuration changes required.
+
+Full notes: [v10.1.27-alpha release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.27-alpha).
 
 ### v10.1.26-alpha — 2026-08-06 — Apps are admin-only by default; one missing log file no longer stops all of Fail2Ban
 
