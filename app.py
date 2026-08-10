@@ -774,7 +774,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.27-alpha"
+VERSION = "10.1.28-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -1172,18 +1172,18 @@ MEDIAMTX_REMOTE_EXT_DOM_NORMALIZE_SCRIPT = (
     "with open(f,'w') as h: h.write(c)\n"
 )
 # Node-RED official icons (https://nodered.org/about/resources/media/)
-NODERED_LOGO_URL = "https://nodered.org/about/resources/media/node-red-icon.png"       # icon only (e.g. small nav)
-NODERED_LOGO_URL_2 = "https://nodered.org/about/resources/media/node-red-icon-2.png"   # icon + "Node-RED" text (card, sidebar)
+NODERED_LOGO_URL = "/static/logos/node-red-icon.png"       # icon only (e.g. small nav)
+NODERED_LOGO_URL_2 = "/static/logos/node-red-icon-2.png"   # icon + "Node-RED" text (card, sidebar)
 # Authentik official brand icon (external URL)
 # Pinned to an immutable tag, NOT `main`: goauthentik moved this asset out of
 # website/static/img on main → the old `.../main/...` URL now 404s (broken logo
 # everywhere, all platforms — browser-loaded so arch-independent). A tag ref can't move.
-AUTHENTIK_LOGO_URL = "https://raw.githubusercontent.com/goauthentik/authentik/version-2024.12/website/static/img/icon_left_brand_colour.svg"
+AUTHENTIK_LOGO_URL = "/static/logos/authentik-icon.svg"
 # Caddy official logo for dark backgrounds — white text (Wikimedia Commons)
-CADDY_LOGO_URL = "https://upload.wikimedia.org/wikipedia/commons/5/56/Caddyserver_logo_dark.svg"
-FAIL2BAN_LOGO_URL = "https://avatars.githubusercontent.com/u/1087378?s=128&v=4"
+CADDY_LOGO_URL = "/static/logos/caddy-logo.svg"
+FAIL2BAN_LOGO_URL = "/static/logos/fail2ban-icon.png"
 # TAK (Team Awareness Kit) official brand logo from tak.gov
-TAK_LOGO_URL = "https://tak.gov/assets/logos/brand-06b80939.svg"
+TAK_LOGO_URL = "/static/logos/tak-brand.svg"
 # Login page logo: put your TAKWERX logo at static/takwerx-logo.png
 # For sharp display (no fuzz): export at 2x display size — e.g. 960px wide or 400–500px height (PNG, transparent).
 LOGIN_LOGO_FILENAME = "takwerx-logo.png"
@@ -2719,7 +2719,7 @@ def detect_modules():
         'running': wo_running,
         'description': 'Drone photo processing → 3D Tiles & TAK overlays',
         'icon': '📡',
-        'icon_url': 'https://raw.githubusercontent.com/WebODM/WebODM/master/app/static/app/img/logo512.png',
+        'icon_url': '/static/logos/webodm-logo.png',
         'route': '/webodm',
         'priority': 12,
     }
@@ -2742,7 +2742,7 @@ def detect_modules():
         # daemon-thread poll in that window reports the tile not-installed once.
         modules['tak_video_restreamer'] = {'name': 'TAK Video Restreamer', 'installed': False, 'running': False,
             'description': 'Flask + MediaMTX restreamer — RTSP, RTSPS, SRT, HLS, KLV', 'icon': '\U0001F3A5',
-            'icon_url': 'https://raw.githubusercontent.com/raytheonbbn/tak-video-restreamer/main/web/static/tak_video_restreamer_logo.png',
+            'icon_url': '/static/logos/tak-video-restreamer-logo.png',
             'route': '/tak-video-restreamer', 'priority': 13, 'conflicts': ['mediamtx']}
 
     # NetBird VPN
@@ -3056,7 +3056,7 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
         parts.append(link('/mediamtx', f'<img src="{html.escape(MEDIAMTX_LOGO_URL)}" alt="MediaMTX" class="nav-icon" style="height:48px;width:auto;max-width:100px;object-fit:contain;display:block">', 'MediaMTX'))
     tvr = modules.get('tak_video_restreamer', {})
     if tvr.get('installed'):
-        parts.append(link('/tak-video-restreamer', '<img src="https://raw.githubusercontent.com/raytheonbbn/tak-video-restreamer/main/web/static/tak_video_restreamer_logo.png" alt="TAK Video Restreamer" class="nav-icon" style="height:24px;width:auto;max-width:48px;object-fit:contain;display:block"><span>TAK Video Restreamer</span>', 'TAK Video Restreamer'))
+        parts.append(link('/tak-video-restreamer', '<img src="/static/logos/tak-video-restreamer-logo.png" alt="TAK Video Restreamer" class="nav-icon" style="height:24px;width:auto;max-width:48px;object-fit:contain;display:block"><span>TAK Video Restreamer</span>', 'TAK Video Restreamer'))
     nr = modules.get('nodered', {})
     if nr.get('installed'):
         parts.append(link('/nodered', f'<img src="{html.escape(NODERED_LOGO_URL)}" alt="" class="nav-icon" style="height:24px;width:auto;max-width:72px;object-fit:contain;display:block"><span>Node-RED</span>'))
@@ -3068,7 +3068,7 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
         parts.append(link('/cesium-tiles', f'<img src="{html.escape(CESIUM_TILES_LOGO_URL)}" alt="Cesium 3D Tiles" class="nav-icon" style="height:24px;width:auto;max-width:100px;object-fit:contain;display:block">', 'Cesium 3D Tiles'))
     wo = modules.get('webodm', {})
     if wo.get('installed'):
-        parts.append(link('/webodm', '<img src="https://raw.githubusercontent.com/WebODM/WebODM/master/app/static/app/img/logo512.png" alt="WebODM" class="nav-icon" style="height:24px;width:auto;max-width:72px;object-fit:contain;display:block;filter:brightness(0) invert(1)"><span>WebODM</span>', 'WebODM'))
+        parts.append(link('/webodm', '<img src="/static/logos/webodm-logo.png" alt="WebODM" class="nav-icon" style="height:24px;width:auto;max-width:72px;object-fit:contain;display:block;filter:brightness(0) invert(1)"><span>WebODM</span>', 'WebODM'))
     nb = modules.get('netbird', {})
     if nb.get('installed'):
         parts.append(link('/netbird', '<img src="https://netbird.io/favicon.ico" alt="NetBird" class="nav-icon" style="height:24px;width:auto;max-width:48px;object-fit:contain;display:block"><span>NetBird VPN</span>', 'NetBird VPN'))
@@ -5026,31 +5026,15 @@ def _w1_revert_mfa(h, log):
             log('W1: force-enroll restored to prior (%s)' % (fe.get('prior_not_configured_action') or 'skip'))
         except Exception as e:
             log('W1: force-enroll restore error: %s' % str(e)[:120])
-    # WS3c: remove the recovery flow's Session Logout binding — with the User Login
-    # binding restored below, the reset ends logged-in AS THE RESET USER again, and
-    # a trailing logout would immediately destroy that session.
-    for _lb in (w1.get('ak_recovery_logout') or []):
-        try:
-            if _lb.get('binding_pk'):
-                _ak_api_call(f'{ak_url}/api/v3/flows/bindings/{_lb["binding_pk"]}/',
-                             method='DELETE', headers=ak_headers)
-                log('W1: recovery-flow Session Logout binding removed')
-        except Exception as e:
-            log('W1: recovery logout-binding remove error: %s' % str(e)[:100])
+    # v10.1.28: the recovery flow now ends SIGNED OUT on every box, hardened or not
+    # (see _ensure_authentik_recovery_flow). A W1 revert must therefore NOT strip the
+    # Session Logout binding, and must NOT restore the User Login binding — either one
+    # re-arms the post-reset callback 400 (cross-site click-tracker + SameSite=Lax) and
+    # re-opens the WS3c privilege-handoff hazard. Both are now no-ops; the recorded pks
+    # are dropped so a later re-apply re-records cleanly.
     w1.pop('ak_recovery_logout', None)
-    # WS3: restore the recovery flow's User Login binding — non-hardened boxes keep
-    # today's convenience behavior (reset ends logged-in).
-    for _rb in (w1.get('ak_recovery_login') or []):
-        try:
-            _ak_api_call(f'{ak_url}/api/v3/flows/bindings/',
-                         data=json.dumps({'target': _rb.get('flow_pk'), 'stage': _rb.get('stage_pk'),
-                                          'order': _rb.get('order', 100), 'evaluate_on_plan': True,
-                                          're_evaluate_policies': False, 'policy_engine_mode': 'any',
-                                          'invalid_response_action': 'retry'}).encode(),
-                         method='POST', headers=ak_headers)
-            log('W1: recovery-flow User Login binding restored')
-        except Exception as e:
-            log('W1: recovery login-binding restore error: %s' % str(e)[:100])
+    w1.pop('ak_recovery_login', None)
+    log('W1: recovery flow left ending signed-out (fleet-uniform since v10.1.28)')
     for slug, info in (w1.get('ak_apps') or {}).items():
         try:
             if info.get('binding_pk'):
@@ -10336,8 +10320,8 @@ def connectivity_anchor_disconnect_api():
 # remote code (CLAUDE.md supply-chain rule). WHEN YOU EDIT connectivity-anchor-
 # bootstrap.sh: commit it, then update BOTH the commit SHA in the URL and the digest
 # below (`git show <sha>:scripts/connectivity-anchor-bootstrap.sh | shasum -a 256`).
-_CONN_ANCHOR_BOOTSTRAP_COMMIT = '6bb58f2a9469dd5c3ce112b7f6f986de2fee4b62'
-_CONN_ANCHOR_BOOTSTRAP_SHA256 = 'be1ef1eb98561395e7a454ec5db10a5d3215dae89b871fb9d6f16e672b40418c'
+_CONN_ANCHOR_BOOTSTRAP_COMMIT = '33f6422fc02d6ee9d91c56238537538f706dc111'
+_CONN_ANCHOR_BOOTSTRAP_SHA256 = 'c9c78b6c1734095f4f5b9c51f42b768a797d2a85e01b6998fc6154ac19f03485'
 _CONN_ANCHOR_BOOTSTRAP_RAW = ('https://raw.githubusercontent.com/takwerx/infra-TAK/'
                               + _CONN_ANCHOR_BOOTSTRAP_COMMIT
                               + '/scripts/connectivity-anchor-bootstrap.sh')
@@ -11312,6 +11296,9 @@ def connectivity_wifi_forget_api():
 # root systemd unit takwerx-setup-ap.service (engine tak-setup-ap.sh); the console
 # only start/stops that unit through the broker — no new broker privilege.
 _SETUP_AP_CONF = '/var/lib/takguard/setup-ap.conf'
+# Marks an AP raised by the console's Start button, so tak-setup-ap-watch.sh does
+# not tear it down for the crime of the box still having internet.
+_SETUP_AP_MANUAL_FLAG = '/var/lib/takguard/setup-ap.manual'
 _SETUP_AP_ACTIVE_FLAG = '/var/lib/takguard/setup-ap.active'
 
 
@@ -11401,9 +11388,77 @@ def _conn_setup_ap_write_conf(ssid, password, auto):
                 pass
 
 
+def _conn_setup_ap_have_nm():
+    """True when NetworkManager drives the radio (RHEL, and Ubuntu Desktop)."""
+    try:
+        if not shutil.which('nmcli'):
+            return False
+        r = subprocess.run(['systemctl', 'is-active', '--quiet', 'NetworkManager'], timeout=8)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _conn_setup_ap_deps_ready():
+    """Can this box actually bring the Setup AP up RIGHT NOW, offline?
+
+    NetworkManager boxes need nothing extra (`nmcli device wifi hotspot`).
+    Everything else (Ubuntu Server = netplan/systemd-networkd, the fleet default)
+    goes down tak-setup-ap.sh's hostapd path and needs hostapd + dnsmasq ON DISK."""
+    if _conn_setup_ap_have_nm():
+        return True
+    return bool(shutil.which('hostapd')) and bool(shutil.which('dnsmasq'))
+
+
+def _conn_setup_ap_ensure_deps(log_fn=None):
+    """Pre-install the Setup AP's offline dependencies WHILE THE BOX IS ONLINE.
+
+    v10.1.28 (ops1 2026-08-09, field): tak-setup-ap.sh installed hostapd/dnsmasq
+    lazily at AP-start time — which is by definition the one moment the box has no
+    internet. apt-get could not resolve, start failed, the client radio was
+    restored, and the 30s watcher retried the identical failure forever (176 KB of
+    log, no AP, nothing surfaced to the operator). The box shipped with a Setup AP
+    that could never once come up on Ubuntu Server.
+
+    Arming has to happen while connectivity still exists: on config save, and via
+    the startup converge for boxes already configured. Idempotent and cheap when
+    the packages are already present. Returns True when the box is armed."""
+    _log = log_fn or (lambda m: None)
+    if _conn_setup_ap_deps_ready():
+        return True
+    missing = [p for p in ('hostapd', 'dnsmasq') if not shutil.which(p)]
+    if not missing:
+        return True
+    _log('Setup AP: installing offline dependencies (%s)' % ', '.join(missing))
+    try:
+        ok, out = _pkg_install(missing, timeout=300)
+    except Exception as e:
+        _log('Setup AP: dependency install error: %s' % str(e)[:160])
+        return False
+    if not ok:
+        _log('Setup AP: dependency install FAILED: %s' % (out or '')[-300:])
+        return False
+    # Debian ENABLES dnsmasq.service on install; it would bind :53 on every
+    # interface at next boot and collide with the AP's own script-managed dnsmasq
+    # (which uses bind-interfaces). The engine masks these at start too — do it
+    # here so a reboot between arming and first use cannot break the AP.
+    for _u in ('dnsmasq.service', 'hostapd.service'):
+        try:
+            subprocess.run(_sudo_wrap(['systemctl', 'disable', '--now', _u]),
+                           capture_output=True, text=True, timeout=30)
+        except Exception:
+            pass
+    _log('Setup AP: armed — hostapd + dnsmasq installed')
+    return True
+
+
 def _conn_setup_ap_status():
     st = {'active': os.path.exists(_SETUP_AP_ACTIVE_FLAG), 'ap_capable': None, 'has_wifi': bool(_conn_wifi_iface())}
     st.update(_conn_setup_ap_read_conf())
+    # Surface arming state so the page can never again promise an automatic
+    # broadcast the box is physically unable to perform (ops1 2026-08-09).
+    st['deps_ready'] = _conn_setup_ap_deps_ready()
+    st['uses_nm'] = _conn_setup_ap_have_nm()
     return st
 
 
@@ -11450,7 +11505,17 @@ def connectivity_setup_ap_config_api():
         return jsonify({'success': False, 'error': 'Name/password may not contain quotes, newlines, or any of ` $ ( ) ; & | < > \\'}), 400
     if not _conn_setup_ap_write_conf(ssid, password, auto):
         return jsonify({'success': False, 'error': 'Could not save Setup AP config.'}), 500
-    return jsonify({'success': True, 'status': _conn_setup_ap_status()})
+    # ARM IT NOW, while the box still has internet. The AP itself only ever runs
+    # when connectivity is gone, so this is the last moment the dependencies can
+    # be fetched (ops1 2026-08-09: lazy install at start time = never).
+    _armed = _conn_setup_ap_ensure_deps()
+    st = _conn_setup_ap_status()
+    resp = {'success': True, 'status': st}
+    if not _armed:
+        resp['warning'] = ('Saved, but this box could not install the Setup WiFi components '
+                           '(hostapd/dnsmasq). Automatic broadcast will NOT work until it can '
+                           'reach the internet once — reconnect and press Save settings again.')
+    return jsonify(resp)
 
 
 @app.route('/api/connectivity/setup-ap/start', methods=['POST'])
@@ -11474,9 +11539,28 @@ def connectivity_setup_ap_start_api():
     # Start the root service through the broker. This SEVERS any wifi uplink (the
     # radio becomes the AP), so the HTTP response is sent before the switch lands;
     # the operator reconnects locally to the setup wifi.
-    r = subprocess.run(_sudo_wrap(['systemctl', 'start', 'takwerx-setup-ap.service']),
+    # Claim this AP as operator-initiated BEFORE starting it, so the 30s auto-watcher
+    # cannot race in and stop it (ops1 2026-08-09: manual start survived 7 seconds on
+    # a box with a healthy uplink — the watcher's "internet is fine, AP should be
+    # down" rule could not tell a deliberate start from a stale one).
+    try:
+        subprocess.run(_sudo_wrap(['touch', _SETUP_AP_MANUAL_FLAG]),
+                       capture_output=True, text=True, timeout=15)
+    except Exception:
+        pass
+    # restart, not start. The unit is Type=oneshot RemainAfterExit=yes, so if it is
+    # left stale-active (the watcher used to stop the AP by calling the engine behind
+    # systemd's back) `start` silently does NOTHING and this button appears dead —
+    # exactly what ops1 showed on 2026-08-09: unit "active (exited)", AP down, press
+    # Start, no AP, no error. restart always runs ExecStart.
+    r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takwerx-setup-ap.service']),
                        capture_output=True, text=True, timeout=60)
     if r.returncode != 0:
+        try:
+            subprocess.run(_sudo_wrap(['rm', '-f', _SETUP_AP_MANUAL_FLAG]),
+                           capture_output=True, text=True, timeout=15)
+        except Exception:
+            pass
         return jsonify({'success': False, 'error': (r.stderr or r.stdout or 'start failed').strip()[:200]}), 500
     return jsonify({'success': True})
 
@@ -11587,6 +11671,13 @@ def _conn_join_best_saved():
 @app.route('/api/connectivity/setup-ap/stop', methods=['POST'])
 @login_required
 def connectivity_setup_ap_stop_api():
+    # Release the operator claim first, so the AP cannot be re-protected from the
+    # watcher if the service stop below is partial. The engine clears it too.
+    try:
+        subprocess.run(_sudo_wrap(['rm', '-f', _SETUP_AP_MANUAL_FLAG]),
+                       capture_output=True, text=True, timeout=15)
+    except Exception:
+        pass
     r = subprocess.run(_sudo_wrap(['systemctl', 'stop', 'takwerx-setup-ap.service']),
                        capture_output=True, text=True, timeout=60)
     if r.returncode != 0:
@@ -24046,6 +24137,37 @@ def generate_caddyfile(settings=None):
     def _emit_ak_header_strip(indent):
         for _h in _AK_FWD_HEADERS:
             lines.append(f"{indent}request_header -{_h}")
+
+    def _emit_outpost_callback_rescue(root_url):
+        # v10.1.28: the outpost's OAuth callback answers a bare 400 whenever the state in
+        # the URL doesn't match a session in THIS browser — most commonly a password-reset
+        # email opened in a different browser/window than the one that started the flow
+        # (outpost log: 'mismatched session ID' with should="", then 'invalid state').
+        # The flow's real work (password_set) already succeeded by then; only the landing
+        # dies. There is no Authentik knob for this — the state genuinely cannot follow
+        # the email across browsers — so the edge converts the dead end into one click:
+        # a fresh visit to the app root starts a clean forward_auth round-trip that works.
+        # Emitted at 8-space depth: all four callers sit inside a top-level `route {`.
+        lines.append(f"        route /outpost.goauthentik.io/callback* {{")
+        lines.append(f"            reverse_proxy {ak_up} {{")
+        lines.append(f"                @cb400 status 400")
+        lines.append(f"                handle_response @cb400 {{")
+        lines.append(f"                    header Content-Type \"text/html; charset=utf-8\"")
+        lines.append(f"                    respond <<CBRESCUE")
+        lines.append(f"                        <!doctype html>")
+        lines.append(f"                        <html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Continue to sign in</title>")
+        lines.append(f"                        <style>body{{font-family:system-ui,sans-serif;background:#0f1420;color:#e6e8ee;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}}main{{max-width:26rem;padding:2rem;text-align:center}}h1{{font-size:1.25rem}}p{{color:#9aa3b2;line-height:1.6}}a{{display:inline-block;margin-top:1rem;padding:.7rem 1.6rem;background:#2b6cb0;color:#fff;border-radius:.5rem;text-decoration:none;font-weight:600}}</style></head>")
+        lines.append(f"                        <body><main><h1>Almost there</h1>")
+        # Cause-neutral on purpose: the 400 has several triggers (no outpost session at the
+        # callback, a state minted in another browser, an expired flow). Naming one of them
+        # is wrong for the other cases — field-checked 2026-08-08, where the message blamed a
+        # different browser but the operator had stayed in a single incognito window.
+        lines.append(f"                        <p>Your password was saved. This last step couldn't complete on its own, so sign in below to finish.</p>")
+        lines.append(f"                        <a href=\"{root_url}\">Continue to sign in</a></main></body></html>")
+        lines.append(f"                        CBRESCUE 200")
+        lines.append(f"                }}")
+        lines.append(f"            }}")
+        lines.append(f"        }}")
     if ak.get('installed'):
         # W1 (Hardened posture): drop the unauthenticated /login bypass so the
         # shared-password page is no longer a network ingress — SSO+MFA only.
@@ -24064,6 +24186,7 @@ def generate_caddyfile(settings=None):
             lines.append(f"    }}")
         lines.append(f"    route {{")
         _emit_ak_header_strip("        ")
+        _emit_outpost_callback_rescue(f"https://{infratak_host}/")
         lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
         # v0.9.58: background /api XHR must NOT go through forward_auth. An unauthenticated
         # XHR gets 302-redirected to the cross-origin Authentik OAuth URL (tak.<fqdn>), which
@@ -24122,6 +24245,7 @@ def generate_caddyfile(settings=None):
         lines.append(f"{nodered_host} {{")
         if ak.get('installed'):
             lines.append(f"    route {{")
+            _emit_outpost_callback_rescue(f"https://{nodered_host}/")
             lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
             lines.append(f"        @nodered_public {{")
             lines.append(f"            path /ipaws/alerts.kml /icons/ipaws/*")
@@ -24208,6 +24332,7 @@ def generate_caddyfile(settings=None):
             lines.append(f"    }}")
         if ak.get('installed'):
             lines.append(f"    route {{")
+            _emit_outpost_callback_rescue(f"https://{portal_host}/")
             lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
             lines.append(f"")
             lines.append(f"        @public {{")
@@ -24338,6 +24463,7 @@ def generate_caddyfile(settings=None):
             lines.append(f"        reverse_proxy {mtx_up}")
             lines.append(f"    }}")
             lines.append(f"    route {{")
+            _emit_outpost_callback_rescue(f"https://{mtx_host}/")
             lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
             lines.append(f"        forward_auth {ak_up} {{")
             lines.append(f"            uri /outpost.goauthentik.io/auth/caddy")
@@ -24393,6 +24519,7 @@ def generate_caddyfile(settings=None):
                     lines.append(f"            {rp_line}")
                 lines.append(f"        }}")
                 lines.append(f"        handle {{")
+                _emit_outpost_callback_rescue(f"https://{fh_host}/")
                 lines.append(f"            reverse_proxy /outpost.goauthentik.io/* {ak_up}")
                 lines.append(f"            forward_auth {ak_up} {{")
                 lines.append(f"                uri /outpost.goauthentik.io/auth/caddy")
@@ -24439,6 +24566,7 @@ def generate_caddyfile(settings=None):
         lines.append(f"{wo_host} {{")
         if ak.get('installed'):
             lines.append(f"    route {{")
+            _emit_outpost_callback_rescue(f"https://{wo_host}/")
             lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
             lines.append(f"        forward_auth {ak_up} {{")
             lines.append(f"            uri /outpost.goauthentik.io/auth/caddy")
@@ -34025,9 +34153,72 @@ def _ak_api_call(url, data=None, method='GET', headers=None, max_retries=3, time
         raise last_exc
 
 
+# v10.1.28: "Show password" on the recovery (reset) prompt. authentik's PromptStage has no
+# allow_show_password (that setting exists only on PasswordStage, which is why the LOGIN page
+# already has an eyeball) — upstream goauthentik/authentik#12550. These two pieces reproduce it
+# with supported config only: a `static` prompt field emitting the checkbox, and brand CSS that
+# unmasks siblings when it is checked. Marker string _AK_SHOWPW_MARKER makes the CSS idempotent.
+_AK_SHOWPW_MARKER = 'infra-TAK-showpw'
+# The checkbox flips the inputs' type via an inline onchange handler. Field-verified on
+# ops1: authentik serves flow pages with NO Content-Security-Policy header, so an inline
+# handler runs (a <script> tag would NOT — this HTML lands via innerHTML, which never
+# executes script elements). Walking shadowRoot too, because the CSS-only version below
+# could not reach the inputs. Toggling `type` also works in Firefox, which the CSS
+# fallback cannot (no -webkit-text-security there). data-pw marks what we flipped so
+# unchecking restores only those inputs.
+_AK_SHOWPW_FIELD_HTML = (
+    '<label style="display:flex;gap:8px;align-items:center;font-size:13px;'
+    'cursor:pointer;margin:-8px 0 4px">'
+    '<input type="checkbox" id="showpw" style="cursor:pointer" onchange="'
+    "var c=this.checked;var f=function(r){r.querySelectorAll('input').forEach("
+    "function(i){if(c){if(i.type==='password'){i.type='text';i.setAttribute('data-pw','1')}}"
+    "else{if(i.getAttribute('data-pw')){i.type='password'}}});"
+    "r.querySelectorAll('*').forEach(function(e){if(e.shadowRoot){f(e.shadowRoot)}})};f(document)"
+    '"> Show password</label>'
+)
+_AK_SHOWPW_CSS = (
+    '/* ' + _AK_SHOWPW_MARKER + ': reveal toggle for the password reset prompt.\n'
+    '   PromptStage has no allow_show_password (upstream #12550), so the checkbox in the\n'
+    '   static prompt field drives this rule. Firefox lacks -webkit-text-security, so the\n'
+    '   fields stay masked there — degrades quietly, never errors. */\n'
+    'form:has(#showpw:checked) input[type="password"],\n'
+    'div:has(#showpw:checked) input[type="password"] {\n'
+    '    -webkit-text-security: none !important;\n'
+    '}\n'
+)
+
+
+def _ensure_authentik_showpw_css(ak_url, ak_headers):
+    """Append the show-password CSS to every Authentik brand, idempotently.
+
+    Keyed on _AK_SHOWPW_MARKER rather than an exact-string compare so an operator's own
+    custom CSS in the same field is preserved instead of being overwritten.
+    Returns the number of brands changed.
+    """
+    import urllib.request as _ur
+    changed = 0
+    req = _ur.Request(f'{ak_url}/api/v3/core/brands/', headers=ak_headers)
+    brands = json.loads(_ur.urlopen(req, timeout=15).read().decode()).get('results', [])
+    for b in brands:
+        cur = (b.get('branding_custom_css') or '')
+        if _AK_SHOWPW_MARKER in cur:
+            continue
+        new_css = (cur.rstrip() + '\n\n' + _AK_SHOWPW_CSS) if cur.strip() else _AK_SHOWPW_CSS
+        pr = _ur.Request(
+            f'{ak_url}/api/v3/core/brands/{b["brand_uuid"]}/',
+            data=json.dumps({'branding_custom_css': new_css}).encode(),
+            headers=ak_headers, method='PATCH')
+        _ur.urlopen(pr, timeout=15)
+        changed += 1
+    return changed
+
+
 def _ensure_authentik_recovery_flow(ak_url, ak_headers):
     """Create recovery flow + stages + bindings and link to default authentication flow.
-    Matches official Authentik blueprint: Identification -> Email -> Prompt (new pw) -> User Write -> User Login.
+    Identification -> Email -> Prompt (new pw) -> User Write -> Session Logout.
+    Deliberately diverges from the stock Authentik blueprint, which ends in User Login:
+    the reset ALWAYS ends signed out so the pre-reset OAuth state is never redeemed
+    (see the v10.1.28 note below on the click-tracker / SameSite=Lax callback 400).
     Fetches ALL bindings and filters client-side (the flow__pk server filter is unreliable).
     Returns (success: bool, message: str, recovery_slug: str|None)."""
     import urllib.request as _req
@@ -34101,9 +34292,27 @@ def _ensure_authentik_recovery_flow(ak_url, ak_headers):
 
         # 2) Create all required stages
 
-        id_stage_pk = _find_stage('stages/identification/', 'default-authentication-identification')
+        # v10.1.28: the recovery flow gets its OWN identification stage. Reusing the login
+        # page's default-authentication-identification put a "Forgot username or password?"
+        # link on the reset page itself — that stage carries recovery_flow, and the link is a
+        # dead-end loop for someone who is already resetting. Editing the shared stage instead
+        # would strip the link off the real login page, where it belongs.
+        id_stage_pk = _find_or_create_stage('stages/identification/', 'Recovery Identification', {
+            'user_fields': ['email', 'username'],
+            'case_insensitive_matching': True,
+            'pretend_user_exists': True,
+            'show_matched_user': True})
+        if id_stage_pk:
+            # Assert the links are off even when the stage already existed. user_fields is
+            # resent because this serializer cross-validates the whole object on PATCH.
+            try:
+                _api_patch(f'stages/identification/{id_stage_pk}/', {
+                    'user_fields': ['email', 'username'],
+                    'recovery_flow': None, 'enrollment_flow': None, 'passwordless_flow': None})
+            except Exception:
+                pass
         if not id_stage_pk:
-            id_stage_pk = _find_stage('stages/identification/', 'Recovery Identification')
+            id_stage_pk = _find_stage('stages/identification/', 'default-authentication-identification')
         if not id_stage_pk:
             all_id_stages = _api_get('stages/identification/').get('results', [])
             if all_id_stages:
@@ -34124,16 +34333,26 @@ def _ensure_authentik_recovery_flow(ak_url, ak_headers):
             except Exception:
                 pass
 
-        def _find_or_create_prompt(name, field_key, label, order):
+        def _find_or_create_prompt(name, field_key, label, order,
+                                   ftype='password', required=True, placeholder=None,
+                                   initial_value=None):
             results = _api_get(f'stages/prompt/prompts/?search={_req.quote(name)}').get('results', [])
             for p in results:
                 if p.get('name') == name:
                     return p['pk']
+            body = {
+                'name': name, 'field_key': field_key, 'label': label,
+                'type': ftype, 'required': required,
+                'placeholder': label if placeholder is None else placeholder,
+                'order': order, 'placeholder_expression': False}
+            if initial_value is not None:
+                # A `static` field renders its INITIAL VALUE, not its placeholder
+                # (placeholder is placeholder text / choice list) — per
+                # https://docs.goauthentik.io/add-secure-apps/flows-stages/stages/prompt/
+                body['initial_value'] = initial_value
+                body['initial_value_expression'] = False
             try:
-                return _api_post('stages/prompt/prompts/', {
-                    'name': name, 'field_key': field_key, 'label': label,
-                    'type': 'password', 'required': True, 'placeholder': label,
-                    'order': order, 'placeholder_expression': False})['pk']
+                return _api_post('stages/prompt/prompts/', body)['pk']
             except urllib.error.HTTPError as e:
                 if e.code == 400:
                     results = _api_get(f'stages/prompt/prompts/?search={_req.quote(name)}').get('results', [])
@@ -34144,13 +34363,38 @@ def _ensure_authentik_recovery_flow(ak_url, ak_headers):
 
         pw_field_pk = _find_or_create_prompt('recovery-field-password', 'password', 'Password', 0)
         pw_repeat_field_pk = _find_or_create_prompt('recovery-field-password-repeat', 'password_repeat', 'Password (repeat)', 1)
+        # v10.1.28: the reset page had no way to see what you were typing, while the LOGIN
+        # page does (PasswordStage.allow_show_password=True). PromptStage has no such
+        # setting — upstream goauthentik/authentik#12550 is open with no PR — so the toggle
+        # is built from parts authentik already supports: a `static` prompt field carrying a
+        # checkbox, plus brand CSS that unmasks the password inputs when it is checked.
+        # No JS (authentik's CSP blocks inline handlers) and no patched container, so it
+        # survives Authentik upgrades. Chrome/Safari/Edge only: -webkit-text-security is
+        # unsupported in Firefox, where the fields simply stay masked (no error, no toggle).
+        showpw_field_pk = _find_or_create_prompt(
+            'recovery-field-show-password', 'showpw_toggle', 'Show password', 50,
+            ftype='static', required=False, placeholder='',
+            initial_value=_AK_SHOWPW_FIELD_HTML)
+        if showpw_field_pk:
+            # Self-heal: boxes that got the first cut of this (markup in `placeholder`,
+            # which a static field ignores — it renders nothing at all) are repaired here,
+            # since _find_or_create_prompt returns an existing prompt untouched.
+            try:
+                _api_patch(f'stages/prompt/prompts/{showpw_field_pk}/', {
+                    'initial_value': _AK_SHOWPW_FIELD_HTML,
+                    'initial_value_expression': False})
+            except Exception:
+                pass
+        _recovery_fields = [pw_field_pk, pw_repeat_field_pk]
+        if showpw_field_pk:
+            _recovery_fields.append(showpw_field_pk)
 
         prompt_stage_pk = _find_stage('stages/prompt/stages/', 'Recovery Password Change')
         if not prompt_stage_pk:
             try:
                 prompt_stage_pk = _api_post('stages/prompt/stages/', {
                     'name': 'Recovery Password Change',
-                    'fields': [pw_field_pk, pw_repeat_field_pk]})['pk']
+                    'fields': _recovery_fields})['pk']
             except urllib.error.HTTPError as e:
                 if e.code == 400:
                     prompt_stage_pk = _find_stage('stages/prompt/stages/', 'Recovery Password Change')
@@ -34159,26 +34403,41 @@ def _ensure_authentik_recovery_flow(ak_url, ak_headers):
         else:
             try:
                 _api_patch(f'stages/prompt/stages/{prompt_stage_pk}/', {
-                    'fields': [pw_field_pk, pw_repeat_field_pk]})
+                    'fields': _recovery_fields})
             except Exception:
                 pass
+
+        # The checkbox is inert without the CSS that acts on it — apply both or neither.
+        try:
+            _ensure_authentik_showpw_css(ak_url, ak_headers)
+        except Exception:
+            pass
 
         user_write_pk = _find_or_create_stage('stages/user_write/', 'Recovery User Write',
             {'user_creation_mode': 'never_create'})
 
-        user_login_pk = _find_or_create_stage('stages/user_login/', 'Recovery User Login')
-
-        # v10.1.4 (WS3, load-bearing): when W1 hardening is applied, the recovery flow
-        # must NOT end in a session — drop the user_login stage from the desired set so
-        # step 4 below also DELETES any existing binding. Without this gate, every Email
-        # Relay deploy / "Configure Authentik" press re-created the binding and silently
-        # resurrected the reset-email MFA bypass on hardened boxes. Both local and
-        # split-box paths funnel through this function.
-        try:
-            if ((load_hardening().get('applied') or {}).get('W1_sso') or {}).get('ak_apps'):
-                user_login_pk = None
-        except Exception:
-            pass
+        # v10.1.28: the recovery flow ALWAYS ends signed OUT, on every box — hardened or
+        # not. user_login_pk stays None so step 4 below DELETES any existing User Login
+        # binding, and a user_logout stage is bound LAST (order 110) instead.
+        #
+        # Why (field-confirmed on nuc 2026-08-09): a trailing User Login makes Authentik
+        # resume the pending authorization and bounce the browser to the outpost callback
+        # carrying the state minted BEFORE the reset. Every mail provider rewrites the
+        # reset link through a click tracker (Brevo -> sendibt2.com), so that callback is
+        # reached via a CROSS-SITE redirect chain and Chrome withholds the outpost's
+        # SameSite=Lax session cookie. The outpost then logs "mismatched session ID" with
+        # should="" and returns a bare 400. Ending signed out means the stale state is
+        # never redeemed, so the 400 cannot occur — which is exactly why W1-hardened
+        # boxes (test12/test8, WS3c) never reproduced it while nuc/ops1 did.
+        #
+        # This also closes the WS3c privilege-handoff hazard (test8 2026-07-18) on
+        # non-hardened boxes: finishing someone else's reset can no longer leave the
+        # browser sitting inside whatever session it already held.
+        #
+        # Trade-off, deliberate: after a reset the user signs in with the new password.
+        # Field-proven — it is what test12/test8 have done since v10.1.4.
+        user_login_pk = None
+        logout_stage_pk = _find_or_create_stage('stages/user_logout/', 'Recovery Session Logout')
 
         # 3) Fetch ALL bindings, filter client-side by target == recovery flow PK.
         #    The server-side flow__pk filter is unreliable and returns bindings from other flows.
@@ -34194,7 +34453,8 @@ def _ensure_authentik_recovery_flow(ak_url, ak_headers):
         recovery_bindings = [b for b in all_bindings if str(b.get('target')) == str(recovery_flow_pk)]
 
         desired_stage_pks = set()
-        for pk in [id_stage_pk, email_stage_pk, prompt_stage_pk, user_write_pk, user_login_pk]:
+        for pk in [id_stage_pk, email_stage_pk, prompt_stage_pk, user_write_pk, user_login_pk,
+                   logout_stage_pk]:
             if pk:
                 desired_stage_pks.add(str(pk))
 
@@ -34214,6 +34474,7 @@ def _ensure_authentik_recovery_flow(ak_url, ak_headers):
             (30, prompt_stage_pk),
             (40, user_write_pk),
             (100, user_login_pk),
+            (110, logout_stage_pk),
         ]
         for order, stage_pk in desired_bindings:
             if not stage_pk or str(stage_pk) in already_bound:
@@ -65184,6 +65445,117 @@ def _startup_migrations():
                     # defense; retry on the next restart. Loud on purpose.
                     print(f"Startup migration: ⚠ SECURITY: proxy-auth gate NOT armed after retries "
                           f"(strip-only defense until next restart): {_pa_err}", flush=True)
+
+        # v10.1.28: outpost-callback rescue page (572f6c4). A code-only change to
+        # generate_caddyfile does nothing until the file is regenerated, and a manual
+        # git pull + restart skips the Update-Now regen path — so converge here, the
+        # same one-shot-flag shape as the migrations above. Regenerate, verify the
+        # rescue route is in the output, reload Caddy, stamp the flag.
+        if (s.get('fqdn') or '').strip() and not s.get('caddy_cb_rescue_v2'):
+            _cbr_applied = False
+            _cbr_err = None
+            for _cbr_try in range(6):
+                try:
+                    _cf = generate_caddyfile(s)
+                    if not _cf:
+                        _cbr_err = 'generate returned empty'
+                    elif 'reverse_proxy /outpost.goauthentik.io/' not in _cf:
+                        # No vhost proxies the outpost (Authentik not installed) — nothing
+                        # to rescue; the regen itself is still the converge. Stamp and stop.
+                        _cbr_applied = True
+                        break
+                    elif 'route /outpost.goauthentik.io/callback*' in _cf:
+                        subprocess.run(_sudo_wrap(['systemctl', 'reload', 'caddy']), capture_output=True, timeout=15)
+                        _cbr_applied = True
+                        break
+                    else:
+                        _cbr_err = 'rescue route absent from generated Caddyfile'
+                except Exception as _cbr_e:
+                    _cbr_err = str(_cbr_e)[:160]
+                time.sleep(4)
+            if _cbr_applied:
+                s['caddy_cb_rescue_v2'] = True
+                save_settings(s)
+                s = load_settings()
+                print("Startup migration: Caddyfile regenerated with outpost-callback rescue page", flush=True)
+            else:
+                # Flag not set → retried on next restart. Non-security: the old behavior
+                # (bare 400 on a cross-browser reset landing) persists until then.
+                print(f"Startup migration: callback-rescue regen not applied: {_cbr_err}", flush=True)
+
+        # v10.1.28: Authentik-side convergence, same one-button rule. The cookie_domain sweep
+        # (2acf95f) and the recovery-flow changes (show-password field, dedicated identification
+        # stage) are CODE — the live Authentik objects on an existing box keep the old values
+        # until something re-runs those ensures, and today they only run from a deploy or
+        # "Update config". Without this, a box that presses Update gets new code and a still-broken
+        # reset flow, which is exactly the trap the Caddyfile migration above exists to avoid.
+        # Both ensures are idempotent (normalize-if-different / find-or-create + re-assert).
+        # v10.1.28: flag bumped v1 -> v2. Boxes that already converged under v10.1.28 have
+        # the v1 stamp set, so without a new key the recovery-flow change below (reset now
+        # ends SIGNED OUT on every box, not just W1-hardened ones) would never reach them —
+        # the exact "new code, still-broken flow" trap this block exists to prevent.
+        if not s.get('ak_cookie_recovery_converge_v2'):
+            _akc_done = False
+            _akc_err = None
+            try:
+                _ak_tok = (_get_authentik_env_value(s, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+                           or _get_authentik_env_value(s, 'AUTHENTIK_TOKEN') or '').strip()
+            except Exception:
+                _ak_tok = ''
+            if not _ak_tok:
+                # No Authentik on this box (or no token yet) → nothing to converge. Stamp:
+                # a later Authentik deploy runs both ensures itself as part of its own flow.
+                _akc_done = True
+            else:
+                _ak_hdr = {'Authorization': f'Bearer {_ak_tok}', 'Content-Type': 'application/json'}
+                for _akc_try in range(3):
+                    try:
+                        _ensure_proxy_providers_cookie_domain(
+                            'http://127.0.0.1:9090', _ak_hdr, (s.get('fqdn') or '').strip())
+                        _ensure_authentik_recovery_flow('http://127.0.0.1:9090', _ak_hdr)
+                        _akc_done = True
+                        break
+                    except Exception as _akc_e:
+                        _akc_err = str(_akc_e)[:160]
+                    time.sleep(5)
+            if _akc_done:
+                s['ak_cookie_recovery_converge_v2'] = True
+                save_settings(s)
+                s = load_settings()
+                print("Startup migration: Authentik proxy cookie_domain normalized + recovery flow "
+                      "converged (reset now ends signed-out on every box)", flush=True)
+            else:
+                # Authentik containers may still be starting on a fresh boot — leave the flag
+                # unset so the next restart retries rather than silently skipping forever.
+                print(f"Startup migration: Authentik converge deferred (retries next restart): {_akc_err}", flush=True)
+
+        # v10.1.28: arm the Setup AP's offline dependencies on boxes that were already
+        # configured before this fix. tak-setup-ap.sh installed hostapd/dnsmasq lazily at
+        # AP-start time — the one moment the box has no internet — so on every Ubuntu
+        # Server box (no NetworkManager; the fleet baseline) the automatic broadcast has
+        # NEVER once come up. ops1 2026-08-09: 176 KB of setup-ap.log, all the same
+        # "Temporary failure resolving us.archive.ubuntu.com" every 30s. Rocky boxes were
+        # unaffected (NetworkManager makes the hotspot with no extra packages), which is
+        # why this hid. Console update runs while the box is online — that is the fix
+        # window. Only arms boxes that actually have a radio and have configured the AP.
+        if not s.get('setup_ap_deps_armed_v1'):
+            try:
+                if _conn_wifi_iface() and os.path.exists(_SETUP_AP_CONF):
+                    if _conn_setup_ap_ensure_deps(
+                            log_fn=lambda m: print('Startup migration: %s' % m, flush=True)):
+                        s['setup_ap_deps_armed_v1'] = True
+                        save_settings(s)
+                        s = load_settings()
+                    else:
+                        print('Startup migration: Setup AP not armed (retries next restart)', flush=True)
+                else:
+                    # No radio, or AP never configured → nothing to arm. Stamp so we
+                    # don't re-probe every boot; a later config save arms it directly.
+                    s['setup_ap_deps_armed_v1'] = True
+                    save_settings(s)
+                    s = load_settings()
+            except Exception as _sae:
+                print('Startup migration: Setup AP arming error: %s' % str(_sae)[:160], flush=True)
 
         # v10.0.1: one-time teardown of the legacy 'cfd-remote-assist' install so a fresh
         # 'eud-remote-assist' install is clean. The module was renamed cfd→eud; the in-console

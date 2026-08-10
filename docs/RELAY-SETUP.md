@@ -10,40 +10,82 @@ You create the relay VM once (about 5 minutes in Oracle's console). After that, 
 Relay** card in the Connectivity page does everything else automatically — you just give it the
 relay's IP and upload the key file.
 
-## 1. Create the VM
+## 1. Create the relay
 
-In the [Oracle Cloud console](https://cloud.oracle.com) → **Compute → Instances → Create instance**.
-Oracle's wizard runs across four pages — *Basics → Security → Networking → Storage* — with a **Next**
-button at the bottom of each. Only two pages need anything from you.
+This is two parts — **the network first, then the VM.**
 
-**Page 1 — Basics** (name, placement, image, shape)
+> ⚠️ **Do them in this order.** If you let the instance wizard create the subnet for you, Oracle
+> leaves *Automatically assign public IPv4 address* greyed out with the message "You must select a
+> public subnet" — even though you just told it to make a public subnet. You end up with a relay
+> that has no public address and nothing can reach. Building the network first avoids it entirely.
 
-- **Name:** anything (e.g. `tak-relay`).
+### 1a. The network (about 2 minutes)
+
+Sign in to the [Oracle Cloud console](https://cloud.oracle.com), then get to the home page: **☰ menu
+(top-left) → Home → Infrastructure**. Scroll down to the **Build** panel and click **Set up a network
+with a wizard**.
+
+(Long way round if you prefer menus: ☰ → **Networking → Virtual Cloud Networks → Actions → Start VCN
+Wizard**.)
+
+1. Choose **Create VCN with internet connectivity** → **Start VCN Wizard**.
+2. **VCN name:** `TAK-RELAY-VCN`. **Compartment:** your root/tenancy compartment.
+3. **Leave every default.** VCN CIDR `10.0.0.0/16`, public subnet `10.0.0.0/24`, private subnet
+   `10.0.1.0/24`, IPv6 off, DNS hostnames on.
+4. **Next** → review → **Create**.
+
+That one wizard builds the VCN, a public subnet, a private subnet, an internet gateway, a NAT
+gateway, a service gateway, and the route tables. The relay only uses the public subnet; the rest is
+harmless. The amber "Resource availability checked successfully" box along the way is informational,
+not a problem.
+
+When it finishes it offers **View VCN** — you don't need to look at anything, so go straight on to
+1b.
+
+### 1b. The VM (about 3 minutes)
+
+Back to the home page the same way — **☰ menu → Home → Infrastructure** — then scroll to the **Build**
+panel and click **Create a VM instance**.
+
+(Long way round: ☰ → **Compute → Instances → Create instance**.)
+
+The wizard runs across four sections — *Basics → Security → Networking → Storage*.
+
+**Basics**
+
+- **Name:** anything (e.g. `tak-relay`). **Create in compartment:** the same one as the VCN.
 - **Placement:** leave the availability domain Oracle picked.
-- **Image:** click *Change image* → **Canonical Ubuntu 22.04** (the plain one, not "Minimal").
+- **Image:** click *Change image* → **Canonical Ubuntu** → **22.04 or 24.04** (both field-validated).
+  The plain one, not "Minimal".
 - **Shape:** click *Change shape* → **Ampere → VM.Standard.A1.Flex**, 1 OCPU / 6 GB (Always Free).
-  - *If Oracle says "out of capacity"* for A1: either try a different Availability Domain, or pick
-    **VM.Standard.E2.1.Micro** instead — it's also Always Free and works fine for a relay.
+
+> ⚠️ **The default shape is not free.** Oracle preselects **VM.Standard.E5.Flex** (1 OCPU / 12 GB),
+> which is a paid shape. If you click through without changing it you will be billed for a VM that
+> only forwards packets.
+
+  - **Pick the image before the shape.** Oracle cross-filters the two lists, so choosing an x86 shape
+    first can hide the ARM builds of an image and make it look like that image "isn't available" on
+    A1.
+  - *If Oracle says "out of capacity"* for A1: try a different Availability Domain, or pick
+    **VM.Standard.E2.1.Micro** — also Always Free, and fine for a relay.
   - **ARM or x86 makes no difference here.** A1.Flex is ARM, E2.1.Micro is x86, and the relay setup
     is identical on both — it installs only WireGuard and standard Linux packet forwarding, which
-    ship for both architectures. Take whichever Oracle has capacity for. A1 is the better pick when
-    it's available (more free network bandwidth), not a required one.
+    ship for both architectures. A1 is the better pick when available (more free network bandwidth),
+    not a required one.
 
-**Page 2 — Security:** nothing here applies to a relay. Click **Next**.
+**Security:** nothing here applies to a relay. You will probably see an amber *"The current instance
+settings prevent you from enabling confidential computing"* — that is expected on Ampere shapes and
+is not an error. Click **Next**.
 
-**Page 3 — Networking.** This is the page that matters.
+**Networking**
 
-- **Primary network:** *Create new virtual cloud network*, and **Subnet:** *Create new public
-  subnet*. Accept the generated names.
-  - *Already have a relay in this account?* Pick **Select existing virtual cloud network** and choose
-    the VCN and public subnet from your first one instead — see *Adding a second relay* below.
-- **Public IPv4 address assignment:** leave **Automatically assign public IPv4 address** ON. (Step 2
-  converts it to a permanent address.)
-- **IPv6:** leave off. If the page warns that the subnet doesn't support IPv6, ignore it.
-- **Advanced options → Use network security groups to control traffic:** leave this OFF on a first
-  relay — you'll create the NSG in step 3, after the VM exists. On a second relay, turn it ON and
-  select your existing NSG.
-- Everything else on the page — DNS record, hostname, launch options — stays default.
+- **Primary network:** **Select existing virtual cloud network** → `TAK-RELAY-VCN`.
+- **Subnet:** **Select existing subnet** → **public subnet-TAK-RELAY-VCN**. Take the *public* one.
+- **Automatically assign public IPv4 address:** **ON**. This is the whole reason for doing 1a first —
+  with a pre-existing public subnet the toggle is live.
+- **IPv6:** leave off. The "selected VCN and subnet combination does not support IPv6" warning is
+  expected.
+- Everything else — VNIC name, DNS record, hostname, launch options — stays default.
 
 **Also on the Networking page — SSH keys.** Keep **Generate a key pair for me** and click **Download
 private key**. Save that `.key` file somewhere you'll find it: it is the only thing the console needs
@@ -52,47 +94,26 @@ to set the relay up, and you never have to open it yourself. You don't need the 
 > ⚠️ **This is the only time Oracle offers the key.** If this launch attempt fails and you retry,
 > download again on the attempt that actually succeeds — each attempt generates a different key.
 
-**Page 4 — Storage:** accept the defaults (46.6 GB boot volume, in-transit encryption on). A relay
-forwards packets and stores nothing, so the default volume is far more than it needs. Don't attach a
-block volume.
+**Storage:** accept the defaults (46.6 GB boot volume, in-transit encryption on). A relay forwards
+packets and stores nothing. Don't attach a block volume.
 
-Then **Review** → **Create**, and wait for the instance to show **Running**.
+Then **Create**, and wait for the instance to show **Running**.
 
-## 2. Give it a public IP
+## 2. Note the relay's IP
 
-Your VM already has a public address — it's on the instance's **Networking** tab as **Public IPv4
-address**. That address is *ephemeral*: it survives reboots and stop/start, and is only released if
-you terminate the instance.
+Your VM already has a public address. On the instance page → **Details** tab → **Public IP
+address**. **Write it down — that's your relay's IP**, and it's the one thing the console asks you
+for in step 6.
 
-- On the instance page → **Networking** tab. If you see a **"Connect public subnet to internet"**
-  quick action, click **Connect** and apply it (this adds the internet gateway).
-  - **Skip this if you reused an existing relay's subnet** — it already has a gateway, and clicking
-    it creates a second NSG and rewrites the route table for nothing.
-- **Note the address down — this is your relay's IP.**
-
-### Should you reserve it?
-
-**Running one box? Yes — do it.** A *reserved* address survives rebuilding the VM, and Oracle
-doesn't charge for it (your tenancy includes one). It costs a few clicks now and saves you a mess
-later, because a relay's address ends up inside enrollment packages and data packages you've already
-handed to clients.
-
-- Click your VNIC name → **IP administration** tab → the primary IP row → **⋮ → Edit**.
-- Set **Public IP type: Reserved public IP** → create a new one → **Update**.
-
-**Running several relays, or just testing? Don't bother.** The included allowance is one address, and
-relays don't get rebuilt in normal operation. If you ever do rebuild one, changing a DNS A record
-takes ten seconds.
-
-> **Either way, hand clients a domain name, not the raw IP.** Point an A record at the relay and use
-> that name in enrollment and data packages. Then a rebuilt relay is one DNS edit instead of
-> re-issuing configuration to every client in the field. You need that A record anyway — it's how
-> Let's Encrypt reaches port 80 to issue your certificate.
+That's the whole step. The address stays put through reboots and stop/start; it only changes if you
+terminate the instance and build a new one. In step 4 you'll point a domain name at it, so even that
+is a one-line DNS edit rather than a problem.
 
 ## 3. Open the ports
 
-On the **Networking** tab → click the network security group (**ig-quick-action-NSG**) → **Add
-Rules**. Add these ingress rules, each with **Source `0.0.0.0/0`**:
+These are the rules the relay needs. **Set Up Relay** configures the relay itself automatically — the
+moment the tunnel comes up these ports are already being forwarded — so Oracle's cloud firewall is
+the only part you do by hand.
 
 | Protocol | Port | What it carries |
 |---|---|---|
@@ -103,15 +124,108 @@ Rules**. Add these ingress rules, each with **Source `0.0.0.0/0`**:
 | **TCP** | **8089** | ATAK / iTAK / WinTAK client connections (mutual-TLS) |
 | **TCP** | **8443** | TAK admin WebGUI (client-cert auth) |
 | **TCP** | **8446** | TAK admin WebGUI (Let's Encrypt cert / LDAP login) |
-| TCP | 8554 | MediaMTX **RTSP** video — only if you stream |
-| TCP | 8322 | MediaMTX **RTSPS** video — only if you stream |
-| UDP | 8890 | MediaMTX **SRT** video — only if you stream |
+| TCP | 8554 | MediaMTX **RTSP** video |
+| TCP | 8322 | MediaMTX **RTSPS** video |
+| UDP | 8890 | MediaMTX **SRT** video |
+| TCP + UDP | 3479 | CoTURN control channel — EUD Remote Assist |
+| UDP | 50000–50050 | CoTURN relayed media — EUD Remote Assist |
+| **TCP** | **5001** | The infra-TAK console's direct-IP backdoor — see the note below |
 
-**Set Up Relay** configures all of these automatically on the relay itself — the moment the tunnel
-comes up they're already being forwarded, so the NSG rules above are the only part you do by hand.
-The three video rows are only needed if you stream. Optional extras are in *Going beyond the
-defaults* below.
+That list is exactly what the relay forwards — nothing else would get through even if you opened it.
 
+> **About 5001.** That's the console's direct-IP backdoor, the same one every infra-TAK box has and
+> the one the README's recovery section tells you to use. It's a password login with no SSO in front
+> of it, which is the deal on any box with a public address — and applying **Hardening (Cyber
+> Controls W1)** closes it, on a relayed box exactly as on any other, because W1 shuts the port at
+> the box's own firewall no matter which way the packet came in.
+
+**There are two ways to enter them. Pick one, not both:**
+
+- **Paste them all at once** — one command in Oracle's Cloud Shell sets every rule in the table.
+  Takes about a minute and can't be typed wrong. Carry on reading below.
+- **Type them in by hand** — Oracle's rule dialog, one row at a time. Skip ahead to
+  *[The manual way](#the-manual-way--oracles-dialog)*.
+
+Same result either way. The paste is recommended; the manual route is there if you'd rather not
+touch a command line.
+
+### The fast way — Cloud Shell (recommended)
+
+First get your security list's OCID. **☰ menu → Networking → Virtual Cloud Networks →
+TAK-RELAY-VCN → Security tab → click "Default Security List for TAK-RELAY-VCN".** The **OCID** is on
+that page with a **Copy** button next to it.
+
+> ⚠️ **Make sure you're one level deep.** The VCN page also shows an OCID, and copying that one is an
+> easy mistake — the command then fails with `NotAuthorizedOrNotFound` / 404. Check the prefix: you
+> want the one starting **`ocid1.securitylist.`**, not `ocid1.vcn.`
+
+Then open **Cloud Shell** — the `>_` icon in the top bar of the Oracle console. It comes with the OCI
+CLI already signed in as you; there is no API key to set up.
+
+**Paste 1 — your OCID.** Type `SL=`, paste the OCID straight after it (no spaces, no quotes, no
+angle brackets), press Enter:
+
+```bash
+SL=ocid1.securitylist.oc1.phx.aaaaaaaaEXAMPLEEXAMPLEEXAMPLE
+```
+
+**Paste 2 — the rules.** Nothing in this one needs editing, so paste the whole block as-is:
+
+```bash
+cat > ingress.json <<'EOF'
+[
+  {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"6","isStateless":false,"description":"SSH (console relay setup)","tcpOptions":{"destinationPortRange":{"min":22,"max":22}}},
+  {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"1","isStateless":false,"description":"ICMP path MTU","icmpOptions":{"type":3,"code":4}},
+  {"source":"10.0.0.0/16","sourceType":"CIDR_BLOCK","protocol":"1","isStateless":false,"description":"ICMP intra-VCN","icmpOptions":{"type":3}},
+  {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"17","isStateless":false,"description":"WireGuard tunnel (default port)","udpOptions":{"destinationPortRange":{"min":51820,"max":51820}}},
+  {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"17","isStateless":false,"description":"WireGuard tunnel (alternate port)","udpOptions":{"destinationPortRange":{"min":443,"max":443}}},
+  {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"6","isStateless":false,"description":"HTTP - Lets Encrypt validation + redirect","tcpOptions":{"destinationPortRange":{"min":80,"max":80}}},
+  {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"6","isStateless":false,"description":"HTTPS - all web UIs via Caddy","tcpOptions":{"destinationPortRange":{"min":443,"max":443}}},
+  {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"6","isStateless":false,"description":"TAK client connections (mutual TLS)","tcpOptions":{"destinationPortRange":{"min":8089,"max":8089}}},
+  {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"6","isStateless":false,"description":"TAK admin WebGUI (client cert)","tcpOptions":{"destinationPortRange":{"min":8443,"max":8443}}},
+  {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"6","isStateless":false,"description":"TAK admin WebGUI (LE cert / LDAP)","tcpOptions":{"destinationPortRange":{"min":8446,"max":8446}}},
+  {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"6","isStateless":false,"description":"MediaMTX RTSP video","tcpOptions":{"destinationPortRange":{"min":8554,"max":8554}}},
+  {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"6","isStateless":false,"description":"MediaMTX RTSPS video","tcpOptions":{"destinationPortRange":{"min":8322,"max":8322}}},
+  {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"17","isStateless":false,"description":"MediaMTX SRT video","udpOptions":{"destinationPortRange":{"min":8890,"max":8890}}},
+  {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"6","isStateless":false,"description":"CoTURN control (Remote Assist)","tcpOptions":{"destinationPortRange":{"min":3479,"max":3479}}},
+  {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"17","isStateless":false,"description":"CoTURN control (Remote Assist)","udpOptions":{"destinationPortRange":{"min":3479,"max":3479}}},
+  {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"17","isStateless":false,"description":"CoTURN relayed media (Remote Assist)","udpOptions":{"destinationPortRange":{"min":50000,"max":50050}}},
+  {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"6","isStateless":false,"description":"infra-TAK console backdoor (closed by Hardening W1)","tcpOptions":{"destinationPortRange":{"min":5001,"max":5001}}}
+]
+EOF
+
+oci network security-list update \
+  --security-list-id "$SL" \
+  --ingress-security-rules file://ingress.json \
+  --force
+```
+
+Refresh the **Security rules** page and you should see 17 ingress rules.
+
+> **Why two pastes?** Editing a long command in a terminal is miserable — the arrow keys scroll
+> through command history instead of moving the cursor, so a mis-paste is easier to start over than
+> to fix. Putting the OCID in `SL` on its own line means the big block never needs touching. (If you
+> do need to move around a line: **Ctrl+A** jumps to the start, **Ctrl+E** to the end.)
+
+> **⚠️ This REPLACES the ingress list, it doesn't append.** That's why the first three entries
+> re-state the SSH and ICMP rules Oracle created with the VCN. Don't trim them — dropping the SSH row
+> locks the console out of the relay and setup can never run.
+>
+> `"protocol"` is the IP protocol number: **6** = TCP, **17** = UDP, **1** = ICMP. The port lives
+> inside `tcpOptions`/`udpOptions`, which is why this route can't hit the port-field trap below.
+
+### The manual way — Oracle's dialog
+
+**☰ menu → Networking → Virtual Cloud Networks → TAK-RELAY-VCN → Security tab → Default Security
+List for TAK-RELAY-VCN → Security rules tab → Add Ingress Rules.** There's a **+ Another Ingress
+Rule** button, so you can enter them all in one pass.
+For each rule: *Stateless* unchecked, **Source Type** CIDR, **Source CIDR** `0.0.0.0/0`, the protocol,
+and the port in **Destination Port Range**.
+
+> **⚠️ Watch out for the port field.** The dialog has two port boxes — *Source Port Range* first,
+> then *Destination Port Range*. Put the port number in **Destination Port Range** and leave Source
+> blank. Putting it in Source silently drops all traffic while looking correct.
+>
 > **⚠️ Add BOTH UDP rows, even though you only picked one port.** The relay listens on the port you
 > chose in the console and redirects the other one to it, so the tunnel survives networks that block
 > one or the other. The console's default is **51820** — if you open only UDP 443 and leave the
@@ -120,10 +234,16 @@ defaults* below.
 > **⚠️ UDP 443 and TCP 443 are BOTH required — they're different.** UDP 443 is a tunnel fallback;
 > TCP 443 is the HTTPS web traffic. Same number, different protocol, two separate rules. With only
 > the UDP row, no website loads and Let's Encrypt can't issue.
->
-> **⚠️ Watch out for the port field.** Oracle's Add-Rule dialog has two port boxes — *Source Port
-> Range* first, then *Destination Port Range*. Put the port number in **Destination Port Range** and
-> leave Source blank. Putting it in Source silently drops all traffic while looking correct.
+
+### Security list or network security group?
+
+Both do the same job — allow or deny traffic. The difference is what they attach to. A **security
+list** attaches to the *subnet*, so it covers everything launched into it. A **network security
+group** attaches to individual *VNICs* and has to be opted into per instance.
+
+Your relay has a security list and no NSG — that's what the VCN wizard builds. The subnet attachment
+is also why a second relay needs no firewall work at all: launch it into the same public subnet and
+it inherits every rule above.
 
 ### What about all the other ports?
 
@@ -135,13 +255,14 @@ normal box — they're reached through 443 with SSO in front. One rule covers th
 
 ### Adding a second relay
 
-If this account already runs a relay, don't build a second network for it. On the **Networking**
-page choose **Select existing virtual cloud network**, pick the VCN and public subnet from your first
-relay, then under **Advanced options** turn on **Use network security groups to control traffic** and
-select the NSG you already made (`ig-quick-action-NSG`).
+If this account already runs a relay, don't build a second network for it. **Skip step 1a entirely.**
+In the instance wizard's **Networking** section choose **Select existing virtual cloud network**, pick
+`TAK-RELAY-VCN` and the same **public subnet** as your first relay, and leave the public IP toggle on.
 
-That reuses the internet gateway and every port rule you already entered, so **you can skip steps 2
-and 3 entirely** — apart from giving the new VM its own Reserved public IP.
+That's all. Because the port rules live on a *security list attached to the subnet*, the new VM
+inherits every one of them the moment it launches — nothing to opt into, no NSG to select. **You can
+skip steps 1a and 3 entirely**. Give the new relay its own DNS name pointing at its own
+public address and you're done.
 
 Two relays in one VCN don't interfere: each gets its own private and public address, and each one's
 WireGuard overlay (`172.31.99.x`) exists only on its own machine.
@@ -183,61 +304,7 @@ anything else.
 > and data packages you've already handed to clients, so rebuilding the relay means re-issuing
 > configuration to every device in the field. With a domain name it's one DNS edit.
 
-## 5. Going beyond the defaults (optional)
-
-**A rule in the NSG is only half of a forward.** Oracle's NSG decides what reaches the relay's
-network card; the relay's own forwarding table decides what actually gets carried down the tunnel to
-your box. Adding an NSG rule for a port the relay doesn't forward is harmless but does nothing — the
-packet arrives and is dropped. This catches people out, because the NSG page then *looks* like the
-port is open.
-
-These two are worth adding, and each needs both halves. SSH to the relay
-(`ssh -i <your.key> ubuntu@<relay-ip>`) and run the matching command, then add the NSG rule:
-
-| Port | Gives you | On the relay |
-|---|---|---|
-| TCP **2222** | SSH to the box behind the relay, on 2222 → the box's 22 | `sudo iptables -t nat -I PREROUTING -p tcp --dport 2222 -j DNAT --to-destination 172.31.99.2:22` then `sudo iptables -I FORWARD -d 172.31.99.2 -p tcp --dport 22 -j ACCEPT` |
-| TCP **5001** | The infra-TAK console on the relay's public IP — see the warning below | same two commands with `5001` in place of both `2222` and `22` |
-
-Both commands use `-I` (insert), not `-A` (append) — that matters. Oracle's images ship a FORWARD
-chain that ends in a blanket REJECT, so an appended ACCEPT lands *after* the REJECT and never
-matches. The rule looks present in `iptables -S` and does nothing.
-
-Run `sudo netfilter-persistent save` afterwards so the rules survive a reboot. Re-running **Set Up
-Relay** from the console will not remove them — the setup script only ever adds rules, it never
-flushes.
-
-> **⚠️ Think before forwarding 5001.** That is the admin console, and it is deliberately a
-> direct-IP backdoor with no Caddy and no SSO in front of it — that design is fine on a LAN, and a
-> different proposition on a public Oracle address where anyone can reach the login page. The
-> supported path to the console from outside is HTTPS on 443 through Caddy, with Authentik in front.
-
-### Video through a relay
-
-All three MediaMTX streaming options work through a relay and are forwarded automatically — **RTSP**
-(8554), **RTSPS** (8322) and **SRT** (8890). Add the matching NSG rules for the ones you use.
-
-**If an SRT stream stutters, try a smaller packet size.** The tunnel runs at an MTU of 1280 bytes
-(deliberate — cellular carriers add IPv6 translation overhead, and anything larger silently breaks
-big packets on those networks), while SRT defaults to 1316. Streams generally play fine as-is on a
-clean connection; if yours breaks up over cellular or a lossy link, send at 1200:
-
-```
-srt://<relay-ip>:8890?streamid=<stream>&pkt_size=1200
-```
-
-Encoders expose this as *packet size*, *payload size* or `pkt_size`.
-
-RTSP needs nothing special — our MediaMTX ships `rtspTransports: [tcp]`, which is what a relay
-carries cleanly, and players negotiate it automatically.
-
-**Remote Assist screen sharing is the one thing still outside this** — CoTURN needs UDP 3479 plus a
-wide range of media ports, which isn't forwarded.
-
-Watching a stream *inside* the CloudTAK or MediaMTX web player works regardless of any of the above,
-because that's HTTPS on 443 rather than a raw video port.
-
-## 6. Finish in the console — automatically
+## 5. Finish in the console — automatically
 
 That's all the manual work. Back in infra-TAK → **Connectivity → Connect a Relay**:
 
@@ -250,6 +317,41 @@ That's all the manual work. Back in infra-TAK → **Connectivity → Connect a R
 The console SSHes into the relay, installs and configures everything, and brings up the tunnel. When
 the status line reads **● Tunnel UP**, your box is reachable through the relay from anywhere — no
 further steps, and it re-connects on its own every time your box changes networks.
+
+## Getting in when the web side is broken
+
+Normally you reach the console at `https://your-domain` with SSO in front of it. If Caddy or
+Authentik is down, that door is shut — and on a relayed box there's no direct-IP fallback either.
+
+You don't need to open anything for this. Your relay is already an SSH server you can reach, and
+your box sits at the fixed address **`172.31.99.2`** on the other end of the tunnel. So you hop
+through the relay and forward the console's port back to your own machine.
+
+First load the relay key into your SSH agent — `-i` on its own does **not** apply to the hop through
+the relay, only to the box at the far end:
+
+```bash
+chmod 600 ~/Downloads/your-relay-key.key      # once, if you haven't already
+ssh-add ~/Downloads/your-relay-key.key
+```
+
+Then, in one command:
+
+```bash
+ssh -J ubuntu@<relay-ip> -L 5001:localhost:5001 <your-box-user>@172.31.99.2
+```
+
+Leave that session open and browse to **https://localhost:5001**. That's the console, reached
+directly, with the password login that exists for exactly this situation.
+
+- `ubuntu` is the relay's login (Oracle's Ubuntu images use it); `<your-box-user>` is whatever you
+  log into your box with.
+- `172.31.99.2` is the same on every infra-TAK box — it's the box's address inside the tunnel, not
+  something you configure.
+- This works whether or not the box is hardened, because the traffic arrives over the tunnel as if
+  you were sitting next to it. Nothing is exposed to the internet.
+- If SSH to the relay is refused, check the key file's permissions first — `0644` makes SSH ignore
+  it silently apart from a warning.
 
 ## Free Tier vs Pay As You Go — read this before you rely on a relay
 
@@ -280,12 +382,17 @@ stopped relay surfaces as an alert rather than a silent outage.
 
 ## Notes
 
-- **Cost:** Oracle's Always Free tier covers this VM and a reserved IP at no charge.
+- **Cost:** Oracle's Always Free tier covers this VM at no charge.
 - **Why two tunnel ports:** 51820 is WireGuard's standard port and the carrier-safe default —
   cellular networks run QUIC-aware middleboxes that sometimes eat non-QUIC traffic on UDP 443. But
   some hotel and guest Wi-Fi permits *only* 443. The relay listens on whichever you picked and
   redirects the other to it, so you can switch in the console without touching Oracle again — as
   long as both UDP rules are open.
+- **If an SRT video stream stutters, send smaller packets.** The tunnel runs at an MTU of 1280 bytes
+  (deliberate — cellular carriers add IPv6 translation overhead, and anything larger silently breaks
+  big packets on those networks) while SRT defaults to 1316. Most streams play fine as-is; if yours
+  breaks up, add `&pkt_size=1200` to the URL — `srt://<relay-ip>:8890?streamid=<stream>&pkt_size=1200`.
+  Encoders call this *packet size*, *payload size* or `pkt_size`. RTSP needs nothing special.
 - **Privacy:** the relay is a packet forwarder with no TLS stack in the path, so it never terminates
   or decrypts a connection. TAK's mutual-TLS, HTTPS, and RTSPS all run end-to-end between the client
   and your box — the relay can't read any of it. Note that this cuts both ways: traffic that isn't

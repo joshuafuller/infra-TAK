@@ -24,6 +24,11 @@ set -u
 STATE_DIR="/var/lib/takguard"
 CONF="$STATE_DIR/setup-ap.conf"          # written by the console: SSID_SUFFIX/PASS/etc.
 ACTIVE_FLAG="$STATE_DIR/setup-ap.active"
+# Set by the console's Start button; tells the auto-watcher this AP was raised
+# DELIBERATELY and must not be torn down just because the box still has internet
+# (ops1 2026-08-09: manual Start lived 7s before the 30s watcher stopped it — the
+# operator saw the UI say "starting" and then nothing). Cleared on any stop.
+MANUAL_FLAG="$STATE_DIR/setup-ap.manual"
 AP_IP="10.42.0.1"
 AP_CIDR="24"
 AP_RANGE_LO="10.42.0.50"
@@ -112,7 +117,12 @@ ap_capable(){
 restore_client(){
     log "restore_client: handing radio back to the client stack"
     rm -f "$ACTIVE_FLAG"
-    pkill -f "hostapd $HOSTAPD_CONF" 2>/dev/null
+    # Match on the conf path ALONE. hostapd is launched as `hostapd -B <conf>`, so
+    # the old pattern "hostapd $HOSTAPD_CONF" never matched (the -B sits between the
+    # two words) and hostapd was NEVER killed on stop — it leaked, kept holding the
+    # radio, and is the long-standing "Stop button never fires" bug (ops1 2026-08-09:
+    # a stray `hostapd -B /tmp/takwerx-hostapd.conf` still running after "stop: done").
+    pkill -f "$HOSTAPD_CONF" 2>/dev/null
     pkill -f "dnsmasq.*$DNSMASQ_CONF" 2>/dev/null
     # drop the captive :80 redirect responder + firewall rule
     pkill -f 'takwerx-captive' 2>/dev/null
@@ -146,6 +156,10 @@ restore_client(){
         # NM re-autoconnects known profiles on its own.
     else
         [ -n "$IFACE" ] && ip link set "$IFACE" up 2>/dev/null
+        # Bring the global D-Bus wpa_supplicant back (stopped in start_ap so it could
+        # not reclaim the radio out from under hostapd). netplan apply alone does not
+        # reliably restart it, and without it saved wifi never reconnects.
+        systemctl start wpa_supplicant.service 2>/dev/null || true
         netplan apply 2>>"$LOG" || log "restore_client: netplan apply returned non-zero"
     fi
 }
@@ -283,10 +297,65 @@ socketserver.TCPServer((IP, PORT), H).serve_forever()
 PY" >>"$LOG" 2>&1 &
 }
 
+# Radio snapshot written to $LOG. Everything here is read-only and best-effort —
+# never let a missing tool break an AP bring-up.
+ap_diag(){
+    _when="${1:-now}"
+    {
+        echo "===== ap_diag[$_when] $(date -u +%FT%TZ) ====="
+        echo "[iw info]";        iw dev "$IFACE" info 2>&1
+        echo "[reg]";            iw reg get 2>&1 | head -14
+        echo "[hostapd status]"; command -v hostapd_cli >/dev/null 2>&1 \
+                                   && hostapd_cli -i "$IFACE" status 2>&1 | head -20 \
+                                   || echo "(no hostapd_cli)"
+        echo "[link]";           ip -brief link show "$IFACE" 2>&1
+        echo "[addr]";           ip -brief addr show "$IFACE" 2>&1
+        echo "[procs]";          pgrep -a 'hostapd|wpa_supplicant|dnsmasq' 2>&1
+        echo "[rfkill]";         (rfkill list 2>/dev/null || grep -H . /sys/class/rfkill/*/soft /sys/class/rfkill/*/hard 2>/dev/null)
+        echo "[stations]";       iw dev "$IFACE" station dump 2>&1 | grep -c '^Station' 2>/dev/null
+        echo "[driver msgs]";    dmesg 2>/dev/null | grep -iE 'iwlwifi|wlp1s0|regulatory|cfg80211' | tail -12
+        echo "===== end ap_diag[$_when] ====="
+    } >>"$LOG" 2>&1
+}
+
 start_ap(){
     [ -f "$ACTIVE_FLAG" ] && { log "start: AP already active"; echo "already-active"; return 0; }
     if [ -z "$IFACE" ]; then log "start: no wifi interface"; echo "no-wifi-interface"; return 2; fi
     if ! ap_capable; then log "start: radio has no AP mode"; echo "no-ap-mode"; return 3; fi
+
+    # v10.1.28 (ops1 2026-08-09, field): on a non-NM box (Ubuntu Server = the fleet
+    # baseline) the AP is built from hostapd + dnsmasq, and those must already be ON
+    # DISK. They are installed by the console while the box is ONLINE ("arming" — on
+    # Setup AP config save and via the startup converge).
+    #
+    # This check must run BEFORE the ERR trap and before the radio is touched. The
+    # old code installed them lazily further down, past the trap: when the AP was
+    # actually needed the box had no internet by definition, apt-get failed to
+    # resolve, the trap fired, restore_client tore the client stack down, and the
+    # 30s watcher retried the identical failure forever — 176 KB of log, no AP, and
+    # a radio being reset every half minute. Fail early, loudly, and leave the radio
+    # alone. If we DO have connectivity (manual start, or arming), install here.
+    if ! have_nm; then
+        _missing=""
+        command -v hostapd >/dev/null 2>&1 || _missing="hostapd"
+        command -v dnsmasq >/dev/null 2>&1 || _missing="${_missing:+$_missing }dnsmasq"
+        if [ -n "$_missing" ]; then
+            log "start: missing $_missing — attempting install (needs internet)"
+            DEBIAN_FRONTEND=noninteractive apt-get install -y $_missing >>"$LOG" 2>&1
+            _still=""
+            command -v hostapd >/dev/null 2>&1 || _still="hostapd"
+            command -v dnsmasq >/dev/null 2>&1 || _still="${_still:+$_still }dnsmasq"
+            if [ -n "$_still" ]; then
+                log "start: NOT ARMED — $_still missing and no internet to fetch it. Radio left untouched."
+                log "start: fix — connect this box to the internet once, then press Save settings on the Connectivity page."
+                echo "not-armed"; return 4
+            fi
+            systemctl disable --now dnsmasq.service 2>/dev/null || true
+            systemctl disable --now hostapd.service 2>/dev/null || true
+            log "start: armed — $_missing installed"
+        fi
+    fi
+
     log "start: bringing up AP ssid='$AP_SSID' iface='$IFACE' nm=$(have_nm && echo yes || echo no)"
 
     # ANY failure past this point restores the client and reports failure.
@@ -367,8 +436,9 @@ EOF
         nmcli connection up takwerx-hotspot
         set +e
     else
-        command -v hostapd  >/dev/null 2>&1 || { log "start: installing hostapd";  DEBIAN_FRONTEND=noninteractive apt-get install -y hostapd  >>"$LOG" 2>&1; }
-        command -v dnsmasq  >/dev/null 2>&1 || { log "start: installing dnsmasq";  DEBIAN_FRONTEND=noninteractive apt-get install -y dnsmasq  >>"$LOG" 2>&1; }
+        # (hostapd/dnsmasq presence is guaranteed by the arming check at the top of
+        # start_ap — the lazy install that used to live here is what made the AP
+        # unstartable offline. Do not reintroduce it.)
         # Mask the packaged units so they never auto-start on boot and fight our
         # script-managed instances. Debian ENABLES dnsmasq.service on install — on
         # the next reboot it would bind :53 on all interfaces before/against our
@@ -380,9 +450,26 @@ EOF
         systemctl disable --now hostapd.service 2>/dev/null || true
         systemctl mask dnsmasq.service hostapd.service 2>/dev/null || true
         set -e
-        # release the client so hostapd can own the radio
+        # Release the client stack so hostapd can own the radio — COMPLETELY.
+        #
+        # ops1 2026-08-09, root cause of "the AP is up but nobody can see it": Ubuntu
+        # server also runs a GLOBAL D-Bus wpa_supplicant:
+        #     /sbin/wpa_supplicant -u -s -O /run/wpa_supplicant
+        # Its command line contains no interface name, so BOTH lines below missed it —
+        # the per-interface unit was never running, and the pkill pattern
+        # "wpa_supplicant.*wlp1s0" cannot match it. It kept managing wlp1s0 underneath
+        # hostapd and reclaimed the radio seconds after every bring-up. dmesg showed
+        # "wlp1s0: link becomes ready" every ~30-40s and hostapd's PID changed between
+        # two snapshots 20s apart: the AP was FLAPPING, alive only in short windows, so
+        # a laptop scan almost always missed it. The one time it looked stable was a
+        # manual start that happened to be caught inside a live window.
+        #
+        # Stop the global unit too, then kill by process name (not cmdline) as the
+        # backstop. Both are restored in restore_client.
         systemctl stop "wpa_supplicant@${IFACE}.service" 2>/dev/null || true
-        pkill -f "wpa_supplicant.*${IFACE}" 2>/dev/null || true
+        systemctl stop wpa_supplicant.service 2>/dev/null || true
+        pkill -x wpa_supplicant 2>/dev/null || true
+        sleep 1
         ip addr flush dev "$IFACE"
         ip link set "$IFACE" down; ip link set "$IFACE" up
         ip addr add "${AP_IP}/${AP_CIDR}" dev "$IFACE"
@@ -390,6 +477,7 @@ EOF
         cat > "$HOSTAPD_CONF" <<EOF
 interface=$IFACE
 driver=nl80211
+ctrl_interface=/var/run/hostapd
 ssid=$AP_SSID
 hw_mode=g
 channel=6
@@ -432,12 +520,25 @@ EOF
     trap - ERR
     touch "$ACTIVE_FLAG"
     log "start: AP UP ssid='$AP_SSID' ip=$AP_IP"
+    # hostapd can report AP-ENABLED while nothing actually reaches the air. ops1
+    # 2026-08-09: the AP was "up" for 4 minutes with the operator watching the
+    # laptop wifi list — neighbouring SSIDs all present, infra-TAK absent. Twice,
+    # both on an AUTO start (no ethernet, no saved client wifi). The one time it
+    # WAS visible was a manual start on a box that had both. Suspicion is the
+    # regulatory domain never leaving world/00 without a client association, so
+    # the driver accepts the AP but suppresses beacons — unproven.
+    #
+    # We lose remote access at precisely the moment it fails, so snapshot the
+    # radio here and again shortly after (catches "came up then went quiet")
+    # instead of needing someone at the box with a keyboard.
+    ap_diag now
+    ( sleep 20; ap_diag t+20s ) >/dev/null 2>&1 &
     echo "started"
 }
 
 case "${1:-}" in
     start)  start_ap ;;
-    stop)   restore_client; log "stop: done"; echo "stopped" ;;
+    stop)   rm -f "$MANUAL_FLAG"; restore_client; log "stop: done"; echo "stopped" ;;
     status)
         if [ -f "$ACTIVE_FLAG" ]; then
             echo "active ssid=$AP_SSID ip=$AP_IP"

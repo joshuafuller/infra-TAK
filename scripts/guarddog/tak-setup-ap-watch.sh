@@ -23,6 +23,7 @@ set -u
 STATE_DIR="/var/lib/takguard"
 CONF="$STATE_DIR/setup-ap.conf"
 ACTIVE_FLAG="$STATE_DIR/setup-ap.active"
+MANUAL_FLAG="$STATE_DIR/setup-ap.manual"
 NOUP_SINCE="$STATE_DIR/setup-ap.nouplink-since"
 BOOT_GRACE=45          # seconds after boot to let a known wifi connect
 RUN_GRACE=90           # seconds of sustained no-uplink while running before AP
@@ -56,12 +57,56 @@ uplink_ok(){
 # uplink_ok already covers "can we reach the internet by ANY means", so we just
 # use it — an ethernet uplink makes uplink_ok true and suppresses the AP.
 
-AP_UP(){ [ -f "$ACTIVE_FLAG" ]; }
+# Is an AP ACTUALLY broadcasting right now? Ask the radio, not a file.
+#
+# This used to be `[ -f "$ACTIVE_FLAG" ]` alone. The flag is written on start and
+# removed on stop, so any path that takes the AP down without going through the
+# engine's stop — a crash, a kill, a reboot mid-AP, a netplan/NM reclaim of the
+# radio — leaves it behind. The no-uplink branch below then reads "already
+# broadcasting, nothing to do" and silently never starts the AP again. The box
+# sits with no network and no AP, forever, saying nothing (ops1 2026-08-09: after
+# several manual start/stop/join cycles the auto-broadcast stopped firing).
+#
+# Truth = the interface is in AP mode, or hostapd is running against our conf.
+# If the flag disagrees with reality, the flag is wrong: clear it and carry on so
+# the normal start path can run.
+ap_really_up(){
+    _if="$(command -v iw >/dev/null 2>&1 && iw dev 2>/dev/null | awk '/Interface/{print $2; exit}')"
+    if [ -n "$_if" ] && iw dev "$_if" info 2>/dev/null | grep -q "type AP"; then
+        return 0
+    fi
+    pgrep -f "takwerx-hostapd.conf" >/dev/null 2>&1 && return 0
+    return 1
+}
+AP_UP(){
+    if ap_really_up; then
+        [ -f "$ACTIVE_FLAG" ] || touch "$ACTIVE_FLAG" 2>/dev/null   # reality wins
+        return 0
+    fi
+    if [ -f "$ACTIVE_FLAG" ]; then
+        # Stale marker from an AP that is no longer up. Drop it (and any manual
+        # claim it was carrying) so auto-broadcast is not wedged off.
+        rm -f "$ACTIVE_FLAG" "$MANUAL_FLAG" 2>/dev/null
+    fi
+    return 1
+}
 
 if uplink_ok; then
     rm -f "$NOUP_SINCE"
-    if AP_UP; then
-        "$ENGINE" stop >/dev/null 2>&1
+    # Never tear down an AP the operator raised on purpose. The Start button exists
+    # precisely so it can be used while the box still has a working uplink (that is
+    # how you reach the console to press it), and this watcher used to kill it within
+    # 30s — the AP came up, the operator's laptop had not even finished a scan, and
+    # it was gone (ops1 2026-08-09: up 18:04:05, stopped 18:04:12). Only the console's
+    # Stop button, or `tak-setup-ap.sh stop`, clears MANUAL_FLAG.
+    if AP_UP && [ ! -f "$MANUAL_FLAG" ]; then
+        # Go through systemd, NOT the engine directly. takwerx-setup-ap.service is
+        # Type=oneshot RemainAfterExit=yes, so calling "$ENGINE" behind systemd's back
+        # left the unit reading "active (exited)" while the AP was actually down —
+        # and systemd then treats every later `systemctl start` as a no-op, silently
+        # killing the console's Start button until someone issues a manual stop
+        # (ops1 2026-08-09: unit active(exited), AP down, start did nothing).
+        systemctl stop takwerx-setup-ap.service >/dev/null 2>&1
     fi
     exit 0
 fi
@@ -88,5 +133,8 @@ ELAPSED=$(( $(now) - SINCE ))
 # Fresh-boot-with-no-wifi ⇒ immediate (we're just past BOOT_GRACE, no client
 # connected). Runtime drop ⇒ require RUN_GRACE of sustained no-uplink.
 if [ "$UPTIME_S" -le $(( BOOT_GRACE + 60 )) ] || [ "$ELAPSED" -ge "$RUN_GRACE" ]; then
-    "$ENGINE" start >/dev/null 2>&1
+    # restart, not start: if a previous teardown left the unit stale-active, `start`
+    # is a no-op and the AP would never come up again. restart always runs ExecStart
+    # (and ExecStop first, which is harmless when already down).
+    systemctl restart takwerx-setup-ap.service >/dev/null 2>&1
 fi
