@@ -20,6 +20,20 @@ SIZE_THRESHOLD=$((SIZE_THRESHOLD_GB * 1024 * 1024 * 1024))
 CRITICAL_THRESHOLD_GB=40
 CRITICAL_THRESHOLD=$((CRITICAL_THRESHOLD_GB * 1024 * 1024 * 1024))
 
+# v10.1.29 (W8) — absolute GB thresholds alone cannot see the failure that
+# actually strands a box. A 43 GB CoT database is fine on a 500 GB disk and fatal
+# on a 96 GB one, and the box that filled on 2026-08-10 had been past CRITICAL
+# for weeks with no free-space signal and no retention-stalled signal at all.
+# Two extra conditions, each with its OWN latch so one firing can never suppress
+# another (the single shared latch was itself part of why nothing reached the
+# reporter).
+FS_WARN_PCT=15          # free space on the DB data directory
+FS_CRIT_PCT=8
+RETENTION_STALE_FACTOR=2   # oldest row older than N x the configured TTL
+FS_ALERT_FILE="/var/lib/takguard/cotdb_alert_sent.freespace"
+RET_ALERT_FILE="/var/lib/takguard/cotdb_alert_sent.retention"
+NOTTL_ALERT_FILE="/var/lib/takguard/cotdb_alert_sent.nottl"
+
 # Check if two-server mode (remote DB)
 GD_CONF="/opt/tak-guarddog/guarddog.conf"
 TWO_SERVER=false
@@ -51,6 +65,184 @@ fi
 # Ensure numeric
 COT_SIZE=$((COT_SIZE + 0))
 
+# ===========================================================================
+# v10.1.29 (W8) — shared helpers + the two conditions that actually predict a
+# stranded box. Each condition owns its latch and is evaluated BEFORE the size
+# check, which keeps its original early-exit.
+# ===========================================================================
+gd_ssh_db() {
+  ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new \
+    -o UserKnownHostsFile=/opt/tak-guarddog/known_hosts -o ConnectTimeout=10 \
+    "${SSH_USER}@${DB_HOST}" "$1" 2>/dev/null
+}
+
+gd_remote_db() { [ "$TWO_SERVER" = "true" ] && [ -n "$DB_HOST" ] && [ -n "$SSH_KEY" ] && [ -f "$SSH_KEY" ]; }
+
+cotdb_scalar() {
+  local sql="$1"; local db="${2:-}"
+  if gd_remote_db; then
+    gd_ssh_db "cd / && sudo -u postgres psql -t -A ${db:+-d $db} -c $(printf '%q' "$sql")"
+  elif gd_psql_present; then
+    gd_psql_scalar "$sql" "$db"
+  fi
+}
+
+# Shell in the DB's own context: over SSH remotely, inside takserver-db in
+# container mode, plain bash natively. `df` must measure where the DATA lives.
+cotdb_shell() {
+  if gd_remote_db; then gd_ssh_db "$1"; else gd_db_shell "$1" 2>/dev/null; fi
+}
+
+cotdb_numeric() { case "$1" in ''|*[!0-9]*) echo "" ;; *) echo "$1" ;; esac; }
+
+send_cot_alert() {
+  local subj="$1"; local body="$2"
+  [ -n "ALERT_EMAIL_PLACEHOLDER" ] && echo -e "$body" | /opt/tak-guarddog/send-alert-email.sh "$subj" "ALERT_EMAIL_PLACEHOLDER"
+  if [ -f /opt/tak-guarddog/sms_send.sh ]; then
+    local tmpf="/tmp/gd-sms-$$.txt"
+    printf '%s' "$body" > "$tmpf"
+    /opt/tak-guarddog/sms_send.sh "$subj" "$tmpf" 2>/dev/null || true
+    rm -f "$tmpf"
+  fi
+  mkdir -p /var/log/takguard
+}
+
+# Fire at most once a day per condition (matches the size latch's cadence).
+cot_latch_ready() { [ ! -f "$1" ] || [ -n "$(find "$1" -mtime +1 2>/dev/null)" ]; }
+
+TS_NOW="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+# ── Condition A: free space on the DB data directory ──────────────────────
+DATA_DIR=$(cotdb_scalar "SHOW data_directory;" | tr -d '[:space:]')
+[ -z "$DATA_DIR" ] && DATA_DIR="/"
+FS_LINE=$(cotdb_shell "df -P '$DATA_DIR' 2>/dev/null | tail -1")
+FS_TOTAL=$(cotdb_numeric "$(echo "$FS_LINE" | awk '{print $2}')")
+FS_AVAIL=$(cotdb_numeric "$(echo "$FS_LINE" | awk '{print $4}')")
+if [ -n "$FS_TOTAL" ] && [ -n "$FS_AVAIL" ] && [ "$FS_TOTAL" -gt 0 ]; then
+  FS_PCT=$(( FS_AVAIL * 100 / FS_TOTAL ))
+  FS_AVAIL_GB=$(( FS_AVAIL / 1024 / 1024 ))
+  if [ "$FS_PCT" -lt "$FS_WARN_PCT" ]; then
+    FS_LEVEL="WARNING"
+    [ "$FS_PCT" -lt "$FS_CRIT_PCT" ] && FS_LEVEL="CRITICAL"
+    if cot_latch_ready "$FS_ALERT_FILE"; then
+      touch "$FS_ALERT_FILE"
+      send_cot_alert "TAK Server database disk space ($FS_LEVEL) on $SERVER_IDENTIFIER" \
+"The filesystem holding the TAK Server database is running out of space.
+
+Server: $SERVER_IDENTIFIER
+Time (UTC): $TS_NOW
+Data directory: $DATA_DIR
+Free: ${FS_AVAIL_GB}GB (${FS_PCT}% — warning below ${FS_WARN_PCT}%, critical below ${FS_CRIT_PCT}%)
+
+Act on this BEFORE the disk fills. Once it is full:
+ - VACUUM FULL and Online Compact CANNOT run — both need free space roughly
+   equal to the largest table, so PostgreSQL fails with 'could not extend file'.
+ - Updating the console needs ~1GB free and will refuse.
+
+Open the console, go to Guard Dog -> Database maintenance (CoT), and press
+Diagnose. It reports which case this box is in and highlights the button that
+recovers it (Run Retention Now, Purge Old CoT, or Online Compact)."
+      echo "$(date): CoT DB free-space alert sent (${FS_PCT}% free on ${DATA_DIR})" >> /var/log/takguard/restarts.log
+    fi
+  else
+    rm -f "$FS_ALERT_FILE"
+  fi
+fi
+
+# ── Condition B: retention stalled ────────────────────────────────────────
+# The alert that would have reached the 2026-08-10 reporter WEEKS before the
+# disk filled: retention configured at 1 day, yet 48.3M rows resident.
+# v10.1.29: distinguish "no TTL configured" from "TTL configured but not
+# deleting". They are different faults with different fixes, and defaulting to 24
+# when nothing is set made this script assert a policy that does not exist.
+# v10.1.29: read TAK 5.x's ACTUAL policy file, not CoreConfig.xml's retentionDays
+# (which 5.x does not use — see tak-retention-guard.sh Step 3). Value is SECONDS.
+RETENTION_HOURS=""
+RETENTION_SET=0
+POLICY_YML="/opt/tak/conf/retention/retention-policy.yml"
+if [ -f "$POLICY_YML" ]; then
+  RH=$(python3 - "$POLICY_YML" <<'PY' 2>/dev/null
+import re, sys
+try:
+    t = open(sys.argv[1]).read()
+    blk = t.split('dataRetentionMap:', 1)
+    m = re.search(r'^\s+cot:\s*(\S+)\s*$', blk[1] if len(blk) > 1 else t, re.M)
+    if m and m.group(1).isdigit() and int(m.group(1)) > 0:
+        print(max(1, int(m.group(1)) // 3600))
+    else:
+        print('')
+except Exception:
+    print('')
+PY
+)
+  if [ -n "$RH" ] && [ "$RH" -gt 0 ] 2>/dev/null; then
+    RETENTION_HOURS=$RH
+    RETENTION_SET=1
+  fi
+fi
+OLDEST_SECS=$(cotdb_scalar "SET statement_timeout='20s'; SELECT COALESCE(EXTRACT(EPOCH FROM (now() - min(servertime)))::bigint, 0) FROM cot_router;" cot | tr -d '[:space:]')
+OLDEST_SECS=$(cotdb_numeric "$OLDEST_SECS")
+
+if [ "$RETENTION_SET" = "0" ]; then
+  # ── Condition B1: no retention policy AT ALL ──────────────────────────────
+  # Not a footnote: with no TTL, TAK Server never deletes a CoT row, so the
+  # database grows without bound until the filesystem fills. That is the
+  # 2026-08-10 failure in slow motion, and it is silent until the disk is gone.
+  rm -f "$RET_ALERT_FILE"          # can't be "stalled" if it was never configured
+  if cot_latch_ready "$NOTTL_ALERT_FILE"; then
+    touch "$NOTTL_ALERT_FILE"
+    send_cot_alert "TAK Server has NO CoT retention policy on $SERVER_IDENTIFIER" \
+"No CoT data-retention policy is configured on this TAK Server.
+
+Server: $SERVER_IDENTIFIER
+Time (UTC): $TS_NOW
+CoT database: $((COT_SIZE / 1024 / 1024)) MB
+Oldest CoT row: $(( ${OLDEST_SECS:-0} / 86400 )) days old
+
+Nothing is deleting old position reports, so this database grows for as long as
+the server runs. Neither VACUUM nor Online Compact can help — they reclaim space
+from DELETED rows, and no rows are being deleted. The end state is a full disk,
+at which point compacting is no longer possible either.
+
+Fix (takes a minute): TAK Server Web Admin at :8443 -> Data Retention Policies,
+set a CoT (non-chat) retention period. infra-TAK reads this setting but
+deliberately does not write it — the policy is TAK Server's to own.
+
+Guard Dog's 15-minute retention guard enforces whatever TTL you set there."
+    echo "$(date): CoT no-retention-policy alert sent (db $((COT_SIZE / 1024 / 1024))MB)" >> /var/log/takguard/restarts.log
+  fi
+elif [ -n "$OLDEST_SECS" ] && [ "$OLDEST_SECS" -gt "$(( RETENTION_HOURS * 3600 * RETENTION_STALE_FACTOR ))" ]; then
+  rm -f "$NOTTL_ALERT_FILE"
+  OLDEST_DAYS=$(( OLDEST_SECS / 86400 ))
+  if cot_latch_ready "$RET_ALERT_FILE"; then
+    touch "$RET_ALERT_FILE"
+    send_cot_alert "TAK Server CoT retention is not deleting on $SERVER_IDENTIFIER" \
+"TAK Server's CoT retention policy is not actually removing old data.
+
+Server: $SERVER_IDENTIFIER
+Time (UTC): $TS_NOW
+Configured retention: ${RETENTION_HOURS} hours
+Oldest CoT row: ${OLDEST_DAYS} days old (alert fires past ${RETENTION_STALE_FACTOR}x the retention window)
+
+The database is therefore growing from LIVE rows, not from reclaimable bloat —
+VACUUM and Online Compact will free nothing here. Left alone this fills the disk.
+
+Likely causes:
+ - TAK Server's retention process is not running.
+ - Guard Dog's takretentionguard.timer is not enabled (it was written but never
+   enabled on consoles installed before v10.1.1).
+ - The retention TTL is not actually set in TAK Server's Web Admin (:8443 ->
+   Data Retention Policies).
+
+Fix from the console: Guard Dog -> Database maintenance (CoT) -> Diagnose, then
+Run Retention Now (it also re-arms the timer)."
+    echo "$(date): CoT retention-stalled alert sent (oldest row ${OLDEST_DAYS}d, retention ${RETENTION_HOURS}h)" >> /var/log/takguard/restarts.log
+  fi
+else
+  rm -f "$RET_ALERT_FILE" "$NOTTL_ALERT_FILE"
+fi
+
+# ── Condition C: absolute database size (original behaviour, own latch) ────
 if [ "$COT_SIZE" -lt "$SIZE_THRESHOLD" ]; then
   rm -f "$ALERT_SENT_FILE"
   exit 0
