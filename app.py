@@ -781,7 +781,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.29-alpha"
+VERSION = "10.1.30-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -3003,7 +3003,15 @@ def _gd_alert_bar(settings):
     # monitor id, which leaked an internal id (`cloudtak_ctr`) onto an operator's
     # screen and produced "Disk are failing". The banner's job is to get you to
     # the page, not to reproduce it.
-    if has_email or has_sms:
+    # EXCEPT that "you are not being told about this" is a different fact from "there
+    # is an alert", and the operator has to know it. A paused box looks identical to a
+    # working one from the inbox side — which is the whole hazard of a mute switch.
+    if (has_email or has_sms) and _gd_alerts_pause_state(s)[0]:
+        body = ('⚠ Guard Dog has an active alert — and alert delivery is PAUSED, '
+                'so no email or SMS is being sent. '
+                '<a href="/guarddog" style="color:inherit;text-decoration:underline">'
+                'Review →</a>')
+    elif has_email or has_sms:
         body = ('⚠ Guard Dog has an active alert. '
                 '<a href="/guarddog" style="color:inherit;text-decoration:underline">View →</a>')
     else:
@@ -11312,13 +11320,35 @@ def _conn_wifi_forget(ssid):
             doc = _yaml.safe_load(r.stdout or '') or {}
             wifis = ((doc.get('network') or {}).get('wifis') or {})
             removed_here = False
+            emptied = []
             for _iface, cfg in wifis.items():
-                aps = cfg.get('access-points') or {}
+                aps = (cfg or {}).get('access-points') or {}
                 if ssid in aps:
                     del aps[ssid]
                     removed_here = True
+                    if not aps:
+                        emptied.append(_iface)
             if not removed_here:
                 continue
+            # Prune an interface whose LAST access point just went away, and then a
+            # `wifis:` block with no interfaces left. netplan's generator assumes the
+            # access-points list is never empty and fails outright on `access-points: {}`
+            # (canonical/netplan#468), so leaving the husk behind made `netplan generate`
+            # fail, which reverted the whole edit — i.e. removing the only saved network
+            # for an interface could NEVER succeed. That is the exact shape the Ubuntu
+            # installer writes (one AP under 00-installer-config-wireless.yaml), so this
+            # hit any box whose wifi was set up at install time. Field-hit ops1,
+            # 2026-08-12: "Config failed validation — reverted, nothing changed."
+            # Mutate `wifis` only AFTER the loop above — deleting during iteration
+            # raises RuntimeError, which the bare `except: continue` would swallow into
+            # a silent no-op ("that network is not saved on this box").
+            for _iface in emptied:
+                wifis.pop(_iface, None)
+            if not wifis:
+                (doc.get('network') or {}).pop('wifis', None)
+            # netplan needs the version key even when nothing else is left in the file.
+            if isinstance(doc.get('network'), dict):
+                doc['network'].setdefault('version', 2)
             new_yaml = _yaml.safe_dump(doc, default_flow_style=False, sort_keys=False)
             tmp = None
             try:
@@ -11332,7 +11362,13 @@ def _conn_wifi_forget(ssid):
                 gen = _run_priv_chain([['netplan', 'generate']], mode='and')
                 if not gen or gen.returncode != 0:
                     _run_priv_chain([['cp', '-a', bak, f], ['netplan', 'generate']], mode='seq')
-                    return False, 'Config failed validation — reverted, nothing changed.'
+                    # Carry netplan's own words out to the UI. The bare message gave the
+                    # operator nothing to act on and nothing to report, which is how the
+                    # empty-access-points bug above stayed invisible.
+                    why = ((getattr(gen, 'stderr', '') or getattr(gen, 'stdout', '') or '')
+                           .strip().splitlines() or [''])[-1][:200]
+                    return False, ('Config failed validation — reverted, nothing changed.'
+                                   + (f' netplan: {why}' if why else ''))
                 touched = True
             finally:
                 if tmp and os.path.exists(tmp):
@@ -13106,6 +13142,39 @@ def _safe_alert_email(addr):
     return addr if _ALERT_EMAIL_RE.match(addr) else ''
 
 
+# v10.1.30: guarddog_alert_email holds one OR MORE addresses (operator-requested
+# 2026-08-12). Stored comma-joined in the one existing settings key rather than in a
+# new list key, so every reader that only ever expected a string — including scripts
+# already baked onto boxes — keeps working, and a single-address box needs no
+# migration. Separator is a bare comma with NO SPACES: the value is substituted into
+# root-executed script text, so it has to survive as a single shell token. Each
+# address is still checked against the same strict allowlist, so quotes/;/`/$ and
+# whitespace can never reach a shell through the list form either.
+def _safe_alert_emails(value):
+    """[addr, ...] — every valid address in `value`, de-duplicated, order preserved.
+    Accepts comma, semicolon, or whitespace separated input. Invalid entries dropped."""
+    out, seen = [], set()
+    for tok in re.split(r'[,;\s]+', (value or '').strip()):
+        a = _safe_alert_email(tok)
+        if a and a.lower() not in seen:
+            seen.add(a.lower())
+            out.append(a)
+    return out
+
+
+def _safe_alert_email_list(value):
+    """Canonical storage/substitution form: 'a@x.com,b@y.com', or '' if none valid.
+    Use this at EVERY placeholder-substitution site — _safe_alert_email() alone
+    silently blanks a multi-address value, which would disable alerts entirely."""
+    return ','.join(_safe_alert_emails(value))
+
+
+def _alert_email_rejects(value):
+    """Non-empty tokens in `value` that are NOT valid addresses — for error messages."""
+    return [t for t in re.split(r'[,;\s]+', (value or '').strip())
+            if t and not _safe_alert_email(t)]
+
+
 @app.route('/api/guarddog/deploy', methods=['POST'])
 @login_required
 def guarddog_deploy_api():
@@ -13113,11 +13182,13 @@ def guarddog_deploy_api():
         return jsonify({'error': 'Deployment already in progress'}), 409
     data = request.json or {}
     alert_email = (data.get('alert_email') or '').strip()
-    if alert_email and not _safe_alert_email(alert_email):
-        return jsonify({'error': 'Invalid alert email address'}), 400
+    _bad = _alert_email_rejects(alert_email)
+    if _bad:
+        return jsonify({'error': 'Invalid alert email address: ' + ', '.join(_bad[:3])}), 400
+    alert_email = _safe_alert_email_list(alert_email)
     settings = load_settings()
     if not alert_email:
-        alert_email = _safe_alert_email(settings.get('guarddog_alert_email'))
+        alert_email = _safe_alert_email_list(settings.get('guarddog_alert_email'))
     # Allow deploy with no email (monitors run; alerts only after user configures email)
     settings['guarddog_alert_email'] = alert_email
     nickname = (data.get('server_nickname') or '').strip()
@@ -13327,7 +13398,7 @@ def _sync_guarddog_remote_db_from_settings(settings=None):
         try:
             content = open(src, 'r', encoding='utf-8').read()
             content = (content
-                .replace('ALERT_EMAIL_PLACEHOLDER', _safe_alert_email(alert_email))
+                .replace('ALERT_EMAIL_PLACEHOLDER', _safe_alert_email_list(alert_email))
                 .replace('ALERT_SMS_PLACEHOLDER', '')
                 .replace('CERT_PASS_PLACEHOLDER', cert_pass)
                 .replace('CONSOLE_VERSION_PLACEHOLDER', VERSION)
@@ -14644,6 +14715,36 @@ def _f2b_banaction():
     return 'iptables-allports' if _distro_family() == 'rhel' else 'ufw'
 
 
+# MediaMTX / TAK Video Restreamer listeners, from the mediamtx.yml we generate
+# (~line 28620) plus the TVR ports in _FW_PORTS. Kept beside the writer that uses
+# them so a new listener in the config is an obvious two-line change here too.
+_F2B_MEDIA_PORTS_TCP = '1935,8322,8554,8555,8888,8889,8892'  # rtmp, rtsps, rtsp, tvr-rtsp, hls, webrtc, aux
+_F2B_MEDIA_PORTS_UDP = '8000,8001,8189,8890'                 # rtp, rtcp, webrtc-ice, srt
+
+
+def _f2b_banaction_media():
+    """Ban action for the mediamtx-rtsp jail ONLY: block the media ports, nothing else.
+
+    Deliberate exception to the fleet-uniform all-ports `_f2b_banaction()`, taken
+    2026-08-11 after a field ban (Ryan F., NY) severed an operator's TAK Server
+    connection during a live SWAT exercise. `ufw`/`iptables-allports` drop the IP on
+    EVERY port, so one strike on a video listener also cuts 8089/8443/8446 and the
+    console at 5001 — and `recidive` escalates a repeat to a permanent ban. Video
+    abuse must never be able to take away command and control.
+
+    The blast radius that remains is exactly the surface the jail watches. An attacker
+    brute-forcing RTSP credentials is stopped from streaming; they are not handed a
+    lever on the TAK stack. iptables-multiport is available on both families (it is
+    Debian fail2ban's own default banaction, and RHEL already runs the iptables-*
+    actions via nft-backed iptables), so this needs no per-family branch.
+
+    Two action instances because one iptables-multiport instance carries a single
+    protocol — UDP matters here (SRT 8890, RTP/RTCP, WebRTC ICE), so a TCP-only ban
+    would leave a banned publisher still pushing media."""
+    return (f'iptables-multiport[name=mediamtx-tcp, port="{_F2B_MEDIA_PORTS_TCP}", protocol=tcp]\n'
+            f'         iptables-multiport[name=mediamtx-udp, port="{_F2B_MEDIA_PORTS_UDP}", protocol=udp]')
+
+
 def _f2b_sshd_logpath():
     """sshd auth log path, or '' when this box has no syslog file to tail.
 
@@ -14819,10 +14920,29 @@ _F2B_OWNED_FILTERS = {
     ),
     'mediamtx-rtsp': (
         "[Definition]\n"
-        "# Match RTSP connection opens per source IP.\n"
-        "# Counts 'opened' events — catches scanners before their probe cycle completes;\n"
-        "# legitimate ATAK clients reconnect occasionally but never at scanner rates.\n"
-        "failregex = \\[RTSP\\] \\[conn <HOST>:\\d+\\] opened\n"
+        "# Match MediaMTX AUTHENTICATION FAILURES per source IP.\n"
+        "#\n"
+        "# v10.1.30 rewrite. The previous filter matched\n"
+        "#     \\[RTSP\\] \\[conn <HOST>:\\d+\\] opened\n"
+        "# which is a SUCCESS event — every RTSP connection open, regardless of whether\n"
+        "# the caller authenticated. At the shipped default (10 opens / 30 s) that bans\n"
+        "# any client that legitimately opens several streams at once. Field-hit\n"
+        "# 2026-08-11 (Ryan F., NY): a video-wall plugin pulling N tiles = N simultaneous\n"
+        "# RTSP opens from one phone, banned mid-operation during a SWAT exercise. Every\n"
+        "# other jail we ship matches a FAILURE; this one never did.\n"
+        "#\n"
+        "# MediaMTX logs a rejected caller on connection close, at INFO:\n"
+        "#     [RTSP] [conn 1.2.3.4:5678] closed: authentication failed: ...\n"
+        "# The `[s->c] RTSP/1.0 401 Unauthorized` line is emitted at DEBUG only, so it is\n"
+        "# NOT usable — our mediamtx.yml runs the default logLevel (info) and a filter\n"
+        "# keyed to a debug-only line would silently never fire.\n"
+        "#\n"
+        "# Protocol-agnostic on purpose: RTMP/SRT/WebRTC publishers log the same\n"
+        "# `closed: authentication failed` shape, and a credential-stuffer will try\n"
+        "# whichever listener answers. Anchored on the conn/session bracket so an\n"
+        "# unrelated line mentioning the phrase cannot match.\n"
+        "failregex = \\[conn <HOST>:\\d+\\] closed: .*authentication failed\n"
+        "            \\[conn <HOST>:\\d+\\] \\[session [^\\]]+\\] closed: .*authentication failed\n"
         "ignoreregex =\n"
     ),
 }
@@ -14853,6 +14973,18 @@ _F2B_LEGACY_FILTERS = {
         # date-detector threw IndexError on every Authentik JSON line, so it matched
         # nothing while appearing healthy.
         '[Definition]\n# Read from Authentik\'s OWN source, 2026-07-27 (authentik 2026.5.x,\n# authentik/stages/identification/stage.py):\n#     self.stage.logger.info(\n#         "invalid_login", identifier=uid_field, client_ip=client_ip,\n#         action="invalid_identifier", ...)\n# structlog renders the first positional arg as "event", so the line is\n#     {... "event":"invalid_login" ... "client_ip":"1.2.3.4" ...}\n#\n# The previous filter matched "action": "login_failed" and never fired once on\n# any box: that string does not appear in the log at all. `login_failed` is a\n# Django SIGNAL name (authentik/core/signals.py), not a logged field — it feeds\n# Authentik\'s own reputation scoring, not this file.\n#\n# REQUIRES AUTHENTIK_LOG_LEVEL=info — the call above is logger.info(), so at\n# `warning` the line is never emitted and this jail cannot fire.\n#\n# Field order is not guaranteed by structlog, so match client_ip in EITHER\n# direction relative to the event. Both alternatives cannot match the same line\n# (each requires the other token on the opposite side), so no double-counting.\n#\n# SCOPE, deliberately: this catches an unknown/invalid IDENTIFIER — credential\n# stuffing and username enumeration, the dominant attack. A wrong PASSWORD on a\n# valid username logs "Invalid credentials" with NO client_ip\n# (stages/password/stage.py), so it is not bannable from the log in this\n# version. Authentik\'s built-in reputation policy covers that case natively.\nfailregex = "event":\\s*"invalid_login".*"client_ip":\\s*"<HOST>"\n            "client_ip":\\s*"<HOST>".*"event":\\s*"invalid_login"\nignoreregex =\n',
+    ],
+    'mediamtx-rtsp': [
+        # v0.9.x–v10.1.29: matched `opened`, a SUCCESS event, so it counted legitimate
+        # stream pulls as strikes. Banned a real operator mid-exercise (2026-08-11).
+        # Every box with MediaMTX auto-installed this jail, so the upgrade has to reach
+        # them through the self-heal — creating-if-missing would skip all of them.
+        "[Definition]\n"
+        "# Match RTSP connection opens per source IP.\n"
+        "# Counts 'opened' events — catches scanners before their probe cycle completes;\n"
+        "# legitimate ATAK clients reconnect occasionally but never at scanner rates.\n"
+        "failregex = \\[RTSP\\] \\[conn <HOST>:\\d+\\] opened\n"
+        "ignoreregex =\n",
     ],
 }
 
@@ -16373,8 +16505,13 @@ def _f2b_mediamtx_jail_enabled():
     return os.path.exists('/etc/fail2ban/jail.d/infratak-mediamtx-rtsp.conf')
 
 def _f2b_read_mediamtx_jail_config():
-    """Read current thresholds from the infratak-mediamtx-rtsp jail config file."""
-    cfg = {'maxretry': 10, 'findtime': 30, 'bantime': 3600}
+    """Read current thresholds and ignoreip from the infratak-mediamtx-rtsp jail config.
+
+    ignoreip was missing here until v10.1.30, which made this the only jail whose
+    per-jail operator whitelist could not survive: the startup self-heal re-derives a
+    jail from what this returns, so anything an operator added was silently dropped on
+    the next console restart."""
+    cfg = {'maxretry': 10, 'findtime': 30, 'bantime': 3600, 'ignoreip': ''}
     jail_path = '/etc/fail2ban/jail.d/infratak-mediamtx-rtsp.conf'
     if not os.path.exists(jail_path):
         return cfg
@@ -16386,6 +16523,8 @@ def _f2b_read_mediamtx_jail_config():
                     if line.startswith(key):
                         try: cfg[key] = int(line.split('=')[1].strip())
                         except Exception: pass
+                if line.startswith('ignoreip'):
+                    cfg['ignoreip'] = line.split('=', 1)[1].strip()
     except Exception:
         pass
     return cfg
@@ -16415,7 +16554,7 @@ def _f2b_write_mediamtx_jail(maxretry, findtime, bantime, ignoreip=''):
         f"findtime = {findtime}\n"
         f"bantime  = {bantime}\n"
         f"ignoreip = {_f2b_trusted_ignoreip(ignoreip)}\n"
-        f"action   = {_f2b_banaction()}{guarddog_action}\n"
+        f"action   = {_f2b_banaction_media()}{guarddog_action}\n"
     )
     jail_path = '/etc/fail2ban/jail.d/infratak-mediamtx-rtsp.conf'
     _write_priv(jail_path, jail_conf)
@@ -16470,7 +16609,8 @@ def fail2ban_mediamtx_config_api():
     except (ValueError, TypeError) as e:
         return jsonify({'ok': False, 'error': f'Invalid value: {e}'}), 400
     try:
-        _f2b_write_mediamtx_jail(maxretry, findtime, bantime)
+        _f2b_write_mediamtx_jail(maxretry, findtime, bantime,
+                                 str(data.get('ignoreip', '') or '').strip())
         _svc = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'fail2ban']),
                               capture_output=True, text=True)
         if _svc.stdout.strip() != 'active':
@@ -16879,7 +17019,7 @@ def _f2b_rewrite_all_jails():
         done.append('sshd')
     if _f2b_mediamtx_jail_enabled():
         c = _f2b_read_mediamtx_jail_config()
-        _f2b_write_mediamtx_jail(c['maxretry'], c['findtime'], c['bantime'])
+        _f2b_write_mediamtx_jail(c['maxretry'], c['findtime'], c['bantime'], _f2b_operator_extra(c.get('ignoreip', '')))
         done.append('mediamtx-rtsp')
     if _f2b_portal_jail_enabled():
         c = _f2b_read_portal_jail_config()
@@ -16960,6 +17100,16 @@ def _f2b_write_recidive_config(maxretry, findtime):
         "bantime  = -1\n"
         f"findtime = {findtime}\n"
         f"maxretry = {maxretry}\n"
+        # v10.1.30: never escalate a MEDIA ban into an all-ports one. recidive matches
+        # `Ban <HOST>` from EVERY jail, bans for -1 (permanent) and uses the all-ports
+        # action — so without this line the media-only scoping of mediamtx-rtsp is
+        # undone after `maxretry` bans, and a repeat video offender loses TAK Server
+        # and the console permanently. That is the exact incident this release exists
+        # to fix (Ryan F., 2026-08-11), just delayed by three bans — and it is most
+        # reachable in his own situation, a phone behind carrier NAT sharing one
+        # public IP. Repeat media abuse keeps earning media-scoped bans instead.
+        # Caught by /security-review before ship, 2026-08-13.
+        "ignoreregex = \\[mediamtx-rtsp\\] Ban\n"
         f"ignoreip = {_f2b_trusted_ignoreip()}\n"
         f"action   = {_f2b_banaction()}\n"
     )
@@ -18613,20 +18763,80 @@ def guarddog_uninstall():
     subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=10)
     return jsonify({'success': True})
 
-def _guarddog_send_alert_email_via_relay(to_addr, subject, body):
-    """Send email via Email Relay (localhost:25 → Postfix → Brevo). Used by test email and send-alert-email endpoint."""
+# ── v10.1.30: notification pause (operator-requested 2026-08-12) ──────────────
+# ONE switch muting Guard Dog email + SMS, with an optional auto-resume. Guard Dog
+# keeps monitoring the whole time and the console keeps showing alerts on screen —
+# this suppresses DELIVERY only, so a paused box is quiet, not blind.
+#
+# Enforced inside the two send helpers rather than at each call site. There are
+# five senders today (the two localhost script routes, the AK/PG watchdog, the
+# pending-update notifier, and the test buttons) and a sixth will get added by
+# someone who has never read this comment; gating the helper makes "paused" the
+# default for anything new. The test buttons pass force=True — a test that stays
+# silent while paused is indistinguishable from a broken relay, which is exactly
+# when an operator reaches for it.
+_GD_PAUSE_DURATIONS = {'1h': 1, '4h': 4, '24h': 24}
+
+
+def _gd_alerts_pause_state(settings=None):
+    """Effective pause state: (paused: bool, until_iso: str). '' until = indefinite.
+
+    PURE — never writes. An elapsed snooze reports not-paused rather than being
+    cleared on read, so the expiry needs no writer, cannot race two workers against
+    each other, and cannot leave a box muted because a cleanup write failed.
+
+    An unparseable `until` reports NOT paused. A corrupt timestamp must never be
+    able to silence a box forever; the failure direction has to be toward noise."""
+    from datetime import timezone as _tz
+    s = settings if settings is not None else load_settings()
+    if not s.get('guarddog_alerts_paused'):
+        return False, ''
+    until = (s.get('guarddog_alerts_paused_until') or '').strip()
+    if not until:
+        return True, ''                      # indefinite — until the operator resumes
+    try:
+        dt = datetime.fromisoformat(until.replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_tz.utc)
+    except Exception:
+        return False, ''
+    if datetime.now(_tz.utc) >= dt:
+        return False, until                  # snooze elapsed — auto-resumed
+    return True, until
+
+
+def _guarddog_send_alert_email_via_relay(to_addr, subject, body, force=False):
+    """Send email via Email Relay (localhost:25 → Postfix → Brevo). Used by test email and send-alert-email endpoint.
+
+    Returns True if sent, False if suppressed by the notification pause. Raises on
+    a genuine send failure, so a suppressed alert is never reported as an error."""
     import smtplib
     from email.mime.text import MIMEText
+    if not force:
+        paused, until = _gd_alerts_pause_state()
+        if paused:
+            print(f"[guarddog] alert email suppressed — notifications paused"
+                  f"{' until ' + until if until else ' (indefinite)'}: {subject}", flush=True)
+            return False
     settings = load_settings()
     relay = settings.get('email_relay', {})
     from_addr = relay.get('from_addr', 'noreply@localhost')
     from_name = relay.get('from_name', 'Guard Dog')
+    # to_addr may carry several addresses (comma-joined). Re-validate here rather than
+    # trusting the caller: this is the last point before SMTP, and every entry point
+    # feeding it is a separate route.
+    recipients = _safe_alert_emails(to_addr)
+    if not recipients:
+        return False
     msg = MIMEText(body or '', 'plain', 'utf-8')
     msg['From'] = f'{from_name} <{from_addr}>'
-    msg['To'] = to_addr
+    msg['To'] = ', '.join(recipients)
     msg['Subject'] = subject or 'Guard Dog Alert'
     with smtplib.SMTP('localhost', 25, timeout=15) as s:
-        s.sendmail(from_addr, [to_addr], msg.as_string())
+        # One envelope, all recipients — a per-address loop would let a single bad
+        # mailbox abort the rest partway through.
+        s.sendmail(from_addr, recipients, msg.as_string())
+    return True
 
 
 # ── v10.1.7 WS2: pending-update email notifications ──────────────────────────
@@ -18748,7 +18958,7 @@ def _update_notify_check_once():
     one pending item's identity has not been mailed before (one email per new SHA/tag,
     never per poll). Returns {'pending': [...], 'emailed': bool} for the trigger route."""
     settings = load_settings()
-    to_addr = _safe_alert_email(settings.get('guarddog_alert_email'))
+    to_addr = _safe_alert_email_list(settings.get('guarddog_alert_email'))
     if not to_addr:
         return {'pending': [], 'emailed': False, 'skipped': 'no alert email configured'}
     if settings.get('guarddog_update_email_enabled') is False:
@@ -18898,14 +19108,26 @@ def guarddog_send_alert_email():
     if request.remote_addr not in ('127.0.0.1', '::1'):
         return jsonify({'error': 'Forbidden'}), 403
     data = request.get_json(silent=True) or {}
-    to_addr = (data.get('to') or '').strip() or (load_settings().get('guarddog_alert_email') or '').strip()
+    # settings.json is the SOURCE OF TRUTH for the recipient; the caller's `to` is a
+    # legacy fallback only. The watch scripts pass the address that was baked into
+    # them at deploy time (ALERT_EMAIL_PLACEHOLDER), and this used to prefer that —
+    # so clearing the alert email in the console changed the field, said "saved", and
+    # alerts kept arriving at the stale baked address until Guard Dog was redeployed.
+    # Changing the address had the same fault: the OLD one kept getting mail. Reading
+    # settings first makes remove, change, and pause all take effect at once, with no
+    # redeploy ([[no-redeploy-button-on-installed-modules]]).
+    # No `or data.get('to')` fallback: keeping one would defeat the whole fix, since a
+    # cleared setting would fall straight back to the baked address it is trying to
+    # remove. Empty here means the operator removed the recipient — send nothing. The
+    # console shows this same field, so what it displays is what actually gets mail.
+    to_addr = (load_settings().get('guarddog_alert_email') or '').strip()
     if not to_addr:
-        return jsonify({'error': 'No recipient'}), 400
+        return jsonify({'success': True, 'suppressed': True, 'reason': 'no recipient configured'})
     subject = (data.get('subject') or 'Guard Dog Alert')[:200]
     body = (data.get('body') or '')[:50000]
     try:
-        _guarddog_send_alert_email_via_relay(to_addr, subject, body)
-        return jsonify({'success': True})
+        sent = _guarddog_send_alert_email_via_relay(to_addr, subject, body)
+        return jsonify({'success': True, 'suppressed': not sent})
     except Exception as e:
         return jsonify({'error': str(e)[:200]}), 500
 
@@ -18919,17 +19141,25 @@ def guarddog_test_email():
     to_addr = data.get('to', '').strip() or (settings.get('guarddog_alert_email') or '').strip()
     if not to_addr:
         return jsonify({'success': False, 'error': 'No email address configured'}), 400
-    if not _safe_alert_email(to_addr):
-        return jsonify({'success': False, 'error': 'Invalid alert email address'}), 400
+    _bad = _alert_email_rejects(to_addr)
+    if _bad:
+        return jsonify({'success': False,
+                        'error': 'Invalid alert email address: ' + ', '.join(_bad[:3])}), 400
+    to_addr = _safe_alert_email_list(to_addr)
     if data.get('save'):
         settings['guarddog_alert_email'] = to_addr
         save_settings(settings)
     try:
         _guarddog_send_alert_email_via_relay(
             to_addr, 'Guard Dog Test Alert',
-            'Test alert from infra-TAK Guard Dog.\n\nIf you received this, email notifications are working (via Email Relay/Brevo when deployed).'
+            'Test alert from infra-TAK Guard Dog.\n\nIf you received this, email notifications are working (via Email Relay/Brevo when deployed).',
+            force=True   # a test that goes silent while paused looks like a broken relay
         )
-        return jsonify({'success': True, 'message': f'Test email sent to {to_addr}'})
+        paused, _u = _gd_alerts_pause_state(settings)
+        return jsonify({'success': True,
+                        'message': f'Test email sent to {to_addr}'
+                                   + (' — note: alerts are currently PAUSED, so real alerts are not being delivered.'
+                                      if paused else '')})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)[:200]}), 500
 
@@ -18940,8 +19170,13 @@ def guarddog_notifications_save():
     data = request.json or {}
     settings = load_settings()
     email = (data.get('alert_email') or '').strip()
-    if email and not _safe_alert_email(email):
-        return jsonify({'success': False, 'error': 'Invalid alert email address'}), 400
+    _bad = _alert_email_rejects(email)
+    if _bad:
+        return jsonify({'success': False,
+                        'error': 'Invalid alert email address: ' + ', '.join(_bad[:3])}), 400
+    # Store canonicalised (validated, de-duplicated, comma-joined) so every consumer —
+    # including scripts baked at deploy time — reads one predictable shape.
+    email = _safe_alert_email_list(email)
     nickname = (data.get('server_nickname') or '').strip()
     settings['guarddog_alert_email'] = email
     settings['guarddog_server_nickname'] = nickname
@@ -18953,6 +19188,66 @@ def guarddog_notifications_save():
         except Exception:
             pass
     return jsonify({'success': True, 'message': 'Saved. Alerts will use the server nickname.'})
+
+@app.route('/api/guarddog/notifications/pause', methods=['POST'])
+@login_required
+def guarddog_notifications_pause():
+    """Pause or resume Guard Dog alert delivery (email + SMS together).
+
+    Body: {paused: bool, duration: '1h'|'4h'|'24h'|''}. Empty duration = indefinite.
+    Monitoring is unaffected — this suppresses delivery only."""
+    from datetime import timezone as _tz
+    data = request.json or {}
+    paused = bool(data.get('paused'))
+    settings = load_settings()
+    if not paused:
+        settings['guarddog_alerts_paused'] = False
+        settings['guarddog_alerts_paused_until'] = ''
+        save_settings(settings)
+        return jsonify({'success': True, 'paused': False, 'message': 'Alerts resumed.'})
+    duration = (data.get('duration') or '').strip()
+    if duration and duration not in _GD_PAUSE_DURATIONS:
+        return jsonify({'success': False,
+                        'error': 'Duration must be 1h, 4h, 24h, or empty for indefinite'}), 400
+    until = ''
+    if duration:
+        until = (datetime.now(_tz.utc)
+                 + timedelta(hours=_GD_PAUSE_DURATIONS[duration])).replace(microsecond=0).isoformat()
+    settings['guarddog_alerts_paused'] = True
+    settings['guarddog_alerts_paused_until'] = until
+    save_settings(settings)
+    return jsonify({'success': True, 'paused': True, 'until': until,
+                    'message': (f'Alerts paused for {duration}.' if duration
+                                else 'Alerts paused until you resume them.')})
+
+
+@app.route('/api/guarddog/notifications/status')
+@login_required
+def guarddog_notifications_status():
+    """Live pause state for the Guard Dog card. Reports the EFFECTIVE state, so an
+    elapsed snooze reads as resumed without anything having to write settings."""
+    settings = load_settings()
+    paused, until = _gd_alerts_pause_state(settings)
+    # Report what is ACTUALLY saved and would receive an alert right now, read back
+    # from settings — not echoed from whatever the form posted. The card previously
+    # rendered the field once at page load and then said nothing, so after an edit
+    # there was no way to tell a typed value from a saved one, and no way to see that
+    # a save had silently dropped an invalid address.
+    emails = _safe_alert_emails(settings.get('guarddog_alert_email'))
+    sms = settings.get('guarddog_sms') or {}
+    return jsonify({
+        'paused': paused,
+        'until': until if paused else '',
+        'indefinite': bool(paused and not until),
+        'has_email': bool(emails),
+        'has_sms': bool(sms.get('provider')),
+        'emails': emails,
+        'email_saved': ','.join(emails),
+        'nickname': (settings.get('guarddog_server_nickname') or '').strip(),
+        'sms_provider': sms.get('provider') or '',
+        'sms_to': (sms.get('to_numbers') or '').strip(),
+    })
+
 
 @app.route('/api/guarddog/sms/save', methods=['POST'])
 @login_required
@@ -19024,10 +19319,19 @@ BODY_FILE="$2"
         p = os.path.join('/opt/tak-guarddog', name)
         _write_priv(p, content, perm=0o755)   # v10.0.5 non-root: /opt/tak-guarddog root-owned
 
-def _guarddog_send_sms_now(sms, text):
-    """Send SMS via Twilio or Brevo. sms = settings['guarddog_sms'], text = message body (max 1600 chars). Raises on error. Returns optional dict with e.g. {'brevo_message_id': ...} for debugging."""
+def _guarddog_send_sms_now(sms, text, force=False):
+    """Send SMS via Twilio or Brevo. sms = settings['guarddog_sms'], text = message body (max 1600 chars). Raises on error. Returns optional dict with e.g. {'brevo_message_id': ...} for debugging.
+
+    Returns {'suppressed': True} without sending when notifications are paused
+    (force=True bypasses, for the test button). See _gd_alerts_pause_state()."""
     text = (text or '')[:1600]
     out = {}
+    if not force:
+        paused, until = _gd_alerts_pause_state()
+        if paused:
+            print(f"[guarddog] alert SMS suppressed — notifications paused"
+                  f"{' until ' + until if until else ' (indefinite)'}", flush=True)
+            return {'suppressed': True}
     if sms.get('provider') == 'twilio':
         import base64
         import urllib.error
@@ -19127,8 +19431,11 @@ def guarddog_test_sms():
     if not sms or sms.get('provider') not in ('twilio', 'brevo'):
         return jsonify({'success': False, 'error': 'SMS not configured. Save Twilio or Brevo settings first.'}), 400
     try:
-        info = _guarddog_send_sms_now(sms, 'Guard Dog test - if you got this, SMS is working.')
+        info = _guarddog_send_sms_now(sms, 'Guard Dog test - if you got this, SMS is working.',
+                                      force=True)   # same reason as the test email
         msg = 'Test SMS sent to configured number(s).'
+        if _gd_alerts_pause_state(settings)[0]:
+            msg += ' Note: alerts are currently PAUSED, so real alerts are not being delivered.'
         if info.get('brevo_message_id') is not None:
             msg += f' Brevo message ID: {info["brevo_message_id"]} (check Brevo SMS logs if the text did not arrive).'
         return jsonify({'success': True, 'message': msg})
@@ -19267,7 +19574,7 @@ def run_guarddog_deploy(alert_email):
             content = open(src, 'r').read()
             cert_pass = _get_tak_cert_password(settings)
             content = (content
-                .replace('ALERT_EMAIL_PLACEHOLDER', _safe_alert_email(alert_email))
+                .replace('ALERT_EMAIL_PLACEHOLDER', _safe_alert_email_list(alert_email))
                 .replace('ALERT_SMS_PLACEHOLDER', alert_sms or '')
                 .replace('CERT_PASS_PLACEHOLDER', cert_pass)
                 .replace('CONSOLE_VERSION_PLACEHOLDER', VERSION))
@@ -63665,7 +63972,7 @@ def _auto_update_guarddog():
             with open(src) as f:
                 content = f.read()
             content = (content
-                .replace('ALERT_EMAIL_PLACEHOLDER', _safe_alert_email(alert_email))
+                .replace('ALERT_EMAIL_PLACEHOLDER', _safe_alert_email_list(alert_email))
                 .replace('ALERT_SMS_PLACEHOLDER', '')
                 .replace('CERT_PASS_PLACEHOLDER', cert_pass)
                 .replace('CONSOLE_VERSION_PLACEHOLDER', VERSION))
@@ -64579,6 +64886,95 @@ def _startup_reapply_f2b_trusted_ignoreip():
         print('Startup migration: f2b trusted-ignoreip re-apply warning (non-fatal): %s' % _e)
 
 _startup_reapply_f2b_trusted_ignoreip()
+
+
+def _startup_converge_mediamtx_banaction():
+    """v10.1.30: converge the mediamtx jail's ban action to the media-ports-only form.
+
+    Caught in T&E 2026-08-13 — RED on all five boxes. The corrected FILTER reached the
+    fleet (via _F2B_LEGACY_FILTERS + _f2b_selfheal_filters), but the corrected BAN SCOPE
+    did not, so every box was still running `action = ufw` / `iptables-allports`: a video
+    strike would still have severed TAK Server, which is the half of the fix that
+    actually mattered to the operator who reported it.
+
+    Nothing rewrites an EXISTING jail's action. `_f2b_rewrite_all_jails()` is the only
+    writer and its startup caller early-returns unless the trusted-CIDR list changed
+    (`if not need: return`), while the auto-install path explicitly skips a jail that is
+    already present. So a jail written by any earlier release keeps that release's action
+    forever. Exactly the trap `_F2B_LEGACY_FILTERS` exists to close, one layer up — the
+    filter got a self-heal and the jail config never had one.
+
+    Deliberately narrow: only this jail, only its action, and only when it does not
+    already match. Rewriting via `_f2b_write_mediamtx_jail()` re-derives thresholds and
+    ignoreip from what is stored, so an operator's tuning and whitelist survive."""
+    try:
+        if not _f2b_mediamtx_jail_enabled():
+            return
+        jail_path = '/etc/fail2ban/jail.d/infratak-mediamtx-rtsp.conf'
+        try:
+            with open(jail_path) as _jf:
+                cur = _jf.read()
+        except OSError:
+            return
+        # Compare against the action we would write now. Substring, not equality: the
+        # guarddog notify action is appended after it and is not ours to judge here.
+        want_first = _f2b_banaction_media().splitlines()[0].strip()
+        if want_first in cur:
+            return
+        c = _f2b_read_mediamtx_jail_config()
+        _f2b_write_mediamtx_jail(c['maxretry'], c['findtime'], c['bantime'],
+                                 _f2b_operator_extra(c.get('ignoreip', '')))
+        subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']),
+                       capture_output=True, timeout=15)
+        print('Startup migration: ✓ mediamtx jail ban action converged to media ports '
+              'only — it was banning on EVERY port, which severs TAK Server on a video '
+              'strike (v10.1.30)')
+    except PermissionError:
+        pass
+    except Exception as _e:
+        print('Startup migration: mediamtx banaction converge warning (non-fatal): %s' % _e)
+
+
+def _startup_converge_recidive_media_exempt():
+    """v10.1.30: stop recidive from escalating a MEDIA ban into a permanent all-ports one.
+
+    Scoping the mediamtx jail to media ports is worth nothing while recidive is enabled:
+    it matches `Ban <HOST>` from every jail, bans for -1, and uses the ALL-PORTS action.
+    After `maxretry` media bans the offender loses TAK Server and the console —
+    permanently. Found by /security-review before the v10.1.30 ship; recidive was
+    enabled on all five fleet boxes at the time, so this was live everywhere, not
+    hypothetical.
+
+    Same convergence problem as the ban action: `_f2b_rewrite_all_jails()` only runs
+    when the trusted-CIDR list changes, so an existing recidive jail keeps whatever it
+    was written with. Narrow: only adds the exemption when it is missing, and rewrites
+    through `_f2b_write_recidive_config()` so stored thresholds survive."""
+    try:
+        if not _f2b_recidive_enabled():
+            return
+        path = '/etc/fail2ban/jail.d/infratak-recidive.conf'
+        try:
+            with open(path) as _rf:
+                cur = _rf.read()
+        except OSError:
+            return
+        if 'mediamtx-rtsp' in cur:
+            return
+        c = _f2b_read_recidive_config()
+        _f2b_write_recidive_config(c['maxretry'], c['findtime'])
+        subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']),
+                       capture_output=True, timeout=15)
+        print('Startup migration: ✓ recidive now ignores mediamtx-rtsp bans — it was '
+              'escalating a media-only ban into a PERMANENT all-ports one, undoing the '
+              'media scoping entirely (v10.1.30)')
+    except PermissionError:
+        pass
+    except Exception as _e:
+        print('Startup migration: recidive media-exempt converge warning (non-fatal): %s' % _e)
+
+# NOT invoked here. This function is broker-dependent (_f2b_write_mediamtx_jail writes
+# under /etc), and module level runs before the broker-ready gate in _startup_migrations().
+# It is called from the fail2ban self-heal block there instead — see the note at that call.
 
 
 # v0.9.12 A7: startup migration — patch base compose port bindings to loopback
@@ -65637,7 +66033,7 @@ Reads guarddog_alert_email + email_relay from infra-TAK settings.json.
 Sends via localhost:25 (same Postfix relay Guard Dog uses). Exits cleanly
 if email is not configured so fail2ban does not treat it as an error.
 """
-import sys, os, json, smtplib, subprocess
+import sys, os, re, json, smtplib, subprocess
 from email.mime.text import MIMEText
 from datetime import datetime, timezone
 
@@ -65685,6 +66081,28 @@ def main():
               file=sys.stderr)
         sys.exit(0)
 
+    # Honour the Guard Dog notification pause. This script does its own SMTP rather
+    # than going through the console, so the helper-level gate does not cover it —
+    # without this, pausing alerts would silence everything EXCEPT ban notices, which
+    # is the surprise you would only find out about at 3am. Parsing mirrors
+    # _gd_alerts_pause_state(): an elapsed or unparseable deadline means NOT paused,
+    # so a bad timestamp can never mute bans permanently.
+    if settings.get('guarddog_alerts_paused'):
+        _until = (settings.get('guarddog_alerts_paused_until') or '').strip()
+        _muted = True
+        if _until:
+            try:
+                _dt = datetime.fromisoformat(_until.replace('Z', '+00:00'))
+                if _dt.tzinfo is None:
+                    _dt = _dt.replace(tzinfo=timezone.utc)
+                _muted = datetime.now(timezone.utc) < _dt
+            except Exception:
+                _muted = False
+        if _muted:
+            print("infratak-f2b-notify: notifications paused — no email sent",
+                  file=sys.stderr)
+            sys.exit(0)
+
     relay     = settings.get('email_relay', {})
     from_addr = relay.get('from_addr', 'noreply@localhost')
     from_name = relay.get('from_name', 'Guard Dog')
@@ -65711,15 +66129,18 @@ def main():
         f'To unban this IP, open your infra-TAK console → Fail2ban page.\n'
     )
 
+    # guarddog_alert_email may hold several comma-joined addresses (v10.1.30).
+    recipients = [a for a in re.split(r'[,;\s]+', to_addr) if a]
+
     msg = MIMEText(body, 'plain', 'utf-8')
     msg['From'] = f'{from_name} <{from_addr}>'
-    msg['To'] = to_addr
+    msg['To'] = ', '.join(recipients)
     msg['Subject'] = subject
 
     try:
         with smtplib.SMTP('localhost', 25, timeout=15) as smtp:
-            smtp.sendmail(from_addr, [to_addr], msg.as_string())
-        print(f"infratak-f2b-notify: alert sent to {to_addr}", file=sys.stderr)
+            smtp.sendmail(from_addr, recipients, msg.as_string())
+        print(f"infratak-f2b-notify: alert sent to {msg['To']}", file=sys.stderr)
     except Exception as e:
         print(f"infratak-f2b-notify: email failed: {e}", file=sys.stderr)
 
@@ -66324,6 +66745,26 @@ def _startup_migrations():
             _f2b_selfheal_trusted_ignoreip(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _f2b_e3:
             print(f"Startup migration: fail2ban trusted-ignoreip self-heal error (non-fatal): {_f2b_e3}", flush=True)
+
+        # v10.1.30 — converge the mediamtx jail's ban action to media-ports-only. MUST run
+        # here, inside _startup_migrations() and therefore AFTER the broker-ready gate
+        # above — not at import time. Its first home was module level beside
+        # _startup_reapply_f2b_trusted_ignoreip(), which executes before the broker is
+        # mediating: on test12 that produced `exit status 125` from the broker on both the
+        # first restart and the retry, so the fix never landed and the jail kept banning on
+        # every port. It was not a race — it reproduced exactly. Same window that ate the
+        # Caddy re-assert, the TAK Portal / CloudTAK recreates and the metrics collector on
+        # that box, all with `[Errno 111] Connection refused`.
+        try:
+            _startup_converge_mediamtx_banaction()
+        except Exception as _f2b_e3b:
+            print(f"Startup migration: mediamtx banaction converge error (non-fatal): {_f2b_e3b}", flush=True)
+        # Must follow the above: scoping the mediamtx ban to media ports is undone by
+        # recidive, which escalates any repeat to a permanent ALL-PORTS ban.
+        try:
+            _startup_converge_recidive_media_exempt()
+        except Exception as _f2b_e3c:
+            print(f"Startup migration: recidive media-exempt converge error (non-fatal): {_f2b_e3c}", flush=True)
 
         # v10.1.11 — a jail that cannot fire is worse than no jail, because every
         # surface reports it as configured. Repair the two ways we shipped one:
@@ -69091,7 +69532,7 @@ def _post_update_auto_deploy():
                 if _mtx_svc and _f2b_is_available() and not _f2b_mediamtx_jail_enabled():
                     _f2b_write_mediamtx_jail(maxretry=10, findtime=30, bantime=3600)
                     subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=15)
-                    print("Post-update: MediaMTX RTSP Fail2ban jail installed (10 conns/30s → 1h ban)")
+                    print("Post-update: MediaMTX RTSP Fail2ban jail installed (10 failed auths/30s → 1h ban on media ports only)")
                 elif _mtx_svc and _f2b_mediamtx_jail_enabled():
                     print("Post-update: MediaMTX RTSP Fail2ban jail already present — no change")
             except Exception as _mtx_f2b_err:
