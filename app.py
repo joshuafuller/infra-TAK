@@ -781,7 +781,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.32-alpha"
+VERSION = "10.1.33-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -21242,12 +21242,24 @@ def _caddy_letsencrypt_days_left(settings):
     cert_base = '/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory'
     for name in (fqdn, f'infratak.{fqdn}'):
         crt = os.path.join(cert_base, name, f'{name}.crt')
-        if not os.path.isfile(crt):
+        # v10.1.33: was os.path.isfile() + `openssl -in <crt>`. Caddy's store is 0700
+        # caddy:caddy and the console is takwerx, so BOTH the stat and the read failed on
+        # every non-root box and this fallback silently never produced a number. Same
+        # blindness as _caddy_cert_pair_ready().
+        #
+        # Read the PEM with privilege, then pipe it to openssl on STDIN — `openssl` is not
+        # broker-allowlisted (and does not need to be, since it needs no privilege of its
+        # own once it has the bytes).
+        try:
+            _pem = _read_priv(crt)
+        except Exception:
+            continue
+        if not _pem.strip():
             continue
         try:
             r = subprocess.run(
-                ['openssl', 'x509', '-enddate', '-noout', '-in', crt],
-                capture_output=True, text=True, timeout=5
+                ['openssl', 'x509', '-enddate', '-noout'],
+                input=_pem, capture_output=True, text=True, timeout=5
             )
             if r.returncode != 0:
                 continue
@@ -23035,12 +23047,20 @@ def _get_mediamtx_hls_upstream(settings):
         host = (cfg.get('remote', {}).get('host') or '').strip()
         if host:
             # Remote MediaMTX: the yml lives on the remote host (too heavy to read
-            # here every regen). Preserve the prior cert-existence signal as a
-            # best-effort for the remote case — the non-root traversal problem is
-            # local-console-only, so this path is unaffected by the fleet bug.
+            # here every regen), so fall back to the cert-existence signal.
+            #
+            # v10.1.33: that fallback had the SAME non-root blindness this function's
+            # docstring describes. The note here claimed "the non-root traversal problem
+            # is local-console-only, so this path is unaffected" — but cert_base is a
+            # path on the LOCAL console box (Caddy runs here, fronting the remote
+            # MediaMTX), evaluated by the local takwerx process. It returned False on
+            # every non-root box regardless of the remote's state, so split-server
+            # deployments always got the plain-HTTP upstream. Test it with privilege.
             mtx_domain = _get_service_domain(settings, 'mediamtx') if settings.get('fqdn') else ''
             cert_base = '/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory'
-            enc = bool(mtx_domain and os.path.exists(f'{cert_base}/{mtx_domain}/{mtx_domain}.crt'))
+            enc = bool(mtx_domain and _caddy_cert_pair_ready(
+                f'{cert_base}/{mtx_domain}/{mtx_domain}.crt',
+                f'{cert_base}/{mtx_domain}/{mtx_domain}.key'))
             return f'{host}:8888', enc
     return '127.0.0.1:8888', _hls_encrypted_from_yml()
 
@@ -28240,6 +28260,144 @@ def mediamtx_uninstall():
     _deregister_authentik_proxy_app(settings, 'stream', 'MediaMTX', plog=lambda m: steps.append(m.strip()))
     return jsonify({'success': True, 'steps': steps})
 
+def _caddy_cert_pair_ready(cert_file, key_file):
+    """True when BOTH Caddy cert files exist — tested WITH PRIVILEGE, not os.path.exists().
+
+    v10.1.33. Found on test12 2026-08-14 while chasing an unrelated MediaMTX report: the
+    deploy logged `⚠ Cert not found after 60s — SSL not wired` for a domain whose
+    Let's Encrypt cert was present, valid and actively serving HTTPS.
+
+    The cert was never missing — the console cannot SEE it. Caddy stores certs under
+    /var/lib/caddy/.local/share/caddy/certificates, which is `drwx------ caddy:caddy`.
+    The console runs as `takwerx`, which is deliberately not in group `caddy`, so
+    `os.path.exists()` on that path returns False for a file that plainly exists. A
+    permission error reported as absence — same failure shape as [[broker-privilege-boundary]]
+    and the CoreConfig 640 case in _read_coreconfig(): the box answers "no" instead of
+    "not allowed", and every caller downstream believes it.
+
+    Impact was silent and total on non-root boxes: MediaMTX never got rtspServerCert /
+    hlsServerCert wired, so RTSPS and HTTPS-HLS stayed off on every deploy since the
+    non-root flip. Worse, the code that grants takwerx access to those certs
+    (usermod -aG caddy + chmod g+rx on the chain) lives INSIDE the `if cert exists`
+    branch — gated behind the very permission it exists to grant. The remediation the
+    deploy log printed ("reload Caddy, restart MediaMTX to retry") could never succeed.
+
+    Note a group grant alone would not fix this: supplementary groups are fixed when the
+    console process starts, so a running console stays blind until restart. Detection has
+    to be privileged, which is why this asks sudo/broker rather than the filesystem."""
+    try:
+        for _p in (cert_file, key_file):
+            if subprocess.run(_sudo_wrap(['test', '-f', _p]),
+                              capture_output=True, timeout=10).returncode != 0:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _stage_priv_file(src_path, dest_path):
+    """Copy a root/caddy-owned file to a path the console can actually read.
+
+    v10.1.33: scp and shutil.copy2 both read the SOURCE as the console user, so handing
+    them a 0600 caddy:caddy cert fails for the same reason os.path.exists() did. Pull the
+    bytes through the broker/sudo first, then hand the copy a file we own."""
+    data = _read_priv(src_path)
+    with open(dest_path, 'w') as _f:
+        _f.write(data)
+    os.chmod(dest_path, 0o600)
+
+
+def _mediamtx_yml_wire_tls(txt, cert_file, key_file):
+    """Return mediamtx.yml text with Caddy's cert wired in and encryption enabled.
+
+    v10.1.33: shared by the deploy path and _startup_converge_mediamtx_ssl() so the two
+    can never drift. Pure text in, text out — no I/O, so it is testable and the caller
+    decides how to persist it (always _write_priv: /usr/local/etc is root:root 0755, so
+    anything that writes a temp file in that directory fails as takwerx)."""
+    # Strip indented continuation lines under the keys we rewrite (what the old
+    # `sed '/^key:/{ n; /^  /d }'` pass did).
+    for _k in ('rtspServerKey', 'rtspServerCert', 'hlsServerKey',
+               'hlsServerCert', 'rtmpServerKey', 'rtmpServerCert'):
+        txt = re.sub(r'(?m)^(%s:.*\n)(?:[ \t]+\S.*\n)*' % re.escape(_k), r'\1', txt)
+    for _k, _v in (('rtspServerKey', key_file), ('rtspServerCert', cert_file),
+                   ('hlsServerKey', key_file), ('hlsServerCert', cert_file),
+                   ('rtmpServerKey', key_file), ('rtmpServerCert', cert_file),
+                   ('rtspEncryption', '"optional"'), ('hlsEncryption', 'yes')):
+        _new = '%s: %s' % (_k, _v)
+        txt, _n = re.subn(r'(?m)^%s:.*$' % re.escape(_k), _new.replace('\\', '\\\\'), txt)
+        if _n == 0:                       # key absent — append it
+            txt = txt.rstrip('\n') + '\n' + _new + '\n'
+    return txt
+
+
+def _mediamtx_tls_wired(txt, cert_file):
+    """True when mediamtx.yml already has HLS encryption on and this cert wired.
+
+    `[ \\t]*` rather than `\\s*` — with (?m), \\s matches newlines and the pattern will
+    happily stitch two lines together. See the guard in _startup_converge_mediamtx_ssl()."""
+    return bool(re.search(r'(?m)^hlsEncryption:[ \t]*yes[ \t]*$', txt)) and cert_file in txt
+
+
+def _grant_caddy_cert_read(cert_base, cert_dir, cert_file, key_file):
+    """Make Caddy's LE cert readable by the mediamtx service (group caddy).
+
+    MediaMTX EXITS if a configured cert cannot be read, so this must succeed BEFORE
+    anything enables TLS in the config — otherwise wiring SSL converts a healthy box into
+    a crash-loop. The service gets group `caddy` from SupplementaryGroups= in its unit;
+    this opens the traversal + read bits it needs. No usermod: see the note at the deploy
+    call site ([[broker-privilege-boundary]])."""
+    for _d in ('/var/lib/caddy', '/var/lib/caddy/.local', '/var/lib/caddy/.local/share',
+               '/var/lib/caddy/.local/share/caddy',
+               '/var/lib/caddy/.local/share/caddy/certificates', cert_base, cert_dir):
+        subprocess.run(_sudo_wrap(['chmod', 'g+rx', _d]), capture_output=True, timeout=15)
+    subprocess.run(_sudo_wrap(['chmod', 'g+r', cert_file, key_file]),
+                   capture_output=True, timeout=15)
+
+
+_MEDIAMTX_CONF_DIR = '/usr/local/etc'
+
+
+def _mediamtx_grant_config_dir_write(plog=None):
+    """Let the web editor actually save: group-write on MediaMTX's config DIRECTORY.
+
+    v10.1.33. The editor runs as takwerx and its save handlers shell out to `sed -i`
+    (12+ call sites in the upstream editor we vendor). `sed -i` writes a temp file in the
+    TARGET'S DIRECTORY and renames it over the original, so owning mediamtx.yml is not
+    enough — `/usr/local/etc` is root:root 0755 and every save failed with
+    `sed: couldn't open temporary file /usr/local/etc/sedXXXXXX: Permission denied` (rc=4).
+    The UI reported "Failed to save settings", so Basic/Protocols/encryption settings could
+    not be changed from the console on ANY non-root box.
+
+    Directory permission rather than a source patch, deliberately: the editor is cloned
+    from `main` UNPINNED ([[mediamtx-editor-ref-unpinned]]), so a patched `sed` call is
+    clobbered on the next re-pull. On our boxes this directory holds only MediaMTX's own
+    files (verified across the fleet), so the widening stays scoped to this module.
+
+    Also tightens mediamtx.yml to 0640. It carries `authInternalUsers` passwords and has
+    been 0644 world-readable. That hardening only sticks because the editor unit sets
+    `UMask=0027` — `sed -i` creates a NEW file, so without the umask the mode silently
+    reverts to 0644 on the next save."""
+    def _log(m):
+        if plog:
+            plog(m)
+    try:
+        # `chown root:takwerx`, not `chgrp` — chgrp is not in the broker allowlist and
+        # would be denied on a routed box; chown is, and does the same job.
+        subprocess.run(_sudo_wrap(['chown', 'root:takwerx', _MEDIAMTX_CONF_DIR]),
+                       capture_output=True, timeout=15)
+        subprocess.run(_sudo_wrap(['chmod', '775', _MEDIAMTX_CONF_DIR]),
+                       capture_output=True, timeout=15)
+        yml = os.path.join(_MEDIAMTX_CONF_DIR, 'mediamtx.yml')
+        if _caddy_cert_pair_ready(yml, yml):        # cheap privileged existence test
+            subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', yml]),
+                           capture_output=True, timeout=15)
+            subprocess.run(_sudo_wrap(['chmod', '640', yml]), capture_output=True, timeout=15)
+        return True
+    except Exception as _e:
+        _log(f"  ⚠ Could not grant config-dir write access: {_e}")
+        return False
+
+
 def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
     """Run MediaMTX deploy on a remote host via SSH."""
     import re as _re
@@ -28332,6 +28490,15 @@ hlsAddress: 0.0.0.0:8888
 hlsAllowOrigins: ['*']
 hlsTrustedProxies: ['127.0.0.1']
 webrtc: no
+# v10.1.33: MoQ OFF. Upstream defaults it ON with RELATIVE cert paths
+# (moqServerKey: auto.key / moqServerCert: auto.crt) that it generates into the
+# process CWD. Our unit is User=takwerx with no WorkingDirectory, so CWD is / and
+# the write is denied. Through v1.19.x that was survivable — warnings only. v1.20.0
+# added a native QUIC listener (moqQUICAddress: :8893) whose keypair load failure is
+# FATAL, so the same denied write now exits 1 and crash-loops the service. We never
+# used MoQ; turning it off also drops the 8892 listener that _KNOWN_PUBLIC_PORTS has
+# been carrying as an unexplained "aux listener".
+moq: no
 srt: yes
 srtAddress: :8890
 authMethod: internal
@@ -28592,15 +28759,30 @@ paths:
         key_file  = f'{cert_base}/{mtx_domain}/{mtx_domain}.key'
         plog(f"  Waiting for Caddy to issue cert for {mtx_domain}...")
         for i in range(30):
-            if os.path.exists(cert_file) and os.path.exists(key_file):
+            # v10.1.33: privileged test — os.path.exists() reports Caddy's 0700 cert dir
+            # as "no cert" on every non-root box. See _caddy_cert_pair_ready().
+            if _caddy_cert_pair_ready(cert_file, key_file):
                 break
             if i % 5 == 0:
                 plog(f"  ⏳ {i * 2}s...")
             time.sleep(2)
-        if os.path.exists(cert_file) and os.path.exists(key_file):
+        if _caddy_cert_pair_ready(cert_file, key_file):
             _module_run(deploy_cfg, 'mkdir -p /etc/mediamtx/certs', timeout=10)
-            ok_cert, _ = _module_copy(deploy_cfg, cert_file, '/tmp/mediamtx_stream.crt', log_fn=plog)
-            ok_key, _  = _module_copy(deploy_cfg, key_file,  '/tmp/mediamtx_stream.key', log_fn=plog)
+            # Stage both files somewhere the console can read before copying: scp/copy2
+            # open the SOURCE as takwerx and would fail on 0600 caddy:caddy.
+            ok_cert = ok_key = False
+            _stage_dir = tempfile.mkdtemp(prefix='mtx-cert-')
+            try:
+                _lc = os.path.join(_stage_dir, 'stream.crt')
+                _lk = os.path.join(_stage_dir, 'stream.key')
+                _stage_priv_file(cert_file, _lc)
+                _stage_priv_file(key_file, _lk)
+                ok_cert, _ = _module_copy(deploy_cfg, _lc, '/tmp/mediamtx_stream.crt', log_fn=plog)
+                ok_key, _  = _module_copy(deploy_cfg, _lk, '/tmp/mediamtx_stream.key', log_fn=plog)
+            except Exception as _stage_e:
+                plog(f"  ⚠ Could not stage certs for copy: {_stage_e}")
+            finally:
+                shutil.rmtree(_stage_dir, ignore_errors=True)
             if ok_cert and ok_key:
                 _module_run(deploy_cfg, 'mv /tmp/mediamtx_stream.crt /etc/mediamtx/certs/stream.crt && mv /tmp/mediamtx_stream.key /etc/mediamtx/certs/stream.key && chmod 600 /etc/mediamtx/certs/stream.key', timeout=10)
                 remote_cert = '/etc/mediamtx/certs/stream.crt'
@@ -28942,6 +29124,11 @@ webrtcAddress: :8889
 webrtcEncryption: no
 webrtcAllowOrigins: ['*']
 
+# v10.1.33: MoQ OFF — see the note on the split-server template above. Upstream
+# defaults it ON with relative cert paths it cannot write as takwerx from CWD=/;
+# v1.20.0's native QUIC listener makes that failure fatal (exit 1, crash-loop).
+moq: no
+
 srt: yes
 srtAddress: :8890
 
@@ -29217,6 +29404,7 @@ Environment=MEDIAMTX_API_URL=http://127.0.0.1:9898
 {ldap_env_lines}Restart=always
 RestartSec=5
 User=takwerx
+UMask=0027
 
 [Install]
 WantedBy=multi-user.target
@@ -29269,7 +29457,22 @@ WantedBy=multi-user.target
                 # mediamtx.yml is read by `mediamtx` (User=takwerx) and written by
                 # the editor's Save-Config UI. takwerx ownership lets both work.
                 subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', '/usr/local/etc/mediamtx.yml']), capture_output=True, timeout=5)
-                plog("  ✓ Web editor writable paths chowned to takwerx (backups + /opt/mediamtx-webeditor + mediamtx.yml)")
+                # v10.1.33: owning the FILE is not enough for the editor. Its save paths
+                # shell out to `sed -i` (12+ call sites in the upstream editor), and
+                # `sed -i` writes its temp file in the target's DIRECTORY, then renames.
+                # /usr/local/etc is root:root 0755, so as takwerx every save died with
+                #   sed: couldn't open temporary file /usr/local/etc/sedXXXXXX: Permission denied
+                # and the UI showed "Failed to save settings". Found on test12 2026-08-14
+                # while checking whether an editor save preserves `moq: no` — it never got
+                # far enough to touch the file. Broken on every non-root box.
+                #
+                # Fixed by group-owning the directory rather than patching the editor: it
+                # is cloned from `main` UNPINNED ([[mediamtx-editor-ref-unpinned]]), so any
+                # source patch is clobbered on the next re-pull, while a directory
+                # permission survives. On our boxes /usr/local/etc holds only MediaMTX's
+                # own files, so the widening is scoped to this module.
+                _mediamtx_grant_config_dir_write(plog=plog)
+                plog("  ✓ Web editor writable paths chowned to takwerx (backups + /opt/mediamtx-webeditor + mediamtx.yml + config dir group-writable)")
             except Exception as _pe:
                 plog(f"  ⚠ Could not chown web editor paths: {_pe}")
 
@@ -29308,28 +29511,54 @@ WantedBy=multi-user.target
             key_file  = f'{cert_base}/{mtx_domain}/{mtx_domain}.key'
             plog(f"  Waiting for Caddy to issue cert for {mtx_domain}...")
             for i in range(30):
-                if os.path.exists(cert_file) and os.path.exists(key_file):
+                # v10.1.33: privileged test — os.path.exists() reports Caddy's 0700 cert
+                # dir as "no cert" on every non-root box, so this loop always ran the full
+                # 60s and then declared a live, valid cert missing. See
+                # _caddy_cert_pair_ready() for the full account.
+                if _caddy_cert_pair_ready(cert_file, key_file):
                     break
                 if i % 5 == 0:
                     plog(f"  ⏳ {i * 2}s...")
                 time.sleep(2)
 
-            if os.path.exists(cert_file):
+            if _caddy_cert_pair_ready(cert_file, key_file):
                 yml = '/usr/local/etc/mediamtx.yml'
-                # Wire cert paths — strip continuation lines first then replace
-                for key in ['rtspServerKey', 'rtspServerCert', 'hlsServerKey', 'hlsServerCert', 'rtmpServerKey', 'rtmpServerCert']:
-                    subprocess.run(f"sed -i '/^{key}:/{{ n; /^  /d }}' {yml}", shell=True)
-                subprocess.run(f"sed -i 's|^rtspServerKey:.*|rtspServerKey: {key_file}|' {yml}", shell=True)
-                subprocess.run(f"sed -i 's|^rtspServerCert:.*|rtspServerCert: {cert_file}|' {yml}", shell=True)
-                subprocess.run(f"sed -i 's|^hlsServerKey:.*|hlsServerKey: {key_file}|' {yml}", shell=True)
-                subprocess.run(f"sed -i 's|^hlsServerCert:.*|hlsServerCert: {cert_file}|' {yml}", shell=True)
-                subprocess.run(f"sed -i 's|^rtmpServerKey:.*|rtmpServerKey: {key_file}|' {yml}", shell=True)
-                subprocess.run(f"sed -i 's|^rtmpServerCert:.*|rtmpServerCert: {cert_file}|' {yml}", shell=True)
-                # Enable encryption
-                subprocess.run(f"sed -i 's|^rtspEncryption:.*|rtspEncryption: \"optional\"|' {yml}", shell=True)
-                subprocess.run(f"sed -i 's|^hlsEncryption:.*|hlsEncryption: yes|' {yml}", shell=True)
-                plog(f"✓ SSL certificates wired — RTSPS and HTTPS HLS enabled")
-                plog(f"  Cert: {cert_file}")
+                # v10.1.33: this was eight `sed -i ... {yml}` calls with shell=True, no
+                # sudo and no return-code check. Every one of them FAILED on non-root:
+                # `sed -i` writes a temp file in the TARGET'S DIRECTORY, and /usr/local/etc
+                # is root:root 0755, so as takwerx sed dies with
+                # `couldn't open temporary file /usr/local/etc/sedXXXXXX: Permission denied`
+                # (rc=4). Owning the file is not enough — you need write on the directory.
+                # Nothing looked at rc, so the deploy printed "✓ SSL certificates wired"
+                # over eight silent failures, and mediamtx.yml kept rtspEncryption "no" and
+                # empty cert paths. Confirmed on test12 2026-08-14: deploy claimed success
+                # while the yml was untouched.
+                #
+                # Read-modify-write in Python and put it back through _write_priv (broker/
+                # root), which does not care about the directory's mode. Then VERIFY, so a
+                # failure can never again be reported as success.
+                try:
+                    try:
+                        with open(yml) as _yf:
+                            _txt = _yf.read()
+                    except (PermissionError, FileNotFoundError):
+                        _txt = _read_priv(yml)
+                    _txt = _mediamtx_yml_wire_tls(_txt, cert_file, key_file)
+                    _write_priv(yml, _txt)
+                    # chown back: the web editor runs as takwerx and rewrites this file.
+                    subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', yml]),
+                                   capture_output=True, timeout=15)
+                    _check = _read_priv(yml)
+                    if _mediamtx_tls_wired(_check, cert_file):
+                        plog("✓ SSL certificates wired — RTSPS and HTTPS HLS enabled")
+                        plog(f"  Cert: {cert_file}")
+                    else:
+                        plog("  ⚠ SSL wiring did not take — mediamtx.yml still shows encryption off")
+                        plog("     RTSPS/HTTPS-HLS are NOT active. Re-run the deploy after checking "
+                             "permissions on /usr/local/etc/mediamtx.yml")
+                except Exception as _sslw_e:
+                    plog(f"  ⚠ SSL wiring failed: {_sslw_e}")
+                    plog("     RTSPS/HTTPS-HLS are NOT active.")
 
                 # Grant MediaMTX (running as takwerx) read access to Caddy's LE cert files.
                 # Caddy stores certs as 0600 caddy:caddy under /var/lib/caddy/.local/share/caddy/...
@@ -29337,7 +29566,20 @@ WantedBy=multi-user.target
                 # make the directory chain group-traversable + the cert/key files group-readable.
                 # Without this, mediamtx fails on startup with "permission denied" on the cert path.
                 try:
-                    subprocess.run('usermod -aG caddy takwerx 2>/dev/null', shell=True, capture_output=True)
+                    # v10.1.33: the `usermod -aG caddy takwerx` that used to be here is
+                    # GONE, not fixed. It ran as `subprocess.run('usermod ... 2>/dev/null',
+                    # shell=True)` — no sudo, stderr discarded — so it had been a silent
+                    # no-op on every non-root box regardless. Routing it through _sudo_wrap
+                    # would not work either: `usermod` is deliberately absent from the
+                    # broker allowlist, and adding it would hand the console the ability to
+                    # put takwerx in ANY group, which is a privilege boundary we do not
+                    # cross for a convenience ([[broker-privilege-boundary]]).
+                    #
+                    # It is not needed. The mediamtx PROCESS gets the caddy group from
+                    # SupplementaryGroups=caddy in its unit (Step 5), which systemd applies
+                    # independently of /etc/group. The console does not need the group
+                    # either — it reads these paths through sudo/broker now. The chmod
+                    # chain below is what actually makes the files readable.
                     for d in ('/var/lib/caddy',
                               '/var/lib/caddy/.local',
                               '/var/lib/caddy/.local/share',
@@ -29349,7 +29591,10 @@ WantedBy=multi-user.target
                     subprocess.run(_sudo_wrap(['chmod', 'g+r', cert_file, key_file]), capture_output=True)
                     # daemon-reload so the SupplementaryGroups=caddy in the unit (written in Step 5) takes effect
                     subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True)
-                    plog("  ✓ Cert read-access granted to MediaMTX (takwerx in caddy group)")
+                    # v10.1.33: message corrected — the group comes from the unit's
+                    # SupplementaryGroups=caddy, not from a usermod (which never ran).
+                    plog("  ✓ Cert read-access granted to MediaMTX (group-readable + "
+                         "SupplementaryGroups=caddy on the unit)")
                 except Exception as _e:
                     plog(f"  ⚠ Could not grant cert read-access: {_e}")
 
@@ -44116,7 +44361,11 @@ def _reassert_mediamtx_cert_grant(plog=None):
         if not need:
             return False  # grant intact — healthy box, no restart
         _log("  mediamtx: cert-read grant missing (renewal/ssl-flip dropped group perms) — re-applying")
-        subprocess.run('usermod -aG caddy takwerx 2>/dev/null; true', shell=True, capture_output=True, timeout=5)
+        # v10.1.33: the bare `usermod -aG caddy takwerx 2>/dev/null` that used to be here
+        # is removed rather than sudo-wrapped. It was a silent no-op as takwerx, and
+        # `usermod` is intentionally not broker-allowlisted (it could place takwerx in any
+        # group). The mediamtx unit's SupplementaryGroups=caddy already gives the service
+        # the group; the chmod re-apply below is the part that was ever doing the work.
         # chmod via sudo unconditionally (no os.path.exists guard — the console can't stat under
         # the locked caddy dirs; a chmod on a non-existent path just errors harmlessly).
         for d in ('/var/lib/caddy',
@@ -65022,6 +65271,439 @@ def _startup_reapply_f2b_trusted_ignoreip():
 _startup_reapply_f2b_trusted_ignoreip()
 
 
+def _startup_converge_mediamtx_moq():
+    """v10.1.33: disable MoQ in an existing mediamtx.yml — on v1.20.0+ it crash-loops
+    mediamtx.service wherever the unit runs as takwerx.
+
+    SCOPE (measured across the dev fleet 2026-08-14, correcting an earlier overstatement
+    that this hits "every box"). The crash needs BOTH conditions:
+      * unit `User=takwerx` — CWD is / and the MoQ cert write is denied
+      * binary v1.20.0+ — the native QUIC listener makes that denial fatal
+    Fleet at the time: test12/nuc/aws-arm ran takwerx units (test12 on v1.20.0 = the
+    crash; nuc v1.19.3 and aws-arm v1.19.2 = warnings only, inoculated for later).
+    test6/test8 still carry LEGACY root units the non-root flip never rewrote — there the
+    write SUCCEEDS, so instead of crashing they had been quietly dropping /auto.crt and
+    /auto.key in the filesystem root (test6's were dated Jun 23) and serving MoQ on
+    8892/8893. Disabling MoQ fixes both shapes; test6 confirmed 8892/8893 closed after.
+
+    REPORTED: pwtak, 2026-08-14 — `mediamtx.service` in auto-restart, NRestarts climbing
+    without bound, exit 1 every ~5s:
+        WAR [MoQ] certificate auto.key not found, generating it from scratch
+        WAR [MoQ] failed to save TLS key to auto.key: open auto.key: permission denied
+        ERR unable to load TLS keypair for native MoQ QUIC listener: open auto.crt: ...
+
+    ROOT CAUSE: we install the binary from bluenviron/mediamtx releases/latest, unpinned
+    (both deploy paths). MoQ defaults to ON with RELATIVE cert paths —
+    `moqServerKey: auto.key`, `moqServerCert: auto.crt` — generated into the process CWD.
+    Our unit is `User=takwerx` with no WorkingDirectory, so CWD is `/` and the write is
+    denied. That denial is not new; what changed is its consequence. Verified against the
+    real binaries with CWD=/:
+      v1.19.3  — same two "failed to save TLS key/cert" warnings, MoQ still starts on
+                 :8892, process SURVIVES. Silently exposed, but working.
+      v1.20.0  — adds a native QUIC listener (`moqQUICAddress: :8893`) that cannot fall
+                 back; "unable to load TLS keypair for native MoQ QUIC listener" is FATAL
+                 to the whole process → exit 1 → systemd Restart=always → crash-loop.
+    `moq: no` clears it with zero error lines on both versions.
+
+    Side benefit: this also stops the :8892 listener nobody here chose. It has been
+    sitting in _KNOWN_PUBLIC_PORTS as "aux listener" — the undeclared-listener check was
+    taught to ignore it instead of anyone identifying it as MoQ.
+
+    Why this needs a converge and not just the template fix: the templates only run on a
+    fresh deploy. Boxes already installed keep their on-disk mediamtx.yml, and the
+    "Update MediaMTX" action pulls the new binary onto that OLD config — so a working
+    box breaks the moment the operator updates. That is the wider blast radius, and the
+    operator should not have to redeploy MediaMTX to escape it.
+
+    NOT version-gated on purpose: MediaMTX does not reject the key on older binaries —
+    verified empirically against v1.19.3, which starts clean with `moq: no` present. So
+    it is safe to write regardless of which binary the box is running, and a box patched
+    today stays patched when it later updates to v1.20.0+.
+
+    Idempotent: any existing `moq:` key (ours or an operator's) is left alone."""
+    try:
+        cfg_path = '/usr/local/etc/mediamtx.yml'
+        if not os.path.exists('/usr/local/bin/mediamtx') or not os.path.exists(cfg_path):
+            return
+        try:
+            with open(cfg_path) as _cf:
+                cur = _cf.read()
+        except OSError:
+            return
+        if re.search(r'(?m)^\s*moq\s*:', cur):
+            return
+        # Top-level key appended at column 0 — this terminates the trailing `paths:`
+        # block cleanly and is valid YAML wherever the file ends.
+        patched = cur.rstrip('\n') + (
+            '\n\n# v10.1.33: MoQ disabled. Upstream defaults it ON with relative cert\n'
+            '# paths (auto.key/auto.crt) it cannot write as takwerx from CWD=/. Since\n'
+            "# v1.20.0's native QUIC listener that failure is fatal — exit 1 on every\n"
+            '# start, forever. We do not use MoQ.\n'
+            'moq: no\n'
+        )
+        _write_priv(cfg_path, patched)
+        # Only bounce a service the operator has not deliberately stopped. In the broken
+        # state `is-active` reports activating/failed, never inactive, so the crash-loop
+        # case is still covered.
+        st = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'mediamtx']),
+                            capture_output=True, text=True, timeout=15)
+        if (st.stdout or '').strip() != 'inactive':
+            subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx']),
+                           capture_output=True, timeout=60)
+        print('Startup migration: ✓ MediaMTX MoQ disabled in mediamtx.yml — its default-on '
+              'QUIC listener cannot write auto.crt as takwerx, which crash-loops the '
+              'service on exit 1 under upstream v1.20.0+ (v10.1.33)')
+    except PermissionError:
+        pass
+    except Exception as _e:
+        print('Startup migration: mediamtx MoQ converge warning (non-fatal): %s' % _e)
+
+
+def _startup_converge_mediamtx_editor_write():
+    """v10.1.33: make the MediaMTX web editor's Save work on an existing non-root box.
+
+    Found on test12 2026-08-14 while checking whether an editor save preserves `moq: no`:
+    the save never got far enough to touch the file. Every save handler shells out to
+    `sed -i`, which needs write on `/usr/local/etc` (root:root 0755) to place its temp
+    file — so the editor has been unable to change ANY setting on ANY non-root box, with
+    a red "Failed to save settings" banner. Pre-existing, not from this release, but it is
+    the same failure the rest of v10.1.33 is about.
+
+    Deploy-path fix is `_mediamtx_grant_config_dir_write()`; this reaches boxes already
+    installed, since there is no redeploy button. Also adds `UMask=0027` to the editor unit
+    so the 0640 tightening on mediamtx.yml survives the editor rewriting the file — without
+    it `sed -i` recreates the file at 0644 and quietly re-exposes the stream passwords."""
+    try:
+        if not os.path.exists('/usr/local/bin/mediamtx') or not os.path.isdir('/opt/mediamtx-webeditor'):
+            return
+        unit = '/etc/systemd/system/mediamtx-webeditor.service'
+        need_dir = True
+        st = subprocess.run(_sudo_wrap(['stat', '-c', '%a %G', _MEDIAMTX_CONF_DIR]),
+                            capture_output=True, text=True, timeout=15)
+        parts = (st.stdout or '').split()
+        if len(parts) == 2 and parts[1] == 'takwerx' and len(parts[0]) >= 2 and (int(parts[0][-2]) & 2):
+            need_dir = False
+
+        unit_txt = ''
+        need_umask = False
+        if os.path.exists(unit):
+            try:
+                unit_txt = _read_priv(unit)
+                need_umask = 'UMask=' not in unit_txt
+            except Exception:
+                need_umask = False
+        if not need_dir and not need_umask:
+            return
+
+        if need_dir:
+            _mediamtx_grant_config_dir_write()
+        moved_off_root = False
+        if need_umask and unit_txt:
+            # Match ANY User= value, not just takwerx. The first cut anchored on
+            # `User=takwerx` and therefore silently did nothing on test6/test8, whose
+            # editor units still say `User=root` — the same class of quiet no-op this
+            # whole release is about, in my own converge. Caught on the fleet 2026-08-14.
+            #
+            # Those legacy units are also why the editor's Save "worked" there: as root
+            # `sed -i` can write /usr/local/etc. So move the editor off root at the same
+            # time, matching the three boxes that already run it as takwerx (proven — a
+            # real save round-tripped on test12 with the config intact). Patch in place
+            # rather than rewriting: the unit carries per-box Environment/LDAP lines.
+            new_txt = re.sub(r'(?m)^User=\S+[ \t]*$', 'User=takwerx', unit_txt, count=1)
+            moved_off_root = 'User=root' in unit_txt
+            new_txt = re.sub(r'(?m)^(User=takwerx[ \t]*)$', r'\1\nUMask=0027', new_txt, count=1)
+            if 'UMask=0027' not in new_txt:
+                # Never skip quietly — say why, so this cannot rot unnoticed.
+                print('Startup migration: ⚠ MediaMTX editor unit has no User= line to anchor '
+                      'UMask=0027 — mediamtx.yml may revert to 0644 (world-readable, it holds '
+                      'stream passwords) on the next editor save. Config-dir fix still applied '
+                      '(v10.1.33)')
+            else:
+                if moved_off_root:
+                    subprocess.run(_sudo_wrap(['chown', '-R', 'takwerx:takwerx',
+                                               '/opt/mediamtx-webeditor']),
+                                   capture_output=True, timeout=30)
+                _write_priv(unit, new_txt)
+                subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=30)
+                subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx-webeditor']),
+                               capture_output=True, timeout=60)
+                ok = False
+                for _ in range(10):
+                    time.sleep(1)
+                    if (subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'mediamtx-webeditor']),
+                                       capture_output=True, text=True, timeout=15
+                                       ).stdout or '').strip() == 'active':
+                        ok = True
+                        break
+                if not ok:
+                    _write_priv(unit, unit_txt)
+                    subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=30)
+                    subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx-webeditor']),
+                                   capture_output=True, timeout=60)
+                    print('Startup migration: ⚠ MediaMTX web editor would not start after the '
+                          'unit change — ROLLED BACK and restarted. Editor still works; it is '
+                          'still running as before (v10.1.33)')
+                    return
+        bits = []
+        if moved_off_root:
+            bits.append('web editor moved off root to takwerx')
+        if need_dir:
+            bits.append('config dir group-writable (editor Save was failing on every non-root box)')
+        if need_umask:
+            bits.append('editor UMask=0027 so mediamtx.yml stays 0640 with its stream passwords')
+        print('Startup migration: ✓ MediaMTX editor write access converged — ' + '; '.join(bits) + ' (v10.1.33)')
+    except PermissionError:
+        pass
+    except Exception as _e:
+        print('Startup migration: mediamtx editor-write converge warning (non-fatal): %s' % _e)
+
+
+_MEDIAMTX_UNIT_TEXT = """[Unit]
+Description=MediaMTX RTSP/HLS/SRT Streaming Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mediamtx /usr/local/etc/mediamtx.yml
+Restart=always
+RestartSec=5
+User=takwerx
+SupplementaryGroups=caddy
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def _startup_converge_mediamtx_unit_nonroot():
+    """v10.1.33: move a legacy `User=root` mediamtx.service onto takwerx.
+
+    Found 2026-08-14 surveying the fleet for the MoQ fix: `systemctl show mediamtx -p User`
+    returned **root** on test6 and test8, and takwerx on test12/nuc/aws-arm. The non-root
+    flip rewrote the unit for NEW deploys and never converged existing ones, so a box that
+    installed MediaMTX before the flip has been running a network-exposed streaming server
+    with full root ever since — against the posture the rest of the stack holds.
+
+    It also silently changed the MoQ bug's shape: as root the cert write SUCCEEDS, so
+    instead of crash-looping, those boxes wrote /auto.crt + /auto.key into the FILESYSTEM
+    ROOT (test6's dated 2026-06-23) and served MoQ on 8892/8893. Those files are inert now
+    that MoQ is off; this reports them rather than deleting anything at /.
+
+    Ordering: runs AFTER the MoQ and SSL converges. Flipping the user is the step most
+    likely to fail, and it must not be what stops the other two from landing.
+
+    Safety — this changes the identity of a RUNNING service, so it refuses rather than
+    guesses, and rolls back if the service does not come back:
+      * skips if recording or playback is enabled — those write to paths that may be
+        root-owned, and silently breaking a recording box is worse than leaving it as root
+      * grants cert read access BEFORE the flip (mediamtx exits hard on an unreadable
+        cert; as root it could read Caddy's store, as takwerx it needs the group bits)
+      * chowns mediamtx.yml to takwerx so the service and the web editor can both write
+      * verifies the service is active afterwards, and restores the ORIGINAL unit and
+        restarts if not
+    Ports are all >1024, so binding is unaffected by the drop from root."""
+    try:
+        unit_path = '/etc/systemd/system/mediamtx.service'
+        yml = '/usr/local/etc/mediamtx.yml'
+        if not os.path.exists('/usr/local/bin/mediamtx') or not os.path.exists(unit_path):
+            return
+        cur_user = (subprocess.run(_sudo_wrap(['systemctl', 'show', 'mediamtx', '-p', 'User', '--value']),
+                                   capture_output=True, text=True, timeout=15).stdout or '').strip()
+        if cur_user != 'root':
+            return                        # already converged (or never was root)
+
+        try:
+            with open(yml) as _f:
+                ycur = _f.read()
+        except (PermissionError, FileNotFoundError):
+            ycur = _read_priv(yml)
+        except OSError:
+            return
+        # Refuse on a recording/playback box — those paths may be root-owned.
+        if (re.search(r'(?m)^[ \t]+record:[ \t]*(yes|true)[ \t]*$', ycur)
+                or re.search(r'(?m)^record:[ \t]*(yes|true)[ \t]*$', ycur)
+                or re.search(r'(?m)^playback:[ \t]*(yes|true)[ \t]*$', ycur)):
+            print('Startup migration: MediaMTX still runs as root — NOT converged, this box '
+                  'has recording/playback enabled and those paths may be root-owned. Flip it '
+                  'by hand or redeploy MediaMTX when convenient (v10.1.33)')
+            return
+
+        try:
+            old_unit = _read_priv(unit_path)
+        except Exception:
+            return
+        if 'User=takwerx' in old_unit:
+            return
+
+        # Cert read access BEFORE the flip — as root it could read Caddy's store directly.
+        settings = load_settings()
+        mtx_domain = _get_service_domain(settings, 'mediamtx') if settings.get('fqdn') else ''
+        if mtx_domain:
+            cb = '/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory'
+            cd = f'{cb}/{mtx_domain}'
+            cf, kf = f'{cd}/{mtx_domain}.crt', f'{cd}/{mtx_domain}.key'
+            if _caddy_cert_pair_ready(cf, kf):
+                _grant_caddy_cert_read(cb, cd, cf, kf)
+        subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', yml]), capture_output=True, timeout=15)
+
+        _write_priv(unit_path, _MEDIAMTX_UNIT_TEXT)
+        subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=30)
+        subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx']), capture_output=True, timeout=60)
+        ok = False
+        for _ in range(12):
+            time.sleep(1)
+            if (subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'mediamtx']),
+                               capture_output=True, text=True, timeout=15
+                               ).stdout or '').strip() == 'active':
+                ok = True
+                break
+        if not ok:
+            _write_priv(unit_path, old_unit)
+            subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=30)
+            subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx']), capture_output=True, timeout=60)
+            print('Startup migration: ⚠ MediaMTX would not start as takwerx — unit ROLLED BACK '
+                  'to root and the service restarted. Streaming is unaffected; the box is still '
+                  'running MediaMTX as root. Check what under its config paths is root-owned '
+                  '(v10.1.33)')
+            return
+        print('Startup migration: ✓ MediaMTX moved off root — unit now User=takwerx '
+              '+ SupplementaryGroups=caddy. It had kept a pre-non-root-flip unit and was '
+              'running the streaming server as root (v10.1.33)')
+        if os.path.exists('/auto.crt') or os.path.exists('/auto.key'):
+            print('Startup migration:   note — /auto.crt and /auto.key at the filesystem root '
+                  'are leftovers MoQ wrote while this ran as root. Inert now that MoQ is off; '
+                  'safe to delete at your convenience.')
+    except PermissionError:
+        pass
+    except Exception as _e:
+        print('Startup migration: mediamtx unit converge warning (non-fatal): %s' % _e)
+
+
+def _startup_converge_mediamtx_ssl():
+    """v10.1.33: wire Caddy's cert into an existing MediaMTX that never got SSL.
+
+    Companion to _caddy_cert_pair_ready(). That fix repairs the DEPLOY path, but a box
+    deployed before it keeps a mediamtx.yml with `rtspEncryption: "no"` and empty cert
+    paths, and there is no redeploy button ([[no-redeploy-button-on-installed-modules]]).
+    Every non-root box that installed MediaMTX since the flip is in that state: RTSPS on
+    8322 has never worked on any of them.
+
+    Why nobody noticed: the deploy failed to set `hlsEncryption` AND Caddy was told "no
+    cert → use the http upstream". Both halves were wrong in the SAME direction, so HLS
+    playback kept working. Only RTSPS was actually lost. That accident is also the hazard
+    here — flipping MediaMTX to TLS without regenerating Caddy would leave Caddy proxying
+    http to an https listener and BREAK working video with a 400. So this converge is
+    ordered to never leave the box in a mismatched state, and rolls back if it cannot
+    finish:
+
+      1. grant cert read access FIRST — MediaMTX exits hard on an unreadable cert, so
+         doing this after the config flip would crash-loop a healthy box
+      2. keep the old yml in memory, write the wired one, verify it read back
+      3. restart mediamtx and confirm it is actually active
+      4. only then regenerate Caddy so /hls-proxy switches to the https backend
+      5. any failure → restore the original yml, restart, log loudly and leave Caddy alone
+
+    Deliberately narrow. It acts ONLY on the exact broken shape — TLS off and no cert
+    wired — so a box with custom certs, a deliberate plaintext setup, or an already-wired
+    config is untouched. Split-server installs are skipped: the yml lives on the remote
+    host and belongs to that deploy path."""
+    try:
+        yml = '/usr/local/etc/mediamtx.yml'
+        if not os.path.exists('/usr/local/bin/mediamtx') or not os.path.exists(yml):
+            return
+        settings = load_settings()
+        if not settings.get('fqdn'):
+            return                      # no domain → no LE cert to wire (port-5080 plaintext)
+        cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
+        if cfg.get('target_mode') == 'remote':
+            return                      # remote yml — not ours to rewrite from here
+        mtx_domain = _get_service_domain(settings, 'mediamtx')
+        if not mtx_domain:
+            return
+        try:
+            with open(yml) as _f:
+                cur = _f.read()
+        except (PermissionError, FileNotFoundError):
+            cur = _read_priv(yml)
+        except OSError:
+            return
+
+        cert_base = '/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory'
+        cert_dir  = f'{cert_base}/{mtx_domain}'
+        cert_file = f'{cert_dir}/{mtx_domain}.crt'
+        key_file  = f'{cert_dir}/{mtx_domain}.key'
+
+        if _mediamtx_tls_wired(cur, cert_file):
+            return                      # already correct
+        # Only touch the known-broken shape: encryption off AND no cert of any kind wired.
+        # An operator's custom cert or a deliberate plaintext box must survive untouched.
+        #
+        # `[ \t]*`, NOT `\s*`: in multiline mode \s matches the NEWLINE, so `\s*\S` after
+        # an EMPTY `rtspServerCert:` runs on to the first character of the next line and
+        # reports a cert that isn't there. Caught in testing — the first version of this
+        # guard skipped every box it was written to repair.
+        #
+        # Note some boxes store the value as an INDENTED CONTINUATION line:
+        #     rtspServerCert:
+        #       /var/lib/caddy/.../stream.example.com.crt
+        # (test6, 2026-08-14 — this is why the old deploy carried a
+        # `sed '/^key:/{ n; /^  /d }'` pass). Such a box reads as "no cert" here, and that
+        # is FINE: it is then caught by the hlsEncryption gate below if it is healthy, and
+        # if it is not, _mediamtx_yml_wire_tls() strips the continuation and normalises the
+        # key inline. Do not "fix" this check to span lines — that would make the
+        # already-wired case fall through to the encryption gate instead of stopping here.
+        if (re.search(r'(?m)^rtspServerCert:[ \t]*\S', cur)
+                or re.search(r'(?m)^hlsServerCert:[ \t]*\S', cur)):
+            return
+        if not re.search(r'(?m)^hlsEncryption:[ \t]*(no|false)[ \t]*$', cur):
+            return
+        if not _caddy_cert_pair_ready(cert_file, key_file):
+            return                      # cert not issued yet — deploy/renewal will handle it
+
+        # 1. read access BEFORE the config flip
+        _grant_caddy_cert_read(cert_base, cert_dir, cert_file, key_file)
+        subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=30)
+
+        # 2. write + verify
+        _write_priv(yml, _mediamtx_yml_wire_tls(cur, cert_file, key_file))
+        subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', yml]), capture_output=True, timeout=15)
+        if not _mediamtx_tls_wired(_read_priv(yml), cert_file):
+            _write_priv(yml, cur)
+            subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', yml]), capture_output=True, timeout=15)
+            print('Startup migration: ⚠ MediaMTX SSL converge could not write mediamtx.yml '
+                  '— reverted, box unchanged (v10.1.33)')
+            return
+
+        # 3. restart and confirm it actually came up on the new config
+        subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx']), capture_output=True, timeout=60)
+        ok = False
+        for _ in range(10):
+            time.sleep(1)
+            if (subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'mediamtx']),
+                               capture_output=True, text=True, timeout=15
+                               ).stdout or '').strip() == 'active':
+                ok = True
+                break
+        if not ok:
+            # 5. roll back — a box with working HLS must not be left with a dead MediaMTX
+            _write_priv(yml, cur)
+            subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', yml]), capture_output=True, timeout=15)
+            subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx']), capture_output=True, timeout=60)
+            print('Startup migration: ⚠ MediaMTX did not start with SSL wired — config '
+                  'ROLLED BACK and service restarted. RTSPS stays off; HLS unaffected. '
+                  'Check that the service can read %s (v10.1.33)' % cert_file)
+            return
+
+        # 4. Caddy last — /hls-proxy must follow MediaMTX to https or HLS 400s
+        _caddy_regenerate_if_fqdn()
+        print('Startup migration: ✓ MediaMTX SSL wired from Caddy cert — RTSPS (8322) and '
+              'HTTPS HLS now enabled; they had never been configured on this box (v10.1.33)')
+    except PermissionError:
+        pass
+    except Exception as _e:
+        print('Startup migration: mediamtx SSL converge warning (non-fatal): %s' % _e)
+
+
 def _startup_converge_mediamtx_banaction():
     """v10.1.30: converge the mediamtx jail's ban action to the media-ports-only form.
 
@@ -66899,6 +67581,40 @@ def _startup_migrations():
             _startup_converge_recidive_media_exempt()
         except Exception as _f2b_e3c:
             print(f"Startup migration: recidive media-exempt converge error (non-fatal): {_f2b_e3c}", flush=True)
+
+        # v10.1.33 — disable MoQ in an existing mediamtx.yml. Same reason this sits inside
+        # _startup_migrations() rather than at import time: it writes a privileged path and
+        # restarts a service, both of which need the broker mediating (see the note above).
+        try:
+            _startup_converge_mediamtx_moq()
+        except Exception as _mtx_moq_e:
+            print(f"Startup migration: mediamtx MoQ converge error (non-fatal): {_mtx_moq_e}", flush=True)
+
+        # v10.1.33 — wire Caddy's cert into a MediaMTX that never got SSL. MUST run after
+        # the MoQ converge: that one may restart mediamtx, and this one judges success by
+        # whether the service comes back up. Ordering them the other way would let a MoQ
+        # restart land mid-verification and trigger a needless rollback.
+        try:
+            _startup_converge_mediamtx_ssl()
+        except Exception as _mtx_ssl_e:
+            print(f"Startup migration: mediamtx SSL converge error (non-fatal): {_mtx_ssl_e}", flush=True)
+
+        # v10.1.33 — move a legacy root mediamtx.service onto takwerx. LAST of the three:
+        # changing a running service's identity is the likeliest to fail, and it must not
+        # be what prevents the MoQ and SSL converges above from landing.
+        try:
+            _startup_converge_mediamtx_unit_nonroot()
+        except Exception as _mtx_unit_e:
+            print(f"Startup migration: mediamtx unit converge error (non-fatal): {_mtx_unit_e}", flush=True)
+
+        # v10.1.33 — make the web editor's Save work (it shells out to `sed -i`, which
+        # needs write on /usr/local/etc). After the unit converge: that one may restart
+        # mediamtx, and this one restarts the EDITOR, so keeping them ordered avoids two
+        # services bouncing in the same instant for unrelated reasons.
+        try:
+            _startup_converge_mediamtx_editor_write()
+        except Exception as _mtx_ed_e:
+            print(f"Startup migration: mediamtx editor-write converge error (non-fatal): {_mtx_ed_e}", flush=True)
 
         # v10.1.32 — heal apt sources left pointing at a vanished install medium
         # (USB/ISO installs; see _apt_disable_dead_local_sources). One converge here
