@@ -781,7 +781,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.33-alpha"
+VERSION = "10.1.34-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -790,6 +790,22 @@ GITHUB_REPO = "takwerx/infra-TAK"
 # the version currently under validation.  When vetting passes, promote DEV → VETTED and
 # bump VERSION to a new infra-TAK release.
 AUTHENTIK_VETTED_RELEASE = "2026.5.6"   # v10.1.15: promoted — PG conn-leak + dramatiq broker fixes (5.5/5.6). 60-min soak on 4 boxes 2026-07-30 (test6, test12, nuc/Rocky-nonroot, aws-arm/ARM64) all clean; PG-bounce test on test12 PASSED with 0 CRITICALs (the 5.4 yellow-flag dramatiq cluster did not reproduce — hold rationale resolved)
+
+# Operator-vetted MediaMTX binary (bluenviron/mediamtx).  Same contract as
+# AUTHENTIK_VETTED_RELEASE: update this ONLY after T&E on the new upstream version.
+#
+# Why this is pinned (v10.1.34).  Deploys used to resolve releases/latest at install
+# time, so (a) the fleet drifted — five boxes were running four different versions —
+# and (b) an upstream default change could break every new install with no change on
+# our side.  That is exactly what happened in 10.1.33: upstream v1.20.0 turned the MoQ
+# QUIC listener's keypair failure FATAL, and fresh deploys crash-looped.  Pinning makes
+# an upstream release a deliberate, tested step instead of a surprise.
+#
+# Rollout is NEW INSTALLS + the explicit Update action only (operator decision
+# 2026-08-14).  There is deliberately NO startup converge that moves existing boxes:
+# MediaMTX exits hard on a bad cert/config, so an unattended version move on a live
+# streaming box is a crash-loop, not a warning.
+MEDIAMTX_VETTED_RELEASE = "1.20.0"      # v10.1.34: pinned. Validated on test6 + test12 (Ubuntu x86) in the 10.1.33 fleet check with `moq: no` neutralising the fatal QUIC listener. Rocky/ARM coverage is a 10.1.34 T&E item — nuc ran 1.19.3 and aws-arm 1.19.2 at pin time.
 AUTHENTIK_DEV_RELEASE    = "2026.5.6"   # OFFLINE FALLBACK ONLY — dev channel tracks upstream-latest live (_get_authentik_target_release); this value is used only when the GitHub lookup is unreachable. Bump it to the current latest when convenient, but it no longer gates what dev installs.
 # CloudTAK version target. v13.45 split the server into hub (stateful) / api (stateless) modes —
 # a breaking change for plugin server routes, which now live in api/stateless/routes/ with the
@@ -9728,11 +9744,17 @@ def mediamtx_page():
         deploying=mediamtx_deploy_status.get('running', False),
         deploy_done=mediamtx_deploy_status.get('complete', False),
         mediamtx_version=mtx_vinfo.get('version') or '',
-        mediamtx_update_available=mtx_vinfo.get('update_available', False),
+        mediamtx_update_available=mtx_vinfo.get('binary_update_available', False),
         mediamtx_latest=mtx_vinfo.get('latest') or '',
         editor_version=mtx_vinfo.get('editor_version') or '',
         editor_update_available=mtx_vinfo.get('editor_update_available', False),
-        editor_latest=mtx_vinfo.get('editor_latest') or '')
+        editor_latest=mtx_vinfo.get('editor_latest') or '',
+        # The page states the installed version and, when upstream is newer, points at
+        # the web editor. No vetted/channel badges: the operator cannot act on the pin
+        # from here, and a console that advertises a version it will not install is the
+        # defect this replaced.
+        mediamtx_upstream_latest=mtx_vinfo.get('upstream_latest') or '',
+        mediamtx_upstream_url=mtx_vinfo.get('upstream_url') or '')
 
 
 # ── NetBird VPN ─────────────────────────────────────────────────────────────
@@ -18468,7 +18490,7 @@ def _guarddog_timer_list():
             'takprocessguard.timer', 'takcertguard.timer', 'takintcaguard.timer',
             'takauthentikguard.timer', 'takauthentiktasklogpurge.timer',
             'takdbrepack.timer', 'takretentionguard.timer',
-            'takmediamtxguard.timer', 'taknoderedguard.timer', 'takcloudtakguard.timer',
+            'takmediamtxguard.timer', 'taknoderedguard.timer', 'takfeedsourceguard.timer', 'takcloudtakguard.timer',
             'taktakportalguard.timer', 'takfedhubguard.timer']
 
 GUARDDOG_DISKIO_TIMER = 'takdiskioguard.timer'
@@ -18762,7 +18784,7 @@ def guarddog_uninstall():
     services_extra = ['tak8089guard.service', 'takoomguard.service', 'takdiskguard.service', 'takdiskioguard.service', 'takdbguard.service',
                       'takcotdbguard.service', 'taknetguard.service', 'takprocessguard.service', 'takcertguard.service',
                       'takintcaguard.service',
-                      'takauthentikguard.service', 'takmediamtxguard.service', 'taknoderedguard.service', 'takcloudtakguard.service', 'taktakportalguard.service', 'tak-health.service']
+                      'takauthentikguard.service', 'takmediamtxguard.service', 'taknoderedguard.service', 'takfeedsourceguard.service', 'takcloudtakguard.service', 'taktakportalguard.service', 'tak-health.service']
     for name in timers + services_extra:
         # v10.0.5 non-root: /etc/systemd/system is root-owned — remove via broker.
         subprocess.run(_sudo_wrap(['rm', '-f', os.path.join('/etc/systemd/system', name)]), capture_output=True)
@@ -19562,6 +19584,11 @@ def run_guarddog_deploy(alert_email):
             script_files.append('tak-mediamtx-watch.sh')
         if os.path.exists(os.path.join(nr_dir, 'docker-compose.yml')):
             script_files.append('tak-nodered-watch.sh')
+            # v10.1.34: feed-source staleness rides with Node-RED, since ArcGIS feed
+            # configs live in Node-RED's global context. The script exits 0 quietly when
+            # no arcgis_configs exist, so installing it alongside Node-RED is harmless
+            # on a box that only runs other flows.
+            script_files.append('tak-feedsource-watch.sh')
         if os.path.exists(cloudtak_dir) and os.path.exists(os.path.join(cloudtak_dir, 'docker-compose.yml')):
             script_files.append('tak-cloudtak-watch.sh')
         portal_dir = os.path.expanduser('~/TAK-Portal')
@@ -19707,6 +19734,14 @@ def run_guarddog_deploy(alert_email):
                 ('taknoderedguard.service', '[Unit]\nDescription=Guard Dog Node-RED Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-nodered-watch.sh\n'),
                 ('taknoderedguard.timer', '[Unit]\nDescription=Run Node-RED guard every 1 minute\n\n[Timer]\nOnBootSec=15min\nOnUnitActiveSec=1min\nUnit=taknoderedguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ])
+        if 'tak-feedsource-watch.sh' in script_files:
+            # Hourly, not per-minute like the service monitors: this watches an EXTERNAL
+            # publisher's edit timestamp, the threshold is 6h, and each run costs one
+            # HTTPS request per configured feed against a third-party service.
+            units.extend([
+                ('takfeedsourceguard.service', '[Unit]\nDescription=Guard Dog Map Feed Source Monitor (upstream publisher staleness)\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-feedsource-watch.sh\n'),
+                ('takfeedsourceguard.timer', '[Unit]\nDescription=Check map feed sources hourly\n\n[Timer]\nOnBootSec=20min\nOnUnitActiveSec=1h\nUnit=takfeedsourceguard.service\n\n[Install]\nWantedBy=timers.target\n'),
+            ])
         if 'tak-cloudtak-watch.sh' in script_files:
             units.extend([
                 ('takcloudtakguard.service', '[Unit]\nDescription=Guard Dog CloudTAK Monitor\n\n[Service]\nType=oneshot\nExecStart=/opt/tak-guarddog/tak-cloudtak-watch.sh\n'),
@@ -19812,6 +19847,12 @@ def run_guarddog_deploy(alert_email):
             timers.append('takmediamtxguard.timer')
         if 'tak-nodered-watch.sh' in script_files:
             timers.append('taknoderedguard.timer')
+        if 'tak-feedsource-watch.sh' in script_files:
+            # v10.1.34. Registering a watcher takes THREE edits, not two: the script
+            # (script_files), the unit files (units), and enabling the timer HERE.
+            # Missing this one wrote both unit files and left the timer disabled and
+            # inactive — installed, invisible, and silent. Caught on test12 2026-08-14.
+            timers.append('takfeedsourceguard.timer')
         if 'tak-cloudtak-watch.sh' in script_files:
             timers.append('takcloudtakguard.timer')
         if 'tak-takportal-watch.sh' in script_files:
@@ -26489,10 +26530,56 @@ def _get_cloudtak_version_info():
     return out
 
 
+# ── Cached GitHub release lookups ────────────────────────
+_GH_JSON_CACHE = {}      # url -> {"at": epoch, "data": parsed}
+_GH_JSON_TTL = 1800      # 30 min. Release cadences are days; nobody needs fresher.
+
+
+def _gh_json_cached(url, timeout=15, ttl=_GH_JSON_TTL):
+    """GET a GitHub API URL, cached in-process, serving last-known-good on failure.
+
+    v10.1.34: for MediaMTX the console's ONLY job is announcing that a newer version
+    exists — and it was doing that with an uncached, unauthenticated api.github.com call
+    on EVERY render. Unauthenticated GitHub allows 60 requests/hour per IP; app.py has 17
+    call sites and one dashboard load fires a batch of them. Once a box is rate-limited
+    every lookup raises, every handler swallows it, and the UI silently reads as "you are
+    up to date" — while another surface, rendered a second earlier off a call that did
+    succeed, says an update IS available. That is exactly the console-card vs module-page
+    disagreement reported on test8 2026-08-15: card said `update`, page said nothing,
+    both were reading the same function.
+
+    Failing to reach GitHub must not look like news, and must not look like the absence
+    of news either. A stale-but-true answer beats a confident lie.
+
+    Only the two MediaMTX callers are routed through this so far. The other 15 sites
+    share the same defect and the same fix — ROADMAP, not this change.
+    """
+    # _ur is a per-function import convention throughout this file, never module
+    # level. Omitting it here is what made every MediaMTX/editor lookup raise
+    # NameError into a bare except and render as "no update available".
+    import urllib.request as _ur
+    now = time.time()
+    hit = _GH_JSON_CACHE.get(url)
+    if hit and (now - hit['at']) < ttl:
+        return hit['data']
+    try:
+        req = _ur.Request(url, headers={'Accept': 'application/vnd.github.v3+json',
+                                        'User-Agent': 'infra-TAK'})
+        with _ur.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode())
+        _GH_JSON_CACHE[url] = {'at': now, 'data': data}
+        return data
+    except Exception:
+        # Rate-limited, offline, or GitHub is having a day: serve the last good answer
+        # however old. Only a box that has NEVER had one gets None.
+        return hit['data'] if hit else None
+
+
 def _get_mediamtx_editor_version_info(deploy_cfg):
     """Return {version: str, update_available: bool, latest: str|None} for MediaMTX web editor (takwerx/mediamtx-installer).
     Current from CURRENT_VERSION in /opt/mediamtx-webeditor/mediamtx_config_editor.py on target."""
     import re as _re
+    import urllib.request as _ur
     out = {'version': '', 'update_available': False, 'latest': None}
     # Current: grep CURRENT_VERSION from editor script on target
     cmd = 'grep -oE \'CURRENT_VERSION = "[^"]+"\' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null | head -1'
@@ -26515,14 +26602,33 @@ def _get_mediamtx_editor_version_info(deploy_cfg):
                             break
             except Exception:
                 pass
-    # Latest from takwerx/mediamtx-installer releases/latest
+    # Latest from takwerx/mediamtx-installer, via TWO independent sources.
+    # The releases API is the authority, but it shares one 60/hour unauthenticated
+    # budget with 16 other call sites in this file. raw.githubusercontent.com is a
+    # different host with a different budget, and reading CURRENT_VERSION off main is
+    # exactly how the editor checks itself. Either source answering is enough.
     try:
-        req = _ur.Request(
-            'https://api.github.com/repos/takwerx/mediamtx-installer/releases/latest',
-            headers={'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'infra-TAK'})
-        with _ur.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode())
+        data = _gh_json_cached('https://api.github.com/repos/takwerx/mediamtx-installer/releases/latest')
         tag = (data or {}).get('tag_name') or ''
+        if not tag:
+            try:
+                _raw = _ur.Request(
+                    'https://raw.githubusercontent.com/takwerx/mediamtx-installer/main'
+                    '/config-editor/mediamtx_config_editor.py',
+                    headers={'User-Agent': 'infra-TAK'})
+                with _ur.urlopen(_raw, timeout=15) as _r:
+                    _head = _r.read(32768).decode('utf-8', 'replace')
+                _m = _re.search(r'CURRENT_VERSION\s*=\s*["\']([^"\']+)["\']', _head)
+                if _m:
+                    tag = _m.group(1)
+            except Exception as _raw_err:
+                print(f"MediaMTX editor version: raw fallback failed: {_raw_err}", flush=True)
+        if not tag:
+            # Never silent. A missing 'editor vX available' notice is indistinguishable
+            # from 'you are current', and that is how test8 sat on v2.0.9 unnoticed.
+            print("MediaMTX editor version: both sources returned nothing "
+                  "(installed=%s), update notice suppressed" % (out['version'] or '?'),
+                  flush=True)
         if tag:
             out['latest'] = tag.lstrip('vV')
             if out['version'] and out['latest']:
@@ -26568,28 +26674,56 @@ def _get_mediamtx_version_info():
                 out['version'] = _run_ver(f'{bin_path} -version 2>&1') or _run_ver(f'{bin_path} --version 2>&1')
                 if out['version']:
                     break
+    # v10.1.34: THE CONSOLE ANNOUNCES, THE WEB EDITOR UPDATES. infra-TAK installs a
+    # vetted MediaMTX on a FRESH deploy and never touches the binary again; every
+    # subsequent MediaMTX and web-editor update happens in the web editor at
+    # https://stream.<fqdn>. So "update available" here means exactly one thing —
+    # upstream has published a newer release than this box is running — and the only
+    # action it may ever suggest is "open the web editor".
+    #
+    # It briefly meant "behind MEDIAMTX_VETTED_RELEASE", paired with an overlay that
+    # 409'd the editor's Upgrade button and told the operator to press a console Update
+    # button that does not render on an installed box. That left the fleet with no
+    # working update path at all. Do not reintroduce it.
+    def _vparts(v):
+        p = [int(x) for x in _re.findall(r'\d+', v or '')[:3]]
+        return p + [0] * (3 - len(p))
+
+    # vetted_release is what a FRESH deploy installs. It is deliberately NOT surfaced as
+    # a badge: the operator cannot act on it from here, and a console that advertises a
+    # version it will not install is the exact complaint that produced this rewrite.
+    out['vetted_release'] = MEDIAMTX_VETTED_RELEASE
+    out['latest'] = None
+    out['update_available'] = False
+    # Kept distinct from update_available, which is a UNION of the binary and the web
+    # editor further down. The status banner announces a MediaMTX RELEASE, so it must
+    # not fire because the editor happens to have an update.
+    out['binary_update_available'] = False
+
+    # Upstream awareness. This is the ONLY source of "an update exists" — compared
+    # against what this box is actually running, not against our pin.
     try:
-        req = _ur.Request(
-            'https://api.github.com/repos/bluenviron/mediamtx/releases/latest',
-            headers={'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'infra-TAK'})
-        with _ur.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode())
-        tag = (data or {}).get('tag_name') or ''
+        data = _gh_json_cached('https://api.github.com/repos/bluenviron/mediamtx/releases/latest')
+        tag = ((data or {}).get('tag_name') or '').lstrip('vV')
         if tag:
-            out['latest'] = tag.lstrip('vV')
-            if out['version'] and out['latest']:
-                cur_parts = [int(x) for x in _re.findall(r'\d+', out['version'])[:3]]
-                lat_parts = [int(x) for x in _re.findall(r'\d+', out['latest'])[:3]]
-                while len(cur_parts) < 3:
-                    cur_parts.append(0)
-                while len(lat_parts) < 3:
-                    lat_parts.append(0)
-                if lat_parts > cur_parts:
-                    out['update_available'] = True
-            elif out['latest']:
-                out['update_available'] = True
+            out['upstream_latest'] = tag
+            out['upstream_url'] = (data or {}).get('html_url') or ''
+            out['latest'] = tag
+            # No installed version means not installed or a failed probe: never claim news.
+            if out['version']:
+                out['binary_update_available'] = _vparts(tag) > _vparts(out['version'])
+                out['update_available'] = out['binary_update_available']
     except Exception:
-        pass
+        # Offline or rate-limited: absence of upstream news must never look like news.
+        out['upstream_latest'] = None
+    # A box that has never once reached GitHub still knows one true thing: the release we
+    # ship exists. Use it as a FLOOR so the page is not silently blank when the lookup is
+    # unavailable — blank reads as "you are current", which is the lie. Never the reverse:
+    # the pin only fills a gap, it never suppresses real upstream news.
+    if not out['latest'] and out['version']:
+        out['latest'] = MEDIAMTX_VETTED_RELEASE
+        out['binary_update_available'] = _vparts(MEDIAMTX_VETTED_RELEASE) > _vparts(out['version'])
+        out['update_available'] = out['binary_update_available']
     # Web editor: current from CURRENT_VERSION on target, latest from takwerx/mediamtx-installer
     editor_info = _get_mediamtx_editor_version_info(deploy_cfg)
     out['editor_version'] = editor_info.get('version') or ''
@@ -28433,14 +28567,12 @@ def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
 
     # Step 2: Version + arch on remote
     plog("")
-    plog("━━━ Step 2/7: Detecting MediaMTX Version ━━━")
-    r = subprocess.run('curl -s https://api.github.com/repos/bluenviron/mediamtx/releases/latest', shell=True, capture_output=True, text=True, timeout=30)
-    m = _re.search(r'"tag_name":\s*"v([^"]+)"', r.stdout or '')
-    if not m:
-        plog("✗ Could not detect latest MediaMTX version")
-        mediamtx_deploy_status.update({'running': False, 'error': True})
-        return
-    version = m.group(1)
+    plog("━━━ Step 2/7: Selecting MediaMTX Version ━━━")
+    # v10.1.34: pinned to MEDIAMTX_VETTED_RELEASE, no longer releases/latest.
+    # Deploys used to resolve upstream-latest here, which is how 10.1.33's MoQ
+    # crash-loop reached fresh installs with no change on our side.
+    version = MEDIAMTX_VETTED_RELEASE
+    plog(f"  Vetted version: {version} (pinned — upstream releases are adopted only after T&E)")
     ok, arch_out = _module_run(deploy_cfg, 'uname -m', timeout=10)
     arch_raw = (arch_out or '').strip() or 'x86_64'
     arch_map = {'x86_64': 'amd64', 'aarch64': 'arm64', 'armv7l': 'armv7'}
@@ -28450,13 +28582,31 @@ def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
     # Step 3: Download and install binary on remote
     plog("")
     plog("━━━ Step 3/7: Downloading & Installing MediaMTX (remote) ━━━")
-    url = f"https://github.com/bluenviron/mediamtx/releases/download/v{version}/mediamtx_v{version}_linux_{mtx_arch}.tar.gz"
+    tarball = f"mediamtx_v{version}_linux_{mtx_arch}.tar.gz"
+    base_url = f"https://github.com/bluenviron/mediamtx/releases/download/v{version}"
+    url = f"{base_url}/{tarball}"
+    sums_url = f"{base_url}/checksums.sha256"
+    # v10.1.34: VERIFY THE ARTIFACT, not just the version. Pinning decides WHICH release
+    # to fetch; it says nothing about what actually arrived over the wire. Upstream
+    # publishes checksums.sha256 with every release (and build attestation) and we were
+    # ignoring both — downloading a tarball and executing it as root with no integrity
+    # check at all. Half a supply-chain control is not one.
+    # Fails CLOSED: a missing or mismatching checksum aborts the install rather than
+    # falling through to "install it anyway", which is the only behaviour worth having.
     # restorecon relabels the binary to bin_t on RHEL/SELinux (mv from /tmp keeps
-    # tmp_t → systemd 203/EXEC); no-op on Debian (|| true). Universal one-liner.
-    cmd = f'cd /tmp && wget -q -O mediamtx.tar.gz "{url}" && tar -xzf mediamtx.tar.gz && mv -f mediamtx /usr/local/bin/ && chmod +x /usr/local/bin/mediamtx && (restorecon /usr/local/bin/mediamtx 2>/dev/null || chcon -t bin_t /usr/local/bin/mediamtx 2>/dev/null || true) && rm -f mediamtx.tar.gz'
+    # tmp_t → systemd 203/EXEC); no-op on Debian (|| true).
+    cmd = (
+        f'cd /tmp && rm -f {tarball} checksums.sha256 && '
+        f'wget -q -O {tarball} "{url}" && '
+        f'wget -q -O checksums.sha256 "{sums_url}" && '
+        f'grep " {tarball}$" checksums.sha256 | sha256sum --check --status && '
+        f'tar -xzf {tarball} && mv -f mediamtx /usr/local/bin/ && chmod +x /usr/local/bin/mediamtx && '
+        f'(restorecon /usr/local/bin/mediamtx 2>/dev/null || chcon -t bin_t /usr/local/bin/mediamtx 2>/dev/null || true) && '
+        f'rm -f {tarball} checksums.sha256'
+    )
     ok, out = _module_run(deploy_cfg, cmd, timeout=120, log_fn=plog)
     if not ok:
-        plog(f"✗ Download/install failed: {(out or '')[-200:]}")
+        plog(f"✗ Download/verify/install failed (checksum mismatch aborts the install): {(out or '')[-200:]}")
         mediamtx_deploy_status.update({'running': False, 'error': True})
         return
     plog(f"✓ MediaMTX v{version} installed")
@@ -28982,37 +29132,67 @@ def run_mediamtx_deploy():
         if not created:
             plog("  ✓ takwerx system user already present")
 
-        # Step 2: Detect architecture and latest version
+        # Step 2: Detect architecture, select the vetted version
         plog("")
-        plog("━━━ Step 2/7: Detecting MediaMTX Version ━━━")
+        plog("━━━ Step 2/7: Selecting MediaMTX Version ━━━")
         arch_map = {'x86_64': 'amd64', 'aarch64': 'arm64', 'armv7l': 'armv7'}
         arch_raw = subprocess.run('uname -m', shell=True, capture_output=True, text=True).stdout.strip()
         mtx_arch = arch_map.get(arch_raw, 'amd64')
         plog(f"  Architecture: {arch_raw} → {mtx_arch}")
 
-        r = subprocess.run('curl -s https://api.github.com/repos/bluenviron/mediamtx/releases/latest',
-            shell=True, capture_output=True, text=True, timeout=30)
-        import re as _re
-        m = _re.search(r'"tag_name":\s*"v([^"]+)"', r.stdout)
-        if not m:
-            plog("✗ Could not detect latest MediaMTX version")
-            mediamtx_deploy_status.update({'running': False, 'error': True})
-            return
-        version = m.group(1)
-        plog(f"✓ Latest version: {version}")
+        # v10.1.34: pinned to MEDIAMTX_VETTED_RELEASE, no longer releases/latest.
+        version = MEDIAMTX_VETTED_RELEASE
+        plog(f"✓ Vetted version: {version} (pinned — upstream releases are adopted only after T&E)")
 
         # Step 3: Download and install binary
         plog("")
         plog("━━━ Step 3/7: Downloading & Installing MediaMTX ━━━")
-        url = f"https://github.com/bluenviron/mediamtx/releases/download/v{version}/mediamtx_v{version}_linux_{mtx_arch}.tar.gz"
+        tarball = f"mediamtx_v{version}_linux_{mtx_arch}.tar.gz"
+        base_url = f"https://github.com/bluenviron/mediamtx/releases/download/v{version}"
+        url = f"{base_url}/{tarball}"
         tmp = '/tmp/mediamtx_install'
         os.makedirs(tmp, exist_ok=True)
-        r = subprocess.run(f'wget -q -O {tmp}/mediamtx.tar.gz "{url}"', shell=True, capture_output=True, text=True, timeout=120)
+        r = subprocess.run(['wget', '-q', '-O', os.path.join(tmp, tarball), url],
+                           capture_output=True, text=True, timeout=120)
         if r.returncode != 0:
             plog(f"✗ Download failed")
             mediamtx_deploy_status.update({'running': False, 'error': True})
             return
-        subprocess.run(f'tar -xzf {tmp}/mediamtx.tar.gz -C {tmp}', shell=True, capture_output=True)
+        # v10.1.34: verify against upstream's published checksums before executing it as
+        # root. See the remote path for the full rationale. Fails CLOSED.
+        # Verified in-process with hashlib rather than shelling out to sha256sum: no
+        # shell, nothing to quote, and the comparison is explicit. Fails CLOSED — a
+        # missing checksums file, a missing entry, or a mismatch all abort the install.
+        try:
+            import hashlib  # not a module-level import in this file
+            rs = subprocess.run(['wget', '-q', '-O', os.path.join(tmp, 'checksums.sha256'),
+                                 f'{base_url}/checksums.sha256'],
+                                capture_output=True, text=True, timeout=60)
+            if rs.returncode != 0:
+                raise RuntimeError('could not fetch upstream checksums.sha256')
+            want = ''
+            with open(os.path.join(tmp, 'checksums.sha256'), 'r') as _cf:
+                for _line in _cf:
+                    _parts = _line.split()
+                    if len(_parts) == 2 and _parts[1].lstrip('*') == tarball:
+                        want = _parts[0].lower()
+                        break
+            if not want:
+                raise RuntimeError(f'{tarball} not listed in upstream checksums.sha256')
+            _h = hashlib.sha256()
+            with open(os.path.join(tmp, tarball), 'rb') as _bf:
+                for _chunk in iter(lambda: _bf.read(1024 * 1024), b''):
+                    _h.update(_chunk)
+            got = _h.hexdigest().lower()
+            if got != want:
+                raise RuntimeError(f'checksum mismatch (expected {want[:16]}…, got {got[:16]}…)')
+        except Exception as _ve:
+            plog(f"✗ REFUSING TO INSTALL — artifact verification failed: {_ve}")
+            plog("  Nothing was changed. The running MediaMTX is untouched.")
+            mediamtx_deploy_status.update({'running': False, 'error': True})
+            return
+        plog(f"✓ Verified {tarball} against upstream checksums.sha256")
+        subprocess.run(['tar', '-xzf', os.path.join(tmp, tarball), '-C', tmp], capture_output=True)
         # install(1) reads the /tmp source (broker source-permissive), writes the
         # allowlisted dest, and sets the mode in one step (replaces mv + chmod).
         subprocess.run(_sudo_wrap(['install', '-m', '0755', f'{tmp}/mediamtx', '/usr/local/bin/mediamtx']), capture_output=True)
@@ -65475,6 +65655,78 @@ WantedBy=multi-user.target
 """
 
 
+def _startup_converge_mediamtx_overlay():
+    """v10.1.34: ship mediamtx_ldap_overlay.py to existing boxes on a console update.
+
+    The overlay is our own module the vendored editor imports (LDAP/Authentik auth and
+    the viewer-role restrictions live in it), and it was copied ONLY by the MediaMTX
+    deploy path. A console update never touched it, so overlays rotted: test8 was still
+    running the 2026-03-16 copy five months later. This converges it on console update.
+
+    It is also how v10.1.34 UNDOES its own mistake. v10.1.34 briefly shipped a
+    before_request intercept that answered the web editor's Upgrade and Rollback buttons
+    with a 409, on the false premise that the console performs MediaMTX updates. It does
+    not — every MediaMTX and web-editor update happens IN THE WEB EDITOR; the console
+    only reports that a newer version exists. The intercept therefore blocked the only
+    real update path and pointed operators at a console button that does not render on an
+    installed box. Pushing the corrected overlay removes it from test8/test12/aws-arm,
+    and the same pass strips the now-dead INFRATAK_MEDIAMTX_VETTED line those boxes
+    carry in their editor unit. infra-TAK does not reach into the editor.
+
+    Restarts the editor only when something actually changed, so a healthy box is left
+    alone."""
+    try:
+        if not os.path.isdir('/opt/mediamtx-webeditor'):
+            return
+        src = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mediamtx_ldap_overlay.py')
+        if not os.path.exists(src):
+            return
+        dst = '/opt/mediamtx-webeditor/mediamtx_ldap_overlay.py'
+        changed = False
+
+        with open(src, 'r') as f:
+            want = f.read()
+        have = ''
+        try:
+            have = _read_priv(dst)
+        except Exception:
+            have = ''
+        if have != want:
+            _write_priv(dst, want)
+            subprocess.run(_sudo_wrap(['chown', 'takwerx:takwerx', dst]), capture_output=True, timeout=15)
+            changed = True
+            print("Startup migration: MediaMTX editor overlay updated (LDAP/Authentik auth + viewer roles)", flush=True)
+
+        unit = '/etc/systemd/system/mediamtx-webeditor.service'
+        if os.path.exists(unit):
+            try:
+                txt = _read_priv(unit)
+            except Exception:
+                txt = ''
+            # v10.1.34 shipped Environment=INFRATAK_MEDIAMTX_VETTED here to feed the
+            # upgrade intercept. The intercept is gone and the variable is dead, so take
+            # it back off the boxes that got it rather than leaving litter in a unit file
+            # we had no business editing in the first place.
+            if txt and 'INFRATAK_MEDIAMTX_VETTED=' in txt:
+                kept = [ln for ln in txt.split('\n')
+                        if not ln.startswith('Environment=INFRATAK_MEDIAMTX_VETTED=')]
+                txt = '\n'.join(kept)
+                _write_priv(unit, txt)
+                subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=30)
+                changed = True
+                print("Startup migration: removed dead INFRATAK_MEDIAMTX_VETTED from the MediaMTX editor unit", flush=True)
+
+        if changed:
+            r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx-webeditor']),
+                               capture_output=True, text=True, timeout=60)
+            if r.returncode != 0:
+                print(f"Startup migration: \u26a0 MediaMTX editor restart failed: {(r.stderr or r.stdout or '').strip()[:200]}", flush=True)
+            else:
+                print("Startup migration: MediaMTX editor restarted with the current overlay", flush=True)
+    except Exception as _e:
+        print(f"Startup migration: MediaMTX editor overlay converge error (non-fatal): {_e}", flush=True)
+
+
 def _startup_converge_mediamtx_unit_nonroot():
     """v10.1.33: move a legacy `User=root` mediamtx.service onto takwerx.
 
@@ -67594,6 +67846,15 @@ def _startup_migrations():
         # the MoQ converge: that one may restart mediamtx, and this one judges success by
         # whether the service comes back up. Ordering them the other way would let a MoQ
         # restart land mid-verification and trigger a needless rollback.
+        # v10.1.34 — push our editor overlay (and the vetted-release env) to boxes on a
+        # console update. Without this the upgrade intercept only ever reaches a box that
+        # someone redeploys MediaMTX on, which is nobody: it was live on ZERO boxes while
+        # the un-intercepted button put an x86 binary on an ARM box (aws-arm 2026-08-15).
+        try:
+            _startup_converge_mediamtx_overlay()
+        except Exception as _mtx_ov_e:
+            print(f"Startup migration: mediamtx overlay converge error (non-fatal): {_mtx_ov_e}", flush=True)
+
         try:
             _startup_converge_mediamtx_ssl()
         except Exception as _mtx_ssl_e:
