@@ -804,7 +804,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.39-alpha"
+VERSION = "10.1.40-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -2490,6 +2490,27 @@ def _apply_authentik_session():
             return False
     session['authenticated'] = True
     session['authentik_username'] = uname
+    # v10.1.40: stamp the idle clock at the moment SSO authenticates.
+    #
+    # Only ONE place used to set last_activity — inside _enforce_session_idle_lock()
+    # itself. Of the three paths that establish an authenticated session, the password
+    # path at index() POST calls session.clear() first (so a stale value cannot survive),
+    # but THIS path and the other did not, leaving whatever the browser's cookie already
+    # carried. A returning user whose cookie held a last_activity older than idle_max was
+    # therefore re-authenticated by forward_auth and then, on the very next request, had
+    # the idle lock fire against a timestamp from their PREVIOUS visit — bounced to
+    # /outpost.goauthentik.io/sign_out and round the invalidation flow again.
+    #
+    # Verified on test8 2026-08-19 by forging a session cookie with last_activity two
+    # hours old and replaying it with the forward_auth headers: the console answered
+    # 302 -> https://infratak.<fqdn>/outpost.goauthentik.io/sign_out and cleared the
+    # cookie. That is the first hop of the loop the operator kept hitting, where the only
+    # reliable escape was clearing site data.
+    #
+    # Authenticating IS activity, so this is the correct value regardless of whether it
+    # fully explains that loop — the console is reachable on several vhosts and each keeps
+    # its own cookie, so a stale one on a sibling host can still bounce once.
+    session['last_activity'] = int(time.time())
     return True
 
 def login_required(f):
@@ -4424,6 +4445,7 @@ def index():
                 version=VERSION, login_logo_url=logo_url)
         if check_password_hash(auth['password_hash'], request.form.get('password', '')):
             session['authenticated'] = True
+            session['last_activity'] = int(time.time())  # v10.1.40: see _apply_authentik_session
             audit('auth:login-password', 'console password / break-glass')
             return redirect(_safe_next_path() or url_for('console_page'))
         return render_template('login.html', error='Invalid password', version=VERSION, login_logo_url=logo_url)
@@ -6622,7 +6644,8 @@ def update_check():
             dev_data = json.loads(dev_resp.read().decode())
             if not dev_data:
                 return _update_check_response({'current': VERSION, 'latest': None, 'channel': 'dev',
-                    'error': 'No commits on dev', 'body': '', 'update_available': False})
+                    'error': 'No commits on dev', 'body': '', 'update_available': False,
+                    'check_failed': True})
             head = dev_data[0]
             head_sha = head.get('sha', '')[:7]
             head_msg = (head.get('commit', {}).get('message', '') or '').splitlines()[0][:80]
@@ -6644,8 +6667,14 @@ def update_check():
             return _update_check_response({'current': VERSION, 'latest': latest_label, 'notes': notes,
                 'body': body, 'channel': 'dev', 'update_available': _is_ahead})
         except Exception as e:
+            # v10.1.40: check_failed distinguishes "I could not find out" from "there is
+            # nothing new". Without it the UI's `else` branch printed "Up to date" over a
+            # GitHub rate-limit (unauthenticated = 60/hour/IP, and the Guard Dog updates
+            # watcher spends from the same bucket), a DNS blip or a 5s timeout — so a box
+            # could stop seeing console updates for an hour and say it was current.
             return _update_check_response({'current': VERSION, 'latest': None, 'channel': 'dev',
-                'error': str(e)[:200], 'body': '', 'update_available': False})
+                'error': str(e)[:200], 'body': '', 'update_available': False,
+                'check_failed': True})
 
     # Main channel: existing tag-based check.
     force = request.args.get('refresh') == '1'
@@ -6668,7 +6697,7 @@ def update_check():
         resp = urllib.request.urlopen(req, timeout=5)
         data = json.loads(resp.read().decode())
         if not data:
-            return _update_check_response({'current': VERSION, 'latest': None, 'channel': 'main', 'error': 'No tags found', 'body': '', 'update_available': False})
+            return _update_check_response({'current': VERSION, 'latest': None, 'channel': 'main', 'error': 'No tags found', 'body': '', 'update_available': False, 'check_failed': True})
         # Only surface tags that are actually on the main branch so that tags
         # pushed on dev before a merge-to-main don't show as "update available".
         try:
@@ -6691,7 +6720,7 @@ def update_check():
             except (ValueError, IndexError):
                 continue
         if not versions:
-            return _update_check_response({'current': VERSION, 'latest': None, 'channel': 'main', 'error': 'No version tags', 'body': '', 'update_available': False})
+            return _update_check_response({'current': VERSION, 'latest': None, 'channel': 'main', 'error': 'No version tags', 'body': '', 'update_available': False, 'check_failed': True})
         versions.sort(key=lambda x: x[0], reverse=True)
         latest_tag = versions[0][1]
         latest = latest_tag.get('name', '').lstrip('v')
@@ -6711,7 +6740,7 @@ def update_check():
         return _update_check_response({'current': VERSION, 'latest': latest, 'notes': notes, 'body': body,
             'channel': 'main', 'update_available': is_newer})
     except Exception as e:
-        return _update_check_response({'current': VERSION, 'latest': None, 'channel': 'main', 'error': str(e)[:200], 'body': '', 'update_available': False})
+        return _update_check_response({'current': VERSION, 'latest': None, 'channel': 'main', 'error': str(e)[:200], 'body': '', 'update_available': False, 'check_failed': True})
 
 def _fetch_latest_tag_name():
     """Return the latest release tag name (e.g. 'v0.2.3-alpha') from GitHub, or None on error."""
@@ -15777,6 +15806,39 @@ def _f2b_dead_jails():
         lp = lm.group(1)
         try:
             if os.path.getsize(lp) == 0 and not _f2b_log_has_rotated_history(lp):
+                # v10.1.40 — the Authentik jail is NOT covered by the 0-byte rule, and
+                # treating it as if it were is a false alarm.
+                #
+                # The STARVING test assumes "a log that has never received one byte is
+                # unambiguous". True for takportal, whose writer emits routine traffic.
+                # FALSE here: this feed is
+                #     docker logs -f authentik-server-1 | grep -F invalid_login >> auth.log
+                # so it writes ONLY when a login actually fails. A healthy box on which
+                # nobody has ever mistyped a password has a legitimately 0-byte auth.log
+                # and a perfectly armed jail. Reporting that as "protecting nothing" is
+                # the same cry-wolf failure the rotated-log carve-out above exists to
+                # prevent, and it reached a customer (Charles Laird, NC, v10.1.39).
+                #
+                # The signal that actually distinguishes the two cases is whether the
+                # FORWARDER is running — which the console already computes for its
+                # status badge and, until now, never used here.
+                if name == 'authentik':
+                    try:
+                        _fwd = subprocess.run(
+                            ['systemctl', 'is-active', 'authentik-log-forwarder'],
+                            capture_output=True, text=True, timeout=10
+                            ).stdout.strip() == 'active'
+                    except Exception:
+                        _fwd = None       # inconclusive — do NOT convict on it
+                    if _fwd is not False:
+                        continue          # feed alive (or unknown): armed, nothing to log yet
+                    dead.append((name, filt,
+                                 'the Authentik log forwarder (authentik-log-forwarder.'
+                                 'service) is not running, so nothing writes %s and this '
+                                 'jail has no feed. The console restarts it automatically '
+                                 'on startup; to fix it now, toggle the Authentik jail off '
+                                 'and on.' % lp))
+                    continue
                 dead.append((name, filt,
                              'loaded, but its log %s is 0 bytes and has no rotated '
                              'history — nothing has ever written to it, so this jail '
@@ -16112,11 +16174,29 @@ _AK_FORWARDER_EXEC = ("ExecStart=/bin/bash -c 'docker logs -f authentik-server-1
                       "| grep --line-buffered -F invalid_login "
                       ">> /var/log/authentik/auth.log'\n")
 
+# v10.1.40 marker. Bump this string whenever the unit body changes so
+# _f2b_selfheal_ak_forwarder() can recognise an out-of-date unit without having to
+# enumerate every broken generation that ever shipped.
+_AK_FORWARDER_MARK = '# infratak-forwarder-rev2'
+
 _AK_FORWARDER_UNIT = (
     "[Unit]\n"
+    f"{_AK_FORWARDER_MARK}\n"
     "Description=Authentik Docker Log Forwarder for fail2ban\n"
     "After=docker.service\n"
-    "Requires=docker.service\n\n"
+    # v10.1.40: Wants=, NOT Requires=. With Requires= a docker.service restart STOPS
+    # this unit and never brings it back — and dockerd restarts on any OS update that
+    # upgrades docker-ce, which is routine. Field: Charles Laird (NC, yfdtak.com) on
+    # v10.1.39 showed "Log Forwarder Stopped" with a 0-byte auth.log and a red
+    # "protecting nothing" banner; the jail was fine, its feed was dead. Wants= keeps
+    # the ordering without the stop-propagation, and Restart=always then reattaches
+    # once `docker logs -f` exits with the bounced container.
+    "Wants=docker.service\n"
+    # Never give up permanently. Without this, a burst of fast exits (docker socket not
+    # ready at boot, container not yet created) can trip systemd's default start-rate
+    # limit and leave the unit failed until a human intervenes — which is exactly the
+    # state this feed must never reach, because nothing else writes auth.log.
+    "StartLimitIntervalSec=0\n\n"
     "[Service]\n"
     "Type=simple\n"
     "Restart=always\n"
@@ -16352,6 +16432,52 @@ def _f2b_ensure_authentik_logrotate(plog=None):
         return False
 
 
+def _f2b_start_ak_forwarder(plog=None):
+    """Start authentik-log-forwarder.service and REPORT whether it actually started.
+
+    v10.1.40. Every previous start site did a bare
+        systemctl enable --now authentik-log-forwarder
+    with capture_output=True and no return-code check. Two ways that lies:
+
+    1. A unit in `failed` state that has tripped systemd's start rate limit refuses
+       every start with "start request repeated too quickly" until someone runs
+       `reset-failed`. Nothing in the codebase ever did. This is why toggling the
+       Authentik jail off and on did NOT recover Charles Laird's box (NC, v10.1.39) —
+       the console ran the start, systemd declined, the return code was discarded, and
+       the UI reported "log forwarder started" over a forwarder that was still dead.
+    2. Even without the rate limit, a start that fails for any other reason was
+       invisible for the same reason.
+
+    So: clear the failed state first, start, then VERIFY with is-active and hand the
+    caller the truth. Returns (ok: bool, msg: str)."""
+    _log = plog or (lambda m: None)
+    try:
+        # Harmless when the unit is not failed; the whole point is that we cannot know.
+        subprocess.run(_sudo_wrap(['systemctl', 'reset-failed', 'authentik-log-forwarder']),
+                       capture_output=True, timeout=20)
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now',
+                                       'authentik-log-forwarder']),
+                           capture_output=True, text=True, timeout=40)
+    except Exception as e:
+        _log(f'fail2ban: could not start the Authentik log forwarder: {e}')
+        return (False, f'log forwarder start failed: {str(e)[:120]}')
+    # Never trust rc alone here — verify the daemon agrees it is running.
+    try:
+        active = subprocess.run(['systemctl', 'is-active', 'authentik-log-forwarder'],
+                                capture_output=True, text=True, timeout=15
+                                ).stdout.strip() == 'active'
+    except Exception:
+        active = False
+    if active:
+        return (True, 'log forwarder started')
+    err = ((r.stderr or r.stdout or '').strip() or 'no error reported')[:200]
+    _log(f'fail2ban: the Authentik log forwarder did NOT start — {err}')
+    return (False, f'log forwarder FAILED to start: {err}')
+
+
 def _f2b_selfheal_ak_forwarder(plog=None):
     """Bring the Authentik log forwarder up to the current, working definition.
 
@@ -16378,8 +16504,45 @@ def _f2b_selfheal_ak_forwarder(plog=None):
             cur = f.read()
     except OSError:
         return False
-    if 'invalid_login' in cur:
-        return False                      # already current (or a hand-rolled narrowing)
+    # v10.1.40: two independent conditions now.
+    #   (a) the unit body is out of date — either of the two broken generations above,
+    #       or the pre-rev2 unit whose `Requires=docker.service` made a dockerd restart
+    #       stop the forwarder for good.
+    #   (b) the unit is fine but NOT RUNNING. That is the state Charles Laird's box was
+    #       in on v10.1.39: correct unit, dead feed, 0-byte auth.log, and a red banner
+    #       blaming the jail. Nothing in the console ever restarted it — the page could
+    #       SEE it (it renders a "Log Forwarder Stopped" badge from `forwarder_active`)
+    #       but no code acted on it, and there was no button to press.
+    _stale = ('invalid_login' not in cur) or (_AK_FORWARDER_MARK not in cur)
+    if not _stale:
+        # Body is current — but is it actually running? Only worth starting when the
+        # jail is on and Authentik is up; otherwise a stopped forwarder is correct.
+        try:
+            _active = subprocess.run(['systemctl', 'is-active', 'authentik-log-forwarder'],
+                                     capture_output=True, text=True, timeout=10
+                                     ).stdout.strip() == 'active'
+        except Exception:
+            return False
+        if _active:
+            return False
+        if not _f2b_authentik_jail_enabled():
+            return False
+        try:
+            _ak_up = 'authentik' in subprocess.run(
+                _sudo_wrap(['docker', 'ps', '--format', '{{.Names}}']),
+                capture_output=True, text=True, timeout=20).stdout
+        except Exception:
+            return False
+        if not _ak_up:
+            return False                  # Authentik down: nothing to forward yet
+        _ok, _m = _f2b_start_ak_forwarder(plog)
+        if not _ok:
+            return False
+        _log('fail2ban: the Authentik log forwarder was stopped while its jail was '
+             'enabled — restarted it. Nothing writes /var/log/authentik/auth.log while '
+             'it is down, so the jail had no feed. A dockerd restart (any OS update '
+             'that upgrades docker-ce) is the usual cause on units predating v10.1.40.')
+        return True
     try:
         _write_priv(svc_path, _AK_FORWARDER_UNIT)
     except Exception as e:
@@ -16390,12 +16553,19 @@ def _f2b_selfheal_ak_forwarder(plog=None):
     # safe because this file is the jail's private feed, not an audit record, and the
     # full stream remains in `docker logs`.
     try:
-        subprocess.run(_sudo_wrap(['truncate', '-s', '0', '/var/log/authentik/auth.log']),
-                       capture_output=True, timeout=15)
-    except Exception:
-        pass
+        # v10.1.40: was `truncate -s 0`, which the broker DENIES on every non-root box
+        # ("binary not in allow-list: truncate") — and the failure was swallowed, so the
+        # rewrite path believed it had cleared the file for eight releases. /var/log/ is
+        # already a broker write prefix, so an empty write does the same job through a
+        # path that is actually permitted, on root and non-root alike.
+        _write_priv('/var/log/authentik/auth.log', '')
+    except Exception as _tr_e:
+        _log(f'fail2ban: could not clear auth.log after the forwarder rebuild: {_tr_e}')
     try:
         subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=30)
+        # v10.1.40: clear any failed/rate-limited state, or the restart is refused.
+        subprocess.run(_sudo_wrap(['systemctl', 'reset-failed', 'authentik-log-forwarder']),
+                       capture_output=True, timeout=20)
         subprocess.run(_sudo_wrap(['systemctl', 'restart', 'authentik-log-forwarder']),
                        capture_output=True, timeout=30)
         subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=60)
@@ -16849,9 +17019,10 @@ def fail2ban_authentik_toggle_api():
             capture_output=True, text=True).stdout
         forwarder_msg = 'log forwarder not started (Authentik not running)'
         if 'authentik' in ak_running:
-            subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', 'authentik-log-forwarder']),
-                           capture_output=True)
-            forwarder_msg = 'log forwarder started'
+            # v10.1.40: was a bare enable --now with the return code discarded, so a
+            # rate-limited/failed unit reported success while staying dead (Charles
+            # Laird, NC — toggling the jail off/on "worked" and changed nothing).
+            _fok, forwarder_msg = _f2b_start_ak_forwarder()
         subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=15)
         # v10.1.38 — ARM the jail, don't just switch it on.
         #
@@ -18250,6 +18421,14 @@ def _guarddog_health_check(service_id):
             s = socket.create_connection((db_host, db_port), timeout=5)
             s.close()
             return True
+    except subprocess.TimeoutExpired:
+        # v10.1.40: same carve-out as _monitor_health_check() below, and it matters MORE
+        # here — this function's caller does `'ok' if val else 'fail'`, so a timed-out
+        # probe painted a hard RED on the Console card rather than a caution. The probes
+        # above run on 2-5s timeouts (`ss` 2s, `systemctl is-active` 3s, `docker ps` 5s),
+        # which a box under load will blow through while being perfectly healthy.
+        # None means "no reading"; the caller already filters it (`if val is not None`).
+        return None
     except Exception:
         return False
     return False
@@ -18958,6 +19137,19 @@ def _monitor_health_check(monitor_id):
                 if not ok2:
                     return None
                 return 'OK' in (out2 or '')
+    except subprocess.TimeoutExpired:
+        # v10.1.40: a check that RAN OUT OF TIME has told us nothing — it is not a
+        # failing monitor. Returning False here made a loaded box report itself sick:
+        # every probe above runs on a 2-5s timeout, and on test6 at load ~8 one would
+        # intermittently expire, flip its service to 'caution' (some monitors pass,
+        # some "fail"), and yellow the Console module card — while the Guard Dog page,
+        # reading a 25s cache instead of running the checks live, stayed green. The
+        # operator sees a caution, clicks through, and finds nothing wrong.
+        # None is the documented third state and every caller already honours it
+        # (_compute_guarddog_overall filters `if v is not None`), so the machinery to
+        # say "unknown" was always there — this path just bypassed it.
+        # Same class as _caddy_validate_config()'s permission-denied carve-out.
+        return None
     except Exception:
         return False
     return None
@@ -20429,7 +20621,13 @@ def run_guarddog_deploy(alert_email):
                 .replace('ALERT_EMAIL_PLACEHOLDER', _safe_alert_email_list(alert_email))
                 .replace('ALERT_SMS_PLACEHOLDER', alert_sms or '')
                 .replace('CERT_PASS_PLACEHOLDER', cert_pass)
-                .replace('CONSOLE_VERSION_PLACEHOLDER', VERSION))
+                .replace('CONSOLE_VERSION_PLACEHOLDER', VERSION)
+                # v10.1.40: the updates watcher must compare Authentik against what THIS
+                # box's console will actually offer, not upstream latest — see
+                # scripts/guarddog/tak-updates-watch.sh.
+                .replace('UPDATE_CHANNEL_PLACEHOLDER',
+                         (settings.get('update_channel') or 'main').strip().lower())
+                .replace('AK_VETTED_PLACEHOLDER', AUTHENTIK_VETTED_RELEASE))
             if is_two_server and name in ('tak-remotedb-watch.sh', 'tak-remotedb-auth-watch.sh', 'tak-cotdb-watch.sh', 'tak-auto-vacuum.sh', 'tak-db-repack.sh', 'tak-retention-guard.sh'):
                 content = content.replace('DB_HOST_PLACEHOLDER', s1_host)
                 content = content.replace('DB_PORT_PLACEHOLDER', db_port)
@@ -23120,25 +23318,117 @@ def caddy_control():
     else:
         return jsonify({'success': False, 'error': 'Unknown action'})
 
+def _caddy_ensure_apt_repo(log_fn=None):
+    """Make sure the cloudsmith Caddy repo exists and apt has refreshed against it.
+
+    v10.1.40 — GH #59 residual, reproduced on test8 2026-08-19. The repo-add lives only in
+    run_caddy_deploy()'s Step 1, and the console shows no Deploy button once Caddy is
+    installed ([[no-redeploy-button-on-installed-modules]]). So the ONLY upgrade action an
+    operator can reach is /api/caddy/update, which ran
+
+        (apt update, then an install limited to *upgrades only*)
+
+    with no repo added first. On a box carrying a DISTRO Caddy (Ubuntu 22.04 universe 2.4.5, Debian
+    bookworm 2.6.2) the candidate therefore stays at the distro version, `--only-upgrade`
+    is a no-op, and the route returns success. Measured: clicking Update on a 2.6.2 box
+    left it on 2.6.2 while the UI said "Caddy updated successfully."
+
+    That is exactly what GH #59's reporter described ("tried your commands but it didn't
+    update the caddy installed") — he was right, and he had to replace the binary by hand.
+
+    Returns True when apt can see a Caddy candidate from cloudsmith."""
+    _log = log_fn or (lambda m: None)
+    listf = '/etc/apt/sources.list.d/caddy-stable.list'
+    env = _broker_shim_env({**os.environ, 'DEBIAN_FRONTEND': 'noninteractive',
+                            'NEEDRESTART_MODE': 'a'})
+    try:
+        if not os.path.exists(listf):
+            _log('Caddy repo missing — adding the cloudsmith repository')
+            # Prereqs go through the apt/dnf shim, never a bare package manager (CLAUDE.md).
+            _pkg_install(['debian-keyring', 'debian-archive-keyring',
+                          'apt-transport-https', 'curl'], log_fn=log_fn, timeout=180)
+            # These two genuinely need a shell (they are pipelines). Written as explicit
+            # literals rather than a loop variable so no variable is ever handed to
+            # shell=True — same commands run by run_caddy_deploy()'s Step 1.
+            _key = subprocess.run(
+                'curl -1sLf "https://dl.cloudsmith.io/public/caddy/stable/gpg.key" '
+                '| gpg --batch --yes --dearmor '
+                '-o /usr/share/keyrings/caddy-stable-archive-keyring.gpg 2>&1',
+                shell=True, capture_output=True, text=True, timeout=120, env=env)
+            if _key.returncode != 0:
+                _log(f'could not fetch the Caddy signing key: '
+                     f'{(_key.stderr or _key.stdout).strip()[:200]}')
+                return False
+            _src = subprocess.run(
+                'curl -1sLf "https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt" '
+                '| tee /etc/apt/sources.list.d/caddy-stable.list 2>&1',
+                shell=True, capture_output=True, text=True, timeout=120, env=env)
+            if _src.returncode != 0:
+                _log(f'could not write the Caddy sources list: '
+                     f'{(_src.stderr or _src.stdout).strip()[:200]}')
+                return False
+        subprocess.run('apt-get update -qq 2>&1', shell=True, capture_output=True,
+                       text=True, timeout=180, env=env)
+        return True
+    except Exception as e:
+        _log(f'Caddy repo setup error: {str(e)[:200]}')
+        return False
+
+
 @app.route('/api/caddy/update', methods=['POST'])
 @login_required
 def caddy_update():
-    """Upgrade Caddy to the latest apt package version and reload."""
+    """Upgrade Caddy to the latest package version and reload.
+
+    v10.1.40: this is the ONLY upgrade action the UI exposes once Caddy is installed, so it
+    must be able to lift a distro Caddy over the 2.7 floor the generated Caddyfile needs.
+    It could not: it never added the cloudsmith repo, so on a distro box the candidate was
+    the distro version, `--only-upgrade` did nothing, and this route reported success
+    anyway. Verified on test8 2026-08-19 — clicked Update on 2.6.2, UI said "Caddy updated
+    successfully", box stayed on 2.6.2. GH #59's reporter hit exactly this.
+    """
     try:
         settings = load_settings()
         pkg_mgr = settings.get('pkg_mgr', 'apt')
+        _before = _caddy_version_tuple(refresh=True)
         if pkg_mgr == 'apt':
-            r = _run_priv_chain([['apt-get', 'update', '-qq'], ['apt-get', 'install', '--only-upgrade', '-y', 'caddy']], 'and', timeout=120)
+            # Repo FIRST — otherwise apt cannot see a newer Caddy at all.
+            _caddy_ensure_apt_repo()
+            # Plain install, not --only-upgrade: on a distro box the cloudsmith package is a
+            # different origin, and `install` is what moves it across. Already-current boxes
+            # are a no-op either way.
+            r = _run_priv_chain([['apt-get', 'update', '-qq'],
+                                 ['apt-get', 'install', '-y', 'caddy']], 'and', timeout=300)
         else:
+            _caddy_install_official_static(None) if (_before and _before < _CADDY_MIN_SUPPORTED) else None
             r = subprocess.run(
-                _sudo_wrap(['dnf', 'upgrade', '-y', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
+                _sudo_wrap(['dnf', 'upgrade', '-y', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=300)
         if r.returncode != 0:
             return jsonify({'success': False, 'error': (r.stdout or r.stderr or 'Package upgrade failed').strip()})
         # Restart (not reload) — apt replaced the binary; reload only re-reads config and
         # can block indefinitely if Caddy is mid-ACME-challenge (issue #25)
         reload_r = subprocess.run(
             _sudo_wrap(['systemctl', 'restart', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
-        return jsonify({'success': True, 'output': (r.stdout or '').strip()})
+        # v10.1.40: report what actually happened. "Updated successfully" over an unchanged
+        # version is how GH #59's reporter was told his Caddy had upgraded when it had not.
+        _after = _caddy_version_tuple(refresh=True)
+        _vs = lambda v: '.'.join(map(str, v)) if v else 'unknown'
+        _out = (r.stdout or '').strip()
+        if _after and _after < _CADDY_MIN_SUPPORTED:
+            return jsonify({
+                'success': False,
+                'error': (f'Caddy is still {_vs(_after)}, below the {_vs(_CADDY_MIN_SUPPORTED)} '
+                          'minimum this console generates config for. The package manager has no '
+                          'newer Caddy available on this box. Nothing was broken — the generated '
+                          'Caddyfile stays parseable — but the SSO callback-rescue page stays '
+                          'plain until Caddy is upgraded (GH #59).'),
+                'installed': _vs(_after), 'output': _out})
+        if _before and _after and _before == _after:
+            return jsonify({'success': True, 'no_change': True,
+                            'installed': _vs(_after),
+                            'output': _out or f'Caddy is already {_vs(_after)} — nothing to upgrade.'})
+        return jsonify({'success': True, 'installed': _vs(_after),
+                        'previous': _vs(_before), 'output': _out})
     except subprocess.TimeoutExpired:
         return jsonify({'success': False, 'error': 'apt-get timed out'})
     except Exception as e:
@@ -25543,12 +25833,23 @@ def _caddy_validate_config(path=None, timeout=30):
     """Run Caddy's own adapter over `path`. Returns (verdict, output).
 
     verdict is 'ok' | 'bad' | 'unknown'. 'unknown' covers a missing/unrunnable caddy binary,
-    a timeout, and — importantly — a permission-denied result: on custom-cert
-    (ssl_mode='custom') non-root boxes this runs as takwerx, which cannot traverse
-    /var/lib/caddy (0750 caddy:caddy) to open the deployed cert copy, so validate fails on a
-    config the caddy service itself loads fine. That is inconclusive, NOT a bad config —
-    the same carve-out the W1 path already makes (~app.py:5981). Without it we would
-    "restore" a good config over a good config on every single write."""
+    a timeout, and — importantly — a permission-denied result. TWO different paths produce
+    that, and v10.1.39 shipped naming only the first:
+
+      1. custom-cert (ssl_mode='custom') non-root boxes: this runs as takwerx, which cannot
+         traverse /var/lib/caddy (0750 caddy:caddy) to open the deployed cert copy. This is
+         the W1 case (~app.py:5981).
+      2. the Caddy LOG file — and this is the one actually observed in the field. On `nuc`
+         during the GH #59 validation (2026-08-18), `caddy validate` run as the console user
+         failed with permission denied opening /var/log/caddy/takportal-access.log (0644
+         caddy:caddy), because validate sets up the log WRITER. nuc has NO ssl_mode set at
+         all, so the custom-cert explanation did not apply to it. Same class, different path.
+
+    Either way the config is fine and the caddy service loads it. That is inconclusive, NOT
+    a bad config. Without this carve-out _caddy_validate_or_restore() would "restore" a good
+    config over a good config on EVERY write on a non-root box — silently undoing every
+    module deploy. nuc logged zero self-heal lines during the 10.1.39 soak, which is the
+    correct quiet behaviour and the evidence this carve-out is load-bearing."""
     cp = path or CADDYFILE_PATH
     try:
         if not shutil.which('caddy'):
@@ -25610,6 +25911,58 @@ def _caddy_validate_or_restore(prev_contents, plog=None):
     return False, err
 
 
+def _ak_invalidate_all_sessions(plog=None):
+    """Delete every Authentik authenticated session. Returns (deleted, total).
+
+    v10.1.40 — the other half of the Caddy floor-lift. Lifting a box off Caddy < 2.7 repairs
+    the SERVER; it does nothing for a browser that already holds a session minted while the
+    proxy was mangling headers. Measured on test8 2026-08-19: with Caddy already back on
+    2.11.4 and the config correct, the operator authenticated cleanly — the Authentik log
+    shows `user: webadmin`, `amr: ["pwd","mfa"]`, `is_superuser: true` — and was immediately
+    bounced through `/if/flow/default-invalidation-flow/?id_token_hint=…` back to the sign-in
+    page. An incognito window worked first try; clearing site data fixed the normal one.
+
+    So the box heals and the human stays locked out, with nothing on screen explaining why,
+    and the only documented escape is DevTools → Clear site data — a CLI-class remedy we
+    treat as a product defect ([[feedback-ui-only-never-propose-cli]]). Killing the stale
+    sessions server-side turns that into an ordinary "please sign in again".
+
+    Only ever called after a floor-lift actually fired, i.e. on a box that WAS below 2.7 and
+    therefore had no working sessions worth preserving. A healthy box never reaches this."""
+    _log = plog or (lambda m: None)
+    try:
+        s = load_settings()
+        tok = (_get_authentik_env_value(s, 'AUTHENTIK_TOKEN')
+               or _get_authentik_env_value(s, 'AUTHENTIK_BOOTSTRAP_TOKEN'))
+        if not tok:
+            _log('could not invalidate stale SSO sessions — no Authentik API token on this box')
+            return (0, 0)
+        base = _get_authentik_api_url(s)
+        hdrs = {'Authorization': f'Bearer {tok}', 'Content-Type': 'application/json'}
+        uuids, page = [], 1
+        while page <= 20:                      # bounded; 20*100 sessions is far past real
+            r = _ak_api_call(f'{base}/api/v3/core/authenticated_sessions/'
+                             f'?page_size=100&page={page}', headers=hdrs, timeout=20)
+            d = json.loads(r.read().decode())
+            got = d.get('results') or []
+            uuids += [x.get('uuid') for x in got if x.get('uuid')]
+            if len(got) < 100:
+                break
+            page += 1
+        killed = 0
+        for u in uuids:
+            try:
+                _ak_api_call(f'{base}/api/v3/core/authenticated_sessions/{u}/',
+                             method='DELETE', headers=hdrs, timeout=15)
+                killed += 1
+            except Exception:
+                pass                            # one stubborn session must not stop the rest
+        return (killed, len(uuids))
+    except Exception as e:
+        _log(f'stale-session invalidation failed (non-fatal): {str(e)[:160]}')
+        return (0, 0)
+
+
 def _startup_caddy_selfheal():
     """Unconditional Caddyfile self-heal, run once per console start (GH #59, v10.1.39).
 
@@ -25621,6 +25974,101 @@ def _startup_caddy_selfheal():
     restart. Rides the console update, never start.sh ([[feedback-console-path-delivery]])."""
     if not os.path.exists(CADDYFILE_PATH):
         return
+
+    # v10.1.40 — LIFT THE BOX OVER THE 2.7 FLOOR, not just make its config parse.
+    #
+    # v10.1.39 stopped a Caddy < 2.7 box from being catastrophically broken: no heredoc
+    # below 2.7, so the config parses and every vhost serves. Proven on test8 2026-08-19 —
+    # downgraded to 2.6.2, all 13 vhosts died, a console restart regenerated a parseable
+    # file and they all came back.
+    #
+    # But "serving" is not "working". Measured on that same box: with Caddy 2.6.2 every
+    # site returned 200/302 while SSO LOGIN LOOPED — user, password, authenticator, back to
+    # the sign-in page. Cause, confirmed by diffing `caddy adapt` output between 2.6.2 and
+    # 2.11.4 on the identical Caddyfile: 2.7 rewrote how `copy_headers` compiles. 2.11.4
+    # emits, per header, a delete followed by a set guarded on the upstream having returned
+    # a non-empty value. 2.6.2 emits an UNCONDITIONAL set, so an unauthenticated request
+    # reaches the console carrying a full set of empty/unresolved X-Authentik-* headers and
+    # the session logic never settles. That behaviour is not expressible in the old
+    # Caddyfile syntax, so it cannot be worked around in the generator.
+    #
+    # Dropping the forward_auth blocks below 2.7 would be worse — they ARE the auth gate.
+    # So the only correct repair is to stop the box being below 2.7. The deploy gate and
+    # (since this release) the Update button both do that, but each needs an operator to
+    # click something, and a box left alone sits in the looping state indefinitely. Do it
+    # here, unattended, the same way the Authentik log forwarder self-heals.
+    try:
+        _cv0 = _caddy_version_tuple(refresh=True)
+        if _cv0 and _cv0 < _CADDY_MIN_SUPPORTED:
+            _v0s = '.'.join(map(str, _cv0))
+            _mins = '.'.join(map(str, _CADDY_MIN_SUPPORTED))
+            print('Startup migration: Caddy %s is below the %s floor — SSO login loops on '
+                  'this version (copy_headers compiles differently before 2.7). Upgrading…'
+                  % (_v0s, _mins), flush=True)
+            if (load_settings().get('pkg_mgr', 'apt') or 'apt').lower() == 'apt':
+                _caddy_ensure_apt_repo(lambda m: print('Startup migration:   %s' % m, flush=True))
+                _pkg_install('caddy', log_fn=lambda m: print('Startup migration:   %s' % m,
+                                                             flush=True), timeout=300)
+            else:
+                _caddy_install_official_static(lambda m: print('Startup migration:   %s' % m,
+                                                              flush=True))
+            _cv1 = _caddy_version_tuple(refresh=True)
+            if _cv1 and _cv1 >= _CADDY_MIN_SUPPORTED:
+                print('Startup migration: ✓ Caddy %s → %s; regenerating the Caddyfile so the '
+                      'styled rescue page and conditional auth headers come back'
+                      % (_v0s, '.'.join(map(str, _cv1))), flush=True)
+                # Regenerate, then CONFIRM the new file parses — and retry once if it does
+                # not. v10.1.40: the apt upgrade takes ~2 minutes (repo add + update +
+                # install), and a single version probe taken while dpkg is still swapping
+                # /usr/bin/caddy can report >= 2.7 a moment before the binary on disk really
+                # is. The generator then emits a heredoc that the not-yet-replaced binary
+                # rejects ("unrecognized directive: <!doctype"), generate_caddyfile's own
+                # backstop restores the previous file, and the box keeps the PLAIN rescue
+                # page until something else regenerates. Observed once on test8 2026-08-19;
+                # a second run won the race and succeeded, which is what makes it a race.
+                # Never fatal — the GH #59 backstop means a bad file is never applied — but
+                # re-probing and retrying gets the styled page back on the first pass.
+                for _rgn in (1, 2):
+                    try:
+                        generate_caddyfile(load_settings())
+                        _vv, _ = _caddy_validate_config()
+                        if _vv != 'bad':
+                            subprocess.run(_sudo_wrap(['systemctl', 'restart', 'caddy']),
+                                           capture_output=True, timeout=90)
+                            break
+                        if _rgn == 1:
+                            print('Startup migration:   regenerated Caddyfile did not parse '
+                                  '(binary likely still settling) — re-probing and retrying',
+                                  flush=True)
+                            time.sleep(8)
+                            _caddy_version_tuple(refresh=True)
+                        else:
+                            print('Startup migration: ⚠ Caddyfile still does not parse after '
+                                  'the Caddy upgrade; previous config retained (rescue page '
+                                  'stays plain until the next regeneration)', flush=True)
+                    except Exception as _rg:
+                        print('Startup migration: ⚠ Caddyfile regen after upgrade failed: %s'
+                              % str(_rg)[:160], flush=True)
+                        break
+                # Kill sessions minted while the proxy was mangling auth headers — they
+                # survive the upgrade and lock the user out of a box that is now healthy.
+                _k, _t = _ak_invalidate_all_sessions(
+                    lambda m: print('Startup migration:   %s' % m, flush=True))
+                if _t:
+                    print('Startup migration:   invalidated %d/%d Authentik session(s) minted '
+                          'while Caddy was below the floor — everyone signs in again once, '
+                          'instead of looping on a stale cookie' % (_k, _t), flush=True)
+            else:
+                # Say it plainly. A box here serves every page and cannot log anyone in,
+                # which is harder to diagnose than an outage.
+                print('Startup migration: ⚠ Caddy is STILL %s (< %s). Sites will serve but '
+                      'SSO LOGIN WILL LOOP. Upgrade Caddy on this box (console → Caddy → '
+                      'Update), or the package manager has no newer version available.'
+                      % ('.'.join(map(str, _cv1)) if _cv1 else 'unknown', _mins), flush=True)
+    except Exception as _cvE:
+        print('Startup migration: Caddy version floor check error (non-fatal): %s'
+              % str(_cvE)[:160], flush=True)
+
     verdict, out = _caddy_validate_config()
     if verdict == 'ok':
         return
@@ -65453,10 +65901,31 @@ def _kernel_patch_start_job():
         'done\n'
         'if [ "$WAITED" -ge 1800 ]; then echo "[$(TS)] FATAL: apt/dpkg still busy after 30 min"; exit 1; fi\n'
         'echo "[$(TS)] apt-get update"\n'
-        'apt-get -o DPkg::Lock::Timeout=300 update 2>&1 || { rc=$?; echo "[$(TS)] FATAL: apt-get update failed (exit $rc)"; exit $rc; }\n'
+        # v10.1.40: Acquire::Retries. apt defaults to ZERO retries; dnf defaults to 10.
+        # apt was the outlier, and on 2026-08-19 a transient 503 from AWS's regional ports
+        # mirror (us-east-2.ec2.ports.ubuntu.com) failed the operator's update on aws-arm
+        # with nothing installed. Every failing URL returned 200 minutes later — one retry
+        # would have carried it. Same class as the v10.1.37 lock-wait: do not hand the
+        # operator a red FATAL panel for a transient upstream condition.
+        'apt-get -o Acquire::Retries=3 -o DPkg::Lock::Timeout=300 update 2>&1 || { rc=$?; echo "[$(TS)] FATAL: apt-get update failed (exit $rc)"; exit $rc; }\n'
         'echo "[$(TS)] apt-get full-upgrade -y (TAK Server packages held)"\n'
-        'apt-get -y -o DPkg::Lock::Timeout=300 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" full-upgrade 2>&1 \\\n'
-        '  || { rc=$?; echo "[$(TS)] FATAL: apt-get full-upgrade failed (exit $rc)"; exit $rc; }\n'
+        'UPGLOG="$(mktemp)"\n'
+        'apt-get -y -o Acquire::Retries=3 -o DPkg::Lock::Timeout=300 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" full-upgrade 2>&1 \\\n'
+        '  | tee "$UPGLOG"\n'
+        'rc=${PIPESTATUS[0]}\n'
+        'if [ "$rc" -ne 0 ]; then\n'
+        # A download failure and an install failure are NOT the same event and must not
+        # read the same. On a fetch failure apt installs nothing, so the box is untouched
+        # and the honest advice is "try again" — not the bare FATAL that sent the operator
+        # looking for a fault on their own machine.
+        '  if grep -qE "Failed to fetch|Unable to fetch some archives|503  Service Unavailable|Connection timed out|Temporary failure resolving" "$UPGLOG"; then\n'
+        '    echo "[$(TS)] FATAL: apt-get full-upgrade failed (exit $rc) — could not DOWNLOAD from the distribution mirror. Nothing was installed and this system is unchanged. Mirror outages are usually transient: run Install updates again in a few minutes."\n'
+        '  else\n'
+        '    echo "[$(TS)] FATAL: apt-get full-upgrade failed (exit $rc)"\n'
+        '  fi\n'
+        '  rm -f "$UPGLOG"; exit $rc\n'
+        'fi\n'
+        'rm -f "$UPGLOG"\n'
         'echo "[$(TS)] === DONE — safe to reboot ==="\n'
     )
     if pkg_mgr == 'dnf':
@@ -65492,8 +65961,20 @@ def _kernel_patch_start_job():
             '  sleep 5; WAITED=$((WAITED+5))\n'
             'done\n'
             'echo "[$(TS)] dnf -y upgrade (TAK Server packages excluded)"\n'
-            "dnf -y upgrade --exclude='takserver*' 2>&1 \\\n"
-            '  || { rc=$?; echo "[$(TS)] FATAL: dnf upgrade failed (exit $rc)"; exit $rc; }\n'
+            'UPGLOG="$(mktemp)"\n'
+            "dnf -y upgrade --exclude='takserver*' 2>&1 | tee \"$UPGLOG\"\n"
+            'rc=${PIPESTATUS[0]}\n'
+            'if [ "$rc" -ne 0 ]; then\n'
+            # Message parity with the apt leg. dnf already defaults to retries=10, so no
+            # retry knob is added here — only the honest fetch-vs-install distinction.
+            '  if grep -qiE "Failed to download|Cannot download|Error downloading packages|Could not resolve host|Connection timed out" "$UPGLOG"; then\n'
+            '    echo "[$(TS)] FATAL: dnf upgrade failed (exit $rc) — could not DOWNLOAD from the distribution mirror. Nothing was installed and this system is unchanged. Mirror outages are usually transient: run Install updates again in a few minutes."\n'
+            '  else\n'
+            '    echo "[$(TS)] FATAL: dnf upgrade failed (exit $rc)"\n'
+            '  fi\n'
+            '  rm -f "$UPGLOG"; exit $rc\n'
+            'fi\n'
+            'rm -f "$UPGLOG"\n'
             'echo "[$(TS)] === DONE — safe to reboot ==="\n'
         )
     _script_path = '/var/lib/infratak-kernel-patch.sh'
@@ -66324,7 +66805,13 @@ def _auto_update_guarddog():
                 .replace('ALERT_EMAIL_PLACEHOLDER', _safe_alert_email_list(alert_email))
                 .replace('ALERT_SMS_PLACEHOLDER', '')
                 .replace('CERT_PASS_PLACEHOLDER', cert_pass)
-                .replace('CONSOLE_VERSION_PLACEHOLDER', VERSION))
+                .replace('CONSOLE_VERSION_PLACEHOLDER', VERSION)
+                # v10.1.40: the updates watcher must compare Authentik against what THIS
+                # box's console will actually offer, not upstream latest — see
+                # scripts/guarddog/tak-updates-watch.sh.
+                .replace('UPDATE_CHANNEL_PLACEHOLDER',
+                         (settings.get('update_channel') or 'main').strip().lower())
+                .replace('AK_VETTED_PLACEHOLDER', AUTHENTIK_VETTED_RELEASE))
             if is_two_server and name in ('tak-remotedb-watch.sh', 'tak-remotedb-auth-watch.sh', 'tak-cotdb-watch.sh', 'tak-auto-vacuum.sh', 'tak-db-repack.sh', 'tak-retention-guard.sh'):
                 content = content.replace('DB_HOST_PLACEHOLDER', s1_host)
                 content = content.replace('DB_PORT_PLACEHOLDER', db_port)
@@ -66743,24 +67230,48 @@ def _startup_ensure_broker():
         active = subprocess.run(['systemctl', 'is-active', 'takwerx-broker'],
                                 capture_output=True, text=True, timeout=8).stdout.strip()
         if unit_changed or active != 'active' or src_hash != old_hash:
+            # v10.1.40 (B3b): when the console routes through the broker — which is EVERY
+            # non-root box, i.e. the whole fleet — this is a SELF-restart: the daemon is
+            # killed by the very command it is executing, so the response never arrives and
+            # the client's return code says nothing about whether the restart worked. It
+            # always looked like a failure (rc=1, JSONDecodeError traceback pre-B3a; rc=125
+            # after it), the stamp was therefore never written, and the next console start
+            # restarted the broker again — forever, on every box. The restart itself always
+            # SUCCEEDED (broker ActiveEnterTimestamp ~6s after the console's, NRestarts=0).
+            # So: on a self-restart, judge by re-probing the new daemon, not by rc. That is
+            # exactly what the v10.1.4 (WS9) mediation wait below already does — it just was
+            # not wired to the verdict. See PLAN-v10.1.40 §3B/§4B.
+            _self_restart = _broker_should_route() and _broker_available()
+
+            def _broker_mainpid():
+                """Read-only, no privilege needed. '' when UNKNOWN (not when zero).
+
+                v10.1.40: timeout is generous on purpose. test12 runs at load ~8 and an
+                8s timeout here expired, returning '' — which an earlier cut of this code
+                read as "the daemon did not restart" and refused to stamp. Unknown is not
+                failure; see the caller."""
+                for _attempt in (1, 2):
+                    try:
+                        _p = subprocess.run(['systemctl', 'show', 'takwerx-broker', '-p',
+                                             'MainPID', '--value'],
+                                            capture_output=True, text=True, timeout=20)
+                        _v = (_p.stdout or '').strip()
+                        if _v:
+                            return _v
+                    except Exception:
+                        pass
+                    time.sleep(1)
+                return ''
+
+            # v10.1.40: capture the PID BEFORE the restart. On a self-restart the mediation
+            # probe alone is not proof — the OLD daemon can answer it perfectly well if the
+            # restart silently never happened, and stamping that would recreate the exact
+            # v10.1.13 field wedge (box believes it converged, stale daemon denies verbs the
+            # console issues). Requiring a CHANGED MainPID makes "it actually restarted" the
+            # thing we verify, not "something is listening".
+            _pid_before = _broker_mainpid() if _self_restart else ''
             _rr = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takwerx-broker']),
                                  capture_output=True, text=True, timeout=20)
-            if _rr.returncode == 0:
-                try:
-                    with open(stamp, 'w') as sf:
-                        sf.write(src_hash)
-                except OSError:
-                    pass
-                print('Startup migration: privileged broker installed/(re)started (takwerx-broker.service)', flush=True)
-            else:
-                # v10.1.13: never stamp a FAILED restart. Stamping it made the box
-                # believe the broker converged, so the stale daemon was never
-                # retried — a console then issues verbs its own broker denies,
-                # and every privileged action fails until a manual start.sh
-                # (the 2026-07-28 field wedge). Leaving the old stamp makes the
-                # next console boot retry the restart.
-                print(f"Startup migration: ⚠ broker restart FAILED (rc={_rr.returncode}): "
-                      f"{(_rr.stderr or _rr.stdout or '').strip()[:200]} — will retry next boot", flush=True)
             # v10.1.4 (WS9): after the restart, BLOCK until the new daemon mediates a real
             # exec. The restart tears down the socket, and the module-level migrations that
             # run next (hardening posture re-assert, TAK Portal recreate, …) raced the new
@@ -66768,10 +67279,19 @@ def _startup_ensure_broker():
             # console restart (test12 2026-07-17, 17:31:42-43 — 4s after the restart the
             # daemon still wasn't accepting). Downstream "brief waits" existed but guessed
             # too short under load; waiting HERE fixes every caller at once.
+            # v10.1.40: 30s was a guess (v10.1.4) and test12 disproves it. systemd reports
+            # takwerx-broker Stopping→Started within the SAME second there, yet the daemon
+            # was still not accepting on the socket 45s later at load ~8 — the Portal,
+            # CloudTAK and metrics converge steps all hit 'Connection refused' AFTER the
+            # 30s window had already expired. Because the verdict now feeds the stamp, a
+            # too-short wait means the box never converges and restarts the broker on every
+            # console start forever. This wait only runs when a restart actually happened,
+            # so the extra ceiling costs nothing on a settled box.
+            _BROKER_MEDIATE_SECS = 60
+            _rw_ok = False
             if _broker_should_route():
                 _rw_t0 = time.time()
-                _rw_ok = False
-                while time.time() - _rw_t0 < 30:
+                while time.time() - _rw_t0 < _BROKER_MEDIATE_SECS:
                     try:
                         if _broker_available():
                             _rw = subprocess.run(_sudo_wrap(['systemctl', '--version']),
@@ -66782,9 +67302,60 @@ def _startup_ensure_broker():
                     except Exception:
                         pass
                     time.sleep(1)
-                if not _rw_ok:
-                    print('Startup migration: ⚠ broker not mediating within 30s of its restart — '
-                          'later migrations may fail and will retry next console restart', flush=True)
+            # A self-restart's rc is meaningless (see above); a direct restart's rc is not.
+            # For the self-restart verdict, mediation is necessary but NOT sufficient —
+            # the daemon must also be a NEW process (see _pid_before).
+            if _self_restart:
+                _pid_after = _broker_mainpid()
+                # THREE states, not two. `None` = inconclusive (we could not read a PID on
+                # one side or the other), and inconclusive must NEVER read as failure —
+                # that is the same trap as classifying `caddy validate`'s permission-denied
+                # as a bad config (GH #59). Here it would refuse to stamp a broker that
+                # restarted perfectly well, leaving the box in the very loop this fixes.
+                if _pid_before and _pid_after and _pid_after != '0':
+                    _restarted = (_pid_after != _pid_before)
+                else:
+                    _restarted = None
+                # Mediation is the primary proof: it is a positive liveness signal from the
+                # daemon itself. The PID check exists only to VETO the case where the OLD
+                # daemon answered because the restart never happened.
+                _restart_ok = _rw_ok and (_restarted is not False)
+            else:
+                _restarted = True
+                _restart_ok = (_rr.returncode == 0)
+            if _restart_ok:
+                try:
+                    with open(stamp, 'w') as sf:
+                        sf.write(src_hash)
+                except OSError:
+                    pass
+                print('Startup migration: privileged broker installed/(re)started (takwerx-broker.service)', flush=True)
+                if _broker_should_route() and not _rw_ok:
+                    # Restart judged OK but the daemon still is not answering: downstream
+                    # migrations are about to race it, so say so (the v10.1.4 WS9 warning).
+                    print(f'Startup migration: ⚠ broker not mediating within '
+                          f'{_BROKER_MEDIATE_SECS}s of its restart — later migrations may '
+                          'fail and will retry next console restart', flush=True)
+            else:
+                # v10.1.13: never stamp a FAILED restart. Stamping it made the box
+                # believe the broker converged, so the stale daemon was never
+                # retried — a console then issues verbs its own broker denies,
+                # and every privileged action fails until a manual start.sh
+                # (the 2026-07-28 field wedge). Leaving the old stamp makes the
+                # next console boot retry the restart.
+                # v10.1.40: on a self-restart say WHICH signal failed. rc is not the
+                # evidence there — "the new daemon never answered within 30s" is.
+                if _self_restart:
+                    if _restarted is False:
+                        _why = f'the daemon did not restart (MainPID still {_pid_before})'
+                    else:
+                        _why = (f'the new daemon did not answer within {_BROKER_MEDIATE_SECS}s '
+                                'of its restart')
+                    print(f'Startup migration: ⚠ broker restart FAILED — {_why}. '
+                          'Later migrations may fail; will retry next boot', flush=True)
+                else:
+                    print(f"Startup migration: ⚠ broker restart FAILED (rc={_rr.returncode}): "
+                          f"{(_rr.stderr or _rr.stdout or '').strip()[:200]} — will retry next boot", flush=True)
     except PermissionError:
         pass
     except Exception as _e:
@@ -66851,6 +67422,63 @@ def _startup_repo_ownership_heal():
         print(f"Startup migration: repo ownership heal error (non-fatal): {_e}", flush=True)
 
 
+def _startup_normalize_git_refspec():
+    """v10.1.40 (C2): make `git fetch origin <branch>` actually update a tracking ref.
+
+    `remote.origin.fetch` is not uniform across the fleet and two of five boxes could not
+    pull `dev` with the canonical T&E command at all. Surveyed 2026-08-19:
+
+        test6, test8   +refs/heads/dev:refs/remotes/origin/dev   (dev only)
+        test12, nuc    +refs/heads/*:refs/remotes/origin/*       (correct)
+        aws-arm        (EMPTY)                                   (nothing ever updates)
+
+    With an empty or branch-scoped refspec, `git fetch origin dev` fetches the objects but
+    updates NO tracking ref, so the `git checkout -B dev origin/dev` that follows resolves
+    against a STALE origin/dev and the box silently stays on its previous SHA while the
+    command reports success. That is the "soaking the wrong SHA" hazard — found on aws-arm
+    2026-08-18 during GH #59 validation. T&E Step 2's SHA gate caught it, so the procedure
+    held, but a pull that silently no-ops should not depend on a downstream gate.
+
+    Converges every box on the git default. Console-owned file (.git/config), so no broker
+    and no privilege needed — and deliberately NOT in start.sh, because fixes have to ride
+    the console update ([[feedback-console-path-delivery]]).
+
+    Fleet-uniform by construction: one constant, written unconditionally when it differs.
+    Never a max()/preserve of whatever the box happened to have."""
+    WANT = '+refs/heads/*:refs/remotes/origin/*'
+    try:
+        repo = os.path.dirname(os.path.abspath(__file__))
+        if not os.path.isdir(os.path.join(repo, '.git')):
+            return
+        gitc = ['git', '-c', f'safe.directory={repo}']
+        cur = subprocess.run(gitc + ['config', '--get-all', 'remote.origin.fetch'],
+                             cwd=repo, capture_output=True, text=True, timeout=20)
+        have = [l.strip() for l in (cur.stdout or '').splitlines() if l.strip()]
+        if have == [WANT]:
+            return                                    # already converged — silent no-op
+        r = subprocess.run(gitc + ['config', '--replace-all', 'remote.origin.fetch', WANT],
+                           cwd=repo, capture_output=True, text=True, timeout=20)
+        if r.returncode != 0:
+            print(f"Startup migration: git refspec normalise FAILED: "
+                  f"{(r.stderr or r.stdout or '').strip()[:200]}", flush=True)
+            return
+        # Verify rather than assume — this whole migration exists because a git command
+        # reported success while changing nothing.
+        chk = subprocess.run(gitc + ['config', '--get-all', 'remote.origin.fetch'],
+                             cwd=repo, capture_output=True, text=True, timeout=20)
+        now = [l.strip() for l in (chk.stdout or '').splitlines() if l.strip()]
+        if now == [WANT]:
+            print(f"Startup migration: git refspec normalised {have or ['(empty)']} -> "
+                  f"{WANT} — `git fetch origin <branch>` now updates its tracking ref",
+                  flush=True)
+        else:
+            print(f"Startup migration: ⚠ git refspec normalise did not take, still {now}",
+                  flush=True)
+    except Exception as _e:
+        print(f"Startup migration: git refspec normalise error (non-fatal): {_e}", flush=True)
+
+
+_startup_normalize_git_refspec()
 _startup_repo_ownership_heal()
 _startup_ensure_broker()
 
@@ -68818,9 +69446,12 @@ def _fail2ban_install_and_configure(plog):
         _sudo_wrap(['docker', 'ps', '--format', '{{.Names}}']),
         capture_output=True, text=True).stdout
     if 'authentik' in ak_running:
-        subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', 'authentik-log-forwarder']),
-                       capture_output=True)
-        plog("fail2ban migration: Authentik detected — log forwarder enabled and started")
+        # v10.1.40: report what actually happened. This used to print
+        # "enabled and started" unconditionally, over a start whose return code was
+        # discarded — so a refused start read as a success in the deploy log.
+        _fok, _fmsg = _f2b_start_ak_forwarder(plog)
+        plog("fail2ban migration: Authentik detected — %s"
+             % ('log forwarder enabled and started' if _fok else _fmsg))
     else:
         plog("fail2ban migration: Authentik not running — log forwarder will start when Authentik jail is enabled")
     subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', 'fail2ban']),
