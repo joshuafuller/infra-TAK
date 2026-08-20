@@ -804,7 +804,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.41-alpha"
+VERSION = "10.1.42-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -5558,6 +5558,20 @@ AK_EVENT_RETENTION = 'days=30'
 # KEEP IN SYNC with the two blueprint literals (`session_duration: hours=1` in the local and
 # remote tak-ldap-setup.yaml templates) — those are plain strings and cannot interpolate this.
 AK_LDAP_SESSION_DURATION = 'hours=1'
+
+# v10.1.42 W-P4 — TAK Server's CoreConfig <ldap updateinterval> is in MILLISECONDS.
+# TAK Server Configuration Guide 5.7 and 5.8, <ldap> attribute table: "Frequency (in
+# milliseconds) at which the server refreshes group memberships from LDAP" — and both guides'
+# example stanza reads updateinterval="60000". infra-TAK wrote a literal '30' from the start,
+# i.e. 30 MILLISECONDS. That does not poll at 33 Hz: it means the group-membership cache is
+# expired at every check, so every auth/group lookup goes live to LDAP and the cache never
+# serves a hit. That is the bind+search chatter seen across the fleet, and it is ambient load
+# feeding the Authentik event/CPU churn (see memory authentik-2026-5-event-task-churn-fleet-cpu).
+# Raised by Christian Elsen (AWS) 2026-08-20 and confirmed against both guides.
+# 30000 = a real 30-second refresh: channel-membership changes still propagate in under 30s,
+# while LDAP traffic drops by orders of magnitude. Fleet constant — never tune it per box, and
+# never "helpfully" shrink the number: the unit is milliseconds.
+TAK_LDAP_UPDATE_INTERVAL_MS = '30000'
 
 # v10.1.17 W4 — finished-task retention for the 2026.5 postgres-backed worker queue.
 # Stock AUTHENTIK_WORKER__TASK_EXPIRATION=days=30 held ~59k `done` rows per box in
@@ -22239,6 +22253,56 @@ def fedhub_rotate_ca_log_api():
     })
 
 
+def _caddy_acme_issuer_key(ca_url):
+    """Caddy's certificate-store directory name for an ACME directory URL, or '' if unparseable.
+
+    certmagic keys the store by host + path with '/' turned into '-', so
+    https://acme-v02.api.letsencrypt.org/directory -> acme-v02.api.letsencrypt.org-directory.
+    Callers must treat the result as a HINT and verify it against what is actually on disk —
+    if this derivation is ever wrong, an unmatched hint degrades to the previous behaviour
+    instead of pointing at a directory that does not exist."""
+    try:
+        from urllib.parse import urlparse as _urlparse
+        u = _urlparse((ca_url or '').strip())
+        if not u.netloc:
+            return ''
+        return (u.netloc + (u.path or '').replace('/', '-')).strip('-')
+    except Exception:
+        return ''
+
+
+def _caddy_configured_issuer_dir():
+    """The issuer directory name infra-TAK BELIEVES is live, from config rather than from mtime.
+
+    v10.1.42 (W-C3). With an operator-set CA, that is its directory. With none set, the box is on
+    Caddy's default pair and the answer is Let's Encrypt — ZeroSSL is only a fallback. Returning
+    the LE name in the unconfigured case is the half that matters: the failure this fixes happened
+    after a REVERT, when acme_ca is empty and the abandoned issuer's directory is still newest."""
+    try:
+        ca = (load_caddy_acme().get('acme_ca') or '').strip()
+    except Exception:
+        ca = ''
+    return _caddy_acme_issuer_key(ca) if ca else CADDY_LE_ISSUER_DIR
+
+
+def _caddy_cert_not_expired(crt_path):
+    """True when the PEM at crt_path is currently valid. Unverifiable -> True (see below).
+
+    The store is 0700 caddy:caddy, so the bytes come through _read_priv and openssl reads them on
+    stdin (openssl is not broker-allowlisted and does not need to be). On any failure this answers
+    True: the caller uses it only to reject an EXPIRED preferred issuer, and 'could not check' must
+    not silently hand the decision back to newest-wins — that is the behaviour being fixed."""
+    try:
+        pem = _read_priv(crt_path)
+        if not (pem or '').strip():
+            return True
+        r = subprocess.run(['openssl', 'x509', '-checkend', '0', '-noout'],
+                           input=pem, capture_output=True, text=True, timeout=5)
+        return r.returncode == 0
+    except Exception:
+        return True
+
+
 def _caddy_acme_cert_base(domain=None):
     """Return the ACME issuer directory inside Caddy's cert store, resolved from disk.
 
@@ -22263,10 +22327,18 @@ def _caddy_acme_cert_base(domain=None):
       - With a `domain`, find that domain's actual `<domain>.crt` under any issuer directory
         and return the issuer directory holding it.
       - When several issuers hold a cert for the domain (the switching case — Caddy does not
-        delete the old CA's copy), take the **most recently written**, which is the one being
-        renewed. Preferring the Let's Encrypt name here would be wrong: after a switch it is
-        the stale copy.
-      - Without a `domain`, return the only issuer directory present, else the LE one.
+        delete the old CA's copy), prefer the issuer we are CONFIGURED to use
+        (_caddy_configured_issuer_dir()), and fall back to the most recently written.
+
+        v10.1.42 (W-C3): newest-wins alone is wrong in the direction that hurts. After a CA is
+        reverted, the abandoned issuer's directory stays newest until the real cert renews, so
+        the resolver keeps returning it — on `nuc` that primed _selfheal_takserver_le_cert() to
+        import a **staging** certificate into TAK's 8446 keystore, which is the documented
+        WebTAK-403 / CloudTAK-login-failure signature. Configuration is the authority on which
+        issuer is live; mtime is only the tie-breaker. The preferred directory is skipped if its
+        certificate has actually expired, so a genuine ZeroSSL fallback still resolves.
+      - Without a `domain`, return the configured issuer's directory when it exists, else the
+        only issuer directory present, else the LE one.
       - On any doubt, fall back to the Let's Encrypt path — today's behaviour, so this can
         never be worse than what it replaces.
 
@@ -22299,12 +22371,28 @@ def _caddy_acme_cert_base(domain=None):
             if rows:
                 rows.sort(reverse=True)
                 # <store>/<issuer>/<domain>/<domain>.crt -> <store>/<issuer>
-                return os.path.dirname(os.path.dirname(rows[0][1]))
+                newest = os.path.dirname(os.path.dirname(rows[0][1]))
+                if len(rows) == 1:
+                    return newest
+                # More than one issuer holds a cert for this domain — a CA switch or a revert.
+                # Configuration decides, not mtime. See W-C3 in the docstring.
+                want = _caddy_configured_issuer_dir()
+                if want:
+                    for _ts, _path in rows:
+                        _base = os.path.dirname(os.path.dirname(_path))
+                        if os.path.basename(_base) == want and _caddy_cert_not_expired(_path):
+                            return _base
+                return newest
             return le
         r = subprocess.run(_sudo_wrap([
             'find', CADDY_CERT_STORE, '-mindepth', '1', '-maxdepth', '1', '-type', 'd']),
             capture_output=True, text=True, timeout=15)
         dirs = [ln.strip() for ln in (r.stdout or '').splitlines() if ln.strip()]
+        want = _caddy_configured_issuer_dir()
+        if want:
+            for d in dirs:
+                if os.path.basename(d) == want:
+                    return d
         if len(dirs) == 1:
             return dirs[0]
         return le
@@ -23147,23 +23235,25 @@ def caddy_acme_set():
             return jsonify({'success': False, 'error': f'Could not clear: {e}'}), 500
         print('AUDIT: ACME issuer reverted to the Caddy default by %s'
               % (session.get('authentik_username') or 'console-admin'), flush=True)
-        msg = ("Reverted to Caddy's default CA (Let's Encrypt, ZeroSSL fallback). Existing "
-               "certificates keep serving until they renew.")
+        # v10.1.42 (W-C2): the old message said "existing certificates keep serving until they
+        # renew". They do not — Caddy reissues from the new issuer within seconds. That claim was
+        # wrong on the way out AND on the way back.
+        msg = ("Reverted to Caddy's default CA (Let's Encrypt, ZeroSSL fallback). Caddy is "
+               "requesting fresh certificates now; give it a minute, then reload this page.")
         try:
             eab_changed = _sync_caddy_acme_eab_dropin({})   # removes the credential drop-in
         except Exception:
             eab_changed = True
         if (load_settings().get('fqdn') or '').strip():
-            try:
-                generate_caddyfile()
-            except Exception as e:
-                return jsonify({'success': False, 'error': f'Caddyfile regeneration failed: {e}'}), 500
-            r = subprocess.run(_sudo_wrap(['systemctl', 'restart' if eab_changed else 'reload', 'caddy']),
-                               capture_output=True, text=True, timeout=90)
-            if r.returncode != 0:
-                return jsonify({'success': False,
-                                'error': 'Setting cleared but Caddy reload failed: '
-                                         + (r.stdout or r.stderr or '').strip()[-300:]}), 500
+            # v10.1.42 (W-C1): DEFER. The console is behind Caddy, so restarting it here kills
+            # the connection carrying this very response and the browser reports
+            # "TypeError: Failed to fetch" for work that fully succeeded. The Caddyfile is
+            # regenerated inside the deferred worker and any failure lands in caddy_last_action,
+            # which the Caddy card and /api/caddy/log already surface.
+            threading.Thread(target=_caddy_restart_after_response,
+                             kwargs={'action': 'acme-revert',
+                                     'verb': 'restart' if eab_changed else 'reload'},
+                             daemon=True).start()
         return jsonify({'success': True, 'message': msg})
 
     cfg = {
@@ -23199,26 +23289,33 @@ def caddy_acme_set():
     except Exception as e:
         return jsonify({'success': False,
                         'error': f'Saved, but the EAB credential drop-in failed: {e}'}), 500
-    if not (load_settings().get('fqdn') or '').strip():
+    _s_now = load_settings()
+    if not (_s_now.get('fqdn') or '').strip():
         return jsonify({'success': True, 'warning': warn,
                         'message': 'Saved. It takes effect when a base domain is configured.'})
-    try:
-        generate_caddyfile()
-    except Exception as e:
-        return jsonify({'success': False, 'error': f'Saved, but Caddyfile regeneration failed: {e}'}), 500
+    # The way back in, spelled out with this box's real address — an operator reading this
+    # message may be about to lose the hostname it is served on.
+    _ip_url = (f"https://{(_s_now.get('server_ip') or '').strip()}"
+               f":{_s_now.get('console_port') or 5001}")
+    # v10.1.42 (W-C1): DEFER the apply. The console is behind Caddy, so restarting it inline
+    # kills the connection carrying this response — every Save & apply reported
+    # "TypeError: Failed to fetch" for an operation that had fully succeeded (found on nuc).
     # systemd reads Environment= at unit START, so changed credentials need a restart; a
     # reload would leave Caddy holding the previous (or empty) EAB values.
-    _verb = 'restart' if eab_changed else 'reload'
-    r = subprocess.run(_sudo_wrap(['systemctl', _verb, 'caddy']),
-                       capture_output=True, text=True, timeout=90)
-    if r.returncode != 0:
-        return jsonify({'success': False, 'warning': warn,
-                        'error': 'Saved, but Caddy reload failed: '
-                                 + (r.stdout or r.stderr or '').strip()[-300:]}), 500
+    threading.Thread(target=_caddy_restart_after_response,
+                     kwargs={'action': 'acme-set',
+                             'verb': 'restart' if eab_changed else 'reload'},
+                     daemon=True).start()
     return jsonify({
         'success': True, 'warning': warn,
-        'message': ('Certificate authority updated. Caddy will request new certificates from '
-                    'it as each one renews — existing certificates keep serving until then.'),
+        # v10.1.42 (W-C2): this used to say certificates were not reissued until renewal. False —
+        # on nuc every hostname was reissued from the new CA within seconds. Telling an operator a
+        # CA change is low-impact when it changes what every browser sees, at once, is how someone
+        # ends up locked out of a box in the field.
+        'message': ('Certificate authority updated. Caddy is requesting new certificates from it '
+                    'NOW — every hostname on this box will be reissued within about a minute. If '
+                    'the new certificates are not trusted, reach the console at '
+                    + _ip_url + ' (HSTS does not apply to a bare IP) and revert.'),
     })
 
 
@@ -23642,17 +23739,23 @@ def _caddy_failure_detail():
     return lines[-1][-400:] if lines else ''
 
 
-def _caddy_restart_after_response(action='restart'):
+def _caddy_restart_after_response(action='restart', verb='restart'):
     """Run in background: write Caddyfile and restart Caddy after a short delay so
     the HTTP response can be sent first (console is often behind Caddy).
 
     Records the outcome in caddy_last_action so a failure is visible on the Caddy
-    card and in /api/caddy/log instead of vanishing."""
+    card and in /api/caddy/log instead of vanishing.
+
+    `action` is the label shown in the UI; `verb` is what systemctl actually does. v10.1.42
+    (W-C1) added `verb` so the ACME-issuer route can defer a *reload* when only the Caddyfile
+    changed, and a *restart* when the EAB credential drop-in changed (systemd reads
+    Environment= at unit START, so a reload would leave Caddy holding the previous values).
+    Every existing caller keeps the restart default."""
     time.sleep(2)
     rc, out, ok = None, '', False
     try:
         generate_caddyfile(load_settings())
-        r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'caddy']), stdout=subprocess.PIPE,
+        r = subprocess.run(_sudo_wrap(['systemctl', verb, 'caddy']), stdout=subprocess.PIPE,
                            stderr=subprocess.STDOUT, text=True, timeout=90)
         rc = r.returncode
         out = (r.stdout or '').strip()
@@ -23670,7 +23773,7 @@ def _caddy_restart_after_response(action='restart'):
             detail = _caddy_failure_detail()
             out = (out + ('\n' + detail if detail else '')).strip()
     except subprocess.TimeoutExpired:
-        rc, ok, out = -1, False, 'systemctl restart caddy timed out after 90s'
+        rc, ok, out = -1, False, f'systemctl {verb} caddy timed out after 90s'
     except Exception as e:
         rc, ok, out = -1, False, f'{type(e).__name__}: {e}'
     caddy_last_action.update({'ok': ok, 'action': action, 'rc': rc,
@@ -29276,35 +29379,79 @@ def takportal_page():
 takportal_deploy_log = []
 takportal_deploy_status = {'running': False, 'complete': False, 'error': False}
 
-# Keys in TAK Portal settings.json that are configurable in TAK Portal UI (e.g. custom logo/photo). We never overwrite these when pushing settings on update/reconfigure/deploy.
-# EMAIL_ALWAYS_CC / EMAIL_SEND_COPY_TO: operator-set CC/BCC addresses entered in TAK
-# Portal's UI. _portal_email_settings() always emits them as "" — without preserve,
-# every settings push (deploy, update-config, post-update guardrail) wiped them
-# (field report, fixed v10.1.19). Preserve-if-set: fresh installs still get "".
-# EMAIL_FAIL_HARD (v10.1.20): operator POLICY, not transport — preserve-if-set too.
-PRESERVE_TAKPORTAL_KEYS = frozenset(['BRAND_LOGO_URL', 'TAK_SSH_ONBOARDED', 'TAK_SSH_LAST_HANDSHAKE_AT',
-                                     'EMAIL_ALWAYS_CC', 'EMAIL_SEND_COPY_TO', 'EMAIL_FAIL_HARD'])
+# TAK Portal's settings.json is OPERATOR-OWNED (v10.1.42, W-P1).
+#
+# infra-TAK is authoritative for the keys below and NOTHING else. Every other key
+# _takportal_build_settings_dict() emits is SEED-ONLY: written when the portal's file has
+# no value for it (fresh install, or a key the portal has never had), never overwritten
+# afterwards. Hands-off is the DEFAULT, not an opt-out.
+#
+# This replaces the old PRESERVE_TAKPORTAL_KEYS allowlist ("write everything except these"),
+# which lost an operator's setting three times before anyone noticed: EMAIL_ALWAYS_CC /
+# EMAIL_SEND_COPY_TO (v10.1.19), EMAIL_FAIL_HARD (v10.1.20), and TAK_SSH_USER /
+# TAK_SSH_LAST_HANDSHAKE_AT (field report, Justin Davis/TN, 2026-08-20). Every new key we
+# emitted was another field a customer lost before we heard about it. Do not reintroduce a
+# preserve-list — widen this authoritative set only when infra-TAK genuinely owns the fact,
+# and only deliberately. See CLAUDE.md "Third-party app config is operator-owned".
+#
+# AUTHENTIK_URL / AUTHENTIK_TOKEN: the portal cannot talk to Authentik without these, they are
+# derived entirely from infra-TAK's own deployment, and a blank token freezes portal user
+# management (_heal_takportal_authentik_token). AUTHENTIK_BOOTSTRAP_TOKEN is listed for the
+# same reason should the portal ever consume it (we do not emit it today).
+TAKPORTAL_AUTHORITATIVE_KEYS = frozenset(['AUTHENTIK_URL', 'AUTHENTIK_TOKEN',
+                                          'AUTHENTIK_BOOTSTRAP_TOKEN'])
 
 # Email TRANSPORT keys (v10.1.20): authoritative when the Email Relay module is configured,
 # SEED-ONLY (write-if-absent) when it is not — see _takportal_merged_settings_json().
+# EMAIL_ALWAYS_CC / EMAIL_SEND_COPY_TO / EMAIL_FAIL_HARD are deliberately NOT transport:
+# they are operator policy and stay seed-only even while the relay is configured.
 EMAIL_TRANSPORT_KEYS = frozenset(['EMAIL_ENABLED', 'EMAIL_PROVIDER', 'SMTP_HOST', 'SMTP_PORT',
                                   'SMTP_SECURE', 'SMTP_USER', 'SMTP_PASS', 'SMTP_FROM'])
 
 
 def _takportal_get_existing_settings():
-    """Read current settings.json from TAK Portal container. Returns dict or {} if container missing or file invalid."""
+    """Read current settings.json from TAK Portal container. Returns dict or {} if container missing or file invalid.
+
+    v10.1.42: falls back to `docker cp` when `docker exec` fails. exec needs a RUNNING
+    container; cp works on a created/stopped one. The deploy path seeds settings.json into a
+    created-but-not-started container — without this fallback that seed read {} and rewrote
+    the whole file from our defaults, clobbering operator values on any redeploy."""
     try:
         r = subprocess.run(
             _sudo_wrap(['docker', 'exec', 'tak-portal', 'cat', '/usr/src/app/data/settings.json']), capture_output=True, text=True, timeout=10)
-        if r.returncode != 0 or not (r.stdout or '').strip():
+        if r.returncode == 0 and (r.stdout or '').strip():
+            return json.loads(r.stdout.strip())
+    except Exception:
+        pass
+    # Container not running (or exec unavailable) — stream the file out as a tar on stdout.
+    # `docker cp <container>:<path> -` avoids writing a temp file: under _sudo_wrap the copy
+    # would land root-owned and a non-root console could not read it back.
+    try:
+        import io as _io
+        import tarfile as _tarfile
+        cp = subprocess.run(
+            _sudo_wrap(['docker', 'cp', 'tak-portal:/usr/src/app/data/settings.json', '-']),
+            capture_output=True, timeout=15)
+        if cp.returncode != 0 or not cp.stdout:
             return {}
-        return json.loads(r.stdout.strip())
+        with _tarfile.open(fileobj=_io.BytesIO(cp.stdout)) as tf:
+            member = next((m for m in tf.getmembers() if m.isfile()), None)
+            if member is None:
+                return {}
+            body = (tf.extractfile(member).read() or b'').decode('utf-8', 'replace').strip()
+        return json.loads(body) if body else {}
     except Exception:
         return {}
 
 
 def _takportal_build_settings_dict(settings):
-    """Build infra-TAK managed TAK Portal settings dict (no merge)."""
+    """Build infra-TAK's view of TAK Portal's settings (no merge).
+
+    v10.1.42: this is a PROPOSAL, not a mandate. Only TAKPORTAL_AUTHORITATIVE_KEYS (plus the
+    email transport keys while Email Relay is configured) are actually written over an
+    existing portal value — everything else here is seed-only. See
+    _takportal_merged_settings_json(); never docker-cp this dict straight into a portal that
+    already has a settings.json."""
     server_ip = (settings.get('server_ip') or '').strip() or 'localhost'
     ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
     # v10.0.9 preserve-on-empty: if the .env read comes back empty (e.g. a config rebuild racing
@@ -29339,8 +29486,8 @@ def _takportal_build_settings_dict(settings):
     # _write_takportal_override) — that resolves the FQDN to 172.17.0.1 INSIDE the container on
     # both normal and gateway-fronted boxes (the Portal validates the CA chain, not the
     # hostname). Reverts c384fc8's host.docker.internal override, which leaked into every QR.
-    # Recomputed every build (deterministic; never preserved — TAK_URL is intentionally NOT in
-    # PRESERVE_TAKPORTAL_KEYS).
+    # v10.1.42: seed-only like the rest — recomputed here, but only written into a portal
+    # that has no TAK_URL yet. An operator who edits it in the portal UI keeps their value.
     tak_dns = (_get_takserver_host(settings) or '').strip()
     if settings.get('fqdn') and tak_dns:
         tak_url_host = tak_dns
@@ -29357,6 +29504,10 @@ def _takportal_build_settings_dict(settings):
     # SSH user = whoever the console runs as — that's whose ~/.ssh/authorized_keys
     # _takportal_setup_ssh installs the portal key into (root, or takwerx after the
     # non-root flip).
+    # v10.1.42: SEED-ONLY. Justin Davis (TN) had deliberately set TAK_SSH_USER=root; the old
+    # "overwrite when the current value looks like something we wrote" heuristic classified his
+    # choice as our leftover and healed it away on every portal update. We now propose this
+    # value for a portal that has none, and never touch it again.
     ssh_user = 'root'
     if tak_local:
         try:
@@ -29364,7 +29515,7 @@ def _takportal_build_settings_dict(settings):
             ssh_user = _pwd.getpwuid(os.getuid()).pw_name
         except Exception:
             pass
-    return {
+    _built = {
         "AUTHENTIK_URL": f"http://{auth_url_host}:{auth_url_port}",
         "AUTHENTIK_TOKEN": ak_token or "",
         # v0.9.15 — akadmin and webadmin are both HIDDEN and ACTION-LOCKED in
@@ -29404,39 +29555,100 @@ def _takportal_build_settings_dict(settings):
         "TAK_SSH_PUBLIC_KEY_PATH": "data/ssh/tak_ssh_ed25519.pub",
         "TAK_SSH_PASSPHRASE": "",
     }
+    # v10.1.42 (W-P2): TAK_SSH_ONBOARDED used to be written by a SECOND writer inside
+    # _takportal_setup_ssh() that bypassed every merge rule. It is emitted here instead — as a
+    # seed, and only once the keypair actually exists on disk, so a portal that has never been
+    # onboarded is told "true" only when it is true. TAK_SSH_LAST_HANDSHAKE_AT is deliberately
+    # NOT emitted: it means "when the PORTAL last handshook", a fact we do not own.
+    if tak_local and os.path.exists(os.path.expanduser('~/TAK-Portal/data/ssh/tak_ssh_ed25519')):
+        _built["TAK_SSH_ONBOARDED"] = "true"
+    return _built
+
+
+def _takportal_settings_value_is_blank(v):
+    """True when a settings.json value carries no operator intent (missing / empty / whitespace).
+
+    A blank value is not a choice — seeding over it is safe, and it is what un-sticks a key that
+    was written as "" before its source existed (e.g. AUTHENTIK_PUBLIC_URL seeded before an FQDN
+    was set). Any non-empty value — including False / 0 — is treated as the operator's."""
+    if v is None:
+        return True
+    if isinstance(v, str):
+        return not v.strip()
+    return False
 
 
 def _takportal_merged_settings_json(settings):
-    """Build settings JSON for TAK Portal, preserving user-configured keys (e.g. BRAND_LOGO_URL / custom photo) from existing container settings."""
+    """Build settings JSON for TAK Portal. THE single source of every settings.json we write.
+
+    v10.1.42 (W-P1) — ownership is inverted. The old model wrote everything infra-TAK computes
+    EXCEPT an ever-growing preserve-list, so every key we added was a field an operator could
+    lose silently. The model now:
+
+      * TAKPORTAL_AUTHORITATIVE_KEYS  -> always written (the portal breaks without them)
+      * EMAIL_TRANSPORT_KEYS          -> written only while Email Relay is configured (v10.1.20)
+      * everything else               -> SEED-ONLY: written when the portal has no value of its
+                                         own for the key, never overwritten afterwards
+      * keys we do not emit at all    -> untouched, always
+
+    There is deliberately no heuristic that infers ownership from the VALUE. "Overwrite it if it
+    equals something we might have written" cannot tell our default from an operator who chose
+    the same thing — that is exactly how a customer's deliberate TAK_SSH_USER=root was healed
+    away on every portal update (field report, Justin Davis/TN, 2026-08-20)."""
     existing = _takportal_get_existing_settings()
     our = _takportal_build_settings_dict(settings)
     merged = dict(existing) if isinstance(existing, dict) else {}
-    # SSH target: an operator-entered host/user/port (on-prem internal IP, non-root SSH
-    # user) must survive every settings push. Only values infra-TAK itself is known to
-    # have written are overwritten — so boxes broken by the old server_ip default
-    # self-heal on the next push, while manual fixes are never clobbered again.
-    _server_ip = (settings.get('server_ip') or '').strip()
-    _ssh_managed = {
-        'TAK_SSH_HOST': {'host.docker.internal', _server_ip},
-        'TAK_SSH_USER': {'root', (our.get('TAK_SSH_USER') or '')},
-        'TAK_SSH_PORT': {'22'},
-    }
     # v10.1.20 email ownership: when the Email Relay module IS configured, infra-TAK is
-    # authoritative for the portal's email TRANSPORT keys. When it is NOT, those keys are
-    # SEED-ONLY — written once on a portal whose settings lack them (fresh install), never
-    # overwritten after, so a manually-configured portal SMTP survives every settings push.
+    # authoritative for the portal's email TRANSPORT keys — our relay, our credentials, and they
+    # must follow a relay reconfigure. When it is NOT, they fall back to seed-only like
+    # everything else, so a hand-configured portal SMTP survives every settings push.
     _relay = settings.get('email_relay') or {}
     _relay_configured = bool(_relay.get('relay_host') and _relay.get('smtp_user'))
     for k, v in our.items():
-        cur = (merged.get(k) or '').strip() if isinstance(merged.get(k), str) else ''
-        if k in PRESERVE_TAKPORTAL_KEYS and cur:
+        if _takportal_settings_value_is_blank(merged.get(k)):
+            merged[k] = v  # seed — the portal has no value of its own for this key
             continue
-        if k in EMAIL_TRANSPORT_KEYS and not _relay_configured and k in merged:
-            continue  # no relay to speak for — portal's email transport is operator-owned
-        if k in _ssh_managed and cur and cur not in _ssh_managed[k]:
-            continue  # operator-customized SSH target — never overwrite
-        merged[k] = v
+        if k in TAKPORTAL_AUTHORITATIVE_KEYS:
+            merged[k] = v
+            continue
+        if k in EMAIL_TRANSPORT_KEYS and _relay_configured:
+            merged[k] = v
+            continue
+        # operator-owned — hands off, whatever the current value is
     return json.dumps(merged, indent=2)
+
+
+def _takportal_write_settings_json(settings_json, plog=None):
+    """v10.1.42 (W-P2): the ONE and ONLY writer of TAK Portal's settings.json.
+
+    Every path that updates the portal's settings goes through here, and everything that reaches
+    here has been through _takportal_merged_settings_json(). A second writer is how
+    TAK_SSH_LAST_HANDSHAKE_AT got clobbered *despite* being on the old preserve-list: it did its
+    own read-modify-write straight into the container and bypassed every rule. If you are about
+    to add another `docker cp ... tak-portal:/usr/src/app/data/settings.json` — don't; call this.
+
+    Returns (ok, error_message). Never raises."""
+    _log = plog or (lambda m: print(m, flush=True))
+    try:
+        fd, tmp = tempfile.mkstemp(suffix='.json', prefix='takportal-settings-')
+        try:
+            with os.fdopen(fd, 'w') as f:
+                f.write(settings_json)
+            cp = subprocess.run(_sudo_wrap(['docker', 'cp', tmp, 'tak-portal:/usr/src/app/data/settings.json']),
+                                capture_output=True, text=True, timeout=20)
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        if cp.returncode != 0:
+            err = ((cp.stderr or cp.stdout) or 'docker cp failed').strip()[:300]
+            _log(f"  takportal settings write failed: {err}")
+            return False, err
+        return True, ''
+    except Exception as e:
+        _log(f"  takportal settings write error: {str(e)[:200]}")
+        return False, str(e)[:300]
 
 
 def _takportal_push_settings(plog=None, restart=True):
@@ -29451,20 +29663,9 @@ def _takportal_push_settings(plog=None, restart=True):
         if (r.stdout or '').strip() != 'true':
             return False
         settings = load_settings()
-        settings_json = _takportal_merged_settings_json(settings)
-        fd, tmp = tempfile.mkstemp(suffix='.json', prefix='takportal-push-')
-        try:
-            with os.fdopen(fd, 'w') as f:
-                f.write(settings_json)
-            cp = subprocess.run(_sudo_wrap(['docker', 'cp', tmp, 'tak-portal:/usr/src/app/data/settings.json']),
-                                capture_output=True, text=True, timeout=20)
-        finally:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
-        if cp.returncode != 0:
-            _log(f"  takportal settings push: docker cp failed: {((cp.stderr or cp.stdout) or '').strip()[:200]}")
+        ok, err = _takportal_write_settings_json(_takportal_merged_settings_json(settings), plog=_log)
+        if not ok:
+            _log(f"  takportal settings push: docker cp failed: {err}")
             return False
         if restart:
             rs = subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']),
@@ -29582,29 +29783,21 @@ def _takportal_setup_ssh(log_fn=None):
         if log_fn:
             log_fn("  ✓ SSH keys copied into TAK Portal container")
 
-        # Mark onboarded in container settings
-        try:
-            from datetime import datetime as _dt
-            r = subprocess.run(
-                _sudo_wrap(['docker', 'exec', 'tak-portal', 'cat', '/usr/src/app/data/settings.json']), capture_output=True, text=True, timeout=10)
-            if r.returncode == 0 and r.stdout.strip():
-                import json as _json
-                portal_cfg = _json.loads(r.stdout)
-                portal_cfg['TAK_SSH_ONBOARDED'] = 'true'
-                portal_cfg['TAK_SSH_LAST_HANDSHAKE_AT'] = _dt.now().isoformat()
-                fd, tmp = tempfile.mkstemp(suffix='.json', prefix='tak-portal-ssh-')
-                try:
-                    with os.fdopen(fd, 'w') as f:
-                        _json.dump(portal_cfg, f, indent=2)
-                    subprocess.run(
-                        _sudo_wrap(['docker', 'cp', tmp, 'tak-portal:/usr/src/app/data/settings.json']), capture_output=True, text=True, timeout=10)
-                finally:
-                    try:
-                        os.remove(tmp)
-                    except OSError:
-                        pass
-        except Exception:
-            pass
+        # Mark onboarded — through the ONE writer, not behind its back.
+        #
+        # v10.1.42 (W-P2): this used to read settings.json out of the container, mutate two keys
+        # and docker-cp the WHOLE file back. That bypassed every merge rule (it is why
+        # TAK_SSH_LAST_HANDSHAKE_AT was clobbered on a customer box despite already being on the
+        # old preserve-list), and it lost anything TAK Portal itself changed between the read and
+        # the write. Two things changed:
+        #   * TAK_SSH_LAST_HANDSHAKE_AT is no longer written at all. It means "when the PORTAL
+        #     last completed a handshake" — not "when infra-TAK last ran this function", which is
+        #     what we were stamping into it, in the wrong format (naive local microseconds vs the
+        #     portal's ISO-8601 Z). It is the portal's fact; the portal owns it.
+        #   * TAK_SSH_ONBOARDED is emitted by _takportal_build_settings_dict() (by now the keypair
+        #     exists, so it is true) and seeded by the normal merge — write-if-absent, so a portal
+        #     that already has a value of its own keeps it.
+        _takportal_push_settings(restart=False)
 
         return True
     except Exception as e:
@@ -29643,18 +29836,9 @@ def takportal_control():
         settings = load_settings()
         settings_json = _takportal_merged_settings_json(settings)
         try:
-            fd, tmp_settings = tempfile.mkstemp(suffix='.json', prefix='tak-portal-')
-            try:
-                with os.fdopen(fd, 'w') as f:
-                    f.write(settings_json)
-                cp = subprocess.run(_sudo_wrap(['docker', 'cp', tmp_settings, 'tak-portal:/usr/src/app/data/settings.json']), capture_output=True, text=True, timeout=20)
-            finally:
-                try:
-                    os.remove(tmp_settings)
-                except OSError:
-                    pass
-            if cp.returncode != 0:
-                return jsonify({'success': False, 'error': (cp.stderr or cp.stdout or 'docker cp failed').strip()[:300]}), 500
+            cp_ok, cp_err = _takportal_write_settings_json(settings_json)
+            if not cp_ok:
+                return jsonify({'success': False, 'error': cp_err or 'docker cp failed'}), 500
             _takportal_setup_ssh()
             subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']), capture_output=True, text=True, timeout=30)
         except Exception as e:
@@ -29727,22 +29911,13 @@ def takportal_control():
                 cloudtak_url = portal_settings.get('CLOUDTAK_URL', '')
             except Exception:
                 pass
-            fd, tmp_settings = tempfile.mkstemp(suffix='.json', prefix='tak-portal-')
-            try:
-                with os.fdopen(fd, 'w') as f:
-                    f.write(settings_json)
-                cp = subprocess.run(_sudo_wrap(['docker', 'cp', tmp_settings, 'tak-portal:/usr/src/app/data/settings.json']), capture_output=True, text=True, timeout=20)
-            finally:
-                try:
-                    os.remove(tmp_settings)
-                except OSError:
-                    pass
-            if cp.returncode == 0:
+            cp_ok, cp_err = _takportal_write_settings_json(settings_json)
+            if cp_ok:
                 _takportal_setup_ssh()
                 subprocess.run(_sudo_wrap(['docker', 'restart', 'tak-portal']), capture_output=True, text=True, timeout=30)
                 settings_synced = True
             else:
-                settings_sync_error = (cp.stderr or cp.stdout or 'docker cp failed').strip()[:300]
+                settings_sync_error = cp_err or 'docker cp failed'
         except Exception as e:
             settings_sync_error = str(e)[:300]
         subprocess.run(_sudo_wrap(['docker', 'image', 'prune', '-f']), cwd=portal_dir, capture_output=True, text=True, timeout=30)
@@ -30016,20 +30191,15 @@ def run_takportal_deploy():
         # boot. Step 6 re-writes settings.json idempotently (and adds the SSH-onboarded
         # flag) after the post-start cert/SSH sync, so this is purely a head-start.
         try:
-            import json as _json_seed
-            _seed_dict = _takportal_build_settings_dict(load_settings())
-            _fd_seed, _tmp_seed = tempfile.mkstemp(suffix='.json', prefix='tak-portal-seed-')
-            try:
-                with os.fdopen(_fd_seed, 'w') as _sf:
-                    _sf.write(_json_seed.dumps(_seed_dict, indent=2))
-                subprocess.run(
-                    _sudo_wrap(['docker', 'cp', _tmp_seed, 'tak-portal:/usr/src/app/data/settings.json']), capture_output=True, text=True, timeout=10)
-                plog("  ✓ Seeded settings.json before first start (suppresses placeholder Authentik fetch)")
-            finally:
-                try:
-                    os.remove(_tmp_seed)
-                except OSError:
-                    pass
+            # v10.1.42: go through the merge, not the raw build dict. The data volume can survive
+            # a redeploy, so this container may already hold an operator's settings.json —
+            # _takportal_get_existing_settings() reads it via docker cp (the container is created,
+            # not running, so exec is unavailable) and the merge seeds only what is missing.
+            _seed_ok, _seed_err = _takportal_write_settings_json(
+                _takportal_merged_settings_json(load_settings()), plog=plog)
+            if not _seed_ok:
+                raise RuntimeError(_seed_err or 'docker cp failed')
+            plog("  ✓ Seeded settings.json before first start (suppresses placeholder Authentik fetch)")
         except Exception as _seed_e:
             plog(f"  ⚠ Could not pre-seed settings.json: {str(_seed_e)[:80]} (first boot may log a harmless placeholder error)")
 
@@ -30080,19 +30250,18 @@ def run_takportal_deploy():
         settings = load_settings()
         server_ip = (settings.get('server_ip') or '').strip() or 'localhost'
         import json as json_mod
-        portal_settings = _takportal_build_settings_dict(settings)
-        ak_token = portal_settings.get('AUTHENTIK_TOKEN', '')
-        settings_json = json_mod.dumps(portal_settings, indent=2)
-        fd, tmp_settings = tempfile.mkstemp(suffix='.json', prefix='tak-portal-')
+        # v10.1.42: merge, never the raw build dict — a redeploy over a surviving data volume
+        # must not overwrite what the operator set in TAK Portal's own UI. portal_settings below
+        # is the MERGED result, so the log lines report what the portal will actually run with.
+        settings_json = _takportal_merged_settings_json(settings)
         try:
-            with os.fdopen(fd, 'w') as f:
-                f.write(settings_json)
-            subprocess.run(_sudo_wrap(['docker', 'cp', tmp_settings, 'tak-portal:/usr/src/app/data/settings.json']), capture_output=True, text=True)
-        finally:
-            try:
-                os.remove(tmp_settings)
-            except OSError:
-                pass
+            portal_settings = json_mod.loads(settings_json)
+        except Exception:
+            portal_settings = _takportal_build_settings_dict(settings)
+        ak_token = portal_settings.get('AUTHENTIK_TOKEN', '')
+        _st6_ok, _st6_err = _takportal_write_settings_json(settings_json, plog=plog)
+        if not _st6_ok:
+            plog(f"  ⚠ settings.json write failed: {_st6_err}")
         plog(f"  AUTHENTIK_URL (internal): {portal_settings['AUTHENTIK_URL']}")
         plog(f"  AUTHENTIK_PUBLIC_URL: {portal_settings.get('AUTHENTIK_PUBLIC_URL', '')}")
         plog(f"  TAK Server URL: {portal_settings['TAK_URL']}")
@@ -30111,7 +30280,7 @@ def run_takportal_deploy():
         plog("")
         plog("\u2501\u2501\u2501 Setting up SSH (container \u2192 host) \u2501\u2501\u2501")
         if _takportal_setup_ssh(log_fn=plog):
-            plog(f"  SSH target: {portal_settings.get('TAK_SSH_HOST', 'host.docker.internal')}:22 as root")
+            plog(f"  SSH target: {portal_settings.get('TAK_SSH_HOST', 'host.docker.internal')}:{portal_settings.get('TAK_SSH_PORT', '22')} as {portal_settings.get('TAK_SSH_USER', 'root')}")
             plog("\u2713 SSH ready (no handshake needed)")
         else:
             plog("\u26a0 SSH auto-setup failed — configure manually in TAK Portal settings")
@@ -54330,7 +54499,8 @@ def _apply_coreconfig_ldap_auth_et(coreconfig_path, ldap_host, ldap_pass, plog=N
     _ldap_attrs = {
         'url': f'ldap://{ldap_host}:{_ldap_port}',
         'userstring': 'cn={username},ou=users,dc=takldap',
-        'updateinterval': '30',
+        # v10.1.42 (W-P4): MILLISECONDS, not seconds — see TAK_LDAP_UPDATE_INTERVAL_MS.
+        'updateinterval': TAK_LDAP_UPDATE_INTERVAL_MS,
         'groupprefix': 'cn=tak_',
         'groupNameExtractorRegex': 'cn=tak_(.*?)(?:,|$)',
         'serviceAccountDN': 'cn=adm_ldapservice,ou=users,dc=takldap',
@@ -54526,7 +54696,8 @@ def _apply_coreconfig_ldap_auth_text(coreconfig_path, ldap_host, ldap_pass, plog
         '    <auth default="ldap" x509groups="true" x509addAnonymous="false" x509useGroupCache="true"'
         ' x509useGroupCacheDefaultActive="true" x509checkRevocation="true" x509useGroupCacheRequiresExtKeyUsage="false">\n'
         f'        <ldap url="ldap://{ldap_host}:389" userstring="cn={{username}},ou=users,dc=takldap"'
-        f' updateinterval="30" groupprefix="cn=tak_" groupNameExtractorRegex="cn=tak_(.*?)(?:,|$)"'
+        f' updateinterval="{TAK_LDAP_UPDATE_INTERVAL_MS}" groupprefix="cn=tak_"'
+        f' groupNameExtractorRegex="cn=tak_(.*?)(?:,|$)"'
         f' serviceAccountDN="cn=adm_ldapservice,ou=users,dc=takldap" serviceAccountCredential="{ldap_pass}"'
         f' groupBaseRDN="ou=groups,dc=takldap" userBaseRDN="ou=users,dc=takldap"'
         f' dnAttributeName="DN" nameAttr="CN" adminGroup="ROLE_ADMIN"/>\n'
@@ -54544,6 +54715,63 @@ def _apply_coreconfig_ldap_auth_text(coreconfig_path, ldap_host, ldap_pass, plog
         return True, f'CoreConfig.xml LDAP auth updated (text patcher, ldap://{ldap_host}:389)'
     except Exception as e:
         return False, f'CoreConfig.xml text patcher error: {e}'
+
+
+def _heal_coreconfig_updateinterval_ms(log=None):
+    """v10.1.42 (W-P4): heal a seconds-vs-milliseconds <ldap updateinterval> in CoreConfig.xml.
+
+    The two-line constant fix does not reach a box that is already wired to LDAP: both deploy
+    paths call _apply_ldap_to_coreconfig() only `if not _coreconfig_has_ldap()`, so an existing
+    install would keep updateinterval="30" until somebody clicked "Resync LDAP". Fixes ride the
+    console update (memory feedback-console-path-delivery), so this runs as a startup migration.
+
+    Deliberately narrow:
+      * only fires when the value is numeric AND < 1000 — a number that can only be the
+        seconds-vs-ms mistake. An operator's 60000 (TAK's own documented example) is left alone;
+        a fresh LDAP sync still writes the TAK_LDAP_UPDATE_INTERVAL_MS fleet constant.
+      * a targeted attribute substitution on the raw text, NOT an ElementTree round-trip — this
+        must change one attribute and leave the rest of the document byte-for-byte, and CoreConfig
+        canonicalization/namespace churn has bitten us before (memory
+        tak-coreconfig-canonicalization-and-defaults).
+      * it does NOT restart TAK Server. A restart drops every connected client; the file is
+        correct and the running JVM picks it up on the operator's next restart. Say so in the log.
+
+    Idempotent, non-fatal, returns True only when it actually changed the file."""
+    _log = log or (lambda m: print(m, flush=True))
+    try:
+        if not os.path.exists(CORECONFIG_PATH):
+            return False
+        content = _read_coreconfig(CORECONFIG_PATH)
+    except Exception as _re_err:
+        # Unreadable CoreConfig is a real condition (640 tak:tak, broker down) but it must
+        # never block boot — and it is emphatically not "no migration needed".
+        _log(f"CoreConfig updateinterval migration: cannot read CoreConfig.xml "
+             f"({str(_re_err)[:100]}) — skipped, will retry next boot")
+        return False
+    try:
+        _tag_re = re.compile(r'<(?:[A-Za-z][\w-]*:)?ldap\b[^>]*>', re.IGNORECASE)
+        _attr_re = re.compile(r'(\bupdateinterval\s*=\s*)(["\'])(\d+)\2', re.IGNORECASE)
+        found = []
+
+        def _fix_attr(a):
+            val = int(a.group(3))
+            if val >= 1000:
+                return a.group(0)  # plausible milliseconds — operator's or already ours
+            found.append(val)
+            return f'{a.group(1)}{a.group(2)}{TAK_LDAP_UPDATE_INTERVAL_MS}{a.group(2)}'
+
+        new_content = _tag_re.sub(lambda m: _attr_re.sub(_fix_attr, m.group(0)), content)
+        if not found:
+            return False
+        _write_priv(CORECONFIG_PATH, new_content)
+        _log(f"CoreConfig <ldap updateinterval> {found[0]} -> {TAK_LDAP_UPDATE_INTERVAL_MS} "
+             f"(the unit is MILLISECONDS — {found[0]}ms expired the group cache on every check, "
+             f"so every auth lookup went live to LDAP). TAK Server picks this up on its NEXT "
+             f"restart; nothing was restarted for you.")
+        return True
+    except Exception as e:
+        _log(f"CoreConfig updateinterval migration error (non-fatal): {str(e)[:160]}")
+        return False
 
 
 def _coreconfig_has_ldap():
@@ -71842,6 +72070,18 @@ def _startup_migrations():
         except Exception as nb_orph_err:
             print(f"Startup migration: netbird orphan-heal spawn error (non-fatal): {nb_orph_err}")
 
+        # v10.1.42 (W-P4) — heal a seconds-vs-milliseconds <ldap updateinterval> in
+        # CoreConfig.xml on boxes already wired to LDAP. The deploy paths only run the LDAP
+        # writer when LDAP is ABSENT, so without this an existing install keeps the 30ms value
+        # (group cache expired at every check -> every auth lookup goes live to LDAP) until
+        # someone clicks "Resync LDAP". Narrow, idempotent, and never restarts TAK Server.
+        try:
+            _heal_coreconfig_updateinterval_ms(
+                lambda m: print(f"Startup migration: {m}", flush=True)
+            )
+        except Exception as _ui_err:
+            print(f"Startup migration: CoreConfig updateinterval error (non-fatal): {_ui_err}")
+
         # v0.9.29 — self-heal mediamtx-webeditor writable paths on existing installs
         # that pre-date the deploy-time chown. The upstream mediamtx_config_editor.py
         # hard-codes BACKUP_DIR=/usr/local/etc/mediamtx_backups and call os.makedirs()
@@ -72693,16 +72933,7 @@ def _post_update_auto_deploy():
                             try:
                                 settings = load_settings()
                                 settings_json = _takportal_merged_settings_json(settings)
-                                fd, tmp = tempfile.mkstemp(suffix='.json', prefix='tak-portal-')
-                                try:
-                                    with os.fdopen(fd, 'w') as f:
-                                        f.write(settings_json)
-                                    subprocess.run(_sudo_wrap(['docker', 'cp', tmp, 'tak-portal:/usr/src/app/data/settings.json']), capture_output=True, text=True, timeout=20)
-                                finally:
-                                    try:
-                                        os.remove(tmp)
-                                    except OSError:
-                                        pass
+                                _takportal_write_settings_json(settings_json)
                                 _takportal_setup_ssh()
                                 _ensure_infratak_network_for_authentik()
                                 _ensure_infratak_network_for_portal()

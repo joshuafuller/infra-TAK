@@ -111,7 +111,7 @@
 </label>
 <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;padding:10px 0;border-top:1px solid var(--border)">
 <input type="radio" name="ssl-mode" value="custom" {% if _sslmode == 'custom' %}checked{% endif %} onchange="toggleSslMode()" style="margin-top:3px">
-<div><div style="font-weight:600;color:var(--text-primary)">Custom certificate <span style="font-size:11px;color:var(--text-dim);font-weight:400">— bring your own (commercial / enterprise PKI)</span></div>
+<div><div style="font-weight:600;color:var(--text-primary)">Custom Certificate <span style="font-size:11px;color:var(--text-dim);font-weight:400">— bring your own (commercial / enterprise PKI)</span></div>
 <div style="font-size:12px;color:var(--text-dim);margin-top:2px">Upload your own full-chain certificate + private key (PEM). Applied to all subdomains — use a wildcard (e.g. <code style="background:rgba(255,255,255,.05);padding:1px 5px;border-radius:3px">*.{{ settings.get('fqdn','') }}</code>). For domains behind a corporate WAF/gateway where ACME can't reach.</div></div>
 </label>
 <div id="custom-cert-panel" style="margin-top:16px;padding-top:16px;border-top:1px solid var(--border);{% if _sslmode != 'custom' %}display:none{% endif %}">
@@ -137,7 +137,7 @@
 </div>
 <div id="acme-ca-panel" style="margin-top:16px;padding-top:16px;border-top:1px solid var(--border);{% if _sslmode == 'custom' %}display:none{% endif %}">
 <div style="display:flex;align-items:center;justify-content:space-between;cursor:pointer" onclick="toggleAcmeCa()">
-<div><div style="font-weight:600;color:var(--text-primary);font-size:13px">Certificate authority <span style="font-size:11px;color:var(--text-dim);font-weight:400">— advanced</span></div>
+<div><div style="font-weight:600;color:var(--text-primary);font-size:13px">Certificate Authority <span style="font-size:11px;color:var(--text-dim);font-weight:400">— advanced</span></div>
 <div id="acme-ca-summary" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin-top:4px">Checking…</div></div>
 <span id="acme-ca-chevron" style="color:var(--text-dim);font-size:12px">&#9656;</span>
 </div>
@@ -159,7 +159,7 @@
 <button onclick="clearAcmeCa()" id="acme-ca-clear-btn" class="control-btn">Revert to default CA</button>
 <span id="acme-ca-status" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);line-height:1.5;white-space:pre-wrap"></span>
 </div>
-<div style="font-size:11px;color:var(--text-dim);margin-top:12px;line-height:1.5">The block is checked with Caddy's own config parser before it is written, so an invalid value is refused here instead of taking the whole Caddyfile down. Existing certificates keep serving until they renew — changing the CA does not reissue immediately.</div>
+<div style="font-size:11px;color:var(--text-dim);margin-top:12px;line-height:1.5">The block is checked with Caddy's own config parser before it is written, so an invalid value is refused here instead of taking the whole Caddyfile down. <strong style="color:var(--text-primary)">Changing the CA reissues every certificate on this box within about a minute</strong> — it is not deferred until renewal. If the new certificates are not trusted, this console sends HSTS and your browser will refuse to load it; reach it at <span style="font-family:'JetBrains Mono',monospace">https://{{ settings.server_ip }}:{{ settings.console_port or 5001 }}</span> (HSTS does not apply to a bare IP) and revert from there.</div>
 </div>
 </div>
 </div>
@@ -205,7 +205,7 @@
 </label>
 <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;padding:8px 0;border-top:1px solid var(--border)">
 <input type="radio" name="setup-ssl-mode" value="custom" onchange="toggleSetupSslMode()" style="margin-top:3px">
-<div><div style="font-weight:600;color:var(--text-primary);font-size:14px">Custom certificate <span style="font-size:11px;color:var(--text-dim);font-weight:400">— bring your own (no ACME)</span></div>
+<div><div style="font-weight:600;color:var(--text-primary);font-size:14px">Custom Certificate <span style="font-size:11px;color:var(--text-dim);font-weight:400">— bring your own (no ACME)</span></div>
 <div style="font-size:12px;color:var(--text-dim)">Upload a full-chain PEM + key, applied to all subdomains. Use a wildcard (e.g. *.yourdomain.com). Caddy never attempts Let's Encrypt.</div></div>
 </label>
 <div id="setup-custom-cert" style="display:none;margin:12px 0 4px;padding:16px;background:rgba(59,130,246,0.05);border:1px solid rgba(59,130,246,0.15);border-radius:8px">
@@ -248,7 +248,7 @@ async function deployCaddy(){
     var req;
     if(mode==='custom'){
         var cf=document.getElementById('setup-cert-file'),kf=document.getElementById('setup-key-file');
-        if(!cf.files.length||!kf.files.length){alert('Custom certificate selected — choose both a certificate and a private key file.');return}
+        if(!cf.files.length||!kf.files.length){alert('Custom Certificate selected — choose both a certificate and a private key file.');return}
         if(!confirm('Deploy Caddy for '+domain+' with your custom certificate?\n\nCaddy will serve your cert on all subdomains and will not attempt Let\'s Encrypt.')){return}
         var fd=new FormData();fd.append('domain',domain);fd.append('ssl_mode','custom');fd.append('cert_file',cf.files[0]);fd.append('key_file',kf.files[0]);
         req={method:'POST',body:fd};
@@ -389,7 +389,7 @@ function _acmeCaPayload(extra){
     if(extra)Object.assign(p,extra);
     return p;
 }
-async function _acmeCaPost(payload,btnId,busyText){
+async function _acmeCaPost(payload,btnId,busyText,refresh){
     var st=document.getElementById('acme-ca-status'),btn=document.getElementById(btnId);
     var old=btn?btn.textContent:'';
     if(btn){btn.disabled=true;btn.textContent=busyText;}
@@ -401,7 +401,12 @@ async function _acmeCaPost(payload,btnId,busyText){
         if(d.success){
             st.style.color='var(--green)';
             st.textContent='\u2713 '+(d.message||'Done')+(d.warning?('\n'+d.warning):'');
-            await loadAcmeCa();
+            // Only re-read from the server when the server actually changed. Validate saves
+            // nothing, so refreshing after it wipes the operator's typed CA URL and email
+            // (the HMAC survived only because loadAcmeCa touches its placeholder, not its
+            // value) — and the next click of Save then posts an empty URL. Found on nuc
+            // during the v10.1.41 post-ship UI check.
+            if(refresh!==false)await loadAcmeCa();
         }else{
             st.style.color='var(--red)';
             st.textContent='\u2717 '+(d.error||'Failed');
@@ -409,10 +414,24 @@ async function _acmeCaPost(payload,btnId,busyText){
     }catch(e){st.style.color='var(--red)';st.textContent='\u2717 '+e;}
     if(btn){btn.disabled=false;btn.textContent=old;}
 }
-function validateAcmeCa(){return _acmeCaPost(_acmeCaPayload({validate_only:true}),'acme-ca-validate-btn','Checking…');}
-function saveAcmeCa(){return _acmeCaPost(_acmeCaPayload(),'acme-ca-save-btn','Applying…');}
+var ACME_IP_URL="https://{{ settings.server_ip }}:{{ settings.console_port or 5001 }}";
+function validateAcmeCa(){return _acmeCaPost(_acmeCaPayload({validate_only:true}),'acme-ca-validate-btn','Checking…',false);}
+// v10.1.42: changing the CA is not a low-impact setting change and must not be one click.
+// Caddy reissues every hostname within seconds; if the new certificates are not trusted, this
+// console's HSTS header makes the browser hard-refuse it — no "Advanced -> Proceed" — and the
+// only control that undoes the change lives inside the console you can no longer reach.
+// Name the consequence AND the way back, before the click.
+function saveAcmeCa(){
+    if(!confirm("Change the certificate authority for this box?\n\n"
+        +"Caddy reissues certificates for EVERY hostname here within about a minute. This is NOT deferred until renewal.\n\n"
+        +"If the new CA is wrong, or its certificates are not trusted by your browser, this console sends HSTS and the browser will REFUSE to load it \u2014 with no \"proceed anyway\" option. The control that undoes this is in here.\n\n"
+        +"The way back in: "+ACME_IP_URL+"\n(HSTS does not apply to a bare IP address.)\n\nContinue?"))return;
+    return _acmeCaPost(_acmeCaPayload(),'acme-ca-save-btn','Applying…');
+}
 function clearAcmeCa(){
-    if(!confirm("Revert to Caddy's default CA (Let's Encrypt, ZeroSSL fallback)?\n\nExisting certificates keep serving until they renew."))return;
+    if(!confirm("Revert to Caddy's default CA (Let's Encrypt, ZeroSSL fallback)?\n\n"
+        +"Caddy reissues every certificate on this box within about a minute \u2014 reverting is not deferred until renewal either.\n\n"
+        +"If this console becomes unreachable, use "+ACME_IP_URL))return;
     return _acmeCaPost({clear:true},'acme-ca-clear-btn','Reverting…');
 }
 async function applyAutoMode(){
@@ -433,7 +452,7 @@ async function loadCustomCertInfo(){
         var r=await fetch('/api/caddy/custom-cert/info');var d=await r.json();
         if(d.present){
             el.style.color='var(--green)';
-            el.innerHTML='✓ Custom certificate in use'+(d.not_after?' · expires '+d.not_after:'')+(d.names&&d.names.length?'<br><span style="color:var(--text-dim)">Names: '+d.names.join(', ')+'</span>':'');
+            el.innerHTML='✓ Custom Certificate in use'+(d.not_after?' · expires '+d.not_after:'')+(d.names&&d.names.length?'<br><span style="color:var(--text-dim)">Names: '+d.names.join(', ')+'</span>':'');
         }else{
             el.style.color='var(--text-dim)';
             el.textContent='No custom certificate uploaded yet.';
