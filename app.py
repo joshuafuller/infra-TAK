@@ -804,7 +804,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.44-alpha"
+VERSION = "10.1.45-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 # Operator-vetted Authentik releases.  Update AUTHENTIK_VETTED_RELEASE only after completing
 # the full T&E validation on the new Authentik version across ≥3 dev boxes.
@@ -31738,18 +31738,57 @@ WantedBy=multi-user.target
 
         webeditor_src = None
         clone_dir = '/tmp/mediamtx_editor_clone'
-        try:
-            subprocess.run(f'rm -rf {clone_dir}', shell=True, capture_output=True)
-            os.makedirs(clone_dir, exist_ok=True)
-            r = subprocess.run(f'git clone --depth 1 --branch "{MEDIAMTX_EDITOR_REF}" "{MEDIAMTX_EDITOR_REPO}" {clone_dir}',
-                shell=True, capture_output=True, text=True, timeout=60)
-            if r.returncode == 0:
-                candidate = os.path.join(clone_dir, MEDIAMTX_EDITOR_PATH, 'mediamtx_config_editor.py')
-                if os.path.exists(candidate):
-                    webeditor_src = candidate
-                    plog(f"  Cloned editor from {MEDIAMTX_EDITOR_REPO}")
-        except Exception as e:
-            plog(f"  Clone failed: {e}")
+        # v10.1.44 W5: this used to be a single 60s clone with no retry, and the local
+        # fallbacks below never fire on a real box (neither mediamtx_config_editor.py nor
+        # config-editor/ ships in this repo). So one transient network blip cost the
+        # operator the web editor outright, with nothing in the log naming the cure
+        # (field report, MMTX03, 2026-08-22 — the clone timed out at exactly 60s while
+        # the MediaMTX binary download on the same box succeeded). Retry once, then fall
+        # back to the single-file raw fetch that /api/mediamtx/recovery already uses.
+        for _attempt in (1, 2):
+            try:
+                subprocess.run(f'rm -rf {clone_dir}', shell=True, capture_output=True)
+                os.makedirs(clone_dir, exist_ok=True)
+                # 90s, matching the remote-target clone at ~app.py:31109. The local path
+                # used to allow only 60s for the identical clone, an asymmetry with no
+                # justification behind it. Retrying twice at 60s gives more TOTAL tolerance
+                # than one 90s try, but it does nothing for the case this product actually
+                # meets in the field: a satellite / Ku-band / degraded-LTE link where EVERY
+                # attempt takes 70-80s. Both retries fail identically there; only a longer
+                # per-attempt ceiling helps.
+                r = subprocess.run(f'git clone --depth 1 --branch "{MEDIAMTX_EDITOR_REF}" "{MEDIAMTX_EDITOR_REPO}" {clone_dir}',
+                    shell=True, capture_output=True, text=True, timeout=90)
+                if r.returncode == 0:
+                    candidate = os.path.join(clone_dir, MEDIAMTX_EDITOR_PATH, 'mediamtx_config_editor.py')
+                    if os.path.exists(candidate):
+                        webeditor_src = candidate
+                        plog(f"  Cloned editor from {MEDIAMTX_EDITOR_REPO}")
+                        break
+                plog(f"  Clone attempt {_attempt}/2 failed: {(r.stderr or '').strip()[:160]}")
+            except Exception as e:
+                plog(f"  Clone attempt {_attempt}/2 failed: {e}")
+        if not webeditor_src:
+            # No git, different code path, one file instead of a repo — this survives the
+            # blips that kill the clone. Same URL /api/mediamtx/recovery pulls, so if this
+            # fails the Patch web editor button would fail too, and the log says so below.
+            try:
+                import urllib.request as _urlreq
+                os.makedirs(clone_dir, exist_ok=True)
+                _raw_dst = os.path.join(clone_dir, 'mediamtx_config_editor.py')
+                # 90s here too: this fallback exists FOR the slow link, so it must not be
+                # given a tighter budget than the clone it is rescuing.
+                with _urlreq.urlopen(MEDIAMTX_EDITOR_RAW_URL, timeout=90) as _resp:
+                    _body = _resp.read()
+                # Guard against a captive portal / proxy handing back an HTML error page.
+                if b'app = Flask' in _body:
+                    with open(_raw_dst, 'wb') as _bf:
+                        _bf.write(_body)
+                    webeditor_src = _raw_dst
+                    plog("  Clone unavailable - fetched editor directly from raw.githubusercontent.com")
+                else:
+                    plog("  Raw editor fetch returned unexpected content - ignoring it")
+            except Exception as e:
+                plog(f"  Raw editor fetch failed: {e}")
         if not webeditor_src:
             app_dir = os.path.dirname(os.path.abspath(__file__))
             for p in [os.path.join(app_dir, 'mediamtx_config_editor.py'),
@@ -31886,8 +31925,9 @@ WantedBy=multi-user.target
                             os.chmod(dst_path, 0o755)
                 plog("✓ Ku-band simulator scripts installed")
         else:
-            plog("⚠ mediamtx_config_editor.py not found (clone failed and no local file)")
-            plog("  Place it next to app.py or in config-editor/, or fix repo access, then redeploy")
+            plog("⚠ mediamtx_config_editor.py not found (clone and raw fetch both failed)")
+            plog("  This box could not reach github.com - check egress, then click")
+            plog("  🔧 Patch web editor on this page to retry just the editor (no redeploy needed)")
             plog("  MediaMTX streaming will work — web editor unavailable until then")
 
         # Clean up clone dir now that copy is done
