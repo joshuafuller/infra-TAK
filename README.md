@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.46-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.46-alpha)**
+**Current release: [v10.1.47-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.47-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -417,6 +417,22 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.47-alpha — 2026-08-24 — the startup protection now works on Rocky Linux too, and one device flooding the server no longer does it unseen
+
+**Headline: the reboot protection we shipped last release only ever worked on Ubuntu. It works everywhere now — and the server has started noticing when a single device opens hundreds or thousands of connections at once.**
+
+**The startup gate now covers Rocky Linux.** When a server reboots, TAK Server accepts connections for a couple of minutes before it is genuinely ready, and devices that connect during that window can end up connected to nothing — the exact fault the last release taught your server to report. v10.1.46 added a gate that holds devices off until the server is actually ready, but it only held on Ubuntu. On Rocky Linux the rule was being wiped seconds after it was placed, by ordinary background activity on the machine, so the protection was never really there. The gate now uses a part of the firewall that nothing else rewrites, and it has been verified to survive everything on the box that touches firewall rules. Your devices are held off for the two or three minutes the server needs, then let straight back in automatically.
+
+**There are three independent ways it lets go**, because a gate that sticks is worse than no gate: the normal release when the server reports ready, a fifteen-minute failsafe timer if that never happens, and it clears on its own at the next restart. Local services and video feeds are never held.
+
+**One device opening thousands of connections is now reported.** A device running a pre-release client was seen holding roughly three thousand simultaneous connections to a server. Nothing detected it, logged it, or reported it. Guard Dog now watches for a single device — or a single address — holding far more connections than any healthy one ever does, and emails you naming the device and the count. As with everything else in this line of work it only reports: it will not disconnect anybody. Using the same account across ATAK, WinTAK, iTAK and TAK Aware at once is normal and will not trigger it.
+
+**Alert emails now tell you the right fix.** The client alert used to tell everyone to restart TAK Server. That is correct for a device missing from your client list, and wrong for an account that has no channel assigned — no amount of restarting gives an account a channel. Each condition now comes with its own instructions.
+
+**The Reboot button now points at the smaller tool.** Rebooting the whole machine is what produces the connected-to-nothing devices in the first place, and it is often reached for to fix something a TAK Server restart would have fixed. The reboot confirmation now says plainly that every connected device will drop, and points at TAK Server → Restart instead.
+
+**infra-TAK is now formally licensed under the AGPL-3.0.** It has always been free and open source; this makes it permanent and legally binding. Anyone can run it, modify it, and deploy it commercially, and anyone who modifies it and offers it as a service must publish their source too.
 
 ### v10.1.46-alpha — 2026-08-24 — your server now tells you when people are connected to nothing, and Rocky Linux starts properly for the first time
 
@@ -919,7 +935,35 @@ Older releases: [GitHub Releases tab](https://github.com/takwerx/infra-TAK/relea
 
 ## License
 
-MIT
+Copyright (C) 2026 Andreas Johansson (TAKWERX).
+
+infra-TAK is free software, licensed under the
+**[GNU Affero General Public License v3.0 or later](LICENSE)** (AGPL-3.0-or-later).
+
+You may run it, study it, modify it, and share it — for any purpose, commercial
+or not, with no fee and no per-seat licence. What the AGPL adds over a permissive
+licence is a guarantee that it **stays** free: if you modify infra-TAK and let
+other people use it — including over a network, as a hosted console — you must
+offer those users the complete corresponding source of your modified version
+under the same licence (AGPL §13). That is the point. Nobody can take this,
+close it, and sell it back to the emergency-services community.
+
+**If you only deploy and use infra-TAK, this obligation never touches you.**
+Running the console for your own agency — however many boxes, however many users
+— triggers nothing. The source offer is owed only by someone who *modifies* the
+code and then serves it to others.
+
+**Scope.** The AGPL covers infra-TAK's own code. It does not change the licence
+of the software infra-TAK installs and orchestrates — TAK Server, Authentik,
+CloudTAK, Caddy, MediaMTX, Node-RED and the rest are separate programs, invoked
+at arm's length over Docker and systemd, and each keeps its own licence and its
+own terms.
+
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for the
+contribution terms and the [Contributor Licence Agreement](CLA.md).
+
+Releases before v10.1.47 were published under the MIT licence and remain
+available under those terms.
 
 ## Credits
 
