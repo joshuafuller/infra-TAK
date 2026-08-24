@@ -37,6 +37,45 @@ _tcp_up() { timeout 4 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; }
 # fine and should not be disturbed.
 _uptime_sec=$(awk '{printf "%d", $1}' /proc/uptime 2>/dev/null || echo 9999)
 if [ "$_uptime_sec" -lt 600 ]; then
+  # ── 0. Hold the client port shut until TAK can actually account for clients ──
+  # v10.1.46 (W1). TAK opens 8089 from the messaging JVM but serves the client
+  # dashboard and /Marti/api/* from the api JVM, which finishes 5.5-30s LATER.
+  # Anything that connects in that gap works but is invisible to the api JVM
+  # forever. tak-post-start.sh releases the gate the instant 8443 answers; a
+  # trap there, an independent takclientgate.timer backstop at OnBootSec=15min,
+  # and a console-startup sweep all release it independently — and the rules are
+  # runtime-only on both families, so a reboot clears them regardless. The gate
+  # script fails OPEN on every error — a box that cannot gate simply behaves like
+  # 10.1.44, where the post-start sweeper still recycles the racers.
+  # This runs as ExecStartPre, so the gate is up before TAK's first listener.
+  # ── HELD FOR 10.1.47 — DO NOT RE-ENABLE WITHOUT READING THIS ──────────────
+  # The gate is NOT inserted in 10.1.46. It works on Debian (proven three times on
+  # test6/test8, including with a live EUD and the backstop test) but NOT on RHEL:
+  #
+  #   06:06:41  boot-sequencer: client gate ENGAGED on 8089 (firewalld)
+  #   06:06:48  docker starts
+  #   06:06:50  console startup hardening runs firewall-cmd
+  #   06:08:xx  post-start: client gate not engaged — nothing to release
+  #
+  # firewalld runtime rich rules do not survive boot on a box where Docker and the
+  # console's own hardening both touch the firewall seconds later — the same class
+  # of failure that killed the ufw-chain approach on Debian (see tak-client-gate.sh
+  # header). infra-TAK is multiplatform by hard requirement: a gate that only works
+  # on Ubuntu does not land.
+  #
+  # 10.1.47 unifies both families on the RAW table (already proven on Debian), which
+  # is untouched by ufw reloads and should likewise be untouched by firewalld ones.
+  # That needs verifying as root on a RHEL box first — it could not be verified from
+  # the dev Mac because the broker (correctly) allows neither `iptables` nor an
+  # arbitrary `systemd-run` unit.
+  #
+  # Everything else stays installed on purpose: tak-client-gate.sh, takclientgate.timer
+  # and the console-startup sweep all still run, so any stray gate left by a box that
+  # ran a 10.1.46 dev build gets cleaned up rather than stranded.
+  #
+  # To re-enable: restore the single line below AND land the raw-table unification.
+  #   GATE_LOG_PREFIX="boot-sequencer" /opt/tak-guarddog/tak-client-gate.sh insert || true
+
   _log "Boot detected (uptime ${_uptime_sec}s) — stopping Docker containers and MediaMTX to give TAK Server full CPU..."
 
   _ak_d="$(gd_find_stack_dir authentik authentik-server-1)"
