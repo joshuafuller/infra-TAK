@@ -388,6 +388,28 @@ def _backup_coreconfig_before_write(path, content, mode):
         pass
 
 
+# Paths the console must never ASK the broker to write. /etc/logrotate.d/ is off
+# the broker allow-list deliberately and permanently: logrotate runs prerotate/
+# postrotate as root, so a write there is a console→root escalation primitive —
+# the same reasoning that keeps /etc/tmpfiles.d/ off it. Asking anyway succeeded
+# only in printing a DENY line in the broker audit log on every non-root boot,
+# which reads like a fault and isn't one. Widening the broker is NOT the fix
+# (v10.1.48 W7); not asking is.
+_BROKER_NEVER_ASK_PREFIXES = ('/etc/logrotate.d/', '/etc/tmpfiles.d/')
+
+
+def _priv_write_denied_by_design(path):
+    """True when a privileged write to `path` is known to be refused on this box.
+
+    Only meaningful for the broker-routed (non-root) console — as root the write
+    just works, and there is nothing to skip.
+    """
+    if not (_broker_should_route() and _broker_available()):
+        return False
+    p = os.path.abspath(path or '')
+    return any(p.startswith(prefix) for prefix in _BROKER_NEVER_ASK_PREFIXES)
+
+
 def _write_priv(path, content, mode='w', perm=None):
     """Write to a privileged path. Routes through the broker when active;
     otherwise direct (root) or 'sudo tee' (legacy non-root). When `perm` is
@@ -820,7 +842,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.47-alpha"
+VERSION = "10.1.48-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -2579,6 +2601,26 @@ def login_required(f):
             return redirect(url_for('login'))
         return f(*args, **kwargs)
     return decorated
+
+def _require_admin_password(data=None):
+    """Admin-password gate for a destructive route. Returns a (response, status)
+    tuple to hand straight back, or None when the password checks out.
+
+    @login_required proves a session; it does not prove the person at the keyboard
+    meant to destroy something. Every uninstall re-asks for the password — that is
+    the contract modules/__init__._check_admin_password() enforces for registry
+    modules, and v10.1.48 W9 brought the four app.py holdouts (caddy, fail2ban,
+    cesium-tiles, remote-assist coturn) up to it. /redteam-selfaudit fails on a new
+    ungated uninstall route so the set cannot silently grow again.
+    """
+    if data is None:
+        data = request.get_json(silent=True) or {}
+    password = (data or {}).get('password', '')
+    auth = load_auth()
+    if not auth.get('password_hash') or not check_password_hash(auth['password_hash'], password):
+        return jsonify({'success': False, 'error': 'Invalid admin password'}), 403
+    return None
+
 
 def _probe_run(*a, **kw):
     """v0.9.48: probe subprocess that NEVER raises. detect_modules() is polled by
@@ -12060,7 +12102,12 @@ def _conn_wifi_forget(ssid):
                 _run_priv_chain([['install', '-m', '600', '-o', 'root', '-g', 'root', tmp, f]], mode='and')
                 gen = _run_priv_chain([['netplan', 'generate']], mode='and')
                 if not gen or gen.returncode != 0:
-                    _run_priv_chain([['cp', '-a', bak, f], ['netplan', 'generate']], mode='seq')
+                    rev = _run_priv_chain([['cp', '-a', bak, f], ['netplan', 'generate']], mode='seq')
+                    # Drop the backup once the original is demonstrably back in place.
+                    # If the revert ITSELF failed, keep it — then it is the only copy
+                    # of the operator's working config, not litter.
+                    if rev is not None and getattr(rev, 'returncode', 1) == 0:
+                        _run_priv_chain([['rm', '-f', bak]], mode='and')
                     # Carry netplan's own words out to the UI. The bare message gave the
                     # operator nothing to act on and nothing to report, which is how the
                     # empty-access-points bug above stayed invisible.
@@ -12068,6 +12115,9 @@ def _conn_wifi_forget(ssid):
                            .strip().splitlines() or [''])[-1][:200]
                     return False, ('Config failed validation — reverted, nothing changed.'
                                    + (f' netplan: {why}' if why else ''))
+                # Generated cleanly — the backup has done its job (v10.1.48 W14;
+                # these accumulated in /etc/netplan, one per forget, forever).
+                _run_priv_chain([['rm', '-f', bak]], mode='and')
                 touched = True
             finally:
                 if tmp and os.path.exists(tmp):
@@ -12080,6 +12130,11 @@ def _conn_wifi_forget(ssid):
     if not touched:
         return False, 'That network is not saved on this box.'
     _run_priv_chain([['netplan', 'apply']], mode='and')
+    # The new config is generated AND applied, so any .infratak-forget.bak still
+    # sitting here is from an earlier release that never cleaned up. Safe to sweep
+    # only at this point — earlier, one of them could still be a live rollback.
+    for _stale in sorted(_glob.glob('/etc/netplan/*.infratak-forget.bak')):
+        _run_priv_chain([['rm', '-f', _stale]], mode='and')
     return True, ''
 
 
@@ -13482,6 +13537,9 @@ def remote_assist_coturn_install():
 @app.route('/api/remote-assist/coturn/uninstall', methods=['POST'])
 @login_required
 def remote_assist_coturn_uninstall():
+    _denied = _require_admin_password()
+    if _denied:
+        return _denied
     import subprocess as _sp
     ra_dir = REMOTE_ASSIST_INSTALL_DIR
     override_path = os.path.join(ra_dir, 'docker-compose.override.yml')
@@ -14036,6 +14094,9 @@ def _sync_guarddog_remote_db_from_settings(settings=None):
         return True, 'skipped (Guard Dog not installed)'
 
     is_external = (mode == 'external_db')
+    _no_recip = _guarddog_alert_recipient_warning(settings)
+    if _no_recip:
+        print(f"[guarddog] WARNING: {_no_recip}", flush=True)
 
     if is_external:
         edb = tak_cfg.get('external_db', {})
@@ -16465,6 +16526,15 @@ def _f2b_ensure_authentik_logrotate(plog=None):
     if not os.path.isdir('/etc/logrotate.d'):
         return False
     path = '/etc/logrotate.d/infratak-authentik'
+    if _priv_write_denied_by_design(path):
+        # Don't ask for what is refused by design. _f2b_bound_ak_logfile() already
+        # enforces the same ceiling from the console, so the log stays bounded —
+        # this is a no-op with a reason, not a degraded state.
+        _log('fail2ban: logrotate rule not installed — /etc/logrotate.d/ is off the '
+             'broker allow-list by design (postrotate runs as root). The console '
+             'enforces the same %d MB ceiling on auth.log directly.'
+             % (_F2B_AK_LOG_MAX_BYTES // (1024 * 1024)))
+        return False
     conf = (
         "# infra-TAK v10.1.11 — auth.log feeds the Authentik fail2ban jail and was\n"
         "# previously unrotated. copytruncate: the docker-logs forwarder holds the fd.\n"
@@ -18343,6 +18413,9 @@ def fail2ban_install_status_api():
 @login_required
 def fail2ban_uninstall_api():
     """Remove fail2ban, its configs, and clear settings.fail2ban_setup."""
+    _denied = _require_admin_password()
+    if _denied:
+        return _denied
     log = []
     def _plog(msg):
         log.append(msg)
@@ -20210,6 +20283,25 @@ def _guarddog_spiral_correlation_check(cl_waiting):
 
 
 @app.route('/api/guarddog/send-alert-email', methods=['POST'])
+def _guarddog_alert_recipient_warning(settings=None):
+    """Return a warning string when Guard Dog has no alert recipient, else ''.
+
+    A watcher deployed with no recipient is not broken — the console resolves the
+    address from settings.json at send time, so one set later starts working with
+    no redeploy. What it must not be is SILENT: every alert that box raises is
+    suppressed with a 200 OK and nothing anywhere says so (found on test6 during
+    the v10.1.47 T&E, where `send-alert-email.sh "$SUBJ" ""` was read as the fault
+    — it is not; the empty $2 is by design, see scripts/guarddog/send-alert-email.sh).
+    """
+    if settings is None:
+        settings = load_settings()
+    if (settings.get('guarddog_alert_email') or '').strip():
+        return ''
+    return ('no Guard Dog alert recipient is configured — every alert this box '
+            'raises will be suppressed. Set one on the Guard Dog page (it takes '
+            'effect immediately; no redeploy needed).')
+
+
 def guarddog_send_alert_email():
     """Called by Guard Dog scripts (localhost only) to send alerts via Email Relay (same path as test email)."""
     if request.remote_addr not in ('127.0.0.1', '::1'):
@@ -20228,9 +20320,14 @@ def guarddog_send_alert_email():
     # remove. Empty here means the operator removed the recipient — send nothing. The
     # console shows this same field, so what it displays is what actually gets mail.
     to_addr = (load_settings().get('guarddog_alert_email') or '').strip()
-    if not to_addr:
-        return jsonify({'success': True, 'suppressed': True, 'reason': 'no recipient configured'})
     subject = (data.get('subject') or 'Guard Dog Alert')[:200]
+    if not to_addr:
+        # v10.1.48 W4: this returned a bare 200 and the caller pipes its output to
+        # /dev/null, so a box with no recipient dropped every alert without a trace
+        # anywhere. Say so in the journal — suppressed is a decision, not a non-event.
+        print(f"[guarddog] alert SUPPRESSED (no recipient configured): {subject}",
+              flush=True)
+        return jsonify({'success': True, 'suppressed': True, 'reason': 'no recipient configured'})
     body = (data.get('body') or '')[:50000]
     try:
         sent = _guarddog_send_alert_email_via_relay(to_addr, subject, body)
@@ -20702,6 +20799,9 @@ def run_guarddog_deploy(alert_email):
         fh_host = (fh_cfg.get('remote', {}).get('host') or '').strip() if fh_deployed else ''
         if fh_deployed and fh_host:
             script_files.append('tak-fedhub-watch.sh')
+        _no_recip = _guarddog_alert_recipient_warning(settings)
+        if _no_recip:
+            plog(f"⚠ {_no_recip}")
         # Scripts (e.g. tak-cert-watch.sh) live in repo scripts/guarddog/ — read from disk each deploy.
         for name in script_files:
             src = os.path.join(scripts_dir, name)
@@ -24045,6 +24145,9 @@ def caddy_update():
 @app.route('/api/caddy/uninstall', methods=['POST'])
 @login_required
 def caddy_uninstall():
+    _denied = _require_admin_password()
+    if _denied:
+        return _denied
     steps = []
     subprocess.run(_sudo_wrap(['systemctl', 'stop', 'caddy']), capture_output=True, timeout=90)
     subprocess.run(_sudo_wrap(['systemctl', 'disable', 'caddy']), capture_output=True, timeout=90)
@@ -24061,7 +24164,7 @@ def caddy_uninstall():
             try:
                 os.remove(path)
             except Exception:
-                subprocess.run(f'rm -f {path}', shell=True, capture_output=True)
+                subprocess.run(_sudo_wrap(['rm', '-f', path]), capture_output=True)
     if os.path.exists('/etc/caddy'):
         subprocess.run(_sudo_wrap(['rm', '-rf', '/etc/caddy']), capture_output=True, timeout=10)
     subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True)
@@ -30770,9 +30873,20 @@ def mediamtx_recovery():
         if not copy_ok:
             return jsonify({'error': 'Failed to copy overlay script to target'}), 500
         # Install script, make ExecStartPre best-effort so a failing pre-step cannot block start, then restart
+        # v10.1.48: this path ships a new overlay but used to leave the unit alone.
+        # The overlay now refuses X-Authentik-* from an unpinned peer, so on a SPLIT
+        # box (editor bound 0.0.0.0, Caddy calling from the console's IP) a stale unit
+        # would mean admins silently drop to the editor's own login. Set the peer list
+        # here too, idempotently, before the restart.
+        _tp_unit = '/etc/systemd/system/mediamtx-webeditor.service'
+        _tp_line = (f'Environment={_MEDIAMTX_TRUSTED_PROXIES_KEY}='
+                    f'{_mediamtx_editor_trusted_proxies(settings, deploy_cfg)}')
         cmd = (
             'mv /tmp/ensure_overlay.py /opt/mediamtx-webeditor/ensure_overlay.py && chmod 755 /opt/mediamtx-webeditor/ensure_overlay.py && '
             "sed -i 's|^ExecStartPre=/usr/bin/python3|ExecStartPre=-/usr/bin/python3|' /etc/systemd/system/mediamtx-webeditor.service 2>/dev/null; "
+            f"if grep -q '^Environment={_MEDIAMTX_TRUSTED_PROXIES_KEY}=' {_tp_unit} 2>/dev/null; then "
+            f"sed -i 's|^Environment={_MEDIAMTX_TRUSTED_PROXIES_KEY}=.*|{_tp_line}|' {_tp_unit}; "
+            f"else sed -i '/^\\[Service\\]/a {_tp_line}' {_tp_unit} 2>/dev/null; fi; "
             'systemctl daemon-reload 2>/dev/null; systemctl restart mediamtx-webeditor 2>/dev/null; true'
         )
         ok_run, out = _module_run(deploy_cfg, cmd, timeout=25)
@@ -31311,6 +31425,10 @@ paths:
             f'Environment=LDAP_ENABLED=1\n'
             f'Environment=AUTHENTIK_API_URL={ak_public_url}\n'
             f'Environment=AUTHENTIK_TOKEN={ak_token_val}\n'
+            # Split box: the editor binds 0.0.0.0 for Caddy on the console, so the
+            # console's address must be trusted for the overlay's header auth.
+            f'Environment={_MEDIAMTX_TRUSTED_PROXIES_KEY}='
+            f'{_mediamtx_editor_trusted_proxies(settings, deploy_cfg)}\n'
         )
     editor_svc = f"[Unit]\nDescription=MediaMTX Web Configuration Editor\nAfter=network.target mediamtx.service\n\n[Service]\nType=simple\nExecStart=/usr/bin/python3 /opt/mediamtx-webeditor/mediamtx_config_editor.py\nWorkingDirectory=/opt/mediamtx-webeditor\nEnvironment=PORT=5080\nEnvironment=MEDIAMTX_API_URL=http://127.0.0.1:9898\n{ldap_env_lines}Restart=always\nRestartSec=5\nUser=takwerx\n\n[Install]\nWantedBy=multi-user.target\n"
     with open('/tmp/mediamtx_webeditor_remote.service', 'w') as f:
@@ -32059,6 +32177,10 @@ WantedBy=multi-user.target
                 f'Environment=LDAP_ENABLED=1\n'
                 f'Environment=AUTHENTIK_API_URL=http://127.0.0.1:9090\n'
                 f'Environment=AUTHENTIK_TOKEN={ak_token_val}\n'
+                # Local box: the editor is loopback-bound, so loopback is the whole
+                # trusted set — written explicitly so the unit states the policy.
+                f'Environment={_MEDIAMTX_TRUSTED_PROXIES_KEY}='
+                f'{_mediamtx_editor_trusted_proxies(settings)}\n'
             )
 
         # Write self-healing overlay script — runs before every service start
@@ -36240,6 +36362,9 @@ def cesium_tiles_disable():
 @app.route('/api/cesium-tiles/uninstall', methods=['POST'])
 @login_required
 def cesium_tiles_uninstall():
+    _denied = _require_admin_password()
+    if _denied:
+        return _denied
     import shutil
     s = load_settings()
     s['cesium_tiles_enabled'] = False
@@ -66460,6 +66585,11 @@ def deploy_log_stream():
 @login_required
 def takserver_purge_failed_install():
     """Purge a broken takserver dpkg state after a FATAL install failure so the operator can re-upload and retry."""
+    # v10.1.48 W9: this runs `rm -rf /opt/tak`. Recovery path or not, it destroys a
+    # TAK install — same gate as every other destructive route.
+    _denied = _require_admin_password()
+    if _denied:
+        return _denied
     if deploy_status.get('running'):
         return jsonify({'error': 'Deployment is running — wait for it to complete first.'}), 400
     log = []
@@ -67425,7 +67555,7 @@ def run_full_uninstall():
                 try:
                     os.remove(path)
                 except Exception:
-                    subprocess.run(f'rm -f {path}', shell=True, capture_output=True)
+                    subprocess.run(_sudo_wrap(['rm', '-f', path]), capture_output=True)
         if os.path.exists('/etc/caddy'):
             subprocess.run(_sudo_wrap(['rm', '-rf', '/etc/caddy']), capture_output=True, timeout=10)
         subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True)
@@ -67689,6 +67819,9 @@ def _auto_update_guarddog():
         return
     try:
         settings = load_settings()
+        _no_recip = _guarddog_alert_recipient_warning(settings)
+        if _no_recip:
+            print(f"[guarddog] WARNING: {_no_recip}", flush=True)
         tak_cfg = _get_tak_deployment_config(settings)
         is_two_server = tak_cfg.get('mode') == 'two_server'
         s1_host = (tak_cfg.get('server_one', {}).get('host') or '').strip() if is_two_server else ''
@@ -69038,6 +69171,70 @@ WantedBy=multi-user.target
 """
 
 
+_MEDIAMTX_TRUSTED_PROXIES_KEY = 'INFRATAK_TRUSTED_PROXIES'
+
+
+def _mediamtx_editor_trusted_proxies(settings=None, deploy_cfg=None):
+    """Peers whose `X-Authentik-*` headers the MediaMTX editor overlay may believe.
+
+    v10.1.48. The overlay turns the VALUE of a request header into an admin session;
+    that is safe only if the peer is pinned (the v10.1.0 lesson, applied to the file
+    nothing had ever scanned — see mediamtx_ldap_overlay.py).
+
+    Single-box: the editor binds 127.0.0.1 and only local Caddy reaches it, so
+    loopback is the whole answer. Split-box: the editor binds 0.0.0.0 so Caddy on the
+    CONSOLE box can reach it (`app.py` remote deploy), so the console's address has to
+    be trusted too — the UFW source-scope stops being the only control.
+    """
+    peers = ['127.0.0.1', '::1']
+    if settings is None:
+        try:
+            settings = load_settings()
+        except Exception:
+            settings = {}
+    if (deploy_cfg or {}).get('target_mode') == 'remote':
+        # Only the split case needs a non-loopback peer, and only the console's own
+        # address — never a subnet, never a wildcard.
+        for key in ('server_ip', 'fqdn'):
+            val = (settings.get(key) or '').strip()
+            # A comma or space here would break the unit's Environment= line and
+            # silently widen the list; take only a clean single token.
+            if val and ',' not in val and ' ' not in val and val not in peers:
+                peers.append(val)
+    return ','.join(peers)
+
+
+def _unit_text_with_env(txt, key, value):
+    """Return `txt` with exactly one `Environment=key=value` line in [Service].
+
+    Idempotent: replaces an existing line for `key`, else inserts after the last
+    Environment= line (or at the top of [Service] when there is none). Returns the
+    text unchanged when it already says the right thing, so callers can use the
+    identity check to decide whether a daemon-reload/restart is needed.
+    """
+    want = f'Environment={key}={value}'
+    lines = txt.split('\n')
+    out, replaced = [], False
+    for ln in lines:
+        if ln.startswith(f'Environment={key}='):
+            if not replaced:
+                out.append(want)
+                replaced = True
+            continue  # drop any duplicates
+        out.append(ln)
+    if replaced:
+        return '\n'.join(out)
+    last_env = max((i for i, ln in enumerate(out) if ln.startswith('Environment=')),
+                   default=None)
+    if last_env is None:
+        try:
+            last_env = out.index('[Service]')
+        except ValueError:
+            return txt  # not a unit file we recognise — leave it alone
+    out.insert(last_env + 1, want)
+    return '\n'.join(out)
+
+
 def _startup_converge_mediamtx_overlay():
     """v10.1.34: ship mediamtx_ldap_overlay.py to existing boxes on a console update.
 
@@ -69098,6 +69295,23 @@ def _startup_converge_mediamtx_overlay():
                 subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=30)
                 changed = True
                 print("Startup migration: removed dead INFRATAK_MEDIAMTX_VETTED from the MediaMTX editor unit", flush=True)
+            # v10.1.48: the overlay above now refuses X-Authentik-* headers from an
+            # unpinned peer. Converge the unit in the SAME pass that ships the file, so
+            # an existing box never runs new overlay + old unit. This is a local editor
+            # (the console box), hence loopback — the split-box case gets the console IP
+            # from the deploy / "Patch web editor" paths, which write the whole unit.
+            if txt:
+                _want = _unit_text_with_env(
+                    txt, _MEDIAMTX_TRUSTED_PROXIES_KEY,
+                    _mediamtx_editor_trusted_proxies())
+                if _want != txt:
+                    _write_priv(unit, _want)
+                    subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']),
+                                   capture_output=True, timeout=30)
+                    changed = True
+                    print("Startup migration: pinned the MediaMTX editor's trusted "
+                          "header peers (%s)" % _mediamtx_editor_trusted_proxies(),
+                          flush=True)
 
         if changed:
             r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'mediamtx-webeditor']),
