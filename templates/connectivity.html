@@ -510,7 +510,17 @@ async function pollVerify(){
         document.getElementById('verify-status').textContent = d.error;
         return;
       }
-      if(d.result){ renderVerify(d.result); }
+      if(d.result){ renderVerify(d.result); return; }
+      // v10.1.52 (GH #62): a run that ends with NEITHER an error nor a result used to fall
+      // out of here having just cleared the status line -- so the panel went silently blank
+      // and the operator was left staring at nothing. That is also the initial state
+      // ({running:false, error:'', result:null}), so a poll that raced the start, or a worker
+      // that died before setting either field, looked identical to "nothing happened".
+      // Reporter's words: "looks like it is trying to show a error but none is shown."
+      // Never end this branch without saying something.
+      document.getElementById('verify-status').textContent =
+        'The reachability check ended without returning a result. Try Verify Again \u2014 if it keeps '
+        + 'happening, check the console log (journalctl -u takwerx-console) for the verify worker.';
     }
   }catch(e){}
 }
@@ -530,7 +540,21 @@ function renderVerify(res){
       + '<span class="dot" style="background:var(--red)"></span>'
       + '<div style="font-size:13px;color:var(--text-secondary)"><b style="color:var(--red)">Not reachable yet.</b> Fix the red rows below, then Verify Again — repeat until all green.</div></div>';
   }
-  const order = ['443','8089','8443','8446','80'];
+  // v10.1.52 (GH #62): this used to iterate ONLY these five and drop everything else on the
+  // floor. v10.1.49 added backend probes for the ports a module opens after install --
+  // 8448 (EUD Remote Assist device API, the enrolment QR target), 8554/8322 (MediaMTX video)
+  // -- and the renderer silently discarded every one of them. So the feature whose whole
+  // point was "a port a module opened is no longer unverifiable" still showed the operator
+  // the same five base rows. GH #62's reporter, on the release that supposedly fixed his
+  // issue: "Not seeing the EUD line as a check." He was right, and the detection fix alone
+  // would not have shown it either.
+  // Base ports keep their curated order; anything else the backend probed is appended in
+  // numeric order, so a port added by a future module renders without touching this list.
+  const base = ['443','8089','8443','8446','80'];
+  const probed = Object.keys(res.ports || {});
+  const extra = probed.filter(p => !base.includes(String(p)))
+                      .sort((a, b) => Number(a) - Number(b));
+  const order = base.concat(extra);
   const rows = [];
   for(const p of order){
     const v = (res.ports || {})[p];
