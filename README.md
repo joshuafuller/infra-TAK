@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.1.54-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.54-alpha)**
+**Current release: [v10.1.55-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.1.55-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -417,6 +417,18 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.1.55-alpha — 2026-08-31 — a reboot could leave every user connected and invisible
+
+**Headline: after a host restart, users could sign in, get a callsign, and then see nobody and be seen by nobody — while every part of the system reported itself healthy. That is fixed, along with a fault that could interrupt the identity service mid-restart and leave it down.**
+
+**Why it happened.** The component that answers "which teams is this user in?" can finish starting before the identity server behind it is ready to answer. When that happens it still accepts sign-ins perfectly, so every status light stays green — but it cannot look up a single team. TAK Server delivers strictly by team, so anyone who signed in that way was placed in no team at all: connected, named, and completely isolated. Nothing flagged it, because the checks in place only asked whether the service was reachable, not whether it could actually answer a question. On a restart the container system starts these two pieces side by side, so it is a matter of timing which wins.
+
+**What changes.** The console now asks the real question at startup — it performs an actual team lookup and waits for a genuine answer before letting anything depend on it. If the answer does not come, it rebuilds that component and asks again, and if it still cannot answer it says so loudly instead of reporting green. The same release fixes a separate fault where the console's own health monitoring and its background repair could act on the identity service at the same moment; one could interrupt the other mid-restart and leave the database container created but never started, which presented as the service hanging on "starting" forever.
+
+**Also in this release.** Updating TAK Portal now follows the same release channel that installing it does, so pressing Update no longer pulls unreleased code — and if you have turned on Beta Features inside TAK Portal, Update follows that instead, including stepping back down to the latest release when you turn it off. Video streams served through CloudTAK are now watched for a configuration reset that could follow an update and cause a black screen on a stream that is actually fine. Light mode no longer shows a stray word in place of the theme icon. New bug reports now ask for your version and platform up front.
+
+**Upgrade note:** ride the normal console update. Nothing to configure. The startup check applies from the next restart onward.
 
 ### v10.1.54-alpha — 2026-08-29 — the TAK Portal update notice had gone quiet
 

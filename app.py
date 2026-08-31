@@ -964,7 +964,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.54-alpha"
+VERSION = "10.1.55-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -1065,7 +1065,14 @@ TAKPORTAL_REPO = "https://github.com/AdventureSeeker423/TAK-Portal.git"
 # and in settings, instead of an anonymous branch tip. Same shape as the CloudTAK
 # deploy's `remote_release_tag`. Freezing it to one version is a live product
 # decision (update cadence vs supply-chain strictness) — see ROADMAP.
-TAKPORTAL_REF_FALLBACK = "1.4.0"   # used only when the releases API is unreachable
+TAKPORTAL_REF_FALLBACK = "1.4.6"   # used only when the releases API is unreachable
+# v10.1.55 (W4): bumped 1.4.0 -> 1.4.6. This is the DEPLOY FLOOR — the version an
+# offline box installs when it cannot ask GitHub what the latest release is. It had
+# drifted six releases behind, so an air-gapped deploy silently installed an old
+# Portal. It is EXPECTED to be stale between bumps; that is tolerable for a floor and
+# is exactly why it must never be reused as an update comparison (see
+# _fetch_takportal_latest, which returns None offline precisely so the update badge
+# cannot invent an answer from a constant).
 REMOTE_ASSIST_REPO = "https://github.com/cfd2474/EUD_Remote_Assist_Portal.git"
 REMOTE_ASSIST_INSTALL_DIR = os.path.expanduser("~/eud-remote-assist")
 REMOTE_ASSIST_PORT = 8767
@@ -16802,8 +16809,11 @@ def _f2b_selfheal_authentik_log_level(plog=None, detail=None):
     before = _ak_server_container_id()
     ok = True
     try:
-        r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ak_dir,
-                           capture_output=True, text=True, timeout=300)
+        with _authentik_compose_lock('fail2ban-loglevel', plog=_log) as _locked:  # v10.1.55 W3
+            if not _locked:
+                raise RuntimeError('another healer holds the Authentik compose lock')
+            r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ak_dir,
+                               capture_output=True, text=True, timeout=300)
         if r.returncode != 0:
             ok = False
             _log('fail2ban: Authentik apply returned %s — the new log level takes effect at '
@@ -24005,9 +24015,11 @@ def _authentik_sync_all_domain_refs(fqdn, settings, plog=None):
                 with open(compose_path, 'w') as _f:
                     _f.write(comp)
                 _log(f"✓ docker-compose.yml: LDAP AUTHENTIK_HOST → {_ldap_internal} (internal)")
-                subprocess.run(
-                    _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'ldap']), cwd=ak_dir, capture_output=True, text=True, timeout=60
-                )
+                with _authentik_compose_lock('ldap-internal-host', plog=_log) as _locked:  # v10.1.55 W3
+                    if _locked:
+                        subprocess.run(
+                            _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'ldap']), cwd=ak_dir, capture_output=True, text=True, timeout=60
+                        )
                 _log("✓ LDAP container recreated with internal host")
             else:
                 _log(f"✓ docker-compose.yml: LDAP AUTHENTIK_HOST already internal — no change")
@@ -24142,7 +24154,11 @@ def _authentik_sync_all_domain_refs(fqdn, settings, plog=None):
     if env_changed:
         _log("Env changed — running docker compose down && up -d to apply (this takes ~30s)…")
         try:
-            _run_priv_chain([['docker', 'compose', 'down', '--timeout', '20'], ['docker', 'compose', 'up', '-d']], 'and', timeout=120, cwd=ak_dir)
+            with _authentik_compose_lock('env-changed-downup', plog=_log) as _locked:  # v10.1.55 W3
+                if not _locked:
+                    raise RuntimeError('another healer holds the Authentik compose lock — '
+                                       'env change NOT applied, retry')
+                _run_priv_chain([['docker', 'compose', 'down', '--timeout', '20'], ['docker', 'compose', 'up', '-d']], 'and', timeout=120, cwd=ak_dir)
             _log("✓ Authentik restarted with new env")
         except Exception as e:
             _log(f"⚠ Authentik restart: {e}")
@@ -30183,11 +30199,17 @@ def takportal_page():
     portal_version = vinfo['version'] or ''
     portal_update_available = vinfo['update_available']
     portal_latest = vinfo['latest']
+    # Which channel Update will follow (TAK Portal's own BETA_MODE). Only read when the
+    # container is up: the reader's docker-cp fallback can spend 15s on a stopped one,
+    # and this is an inline page render. Stable is also the correct answer when we cannot
+    # look — the same fail-closed default _takportal_beta_mode() uses.
+    portal_beta_mode = bool(portal.get('running')) and _takportal_beta_mode()
     takportal_deploy_cfg = _get_module_deployment_config(settings, 'takportal_deployment')
     return render_template('takportal.html',
         settings=settings, portal=portal, container_info=container_info,
         portal_port=portal_port, portal_version=portal_version,
         portal_update_available=portal_update_available, portal_latest=portal_latest,
+        portal_beta_mode=portal_beta_mode,
         takportal_deploy_cfg=takportal_deploy_cfg,
         authentik_base_url=_get_authentik_base_url(settings),
         takserver_base_url=_get_takserver_base_url(settings),
@@ -30262,6 +30284,208 @@ def _takportal_get_existing_settings():
         return json.loads(body) if body else {}
     except Exception:
         return {}
+
+
+# --- TAK Portal update channel (v10.1.55) ------------------------------------
+# TAK Portal ships ONE branch (main) and two update channels, selected by the
+# portal's own "Enable Beta Features" setting (BETA_MODE in its settings.json):
+#
+#   BETA_MODE off / unreadable  ->  the latest published GitHub RELEASE tag
+#   BETA_MODE on                ->  tip of origin/main
+#
+# Deploy has pinned to a release tag since v10.1.49 (_takportal_latest_tag), but
+# Update was a different code path: it ran `git pull --rebase` on whatever branch
+# the clone happened to track, which on a main-tracking box yanked unreleased code
+# the moment anyone pressed the button. This is the Update side of that pin.
+#
+# Upstream's own `./takportal update` implements exactly these rules and is present
+# in every checkout. We do NOT shell out to it, for one reason that is not
+# negotiable: it does `git checkout` and `docker compose up -d --build` in a single
+# uninterruptible step, and our loopback port hardening lives in the git-TRACKED
+# docker-compose.yml (`_patch_takportal_compose_ports` — the override file cannot
+# express it; Compose v5 silently drops `ports: !reset`). A checkout reverts that
+# patch, so a build started by the script publishes the portal on 0.0.0.0:3000,
+# past the Caddy/Authentik forward_auth boundary, and Docker's own iptables rules
+# put it in front of UFW. The patch has to land BETWEEN the checkout and the build,
+# and only an in-process sequence can do that. The channel rules below are kept
+# deliberately identical to the script's so the two cannot drift apart.
+
+
+def _takportal_beta_mode():
+    """True when TAK Portal's own BETA_MODE setting is on.
+
+    Source of truth is the container volume's /usr/src/app/data/settings.json, NOT the
+    git clone and NOT infra-TAK's settings.json — Beta Mode is a TAK Portal setting the
+    operator flips inside the portal, and infra-TAK only reads it.
+
+    Fails CLOSED: an unreadable file, a stopped container, a parse error, or a missing
+    key all mean stable. Never fail open to main — an update that guesses `main` because
+    it could not read a setting is the exact failure this channel logic exists to stop.
+    """
+    try:
+        s = _takportal_get_existing_settings()
+    except Exception:
+        return False
+    if not isinstance(s, dict):
+        return False
+    return str(s.get('BETA_MODE') or '').strip().lower() == 'true'
+
+
+def _takportal_release_tag_strict(portal_dir, plog=None):
+    """Latest published TAK Portal release TAG, or None. Never falls back to the pin.
+
+    Deliberately NOT _takportal_latest_tag(): that helper returns TAKPORTAL_REF_FALLBACK
+    ('1.4.0') when the API is unreachable. That constant is a DEPLOY FLOOR — a version
+    known good enough to install from scratch. Handing it to an UPDATE would silently
+    roll a healthy 1.4.6 box back to 1.4.0 every time GitHub had a bad minute. Same
+    reasoning as _fetch_takportal_latest() and the badge: a pin is not an observation.
+
+    Order matches upstream's `./takportal update`: releases API, then the repo's own
+    tags, then give up. Returning None means the caller must abort, not pull main.
+    """
+    _log = plog or (lambda m: print(m, flush=True))
+    # `_ur` is imported PER FUNCTION throughout this file — there is no module-level
+    # binding ([[apppy-ur-per-function-import-silent-nameerror]]).
+    import urllib.request as _ur
+    tag = ''
+    try:
+        req = _ur.Request(
+            'https://api.github.com/repos/AdventureSeeker423/TAK-Portal/releases/latest',
+            headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'infra-TAK'})
+        with _ur.urlopen(req, timeout=15) as r:
+            tag = str((json.loads(r.read().decode()) or {}).get('tag_name') or '').strip()
+    except Exception as e:
+        _log(f"  TAK Portal releases API unreachable ({str(e)[:100]}) — trying git tags")
+    # Keep the tag EXACTLY as upstream published it (with a 'v' if they used one) —
+    # it goes straight to `git checkout`, and a stripped prefix would not resolve.
+    if tag and re.match(r'^v?\d+(\.\d+){1,3}$', tag):
+        return tag
+    try:
+        r = subprocess.run(['git', '-C', portal_dir, '-c', f'safe.directory={portal_dir}',
+                            'ls-remote', '--tags', '--refs', 'origin'],
+                           capture_output=True, text=True, timeout=60)
+        best, best_key = None, None
+        for line in (r.stdout or '').splitlines():
+            name = line.strip().rsplit('refs/tags/', 1)[-1].strip()
+            if not re.match(r'^v?\d+\.\d+\.\d+$', name):
+                continue
+            key = _takportal_version_tuple(name)
+            if best_key is None or key > best_key:
+                best, best_key = name, key
+        if best:
+            _log(f"  Using highest release tag from git: {best}")
+            return best
+    except Exception as e:
+        _log(f"  git ls-remote for tags failed: {str(e)[:100]}")
+    return None
+
+
+def _takportal_git_hint(stderr):
+    """Turn a git failure into something the operator can act on, or ''.
+
+    The root-owned-.git case is the one that matters: after the non-root flip a
+    re-homed TAK-Portal carries root-owned objects/refs, `git fetch` as takwerx exits
+    128, and until now the Update route ignored the exit code entirely and rebuilt the
+    OLD tree behind a green "Updated" ([[takportal-update-silent-pull-failure]]).
+    """
+    e = (stderr or '').lower()
+    if 'insufficient permission' in e or 'permission denied' in e:
+        return (' The portal checkout has files this console cannot write (usually root-owned '
+                '.git objects left by an older install). Fix with: '
+                'chown -R $(stat -c %U ~/TAK-Portal) ~/TAK-Portal')
+    if 'could not resolve host' in e or 'unable to access' in e or 'timed out' in e:
+        return ' The box could not reach github.com.'
+    return ''
+
+
+def _takportal_update_git(portal_dir, plog=None):
+    """Move ~/TAK-Portal onto its channel's ref. Returns a dict, never raises.
+
+    {ok, channel, ref, from_version, to_version, rolled_back, message, error}
+
+    Nothing here builds or restarts anything — the caller must re-apply the compose
+    port hardening (which this checkout reverts) BEFORE it builds. See the block
+    comment above _takportal_beta_mode().
+    """
+    _log = plog or (lambda m: print(m, flush=True))
+    _git = ['git', '-C', portal_dir, '-c', f'safe.directory={portal_dir}']
+    beta = _takportal_beta_mode()
+    # package.json directly, not _get_takportal_version_info(): that helper also runs
+    # `docker logs --tail 2000` and hits the GitHub releases API to decide the BADGE.
+    # None of that belongs on the button press, and on a chatty box the log read is
+    # seconds of pure waste inside an operation that already has a build to do.
+    from_version = ''
+    try:
+        with open(os.path.join(portal_dir, 'package.json')) as _pj:
+            from_version = str((json.load(_pj) or {}).get('version') or '').strip()
+    except Exception:
+        pass
+    out = {'ok': False, 'channel': 'beta' if beta else 'stable', 'ref': '',
+           'from_version': from_version, 'to_version': '', 'rolled_back': False,
+           'message': '', 'error': ''}
+    if not os.path.isdir(os.path.join(portal_dir, '.git')):
+        out['error'] = f'{portal_dir} is not a git checkout — redeploy TAK Portal instead of updating.'
+        return out
+    # Discard local edits to TRACKED files before moving refs. The only tracked file we
+    # modify is docker-compose.yml (the loopback port patch), and it is re-applied by the
+    # caller after the checkout — so this loses nothing. The untracked
+    # docker-compose.override.yml (networks, extra_hosts) is not touched by git at all.
+    subprocess.run(_git + ['checkout', '--', '.'], capture_output=True, text=True, timeout=30)
+
+    if beta:
+        out['ref'] = 'origin/main'
+        f = subprocess.run(_git + ['fetch', 'origin', 'main', '--force'],
+                           capture_output=True, text=True, timeout=180)
+        if f.returncode != 0:
+            err = (f.stderr or f.stdout or '').strip()[:300]
+            out['error'] = f'git fetch origin main failed: {err}.{_takportal_git_hint(err)}'
+            return out
+        c = subprocess.run(_git + ['checkout', '--force', '-B', 'main', 'origin/main'],
+                           capture_output=True, text=True, timeout=60)
+        if c.returncode != 0:
+            err = (c.stderr or c.stdout or '').strip()[:300]
+            out['error'] = f'git checkout origin/main failed: {err}.{_takportal_git_hint(err)}'
+            return out
+        out['ok'] = True
+        out['message'] = 'Beta Mode is on — updated to the latest beta (main).'
+        _log(f"  {out['message']}")
+        return out
+
+    tag = _takportal_release_tag_strict(portal_dir, plog=_log)
+    if not tag:
+        out['error'] = ('Could not resolve the latest TAK Portal release from GitHub. '
+                        'Nothing was changed — the update deliberately did NOT fall back to '
+                        'the main branch. Check the box\'s access to github.com and retry.')
+        return out
+    out['ref'] = tag
+    out['to_version'] = tag.lstrip('vV')
+    subprocess.run(_git + ['fetch', 'origin', '--tags', '--force'],
+                   capture_output=True, text=True, timeout=180)
+    # A shallow clone (deploy uses --depth 1 --branch <tag>) has exactly one tag, so the
+    # blanket fetch above can come back without the one we need. Ask for it by name.
+    ft = subprocess.run(_git + ['fetch', 'origin', f'refs/tags/{tag}:refs/tags/{tag}', '--force'],
+                        capture_output=True, text=True, timeout=180)
+    if ft.returncode != 0:
+        ft = subprocess.run(_git + ['fetch', 'origin', 'tag', tag, '--force'],
+                            capture_output=True, text=True, timeout=180)
+    c = subprocess.run(_git + ['checkout', '--force', tag], capture_output=True, text=True, timeout=60)
+    if c.returncode != 0:
+        err = ((c.stderr or c.stdout) or (ft.stderr or '')).strip()[:300]
+        out['error'] = f'Could not check out release {tag}: {err}.{_takportal_git_hint(err)}'
+        return out
+    out['ok'] = True
+    # Rollback is intentional and must be SAID, not hidden: a box that lived on main with
+    # Beta Mode on and then turned it off converges DOWN to the newest release.
+    if from_version and _takportal_version_tuple(from_version) > _takportal_version_tuple(tag):
+        out['rolled_back'] = True
+        out['message'] = (f'Rolling back from {from_version} to release {tag} because '
+                          f'Beta Mode is off. Portal data is not reverted.')
+    elif from_version and _takportal_version_tuple(from_version) < _takportal_version_tuple(tag):
+        out['message'] = f'Updated from {from_version} to GitHub Release {tag}.'
+    else:
+        out['message'] = f'Checked out GitHub Release {tag}.'
+    _log(f"  {out['message']}")
+    return out
 
 
 def _takportal_build_settings_dict(settings):
@@ -30939,19 +31163,28 @@ def takportal_control():
                         'message': msg, 'warnings': warnings, 'tak_local': tak_local,
                         'chain_summary': chain_summary})
     elif action == 'update':
-        # Reset any local changes to tracked files before pulling — the network
-        # and hardening patches now live in docker-compose.override.yml (not tracked
-        # by git) so it's safe to discard dirty tracked files without losing anything.
-        subprocess.run(
-            f'git -c safe.directory={portal_dir} -C {portal_dir} checkout -- .',
-            shell=True, capture_output=True, text=True, timeout=15)
-        pull = subprocess.run(
-            f'cd {portal_dir} && git -c safe.directory={portal_dir} pull --rebase',
-            shell=True, capture_output=True, text=True, timeout=60)
-        pull_msg = pull.stdout.strip().split('\n')[-1] if pull.stdout.strip() else ''
-        # Rewrite the override file so network hardening survives the pull.
-        # Also patch the base compose so port binding is loopback-only
-        # (git pull resets the upstream 0.0.0.0 binding on every update).
+        # v10.1.55: channel-aware, and it no longer pulls a branch.
+        #
+        # This used to be `git pull --rebase` on whatever branch the clone tracked —
+        # a different code path from Deploy, which has pinned to a published release
+        # tag since v10.1.49. On a main-tracking box the button therefore shipped
+        # unreleased TAK Portal code, and the returncode was never checked, so a
+        # checkout that could not fetch at all rebuilt the OLD tree behind a green
+        # "Updated" ([[takportal-update-silent-pull-failure]]). Both are fixed here:
+        # the channel comes from TAK Portal's own BETA_MODE, and a git failure is a
+        # hard 500 with the git error in it.
+        gitr = _takportal_update_git(portal_dir)
+        if not gitr['ok']:
+            return jsonify({'success': False, 'error': gitr['error'],
+                            'channel': gitr['channel']}), 500
+        pull_msg = gitr['message']
+        # ORDER IS LOAD-BEARING. The checkout above reverted docker-compose.yml to
+        # upstream's `${WEB_UI_PORT:-3000}:${WEB_UI_PORT:-3000}` — a 0.0.0.0 bind that
+        # publishes the portal past the Caddy/Authentik forward_auth boundary, in front
+        # of UFW (Docker writes its own iptables rules). Re-patch it to loopback BEFORE
+        # the build below, never after: "after" means the container comes up exposed and
+        # stays that way until something recreates it. This is also why we do not shell
+        # out to upstream's `./takportal update`, which fuses the checkout and the build.
         _write_takportal_override()
         _patch_takportal_compose_ports(portal_dir)
         build = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--build']), cwd=portal_dir, capture_output=True, text=True, timeout=180)
@@ -30990,7 +31223,11 @@ def takportal_control():
         running = 'Up' in (r.stdout or '')
         if not running:
             return jsonify({'success': False, 'error': 'Container not running after update — click Start below.'}), 500
-        return jsonify({'success': True, 'running': running, 'action': action, 'pull': pull_msg, 'version': new_version, 'settings_synced': settings_synced, 'settings_sync_error': settings_sync_error, 'cloudtak_url': cloudtak_url})
+        return jsonify({'success': True, 'running': running, 'action': action, 'pull': pull_msg,
+                        'version': new_version, 'settings_synced': settings_synced,
+                        'settings_sync_error': settings_sync_error, 'cloudtak_url': cloudtak_url,
+                        'channel': gitr['channel'], 'ref': gitr['ref'],
+                        'from_version': gitr['from_version'], 'rolled_back': gitr['rolled_back']})
     else:
         return jsonify({'error': 'Invalid action'}), 400
     time.sleep(3)
@@ -38594,8 +38831,11 @@ def _authentik_recover_compose_conflict(ak_dir, err, plog):
     for ref in sorted(names):
         plog(f"  Removing conflicting container {ref}...")
         subprocess.run(_sudo_wrap(['docker', 'rm', '-f', ref]), capture_output=True, text=True, timeout=60)
-    r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--remove-orphans']),
-                       cwd=ak_dir, capture_output=True, text=True, timeout=300)
+    with _authentik_compose_lock('conflict-recovery', plog=plog) as _locked:  # v10.1.55 W3
+        if not _locked:
+            raise RuntimeError('Authentik recovery deferred: another healer holds the compose lock')
+        r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--remove-orphans']),
+                           cwd=ak_dir, capture_output=True, text=True, timeout=300)
     if r.returncode != 0:
         raise RuntimeError(f'Authentik recovery up -d failed: {(r.stderr or r.stdout)[:400]}')
     plog("  ✓ Authentik stack recovered (conflicting containers removed, full up -d)")
@@ -38706,8 +38946,12 @@ services:
             _log("  Authentik LDAP outpost is mid-recreate — waiting for it to settle...")
         time.sleep(5)
     _log("  Recreating Authentik server + worker for SMTP (ldap/db/redis untouched)...")
-    r = subprocess.run(
-        _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', '--no-deps', '--remove-orphans', 'server', 'worker']), cwd=ak_dir, capture_output=True, text=True, timeout=120)
+    with _authentik_compose_lock('smtp-recreate', plog=_log) as _locked:  # v10.1.55 W3
+        if not _locked:
+            _log("  ⚠ SMTP recreate SKIPPED — another healer holds the Authentik compose lock")
+            return False
+        r = subprocess.run(
+            _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', '--no-deps', '--remove-orphans', 'server', 'worker']), cwd=ak_dir, capture_output=True, text=True, timeout=120)
     if r.returncode != 0:
         _err = r.stderr or r.stdout or ''
         if 'already in use' in _err:
@@ -43353,7 +43597,9 @@ def _wait_for_authentik_stack_healthy(plog, timeout=240):
                 stopped.append(c)
         if stopped and not healed:
             plog(f"  ⚠ Authentik stack: {', '.join(stopped)} not running — starting the stack (docker compose up -d)…")
-            subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180)
+            with _authentik_compose_lock('stack-down-heal', plog=plog) as _locked:  # v10.1.55 W3
+                if _locked:
+                    subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180)
             healed = True
             time.sleep(10)
             continue
@@ -48730,6 +48976,166 @@ def _clear_stale_authentik_migration_lock(plog):
         return 0
 
 
+import contextlib   # v10.1.55 (W3): module-level, for the Authentik compose mutex below.
+                   # `fcntl` stays a per-function import like `_ur` elsewhere in this file
+                   # ([[apppy-ur-per-function-import-silent-nameerror]]).
+
+
+# --- Authentik compose mutex (v10.1.55 W3) -----------------------------------
+# TWO independent healers own ~/authentik's compose project and neither knew the
+# other existed:
+#
+#   * Guard Dog — takauthentikguard.timer, EVERY 60 SECONDS, running
+#     /opt/tak-guarddog/tak-authentik-watch.sh, whose escalation path is
+#     `docker compose down --timeout 30 && docker compose up -d`
+#   * this console — _recreate_authentik_server_worker() and half a dozen other
+#     `docker compose up` call sites against the same directory
+#
+# test12, 2026-08-31. Guard Dog was inside a full down+up, waiting for the server
+# to go healthy, when the console's [ak-mr-autotune] force-recreated server+worker
+# underneath it:
+#
+#   00:16:10 tak-authentik-watch.sh:  Container authentik-server-1 Waiting
+#   00:16:29 gunicorn: [ak-mr-autotune] recreating server+worker to apply new values...
+#   00:16:35 tak-authentik-watch.sh: dependency failed to start: container authentik-server-1 exited (0)
+#
+# An interrupted down+up leaves containers behind: authentik-postgresql-1 sat in
+# state `created`, StartedAt=0001-01-01, ExitCode=0, never started, while server and
+# worker spun at 115%/70% CPU against a database that did not exist. Every service
+# reported healthy. The operator saw "Authentik is refreshing" forever.
+#
+# The two parties are a gunicorn process and a bash script under systemd, so this
+# has to be flock(2) on a shared path — NOT the PID-file pattern the spiral monitor
+# uses, which only excludes other workers in the same process family. Both sides
+# speak flock natively: fcntl.flock here, flock(1) in the guard scripts.
+
+# ONE fixed path, deliberately in /tmp, and deliberately NOT "/var/lock if it exists".
+#
+# The first cut of this preferred /var/lock and fell back to /tmp. That is a mutex that
+# does not mutex: on nuc (Rocky 9) /var/lock is a root-owned 0755 symlink to /run/lock,
+# so root's Guard Dog takes /var/lock (the directory exists, so its `[ -d ]` test passes)
+# while the non-root console gets EACCES and falls back to /tmp. Two processes, two
+# different files, zero exclusion — and nothing anywhere would say so. Caught on nuc
+# 2026-08-31 by actually running the two halves against each other; every `[ -d ]`-style
+# probe has this shape, because root passes it and the console does not.
+#
+# /tmp is 1777 on Debian and RHEL alike, so both parties can create and open it. Its
+# sticky bit stops anyone deleting someone else's file, and tmpfiles cleaning a stale
+# lock is harmless — the next caller recreates it. `flock` is advisory and keyed on the
+# inode, so the ONLY thing that matters is that both sides open the same path. Never
+# reintroduce a conditional here: if the two sides can disagree, they eventually will.
+_AK_COMPOSE_LOCK_PATH = '/tmp/takwerx-authentik-compose.lock'
+_AK_COMPOSE_LOCK_WAIT_S = 180   # a full down+up on a slow box is ~60-90s; wait past it
+
+
+def _ak_compose_lock_path():
+    """The shared lock path. Returns it whenever it exists or we can create it.
+
+    Deliberately does NOT require write access. Root's Guard Dog can create this file
+    0644 root-owned (a plain `9>>` redirect obeys root's umask), and the non-root
+    console then cannot open it O_RDWR. The first cut treated that as "no usable lock
+    path" and proceeded UNLOCKED — i.e. the mutex silently disabled itself on exactly
+    the boxes it matters on. Observed on test12 2026-08-31:
+
+        -rw-r--r-- 1 root root 0 /tmp/takwerx-authentik-compose.lock
+        authentik compose lock: no usable lock path — proceeding UNLOCKED
+
+    flock(2) is advisory and needs only an open descriptor — a read-only fd locks
+    exclusively just fine — so an existing unwritable file is still perfectly usable.
+    See the O_RDONLY fallback in _authentik_compose_lock().
+    """
+    p = _AK_COMPOSE_LOCK_PATH
+    try:
+        fd = os.open(p, os.O_CREAT | os.O_RDWR, 0o666)
+        os.close(fd)
+        try:
+            os.chmod(p, 0o666)   # widen it for the other party; EPERM if they own it
+        except OSError:
+            pass
+        return p
+    except OSError:
+        pass
+    # Exists but we cannot open it read-write (the root-created 0644 case). Still lockable.
+    return p if os.path.exists(p) else None
+
+
+@contextlib.contextmanager
+def _authentik_compose_lock(holder, plog=None, timeout=_AK_COMPOSE_LOCK_WAIT_S):
+    """Serialise a compose operation on ~/authentik against Guard Dog and other workers.
+
+    Yields True when the lock is held, False when it could not be taken. Callers MUST
+    honour a False by skipping the operation — never proceed unlocked. A skipped
+    autotune costs nothing; a collision costs an outage. Never raises: if flock is
+    unavailable the operation proceeds (degraded to today's behaviour) rather than
+    the console losing the ability to manage Authentik at all.
+    """
+    _log = plog or (lambda m: print(m, flush=True))
+    path = _ak_compose_lock_path()
+    if not path:
+        _log(f"  authentik compose lock: no usable lock path — proceeding UNLOCKED ({holder})")
+        yield True
+        return
+    import fcntl as _fcntl
+    import time as _time
+    fh = None
+    acquired = False
+    writable = False
+    try:
+        try:
+            fh = open(path, 'r+')
+            writable = True
+        except OSError:
+            # Root-owned 0644 (see _ak_compose_lock_path). Lock it read-only rather than
+            # give up — an advisory flock on an O_RDONLY fd excludes exactly the same.
+            fh = open(path, 'r')
+        deadline = _time.time() + timeout
+        waited = False
+        while True:
+            try:
+                _fcntl.flock(fh.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+                acquired = True
+                break
+            except OSError:
+                if _time.time() >= deadline:
+                    break
+                if not waited:
+                    _log(f"  authentik compose lock: held by another process — waiting ({holder})")
+                    waited = True
+                _time.sleep(2)
+        if not acquired:
+            _log(f"  authentik compose lock: NOT acquired after {timeout}s — skipping {holder} "
+                 f"(another healer is mid-compose; retrying later is correct)")
+            yield False
+            return
+        if waited:
+            _log(f"  authentik compose lock: acquired after waiting ({holder})")
+        if writable:
+            # Best-effort breadcrumb for whoever is debugging a stuck lock. Never
+            # required, and impossible on the read-only fallback fd.
+            try:
+                fh.seek(0)
+                fh.truncate()
+                fh.write(f"{os.getpid()} {holder}\n")
+                fh.flush()
+            except OSError:
+                pass
+        yield True
+    except Exception as e:
+        _log(f"  authentik compose lock: unavailable ({str(e)[:120]}) — proceeding UNLOCKED ({holder})")
+        yield True
+    finally:
+        if fh is not None:
+            try:
+                if acquired:
+                    _fcntl.flock(fh.fileno(), _fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                fh.close()
+            except Exception:
+                pass
+
+
 def _recreate_authentik_server_worker(plog, reason):
     """v0.8.7: Force-recreate Authentik server + worker containers (NEVER ldap).
 
@@ -48762,13 +49168,22 @@ def _recreate_authentik_server_worker(plog, reason):
     ok = False
     err_text = ''
     try:
-        r = subprocess.run(
-            _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', '--no-deps', 'server', 'worker']),
-            cwd=os.path.expanduser('~/authentik'), capture_output=True, text=True, timeout=180
-        )
-        ok = (r.returncode == 0)
-        if not ok:
-            err_text = ((r.stderr or '') + (r.stdout or ''))[:300]
+        # v10.1.55 (W3): serialise against Guard Dog's 60-second takauthentikguard.timer.
+        # This exact call is what aborted Guard Dog's down+up mid-flight on test12 and left
+        # authentik-postgresql-1 created-but-never-started. If the lock cannot be taken we
+        # SKIP — a deferred recreate is free, a collision is an outage.
+        with _authentik_compose_lock(f'recreate:{reason}', plog=plog) as _locked:
+            if not _locked:
+                plog(f"  authentik recreate SKIPPED (reason={reason}) — another healer holds "
+                     f"the compose lock; the caller should retry on its next tick")
+                return False
+            r = subprocess.run(
+                _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', '--no-deps', 'server', 'worker']),
+                cwd=os.path.expanduser('~/authentik'), capture_output=True, text=True, timeout=180
+            )
+            ok = (r.returncode == 0)
+            if not ok:
+                err_text = ((r.stderr or '') + (r.stdout or ''))[:300]
     except Exception as e:
         ok = False
         err_text = f"exception: {e}"[:300]
@@ -51746,9 +52161,11 @@ def _authentik_max_requests_autotune_evaluate(plog=None):
 
     Decision matrix with ASYMMETRIC cooldowns (fast-down, slow-up):
       - autotune disabled in settings                    → no change
-      - fire in last 30 min AND current > floor          → tune DOWN (halve,
+      - a fire NEWER than the last tune AND current > floor → tune DOWN (halve,
         clamped to floor). Cooldown: 2 min between down-tunes — converge
-        fast under fire.
+        fast under fire. v10.1.55 (W2): this used to read "a fire in the last
+        30 min", which is not the same thing — see the comment on the down
+        path for the single-fire runaway that produced.
       - no fire in 6h AND current < min(baseline, ceiling) → tune UP (+25%,
         clamped). Cooldown: 30 min between up-tunes — avoid oscillation.
       - otherwise                                        → no change
@@ -51756,8 +52173,11 @@ def _authentik_max_requests_autotune_evaluate(plog=None):
     The cooldown asymmetry matters: tak-10 (May 2026) showed the original
     symmetric 30-min cooldown was too slow to converge — the box took 5+
     fires inside a single cooldown window. With down-cooldown=2 min, the
-    box halves on every other watchdog tick under sustained pressure
-    (1000 → 500 → 250 → 125 → 100 floor in ~8 min).
+    box halves on every other watchdog tick under sustained pressure —
+    meaning FIVE fires walk it 1000 → 500 → 250 → 125 → 100. It takes five
+    fires, not one: the earlier wording ("1000 → 500 → 250 → 125 → 100 floor
+    in ~8 min") described the v10.1.55 bug, where a single fire did the whole
+    descent on its own.
 
     The starting value baseline for "bump up" is min(starting_value, ceiling).
     Starting value defaults to 1000 (the v0.9.23 migration default) but can
@@ -51789,20 +52209,43 @@ def _authentik_max_requests_autotune_evaluate(plog=None):
         _quiet = (_now - _last_fire_ts) > _AUTHENTIK_MAX_REQUESTS_QUIET_WINDOW_S if _last_fire_ts else True
 
         # ── Tune DOWN path ──
-        if _recent_fire and _current > _floor:
+        # v10.1.55 (W2): the trigger is a fire we have NOT ALREADY ACTED ON — not merely
+        # "a fire happened in the last 30 min". `_recent_fire` compared the newest fire
+        # against a 1800s lookback while the down-cooldown is 120s, so ONE fire kept
+        # satisfying the condition on every evaluation for half an hour and walked
+        # MAX_REQUESTS all the way to the floor. Observed on test12 2026-08-31 from a
+        # single 00:06:35 fire:
+        #   00:09:41 1000->500   "watchdog fired 1x in last 30min (last fire 186s ago)"
+        #   00:13:05  500->250   "watchdog fired 1x in last 30min (last fire 390s ago)"
+        #   00:16:29  250->125   "watchdog fired 1x in last 30min (last fire 594s ago)"
+        #   00:19:40  125->100   "watchdog fired 1x in last 30min (last fire 785s ago)"
+        # `fired 1x` in all four lines — the same fire, counted four times. Each step
+        # force-recreates server+worker (~20s of Authentik downtime) and each is a chance
+        # to collide with Guard Dog's 60-second takauthentikguard.timer, which is how
+        # authentik-postgresql-1 ended up created-but-never-started and the box sat on
+        # "Authentik is refreshing" until someone started it by hand.
+        #
+        # Under genuinely sustained pressure nothing is lost: each NEW fire still steps the
+        # value down after the 120s cooldown, which is the "fast convergence under fire"
+        # the original intent wanted. What is gone is treating one incident as sustained.
+        _fires_since_tune = [_f for _f in _fires if _f > _last_tune_ts]
+        if _fires_since_tune and _current > _floor:
             if _since_tune < _AUTHENTIK_MAX_REQUESTS_TUNE_DOWN_COOLDOWN_S:
                 return (None, None, None)  # tune-down cooldown still in effect
             _new = max(_floor, _current // 2)
             _new_jitter = max(5, _new // 20)
-            _fires_30min = len([_f for _f in _fires if _now - _f < _AUTHENTIK_MAX_REQUESTS_FIRE_LOOKBACK_S])
+            # Report what actually drove THIS decision. The old string reported every fire
+            # in the lookback window, so the log read "fired 1x" while tuning for the
+            # fourth time off that one fire — which is precisely what made the runaway
+            # look like four separate incidents in the journal.
             _reason = (
-                f"DOWN: watchdog fired {_fires_30min}x in last 30min "
+                f"DOWN: {len(_fires_since_tune)} new watchdog fire(s) since last tune "
                 f"(last fire {_now - _last_fire_ts}s ago) — MAX_REQUESTS too high"
             )
             try:
                 _autotune_log(
                     f"DECISION_DOWN | from={_current} to={_new} jitter={_new_jitter} "
-                    f"fires_30min={_fires_30min} last_fire_age_s={_now - _last_fire_ts}"
+                    f"fires_since_tune={len(_fires_since_tune)} last_fire_age_s={_now - _last_fire_ts}"
                 )
             except Exception:
                 pass
