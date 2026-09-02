@@ -964,7 +964,7 @@ def apply_security_headers(response):
     if request.is_secure or xf_proto == 'https':
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
-VERSION = "10.1.57-alpha"
+VERSION = "10.1.58-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -20815,6 +20815,84 @@ def guarddog_notifications_pause():
                                 else 'Alerts paused until you resume them.')})
 
 
+@app.route('/api/guarddog/restarts')
+@login_required
+def guarddog_restarts_api():
+    """Recent restarts with WHY, from tak-restart-watch.sh's history file (v10.1.57 W5).
+
+    Deliberately NOT folded into /api/guarddog/health: that route is served from a warm
+    cache so the page can paint colours in ~1s, and this is a small file read that would
+    only add latency to it.
+
+    The point of this endpoint is that the customer's OWN console can say "your hosting
+    provider shut you down". helpnow was power-cycled ten times by its host and the
+    operator spent days blaming a certificate he had changed, because nothing anywhere
+    told him otherwise.
+    """
+    def _uptime_s():
+        try:
+            with open('/proc/uptime') as _u:
+                return int(float(_u.read().split()[0]))
+        except Exception:
+            return 0
+
+    def _iso_ts(s):
+        """Seconds since epoch from the watcher's short-iso stamps, or 0.
+
+        strptime('%z'), not datetime.fromisoformat(): journalctl -o short-iso emits
+        '2026-08-31T00:57:29-0700' (no colon in the offset), and fromisoformat only
+        learned to accept that in Python 3.11. Ubuntu 22.04 — the baseline platform —
+        ships 3.10, so fromisoformat would raise there and silently zero every count.
+        """
+        if not s or s == 'unknown':
+            return 0
+        for fmt in ('%Y-%m-%dT%H:%M:%S%z', '%Y-%m-%dT%H:%M:%SZ', '%Y-%m-%dT%H:%M:%S'):
+            try:
+                return datetime.strptime(s, fmt).timestamp()
+            except Exception:
+                continue
+        return 0
+
+    path = '/var/lib/takguard/restart-history.jsonl'
+    entries = []
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except Exception:
+                    continue          # a torn line is not a reason to fail the card
+    except FileNotFoundError:
+        # No file yet = the watcher has not run a boot since install. That is "nothing
+        # to report", NOT an error, and the card must not shout about it.
+        return jsonify({'success': True, 'supported': True, 'entries': [],
+                        'window_days': 7, 'unexpected_7d': 0, 'uptime_seconds': _uptime_s()})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)[:200]}), 500
+
+    entries = entries[-50:]
+    entries.reverse()                 # newest first
+    cutoff = time.time() - 7 * 86400
+    unexpected = 0
+    for e in entries:
+        # OPERATOR is a deliberate reboot and is not counted against the box.
+        if (e.get('verdict') or '') == 'OPERATOR':
+            continue
+        try:
+            when = e.get('booted_at') or ''
+            ts = _iso_ts(when)
+        except Exception:
+            ts = 0
+        if ts >= cutoff:
+            unexpected += 1
+    return jsonify({'success': True, 'supported': True, 'entries': entries,
+                    'window_days': 7, 'unexpected_7d': unexpected,
+                    'uptime_seconds': _uptime_s()})
+
+
 @app.route('/api/guarddog/notifications/status')
 @login_required
 def guarddog_notifications_status():
@@ -21141,6 +21219,10 @@ def run_guarddog_deploy(alert_email):
             # visibility watcher. Both are fleet-wide — the gate no-ops on a box
             # with no firewall backend, the watcher no-ops until TAK is up.
             'tak-client-gate.sh', 'tak-session-watch.sh',
+            # v10.1.57 W4: classify the previous boot and say WHY the box went down.
+            # Guard Dog had no restart detection at all — a customer box was power-cycled
+            # ten times by its host and the console had nothing to say about it.
+            'tak-restart-watch.sh',
             'tak-8089-watch.sh', 'tak-oom-watch.sh', 'tak-disk-watch.sh', 'tak-diskio-watch.sh',
             'tak-network-watch.sh', 'tak-process-watch.sh', 'tak-cert-watch.sh', 'tak-intca-watch.sh', 'tak-health-endpoint.py',
             'tak-metrics-collector.py', 'tak-updates-watch.sh', 'tak-swap-reclaim.sh',
@@ -21276,6 +21358,9 @@ def run_guarddog_deploy(alert_email):
             ('takintcaguard.timer', '[Unit]\nDescription=Run TAK Intermediate CA expiry monitor daily\n\n[Timer]\nOnBootSec=2h\nOnUnitActiveSec=1d\nUnit=takintcaguard.service\n\n[Install]\nWantedBy=timers.target\n'),
             ('tak-health.service', '[Unit]\nDescription=TAK Server Health Check Endpoint\nAfter=network.target takserver.service\n\n[Service]\nType=simple\nExecStart=/usr/bin/python3 /opt/tak-guarddog/tak-health-endpoint.py\nRestart=always\nRestartSec=10\n\n[Install]\nWantedBy=multi-user.target\n'),
             ('tak-metrics-collector.service', _METRICS_COLLECTOR_UNIT),
+            # Boot-time oneshot, no timer: there is exactly one previous boot to classify
+            # per boot. Ordered after the console because the alert relay lives on :5001.
+            ('takrestartwatch.service', '[Unit]\nDescription=Guard Dog Unexpected-Restart Detector\nAfter=network-online.target takwerx-console.service\nWants=network-online.target\n\n[Service]\nType=oneshot\nTimeoutStartSec=300\nExecStart=/opt/tak-guarddog/tak-restart-watch.sh\n\n[Install]\nWantedBy=multi-user.target\n'),
             ('tak-post-start.service', '[Unit]\nDescription=Guard Dog Post-Start Orchestrator (starts Authentik, TAK Portal, CloudTAK after TAK)\nAfter=takserver.service docker.service\nWants=takserver.service\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nTimeoutStartSec=1200\nExecStart=/opt/tak-guarddog/tak-post-start.sh\n\n[Install]\nWantedBy=multi-user.target\n'),
         ]
         # Two-server: remote DB monitor instead of local PG monitors
@@ -21509,6 +21594,9 @@ def run_guarddog_deploy(alert_email):
         # v0.9.12 A6: source-scope UFW for Guard Dog health endpoint
         _auto_harden_guarddog_8080(settings, plog=plog)
         subprocess.run(_sudo_wrap(['systemctl', 'enable', 'tak-post-start.service']), capture_output=True, text=True, timeout=5)
+        # v10.1.57 W4: boot oneshot, so it needs enabling the same way — a timer would
+        # never fire it (there is exactly one previous boot to classify, at boot).
+        subprocess.run(_sudo_wrap(['systemctl', 'enable', 'takrestartwatch.service']), capture_output=True, text=True, timeout=5)
         plog("✓ Boot orchestrator enabled (staggered start: TAK → Authentik → TAK Portal → CloudTAK)")
         for f in ['process_alert_sent', 'disk_alert_sent', 'db_alert_sent', 'cotdb_alert_sent', 'network_alert_sent', 'cert_alert_sent']:
             p = os.path.join('/var/lib/takguard', f)
